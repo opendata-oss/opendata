@@ -39,6 +39,8 @@ Log Entry:
   SlateDB Value: | record value (bytes) |
 ```
 
+The `0x01` discriminator is reserved for log entries. Additional record types (e.g., metadata, indexes) may be introduced in future RFCs using different discriminators.
+
 This encoding preserves lexicographic key ordering, enabling key-range scans. Entries for the same key are ordered by sequence number.
 
 #### Variable-Length Key Considerations
