@@ -11,7 +11,7 @@ This RFC defines the storage model and core API for open-log. Keys are stored di
 
 ## Motivation
 
-open-log is a key-oriented log system inspired by Kafka, but with a simpler model: keys are user-defined and every key is logically its own independent log. There is no concept of partitions or repartitioning—users simply write to new keys when their access patterns change.
+Open-Log is a key-oriented log system inspired by Kafka, but with a simpler model: keys are user-defined and every key is logically its own independent log. There is no concept of partitions or repartitioning—users simply write to new keys when their access patterns change.
 
 Logs are stored in SlateDB's LSM tree. Writes are appended to the WAL and memtable, then flushed to sorted string tables (SSTs). LSM compaction naturally organizes data for log locality, grouping entries by key prefix over time. This provides efficient sequential reads for individual logs without requiring explicit partitioning infrastructure.
 
