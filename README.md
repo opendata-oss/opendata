@@ -8,11 +8,13 @@
  
 ## Our Vision
 
-We've created OpenData as an open source community effort to build focused, object-store native, versions of every type of online data system, from event streaming systems, to time series databases, text search systems, vector databases, and beyond. These systems will embody the following principles: 
+OpenData is a solution to these sturctural problems with open source data infrastructure. 
+
+OpenData is an open source community building focused and object-store native versions of every online data system from event streaming systems, to time series databases, text search systems, vector databases, and beyond. These systems will embody the following principles: 
 
 1. Each OpenData product will target one core use case and aim to be great at it. 
 2. Each OpenData product will be built from ground up with object storage as a starting point.
-3. Each OpenData product will be built on a common set of primitives. One set of primitives is (SlateDB)[https://www.slatedb.io], but there may be others. 
+3. Each OpenData product will be built on a common set of primitives. One set of primitives is [SlateDB](https://www.slatedb.io), but there may be others. 
 4. Each product and every common component will be licensed under the MIT license. 
 5. All OpenData products will be built with a uniform operational experience, which includes common CLI tooling, common versioning schemes, common configuration styles, and more.
 6. Every OpenData product will be designed to operate with the others. 
