@@ -1,5 +1,6 @@
 // Common types, constants, error handling, record tag encoding, and common encoding utilities
 
+use crate::model::BucketSize;
 use bytes::BytesMut;
 
 /// Key format version (currently 0x01)
@@ -30,26 +31,6 @@ impl RecordType {
     }
 }
 
-/// Time bucket size (1-15, exponential: 1=1h, 2=2h, 3=4h, 4=8h, etc. = 2^(n-1) hours)
-pub type TimeBucketSize = u8;
-
-/// Convert TimeBucketSize to hours
-pub fn time_bucket_size_hours(size: TimeBucketSize) -> u32 {
-    if size == 0 || size > 15 {
-        return 0;
-    }
-    2u32.pow((size - 1) as u32)
-}
-
-/// Time bucket (minutes since UNIX epoch)
-pub type TimeBucket = u32;
-
-/// Series ID (unique within a time bucket)
-pub type SeriesId = u32;
-
-/// Series fingerprint (hash of label set)
-pub type SeriesFingerprint = u64;
-
 /// Encoding error with a descriptive message
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodingError {
@@ -68,14 +49,14 @@ impl std::fmt::Display for EncodingError {
 ///
 /// - High 4 bits: record type (1-15)
 /// - Low 4 bits: bucket size (1-15) for bucket-scoped records, 0x00 for global-scoped
-pub fn encode_record_tag(record_type: RecordType, bucket_size: Option<TimeBucketSize>) -> u8 {
+pub fn encode_record_tag(record_type: RecordType, bucket_size: Option<BucketSize>) -> u8 {
     let type_bits = (record_type as u8) << 4;
     let size_bits = bucket_size.unwrap_or(0) & 0x0F;
     type_bits | size_bits
 }
 
 /// Decode a record tag into record type and optional bucket size
-pub fn decode_record_tag(tag: u8) -> Result<(RecordType, Option<TimeBucketSize>), EncodingError> {
+pub fn decode_record_tag(tag: u8) -> Result<(RecordType, Option<BucketSize>), EncodingError> {
     let record_type = RecordType::from_u8((tag >> 4) & 0x0F)?;
     let bucket_size = tag & 0x0F;
     let size = if bucket_size == 0 {
@@ -256,15 +237,6 @@ mod tests {
         // then
         assert_eq!(decoded_type, record_type);
         assert_eq!(decoded_size, bucket_size);
-    }
-
-    #[test]
-    fn should_convert_time_bucket_size_to_hours() {
-        assert_eq!(time_bucket_size_hours(1), 1);
-        assert_eq!(time_bucket_size_hours(2), 2);
-        assert_eq!(time_bucket_size_hours(3), 4);
-        assert_eq!(time_bucket_size_hours(4), 8);
-        assert_eq!(time_bucket_size_hours(5), 16);
     }
 
     #[test]

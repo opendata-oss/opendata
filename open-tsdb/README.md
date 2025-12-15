@@ -144,7 +144,7 @@ execution to map series IDs back to their label sets when needed.
 ```
 ┌─────────┬─────────────┬─────────────┬─────────────────────┐
 │ version | record_tag  | time_bucket │ series_fingerprint  │
-│ 1 byte  │   8 bits    │   4 bytes   │   8 bytes           │
+│ 1 byte  │   8 bits    │   4 bytes   │   16 bytes          │
 └─────────┴─────────────┴─────────────┴─────────────────────┘
 ```
 
@@ -155,7 +155,7 @@ execution to map series IDs back to their label sets when needed.
   - `bits 7-4` (u4): Record type (`0x02` for `SeriesDictionary`)
   - `bits 3-0` (u4): Bucket size in hours
 - `time_bucket` (u32): The number of minutes since the UNIX epoch
-- `series_fingerprint` (u64): The fingerprint of the label set, computed as a hash of the labels
+- `series_fingerprint` (u128): The fingerprint of the label set, computed as a hash of the labels
 
 The series fingerprint is computed using the labels of the series, which means
 there is a small chance that two series with different labels will have the same

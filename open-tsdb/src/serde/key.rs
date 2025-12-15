@@ -1,6 +1,7 @@
 // Key structures with big-endian encoding
 
 use super::*;
+use crate::model::{BucketSize, BucketStart, SeriesFingerprint, SeriesId};
 use bytes::{Bytes, BytesMut};
 
 /// BucketList key (global-scoped)
@@ -51,9 +52,9 @@ impl BucketListKey {
 /// SeriesDictionary key
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeriesDictionaryKey {
-    pub time_bucket: TimeBucket,
+    pub time_bucket: BucketStart,
     pub series_fingerprint: SeriesFingerprint,
-    pub bucket_size: TimeBucketSize,
+    pub bucket_size: BucketSize,
 }
 
 impl SeriesDictionaryKey {
@@ -69,7 +70,7 @@ impl SeriesDictionaryKey {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 2 + 4 + 8 {
+        if buf.len() < 2 + 4 + 16 {
             return Err(EncodingError {
                 message: "Buffer too short for SeriesDictionaryKey".to_string(),
             });
@@ -96,8 +97,9 @@ impl SeriesDictionaryKey {
         })?;
 
         let time_bucket = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
-        let series_fingerprint = u64::from_be_bytes([
-            buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13],
+        let series_fingerprint = u128::from_be_bytes([
+            buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+            buf[16], buf[17], buf[18], buf[19], buf[20], buf[21],
         ]);
 
         Ok(SeriesDictionaryKey {
@@ -111,9 +113,9 @@ impl SeriesDictionaryKey {
 /// ForwardIndex key
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardIndexKey {
-    pub time_bucket: TimeBucket,
+    pub time_bucket: BucketStart,
     pub series_id: SeriesId,
-    pub bucket_size: TimeBucketSize,
+    pub bucket_size: BucketSize,
 }
 
 impl ForwardIndexKey {
@@ -169,10 +171,10 @@ impl ForwardIndexKey {
 /// InvertedIndex key
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvertedIndexKey {
-    pub time_bucket: TimeBucket,
+    pub time_bucket: BucketStart,
     pub attribute: String,
     pub value: String,
-    pub bucket_size: TimeBucketSize,
+    pub bucket_size: BucketSize,
 }
 
 impl InvertedIndexKey {
@@ -234,9 +236,9 @@ impl InvertedIndexKey {
 /// TimeSeries key
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeSeriesKey {
-    pub time_bucket: TimeBucket,
+    pub time_bucket: BucketStart,
     pub series_id: SeriesId,
-    pub bucket_size: TimeBucketSize,
+    pub bucket_size: BucketSize,
 }
 
 impl TimeSeriesKey {

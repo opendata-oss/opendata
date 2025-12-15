@@ -1,12 +1,13 @@
 // BucketList value structure
 
 use super::*;
+use crate::model::{BucketSize, BucketStart};
 use bytes::{Bytes, BytesMut};
 
 /// BucketList value: SingleArray<(bucket_size: u8, time_bucket: u32)>
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketListValue {
-    pub buckets: Vec<(TimeBucketSize, TimeBucket)>,
+    pub buckets: Vec<(BucketSize, BucketStart)>,
 }
 
 impl BucketListValue {
@@ -23,14 +24,14 @@ impl BucketListValue {
     }
 }
 
-impl Encode for (TimeBucketSize, TimeBucket) {
+impl Encode for (BucketSize, BucketStart) {
     fn encode(&self, buf: &mut BytesMut) {
         buf.extend_from_slice(&[self.0]);
         buf.extend_from_slice(&self.1.to_le_bytes());
     }
 }
 
-impl Decode for (TimeBucketSize, TimeBucket) {
+impl Decode for (BucketSize, BucketStart) {
     fn decode(buf: &mut &[u8]) -> Result<Self, EncodingError> {
         if buf.len() < 1 + 4 {
             return Err(EncodingError {

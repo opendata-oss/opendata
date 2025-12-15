@@ -1,5 +1,7 @@
 use blake3::Hasher;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::model::Attribute;
 
 /// Error type for OpenTSDB operations
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +29,18 @@ impl std::fmt::Display for OpenTsdbError {
     }
 }
 
+impl From<std::time::SystemTimeError> for OpenTsdbError {
+    fn from(err: std::time::SystemTimeError) -> Self {
+        OpenTsdbError::InvalidInput(format!("Invalid timestamp: {}", err))
+    }
+}
+
+impl From<std::num::TryFromIntError> for OpenTsdbError {
+    fn from(err: std::num::TryFromIntError) -> Self {
+        OpenTsdbError::InvalidInput(format!("Integer conversion error: {}", err))
+    }
+}
+
 /// Result type alias for OpenTSDB operations
 pub type Result<T> = std::result::Result<T, OpenTsdbError>;
 
@@ -39,6 +53,26 @@ pub(crate) fn fingerprint_string(value: &str) -> u64 {
     let mut first8 = [0u8; 8];
     first8.copy_from_slice(&digest.as_bytes()[..8]);
     u64::from_le_bytes(first8)
+}
+
+trait Fingerprint {
+    fn fingerprint(&self) -> u128;
+}
+
+impl Fingerprint for Vec<Attribute> {
+    fn fingerprint(&self) -> u128 {
+        let mut hasher = Hasher::new();
+        for attribute in self {
+            hasher.update(attribute.0.as_bytes());
+            hasher.update(attribute.1.as_bytes());
+        }
+
+        let digest = hasher.finalize();
+        let mut first16 = [0u8; 16];
+        first16.copy_from_slice(&digest.as_bytes()[..16]);
+
+        u128::from_le_bytes(first16)
+    }
 }
 
 /// Parse a timestamp parameter that can be either RFC3339 or Unix timestamp (float seconds).
@@ -101,6 +135,21 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     // Try parsing Prometheus duration format
     promql_parser::util::parse_duration(s)
         .map_err(|e| OpenTsdbError::InvalidInput(format!("Invalid duration: {}", e)))
+}
+
+/// Truncate `time` down to the start of the hour and return the Unix epoch minutes as `u32`.
+/// Errors if `time` is before the Unix epoch or beyond `u32::MAX` minutes (~8170 years).
+pub fn hour_bucket_in_epoch_minutes(time: SystemTime) -> Result<u32> {
+    const HOUR_MINS: u64 = 60;
+    let mins = time.duration_since(UNIX_EPOCH)?.as_secs() / 60;
+    let bucket = mins - (mins % HOUR_MINS);
+    let bucket_u32 = u32::try_from(bucket)?;
+    Ok(bucket_u32)
+}
+
+pub fn hour_bucket_unix_secs(time: SystemTime) -> Option<u64> {
+    let secs = time.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(secs - (secs % 3600))
 }
 
 #[cfg(test)]

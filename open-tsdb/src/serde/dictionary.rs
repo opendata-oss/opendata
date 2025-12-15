@@ -1,6 +1,7 @@
 // SeriesDictionary value structure
 
 use super::*;
+use crate::model::SeriesId;
 use bytes::{Bytes, BytesMut};
 
 /// SeriesDictionary value: SingleArray<series_id: u32>
