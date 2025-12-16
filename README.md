@@ -1,6 +1,6 @@
 # Overview
 
-OpenData is a collection of open source data infrastructure projects designed from ground up objectstoraege. Our goal is to deliver highly focused, objectstore-native versions of online databases that can power your application stack. As of today, we have a competitive timeseries database and a data streaming backend. We plan to ship vector search, text search, and other database types over time. Contributions are welcome!
+OpenData is a collection of open source data infrastructure projects designed from ground up for objectstoraege. We aim to deliver highly focused, objectstore-native versions of online databases that can power your application stack. As of today, we have a competitive timeseries database and a data streaming backend. We plan to ship vector search, text search, and other database types over time. Contributions are welcome!
 
 Building performant, cost effective, and correct online systems on objectstorage takes special care. Successful designs all have to solve the problem of write batching, multiple levels of caching, and snapshot isolation for correctness. OpenData systems build on a common foundation to solve these problems. This common foundation gives OpenData systems a common set of operational tools, configuration systems, etc., that make our systems easier to operate in aggregate. 
 
@@ -9,8 +9,8 @@ Building performant, cost effective, and correct online systems on objectstorage
 
 OpenData ships two systems today:
 
-* TSDB : An objectstore native timeseries database that can serve as a backend for Prometheus. Its a great option for a low cost, easy to operate, grafana backend.
-* EventStore: Think of it as Kafka 2.0. An objecstore native event streaming backend that allows you to have millions of logs, so you can finally get a replayable log per key cost effectively.
+* TSDB: An objectstore native timeseries database that can serve as a backend for Prometheus. Its a great option for a low cost, easy to operate, grafana backend.
+* EventStore: Think of it as Kafka 2.0. An objecstore native event streaming backend that supports millions of logs, so you can finally get a replayable log per key.
 
 # Quick Start
 
@@ -27,16 +27,14 @@ TODO.
 
 ## Our Vision
 
-OpenData is a solution to these sturctural problems with open source data infrastructure. 
+To address these structural problems with opensource data infrastructure today, OpenData systems adopt the following principles: 
 
-OpenData is an open source community building focused and object-store native versions of every online data system from event streaming systems, to time series databases, text search systems, vector databases, and beyond. These systems will embody the following principles: 
-
-1. Each OpenData product will target one core use case and aim to be great at it. 
-2. Each OpenData product will be built from ground up with object storage as a starting point.
+1. Each OpenData product will target one core use case and aim to be best-in-class at it. 
+2. Each OpenData product will be designed from ground up with object storage as a starting point.
 3. Each OpenData product will be built on a common set of primitives. One set of primitives is [SlateDB](https://www.slatedb.io), but there may be others. 
 4. Each product and every common component will be licensed under the MIT license. 
 5. All OpenData products will be built with a uniform operational experience, which includes common CLI tooling, common versioning schemes, common configuration styles, and more.
-6. Every OpenData product will be designed to operate with the others. 
+6. Every OpenData product will be designed to compose with the others. 
 
 OpenData aims to put control back in the hands of developers. Your data is always in your custody, and OpenData makes it practical to serve that data to any app without needing multiple specialist engineers on staff.
 
