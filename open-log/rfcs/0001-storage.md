@@ -31,15 +31,15 @@ Logs are stored in SlateDB's LSM tree. Writes are appended to the WAL and memtab
 
 ### Key Encoding
 
-SlateDB keys are a composite of the user key and a `u64` sequence number. A leading byte discriminator distinguishes entry types.
+SlateDB keys are a composite of the user key and a `u64` sequence number. A version prefix and record type discriminator provide forward compatibility.
 
 ```
 Log Entry:
-  SlateDB Key:   | 0x01 | key (bytes) | sequence (u64) |
+  SlateDB Key:   | version (u8) | type (u8) | key (bytes) | sequence (u64) |
   SlateDB Value: | record value (bytes) |
 ```
 
-The `0x01` discriminator is reserved for log entries. Additional record types (e.g., metadata, indexes) may be introduced in future RFCs using different discriminators.
+The initial version is `1`. The type discriminator `0x01` is reserved for log entries. Additional record types (e.g., metadata, indexes) may be introduced in future RFCs using different discriminators.
 
 This encoding preserves lexicographic key ordering, enabling key-range scans. Entries for the same key are ordered by sequence number.
 
@@ -55,9 +55,12 @@ In practice, users are likely to use fixed-length keys, which avoids this issue 
 
 ### Sequence Numbers
 
-Sequence numbers are assigned from a global counter that increments on every append. Each key's log is monotonically ordered by sequence number, but the sequence numbers are not contiguous—other keys' appends are interleaved in the global sequence.
+Sequence numbers are assigned from a single counter that is maintained by the SlateDB writer and is incremented after every append. Each key's log is monotonically ordered by sequence number, but the sequence numbers are not contiguous—other keys' appends are interleaved in the global sequence.
 
 This approach simplifies ingestion by avoiding per-key sequence tracking. The trade-off is that sequence numbers do not reflect the count of entries within a key's log.
+
+If SlateDB supports multi-writer in the future, each writer would maintain its own sequence counter. This design assumes each key would still have a single writer—interleaving appends from multiple writers to the same key would break monotonic ordering within that key's log.
+
 
 ### Write API
 
@@ -107,16 +110,26 @@ impl OpenLog {
 
 ### Lag and Count (under consideration)
 
-Without contiguous sequence numbers, computing lag requires additional bookkeeping. The approach under consideration augments SlateDB data structures:
+Lag is a critical metric for tracking progress reading from a log. Without contiguous sequence numbers, computing lag requires additional bookkeeping. The approach under consideration augments SlateDB's SST index structure.
 
-- Each SST tracks the number of records it contains
-- Each SST provides the relative index of a given entry within it
+Each block entry in the SST index would include a cumulative record count:
 
-With this metadata, walking the LSM tree at the metadata level can compute the number of records within a given key/sequence range without scanning all entries.
+```
+Block Entry: | block_offset | cumulative_record_count | first_key |
+```
+
+To count records in a range, we scan the LSM at the index level rather than reading all entries. However, block boundaries may not align with the query range. Within each level of the LSM that overlaps our target range, we may need to read the first and last blocks from that range to determine the exact offset relative to block boundaries.
+
+An approximate count could be offered based on the index alone without reading any blocks—useful when exact counts are not required.
 
 ```rust
+// TODO: decide which SlateDB ScanOptions parameters to pass through
+struct CountOptions {
+    approximate: bool,
+}
+
 impl OpenLog {
-    async fn count(&self, key: Bytes, seq_range: impl RangeBounds<u64>) -> Result<u64, Error>;
+    async fn count(&self, key: Bytes, seq_range: impl RangeBounds<u64>, options: CountOptions) -> Result<u64, Error>;
 }
 ```
 
