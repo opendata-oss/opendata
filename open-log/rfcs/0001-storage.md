@@ -61,6 +61,31 @@ This approach simplifies ingestion by avoiding per-key sequence tracking. The tr
 
 If SlateDB supports multi-writer in the future, each writer would maintain its own sequence counter. This design assumes each key would still have a single writer—interleaving appends from multiple writers to the same key would break monotonic ordering within that key's log.
 
+### SST Representation
+
+Open-log proposes two enhancements to SlateDB's SST structure to support efficient `scan` and `count` operations.
+
+#### Block Record Counts
+
+Each block entry in the SST index would include a cumulative record count:
+
+```
+Block Entry: | block_offset | cumulative_record_count | first_key |
+```
+
+This enables counting records in a range by scanning the LSM at the index level rather than reading all entries. Block boundaries may not align with the query range, so the first and last blocks in each overlapping level may need to be read for exact counts. An approximate count can be computed from the index alone.
+
+#### Bloom Filter Granularity
+
+SlateDB SSTs include bloom filters to accelerate point lookups. For open-log, the bloom filter should be keyed on the log key alone, not the composite SlateDB key which includes the sequence number. This allows the bloom filter to indicate whether a given log is present in an SST, reducing the blocks read during `scan` or `count` queries.
+
+### Append-Only Scan Optimization
+
+In a typical key-value store, range scans must concurrently merge all LSM levels because any level may contain the most recent value for a given key. The append-only structure of open-log provides a stronger guarantee: newer entries are always in higher levels (L0 and recent sorted runs), while older entries settle into deeper levels through compaction.
+
+This ordering guarantee enables level-by-level iteration rather than concurrent merging. For queries targeting the tip of a log, we can avoid loading blocks from older levels entirely. This improves performance and prevents cache thrashing from loading historical data that isn't needed.
+
+How this optimization can be exposed in SlateDB remains to be explored.
 
 ### Write API
 
@@ -108,19 +133,9 @@ impl OpenLog {
 }
 ```
 
-### Lag and Count (under consideration)
+### Count API (under consideration)
 
-Lag is a critical metric for tracking progress reading from a log. Without contiguous sequence numbers, computing lag requires additional bookkeeping. The approach under consideration augments SlateDB's SST index structure.
-
-Each block entry in the SST index would include a cumulative record count:
-
-```
-Block Entry: | block_offset | cumulative_record_count | first_key |
-```
-
-To count records in a range, we scan the LSM at the index level rather than reading all entries. However, block boundaries may not align with the query range. Within each level of the LSM that overlaps our target range, we may need to read the first and last blocks from that range to determine the exact offset relative to block boundaries.
-
-An approximate count could be offered based on the index alone without reading any blocks—useful when exact counts are not required.
+Lag is a critical metric for tracking progress reading from a log. Without contiguous sequence numbers, computing lag requires the SST enhancements described in [SST Representation](#sst-representation).
 
 ```rust
 // TODO: decide which SlateDB ScanOptions parameters to pass through
@@ -133,7 +148,7 @@ impl OpenLog {
 }
 ```
 
-This mirrors the scan API but returns a count rather than entries.
+This mirrors the scan API but returns a count rather than entries. The `approximate` option allows counting from the index alone without reading boundary blocks.
 
 ## Alternatives
 
