@@ -39,7 +39,7 @@ Storage is one third of the problem a database needs to solve, with querying bei
 
 ### Metadata 
 
-Managing metadaa is the final third of the problem that needs to be solved by a database. The metadata problem boils down to making sure that data  stored by the ingestion layer can be found and queried by the query engine, and that the writers and readers are coordinated so that the Integrity of writes (I in ACID) is maintained. 
+Managing metadata is the final third of the problem that needs to be solved by a database. The metadata problem boils down to making sure that data  stored by the ingestion layer can be found and queried by the query engine, and that the writers and readers are coordinated so that the Integrity of writes (I in ACID) is maintained. 
 
 In addition to solving core storage problems, SlateDB also solves this basic metadata problem via [Manifests](https://github.com/slatedb/slatedb/blob/main/rfcs/0001-manifest.md). It's worth reading that RFC, but here's a summary of manifests work and why we can build on them to solve the metadata problem for OpenData.
 
