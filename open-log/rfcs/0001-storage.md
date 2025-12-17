@@ -1,4 +1,4 @@
-# RFC 0001: Open-Log Storage
+# RFC 0001: Log Storage
 
 **Status**: Draft
 
@@ -7,11 +7,11 @@
 
 ## Summary
 
-This RFC defines the storage model and core API for open-log. Keys are stored directly in the LSM with a sequence number suffix, enabling per-key log streams with global ordering. The API provides append and scan operations mirroring SlateDB's interface.
+This RFC defines the storage model and core API for OpenData-Log. Keys are stored directly in the LSM with a sequence number suffix, enabling per-key log streams with global ordering. The API provides append and scan operations mirroring SlateDB's interface.
 
 ## Motivation
 
-Open-Log is a key-oriented log system inspired by Kafka, but with a simpler model: keys are user-defined and every key is logically its own independent log. There is no concept of partitions or repartitioning—users simply write to new keys when their access patterns change.
+OpenData-Log is a key-oriented log system inspired by Kafka, but with a simpler model: keys are user-defined and every key is logically its own independent log. There is no concept of partitions or repartitioning—users simply write to new keys when their access patterns change.
 
 Logs are stored in SlateDB's LSM tree. Writes are appended to the WAL and memtable, then flushed to sorted string tables (SSTs). LSM compaction naturally organizes data for log locality, grouping entries by key prefix over time. This provides efficient sequential reads for individual logs without requiring explicit partitioning infrastructure.
 
@@ -63,7 +63,7 @@ If SlateDB supports multi-writer in the future, each writer would maintain its o
 
 ### SST Representation
 
-Open-log proposes two enhancements to SlateDB's SST structure to support efficient `scan` and `count` operations.
+OpenData-Log proposes two enhancements to SlateDB's SST structure to support efficient `scan` and `count` operations.
 
 #### Block Record Counts
 
@@ -77,7 +77,7 @@ This enables counting records in a range by scanning the LSM at the index level 
 
 #### Bloom Filter Granularity
 
-SlateDB SSTs include bloom filters to accelerate point lookups. For open-log, the bloom filter should be keyed on the log key alone, not the composite SlateDB key which includes the sequence number. This allows the bloom filter to indicate whether a given log is present in an SST, reducing the blocks read during `scan` or `count` queries.
+SlateDB SSTs include bloom filters to accelerate point lookups. For OpenData-Log, the bloom filter should be keyed on the log key alone, not the composite SlateDB key which includes the sequence number. This allows the bloom filter to indicate whether a given log is present in an SST, reducing the blocks read during `scan` or `count` queries.
 
 ### Append-Only Scan Optimization
 
@@ -101,7 +101,7 @@ struct WriteOptions {
     await_durable: bool,
 }
 
-impl OpenLog {
+impl Log {
     async fn append(&self, record: Record, options: WriteOptions) -> Result<(), Error>;
     async fn append_batch(&self, records: Vec<Record>, options: WriteOptions) -> Result<(), Error>;
 }
@@ -128,7 +128,7 @@ impl ScanIterator {
     async fn next(&mut self) -> Result<Option<LogEntry>, Error>;
 }
 
-impl OpenLog {
+impl Log {
     fn scan(&self, key: Bytes, seq_range: impl RangeBounds<u64>, options: ScanOptions) -> ScanIterator;
 }
 ```
@@ -143,7 +143,7 @@ struct CountOptions {
     approximate: bool,
 }
 
-impl OpenLog {
+impl Log {
     async fn count(&self, key: Bytes, seq_range: impl RangeBounds<u64>, options: CountOptions) -> Result<u64, Error>;
 }
 ```
