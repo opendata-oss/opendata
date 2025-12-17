@@ -30,25 +30,24 @@ OpenData leans heavily on [SlateDB](https://www.slatedb.io) as the core data sub
 1. The Ingestors are likely to be very similar across databases, since they just write a log to satisfy durability guarantees. SlateDB already has a WAL implementation that is optimized for writing to object storage. It makes sense for us to reuse that WAL implementation while extending and generalizing it wherever necessary.
 2. SlateDB already has compactor modules. Generalizing the compactor framework so that custom compaction logic and output formats can be plugged in by database implementations is a logical direction for us to take. 
 3. Further improvements would be to enable parallelizing compaction, which would mean developing some notion of partitioning into SlateDB. 
-5. SlateDB already has an objectstore native implementation of an LSM tree. This implementation is built to cache index data to enable fast lookups, etc. This generic structure is likely to be useful across a variety of database types. If there are other common data structures that are useful across datastructures (like high performance dictionaries, etc), we'd want to make them availabel in SlateDB.
-6. SlateDB has built a metadata management layer through manifest files. This enables snapshot isolation across readers and writers, which is a generic capability that we will develop in th context of SlateDB and leverage across OpenData. 
+5. SlateDB already has an objectstore native implementation of an LSM tree. This implementation is built to cache index data to enable fast lookups, etc. This generic structure is likely to be useful across a variety of database types. If there are other common data structures that are useful across databases (like high performance dictionaries, etc), we'd want to make them available in SlateDB.
 
 ### Query
 
-Storage is one third of the problem a database needs to sorve, with querying being another third. Thus we'd like to have a shared framework for querying like we have SlateDB for storage. We are evaluating [Apache Datafusion](https://datafusion.apache.org/) for this purpose, but suggestions for better options are welcome! 
+Storage is one third of the problem a database needs to solve, with querying being another third. Thus we'd like to have a shared framework for querying like we have SlateDB for storage. We are evaluating [Apache Datafusion](https://datafusion.apache.org/) for this purpose, but suggestions for better options are welcome! 
 
 
 ### Metadata 
 
-Managing metadaa is the final third of the problem that needs to be solved by a database. The metadata problem boils down to make sure that data that's stored by the ingestion layer can be found and queried by the query engine, and that the writers and readers are coordinated so that the Integrity of writes (I in ACID) is maintained. 
+Managing metadaa is the final third of the problem that needs to be solved by a database. The metadata problem boils down to making sure that data  stored by the ingestion layer can be found and queried by the query engine, and that the writers and readers are coordinated so that the Integrity of writes (I in ACID) is maintained. 
 
 In addition to solving core storage problems, SlateDB also solves this basic metadata problem via [Manifests](https://github.com/slatedb/slatedb/blob/main/rfcs/0001-manifest.md). It's worth reading that RFC, but here's a summary of manifests work and why we can build on them to solve the metadata problem for OpenData.
 
-1. The manifest contains the locations and versions of all the files that comprise the data in the system. 
+1. The manifest contains the locations and versions of all the data files the system. 
 2. The general principle is that data is only read if the files which contain that data are accessible via the manifest. 
 3. SlateDB leverages compare-and-set operations that are available in every object store to atomically update the manifest.
 4. Ingestors and Compactors flush data to objectstore first, and then atomically update the locations of the new files in the manifest.
-5. SlateDB leverages the version information in the manifest to ensure that versions can't roll back. Writes with older versions are rejected. This provides a fencing mechansism to ensure zombie writers can't roll data backward. 
+5. SlateDB leverages the version information in the manifest to ensure that versions can't roll back by rejectiing writes with older versions. This provides a fencing mechansism which ensures zombie writers can't roll data backward. 
 6. Readers of data, including Compactors and Query Executors, thus always get a consistent view of the metadata at any point in time. 
 7. The manifest system as a whole provides snapshot isolation across reads and writes for every OpenData database. 
 
@@ -81,12 +80,12 @@ TODO.
 ## Our Beliefs 
 
 1. We believe that object storage is a fundamentally new ingredient in data systems: it provides highly durable, highly available, infinite storage with unique performance and cost structures. On the one hand, it solves one of the hardest problems in distributed data systems: consistent replication. On the other hand, care must be taken to make it work corretly, performantly, and cost effectively. It turns out that the techniques to achieve the latter are pretty similar across systems: batching on writes, caching on reads, snapshot isolation. When done right, systems built natively on object storage are far simpler and cheaper to operate in modern clouds than those that haven't used object storage as a starting point.
-2. Inspired by the UNIX philosophy, we believe single purpose systems that compose well are superior to systems that try to solve many problems under one umbrella.
+2. Inspired by the UNIX philosophy, we believe single purpose systems that compose well are superior to systems that try to solve many problems under one umbrella, which is what has tended to happen with existing open surce projects since each are in a silo.
 3. We believe that there is a general lack of objectstore native open source data systems, to the detriment of the developer community at large. 
 
 ## Our Vision
 
-To address these structural problems with opensource data infrastructure today, OpenData systems adopt the following principles: 
+To address these structural problems with open source data infrastructure today, OpenData systems adopt the following principles: 
 
 1. Each OpenData product will target one core use case and aim to be best-in-class at it. 
 2. Each OpenData product will be designed from ground up with object storage as a starting point.
