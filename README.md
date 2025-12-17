@@ -4,13 +4,51 @@ OpenData is a collection of open source data infrastructure projects designed fr
 
 Building performant, cost effective, and correct online systems on objectstorage takes special care. Successful designs all have to solve the problem of write batching, multiple levels of caching, and snapshot isolation for correctness. OpenData systems build on a common foundation to solve these problems. This common foundation gives OpenData systems a common set of operational tools, configuration systems, etc., that make our systems easier to operate in aggregate. 
 
+# Architecture
+
+Each OpenData product has a high level architecture that looks like this:
+
+![OpenData high level architectural components](public/img/opendata-arch.png)
+
+## Data Flow
+The core concepts are best understood by following the typical data flow.
+
+1. The API layer is specific to each product, and implements the appropriate read and write APIs for the product. When the API layer receives write requests, they are forwarded to the Ingestor services.
+2. The Ingestor services are stateless. They batch writes coming from the API layer, flush the data in a Write-Ahead-Log (WAL) format which is optimized for object storage, and update Metadata. We describe the metadata layer in detail later, but for now it suffices to know that the matadata contains locations and versions of all files in the system. The metadata lives in objectstorage, and all OpenData systems use the same components to enable writing metadata updates atomically. Atomic updates to metadata ensure that readers and writers in the system operate on consistent views of the data in the system.
+3. There are two types of Compactors in the OpenData system. One type is called the WAL compactor. It takes new WAL files written by ingestors and write the WAL entries into a format that's optimized to serve queries of each specific the data system. For example, a compactor for a TSDB will take a WAL file and write inverted indexes, dictionaries, etc. These read-optimized files are called Collections. 
+4. The other type of Compactor takes existing collections and rewrites them for various reasons, including to drop deleted data, to improve data locality across updates, etc. This logic is again product specific. The goal of the background compaction process is to maintain read optimized versions of the data across updates. 
+5. The query executors are responsible for serving queries on the system. These are custom for each product type. For instance, the query executor of our TSDB implements PromQL. When executing a query, the executor lookup the metadata to find the files relevant to serving the query, and essentially retrieves the data from those files. A big job of the query executor is to keep the right indexes in memory and the hot data cached so that queries on the system are both fast and do not create unduly expensive calls to the objectstore.
+6. The API layer forwards queries to the query executors for compliation and execution, and returns results to clients. 
+
+## Shared components
+
+TODO, but a sketch of the content is: 
+
+1. OpenData leverages SlateDB's compactor framework, caching algorithms, and objectstore-native LSM file format.
+2. OpenData relies completely on SlateDB's manifest implementation for reading and writing metadata.
+3. OpenData relies on SlateDB's WAL format as an performant objectstore-native WAL.
+4. On the query side, OpenData leverages Datafusion to build performant and functional query engines. 
+
+As a general principle, we prefer common data and query components to be part of SlateDB and Datafusion respectivzely.
+
+## Metadata 
+
+TODO, but here's a sketch:
+
+1. The metadata layer leverages SlateDB's [manifest](https://github.com/slatedb/slatedb/blob/main/rfcs/0001-manifest.md). The manifest contains the locations of all the files that comprise the data in the system. 
+2. The general principle is that data is only read if the files are accessible via the manifest. 
+3. SlateDB leverages compare-and-set operations that are available in every object store to atomically updatet the manifest.
+4. Ingestors and Compactors flush data to objectstore, and then atomically update the locations in the manifest.
+5. SlateDB further versions the metadata using epochs, which ensures that zombie writers can't roll versions back.
+6. Readers of data, including Compactors and Query Executors, thus always get a consistent view of the metadata at any point in time. 
+7. This allows basic snapshot isolation across reads and writes. 
 
 # Our systems.
 
 OpenData ships two systems today:
 
-* TSDB: An objectstore native timeseries database that can serve as a backend for Prometheus. Its a great option for a low cost, easy to operate, grafana backend.
-* EventStore: Think of it as Kafka 2.0. An objecstore native event streaming backend that supports millions of logs, so you can finally get a replayable log per key.
+* TSDB: An objectstore native timeseries database that can serve as a backend for Prometheus. Its a great option for a low cost, easy to operate, grafana backend. Learn more about it here : <link to RFC>
+* EventStore: Think of it as Kafka 2.0. An objecstore native event streaming backend that supports millions of logs, so you can finally get a replayable log per key. Learn more about it here: <link to rfc>
 
 # Quick Start
 
