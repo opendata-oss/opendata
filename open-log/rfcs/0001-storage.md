@@ -97,13 +97,14 @@ struct Record {
     value: Bytes,
 }
 
+#[derive(Default)]
 struct WriteOptions {
     await_durable: bool,
 }
 
 impl Log {
-    async fn append(&self, record: Record, options: WriteOptions) -> Result<(), Error>;
-    async fn append_batch(&self, records: Vec<Record>, options: WriteOptions) -> Result<(), Error>;
+    async fn append(&self, records: Vec<Record>) -> Result<(), Error>;
+    async fn append_with_options(&self, records: Vec<Record>, options: WriteOptions) -> Result<(), Error>;
 }
 ```
 
@@ -119,6 +120,7 @@ struct LogEntry {
 }
 
 // TODO: decide which SlateDB ScanOptions parameters to pass through
+#[derive(Default)]
 struct ScanOptions {
 }
 
@@ -129,26 +131,36 @@ impl ScanIterator {
 }
 
 impl Log {
-    fn scan(&self, key: Bytes, seq_range: impl RangeBounds<u64>, options: ScanOptions) -> ScanIterator;
+    fn scan(&self, key: Bytes, seq_range: impl RangeBounds<u64>) -> ScanIterator;
+    fn scan_with_options(&self, key: Bytes, seq_range: impl RangeBounds<u64>, options: ScanOptions) -> ScanIterator;
 }
 ```
 
 ### Count API (under consideration)
 
-Lag is a critical metric for tracking progress reading from a log. Without contiguous sequence numbers, computing lag requires the SST enhancements described in [SST Representation](#sst-representation).
+Lag is a critical metric for tracking progress reading from a log. Without contiguous sequence numbers, computing lag requires the SST enhancements described in [SST Representation](#sst-representation). This proposal adds an explicit API to count the number of records that are present within any range of the log for a key. 
 
 ```rust
 // TODO: decide which SlateDB ScanOptions parameters to pass through
+#[derive(Default)]
 struct CountOptions {
-    approximate: bool,
+    approximate: bool,  // default: false (precise counts)
 }
 
 impl Log {
-    async fn count(&self, key: Bytes, seq_range: impl RangeBounds<u64>, options: CountOptions) -> Result<u64, Error>;
+    async fn count(&self, key: Bytes, seq_range: impl RangeBounds<u64>) -> Result<u64, Error>;
+    async fn count_with_options(&self, key: Bytes, seq_range: impl RangeBounds<u64>, options: CountOptions) -> Result<u64, Error>;
 }
 ```
 
 This mirrors the scan API but returns a count rather than entries. The `approximate` option allows counting from the index alone without reading boundary blocks.
+
+For example, to compute the current lag for a key from a given sequence number:
+
+```rust
+let current_seq: u64 = 1000;
+let lag = log.count(key, current_seq..).await?;
+```
 
 ## Alternatives
 
