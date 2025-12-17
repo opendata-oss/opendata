@@ -15,9 +15,9 @@ The core concepts are best understood by following the typical data flow.
 
 1. The API layer is specific to each product, and implements the appropriate read and write APIs for the product. When the API layer receives write requests, they are forwarded to the Ingestor services.
 2. The Ingestor services are stateless. They batch writes coming from the API layer, flush the data in a Write-Ahead-Log (WAL) format which is optimized for object storage, and update Metadata. We describe the metadata layer in detail later, but for now it suffices to know that the matadata contains locations and versions of all files in the system. The metadata lives in objectstorage, and all OpenData systems use the same components to enable writing metadata updates atomically. Atomic updates to metadata ensure that readers and writers in the system operate on consistent views of the data in the system.
-3. There are two types of Compactors in the OpenData system. One type is called the WAL compactor. It takes new WAL files written by ingestors and write the WAL entries into a format that's optimized to serve queries of each specific the data system. For example, a compactor for a TSDB will take a WAL file and write inverted indexes, dictionaries, etc. These read-optimized files are called Collections. 
-4. The other type of Compactor takes existing collections and rewrites them for various reasons, including to drop deleted data, to improve data locality across updates, etc. This logic is again product specific. The goal of the background compaction process is to maintain read optimized versions of the data across updates. 
-5. The query executors are responsible for serving queries on the system. These are custom for each product type. For instance, the query executor of our TSDB implements PromQL. When executing a query, the executor lookup the metadata to find the files relevant to serving the query, and essentially retrieves the data from those files. A big job of the query executor is to keep the right indexes in memory and the hot data cached so that queries on the system are both fast and do not create unduly expensive calls to the objectstore.
+3. There are two types of Compactors in the OpenData system. One type is called the WAL compactor. It takes new WAL files written by ingestors and write the WAL entries into a format that's optimized to serve the queries of each data system. For example, a compactor for a TSDB will take a WAL file and write inverted indexes, dictionaries, etc. These read-optimized files are called Collections. 
+4. The other type of Compactor takes existing Collections and rewrites them for various reasons, including to drop deleted data, to improve data locality across updates, etc. This logic is again product specific. The goal of the background compaction process is to maintain read optimized versions of the data across updates. 
+5. The query executors are responsible for serving queries on the system. These are custom for each product type. For instance, the query executor of our TSDB implements PromQL. When executing a query, the executors lookup the metadata to find the files relevant to serving the query, and retrieves the data from those files. A big job of the query executor is to keep the right indexes in memory and the hot data cached so that queries on the system are both fast and do not create unduly expensive calls to the objectstore.
 6. The API layer forwards queries to the query executors for compliation and execution, and returns results to clients. 
 
 ## Shared components
@@ -29,7 +29,7 @@ TODO, but a sketch of the content is:
 3. OpenData relies on SlateDB's WAL format as an performant objectstore-native WAL.
 4. On the query side, OpenData leverages Datafusion to build performant and functional query engines. 
 
-As a general principle, we prefer common data and query components to be part of SlateDB and Datafusion respectivzely.
+As a general principle, we prefer common data and query components to be part of SlateDB and Datafusion respectively.
 
 ## Metadata 
 
