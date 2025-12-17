@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use opendata_common::clock::SystemClock;
-use promql_parser::parser::EvalStmt;
+use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 
 use super::evaluator::Evaluator;
 use super::parser::Parseable;
@@ -18,7 +18,45 @@ use super::response::{
     SeriesResponse, VectorSeries,
 };
 use super::router::PromqlRouter;
+use super::selector::evaluate_selector_with_reader;
+use crate::model::{Attribute, SeriesId};
+use crate::query::QueryReader;
 use crate::tsdb::Tsdb;
+
+/// Parse a match[] selector string into a VectorSelector
+fn parse_selector(selector: &str) -> Result<VectorSelector, String> {
+    let expr = promql_parser::parser::parse(selector).map_err(|e| e.to_string())?;
+    match expr {
+        Expr::VectorSelector(vs) => Ok(vs),
+        _ => Err("Expected a vector selector".to_string()),
+    }
+}
+
+/// Get all series IDs matching any of the given selectors (UNION)
+async fn get_matching_series<R: QueryReader>(
+    reader: &R,
+    matches: &[String],
+) -> Result<HashSet<SeriesId>, String> {
+    let mut all_series = HashSet::new();
+
+    for selector_str in matches {
+        let selector = parse_selector(selector_str)?;
+        let series = evaluate_selector_with_reader(reader, &selector)
+            .await
+            .map_err(|e| e.to_string())?;
+        all_series.extend(series);
+    }
+
+    Ok(all_series)
+}
+
+/// Convert attributes to a HashMap
+fn attributes_to_map(attributes: &[Attribute]) -> HashMap<String, String> {
+    attributes
+        .iter()
+        .map(|attr| (attr.key.clone(), attr.value.clone()))
+        .collect()
+}
 
 #[async_trait]
 impl PromqlRouter for Tsdb {
@@ -222,16 +260,259 @@ impl PromqlRouter for Tsdb {
         }
     }
 
-    async fn series(&self, _request: SeriesRequest) -> SeriesResponse {
-        todo!()
+    async fn series(&self, request: SeriesRequest) -> SeriesResponse {
+        // Validate matches is non-empty
+        if request.matches.is_empty() {
+            let err = ErrorResponse::bad_data("at least one match[] required");
+            return SeriesResponse {
+                status: err.status,
+                data: None,
+                error: Some(err.error),
+                error_type: Some(err.error_type),
+            };
+        }
+
+        // Calculate time range (use defaults if not provided)
+        let start_secs = request.start.unwrap_or(0);
+        let end_secs = request.end.unwrap_or(i64::MAX);
+
+        // Get query reader for time range
+        let reader = match self.query_reader(start_secs, end_secs).await {
+            Ok(reader) => reader,
+            Err(e) => {
+                let err = ErrorResponse::internal(e.to_string());
+                return SeriesResponse {
+                    status: err.status,
+                    data: None,
+                    error: Some(err.error),
+                    error_type: Some(err.error_type),
+                };
+            }
+        };
+
+        // Get all matching series IDs (UNION)
+        let series_ids = match get_matching_series(&reader, &request.matches).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                let err = ErrorResponse::bad_data(e);
+                return SeriesResponse {
+                    status: err.status,
+                    data: None,
+                    error: Some(err.error),
+                    error_type: Some(err.error_type),
+                };
+            }
+        };
+
+        // Get forward index for all series
+        let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
+        let forward_index = match reader.forward_index(&series_ids_vec).await {
+            Ok(index) => index,
+            Err(e) => {
+                let err = ErrorResponse::internal(e.to_string());
+                return SeriesResponse {
+                    status: err.status,
+                    data: None,
+                    error: Some(err.error),
+                    error_type: Some(err.error_type),
+                };
+            }
+        };
+
+        // Extract label sets from each series
+        let mut result: Vec<HashMap<String, String>> = series_ids_vec
+            .iter()
+            .filter_map(|id| forward_index.get_spec(id))
+            .map(|spec| attributes_to_map(&spec.attributes))
+            .collect();
+
+        // Apply limit if specified
+        if let Some(limit) = request.limit {
+            result.truncate(limit);
+        }
+
+        SeriesResponse {
+            status: "success".to_string(),
+            data: Some(result),
+            error: None,
+            error_type: None,
+        }
     }
 
-    async fn labels(&self, _request: LabelsRequest) -> LabelsResponse {
-        todo!()
+    async fn labels(&self, request: LabelsRequest) -> LabelsResponse {
+        // Validate matches is provided and non-empty
+        let matches = match request.matches {
+            Some(m) if !m.is_empty() => m,
+            _ => {
+                let err = ErrorResponse::bad_data("at least one match[] required");
+                return LabelsResponse {
+                    status: err.status,
+                    data: None,
+                    error: Some(err.error),
+                    error_type: Some(err.error_type),
+                };
+            }
+        };
+
+        // Calculate time range (use defaults if not provided)
+        let start_secs = request.start.unwrap_or(0);
+        let end_secs = request.end.unwrap_or(i64::MAX);
+
+        // Get query reader for time range
+        let reader = match self.query_reader(start_secs, end_secs).await {
+            Ok(reader) => reader,
+            Err(e) => {
+                let err = ErrorResponse::internal(e.to_string());
+                return LabelsResponse {
+                    status: err.status,
+                    data: None,
+                    error: Some(err.error),
+                    error_type: Some(err.error_type),
+                };
+            }
+        };
+
+        // Get all matching series IDs
+        let series_ids = match get_matching_series(&reader, &matches).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                let err = ErrorResponse::bad_data(e);
+                return LabelsResponse {
+                    status: err.status,
+                    data: None,
+                    error: Some(err.error),
+                    error_type: Some(err.error_type),
+                };
+            }
+        };
+
+        // Get forward index
+        let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
+        let forward_index = match reader.forward_index(&series_ids_vec).await {
+            Ok(index) => index,
+            Err(e) => {
+                let err = ErrorResponse::internal(e.to_string());
+                return LabelsResponse {
+                    status: err.status,
+                    data: None,
+                    error: Some(err.error),
+                    error_type: Some(err.error_type),
+                };
+            }
+        };
+
+        // Collect all unique label names
+        let mut label_names: HashSet<String> = HashSet::new();
+        for id in &series_ids_vec {
+            if let Some(spec) = forward_index.get_spec(id) {
+                for attr in &spec.attributes {
+                    label_names.insert(attr.key.clone());
+                }
+            }
+        }
+
+        // Sort and apply limit
+        let mut result: Vec<String> = label_names.into_iter().collect();
+        result.sort();
+        if let Some(limit) = request.limit {
+            result.truncate(limit);
+        }
+
+        LabelsResponse {
+            status: "success".to_string(),
+            data: Some(result),
+            error: None,
+            error_type: None,
+        }
     }
 
-    async fn label_values(&self, _request: LabelValuesRequest) -> LabelValuesResponse {
-        todo!()
+    async fn label_values(&self, request: LabelValuesRequest) -> LabelValuesResponse {
+        // Validate matches is provided and non-empty
+        let matches = match request.matches {
+            Some(m) if !m.is_empty() => m,
+            _ => {
+                let err = ErrorResponse::bad_data("at least one match[] required");
+                return LabelValuesResponse {
+                    status: err.status,
+                    data: None,
+                    error: Some(err.error),
+                    error_type: Some(err.error_type),
+                };
+            }
+        };
+
+        // Calculate time range (use defaults if not provided)
+        let start_secs = request.start.unwrap_or(0);
+        let end_secs = request.end.unwrap_or(i64::MAX);
+
+        // Get query reader for time range
+        let reader = match self.query_reader(start_secs, end_secs).await {
+            Ok(reader) => reader,
+            Err(e) => {
+                let err = ErrorResponse::internal(e.to_string());
+                return LabelValuesResponse {
+                    status: err.status,
+                    data: None,
+                    error: Some(err.error),
+                    error_type: Some(err.error_type),
+                };
+            }
+        };
+
+        // Get all matching series IDs
+        let series_ids = match get_matching_series(&reader, &matches).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                let err = ErrorResponse::bad_data(e);
+                return LabelValuesResponse {
+                    status: err.status,
+                    data: None,
+                    error: Some(err.error),
+                    error_type: Some(err.error_type),
+                };
+            }
+        };
+
+        // Get forward index
+        let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
+        let forward_index = match reader.forward_index(&series_ids_vec).await {
+            Ok(index) => index,
+            Err(e) => {
+                let err = ErrorResponse::internal(e.to_string());
+                return LabelValuesResponse {
+                    status: err.status,
+                    data: None,
+                    error: Some(err.error),
+                    error_type: Some(err.error_type),
+                };
+            }
+        };
+
+        // Collect all unique values for the specified label
+        let mut values: HashSet<String> = HashSet::new();
+        for id in &series_ids_vec {
+            if let Some(spec) = forward_index.get_spec(id) {
+                for attr in &spec.attributes {
+                    if attr.key == request.label_name {
+                        values.insert(attr.value.clone());
+                    }
+                }
+            }
+        }
+
+        // Sort and apply limit
+        let mut result: Vec<String> = values.into_iter().collect();
+        result.sort();
+        if let Some(limit) = request.limit {
+            result.truncate(limit);
+        }
+
+        LabelValuesResponse {
+            status: "success".to_string(),
+            data: Some(result),
+            error: None,
+            error_type: None,
+        }
     }
 
     async fn metadata(&self, _request: MetadataRequest) -> MetadataResponse {
@@ -402,5 +683,179 @@ mod tests {
         assert_eq!(series.values[0], (4000.0, "10".to_string()));
         assert_eq!(series.values[1], (4060.0, "20".to_string()));
         assert_eq!(series.values[2], (4120.0, "30".to_string()));
+    }
+
+    #[tokio::test]
+    async fn should_return_series_for_valid_matcher() {
+        // given
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+
+        // Ingest two different series
+        let samples = vec![
+            create_sample("http_requests", vec![("env", "prod")], 4_000_000, 10.0),
+            create_sample("http_requests", vec![("env", "staging")], 4_000_000, 20.0),
+        ];
+        mini.ingest(samples).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        let request = SeriesRequest {
+            matches: vec!["http_requests".to_string()],
+            start: Some(3600),
+            end: Some(7200),
+            limit: None,
+        };
+
+        // when
+        let response = tsdb.series(request).await;
+
+        // then
+        assert_eq!(response.status, "success");
+        assert!(response.data.is_some());
+
+        let data = response.data.unwrap();
+        assert_eq!(data.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn should_return_labels_for_matching_series() {
+        // given
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+
+        let sample = create_sample(
+            "http_requests",
+            vec![("env", "prod"), ("method", "GET")],
+            4_000_000,
+            10.0,
+        );
+        mini.ingest(vec![sample]).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        let request = LabelsRequest {
+            matches: Some(vec!["http_requests".to_string()]),
+            start: Some(3600),
+            end: Some(7200),
+            limit: None,
+        };
+
+        // when
+        let response = tsdb.labels(request).await;
+
+        // then
+        assert_eq!(response.status, "success");
+        assert!(response.data.is_some());
+
+        let data = response.data.unwrap();
+        assert!(data.contains(&"__name__".to_string()));
+        assert!(data.contains(&"env".to_string()));
+        assert!(data.contains(&"method".to_string()));
+    }
+
+    #[tokio::test]
+    async fn should_return_label_values_for_matching_series() {
+        // given
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+
+        let samples = vec![
+            create_sample("http_requests", vec![("env", "prod")], 4_000_000, 10.0),
+            create_sample("http_requests", vec![("env", "staging")], 4_000_000, 20.0),
+        ];
+        mini.ingest(samples).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        let request = LabelValuesRequest {
+            label_name: "env".to_string(),
+            matches: Some(vec!["http_requests".to_string()]),
+            start: Some(3600),
+            end: Some(7200),
+            limit: None,
+        };
+
+        // when
+        let response = tsdb.label_values(request).await;
+
+        // then
+        assert_eq!(response.status, "success");
+        assert!(response.data.is_some());
+
+        let data = response.data.unwrap();
+        assert_eq!(data.len(), 2);
+        assert!(data.contains(&"prod".to_string()));
+        assert!(data.contains(&"staging".to_string()));
+    }
+
+    #[tokio::test]
+    async fn should_return_error_when_series_has_no_matcher() {
+        // given
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        let request = SeriesRequest {
+            matches: vec![],
+            start: None,
+            end: None,
+            limit: None,
+        };
+
+        // when
+        let response = tsdb.series(request).await;
+
+        // then
+        assert_eq!(response.status, "error");
+        assert_eq!(response.error_type, Some("bad_data".to_string()));
+    }
+
+    #[tokio::test]
+    async fn should_return_error_when_labels_has_no_matcher() {
+        // given
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        let request = LabelsRequest {
+            matches: None,
+            start: None,
+            end: None,
+            limit: None,
+        };
+
+        // when
+        let response = tsdb.labels(request).await;
+
+        // then
+        assert_eq!(response.status, "error");
+        assert_eq!(response.error_type, Some("bad_data".to_string()));
+    }
+
+    #[tokio::test]
+    async fn should_return_error_when_label_values_has_no_matcher() {
+        // given
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        let request = LabelValuesRequest {
+            label_name: "env".to_string(),
+            matches: None,
+            start: None,
+            end: None,
+            limit: None,
+        };
+
+        // when
+        let response = tsdb.label_values(request).await;
+
+        // then
+        assert_eq!(response.status, "error");
+        assert_eq!(response.error_type, Some("bad_data".to_string()));
     }
 }
