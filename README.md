@@ -77,24 +77,10 @@ TODO.
 
 # Why OpenData?
 
-## Our Beliefs 
+1. We believe that object storage is a fundamentally new ingredient in data systems: it provides highly durable, highly available, infinite storage with unique performance and cost structures. It solves one of the hardest problems in distributed data systems: consistent replication. At the same time, tremendous care must be taken to make object storage work correctly, performantly, and cost effectively. When done right, systems built natively on object storage are far simpler and cheaper to operate in modern clouds than the alternatives. We want to bring the benefits of object storage to every database.
+2. Inspired by the UNIX philosophy, we believe single purpose systems that compose well are superior to systems that try to solve many problems under one umbrella, which is what has tended to happen with existing open surce projects since each is developed in a silo. Buy building multiple focused systems on a common core, Open Data will not have to trade off power for simplicity. 
+4. Object store native designs have tended to be proprietary, to the detriment of the developer community at large. Open Data remedies that by being MIT licensed from day one. 
 
-1. We believe that object storage is a fundamentally new ingredient in data systems: it provides highly durable, highly available, infinite storage with unique performance and cost structures. On the one hand, it solves one of the hardest problems in distributed data systems: consistent replication. On the other hand, care must be taken to make it work corretly, performantly, and cost effectively. It turns out that the techniques to achieve the latter are pretty similar across systems: batching on writes, caching on reads, snapshot isolation. When done right, systems built natively on object storage are far simpler and cheaper to operate in modern clouds than those that haven't used object storage as a starting point.
-2. Inspired by the UNIX philosophy, we believe single purpose systems that compose well are superior to systems that try to solve many problems under one umbrella, which is what has tended to happen with existing open surce projects since each are in a silo.
-3. We believe that there is a general lack of objectstore native open source data systems, to the detriment of the developer community at large. 
-
-## Our Vision
-
-To address these structural problems with open source data infrastructure today, OpenData systems adopt the following principles: 
-
-1. Each OpenData product will target one core use case and aim to be best-in-class at it. 
-2. Each OpenData product will be designed from ground up with object storage as a starting point.
-3. Each OpenData product will be built on a common set of primitives. One set of primitives is [SlateDB](https://www.slatedb.io), but there may be others. 
-4. Each product and every common component will be licensed under the MIT license. 
-5. All OpenData products will be built with a uniform operational experience, which includes common CLI tooling, common versioning schemes, common configuration styles, and more.
-6. Every OpenData product will be designed to compose with the others. 
-
-OpenData aims to put control back in the hands of developers. Your data is always in your custody, and OpenData makes it practical to serve that data to any app without needing multiple specialist engineers on staff.
 
 # License
 
