@@ -152,7 +152,7 @@ This mirrors the scan API but returns a count rather than entries. The `approxim
 
 ## Alternatives
 
-### KeyMapper abstraction
+### KeyMapper Abstraction
 
 An earlier design introduced a `KeyMapper` trait to map user keys to fixed-width `u64` log_ids:
 
@@ -175,8 +175,13 @@ This approach was rejected because:
 
 The simpler key+sequence encoding preserves key ordering and avoids the collision problem entirely.
 
+### Headers
+
+Messaging systems often expose a way to attach headers to messages in order to enable middleware use cases, such as routing. We opted not to include headers in order to keep our data model as simple as possible. Although the log abstraction could be used to build messaging system or any other system which relied on headers, we do not believe that headers are fundamental to the log data structure. There are many potential use cases which do not need headers. Instead, our position is that headers should be designed into systems built on top of the log as necessary. That allows those systems to define the header semantics that are appropriate for their system rather than trying to define a common semantics in the log.
+ 
+
 ## Updates
 
-| Date | Description |
-|------|-------------|
-| YYYY-MM-DD | Initial draft |
+| Date       | Description |
+|------------|-------------|
+| 2025-12-15 | Initial draft |
