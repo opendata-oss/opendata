@@ -26,6 +26,15 @@ pub(crate) trait QueryReader: Send + Sync {
         terms: &[Attribute],
     ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + '_>>;
 
+    /// Get a view into all inverted index data.
+    /// Used for labels/label_values queries to access all attribute keys.
+    async fn all_inverted_index(&self) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + '_>>;
+
+    /// Get all unique values for a specific label name.
+    /// This is more efficient than loading all inverted index data when
+    /// only values for a single label are needed.
+    async fn label_values(&self, label_name: &str) -> Result<Vec<String>>;
+
     /// Get samples for a series within a time range, merging from all layers.
     /// Returns samples sorted by timestamp with duplicates removed (head takes priority).
     async fn samples(&self, series_id: SeriesId, start_ms: u64, end_ms: u64)
@@ -68,6 +77,23 @@ pub(crate) mod test_utils {
             _terms: &[Attribute],
         ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + '_>> {
             Ok(Box::new(self.inverted_index.clone()))
+        }
+
+        async fn all_inverted_index(
+            &self,
+        ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + '_>> {
+            Ok(Box::new(self.inverted_index.clone()))
+        }
+
+        async fn label_values(&self, label_name: &str) -> Result<Vec<String>> {
+            let values: Vec<String> = self
+                .inverted_index
+                .postings
+                .iter()
+                .filter(|entry| entry.key().key == label_name)
+                .map(|entry| entry.key().value.clone())
+                .collect();
+            Ok(values)
         }
 
         async fn samples(

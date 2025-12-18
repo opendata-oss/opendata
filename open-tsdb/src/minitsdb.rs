@@ -50,6 +50,20 @@ impl<'a> QueryReader for MiniQueryReader<'a> {
         Ok(Box::new(inverted_index))
     }
 
+    async fn all_inverted_index(&self) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + '_>> {
+        let inverted_index = self
+            .snapshot
+            .get_inverted_index(self.bucket.clone())
+            .await?;
+        Ok(Box::new(inverted_index))
+    }
+
+    async fn label_values(&self, label_name: &str) -> Result<Vec<String>> {
+        self.snapshot
+            .get_label_values(self.bucket, label_name)
+            .await
+    }
+
     async fn samples(
         &self,
         series_id: SeriesId,

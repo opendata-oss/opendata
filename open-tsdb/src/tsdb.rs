@@ -212,6 +212,40 @@ impl QueryReader for TsdbQueryReader {
         Ok(Box::new(merged))
     }
 
+    async fn all_inverted_index(&self) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + '_>> {
+        // Merge all inverted indexes from all buckets
+        let merged = InvertedIndex::default();
+
+        for mini in &self.mini_tsdbs {
+            let reader = mini.query_reader().await;
+            let index = reader.all_inverted_index().await?;
+
+            // Merge all keys from this bucket
+            for attr in index.all_keys() {
+                let bitmap = index.intersect(vec![attr.clone()]);
+                if !bitmap.is_empty() {
+                    let mut entry = merged.postings.entry(attr).or_default();
+                    *entry.value_mut() |= bitmap;
+                }
+            }
+        }
+
+        Ok(Box::new(merged))
+    }
+
+    async fn label_values(&self, label_name: &str) -> Result<Vec<String>> {
+        // Collect and deduplicate label values from all buckets
+        let mut all_values = std::collections::HashSet::new();
+
+        for mini in &self.mini_tsdbs {
+            let reader = mini.query_reader().await;
+            let values = reader.label_values(label_name).await?;
+            all_values.extend(values);
+        }
+
+        Ok(all_values.into_iter().collect())
+    }
+
     async fn samples(
         &self,
         series_id: SeriesId,

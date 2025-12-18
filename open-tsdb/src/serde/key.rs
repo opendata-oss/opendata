@@ -3,6 +3,7 @@
 use super::*;
 use crate::model::{BucketSize, BucketStart, RecordTag, SeriesFingerprint, SeriesId};
 use bytes::{Bytes, BytesMut};
+use opendata_common::BytesRange;
 
 /// BucketList key (global-scoped)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +217,19 @@ impl InvertedIndexKey {
         buf.freeze()
     }
 
+    /// Create a BytesRange that covers all entries for a specific attribute (label name)
+    /// within a given bucket. This allows efficient scanning for all values of a label.
+    pub fn attribute_range(bucket: &crate::model::TimeBucket, attribute: &str) -> BytesRange {
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[
+            KEY_VERSION,
+            RecordTag::new_bucket_scoped(RecordType::InvertedIndex, bucket.size).as_byte(),
+        ]);
+        buf.extend_from_slice(&bucket.start.to_be_bytes());
+        encode_utf8(attribute, &mut buf);
+        BytesRange::prefix(buf.freeze())
+    }
+
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
         if buf.len() < 2 + 4 {
             return Err(EncodingError {
@@ -427,5 +441,100 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn should_create_attribute_range_that_matches_same_attribute_keys() {
+        // given
+        let bucket = crate::model::TimeBucket {
+            start: 12345,
+            size: 1,
+        };
+        let key1 = InvertedIndexKey {
+            time_bucket: 12345,
+            attribute: "host".to_string(),
+            value: "server1".to_string(),
+            bucket_size: 1,
+        };
+        let key2 = InvertedIndexKey {
+            time_bucket: 12345,
+            attribute: "host".to_string(),
+            value: "server2".to_string(),
+            bucket_size: 1,
+        };
+        let key3 = InvertedIndexKey {
+            time_bucket: 12345,
+            attribute: "env".to_string(),
+            value: "prod".to_string(),
+            bucket_size: 1,
+        };
+
+        // when
+        let range = InvertedIndexKey::attribute_range(&bucket, "host");
+
+        // then
+        assert!(range.contains(&key1.encode()));
+        assert!(range.contains(&key2.encode()));
+        assert!(!range.contains(&key3.encode()));
+    }
+
+    #[test]
+    fn should_not_match_shorter_attribute_with_value_that_looks_like_suffix() {
+        // given - searching for "hostname" should NOT match a key with
+        // attribute "host" and value "name" even though "host" + "name" = "hostname"
+        // The length-prefix encoding should prevent this collision.
+        let bucket = crate::model::TimeBucket {
+            start: 12345,
+            size: 1,
+        };
+        let host_name_key = InvertedIndexKey {
+            time_bucket: 12345,
+            attribute: "host".to_string(),
+            value: "name".to_string(),
+            bucket_size: 1,
+        };
+
+        // when - search for "hostname"
+        let range = InvertedIndexKey::attribute_range(&bucket, "hostname");
+
+        // then - should NOT match the "host":"name" key
+        assert!(
+            !range.contains(&host_name_key.encode()),
+            "attribute_range for 'hostname' should not match key with attribute='host' value='name'. \
+             The length-prefix encoding should differentiate them: \
+             'hostname' encodes as [len=8, ...] while 'host' encodes as [len=4, ...]"
+        );
+    }
+
+    #[test]
+    fn should_not_match_when_value_bytes_could_mimic_attribute_continuation() {
+        // given - test a more contrived case where the value length bytes
+        // might numerically match what would be expected for a longer attribute
+        let bucket = crate::model::TimeBucket {
+            start: 12345,
+            size: 1,
+        };
+
+        // Key with short attribute and value whose length encoding could be confused
+        // attribute "ab" (len=2) with value of length that starts with same byte
+        let short_attr_key = InvertedIndexKey {
+            time_bucket: 12345,
+            attribute: "ab".to_string(),
+            value: "cdef".to_string(), // len=4, encoded as [0x04, 0x00] in little-endian
+            bucket_size: 1,
+        };
+
+        // Search for "abcdef" (len=6)
+        // If encoding was naive concatenation, "ab" + "cdef" might look like "abcdef"
+        // But with length-prefix: [len=2][ab][len=4][cdef] vs [len=6][abcdef]
+
+        // when
+        let range = InvertedIndexKey::attribute_range(&bucket, "abcdef");
+
+        // then
+        assert!(
+            !range.contains(&short_attr_key.encode()),
+            "attribute_range for 'abcdef' should not match key with attribute='ab' value='cdef'"
+        );
     }
 }

@@ -358,10 +358,14 @@ impl PromqlRouter for Tsdb {
             }
         };
 
-        // Get forward index - either filtered by matches or all series
-        let forward_index = match &request.matches {
+        // Collect label names using hybrid approach:
+        // - Filtered (match[]): use forward index (targeted I/O for matching series)
+        // - Unfiltered: use inverted index (direct access to all label keys)
+        let mut label_names: HashSet<String> = HashSet::new();
+
+        match &request.matches {
             Some(matches) if !matches.is_empty() => {
-                // Get matching series IDs first
+                // Filtered: use forward index for targeted I/O
                 let series_ids = match get_matching_series(&reader, matches).await {
                     Ok(ids) => ids,
                     Err(e) => {
@@ -375,7 +379,7 @@ impl PromqlRouter for Tsdb {
                     }
                 };
                 let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-                match reader.forward_index(&series_ids_vec).await {
+                let forward_index = match reader.forward_index(&series_ids_vec).await {
                     Ok(index) => index,
                     Err(e) => {
                         let err = ErrorResponse::internal(e.to_string());
@@ -385,12 +389,17 @@ impl PromqlRouter for Tsdb {
                             error: Some(err.error),
                             error_type: Some(err.error_type),
                         };
+                    }
+                };
+                for (_id, spec) in forward_index.all_series() {
+                    for attr in &spec.attributes {
+                        label_names.insert(attr.key.clone());
                     }
                 }
             }
             _ => {
-                // No match[] provided - get all series
-                match reader.all_forward_index().await {
+                // Unfiltered: use inverted index for direct key access
+                let inverted_index = match reader.all_inverted_index().await {
                     Ok(index) => index,
                     Err(e) => {
                         let err = ErrorResponse::internal(e.to_string());
@@ -401,17 +410,12 @@ impl PromqlRouter for Tsdb {
                             error_type: Some(err.error_type),
                         };
                     }
+                };
+                for attr in inverted_index.all_keys() {
+                    label_names.insert(attr.key);
                 }
             }
         };
-
-        // Collect all unique label names from all series
-        let mut label_names: HashSet<String> = HashSet::new();
-        for (_id, spec) in forward_index.all_series() {
-            for attr in &spec.attributes {
-                label_names.insert(attr.key.clone());
-            }
-        }
 
         // Sort and apply limit
         let mut result: Vec<String> = label_names.into_iter().collect();
@@ -447,10 +451,14 @@ impl PromqlRouter for Tsdb {
             }
         };
 
-        // Get forward index - either filtered by matches or all series
-        let forward_index = match &request.matches {
+        // Collect label values using hybrid approach:
+        // - Filtered (match[]): use forward index (targeted I/O for matching series)
+        // - Unfiltered: use inverted index (direct access to all label keys)
+        let mut values: HashSet<String> = HashSet::new();
+
+        match &request.matches {
             Some(matches) if !matches.is_empty() => {
-                // Get matching series IDs first
+                // Filtered: use forward index for targeted I/O
                 let series_ids = match get_matching_series(&reader, matches).await {
                     Ok(ids) => ids,
                     Err(e) => {
@@ -464,7 +472,7 @@ impl PromqlRouter for Tsdb {
                     }
                 };
                 let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-                match reader.forward_index(&series_ids_vec).await {
+                let forward_index = match reader.forward_index(&series_ids_vec).await {
                     Ok(index) => index,
                     Err(e) => {
                         let err = ErrorResponse::internal(e.to_string());
@@ -474,13 +482,20 @@ impl PromqlRouter for Tsdb {
                             error: Some(err.error),
                             error_type: Some(err.error_type),
                         };
+                    }
+                };
+                for (_id, spec) in forward_index.all_series() {
+                    for attr in &spec.attributes {
+                        if attr.key == request.label_name {
+                            values.insert(attr.value.clone());
+                        }
                     }
                 }
             }
             _ => {
-                // No match[] provided - get all series
-                match reader.all_forward_index().await {
-                    Ok(index) => index,
+                // Unfiltered: use optimized label_values that scans only keys for this label
+                let label_values = match reader.label_values(&request.label_name).await {
+                    Ok(vals) => vals,
                     Err(e) => {
                         let err = ErrorResponse::internal(e.to_string());
                         return LabelValuesResponse {
@@ -490,19 +505,10 @@ impl PromqlRouter for Tsdb {
                             error_type: Some(err.error_type),
                         };
                     }
-                }
+                };
+                values.extend(label_values);
             }
         };
-
-        // Collect all unique values for the specified label
-        let mut values: HashSet<String> = HashSet::new();
-        for (_id, spec) in forward_index.all_series() {
-            for attr in &spec.attributes {
-                if attr.key == request.label_name {
-                    values.insert(attr.value.clone());
-                }
-            }
-        }
 
         // Sort and apply limit
         let mut result: Vec<String> = values.into_iter().collect();
@@ -893,5 +899,89 @@ mod tests {
         assert_eq!(data.len(), 2);
         assert!(data.contains(&"prod".to_string()));
         assert!(data.contains(&"staging".to_string()));
+    }
+
+    #[tokio::test]
+    async fn should_filter_labels_by_match_correctly() {
+        // given: two different metrics with different labels
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+
+        // http_requests has env and method labels
+        let samples = vec![
+            create_sample(
+                "http_requests",
+                vec![("env", "prod"), ("method", "GET")],
+                4_000_000,
+                10.0,
+            ),
+            // db_queries has env and table labels (different from http_requests)
+            create_sample(
+                "db_queries",
+                vec![("env", "prod"), ("table", "users")],
+                4_000_000,
+                20.0,
+            ),
+        ];
+        mini.ingest(samples).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        // when: query labels with match[] filter for http_requests only
+        let request = LabelsRequest {
+            matches: Some(vec!["http_requests".to_string()]),
+            start: Some(3600),
+            end: Some(7200),
+            limit: None,
+        };
+        let response = tsdb.labels(request).await;
+
+        // then: should only return labels from http_requests, not db_queries
+        assert_eq!(response.status, "success");
+        let data = response.data.unwrap();
+        assert!(data.contains(&"__name__".to_string()));
+        assert!(data.contains(&"env".to_string()));
+        assert!(data.contains(&"method".to_string()));
+        // table label should NOT be present since it belongs to db_queries
+        assert!(!data.contains(&"table".to_string()));
+    }
+
+    #[tokio::test]
+    async fn should_filter_label_values_by_match_correctly() {
+        // given: two different metrics with same label name but different values
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+
+        let samples = vec![
+            // http_requests with env=prod
+            create_sample("http_requests", vec![("env", "prod")], 4_000_000, 10.0),
+            // db_queries with env=staging (different metric, different env value)
+            create_sample("db_queries", vec![("env", "staging")], 4_000_000, 20.0),
+        ];
+        mini.ingest(samples).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        // when: query label values for "env" with match[] filter for http_requests only
+        let request = LabelValuesRequest {
+            label_name: "env".to_string(),
+            matches: Some(vec!["http_requests".to_string()]),
+            start: Some(3600),
+            end: Some(7200),
+            limit: None,
+        };
+        let response = tsdb.label_values(request).await;
+
+        // then: should only return env values from http_requests, not db_queries
+        assert_eq!(response.status, "success");
+        let data = response.data.unwrap();
+        assert_eq!(data.len(), 1);
+        assert!(data.contains(&"prod".to_string()));
+        // staging should NOT be present since it belongs to db_queries
+        assert!(!data.contains(&"staging".to_string()));
     }
 }

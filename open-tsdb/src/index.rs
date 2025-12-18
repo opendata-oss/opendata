@@ -32,11 +32,18 @@ pub(crate) trait InvertedIndexLookup {
     /// Intersect posting lists for the given terms.
     /// Returns series IDs that match ALL terms.
     fn intersect(&self, terms: Vec<Attribute>) -> RoaringBitmap;
+
+    /// Get all attribute keys in the inverted index.
+    fn all_keys(&self) -> Vec<Attribute>;
 }
 
 impl<T: InvertedIndexLookup + ?Sized> InvertedIndexLookup for Box<T> {
     fn intersect(&self, terms: Vec<Attribute>) -> RoaringBitmap {
         (**self).intersect(terms)
+    }
+
+    fn all_keys(&self) -> Vec<Attribute> {
+        (**self).all_keys()
     }
 }
 
@@ -99,6 +106,13 @@ impl InvertedIndexLookup for InvertedIndex {
         }
 
         result
+    }
+
+    fn all_keys(&self) -> Vec<Attribute> {
+        self.postings
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 }
 
@@ -781,5 +795,51 @@ mod tests {
         assert!(result_bitmap.contains(1001)); // Odd
         assert!(result_bitmap.contains(19998)); // Even
         assert!(result_bitmap.contains(19999)); // Odd
+    }
+
+    #[test]
+    fn should_return_empty_keys_for_empty_index() {
+        // given
+        let index = InvertedIndex::default();
+
+        // when
+        let keys = index.all_keys();
+
+        // then
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn should_return_all_keys_from_index() {
+        // given
+        let index = InvertedIndex::default();
+
+        let term1 = Attribute {
+            key: "env".to_string(),
+            value: "prod".to_string(),
+        };
+        let term2 = Attribute {
+            key: "env".to_string(),
+            value: "staging".to_string(),
+        };
+        let term3 = Attribute {
+            key: "method".to_string(),
+            value: "GET".to_string(),
+        };
+
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(1);
+        index.postings.insert(term1.clone(), bitmap.clone());
+        index.postings.insert(term2.clone(), bitmap.clone());
+        index.postings.insert(term3.clone(), bitmap);
+
+        // when
+        let keys = index.all_keys();
+
+        // then
+        assert_eq!(keys.len(), 3);
+        assert!(keys.contains(&term1));
+        assert!(keys.contains(&term2));
+        assert!(keys.contains(&term3));
     }
 }

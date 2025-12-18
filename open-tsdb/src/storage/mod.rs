@@ -187,6 +187,33 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
 
         Ok(max_series_id)
     }
+
+    /// Get all unique values for a specific label name within a bucket.
+    /// This method scans only the inverted index keys for the specified label,
+    /// which is more efficient than loading all inverted index entries.
+    ///
+    /// Note: We don't need to verify that the decoded `key.attribute` matches
+    /// `label_name` after scanning. The `attribute_range` prefix includes a
+    /// 2-byte little-endian length prefix before the attribute string (see
+    /// `encode_utf8`), which guarantees that only exact attribute matches are
+    /// returned. For example, searching for "hostname" (len=8, encoded as
+    /// `[0x08, 0x00, ...]`) can never match a key with attribute "host"
+    /// (len=4, encoded as `[0x04, 0x00, ...]`) because the length bytes differ.
+    /// See `serde::key::tests::should_not_match_shorter_attribute_with_value_that_looks_like_suffix`
+    /// for test coverage of this invariant.
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn get_label_values(&self, bucket: &TimeBucket, label_name: &str) -> Result<Vec<String>> {
+        let range = InvertedIndexKey::attribute_range(bucket, label_name);
+        let records = self.scan(range).await?;
+
+        let mut values = Vec::new();
+        for record in records {
+            let key = InvertedIndexKey::decode(record.key.as_ref())?;
+            values.push(key.value);
+        }
+
+        Ok(values)
+    }
 }
 
 // Implement the trait for all types that implement StorageRead
