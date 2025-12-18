@@ -4,5 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-slatedb.workspace = true
+bytes.workspace = true
 opendata-common.workspace = true
+slatedb.workspace = true
