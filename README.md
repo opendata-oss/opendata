@@ -9,6 +9,28 @@ OpenData is a collection of open source databases designed from ground up for ob
 
 Building performant, cost-effective, and correct online database on object storage takes special care. Successful designs all have to solve the problem of write batching, multiple levels of caching, and snapshot isolation for correctness. OpenData databases build on a common foundation to solve these problems. This common foundation gives our databases a common set of operational tools, configuration systems, etc., that make our databases easier to operate in aggregate. 
 
+# Databases
+
+OpenData ships two databases today, with more on the way:
+
+* **TSDB**: An objectstore native timeseries database that can serve as a backend for Prometheus. Its a great option for a low cost, easy to operate, grafana backend. Learn more about it [here](open-tsdb/rfcs/0001-tsdb-storage.md).
+* **Log**: Think of it as Kafka 2.0. An objecstore native event streaming backend that supports millions of logs, so you can finally get a replayable log per key. Learn more about it [here](open-log/rfcs/0001-storage.md).
+
+
+# Which usecases are OpenData Databases suited for?
+
+The key feature of OpenData databases is that object storage is the sole persistence layer, and readers and writers coordinate solely via manifest files in object storage. This results in several interesting properties: 
+1. Object storage being the sole persistence layer means that each Database instance can be tuned to trade off between [Latency, Cost, and Durability](https://materializedview.io/p/cloud-storage-triad-latency-cost-durability). This flexibility allows new workloads which may not have been economical with traditional designs.
+2. Since Ingestors, Compactors, and Query Executors are completely stateless and decoupled, each can be scaled to 0 independently. This means workloads with massive skews between writes and reads can be served far more economically with OpenData databases.
+3. The architecture allows several deployment models. It's possible for OpenData databases to be fully embedded, with the Ingestors, Compactors, and Query Executors running within the application process. Or they can be fully distributed, with each component running as services in a k8s cluster. In either case, data is in S3 and always persistent. This makes per app, per agent, or other arrangements a natural fit.
+
+The flip side of this decoupled architecture is that you have higher end-to-end latency between when data is inserted into the system and when it is returned in a query. This means truly interactive use cases where users must read their writes as soon as possible are not good fits for OpenData databases. However, when some end-to-end latency is acceptable, the flexiblity of the OpenData architecture makes OpenData databases the superior option in a cloud-native world. 
+
+# Quick Start
+
+TODO.
+
+
 # Architecture
 
 ## 10,000ft view
@@ -104,28 +126,6 @@ In addition to solving core storage problems, SlateDB also solves this basic met
 7. The manifest system as a whole provides snapshot isolation across reads and writes for every OpenData database. 
 
 Different databases likely need different metadata. Making the manifest system extensible would allow us to use it across databases, which we think is a high leverage thing to do.
-
-# Which usecases are OpenData Databases suited for?
-
-The key feature of OpenData databases is that object storage is the sole persistence layer, and readers and writers coordinate solely via manifest files in object storage. This results in several interesting properties: 
-1. Object storage being the sole persistence layer means that each Database instance can be tuned to trade off between [Latency, Cost, and Durability](https://materializedview.io/p/cloud-storage-triad-latency-cost-durability). This flexibility allows new workloads which may not have been economical with traditional designs.
-2. Since Ingestors, Compactors, and Query Executors are completely stateless and decoupled, each can be scaled to 0 independently. This means workloads with massive skews between writes and reads can be served far more economically with OpenData databases.
-3. The architecture allows several deployment models. It's possible for OpenData databases to be fully embedded, with the Ingestors, Compactors, and Query Executors running within the application process. Or they can be fully distributed, with each component running as services in a k8s cluster. In either case, data is in S3 and always persistent. This makes per app, per agent, or other arrangements a natural fit.
-
-The flip side of this decoupled architecture is that you have higher end-to-end latency between when data is inserted into the system and when it is returned in a query. This means truly interactive use cases where users must read their writes as soon as possible are not good fits for OpenData databases. However, when some end-to-end latency is acceptable, the flexiblity of the OpenData architecture makes OpenData databases the superior option in a cloud-native world. 
-
-
-# Databases
-
-OpenData ships two databases today:
-
-* TSDB: An objectstore native timeseries database that can serve as a backend for Prometheus. Its a great option for a low cost, easy to operate, grafana backend. Learn more about it [here](open-tsdb/README.md).
-* Log: Think of it as Kafka 2.0. An objecstore native event streaming backend that supports millions of logs, so you can finally get a replayable log per key. Learn more about it [here](open-log/rfcs/0001-storage.md).
-
-# Quick Start
-
-TODO.
-
 
 # Why OpenData?
 
