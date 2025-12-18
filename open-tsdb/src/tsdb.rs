@@ -145,6 +145,23 @@ impl QueryReader for TsdbQueryReader {
         Ok(Box::new(merged))
     }
 
+    async fn all_forward_index(&self) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + '_>> {
+        // Merge all forward indexes from all buckets
+        let merged = ForwardIndex::default();
+
+        for mini in &self.mini_tsdbs {
+            let reader = mini.query_reader().await;
+            let index = reader.all_forward_index().await?;
+
+            // Merge all series from this bucket
+            for (sid, spec) in index.all_series() {
+                merged.series.insert(sid, spec);
+            }
+        }
+
+        Ok(Box::new(merged))
+    }
+
     async fn inverted_index(
         &self,
         terms: &[Attribute],

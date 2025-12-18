@@ -340,20 +340,6 @@ impl PromqlRouter for Tsdb {
     }
 
     async fn labels(&self, request: LabelsRequest) -> LabelsResponse {
-        // Validate matches is provided and non-empty
-        let matches = match request.matches {
-            Some(m) if !m.is_empty() => m,
-            _ => {
-                let err = ErrorResponse::bad_data("at least one match[] required");
-                return LabelsResponse {
-                    status: err.status,
-                    data: None,
-                    error: Some(err.error),
-                    error_type: Some(err.error_type),
-                };
-            }
-        };
-
         // Calculate time range (use defaults if not provided)
         let start_secs = request.start.unwrap_or(0);
         let end_secs = request.end.unwrap_or(i64::MAX);
@@ -372,42 +358,58 @@ impl PromqlRouter for Tsdb {
             }
         };
 
-        // Get all matching series IDs
-        let series_ids = match get_matching_series(&reader, &matches).await {
-            Ok(ids) => ids,
-            Err(e) => {
-                let err = ErrorResponse::bad_data(e);
-                return LabelsResponse {
-                    status: err.status,
-                    data: None,
-                    error: Some(err.error),
-                    error_type: Some(err.error_type),
+        // Get forward index - either filtered by matches or all series
+        let forward_index = match &request.matches {
+            Some(matches) if !matches.is_empty() => {
+                // Get matching series IDs first
+                let series_ids = match get_matching_series(&reader, matches).await {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        let err = ErrorResponse::bad_data(e);
+                        return LabelsResponse {
+                            status: err.status,
+                            data: None,
+                            error: Some(err.error),
+                            error_type: Some(err.error_type),
+                        };
+                    }
                 };
-            }
-        };
-
-        // Get forward index
-        let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-        let forward_index = match reader.forward_index(&series_ids_vec).await {
-            Ok(index) => index,
-            Err(e) => {
-                let err = ErrorResponse::internal(e.to_string());
-                return LabelsResponse {
-                    status: err.status,
-                    data: None,
-                    error: Some(err.error),
-                    error_type: Some(err.error_type),
-                };
-            }
-        };
-
-        // Collect all unique label names
-        let mut label_names: HashSet<String> = HashSet::new();
-        for id in &series_ids_vec {
-            if let Some(spec) = forward_index.get_spec(id) {
-                for attr in &spec.attributes {
-                    label_names.insert(attr.key.clone());
+                let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
+                match reader.forward_index(&series_ids_vec).await {
+                    Ok(index) => index,
+                    Err(e) => {
+                        let err = ErrorResponse::internal(e.to_string());
+                        return LabelsResponse {
+                            status: err.status,
+                            data: None,
+                            error: Some(err.error),
+                            error_type: Some(err.error_type),
+                        };
+                    }
                 }
+            }
+            _ => {
+                // No match[] provided - get all series
+                match reader.all_forward_index().await {
+                    Ok(index) => index,
+                    Err(e) => {
+                        let err = ErrorResponse::internal(e.to_string());
+                        return LabelsResponse {
+                            status: err.status,
+                            data: None,
+                            error: Some(err.error),
+                            error_type: Some(err.error_type),
+                        };
+                    }
+                }
+            }
+        };
+
+        // Collect all unique label names from all series
+        let mut label_names: HashSet<String> = HashSet::new();
+        for (_id, spec) in forward_index.all_series() {
+            for attr in &spec.attributes {
+                label_names.insert(attr.key.clone());
             }
         }
 
@@ -427,20 +429,6 @@ impl PromqlRouter for Tsdb {
     }
 
     async fn label_values(&self, request: LabelValuesRequest) -> LabelValuesResponse {
-        // Validate matches is provided and non-empty
-        let matches = match request.matches {
-            Some(m) if !m.is_empty() => m,
-            _ => {
-                let err = ErrorResponse::bad_data("at least one match[] required");
-                return LabelValuesResponse {
-                    status: err.status,
-                    data: None,
-                    error: Some(err.error),
-                    error_type: Some(err.error_type),
-                };
-            }
-        };
-
         // Calculate time range (use defaults if not provided)
         let start_secs = request.start.unwrap_or(0);
         let end_secs = request.end.unwrap_or(i64::MAX);
@@ -459,43 +447,59 @@ impl PromqlRouter for Tsdb {
             }
         };
 
-        // Get all matching series IDs
-        let series_ids = match get_matching_series(&reader, &matches).await {
-            Ok(ids) => ids,
-            Err(e) => {
-                let err = ErrorResponse::bad_data(e);
-                return LabelValuesResponse {
-                    status: err.status,
-                    data: None,
-                    error: Some(err.error),
-                    error_type: Some(err.error_type),
+        // Get forward index - either filtered by matches or all series
+        let forward_index = match &request.matches {
+            Some(matches) if !matches.is_empty() => {
+                // Get matching series IDs first
+                let series_ids = match get_matching_series(&reader, matches).await {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        let err = ErrorResponse::bad_data(e);
+                        return LabelValuesResponse {
+                            status: err.status,
+                            data: None,
+                            error: Some(err.error),
+                            error_type: Some(err.error_type),
+                        };
+                    }
                 };
+                let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
+                match reader.forward_index(&series_ids_vec).await {
+                    Ok(index) => index,
+                    Err(e) => {
+                        let err = ErrorResponse::internal(e.to_string());
+                        return LabelValuesResponse {
+                            status: err.status,
+                            data: None,
+                            error: Some(err.error),
+                            error_type: Some(err.error_type),
+                        };
+                    }
+                }
             }
-        };
-
-        // Get forward index
-        let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-        let forward_index = match reader.forward_index(&series_ids_vec).await {
-            Ok(index) => index,
-            Err(e) => {
-                let err = ErrorResponse::internal(e.to_string());
-                return LabelValuesResponse {
-                    status: err.status,
-                    data: None,
-                    error: Some(err.error),
-                    error_type: Some(err.error_type),
-                };
+            _ => {
+                // No match[] provided - get all series
+                match reader.all_forward_index().await {
+                    Ok(index) => index,
+                    Err(e) => {
+                        let err = ErrorResponse::internal(e.to_string());
+                        return LabelValuesResponse {
+                            status: err.status,
+                            data: None,
+                            error: Some(err.error),
+                            error_type: Some(err.error_type),
+                        };
+                    }
+                }
             }
         };
 
         // Collect all unique values for the specified label
         let mut values: HashSet<String> = HashSet::new();
-        for id in &series_ids_vec {
-            if let Some(spec) = forward_index.get_spec(id) {
-                for attr in &spec.attributes {
-                    if attr.key == request.label_name {
-                        values.insert(attr.value.clone());
-                    }
+        for (_id, spec) in forward_index.all_series() {
+            for attr in &spec.attributes {
+                if attr.key == request.label_name {
+                    values.insert(attr.value.clone());
                 }
             }
         }
@@ -817,15 +821,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_return_error_when_labels_has_no_matcher() {
+    async fn should_return_all_labels_when_no_matcher_provided() {
         // given
         let storage = create_test_storage().await;
         let tsdb = Tsdb::new(storage);
 
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+
+        let sample = create_sample(
+            "http_requests",
+            vec![("env", "prod"), ("method", "GET")],
+            4_000_000,
+            10.0,
+        );
+        mini.ingest(vec![sample]).await.unwrap();
+        tsdb.flush().await.unwrap();
+
         let request = LabelsRequest {
             matches: None,
-            start: None,
-            end: None,
+            start: Some(3600),
+            end: Some(7200),
             limit: None,
         };
 
@@ -833,21 +849,36 @@ mod tests {
         let response = tsdb.labels(request).await;
 
         // then
-        assert_eq!(response.status, "error");
-        assert_eq!(response.error_type, Some("bad_data".to_string()));
+        assert_eq!(response.status, "success");
+        assert!(response.data.is_some());
+
+        let data = response.data.unwrap();
+        assert!(data.contains(&"__name__".to_string()));
+        assert!(data.contains(&"env".to_string()));
+        assert!(data.contains(&"method".to_string()));
     }
 
     #[tokio::test]
-    async fn should_return_error_when_label_values_has_no_matcher() {
+    async fn should_return_all_label_values_when_no_matcher_provided() {
         // given
         let storage = create_test_storage().await;
         let tsdb = Tsdb::new(storage);
 
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+
+        let samples = vec![
+            create_sample("http_requests", vec![("env", "prod")], 4_000_000, 10.0),
+            create_sample("http_requests", vec![("env", "staging")], 4_000_000, 20.0),
+        ];
+        mini.ingest(samples).await.unwrap();
+        tsdb.flush().await.unwrap();
+
         let request = LabelValuesRequest {
             label_name: "env".to_string(),
             matches: None,
-            start: None,
-            end: None,
+            start: Some(3600),
+            end: Some(7200),
             limit: None,
         };
 
@@ -855,7 +886,12 @@ mod tests {
         let response = tsdb.label_values(request).await;
 
         // then
-        assert_eq!(response.status, "error");
-        assert_eq!(response.error_type, Some("bad_data".to_string()));
+        assert_eq!(response.status, "success");
+        assert!(response.data.is_some());
+
+        let data = response.data.unwrap();
+        assert_eq!(data.len(), 2);
+        assert!(data.contains(&"prod".to_string()));
+        assert!(data.contains(&"staging".to_string()));
     }
 }

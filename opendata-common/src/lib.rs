@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 pub mod clock;
 pub mod storage;
 pub mod util;

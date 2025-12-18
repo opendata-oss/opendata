@@ -15,6 +15,10 @@ pub(crate) trait QueryReader: Send + Sync {
         series_ids: &[SeriesId],
     ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + '_>>;
 
+    /// Get a view into all forward index data.
+    /// Used when no match[] filter is provided to retrieve all series.
+    async fn all_forward_index(&self) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + '_>>;
+
     /// Get a view into inverted index data for the specified terms.
     /// This avoids cloning bitmaps upfront - only storage data is pre-loaded.
     async fn inverted_index(
@@ -49,6 +53,12 @@ pub(crate) mod test_utils {
         async fn forward_index(
             &self,
             _series_ids: &[SeriesId],
+        ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + '_>> {
+            Ok(Box::new(self.forward_index.clone()))
+        }
+
+        async fn all_forward_index(
+            &self,
         ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + '_>> {
             Ok(Box::new(self.forward_index.clone()))
         }

@@ -34,6 +34,11 @@ impl<'a> QueryReader for MiniQueryReader<'a> {
         Ok(Box::new(forward_index))
     }
 
+    async fn all_forward_index(&self) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + '_>> {
+        let forward_index = self.snapshot.get_forward_index(self.bucket.clone()).await?;
+        Ok(Box::new(forward_index))
+    }
+
     async fn inverted_index(
         &self,
         terms: &[Attribute],

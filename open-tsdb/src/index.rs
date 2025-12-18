@@ -10,11 +10,19 @@ pub(crate) trait ForwardIndexLookup {
     /// Get the series spec for a given series ID.
     /// Returns None if the series is not found.
     fn get_spec(&self, series_id: &SeriesId) -> Option<SeriesSpec>;
+
+    /// Get all series specs in the forward index.
+    /// Returns a vector of (series_id, spec) pairs.
+    fn all_series(&self) -> Vec<(SeriesId, SeriesSpec)>;
 }
 
 impl<T: ForwardIndexLookup + ?Sized> ForwardIndexLookup for Box<T> {
     fn get_spec(&self, series_id: &SeriesId) -> Option<SeriesSpec> {
         (**self).get_spec(series_id)
+    }
+
+    fn all_series(&self) -> Vec<(SeriesId, SeriesSpec)> {
+        (**self).all_series()
     }
 }
 
@@ -50,6 +58,13 @@ impl ForwardIndex {
 impl ForwardIndexLookup for ForwardIndex {
     fn get_spec(&self, series_id: &SeriesId) -> Option<SeriesSpec> {
         self.series.get(series_id).map(|r| r.value().clone())
+    }
+
+    fn all_series(&self) -> Vec<(SeriesId, SeriesSpec)> {
+        self.series
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect()
     }
 }
 
