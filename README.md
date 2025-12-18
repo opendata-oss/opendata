@@ -10,7 +10,27 @@ Building performant, cost-effective, and correct online systems on object storag
 
 The OpenData ecosystem builds databases for object storage on a common core. At a high level, the ingestion, storage, and query layers are logically separated from each other. The ingestion layer implements write APIs, the storage layer takes writes and indexes them into read optimized data structures, and the query layer implements query APIs that consume read optimized versions of the written data. Each layer leverages a common set of components across the products, which is a key part of what makes the experience to develop and operate OpenData systems efficient.
 
-![OpenData 10,000ft architecture](public/img/opendata-high-level.png)
+```
+  ┌───────┐        ┌───────┐        ┌───────┐
+  │Ingest │        │Storage│        │ Query │
+┌─┴───────┴─┐    ┌─┴───────┴─┐    ┌─┴───────┴─┐
+│    OTEL   │    │    TSDB   │    │   PromQL  │
+│           │    │           │    │           │
+├───────────┤    ├───────────┤    ├───────────┤
+│   Kafka   │    │    Log    │    │   Kafka   │
+│ Producer  │    │           │    │  Consumer │
+├───────────┤    ├───────────┤    ├───────────┤
+│  Object   │    │  Search   │    │   Lucene  │
+│  storage  │    │           │    │     QL    │
+└───────────┘    └───────────┘    └───────────┘
+      ╔════════════════════════════════╗
+      ║        Common Components       ║
+      ║         (SlateDB, etc)         ║
+      ╠════════════════════════════════╣
+      ║        Object Storage          ║
+      ║                                ║
+      ╚════════════════════════════════╝
+```
 
 Next, we dig into the typical data flow for a specific OpenData database.  
 
@@ -18,8 +38,28 @@ Next, we dig into the typical data flow for a specific OpenData database.
 
 Each OpenData databases has a high level data flow that looks like this:
 
-![OpenData data flow](public/img/opendata-arch.png)
+```
 
+ write │                          ▲ query
+       │                          │
+       │                          │
+┌──────▼──────────────────────────┴───────┐
+│                  API                    │
+└─────┬─────────────────────────────▲─────┘
+     1│                            6│
+╔═════▼═════╗  ╔═══════════╗  ╔═════╩═════╗
+║           ║  ║           ║  ║   query   ║
+║ ingestors ║  ║ compactors║  ║ executors ║
+║           ║  ║           ║  ║           ║
+╚═════╦═════╝  ╚══▲══════▲═╝  ╚═════▲═════╝
+     2│          3│     4│         5│
+┏━━━━━▼━━━━━━━━━━━┻━━┳━━━▼━━━━━━━━━━┻━━━━━┓
+┃        WALs        │   Collections      ┃
+┣────────────────────┴────────────────────┫
+┃                Metadata                 ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+              Object Storage
+```
 1. The API layer is specific to each database, and implements the appropriate read and write APIs for the database. When the API layer receives write requests, they are forwarded to the Ingestor component. For instance, a TSDB may implement the OTEL protocol at the API layer which receives OTEL write requests.
 2. The Ingestors receive writes coming from the API layer, convert them to Write-Ahead-Log (WAL) records, batch these records and flush them to object storage, and then update the Metadata. The WAL record formats may differ for different database types. We describe the metadata layer in detail later, but for now it suffices to know that the matadata contains locations and versions of all files in the system. The metadata lives in object storage, and all OpenData systems use the same components to enable writing metadata updates atomically. Atomic updates to metadata ensure that readers and writers in the system operate on consistent views of the data in the system. 
 3. There are two types of Compactors in the OpenData system. One type is called the WAL compactor. It takes new WAL files written by ingestors and write the WAL entries into a format that's optimized to serve the queries of each database. For example, a compactor for a TSDB will take a WAL file and write inverted indexes, dictionaries, etc. These read-optimized files are called Collections. 
