@@ -124,15 +124,15 @@ struct LogEntry {
 struct ScanOptions {
 }
 
-struct ScanIterator { ... }
+struct LogIterator { ... }
 
-impl ScanIterator {
+impl LogIterator {
     async fn next(&mut self) -> Result<Option<LogEntry>, Error>;
 }
 
 impl Log {
-    fn scan(&self, key: Bytes, seq_range: impl RangeBounds<u64>) -> ScanIterator;
-    fn scan_with_options(&self, key: Bytes, seq_range: impl RangeBounds<u64>, options: ScanOptions) -> ScanIterator;
+    fn scan(&self, key: Bytes, seq_range: impl RangeBounds<u64>) -> LogIterator;
+    fn scan_with_options(&self, key: Bytes, seq_range: impl RangeBounds<u64>, options: ScanOptions) -> LogIterator;
 }
 ```
 
@@ -161,6 +161,35 @@ For example, to compute the current lag for a key from a given sequence number:
 let current_seq: u64 = 1000;
 let lag = log.count(key, current_seq..).await?;
 ```
+
+### LogRead Trait and LogReader
+
+Following SlateDB's pattern with `DbRead` and `DbReader`, we define a `LogRead` trait that abstracts read operations. Both `Log` and `LogReader` implement this trait.
+
+```rust
+trait LogRead {
+    fn scan(&self, key: Bytes, seq_range: impl RangeBounds<u64>) -> LogIterator;
+    fn scan_with_options(&self, key: Bytes, seq_range: impl RangeBounds<u64>, options: ScanOptions) -> LogIterator;
+    async fn count(&self, key: Bytes, seq_range: impl RangeBounds<u64>) -> Result<u64, Error>;
+    async fn count_with_options(&self, key: Bytes, seq_range: impl RangeBounds<u64>, options: CountOptions) -> Result<u64, Error>;
+}
+
+impl LogRead for Log { ... }
+impl LogRead for LogReader { ... }
+```
+
+`LogReader` is a read-only view of the log, useful for consumers that should not have write access:
+
+```rust
+impl Log {
+    fn reader(&self) -> LogReader;
+}
+```
+
+This separation allows:
+
+- **Access control** — Share `LogReader` with components that only need read access.
+- **Generic programming** — Write functions that accept `impl LogRead` to work with either `Log` or `LogReader`.
 
 ## Alternatives
 

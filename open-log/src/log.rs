@@ -2,7 +2,7 @@
 //!
 //! This module provides the [`Log`] struct, the primary entry point for
 //! interacting with OpenData Log. It exposes both write operations ([`append`])
-//! and read operations ([`scan`], [`count`]).
+//! and read operations ([`scan`], [`count`]) via the [`LogRead`] trait.
 
 use std::ops::RangeBounds;
 
@@ -11,12 +11,12 @@ use bytes::Bytes;
 use crate::config::{CountOptions, ScanOptions, WriteOptions};
 use crate::error::Result;
 use crate::model::{LogEntry, Record};
-use crate::reader::LogReader;
+use crate::reader::{LogRead, LogReader};
 
 /// An iterator over log entries for a specific key.
 ///
-/// Created by [`Log::scan`] or [`Log::scan_with_options`]. Yields entries
-/// in sequence number order within the specified range.
+/// Created by [`LogRead::scan`] or [`LogRead::scan_with_options`]. Yields
+/// entries in sequence number order within the specified range.
 ///
 /// # Streaming Behavior
 ///
@@ -31,12 +31,12 @@ use crate::reader::LogReader;
 ///     process_entry(entry);
 /// }
 /// ```
-pub struct ScanIterator {
+pub struct LogIterator {
     // Implementation details will be added later
     _private: (),
 }
 
-impl ScanIterator {
+impl LogIterator {
     /// Advances the iterator and returns the next log entry.
     ///
     /// Returns `Ok(Some(entry))` if there is another entry in the range,
@@ -56,6 +56,12 @@ impl ScanIterator {
 /// It provides methods to append records, scan entries, and count records
 /// within a key's log.
 ///
+/// # Read Operations
+///
+/// Read operations are provided via the [`LogRead`] trait, which `Log`
+/// implements. This allows generic code to work with either `Log` or
+/// [`LogReader`].
+///
 /// # Thread Safety
 ///
 /// `Log` is designed to be shared across threads. All methods take `&self`
@@ -70,7 +76,7 @@ impl ScanIterator {
 /// # Example
 ///
 /// ```ignore
-/// use open_log::{Log, Record, WriteOptions};
+/// use open_log::{Log, LogRead, Record, WriteOptions};
 /// use bytes::Bytes;
 ///
 /// // Open a log (implementation details TBD)
@@ -98,8 +104,6 @@ pub struct Log {
 }
 
 impl Log {
-    // ==================== Write API ====================
-
     /// Appends records to the log.
     ///
     /// Records are assigned sequence numbers in the order they appear in the
@@ -165,139 +169,12 @@ impl Log {
         todo!()
     }
 
-    // ==================== Read API ====================
-
-    /// Scans entries for a key within a sequence number range.
-    ///
-    /// Returns an iterator that yields entries in sequence number order.
-    /// The range is specified using Rust's standard range syntax.
-    ///
-    /// This method uses default scan options. Use [`scan_with_options`] for
-    /// custom read behavior.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The key identifying the log stream to scan.
-    /// * `seq_range` - The sequence number range to scan. Supports all Rust
-    ///   range types (`..`, `start..`, `..end`, `start..end`, etc.).
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // Scan all entries for a key
-    /// let iter = log.scan(Bytes::from("orders"), ..);
-    ///
-    /// // Scan from sequence 100 onwards
-    /// let iter = log.scan(Bytes::from("orders"), 100..);
-    ///
-    /// // Scan a specific range
-    /// let iter = log.scan(Bytes::from("orders"), 100..200);
-    /// ```
-    ///
-    /// [`scan_with_options`]: Log::scan_with_options
-    pub fn scan(&self, key: Bytes, seq_range: impl RangeBounds<u64>) -> ScanIterator {
-        self.scan_with_options(key, seq_range, ScanOptions::default())
-    }
-
-    /// Scans entries for a key within a sequence number range with custom options.
-    ///
-    /// Returns an iterator that yields entries in sequence number order.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The key identifying the log stream to scan.
-    /// * `seq_range` - The sequence number range to scan.
-    /// * `options` - Scan options controlling read behavior.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let options = ScanOptions::default();
-    /// let iter = log.scan_with_options(Bytes::from("orders"), 100.., options);
-    /// ```
-    pub fn scan_with_options(
-        &self,
-        _key: Bytes,
-        _seq_range: impl RangeBounds<u64>,
-        _options: ScanOptions,
-    ) -> ScanIterator {
-        todo!()
-    }
-
-    /// Counts entries for a key within a sequence number range.
-    ///
-    /// Returns the number of entries in the specified range. This is useful
-    /// for computing lag (how far behind a consumer is) or progress metrics.
-    ///
-    /// This method uses default count options (exact count). Use
-    /// [`count_with_options`] for approximate counts.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The key identifying the log stream to count.
-    /// * `seq_range` - The sequence number range to count.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the count fails due to storage issues.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // Count all entries
-    /// let total = log.count(Bytes::from("orders"), ..).await?;
-    ///
-    /// // Compute lag from a checkpoint
-    /// let checkpoint: u64 = 1000;
-    /// let lag = log.count(Bytes::from("orders"), checkpoint..).await?;
-    /// println!("Consumer is {} entries behind", lag);
-    /// ```
-    ///
-    /// [`count_with_options`]: Log::count_with_options
-    pub async fn count(&self, key: Bytes, seq_range: impl RangeBounds<u64>) -> Result<u64> {
-        self.count_with_options(key, seq_range, CountOptions::default())
-            .await
-    }
-
-    /// Counts entries for a key within a sequence number range with custom options.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The key identifying the log stream to count.
-    /// * `seq_range` - The sequence number range to count.
-    /// * `options` - Count options, including whether to return an approximate count.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the count fails due to storage issues.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // Get an approximate count for faster results
-    /// let options = CountOptions { approximate: true };
-    /// let approx_count = log.count_with_options(
-    ///     Bytes::from("orders"),
-    ///     ..,
-    ///     options
-    /// ).await?;
-    /// ```
-    pub async fn count_with_options(
-        &self,
-        _key: Bytes,
-        _seq_range: impl RangeBounds<u64>,
-        _options: CountOptions,
-    ) -> Result<u64> {
-        todo!()
-    }
-
-    // ==================== Reader API ====================
-
     /// Creates a read-only view of the log.
     ///
     /// The returned [`LogReader`] provides access to all read operations
-    /// ([`scan`], [`count`]) but not write operations. This is useful for
-    /// consumers that should not have write access to the log.
+    /// ([`scan`](LogRead::scan), [`count`](LogRead::count)) but not write
+    /// operations. This is useful for consumers that should not have write
+    /// access to the log.
     ///
     /// # Example
     ///
@@ -311,10 +188,27 @@ impl Log {
     /// // But cannot append (this would be a compile error):
     /// // reader.append(records).await?; // ERROR: no method `append`
     /// ```
-    ///
-    /// [`scan`]: LogReader::scan
-    /// [`count`]: LogReader::count
     pub fn reader(&self) -> LogReader {
+        todo!()
+    }
+}
+
+impl LogRead for Log {
+    fn scan_with_options(
+        &self,
+        _key: Bytes,
+        _seq_range: impl RangeBounds<u64> + Send,
+        _options: ScanOptions,
+    ) -> LogIterator {
+        todo!()
+    }
+
+    async fn count_with_options(
+        &self,
+        _key: Bytes,
+        _seq_range: impl RangeBounds<u64> + Send,
+        _options: CountOptions,
+    ) -> Result<u64> {
         todo!()
     }
 }

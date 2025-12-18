@@ -49,6 +49,6 @@ mod reader;
 
 pub use config::{CountOptions, ScanOptions, WriteOptions};
 pub use error::{Error, Result};
-pub use log::{Log, ScanIterator};
+pub use log::{Log, LogIterator};
 pub use model::{LogEntry, Record};
-pub use reader::LogReader;
+pub use reader::{LogRead, LogReader};
