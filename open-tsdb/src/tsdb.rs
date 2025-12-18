@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,7 +8,7 @@ use opendata_common::Storage;
 
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndex, InvertedIndexLookup};
 use crate::minitsdb::MiniTsdb;
-use crate::model::{Attribute, Sample, SeriesId, TimeBucket};
+use crate::model::{Attribute, Sample, SampleWithAttributes, SeriesId, TimeBucket};
 use crate::query::QueryReader;
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::util::Result;
@@ -112,6 +113,31 @@ impl Tsdb {
         for (_, mini) in &self.ingest_cache {
             mini.flush(self.storage.clone()).await?;
         }
+        Ok(())
+    }
+
+    /// Ingest samples into the TSDB, grouping by time bucket.
+    pub(crate) async fn ingest_samples(&self, samples: Vec<SampleWithAttributes>) -> Result<()> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+
+        // Group samples by bucket
+        let mut by_bucket: HashMap<TimeBucket, Vec<SampleWithAttributes>> = HashMap::new();
+
+        for sample in samples {
+            let bucket = TimeBucket::round_to_hour(
+                std::time::UNIX_EPOCH + std::time::Duration::from_millis(sample.sample.timestamp),
+            )?;
+            by_bucket.entry(bucket).or_default().push(sample);
+        }
+
+        // Ingest each bucket
+        for (bucket, bucket_samples) in by_bucket {
+            let mini = self.get_or_create_for_ingest(bucket).await?;
+            mini.ingest(bucket_samples).await?;
+        }
+
         Ok(())
     }
 }

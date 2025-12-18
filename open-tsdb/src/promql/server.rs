@@ -6,6 +6,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+#[cfg(feature = "remote-write")]
+use axum::routing::post;
 use axum::{Json, Router};
 use tokio::time::interval;
 
@@ -113,9 +115,15 @@ impl PromqlServer {
             .route("/api/v1/series", get(handle_series).post(handle_series))
             .route("/api/v1/labels", get(handle_labels))
             .route("/api/v1/label/{name}/values", get(handle_label_values))
-            .route("/metrics", get(handle_metrics))
-            .layer(MetricsLayer::new(metrics))
-            .with_state(state);
+            .route("/metrics", get(handle_metrics));
+
+        #[cfg(feature = "remote-write")]
+        let app = app.route(
+            "/api/v1/write",
+            post(super::remote_write::handle_remote_write),
+        );
+
+        let app = app.layer(MetricsLayer::new(metrics)).with_state(state);
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.port));
         tracing::info!("Starting Prometheus-compatible server on {}", addr);

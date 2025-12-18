@@ -9,7 +9,7 @@ use tokio::time::interval;
 use super::config::{PrometheusConfig, ScrapeConfig};
 use super::metrics::{Metrics, ScrapeLabels};
 use super::openmetrics::parse_openmetrics;
-use crate::model::{Attribute, MetricType, Sample, SampleWithAttributes, TimeBucket};
+use crate::model::{Attribute, MetricType, Sample, SampleWithAttributes};
 use crate::tsdb::Tsdb;
 use crate::util::OpenTsdbError;
 use crate::util::Result;
@@ -236,27 +236,7 @@ impl Scraper {
 
     /// Ingest samples into the TSDB.
     async fn ingest_samples(&self, samples: Vec<SampleWithAttributes>) -> Result<()> {
-        if samples.is_empty() {
-            return Ok(());
-        }
-
-        // Group samples by bucket
-        let mut by_bucket: HashMap<TimeBucket, Vec<SampleWithAttributes>> = HashMap::new();
-
-        for sample in samples {
-            let bucket = TimeBucket::round_to_hour(
-                std::time::UNIX_EPOCH + std::time::Duration::from_millis(sample.sample.timestamp),
-            )?;
-            by_bucket.entry(bucket).or_default().push(sample);
-        }
-
-        // Ingest each bucket
-        for (bucket, bucket_samples) in by_bucket {
-            let mini = self.tsdb.get_or_create_for_ingest(bucket).await?;
-            mini.ingest(bucket_samples).await?;
-        }
-
-        Ok(())
+        self.tsdb.ingest_samples(samples).await
     }
 }
 

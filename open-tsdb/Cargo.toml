@@ -3,6 +3,10 @@ name = "open-tsdb"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+remote-write = ["dep:prost", "dep:snap"]
+
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
@@ -31,6 +35,10 @@ prometheus-client = "0.22"
 promql-parser = "0.6"
 roaring = "0.7"
 tsz = "0.1"
+
+# Optional dependencies for remote-write feature
+prost = { workspace = true, optional = true }
+snap = { workspace = true, optional = true }
 
 [dev-dependencies]
 fail.workspace = true
