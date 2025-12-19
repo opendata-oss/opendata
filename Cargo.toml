@@ -2,8 +2,8 @@
 resolver = "2"
 members = [
     "opendata-common",
-    "open-tsdb",
-    "open-log",
+    "timeseries",
+    "log",
 ]
 
 [workspace.package]

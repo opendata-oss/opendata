@@ -63,7 +63,7 @@ Major changes require an RFC (Request for Comments) before implementation. This 
 
 1. Copy the [RFC template](rfcs/0000-template.md) to the appropriate directory:
    - `rfcs/` - For cross-project or architectural changes
-   - `<project>/rfcs/` - For project-specific changes (e.g., `open-tsdb/rfcs/`)
+   - `<project>/rfcs/` - For project-specific changes (e.g., `timeseries/rfcs/`)
 2. Name the file `NNNN-short-description.md` where `NNNN` is the next available number
 3. Fill out the template sections:
    - **Summary** - Brief description of the proposal
@@ -147,7 +147,7 @@ fn should_return_error_when_input_is_invalid() {
 ```bash
 cargo test --all                    # Run all tests
 cargo test --all -- --nocapture     # Run with output
-cargo test -p open-tsdb             # Run tests for a specific crate
+cargo test -p timeseries             # Run tests for a specific crate
 ```
 
 ## License

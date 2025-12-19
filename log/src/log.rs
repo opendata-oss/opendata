@@ -76,7 +76,7 @@ impl LogIterator {
 /// # Example
 ///
 /// ```ignore
-/// use open_log::{Log, LogRead, Record, WriteOptions};
+/// use log::{Log, LogRead, Record, WriteOptions};
 /// use bytes::Bytes;
 ///
 /// // Open a log (implementation details TBD)

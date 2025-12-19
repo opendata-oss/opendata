@@ -27,7 +27,7 @@ use crate::log::LogIterator;
 /// # Example
 ///
 /// ```ignore
-/// use open_log::LogRead;
+/// use log::LogRead;
 /// use bytes::Bytes;
 ///
 /// async fn process_log(reader: &impl LogRead) -> Result<()> {
@@ -146,7 +146,7 @@ pub trait LogRead {
 /// # Example
 ///
 /// ```ignore
-/// use open_log::{LogReader, LogRead};
+/// use log::{LogReader, LogRead};
 /// use bytes::Bytes;
 ///
 /// async fn consume_events(reader: LogReader, key: Bytes) -> Result<()> {

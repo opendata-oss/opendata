@@ -1,4 +1,4 @@
-//! Prometheus metrics for the open-tsdb server.
+//! Prometheus metrics for the timeseries server.
 
 use axum::http::Method;
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};

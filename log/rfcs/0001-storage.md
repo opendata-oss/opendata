@@ -81,7 +81,7 @@ SlateDB SSTs include bloom filters to accelerate point lookups. For OpenData-Log
 
 ### Append-Only Scan Optimization
 
-In a typical key-value store, range scans must concurrently merge all LSM levels because any level may contain the most recent value for a given key. The append-only structure of open-log provides a stronger guarantee: newer entries are always in higher levels (L0 and recent sorted runs), while older entries settle into deeper levels through compaction.
+In a typical key-value store, range scans must concurrently merge all LSM levels because any level may contain the most recent value for a given key. The append-only structure of log provides a stronger guarantee: newer entries are always in higher levels (L0 and recent sorted runs), while older entries settle into deeper levels through compaction.
 
 This ordering guarantee enables level-by-level iteration rather than concurrent merging. For queries targeting the tip of a log, we can avoid loading blocks from older levels entirely. This improves performance and prevents cache thrashing from loading historical data that isn't needed.
 

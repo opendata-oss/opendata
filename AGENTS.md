@@ -7,8 +7,8 @@ OpenData is a collection of deployable database systems that share common infras
 ### Crates
 
 - **opendata-common**: Shared library containing common utilities and abstractions used by all database implementations
-- **open-tsdb**: A timeseries database optimized for time-ordered data
-- **open-log**: A Kafka-like log abstraction for append-only event streams
+- **timeseries**: A timeseries database optimized for time-ordered data
+- **log**: A Kafka-like log abstraction for append-only event streams
 
 ## Development
 
@@ -16,14 +16,14 @@ OpenData is a collection of deployable database systems that share common infras
 
 ```bash
 cargo build              # Build all crates
-cargo build -p open-tsdb # Build specific crate
+cargo build -p timeseries # Build specific crate
 ```
 
 ### Testing
 
 ```bash
 cargo test --all         # Run all tests
-cargo test -p open-tsdb  # Test specific crate
+cargo test -p timeseries  # Test specific crate
 ```
 
 ### Formatting and Linting

@@ -22,7 +22,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use open_log::{Log, Record, WriteOptions};
+//! use log::{Log, Record, WriteOptions};
 //! use bytes::Bytes;
 //!
 //! // Open a log

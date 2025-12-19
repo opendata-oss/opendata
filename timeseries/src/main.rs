@@ -76,7 +76,7 @@ async fn main() {
     let server = PromqlServer::new(tsdb, config);
 
     tracing::info!(
-        "Starting open-tsdb Prometheus-compatible server on port {}...",
+        "Starting timeseries Prometheus-compatible server on port {}...",
         args.port
     );
     server.run().await;

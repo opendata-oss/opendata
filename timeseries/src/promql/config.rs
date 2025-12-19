@@ -12,7 +12,7 @@ use crate::util::Result;
 
 /// CLI arguments for the server.
 #[derive(Parser, Debug)]
-#[command(name = "open-tsdb")]
+#[command(name = "timeseries")]
 #[command(about = "Prometheus-compatible time series database")]
 pub struct CliArgs {
     /// Path to the prometheus.yaml configuration file

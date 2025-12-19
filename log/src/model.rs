@@ -24,7 +24,7 @@ use bytes::Bytes;
 ///
 /// ```
 /// use bytes::Bytes;
-/// use open_log::Record;
+/// use log::Record;
 ///
 /// let record = Record {
 ///     key: Bytes::from("orders"),

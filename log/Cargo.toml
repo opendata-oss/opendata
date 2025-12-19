@@ -1,5 +1,5 @@
 [package]
-name = "open-log"
+name = "log"
 version.workspace = true
 edition.workspace = true
 

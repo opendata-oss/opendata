@@ -20,7 +20,7 @@ In a terminal, start the mock server which exposes simulated metrics (CPU usage,
 memory, request counts, histograms, etc.) in Prometheus text format:
 
 ```bash
-python3 open-tsdb/etc/mock_metrics_server.py --port 8080
+python3 timeseries/etc/mock_metrics_server.py --port 8080
 ```
 
 ### 2. Start OpenTSDB
@@ -30,7 +30,7 @@ to scrape the mock server every 15 seconds. Data is persisted to a local SlateDB
 instance in the `./.data` directory (created automatically):
 
 ```bash
-cargo run -p open-tsdb -- --config open-tsdb/etc/prometheus.yaml --port 9090
+cargo run -p timeseries -- --config timeseries/etc/prometheus.yaml --port 9090
 ```
 
 ### 3. Query the Data
