@@ -1,18 +1,18 @@
-# OpenTSDB
+# OpenData Timeseries
 
-OpenTSDB is a time series database with prometheus-like APIs which uses SlateDB
-as the underlying storage engine.
+OpenData Timeseries is a time series database with prometheus-like APIs which
+uses SlateDB as the underlying storage engine.
 
 ## Quickstart
 
-This quickstart runs OpenTSDB locally, scraping metrics from a mock server and
+This quickstart runs Timeseries locally, scraping metrics from a mock server and
 storing them in a local SlateDB instance on disk. You can then query the data
 using the Prometheus-compatible API.
 
 ### Prerequisites
 
 - Python 3 (for the mock metrics server)
-- Rust/Cargo (for building OpenTSDB)
+- Rust/Cargo (for building Timeseries)
 
 ### 1. Start the Mock Metrics Server
 
@@ -23,9 +23,9 @@ memory, request counts, histograms, etc.) in Prometheus text format:
 python3 timeseries/etc/mock_metrics_server.py --port 8080
 ```
 
-### 2. Start OpenTSDB
+### 2. Start Timeseries
 
-In another terminal, start OpenTSDB with the provided config. This tells OpenTSDB
+In another terminal, start Timeseries with the provided config. This tells Timeseries
 to scrape the mock server every 15 seconds. Data is persisted to a local SlateDB
 instance in the `./.data` directory (created automatically):
 
@@ -35,7 +35,7 @@ cargo run -p timeseries -- --config timeseries/etc/prometheus.yaml --port 9090
 
 ### 3. Query the Data
 
-Wait about 15-30 seconds for OpenTSDB to scrape and index the metrics, then query
+Wait about 15-30 seconds for Timeseries to scrape and index the metrics, then query
 the data using curl.
 
 **List all label names:**
@@ -68,8 +68,8 @@ To start fresh, stop the servers and delete the `./.data` directory.
 
 ## Storage Design
 
-OpenTSDB uses SlateDB's LSM tree to store time series data organized into time
+Timeseries uses SlateDB's LSM tree to store time series data organized into time
 buckets. Each bucket contains indexes for efficient label-based querying
 (inverted index mapping label/value pairs to series IDs) and Gorilla-compressed
-time series samples. For detailed storage specifications, see [RFC 0001: TSDB
+time series samples. For detailed storage specifications, see [RFC 0001: Timeseries
 Storage](rfcs/0001-tsdb-storage.md).
