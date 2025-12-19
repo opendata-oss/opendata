@@ -9,16 +9,16 @@
 
 ## Summary
 
-This RFC defines the storage model for OpenData-TSDB, a time series database built on
-[SlateDB](https://github.com/slatedb/slatedb). Data is organized into time
-buckets with inverted indexes for efficient label-based querying, a forward
-index for retreiving series information from a given series id, and
-Gorilla-compressed storage for time series samples.
+This RFC defines the storage model for OpenData-timeseries, a time series
+database built on [SlateDB](https://github.com/slatedb/slatedb). Data is
+organized into time buckets with inverted indexes for efficient label-based
+querying, a forward index for retreiving series information from a given series
+id, and Gorilla-compressed storage for time series samples.
 
 ## Motivation
 
-OpenData-TSDB stores time series data with Prometheus-compatible semantics. The
-storage design must support:
+OpenData-timeseries stores time series data with Prometheus-compatible
+semantics. The storage design must support:
 
 1. **Efficient label-based queries** — Finding series by label selectors (e.g.,
   `{job="api", status="500"}`) requires inverted indexes mapping label/value pairs
@@ -49,6 +49,27 @@ storage design must support:
 - Query execution and optimization
 
 ## Design
+
+### Background on the query path
+
+This RFC focuses on storage design rather than query execution, but understanding
+the query path helps explain the storage model. A timeseries database has three
+storage components:
+
+- **Raw series storage**: Stores `(timestamp, value)` pairs keyed by series ID
+- **Inverted index**: Maps attribute/value pairs to series IDs, enabling efficient
+  label selector matching (e.g., `{job="api", status="500"}`)
+- **Forward index**: Maps series IDs to their canonical attribute specifications
+  (all labels as UTF-8 strings), used to resolve series discovered via the
+  inverted index
+
+To illustrate, here's how the query `sum by (instance) (metric{path="/query",
+method="GET", status="200"})` is served:
+
+1. Parse the query into a query plan
+2. Use the inverted index to find series matching `{__name__="metric", path="/query", method="GET", status="200"}`
+3. Use the forward index to resolve each series ID to its full attribute set (including `instance` for grouping)
+4. Sum the values for matching series and return the result
 
 ### Record Layout
 
@@ -100,7 +121,7 @@ record key as a `u32` representing number of minutes since the UNIX epoch. The
 byte ordering must be big-endian to be consistent with lexicographic ordering
 from SlateDB.
 
-OpenData-TSDB will eventually support windows of time at different granularities.
+OpenData-timeseries will eventually support windows of time at different granularities.
 Recent data will likely be fine-grained buckets (every hour in our prototype).
 As these buckets age in the system, they will be rolled up into more coarsely
 defined buckets. New data may be stored by hour, for example, and then later
