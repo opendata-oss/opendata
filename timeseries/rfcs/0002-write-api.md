@@ -11,7 +11,7 @@ This RFC proposes a public write API for OpenData-TimeSeries, which is modeled a
 
 ## Motivation
 
-It would be useful to expose a low-level API to write time series data and enable ingestion flexibility. Although OTEL is likely to be the primary data model for ingestion, it has a more complicated data model with support for histograms and summary types. We can isolate representation of these higher-level metric types in a separate OTEL module without affecting the core time series simplicity (similar to Prometheus). In principle, OpenData-TimeSeries can accommodate other representations of time series data including those closer to user applications.  
+It would be useful to expose a low-level API to write time series data and enable ingest flexibility. Although OTEL is likely to be the primary data model for ingestion, it has a fairly complicated representation with support for higher-level metric types such as histograms and summaries. OpenData-TimeSeries aims to be simple in its core. We can isolate higher-level types in a separate OTEL module without compromising a simpler internal representation (similar to Prometheus). In principle, this allows OpenData-TimeSeries to accommodate other representations of time series data including those closer to user applications.    
 
 ## Goals
 
@@ -156,7 +156,7 @@ OpenData emphasizes minimalism and composition. The core data model is the small
 
 Richer abstractions are composed on top. For example, an OTEL mapping module would decompose histograms into multiple simple series (`_bucket`, `_sum`, `_count`) at ingestion time. Prometheus takes a similar approach for the same reasons.
 
-In a similar vein, Prometheus adds alphanumeric validation on label names in order to keep PromQL simple. However, nothing in our underlying timeseries data system actually relies on this assumption, and we can therefore layer it on top.  
+In a similar vein, Prometheus adds alphanumeric validation on label names in order to keep PromQL simple. However, nothing in our underlying timeseries data system actually relies on this assumption, and we can therefore layer it on top. Future systems may allow more localization even in the core APIs, so we aim to keep the internal representation as permissive as possible.  
 
 This design has several benefits:
 
@@ -457,8 +457,6 @@ Complex types like histograms are decomposed into simple series at higher layers
 - **Minimal** - One data type, one storage format, fewer edge cases
 - **Composable** - Higher layers can implement any histogram scheme without core changes
 - **Permissive** - No opinions about bucket boundaries, quantiles, or naming conventions
-
-Prometheus takes a similar approach for the same reasons.
 
 **Trade-offs**: Users must use the OTEL module (or implement their own decomposition) to ingest histogram/summary data.
 
