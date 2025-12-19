@@ -205,9 +205,6 @@ pub struct TimeSeries {
 impl TimeSeries {
     /// Open or create a time series database with the given configuration.
     pub async fn open(config: TimeSeriesConfig) -> Result<Self>;
-
-    /// Create an in-memory time series database for testing.
-    pub fn in_memory() -> Self;
 }
 ```
 
@@ -339,7 +336,8 @@ A separate module handles conversion from OpenTelemetry data models to the TimeS
 3. **Attribute mapping** - Converting OTEL resource/scope/metric attributes to labels
 
 ```rust
-/// Module for converting OpenTelemetry metrics to TimeSeries format.
+/// Hypothetical Module for converting OpenTelemetry metrics to TimeSeries format.
+#[cfg(feature = "otel")]
 pub mod otel {
     use super::{Series, Label, Sample, SeriesMetadata, MetricType};
 
@@ -463,10 +461,6 @@ Complex types like histograms are decomposed into simple series at higher layers
 Prometheus takes a similar approach for the same reasons.
 
 **Trade-offs**: Users must use the OTEL module (or implement their own decomposition) to ingest histogram/summary data.
-
-## Open Questions
-
-1. **Metric metadata storage**: Where should metadata be stored? With the series data, or in a separate metadata store?
 
 ## Updates
 
