@@ -91,11 +91,10 @@ impl Sample {
     }
 }
 
-/// Optional metadata about a series.
+/// Metadata about a series.
 ///
-/// Metadata provides additional context about a time series that is not
-/// part of its identity. This information is useful for documentation,
-/// visualization, and type-aware processing.
+/// Metadata includes the metric type, a human-readable description, and
+/// the unit of measurement.
 #[derive(Debug, Clone, Default)]
 pub struct SeriesMetadata {
     /// The type of metric (gauge or counter).
@@ -124,9 +123,8 @@ pub enum MetricType {
 
 /// A time series with its identifying labels and data points.
 ///
-/// A series represents a single stream of timestamped values identified
-/// by a unique set of labels. The labels must include `__name__` to
-/// identify the metric.
+/// A series represents a single stream of timestamped values. Each series
+/// is uniquely identified by its metric name, labels, and metadata.
 ///
 /// # Example
 ///
@@ -134,10 +132,8 @@ pub enum MetricType {
 /// use timeseries::{Series, Label, Sample};
 ///
 /// let series = Series::new(
-///     vec![
-///         Label::metric_name("http_requests_total"),
-///         Label::new("method", "GET"),
-///     ],
+///     "http_requests_total",
+///     vec![Label::new("method", "GET")],
 ///     vec![Sample::new(1700000000000, 1.0)],
 /// );
 ///
@@ -149,7 +145,10 @@ pub enum MetricType {
 /// ```
 #[derive(Debug, Clone)]
 pub struct Series {
-    /// Labels identifying this series (must include `__name__`).
+    /// The metric name.
+    pub name: String,
+
+    /// Labels identifying this series.
     pub labels: Vec<Label>,
 
     /// One or more samples to write.
@@ -160,9 +159,14 @@ pub struct Series {
 }
 
 impl Series {
-    /// Creates a new series with the given labels and samples.
-    pub fn new(labels: Vec<Label>, samples: Vec<Sample>) -> Self {
+    /// Creates a new series with the given name, labels, and samples.
+    pub fn new(
+        name: impl Into<String>,
+        labels: Vec<Label>,
+        samples: Vec<Sample>,
+    ) -> Self {
         Self {
+            name: name.into(),
             labels,
             samples,
             metadata: None,
@@ -176,9 +180,9 @@ impl Series {
     ///
     /// # Arguments
     ///
-    /// * `metric_name` - The metric name (will be stored as `__name__` label).
-    pub fn builder(metric_name: impl Into<String>) -> SeriesBuilder {
-        SeriesBuilder::new(metric_name)
+    /// * `name` - The metric name.
+    pub fn builder(name: impl Into<String>) -> SeriesBuilder {
+        SeriesBuilder::new(name)
     }
 }
 
@@ -188,15 +192,17 @@ impl Series {
 /// and optional metadata.
 #[derive(Debug, Clone)]
 pub struct SeriesBuilder {
+    name: String,
     labels: Vec<Label>,
     samples: Vec<Sample>,
     metadata: Option<SeriesMetadata>,
 }
 
 impl SeriesBuilder {
-    fn new(metric_name: impl Into<String>) -> Self {
+    fn new(name: impl Into<String>) -> Self {
         Self {
-            labels: vec![Label::metric_name(metric_name)],
+            name: name.into(),
+            labels: Vec::new(),
             samples: Vec::new(),
             metadata: None,
         }
@@ -229,6 +235,7 @@ impl SeriesBuilder {
     /// Builds the series.
     pub fn build(self) -> Series {
         Series {
+            name: self.name,
             labels: self.labels,
             samples: self.samples,
             metadata: self.metadata,
@@ -286,9 +293,9 @@ mod tests {
             .sample(2000, 0.6)
             .build();
 
-        assert_eq!(series.labels.len(), 2);
-        assert_eq!(series.labels[0], Label::metric_name("cpu_usage"));
-        assert_eq!(series.labels[1], Label::new("host", "server1"));
+        assert_eq!(series.name, "cpu_usage");
+        assert_eq!(series.labels.len(), 1);
+        assert_eq!(series.labels[0], Label::new("host", "server1"));
         assert_eq!(series.samples.len(), 2);
         assert_eq!(series.samples[0].value, 0.5);
         assert_eq!(series.samples[1].value, 0.6);
