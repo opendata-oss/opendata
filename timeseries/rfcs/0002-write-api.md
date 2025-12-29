@@ -36,13 +36,12 @@ The public data model closely follows Prometheus conventions.
 
 #### Labels
 
-Labels are key-value pairs that identify a time series. The metric name is represented as a label with the key `__name__`.
+Labels are key-value pairs that, along with the metric name, identify a time series.
 
 ```rust
 /// A label is a key-value pair that identifies a time series.
 ///
 /// # Naming
-/// - The metric name is stored with key `__name__`
 /// - Label names and values can be any valid UTF-8 string
 /// - Labels starting with `__` are reserved for internal use
 ///
@@ -57,9 +56,6 @@ pub struct Label {
 
 impl Label {
     pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self;
-
-    /// Create a metric name label (__name__)
-    pub fn metric_name(name: impl Into<String>) -> Self;
 }
 ```
 
@@ -89,58 +85,58 @@ impl Sample {
 
 #### Series
 
-A series combines labels with one or more samples. This is the primary unit of ingestion.
+A series combines a metric name, labels, and samples. This is the primary unit of ingestion.
 
 ```rust
 /// A time series with its identifying labels and data points.
 ///
-/// A series represents a single stream of timestamped values identified
-/// by a unique set of labels. The labels must include `__name__` to
-/// identify the metric.
+/// A series represents a single stream of timestamped values.
+///
+/// # Identity and Metadata
+///
+/// A series is uniquely identified by its `name` and `labels`. The `metric_type`,
+/// `unit`, and `description` fields are metadata with last-write-wins semantics.
 #[derive(Debug, Clone)]
 pub struct Series {
-    /// Labels identifying this series (must include __name__)
+    // --- Identity ---
+    /// The metric name
+    pub name: String,
+
+    /// Labels identifying this series
     pub labels: Vec<Label>,
 
-    /// One or more samples to write
-    pub samples: Vec<Sample>,
-
-    /// Optional metadata about this series
-    pub metadata: Option<SeriesMetadata>,
-}
-
-impl Series {
-    pub fn new(labels: Vec<Label>, samples: Vec<Sample>) -> Self;
-
-    /// Builder-style construction
-    pub fn builder(metric_name: impl Into<String>) -> SeriesBuilder;
-}
-
-pub struct SeriesBuilder {
-    labels: Vec<Label>,
-    samples: Vec<Sample>,
-    metadata: Option<SeriesMetadata>,
-}
-
-impl SeriesBuilder {
-    pub fn label(self, name: impl Into<String>, value: impl Into<String>) -> Self;
-    pub fn sample(self, timestamp_ms: i64, value: f64) -> Self;
-    pub fn sample_now(self, value: f64) -> Self;
-    pub fn metadata(self, metadata: SeriesMetadata) -> Self;
-    pub fn build(self) -> Series;
-}
-
-/// Optional metadata about a series.
-#[derive(Debug, Clone, Default)]
-pub struct SeriesMetadata {
+    // --- Metadata (last-write-wins) ---
     /// The type of metric (gauge or counter)
     pub metric_type: Option<MetricType>,
+
+    /// Unit of measurement (e.g., "bytes", "seconds")
+    pub unit: Option<String>,
 
     /// Human-readable description of the metric
     pub description: Option<String>,
 
-    /// Unit of measurement (e.g., "bytes", "seconds")
-    pub unit: Option<String>,
+    // --- Data ---
+    /// One or more samples to write
+    pub samples: Vec<Sample>,
+}
+
+impl Series {
+    pub fn new(name: impl Into<String>, labels: Vec<Label>, samples: Vec<Sample>) -> Self;
+
+    /// Builder-style construction
+    pub fn builder(name: impl Into<String>) -> SeriesBuilder;
+}
+
+pub struct SeriesBuilder { ... }
+
+impl SeriesBuilder {
+    pub fn label(self, name: impl Into<String>, value: impl Into<String>) -> Self;
+    pub fn metric_type(self, metric_type: MetricType) -> Self;
+    pub fn unit(self, unit: impl Into<String>) -> Self;
+    pub fn description(self, description: impl Into<String>) -> Self;
+    pub fn sample(self, timestamp_ms: i64, value: f64) -> Self;
+    pub fn sample_now(self, value: f64) -> Self;
+    pub fn build(self) -> Series;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,7 +148,7 @@ pub enum MetricType {
 
 #### Design Philosophy: Minimal Core
 
-OpenData emphasizes minimalism and composition. The core data model is the smallest useful primitive: a `Series` is simply a set of labels and timestamped float values. There is no native representation of histograms, summaries, or other complex metric types.
+OpenData emphasizes minimalism and composition. The core data model is the smallest useful primitive: a `Series` is simply a metric name, labels, and timestamped float values. There is no native representation of histograms, summaries, or other complex metric types.
 
 Richer abstractions are composed on top. For example, an OTEL mapping module would decompose histograms into multiple simple series (`_bucket`, `_sum`, `_count`) at ingestion time. Prometheus takes a similar approach for the same reasons.
 
@@ -255,8 +251,8 @@ impl TimeSeries {
     ///
     /// # Series Identification
     ///
-    /// Each unique combination of labels identifies a distinct time series.
-    /// The label set must include a `__name__` label for the metric name.
+    /// A series is uniquely identified by its `name` and `labels`. Metadata
+    /// fields (`metric_type`, `unit`, `description`) use last-write-wins semantics.
     ///
     /// # Ordering
     ///
@@ -339,7 +335,7 @@ A separate module handles conversion from OpenTelemetry data models to the TimeS
 /// Hypothetical Module for converting OpenTelemetry metrics to TimeSeries format.
 #[cfg(feature = "otel")]
 pub mod otel {
-    use super::{Series, Label, Sample, SeriesMetadata, MetricType};
+    use super::{Series, Label, Sample, MetricType};
 
     /// Convert OTEL metrics to Series for ingestion.
     ///
@@ -365,7 +361,7 @@ pub mod otel {
     /// - OTEL resource attributes → labels with `resource_` prefix (if enabled)
     /// - OTEL scope attributes → labels with `scope_` prefix (if enabled)
     /// - OTEL metric attributes → labels directly
-    /// - Metric name → `__name__` label
+    /// - Metric name → `Series.name` field
     pub fn from_metrics_request(
         request: &ExportMetricsServiceRequest,
         config: &OtelConfig,
@@ -400,8 +396,8 @@ pub mod otel {
 |--------|-----|------------|
 | Primary write method | `append(Vec<Record>)` | `write(Vec<Series>)` |
 | Options variant | `append_with_options()` | `write_with_options()` |
-| Data unit | `Record` (key + value bytes) | `Series` (labels + samples) |
-| Identification | `key: Bytes` | `labels: Vec<Label>` |
+| Data unit | `Record` (key + value bytes) | `Series` (name + labels + samples) |
+| Identification | `key: Bytes` | `name + labels` |
 | Sequencing | Global sequence number | Timestamp (ms) |
 | Durability control | `WriteOptions::await_durable` | `WriteOptions::await_durable` |
 | Reader access | `fn reader() -> LogReader` | `fn reader() -> TimeSeriesReader` |
@@ -465,3 +461,4 @@ Complex types like histograms are decomposed into simple series at higher layers
 | Date       | Description |
 |------------|-------------|
 | 2025-12-19 | Initial draft |
+| 2025-12-29 | Separate `name` field on Series; flatten SeriesMetadata into Series; clarify identity fields |

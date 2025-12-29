@@ -91,22 +91,6 @@ impl Sample {
     }
 }
 
-/// Metadata about a series.
-///
-/// Metadata includes the metric type, a human-readable description, and
-/// the unit of measurement.
-#[derive(Debug, Clone, Default)]
-pub struct SeriesMetadata {
-    /// The type of metric (gauge or counter).
-    pub metric_type: Option<MetricType>,
-
-    /// Human-readable description of the metric.
-    pub description: Option<String>,
-
-    /// Unit of measurement (e.g., "bytes", "seconds").
-    pub unit: Option<String>,
-}
-
 /// The type of a metric.
 ///
 /// This enum represents the two fundamental metric types in time series data:
@@ -123,8 +107,12 @@ pub enum MetricType {
 
 /// A time series with its identifying labels and data points.
 ///
-/// A series represents a single stream of timestamped values. Each series
-/// is uniquely identified by its metric name, labels, and metadata.
+/// A series represents a single stream of timestamped values.
+///
+/// # Identity and Metadata
+///
+/// A series is uniquely identified by its `name` and `labels`. The `metric_type`,
+/// `unit`, and `description` fields are metadata with last-write-wins semantics.
 ///
 /// # Example
 ///
@@ -145,17 +133,26 @@ pub enum MetricType {
 /// ```
 #[derive(Debug, Clone)]
 pub struct Series {
+    // --- Identity ---
     /// The metric name.
     pub name: String,
 
     /// Labels identifying this series.
     pub labels: Vec<Label>,
 
+    // --- Metadata (last-write-wins) ---
+    /// The type of metric (gauge or counter).
+    pub metric_type: Option<MetricType>,
+
+    /// Unit of measurement (e.g., "bytes", "seconds").
+    pub unit: Option<String>,
+
+    /// Human-readable description of the metric.
+    pub description: Option<String>,
+
+    // --- Data ---
     /// One or more samples to write.
     pub samples: Vec<Sample>,
-
-    /// Optional metadata about this series.
-    pub metadata: Option<SeriesMetadata>,
 }
 
 impl Series {
@@ -168,15 +165,17 @@ impl Series {
         Self {
             name: name.into(),
             labels,
+            metric_type: None,
+            unit: None,
+            description: None,
             samples,
-            metadata: None,
         }
     }
 
     /// Creates a builder for constructing a series.
     ///
     /// The builder provides a fluent API for creating series with
-    /// labels, samples, and optional metadata.
+    /// labels, samples, and metadata fields.
     ///
     /// # Arguments
     ///
@@ -189,13 +188,15 @@ impl Series {
 /// Builder for constructing [`Series`] instances.
 ///
 /// Provides a fluent API for creating series with labels, samples,
-/// and optional metadata.
+/// and metadata fields.
 #[derive(Debug, Clone)]
 pub struct SeriesBuilder {
     name: String,
     labels: Vec<Label>,
+    metric_type: Option<MetricType>,
+    unit: Option<String>,
+    description: Option<String>,
     samples: Vec<Sample>,
-    metadata: Option<SeriesMetadata>,
 }
 
 impl SeriesBuilder {
@@ -203,14 +204,34 @@ impl SeriesBuilder {
         Self {
             name: name.into(),
             labels: Vec::new(),
+            metric_type: None,
+            unit: None,
+            description: None,
             samples: Vec::new(),
-            metadata: None,
         }
     }
 
     /// Adds a label to the series.
     pub fn label(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.labels.push(Label::new(name, value));
+        self
+    }
+
+    /// Sets the metric type.
+    pub fn metric_type(mut self, metric_type: MetricType) -> Self {
+        self.metric_type = Some(metric_type);
+        self
+    }
+
+    /// Sets the unit of measurement.
+    pub fn unit(mut self, unit: impl Into<String>) -> Self {
+        self.unit = Some(unit.into());
+        self
+    }
+
+    /// Sets the description.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
         self
     }
 
@@ -226,19 +247,15 @@ impl SeriesBuilder {
         self
     }
 
-    /// Sets the metadata for the series.
-    pub fn metadata(mut self, metadata: SeriesMetadata) -> Self {
-        self.metadata = Some(metadata);
-        self
-    }
-
     /// Builds the series.
     pub fn build(self) -> Series {
         Series {
             name: self.name,
             labels: self.labels,
+            metric_type: self.metric_type,
+            unit: self.unit,
+            description: self.description,
             samples: self.samples,
-            metadata: self.metadata,
         }
     }
 }
