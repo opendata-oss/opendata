@@ -120,11 +120,11 @@ impl Log {
     /// # Example
     ///
     /// ```ignore
-    /// use log::{Log, LogConfig};
+    /// use log::{Log, Config};
     ///
-    /// let log = Log::open(LogConfig::default()).await?;
+    /// let log = Log::open(Config::default()).await?;
     /// ```
-    pub async fn open(_config: crate::config::LogConfig) -> crate::error::Result<Self> {
+    pub async fn open(_config: crate::config::Config) -> crate::error::Result<Self> {
         todo!()
     }
 

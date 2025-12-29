@@ -20,11 +20,11 @@
 //! # Example
 //!
 //! ```ignore
-//! use timeseries::{TimeSeries, TimeSeriesConfig, Series};
+//! use timeseries::{TimeSeries, Config, Series};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let ts = TimeSeries::open(TimeSeriesConfig::default()).await?;
+//!     let ts = TimeSeries::open(Config::default()).await?;
 //!
 //!     let series = Series::builder("http_requests_total")
 //!         .label("method", "GET")
@@ -59,7 +59,7 @@ mod series;
 mod timeseries;
 
 // Public re-exports
-pub use config::{TimeSeriesConfig, WriteOptions};
+pub use config::{Config, WriteOptions};
 pub use error::{Error, Result};
 pub use series::{Label, MetricType, Sample, Series, SeriesBuilder};
 pub use timeseries::TimeSeries;

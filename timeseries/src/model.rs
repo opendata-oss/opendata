@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::time::SystemTime;
 
 use crate::util::{Result, hour_bucket_in_epoch_minutes};

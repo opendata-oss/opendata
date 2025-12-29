@@ -13,29 +13,21 @@ use opendata_common::StorageConfig;
 /// # Example
 ///
 /// ```ignore
-/// use log::LogConfig;
+/// use log::Config;
 /// use opendata_common::StorageConfig;
 ///
-/// let config = LogConfig {
+/// let config = Config {
 ///     storage: StorageConfig::default(),
 /// };
 /// let log = Log::open(config).await?;
 /// ```
-#[derive(Debug, Clone)]
-pub struct LogConfig {
+#[derive(Debug, Clone, Default)]
+pub struct Config {
     /// Storage backend configuration.
     ///
     /// Determines where and how log data is persisted. See [`StorageConfig`]
     /// for available options including in-memory and SlateDB backends.
     pub storage: StorageConfig,
-}
-
-impl Default for LogConfig {
-    fn default() -> Self {
-        Self {
-            storage: StorageConfig::default(),
-        }
-    }
 }
 
 /// Options for write operations.

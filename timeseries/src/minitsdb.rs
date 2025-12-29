@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::sync::{Arc, atomic::AtomicU32};
 
 use async_trait::async_trait;

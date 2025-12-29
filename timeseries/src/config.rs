@@ -16,11 +16,11 @@ use opendata_common::StorageConfig;
 /// # Example
 ///
 /// ```ignore
-/// use timeseries::TimeSeriesConfig;
+/// use timeseries::Config;
 /// use opendata_common::StorageConfig;
 /// use std::time::Duration;
 ///
-/// let config = TimeSeriesConfig {
+/// let config = Config {
 ///     storage: StorageConfig::default(),
 ///     flush_interval: Duration::from_secs(30),
 ///     retention: Some(Duration::from_secs(86400 * 7)), // 7 days
@@ -28,7 +28,7 @@ use opendata_common::StorageConfig;
 /// let ts = TimeSeries::open(config).await?;
 /// ```
 #[derive(Debug, Clone)]
-pub struct TimeSeriesConfig {
+pub struct Config {
     /// Storage backend configuration.
     ///
     /// Determines where and how time series data is persisted. See [`StorageConfig`]
@@ -48,7 +48,7 @@ pub struct TimeSeriesConfig {
     pub retention: Option<Duration>,
 }
 
-impl Default for TimeSeriesConfig {
+impl Default for Config {
     fn default() -> Self {
         Self {
             storage: StorageConfig::default(),

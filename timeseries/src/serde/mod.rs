@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub mod bucket_list;
 pub mod dictionary;
 pub mod forward_index;

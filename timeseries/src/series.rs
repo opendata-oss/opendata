@@ -74,7 +74,10 @@ pub struct Sample {
 impl Sample {
     /// Creates a new sample with the given timestamp and value.
     pub fn new(timestamp_ms: i64, value: f64) -> Self {
-        Self { timestamp_ms, value }
+        Self {
+            timestamp_ms,
+            value,
+        }
     }
 
     /// Creates a sample with the current timestamp.
@@ -157,11 +160,7 @@ pub struct Series {
 
 impl Series {
     /// Creates a new series with the given name, labels, and samples.
-    pub fn new(
-        name: impl Into<String>,
-        labels: Vec<Label>,
-        samples: Vec<Sample>,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, labels: Vec<Label>, samples: Vec<Sample>) -> Self {
         Self {
             name: name.into(),
             labels,

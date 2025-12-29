@@ -178,11 +178,11 @@ Users who need histogram semantics can either:
 /// # Example
 ///
 /// ```rust
-/// use opendata_timeseries::{TimeSeries, TimeSeriesConfig, Series};
+/// use opendata_timeseries::{TimeSeries, Config, Series};
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let ts = TimeSeries::open(TimeSeriesConfig::default()).await?;
+///     let ts = TimeSeries::open(Config::default()).await?;
 ///
 ///     let series = Series::builder("http_requests_total")
 ///         .label("method", "GET")
@@ -200,7 +200,7 @@ pub struct TimeSeries {
 
 impl TimeSeries {
     /// Open or create a time series database with the given configuration.
-    pub async fn open(config: TimeSeriesConfig) -> Result<Self>;
+    pub async fn open(config: Config) -> Result<Self>;
 }
 ```
 
@@ -209,7 +209,7 @@ impl TimeSeries {
 ```rust
 /// Configuration for a TimeSeries instance.
 #[derive(Debug, Clone)]
-pub struct TimeSeriesConfig {
+pub struct Config {
     /// Storage backend configuration
     pub storage: StorageConfig,
 
@@ -220,7 +220,7 @@ pub struct TimeSeriesConfig {
     pub retention: Option<Duration>,
 }
 
-impl Default for TimeSeriesConfig {
+impl Default for Config {
     fn default() -> Self {
         Self {
             storage: StorageConfig::default(),
@@ -394,6 +394,7 @@ pub mod otel {
 
 | Aspect | Log | TimeSeries |
 |--------|-----|------------|
+| Configuration | `Config` | `Config` |
 | Primary write method | `append(Vec<Record>)` | `write(Vec<Series>)` |
 | Options variant | `append_with_options()` | `write_with_options()` |
 | Data unit | `Record` (key + value bytes) | `Series` (name + labels + samples) |
@@ -462,3 +463,4 @@ Complex types like histograms are decomposed into simple series at higher layers
 |------------|-------------|
 | 2025-12-19 | Initial draft |
 | 2025-12-29 | Separate `name` field on Series; flatten SeriesMetadata into Series; clarify identity fields |
+| 2025-12-29 | Rename `TimeSeriesConfig` to `Config` for consistency with Rust conventions |

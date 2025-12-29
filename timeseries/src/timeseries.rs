@@ -4,7 +4,7 @@
 //! interacting with OpenData TimeSeries. It exposes write operations for
 //! ingesting time series data.
 
-use crate::config::{TimeSeriesConfig, WriteOptions};
+use crate::config::{Config, WriteOptions};
 use crate::error::Result;
 use crate::series::Series;
 
@@ -17,11 +17,11 @@ use crate::series::Series;
 /// # Example
 ///
 /// ```ignore
-/// use timeseries::{TimeSeries, TimeSeriesConfig, Series};
+/// use timeseries::{TimeSeries, Config, Series};
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let ts = TimeSeries::open(TimeSeriesConfig::default()).await?;
+///     let ts = TimeSeries::open(Config::default()).await?;
 ///
 ///     let series = Series::builder("http_requests_total")
 ///         .label("method", "GET")
@@ -55,11 +55,11 @@ impl TimeSeries {
     /// # Example
     ///
     /// ```ignore
-    /// use timeseries::{TimeSeries, TimeSeriesConfig};
+    /// use timeseries::{TimeSeries, Config};
     ///
-    /// let ts = TimeSeries::open(TimeSeriesConfig::default()).await?;
+    /// let ts = TimeSeries::open(Config::default()).await?;
     /// ```
-    pub async fn open(_config: TimeSeriesConfig) -> Result<Self> {
+    pub async fn open(_config: Config) -> Result<Self> {
         todo!()
     }
 
@@ -104,7 +104,8 @@ impl TimeSeries {
     /// ts.write(series).await?;
     /// ```
     pub async fn write(&self, series: Vec<Series>) -> Result<()> {
-        self.write_with_options(series, WriteOptions::default()).await
+        self.write_with_options(series, WriteOptions::default())
+            .await
     }
 
     /// Writes one or more time series with custom options.

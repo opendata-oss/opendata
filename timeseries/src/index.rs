@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use dashmap::{DashMap, mapref::one::Ref};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
