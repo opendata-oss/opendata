@@ -104,6 +104,30 @@ pub struct Log {
 }
 
 impl Log {
+    /// Opens or creates a log with the given configuration.
+    ///
+    /// This is the primary entry point for creating a `Log` instance. The
+    /// configuration specifies the storage backend and other settings.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Configuration specifying storage backend and settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage backend cannot be initialized.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use log::{Log, LogConfig};
+    ///
+    /// let log = Log::open(LogConfig::default()).await?;
+    /// ```
+    pub async fn open(_config: crate::config::LogConfig) -> crate::error::Result<Self> {
+        todo!()
+    }
+
     /// Appends records to the log.
     ///
     /// Records are assigned sequence numbers in the order they appear in the

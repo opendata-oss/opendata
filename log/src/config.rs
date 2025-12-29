@@ -1,7 +1,42 @@
 //! Configuration options for OpenData Log operations.
 //!
-//! This module defines the options structs that control the behavior of
-//! write, scan, and count operations.
+//! This module defines the configuration and options structs that control
+//! the behavior of the log, including storage setup and operation parameters.
+
+use opendata_common::StorageConfig;
+
+/// Configuration for opening a [`Log`](crate::Log).
+///
+/// This struct holds all the settings needed to initialize a log instance,
+/// including storage backend configuration.
+///
+/// # Example
+///
+/// ```ignore
+/// use log::LogConfig;
+/// use opendata_common::StorageConfig;
+///
+/// let config = LogConfig {
+///     storage: StorageConfig::default(),
+/// };
+/// let log = Log::open(config).await?;
+/// ```
+#[derive(Debug, Clone)]
+pub struct LogConfig {
+    /// Storage backend configuration.
+    ///
+    /// Determines where and how log data is persisted. See [`StorageConfig`]
+    /// for available options including in-memory and SlateDB backends.
+    pub storage: StorageConfig,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            storage: StorageConfig::default(),
+        }
+    }
+}
 
 /// Options for write operations.
 ///

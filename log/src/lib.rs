@@ -22,11 +22,11 @@
 //! # Example
 //!
 //! ```ignore
-//! use log::{Log, Record, WriteOptions};
+//! use log::{Log, LogConfig, Record};
 //! use bytes::Bytes;
 //!
 //! // Open a log
-//! let log = Log::open(path, options).await?;
+//! let log = Log::open(LogConfig::default()).await?;
 //!
 //! // Append records
 //! let records = vec![
@@ -47,7 +47,7 @@ mod log;
 mod model;
 mod reader;
 
-pub use config::{CountOptions, ScanOptions, WriteOptions};
+pub use config::{CountOptions, LogConfig, ScanOptions, WriteOptions};
 pub use error::{Error, Result};
 pub use log::{Log, LogIterator};
 pub use model::{LogEntry, Record};

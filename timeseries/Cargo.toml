@@ -3,6 +3,13 @@ name = "timeseries"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "timeseries"
+path = "src/main.rs"
+
 [features]
 default = []
 remote-write = ["dep:prost", "dep:snap"]
