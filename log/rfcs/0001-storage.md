@@ -245,6 +245,10 @@ This approach was rejected because:
 
 The simpler key+sequence encoding preserves key ordering and avoids the collision problem entirely.
 
+### SlateDB Sequence Numbers
+
+SlateDB maintains its own internal sequence number for MVCC versioning. Ideally, OpenData-Log would reuse this counter rather than implementing separate tracking with `LastBlock` records. However, SlateDB's sequence number is not currently exposed in its public API. If SlateDB adds support for accessing or influencing sequence assignment in the future, this design could be simplified.
+
 ### Headers
 
 Messaging systems often expose a way to attach headers to messages in order to enable middleware use cases, such as routing. We opted not to include headers in order to keep our data model as simple as possible. Although the log abstraction could be used to build messaging system or any other system which relied on headers, we do not believe that headers are fundamental to the log data structure. There are many potential use cases which do not need headers. Instead, our position is that headers should be designed into systems built on top of the log as necessary. That allows those systems to define the header semantics that are appropriate for their system rather than trying to define a common semantics in the log.
