@@ -57,9 +57,9 @@ the query path helps explain the storage model. A timeseries database has three
 storage components:
 
 - **Raw series storage**: Stores `(timestamp, value)` pairs keyed by series ID
-- **Inverted index**: Maps attribute/value pairs to series IDs, enabling efficient
+- **Inverted index**: Maps label/value pairs to series IDs, enabling efficient
   label selector matching (e.g., `{job="api", status="500"}`)
-- **Forward index**: Maps series IDs to their canonical attribute specifications
+- **Forward index**: Maps series IDs to their canonical label specifications
   (all labels as UTF-8 strings), used to resolve series discovered via the
   inverted index
 
@@ -68,7 +68,7 @@ method="GET", status="200"})` is served:
 
 1. Parse the query into a query plan
 2. Use the inverted index to find series matching `{__name__="metric", path="/query", method="GET", status="200"}`
-3. Use the forward index to resolve each series ID to its full attribute set (including `instance` for grouping)
+3. Use the forward index to resolve each series ID to its full label set (including `instance` for grouping)
 4. Sum the values for matching series and return the result
 
 ### Record Layout
@@ -158,8 +158,8 @@ architectures (x86, ARM).
 | `0x00`  | *(reserved)*        | Reserved for future use                                   |
 | `0x01`  | `BucketList`        | Lists the available time buckets                          |
 | `0x02`  | `SeriesDictionary`  | Stores the mapping of series to series IDs                |
-| `0x03`  | `ForwardIndex`      | Stores the canonical attribute set for each series        |
-| `0x04`  | `InvertedIndex`     | Maps attribute/value pairs to posting lists of series IDs |
+| `0x03`  | `ForwardIndex`      | Stores the canonical label set for each series            |
+| `0x04`  | `InvertedIndex`     | Maps label/value pairs to posting lists of series IDs     |
 | `0x05`  | `TimeSeries`        | Holds the raw time-series payloads                        |
 
 ## Record Definitions & Schemas
@@ -201,7 +201,7 @@ will be replaced by the new coarse buckets in the listing.
 
 ### `SeriesDictionary` (`RecordType::SeriesDictionary` = `0x02`)
 
-The series dictionary maps label sets (attribute/value pairs) to series IDs.
+The series dictionary maps label sets (label/value pairs) to series IDs.
 This enables ingestion to resolve a series ID for a given label set, and allows
 query execution to map series IDs back to their label sets when needed.
 
@@ -246,9 +246,9 @@ of series in the bucket, not globally.
 ### `ForwardIndex` (`RecordType::ForwardIndex` = `0x03`)
 
 The forward index is used during query time to map each series ID defined
-through the index to its canonical specification, which includes all attributes
+through the index to its canonical specification, which includes all labels
 defined as UTF-8 strings. This is used during query execution in order to map
-each series discovered through the inverted index back to the attributes which
+each series discovered through the inverted index back to the labels which
 define it so that they can be returned to the user.
 
 **Key Layout:**
@@ -271,7 +271,7 @@ define it so that they can be returned to the user.
 **Value Schema:**
 
 The forward index stores the canonical time-series specification keyed by
-`(metric_id, series_id)` using compact references into the attribute and value
+`(metric_id, series_id)` using compact references into the label and value
 dictionaries.
 
 ```
@@ -280,8 +280,8 @@ dictionaries.
 ├──────────────────────────────────────────────────────────────────────────┤
 │  metric_unit:        OptionalNonEmptyUtf8                                │
 │  metric_meta:        MetricMeta                                          │
-│  attr_count:         u16                                                 │
-│  attrs:              Array<AttributeBinding>                             │
+│  label_count:        u16                                                 │
+│  labels:             Array<LabelBinding>                                 │
 │                                                                          │
 │  MetricMeta                                                              │
 │  ┌────────────────────────────────────────────────────────────────────┐  │
@@ -289,9 +289,9 @@ dictionaries.
 │  │  flags:       u8                                                   │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
 │                                                                          │
-│  AttributeBinding                                                        │
+│  LabelBinding                                                            │
 │  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │  attr:  utf8                                                       │  │
+│  │  name:  utf8                                                       │  │
 │  │  value: utf8                                                       │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────────────────┘
@@ -303,28 +303,28 @@ dictionaries.
 - `metric_meta` (`MetricMeta`): Encodes the series' metric type and auxiliary flags.
   - `metric_type` (u8): Enumeration matching `TimeSeriesSpec::metric_type` — `1=Gauge`, `2=Sum`, `3=Histogram`, `4=ExponentialHistogram`, `5=Summary`.
   - `flags` (u8): Bit-packed metadata; bits `0-1` store temporality (`0=Unspecified`, `1=Cumulative`, `2=Delta`), bit `2` is the `monotonic` flag (only meaningful when `metric_type=2`), remaining bits are reserved and must be zero.
-- `attr_count` (u16): Total number of attribute bindings.
-- `attrs` (`Array<AttributeBinding>`): All attribute bindings encoded as `attr_count` followed by that many `AttributeBinding` entries.
-  - `attr` (`Utf8`): Attribute name.
-  - `value` (`Utf8`): Attribute value.
+- `label_count` (u16): Total number of label bindings.
+- `labels` (`Array<LabelBinding>`): All label bindings encoded as `label_count` followed by that many `LabelBinding` entries.
+  - `name` (`Utf8`): Label name.
+  - `value` (`Utf8`): Label value.
 
-All attribute groups are serialized in lexicographical order of the `attr` and
-`value` fields. Given the frequent repetition of attribute names and values, a
+All label groups are serialized in lexicographical order of the `name` and
+`value` fields. Given the frequent repetition of label names and values, a
 standard compression algorithm will significantly reduce the size of the record
 even absent a dedicated dictionary.
 
 ### `InvertedIndex` (`RecordType::InvertedIndex` = `0x04`)
 
-The inverted index maps each attribute and value to a list of the series which
-have defined that attribute and value (also known as a posting list). For
-example, suppose that series 713 identifies two attributes: A=1 and B=2. The
-attribute value `A=1` will have a posting list which then includes series 713,
+The inverted index maps each label and value to a list of the series which
+have defined that label and value (also known as a posting list). For
+example, suppose that series 713 identifies two labels: A=1 and B=2. The
+label value `A=1` will have a posting list which then includes series 713,
 and similarly for `B=2`.
 
 **Key Layout:**
 ```
 ┌─────────┬──────────────┬─────────────┬────────────┬─────────────┐
-│ version │  record_tag  │ time_bucket │ attribute  │   value     │
+│ version │  record_tag  │ time_bucket │   label    │   value     │
 │ 1 byte  │   8 bits     │   4 bytes   │   utf8     │   utf8      │
 └─────────┴──────────────┴─────────────┴────────────┴─────────────┘
 ```
@@ -335,10 +335,10 @@ and similarly for `B=2`.
   - `bits 7-4` (u4): Record type (`0x04` for `InvertedIndex`)
   - `bits 3-0` (u4): Bucket size in hours
 - `time_bucket` (u32): The number of minutes since the UNIX epoch
-- `attribute` (`Utf8`): Attribute name.
-- `value` (`Utf8`): Attribute value.
+- `label` (`Utf8`): Label name.
+- `value` (`Utf8`): Label value.
 
-Note that since the attribute names and values are stored lexicographically,
+Note that since the label names and values are stored lexicographically,
 SlateDB's prefix encoding will be very effective without the use of a
 dictionary.
 
@@ -357,7 +357,7 @@ The value schema stores the posting list of series IDs.
 **Structure:**
 
 - The value is a RoaringBitmap encoding the set of `series_id` values (u32) that
-  have the specified attribute/value pair for the specified metric.
+  have the specified label/value pair for the specified metric.
 - Series IDs within the bitmap are maintained in sorted order.
 - RoaringBitmap provides efficient compression and set operations.
 
@@ -441,7 +441,7 @@ This was rejected for several reasons:
   IDs back to strings during query execution. This adds significant bookkeeping
   overhead.
 
-2. **SlateDB prefix encoding** — Since attribute names and values are stored
+2. **SlateDB prefix encoding** — Since label names and values are stored
   lexicographically in inverted index keys, SlateDB's built-in prefix encoding
   already provides effective compression. Keys with common prefixes (e.g.,
   `status=200`, `status=404`, `status=500`) share prefix bytes automatically.
@@ -461,8 +461,8 @@ This was rejected for several reasons:
 An alternative would prefix inverted index keys with a metric identifier:
 
 ```
-Current:  | version | tag | bucket | attribute | value |
-Alt:      | version | tag | bucket | metric_id | attribute | value |
+Current:  | version | tag | bucket | label | value |
+Alt:      | version | tag | bucket | metric_id | label | value |
 ```
 
 This was rejected because treating the metric name as a first-class prefix would
@@ -478,7 +478,7 @@ limit query flexibility:
   multiple metrics would require scanning all metric prefixes, whereas a flat
   structure allows direct lookup.
 
-3. **Prometheus/VictoriaMetrics alignment** — [Neither VictoriaMetrics nor Prometheus treat the metric name as a first-class attribute](https://docs.victoriametrics.com/keyconcepts/). Following their lead ensures compatibility with existing query patterns and tooling expectations.
+3. **Prometheus/VictoriaMetrics alignment** — [Neither VictoriaMetrics nor Prometheus treat the metric name as a first-class label](https://docs.victoriametrics.com/keyconcepts/). Following their lead ensures compatibility with existing query patterns and tooling expectations.
 
 ### Namespace Prefix
 
