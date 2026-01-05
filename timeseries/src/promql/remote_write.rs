@@ -31,14 +31,15 @@ pub struct WriteRequest {
 #[derive(Clone, PartialEq, Message)]
 pub struct TimeSeries {
     #[prost(message, repeated, tag = "1")]
-    pub labels: Vec<Label>,
+    pub labels: Vec<ProtobufLabel>,
     #[prost(message, repeated, tag = "2")]
     pub samples: Vec<ProtobufSample>,
 }
 
-/// Label is a name-value pair for metric identification.
+/// ProtobufLabel is a name-value pair for metric identification.
+/// Named ProtobufLabel to avoid conflict with crate::series::Label.
 #[derive(Clone, PartialEq, Message)]
-pub struct Label {
+pub struct ProtobufLabel {
     #[prost(string, tag = "1")]
     pub name: String,
     #[prost(string, tag = "2")]
@@ -209,11 +210,11 @@ mod tests {
         let request = WriteRequest {
             timeseries: vec![TimeSeries {
                 labels: vec![
-                    Label {
+                    ProtobufLabel {
                         name: "__name__".to_string(),
                         value: "http_requests_total".to_string(),
                     },
-                    Label {
+                    ProtobufLabel {
                         name: "method".to_string(),
                         value: "GET".to_string(),
                     },
@@ -244,11 +245,11 @@ mod tests {
         let request = WriteRequest {
             timeseries: vec![TimeSeries {
                 labels: vec![
-                    Label {
+                    ProtobufLabel {
                         name: "__name__".to_string(),
                         value: "http_requests".to_string(),
                     },
-                    Label {
+                    ProtobufLabel {
                         name: "env".to_string(),
                         value: "prod".to_string(),
                     },
@@ -300,7 +301,7 @@ mod tests {
         let request = WriteRequest {
             timeseries: vec![
                 TimeSeries {
-                    labels: vec![Label {
+                    labels: vec![ProtobufLabel {
                         name: "__name__".to_string(),
                         value: "metric_a".to_string(),
                     }],
@@ -310,7 +311,7 @@ mod tests {
                     }],
                 },
                 TimeSeries {
-                    labels: vec![Label {
+                    labels: vec![ProtobufLabel {
                         name: "__name__".to_string(),
                         value: "metric_b".to_string(),
                     }],
@@ -348,7 +349,7 @@ mod tests {
         // given
         let request = WriteRequest {
             timeseries: vec![TimeSeries {
-                labels: vec![Label {
+                labels: vec![ProtobufLabel {
                     name: "__name__".to_string(),
                     value: "empty_metric".to_string(),
                 }],
@@ -370,7 +371,7 @@ mod tests {
         // given
         let request = WriteRequest {
             timeseries: vec![TimeSeries {
-                labels: vec![Label {
+                labels: vec![ProtobufLabel {
                     name: "__name__".to_string(),
                     value: "test_metric".to_string(),
                 }],
@@ -440,7 +441,7 @@ mod tests {
         // given
         let request = WriteRequest {
             timeseries: vec![TimeSeries {
-                labels: vec![Label {
+                labels: vec![ProtobufLabel {
                     name: "__name__".to_string(),
                     value: "test".to_string(),
                 }],
@@ -492,11 +493,11 @@ mod tests {
         let timeseries: Vec<TimeSeries> = (0..1000)
             .map(|i| TimeSeries {
                 labels: vec![
-                    Label {
+                    ProtobufLabel {
                         name: "__name__".to_string(),
                         value: format!("metric_{}", i),
                     },
-                    Label {
+                    ProtobufLabel {
                         name: "instance".to_string(),
                         value: format!("host_{}", i % 10),
                     },
