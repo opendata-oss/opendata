@@ -55,11 +55,40 @@ In practice, users are likely to use fixed-length keys, which avoids this issue 
 
 ### Sequence Numbers
 
-Sequence numbers are assigned from a single counter that is maintained by the SlateDB writer and is incremented after every append. Each key's log is monotonically ordered by sequence number, but the sequence numbers are not contiguous—other keys' appends are interleaved in the global sequence.
+Sequence numbers are assigned from a single counter that is maintained by the SlateDB writer and is incremented after every append. Each key's log is monotonically ordered by sequence number, but the sequence numbers are not contiguous—other keys' appends are interleaved in the global sequence. Additionally, sequence numbers may have gaps due to crash recovery (see below). The only guarantee is monotonicity: within a key's log, sequence numbers are strictly increasing.
 
 This approach simplifies ingestion by avoiding per-key sequence tracking. The trade-off is that sequence numbers do not reflect the count of entries within a key's log.
 
 If SlateDB supports multi-writer in the future, each writer would maintain its own sequence counter. This design assumes each key would still have a single writer—interleaving appends from multiple writers to the same key would break monotonic ordering within that key's log.
+
+#### Block-Based Sequence Allocation
+
+To efficiently track and recover the sequence counter, the writer uses block-based allocation. Rather than persisting the sequence number after every append, the writer pre-allocates a block of sequence numbers and records the allocation in the LSM.
+
+A new record type `LastBlock` (type discriminator `0x02`) stores the current allocation:
+
+```
+LastBlock Record:
+  SlateDB Key:   | version (u8) | type (u8) |
+  SlateDB Value: | base_sequence (u64) | block_size (u64) |
+```
+
+The `LastBlock` key is static—it contains only the version and type discriminator with no user key component. This ensures there is exactly one such record in the database.
+
+**Allocation procedure:**
+
+1. On initialization, the writer reads the `LastBlock` record (if present) to determine the last allocated range `[base, base + size)`.
+2. The writer allocates a new block starting at `base + size` and writes a new `LastBlock` record before processing any appends.
+3. During normal operation, the writer assigns sequence numbers from the current block, incrementing after each append.
+4. When the current block is exhausted, the writer allocates a new block and writes an updated `LastBlock` record.
+
+**Recovery:**
+
+On crash recovery, the writer reads the `LastBlock` record and allocates a fresh block starting after the previous range. Any sequence numbers that were allocated but not used before the crash are simply skipped. This may create gaps in the sequence space, but monotonicity is preserved.
+
+**Block sizing:**
+
+The block size is an internal implementation detail and is not exposed through configuration. The implementation may vary the block size to balance write amplification (larger blocks reduce `LastBlock` write frequency) against sequence space efficiency (smaller blocks waste fewer sequence numbers on crash).
 
 ### SST Representation
 
@@ -226,3 +255,4 @@ Messaging systems often expose a way to attach headers to messages in order to e
 | Date       | Description |
 |------------|-------------|
 | 2025-12-15 | Initial draft |
+| 2026-01-05 | Added block-based sequence allocation |
