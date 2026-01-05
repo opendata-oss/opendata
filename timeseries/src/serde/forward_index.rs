@@ -1,6 +1,7 @@
-// ForwardIndex value structure with MetricMeta and AttributeBinding
+// ForwardIndex value structure with MetricMeta and LabelBinding
 
-use crate::model::{Attribute, MetricType, SeriesSpec, Temporality};
+use crate::model::{MetricType, SeriesSpec, Temporality};
+use crate::series::Label;
 
 use super::*;
 use bytes::{Bytes, BytesMut};
@@ -79,18 +80,18 @@ impl Decode for MetricMeta {
     }
 }
 
-impl Encode for Attribute {
+impl Encode for Label {
     fn encode(&self, buf: &mut BytesMut) {
-        encode_utf8(&self.key, buf);
+        encode_utf8(&self.name, buf);
         encode_utf8(&self.value, buf);
     }
 }
 
-impl Decode for Attribute {
+impl Decode for Label {
     fn decode(buf: &mut &[u8]) -> Result<Self, EncodingError> {
-        let attr = decode_utf8(buf)?;
+        let name = decode_utf8(buf)?;
         let value = decode_utf8(buf)?;
-        Ok(Attribute { key: attr, value })
+        Ok(Label { name, value })
     }
 }
 
@@ -99,8 +100,8 @@ impl Decode for Attribute {
 pub struct ForwardIndexValue {
     pub metric_unit: Option<String>,
     pub metric_meta: MetricMeta,
-    pub attr_count: u16,
-    pub attrs: Vec<Attribute>,
+    pub label_count: u16,
+    pub labels: Vec<Label>,
 }
 
 impl ForwardIndexValue {
@@ -108,8 +109,8 @@ impl ForwardIndexValue {
         let mut buf = BytesMut::new();
         encode_optional_utf8(self.metric_unit.as_deref(), &mut buf);
         self.metric_meta.encode(&mut buf);
-        buf.extend_from_slice(&self.attr_count.to_le_bytes());
-        encode_array(&self.attrs, &mut buf);
+        buf.extend_from_slice(&self.label_count.to_le_bytes());
+        encode_array(&self.labels, &mut buf);
         buf.freeze()
     }
 
@@ -120,20 +121,20 @@ impl ForwardIndexValue {
 
         if slice.len() < 2 {
             return Err(EncodingError {
-                message: "Buffer too short for attr_count".to_string(),
+                message: "Buffer too short for label_count".to_string(),
             });
         }
-        let attr_count = u16::from_le_bytes([slice[0], slice[1]]);
+        let label_count = u16::from_le_bytes([slice[0], slice[1]]);
         slice = &slice[2..];
 
-        let attrs = decode_array::<Attribute>(&mut slice)?;
+        let labels = decode_array::<Label>(&mut slice)?;
 
-        if attrs.len() != attr_count as usize {
+        if labels.len() != label_count as usize {
             return Err(EncodingError {
                 message: format!(
-                    "Attribute count mismatch: expected {}, got {}",
-                    attr_count,
-                    attrs.len()
+                    "Label count mismatch: expected {}, got {}",
+                    label_count,
+                    labels.len()
                 ),
             });
         }
@@ -141,8 +142,8 @@ impl ForwardIndexValue {
         Ok(ForwardIndexValue {
             metric_unit,
             metric_meta,
-            attr_count,
-            attrs,
+            label_count,
+            labels,
         })
     }
 }
@@ -171,7 +172,7 @@ impl From<ForwardIndexValue> for SeriesSpec {
         SeriesSpec {
             metric_unit: value.metric_unit,
             metric_type,
-            attributes: value.attrs,
+            labels: value.labels,
         }
     }
 }
@@ -189,14 +190,14 @@ mod tests {
                 metric_type: 1, // Gauge
                 flags: 0x00,
             },
-            attr_count: 2,
-            attrs: vec![
-                Attribute {
-                    key: "host".to_string(),
+            label_count: 2,
+            labels: vec![
+                Label {
+                    name: "host".to_string(),
                     value: "server1".to_string(),
                 },
-                Attribute {
-                    key: "env".to_string(),
+                Label {
+                    name: "env".to_string(),
                     value: "prod".to_string(),
                 },
             ],
@@ -219,9 +220,9 @@ mod tests {
                 metric_type: 2, // Sum
                 flags: 0x05,    // Cumulative (0x01) | Monotonic (0x04)
             },
-            attr_count: 1,
-            attrs: vec![Attribute {
-                key: "service".to_string(),
+            label_count: 1,
+            labels: vec![Label {
+                name: "service".to_string(),
                 value: "api".to_string(),
             }],
         };
@@ -237,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn should_encode_and_decode_forward_index_value_empty_attrs() {
+    fn should_encode_and_decode_forward_index_value_empty_labels() {
         // given
         let value = ForwardIndexValue {
             metric_unit: Some("seconds".to_string()),
@@ -245,8 +246,8 @@ mod tests {
                 metric_type: 3, // Histogram
                 flags: 0x02,    // Delta
             },
-            attr_count: 0,
-            attrs: vec![],
+            label_count: 0,
+            labels: vec![],
         };
 
         // when

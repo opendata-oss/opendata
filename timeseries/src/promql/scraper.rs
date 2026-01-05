@@ -9,7 +9,8 @@ use tokio::time::interval;
 use super::config::{PrometheusConfig, ScrapeConfig};
 use super::metrics::{Metrics, ScrapeLabels};
 use super::openmetrics::parse_openmetrics;
-use crate::model::{Attribute, MetricType, Sample, SampleWithAttributes};
+use crate::model::{MetricType, Sample, SampleWithLabels};
+use crate::series::Label;
 use crate::tsdb::Tsdb;
 use crate::util::OpenTsdbError;
 use crate::util::Result;
@@ -133,24 +134,24 @@ impl Scraper {
     }
 
     /// Create an `up` sample for a target.
-    fn create_up_sample(&self, job_name: &str, target: &str, value: f64) -> SampleWithAttributes {
+    fn create_up_sample(&self, job_name: &str, target: &str, value: f64) -> SampleWithLabels {
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
 
-        SampleWithAttributes {
-            attributes: vec![
-                Attribute {
-                    key: "__name__".to_string(),
+        SampleWithLabels {
+            labels: vec![
+                Label {
+                    name: "__name__".to_string(),
                     value: "up".to_string(),
                 },
-                Attribute {
-                    key: "job".to_string(),
+                Label {
+                    name: "job".to_string(),
                     value: job_name.to_string(),
                 },
-                Attribute {
-                    key: "instance".to_string(),
+                Label {
+                    name: "instance".to_string(),
                     value: target.to_string(),
                 },
             ],
@@ -200,21 +201,21 @@ impl Scraper {
         // Add job and instance labels to all samples
         for sample in &mut samples {
             // Add job label
-            sample.attributes.push(Attribute {
-                key: "job".to_string(),
+            sample.labels.push(Label {
+                name: "job".to_string(),
                 value: job_name.to_string(),
             });
 
             // Add instance label
-            sample.attributes.push(Attribute {
-                key: "instance".to_string(),
+            sample.labels.push(Label {
+                name: "instance".to_string(),
                 value: target.to_string(),
             });
 
             // Add any extra labels from static_config
             for (key, value) in extra_labels {
-                sample.attributes.push(Attribute {
-                    key: key.clone(),
+                sample.labels.push(Label {
+                    name: key.clone(),
                     value: value.clone(),
                 });
             }
@@ -235,7 +236,7 @@ impl Scraper {
     }
 
     /// Ingest samples into the TSDB.
-    async fn ingest_samples(&self, samples: Vec<SampleWithAttributes>) -> Result<()> {
+    async fn ingest_samples(&self, samples: Vec<SampleWithLabels>) -> Result<()> {
         self.tsdb.ingest_samples(samples).await
     }
 }

@@ -9,12 +9,11 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::delta::{TsdbDelta, TsdbDeltaBuilder};
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
-use crate::model::{
-    Attribute, Sample, SampleWithAttributes, SeriesFingerprint, SeriesId, TimeBucket,
-};
+use crate::model::{Sample, SampleWithLabels, SeriesFingerprint, SeriesId, TimeBucket};
 use crate::query::QueryReader;
 use crate::serde::key::TimeSeriesKey;
 use crate::serde::timeseries::TimeSeriesIterator;
+use crate::series::Label;
 use crate::storage::{OpenTsdbStorageExt, OpenTsdbStorageReadExt};
 use crate::util::{OpenTsdbError, Result};
 
@@ -43,7 +42,7 @@ impl<'a> QueryReader for MiniQueryReader<'a> {
 
     async fn inverted_index(
         &self,
-        terms: &[Attribute],
+        terms: &[Label],
     ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + '_>> {
         let inverted_index = self
             .snapshot
@@ -154,7 +153,7 @@ impl MiniTsdb {
     /// Ingest samples with attributes.
     /// Note: Ingested data is batched and NOT visible to queries until flush().
     /// Returns an error if any sample timestamp is outside the bucket's time range.
-    pub(crate) async fn ingest(&self, samples: Vec<SampleWithAttributes>) -> Result<()> {
+    pub(crate) async fn ingest(&self, samples: Vec<SampleWithLabels>) -> Result<()> {
         let mut builder =
             TsdbDeltaBuilder::new(self.bucket.clone(), &self.series_dict, &self.next_series_id);
 

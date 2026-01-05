@@ -9,7 +9,7 @@ use crate::serde::key::TimeSeriesKey;
 use crate::serde::timeseries::TimeSeriesValue;
 use crate::{
     index::ForwardIndex,
-    model::{Attribute, SeriesFingerprint, SeriesId, SeriesSpec, TimeBucket},
+    model::{SeriesFingerprint, SeriesId, SeriesSpec, TimeBucket},
     serde::{
         TimeBucketScoped,
         bucket_list::BucketListValue,
@@ -18,6 +18,7 @@ use crate::{
         inverted_index::InvertedIndexValue,
         key::{BucketListKey, ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey},
     },
+    series::Label,
     util::Result,
 };
 
@@ -108,8 +109,8 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
             let key = InvertedIndexKey::decode(record.key.as_ref())?;
             let value = InvertedIndexValue::decode(record.value.as_ref())?;
             inverted_index.postings.insert(
-                Attribute {
-                    key: key.attribute,
+                Label {
+                    name: key.attribute,
                     value: key.value,
                 },
                 value.postings,
@@ -124,14 +125,14 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
     async fn get_inverted_index_terms(
         &self,
         bucket: &TimeBucket,
-        terms: &[Attribute],
+        terms: &[Label],
     ) -> Result<InvertedIndex> {
         let result = InvertedIndex::default();
         for term in terms {
             let key = InvertedIndexKey {
                 time_bucket: bucket.start,
                 bucket_size: bucket.size,
-                attribute: term.key.clone(),
+                attribute: term.name.clone(),
                 value: term.value.clone(),
             }
             .encode();
@@ -199,7 +200,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
     /// returned. For example, searching for "hostname" (len=8, encoded as
     /// `[0x08, 0x00, ...]`) can never match a key with attribute "host"
     /// (len=4, encoded as `[0x04, 0x00, ...]`) because the length bytes differ.
-    /// See `serde::key::tests::should_not_match_shorter_attribute_with_value_that_looks_like_suffix`
+    /// See `serde::name::tests::should_not_match_shorter_attribute_with_value_that_looks_like_suffix`
     /// for test coverage of this invariant.
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get_label_values(&self, bucket: &TimeBucket, label_name: &str) -> Result<Vec<String>> {
@@ -261,8 +262,8 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
         let value = ForwardIndexValue {
             metric_unit: series_spec.metric_unit,
             metric_meta: series_spec.metric_type.into(),
-            attr_count: series_spec.attributes.len() as u16,
-            attrs: series_spec.attributes,
+            label_count: series_spec.labels.len() as u16,
+            labels: series_spec.labels,
         }
         .encode();
         Ok(RecordOp::Put(Record { key, value }))
@@ -271,14 +272,14 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
     fn merge_inverted_index(
         &self,
         bucket: TimeBucket,
-        attribute: Attribute,
+        label: Label,
         postings: RoaringBitmap,
     ) -> Result<RecordOp> {
         let key = InvertedIndexKey {
             time_bucket: bucket.start,
             bucket_size: bucket.size,
-            attribute: attribute.key,
-            value: attribute.value,
+            attribute: label.name,
+            value: label.value,
         }
         .encode();
         let value = InvertedIndexValue { postings }.encode()?;

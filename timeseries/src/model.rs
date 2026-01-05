@@ -2,6 +2,7 @@
 
 use std::time::SystemTime;
 
+use crate::series::Label;
 use crate::util::{Result, hour_bucket_in_epoch_minutes};
 
 /// Series ID (unique within a time bucket)
@@ -20,13 +21,6 @@ pub(crate) type BucketSize = u8;
 /// Encoded as a single byte with high 4 bits for type and low 4 bits for bucket size (or reserved).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RecordTag(pub(crate) u8);
-
-/// Attribute key-value pair
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct Attribute {
-    pub(crate) key: String,
-    pub(crate) value: String,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Temporality {
@@ -77,7 +71,7 @@ impl TimeBucket {
 pub(crate) struct SeriesSpec {
     pub(crate) metric_unit: Option<String>,
     pub(crate) metric_type: MetricType,
-    pub(crate) attributes: Vec<Attribute>,
+    pub(crate) labels: Vec<Label>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -86,11 +80,11 @@ pub(crate) struct Sample {
     pub(crate) value: f64,
 }
 
-/// A sample with all its attributes, including the metric name
+/// A sample with all its labels, including the metric name
 #[derive(Clone, Debug)]
-pub(crate) struct SampleWithAttributes {
+pub(crate) struct SampleWithLabels {
     // TODO: this should be SeriesSample and use SeriesSpec
-    pub(crate) attributes: Vec<Attribute>,
+    pub(crate) labels: Vec<Label>,
     pub(crate) metric_unit: Option<String>,
     pub(crate) metric_type: MetricType,
     pub(crate) sample: Sample,

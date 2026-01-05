@@ -4,8 +4,9 @@ use promql_parser::label::{METRIC_NAME, MatchOp};
 use promql_parser::parser::VectorSelector;
 
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndex, InvertedIndexLookup};
-use crate::model::{Attribute, SeriesId};
+use crate::model::SeriesId;
 use crate::query::QueryReader;
+use crate::series::Label;
 use crate::util::Result;
 
 /// Evaluates a PromQL vector selector using a QueryReader.
@@ -57,18 +58,18 @@ fn evaluate_on_indexes(
 }
 
 /// Extract equality terms from the selector.
-fn extract_equality_terms(selector: &VectorSelector) -> Vec<Attribute> {
+fn extract_equality_terms(selector: &VectorSelector) -> Vec<Label> {
     let mut terms = Vec::new();
     if let Some(ref name) = selector.name {
-        terms.push(Attribute {
-            key: METRIC_NAME.to_string(),
+        terms.push(Label {
+            name: METRIC_NAME.to_string(),
             value: name.clone(),
         });
     }
     for matcher in &selector.matchers.matchers {
         if matches!(matcher.op, MatchOp::Equal) {
-            terms.push(Attribute {
-                key: matcher.name.clone(),
+            terms.push(Label {
+                name: matcher.name.clone(),
                 value: matcher.value.clone(),
             });
         }
@@ -100,15 +101,17 @@ fn apply_not_equal_matchers(
         result.retain(|id| {
             index
                 .get_spec(id)
-                .map(|spec| !has_attr(&spec.attributes, &matcher.name, &matcher.value))
+                .map(|spec| !has_label(&spec.labels, &matcher.name, &matcher.value))
                 .unwrap_or(false)
         });
     }
     result
 }
 
-fn has_attr(attributes: &[Attribute], key: &str, value: &str) -> bool {
-    attributes.iter().any(|a| a.key == key && a.value == value)
+fn has_label(labels: &[Label], name: &str, value: &str) -> bool {
+    labels
+        .iter()
+        .any(|label| label.name == name && label.value == value)
 }
 
 #[cfg(test)]
@@ -136,16 +139,16 @@ mod tests {
 
         for (id, metric, method, env) in series {
             let attrs = vec![
-                Attribute {
-                    key: METRIC_NAME.to_string(),
+                Label {
+                    name: METRIC_NAME.to_string(),
                     value: metric.to_string(),
                 },
-                Attribute {
-                    key: "method".to_string(),
+                Label {
+                    name: "method".to_string(),
                     value: method.to_string(),
                 },
-                Attribute {
-                    key: "env".to_string(),
+                Label {
+                    name: "env".to_string(),
                     value: env.to_string(),
                 },
             ];
@@ -154,7 +157,7 @@ mod tests {
                 SeriesSpec {
                     metric_unit: None,
                     metric_type: MetricType::Gauge,
-                    attributes: attrs.clone(),
+                    labels: attrs.clone(),
                 },
             );
             for attr in attrs {
@@ -287,16 +290,16 @@ mod tests {
         // Add series with env=prod, method=GET
         builder.add_sample(
             vec![
-                Attribute {
-                    key: METRIC_NAME.to_string(),
+                Label {
+                    name: METRIC_NAME.to_string(),
                     value: "http_requests_total".to_string(),
                 },
-                Attribute {
-                    key: "env".to_string(),
+                Label {
+                    name: "env".to_string(),
                     value: "prod".to_string(),
                 },
-                Attribute {
-                    key: "method".to_string(),
+                Label {
+                    name: "method".to_string(),
                     value: "GET".to_string(),
                 },
             ],
@@ -310,16 +313,16 @@ mod tests {
         // Add series with env=prod, method=POST
         builder.add_sample(
             vec![
-                Attribute {
-                    key: METRIC_NAME.to_string(),
+                Label {
+                    name: METRIC_NAME.to_string(),
                     value: "http_requests_total".to_string(),
                 },
-                Attribute {
-                    key: "env".to_string(),
+                Label {
+                    name: "env".to_string(),
                     value: "prod".to_string(),
                 },
-                Attribute {
-                    key: "method".to_string(),
+                Label {
+                    name: "method".to_string(),
                     value: "POST".to_string(),
                 },
             ],
@@ -333,16 +336,16 @@ mod tests {
         // Add series with env=staging, method=GET
         builder.add_sample(
             vec![
-                Attribute {
-                    key: METRIC_NAME.to_string(),
+                Label {
+                    name: METRIC_NAME.to_string(),
                     value: "http_requests_total".to_string(),
                 },
-                Attribute {
-                    key: "env".to_string(),
+                Label {
+                    name: "env".to_string(),
                     value: "staging".to_string(),
                 },
-                Attribute {
-                    key: "method".to_string(),
+                Label {
+                    name: "method".to_string(),
                     value: "GET".to_string(),
                 },
             ],

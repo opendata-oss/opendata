@@ -8,6 +8,7 @@ mod model;
 mod promql;
 mod query;
 mod serde;
+mod series;
 mod storage;
 #[cfg(test)]
 mod test_utils;

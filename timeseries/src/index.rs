@@ -4,7 +4,8 @@ use dashmap::{DashMap, mapref::one::Ref};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 
-use crate::model::{Attribute, SeriesId, SeriesSpec};
+use crate::model::{SeriesId, SeriesSpec};
+use crate::series::Label;
 
 /// Trait for looking up series specs by ID.
 /// This allows both ForwardIndex and view types to be used interchangeably.
@@ -33,18 +34,18 @@ impl<T: ForwardIndexLookup + ?Sized> ForwardIndexLookup for Box<T> {
 pub(crate) trait InvertedIndexLookup {
     /// Intersect posting lists for the given terms.
     /// Returns series IDs that match ALL terms.
-    fn intersect(&self, terms: Vec<Attribute>) -> RoaringBitmap;
+    fn intersect(&self, terms: Vec<Label>) -> RoaringBitmap;
 
     /// Get all attribute keys in the inverted index.
-    fn all_keys(&self) -> Vec<Attribute>;
+    fn all_keys(&self) -> Vec<Label>;
 }
 
 impl<T: InvertedIndexLookup + ?Sized> InvertedIndexLookup for Box<T> {
-    fn intersect(&self, terms: Vec<Attribute>) -> RoaringBitmap {
+    fn intersect(&self, terms: Vec<Label>) -> RoaringBitmap {
         (**self).intersect(terms)
     }
 
-    fn all_keys(&self) -> Vec<Attribute> {
+    fn all_keys(&self) -> Vec<Label> {
         (**self).all_keys()
     }
 }
@@ -79,17 +80,17 @@ impl ForwardIndexLookup for ForwardIndex {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InvertedIndex {
-    /// Maps Attribute (key, value) to the list of series_id values containing it.
-    pub(crate) postings: DashMap<Attribute, RoaringBitmap>,
+    /// Maps Label (key, value) to the list of series_id values containing it.
+    pub(crate) postings: DashMap<Label, RoaringBitmap>,
 }
 
 impl InvertedIndexLookup for InvertedIndex {
-    fn intersect(&self, terms: Vec<Attribute>) -> RoaringBitmap {
+    fn intersect(&self, terms: Vec<Label>) -> RoaringBitmap {
         if terms.is_empty() {
             return RoaringBitmap::new();
         }
 
-        let mut bitmaps: Vec<Ref<'_, Attribute, RoaringBitmap>> = Vec::new();
+        let mut bitmaps: Vec<Ref<'_, Label, RoaringBitmap>> = Vec::new();
 
         for term in &terms {
             match self.postings.get(term) {
@@ -110,7 +111,7 @@ impl InvertedIndexLookup for InvertedIndex {
         result
     }
 
-    fn all_keys(&self) -> Vec<Attribute> {
+    fn all_keys(&self) -> Vec<Label> {
         self.postings
             .iter()
             .map(|entry| entry.key().clone())
@@ -119,7 +120,7 @@ impl InvertedIndexLookup for InvertedIndex {
 }
 
 impl InvertedIndex {
-    pub(crate) fn union(&self, terms: Vec<Attribute>) -> RoaringBitmap {
+    pub(crate) fn union(&self, terms: Vec<Label>) -> RoaringBitmap {
         if terms.is_empty() {
             return RoaringBitmap::new();
         }
@@ -135,7 +136,7 @@ impl InvertedIndex {
         result
     }
 
-    fn insert(&self, term: Attribute, postings: RoaringBitmap) {
+    fn insert(&self, term: Label, postings: RoaringBitmap) {
         let mut entry = self.postings.entry(term).or_default();
         let value = entry.value_mut();
         *value |= postings;
@@ -147,7 +148,7 @@ impl InvertedIndex {
         }
     }
 
-    pub(crate) fn merge_from_map(&self, other: HashMap<Attribute, RoaringBitmap>) {
+    pub(crate) fn merge_from_map(&self, other: HashMap<Label, RoaringBitmap>) {
         for (term, postings) in other {
             self.insert(term, postings);
         }
@@ -233,17 +234,17 @@ mod tests {
             for &value in list {
                 bitmap.insert(value);
             }
-            let term = Attribute {
-                key: format!("attr_{}", i),
+            let term = Label {
+                name: format!("attr_{}", i),
                 value: "value_0".to_string(),
             };
             index.postings.insert(term.clone(), bitmap);
         }
 
         // When: intersecting all terms
-        let terms: Vec<Attribute> = (0..posting_lists.len())
-            .map(|i| Attribute {
-                key: format!("attr_{}", i),
+        let terms: Vec<Label> = (0..posting_lists.len())
+            .map(|i| Label {
+                name: format!("attr_{}", i),
                 value: "value_0".to_string(),
             })
             .collect();
@@ -263,20 +264,20 @@ mod tests {
         bitmap.insert(2);
         bitmap.insert(3);
 
-        let term = Attribute {
-            key: "attr_0".to_string(),
+        let term = Label {
+            name: "attr_0".to_string(),
             value: "value_0".to_string(),
         };
         index.postings.insert(term.clone(), bitmap);
 
         // When: intersecting with a term that doesn't exist in the index
         let terms = vec![
-            Attribute {
-                key: "attr_0".to_string(),
+            Label {
+                name: "attr_0".to_string(),
                 value: "value_0".to_string(),
             },
-            Attribute {
-                key: "attr_1".to_string(),
+            Label {
+                name: "attr_1".to_string(),
                 value: "value_0".to_string(),
             }, // This term doesn't exist
         ];
@@ -346,17 +347,17 @@ mod tests {
             for &value in list {
                 bitmap.insert(value);
             }
-            let term = Attribute {
-                key: format!("attr_{}", i),
+            let term = Label {
+                name: format!("attr_{}", i),
                 value: "value_0".to_string(),
             };
             index.postings.insert(term, bitmap);
         }
 
         // When: taking the union of all terms
-        let terms: Vec<Attribute> = (0..posting_lists.len())
-            .map(|i| Attribute {
-                key: format!("attr_{}", i),
+        let terms: Vec<Label> = (0..posting_lists.len())
+            .map(|i| Label {
+                name: format!("attr_{}", i),
                 value: "value_0".to_string(),
             })
             .collect();
@@ -388,8 +389,8 @@ mod tests {
         bitmap.insert(1);
         bitmap.insert(2);
         bitmap.insert(3);
-        let term = Attribute {
-            key: "attr_0".to_string(),
+        let term = Label {
+            name: "attr_0".to_string(),
             value: "value_0".to_string(),
         };
         index1.postings.insert(term.clone(), bitmap.clone());
@@ -415,8 +416,8 @@ mod tests {
         bitmap.insert(10);
         bitmap.insert(20);
         bitmap.insert(30);
-        let term = Attribute {
-            key: "attr_1".to_string(),
+        let term = Label {
+            name: "attr_1".to_string(),
             value: "value_1".to_string(),
         };
         index2.postings.insert(term.clone(), bitmap.clone());
@@ -437,8 +438,8 @@ mod tests {
         let mut bitmap1 = RoaringBitmap::new();
         bitmap1.insert(1);
         bitmap1.insert(2);
-        let term1 = Attribute {
-            key: "attr_0".to_string(),
+        let term1 = Label {
+            name: "attr_0".to_string(),
             value: "value_0".to_string(),
         };
         index1.postings.insert(term1.clone(), bitmap1);
@@ -447,8 +448,8 @@ mod tests {
         let mut bitmap2 = RoaringBitmap::new();
         bitmap2.insert(10);
         bitmap2.insert(20);
-        let term2 = Attribute {
-            key: "attr_1".to_string(),
+        let term2 = Label {
+            name: "attr_1".to_string(),
             value: "value_1".to_string(),
         };
         index2.postings.insert(term2.clone(), bitmap2);
@@ -481,8 +482,8 @@ mod tests {
     #[test]
     fn should_merge_same_term_with_disjoint_series() {
         // Given: two indexes with the same term but disjoint series IDs
-        let term = Attribute {
-            key: "attr_5".to_string(),
+        let term = Label {
+            name: "attr_5".to_string(),
             value: "value_10".to_string(),
         };
 
@@ -512,8 +513,8 @@ mod tests {
     #[test]
     fn should_merge_same_term_with_overlapping_series() {
         // Given: two indexes with the same term and overlapping series IDs
-        let term = Attribute {
-            key: "attr_7".to_string(),
+        let term = Label {
+            name: "attr_7".to_string(),
             value: "value_14".to_string(),
         };
 
@@ -547,8 +548,8 @@ mod tests {
     #[test]
     fn should_merge_same_term_with_identical_series() {
         // Given: two indexes with the same term and identical series IDs
-        let term = Attribute {
-            key: "attr_8".to_string(),
+        let term = Label {
+            name: "attr_8".to_string(),
             value: "value_16".to_string(),
         };
 
@@ -578,16 +579,16 @@ mod tests {
     #[test]
     fn should_merge_partial_overlap_terms() {
         // Given: two indexes with some overlapping and some unique terms
-        let shared_term = Attribute {
-            key: "attr_0".to_string(),
+        let shared_term = Label {
+            name: "attr_0".to_string(),
             value: "value_0".to_string(),
         };
-        let term1_only = Attribute {
-            key: "attr_1".to_string(),
+        let term1_only = Label {
+            name: "attr_1".to_string(),
             value: "value_1".to_string(),
         };
-        let term2_only = Attribute {
-            key: "attr_2".to_string(),
+        let term2_only = Label {
+            name: "attr_2".to_string(),
             value: "value_2".to_string(),
         };
 
@@ -648,8 +649,8 @@ mod tests {
     #[test]
     fn should_merge_multiple_times_successively() {
         // Given: three indexes to merge successively
-        let term = Attribute {
-            key: "attr_9".to_string(),
+        let term = Label {
+            name: "attr_9".to_string(),
             value: "value_18".to_string(),
         };
 
@@ -689,8 +690,8 @@ mod tests {
 
         // Add 100 terms to index1
         for i in 0..100 {
-            let term = Attribute {
-                key: format!("attr_{}", i),
+            let term = Label {
+                name: format!("attr_{}", i),
                 value: format!("value_{}", i),
             };
             let mut bitmap = RoaringBitmap::new();
@@ -700,8 +701,8 @@ mod tests {
 
         // Add 100 terms to index2 (50 overlapping, 50 unique)
         for i in 50..150 {
-            let term = Attribute {
-                key: format!("attr_{}", i),
+            let term = Label {
+                name: format!("attr_{}", i),
                 value: format!("value_{}", i),
             };
             let mut bitmap = RoaringBitmap::new();
@@ -717,8 +718,8 @@ mod tests {
 
         // Verify a few specific cases:
         // - Term only in index1
-        let term_only_1 = Attribute {
-            key: "attr_10".to_string(),
+        let term_only_1 = Label {
+            name: "attr_10".to_string(),
             value: "value_10".to_string(),
         };
         let result: Vec<u32> = index1
@@ -731,8 +732,8 @@ mod tests {
         assert_eq!(result, vec![10]);
 
         // - Term in both indexes
-        let term_both = Attribute {
-            key: "attr_75".to_string(),
+        let term_both = Label {
+            name: "attr_75".to_string(),
             value: "value_75".to_string(),
         };
         let result: Vec<u32> = index1
@@ -745,8 +746,8 @@ mod tests {
         assert_eq!(result, vec![75, 1075]); // Both series IDs present
 
         // - Term only in index2
-        let term_only_2 = Attribute {
-            key: "attr_140".to_string(),
+        let term_only_2 = Label {
+            name: "attr_140".to_string(),
             value: "value_140".to_string(),
         };
         let result: Vec<u32> = index1
@@ -762,8 +763,8 @@ mod tests {
     #[test]
     fn should_merge_with_large_bitmaps() {
         // Given: two indexes with the same term containing large bitmaps
-        let term = Attribute {
-            key: "attr_99".to_string(),
+        let term = Label {
+            name: "attr_99".to_string(),
             value: "value_99".to_string(),
         };
 
@@ -816,16 +817,16 @@ mod tests {
         // given
         let index = InvertedIndex::default();
 
-        let term1 = Attribute {
-            key: "env".to_string(),
+        let term1 = Label {
+            name: "env".to_string(),
             value: "prod".to_string(),
         };
-        let term2 = Attribute {
-            key: "env".to_string(),
+        let term2 = Label {
+            name: "env".to_string(),
             value: "staging".to_string(),
         };
-        let term3 = Attribute {
-            key: "method".to_string(),
+        let term3 = Label {
+            name: "method".to_string(),
             value: "GET".to_string(),
         };
 

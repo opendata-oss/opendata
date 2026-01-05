@@ -10,8 +10,9 @@ use opendata_common::Storage;
 
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndex, InvertedIndexLookup};
 use crate::minitsdb::MiniTsdb;
-use crate::model::{Attribute, Sample, SampleWithAttributes, SeriesId, TimeBucket};
+use crate::model::{Sample, SampleWithLabels, SeriesId, TimeBucket};
 use crate::query::QueryReader;
+use crate::series::Label;
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::util::Result;
 
@@ -119,13 +120,13 @@ impl Tsdb {
     }
 
     /// Ingest samples into the TSDB, grouping by time bucket.
-    pub(crate) async fn ingest_samples(&self, samples: Vec<SampleWithAttributes>) -> Result<()> {
+    pub(crate) async fn ingest_samples(&self, samples: Vec<SampleWithLabels>) -> Result<()> {
         if samples.is_empty() {
             return Ok(());
         }
 
         // Group samples by bucket
-        let mut by_bucket: HashMap<TimeBucket, Vec<SampleWithAttributes>> = HashMap::new();
+        let mut by_bucket: HashMap<TimeBucket, Vec<SampleWithLabels>> = HashMap::new();
 
         for sample in samples {
             let bucket = TimeBucket::round_to_hour(
@@ -192,7 +193,7 @@ impl QueryReader for TsdbQueryReader {
 
     async fn inverted_index(
         &self,
-        terms: &[Attribute],
+        terms: &[Label],
     ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + '_>> {
         // Merge inverted indexes from all buckets
         let merged = InvertedIndex::default();
@@ -274,7 +275,7 @@ impl QueryReader for TsdbQueryReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{MetricType, SampleWithAttributes};
+    use crate::model::{MetricType, SampleWithLabels};
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
     use opendata_common::storage::in_memory::InMemoryStorage;
 
@@ -286,22 +287,22 @@ mod tests {
 
     fn create_sample(
         metric_name: &str,
-        labels: Vec<(&str, &str)>,
+        label_pairs: Vec<(&str, &str)>,
         timestamp: u64,
         value: f64,
-    ) -> SampleWithAttributes {
-        let mut attributes = vec![Attribute {
-            key: "__name__".to_string(),
+    ) -> SampleWithLabels {
+        let mut labels = vec![Label {
+            name: "__name__".to_string(),
             value: metric_name.to_string(),
         }];
-        for (key, val) in labels {
-            attributes.push(Attribute {
-                key: key.to_string(),
+        for (key, val) in label_pairs {
+            labels.push(Label {
+                name: key.to_string(),
                 value: val.to_string(),
             });
         }
-        SampleWithAttributes {
-            attributes,
+        SampleWithLabels {
+            labels,
             metric_unit: None,
             metric_type: MetricType::Gauge,
             sample: Sample { timestamp, value },
@@ -401,8 +402,8 @@ mod tests {
 
         // when: query the data with range covering the bucket (seconds 3600-7200)
         let reader = tsdb.query_reader(3600, 7200).await.unwrap();
-        let terms = vec![Attribute {
-            key: "__name__".to_string(),
+        let terms = vec![Label {
+            name: "__name__".to_string(),
             value: "http_requests".to_string(),
         }];
         let index = reader.inverted_index(&terms).await.unwrap();

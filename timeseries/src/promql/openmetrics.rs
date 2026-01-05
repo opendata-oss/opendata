@@ -1,12 +1,13 @@
 //! OpenMetrics text format parser.
 //!
-//! Parses OpenMetrics exposition format into `SampleWithAttributes` for ingestion.
+//! Parses OpenMetrics exposition format into `SampleWithLabels` for ingestion.
 //! See: https://prometheus.io/docs/specs/om/open_metrics_spec/
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::model::{Attribute, MetricType, Sample, SampleWithAttributes, Temporality};
+use crate::model::{MetricType, Sample, SampleWithLabels, Temporality};
+use crate::series::Label;
 use crate::util::Result;
 
 /// OpenMetrics metric types
@@ -68,7 +69,7 @@ struct MetricFamily {
 /// Parser state
 struct Parser {
     families: HashMap<String, MetricFamily>,
-    samples: Vec<SampleWithAttributes>,
+    samples: Vec<SampleWithLabels>,
     default_timestamp: u64,
 }
 
@@ -86,7 +87,7 @@ impl Parser {
         }
     }
 
-    fn parse(mut self, input: &str) -> Result<Vec<SampleWithAttributes>> {
+    fn parse(mut self, input: &str) -> Result<Vec<SampleWithLabels>> {
         let mut saw_eof = false;
 
         for line in input.lines() {
@@ -163,15 +164,15 @@ impl Parser {
         let metric_type = family.metric_type.to_metric_type(suffix);
 
         // Build attributes with __name__ set to base metric name
-        let mut attributes = vec![Attribute {
-            key: "__name__".to_string(),
+        let mut attributes = vec![Label {
+            name: "__name__".to_string(),
             value: base_name.to_string(),
         }];
 
         // Add suffix as attribute if present
         if !suffix.is_empty() {
-            attributes.push(Attribute {
-                key: "__suffix__".to_string(),
+            attributes.push(Label {
+                name: "__suffix__".to_string(),
                 value: suffix.to_string(),
             });
         }
@@ -179,8 +180,8 @@ impl Parser {
         // Add parsed labels
         attributes.extend(labels);
 
-        let sample = SampleWithAttributes {
-            attributes,
+        let sample = SampleWithLabels {
+            labels: attributes,
             metric_unit: family.unit.clone(),
             metric_type,
             sample: Sample { timestamp, value },
@@ -193,7 +194,7 @@ impl Parser {
     fn parse_metric_name_and_labels<'a>(
         &self,
         line: &'a str,
-    ) -> Result<(String, Vec<Attribute>, &'a str)> {
+    ) -> Result<(String, Vec<Label>, &'a str)> {
         let (name_end, labels_end) = if let Some(brace_start) = line.find('{') {
             let brace_end = find_closing_brace(line, brace_start)?;
             (brace_start, brace_end + 1)
@@ -262,7 +263,7 @@ fn find_closing_brace(s: &str, start: usize) -> Result<usize> {
 }
 
 /// Parse labels from the content between braces
-fn parse_labels(s: &str) -> Result<Vec<Attribute>> {
+fn parse_labels(s: &str) -> Result<Vec<Label>> {
     if s.is_empty() {
         return Ok(Vec::new());
     }
@@ -293,8 +294,8 @@ fn parse_labels(s: &str) -> Result<Vec<Attribute>> {
         let (value, remaining) = parse_quoted_string(rest)?;
         rest = remaining;
 
-        labels.push(Attribute {
-            key: key.to_string(),
+        labels.push(Label {
+            name: key.to_string(),
             value,
         });
     }
@@ -364,7 +365,7 @@ fn extract_base_name_and_suffix(name: &str) -> (&str, &str) {
 /// * `input` - OpenMetrics text format string
 ///
 /// # Returns
-/// A vector of `SampleWithAttributes` ready for ingestion.
+/// A vector of `SampleWithLabels` ready for ingestion.
 ///
 /// # Example
 /// ```ignore
@@ -375,7 +376,7 @@ fn extract_base_name_and_suffix(name: &str) -> (&str, &str) {
 /// "#;
 /// let samples = parse_openmetrics(input)?;
 /// ```
-pub(crate) fn parse_openmetrics(input: &str) -> Result<Vec<SampleWithAttributes>> {
+pub(crate) fn parse_openmetrics(input: &str) -> Result<Vec<SampleWithLabels>> {
     Parser::new().parse(input)
 }
 
@@ -451,9 +452,9 @@ mod tests {
         // then
         assert_eq!(samples.len(), 1);
         let suffix = samples[0]
-            .attributes
+            .labels
             .iter()
-            .find(|a| a.key == "__suffix__")
+            .find(|a| a.name == "__suffix__")
             .map(|a| a.value.as_str())
             .unwrap_or("");
         assert_eq!(suffix, expected_suffix);
@@ -590,9 +591,9 @@ mod tests {
         assert_eq!(samples.len(), 1);
         for (key, value) in expected_labels {
             let found = samples[0]
-                .attributes
+                .labels
                 .iter()
-                .find(|a| a.key == key)
+                .find(|a| a.name == key)
                 .map(|a| a.value.as_str());
             assert_eq!(found, Some(value), "Label {} not found or wrong value", key);
         }
@@ -607,7 +608,7 @@ mod tests {
     #[case::only_escape("test{a=\"\\\"\"} 1\n# EOF", "a", "\"")]
     fn should_parse_escaped_label_values(
         #[case] input: &str,
-        #[case] key: &str,
+        #[case] label_name: &str,
         #[case] expected: &str,
     ) {
         // when
@@ -615,9 +616,9 @@ mod tests {
 
         // then
         let value = samples[0]
-            .attributes
+            .labels
             .iter()
-            .find(|a| a.key == key)
+            .find(|a| a.name == label_name)
             .map(|a| a.value.as_str())
             .unwrap();
         assert_eq!(value, expected);
@@ -808,9 +809,9 @@ errors_total 5
         let requests = samples
             .iter()
             .find(|s| {
-                s.attributes
+                s.labels
                     .iter()
-                    .any(|a| a.key == "__name__" && a.value == "requests")
+                    .any(|a| a.name == "__name__" && a.value == "requests")
             })
             .unwrap();
         assert!(matches!(
@@ -824,9 +825,9 @@ errors_total 5
         let latency = samples
             .iter()
             .find(|s| {
-                s.attributes
+                s.labels
                     .iter()
-                    .any(|a| a.key == "__name__" && a.value == "latency")
+                    .any(|a| a.name == "__name__" && a.value == "latency")
             })
             .unwrap();
         assert!(matches!(latency.metric_type, MetricType::Gauge));
@@ -865,9 +866,9 @@ http_request_duration_count 300
         let buckets: Vec<_> = samples
             .iter()
             .filter(|s| {
-                s.attributes
+                s.labels
                     .iter()
-                    .any(|a| a.key == "__suffix__" && a.value == "_bucket")
+                    .any(|a| a.name == "__suffix__" && a.value == "_bucket")
             })
             .collect();
         assert_eq!(buckets.len(), 6);
@@ -875,11 +876,7 @@ http_request_duration_count 300
         // Check +Inf bucket
         let inf_bucket = buckets
             .iter()
-            .find(|s| {
-                s.attributes
-                    .iter()
-                    .any(|a| a.key == "le" && a.value == "+Inf")
-            })
+            .find(|s| s.labels.iter().any(|a| a.name == "le" && a.value == "+Inf"))
             .unwrap();
         assert_eq!(inf_bucket.sample.value, 300.0);
     }
@@ -907,7 +904,7 @@ rpc_duration_count 10000
         // Quantile samples should have Summary type
         let quantiles: Vec<_> = samples
             .iter()
-            .filter(|s| s.attributes.iter().any(|a| a.key == "quantile"))
+            .filter(|s| s.labels.iter().any(|a| a.name == "quantile"))
             .collect();
         assert_eq!(quantiles.len(), 3);
         for q in &quantiles {
@@ -933,9 +930,9 @@ rpc_duration_count 10000
 
         // then
         let name = samples[0]
-            .attributes
+            .labels
             .iter()
-            .find(|a| a.key == "__name__")
+            .find(|a| a.name == "__name__")
             .map(|a| a.value.as_str())
             .unwrap();
         assert_eq!(name, expected_name);
@@ -977,9 +974,9 @@ rpc_duration_count 10000
             }
         ));
         let name = samples[0]
-            .attributes
+            .labels
             .iter()
-            .find(|a| a.key == "__name__")
+            .find(|a| a.name == "__name__")
             .map(|a| a.value.as_str())
             .unwrap();
         assert_eq!(name, "http_requests");
@@ -1005,9 +1002,9 @@ rpc_duration_count 10000
         ));
         // Base name should have _total stripped
         let name = samples[0]
-            .attributes
+            .labels
             .iter()
-            .find(|a| a.key == "__name__")
+            .find(|a| a.name == "__name__")
             .map(|a| a.value.as_str())
             .unwrap();
         assert_eq!(name, "http_requests");
@@ -1064,9 +1061,9 @@ rpc_duration_count 10000
 
         // then
         let msg = samples[0]
-            .attributes
+            .labels
             .iter()
-            .find(|a| a.key == "msg")
+            .find(|a| a.name == "msg")
             .map(|a| a.value.as_str())
             .unwrap();
         assert_eq!(msg, "hello}world");

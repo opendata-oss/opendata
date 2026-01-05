@@ -3,7 +3,8 @@
 use async_trait::async_trait;
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
-use crate::model::{Attribute, Sample, SeriesId};
+use crate::model::{Sample, SeriesId};
+use crate::series::Label;
 use crate::util::Result;
 
 /// Trait for read-only queries across all data tiers.
@@ -25,7 +26,7 @@ pub(crate) trait QueryReader: Send + Sync {
     /// This avoids cloning bitmaps upfront - only storage data is pre-loaded.
     async fn inverted_index(
         &self,
-        terms: &[Attribute],
+        terms: &[Label],
     ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + '_>>;
 
     /// Get a view into all inverted index data.
@@ -76,7 +77,7 @@ pub(crate) mod test_utils {
 
         async fn inverted_index(
             &self,
-            _terms: &[Attribute],
+            _terms: &[Label],
         ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + '_>> {
             Ok(Box::new(self.inverted_index.clone()))
         }
@@ -92,7 +93,7 @@ pub(crate) mod test_utils {
                 .inverted_index
                 .postings
                 .iter()
-                .filter(|entry| entry.key().key == label_name)
+                .filter(|entry| entry.key().name == label_name)
                 .map(|entry| entry.key().value.clone())
                 .collect();
             Ok(values)
@@ -126,7 +127,7 @@ pub(crate) mod test_utils {
         samples: HashMap<SeriesId, Vec<Sample>>,
         next_series_id: SeriesId,
         /// Maps fingerprint (sorted attributes) to series ID for deduplication
-        fingerprint_to_id: HashMap<Vec<Attribute>, SeriesId>,
+        fingerprint_to_id: HashMap<Vec<Label>, SeriesId>,
     }
 
     impl MockQueryReaderBuilder {
@@ -141,17 +142,17 @@ pub(crate) mod test_utils {
             }
         }
 
-        /// Add a sample with attributes. If a series with the same attributes already exists,
+        /// Add a sample with labels. If a series with the same labels already exists,
         /// the sample is added to that series. Otherwise, a new series is created.
         pub(crate) fn add_sample(
             &mut self,
-            attributes: Vec<Attribute>,
+            labels: Vec<Label>,
             metric_type: MetricType,
             sample: Sample,
         ) -> &mut Self {
-            // Sort attributes for consistent fingerprinting
-            let mut sorted_attrs = attributes.clone();
-            sorted_attrs.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.value.cmp(&b.value)));
+            // Sort labels for consistent fingerprinting
+            let mut sorted_attrs = labels.clone();
+            sorted_attrs.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.value.cmp(&b.value)));
 
             // Get or create series ID
             let series_id = if let Some(&id) = self.fingerprint_to_id.get(&sorted_attrs) {
@@ -166,15 +167,15 @@ pub(crate) mod test_utils {
                     SeriesSpec {
                         metric_unit: None,
                         metric_type,
-                        attributes: attributes.clone(),
+                        labels: labels.clone(),
                     },
                 );
 
                 // Add to inverted index
-                for attr in &attributes {
+                for label in &labels {
                     self.inverted_index
                         .postings
-                        .entry(attr.clone())
+                        .entry(label.clone())
                         .or_default()
                         .insert(id);
                 }

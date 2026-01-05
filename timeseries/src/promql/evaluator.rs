@@ -11,9 +11,10 @@ use promql_parser::parser::{
 };
 
 use crate::index::ForwardIndexLookup;
-use crate::model::{Attribute, SeriesFingerprint};
+use crate::model::SeriesFingerprint;
 use crate::promql::functions::FunctionRegistry;
 use crate::query::QueryReader;
+use crate::series::Label;
 
 #[derive(Debug)]
 pub enum EvaluationError {
@@ -179,7 +180,7 @@ impl<'a, R: QueryReader> Evaluator<'a, R> {
                     )));
                 }
             };
-            let fingerprint = self.compute_fingerprint(&series_spec.attributes);
+            let fingerprint = self.compute_fingerprint(&series_spec.labels);
 
             if series_with_results.contains(&fingerprint) {
                 continue;
@@ -191,7 +192,7 @@ impl<'a, R: QueryReader> Evaluator<'a, R> {
             // Find the best (latest) point in the time range
             if let Some(best_sample) = sample_data.last() {
                 // Convert attributes to labels HashMap
-                let labels = self.attributes_to_labels(&series_spec.attributes);
+                let labels = self.labels_to_hashmap(&series_spec.labels);
 
                 samples.push(EvalSample {
                     timestamp_ms: best_sample.timestamp,
@@ -206,24 +207,24 @@ impl<'a, R: QueryReader> Evaluator<'a, R> {
         Ok(ExprResult::InstantVector(samples))
     }
 
-    /// Convert attributes to labels HashMap
-    fn attributes_to_labels(&self, attributes: &[Attribute]) -> HashMap<String, String> {
-        attributes
+    /// Convert labels to HashMap
+    fn labels_to_hashmap(&self, labels: &[Label]) -> HashMap<String, String> {
+        labels
             .iter()
-            .map(|attr| (attr.key.clone(), attr.value.clone()))
+            .map(|label| (label.name.clone(), label.value.clone()))
             .collect()
     }
 
-    /// Compute fingerprint from attributes (simple hash for deduplication)
-    fn compute_fingerprint(&self, attributes: &[Attribute]) -> SeriesFingerprint {
-        // Use a simple hash of sorted attributes
+    /// Compute fingerprint from labels (simple hash for deduplication)
+    fn compute_fingerprint(&self, labels: &[Label]) -> SeriesFingerprint {
+        // Use a simple hash of sorted labels
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        let mut sorted_attrs: Vec<_> = attributes.iter().collect();
-        sorted_attrs.sort_by(|a, b| a.key.cmp(&b.key));
-        for attr in sorted_attrs {
-            attr.key.hash(&mut hasher);
-            attr.value.hash(&mut hasher);
+        let mut sorted_labels: Vec<_> = labels.iter().collect();
+        sorted_labels.sort_by(|a, b| a.name.cmp(&b.name));
+        for label in sorted_labels {
+            label.name.hash(&mut hasher);
+            label.value.hash(&mut hasher);
         }
         hasher.finish() as SeriesFingerprint
     }
@@ -554,8 +555,9 @@ impl<'a, R: QueryReader> Evaluator<'a, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Attribute, MetricType, Sample, TimeBucket};
+    use crate::model::{MetricType, Sample, TimeBucket};
     use crate::query::test_utils::MockQueryReaderBuilder;
+    use crate::series::Label;
     use crate::test_utils::assertions::approx_eq;
     use promql_parser::label::METRIC_NAME;
     use promql_parser::parser::EvalStmt;
@@ -649,19 +651,19 @@ mod tests {
         }
     }
 
-    /// Helper to create attributes from metric name and labels
-    fn create_attributes(metric_name: &str, labels: Vec<(&str, &str)>) -> Vec<Attribute> {
-        let mut attributes = vec![Attribute {
-            key: METRIC_NAME.to_string(),
+    /// Helper to create labels from metric name and label pairs
+    fn create_labels(metric_name: &str, label_pairs: Vec<(&str, &str)>) -> Vec<Label> {
+        let mut labels = vec![Label {
+            name: METRIC_NAME.to_string(),
             value: metric_name.to_string(),
         }];
-        for (key, val) in labels {
-            attributes.push(Attribute {
-                key: key.to_string(),
+        for (key, val) in label_pairs {
+            labels.push(Label {
+                name: key.to_string(),
                 value: val.to_string(),
             });
         }
-        attributes
+        labels
     }
 
     /// Setup helper: Creates a MockQueryReader with test data
@@ -685,7 +687,7 @@ mod tests {
             .unwrap_or(0);
 
         for (metric_name, labels, offset_ms, value) in data {
-            let attributes = create_attributes(metric_name, labels);
+            let attributes = create_labels(metric_name, labels);
             let sample = Sample {
                 timestamp: base_timestamp + offset_ms,
                 value,

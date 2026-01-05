@@ -19,8 +19,9 @@ use super::response::{
 };
 use super::router::PromqlRouter;
 use super::selector::evaluate_selector_with_reader;
-use crate::model::{Attribute, SeriesId};
+use crate::model::SeriesId;
 use crate::query::QueryReader;
+use crate::series::Label;
 use crate::tsdb::Tsdb;
 
 /// Parse a match[] selector string into a VectorSelector
@@ -51,10 +52,10 @@ async fn get_matching_series<R: QueryReader>(
 }
 
 /// Convert attributes to a HashMap
-fn attributes_to_map(attributes: &[Attribute]) -> HashMap<String, String> {
-    attributes
+fn labels_to_map(labels: &[Label]) -> HashMap<String, String> {
+    labels
         .iter()
-        .map(|attr| (attr.key.clone(), attr.value.clone()))
+        .map(|label| (label.name.clone(), label.value.clone()))
         .collect()
 }
 
@@ -323,7 +324,7 @@ impl PromqlRouter for Tsdb {
         let mut result: Vec<HashMap<String, String>> = series_ids_vec
             .iter()
             .filter_map(|id| forward_index.get_spec(id))
-            .map(|spec| attributes_to_map(&spec.attributes))
+            .map(|spec| labels_to_map(&spec.labels))
             .collect();
 
         // Apply limit if specified
@@ -392,8 +393,8 @@ impl PromqlRouter for Tsdb {
                     }
                 };
                 for (_id, spec) in forward_index.all_series() {
-                    for attr in &spec.attributes {
-                        label_names.insert(attr.key.clone());
+                    for attr in &spec.labels {
+                        label_names.insert(attr.name.clone());
                     }
                 }
             }
@@ -412,7 +413,7 @@ impl PromqlRouter for Tsdb {
                     }
                 };
                 for attr in inverted_index.all_keys() {
-                    label_names.insert(attr.key);
+                    label_names.insert(attr.name);
                 }
             }
         };
@@ -485,8 +486,8 @@ impl PromqlRouter for Tsdb {
                     }
                 };
                 for (_id, spec) in forward_index.all_series() {
-                    for attr in &spec.attributes {
-                        if attr.key == request.label_name {
+                    for attr in &spec.labels {
+                        if attr.name == request.label_name {
                             values.insert(attr.value.clone());
                         }
                     }
@@ -537,7 +538,8 @@ impl PromqlRouter for Tsdb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Attribute, MetricType, Sample, SampleWithAttributes, TimeBucket};
+    use crate::model::{MetricType, Sample, SampleWithLabels, TimeBucket};
+    use crate::series::Label;
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
     use opendata_common::Storage;
     use opendata_common::storage::in_memory::InMemoryStorage;
@@ -551,22 +553,22 @@ mod tests {
 
     fn create_sample(
         metric_name: &str,
-        labels: Vec<(&str, &str)>,
+        label_pairs: Vec<(&str, &str)>,
         timestamp: u64,
         value: f64,
-    ) -> SampleWithAttributes {
-        let mut attributes = vec![Attribute {
-            key: "__name__".to_string(),
+    ) -> SampleWithLabels {
+        let mut labels = vec![Label {
+            name: "__name__".to_string(),
             value: metric_name.to_string(),
         }];
-        for (key, val) in labels {
-            attributes.push(Attribute {
-                key: key.to_string(),
+        for (key, val) in label_pairs {
+            labels.push(Label {
+                name: key.to_string(),
                 value: val.to_string(),
             });
         }
-        SampleWithAttributes {
-            attributes,
+        SampleWithLabels {
+            labels,
             metric_unit: None,
             metric_type: MetricType::Gauge,
             sample: Sample { timestamp, value },

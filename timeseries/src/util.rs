@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opendata_common::StorageError;
 
-use crate::model::Attribute;
+use crate::series::Label;
 
 /// Error type for OpenTSDB operations
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,12 +84,12 @@ pub(crate) trait Fingerprint {
     fn fingerprint(&self) -> u128;
 }
 
-impl Fingerprint for Vec<Attribute> {
+impl Fingerprint for Vec<Label> {
     fn fingerprint(&self) -> u128 {
         let mut hasher = Hasher::new();
-        for attribute in self {
-            hasher.update(attribute.key.as_bytes());
-            hasher.update(attribute.value.as_bytes());
+        for label in self {
+            hasher.update(label.name.as_bytes());
+            hasher.update(label.value.as_bytes());
         }
 
         let digest = hasher.finalize();

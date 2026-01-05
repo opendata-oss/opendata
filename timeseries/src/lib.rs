@@ -55,7 +55,7 @@ mod util;
 // Public API modules
 mod config;
 mod error;
-mod series;
+pub(crate) mod series;
 mod timeseries;
 
 // Public re-exports
