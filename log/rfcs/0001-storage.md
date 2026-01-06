@@ -247,7 +247,7 @@ The simpler key+sequence encoding preserves key ordering and avoids the collisio
 
 ### SlateDB Sequence Numbers
 
-SlateDB maintains its own internal sequence number for MVCC versioning. Ideally, OpenData-Log would reuse this counter rather than implementing separate tracking with `LastBlock` records. However, SlateDB's sequence number is not currently exposed in its public API. If SlateDB adds support for accessing or influencing sequence assignment in the future, this design could be simplified.
+SlateDB maintains its own internal sequence number for MVCC versioning. Ideally, OpenData-Log could reuse this counter rather than implementing separate tracking with `LastBlock` records. However, SlateDB's sequence number is not currently exposed in its public API. Furthermore, since the sequence number is embedded into the key, we would need to align the sequence number prior to writing. Current proposals to expose SlateDb sequence numbers do not offer such a mechanism, but we can reevaluate once the effort is complete. Finally, we should reserve the ability to offer an `edit` API so that a corrupt/incorrect record may be overwritten. This may be more difficult if we are too coupled with the SlateDb sequence number.  
 
 ### Headers
 
