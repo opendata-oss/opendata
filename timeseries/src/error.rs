@@ -22,7 +22,7 @@ use opendata_common::StorageError;
 /// - [`Internal`](Error::Internal): Unexpected internal errors that indicate bugs
 ///   or invariant violations.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TimeseriesError {
+pub enum Error {
     /// Storage-related errors from the underlying storage layer.
     ///
     /// These errors typically indicate I/O failures, corruption, or
@@ -48,53 +48,53 @@ pub enum TimeseriesError {
     Internal(String),
 }
 
-impl std::error::Error for TimeseriesError {}
+impl std::error::Error for Error {}
 
-impl std::fmt::Display for TimeseriesError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TimeseriesError::Storage(msg) => write!(f, "Storage error: {}", msg),
-            TimeseriesError::Encoding(msg) => write!(f, "Encoding error: {}", msg),
-            TimeseriesError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
-            TimeseriesError::Internal(msg) => write!(f, "Internal error: {}", msg),
+            Error::Storage(msg) => write!(f, "Storage error: {}", msg),
+            Error::Encoding(msg) => write!(f, "Encoding error: {}", msg),
+            Error::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
+            Error::Internal(msg) => write!(f, "Internal error: {}", msg),
         }
     }
 }
 
-impl From<StorageError> for TimeseriesError {
+impl From<StorageError> for Error {
     fn from(err: StorageError) -> Self {
         match err {
-            StorageError::Storage(msg) => TimeseriesError::Storage(msg),
-            StorageError::Internal(msg) => TimeseriesError::Internal(msg),
+            StorageError::Storage(msg) => Error::Storage(msg),
+            StorageError::Internal(msg) => Error::Internal(msg),
         }
     }
 }
 
-impl From<&str> for TimeseriesError {
+impl From<&str> for Error {
     fn from(msg: &str) -> Self {
-        TimeseriesError::InvalidInput(msg.to_string())
+        Error::InvalidInput(msg.to_string())
     }
 }
 
-impl From<std::time::SystemTimeError> for TimeseriesError {
+impl From<std::time::SystemTimeError> for Error {
     fn from(err: std::time::SystemTimeError) -> Self {
-        TimeseriesError::InvalidInput(format!("Invalid timestamp: {}", err))
+        Error::InvalidInput(format!("Invalid timestamp: {}", err))
     }
 }
 
-impl From<std::num::TryFromIntError> for TimeseriesError {
+impl From<std::num::TryFromIntError> for Error {
     fn from(err: std::num::TryFromIntError) -> Self {
-        TimeseriesError::InvalidInput(format!("Integer conversion error: {}", err))
+        Error::InvalidInput(format!("Integer conversion error: {}", err))
     }
 }
 
-impl From<crate::serde::EncodingError> for TimeseriesError {
+impl From<crate::serde::EncodingError> for Error {
     fn from(err: crate::serde::EncodingError) -> Self {
-        TimeseriesError::Encoding(err.message)
+        Error::Encoding(err.message)
     }
 }
 
 /// Result type alias for OpenData TimeSeries operations.
 ///
 /// This is a convenience alias for `std::result::Result<T, Error>`.
-pub type Result<T> = std::result::Result<T, TimeseriesError>;
+pub type Result<T> = std::result::Result<T, Error>;

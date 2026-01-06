@@ -3,7 +3,7 @@
 use blake3::Hasher;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::error::TimeseriesError;
+use crate::error::Error;
 use crate::series::Label;
 
 pub use crate::error::Result;
@@ -51,20 +51,20 @@ pub fn parse_timestamp(s: &str) -> Result<SystemTime> {
     match s.parse::<f64>() {
         Ok(secs) => {
             if secs < 0.0 {
-                return Err(TimeseriesError::InvalidInput(format!(
+                return Err(Error::InvalidInput(format!(
                     "Invalid timestamp: negative value {}",
                     secs
                 )));
             }
             Duration::try_from_secs_f64(secs)
-                .map_err(|e| TimeseriesError::InvalidInput(format!("Invalid timestamp: {}", e)))
+                .map_err(|e| Error::InvalidInput(format!("Invalid timestamp: {}", e)))
                 .and_then(|duration| {
                     SystemTime::UNIX_EPOCH.checked_add(duration).ok_or_else(|| {
-                        TimeseriesError::InvalidInput("Invalid timestamp: overflow".to_string())
+                        Error::InvalidInput("Invalid timestamp: overflow".to_string())
                     })
                 })
         }
-        Err(e) => Err(TimeseriesError::InvalidInput(format!(
+        Err(e) => Err(Error::InvalidInput(format!(
             "Could not parse timestamp '{}': not RFC3339 or float ({})",
             s, e
         ))),
@@ -77,7 +77,7 @@ pub fn parse_timestamp_to_seconds(s: &str) -> Result<i64> {
     parse_timestamp(s).and_then(|st| {
         st.duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
-            .map_err(|e| TimeseriesError::InvalidInput(format!("Invalid timestamp: {}", e)))
+            .map_err(|e| Error::InvalidInput(format!("Invalid timestamp: {}", e)))
     })
 }
 
@@ -87,18 +87,18 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     // Try parsing as float (seconds)
     if let Ok(secs) = s.parse::<f64>() {
         if secs < 0.0 {
-            return Err(TimeseriesError::InvalidInput(format!(
+            return Err(Error::InvalidInput(format!(
                 "Invalid duration: negative value {}",
                 secs
             )));
         }
         return Duration::try_from_secs_f64(secs)
-            .map_err(|e| TimeseriesError::InvalidInput(format!("Invalid duration: {}", e)));
+            .map_err(|e| Error::InvalidInput(format!("Invalid duration: {}", e)));
     }
 
     // Try parsing Prometheus duration format
     promql_parser::util::parse_duration(s)
-        .map_err(|e| TimeseriesError::InvalidInput(format!("Invalid duration: {}", e)))
+        .map_err(|e| Error::InvalidInput(format!("Invalid duration: {}", e)))
 }
 
 /// Truncate `time` down to the start of the hour and return the Unix epoch minutes as `u32`.

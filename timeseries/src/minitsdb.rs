@@ -8,13 +8,13 @@ use opendata_common::{Storage, StorageRead};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::delta::{TsdbDelta, TsdbDeltaBuilder};
-use crate::error::TimeseriesError;
+use crate::error::Error;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
-use crate::model::{Sample, SampleWithLabels, SeriesFingerprint, SeriesId, TimeBucket};
+use crate::model::{SampleWithLabels, SeriesFingerprint, SeriesId, TimeBucket};
 use crate::query::QueryReader;
 use crate::serde::key::TimeSeriesKey;
 use crate::serde::timeseries::TimeSeriesIterator;
-use crate::series::Label;
+use crate::series::{Label, Sample};
 use crate::storage::{OpenTsdbStorageExt, OpenTsdbStorageReadExt};
 use crate::util::Result;
 
@@ -69,8 +69,8 @@ impl<'a> QueryReader for MiniQueryReader<'a> {
     async fn samples(
         &self,
         series_id: SeriesId,
-        start_ms: u64,
-        end_ms: u64,
+        start_ms: i64,
+        end_ms: i64,
     ) -> Result<Vec<Sample>> {
         let storage_key = TimeSeriesKey {
             time_bucket: self.bucket.start,
@@ -81,15 +81,14 @@ impl<'a> QueryReader for MiniQueryReader<'a> {
 
         match record {
             Some(record) => {
-                let iter = TimeSeriesIterator::new(record.value.as_ref()).ok_or_else(|| {
-                    TimeseriesError::Internal("Invalid timeseries data in storage".into())
-                })?;
+                let iter = TimeSeriesIterator::new(record.value.as_ref())
+                    .ok_or_else(|| Error::Internal("Invalid timeseries data in storage".into()))?;
 
                 let samples: Vec<Sample> = iter
                     .filter_map(|r| r.ok())
                     // Filter by time range: timestamp > start_ms && timestamp <= end_ms
                     // Following PromQL lookback window semantics with exclusive start
-                    .filter(|s| s.timestamp > start_ms && s.timestamp <= end_ms)
+                    .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
                     .collect();
 
                 Ok(samples)

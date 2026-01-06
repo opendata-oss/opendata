@@ -2,7 +2,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
-use crate::error::TimeseriesError;
+use crate::error::Error;
 use crate::util::{parse_duration, parse_timestamp, parse_timestamp_to_seconds};
 
 // =============================================================================
@@ -81,7 +81,7 @@ pub struct QueryParams {
 }
 
 impl TryFrom<QueryParams> for QueryRequest {
-    type Error = TimeseriesError;
+    type Error = Error;
 
     fn try_from(params: QueryParams) -> Result<Self, Self::Error> {
         Ok(QueryRequest {
@@ -103,7 +103,7 @@ pub struct QueryRangeParams {
 }
 
 impl TryFrom<QueryRangeParams> for QueryRangeRequest {
-    type Error = TimeseriesError;
+    type Error = Error;
 
     fn try_from(params: QueryRangeParams) -> Result<Self, Self::Error> {
         Ok(QueryRangeRequest {
@@ -127,7 +127,7 @@ pub struct SeriesParams {
 }
 
 impl TryFrom<SeriesParams> for SeriesRequest {
-    type Error = TimeseriesError;
+    type Error = Error;
 
     fn try_from(params: SeriesParams) -> Result<Self, Self::Error> {
         Ok(SeriesRequest {
@@ -156,7 +156,7 @@ pub struct LabelsParams {
 }
 
 impl TryFrom<LabelsParams> for LabelsRequest {
-    type Error = TimeseriesError;
+    type Error = Error;
 
     fn try_from(params: LabelsParams) -> Result<Self, Self::Error> {
         Ok(LabelsRequest {
@@ -190,7 +190,7 @@ pub struct LabelValuesParams {
 
 impl LabelValuesParams {
     /// Convert to LabelValuesRequest with the label name from the path
-    pub fn into_request(self, label_name: String) -> Result<LabelValuesRequest, TimeseriesError> {
+    pub fn into_request(self, label_name: String) -> Result<LabelValuesRequest, Error> {
         Ok(LabelValuesRequest {
             label_name,
             matches: if self.matches.is_empty() {

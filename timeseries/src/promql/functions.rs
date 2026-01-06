@@ -9,7 +9,7 @@ pub(crate) trait PromQLFunction {
     fn apply(
         &self,
         samples: Vec<EvalSample>,
-        eval_timestamp_ms: u64,
+        eval_timestamp_ms: i64,
     ) -> EvalResult<Vec<EvalSample>>;
 }
 
@@ -22,7 +22,7 @@ impl PromQLFunction for UnaryFunction {
     fn apply(
         &self,
         mut samples: Vec<EvalSample>,
-        _eval_timestamp_ms: u64,
+        _eval_timestamp_ms: i64,
     ) -> EvalResult<Vec<EvalSample>> {
         for sample in &mut samples {
             sample.value = (self.op)(sample.value);
@@ -139,7 +139,7 @@ impl PromQLFunction for AbsentFunction {
     fn apply(
         &self,
         samples: Vec<EvalSample>,
-        eval_timestamp_ms: u64,
+        eval_timestamp_ms: i64,
     ) -> EvalResult<Vec<EvalSample>> {
         if samples.is_empty() {
             // Return a single sample with value 1.0 at the evaluation timestamp
@@ -162,7 +162,7 @@ impl PromQLFunction for ScalarFunction {
     fn apply(
         &self,
         samples: Vec<EvalSample>,
-        _eval_timestamp_ms: u64,
+        _eval_timestamp_ms: i64,
     ) -> EvalResult<Vec<EvalSample>> {
         if samples.len() == 1 {
             // Return the single sample (scalar converts single-element vector to scalar)
@@ -205,7 +205,7 @@ mod tests {
         let registry = FunctionRegistry::new();
         let func = registry.get("absent").unwrap();
 
-        let eval_timestamp_ms = 5000u64;
+        let eval_timestamp_ms = 5000i64;
 
         // Empty input should return one sample with value 1.0 at eval timestamp
         let result = func.apply(vec![], eval_timestamp_ms).unwrap();

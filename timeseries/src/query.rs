@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
-use crate::model::{Sample, SeriesId};
-use crate::series::Label;
+use crate::model::SeriesId;
+use crate::series::{Label, Sample};
 use crate::util::Result;
 
 /// Trait for read-only queries across all data tiers.
@@ -40,7 +40,7 @@ pub(crate) trait QueryReader: Send + Sync {
 
     /// Get samples for a series within a time range, merging from all layers.
     /// Returns samples sorted by timestamp with duplicates removed (head takes priority).
-    async fn samples(&self, series_id: SeriesId, start_ms: u64, end_ms: u64)
+    async fn samples(&self, series_id: SeriesId, start_ms: i64, end_ms: i64)
     -> Result<Vec<Sample>>;
 }
 
@@ -48,7 +48,8 @@ pub(crate) trait QueryReader: Send + Sync {
 pub(crate) mod test_utils {
     use super::*;
     use crate::index::{ForwardIndex, InvertedIndex};
-    use crate::model::{MetricType, SeriesSpec, TimeBucket};
+    use crate::model::{SeriesSpec, TimeBucket};
+    use crate::series::MetricType;
     use std::collections::HashMap;
 
     /// A mock QueryReader for testing that holds data in memory.
@@ -102,15 +103,17 @@ pub(crate) mod test_utils {
         async fn samples(
             &self,
             series_id: SeriesId,
-            start_ms: u64,
-            end_ms: u64,
+            start_ms: i64,
+            end_ms: i64,
         ) -> Result<Vec<Sample>> {
             let samples = self
                 .samples
                 .get(&series_id)
                 .map(|s| {
                     s.iter()
-                        .filter(|sample| sample.timestamp > start_ms && sample.timestamp <= end_ms)
+                        .filter(|sample| {
+                            sample.timestamp_ms > start_ms && sample.timestamp_ms <= end_ms
+                        })
                         .cloned()
                         .collect()
                 })

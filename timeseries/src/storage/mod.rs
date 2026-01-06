@@ -4,9 +4,9 @@ use opendata_common::{Record, Storage, StorageRead};
 use roaring::RoaringBitmap;
 
 use crate::index::InvertedIndex;
-use crate::model::Sample;
 use crate::serde::key::TimeSeriesKey;
 use crate::serde::timeseries::TimeSeriesValue;
+use crate::series::Sample;
 use crate::{
     index::ForwardIndex,
     model::{SeriesFingerprint, SeriesId, SeriesSpec, TimeBucket},

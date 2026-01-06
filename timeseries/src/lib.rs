@@ -60,6 +60,6 @@ mod timeseries;
 
 // Public re-exports
 pub use config::{Config, WriteOptions};
-pub use error::{Result, TimeseriesError};
+pub use error::{Error, Result};
 pub use series::{Label, MetricType, Sample, Series, SeriesBuilder};
 pub use timeseries::TimeSeries;

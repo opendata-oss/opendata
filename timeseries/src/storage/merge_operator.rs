@@ -86,9 +86,9 @@ fn merge_bucket_list(existing: Bytes, new_value: Bytes) -> Result<Bytes, Encodin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Sample;
     use crate::serde::key::{BucketListKey, InvertedIndexKey, TimeSeriesKey};
     use crate::serde::timeseries::TimeSeriesValue;
+    use crate::series::Sample;
     use bytes::Bytes;
     use opendata_common::storage::MergeOperator;
     use roaring::RoaringBitmap;
@@ -303,16 +303,16 @@ mod tests {
         "both empty"
     )]
     fn should_merge_time_series(
-        #[case] existing_samples: Vec<(u64, f64)>,
-        #[case] new_samples: Vec<(u64, f64)>,
-        #[case] expected_samples: Vec<(u64, f64)>,
+        #[case] existing_samples: Vec<(i64, f64)>,
+        #[case] new_samples: Vec<(i64, f64)>,
+        #[case] expected_samples: Vec<(i64, f64)>,
         #[case] description: &str,
     ) {
         // given
         let existing_points: Vec<Sample> = existing_samples
             .iter()
             .map(|(ts, val)| Sample {
-                timestamp: *ts,
+                timestamp_ms: *ts,
                 value: *val,
             })
             .collect();
@@ -325,7 +325,7 @@ mod tests {
         let new_points: Vec<Sample> = new_samples
             .iter()
             .map(|(ts, val)| Sample {
-                timestamp: *ts,
+                timestamp_ms: *ts,
                 value: *val,
             })
             .collect();
@@ -339,7 +339,7 @@ mod tests {
         let expected_points: Vec<Sample> = expected_samples
             .iter()
             .map(|(ts, val)| Sample {
-                timestamp: *ts,
+                timestamp_ms: *ts,
                 value: *val,
             })
             .collect();
@@ -392,11 +392,11 @@ mod tests {
                 let existing = TimeSeriesValue {
                     points: vec![
                         Sample {
-                            timestamp: 1000,
+                            timestamp_ms: 1000,
                             value: 10.0,
                         },
                         Sample {
-                            timestamp: 2000,
+                            timestamp_ms: 2000,
                             value: 20.0,
                         },
                     ],
@@ -406,11 +406,11 @@ mod tests {
                 let new = TimeSeriesValue {
                     points: vec![
                         Sample {
-                            timestamp: 3000,
+                            timestamp_ms: 3000,
                             value: 30.0,
                         },
                         Sample {
-                            timestamp: 4000,
+                            timestamp_ms: 4000,
                             value: 40.0,
                         },
                     ],

@@ -117,7 +117,8 @@ fn has_label(labels: &[Label], name: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{MetricType, SeriesSpec};
+    use crate::model::SeriesSpec;
+    use crate::series::{MetricType, Sample};
     use promql_parser::label::{Matcher, Matchers};
 
     fn empty_matchers() -> Matchers {
@@ -280,7 +281,7 @@ mod tests {
 
     #[tokio::test]
     async fn should_merge_results_from_head_and_storage() {
-        use crate::model::{Sample, TimeBucket};
+        use crate::model::TimeBucket;
         use crate::query::test_utils::MockQueryReaderBuilder;
 
         // given: create a mock reader with 3 series
@@ -305,7 +306,7 @@ mod tests {
             ],
             MetricType::Gauge,
             Sample {
-                timestamp: 1000,
+                timestamp_ms: 1000,
                 value: 10.0,
             },
         );
@@ -328,7 +329,7 @@ mod tests {
             ],
             MetricType::Gauge,
             Sample {
-                timestamp: 1001,
+                timestamp_ms: 1001,
                 value: 20.0,
             },
         );
@@ -351,7 +352,7 @@ mod tests {
             ],
             MetricType::Gauge,
             Sample {
-                timestamp: 2000,
+                timestamp_ms: 2000,
                 value: 30.0,
             },
         );

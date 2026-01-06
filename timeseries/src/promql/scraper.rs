@@ -9,9 +9,9 @@ use tokio::time::interval;
 use super::config::{PrometheusConfig, ScrapeConfig};
 use super::metrics::{Metrics, ScrapeLabels};
 use super::openmetrics::parse_openmetrics;
-use crate::error::TimeseriesError;
-use crate::model::{MetricType, Sample, SampleWithLabels};
-use crate::series::Label;
+use crate::error::Error;
+use crate::model::SampleWithLabels;
+use crate::series::{Label, MetricType, Sample};
 use crate::tsdb::Tsdb;
 use crate::util::Result;
 
@@ -138,7 +138,7 @@ impl Scraper {
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64;
+            .as_millis() as i64;
 
         SampleWithLabels {
             labels: vec![
@@ -158,7 +158,7 @@ impl Scraper {
             metric_unit: None,
             metric_type: MetricType::Gauge,
             sample: Sample {
-                timestamp: timestamp_ms,
+                timestamp_ms: timestamp_ms,
                 value,
             },
         }
@@ -180,19 +180,20 @@ impl Scraper {
             .get(&url)
             .send()
             .await
-            .map_err(|e| TimeseriesError::Internal(format!("HTTP request failed: {}", e)))?;
+            .map_err(|e| Error::Internal(format!("HTTP request failed: {}", e)))?;
 
         if !response.status().is_success() {
-            return Err(TimeseriesError::Internal(format!(
+            return Err(Error::Internal(format!(
                 "HTTP {} from {}",
                 response.status(),
                 url
             )));
         }
 
-        let body = response.text().await.map_err(|e| {
-            TimeseriesError::Internal(format!("Failed to read response body: {}", e))
-        })?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to read response body: {}", e)))?;
 
         // Parse the OpenMetrics/Prometheus format
         let mut samples = parse_openmetrics(&body)?;

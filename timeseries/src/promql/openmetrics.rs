@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::model::{MetricType, Sample, SampleWithLabels, Temporality};
-use crate::series::Label;
+use crate::model::SampleWithLabels;
+use crate::series::{Label, MetricType, Sample, Temporality};
 use crate::util::Result;
 
 /// OpenMetrics metric types
@@ -70,14 +70,14 @@ struct MetricFamily {
 struct Parser {
     families: HashMap<String, MetricFamily>,
     samples: Vec<SampleWithLabels>,
-    default_timestamp: u64,
+    default_timestamp: i64,
 }
 
 impl Parser {
     fn new() -> Self {
         let default_timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
+            .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
 
         Self {
@@ -184,7 +184,10 @@ impl Parser {
             labels: attributes,
             metric_unit: family.unit.clone(),
             metric_type,
-            sample: Sample { timestamp, value },
+            sample: Sample {
+                timestamp_ms: timestamp,
+                value,
+            },
         };
 
         self.samples.push(sample);
@@ -214,7 +217,7 @@ impl Parser {
         Ok((metric_name.to_string(), labels, rest))
     }
 
-    fn parse_value_and_timestamp(&self, rest: &str) -> Result<(f64, u64)> {
+    fn parse_value_and_timestamp(&self, rest: &str) -> Result<(f64, i64)> {
         let parts: Vec<&str> = rest.split_whitespace().collect();
 
         if parts.is_empty() {
@@ -230,10 +233,10 @@ impl Parser {
             let ts_raw = parse_float(parts[1])?;
             if ts_raw < 1e12 {
                 // Likely seconds (OpenMetrics format)
-                (ts_raw * 1000.0) as u64
+                (ts_raw * 1000.0) as i64
             } else {
                 // Likely milliseconds (Prometheus format)
-                ts_raw as u64
+                ts_raw as i64
             }
         } else {
             self.default_timestamp
@@ -540,7 +543,7 @@ mod tests {
     // Prometheus format (milliseconds) - values >= 1e12 are treated as milliseconds
     #[case::prometheus_milliseconds("1700000000000", 1700000000000)]
     #[case::prometheus_milliseconds_recent("1702500000000", 1702500000000)]
-    fn should_parse_timestamps(#[case] ts_str: &str, #[case] expected_ms: u64) {
+    fn should_parse_timestamps(#[case] ts_str: &str, #[case] expected_ms: i64) {
         // given
         let input = format!("test 1 {}\n# EOF", ts_str);
 
@@ -548,7 +551,7 @@ mod tests {
         let samples = parse_openmetrics(&input).unwrap();
 
         // then
-        assert_eq!(samples[0].sample.timestamp, expected_ms);
+        assert_eq!(samples[0].sample.timestamp_ms, expected_ms);
     }
 
     #[test]
@@ -558,7 +561,7 @@ mod tests {
         let before = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64;
+            .as_millis() as i64;
 
         // when
         let samples = parse_openmetrics(input).unwrap();
@@ -567,9 +570,9 @@ mod tests {
         let after = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64;
-        assert!(samples[0].sample.timestamp >= before);
-        assert!(samples[0].sample.timestamp <= after);
+            .as_millis() as i64;
+        assert!(samples[0].sample.timestamp_ms >= before);
+        assert!(samples[0].sample.timestamp_ms <= after);
     }
 
     // ==================== LABEL PARSING ====================

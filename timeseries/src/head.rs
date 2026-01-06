@@ -7,12 +7,13 @@ use dashmap::DashMap;
 use opendata_common::Storage;
 use opendata_common::storage::StorageSnapshot;
 
-use crate::error::TimeseriesError;
+use crate::error::Error;
+use crate::series::Sample;
 use crate::util::Result;
 use crate::{
     delta::TsdbDelta,
     index::{ForwardIndex, InvertedIndex},
-    model::{Sample, SeriesFingerprint, SeriesId, TimeBucket},
+    model::{SeriesFingerprint, SeriesId, TimeBucket},
     storage::OpenTsdbStorageExt,
 };
 
@@ -72,7 +73,7 @@ impl TsdbHead {
 
     pub fn merge(&self, delta: &TsdbDelta) -> Result<()> {
         if self.frozen.load(Ordering::SeqCst) {
-            return Err(TimeseriesError::Internal("TsdbHead is frozen".to_string()));
+            return Err(Error::Internal("TsdbHead is frozen".to_string()));
         }
 
         self.forward_index.merge(&delta.forward_index);
@@ -99,7 +100,7 @@ impl TsdbHead {
 
     pub async fn flush(&self, storage: Arc<dyn Storage>) -> Result<Arc<dyn StorageSnapshot>> {
         if !self.frozen.load(Ordering::SeqCst) {
-            return Err(TimeseriesError::Internal(
+            return Err(Error::Internal(
                 "Should only flush frozen TsdbHead".to_string(),
             ));
         }

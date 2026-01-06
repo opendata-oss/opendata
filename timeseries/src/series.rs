@@ -94,18 +94,36 @@ impl Sample {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Temporality {
+    Cumulative,
+    Delta,
+    Unspecified,
+}
+
 /// The type of a metric.
 ///
 /// This enum represents the two fundamental metric types in time series data:
 ///
 /// - **Gauge**: A value that can go up or down (e.g., temperature, memory usage)
-/// - **Counter**: A monotonically increasing value (e.g., request count, bytes sent)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// - **Sum**: A monotonically increasing value (e.g., request count, bytes sent)
+/// - **Histogram**: A value that can go up or down (e.g., temperature, memory usage)
+/// - **ExponentialHistogram**: A value that can go up or down (e.g., temperature, memory usage)
+/// - **Summary**: A value that can go up or down (e.g., temperature, memory usage)
+#[derive(Clone, Copy, Debug)]
 pub enum MetricType {
-    /// A metric that can increase or decrease.
     Gauge,
-    /// A monotonically increasing metric.
-    Counter,
+    Sum {
+        monotonic: bool,
+        temporality: Temporality,
+    },
+    Histogram {
+        temporality: Temporality,
+    },
+    ExponentialHistogram {
+        temporality: Temporality,
+    },
+    Summary,
 }
 
 /// A time series with its identifying labels and data points.

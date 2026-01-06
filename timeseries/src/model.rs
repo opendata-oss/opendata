@@ -2,7 +2,7 @@
 
 use std::time::SystemTime;
 
-use crate::series::Label;
+use crate::series::{Label, MetricType, Sample};
 use crate::util::{Result, hour_bucket_in_epoch_minutes};
 
 /// Series ID (unique within a time bucket)
@@ -21,30 +21,6 @@ pub(crate) type BucketSize = u8;
 /// Encoded as a single byte with high 4 bits for type and low 4 bits for bucket size (or reserved).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RecordTag(pub(crate) u8);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Temporality {
-    Cumulative,
-    Delta,
-    Unspecified,
-}
-
-/// Metric type (gauge, sum, histogram, exponential histogram, summary)
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum MetricType {
-    Gauge,
-    Sum {
-        monotonic: bool,
-        temporality: Temporality,
-    },
-    Histogram {
-        temporality: Temporality,
-    },
-    ExponentialHistogram {
-        temporality: Temporality,
-    },
-    Summary,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct TimeBucket {
@@ -72,12 +48,6 @@ pub(crate) struct SeriesSpec {
     pub(crate) metric_unit: Option<String>,
     pub(crate) metric_type: MetricType,
     pub(crate) labels: Vec<Label>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Sample {
-    pub(crate) timestamp: u64,
-    pub(crate) value: f64,
 }
 
 /// A sample with all its labels, including the metric name

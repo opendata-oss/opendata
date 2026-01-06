@@ -5,12 +5,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use dashmap::DashMap;
 
+use crate::series::{MetricType, Sample};
 use crate::{
-    error::TimeseriesError,
+    error::Error,
     index::{ForwardIndex, InvertedIndex},
-    model::{
-        MetricType, Sample, SampleWithLabels, SeriesFingerprint, SeriesId, SeriesSpec, TimeBucket,
-    },
+    model::{SampleWithLabels, SeriesFingerprint, SeriesId, SeriesSpec, TimeBucket},
     series::Label,
     util::{Fingerprint, Result},
 };
@@ -63,13 +62,13 @@ impl<'a> TsdbDeltaBuilder<'a> {
         sample: Sample,
     ) -> Result<()> {
         // Validate sample timestamp is within bucket range
-        let bucket_start_ms = self.bucket.start as u64 * 60 * 1000;
+        let bucket_start_ms = self.bucket.start as i64 * 60 * 1000;
         let bucket_end_ms =
-            (self.bucket.start as u64 + self.bucket.size_in_mins() as u64) * 60 * 1000;
-        if sample.timestamp < bucket_start_ms || sample.timestamp >= bucket_end_ms {
-            return Err(TimeseriesError::InvalidInput(format!(
+            (self.bucket.start as i64 + self.bucket.size_in_mins() as i64) * 60 * 1000;
+        if sample.timestamp_ms < bucket_start_ms || sample.timestamp_ms >= bucket_end_ms {
+            return Err(Error::InvalidInput(format!(
                 "Sample timestamp {} is outside bucket range [{}, {})",
-                sample.timestamp, bucket_start_ms, bucket_end_ms
+                sample.timestamp_ms, bucket_start_ms, bucket_end_ms
             )));
         }
 
@@ -185,7 +184,8 @@ impl TsdbDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{MetricType, Temporality};
+    use crate::series::MetricType;
+    use crate::series::Temporality;
     use dashmap::DashMap;
     use std::sync::atomic::AtomicU32;
 
@@ -209,7 +209,7 @@ mod tests {
     fn create_test_sample() -> Sample {
         // Timestamp must be within bucket range (1000 min = 60,000,000 ms to 1060 min = 63,600,000 ms)
         Sample {
-            timestamp: 60_000_001,
+            timestamp_ms: 60_000_001,
             value: 42.5,
         }
     }
@@ -275,11 +275,11 @@ mod tests {
         let labels = create_test_labels();
         // Timestamps must be within bucket range (60,000,000 to 63,600,000 ms)
         let sample1 = Sample {
-            timestamp: 60_000_001,
+            timestamp_ms: 60_000_001,
             value: 10.0,
         };
         let sample2 = Sample {
-            timestamp: 60_000_002,
+            timestamp_ms: 60_000_002,
             value: 20.0,
         };
         let metric_type = MetricType::Gauge;
@@ -646,7 +646,7 @@ mod tests {
                     Some("bytes".to_string()),
                     MetricType::Gauge,
                     Sample {
-                        timestamp: 60_000_001,
+                        timestamp_ms: 60_000_001,
                         value: 42.0,
                     },
                 )
@@ -668,7 +668,7 @@ mod tests {
                     Some("bytes".to_string()),
                     MetricType::Gauge,
                     Sample {
-                        timestamp: 60_000_002,
+                        timestamp_ms: 60_000_002,
                         value: 43.0,
                     },
                 )
@@ -734,7 +734,7 @@ mod tests {
         let metric_type = MetricType::Gauge;
         // Timestamp before bucket start (60,000,000 ms)
         let sample = Sample {
-            timestamp: 59_999_999,
+            timestamp_ms: 59_999_999,
             value: 42.5,
         };
 
@@ -744,7 +744,7 @@ mod tests {
         // then
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, TimeseriesError::InvalidInput(_)));
+        assert!(matches!(err, Error::InvalidInput(_)));
         assert!(err.to_string().contains("outside bucket range"));
     }
 
@@ -759,7 +759,7 @@ mod tests {
         let metric_type = MetricType::Gauge;
         // Timestamp at bucket end (63,600,000 ms) - should be rejected (exclusive end)
         let sample = Sample {
-            timestamp: 63_600_000,
+            timestamp_ms: 63_600_000,
             value: 42.5,
         };
 
@@ -769,7 +769,7 @@ mod tests {
         // then
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, TimeseriesError::InvalidInput(_)));
+        assert!(matches!(err, Error::InvalidInput(_)));
         assert!(err.to_string().contains("outside bucket range"));
     }
 }

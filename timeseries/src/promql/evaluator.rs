@@ -33,8 +33,8 @@ impl Display for EvaluationError {
 
 impl std::error::Error for EvaluationError {}
 
-impl From<crate::error::TimeseriesError> for EvaluationError {
-    fn from(err: crate::error::TimeseriesError) -> Self {
+impl From<crate::error::Error> for EvaluationError {
+    fn from(err: crate::error::Error) -> Self {
         EvaluationError::StorageError(err.to_string())
     }
 }
@@ -44,7 +44,7 @@ pub(crate) type EvalResult<T> = std::result::Result<T, EvaluationError>;
 // ToDo(cadonna): Add histogram samples
 #[derive(Debug, Clone)]
 pub struct EvalSample {
-    pub(crate) timestamp_ms: u64,
+    pub(crate) timestamp_ms: i64,
     pub(crate) value: f64,
     pub(crate) labels: HashMap<String, String>,
 }
@@ -153,8 +153,8 @@ impl<'a, R: QueryReader> Evaluator<'a, R> {
         let end_ms = end
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64;
-        let start_ms = end_ms - (lookback_delta.as_millis() as u64);
+            .as_millis() as i64;
+        let start_ms = end_ms - (lookback_delta.as_millis() as i64);
 
         // Use the selector module to find matching series
         let candidates =
@@ -195,7 +195,7 @@ impl<'a, R: QueryReader> Evaluator<'a, R> {
                 let labels = self.labels_to_hashmap(&series_spec.labels);
 
                 samples.push(EvalSample {
-                    timestamp_ms: best_sample.timestamp,
+                    timestamp_ms: best_sample.timestamp_ms,
                     value: best_sample.value,
                     labels,
                 });
@@ -252,7 +252,7 @@ impl<'a, R: QueryReader> Evaluator<'a, R> {
         let eval_timestamp_ms = end
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64;
+            .as_millis() as i64;
 
         // Apply the function with the evaluation timestamp
         let result = func.apply(arg_samples, eval_timestamp_ms)?;
@@ -516,7 +516,7 @@ impl<'a, R: QueryReader> Evaluator<'a, R> {
         let timestamp_ms = end
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64;
+            .as_millis() as i64;
 
         // Aggregate each group
         let mut result_samples = Vec::new();
@@ -555,9 +555,9 @@ impl<'a, R: QueryReader> Evaluator<'a, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{MetricType, Sample, TimeBucket};
+    use crate::model::TimeBucket;
     use crate::query::test_utils::MockQueryReaderBuilder;
-    use crate::series::Label;
+    use crate::series::{Label, MetricType, Sample};
     use crate::test_utils::assertions::approx_eq;
     use promql_parser::label::METRIC_NAME;
     use promql_parser::parser::EvalStmt;
@@ -565,7 +565,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     /// Type alias for test data: (metric_name, labels, timestamp_offset_ms, value)
-    type TestSampleData = Vec<(&'static str, Vec<(&'static str, &'static str)>, u64, f64)>;
+    type TestSampleData = Vec<(&'static str, Vec<(&'static str, &'static str)>, i64, f64)>;
 
     /// Helper to parse a PromQL query and evaluate it
     async fn parse_and_evaluate<R: QueryReader>(
@@ -677,7 +677,7 @@ mod tests {
 
         // Base timestamp: 300001ms (ensures samples are > start_ms with 5min lookback)
         // Query time will be calculated to be well after all samples
-        let base_timestamp = 300001u64;
+        let base_timestamp = 300001i64;
 
         // Find max offset before consuming data
         let max_offset = data
@@ -689,7 +689,7 @@ mod tests {
         for (metric_name, labels, offset_ms, value) in data {
             let attributes = create_labels(metric_name, labels);
             let sample = Sample {
-                timestamp: base_timestamp + offset_ms,
+                timestamp_ms: base_timestamp + offset_ms,
                 value,
             };
             builder.add_sample(attributes, MetricType::Gauge, sample);
@@ -705,7 +705,7 @@ mod tests {
         // This ensures start_ms = base_timestamp + max_offset + 1 - 300000 < base_timestamp
         // So all samples at base_timestamp + offset (where offset <= max_offset) are included
         let query_timestamp = base_timestamp + max_offset + 1;
-        let end_time = UNIX_EPOCH + Duration::from_millis(query_timestamp);
+        let end_time = UNIX_EPOCH + Duration::from_millis(query_timestamp as u64);
 
         (builder.build(), end_time)
     }

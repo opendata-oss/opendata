@@ -1,6 +1,6 @@
 // TimeSeries value structure with Gorilla compression using tsz crate
 
-use crate::model::Sample;
+use crate::series::Sample;
 
 use super::*;
 use bytes::Bytes;
@@ -155,7 +155,7 @@ impl<'a> Iterator for TimeSeriesIterator<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self.decoder.next() {
             Ok(dp) => Some(Ok(Sample {
-                timestamp: dp.get_time(),
+                timestamp_ms: dp.get_time() as i64,
                 value: dp.get_value(),
             })),
             Err(tsz::decode::Error::EndOfStream) => None,
@@ -182,11 +182,11 @@ impl TimeSeriesValue {
 
         // Use Gorilla compression
         let w = BufferedWriter::new();
-        let start_time = self.points[0].timestamp;
+        let start_time = self.points[0].timestamp_ms as u64;
         let mut encoder = StdEncoder::new(start_time, w);
 
         for point in &self.points {
-            let dp = DataPoint::new(point.timestamp, point.value);
+            let dp = DataPoint::new(point.timestamp_ms as u64, point.value);
             encoder.encode(dp);
         }
 
@@ -246,9 +246,9 @@ pub(crate) fn merge_time_series(base: Bytes, other: Bytes) -> Result<Bytes, Enco
     let mut other_sample = other_iter.next().transpose()?;
 
     let start_time = match (&base_sample, &other_sample) {
-        (Some(bs), Some(os)) => bs.timestamp.min(os.timestamp),
-        (Some(bs), None) => bs.timestamp,
-        (None, Some(os)) => os.timestamp,
+        (Some(bs), Some(os)) => bs.timestamp_ms.min(os.timestamp_ms),
+        (Some(bs), None) => bs.timestamp_ms,
+        (None, Some(os)) => os.timestamp_ms,
         (None, None) => {
             // Both iterators returned None immediately - treat as empty
             return Ok(Bytes::new());
@@ -257,35 +257,35 @@ pub(crate) fn merge_time_series(base: Bytes, other: Bytes) -> Result<Bytes, Enco
 
     // Create encoder for output
     let writer = BufferedWriter::new();
-    let mut encoder = StdEncoder::new(start_time, writer);
+    let mut encoder = StdEncoder::new(start_time as u64, writer);
 
     // Sorted merge with deduplication (keeping 'other' value on timestamp collision)
     while base_sample.is_some() || other_sample.is_some() {
         match (&base_sample, &other_sample) {
             (Some(bs), Some(os)) => {
-                if bs.timestamp < os.timestamp {
+                if bs.timestamp_ms < os.timestamp_ms {
                     // Take from base
-                    encoder.encode(DataPoint::new(bs.timestamp, bs.value));
+                    encoder.encode(DataPoint::new(bs.timestamp_ms as u64, bs.value));
                     base_sample = base_iter.next().transpose()?;
-                } else if bs.timestamp > os.timestamp {
+                } else if bs.timestamp_ms > os.timestamp_ms {
                     // Take from other
-                    encoder.encode(DataPoint::new(os.timestamp, os.value));
+                    encoder.encode(DataPoint::new(os.timestamp_ms as u64, os.value));
                     other_sample = other_iter.next().transpose()?;
                 } else {
                     // Equal timestamps: take from other (last write wins)
-                    encoder.encode(DataPoint::new(os.timestamp, os.value));
+                    encoder.encode(DataPoint::new(os.timestamp_ms as u64, os.value));
                     base_sample = base_iter.next().transpose()?;
                     other_sample = other_iter.next().transpose()?;
                 }
             }
             (Some(bs), None) => {
                 // Only base remaining
-                encoder.encode(DataPoint::new(bs.timestamp, bs.value));
+                encoder.encode(DataPoint::new(bs.timestamp_ms as u64, bs.value));
                 base_sample = base_iter.next().transpose()?;
             }
             (None, Some(os)) => {
                 // Only other remaining
-                encoder.encode(DataPoint::new(os.timestamp, os.value));
+                encoder.encode(DataPoint::new(os.timestamp_ms as u64, os.value));
                 other_sample = other_iter.next().transpose()?;
             }
             (None, None) => break,
@@ -309,15 +309,15 @@ mod tests {
         let value = TimeSeriesValue {
             points: vec![
                 Sample {
-                    timestamp: 1000,
+                    timestamp_ms: 1000,
                     value: 10.0,
                 },
                 Sample {
-                    timestamp: 2000,
+                    timestamp_ms: 2000,
                     value: 20.0,
                 },
                 Sample {
-                    timestamp: 3000,
+                    timestamp_ms: 3000,
                     value: 30.0,
                 },
             ],
@@ -349,7 +349,7 @@ mod tests {
         // given
         let value = TimeSeriesValue {
             points: vec![Sample {
-                timestamp: 1609459200,
+                timestamp_ms: 1609459200,
                 value: 42.5,
             }],
         };
@@ -368,19 +368,19 @@ mod tests {
         let value = TimeSeriesValue {
             points: vec![
                 Sample {
-                    timestamp: 1000,
+                    timestamp_ms: 1000,
                     value: f64::INFINITY,
                 },
                 Sample {
-                    timestamp: 2000,
+                    timestamp_ms: 2000,
                     value: f64::NEG_INFINITY,
                 },
                 Sample {
-                    timestamp: 3000,
+                    timestamp_ms: 3000,
                     value: 0.0,
                 },
                 Sample {
-                    timestamp: 4000,
+                    timestamp_ms: 4000,
                     value: -0.0,
                 },
             ],
@@ -404,15 +404,15 @@ mod tests {
         let base = TimeSeriesValue {
             points: vec![
                 Sample {
-                    timestamp: 1000,
+                    timestamp_ms: 1000,
                     value: 10.0,
                 },
                 Sample {
-                    timestamp: 2000,
+                    timestamp_ms: 2000,
                     value: 20.0,
                 },
                 Sample {
-                    timestamp: 3000,
+                    timestamp_ms: 3000,
                     value: 30.0,
                 },
             ],
@@ -422,15 +422,15 @@ mod tests {
         let other = TimeSeriesValue {
             points: vec![
                 Sample {
-                    timestamp: 2000,
+                    timestamp_ms: 2000,
                     value: 200.0, // Should override base's 20.0
                 },
                 Sample {
-                    timestamp: 3000,
+                    timestamp_ms: 3000,
                     value: 300.0, // Should override base's 30.0
                 },
                 Sample {
-                    timestamp: 4000,
+                    timestamp_ms: 4000,
                     value: 40.0,
                 },
             ],
@@ -443,13 +443,13 @@ mod tests {
 
         // then: should have 4 points with duplicates resolved (last write wins)
         assert_eq!(merged.points.len(), 4);
-        assert_eq!(merged.points[0].timestamp, 1000);
+        assert_eq!(merged.points[0].timestamp_ms, 1000);
         assert_eq!(merged.points[0].value, 10.0); // From base
-        assert_eq!(merged.points[1].timestamp, 2000);
+        assert_eq!(merged.points[1].timestamp_ms, 2000);
         assert_eq!(merged.points[1].value, 200.0); // From other (overrides base)
-        assert_eq!(merged.points[2].timestamp, 3000);
+        assert_eq!(merged.points[2].timestamp_ms, 3000);
         assert_eq!(merged.points[2].value, 300.0); // From other (overrides base)
-        assert_eq!(merged.points[3].timestamp, 4000);
+        assert_eq!(merged.points[3].timestamp_ms, 4000);
         assert_eq!(merged.points[3].value, 40.0); // From other
     }
 
@@ -459,15 +459,15 @@ mod tests {
         let base = TimeSeriesValue {
             points: vec![
                 Sample {
-                    timestamp: 1000,
+                    timestamp_ms: 1000,
                     value: 10.0,
                 },
                 Sample {
-                    timestamp: 3000,
+                    timestamp_ms: 3000,
                     value: 30.0,
                 },
                 Sample {
-                    timestamp: 5000,
+                    timestamp_ms: 5000,
                     value: 50.0,
                 },
             ],
@@ -477,15 +477,15 @@ mod tests {
         let other = TimeSeriesValue {
             points: vec![
                 Sample {
-                    timestamp: 2000,
+                    timestamp_ms: 2000,
                     value: 20.0,
                 },
                 Sample {
-                    timestamp: 4000,
+                    timestamp_ms: 4000,
                     value: 40.0,
                 },
                 Sample {
-                    timestamp: 6000,
+                    timestamp_ms: 6000,
                     value: 60.0,
                 },
             ],
@@ -498,11 +498,11 @@ mod tests {
 
         // then: should have all 6 points in sorted order
         assert_eq!(merged.points.len(), 6);
-        assert_eq!(merged.points[0].timestamp, 1000);
-        assert_eq!(merged.points[1].timestamp, 2000);
-        assert_eq!(merged.points[2].timestamp, 3000);
-        assert_eq!(merged.points[3].timestamp, 4000);
-        assert_eq!(merged.points[4].timestamp, 5000);
-        assert_eq!(merged.points[5].timestamp, 6000);
+        assert_eq!(merged.points[0].timestamp_ms, 1000);
+        assert_eq!(merged.points[1].timestamp_ms, 2000);
+        assert_eq!(merged.points[2].timestamp_ms, 3000);
+        assert_eq!(merged.points[3].timestamp_ms, 4000);
+        assert_eq!(merged.points[4].timestamp_ms, 5000);
+        assert_eq!(merged.points[5].timestamp_ms, 6000);
     }
 }

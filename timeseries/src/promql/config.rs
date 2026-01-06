@@ -105,11 +105,11 @@ pub struct StaticConfig {
 /// Load Prometheus configuration from a YAML file.
 pub fn load_config<P: AsRef<Path>>(path: P) -> Result<PrometheusConfig> {
     let contents = std::fs::read_to_string(path.as_ref()).map_err(|e| {
-        crate::error::TimeseriesError::InvalidInput(format!("Failed to read config file: {}", e))
+        crate::error::Error::InvalidInput(format!("Failed to read config file: {}", e))
     })?;
 
     serde_yaml::from_str(&contents).map_err(|e| {
-        crate::error::TimeseriesError::InvalidInput(format!("Failed to parse config file: {}", e))
+        crate::error::Error::InvalidInput(format!("Failed to parse config file: {}", e))
     })
 }
 
@@ -141,7 +141,7 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
         "h" => 3600.0,
         "d" => 86400.0,
         _ => {
-            return Err(crate::error::TimeseriesError::InvalidInput(format!(
+            return Err(crate::error::Error::InvalidInput(format!(
                 "Unknown duration unit: {}",
                 unit
             )));

@@ -10,9 +10,9 @@ use opendata_common::Storage;
 
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndex, InvertedIndexLookup};
 use crate::minitsdb::MiniTsdb;
-use crate::model::{Sample, SampleWithLabels, SeriesId, TimeBucket};
+use crate::model::{SampleWithLabels, SeriesId, TimeBucket};
 use crate::query::QueryReader;
-use crate::series::Label;
+use crate::series::{Label, Sample};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::util::Result;
 
@@ -130,7 +130,8 @@ impl Tsdb {
 
         for sample in samples {
             let bucket = TimeBucket::round_to_hour(
-                std::time::UNIX_EPOCH + std::time::Duration::from_millis(sample.sample.timestamp),
+                std::time::UNIX_EPOCH
+                    + std::time::Duration::from_millis(sample.sample.timestamp_ms as u64),
             )?;
             by_bucket.entry(bucket).or_default().push(sample);
         }
@@ -252,8 +253,8 @@ impl QueryReader for TsdbQueryReader {
     async fn samples(
         &self,
         series_id: SeriesId,
-        start_ms: u64,
-        end_ms: u64,
+        start_ms: i64,
+        end_ms: i64,
     ) -> Result<Vec<Sample>> {
         // Collect samples from all buckets and concatenate
         // Since buckets don't overlap in time, we can just append
@@ -266,7 +267,7 @@ impl QueryReader for TsdbQueryReader {
         }
 
         // Sort by timestamp to ensure correct ordering across buckets
-        all_samples.sort_by_key(|s| s.timestamp);
+        all_samples.sort_by_key(|s| s.timestamp_ms);
 
         Ok(all_samples)
     }
@@ -275,7 +276,8 @@ impl QueryReader for TsdbQueryReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{MetricType, SampleWithLabels};
+    use crate::model::SampleWithLabels;
+    use crate::series::MetricType;
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
     use opendata_common::storage::in_memory::InMemoryStorage;
 
@@ -288,7 +290,7 @@ mod tests {
     fn create_sample(
         metric_name: &str,
         label_pairs: Vec<(&str, &str)>,
-        timestamp: u64,
+        timestamp: i64,
         value: f64,
     ) -> SampleWithLabels {
         let mut labels = vec![Label {
@@ -305,7 +307,10 @@ mod tests {
             labels,
             metric_unit: None,
             metric_type: MetricType::Gauge,
-            sample: Sample { timestamp, value },
+            sample: Sample {
+                timestamp_ms: timestamp,
+                value,
+            },
         }
     }
 
