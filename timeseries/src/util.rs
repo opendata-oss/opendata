@@ -3,71 +3,10 @@
 use blake3::Hasher;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use opendata_common::StorageError;
-
+use crate::error::TimeseriesError;
 use crate::series::Label;
 
-/// Error type for OpenTSDB operations
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OpenTsdbError {
-    /// Storage-related errors
-    Storage(String),
-    /// Encoding/decoding errors
-    Encoding(String),
-    /// Invalid input or parameter errors
-    InvalidInput(String),
-    /// Internal errors
-    Internal(String),
-}
-
-impl std::error::Error for OpenTsdbError {}
-
-impl std::fmt::Display for OpenTsdbError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            OpenTsdbError::Storage(msg) => write!(f, "Storage error: {}", msg),
-            OpenTsdbError::Encoding(msg) => write!(f, "Encoding error: {}", msg),
-            OpenTsdbError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
-            OpenTsdbError::Internal(msg) => write!(f, "Internal error: {}", msg),
-        }
-    }
-}
-
-impl From<std::time::SystemTimeError> for OpenTsdbError {
-    fn from(err: std::time::SystemTimeError) -> Self {
-        OpenTsdbError::InvalidInput(format!("Invalid timestamp: {}", err))
-    }
-}
-
-impl From<std::num::TryFromIntError> for OpenTsdbError {
-    fn from(err: std::num::TryFromIntError) -> Self {
-        OpenTsdbError::InvalidInput(format!("Integer conversion error: {}", err))
-    }
-}
-
-impl From<&str> for OpenTsdbError {
-    fn from(msg: &str) -> Self {
-        OpenTsdbError::InvalidInput(msg.to_string())
-    }
-}
-
-impl From<StorageError> for OpenTsdbError {
-    fn from(err: StorageError) -> Self {
-        match err {
-            StorageError::Storage(msg) => OpenTsdbError::Storage(msg),
-            StorageError::Internal(msg) => OpenTsdbError::Internal(msg),
-        }
-    }
-}
-
-impl From<crate::serde::EncodingError> for OpenTsdbError {
-    fn from(err: crate::serde::EncodingError) -> Self {
-        OpenTsdbError::Encoding(err.message)
-    }
-}
-
-/// Result type alias for OpenTSDB operations
-pub type Result<T> = std::result::Result<T, OpenTsdbError>;
+pub use crate::error::Result;
 
 /// Computes a Blake3 hash of a string, truncated to u64 for use as a fingerprint
 /// in dictionary keys (attribute keys and values).
@@ -112,20 +51,20 @@ pub fn parse_timestamp(s: &str) -> Result<SystemTime> {
     match s.parse::<f64>() {
         Ok(secs) => {
             if secs < 0.0 {
-                return Err(OpenTsdbError::InvalidInput(format!(
+                return Err(TimeseriesError::InvalidInput(format!(
                     "Invalid timestamp: negative value {}",
                     secs
                 )));
             }
             Duration::try_from_secs_f64(secs)
-                .map_err(|e| OpenTsdbError::InvalidInput(format!("Invalid timestamp: {}", e)))
+                .map_err(|e| TimeseriesError::InvalidInput(format!("Invalid timestamp: {}", e)))
                 .and_then(|duration| {
                     SystemTime::UNIX_EPOCH.checked_add(duration).ok_or_else(|| {
-                        OpenTsdbError::InvalidInput("Invalid timestamp: overflow".to_string())
+                        TimeseriesError::InvalidInput("Invalid timestamp: overflow".to_string())
                     })
                 })
         }
-        Err(e) => Err(OpenTsdbError::InvalidInput(format!(
+        Err(e) => Err(TimeseriesError::InvalidInput(format!(
             "Could not parse timestamp '{}': not RFC3339 or float ({})",
             s, e
         ))),
@@ -138,7 +77,7 @@ pub fn parse_timestamp_to_seconds(s: &str) -> Result<i64> {
     parse_timestamp(s).and_then(|st| {
         st.duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
-            .map_err(|e| OpenTsdbError::InvalidInput(format!("Invalid timestamp: {}", e)))
+            .map_err(|e| TimeseriesError::InvalidInput(format!("Invalid timestamp: {}", e)))
     })
 }
 
@@ -148,18 +87,18 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     // Try parsing as float (seconds)
     if let Ok(secs) = s.parse::<f64>() {
         if secs < 0.0 {
-            return Err(OpenTsdbError::InvalidInput(format!(
+            return Err(TimeseriesError::InvalidInput(format!(
                 "Invalid duration: negative value {}",
                 secs
             )));
         }
         return Duration::try_from_secs_f64(secs)
-            .map_err(|e| OpenTsdbError::InvalidInput(format!("Invalid duration: {}", e)));
+            .map_err(|e| TimeseriesError::InvalidInput(format!("Invalid duration: {}", e)));
     }
 
     // Try parsing Prometheus duration format
     promql_parser::util::parse_duration(s)
-        .map_err(|e| OpenTsdbError::InvalidInput(format!("Invalid duration: {}", e)))
+        .map_err(|e| TimeseriesError::InvalidInput(format!("Invalid duration: {}", e)))
 }
 
 /// Truncate `time` down to the start of the hour and return the Unix epoch minutes as `u32`.

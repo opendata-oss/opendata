@@ -6,12 +6,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use dashmap::DashMap;
 
 use crate::{
+    error::TimeseriesError,
     index::{ForwardIndex, InvertedIndex},
     model::{
         MetricType, Sample, SampleWithLabels, SeriesFingerprint, SeriesId, SeriesSpec, TimeBucket,
     },
     series::Label,
-    util::{Fingerprint, OpenTsdbError, Result},
+    util::{Fingerprint, Result},
 };
 
 /// The delta chunk is the current in-memory segment of OpenTSDB representing
@@ -66,7 +67,7 @@ impl<'a> TsdbDeltaBuilder<'a> {
         let bucket_end_ms =
             (self.bucket.start as u64 + self.bucket.size_in_mins() as u64) * 60 * 1000;
         if sample.timestamp < bucket_start_ms || sample.timestamp >= bucket_end_ms {
-            return Err(OpenTsdbError::InvalidInput(format!(
+            return Err(TimeseriesError::InvalidInput(format!(
                 "Sample timestamp {} is outside bucket range [{}, {})",
                 sample.timestamp, bucket_start_ms, bucket_end_ms
             )));
@@ -743,7 +744,7 @@ mod tests {
         // then
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, OpenTsdbError::InvalidInput(_)));
+        assert!(matches!(err, TimeseriesError::InvalidInput(_)));
         assert!(err.to_string().contains("outside bucket range"));
     }
 
@@ -768,7 +769,7 @@ mod tests {
         // then
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, OpenTsdbError::InvalidInput(_)));
+        assert!(matches!(err, TimeseriesError::InvalidInput(_)));
         assert!(err.to_string().contains("outside bucket range"));
     }
 }

@@ -54,12 +54,12 @@ mod util;
 
 // Public API modules
 mod config;
-mod error;
+pub(crate) mod error;
 pub(crate) mod series;
 mod timeseries;
 
 // Public re-exports
 pub use config::{Config, WriteOptions};
-pub use error::{Error, Result};
+pub use error::{Result, TimeseriesError};
 pub use series::{Label, MetricType, Sample, Series, SeriesBuilder};
 pub use timeseries::TimeSeries;
