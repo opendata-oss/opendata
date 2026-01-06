@@ -9,10 +9,10 @@ use tokio::time::interval;
 use super::config::{PrometheusConfig, ScrapeConfig};
 use super::metrics::{Metrics, ScrapeLabels};
 use super::openmetrics::parse_openmetrics;
+use crate::error::TimeseriesError;
 use crate::model::{MetricType, Sample, SampleWithLabels};
 use crate::series::Label;
 use crate::tsdb::Tsdb;
-use crate::util::OpenTsdbError;
 use crate::util::Result;
 
 /// Scraper that periodically fetches metrics from configured targets.
@@ -180,20 +180,19 @@ impl Scraper {
             .get(&url)
             .send()
             .await
-            .map_err(|e| OpenTsdbError::Internal(format!("HTTP request failed: {}", e)))?;
+            .map_err(|e| TimeseriesError::Internal(format!("HTTP request failed: {}", e)))?;
 
         if !response.status().is_success() {
-            return Err(OpenTsdbError::Internal(format!(
+            return Err(TimeseriesError::Internal(format!(
                 "HTTP {} from {}",
                 response.status(),
                 url
             )));
         }
 
-        let body = response
-            .text()
-            .await
-            .map_err(|e| OpenTsdbError::Internal(format!("Failed to read response body: {}", e)))?;
+        let body = response.text().await.map_err(|e| {
+            TimeseriesError::Internal(format!("Failed to read response body: {}", e))
+        })?;
 
         // Parse the OpenMetrics/Prometheus format
         let mut samples = parse_openmetrics(&body)?;

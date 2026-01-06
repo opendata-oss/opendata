@@ -2,7 +2,8 @@ use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
-use crate::util::{OpenTsdbError, parse_duration, parse_timestamp, parse_timestamp_to_seconds};
+use crate::error::TimeseriesError;
+use crate::util::{parse_duration, parse_timestamp, parse_timestamp_to_seconds};
 
 // =============================================================================
 // Domain Request Types (parsed, validated)
@@ -80,7 +81,7 @@ pub struct QueryParams {
 }
 
 impl TryFrom<QueryParams> for QueryRequest {
-    type Error = OpenTsdbError;
+    type Error = TimeseriesError;
 
     fn try_from(params: QueryParams) -> Result<Self, Self::Error> {
         Ok(QueryRequest {
@@ -102,7 +103,7 @@ pub struct QueryRangeParams {
 }
 
 impl TryFrom<QueryRangeParams> for QueryRangeRequest {
-    type Error = OpenTsdbError;
+    type Error = TimeseriesError;
 
     fn try_from(params: QueryRangeParams) -> Result<Self, Self::Error> {
         Ok(QueryRangeRequest {
@@ -126,7 +127,7 @@ pub struct SeriesParams {
 }
 
 impl TryFrom<SeriesParams> for SeriesRequest {
-    type Error = OpenTsdbError;
+    type Error = TimeseriesError;
 
     fn try_from(params: SeriesParams) -> Result<Self, Self::Error> {
         Ok(SeriesRequest {
@@ -155,7 +156,7 @@ pub struct LabelsParams {
 }
 
 impl TryFrom<LabelsParams> for LabelsRequest {
-    type Error = OpenTsdbError;
+    type Error = TimeseriesError;
 
     fn try_from(params: LabelsParams) -> Result<Self, Self::Error> {
         Ok(LabelsRequest {
@@ -189,7 +190,7 @@ pub struct LabelValuesParams {
 
 impl LabelValuesParams {
     /// Convert to LabelValuesRequest with the label name from the path
-    pub fn into_request(self, label_name: String) -> Result<LabelValuesRequest, OpenTsdbError> {
+    pub fn into_request(self, label_name: String) -> Result<LabelValuesRequest, TimeseriesError> {
         Ok(LabelValuesRequest {
             label_name,
             matches: if self.matches.is_empty() {

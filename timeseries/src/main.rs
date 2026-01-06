@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod delta;
+mod error;
 mod head;
 mod index;
 mod minitsdb;

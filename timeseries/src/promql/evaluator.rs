@@ -33,8 +33,8 @@ impl Display for EvaluationError {
 
 impl std::error::Error for EvaluationError {}
 
-impl From<crate::util::OpenTsdbError> for EvaluationError {
-    fn from(err: crate::util::OpenTsdbError) -> Self {
+impl From<crate::error::TimeseriesError> for EvaluationError {
+    fn from(err: crate::error::TimeseriesError) -> Self {
         EvaluationError::StorageError(err.to_string())
     }
 }

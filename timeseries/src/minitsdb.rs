@@ -8,6 +8,7 @@ use opendata_common::{Storage, StorageRead};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::delta::{TsdbDelta, TsdbDeltaBuilder};
+use crate::error::TimeseriesError;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::model::{Sample, SampleWithLabels, SeriesFingerprint, SeriesId, TimeBucket};
 use crate::query::QueryReader;
@@ -15,7 +16,7 @@ use crate::serde::key::TimeSeriesKey;
 use crate::serde::timeseries::TimeSeriesIterator;
 use crate::series::Label;
 use crate::storage::{OpenTsdbStorageExt, OpenTsdbStorageReadExt};
-use crate::util::{OpenTsdbError, Result};
+use crate::util::Result;
 
 pub(crate) struct MiniQueryReader<'a> {
     bucket: &'a TimeBucket,
@@ -81,7 +82,7 @@ impl<'a> QueryReader for MiniQueryReader<'a> {
         match record {
             Some(record) => {
                 let iter = TimeSeriesIterator::new(record.value.as_ref()).ok_or_else(|| {
-                    OpenTsdbError::Internal("Invalid timeseries data in storage".into())
+                    TimeseriesError::Internal("Invalid timeseries data in storage".into())
                 })?;
 
                 let samples: Vec<Sample> = iter

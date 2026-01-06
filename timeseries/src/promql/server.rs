@@ -23,8 +23,8 @@ use super::response::{
 };
 use super::router::PromqlRouter;
 use super::scraper::Scraper;
+use crate::error::TimeseriesError;
 use crate::tsdb::Tsdb;
-use crate::util::OpenTsdbError;
 
 /// Shared application state.
 #[derive(Clone)]
@@ -133,16 +133,16 @@ impl PromqlServer {
     }
 }
 
-/// Error response wrapper for converting OpenTsdbError to HTTP responses
-struct ApiError(OpenTsdbError);
+/// Error response wrapper for converting TimeseriesError to HTTP responses
+struct ApiError(TimeseriesError);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, error_type) = match &self.0 {
-            OpenTsdbError::InvalidInput(_) => (StatusCode::BAD_REQUEST, "bad_data"),
-            OpenTsdbError::Storage(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
-            OpenTsdbError::Encoding(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
-            OpenTsdbError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+            TimeseriesError::InvalidInput(_) => (StatusCode::BAD_REQUEST, "bad_data"),
+            TimeseriesError::Storage(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+            TimeseriesError::Encoding(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+            TimeseriesError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };
 
         let body = serde_json::json!({
@@ -155,8 +155,8 @@ impl IntoResponse for ApiError {
     }
 }
 
-impl From<OpenTsdbError> for ApiError {
-    fn from(err: OpenTsdbError) -> Self {
+impl From<TimeseriesError> for ApiError {
+    fn from(err: TimeseriesError) -> Self {
         ApiError(err)
     }
 }
