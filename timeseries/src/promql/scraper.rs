@@ -158,7 +158,7 @@ impl Scraper {
             metric_unit: None,
             metric_type: MetricType::Gauge,
             sample: Sample {
-                timestamp_ms: timestamp_ms,
+                timestamp_ms,
                 value,
             },
         }

@@ -86,8 +86,7 @@ pub fn convert_write_request(request: WriteRequest) -> Vec<SampleWithLabels> {
                 metric_unit: None, // Remote Write 1.0 doesn't include unit info
                 metric_type: MetricType::Gauge, // Default to Gauge since type info not in 1.0
                 sample: Sample {
-                    // Convert from milliseconds (i64) to milliseconds (u64)
-                    timestamp_ms: sample.timestamp as u64,
+                    timestamp_ms: sample.timestamp,
                     value: sample.value,
                 },
             });
@@ -276,7 +275,7 @@ mod tests {
 
         // First sample
         assert_eq!(samples[0].sample.value, 100.0);
-        assert_eq!(samples[0].sample.timestamp, 1700000000000);
+        assert_eq!(samples[0].sample.timestamp_ms, 1700000000000);
         assert_eq!(samples[0].labels.len(), 2);
         assert!(
             samples[0]
@@ -293,7 +292,7 @@ mod tests {
 
         // Second sample
         assert_eq!(samples[1].sample.value, 150.0);
-        assert_eq!(samples[1].sample.timestamp, 1700000001000);
+        assert_eq!(samples[1].sample.timestamp_ms, 1700000001000);
     }
 
     #[test]
@@ -464,10 +463,10 @@ mod tests {
     // ==================== TIMESTAMP CONVERSION TESTS ====================
 
     #[rstest]
-    #[case::positive_timestamp(1700000000000i64, 1700000000000u64)]
-    #[case::zero_timestamp(0i64, 0u64)]
-    #[case::small_timestamp(1000i64, 1000u64)]
-    fn should_convert_timestamp_correctly(#[case] input: i64, #[case] expected: u64) {
+    #[case::positive_timestamp(1700000000000i64, 1700000000000i64)]
+    #[case::zero_timestamp(0i64, 0i64)]
+    #[case::small_timestamp(1000i64, 1000i64)]
+    fn should_convert_timestamp_correctly(#[case] input: i64, #[case] expected: i64) {
         // given
         let request = WriteRequest {
             timeseries: vec![TimeSeries {
@@ -483,7 +482,7 @@ mod tests {
         let samples = convert_write_request(request);
 
         // then
-        assert_eq!(samples[0].sample.timestamp, expected);
+        assert_eq!(samples[0].sample.timestamp_ms, expected);
     }
 
     // ==================== LARGE REQUEST TESTS ====================
