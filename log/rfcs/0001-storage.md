@@ -35,7 +35,7 @@ SlateDB keys are a composite of the user key and a `u64` sequence number. A vers
 
 ```
 Log Entry:
-  SlateDB Key:   | version (u8) | type (u8) | key (bytes) | sequence (u64) |
+  SlateDB Key:   | version (u8) | type (u8) | key (TerminatedBytes) | sequence (u64) |
   SlateDB Value: | record value (bytes) |
 ```
 
@@ -43,15 +43,55 @@ The initial version is `1`. The type discriminator `0x01` is reserved for log en
 
 This encoding preserves lexicographic key ordering, enabling key-range scans. Entries for the same key are ordered by sequence number.
 
-#### Variable-Length Key Considerations
+#### TerminatedBytes
 
-With variable-length keys, the boundary between key and sequence number is ambiguous during comparison. Two approaches to handle this:
+A `TerminatedBytes` is a variable-length byte sequence that terminates with a `0xFF` delimiter. This delimiter provides an unambiguous boundary between the user key and the sequence number, which is necessary for correct lexicographic ordering when keys have variable length.
 
-**Custom comparator** — SlateDB could support a custom comparator that treats the key and sequence number as separate components. This would enable correct ordering without encoding changes.
+To allow arbitrary byte sequences in user keys (including `0xFE` and `0xFF`), the key bytes are escaped before encoding:
 
-**Scan filtering** — Without a custom comparator, scans may return entries from adjacent keys when key bytes happen to interleave with sequence number bytes. Results can be filtered by exact key match.
+| Raw Byte | Encoded As   |
+|----------|--------------|
+| `0xFE`   | `0xFE 0x00`  |
+| `0xFF`   | `0xFE 0x01`  |
+| other    | unchanged    |
 
-In practice, users are likely to use fixed-length keys, which avoids this issue entirely.
+The escape character `0xFE` is always followed by either `0x00` (representing a literal `0xFE`) or `0x01` (representing a literal `0xFF`). After escaping, the `0xFF` byte only appears as the terminating delimiter.
+
+**Example:**
+
+For a user key `hello` (no special bytes):
+```
+Encoded: | h | e | l | l | o | 0xFF |
+```
+
+For a user key containing `0xFE` and `0xFF` bytes (`a 0xFE b 0xFF c`):
+```
+Encoded: | a | 0xFE | 0x00 | b | 0xFE | 0x01 | c | 0xFF |
+```
+
+This encoding preserves lexicographic ordering: if key A < key B in their raw form, then their escaped forms maintain the same ordering. The delimiter ensures that no key can be a prefix of another key's encoding, preventing interleaving of entries from different logs.
+
+#### Variable-Length Key Ordering
+
+With variable-length keys, the boundary between key and sequence number would be ambiguous during lexicographic comparison if not explicitly delimited. Without a delimiter, entries from different keys could interleave incorrectly.
+
+For example, consider keys `a` and `ab` with sequence numbers. Without delimiting:
+```
+Key "a"  + seq 0x0100: | a | 0x00 | ... | 0x01 | 0x00 |
+Key "ab" + seq 0x0001: | a | b    | ... | 0x00 | 0x01 |
+```
+
+Depending on the sequence number bytes, entries from `a` and `ab` could interleave in unexpected ways.
+
+The `TerminatedBytes` encoding solves this by inserting a `0xFF` delimiter after the escaped key bytes. Since `0xFF` is the highest byte value and only appears as the delimiter (never within the escaped key), all entries for a given key are guaranteed to be contiguous and ordered by sequence number.
+
+With `TerminatedBytes`:
+```
+Key "a"  + seq: | a | 0xFF | <sequence bytes> |
+Key "ab" + seq: | a | b | 0xFF | <sequence bytes> |
+```
+
+All entries for key `a` sort before all entries for key `ab`, and within each key, entries are ordered by sequence number.
 
 ### Sequence Numbers
 
@@ -260,3 +300,4 @@ Messaging systems often expose a way to attach headers to messages in order to e
 |------------|-------------|
 | 2025-12-15 | Initial draft |
 | 2026-01-05 | Added block-based sequence allocation |
+| 2026-01-06 | Added TerminatedBytes encoding for variable-length keys |
