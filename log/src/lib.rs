@@ -41,13 +41,13 @@
 //! }
 //! ```
 
-mod codec;
 mod config;
 mod error;
 mod log;
 mod model;
 mod reader;
 mod sequence;
+mod serde;
 
 pub use config::{Config, CountOptions, ScanOptions, WriteOptions};
 pub use error::{Error, Result};

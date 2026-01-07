@@ -28,8 +28,8 @@ use bytes::Bytes;
 use opendata_common::{Record, Storage};
 use tokio::sync::Mutex;
 
-use crate::codec::{LastSeqBlockKey, SeqBlock};
 use crate::error::Result;
+use crate::serde::{LastSeqBlockKey, SeqBlock};
 
 /// Default block size for sequence allocation.
 pub(crate) const DEFAULT_BLOCK_SIZE: u64 = 4096;

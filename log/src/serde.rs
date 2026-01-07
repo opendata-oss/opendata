@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-//! Codec for log storage encoding and decoding.
+//! Serde for log storage
 //!
 //! This module provides encoding and decoding for log records stored in SlateDB.
 //! The encoding scheme is designed to preserve lexicographic ordering of keys
@@ -35,20 +35,18 @@
 //! prefix-based range queries: start at `prefix + 0x00`, end at `prefix + 0xFF`.
 
 use bytes::{BufMut, Bytes, BytesMut};
+use opendata_common::serde::terminated_bytes;
 
 use crate::error::Error;
 
+impl From<opendata_common::serde::DeserializeError> for Error {
+    fn from(err: opendata_common::serde::DeserializeError) -> Self {
+        Error::Encoding(err.message)
+    }
+}
+
 /// Key format version (currently 0x01)
 pub const KEY_VERSION: u8 = 0x01;
-
-/// Terminator byte for TerminatedBytes encoding (lowest byte value)
-const TERMINATOR_BYTE: u8 = 0x00;
-
-/// Escape character for TerminatedBytes encoding
-const ESCAPE_BYTE: u8 = 0x01;
-
-/// Reserved byte for range query upper bounds (highest byte value)
-const RANGE_END_BYTE: u8 = 0xFF;
 
 /// Record type discriminators for log storage
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,102 +58,22 @@ pub enum RecordType {
 }
 
 impl RecordType {
-    /// Returns the byte discriminator for this record type
-    pub fn as_byte(&self) -> u8 {
+    /// Returns the ID of this record type
+    pub fn id(&self) -> u8 {
         *self as u8
     }
 
-    /// Converts a byte to a RecordType
-    pub fn from_byte(byte: u8) -> Result<Self, Error> {
-        match byte {
+    /// Converts a u8 id back to a RecordType
+    pub fn from_id(id: u8) -> Result<Self, Error> {
+        match id {
             0x01 => Ok(RecordType::LogEntry),
             0x02 => Ok(RecordType::SeqBlock),
             _ => Err(Error::Encoding(format!(
                 "invalid record type: 0x{:02x}",
-                byte
+                id
             ))),
         }
     }
-}
-
-/// Encodes raw bytes with escape sequences and `0x00` terminator.
-///
-/// Writes directly to the provided buffer. The encoding:
-/// - `0x00` → `0x01 0x01`
-/// - `0x01` → `0x01 0x02`
-/// - `0xFF` → `0x01 0x03`
-/// - All other bytes unchanged
-/// - Terminated with `0x00`
-///
-/// Using `0x00` as the terminator ensures shorter keys sort before longer
-/// keys with the same prefix, enabling simple prefix-based range queries.
-fn encode_terminated(data: &[u8], buf: &mut BytesMut) {
-    for &byte in data {
-        match byte {
-            TERMINATOR_BYTE => {
-                buf.put_u8(ESCAPE_BYTE);
-                buf.put_u8(0x01);
-            }
-            ESCAPE_BYTE => {
-                buf.put_u8(ESCAPE_BYTE);
-                buf.put_u8(0x02);
-            }
-            RANGE_END_BYTE => {
-                buf.put_u8(ESCAPE_BYTE);
-                buf.put_u8(0x03);
-            }
-            _ => buf.put_u8(byte),
-        }
-    }
-    buf.put_u8(TERMINATOR_BYTE);
-}
-
-/// Decodes terminated bytes from a buffer, advancing past the terminator.
-///
-/// Returns the decoded raw bytes. The input buffer is advanced past the
-/// terminator byte.
-fn decode_terminated(buf: &mut &[u8]) -> Result<Bytes, Error> {
-    let mut result = BytesMut::new();
-    let mut i = 0;
-
-    while i < buf.len() {
-        let byte = buf[i];
-
-        if byte == TERMINATOR_BYTE {
-            // Found terminator, consume it and return
-            *buf = &buf[i + 1..];
-            return Ok(result.freeze());
-        }
-
-        if byte == ESCAPE_BYTE {
-            // Escape sequence - need next byte
-            if i + 1 >= buf.len() {
-                return Err(Error::Encoding(
-                    "truncated escape sequence in terminated bytes".to_string(),
-                ));
-            }
-            let next = buf[i + 1];
-            match next {
-                0x01 => result.put_u8(TERMINATOR_BYTE),
-                0x02 => result.put_u8(ESCAPE_BYTE),
-                0x03 => result.put_u8(RANGE_END_BYTE),
-                _ => {
-                    return Err(Error::Encoding(format!(
-                        "invalid escape sequence: 0x01 0x{:02x}",
-                        next
-                    )));
-                }
-            }
-            i += 2;
-        } else {
-            result.put_u8(byte);
-            i += 1;
-        }
-    }
-
-    Err(Error::Encoding(
-        "unterminated bytes sequence (missing 0x00 terminator)".to_string(),
-    ))
 }
 
 /// Key for a log entry record.
@@ -188,8 +106,8 @@ impl LogEntryKey {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
         buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordType::LogEntry.as_byte());
-        encode_terminated(&self.key, &mut buf);
+        buf.put_u8(RecordType::LogEntry.id());
+        terminated_bytes::serialize(&self.key, &mut buf);
         buf.put_u64(self.sequence);
         buf.freeze()
     }
@@ -209,7 +127,7 @@ impl LogEntryKey {
             )));
         }
 
-        let record_type = RecordType::from_byte(data[1])?;
+        let record_type = RecordType::from_id(data[1])?;
         if record_type != RecordType::LogEntry {
             return Err(Error::Encoding(format!(
                 "invalid record type: expected LogEntry, got {:?}",
@@ -218,7 +136,7 @@ impl LogEntryKey {
         }
 
         let mut buf = &data[2..];
-        let key = decode_terminated(&mut buf)?;
+        let key = terminated_bytes::deserialize(&mut buf)?;
 
         if buf.len() < 8 {
             return Err(Error::Encoding(
@@ -240,8 +158,8 @@ impl LogEntryKey {
     pub fn key_prefix(key: &[u8]) -> Bytes {
         let mut buf = BytesMut::new();
         buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordType::LogEntry.as_byte());
-        encode_terminated(key, &mut buf);
+        buf.put_u8(RecordType::LogEntry.id());
+        terminated_bytes::serialize(key, &mut buf);
         buf.freeze()
     }
 }
@@ -259,7 +177,7 @@ pub struct LastSeqBlockKey;
 impl LastSeqBlockKey {
     /// Encodes the SeqBlock key
     pub fn encode(&self) -> Bytes {
-        Bytes::from(vec![KEY_VERSION, RecordType::SeqBlock.as_byte()])
+        Bytes::from(vec![KEY_VERSION, RecordType::SeqBlock.id()])
     }
 
     /// Decodes and validates a SeqBlock key
@@ -277,7 +195,7 @@ impl LastSeqBlockKey {
             )));
         }
 
-        let record_type = RecordType::from_byte(data[1])?;
+        let record_type = RecordType::from_id(data[1])?;
         if record_type != RecordType::SeqBlock {
             return Err(Error::Encoding(format!(
                 "invalid record type: expected SeqBlock, got {:?}",
@@ -356,16 +274,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_convert_record_type_to_byte_and_back() {
+    fn should_convert_record_type_to_id_and_back() {
         // given
         let log_entry = RecordType::LogEntry;
         let seq_block = RecordType::SeqBlock;
 
         // when/then
-        assert_eq!(log_entry.as_byte(), 0x01);
-        assert_eq!(seq_block.as_byte(), 0x02);
-        assert_eq!(RecordType::from_byte(0x01).unwrap(), RecordType::LogEntry);
-        assert_eq!(RecordType::from_byte(0x02).unwrap(), RecordType::SeqBlock);
+        assert_eq!(log_entry.id(), 0x01);
+        assert_eq!(seq_block.id(), 0x02);
+        assert_eq!(RecordType::from_id(0x01).unwrap(), RecordType::LogEntry);
+        assert_eq!(RecordType::from_id(0x02).unwrap(), RecordType::SeqBlock);
     }
 
     #[test]
@@ -374,248 +292,14 @@ mod tests {
         let invalid_byte = 0x99;
 
         // when
-        let result = RecordType::from_byte(invalid_byte);
+        let result = RecordType::from_id(invalid_byte);
 
         // then
         assert!(result.is_err());
     }
 
     #[test]
-    fn should_encode_and_decode_simple_bytes() {
-        // given
-        let data = b"hello";
-        let mut buf = BytesMut::new();
-
-        // when
-        encode_terminated(data, &mut buf);
-        let mut slice = buf.as_ref();
-        let decoded = decode_terminated(&mut slice).unwrap();
-
-        // then
-        assert_eq!(decoded.as_ref(), b"hello");
-        assert!(slice.is_empty());
-    }
-
-    #[test]
-    fn should_encode_and_decode_bytes_with_escape_char() {
-        // given - data containing 0x01 (escape char)
-        let data = &[0x61, 0x01, 0x62]; // "a" + 0x01 + "b"
-        let mut buf = BytesMut::new();
-
-        // when
-        encode_terminated(data, &mut buf);
-
-        // then - should be escaped as 0x01 0x02
-        assert_eq!(buf.as_ref(), &[0x61, 0x01, 0x02, 0x62, 0x00]);
-
-        // when - decode
-        let mut slice = buf.as_ref();
-        let decoded = decode_terminated(&mut slice).unwrap();
-
-        // then
-        assert_eq!(decoded.as_ref(), data);
-    }
-
-    #[test]
-    fn should_encode_and_decode_bytes_with_terminator_char() {
-        // given - data containing 0x00 (terminator char)
-        let data = &[0x61, 0x00, 0x62]; // "a" + 0x00 + "b"
-        let mut buf = BytesMut::new();
-
-        // when
-        encode_terminated(data, &mut buf);
-
-        // then - should be escaped as 0x01 0x01
-        assert_eq!(buf.as_ref(), &[0x61, 0x01, 0x01, 0x62, 0x00]);
-
-        // when - decode
-        let mut slice = buf.as_ref();
-        let decoded = decode_terminated(&mut slice).unwrap();
-
-        // then
-        assert_eq!(decoded.as_ref(), data);
-    }
-
-    #[test]
-    fn should_encode_and_decode_bytes_with_all_special_chars() {
-        // given - data with all special chars: 0x00, 0x01, 0xFF
-        let data = &[0x00, 0x01, 0xFF, 0x00, 0x01, 0xFF];
-        let mut buf = BytesMut::new();
-
-        // when
-        encode_terminated(data, &mut buf);
-        let mut slice = buf.as_ref();
-        let decoded = decode_terminated(&mut slice).unwrap();
-
-        // then
-        assert_eq!(decoded.as_ref(), data);
-    }
-
-    #[test]
-    fn should_encode_empty_bytes() {
-        // given
-        let data: &[u8] = &[];
-        let mut buf = BytesMut::new();
-
-        // when
-        encode_terminated(data, &mut buf);
-
-        // then - just the terminator
-        assert_eq!(buf.as_ref(), &[0x00]);
-
-        // when - decode
-        let mut slice = buf.as_ref();
-        let decoded = decode_terminated(&mut slice).unwrap();
-
-        // then
-        assert!(decoded.is_empty());
-    }
-
-    #[test]
-    fn should_fail_decode_without_terminator() {
-        // given - no terminator
-        let data = &[0x61, 0x62, 0x63];
-
-        // when
-        let mut slice = &data[..];
-        let result = decode_terminated(&mut slice);
-
-        // then
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn should_fail_decode_with_truncated_escape() {
-        // given - escape at end without following byte
-        let data = &[0x61, 0x01];
-
-        // when
-        let mut slice = &data[..];
-        let result = decode_terminated(&mut slice);
-
-        // then
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn should_fail_decode_with_invalid_escape_sequence() {
-        // given - invalid escape (0x01 followed by 0x04, which is not a valid escape)
-        let data = &[0x61, 0x01, 0x04, 0x00];
-
-        // when
-        let mut slice = &data[..];
-        let result = decode_terminated(&mut slice);
-
-        // then
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn should_preserve_ordering_for_non_prefix_keys() {
-        // given - keys where neither is a prefix of the other
-        // These should maintain lexicographic ordering
-        let pairs = [
-            (b"apple".as_slice(), b"banana".as_slice()),
-            (b"cat", b"dog"),
-            (b"x", b"y"),
-        ];
-
-        for (key_a, key_b) in pairs {
-            // when
-            let mut buf_a = BytesMut::new();
-            encode_terminated(key_a, &mut buf_a);
-            let mut buf_b = BytesMut::new();
-            encode_terminated(key_b, &mut buf_b);
-
-            // then - lexicographic ordering preserved when no prefix relationship
-            assert!(
-                buf_a.as_ref() < buf_b.as_ref(),
-                "Expected {:?} < {:?} after encoding",
-                key_a,
-                key_b
-            );
-        }
-    }
-
-    #[test]
-    fn should_group_prefix_keys_contiguously() {
-        // given - keys where one is a prefix of another
-        // The terminated encoding ensures contiguity: all entries for "a" are
-        // grouped together, all entries for "ab" are grouped together.
-        // Note: shorter keys sort BEFORE longer keys with the same prefix
-        // because 0x00 (terminator) < any regular byte.
-        let mut buf_a = BytesMut::new();
-        encode_terminated(b"a", &mut buf_a);
-        let mut buf_ab = BytesMut::new();
-        encode_terminated(b"ab", &mut buf_ab);
-        let mut buf_abc = BytesMut::new();
-        encode_terminated(b"abc", &mut buf_abc);
-
-        // then - shorter prefixes sort before longer ones
-        // a < ab < abc (because at the divergence point, 0x00 < regular bytes)
-        assert!(buf_a.as_ref() < buf_ab.as_ref());
-        assert!(buf_ab.as_ref() < buf_abc.as_ref());
-    }
-
-    #[test]
-    fn should_not_allow_key_prefix_collision() {
-        // given - key "a" should not be a prefix of key "ab" after encoding
-        // This ensures entries for different keys don't interleave
-        let mut buf_a = BytesMut::new();
-        encode_terminated(b"a", &mut buf_a);
-        let mut buf_ab = BytesMut::new();
-        encode_terminated(b"ab", &mut buf_ab);
-
-        // then - "a" encoding should not be a prefix of "ab" encoding
-        // because "a" has terminator before "b" appears
-        assert!(!buf_ab.starts_with(&buf_a));
-    }
-
-    #[test]
-    fn should_support_prefix_range_queries() {
-        // given - keys with a common prefix "/foo" and one unrelated key
-        let keys = [
-            b"/foo".as_slice(),
-            b"/foo/bar",
-            b"/foobar",
-            b"/food",
-            b"/bar", // unrelated
-        ];
-
-        // Encode all keys
-        let mut encoded: Vec<(_, _)> = keys
-            .iter()
-            .map(|k| {
-                let mut buf = BytesMut::new();
-                encode_terminated(k, &mut buf);
-                (*k, buf.freeze())
-            })
-            .collect();
-        encoded.sort_by(|a, b| a.1.cmp(&b.1));
-
-        // Build range bounds for prefix "/foo"
-        let mut start = BytesMut::from(b"/foo".as_slice());
-        start.put_u8(TERMINATOR_BYTE); // 0x00
-        let mut end = BytesMut::from(b"/foo".as_slice());
-        end.put_u8(RANGE_END_BYTE); // 0xFF
-
-        // then - all keys with prefix "/foo" fall within [start, end)
-        let in_range: Vec<_> = encoded
-            .iter()
-            .filter(|(_, e)| e.as_ref() >= start.as_ref() && e.as_ref() < end.as_ref())
-            .map(|(k, _)| *k)
-            .collect();
-
-        // All "/foo*" keys should be in range, but "/bar" should not
-        assert_eq!(in_range.len(), 4);
-        assert!(in_range.contains(&b"/foo".as_slice()));
-        assert!(in_range.contains(&b"/foo/bar".as_slice()));
-        assert!(in_range.contains(&b"/foobar".as_slice()));
-        assert!(in_range.contains(&b"/food".as_slice()));
-    }
-
-    #[test]
-    fn should_encode_and_decode_log_entry_key() {
+    fn should_serialize_and_deserialize_log_entry_key() {
         // given
         let key = LogEntryKey::new(Bytes::from("orders"), 12345);
 
@@ -628,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn should_encode_and_decode_log_entry_key_with_special_bytes() {
+    fn should_serialize_and_deserialize_log_entry_key_with_special_bytes() {
         // given - key containing all special bytes: terminator (0x00), escape (0x01), range end (0xFF)
         let key = LogEntryKey::new(Bytes::from_static(&[0x61, 0x00, 0x01, 0xFF, 0x62]), 99999);
 
@@ -641,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn should_encode_log_entry_key_with_correct_structure() {
+    fn should_serialize_log_entry_key_with_correct_structure() {
         // given
         let key = LogEntryKey::new(Bytes::from("test"), 256);
 
@@ -650,7 +334,7 @@ mod tests {
 
         // then
         assert_eq!(encoded[0], KEY_VERSION);
-        assert_eq!(encoded[1], RecordType::LogEntry.as_byte());
+        assert_eq!(encoded[1], RecordType::LogEntry.id());
         // "test" + terminator = [t, e, s, t, 0x00]
         // sequence 256 = 0x0000000000000100
     }
@@ -699,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn should_fail_decode_log_entry_key_with_wrong_version() {
+    fn should_fail_deserialize_log_entry_key_with_wrong_version() {
         // given
         let data = LogEntryKey::new(Bytes::from("test"), 1).encode();
         let mut modified = data.to_vec();
@@ -713,9 +397,9 @@ mod tests {
     }
 
     #[test]
-    fn should_fail_decode_log_entry_key_with_wrong_type() {
+    fn should_fail_deserialize_log_entry_key_with_wrong_type() {
         // given - SeqBlock type instead of LogEntry
-        let data = vec![KEY_VERSION, RecordType::SeqBlock.as_byte()];
+        let data = vec![KEY_VERSION, RecordType::SeqBlock.id()];
 
         // when
         let result = LogEntryKey::decode(&data);
@@ -725,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn should_encode_and_decode_seq_block_key() {
+    fn should_serialize_and_deserialize_seq_block_key() {
         // given
         let key = LastSeqBlockKey;
 
@@ -737,13 +421,13 @@ mod tests {
         assert_eq!(decoded, key);
         assert_eq!(encoded.len(), 2);
         assert_eq!(encoded[0], KEY_VERSION);
-        assert_eq!(encoded[1], RecordType::SeqBlock.as_byte());
+        assert_eq!(encoded[1], RecordType::SeqBlock.id());
     }
 
     #[test]
-    fn should_fail_decode_seq_block_key_with_wrong_type() {
+    fn should_fail_deserialize_seq_block_key_with_wrong_type() {
         // given
-        let data = vec![KEY_VERSION, RecordType::LogEntry.as_byte()];
+        let data = vec![KEY_VERSION, RecordType::LogEntry.id()];
 
         // when
         let result = LastSeqBlockKey::decode(&data);
@@ -753,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn should_encode_and_decode_seq_block_value() {
+    fn should_serialize_and_deserialize_seq_block_value() {
         // given
         let value = SeqBlock::new(1000, 100);
 
@@ -779,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn should_fail_decode_seq_block_value_too_short() {
+    fn should_fail_deserialize_seq_block_value_too_short() {
         // given
         let data = vec![0u8; 15]; // need 16 bytes
 
@@ -791,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn should_encode_seq_block_value_in_big_endian() {
+    fn should_serialize_seq_block_value_in_big_endian() {
         // given
         let value = SeqBlock::new(0x0102030405060708, 0x1112131415161718);
 
