@@ -1,4 +1,5 @@
 pub mod clock;
+pub mod serde;
 pub mod storage;
 pub mod util;
 
