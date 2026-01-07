@@ -45,28 +45,29 @@ This encoding preserves lexicographic key ordering, enabling key-range scans. En
 
 #### TerminatedBytes
 
-A `TerminatedBytes` is a variable-length byte sequence that terminates with a `0xFF` delimiter. This delimiter provides an unambiguous boundary between the user key and the sequence number, which is necessary for correct lexicographic ordering when keys have variable length.
+A `TerminatedBytes` is a variable-length byte sequence that terminates with a `0x00` delimiter. This delimiter provides an unambiguous boundary between the user key and the sequence number, which is necessary for correct lexicographic ordering when keys have variable length.
 
-To allow arbitrary byte sequences in user keys (including `0xFE` and `0xFF`), the key bytes are escaped before encoding:
+To allow arbitrary byte sequences in user keys (including `0x00`, `0x01`, and `0xFF`), the key bytes are escaped before encoding:
 
 | Raw Byte | Encoded As   |
 |----------|--------------|
-| `0xFE`   | `0xFE 0x00`  |
-| `0xFF`   | `0xFE 0x01`  |
+| `0x00`   | `0x01 0x01`  |
+| `0x01`   | `0x01 0x02`  |
+| `0xFF`   | `0x01 0x03`  |
 | other    | unchanged    |
 
-The escape character `0xFE` is always followed by either `0x00` (representing a literal `0xFE`) or `0x01` (representing a literal `0xFF`). After escaping, the `0xFF` byte only appears as the terminating delimiter.
+The escape character `0x01` is always followed by `0x01` (literal `0x00`), `0x02` (literal `0x01`), or `0x03` (literal `0xFF`). After escaping, `0x00` only appears as the terminating delimiter, and `0xFF` is reserved for range query bounds (see [Prefix-Based Range Queries](#prefix-based-range-queries)).
 
 **Example:**
 
 For a user key `hello` (no special bytes):
 ```
-Encoded: | h | e | l | l | o | 0xFF |
+Encoded: | h | e | l | l | o | 0x00 |
 ```
 
-For a user key containing `0xFE` and `0xFF` bytes (`a 0xFE b 0xFF c`):
+For a user key containing `0x00`, `0x01`, and `0xFF` bytes (`a 0x00 b 0x01 c 0xFF d`):
 ```
-Encoded: | a | 0xFE | 0x00 | b | 0xFE | 0x01 | c | 0xFF |
+Encoded: | a | 0x01 | 0x01 | b | 0x01 | 0x02 | c | 0x01 | 0x03 | d | 0x00 |
 ```
 
 This encoding preserves lexicographic ordering: if key A < key B in their raw form, then their escaped forms maintain the same ordering. The delimiter ensures that no key can be a prefix of another key's encoding, preventing interleaving of entries from different logs.
@@ -77,21 +78,53 @@ With variable-length keys, the boundary between key and sequence number would be
 
 For example, consider keys `a` and `ab` with sequence numbers. Without delimiting:
 ```
-Key "a"  + seq 0x0100: | a | 0x00 | ... | 0x01 | 0x00 |
+Key "a"  + seq 0x6200: | a | 0x00 | ... | 0x62 | 0x00 |
 Key "ab" + seq 0x0001: | a | b    | ... | 0x00 | 0x01 |
 ```
 
 Depending on the sequence number bytes, entries from `a` and `ab` could interleave in unexpected ways.
 
-The `TerminatedBytes` encoding solves this by inserting a `0xFF` delimiter after the escaped key bytes. Since `0xFF` is the highest byte value and only appears as the delimiter (never within the escaped key), all entries for a given key are guaranteed to be contiguous and ordered by sequence number.
+The `TerminatedBytes` encoding solves this by inserting a `0x00` delimiter after the escaped key bytes. Since `0x00` is the lowest byte value and only appears as the delimiter (never within the escaped key), all entries for a given key are guaranteed to be contiguous and ordered by sequence number.
 
 With `TerminatedBytes`:
 ```
-Key "a"  + seq: | a | 0xFF | <sequence bytes> |
-Key "ab" + seq: | a | b | 0xFF | <sequence bytes> |
+Key "a"  + seq: | a | 0x00 | <sequence bytes> |
+Key "ab" + seq: | a | b | 0x00 | <sequence bytes> |
 ```
 
 All entries for key `a` sort before all entries for key `ab`, and within each key, entries are ordered by sequence number.
+
+#### Prefix-Based Range Queries
+
+Using `0x00` as the terminator (the lowest byte value) ensures that shorter keys sort before longer keys with the same prefix. For example, `/foo` sorts before `/foo/bar`:
+
+```
+Key "/foo"     encoded: | / | f | o | o | 0x00 |
+Key "/foo/bar" encoded: | / | f | o | o | / | b | a | r | 0x00 |
+```
+
+At the comparison point after `foo`, the terminator `0x00` is less than `/` (`0x2F`), so `/foo` < `/foo/bar`.
+
+This ordering simplifies prefix-based range queries. To scan all keys with a given prefix, the range bounds are:
+
+- **Start (inclusive)**: `prefix + 0x00` — the exact prefix key (smallest key with this prefix)
+- **End (exclusive)**: `prefix + 0xFF` — beyond all keys with this prefix
+
+For example, to scan all keys starting with `/foo`:
+```
+Start: | / | f | o | o | 0x00 |  (exact match "/foo")
+End:   | / | f | o | o | 0xFF |  (beyond all "/foo*" keys)
+```
+
+This range `[start, end)` includes:
+- `/foo` (exact match, encoded as `| / | f | o | o | 0x00 |`)
+- `/foo/bar` (encoded as `| / | f | o | o | / | b | a | r | 0x00 |`)
+- `/foobar` (encoded as `| / | f | o | o | b | a | r | 0x00 |`)
+
+But excludes:
+- `/bar` (does not start with `/foo`)
+
+This works because after escaping, no encoded key contains `0x00` or `0xFF` except as control bytes. Any key with prefix `/foo` will have an encoding that starts with `| / | f | o | o |` followed by either `0x00` (exact match) or a byte in the range `0x02`–`0xFE` (longer key, possibly with escape sequences). Since all these values are less than `0xFF`, the end bound correctly excludes keys that don't share the prefix.
 
 ### Sequence Numbers
 
@@ -301,3 +334,4 @@ Messaging systems often expose a way to attach headers to messages in order to e
 | 2025-12-15 | Initial draft |
 | 2026-01-05 | Added block-based sequence allocation |
 | 2026-01-06 | Added TerminatedBytes encoding for variable-length keys |
+| 2026-01-07 | Changed TerminatedBytes delimiter to 0x00 for prefix-friendly ordering |
