@@ -10,11 +10,10 @@ use tokio::sync::{Mutex, RwLock};
 use crate::delta::{TsdbDelta, TsdbDeltaBuilder};
 use crate::error::Error;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
-use crate::model::{SeriesFingerprint, SeriesId, TimeBucket};
+use crate::model::{Label, Sample, Series, SeriesFingerprint, SeriesId, TimeBucket};
 use crate::query::QueryReader;
 use crate::serde::key::TimeSeriesKey;
 use crate::serde::timeseries::TimeSeriesIterator;
-use crate::series::{Label, Sample, Series};
 use crate::storage::{OpenTsdbStorageExt, OpenTsdbStorageReadExt};
 use crate::util::Result;
 

@@ -10,9 +10,8 @@ use opendata_common::Storage;
 
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndex, InvertedIndexLookup};
 use crate::minitsdb::MiniTsdb;
-use crate::model::{SeriesId, TimeBucket};
+use crate::model::{Label, Sample, Series, SeriesId, TimeBucket};
 use crate::query::QueryReader;
-use crate::series::{Label, Sample, Series};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::util::Result;
 
@@ -283,7 +282,7 @@ impl QueryReader for TsdbQueryReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::series::MetricType;
+    use crate::model::MetricType;
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
     use opendata_common::storage::in_memory::InMemoryStorage;
 

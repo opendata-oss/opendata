@@ -3,13 +3,13 @@ use opendata_common::storage::RecordOp;
 use opendata_common::{Record, Storage, StorageRead};
 use roaring::RoaringBitmap;
 
-use crate::index::InvertedIndex;
+use crate::index::{InvertedIndex, SeriesSpec};
+use crate::model::{Sample, SeriesFingerprint, SeriesId, TimeBucket};
 use crate::serde::key::TimeSeriesKey;
 use crate::serde::timeseries::TimeSeriesValue;
-use crate::series::Sample;
 use crate::{
     index::ForwardIndex,
-    model::{SeriesFingerprint, SeriesId, SeriesSpec, TimeBucket},
+    model::Label,
     serde::{
         TimeBucketScoped,
         bucket_list::BucketListValue,
@@ -18,7 +18,6 @@ use crate::{
         inverted_index::InvertedIndexValue,
         key::{BucketListKey, ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey},
     },
-    series::Label,
     util::Result,
 };
 

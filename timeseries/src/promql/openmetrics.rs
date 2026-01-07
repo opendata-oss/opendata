@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::series::{Label, MetricType, Sample, Series, Temporality};
+use crate::model::{Label, MetricType, Sample, Series, Temporality};
 use crate::util::{Fingerprint, Result};
 
 /// OpenMetrics metric types

@@ -8,12 +8,11 @@ use opendata_common::Storage;
 use opendata_common::storage::StorageSnapshot;
 
 use crate::error::Error;
-use crate::series::Sample;
+use crate::model::{Sample, SeriesFingerprint, SeriesId, TimeBucket};
 use crate::util::Result;
 use crate::{
     delta::TsdbDelta,
     index::{ForwardIndex, InvertedIndex},
-    model::{SeriesFingerprint, SeriesId, TimeBucket},
     storage::OpenTsdbStorageExt,
 };
 

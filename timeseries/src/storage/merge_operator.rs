@@ -86,9 +86,9 @@ fn merge_bucket_list(existing: Bytes, new_value: Bytes) -> Result<Bytes, Encodin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Sample;
     use crate::serde::key::{BucketListKey, InvertedIndexKey, TimeSeriesKey};
     use crate::serde::timeseries::TimeSeriesValue;
-    use crate::series::Sample;
     use bytes::Bytes;
     use opendata_common::storage::MergeOperator;
     use roaring::RoaringBitmap;

@@ -5,12 +5,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use dashmap::DashMap;
 
-use crate::series::{MetricType, Sample, Series};
+use crate::index::SeriesSpec;
+use crate::model::{MetricType, Sample, Series, SeriesFingerprint, SeriesId, TimeBucket};
 use crate::{
     error::Error,
     index::{ForwardIndex, InvertedIndex},
-    model::{SeriesFingerprint, SeriesId, SeriesSpec, TimeBucket},
-    series::Label,
+    model::Label,
     util::{Fingerprint, Result},
 };
 
@@ -189,8 +189,8 @@ impl TsdbDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::series::MetricType;
-    use crate::series::Temporality;
+    use crate::model::MetricType;
+    use crate::model::Temporality;
     use dashmap::DashMap;
     use std::sync::atomic::AtomicU32;
 

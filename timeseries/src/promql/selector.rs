@@ -4,9 +4,9 @@ use promql_parser::label::{METRIC_NAME, MatchOp};
 use promql_parser::parser::VectorSelector;
 
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndex, InvertedIndexLookup};
+use crate::model::Label;
 use crate::model::SeriesId;
 use crate::query::QueryReader;
-use crate::series::Label;
 use crate::util::Result;
 
 /// Evaluates a PromQL vector selector using a QueryReader.
@@ -117,8 +117,8 @@ fn has_label(labels: &[Label], name: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::SeriesSpec;
-    use crate::series::{MetricType, Sample};
+    use crate::index::SeriesSpec;
+    use crate::model::{MetricType, Sample};
     use promql_parser::label::{Matcher, Matchers};
 
     fn empty_matchers() -> Matchers {

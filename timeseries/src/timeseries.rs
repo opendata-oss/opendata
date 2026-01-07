@@ -6,7 +6,7 @@
 
 use crate::config::{Config, WriteOptions};
 use crate::error::Result;
-use crate::series::Series;
+use crate::model::Series;
 
 /// A time series database for storing and querying metrics.
 ///

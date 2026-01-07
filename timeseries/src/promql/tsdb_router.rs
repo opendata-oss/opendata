@@ -19,9 +19,9 @@ use super::response::{
 };
 use super::router::PromqlRouter;
 use super::selector::evaluate_selector_with_reader;
+use crate::model::Label;
 use crate::model::SeriesId;
 use crate::query::QueryReader;
-use crate::series::Label;
 use crate::tsdb::Tsdb;
 
 /// Parse a match[] selector string into a VectorSelector
@@ -539,7 +539,7 @@ impl PromqlRouter for Tsdb {
 mod tests {
     use super::*;
     use crate::model::TimeBucket;
-    use crate::series::{Label, MetricType, Sample, Series};
+    use crate::model::{Label, MetricType, Sample, Series};
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
     use opendata_common::Storage;
     use opendata_common::storage::in_memory::InMemoryStorage;
