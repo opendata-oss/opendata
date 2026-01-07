@@ -4,9 +4,9 @@ use promql_parser::label::{METRIC_NAME, MatchOp};
 use promql_parser::parser::VectorSelector;
 
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndex, InvertedIndexLookup};
-use crate::query::QueryReader;
 use crate::model::Label;
 use crate::model::SeriesId;
+use crate::query::QueryReader;
 use crate::util::Result;
 
 /// Evaluates a PromQL vector selector using a QueryReader.
@@ -281,8 +281,8 @@ mod tests {
 
     #[tokio::test]
     async fn should_merge_results_from_head_and_storage() {
-        use crate::query::test_utils::MockQueryReaderBuilder;
         use crate::model::TimeBucket;
+        use crate::query::test_utils::MockQueryReaderBuilder;
 
         // given: create a mock reader with 3 series
         let bucket = TimeBucket::hour(1000);

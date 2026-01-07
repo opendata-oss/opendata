@@ -19,9 +19,9 @@ use super::response::{
 };
 use super::router::PromqlRouter;
 use super::selector::evaluate_selector_with_reader;
-use crate::query::QueryReader;
 use crate::model::Label;
 use crate::model::SeriesId;
+use crate::query::QueryReader;
 use crate::tsdb::Tsdb;
 
 /// Parse a match[] selector string into a VectorSelector

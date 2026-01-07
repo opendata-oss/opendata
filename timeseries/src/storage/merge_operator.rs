@@ -2,11 +2,11 @@
 
 use bytes::Bytes;
 
+use crate::model::RecordTag;
 use crate::serde::bucket_list::BucketListValue;
 use crate::serde::inverted_index::InvertedIndexValue;
 use crate::serde::timeseries::merge_time_series;
 use crate::serde::{EncodingError, RecordType};
-use crate::model::RecordTag;
 
 /// Merge operator for OpenTSDB that handles merging of different record types.
 ///
@@ -86,9 +86,9 @@ fn merge_bucket_list(existing: Bytes, new_value: Bytes) -> Result<Bytes, Encodin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Sample;
     use crate::serde::key::{BucketListKey, InvertedIndexKey, TimeSeriesKey};
     use crate::serde::timeseries::TimeSeriesValue;
-    use crate::model::Sample;
     use bytes::Bytes;
     use opendata_common::storage::MergeOperator;
     use roaring::RoaringBitmap;

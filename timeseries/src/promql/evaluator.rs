@@ -11,10 +11,10 @@ use promql_parser::parser::{
 };
 
 use crate::index::ForwardIndexLookup;
-use crate::promql::functions::FunctionRegistry;
-use crate::query::QueryReader;
 use crate::model::Label;
 use crate::model::SeriesFingerprint;
+use crate::promql::functions::FunctionRegistry;
+use crate::query::QueryReader;
 
 #[derive(Debug)]
 pub enum EvaluationError {
@@ -555,9 +555,9 @@ impl<'a, R: QueryReader> Evaluator<'a, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::test_utils::MockQueryReaderBuilder;
     use crate::model::TimeBucket;
     use crate::model::{Label, MetricType, Sample};
+    use crate::query::test_utils::MockQueryReaderBuilder;
     use crate::test_utils::assertions::approx_eq;
     use promql_parser::label::METRIC_NAME;
     use promql_parser::parser::EvalStmt;

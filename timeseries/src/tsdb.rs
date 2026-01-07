@@ -10,8 +10,8 @@ use opendata_common::Storage;
 
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndex, InvertedIndexLookup};
 use crate::minitsdb::MiniTsdb;
-use crate::query::QueryReader;
 use crate::model::{Label, Sample, Series, SeriesId, TimeBucket};
+use crate::query::QueryReader;
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::util::Result;
 

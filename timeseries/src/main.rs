@@ -5,10 +5,10 @@ mod error;
 mod head;
 mod index;
 mod minitsdb;
+mod model;
 mod promql;
 mod query;
 mod serde;
-mod model;
 mod storage;
 #[cfg(test)]
 mod test_utils;
