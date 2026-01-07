@@ -119,31 +119,22 @@ impl Tsdb {
         Ok(())
     }
 
-    /// Ingest series into the TSDB, grouping by time bucket.
+    /// Ingest series into the TSDB.
+    /// Each series is split by time bucket based on sample timestamps.
     pub(crate) async fn ingest_samples(&self, series_list: Vec<Series>) -> Result<()> {
-        if series_list.is_empty() {
-            return Ok(());
-        }
-
-        // Group series by bucket - each sample may belong to different buckets
-        let mut by_bucket: HashMap<TimeBucket, Vec<Series>> = HashMap::new();
-
         for series in series_list {
-            // Group samples within this series by bucket
+            // Group samples by bucket
             let mut bucket_samples: HashMap<TimeBucket, Vec<Sample>> = HashMap::new();
 
-            for sample in &series.samples {
+            for sample in series.samples {
                 let bucket = TimeBucket::round_to_hour(
                     std::time::UNIX_EPOCH
                         + std::time::Duration::from_millis(sample.timestamp_ms as u64),
                 )?;
-                bucket_samples
-                    .entry(bucket)
-                    .or_default()
-                    .push(sample.clone());
+                bucket_samples.entry(bucket).or_default().push(sample);
             }
 
-            // Create a Series for each bucket with only the samples for that bucket
+            // Ingest each bucket's samples as a series
             for (bucket, samples) in bucket_samples {
                 let bucket_series = Series {
                     labels: series.labels.clone(),
@@ -152,14 +143,10 @@ impl Tsdb {
                     description: series.description.clone(),
                     samples,
                 };
-                by_bucket.entry(bucket).or_default().push(bucket_series);
-            }
-        }
 
-        // Ingest each bucket
-        for (bucket, bucket_series) in by_bucket {
-            let mini = self.get_or_create_for_ingest(bucket).await?;
-            mini.ingest(bucket_series).await?;
+                let mini = self.get_or_create_for_ingest(bucket).await?;
+                mini.ingest(&bucket_series).await?;
+            }
         }
 
         Ok(())
@@ -420,7 +407,7 @@ mod tests {
         // Ingest a sample with timestamp in the bucket range (seconds 3600-7199)
         // Using 4000 seconds = 4000000 ms
         let sample = create_sample("http_requests", vec![("env", "prod")], 4000000, 42.0);
-        mini.ingest(vec![sample]).await.unwrap();
+        mini.ingest(&sample).await.unwrap();
 
         // Flush to make data visible
         tsdb.flush().await.unwrap();
@@ -471,10 +458,21 @@ mod tests {
             .await
             .unwrap();
         mini1
-            .ingest(vec![
-                create_sample("http_requests", vec![("env", "prod")], 3_900_000, 10.0),
-                create_sample("http_requests", vec![("env", "staging")], 3_900_001, 15.0),
-            ])
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod")],
+                3_900_000,
+                10.0,
+            ))
+            .await
+            .unwrap();
+        mini1
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging")],
+                3_900_001,
+                15.0,
+            ))
             .await
             .unwrap();
 
@@ -483,10 +481,21 @@ mod tests {
             .await
             .unwrap();
         mini2
-            .ingest(vec![
-                create_sample("http_requests", vec![("env", "prod")], 7_900_000, 20.0),
-                create_sample("http_requests", vec![("env", "staging")], 7_900_001, 25.0),
-            ])
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod")],
+                7_900_000,
+                20.0,
+            ))
+            .await
+            .unwrap();
+        mini2
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging")],
+                7_900_001,
+                25.0,
+            ))
             .await
             .unwrap();
 
@@ -506,10 +515,21 @@ mod tests {
             .await
             .unwrap();
         mini3
-            .ingest(vec![
-                create_sample("http_requests", vec![("env", "prod")], 11_900_000, 30.0),
-                create_sample("http_requests", vec![("env", "staging")], 11_900_001, 35.0),
-            ])
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod")],
+                11_900_000,
+                30.0,
+            ))
+            .await
+            .unwrap();
+        mini3
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging")],
+                11_900_001,
+                35.0,
+            ))
             .await
             .unwrap();
 
@@ -518,10 +538,21 @@ mod tests {
             .await
             .unwrap();
         mini4
-            .ingest(vec![
-                create_sample("http_requests", vec![("env", "prod")], 15_900_000, 40.0),
-                create_sample("http_requests", vec![("env", "staging")], 15_900_001, 45.0),
-            ])
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod")],
+                15_900_000,
+                40.0,
+            ))
+            .await
+            .unwrap();
+        mini4
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging")],
+                15_900_001,
+                45.0,
+            ))
             .await
             .unwrap();
 

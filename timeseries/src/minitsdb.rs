@@ -150,16 +150,14 @@ impl MiniTsdb {
         })
     }
 
-    /// Ingest series with samples.
+    /// Ingest a single series with samples.
     /// Note: Ingested data is batched and NOT visible to queries until flush().
     /// Returns an error if any sample timestamp is outside the bucket's time range.
-    pub(crate) async fn ingest(&self, series: Vec<Series>) -> Result<()> {
+    pub(crate) async fn ingest(&self, series: &Series) -> Result<()> {
         let mut builder =
             TsdbDeltaBuilder::new(self.bucket.clone(), &self.series_dict, &self.next_series_id);
 
-        for s in &series {
-            builder.ingest(s)?;
-        }
+        builder.ingest(series)?;
 
         let delta = builder.build();
 

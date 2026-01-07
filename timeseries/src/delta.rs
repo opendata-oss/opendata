@@ -234,12 +234,7 @@ mod tests {
 
         // when
         builder
-            .ingest_sample(
-                &labels,
-                &metric_unit,
-                Some(metric_type),
-                sample.clone(),
-            )
+            .ingest_sample(&labels, &metric_unit, Some(metric_type), sample.clone())
             .unwrap();
 
         // then
@@ -292,20 +287,10 @@ mod tests {
 
         // when
         builder
-            .ingest_sample(
-                &labels,
-                &unit,
-                Some(metric_type),
-                sample1.clone(),
-            )
+            .ingest_sample(&labels, &unit, Some(metric_type), sample1.clone())
             .unwrap();
         builder
-            .ingest_sample(
-                &labels,
-                &unit,
-                Some(metric_type),
-                sample2.clone(),
-            )
+            .ingest_sample(&labels, &unit, Some(metric_type), sample2.clone())
             .unwrap();
 
         // then
@@ -342,20 +327,10 @@ mod tests {
 
         // when
         builder
-            .ingest_sample(
-                &attributes1,
-                &unit,
-                Some(metric_type),
-                create_test_sample(),
-            )
+            .ingest_sample(&attributes1, &unit, Some(metric_type), create_test_sample())
             .unwrap();
         builder
-            .ingest_sample(
-                &attributes2,
-                &unit,
-                Some(metric_type),
-                create_test_sample(),
-            )
+            .ingest_sample(&attributes2, &unit, Some(metric_type), create_test_sample())
             .unwrap();
 
         // then
@@ -385,12 +360,7 @@ mod tests {
 
         // when
         builder
-            .ingest_sample(
-                &test_labels,
-                &unit,
-                Some(metric_type),
-                create_test_sample(),
-            )
+            .ingest_sample(&test_labels, &unit, Some(metric_type), create_test_sample())
             .unwrap();
 
         // then
@@ -414,20 +384,10 @@ mod tests {
 
         // when
         builder
-            .ingest_sample(
-                &labels,
-                &unit,
-                Some(metric_type),
-                create_test_sample(),
-            )
+            .ingest_sample(&labels, &unit, Some(metric_type), create_test_sample())
             .unwrap();
         builder
-            .ingest_sample(
-                &labels,
-                &unit,
-                Some(metric_type),
-                create_test_sample(),
-            )
+            .ingest_sample(&labels, &unit, Some(metric_type), create_test_sample())
             .unwrap();
 
         // then
@@ -472,20 +432,10 @@ mod tests {
 
         // when
         builder
-            .ingest_sample(
-                &attributes1,
-                &unit,
-                Some(metric_type),
-                create_test_sample(),
-            )
+            .ingest_sample(&attributes1, &unit, Some(metric_type), create_test_sample())
             .unwrap();
         builder
-            .ingest_sample(
-                &attributes2,
-                &unit,
-                Some(metric_type),
-                create_test_sample(),
-            )
+            .ingest_sample(&attributes2, &unit, Some(metric_type), create_test_sample())
             .unwrap();
 
         // then
@@ -561,12 +511,7 @@ mod tests {
 
         // when
         builder
-            .ingest_sample(
-                &labels,
-                &unit,
-                Some(metric_type),
-                create_test_sample(),
-            )
+            .ingest_sample(&labels, &unit, Some(metric_type), create_test_sample())
             .unwrap();
 
         // then
@@ -591,12 +536,7 @@ mod tests {
 
         // when
         builder
-            .ingest_sample(
-                &labels,
-                &unit,
-                Some(metric_type),
-                create_test_sample(),
-            )
+            .ingest_sample(&labels, &unit, Some(metric_type), create_test_sample())
             .unwrap();
 
         // then
@@ -622,12 +562,7 @@ mod tests {
 
         // when
         builder
-            .ingest_sample(
-                &labels,
-                &unit,
-                Some(metric_type),
-                create_test_sample(),
-            )
+            .ingest_sample(&labels, &unit, Some(metric_type), create_test_sample())
             .unwrap();
 
         // then
@@ -773,8 +708,7 @@ mod tests {
         };
 
         // when
-        let result =
-            builder.ingest_sample(&labels, &unit, Some(metric_type), sample);
+        let result = builder.ingest_sample(&labels, &unit, Some(metric_type), sample);
 
         // then
         assert!(result.is_err());
@@ -801,8 +735,7 @@ mod tests {
         };
 
         // when
-        let result =
-            builder.ingest_sample(&labels, &unit, Some(metric_type), sample);
+        let result = builder.ingest_sample(&labels, &unit, Some(metric_type), sample);
 
         // then
         assert!(result.is_err());
