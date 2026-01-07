@@ -11,10 +11,11 @@ Building performant, cost-effective, and correct online database on object stora
 
 # Databases
 
-OpenData ships two databases today, with more on the way:
+OpenData ships three databases today, with more on the way:
 
 * **TSDB**: An objectstore native timeseries database that can serve as a backend for Prometheus. Its a great option for a low cost, easy to operate, grafana backend. [Learn more](timeseries/rfcs/0001-tsdb-storage.md).
 * **Log**: Think of it as Kafka 2.0. An objecstore native event streaming backend that supports millions of logs, so you can finally get a replayable log per key. [Learn more](log/rfcs/0001-storage.md).
+* **Vector**: An objectstore native vector database for approximate nearest neighbor search. SPANN-style architecture with centroids in memory and posting lists on disk for billion-scale capacity. [Learn more](vector/rfcs/0001-storage.md).
 
 
 # Which usecases are OpenData Databases suited for?
