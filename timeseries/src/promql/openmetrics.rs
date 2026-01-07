@@ -1,14 +1,13 @@
 //! OpenMetrics text format parser.
 //!
-//! Parses OpenMetrics exposition format into `SampleWithLabels` for ingestion.
+//! Parses OpenMetrics exposition format into `Series` for ingestion.
 //! See: https://prometheus.io/docs/specs/om/open_metrics_spec/
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::model::SampleWithLabels;
-use crate::series::{Label, MetricType, Sample, Temporality};
-use crate::util::Result;
+use crate::series::{Label, MetricType, Sample, Series, Temporality};
+use crate::util::{Fingerprint, Result};
 
 /// OpenMetrics metric types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -69,7 +68,7 @@ struct MetricFamily {
 /// Parser state
 struct Parser {
     families: HashMap<String, MetricFamily>,
-    samples: Vec<SampleWithLabels>,
+    series_map: HashMap<u128, Series>,
     default_timestamp: i64,
 }
 
@@ -82,12 +81,12 @@ impl Parser {
 
         Self {
             families: HashMap::new(),
-            samples: Vec::new(),
+            series_map: HashMap::new(),
             default_timestamp,
         }
     }
 
-    fn parse(mut self, input: &str) -> Result<Vec<SampleWithLabels>> {
+    fn parse(mut self, input: &str) -> Result<Vec<Series>> {
         let mut saw_eof = false;
 
         for line in input.lines() {
@@ -113,7 +112,7 @@ impl Parser {
         // OpenMetrics requires it, but most exporters use Prometheus format.
         let _ = saw_eof;
 
-        Ok(self.samples)
+        Ok(self.series_map.into_values().collect())
     }
 
     fn parse_metadata_line(&mut self, line: &str) -> Result<()> {
@@ -163,34 +162,44 @@ impl Parser {
         let family = self.families.get(base_name).cloned().unwrap_or_default();
         let metric_type = family.metric_type.to_metric_type(suffix);
 
-        // Build attributes with __name__ set to base metric name
-        let mut attributes = vec![Label {
+        // Build labels with __name__ set to base metric name
+        let mut series_labels = vec![Label {
             name: "__name__".to_string(),
             value: base_name.to_string(),
         }];
 
-        // Add suffix as attribute if present
+        // Add suffix as label if present
         if !suffix.is_empty() {
-            attributes.push(Label {
+            series_labels.push(Label {
                 name: "__suffix__".to_string(),
                 value: suffix.to_string(),
             });
         }
 
         // Add parsed labels
-        attributes.extend(labels);
+        series_labels.extend(labels);
 
-        let sample = SampleWithLabels {
-            labels: attributes,
-            metric_unit: family.unit.clone(),
-            metric_type,
-            sample: Sample {
-                timestamp_ms: timestamp,
-                value,
-            },
+        let sample = Sample {
+            timestamp_ms: timestamp,
+            value,
         };
 
-        self.samples.push(sample);
+        // Sort labels for consistent fingerprint computation
+        series_labels.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Compute fingerprint and add sample to existing series or create new one
+        let fingerprint = series_labels.fingerprint();
+        self.series_map
+            .entry(fingerprint)
+            .and_modify(|series| series.samples.push(sample.clone()))
+            .or_insert_with(|| Series {
+                labels: series_labels,
+                unit: family.unit.clone(),
+                metric_type: Some(metric_type),
+                description: None,
+                samples: vec![sample],
+            });
+
         Ok(())
     }
 
@@ -362,13 +371,13 @@ fn extract_base_name_and_suffix(name: &str) -> (&str, &str) {
     (name, "")
 }
 
-/// Parse OpenMetrics text format into samples for ingestion.
+/// Parse OpenMetrics text format into series for ingestion.
 ///
 /// # Arguments
 /// * `input` - OpenMetrics text format string
 ///
 /// # Returns
-/// A vector of `SampleWithLabels` ready for ingestion.
+/// A vector of `Series` ready for ingestion.
 ///
 /// # Example
 /// ```ignore
@@ -379,7 +388,7 @@ fn extract_base_name_and_suffix(name: &str) -> (&str, &str) {
 /// "#;
 /// let samples = parse_openmetrics(input)?;
 /// ```
-pub(crate) fn parse_openmetrics(input: &str) -> Result<Vec<SampleWithLabels>> {
+pub(crate) fn parse_openmetrics(input: &str) -> Result<Vec<Series>> {
     Parser::new().parse(input)
 }
 
@@ -415,7 +424,7 @@ mod tests {
         // then
         assert_eq!(samples.len(), 1);
         assert!(
-            std::mem::discriminant(&samples[0].metric_type)
+            std::mem::discriminant(&samples[0].metric_type.unwrap())
                 == std::mem::discriminant(&expected_type),
             "Expected {:?}, got {:?}",
             expected_type,
@@ -462,7 +471,7 @@ mod tests {
             .unwrap_or("");
         assert_eq!(suffix, expected_suffix);
         assert!(
-            std::mem::discriminant(&samples[0].metric_type)
+            std::mem::discriminant(&samples[0].metric_type.unwrap())
                 == std::mem::discriminant(&expected_type)
         );
     }
@@ -491,10 +500,10 @@ mod tests {
         // then
         assert_eq!(samples.len(), 1);
         assert!(
-            (samples[0].sample.value - expected).abs() < f64::EPSILON,
+            (samples[0].samples[0].value - expected).abs() < f64::EPSILON,
             "Expected {}, got {}",
             expected,
-            samples[0].sample.value
+            samples[0].samples[0].value
         );
     }
 
@@ -510,7 +519,7 @@ mod tests {
         let samples = parse_openmetrics(&input).unwrap();
 
         // then
-        assert!(samples[0].sample.value.is_nan());
+        assert!(samples[0].samples[0].value.is_nan());
     }
 
     #[rstest]
@@ -529,7 +538,7 @@ mod tests {
         let samples = parse_openmetrics(&input).unwrap();
 
         // then
-        assert_eq!(samples[0].sample.value, expected);
+        assert_eq!(samples[0].samples[0].value, expected);
     }
 
     // ==================== TIMESTAMP PARSING ====================
@@ -551,7 +560,7 @@ mod tests {
         let samples = parse_openmetrics(&input).unwrap();
 
         // then
-        assert_eq!(samples[0].sample.timestamp_ms, expected_ms);
+        assert_eq!(samples[0].samples[0].timestamp_ms, expected_ms);
     }
 
     #[test]
@@ -571,8 +580,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        assert!(samples[0].sample.timestamp_ms >= before);
-        assert!(samples[0].sample.timestamp_ms <= after);
+        assert!(samples[0].samples[0].timestamp_ms >= before);
+        assert!(samples[0].samples[0].timestamp_ms <= after);
     }
 
     // ==================== LABEL PARSING ====================
@@ -675,7 +684,7 @@ mod tests {
         let samples = parse_openmetrics(input).unwrap();
 
         // then
-        assert_eq!(samples[0].metric_unit.as_deref(), expected_unit);
+        assert_eq!(samples[0].unit.as_deref(), expected_unit);
     }
 
     // ==================== COMMENTS AND EMPTY LINES ====================
@@ -692,7 +701,7 @@ mod tests {
 
         // then
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].sample.value, 1.0);
+        assert_eq!(samples[0].samples[0].value, 1.0);
     }
 
     // ==================== EXEMPLAR HANDLING ====================
@@ -713,7 +722,7 @@ mod tests {
 
         // then
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].sample.value, expected_value);
+        assert_eq!(samples[0].samples[0].value, expected_value);
     }
 
     // ==================== EOF HANDLING ====================
@@ -782,13 +791,41 @@ requests_total{method="PUT"} 25
 "#;
 
         // when
-        let samples = parse_openmetrics(input).unwrap();
+        let series_list = parse_openmetrics(input).unwrap();
 
-        // then
-        assert_eq!(samples.len(), 3);
-        assert_eq!(samples[0].sample.value, 100.0);
-        assert_eq!(samples[1].sample.value, 50.0);
-        assert_eq!(samples[2].sample.value, 25.0);
+        // then - 3 different series (different method labels)
+        assert_eq!(series_list.len(), 3);
+
+        // Find each series by method label and verify value
+        let get_series = series_list
+            .iter()
+            .find(|s| {
+                s.labels
+                    .iter()
+                    .any(|l| l.name == "method" && l.value == "GET")
+            })
+            .unwrap();
+        assert_eq!(get_series.samples[0].value, 100.0);
+
+        let post_series = series_list
+            .iter()
+            .find(|s| {
+                s.labels
+                    .iter()
+                    .any(|l| l.name == "method" && l.value == "POST")
+            })
+            .unwrap();
+        assert_eq!(post_series.samples[0].value, 50.0);
+
+        let put_series = series_list
+            .iter()
+            .find(|s| {
+                s.labels
+                    .iter()
+                    .any(|l| l.name == "method" && l.value == "PUT")
+            })
+            .unwrap();
+        assert_eq!(put_series.samples[0].value, 25.0);
     }
 
     #[test]
@@ -819,10 +856,10 @@ errors_total 5
             .unwrap();
         assert!(matches!(
             requests.metric_type,
-            MetricType::Sum {
+            Some(MetricType::Sum {
                 monotonic: true,
                 ..
-            }
+            })
         ));
 
         let latency = samples
@@ -833,7 +870,7 @@ errors_total 5
                     .any(|a| a.name == "__name__" && a.value == "latency")
             })
             .unwrap();
-        assert!(matches!(latency.metric_type, MetricType::Gauge));
+        assert!(matches!(latency.metric_type, Some(MetricType::Gauge)));
     }
 
     // ==================== HISTOGRAM FULL EXAMPLE ====================
@@ -862,7 +899,7 @@ http_request_duration_count 300
 
         // All should have the unit
         for sample in &samples {
-            assert_eq!(sample.metric_unit, Some("seconds".to_string()));
+            assert_eq!(sample.unit, Some("seconds".to_string()));
         }
 
         // 6 buckets
@@ -881,7 +918,7 @@ http_request_duration_count 300
             .iter()
             .find(|s| s.labels.iter().any(|a| a.name == "le" && a.value == "+Inf"))
             .unwrap();
-        assert_eq!(inf_bucket.sample.value, 300.0);
+        assert_eq!(inf_bucket.samples[0].value, 300.0);
     }
 
     // ==================== SUMMARY FULL EXAMPLE ====================
@@ -911,7 +948,7 @@ rpc_duration_count 10000
             .collect();
         assert_eq!(quantiles.len(), 3);
         for q in &quantiles {
-            assert!(matches!(q.metric_type, MetricType::Summary));
+            assert!(matches!(q.metric_type, Some(MetricType::Summary)));
         }
     }
 
@@ -953,7 +990,7 @@ rpc_duration_count 10000
 
         // then
         assert!(result.is_ok());
-        assert_eq!(result.unwrap()[0].sample.value, 1.0);
+        assert_eq!(result.unwrap()[0].samples[0].value, 1.0);
     }
 
     // ==================== PROMETHEUS FORMAT COMPATIBILITY ====================
@@ -971,10 +1008,10 @@ rpc_duration_count 10000
         assert_eq!(samples.len(), 1);
         assert!(matches!(
             samples[0].metric_type,
-            MetricType::Sum {
+            Some(MetricType::Sum {
                 monotonic: true,
                 ..
-            }
+            })
         ));
         let name = samples[0]
             .labels
@@ -998,10 +1035,10 @@ rpc_duration_count 10000
         assert_eq!(samples.len(), 1);
         assert!(matches!(
             samples[0].metric_type,
-            MetricType::Sum {
+            Some(MetricType::Sum {
                 monotonic: true,
                 ..
-            }
+            })
         ));
         // Base name should have _total stripped
         let name = samples[0]
@@ -1025,7 +1062,7 @@ rpc_duration_count 10000
 
         // then
         assert_eq!(samples.len(), 1);
-        assert!(matches!(samples[0].metric_type, MetricType::Gauge));
+        assert!(matches!(samples[0].metric_type, Some(MetricType::Gauge)));
     }
 
     #[test]
@@ -1039,7 +1076,7 @@ rpc_duration_count 10000
         // then
         assert_eq!(samples.len(), 1);
         // other_metric has no type declaration, so defaults to gauge
-        assert!(matches!(samples[0].metric_type, MetricType::Gauge));
+        assert!(matches!(samples[0].metric_type, Some(MetricType::Gauge)));
     }
 
     #[test]

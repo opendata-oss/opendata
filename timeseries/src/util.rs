@@ -25,6 +25,12 @@ pub(crate) trait Fingerprint {
 
 impl Fingerprint for Vec<Label> {
     fn fingerprint(&self) -> u128 {
+        self.as_slice().fingerprint()
+    }
+}
+
+impl Fingerprint for [Label] {
+    fn fingerprint(&self) -> u128 {
         let mut hasher = Hasher::new();
         for label in self {
             hasher.update(label.name.as_bytes());

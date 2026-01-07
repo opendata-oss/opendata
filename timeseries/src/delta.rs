@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use dashmap::DashMap;
 
-use crate::series::{MetricType, Sample};
+use crate::series::{MetricType, Sample, Series};
 use crate::{
     error::Error,
     index::{ForwardIndex, InvertedIndex},
-    model::{SampleWithLabels, SeriesFingerprint, SeriesId, SeriesSpec, TimeBucket},
+    model::{SeriesFingerprint, SeriesId, SeriesSpec, TimeBucket},
     series::Label,
     util::{Fingerprint, Result},
 };
@@ -43,22 +43,29 @@ impl<'a> TsdbDeltaBuilder<'a> {
         }
     }
 
-    /// Ingest a sample with its labels.
-    /// Returns an error if the sample timestamp is outside the bucket's time range.
-    pub(crate) fn ingest(&mut self, sample_with_labels: SampleWithLabels) -> Result<()> {
-        self.ingest_sample(
-            sample_with_labels.labels,
-            sample_with_labels.metric_unit,
-            sample_with_labels.metric_type,
-            sample_with_labels.sample,
-        )
+    /// Ingest a series with its samples.
+    /// Returns an error if any sample timestamp is outside the bucket's time range.
+    pub(crate) fn ingest(&mut self, series: &Series) -> Result<()> {
+        // Sort labels once before iterating samples
+        let mut sorted_labels = series.labels.clone();
+        sorted_labels.sort_by(|a, b| a.name.cmp(&b.name));
+
+        for sample in &series.samples {
+            self.ingest_sample(
+                &sorted_labels,
+                &series.unit,
+                series.metric_type,
+                sample.clone(),
+            )?;
+        }
+        Ok(())
     }
 
     fn ingest_sample(
         &mut self,
-        mut labels: Vec<Label>,
-        metric_unit: Option<String>,
-        metric_type: MetricType,
+        labels: &[Label],
+        unit: &Option<String>,
+        metric_type: Option<MetricType>,
         sample: Sample,
     ) -> Result<()> {
         // Validate sample timestamp is within bucket range
@@ -72,9 +79,7 @@ impl<'a> TsdbDeltaBuilder<'a> {
             )));
         }
 
-        // Sort labels for consistent fingerprinting
-        labels.sort_by(|a, b| a.name.cmp(&b.name));
-
+        // Labels are already sorted by ingest() before calling this method
         let fingerprint = labels.fingerprint();
 
         // Fast path: check local delta first (for samples in the same batch)
@@ -104,14 +109,14 @@ impl<'a> TsdbDeltaBuilder<'a> {
             self.series_dict_delta.insert(fingerprint, series_id);
 
             let series_spec = SeriesSpec {
-                metric_unit: metric_unit.clone(),
+                unit: unit.clone(),
                 metric_type,
-                labels: labels.clone(),
+                labels: labels.to_vec(),
             };
 
             self.forward_index.series.insert(series_id, series_spec);
 
-            for label in &labels {
+            for label in labels {
                 self.inverted_index
                     .postings
                     .entry(label.clone())
@@ -221,19 +226,15 @@ mod tests {
         let series_dict = DashMap::new();
         let next_series_id = AtomicU32::new(0);
         let mut builder = TsdbDeltaBuilder::new(bucket, &series_dict, &next_series_id);
-        let labels = create_test_labels();
+        let mut labels = create_test_labels();
+        labels.sort_by(|a, b| a.name.cmp(&b.name));
         let sample = create_test_sample();
         let metric_unit = Some("bytes".to_string());
         let metric_type = MetricType::Gauge;
 
         // when
         builder
-            .ingest_sample(
-                labels.clone(),
-                metric_unit.clone(),
-                metric_type,
-                sample.clone(),
-            )
+            .ingest_sample(&labels, &metric_unit, Some(metric_type), sample.clone())
             .unwrap();
 
         // then
@@ -248,15 +249,13 @@ mod tests {
 
         // Verify forward index
         let series_spec = builder.forward_index.series.get(&0).unwrap();
-        assert_eq!(series_spec.metric_unit, metric_unit);
-        match (series_spec.metric_type, metric_type) {
-            (MetricType::Gauge, MetricType::Gauge) => {}
+        assert_eq!(series_spec.unit, metric_unit);
+        match (series_spec.metric_type, Some(metric_type)) {
+            (Some(MetricType::Gauge), Some(MetricType::Gauge)) => {}
             _ => panic!("Metric types don't match"),
         }
-        // Labels are sorted by ingest_sample, so sort them for comparison
-        let mut sorted_labels = labels.clone();
-        sorted_labels.sort_by(|a, b| a.name.cmp(&b.name));
-        assert_eq!(series_spec.labels, sorted_labels);
+        // Labels are already sorted
+        assert_eq!(series_spec.labels, labels);
 
         // Verify inverted index
         for label in &labels {
@@ -272,7 +271,8 @@ mod tests {
         let series_dict = DashMap::new();
         let next_series_id = AtomicU32::new(0);
         let mut builder = TsdbDeltaBuilder::new(bucket, &series_dict, &next_series_id);
-        let labels = create_test_labels();
+        let mut labels = create_test_labels();
+        labels.sort_by(|a, b| a.name.cmp(&b.name));
         // Timestamps must be within bucket range (60,000,000 to 63,600,000 ms)
         let sample1 = Sample {
             timestamp_ms: 60_000_001,
@@ -283,23 +283,14 @@ mod tests {
             value: 20.0,
         };
         let metric_type = MetricType::Gauge;
+        let unit = Some("bytes".to_string());
 
         // when
         builder
-            .ingest_sample(
-                labels.clone(),
-                Some("bytes".to_string()),
-                metric_type,
-                sample1.clone(),
-            )
+            .ingest_sample(&labels, &unit, Some(metric_type), sample1.clone())
             .unwrap();
         builder
-            .ingest_sample(
-                labels.clone(),
-                Some("bytes".to_string()),
-                metric_type,
-                sample2.clone(),
-            )
+            .ingest_sample(&labels, &unit, Some(metric_type), sample2.clone())
             .unwrap();
 
         // then
@@ -321,32 +312,25 @@ mod tests {
         let series_dict = DashMap::new();
         let next_series_id = AtomicU32::new(0);
         let mut builder = TsdbDeltaBuilder::new(bucket, &series_dict, &next_series_id);
-        let attributes1 = vec![Label {
+        let mut attributes1 = vec![Label {
             name: "service".to_string(),
             value: "api".to_string(),
         }];
-        let attributes2 = vec![Label {
+        attributes1.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut attributes2 = vec![Label {
             name: "service".to_string(),
             value: "web".to_string(),
         }];
+        attributes2.sort_by(|a, b| a.name.cmp(&b.name));
         let metric_type = MetricType::Gauge;
+        let unit = Some("bytes".to_string());
 
         // when
         builder
-            .ingest_sample(
-                attributes1,
-                Some("bytes".to_string()),
-                metric_type,
-                create_test_sample(),
-            )
+            .ingest_sample(&attributes1, &unit, Some(metric_type), create_test_sample())
             .unwrap();
         builder
-            .ingest_sample(
-                attributes2,
-                Some("bytes".to_string()),
-                metric_type,
-                create_test_sample(),
-            )
+            .ingest_sample(&attributes2, &unit, Some(metric_type), create_test_sample())
             .unwrap();
 
         // then
@@ -369,16 +353,14 @@ mod tests {
         series_dict.insert(fingerprint, 42); // Existing series_id
         let next_series_id = AtomicU32::new(0);
         let mut builder = TsdbDeltaBuilder::new(bucket, &series_dict, &next_series_id);
+        let mut test_labels = create_test_labels();
+        test_labels.sort_by(|a, b| a.name.cmp(&b.name));
         let metric_type = MetricType::Gauge;
+        let unit = Some("bytes".to_string());
 
         // when
         builder
-            .ingest_sample(
-                create_test_labels(), // Will be sorted by ingest_sample
-                Some("bytes".to_string()),
-                metric_type,
-                create_test_sample(),
-            )
+            .ingest_sample(&test_labels, &unit, Some(metric_type), create_test_sample())
             .unwrap();
 
         // then
@@ -395,25 +377,17 @@ mod tests {
         let series_dict = DashMap::new();
         let next_series_id = AtomicU32::new(0);
         let mut builder = TsdbDeltaBuilder::new(bucket, &series_dict, &next_series_id);
-        let labels = create_test_labels();
+        let mut labels = create_test_labels();
+        labels.sort_by(|a, b| a.name.cmp(&b.name));
         let metric_type = MetricType::Gauge;
+        let unit = Some("bytes".to_string());
 
         // when
         builder
-            .ingest_sample(
-                labels.clone(),
-                Some("bytes".to_string()),
-                metric_type,
-                create_test_sample(),
-            )
+            .ingest_sample(&labels, &unit, Some(metric_type), create_test_sample())
             .unwrap();
         builder
-            .ingest_sample(
-                labels.clone(),
-                Some("bytes".to_string()),
-                metric_type,
-                create_test_sample(),
-            )
+            .ingest_sample(&labels, &unit, Some(metric_type), create_test_sample())
             .unwrap();
 
         // then
@@ -431,7 +405,7 @@ mod tests {
         let series_dict = DashMap::new();
         let next_series_id = AtomicU32::new(0);
         let mut builder = TsdbDeltaBuilder::new(bucket, &series_dict, &next_series_id);
-        let attributes1 = vec![
+        let mut attributes1 = vec![
             Label {
                 name: "z_key".to_string(),
                 value: "value".to_string(),
@@ -441,7 +415,8 @@ mod tests {
                 value: "value".to_string(),
             },
         ];
-        let attributes2 = vec![
+        attributes1.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut attributes2 = vec![
             Label {
                 name: "a_key".to_string(),
                 value: "value".to_string(),
@@ -451,24 +426,16 @@ mod tests {
                 value: "value".to_string(),
             },
         ];
+        attributes2.sort_by(|a, b| a.name.cmp(&b.name));
         let metric_type = MetricType::Gauge;
+        let unit = Some("bytes".to_string());
 
         // when
         builder
-            .ingest_sample(
-                attributes1,
-                Some("bytes".to_string()),
-                metric_type,
-                create_test_sample(),
-            )
+            .ingest_sample(&attributes1, &unit, Some(metric_type), create_test_sample())
             .unwrap();
         builder
-            .ingest_sample(
-                attributes2,
-                Some("bytes".to_string()),
-                metric_type,
-                create_test_sample(),
-            )
+            .ingest_sample(&attributes2, &unit, Some(metric_type), create_test_sample())
             .unwrap();
 
         // then
@@ -484,7 +451,8 @@ mod tests {
         let series_dict = DashMap::new();
         let next_series_id = AtomicU32::new(0);
         let mut builder = TsdbDeltaBuilder::new(bucket, &series_dict, &next_series_id);
-        let labels = create_test_labels();
+        let mut labels = create_test_labels();
+        labels.sort_by(|a, b| a.name.cmp(&b.name));
         let metric_unit = Some("requests_per_second".to_string());
         let metric_type = MetricType::Sum {
             monotonic: true,
@@ -494,21 +462,21 @@ mod tests {
         // when
         builder
             .ingest_sample(
-                labels.clone(),
-                metric_unit.clone(),
-                metric_type,
+                &labels,
+                &metric_unit,
+                Some(metric_type),
                 create_test_sample(),
             )
             .unwrap();
 
         // then
         let series_spec = builder.forward_index.series.get(&0).unwrap();
-        assert_eq!(series_spec.metric_unit, metric_unit);
+        assert_eq!(series_spec.unit, metric_unit);
         match series_spec.metric_type {
-            MetricType::Sum {
+            Some(MetricType::Sum {
                 monotonic,
                 temporality,
-            } => {
+            }) => {
                 assert!(monotonic);
                 assert_eq!(temporality, Temporality::Cumulative);
             }
@@ -523,7 +491,7 @@ mod tests {
         let series_dict = DashMap::new();
         let next_series_id = AtomicU32::new(0);
         let mut builder = TsdbDeltaBuilder::new(bucket, &series_dict, &next_series_id);
-        let labels = vec![
+        let mut labels = vec![
             Label {
                 name: "service".to_string(),
                 value: "api".to_string(),
@@ -537,16 +505,13 @@ mod tests {
                 value: "us-east".to_string(),
             },
         ];
+        labels.sort_by(|a, b| a.name.cmp(&b.name));
         let metric_type = MetricType::Gauge;
+        let unit = Some("bytes".to_string());
 
         // when
         builder
-            .ingest_sample(
-                labels.clone(),
-                Some("bytes".to_string()),
-                metric_type,
-                create_test_sample(),
-            )
+            .ingest_sample(&labels, &unit, Some(metric_type), create_test_sample())
             .unwrap();
 
         // then
@@ -567,15 +532,11 @@ mod tests {
         let mut builder = TsdbDeltaBuilder::new(bucket, &series_dict, &next_series_id);
         let labels = Vec::<Label>::new();
         let metric_type = MetricType::Gauge;
+        let unit = Some("bytes".to_string());
 
         // when
         builder
-            .ingest_sample(
-                labels,
-                Some("bytes".to_string()),
-                metric_type,
-                create_test_sample(),
-            )
+            .ingest_sample(&labels, &unit, Some(metric_type), create_test_sample())
             .unwrap();
 
         // then
@@ -594,19 +555,21 @@ mod tests {
         let series_dict = DashMap::new();
         let next_series_id = AtomicU32::new(0);
         let mut builder = TsdbDeltaBuilder::new(bucket, &series_dict, &next_series_id);
-        let labels = create_test_labels();
+        let mut labels = create_test_labels();
+        labels.sort_by(|a, b| a.name.cmp(&b.name));
         let metric_type = MetricType::Gauge;
+        let unit: Option<String> = None;
 
         // when
         builder
-            .ingest_sample(labels.clone(), None, metric_type, create_test_sample())
+            .ingest_sample(&labels, &unit, Some(metric_type), create_test_sample())
             .unwrap();
 
         // then
         let series_spec = builder.forward_index.series.get(&0).unwrap();
-        assert_eq!(series_spec.metric_unit, None);
-        match (series_spec.metric_type, metric_type) {
-            (MetricType::Gauge, MetricType::Gauge) => {}
+        assert_eq!(series_spec.unit, None);
+        match (series_spec.metric_type, Some(metric_type)) {
+            (Some(MetricType::Gauge), Some(MetricType::Gauge)) => {}
             _ => panic!("Metric types don't match"),
         }
     }
@@ -634,17 +597,19 @@ mod tests {
         // when: spawn two threads that will race to create the same series
         let series_dict_a = series_dict.clone();
         let next_series_id_a = next_series_id.clone();
-        let attributes_a = labels.clone();
+        let mut attributes_a = labels.clone();
+        attributes_a.sort_by(|a, b| a.name.cmp(&b.name));
         let bucket_a = bucket.clone();
+        let unit = Some("bytes".to_string());
 
         let handle_a = thread::spawn(move || {
             let mut builder = TsdbDeltaBuilder::new(bucket_a, &series_dict_a, &next_series_id_a);
             // Timestamp must be within bucket range (60,000,000 to 63,600,000 ms)
             builder
                 .ingest_sample(
-                    attributes_a,
-                    Some("bytes".to_string()),
-                    MetricType::Gauge,
+                    &attributes_a,
+                    &unit,
+                    Some(MetricType::Gauge),
                     Sample {
                         timestamp_ms: 60_000_001,
                         value: 42.0,
@@ -656,17 +621,19 @@ mod tests {
 
         let series_dict_b = series_dict.clone();
         let next_series_id_b = next_series_id.clone();
-        let attributes_b = labels.clone();
+        let mut attributes_b = labels.clone();
+        attributes_b.sort_by(|a, b| a.name.cmp(&b.name));
         let bucket_b = bucket.clone();
+        let unit_b = Some("bytes".to_string());
 
         let handle_b = thread::spawn(move || {
             let mut builder = TsdbDeltaBuilder::new(bucket_b, &series_dict_b, &next_series_id_b);
             // Timestamp must be within bucket range (60,000,000 to 63,600,000 ms)
             builder
                 .ingest_sample(
-                    attributes_b,
-                    Some("bytes".to_string()),
-                    MetricType::Gauge,
+                    &attributes_b,
+                    &unit_b,
+                    Some(MetricType::Gauge),
                     Sample {
                         timestamp_ms: 60_000_002,
                         value: 43.0,
@@ -730,8 +697,10 @@ mod tests {
         let series_dict = DashMap::new();
         let next_series_id = AtomicU32::new(0);
         let mut builder = TsdbDeltaBuilder::new(bucket, &series_dict, &next_series_id);
-        let labels = create_test_labels();
+        let mut labels = create_test_labels();
+        labels.sort_by(|a, b| a.name.cmp(&b.name));
         let metric_type = MetricType::Gauge;
+        let unit = Some("bytes".to_string());
         // Timestamp before bucket start (60,000,000 ms)
         let sample = Sample {
             timestamp_ms: 59_999_999,
@@ -739,7 +708,7 @@ mod tests {
         };
 
         // when
-        let result = builder.ingest_sample(labels, Some("bytes".to_string()), metric_type, sample);
+        let result = builder.ingest_sample(&labels, &unit, Some(metric_type), sample);
 
         // then
         assert!(result.is_err());
@@ -755,8 +724,10 @@ mod tests {
         let series_dict = DashMap::new();
         let next_series_id = AtomicU32::new(0);
         let mut builder = TsdbDeltaBuilder::new(bucket, &series_dict, &next_series_id);
-        let labels = create_test_labels();
+        let mut labels = create_test_labels();
+        labels.sort_by(|a, b| a.name.cmp(&b.name));
         let metric_type = MetricType::Gauge;
+        let unit = Some("bytes".to_string());
         // Timestamp at bucket end (63,600,000 ms) - should be rejected (exclusive end)
         let sample = Sample {
             timestamp_ms: 63_600_000,
@@ -764,7 +735,7 @@ mod tests {
         };
 
         // when
-        let result = builder.ingest_sample(labels, Some("bytes".to_string()), metric_type, sample);
+        let result = builder.ingest_sample(&labels, &unit, Some(metric_type), sample);
 
         // then
         assert!(result.is_err());

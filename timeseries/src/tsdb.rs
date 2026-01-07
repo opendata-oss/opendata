@@ -10,9 +10,9 @@ use opendata_common::Storage;
 
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndex, InvertedIndexLookup};
 use crate::minitsdb::MiniTsdb;
-use crate::model::{SampleWithLabels, SeriesId, TimeBucket};
+use crate::model::{SeriesId, TimeBucket};
 use crate::query::QueryReader;
-use crate::series::{Label, Sample};
+use crate::series::{Label, Sample, Series};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::util::Result;
 
@@ -119,27 +119,34 @@ impl Tsdb {
         Ok(())
     }
 
-    /// Ingest samples into the TSDB, grouping by time bucket.
-    pub(crate) async fn ingest_samples(&self, samples: Vec<SampleWithLabels>) -> Result<()> {
-        if samples.is_empty() {
-            return Ok(());
-        }
+    /// Ingest series into the TSDB.
+    /// Each series is split by time bucket based on sample timestamps.
+    pub(crate) async fn ingest_samples(&self, series_list: Vec<Series>) -> Result<()> {
+        for series in series_list {
+            // Group samples by bucket
+            let mut bucket_samples: HashMap<TimeBucket, Vec<Sample>> = HashMap::new();
 
-        // Group samples by bucket
-        let mut by_bucket: HashMap<TimeBucket, Vec<SampleWithLabels>> = HashMap::new();
+            for sample in series.samples {
+                let bucket = TimeBucket::round_to_hour(
+                    std::time::UNIX_EPOCH
+                        + std::time::Duration::from_millis(sample.timestamp_ms as u64),
+                )?;
+                bucket_samples.entry(bucket).or_default().push(sample);
+            }
 
-        for sample in samples {
-            let bucket = TimeBucket::round_to_hour(
-                std::time::UNIX_EPOCH
-                    + std::time::Duration::from_millis(sample.sample.timestamp_ms as u64),
-            )?;
-            by_bucket.entry(bucket).or_default().push(sample);
-        }
+            // Ingest each bucket's samples as a series
+            for (bucket, samples) in bucket_samples {
+                let bucket_series = Series {
+                    labels: series.labels.clone(),
+                    metric_type: series.metric_type,
+                    unit: series.unit.clone(),
+                    description: series.description.clone(),
+                    samples,
+                };
 
-        // Ingest each bucket
-        for (bucket, bucket_samples) in by_bucket {
-            let mini = self.get_or_create_for_ingest(bucket).await?;
-            mini.ingest(bucket_samples).await?;
+                let mini = self.get_or_create_for_ingest(bucket).await?;
+                mini.ingest(&bucket_series).await?;
+            }
         }
 
         Ok(())
@@ -276,7 +283,6 @@ impl QueryReader for TsdbQueryReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::SampleWithLabels;
     use crate::series::MetricType;
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
     use opendata_common::storage::in_memory::InMemoryStorage;
@@ -292,7 +298,7 @@ mod tests {
         label_pairs: Vec<(&str, &str)>,
         timestamp: i64,
         value: f64,
-    ) -> SampleWithLabels {
+    ) -> Series {
         let mut labels = vec![Label {
             name: "__name__".to_string(),
             value: metric_name.to_string(),
@@ -303,14 +309,15 @@ mod tests {
                 value: val.to_string(),
             });
         }
-        SampleWithLabels {
+        Series {
             labels,
-            metric_unit: None,
-            metric_type: MetricType::Gauge,
-            sample: Sample {
+            unit: None,
+            metric_type: Some(MetricType::Gauge),
+            description: None,
+            samples: vec![Sample {
                 timestamp_ms: timestamp,
                 value,
-            },
+            }],
         }
     }
 
@@ -400,7 +407,7 @@ mod tests {
         // Ingest a sample with timestamp in the bucket range (seconds 3600-7199)
         // Using 4000 seconds = 4000000 ms
         let sample = create_sample("http_requests", vec![("env", "prod")], 4000000, 42.0);
-        mini.ingest(vec![sample]).await.unwrap();
+        mini.ingest(&sample).await.unwrap();
 
         // Flush to make data visible
         tsdb.flush().await.unwrap();
@@ -451,10 +458,21 @@ mod tests {
             .await
             .unwrap();
         mini1
-            .ingest(vec![
-                create_sample("http_requests", vec![("env", "prod")], 3_900_000, 10.0),
-                create_sample("http_requests", vec![("env", "staging")], 3_900_001, 15.0),
-            ])
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod")],
+                3_900_000,
+                10.0,
+            ))
+            .await
+            .unwrap();
+        mini1
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging")],
+                3_900_001,
+                15.0,
+            ))
             .await
             .unwrap();
 
@@ -463,10 +481,21 @@ mod tests {
             .await
             .unwrap();
         mini2
-            .ingest(vec![
-                create_sample("http_requests", vec![("env", "prod")], 7_900_000, 20.0),
-                create_sample("http_requests", vec![("env", "staging")], 7_900_001, 25.0),
-            ])
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod")],
+                7_900_000,
+                20.0,
+            ))
+            .await
+            .unwrap();
+        mini2
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging")],
+                7_900_001,
+                25.0,
+            ))
             .await
             .unwrap();
 
@@ -486,10 +515,21 @@ mod tests {
             .await
             .unwrap();
         mini3
-            .ingest(vec![
-                create_sample("http_requests", vec![("env", "prod")], 11_900_000, 30.0),
-                create_sample("http_requests", vec![("env", "staging")], 11_900_001, 35.0),
-            ])
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod")],
+                11_900_000,
+                30.0,
+            ))
+            .await
+            .unwrap();
+        mini3
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging")],
+                11_900_001,
+                35.0,
+            ))
             .await
             .unwrap();
 
@@ -498,10 +538,21 @@ mod tests {
             .await
             .unwrap();
         mini4
-            .ingest(vec![
-                create_sample("http_requests", vec![("env", "prod")], 15_900_000, 40.0),
-                create_sample("http_requests", vec![("env", "staging")], 15_900_001, 45.0),
-            ])
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod")],
+                15_900_000,
+                40.0,
+            ))
+            .await
+            .unwrap();
+        mini4
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging")],
+                15_900_001,
+                45.0,
+            ))
             .await
             .unwrap();
 

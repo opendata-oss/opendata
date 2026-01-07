@@ -2,7 +2,7 @@
 
 use std::time::SystemTime;
 
-use crate::series::{Label, MetricType, Sample};
+use crate::series::{Label, MetricType};
 use crate::util::{Result, hour_bucket_in_epoch_minutes};
 
 /// Series ID (unique within a time bucket)
@@ -45,19 +45,9 @@ impl TimeBucket {
 
 #[derive(Clone, Debug)]
 pub(crate) struct SeriesSpec {
-    pub(crate) metric_unit: Option<String>,
-    pub(crate) metric_type: MetricType,
+    pub(crate) unit: Option<String>,
+    pub(crate) metric_type: Option<MetricType>,
     pub(crate) labels: Vec<Label>,
-}
-
-/// A sample with all its labels, including the metric name
-#[derive(Clone, Debug)]
-pub(crate) struct SampleWithLabels {
-    // TODO: this should be SeriesSample and use SeriesSpec
-    pub(crate) labels: Vec<Label>,
-    pub(crate) metric_unit: Option<String>,
-    pub(crate) metric_type: MetricType,
-    pub(crate) sample: Sample,
 }
 
 /// Convert TimeBucketSize to hours

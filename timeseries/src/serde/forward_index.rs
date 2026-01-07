@@ -60,6 +60,18 @@ impl From<MetricType> for MetricMeta {
     }
 }
 
+impl From<Option<MetricType>> for MetricMeta {
+    fn from(metric_type: Option<MetricType>) -> Self {
+        match metric_type {
+            Some(mt) => MetricMeta::from(mt),
+            None => MetricMeta {
+                metric_type: 0, // 0 = unknown/unspecified
+                flags: 0,
+            },
+        }
+    }
+}
+
 impl Encode for MetricMeta {
     fn encode(&self, buf: &mut BytesMut) {
         buf.extend_from_slice(&[self.metric_type, self.flags]);
@@ -158,19 +170,20 @@ impl From<ForwardIndexValue> for SeriesSpec {
         };
 
         let metric_type = match value.metric_meta.metric_type {
-            1 => MetricType::Gauge,
-            2 => MetricType::Sum {
+            0 => None, // Unknown/unspecified
+            1 => Some(MetricType::Gauge),
+            2 => Some(MetricType::Sum {
                 monotonic: value.metric_meta.monotonic(),
                 temporality,
-            },
-            3 => MetricType::Histogram { temporality },
-            4 => MetricType::ExponentialHistogram { temporality },
-            5 => MetricType::Summary,
-            _ => MetricType::Gauge, // Default fallback for unknown types
+            }),
+            3 => Some(MetricType::Histogram { temporality }),
+            4 => Some(MetricType::ExponentialHistogram { temporality }),
+            5 => Some(MetricType::Summary),
+            _ => None, // Unknown types map to None
         };
 
         SeriesSpec {
-            metric_unit: value.metric_unit,
+            unit: value.metric_unit,
             metric_type,
             labels: value.labels,
         }

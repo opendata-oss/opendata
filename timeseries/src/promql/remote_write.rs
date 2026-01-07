@@ -12,8 +12,7 @@ use axum::response::{IntoResponse, Response};
 use prost::Message;
 
 use crate::error::Error;
-use crate::model::SampleWithLabels;
-use crate::series::{Label, MetricType, Sample};
+use crate::series::{Label, MetricType, Sample, Series};
 use crate::tsdb::Tsdb;
 use crate::util::Result;
 
@@ -61,43 +60,39 @@ pub struct ProtobufSample {
 // Conversion logic
 // ============================================================================
 
-/// Convert a WriteRequest into a Vec<SampleWithLabels>.
+/// Convert a WriteRequest into a Vec<Series>.
 ///
-/// Each TimeSeries in the WriteRequest produces one SampleWithLabels per sample,
-/// all sharing the same label set.
-pub fn convert_write_request(request: WriteRequest) -> Vec<SampleWithLabels> {
-    let mut result = Vec::new();
+/// Each TimeSeries in the WriteRequest produces one Series containing all its samples.
+pub fn convert_write_request(request: WriteRequest) -> Vec<Series> {
+    request
+        .timeseries
+        .into_iter()
+        .map(|ts| {
+            let labels: Vec<Label> = ts
+                .labels
+                .into_iter()
+                .map(|l| Label::new(l.name, l.value))
+                .collect();
 
-    for ts in request.timeseries {
-        // Convert labels to Labels
-        let labels: Vec<Label> = ts
-            .labels
-            .into_iter()
-            .map(|l| Label {
-                name: l.name,
-                value: l.value,
-            })
-            .collect();
+            let samples: Vec<Sample> = ts
+                .samples
+                .into_iter()
+                .map(|s| Sample::new(s.timestamp, s.value))
+                .collect();
 
-        // Create a SampleWithLabels for each sample in the time series
-        for sample in ts.samples {
-            result.push(SampleWithLabels {
-                labels: labels.clone(),
-                metric_unit: None, // Remote Write 1.0 doesn't include unit info
-                metric_type: MetricType::Gauge, // Default to Gauge since type info not in 1.0
-                sample: Sample {
-                    timestamp_ms: sample.timestamp,
-                    value: sample.value,
-                },
-            });
-        }
-    }
-
-    result
+            Series {
+                labels,
+                metric_type: Some(MetricType::Gauge), // Default to Gauge since type info not in 1.0
+                unit: None,
+                description: None,
+                samples,
+            }
+        })
+        .collect()
 }
 
 /// Parse a snappy-compressed protobuf WriteRequest.
-pub fn parse_remote_write(body: &[u8]) -> Result<Vec<SampleWithLabels>> {
+pub fn parse_remote_write(body: &[u8]) -> Result<Vec<Series>> {
     // Decompress snappy (block format)
     let decompressed = snap::raw::Decoder::new()
         .decompress_vec(body)
@@ -268,31 +263,32 @@ mod tests {
         };
 
         // when
-        let samples = convert_write_request(request);
+        let series_list = convert_write_request(request);
 
-        // then
-        assert_eq!(samples.len(), 2);
+        // then - one series with two samples
+        assert_eq!(series_list.len(), 1);
 
-        // First sample
-        assert_eq!(samples[0].sample.value, 100.0);
-        assert_eq!(samples[0].sample.timestamp_ms, 1700000000000);
-        assert_eq!(samples[0].labels.len(), 2);
+        let series = &series_list[0];
+        assert_eq!(series.labels.len(), 2);
         assert!(
-            samples[0]
+            series
                 .labels
                 .iter()
-                .any(|a| a.name == "__name__" && a.value == "http_requests")
+                .any(|l| l.name == "__name__" && l.value == "http_requests")
         );
         assert!(
-            samples[0]
+            series
                 .labels
                 .iter()
-                .any(|a| a.name == "env" && a.value == "prod")
+                .any(|l| l.name == "env" && l.value == "prod")
         );
 
-        // Second sample
-        assert_eq!(samples[1].sample.value, 150.0);
-        assert_eq!(samples[1].sample.timestamp_ms, 1700000001000);
+        // Two samples in the series
+        assert_eq!(series.samples.len(), 2);
+        assert_eq!(series.samples[0].value, 100.0);
+        assert_eq!(series.samples[0].timestamp_ms, 1700000000000);
+        assert_eq!(series.samples[1].value, 150.0);
+        assert_eq!(series.samples[1].timestamp_ms, 1700000001000);
     }
 
     #[test]
@@ -324,12 +320,12 @@ mod tests {
         };
 
         // when
-        let samples = convert_write_request(request);
+        let series_list = convert_write_request(request);
 
-        // then
-        assert_eq!(samples.len(), 2);
-        assert_eq!(samples[0].sample.value, 1.0);
-        assert_eq!(samples[1].sample.value, 2.0);
+        // then - two series, each with one sample
+        assert_eq!(series_list.len(), 2);
+        assert_eq!(series_list[0].samples[0].value, 1.0);
+        assert_eq!(series_list[1].samples[0].value, 2.0);
     }
 
     #[test]
@@ -388,11 +384,11 @@ mod tests {
             .expect("compression should succeed");
 
         // when
-        let samples = parse_remote_write(&compressed).unwrap();
+        let series_list = parse_remote_write(&compressed).unwrap();
 
         // then
-        assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].sample.value, 42.0);
+        assert_eq!(series_list.len(), 1);
+        assert_eq!(series_list[0].samples[0].value, 42.0);
     }
 
     #[rstest]
@@ -453,11 +449,14 @@ mod tests {
         };
 
         // when
-        let samples = convert_write_request(request);
+        let series_list = convert_write_request(request);
 
         // then
-        assert!(matches!(samples[0].metric_type, MetricType::Gauge));
-        assert!(samples[0].metric_unit.is_none());
+        assert!(matches!(
+            series_list[0].metric_type,
+            Some(MetricType::Gauge)
+        ));
+        assert!(series_list[0].unit.is_none());
     }
 
     // ==================== TIMESTAMP CONVERSION TESTS ====================
@@ -479,10 +478,10 @@ mod tests {
         };
 
         // when
-        let samples = convert_write_request(request);
+        let series_list = convert_write_request(request);
 
         // then
-        assert_eq!(samples[0].sample.timestamp_ms, expected);
+        assert_eq!(series_list[0].samples[0].timestamp_ms, expected);
     }
 
     // ==================== LARGE REQUEST TESTS ====================
@@ -519,9 +518,10 @@ mod tests {
             .expect("compression should succeed");
 
         // when
-        let samples = parse_remote_write(&compressed).unwrap();
+        let series_list = parse_remote_write(&compressed).unwrap();
 
         // then
-        assert_eq!(samples.len(), 10000); // 1000 series * 10 samples
+        assert_eq!(series_list.len(), 1000); // 1000 series
+        assert_eq!(series_list[0].samples.len(), 10); // 10 samples each
     }
 }

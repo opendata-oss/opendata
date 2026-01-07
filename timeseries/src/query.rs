@@ -168,8 +168,8 @@ pub(crate) mod test_utils {
                 self.forward_index.series.insert(
                     id,
                     SeriesSpec {
-                        metric_unit: None,
-                        metric_type,
+                        unit: None,
+                        metric_type: Some(metric_type),
                         labels: labels.clone(),
                     },
                 );
