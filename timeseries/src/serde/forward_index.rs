@@ -1,7 +1,7 @@
 // ForwardIndex value structure with MetricMeta and LabelBinding
 
-use crate::model::SeriesSpec;
-use crate::series::{Label, MetricType, Temporality};
+use crate::index::SeriesSpec;
+use crate::model::{Label, MetricType, Temporality};
 
 use super::*;
 use bytes::{Bytes, BytesMut};

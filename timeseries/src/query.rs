@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::model::SeriesId;
-use crate::series::{Label, Sample};
+use crate::model::{Label, Sample};
 use crate::util::Result;
 
 /// Trait for read-only queries across all data tiers.
@@ -47,9 +47,8 @@ pub(crate) trait QueryReader: Send + Sync {
 #[cfg(test)]
 pub(crate) mod test_utils {
     use super::*;
-    use crate::index::{ForwardIndex, InvertedIndex};
-    use crate::model::{SeriesSpec, TimeBucket};
-    use crate::series::MetricType;
+    use crate::index::{ForwardIndex, InvertedIndex, SeriesSpec};
+    use crate::model::{MetricType, TimeBucket};
     use std::collections::HashMap;
 
     /// A mock QueryReader for testing that holds data in memory.

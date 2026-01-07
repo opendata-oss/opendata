@@ -4,9 +4,10 @@ use blake3::Hasher;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::Error;
-use crate::series::Label;
+use crate::model::Label;
 
 pub use crate::error::Result;
+use crate::model::BucketSize;
 
 /// Computes a Blake3 hash of a string, truncated to u64 for use as a fingerprint
 /// in dictionary keys (attribute keys and values).
@@ -129,9 +130,19 @@ pub(crate) fn normalize_str(s: &str) -> Option<String> {
     Some(s.to_string())
 }
 
+/// Convert TimeBucketSize to hours
+pub fn time_bucket_size_hours(size: BucketSize) -> u32 {
+    if size == 0 || size > 15 {
+        return 0;
+    }
+    2u32.pow((size - 1) as u32)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_duration, parse_timestamp, parse_timestamp_to_seconds};
+    use super::{
+        parse_duration, parse_timestamp, parse_timestamp_to_seconds, time_bucket_size_hours,
+    };
     use bytes::{BufMut, Bytes, BytesMut};
     use opendata_common::BytesRange;
     use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -387,5 +398,14 @@ mod tests {
         // then
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid duration"));
+    }
+
+    #[test]
+    fn should_convert_time_bucket_size_to_hours() {
+        assert_eq!(time_bucket_size_hours(1), 1);
+        assert_eq!(time_bucket_size_hours(2), 2);
+        assert_eq!(time_bucket_size_hours(3), 4);
+        assert_eq!(time_bucket_size_hours(4), 8);
+        assert_eq!(time_bucket_size_hours(5), 16);
     }
 }

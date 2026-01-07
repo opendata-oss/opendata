@@ -10,7 +10,7 @@ use super::config::{PrometheusConfig, ScrapeConfig};
 use super::metrics::{Metrics, ScrapeLabels};
 use super::openmetrics::parse_openmetrics;
 use crate::error::Error;
-use crate::series::{Label, MetricType, Sample, Series};
+use crate::model::{Label, MetricType, Sample, Series};
 use crate::tsdb::Tsdb;
 use crate::util::Result;
 

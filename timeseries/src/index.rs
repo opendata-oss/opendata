@@ -1,11 +1,17 @@
 #![allow(dead_code)]
 
+use crate::model::MetricType;
+use crate::model::{Label, SeriesId};
 use dashmap::{DashMap, mapref::one::Ref};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 
-use crate::model::{SeriesId, SeriesSpec};
-use crate::series::Label;
+#[derive(Clone, Debug)]
+pub(crate) struct SeriesSpec {
+    pub(crate) unit: Option<String>,
+    pub(crate) metric_type: Option<MetricType>,
+    pub(crate) labels: Vec<Label>,
+}
 
 /// Trait for looking up series specs by ID.
 /// This allows both ForwardIndex and view types to be used interchangeably.

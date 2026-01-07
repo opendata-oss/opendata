@@ -42,7 +42,6 @@ mod delta;
 mod head;
 mod index;
 mod minitsdb;
-mod model;
 mod promql;
 mod query;
 mod serde;
@@ -55,11 +54,11 @@ mod util;
 // Public API modules
 mod config;
 pub(crate) mod error;
-pub(crate) mod series;
+pub(crate) mod model;
 mod timeseries;
 
 // Public re-exports
 pub use config::{Config, WriteOptions};
 pub use error::{Error, Result};
-pub use series::{Label, MetricType, Sample, Series, SeriesBuilder};
+pub use model::{Label, MetricType, Sample, Series, SeriesBuilder};
 pub use timeseries::TimeSeries;

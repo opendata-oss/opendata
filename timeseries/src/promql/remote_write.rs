@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use prost::Message;
 
 use crate::error::Error;
-use crate::series::{Label, MetricType, Sample, Series};
+use crate::model::{Label, MetricType, Sample, Series};
 use crate::tsdb::Tsdb;
 use crate::util::Result;
 

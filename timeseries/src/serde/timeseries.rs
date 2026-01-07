@@ -1,6 +1,6 @@
 // TimeSeries value structure with Gorilla compression using tsz crate
 
-use crate::series::Sample;
+use crate::model::Sample;
 
 use super::*;
 use bytes::Bytes;
