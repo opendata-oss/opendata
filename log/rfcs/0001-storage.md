@@ -138,30 +138,30 @@ If SlateDB supports multi-writer in the future, each writer would maintain its o
 
 To efficiently track and recover the sequence counter, the writer uses block-based allocation. Rather than persisting the sequence number after every append, the writer pre-allocates a block of sequence numbers and records the allocation in the LSM.
 
-A new record type `LastBlock` (type discriminator `0x02`) stores the current allocation:
+A new record type `SeqBlock` (type discriminator `0x02`) stores the current allocation:
 
 ```
-LastBlock Record:
+SeqBlock Record:
   SlateDB Key:   | version (u8) | type (u8) |
   SlateDB Value: | base_sequence (u64) | block_size (u64) |
 ```
 
-The `LastBlock` key is static—it contains only the version and type discriminator with no user key component. This ensures there is exactly one such record in the database.
+The `SeqBlock` key is static—it contains only the version and type discriminator with no user key component. This ensures there is exactly one such record in the database.
 
 **Allocation procedure:**
 
-1. On initialization, the writer reads the `LastBlock` record (if present) to determine the last allocated range `[base, base + size)`.
-2. The writer allocates a new block starting at `base + size` and writes a new `LastBlock` record before processing any appends.
+1. On initialization, the writer reads the `SeqBlock` record (if present) to determine the last allocated range `[base, base + size)`.
+2. The writer allocates a new block starting at `base + size` and writes a new `SeqBlock` record before processing any appends.
 3. During normal operation, the writer assigns sequence numbers from the current block, incrementing after each append.
-4. When the current block is exhausted, the writer allocates a new block and writes an updated `LastBlock` record.
+4. When the current block is exhausted, the writer allocates a new block and writes an updated `SeqBlock` record.
 
 **Recovery:**
 
-On crash recovery, the writer reads the `LastBlock` record and allocates a fresh block starting after the previous range. Any sequence numbers that were allocated but not used before the crash are simply skipped. This may create gaps in the sequence space, but monotonicity is preserved.
+On crash recovery, the writer reads the `SeqBlock` record and allocates a fresh block starting after the previous range. Any sequence numbers that were allocated but not used before the crash are simply skipped. This may create gaps in the sequence space, but monotonicity is preserved.
 
 **Block sizing:**
 
-The block size is an internal implementation detail and is not exposed through configuration. The implementation may vary the block size to balance write amplification (larger blocks reduce `LastBlock` write frequency) against sequence space efficiency (smaller blocks waste fewer sequence numbers on crash).
+The block size is an internal implementation detail and is not exposed through configuration. The implementation may vary the block size to balance write amplification (larger blocks reduce `SeqBlock` write frequency) against sequence space efficiency (smaller blocks waste fewer sequence numbers on crash).
 
 ### SST Representation
 
@@ -320,7 +320,7 @@ The simpler key+sequence encoding preserves key ordering and avoids the collisio
 
 ### SlateDB Sequence Numbers
 
-SlateDB maintains its own internal sequence number for MVCC versioning. Ideally, OpenData-Log could reuse this counter rather than implementing separate tracking with `LastBlock` records. However, SlateDB's sequence number is not currently exposed in its public API. Furthermore, since the sequence number is embedded into the key, we would need to align the sequence number prior to writing. Current proposals to expose SlateDb sequence numbers do not offer such a mechanism, but we can reevaluate once the effort is complete. Finally, we should reserve the ability to offer an `edit` API so that a corrupt/incorrect record may be overwritten. This may be more difficult if we are too coupled with the SlateDb sequence number.  
+SlateDB maintains its own internal sequence number for MVCC versioning. Ideally, OpenData-Log could reuse this counter rather than implementing separate tracking with `SeqBlock` records. However, SlateDB's sequence number is not currently exposed in its public API. Furthermore, since the sequence number is embedded into the key, we would need to align the sequence number prior to writing. Current proposals to expose SlateDb sequence numbers do not offer such a mechanism, but we can reevaluate once the effort is complete. Finally, we should reserve the ability to offer an `edit` API so that a corrupt/incorrect record may be overwritten. This may be more difficult if we are too coupled with the SlateDb sequence number.  
 
 ### Headers
 

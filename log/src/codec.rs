@@ -17,7 +17,7 @@
 //! # Record Types
 //!
 //! - `LogEntry` (0x01): User data entries with key and sequence number
-//! - `LastBlock` (0x02): Sequence number block allocation tracking
+//! - `SeqBlock` (0x02): Sequence number block allocation tracking
 //!
 //! # TerminatedBytes Encoding
 //!
@@ -56,7 +56,7 @@ pub enum RecordType {
     /// Log entry record containing user key, sequence, and value
     LogEntry = 0x01,
     /// Block allocation record for sequence number tracking
-    LastBlock = 0x02,
+    SeqBlock = 0x02,
 }
 
 impl RecordType {
@@ -69,7 +69,7 @@ impl RecordType {
     pub fn from_byte(byte: u8) -> Result<Self, Error> {
         match byte {
             0x01 => Ok(RecordType::LogEntry),
-            0x02 => Ok(RecordType::LastBlock),
+            0x02 => Ok(RecordType::SeqBlock),
             _ => Err(Error::Encoding(format!(
                 "invalid record type: 0x{:02x}",
                 byte
@@ -246,27 +246,27 @@ impl LogEntryKey {
     }
 }
 
-/// Key for the LastBlock record (static, singleton key).
+/// Key for the SeqBlock record (static, singleton key).
 ///
 /// ```text
 /// | version (u8) | type (u8) |
 /// ```
 ///
-/// There is exactly one LastBlock record in the database.
+/// There is exactly one SeqBlock record in the database.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LastBlockKey;
+pub struct LastSeqBlockKey;
 
-impl LastBlockKey {
-    /// Encodes the LastBlock key
+impl LastSeqBlockKey {
+    /// Encodes the SeqBlock key
     pub fn encode(&self) -> Bytes {
-        Bytes::from(vec![KEY_VERSION, RecordType::LastBlock.as_byte()])
+        Bytes::from(vec![KEY_VERSION, RecordType::SeqBlock.as_byte()])
     }
 
-    /// Decodes and validates a LastBlock key
+    /// Decodes and validates a SeqBlock key
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
         if data.len() < 2 {
             return Err(Error::Encoding(
-                "buffer too short for LastBlock key".to_string(),
+                "buffer too short for SeqBlock key".to_string(),
             ));
         }
 
@@ -278,18 +278,18 @@ impl LastBlockKey {
         }
 
         let record_type = RecordType::from_byte(data[1])?;
-        if record_type != RecordType::LastBlock {
+        if record_type != RecordType::SeqBlock {
             return Err(Error::Encoding(format!(
-                "invalid record type: expected LastBlock, got {:?}",
+                "invalid record type: expected SeqBlock, got {:?}",
                 record_type
             )));
         }
 
-        Ok(LastBlockKey)
+        Ok(LastSeqBlockKey)
     }
 }
 
-/// Value for the LastBlock record.
+/// Value for the SeqBlock record.
 ///
 /// Stores the current sequence block allocation:
 ///
@@ -299,15 +299,15 @@ impl LastBlockKey {
 ///
 /// The allocated range is `[base_sequence, base_sequence + block_size)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LastBlockValue {
+pub struct SeqBlock {
     /// Base sequence number of the allocated block
     pub base_sequence: u64,
     /// Size of the allocated block
     pub block_size: u64,
 }
 
-impl LastBlockValue {
-    /// Creates a new LastBlock value
+impl SeqBlock {
+    /// Creates a new SeqBlock value
     pub fn new(base_sequence: u64, block_size: u64) -> Self {
         Self {
             base_sequence,
@@ -323,11 +323,11 @@ impl LastBlockValue {
         buf.freeze()
     }
 
-    /// Decodes a LastBlock value from bytes
+    /// Decodes a SeqBlock value from bytes
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
         if data.len() < 16 {
             return Err(Error::Encoding(format!(
-                "buffer too short for LastBlock value: need 16 bytes, got {}",
+                "buffer too short for SeqBlock value: need 16 bytes, got {}",
                 data.len()
             )));
         }
@@ -339,7 +339,7 @@ impl LastBlockValue {
             data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
         ]);
 
-        Ok(LastBlockValue {
+        Ok(SeqBlock {
             base_sequence,
             block_size,
         })
@@ -359,13 +359,13 @@ mod tests {
     fn should_convert_record_type_to_byte_and_back() {
         // given
         let log_entry = RecordType::LogEntry;
-        let last_block = RecordType::LastBlock;
+        let seq_block = RecordType::SeqBlock;
 
         // when/then
         assert_eq!(log_entry.as_byte(), 0x01);
-        assert_eq!(last_block.as_byte(), 0x02);
+        assert_eq!(seq_block.as_byte(), 0x02);
         assert_eq!(RecordType::from_byte(0x01).unwrap(), RecordType::LogEntry);
-        assert_eq!(RecordType::from_byte(0x02).unwrap(), RecordType::LastBlock);
+        assert_eq!(RecordType::from_byte(0x02).unwrap(), RecordType::SeqBlock);
     }
 
     #[test]
@@ -714,8 +714,8 @@ mod tests {
 
     #[test]
     fn should_fail_decode_log_entry_key_with_wrong_type() {
-        // given - LastBlock type instead of LogEntry
-        let data = vec![KEY_VERSION, RecordType::LastBlock.as_byte()];
+        // given - SeqBlock type instead of LogEntry
+        let data = vec![KEY_VERSION, RecordType::SeqBlock.as_byte()];
 
         // when
         let result = LogEntryKey::decode(&data);
@@ -725,41 +725,41 @@ mod tests {
     }
 
     #[test]
-    fn should_encode_and_decode_last_block_key() {
+    fn should_encode_and_decode_seq_block_key() {
         // given
-        let key = LastBlockKey;
+        let key = LastSeqBlockKey;
 
         // when
         let encoded = key.encode();
-        let decoded = LastBlockKey::decode(&encoded).unwrap();
+        let decoded = LastSeqBlockKey::decode(&encoded).unwrap();
 
         // then
         assert_eq!(decoded, key);
         assert_eq!(encoded.len(), 2);
         assert_eq!(encoded[0], KEY_VERSION);
-        assert_eq!(encoded[1], RecordType::LastBlock.as_byte());
+        assert_eq!(encoded[1], RecordType::SeqBlock.as_byte());
     }
 
     #[test]
-    fn should_fail_decode_last_block_key_with_wrong_type() {
+    fn should_fail_decode_seq_block_key_with_wrong_type() {
         // given
         let data = vec![KEY_VERSION, RecordType::LogEntry.as_byte()];
 
         // when
-        let result = LastBlockKey::decode(&data);
+        let result = LastSeqBlockKey::decode(&data);
 
         // then
         assert!(result.is_err());
     }
 
     #[test]
-    fn should_encode_and_decode_last_block_value() {
+    fn should_encode_and_decode_seq_block_value() {
         // given
-        let value = LastBlockValue::new(1000, 100);
+        let value = SeqBlock::new(1000, 100);
 
         // when
         let encoded = value.encode();
-        let decoded = LastBlockValue::decode(&encoded).unwrap();
+        let decoded = SeqBlock::decode(&encoded).unwrap();
 
         // then
         assert_eq!(decoded, value);
@@ -769,7 +769,7 @@ mod tests {
     #[test]
     fn should_calculate_next_base() {
         // given
-        let value = LastBlockValue::new(1000, 100);
+        let value = SeqBlock::new(1000, 100);
 
         // when
         let next = value.next_base();
@@ -779,21 +779,21 @@ mod tests {
     }
 
     #[test]
-    fn should_fail_decode_last_block_value_too_short() {
+    fn should_fail_decode_seq_block_value_too_short() {
         // given
         let data = vec![0u8; 15]; // need 16 bytes
 
         // when
-        let result = LastBlockValue::decode(&data);
+        let result = SeqBlock::decode(&data);
 
         // then
         assert!(result.is_err());
     }
 
     #[test]
-    fn should_encode_last_block_value_in_big_endian() {
+    fn should_encode_seq_block_value_in_big_endian() {
         // given
-        let value = LastBlockValue::new(0x0102030405060708, 0x1112131415161718);
+        let value = SeqBlock::new(0x0102030405060708, 0x1112131415161718);
 
         // when
         let encoded = value.encode();

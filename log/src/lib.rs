@@ -47,6 +47,7 @@ mod error;
 mod log;
 mod model;
 mod reader;
+mod sequence;
 
 pub use config::{Config, CountOptions, ScanOptions, WriteOptions};
 pub use error::{Error, Result};
