@@ -1,4 +1,0 @@
-# Exclude binary assets from GitHub language statistics
-public/assets/* linguist-vendored
-# Treat assets as binary so diffs don't show line changes
-public/assets/* binary
