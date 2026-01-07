@@ -32,6 +32,23 @@ pub enum RecordOp {
     Merge(Record),
 }
 
+/// Options for write operations.
+///
+/// Controls the durability behavior of write operations like [`Storage::put`]
+/// and [`Storage::put_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct WriteOptions {
+    /// Whether to wait for the write to be durable before returning.
+    ///
+    /// When `true`, the operation will not return until the data has been
+    /// persisted to durable storage (e.g., flushed to the WAL and acknowledged
+    /// by the object store).
+    ///
+    /// When `false` (the default), the operation returns as soon as the data
+    /// is in memory, providing lower latency but risking data loss on crash.
+    pub await_durable: bool,
+}
+
 /// Error type for storage operations
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {
@@ -126,6 +143,21 @@ pub trait Storage: StorageRead {
     async fn apply(&self, ops: Vec<RecordOp>) -> StorageResult<()>;
 
     async fn put(&self, records: Vec<Record>) -> StorageResult<()>;
+
+    /// Writes records to storage with custom options.
+    ///
+    /// This method allows control over durability behavior. Use this when you
+    /// need to specify whether to wait for writes to be durable.
+    ///
+    /// # Arguments
+    ///
+    /// * `records` - The records to write
+    /// * `options` - Write options controlling durability behavior
+    async fn put_with_options(
+        &self,
+        records: Vec<Record>,
+        options: WriteOptions,
+    ) -> StorageResult<()>;
 
     /// Merges values for the given keys using the configured merge operator.
     ///

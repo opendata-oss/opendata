@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use super::{MergeOperator, Storage, StorageSnapshot};
+use super::{MergeOperator, Storage, StorageSnapshot, WriteOptions};
 use crate::storage::RecordOp;
 use crate::{BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult};
 
@@ -167,10 +167,24 @@ impl Storage for InMemoryStorage {
         Ok(())
     }
 
+    /// Writes a batch of records to the in-memory store with default options.
+    ///
+    /// Delegates to [`put_with_options`](Self::put_with_options) with default options.
+    async fn put(&self, records: Vec<Record>) -> StorageResult<()> {
+        self.put_with_options(records, WriteOptions::default())
+            .await
+    }
+
     /// Writes a batch of records to the in-memory store.
     ///
     /// All records are written atomically within a single write lock acquisition.
-    async fn put(&self, records: Vec<Record>) -> StorageResult<()> {
+    /// For in-memory storage, write options are ignored since there is no
+    /// durable storage to await.
+    async fn put_with_options(
+        &self,
+        records: Vec<Record>,
+        _options: WriteOptions,
+    ) -> StorageResult<()> {
         let mut data = self
             .data
             .write()

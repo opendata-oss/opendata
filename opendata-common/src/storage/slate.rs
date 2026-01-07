@@ -4,12 +4,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use slatedb::{
     Db, DbIterator, DbSnapshot, MergeOperator as SlateDbMergeOperator, MergeOperatorError,
-    WriteBatch,
+    WriteBatch, config::WriteOptions as SlateDbWriteOptions,
 };
 
 use crate::{
     BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult,
-    storage::{MergeOperator, RecordOp, Storage, StorageSnapshot},
+    storage::{MergeOperator, RecordOp, Storage, StorageSnapshot, WriteOptions},
 };
 
 /// Adapter that wraps our `MergeOperator` trait to implement SlateDB's `MergeOperator` trait.
@@ -175,12 +175,24 @@ impl Storage for SlateDbStorage {
         Ok(())
     }
     async fn put(&self, records: Vec<Record>) -> StorageResult<()> {
+        self.put_with_options(records, WriteOptions::default())
+            .await
+    }
+
+    async fn put_with_options(
+        &self,
+        records: Vec<Record>,
+        options: WriteOptions,
+    ) -> StorageResult<()> {
         let mut batch = WriteBatch::new();
         for record in records {
             batch.put(record.key, record.value);
         }
+        let slate_options = SlateDbWriteOptions {
+            await_durable: options.await_durable,
+        };
         self.db
-            .write(batch)
+            .write_with_options(batch, &slate_options)
             .await
             .map_err(StorageError::from_storage)?;
         Ok(())

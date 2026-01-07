@@ -5,13 +5,18 @@
 //! and read operations ([`scan`], [`count`]) via the [`LogRead`] trait.
 
 use std::ops::RangeBounds;
+use std::sync::Arc;
 
 use bytes::Bytes;
+use opendata_common::storage::factory::create_storage;
+use opendata_common::{Record as StorageRecord, Storage, WriteOptions as StorageWriteOptions};
 
+use crate::codec::LogEntryKey;
 use crate::config::{CountOptions, ScanOptions, WriteOptions};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::model::{LogEntry, Record};
 use crate::reader::{LogRead, LogReader};
+use crate::sequence::{SeqBlockStore, SequenceAllocator};
 
 /// An iterator over log entries for a specific key.
 ///
@@ -99,8 +104,8 @@ impl LogIterator {
 /// let reader = log.reader();
 /// ```
 pub struct Log {
-    // Implementation details will be added later
-    _private: (),
+    storage: Arc<dyn Storage>,
+    sequence_allocator: SequenceAllocator,
 }
 
 impl Log {
@@ -122,10 +127,21 @@ impl Log {
     /// ```ignore
     /// use log::{Log, Config};
     ///
-    /// let log = Log::open(Config::default()).await?;
+    /// let log = Log::open(test_config()).await?;
     /// ```
-    pub async fn open(_config: crate::config::Config) -> crate::error::Result<Self> {
-        todo!()
+    pub async fn open(config: crate::config::Config) -> crate::error::Result<Self> {
+        let storage = create_storage(&config.storage, None)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let block_store = SeqBlockStore::new(Arc::clone(&storage));
+        let sequence_allocator = SequenceAllocator::new(block_store);
+        sequence_allocator.initialize().await?;
+
+        Ok(Self {
+            storage,
+            sequence_allocator,
+        })
     }
 
     /// Appends records to the log.
@@ -187,10 +203,42 @@ impl Log {
     /// ```
     pub async fn append_with_options(
         &self,
-        _records: Vec<Record>,
-        _options: WriteOptions,
+        records: Vec<Record>,
+        options: WriteOptions,
     ) -> Result<()> {
-        todo!()
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        // Allocate sequence numbers for all records in the batch
+        let base_sequence = self
+            .sequence_allocator
+            .allocate(records.len() as u64)
+            .await?;
+
+        // Build storage records with encoded keys
+        let storage_records: Vec<StorageRecord> = records
+            .into_iter()
+            .enumerate()
+            .map(|(i, record)| {
+                let sequence = base_sequence + i as u64;
+                let entry_key = LogEntryKey::new(record.key, sequence);
+                StorageRecord::new(entry_key.encode(), record.value)
+            })
+            .collect();
+
+        // Convert log write options to storage write options
+        let storage_options = StorageWriteOptions {
+            await_durable: options.await_durable,
+        };
+
+        // Write to storage
+        self.storage
+            .put_with_options(storage_records, storage_options)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        Ok(())
     }
 
     /// Creates a read-only view of the log.
@@ -234,5 +282,194 @@ impl LogRead for Log {
         _options: CountOptions,
     ) -> Result<u64> {
         todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use opendata_common::{BytesRange, StorageConfig};
+
+    use super::*;
+    use crate::config::Config;
+
+    fn test_config() -> Config {
+        Config {
+            storage: StorageConfig::InMemory,
+        }
+    }
+
+    #[tokio::test]
+    async fn should_open_log_with_in_memory_config() {
+        // given
+        let config = test_config();
+
+        // when
+        let result = Log::open(config).await;
+
+        // then
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn should_append_single_record() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+        let records = vec![Record {
+            key: Bytes::from("orders"),
+            value: Bytes::from("order-1"),
+        }];
+
+        // when
+        let result = log.append(records).await;
+
+        // then
+        assert!(result.is_ok());
+
+        // verify record was stored
+        let stored = log.storage.scan(BytesRange::unbounded()).await.unwrap();
+        // Should have 2 records: the SeqBlock and the LogEntry
+        assert_eq!(stored.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn should_append_multiple_records_in_batch() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+        let records = vec![
+            Record {
+                key: Bytes::from("orders"),
+                value: Bytes::from("order-1"),
+            },
+            Record {
+                key: Bytes::from("orders"),
+                value: Bytes::from("order-2"),
+            },
+            Record {
+                key: Bytes::from("orders"),
+                value: Bytes::from("order-3"),
+            },
+        ];
+
+        // when
+        let result = log.append(records).await;
+
+        // then
+        assert!(result.is_ok());
+
+        // verify records were stored with sequential sequence numbers
+        let stored = log.storage.scan(BytesRange::unbounded()).await.unwrap();
+        // Should have 4 records: 1 SeqBlock + 3 LogEntries
+        assert_eq!(stored.len(), 4);
+
+        // Decode and verify sequence numbers
+        let log_entries: Vec<_> = stored
+            .iter()
+            .filter_map(|r| LogEntryKey::decode(&r.key).ok())
+            .collect();
+        assert_eq!(log_entries.len(), 3);
+        assert_eq!(log_entries[0].sequence, 0);
+        assert_eq!(log_entries[1].sequence, 1);
+        assert_eq!(log_entries[2].sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn should_append_empty_records_without_error() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+        let records: Vec<Record> = vec![];
+
+        // when
+        let result = log.append(records).await;
+
+        // then
+        assert!(result.is_ok());
+
+        // verify no records were stored (except possibly none)
+        let stored = log.storage.scan(BytesRange::unbounded()).await.unwrap();
+        assert_eq!(stored.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_assign_sequential_sequences_across_appends() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+
+        // when - first append
+        log.append(vec![
+            Record {
+                key: Bytes::from("key1"),
+                value: Bytes::from("value1"),
+            },
+            Record {
+                key: Bytes::from("key2"),
+                value: Bytes::from("value2"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when - second append
+        log.append(vec![Record {
+            key: Bytes::from("key3"),
+            value: Bytes::from("value3"),
+        }])
+        .await
+        .unwrap();
+
+        // then - verify sequences are 0, 1, 2
+        let stored = log.storage.scan(BytesRange::unbounded()).await.unwrap();
+
+        let mut log_entries: Vec<_> = stored
+            .iter()
+            .filter_map(|r| LogEntryKey::decode(&r.key).ok())
+            .collect();
+        log_entries.sort_by_key(|e| e.sequence);
+
+        assert_eq!(log_entries.len(), 3);
+        assert_eq!(log_entries[0].sequence, 0);
+        assert_eq!(log_entries[1].sequence, 1);
+        assert_eq!(log_entries[2].sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn should_store_records_with_correct_keys_and_values() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+        let records = vec![
+            Record {
+                key: Bytes::from("topic-a"),
+                value: Bytes::from("message-a"),
+            },
+            Record {
+                key: Bytes::from("topic-b"),
+                value: Bytes::from("message-b"),
+            },
+        ];
+
+        // when
+        log.append(records).await.unwrap();
+
+        // then - verify keys and values are correctly stored
+        let stored = log.storage.scan(BytesRange::unbounded()).await.unwrap();
+
+        let log_records: Vec<_> = stored
+            .iter()
+            .filter_map(|r| {
+                LogEntryKey::decode(&r.key)
+                    .ok()
+                    .map(|k| (k, r.value.clone()))
+            })
+            .collect();
+
+        assert_eq!(log_records.len(), 2);
+
+        // Find by sequence and verify
+        let entry_0 = log_records.iter().find(|(k, _)| k.sequence == 0).unwrap();
+        assert_eq!(entry_0.0.key, Bytes::from("topic-a"));
+        assert_eq!(entry_0.1, Bytes::from("message-a"));
+
+        let entry_1 = log_records.iter().find(|(k, _)| k.sequence == 1).unwrap();
+        assert_eq!(entry_1.0.key, Bytes::from("topic-b"));
+        assert_eq!(entry_1.1, Bytes::from("message-b"));
     }
 }
