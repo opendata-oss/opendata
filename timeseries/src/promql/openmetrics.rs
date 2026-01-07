@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::series::{Label, MetricType, Sample, Series, Temporality};
-use crate::util::Result;
+use crate::util::{Fingerprint, Result};
 
 /// OpenMetrics metric types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -68,7 +68,7 @@ struct MetricFamily {
 /// Parser state
 struct Parser {
     families: HashMap<String, MetricFamily>,
-    samples: Vec<Series>,
+    series_map: HashMap<u128, Series>,
     default_timestamp: i64,
 }
 
@@ -81,7 +81,7 @@ impl Parser {
 
         Self {
             families: HashMap::new(),
-            samples: Vec::new(),
+            series_map: HashMap::new(),
             default_timestamp,
         }
     }
@@ -112,7 +112,7 @@ impl Parser {
         // OpenMetrics requires it, but most exporters use Prometheus format.
         let _ = saw_eof;
 
-        Ok(self.samples)
+        Ok(self.series_map.into_values().collect())
     }
 
     fn parse_metadata_line(&mut self, line: &str) -> Result<()> {
@@ -162,35 +162,44 @@ impl Parser {
         let family = self.families.get(base_name).cloned().unwrap_or_default();
         let metric_type = family.metric_type.to_metric_type(suffix);
 
-        // Build attributes with __name__ set to base metric name
-        let mut attributes = vec![Label {
+        // Build labels with __name__ set to base metric name
+        let mut series_labels = vec![Label {
             name: "__name__".to_string(),
             value: base_name.to_string(),
         }];
 
-        // Add suffix as attribute if present
+        // Add suffix as label if present
         if !suffix.is_empty() {
-            attributes.push(Label {
+            series_labels.push(Label {
                 name: "__suffix__".to_string(),
                 value: suffix.to_string(),
             });
         }
 
         // Add parsed labels
-        attributes.extend(labels);
+        series_labels.extend(labels);
 
-        let series = Series {
-            labels: attributes,
-            unit: family.unit.clone(),
-            metric_type: Some(metric_type),
-            description: None,
-            samples: vec![Sample {
-                timestamp_ms: timestamp,
-                value,
-            }],
+        let sample = Sample {
+            timestamp_ms: timestamp,
+            value,
         };
 
-        self.samples.push(series);
+        // Sort labels for consistent fingerprint computation
+        series_labels.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Compute fingerprint and add sample to existing series or create new one
+        let fingerprint = series_labels.fingerprint();
+        self.series_map
+            .entry(fingerprint)
+            .and_modify(|series| series.samples.push(sample.clone()))
+            .or_insert_with(|| Series {
+                labels: series_labels,
+                unit: family.unit.clone(),
+                metric_type: Some(metric_type),
+                description: None,
+                samples: vec![sample],
+            });
+
         Ok(())
     }
 
@@ -782,13 +791,41 @@ requests_total{method="PUT"} 25
 "#;
 
         // when
-        let samples = parse_openmetrics(input).unwrap();
+        let series_list = parse_openmetrics(input).unwrap();
 
-        // then
-        assert_eq!(samples.len(), 3);
-        assert_eq!(samples[0].samples[0].value, 100.0);
-        assert_eq!(samples[1].samples[0].value, 50.0);
-        assert_eq!(samples[2].samples[0].value, 25.0);
+        // then - 3 different series (different method labels)
+        assert_eq!(series_list.len(), 3);
+
+        // Find each series by method label and verify value
+        let get_series = series_list
+            .iter()
+            .find(|s| {
+                s.labels
+                    .iter()
+                    .any(|l| l.name == "method" && l.value == "GET")
+            })
+            .unwrap();
+        assert_eq!(get_series.samples[0].value, 100.0);
+
+        let post_series = series_list
+            .iter()
+            .find(|s| {
+                s.labels
+                    .iter()
+                    .any(|l| l.name == "method" && l.value == "POST")
+            })
+            .unwrap();
+        assert_eq!(post_series.samples[0].value, 50.0);
+
+        let put_series = series_list
+            .iter()
+            .find(|s| {
+                s.labels
+                    .iter()
+                    .any(|l| l.name == "method" && l.value == "PUT")
+            })
+            .unwrap();
+        assert_eq!(put_series.samples[0].value, 25.0);
     }
 
     #[test]
