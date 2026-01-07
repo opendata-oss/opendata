@@ -1,13 +1,12 @@
 //! OpenMetrics text format parser.
 //!
-//! Parses OpenMetrics exposition format into `SampleWithLabels` for ingestion.
+//! Parses OpenMetrics exposition format into `Series` for ingestion.
 //! See: https://prometheus.io/docs/specs/om/open_metrics_spec/
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::model::SampleWithLabels;
-use crate::series::{Label, MetricType, Sample, Temporality};
+use crate::series::{Label, MetricType, Sample, Series, Temporality};
 use crate::util::Result;
 
 /// OpenMetrics metric types
@@ -69,7 +68,7 @@ struct MetricFamily {
 /// Parser state
 struct Parser {
     families: HashMap<String, MetricFamily>,
-    samples: Vec<SampleWithLabels>,
+    samples: Vec<Series>,
     default_timestamp: i64,
 }
 
@@ -87,7 +86,7 @@ impl Parser {
         }
     }
 
-    fn parse(mut self, input: &str) -> Result<Vec<SampleWithLabels>> {
+    fn parse(mut self, input: &str) -> Result<Vec<Series>> {
         let mut saw_eof = false;
 
         for line in input.lines() {
@@ -180,17 +179,18 @@ impl Parser {
         // Add parsed labels
         attributes.extend(labels);
 
-        let sample = SampleWithLabels {
+        let series = Series {
             labels: attributes,
-            metric_unit: family.unit.clone(),
-            metric_type,
-            sample: Sample {
+            unit: family.unit.clone(),
+            metric_type: Some(metric_type),
+            description: None,
+            samples: vec![Sample {
                 timestamp_ms: timestamp,
                 value,
-            },
+            }],
         };
 
-        self.samples.push(sample);
+        self.samples.push(series);
         Ok(())
     }
 
@@ -362,13 +362,13 @@ fn extract_base_name_and_suffix(name: &str) -> (&str, &str) {
     (name, "")
 }
 
-/// Parse OpenMetrics text format into samples for ingestion.
+/// Parse OpenMetrics text format into series for ingestion.
 ///
 /// # Arguments
 /// * `input` - OpenMetrics text format string
 ///
 /// # Returns
-/// A vector of `SampleWithLabels` ready for ingestion.
+/// A vector of `Series` ready for ingestion.
 ///
 /// # Example
 /// ```ignore
@@ -379,7 +379,7 @@ fn extract_base_name_and_suffix(name: &str) -> (&str, &str) {
 /// "#;
 /// let samples = parse_openmetrics(input)?;
 /// ```
-pub(crate) fn parse_openmetrics(input: &str) -> Result<Vec<SampleWithLabels>> {
+pub(crate) fn parse_openmetrics(input: &str) -> Result<Vec<Series>> {
     Parser::new().parse(input)
 }
 
@@ -415,7 +415,7 @@ mod tests {
         // then
         assert_eq!(samples.len(), 1);
         assert!(
-            std::mem::discriminant(&samples[0].metric_type)
+            std::mem::discriminant(&samples[0].metric_type.unwrap())
                 == std::mem::discriminant(&expected_type),
             "Expected {:?}, got {:?}",
             expected_type,
@@ -462,7 +462,7 @@ mod tests {
             .unwrap_or("");
         assert_eq!(suffix, expected_suffix);
         assert!(
-            std::mem::discriminant(&samples[0].metric_type)
+            std::mem::discriminant(&samples[0].metric_type.unwrap())
                 == std::mem::discriminant(&expected_type)
         );
     }
@@ -491,10 +491,10 @@ mod tests {
         // then
         assert_eq!(samples.len(), 1);
         assert!(
-            (samples[0].sample.value - expected).abs() < f64::EPSILON,
+            (samples[0].samples[0].value - expected).abs() < f64::EPSILON,
             "Expected {}, got {}",
             expected,
-            samples[0].sample.value
+            samples[0].samples[0].value
         );
     }
 
@@ -510,7 +510,7 @@ mod tests {
         let samples = parse_openmetrics(&input).unwrap();
 
         // then
-        assert!(samples[0].sample.value.is_nan());
+        assert!(samples[0].samples[0].value.is_nan());
     }
 
     #[rstest]
@@ -529,7 +529,7 @@ mod tests {
         let samples = parse_openmetrics(&input).unwrap();
 
         // then
-        assert_eq!(samples[0].sample.value, expected);
+        assert_eq!(samples[0].samples[0].value, expected);
     }
 
     // ==================== TIMESTAMP PARSING ====================
@@ -551,7 +551,7 @@ mod tests {
         let samples = parse_openmetrics(&input).unwrap();
 
         // then
-        assert_eq!(samples[0].sample.timestamp_ms, expected_ms);
+        assert_eq!(samples[0].samples[0].timestamp_ms, expected_ms);
     }
 
     #[test]
@@ -571,8 +571,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        assert!(samples[0].sample.timestamp_ms >= before);
-        assert!(samples[0].sample.timestamp_ms <= after);
+        assert!(samples[0].samples[0].timestamp_ms >= before);
+        assert!(samples[0].samples[0].timestamp_ms <= after);
     }
 
     // ==================== LABEL PARSING ====================
@@ -675,7 +675,7 @@ mod tests {
         let samples = parse_openmetrics(input).unwrap();
 
         // then
-        assert_eq!(samples[0].metric_unit.as_deref(), expected_unit);
+        assert_eq!(samples[0].unit.as_deref(), expected_unit);
     }
 
     // ==================== COMMENTS AND EMPTY LINES ====================
@@ -692,7 +692,7 @@ mod tests {
 
         // then
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].sample.value, 1.0);
+        assert_eq!(samples[0].samples[0].value, 1.0);
     }
 
     // ==================== EXEMPLAR HANDLING ====================
@@ -713,7 +713,7 @@ mod tests {
 
         // then
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].sample.value, expected_value);
+        assert_eq!(samples[0].samples[0].value, expected_value);
     }
 
     // ==================== EOF HANDLING ====================
@@ -786,9 +786,9 @@ requests_total{method="PUT"} 25
 
         // then
         assert_eq!(samples.len(), 3);
-        assert_eq!(samples[0].sample.value, 100.0);
-        assert_eq!(samples[1].sample.value, 50.0);
-        assert_eq!(samples[2].sample.value, 25.0);
+        assert_eq!(samples[0].samples[0].value, 100.0);
+        assert_eq!(samples[1].samples[0].value, 50.0);
+        assert_eq!(samples[2].samples[0].value, 25.0);
     }
 
     #[test]
@@ -819,10 +819,10 @@ errors_total 5
             .unwrap();
         assert!(matches!(
             requests.metric_type,
-            MetricType::Sum {
+            Some(MetricType::Sum {
                 monotonic: true,
                 ..
-            }
+            })
         ));
 
         let latency = samples
@@ -833,7 +833,7 @@ errors_total 5
                     .any(|a| a.name == "__name__" && a.value == "latency")
             })
             .unwrap();
-        assert!(matches!(latency.metric_type, MetricType::Gauge));
+        assert!(matches!(latency.metric_type, Some(MetricType::Gauge)));
     }
 
     // ==================== HISTOGRAM FULL EXAMPLE ====================
@@ -862,7 +862,7 @@ http_request_duration_count 300
 
         // All should have the unit
         for sample in &samples {
-            assert_eq!(sample.metric_unit, Some("seconds".to_string()));
+            assert_eq!(sample.unit, Some("seconds".to_string()));
         }
 
         // 6 buckets
@@ -881,7 +881,7 @@ http_request_duration_count 300
             .iter()
             .find(|s| s.labels.iter().any(|a| a.name == "le" && a.value == "+Inf"))
             .unwrap();
-        assert_eq!(inf_bucket.sample.value, 300.0);
+        assert_eq!(inf_bucket.samples[0].value, 300.0);
     }
 
     // ==================== SUMMARY FULL EXAMPLE ====================
@@ -911,7 +911,7 @@ rpc_duration_count 10000
             .collect();
         assert_eq!(quantiles.len(), 3);
         for q in &quantiles {
-            assert!(matches!(q.metric_type, MetricType::Summary));
+            assert!(matches!(q.metric_type, Some(MetricType::Summary)));
         }
     }
 
@@ -953,7 +953,7 @@ rpc_duration_count 10000
 
         // then
         assert!(result.is_ok());
-        assert_eq!(result.unwrap()[0].sample.value, 1.0);
+        assert_eq!(result.unwrap()[0].samples[0].value, 1.0);
     }
 
     // ==================== PROMETHEUS FORMAT COMPATIBILITY ====================
@@ -971,10 +971,10 @@ rpc_duration_count 10000
         assert_eq!(samples.len(), 1);
         assert!(matches!(
             samples[0].metric_type,
-            MetricType::Sum {
+            Some(MetricType::Sum {
                 monotonic: true,
                 ..
-            }
+            })
         ));
         let name = samples[0]
             .labels
@@ -998,10 +998,10 @@ rpc_duration_count 10000
         assert_eq!(samples.len(), 1);
         assert!(matches!(
             samples[0].metric_type,
-            MetricType::Sum {
+            Some(MetricType::Sum {
                 monotonic: true,
                 ..
-            }
+            })
         ));
         // Base name should have _total stripped
         let name = samples[0]
@@ -1025,7 +1025,7 @@ rpc_duration_count 10000
 
         // then
         assert_eq!(samples.len(), 1);
-        assert!(matches!(samples[0].metric_type, MetricType::Gauge));
+        assert!(matches!(samples[0].metric_type, Some(MetricType::Gauge)));
     }
 
     #[test]
@@ -1039,7 +1039,7 @@ rpc_duration_count 10000
         // then
         assert_eq!(samples.len(), 1);
         // other_metric has no type declaration, so defaults to gauge
-        assert!(matches!(samples[0].metric_type, MetricType::Gauge));
+        assert!(matches!(samples[0].metric_type, Some(MetricType::Gauge)));
     }
 
     #[test]

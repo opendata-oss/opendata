@@ -10,9 +10,9 @@ use opendata_common::Storage;
 
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndex, InvertedIndexLookup};
 use crate::minitsdb::MiniTsdb;
-use crate::model::{SampleWithLabels, SeriesId, TimeBucket};
+use crate::model::{SeriesId, TimeBucket};
 use crate::query::QueryReader;
-use crate::series::{Label, Sample};
+use crate::series::{Label, Sample, Series};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::util::Result;
 
@@ -119,27 +119,47 @@ impl Tsdb {
         Ok(())
     }
 
-    /// Ingest samples into the TSDB, grouping by time bucket.
-    pub(crate) async fn ingest_samples(&self, samples: Vec<SampleWithLabels>) -> Result<()> {
-        if samples.is_empty() {
+    /// Ingest series into the TSDB, grouping by time bucket.
+    pub(crate) async fn ingest_samples(&self, series_list: Vec<Series>) -> Result<()> {
+        if series_list.is_empty() {
             return Ok(());
         }
 
-        // Group samples by bucket
-        let mut by_bucket: HashMap<TimeBucket, Vec<SampleWithLabels>> = HashMap::new();
+        // Group series by bucket - each sample may belong to different buckets
+        let mut by_bucket: HashMap<TimeBucket, Vec<Series>> = HashMap::new();
 
-        for sample in samples {
-            let bucket = TimeBucket::round_to_hour(
-                std::time::UNIX_EPOCH
-                    + std::time::Duration::from_millis(sample.sample.timestamp_ms as u64),
-            )?;
-            by_bucket.entry(bucket).or_default().push(sample);
+        for series in series_list {
+            // Group samples within this series by bucket
+            let mut bucket_samples: HashMap<TimeBucket, Vec<Sample>> = HashMap::new();
+
+            for sample in &series.samples {
+                let bucket = TimeBucket::round_to_hour(
+                    std::time::UNIX_EPOCH
+                        + std::time::Duration::from_millis(sample.timestamp_ms as u64),
+                )?;
+                bucket_samples
+                    .entry(bucket)
+                    .or_default()
+                    .push(sample.clone());
+            }
+
+            // Create a Series for each bucket with only the samples for that bucket
+            for (bucket, samples) in bucket_samples {
+                let bucket_series = Series {
+                    labels: series.labels.clone(),
+                    metric_type: series.metric_type,
+                    unit: series.unit.clone(),
+                    description: series.description.clone(),
+                    samples,
+                };
+                by_bucket.entry(bucket).or_default().push(bucket_series);
+            }
         }
 
         // Ingest each bucket
-        for (bucket, bucket_samples) in by_bucket {
+        for (bucket, bucket_series) in by_bucket {
             let mini = self.get_or_create_for_ingest(bucket).await?;
-            mini.ingest(bucket_samples).await?;
+            mini.ingest(bucket_series).await?;
         }
 
         Ok(())
@@ -276,7 +296,6 @@ impl QueryReader for TsdbQueryReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::SampleWithLabels;
     use crate::series::MetricType;
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
     use opendata_common::storage::in_memory::InMemoryStorage;
@@ -292,7 +311,7 @@ mod tests {
         label_pairs: Vec<(&str, &str)>,
         timestamp: i64,
         value: f64,
-    ) -> SampleWithLabels {
+    ) -> Series {
         let mut labels = vec![Label {
             name: "__name__".to_string(),
             value: metric_name.to_string(),
@@ -303,14 +322,15 @@ mod tests {
                 value: val.to_string(),
             });
         }
-        SampleWithLabels {
+        Series {
             labels,
-            metric_unit: None,
-            metric_type: MetricType::Gauge,
-            sample: Sample {
+            unit: None,
+            metric_type: Some(MetricType::Gauge),
+            description: None,
+            samples: vec![Sample {
                 timestamp_ms: timestamp,
                 value,
-            },
+            }],
         }
     }
 

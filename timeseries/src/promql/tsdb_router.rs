@@ -538,8 +538,8 @@ impl PromqlRouter for Tsdb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{SampleWithLabels, TimeBucket};
-    use crate::series::{Label, MetricType, Sample};
+    use crate::model::TimeBucket;
+    use crate::series::{Label, MetricType, Sample, Series};
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
     use opendata_common::Storage;
     use opendata_common::storage::in_memory::InMemoryStorage;
@@ -556,26 +556,24 @@ mod tests {
         label_pairs: Vec<(&str, &str)>,
         timestamp: i64,
         value: f64,
-    ) -> SampleWithLabels {
-        let mut labels = vec![Label {
-            name: "__name__".to_string(),
-            value: metric_name.to_string(),
-        }];
-        for (key, val) in label_pairs {
-            labels.push(Label {
+    ) -> Series {
+        let labels: Vec<Label> = label_pairs
+            .into_iter()
+            .map(|(key, val)| Label {
                 name: key.to_string(),
                 value: val.to_string(),
-            });
-        }
-        SampleWithLabels {
+            })
+            .collect();
+        let mut series = Series::new(
+            metric_name,
             labels,
-            metric_unit: None,
-            metric_type: MetricType::Gauge,
-            sample: Sample {
+            vec![Sample {
                 timestamp_ms: timestamp,
                 value,
-            },
-        }
+            }],
+        );
+        series.metric_type = Some(MetricType::Gauge);
+        series
     }
 
     #[tokio::test]

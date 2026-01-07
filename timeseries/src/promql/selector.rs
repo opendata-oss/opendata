@@ -156,8 +156,8 @@ mod tests {
             forward.series.insert(
                 id,
                 SeriesSpec {
-                    metric_unit: None,
-                    metric_type: MetricType::Gauge,
+                    unit: None,
+                    metric_type: Some(MetricType::Gauge),
                     labels: attrs.clone(),
                 },
             );

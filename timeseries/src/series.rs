@@ -132,8 +132,9 @@ pub enum MetricType {
 ///
 /// # Identity and Metadata
 ///
-/// A series is uniquely identified by its `name` and `labels`. The `metric_type`,
-/// `unit`, and `description` fields are metadata with last-write-wins semantics.
+/// A series is uniquely identified by its labels, which include the metric name
+/// stored as `__name__`. The `metric_type`, `unit`, and `description` fields are
+/// metadata with last-write-wins semantics.
 ///
 /// # Example
 ///
@@ -151,14 +152,12 @@ pub enum MetricType {
 ///     .label("method", "GET")
 ///     .sample(1700000000000, 1.0)
 ///     .build();
+///
+/// assert_eq!(series.name(), "http_requests_total");
 /// ```
 #[derive(Debug, Clone)]
 pub struct Series {
-    // --- Identity ---
-    /// The metric name.
-    pub name: String,
-
-    /// Labels identifying this series.
+    /// Labels identifying this series, including `__name__` for the metric name.
     pub labels: Vec<Label>,
 
     // --- Metadata (last-write-wins) ---
@@ -178,15 +177,43 @@ pub struct Series {
 
 impl Series {
     /// Creates a new series with the given name, labels, and samples.
+    ///
+    /// The metric name is stored as a `__name__` label and prepended to the
+    /// provided labels.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `labels` contains a `__name__` label. The metric name should
+    /// only be provided via the `name` parameter.
     pub fn new(name: impl Into<String>, labels: Vec<Label>, samples: Vec<Sample>) -> Self {
+        assert!(
+            !labels.iter().any(|l| l.name == "__name__"),
+            "labels must not contain __name__; use the name parameter instead"
+        );
+        let mut all_labels = Vec::with_capacity(labels.len() + 1);
+        all_labels.push(Label::metric_name(name));
+        all_labels.extend(labels);
         Self {
-            name: name.into(),
-            labels,
+            labels: all_labels,
             metric_type: None,
             unit: None,
             description: None,
             samples,
         }
+    }
+
+    /// Returns the metric name (value of the `__name__` label).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the series was constructed without a `__name__` label.
+    /// This should never happen when using the provided constructors.
+    pub fn name(&self) -> &str {
+        self.labels
+            .iter()
+            .find(|l| l.name == "__name__")
+            .map(|l| l.value.as_str())
+            .expect("Series must have a __name__ label")
     }
 
     /// Creates a builder for constructing a series.
@@ -208,7 +235,6 @@ impl Series {
 /// and metadata fields.
 #[derive(Debug, Clone)]
 pub struct SeriesBuilder {
-    name: String,
     labels: Vec<Label>,
     metric_type: Option<MetricType>,
     unit: Option<String>,
@@ -219,8 +245,7 @@ pub struct SeriesBuilder {
 impl SeriesBuilder {
     fn new(name: impl Into<String>) -> Self {
         Self {
-            name: name.into(),
-            labels: Vec::new(),
+            labels: vec![Label::metric_name(name)],
             metric_type: None,
             unit: None,
             description: None,
@@ -229,7 +254,17 @@ impl SeriesBuilder {
     }
 
     /// Adds a label to the series.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is `__name__`. The metric name should only be provided
+    /// via [`Series::builder()`].
     pub fn label(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        let name = name.into();
+        assert!(
+            name != "__name__",
+            "cannot add __name__ label; use Series::builder(name) instead"
+        );
         self.labels.push(Label::new(name, value));
         self
     }
@@ -267,7 +302,6 @@ impl SeriesBuilder {
     /// Builds the series.
     pub fn build(self) -> Series {
         Series {
-            name: self.name,
             labels: self.labels,
             metric_type: self.metric_type,
             unit: self.unit,
@@ -327,11 +361,46 @@ mod tests {
             .sample(2000, 0.6)
             .build();
 
-        assert_eq!(series.name, "cpu_usage");
-        assert_eq!(series.labels.len(), 1);
-        assert_eq!(series.labels[0], Label::new("host", "server1"));
+        assert_eq!(series.name(), "cpu_usage");
+        // labels includes __name__ + host
+        assert_eq!(series.labels.len(), 2);
+        assert_eq!(series.labels[0], Label::metric_name("cpu_usage"));
+        assert_eq!(series.labels[1], Label::new("host", "server1"));
         assert_eq!(series.samples.len(), 2);
         assert_eq!(series.samples[0].value, 0.5);
         assert_eq!(series.samples[1].value, 0.6);
+    }
+
+    #[test]
+    fn should_create_series_with_new() {
+        let series = Series::new(
+            "http_requests",
+            vec![Label::new("method", "GET")],
+            vec![Sample::new(1000, 1.0)],
+        );
+
+        assert_eq!(series.name(), "http_requests");
+        // labels includes __name__ + method
+        assert_eq!(series.labels.len(), 2);
+        assert_eq!(series.labels[0], Label::metric_name("http_requests"));
+        assert_eq!(series.labels[1], Label::new("method", "GET"));
+    }
+
+    #[test]
+    #[should_panic(expected = "labels must not contain __name__")]
+    fn should_panic_when_new_labels_contain_name() {
+        Series::new(
+            "http_requests",
+            vec![Label::metric_name("other_name")],
+            vec![],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot add __name__ label")]
+    fn should_panic_when_builder_adds_name_label() {
+        Series::builder("http_requests")
+            .label("__name__", "other_name")
+            .build();
     }
 }

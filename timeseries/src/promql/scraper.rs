@@ -10,8 +10,7 @@ use super::config::{PrometheusConfig, ScrapeConfig};
 use super::metrics::{Metrics, ScrapeLabels};
 use super::openmetrics::parse_openmetrics;
 use crate::error::Error;
-use crate::model::SampleWithLabels;
-use crate::series::{Label, MetricType, Sample};
+use crate::series::{Label, MetricType, Sample, Series};
 use crate::tsdb::Tsdb;
 use crate::util::Result;
 
@@ -134,18 +133,15 @@ impl Scraper {
     }
 
     /// Create an `up` sample for a target.
-    fn create_up_sample(&self, job_name: &str, target: &str, value: f64) -> SampleWithLabels {
+    fn create_up_sample(&self, job_name: &str, target: &str, value: f64) -> Series {
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
 
-        SampleWithLabels {
-            labels: vec![
-                Label {
-                    name: "__name__".to_string(),
-                    value: "up".to_string(),
-                },
+        let mut series = Series::new(
+            "up",
+            vec![
                 Label {
                     name: "job".to_string(),
                     value: job_name.to_string(),
@@ -155,13 +151,13 @@ impl Scraper {
                     value: target.to_string(),
                 },
             ],
-            metric_unit: None,
-            metric_type: MetricType::Gauge,
-            sample: Sample {
+            vec![Sample {
                 timestamp_ms,
                 value,
-            },
-        }
+            }],
+        );
+        series.metric_type = Some(MetricType::Gauge);
+        series
     }
 
     /// Internal scrape implementation that returns sample count on success.
@@ -236,7 +232,7 @@ impl Scraper {
     }
 
     /// Ingest samples into the TSDB.
-    async fn ingest_samples(&self, samples: Vec<SampleWithLabels>) -> Result<()> {
+    async fn ingest_samples(&self, samples: Vec<Series>) -> Result<()> {
         self.tsdb.ingest_samples(samples).await
     }
 }

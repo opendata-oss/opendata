@@ -260,7 +260,7 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
         }
         .encode();
         let value = ForwardIndexValue {
-            metric_unit: series_spec.metric_unit,
+            metric_unit: series_spec.unit,
             metric_meta: series_spec.metric_type.into(),
             label_count: series_spec.labels.len() as u16,
             labels: series_spec.labels,

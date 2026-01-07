@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use dashmap::DashMap;
 
-use crate::series::{MetricType, Sample};
+use crate::series::{MetricType, Sample, Series};
 use crate::{
     error::Error,
     index::{ForwardIndex, InvertedIndex},
-    model::{SampleWithLabels, SeriesFingerprint, SeriesId, SeriesSpec, TimeBucket},
+    model::{SeriesFingerprint, SeriesId, SeriesSpec, TimeBucket},
     series::Label,
     util::{Fingerprint, Result},
 };
@@ -43,22 +43,25 @@ impl<'a> TsdbDeltaBuilder<'a> {
         }
     }
 
-    /// Ingest a sample with its labels.
-    /// Returns an error if the sample timestamp is outside the bucket's time range.
-    pub(crate) fn ingest(&mut self, sample_with_labels: SampleWithLabels) -> Result<()> {
-        self.ingest_sample(
-            sample_with_labels.labels,
-            sample_with_labels.metric_unit,
-            sample_with_labels.metric_type,
-            sample_with_labels.sample,
-        )
+    /// Ingest a series with its samples.
+    /// Returns an error if any sample timestamp is outside the bucket's time range.
+    pub(crate) fn ingest(&mut self, series: &Series) -> Result<()> {
+        for sample in &series.samples {
+            self.ingest_sample(
+                series.labels.clone(),
+                series.unit.clone(),
+                series.metric_type,
+                sample.clone(),
+            )?;
+        }
+        Ok(())
     }
 
     fn ingest_sample(
         &mut self,
         mut labels: Vec<Label>,
-        metric_unit: Option<String>,
-        metric_type: MetricType,
+        unit: Option<String>,
+        metric_type: Option<MetricType>,
         sample: Sample,
     ) -> Result<()> {
         // Validate sample timestamp is within bucket range
@@ -104,7 +107,7 @@ impl<'a> TsdbDeltaBuilder<'a> {
             self.series_dict_delta.insert(fingerprint, series_id);
 
             let series_spec = SeriesSpec {
-                metric_unit: metric_unit.clone(),
+                unit: unit.clone(),
                 metric_type,
                 labels: labels.clone(),
             };
@@ -231,7 +234,7 @@ mod tests {
             .ingest_sample(
                 labels.clone(),
                 metric_unit.clone(),
-                metric_type,
+                Some(metric_type),
                 sample.clone(),
             )
             .unwrap();
@@ -248,9 +251,9 @@ mod tests {
 
         // Verify forward index
         let series_spec = builder.forward_index.series.get(&0).unwrap();
-        assert_eq!(series_spec.metric_unit, metric_unit);
-        match (series_spec.metric_type, metric_type) {
-            (MetricType::Gauge, MetricType::Gauge) => {}
+        assert_eq!(series_spec.unit, metric_unit);
+        match (series_spec.metric_type, Some(metric_type)) {
+            (Some(MetricType::Gauge), Some(MetricType::Gauge)) => {}
             _ => panic!("Metric types don't match"),
         }
         // Labels are sorted by ingest_sample, so sort them for comparison
@@ -289,7 +292,7 @@ mod tests {
             .ingest_sample(
                 labels.clone(),
                 Some("bytes".to_string()),
-                metric_type,
+                Some(metric_type),
                 sample1.clone(),
             )
             .unwrap();
@@ -297,7 +300,7 @@ mod tests {
             .ingest_sample(
                 labels.clone(),
                 Some("bytes".to_string()),
-                metric_type,
+                Some(metric_type),
                 sample2.clone(),
             )
             .unwrap();
@@ -336,7 +339,7 @@ mod tests {
             .ingest_sample(
                 attributes1,
                 Some("bytes".to_string()),
-                metric_type,
+                Some(metric_type),
                 create_test_sample(),
             )
             .unwrap();
@@ -344,7 +347,7 @@ mod tests {
             .ingest_sample(
                 attributes2,
                 Some("bytes".to_string()),
-                metric_type,
+                Some(metric_type),
                 create_test_sample(),
             )
             .unwrap();
@@ -376,7 +379,7 @@ mod tests {
             .ingest_sample(
                 create_test_labels(), // Will be sorted by ingest_sample
                 Some("bytes".to_string()),
-                metric_type,
+                Some(metric_type),
                 create_test_sample(),
             )
             .unwrap();
@@ -403,7 +406,7 @@ mod tests {
             .ingest_sample(
                 labels.clone(),
                 Some("bytes".to_string()),
-                metric_type,
+                Some(metric_type),
                 create_test_sample(),
             )
             .unwrap();
@@ -411,7 +414,7 @@ mod tests {
             .ingest_sample(
                 labels.clone(),
                 Some("bytes".to_string()),
-                metric_type,
+                Some(metric_type),
                 create_test_sample(),
             )
             .unwrap();
@@ -458,7 +461,7 @@ mod tests {
             .ingest_sample(
                 attributes1,
                 Some("bytes".to_string()),
-                metric_type,
+                Some(metric_type),
                 create_test_sample(),
             )
             .unwrap();
@@ -466,7 +469,7 @@ mod tests {
             .ingest_sample(
                 attributes2,
                 Some("bytes".to_string()),
-                metric_type,
+                Some(metric_type),
                 create_test_sample(),
             )
             .unwrap();
@@ -496,19 +499,19 @@ mod tests {
             .ingest_sample(
                 labels.clone(),
                 metric_unit.clone(),
-                metric_type,
+                Some(metric_type),
                 create_test_sample(),
             )
             .unwrap();
 
         // then
         let series_spec = builder.forward_index.series.get(&0).unwrap();
-        assert_eq!(series_spec.metric_unit, metric_unit);
+        assert_eq!(series_spec.unit, metric_unit);
         match series_spec.metric_type {
-            MetricType::Sum {
+            Some(MetricType::Sum {
                 monotonic,
                 temporality,
-            } => {
+            }) => {
                 assert!(monotonic);
                 assert_eq!(temporality, Temporality::Cumulative);
             }
@@ -544,7 +547,7 @@ mod tests {
             .ingest_sample(
                 labels.clone(),
                 Some("bytes".to_string()),
-                metric_type,
+                Some(metric_type),
                 create_test_sample(),
             )
             .unwrap();
@@ -573,7 +576,7 @@ mod tests {
             .ingest_sample(
                 labels,
                 Some("bytes".to_string()),
-                metric_type,
+                Some(metric_type),
                 create_test_sample(),
             )
             .unwrap();
@@ -599,14 +602,19 @@ mod tests {
 
         // when
         builder
-            .ingest_sample(labels.clone(), None, metric_type, create_test_sample())
+            .ingest_sample(
+                labels.clone(),
+                None,
+                Some(metric_type),
+                create_test_sample(),
+            )
             .unwrap();
 
         // then
         let series_spec = builder.forward_index.series.get(&0).unwrap();
-        assert_eq!(series_spec.metric_unit, None);
-        match (series_spec.metric_type, metric_type) {
-            (MetricType::Gauge, MetricType::Gauge) => {}
+        assert_eq!(series_spec.unit, None);
+        match (series_spec.metric_type, Some(metric_type)) {
+            (Some(MetricType::Gauge), Some(MetricType::Gauge)) => {}
             _ => panic!("Metric types don't match"),
         }
     }
@@ -644,7 +652,7 @@ mod tests {
                 .ingest_sample(
                     attributes_a,
                     Some("bytes".to_string()),
-                    MetricType::Gauge,
+                    Some(MetricType::Gauge),
                     Sample {
                         timestamp_ms: 60_000_001,
                         value: 42.0,
@@ -666,7 +674,7 @@ mod tests {
                 .ingest_sample(
                     attributes_b,
                     Some("bytes".to_string()),
-                    MetricType::Gauge,
+                    Some(MetricType::Gauge),
                     Sample {
                         timestamp_ms: 60_000_002,
                         value: 43.0,
@@ -739,7 +747,8 @@ mod tests {
         };
 
         // when
-        let result = builder.ingest_sample(labels, Some("bytes".to_string()), metric_type, sample);
+        let result =
+            builder.ingest_sample(labels, Some("bytes".to_string()), Some(metric_type), sample);
 
         // then
         assert!(result.is_err());
@@ -764,7 +773,8 @@ mod tests {
         };
 
         // when
-        let result = builder.ingest_sample(labels, Some("bytes".to_string()), metric_type, sample);
+        let result =
+            builder.ingest_sample(labels, Some("bytes".to_string()), Some(metric_type), sample);
 
         // then
         assert!(result.is_err());
