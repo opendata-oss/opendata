@@ -112,10 +112,13 @@ pub trait StorageRead: Send + Sync {
     async fn get(&self, key: Bytes) -> StorageResult<Option<Record>>;
 
     /// Returns an iterator over records in the given range.
+    ///
+    /// The returned iterator is owned and does not borrow from the storage,
+    /// allowing it to be stored in structs or passed across await points.
     async fn scan_iter(
         &self,
         range: BytesRange,
-    ) -> StorageResult<Box<dyn StorageIterator + Send + '_>>;
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>>;
 
     /// Collects all records in the range into a Vec.
     #[tracing::instrument(level = "trace", skip_all)]

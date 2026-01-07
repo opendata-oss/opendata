@@ -93,7 +93,7 @@ impl StorageRead for SlateDbStorage {
     async fn scan_iter(
         &self,
         range: BytesRange,
-    ) -> StorageResult<Box<dyn StorageIterator + Send + '_>> {
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
         let iter = self
             .db
             .scan(range)
@@ -145,7 +145,7 @@ impl StorageRead for SlateDbStorageSnapshot {
     async fn scan_iter(
         &self,
         range: BytesRange,
-    ) -> StorageResult<Box<dyn StorageIterator + Send + '_>> {
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
         let iter = self
             .snapshot
             .scan(range)

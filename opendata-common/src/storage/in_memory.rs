@@ -68,7 +68,7 @@ impl StorageRead for InMemoryStorage {
     async fn scan_iter(
         &self,
         range: BytesRange,
-    ) -> StorageResult<Box<dyn StorageIterator + Send + '_>> {
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
         let data = self
             .data
             .read()
@@ -124,7 +124,7 @@ impl StorageRead for InMemoryStorageSnapshot {
     async fn scan_iter(
         &self,
         range: BytesRange,
-    ) -> StorageResult<Box<dyn StorageIterator + Send + '_>> {
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
         // Collect all matching records into a Vec for the iterator
         let records: Vec<Record> = self
             .data

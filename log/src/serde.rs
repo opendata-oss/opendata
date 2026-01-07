@@ -34,8 +34,11 @@
 //! keys with the same prefix (e.g., "/foo" < "/foo/bar"). This simplifies
 //! prefix-based range queries: start at `prefix + 0x00`, end at `prefix + 0xFF`.
 
+use std::ops::{Bound, RangeBounds};
+
 use bytes::{BufMut, Bytes, BytesMut};
 use opendata_common::serde::terminated_bytes;
+use opendata_common::BytesRange;
 
 use crate::error::Error;
 
@@ -161,6 +164,71 @@ impl LogEntryKey {
         buf.put_u8(RecordType::LogEntry.id());
         terminated_bytes::serialize(key, &mut buf);
         buf.freeze()
+    }
+
+    /// Creates a storage key range for scanning entries of a key within a sequence range.
+    ///
+    /// Converts a user key and sequence number range into a [`BytesRange`] suitable
+    /// for storage scanning. The resulting range will match all log entries for the
+    /// specified key whose sequence numbers fall within the given bounds.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The user key identifying the log stream
+    /// * `seq_range` - The sequence number range to scan (supports all Rust range types)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Scan sequences 10..20 for key "orders"
+    /// let range = LogEntryKey::scan_range(b"orders", 10..20);
+    ///
+    /// // Scan all sequences from 100 onwards
+    /// let range = LogEntryKey::scan_range(b"orders", 100..);
+    ///
+    /// // Scan all sequences
+    /// let range = LogEntryKey::scan_range(b"orders", ..);
+    /// ```
+    pub fn scan_range(key: &[u8], seq_range: impl RangeBounds<u64>) -> BytesRange {
+        let prefix = Self::key_prefix(key);
+
+        let start = match seq_range.start_bound() {
+            Bound::Included(&seq) => {
+                let mut start_key = BytesMut::from(prefix.as_ref());
+                start_key.put_u64(seq);
+                Bound::Included(start_key.freeze())
+            }
+            Bound::Excluded(&seq) => {
+                let mut start_key = BytesMut::from(prefix.as_ref());
+                start_key.put_u64(seq);
+                Bound::Excluded(start_key.freeze())
+            }
+            Bound::Unbounded => {
+                let mut start_key = BytesMut::from(prefix.as_ref());
+                start_key.put_u64(0);
+                Bound::Included(start_key.freeze())
+            }
+        };
+
+        let end = match seq_range.end_bound() {
+            Bound::Included(&seq) => {
+                let mut end_key = BytesMut::from(prefix.as_ref());
+                end_key.put_u64(seq);
+                Bound::Included(end_key.freeze())
+            }
+            Bound::Excluded(&seq) => {
+                let mut end_key = BytesMut::from(prefix.as_ref());
+                end_key.put_u64(seq);
+                Bound::Excluded(end_key.freeze())
+            }
+            Bound::Unbounded => {
+                let mut end_key = BytesMut::from(prefix.as_ref());
+                end_key.put_u64(u64::MAX);
+                Bound::Included(end_key.freeze())
+            }
+        };
+
+        BytesRange::new(start, end)
     }
 }
 

@@ -9,7 +9,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use opendata_common::storage::factory::create_storage;
-use opendata_common::{Record as StorageRecord, Storage, WriteOptions as StorageWriteOptions};
+use opendata_common::{
+    BytesRange, Record as StorageRecord, Storage, StorageIterator, StorageRead,
+    WriteOptions as StorageWriteOptions,
+};
 
 use crate::codec::LogEntryKey;
 use crate::config::{CountOptions, ScanOptions, WriteOptions};
@@ -37,11 +40,24 @@ use crate::sequence::{SeqBlockStore, SequenceAllocator};
 /// }
 /// ```
 pub struct LogIterator {
-    // Implementation details will be added later
-    _private: (),
+    /// Storage to read from (lazily initialized)
+    storage: Arc<dyn StorageRead>,
+    /// Key range for the scan
+    range: BytesRange,
+    /// The underlying storage iterator (initialized on first next() call)
+    inner: Option<Box<dyn StorageIterator + Send>>,
 }
 
 impl LogIterator {
+    /// Creates a new LogIterator for the given storage and key range.
+    pub(crate) fn new(storage: Arc<dyn StorageRead>, range: BytesRange) -> Self {
+        Self {
+            storage,
+            range,
+            inner: None,
+        }
+    }
+
     /// Advances the iterator and returns the next log entry.
     ///
     /// Returns `Ok(Some(entry))` if there is another entry in the range,
@@ -51,7 +67,35 @@ impl LogIterator {
     ///
     /// Returns an error if there is a storage failure while reading entries.
     pub async fn next(&mut self) -> Result<Option<LogEntry>> {
-        todo!()
+        // Lazily initialize the storage iterator on first call
+        if self.inner.is_none() {
+            let iter = self
+                .storage
+                .scan_iter(self.range.clone())
+                .await
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            self.inner = Some(iter);
+        }
+
+        let inner = self.inner.as_mut().unwrap();
+
+        // Get next record from storage
+        let Some(record) = inner
+            .next()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+
+        // Decode the key to get the user key and sequence
+        let entry_key = LogEntryKey::decode(&record.key)?;
+
+        Ok(Some(LogEntry {
+            key: entry_key.key,
+            sequence: entry_key.sequence,
+            value: record.value,
+        }))
     }
 }
 
@@ -268,11 +312,12 @@ impl Log {
 impl LogRead for Log {
     fn scan_with_options(
         &self,
-        _key: Bytes,
-        _seq_range: impl RangeBounds<u64> + Send,
+        key: Bytes,
+        seq_range: impl RangeBounds<u64> + Send,
         _options: ScanOptions,
     ) -> LogIterator {
-        todo!()
+        let range = LogEntryKey::scan_range(&key, seq_range);
+        LogIterator::new(Arc::clone(&self.storage) as Arc<dyn StorageRead>, range)
     }
 
     async fn count_with_options(
@@ -471,5 +516,238 @@ mod tests {
         let entry_1 = log_records.iter().find(|(k, _)| k.sequence == 1).unwrap();
         assert_eq!(entry_1.0.key, Bytes::from("topic-b"));
         assert_eq!(entry_1.1, Bytes::from("message-b"));
+    }
+
+    #[tokio::test]
+    async fn should_scan_all_entries_for_key() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+        log.append(vec![
+            Record {
+                key: Bytes::from("orders"),
+                value: Bytes::from("order-1"),
+            },
+            Record {
+                key: Bytes::from("orders"),
+                value: Bytes::from("order-2"),
+            },
+            Record {
+                key: Bytes::from("orders"),
+                value: Bytes::from("order-3"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when
+        let mut iter = log.scan(Bytes::from("orders"), ..);
+        let mut entries = vec![];
+        while let Some(entry) = iter.next().await.unwrap() {
+            entries.push(entry);
+        }
+
+        // then
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].sequence, 0);
+        assert_eq!(entries[0].value, Bytes::from("order-1"));
+        assert_eq!(entries[1].sequence, 1);
+        assert_eq!(entries[1].value, Bytes::from("order-2"));
+        assert_eq!(entries[2].sequence, 2);
+        assert_eq!(entries[2].value, Bytes::from("order-3"));
+    }
+
+    #[tokio::test]
+    async fn should_scan_with_sequence_range() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+        log.append(vec![
+            Record {
+                key: Bytes::from("events"),
+                value: Bytes::from("event-0"),
+            },
+            Record {
+                key: Bytes::from("events"),
+                value: Bytes::from("event-1"),
+            },
+            Record {
+                key: Bytes::from("events"),
+                value: Bytes::from("event-2"),
+            },
+            Record {
+                key: Bytes::from("events"),
+                value: Bytes::from("event-3"),
+            },
+            Record {
+                key: Bytes::from("events"),
+                value: Bytes::from("event-4"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when - scan sequences 1..4 (exclusive end)
+        let mut iter = log.scan(Bytes::from("events"), 1..4);
+        let mut entries = vec![];
+        while let Some(entry) = iter.next().await.unwrap() {
+            entries.push(entry);
+        }
+
+        // then
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[1].sequence, 2);
+        assert_eq!(entries[2].sequence, 3);
+    }
+
+    #[tokio::test]
+    async fn should_scan_from_starting_sequence() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+        log.append(vec![
+            Record {
+                key: Bytes::from("logs"),
+                value: Bytes::from("log-0"),
+            },
+            Record {
+                key: Bytes::from("logs"),
+                value: Bytes::from("log-1"),
+            },
+            Record {
+                key: Bytes::from("logs"),
+                value: Bytes::from("log-2"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when - scan from sequence 1 onwards
+        let mut iter = log.scan(Bytes::from("logs"), 1..);
+        let mut entries = vec![];
+        while let Some(entry) = iter.next().await.unwrap() {
+            entries.push(entry);
+        }
+
+        // then
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[1].sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn should_scan_up_to_ending_sequence() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+        log.append(vec![
+            Record {
+                key: Bytes::from("logs"),
+                value: Bytes::from("log-0"),
+            },
+            Record {
+                key: Bytes::from("logs"),
+                value: Bytes::from("log-1"),
+            },
+            Record {
+                key: Bytes::from("logs"),
+                value: Bytes::from("log-2"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when - scan up to sequence 2 (exclusive)
+        let mut iter = log.scan(Bytes::from("logs"), ..2);
+        let mut entries = vec![];
+        while let Some(entry) = iter.next().await.unwrap() {
+            entries.push(entry);
+        }
+
+        // then
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sequence, 0);
+        assert_eq!(entries[1].sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn should_scan_only_entries_for_specified_key() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+        log.append(vec![
+            Record {
+                key: Bytes::from("key-a"),
+                value: Bytes::from("value-a-0"),
+            },
+            Record {
+                key: Bytes::from("key-b"),
+                value: Bytes::from("value-b-0"),
+            },
+            Record {
+                key: Bytes::from("key-a"),
+                value: Bytes::from("value-a-1"),
+            },
+            Record {
+                key: Bytes::from("key-b"),
+                value: Bytes::from("value-b-1"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when - scan only key-a
+        let mut iter = log.scan(Bytes::from("key-a"), ..);
+        let mut entries = vec![];
+        while let Some(entry) = iter.next().await.unwrap() {
+            entries.push(entry);
+        }
+
+        // then - should only have entries for key-a
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key, Bytes::from("key-a"));
+        assert_eq!(entries[0].value, Bytes::from("value-a-0"));
+        assert_eq!(entries[1].key, Bytes::from("key-a"));
+        assert_eq!(entries[1].value, Bytes::from("value-a-1"));
+    }
+
+    #[tokio::test]
+    async fn should_return_empty_iterator_for_unknown_key() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+        log.append(vec![Record {
+            key: Bytes::from("existing"),
+            value: Bytes::from("value"),
+        }])
+        .await
+        .unwrap();
+
+        // when - scan for non-existent key
+        let mut iter = log.scan(Bytes::from("unknown"), ..);
+        let entry = iter.next().await.unwrap();
+
+        // then
+        assert!(entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_return_empty_iterator_for_empty_range() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+        log.append(vec![
+            Record {
+                key: Bytes::from("key"),
+                value: Bytes::from("value-0"),
+            },
+            Record {
+                key: Bytes::from("key"),
+                value: Bytes::from("value-1"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when - scan range that doesn't include any existing sequences
+        let mut iter = log.scan(Bytes::from("key"), 10..20);
+        let entry = iter.next().await.unwrap();
+
+        // then
+        assert!(entry.is_none());
     }
 }
