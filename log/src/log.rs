@@ -14,7 +14,7 @@ use opendata_common::{
     WriteOptions as StorageWriteOptions,
 };
 
-use crate::codec::LogEntryKey;
+use crate::serde::LogEntryKey;
 use crate::config::{CountOptions, ScanOptions, WriteOptions};
 use crate::error::{Error, Result};
 use crate::model::{LogEntry, Record};

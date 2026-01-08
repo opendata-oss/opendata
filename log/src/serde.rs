@@ -37,8 +37,8 @@
 use std::ops::{Bound, RangeBounds};
 
 use bytes::{BufMut, Bytes, BytesMut};
-use opendata_common::serde::terminated_bytes;
 use opendata_common::BytesRange;
+use opendata_common::serde::terminated_bytes;
 
 use crate::error::Error;
 
