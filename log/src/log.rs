@@ -40,22 +40,24 @@ use crate::serde::LogEntryKey;
 /// }
 /// ```
 pub struct LogIterator {
-    /// Storage to read from (lazily initialized)
-    storage: Arc<dyn StorageRead>,
-    /// Key range for the scan
-    range: BytesRange,
-    /// The underlying storage iterator (initialized on first next() call)
-    inner: Option<Box<dyn StorageIterator + Send>>,
+    /// The underlying storage iterator
+    inner: Box<dyn StorageIterator + Send>,
 }
 
 impl LogIterator {
-    /// Creates a new LogIterator for the given storage and key range.
-    pub(crate) fn new(storage: Arc<dyn StorageRead>, range: BytesRange) -> Self {
-        Self {
-            storage,
-            range,
-            inner: None,
-        }
+    /// Opens a new LogIterator for the given storage and key range.
+    ///
+    /// This initializes the underlying storage iterator immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage iterator cannot be created.
+    pub(crate) async fn open(storage: Arc<dyn StorageRead>, range: BytesRange) -> Result<Self> {
+        let inner = storage
+            .scan_iter(range)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(Self { inner })
     }
 
     /// Advances the iterator and returns the next log entry.
@@ -67,17 +69,7 @@ impl LogIterator {
     ///
     /// Returns an error if there is a storage failure while reading entries.
     pub async fn next(&mut self) -> Result<Option<LogEntry>> {
-        // Lazily initialize the storage iterator on first call
-        if self.inner.is_none() {
-            let iter = self
-                .storage
-                .scan_iter(self.range.clone())
-                .await
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            self.inner = Some(iter);
-        }
-
-        let inner = self.inner.as_mut().unwrap();
+        let inner = &mut self.inner;
 
         // Get next record from storage
         let Some(record) = inner
@@ -310,14 +302,14 @@ impl Log {
 }
 
 impl LogRead for Log {
-    fn scan_with_options(
+    async fn scan_with_options(
         &self,
         key: Bytes,
         seq_range: impl RangeBounds<u64> + Send,
         _options: ScanOptions,
-    ) -> LogIterator {
+    ) -> Result<LogIterator> {
         let range = LogEntryKey::scan_range(&key, seq_range);
-        LogIterator::new(Arc::clone(&self.storage) as Arc<dyn StorageRead>, range)
+        LogIterator::open(Arc::clone(&self.storage) as Arc<dyn StorageRead>, range).await
     }
 
     async fn count_with_options(
@@ -540,7 +532,7 @@ mod tests {
         .unwrap();
 
         // when
-        let mut iter = log.scan(Bytes::from("orders"), ..);
+        let mut iter = log.scan(Bytes::from("orders"), ..).await.unwrap();
         let mut entries = vec![];
         while let Some(entry) = iter.next().await.unwrap() {
             entries.push(entry);
@@ -586,7 +578,7 @@ mod tests {
         .unwrap();
 
         // when - scan sequences 1..4 (exclusive end)
-        let mut iter = log.scan(Bytes::from("events"), 1..4);
+        let mut iter = log.scan(Bytes::from("events"), 1..4).await.unwrap();
         let mut entries = vec![];
         while let Some(entry) = iter.next().await.unwrap() {
             entries.push(entry);
@@ -621,7 +613,7 @@ mod tests {
         .unwrap();
 
         // when - scan from sequence 1 onwards
-        let mut iter = log.scan(Bytes::from("logs"), 1..);
+        let mut iter = log.scan(Bytes::from("logs"), 1..).await.unwrap();
         let mut entries = vec![];
         while let Some(entry) = iter.next().await.unwrap() {
             entries.push(entry);
@@ -655,7 +647,7 @@ mod tests {
         .unwrap();
 
         // when - scan up to sequence 2 (exclusive)
-        let mut iter = log.scan(Bytes::from("logs"), ..2);
+        let mut iter = log.scan(Bytes::from("logs"), ..2).await.unwrap();
         let mut entries = vec![];
         while let Some(entry) = iter.next().await.unwrap() {
             entries.push(entry);
@@ -693,7 +685,7 @@ mod tests {
         .unwrap();
 
         // when - scan only key-a
-        let mut iter = log.scan(Bytes::from("key-a"), ..);
+        let mut iter = log.scan(Bytes::from("key-a"), ..).await.unwrap();
         let mut entries = vec![];
         while let Some(entry) = iter.next().await.unwrap() {
             entries.push(entry);
@@ -719,7 +711,7 @@ mod tests {
         .unwrap();
 
         // when - scan for non-existent key
-        let mut iter = log.scan(Bytes::from("unknown"), ..);
+        let mut iter = log.scan(Bytes::from("unknown"), ..).await.unwrap();
         let entry = iter.next().await.unwrap();
 
         // then
@@ -744,7 +736,7 @@ mod tests {
         .unwrap();
 
         // when - scan range that doesn't include any existing sequences
-        let mut iter = log.scan(Bytes::from("key"), 10..20);
+        let mut iter = log.scan(Bytes::from("key"), 10..20).await.unwrap();
         let entry = iter.next().await.unwrap();
 
         // then
