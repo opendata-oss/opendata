@@ -12,9 +12,10 @@ use bytes::Bytes;
 use std::sync::Arc;
 
 use common::StorageRead;
+use common::storage::factory::create_storage;
 
-use crate::config::{CountOptions, ScanOptions};
-use crate::error::Result;
+use crate::config::{Config, CountOptions, ScanOptions};
+use crate::error::{Error, Result};
 use crate::log::LogIterator;
 use crate::serde::LogEntryKey;
 
@@ -190,6 +191,40 @@ pub struct LogReader {
 }
 
 impl LogReader {
+    /// Opens a read-only view of the log with the given configuration.
+    ///
+    /// This creates a `LogReader` that can scan and count entries but cannot
+    /// append new records. Use this when you only need read access to the log.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Configuration specifying storage backend and settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage backend cannot be initialized.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use log::{LogReader, LogRead, Config};
+    /// use bytes::Bytes;
+    ///
+    /// let reader = LogReader::open(config).await?;
+    /// let mut iter = reader.scan(Bytes::from("orders"), ..).await?;
+    /// while let Some(entry) = iter.next().await? {
+    ///     println!("seq={}: {:?}", entry.sequence, entry.value);
+    /// }
+    /// ```
+    pub async fn open(config: Config) -> Result<Self> {
+        let storage = create_storage(&config.storage, None)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(Self { storage })
+    }
+
+    /// Creates a LogReader from an existing storage implementation.
+    #[cfg(test)]
     pub(crate) fn new(storage: Arc<dyn StorageRead>) -> Self {
         Self { storage }
     }
