@@ -14,12 +14,12 @@ use opendata_common::{
     WriteOptions as StorageWriteOptions,
 };
 
-use crate::serde::LogEntryKey;
 use crate::config::{CountOptions, ScanOptions, WriteOptions};
 use crate::error::{Error, Result};
 use crate::model::{LogEntry, Record};
 use crate::reader::{LogRead, LogReader};
 use crate::sequence::{SeqBlockStore, SequenceAllocator};
+use crate::serde::LogEntryKey;
 
 /// An iterator over log entries for a specific key.
 ///
