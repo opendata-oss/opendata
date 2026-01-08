@@ -148,11 +148,10 @@ pub trait LogRead {
 ///
 /// # Obtaining a LogReader
 ///
-/// A `LogReader` is obtained by calling [`Log::reader`](crate::Log::reader):
+/// A `LogReader` is created by calling [`LogReader::open`]:
 ///
 /// ```ignore
-/// let log = Log::open(path, options).await?;
-/// let reader = log.reader();
+/// let reader = LogReader::open(config).await?;
 /// ```
 ///
 /// # Thread Safety

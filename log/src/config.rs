@@ -49,8 +49,8 @@ pub struct WriteOptions {
 
 /// Options for scan operations.
 ///
-/// Controls the behavior of [`Log::scan`](crate::Log::scan) and
-/// [`Log::scan_with_options`](crate::Log::scan_with_options).
+/// Controls the behavior of [`LogRead::scan`](crate::LogRead::scan) and
+/// [`LogRead::scan_with_options`](crate::LogRead::scan_with_options).
 /// Additional options may be added in future versions.
 #[derive(Debug, Clone, Default)]
 pub struct ScanOptions {
@@ -61,8 +61,8 @@ pub struct ScanOptions {
 
 /// Options for count operations.
 ///
-/// Controls the behavior of [`Log::count`](crate::Log::count) and
-/// [`Log::count_with_options`](crate::Log::count_with_options).
+/// Controls the behavior of [`LogRead::count`](crate::LogRead::count) and
+/// [`LogRead::count_with_options`](crate::LogRead::count_with_options).
 #[derive(Debug, Clone, Default)]
 pub struct CountOptions {
     /// Whether to return an approximate count.

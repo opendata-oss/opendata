@@ -48,7 +48,7 @@ pub struct Record {
 
 /// An entry read from the log.
 ///
-/// Log entries are returned by [`ScanIterator`](crate::ScanIterator) and contain
+/// Log entries are returned by [`LogIterator`](crate::LogIterator) and contain
 /// the original record data along with metadata assigned at append time.
 ///
 /// # Sequence Numbers

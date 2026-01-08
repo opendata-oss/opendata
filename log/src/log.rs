@@ -102,7 +102,7 @@ impl LogIterator {
 ///
 /// Read operations are provided via the [`LogRead`] trait, which `Log`
 /// implements. This allows generic code to work with either `Log` or
-/// [`LogReader`].
+/// [`LogReader`](crate::LogReader).
 ///
 /// # Thread Safety
 ///
