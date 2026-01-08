@@ -275,10 +275,17 @@ impl Log {
         Ok(())
     }
 
-    /// Returns a reference to the underlying storage for creating a LogReader.
+    /// Creates a Log from an existing storage implementation.
     #[cfg(test)]
-    pub(crate) fn storage(&self) -> Arc<dyn StorageRead> {
-        Arc::clone(&self.storage) as Arc<dyn StorageRead>
+    pub(crate) async fn new(storage: Arc<dyn Storage>) -> Result<Self> {
+        let block_store = SeqBlockStore::new(Arc::clone(&storage));
+        let sequence_allocator = SequenceAllocator::new(block_store);
+        sequence_allocator.initialize().await?;
+
+        Ok(Self {
+            storage,
+            sequence_allocator,
+        })
     }
 }
 
@@ -728,9 +735,13 @@ mod tests {
     #[tokio::test]
     async fn should_scan_entries_via_log_reader() {
         use crate::reader::LogReader;
+        use common::storage::factory::create_storage;
 
-        // given
-        let log = Log::open(test_config()).await.unwrap();
+        // given - create shared storage
+        let storage = create_storage(&StorageConfig::InMemory, None)
+            .await
+            .unwrap();
+        let log = Log::new(storage.clone()).await.unwrap();
         log.append(vec![
             Record {
                 key: Bytes::from("orders"),
@@ -749,7 +760,7 @@ mod tests {
         .unwrap();
 
         // when - create LogReader sharing the same storage
-        let reader = LogReader::new(log.storage());
+        let reader = LogReader::new(storage);
         let mut iter = reader.scan(Bytes::from("orders"), ..).await.unwrap();
         let mut entries = vec![];
         while let Some(entry) = iter.next().await.unwrap() {
