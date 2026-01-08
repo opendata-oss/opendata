@@ -23,13 +23,11 @@ While this supports efficient scans for a specific key's entire log or a sequenc
 
 2. **Time-bounded queries**: "Read entries from 2pm to 4pm yesterday" similarly requires a full scan.
 
-3. **Checkpoint recovery**: Restarting a consumer from a time-based checkpoint requires knowing which sequence numbers correspond to that time.
+3. **Data lifecycle**: Retention policies based on time need to identify which sequence ranges correspond to expired data.
 
-4. **Data lifecycle**: Retention policies based on time need to identify which sequence ranges correspond to expired data.
+4. **Prefix queries**: RFC 0001's key encoding supports prefix-based scans (e.g., all keys under `/sensors/*`), but there's no way to seek within a prefix without knowing the full key. Sequence numbers are global, so scanning `/sensors/*` from sequence 1000 requires knowing which specific keys have entries at or after that sequence. With segments, a prefix scan can seek directly to a segment boundary, skipping earlier data across all matching keys.
 
-5. **Prefix queries**: RFC 0001's key encoding supports prefix-based scans (e.g., all keys under `/sensors/*`), but there's no way to seek within a prefix without knowing the full key. Sequence numbers are global, so scanning `/sensors/*` from sequence 1000 requires knowing which specific keys have entries at or after that sequence. With segments, a prefix scan can seek directly to a segment boundary, skipping earlier data across all matching keys.
-
-The timeseries implementation solves similar problems using time-based buckets, but for logs, time isn't always the right partitioning dimension. A streaming system processing 1 million events per second has different needs than one processing 100 events per day.
+The timeseries implementation solves similar problems using time-based buckets. For logs, time isn't always the right partitioning dimension. A streaming system processing 1 million events per second has different needs than one processing 100 events per day. It should also be possible to align segments on size.
 
 ## Goals
 
@@ -103,14 +101,6 @@ The built-in trigger starts a new segment after a configurable wall-clock durati
 
 Time-based triggering is simple to implement because it only requires comparing the current wall-clock time against the segment's `start_time_ms`. No internal state tracking is needed beyond what's already stored in the segment metadata.
 
-#### Future: Size-Based Triggers
-
-Size-based triggers (e.g., bump after N entries or N bytes) require tracking entry counts or byte sizes, which adds complexity. Once the `count` API from RFC 0001 is implemented, size-based triggers could leverage it. This is deferred to a future RFC.
-
-#### Future: Segment-Based Deletion
-
-Segments provide a natural unit for data lifecycle management. A future RFC will define APIs for deleting entire segments, enabling efficient retention policies. Rather than scanning and deleting individual entries, retention can be enforced by dropping segments older than a threshold. This aligns with how the `segments()` iterator exposes segment boundaries—applications can iterate segments, inspect their `start_time_ms`, and delete those that have expired.
-
 ### Configuration
 
 Segment configuration is part of the main `Config` struct:
@@ -166,6 +156,14 @@ Rejected because:
 None at this time.
 
 ## Potential Future Work
+
+### Size-Based Triggers
+
+Size-based triggers (e.g., seal after N entries or N bytes) require tracking entry counts or byte sizes, which adds complexity. Once the `count` API from RFC 0001 is implemented, size-based triggers could leverage it.
+
+### Segment-Based Deletion
+
+Segments provide a natural unit for data lifecycle management. APIs for deleting entire segments would enable efficient retention policies. Rather than scanning and deleting individual entries, retention can be enforced by dropping segments older than a threshold.
 
 ### Public Segment Sealing API
 
