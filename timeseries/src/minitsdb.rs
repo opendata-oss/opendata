@@ -4,7 +4,7 @@ use std::sync::{Arc, atomic::AtomicU32};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use opendata_common::{Storage, StorageRead};
+use common::{Storage, StorageRead};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::delta::{TsdbDelta, TsdbDeltaBuilder};

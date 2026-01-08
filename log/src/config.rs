@@ -3,7 +3,7 @@
 //! This module defines the configuration and options structs that control
 //! the behavior of the log, including storage setup and operation parameters.
 
-use opendata_common::StorageConfig;
+use common::StorageConfig;
 
 /// Configuration for opening a [`Log`](crate::Log).
 ///
@@ -14,7 +14,7 @@ use opendata_common::StorageConfig;
 ///
 /// ```ignore
 /// use log::Config;
-/// use opendata_common::StorageConfig;
+/// use common::StorageConfig;
 ///
 /// let config = Config {
 ///     storage: StorageConfig::default(),

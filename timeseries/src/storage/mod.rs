@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use opendata_common::storage::RecordOp;
-use opendata_common::{Record, Storage, StorageRead};
+use common::storage::RecordOp;
+use common::{Record, Storage, StorageRead};
 use roaring::RoaringBitmap;
 
 use crate::index::{InvertedIndex, SeriesSpec};

@@ -54,7 +54,7 @@ impl SlateDbStorage {
     ///
     /// This adapter can be used when constructing a SlateDB database with a merge operator:
     /// ```rust,ignore
-    /// use opendata_common::storage::MergeOperator;
+    /// use common::storage::MergeOperator;
     /// use slatedb::{DbBuilder, object_store::ObjectStore};
     ///
     /// let my_merge_op: Arc<dyn MergeOperator> = Arc::new(MyMergeOperator);

@@ -1,5 +1,5 @@
 [package]
-name = "opendata-common"
+name = "common"
 version.workspace = true
 edition.workspace = true
 

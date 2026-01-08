@@ -3,7 +3,7 @@
 use super::*;
 use crate::model::{BucketSize, BucketStart, RecordTag, SeriesFingerprint, SeriesId};
 use bytes::{Bytes, BytesMut};
-use opendata_common::BytesRange;
+use common::BytesRange;
 
 /// BucketList key (global-scoped)
 #[derive(Debug, Clone, PartialEq, Eq)]

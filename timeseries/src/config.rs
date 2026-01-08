@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use opendata_common::StorageConfig;
+use common::StorageConfig;
 
 /// Configuration for opening a [`TimeSeries`](crate::TimeSeries) database.
 ///
@@ -17,7 +17,7 @@ use opendata_common::StorageConfig;
 ///
 /// ```ignore
 /// use timeseries::Config;
-/// use opendata_common::StorageConfig;
+/// use common::StorageConfig;
 /// use std::time::Duration;
 ///
 /// let config = Config {

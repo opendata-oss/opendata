@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use dashmap::DashMap;
-use opendata_common::Storage;
-use opendata_common::storage::StorageSnapshot;
+use common::Storage;
+use common::storage::StorageSnapshot;
 
 use crate::error::Error;
 use crate::model::{Sample, SeriesFingerprint, SeriesId, TimeBucket};

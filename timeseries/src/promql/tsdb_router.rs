@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use opendata_common::clock::SystemClock;
+use common::clock::SystemClock;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 
 use super::evaluator::Evaluator;
@@ -541,8 +541,8 @@ mod tests {
     use crate::model::TimeBucket;
     use crate::model::{Label, MetricType, Sample, Series};
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
-    use opendata_common::Storage;
-    use opendata_common::storage::in_memory::InMemoryStorage;
+    use common::Storage;
+    use common::storage::in_memory::InMemoryStorage;
     use std::time::{Duration, UNIX_EPOCH};
 
     async fn create_test_storage() -> Arc<dyn Storage> {

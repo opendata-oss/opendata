@@ -2,11 +2,11 @@
 
 ## Project Overview
 
-OpenData is a collection of deployable database systems that share common infrastructure. Each database is its own crate but leverages shared logic from `opendata-common`.
+OpenData is a collection of deployable database systems that share common infrastructure. Each database is its own crate but leverages shared logic from `common`.
 
 ### Crates
 
-- **opendata-common**: Shared library containing common utilities and abstractions used by all database implementations
+- **common**: Shared library containing common utilities and abstractions used by all database implementations
 - **timeseries**: A timeseries database optimized for time-ordered data
 - **log**: A Kafka-like log abstraction for append-only event streams
 

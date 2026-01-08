@@ -35,12 +35,12 @@
 //! prefix-based range queries: start at `prefix + 0x00`, end at `prefix + 0xFF`.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use opendata_common::serde::terminated_bytes;
+use common::serde::terminated_bytes;
 
 use crate::error::Error;
 
-impl From<opendata_common::serde::DeserializeError> for Error {
-    fn from(err: opendata_common::serde::DeserializeError) -> Self {
+impl From<common::serde::DeserializeError> for Error {
+    fn from(err: common::serde::DeserializeError) -> Self {
         Error::Encoding(err.message)
     }
 }

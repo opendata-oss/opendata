@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use clap::Parser;
-use opendata_common::storage::config::StorageConfig;
+use common::storage::config::StorageConfig;
 use serde::Deserialize;
 
 use crate::util::Result;

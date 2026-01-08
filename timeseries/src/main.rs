@@ -18,7 +18,7 @@ mod util;
 use std::sync::Arc;
 
 use clap::Parser;
-use opendata_common::storage::factory::create_storage;
+use common::storage::factory::create_storage;
 
 use promql::config::{CliArgs, PrometheusConfig, load_config};
 use promql::server::{PromqlServer, ServerConfig};

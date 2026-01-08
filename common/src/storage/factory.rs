@@ -29,8 +29,8 @@ use super::{MergeOperator, Storage, StorageError, StorageResult};
 /// # Examples
 ///
 /// ```rust,ignore
-/// use opendata_common::storage::config::StorageConfig;
-/// use opendata_common::storage::factory::create_storage;
+/// use common::storage::config::StorageConfig;
+/// use common::storage::factory::create_storage;
 ///
 /// // Create in-memory storage (default)
 /// let storage = create_storage(&StorageConfig::default(), None).await?;

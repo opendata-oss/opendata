@@ -144,7 +144,7 @@ mod tests {
         parse_duration, parse_timestamp, parse_timestamp_to_seconds, time_bucket_size_hours,
     };
     use bytes::{BufMut, Bytes, BytesMut};
-    use opendata_common::BytesRange;
+    use common::BytesRange;
     use std::ops::Bound::{Excluded, Included, Unbounded};
     use std::time::{Duration, SystemTime};
 

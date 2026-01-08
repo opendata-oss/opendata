@@ -25,7 +25,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use opendata_common::{Record, Storage};
+use common::{Record, Storage};
 use tokio::sync::Mutex;
 
 use crate::error::Result;
@@ -212,7 +212,7 @@ impl SequenceAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opendata_common::storage::in_memory::InMemoryStorage;
+    use common::storage::in_memory::InMemoryStorage;
 
     #[tokio::test]
     async fn should_return_none_when_no_block_allocated() {
