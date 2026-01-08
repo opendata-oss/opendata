@@ -298,7 +298,7 @@ impl Log {
     /// // reader.append(records).await?; // ERROR: no method `append`
     /// ```
     pub fn reader(&self) -> LogReader {
-        todo!()
+        LogReader::new(Arc::clone(&self.storage) as Arc<dyn StorageRead>)
     }
 }
 
@@ -743,5 +743,44 @@ mod tests {
 
         // then
         assert!(entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_scan_entries_via_log_reader() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+        log.append(vec![
+            Record {
+                key: Bytes::from("orders"),
+                value: Bytes::from("order-1"),
+            },
+            Record {
+                key: Bytes::from("orders"),
+                value: Bytes::from("order-2"),
+            },
+            Record {
+                key: Bytes::from("orders"),
+                value: Bytes::from("order-3"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when
+        let reader = log.reader();
+        let mut iter = reader.scan(Bytes::from("orders"), ..).await.unwrap();
+        let mut entries = vec![];
+        while let Some(entry) = iter.next().await.unwrap() {
+            entries.push(entry);
+        }
+
+        // then
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].sequence, 0);
+        assert_eq!(entries[0].value, Bytes::from("order-1"));
+        assert_eq!(entries[1].sequence, 1);
+        assert_eq!(entries[1].value, Bytes::from("order-2"));
+        assert_eq!(entries[2].sequence, 2);
+        assert_eq!(entries[2].value, Bytes::from("order-3"));
     }
 }

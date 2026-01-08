@@ -9,9 +9,14 @@ use std::ops::RangeBounds;
 use async_trait::async_trait;
 use bytes::Bytes;
 
+use std::sync::Arc;
+
+use common::StorageRead;
+
 use crate::config::{CountOptions, ScanOptions};
 use crate::error::Result;
 use crate::log::LogIterator;
+use crate::serde::LogEntryKey;
 
 /// Trait for read operations on the log.
 ///
@@ -181,19 +186,25 @@ pub trait LogRead {
 /// ```
 #[derive(Clone)]
 pub struct LogReader {
-    // Implementation details will be added later
-    _private: (),
+    storage: Arc<dyn StorageRead>,
+}
+
+impl LogReader {
+    pub(crate) fn new(storage: Arc<dyn StorageRead>) -> Self {
+        Self { storage }
+    }
 }
 
 #[async_trait]
 impl LogRead for LogReader {
     async fn scan_with_options(
         &self,
-        _key: Bytes,
-        _seq_range: impl RangeBounds<u64> + Send,
+        key: Bytes,
+        seq_range: impl RangeBounds<u64> + Send,
         _options: ScanOptions,
     ) -> Result<LogIterator> {
-        todo!()
+        let range = LogEntryKey::scan_range(&key, seq_range);
+        LogIterator::open(Arc::clone(&self.storage), range).await
     }
 
     async fn count_with_options(
