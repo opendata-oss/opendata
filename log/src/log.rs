@@ -7,6 +7,7 @@
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use opendata_common::storage::factory::create_storage;
 use opendata_common::{
@@ -301,6 +302,7 @@ impl Log {
     }
 }
 
+#[async_trait]
 impl LogRead for Log {
     async fn scan_with_options(
         &self,

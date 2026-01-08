@@ -4,9 +4,9 @@
 //! - [`LogRead`]: The trait defining read operations on the log.
 //! - [`LogReader`]: A read-only view of the log that implements `LogRead`.
 
-use std::future::Future;
 use std::ops::RangeBounds;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::config::{CountOptions, ScanOptions};
@@ -39,6 +39,7 @@ use crate::log::LogIterator;
 ///     Ok(())
 /// }
 /// ```
+#[async_trait]
 pub trait LogRead {
     /// Scans entries for a key within a sequence number range.
     ///
@@ -59,12 +60,13 @@ pub trait LogRead {
     /// Returns an error if the scan fails due to storage issues.
     ///
     /// [`scan_with_options`]: LogRead::scan_with_options
-    fn scan(
+    async fn scan(
         &self,
         key: Bytes,
         seq_range: impl RangeBounds<u64> + Send,
-    ) -> impl Future<Output = Result<LogIterator>> + Send {
+    ) -> Result<LogIterator> {
         self.scan_with_options(key, seq_range, ScanOptions::default())
+            .await
     }
 
     /// Scans entries for a key within a sequence number range with custom options.
@@ -80,12 +82,12 @@ pub trait LogRead {
     /// # Errors
     ///
     /// Returns an error if the scan fails due to storage issues.
-    fn scan_with_options(
+    async fn scan_with_options(
         &self,
         key: Bytes,
         seq_range: impl RangeBounds<u64> + Send,
         options: ScanOptions,
-    ) -> impl Future<Output = Result<LogIterator>> + Send;
+    ) -> Result<LogIterator>;
 
     /// Counts entries for a key within a sequence number range.
     ///
@@ -105,12 +107,9 @@ pub trait LogRead {
     /// Returns an error if the count fails due to storage issues.
     ///
     /// [`count_with_options`]: LogRead::count_with_options
-    fn count(
-        &self,
-        key: Bytes,
-        seq_range: impl RangeBounds<u64> + Send,
-    ) -> impl Future<Output = Result<u64>> + Send {
+    async fn count(&self, key: Bytes, seq_range: impl RangeBounds<u64> + Send) -> Result<u64> {
         self.count_with_options(key, seq_range, CountOptions::default())
+            .await
     }
 
     /// Counts entries for a key within a sequence number range with custom options.
@@ -124,12 +123,12 @@ pub trait LogRead {
     /// # Errors
     ///
     /// Returns an error if the count fails due to storage issues.
-    fn count_with_options(
+    async fn count_with_options(
         &self,
         key: Bytes,
         seq_range: impl RangeBounds<u64> + Send,
         options: CountOptions,
-    ) -> impl Future<Output = Result<u64>> + Send;
+    ) -> Result<u64>;
 }
 
 /// A read-only view of the log.
@@ -186,6 +185,7 @@ pub struct LogReader {
     _private: (),
 }
 
+#[async_trait]
 impl LogRead for LogReader {
     async fn scan_with_options(
         &self,
