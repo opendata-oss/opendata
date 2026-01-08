@@ -3,9 +3,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use dashmap::DashMap;
 use common::Storage;
 use common::storage::StorageSnapshot;
+use dashmap::DashMap;
 
 use crate::error::Error;
 use crate::model::{Sample, SeriesFingerprint, SeriesId, TimeBucket};

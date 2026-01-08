@@ -3,8 +3,8 @@
 use std::sync::{Arc, atomic::AtomicU32};
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 use common::{Storage, StorageRead};
+use dashmap::DashMap;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::delta::{TsdbDelta, TsdbDeltaBuilder};
