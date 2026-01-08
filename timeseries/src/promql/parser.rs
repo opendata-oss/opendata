@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::promql::request::QueryRangeRequest;
 use crate::promql::request::QueryRequest;
-use opendata_common::Clock;
+use common::Clock;
 
 pub const DEFAULT_LOOKBACK_DURATION: Duration = Duration::from_secs(5 * 60);
 
@@ -58,7 +58,7 @@ mod tests {
     use crate::promql::parser::{DEFAULT_LOOKBACK_DURATION, Parseable};
     use crate::promql::request::{QueryRangeRequest, QueryRequest};
     use chrono::DateTime;
-    use opendata_common::clock::{Clock, MockClock, SystemClock};
+    use common::clock::{Clock, MockClock, SystemClock};
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 

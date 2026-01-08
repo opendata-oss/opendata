@@ -3,7 +3,7 @@
 //! This module defines the configuration and options structs that control
 //! the behavior of the log, including storage setup and operation parameters.
 
-use opendata_common::StorageConfig;
+use common::StorageConfig;
 
 /// Configuration for opening a [`Log`](crate::Log).
 ///
@@ -14,7 +14,7 @@ use opendata_common::StorageConfig;
 ///
 /// ```ignore
 /// use log::Config;
-/// use opendata_common::StorageConfig;
+/// use common::StorageConfig;
 ///
 /// let config = Config {
 ///     storage: StorageConfig::default(),
@@ -49,8 +49,8 @@ pub struct WriteOptions {
 
 /// Options for scan operations.
 ///
-/// Controls the behavior of [`Log::scan`](crate::Log::scan) and
-/// [`Log::scan_with_options`](crate::Log::scan_with_options).
+/// Controls the behavior of [`LogRead::scan`](crate::LogRead::scan) and
+/// [`LogRead::scan_with_options`](crate::LogRead::scan_with_options).
 /// Additional options may be added in future versions.
 #[derive(Debug, Clone, Default)]
 pub struct ScanOptions {
@@ -61,8 +61,8 @@ pub struct ScanOptions {
 
 /// Options for count operations.
 ///
-/// Controls the behavior of [`Log::count`](crate::Log::count) and
-/// [`Log::count_with_options`](crate::Log::count_with_options).
+/// Controls the behavior of [`LogRead::count`](crate::LogRead::count) and
+/// [`LogRead::count_with_options`](crate::LogRead::count_with_options).
 #[derive(Debug, Clone, Default)]
 pub struct CountOptions {
     /// Whether to return an approximate count.

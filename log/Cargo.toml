@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 bytes.workspace = true
-opendata-common.workspace = true
+common.workspace = true
 slatedb.workspace = true
+tokio.workspace = true

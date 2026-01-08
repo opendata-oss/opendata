@@ -3,7 +3,7 @@
 //! This module defines [`Error`], the primary error type for all log
 //! operations, along with a convenient [`Result`] type alias.
 
-use opendata_common::StorageError;
+use common::StorageError;
 
 /// Error type for OpenData Log operations.
 ///

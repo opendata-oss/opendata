@@ -14,7 +14,7 @@ use crate::serde::{EncodingError, RecordType};
 /// record type encoded in the key.
 pub(crate) struct OpenTsdbMergeOperator;
 
-impl opendata_common::storage::MergeOperator for OpenTsdbMergeOperator {
+impl common::storage::MergeOperator for OpenTsdbMergeOperator {
     fn merge(&self, key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
         // If no existing value, just return the new value
         let Some(existing) = existing_value else {
@@ -90,7 +90,7 @@ mod tests {
     use crate::serde::key::{BucketListKey, InvertedIndexKey, TimeSeriesKey};
     use crate::serde::timeseries::TimeSeriesValue;
     use bytes::Bytes;
-    use opendata_common::storage::MergeOperator;
+    use common::storage::MergeOperator;
     use roaring::RoaringBitmap;
     use rstest::rstest;
 

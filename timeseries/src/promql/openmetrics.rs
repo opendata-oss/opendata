@@ -1,7 +1,7 @@
 //! OpenMetrics text format parser.
 //!
 //! Parses OpenMetrics exposition format into `Series` for ingestion.
-//! See: https://prometheus.io/docs/specs/om/open_metrics_spec/
+//! See: <https://prometheus.io/docs/specs/om/open_metrics_spec/>
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};

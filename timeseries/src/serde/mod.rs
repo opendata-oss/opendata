@@ -9,7 +9,7 @@ pub mod timeseries;
 
 use crate::model::{RecordTag, TimeBucket};
 use bytes::{BufMut, BytesMut};
-use opendata_common::BytesRange;
+use common::BytesRange;
 
 /// Key format version (currently 0x01)
 pub const KEY_VERSION: u8 = 0x01;

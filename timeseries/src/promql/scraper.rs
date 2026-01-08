@@ -245,7 +245,7 @@ mod tests {
     fn should_create_scraper() {
         // given
         let storage = Arc::new(
-            opendata_common::storage::in_memory::InMemoryStorage::with_merge_operator(Arc::new(
+            common::storage::in_memory::InMemoryStorage::with_merge_operator(Arc::new(
                 crate::storage::merge_operator::OpenTsdbMergeOperator,
             )),
         );

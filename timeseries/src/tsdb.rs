@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use common::Storage;
 use moka::future::Cache;
-use opendata_common::Storage;
 
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndex, InvertedIndexLookup};
 use crate::minitsdb::MiniTsdb;
@@ -284,7 +284,7 @@ mod tests {
     use super::*;
     use crate::model::MetricType;
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
-    use opendata_common::storage::in_memory::InMemoryStorage;
+    use common::storage::in_memory::InMemoryStorage;
 
     async fn create_test_storage() -> Arc<dyn Storage> {
         Arc::new(InMemoryStorage::with_merge_operator(Arc::new(

@@ -3,7 +3,7 @@
 //! This module defines [`Error`], the primary error type for all time series
 //! operations, along with a convenient [`Result`] type alias.
 
-use opendata_common::StorageError;
+use common::StorageError;
 
 /// Error type for OpenData TimeSeries operations.
 ///
