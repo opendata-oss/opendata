@@ -1,4 +1,4 @@
-# RFC 0001: TimeSeries Write API
+# RFC 0002: TimeSeries Write API
 
 **Status**: Draft
 
