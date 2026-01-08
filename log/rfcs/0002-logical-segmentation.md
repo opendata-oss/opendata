@@ -80,63 +80,28 @@ Each segment has associated metadata stored in a separate record:
 ```
 SegmentMeta Record:
   Key:   | version (u8) | type (u8=0x03) | segment_id (u64 BE) |
-  Value: | start_seq (u64 BE) | start_time_ms (i64 BE) | user_meta_len (u32 BE) | user_meta (bytes) |
+  Value: | start_seq (u64 BE) | start_time_ms (i64 BE) |
 ```
 
 The metadata tracks:
 - **start_seq**: The first sequence number in this segment
 - **start_time_ms**: Wall-clock time when the segment was created
-- **user_meta**: Optional user-defined metadata (empty if `user_meta_len` is 0)
 
 End boundaries (end sequence, end time) are derived from the next segment's start values, or from the current log state for the active segment.
 
 #### Metadata Lifecycle
 
-Segment metadata is written in two phases:
-
-1. **On open**: When a new segment is created, a `SegmentMeta` record is written with `start_seq`, `start_time_ms`, and empty `user_meta`. This ensures the segment is immediately discoverable.
-
-2. **On seal**: When `seal_segment()` is called with user metadata, the `SegmentMeta` record is overwritten to include the user-provided bytes. If no user metadata is provided, the record is left unchanged.
-
-User metadata is limited to 64 KiB. This limit is enforced by the API and provides ample space for typical use cases (checksums, correlation IDs, configuration snapshots) while preventing abuse that could impact segment iteration performance.
+When a new segment is created, a `SegmentMeta` record is written with `start_seq` and `start_time_ms`. This ensures the segment is immediately discoverable.
 
 ### Segment Triggers
 
-Segments are "bumped" (a new segment is started) either automatically or manually.
+Segments are "bumped" (a new segment is started) automatically based on configured triggers.
 
 #### Time-Based Trigger
 
 The built-in trigger starts a new segment after a configurable wall-clock duration. Example: With a 1-hour interval, a new segment starts every hour. This provides predictable time-based partitioning similar to timeseries buckets.
 
 Time-based triggering is simple to implement because it only requires comparing the current wall-clock time against the segment's `start_time_ms`. No internal state tracking is needed beyond what's already stored in the segment metadata.
-
-#### Manual Trigger
-
-Applications can explicitly seal segments and attach user-defined metadata:
-
-```rust
-impl Log {
-    /// Seals the current segment and starts a new one.
-    ///
-    /// # Arguments
-    /// * `user_meta` - Optional user-defined metadata to attach to the sealed segment
-    ///
-    /// # Returns
-    /// The sealed segment ID
-    async fn seal_segment(&self, user_meta: Option<Bytes>) -> Result<u64, Error>;
-
-    /// Returns an iterator over all segments in the log.
-    ///
-    /// Segments are returned in order from oldest (segment 0) to newest.
-    /// Each segment includes its metadata (start sequence, start time, user metadata).
-    fn segments(&self) -> SegmentIterator;
-}
-```
-
-Manual sealing enables use cases such as:
-- Creating checkpoint boundaries aligned with application logic
-- Attaching metadata accumulated during writes (checksums, record counts, correlation IDs)
-- Aligning segments with external events (e.g., end of business day)
 
 #### Future: Size-Based Triggers
 
@@ -158,15 +123,15 @@ struct Config {
 
 struct SegmentConfig {
     /// Interval for automatic segment sealing based on wall-clock time.
-    /// If `None`, automatic sealing is disabled and segments only advance
-    /// via manual `seal_segment()` calls.
+    /// If `None`, automatic sealing is disabled and all entries are written
+    /// to segment 0.
     ///
     /// Default: `None` (disabled)
-    auto_seal_interval: Option<Duration>,
+    seal_interval: Option<Duration>,
 }
 ```
 
-With the default configuration (`auto_seal_interval: None`), the log writes to segment 0 indefinitely. Users who want time-based partitioning can enable it by setting an interval. This keeps the default behavior simple while allowing opt-in to automatic segment management.
+With the default configuration (`seal_interval: None`), the log writes to segment 0 indefinitely. Users who want time-based partitioning can enable it by setting an interval. This keeps the default behavior simple while allowing opt-in to automatic segment management.
 
 ## Alternatives
 
@@ -199,6 +164,36 @@ Rejected because:
 ## Open Questions
 
 None at this time.
+
+## Potential Future Work
+
+### Public Segment Sealing API
+
+A future enhancement could expose manual segment sealing to applications:
+
+```rust
+impl Log {
+    /// Seals the current segment and starts a new one.
+    ///
+    /// # Arguments
+    /// * `user_meta` - Optional user-defined metadata to attach to the sealed segment
+    ///
+    /// # Returns
+    /// The sealed segment ID
+    async fn seal_segment(&self, user_meta: Option<Bytes>) -> Result<u64, Error>;
+
+    /// Returns an iterator over all segments in the log.
+    ///
+    /// Segments are returned in order from oldest (segment 0) to newest.
+    /// Each segment includes its metadata (start sequence, start time, user metadata).
+    fn segments(&self) -> SegmentIterator;
+}
+```
+
+This would enable use cases such as:
+- Creating checkpoint boundaries aligned with application logic
+- Attaching metadata accumulated during writes (checksums, record counts, correlation IDs)
+- Aligning segments with external events (e.g., end of business day)
 
 ## Updates
 
