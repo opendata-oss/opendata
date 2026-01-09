@@ -11,23 +11,13 @@ This RFC introduces logical segmentation as a partitioning mechanism for log dat
 
 ## Motivation
 
-RFC 0001 defined a log entry key encoding as:
+RFC 0001 defined a log entry key encoding that supports efficient scans for a specific key's entire history or a sequence number range. However, for operations which naturally span multiple keys, it would be simpler and more efficient to operate on a higher-level unit which spans the entire keyspace of the log.
 
-```
-| version | type | key (TerminatedBytes) | sequence |
-```
+This proposal introduces the notion of a *log segment* to address this gap. A log segment corresponds to the entries spanning a range of sequence numbers across the full keyspace. This is the same notion as the time bucket that we use in the OpenData-Timeseries design, but generalized to allow for segments marked by other factors than time. The segment provides a natural anchor point for cross-key operations and metadata maintenance. In principle, this makes it possible to manage metadata tied to that operation at the level of the segment, rather than level of keys. For example:
 
-While this supports efficient scans for a specific key's entire log or a sequence number range, it lacks the ability to efficiently seek to a particular point based on criteria other than sequence number. Consider these use cases:
+**Range queries** naturally span multiple keys. For example, a prefix scan over `/sensors/*` needs to seek to a particular point in time across all matching keys. Without segments, this requires either scanning from the beginning or maintaining a separate index mapping time to sequence numbers for every key.
 
-1. **Tail queries**: "Read the last day of data" requires scanning from the beginning to find relevant entries, as there's no mapping from time to sequence number.
-
-2. **Time-bounded queries**: "Read entries from 2pm to 4pm yesterday" similarly requires a full scan.
-
-3. **Data lifecycle**: Retention policies based on time need to identify which sequence ranges correspond to expired data.
-
-4. **Prefix queries**: RFC 0001's key encoding supports prefix-based scans (e.g., all keys under `/sensors/*`), but there's no way to seek within a prefix without knowing the full key. Sequence numbers are global, so scanning `/sensors/*` from sequence 1000 requires knowing which specific keys have entries at or after that sequence. With segments, a prefix scan can seek directly to a segment boundary, skipping earlier data across all matching keys.
-
-The timeseries implementation solves similar problems using time-based buckets. For logs, time isn't always the right partitioning dimension. A streaming system processing 1 million events per second has different needs than one processing 100 events per day. It should also be possible to align segments on size.
+**Retention** is simpler to reason about at the segment level. Rather than tracking expiration per key, we can drop entire segments when they age out. This also avoids coherence issues when maintaining metadata about keys. For example, a key listing API (see future work) would tie listing records to segments—when a key is no longer used, it naturally falls out of scope when its segments are removed.
 
 ## Goals
 
@@ -36,8 +26,8 @@ The timeseries implementation solves similar problems using time-based buckets. 
 
 ## Non-Goals
 
-- Defining specific retention policies (left for future RFCs)
-- API design for range and prefix queries (left for future RFCs)
+- Defining specific retention policies
+- API design for range and prefix queries
 - Cross-key queries or joins
 - Segment compaction or merging (users control segment granularity via triggers)
 
@@ -164,6 +154,10 @@ Size-based triggers (e.g., seal after N entries or N bytes) require tracking ent
 ### Segment-Based Deletion
 
 Segments provide a natural unit for data lifecycle management. APIs for deleting entire segments would enable efficient retention policies. Rather than scanning and deleting individual entries, retention can be enforced by dropping segments older than a threshold.
+
+### Key Listing API
+
+Currently the log provides no simple way to inspect which keys are present—users would have to scan the full log. A key listing API would introduce listing records tied to each segment. When a key first appears in a segment, a listing record is written. To enumerate all keys, users iterate the listing records across segments. When segments are deleted, their listing records are removed as well, so keys that are no longer present naturally fall out of scope.
 
 ### Public Segment Sealing API
 
