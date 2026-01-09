@@ -22,14 +22,13 @@ This proposal introduces the notion of a *log segment* to address this gap. A lo
 ## Goals
 
 - Enable efficient seeking within a log based on pluggable criteria (time, size, etc.)
-- Provide a foundation for time-based retention policies and prefix queries
+- Provide a foundation for pluggable retention policies
 
 ## Non-Goals
 
 - Defining specific retention policies
 - API design for range and prefix queries
 - Cross-key queries or joins
-- Segment compaction or merging (users control segment granularity via triggers)
 
 ## Design
 
@@ -51,8 +50,12 @@ The log entry key format is extended to include the segment ID:
 
 ```
 Log Entry:
-  | version (u8) | type (u8) | segment_id (u64 BE) | key (TerminatedBytes) | sequence (u64 BE) |
+  | version (u8) | type (u8) | segment_id (u32 BE) | key (TerminatedBytes) | relative_seq (varint u64) |
 ```
+
+The `segment_id` is a 32-bit identifier, allowing up to ~4 billion segments. Future versions can expand this to 64 bits if needed.
+
+The `relative_seq` is the entry's sequence number relative to the segment's `start_seq` (i.e., it resets to 0 at the start of each segment). Using variable-length encoding keeps keys compact since most relative offsets within a segment are small.
 
 This encoding ensures:
 
@@ -67,7 +70,7 @@ Each segment has associated metadata stored in a separate record:
 
 ```
 SegmentMeta Record:
-  Key:   | version (u8) | type (u8=0x03) | segment_id (u64 BE) |
+  Key:   | version (u8) | type (u8=0x03) | segment_id (u32 BE) |
   Value: | start_seq (u64 BE) | start_time_ms (i64 BE) |
 ```
 
