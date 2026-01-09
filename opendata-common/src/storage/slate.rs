@@ -6,7 +6,7 @@ use slatedb::{
     Db, DbIterator, DbSnapshot, MergeOperator as SlateDbMergeOperator, MergeOperatorError,
     WriteBatch,
 };
-
+use slatedb::config::ScanOptions;
 use crate::{
     BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult,
     storage::{MergeOperator, RecordOp, Storage, StorageSnapshot},
@@ -96,7 +96,16 @@ impl StorageRead for SlateDbStorage {
     ) -> StorageResult<Box<dyn StorageIterator + Send + '_>> {
         let iter = self
             .db
-            .scan(range)
+            .scan_with_options(
+                range,
+                &ScanOptions {
+                    durability_filter: Default::default(),
+                    dirty: false,
+                    read_ahead_bytes: 1024 * 1024,
+                    cache_blocks: true,
+                    max_fetch_tasks: 4,
+                }
+            )
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
@@ -148,7 +157,16 @@ impl StorageRead for SlateDbStorageSnapshot {
     ) -> StorageResult<Box<dyn StorageIterator + Send + '_>> {
         let iter = self
             .snapshot
-            .scan(range)
+            .scan_with_options(
+                range,
+                &ScanOptions {
+                    durability_filter: Default::default(),
+                    dirty: false,
+                    read_ahead_bytes: 1024 * 1024,
+                    cache_blocks: true,
+                    max_fetch_tasks: 4,
+                }
+            )
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
