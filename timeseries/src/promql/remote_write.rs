@@ -149,6 +149,18 @@ impl From<Error> for RemoteWriteError {
 /// - Content-Type: application/x-protobuf
 /// - Content-Encoding: snappy
 /// - Body: Snappy-compressed protobuf WriteRequest
+#[tracing::instrument(
+    level = "debug",
+    skip_all,
+    fields(
+        request_id = uuid::Uuid::new_v4().to_string(),
+        body_size = body.len(),
+        content_type = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or(""),
+        content_encoding = headers.get("content-encoding").and_then(|v| v.to_str().ok()).unwrap_or(""),
+        series_count = tracing::field::Empty,
+        samples_count = tracing::field::Empty
+    )
+)]
 pub async fn handle_remote_write(
     State(state): State<super::server::AppState>,
     headers: HeaderMap,
@@ -183,13 +195,45 @@ pub async fn handle_remote_write(
     }
 
     // Parse the remote write request
-    let samples = parse_remote_write(&body)?;
+    let samples = {
+        let _parse_span = tracing::debug_span!("parse_remote_write").entered();
+        parse_remote_write(&body)?
+    };
+
+    // Record parsed metrics
+    let total_samples: usize = samples.iter().map(|s| s.samples.len()).sum();
+    tracing::Span::current().record("series_count", samples.len());
+    tracing::Span::current().record("samples_count", total_samples);
+
+    tracing::debug!(
+        series_count = samples.len(),
+        samples_count = total_samples,
+        "Parsed remote write request"
+    );
 
     // Ingest samples into the TSDB
-    state.tsdb.ingest_samples(samples).await?;
+    match state.tsdb.ingest_samples(samples).await {
+        Ok(()) => {
+            // Increment successful ingestion counter
+            state
+                .metrics
+                .remote_write_samples_ingested
+                .inc_by(total_samples as u64);
+            tracing::debug!("Successfully ingested remote write request");
 
-    // Return 204 No Content on success (as per spec: empty response body)
-    Ok(StatusCode::NO_CONTENT)
+            // Return 204 No Content on success (as per spec: empty response body)
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(e) => {
+            // Increment failed ingestion counter
+            state
+                .metrics
+                .remote_write_samples_failed
+                .inc_by(total_samples as u64);
+            tracing::error!("Failed to ingest remote write request: {}", e);
+            Err(e.into())
+        }
+    }
 }
 
 #[cfg(test)]

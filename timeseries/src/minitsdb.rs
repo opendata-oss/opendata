@@ -149,14 +149,36 @@ impl MiniTsdb {
         })
     }
 
-    /// Ingest a single series with samples.
+    /// Ingest a batch of series with samples in a single operation.
+    /// This is more efficient than calling ingest() multiple times as it creates only one delta builder.
     /// Note: Ingested data is batched and NOT visible to queries until flush().
     /// Returns an error if any sample timestamp is outside the bucket's time range.
-    pub(crate) async fn ingest(&self, series: &Series) -> Result<()> {
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(
+            bucket = ?self.bucket,
+            series_count = series_list.len(),
+            total_samples = series_list.iter().map(|s| s.samples.len()).sum::<usize>()
+        )
+    )]
+    pub(crate) async fn ingest_batch(&self, series_list: &[Series]) -> Result<()> {
+        let total_samples = series_list.iter().map(|s| s.samples.len()).sum::<usize>();
+
+        tracing::debug!(
+            bucket = ?self.bucket,
+            series_count = series_list.len(),
+            total_samples = total_samples,
+            "Starting MiniTsdb batch ingest"
+        );
+
         let mut builder =
             TsdbDeltaBuilder::new(self.bucket.clone(), &self.series_dict, &self.next_series_id);
 
-        builder.ingest(series)?;
+        // Ingest all series into the same delta builder
+        for series in series_list {
+            builder.ingest(series)?;
+        }
 
         let delta = builder.build();
 
@@ -164,7 +186,24 @@ impl MiniTsdb {
         let mut pending = self.pending_delta.lock().await;
         pending.merge(delta);
 
+        tracing::debug!(
+            bucket = ?self.bucket,
+            series_count = series_list.len(),
+            total_samples = total_samples,
+            "Completed MiniTsdb batch ingest"
+        );
+
         Ok(())
+    }
+
+    /// Ingest a single series with samples.
+    /// Note: Ingested data is batched and NOT visible to queries until flush().
+    /// Returns an error if any sample timestamp is outside the bucket's time range.
+    ///
+    /// For better performance when ingesting multiple series, use ingest_batch() instead.
+    pub(crate) async fn ingest(&self, series: &Series) -> Result<()> {
+        // Delegate to batch method with a single series
+        self.ingest_batch(std::slice::from_ref(series)).await
     }
 
     /// Flush pending data to storage, making it durable and visible to queries.

@@ -7,6 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use common::Storage;
 use moka::future::Cache;
+use tracing::error;
 
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndex, InvertedIndexLookup};
 use crate::minitsdb::MiniTsdb;
@@ -49,6 +50,7 @@ impl Tsdb {
     }
 
     /// Get or create a MiniTsdb for ingestion into a specific bucket.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) async fn get_or_create_for_ingest(
         &self,
         bucket: TimeBucket,
@@ -120,9 +122,25 @@ impl Tsdb {
 
     /// Ingest series into the TSDB.
     /// Each series is split by time bucket based on sample timestamps.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(
+            series_count = series_list.len(),
+            total_samples = tracing::field::Empty,
+            buckets_touched = tracing::field::Empty
+        )
+    )]
     pub(crate) async fn ingest_samples(&self, series_list: Vec<Series>) -> Result<()> {
+        let mut bucket_series_map: HashMap<TimeBucket, Vec<Series>> = HashMap::new();
+        let mut total_samples = 0;
+
+        // First pass: group all series by bucket
         for series in series_list {
-            // Group samples by bucket
+            let series_sample_count = series.samples.len();
+            total_samples += series_sample_count;
+
+            // Group samples by bucket for this series
             let mut bucket_samples: HashMap<TimeBucket, Vec<Sample>> = HashMap::new();
 
             for sample in series.samples {
@@ -133,7 +151,7 @@ impl Tsdb {
                 bucket_samples.entry(bucket).or_default().push(sample);
             }
 
-            // Ingest each bucket's samples as a series
+            // Create a series for each bucket and add to bucket_series_map
             for (bucket, samples) in bucket_samples {
                 let bucket_series = Series {
                     labels: series.labels.clone(),
@@ -142,11 +160,53 @@ impl Tsdb {
                     description: series.description.clone(),
                     samples,
                 };
-
-                let mini = self.get_or_create_for_ingest(bucket).await?;
-                mini.ingest(&bucket_series).await?;
+                bucket_series_map
+                    .entry(bucket)
+                    .or_default()
+                    .push(bucket_series);
             }
         }
+
+        let buckets_touched = bucket_series_map.len();
+
+        // Second pass: ingest all series for each bucket in a single batch
+        for (bucket, series_list) in bucket_series_map {
+            let series_count = series_list.len();
+            let samples_count: usize = series_list.iter().map(|s| s.samples.len()).sum();
+
+            tracing::debug!(
+                bucket = ?bucket,
+                series_count = series_count,
+                samples_count = samples_count,
+                "Ingesting batch into bucket"
+            );
+
+            let mini = match self.get_or_create_for_ingest(bucket.clone()).await {
+                Ok(mini) => mini,
+                Err(err) => {
+                    error!("failed to load minitsdb: {:?}: {:?}", bucket, err);
+                    return Err(err);
+                }
+            };
+            mini.ingest_batch(&series_list).await?;
+
+            tracing::debug!(
+                bucket = ?bucket,
+                series_count = series_count,
+                samples_count = samples_count,
+                "Bucket batch ingestion completed"
+            );
+        }
+
+        // Record final metrics on the main span
+        tracing::Span::current().record("total_samples", total_samples);
+        tracing::Span::current().record("buckets_touched", buckets_touched);
+
+        tracing::debug!(
+            total_samples = total_samples,
+            buckets_touched = buckets_touched,
+            "Completed ingesting all samples"
+        );
 
         Ok(())
     }
