@@ -63,9 +63,10 @@ index structures are stored as key-value pairs in the LSM tree.
 │   │                  Write Path                         │   │
 │   │                                                     │   │
 │   │   1. Vector written to WAL (durability)             │   │
-│   │   2. Assigned to nearest centroid(s)                │   │
-│   │   3. Posting list updated via merge operator        │   │
-│   │   4. Vector data + metadata written                 │   │
+│   │   2. External ID looked up / allocated internal ID  │   │
+│   │   3. Assigned to nearest centroid(s)                │   │
+│   │   4. Posting list updated via merge operator        │   │
+│   │   5. Vector data + metadata + dictionary written    │   │
 │   └─────────────────────────────────────────────────────┘   │
 │                                                             │
 │   ┌─────────────────────────────────────────────────────┐   │
@@ -74,7 +75,7 @@ index structures are stored as key-value pairs in the LSM tree.
 │   │   Centroids:     [chunk 0] [chunk 1] ... [chunk N]  │   │
 │   │                  (loaded into HNSW for navigation)  │   │
 │   │                                                     │   │
-│   │   Posting Lists: centroid_id → RoaringBitmap        │   │
+│   │   Posting Lists: centroid_id → RoaringTreemap       │   │
 │   │                  (vector IDs per cluster)           │   │
 │   │                                                     │   │
 │   │   Deleted:       centroid_id=0 → deleted vector IDs │   │
@@ -83,8 +84,9 @@ index structures are stored as key-value pairs in the LSM tree.
 │   ┌─────────────────────────────────────────────────────┐   │
 │   │                  Vector Storage                     │   │
 │   │                                                     │   │
+│   │   IdDictionary:  external_id → internal vector_id   │   │
 │   │   VectorData:    vector_id → f32[dimensions]        │   │
-│   │   VectorMeta:    vector_id → metadata fields        │   │
+│   │   VectorMeta:    vector_id → external_id + metadata │   │
 │   │   MetadataIndex: (field, value) → vector IDs        │   │
 │   └─────────────────────────────────────────────────────┘   │
 │                                                             │
@@ -135,21 +137,59 @@ matches numeric ordering of encoded values.
 
 Key identifiers used in this RFC:
 
-- `vector_id` (u32): Internal vector identifier, unique within the namespace
+- `vector_id` (u64): Internal vector identifier, system-assigned, unique within the namespace
+- `external_id` (string): User-provided identifier, max 64 bytes, maps to internal vector_id
 - `centroid_id` (u32): Cluster centroid identifier
 - `chunk_id` (u32): Centroid chunk identifier
 
-### Vector ID Generation
+### External and Internal IDs
 
-Vector IDs are user-provided u32 integers. Clients must ensure uniqueness per namespace; in
-practice, many workloads keep a dictionary that maps their external UUIDs or strings onto a compact
-range of integers. Maintaining roughly monotonically increasing IDs improves Roaring bitmap
-compression because sequential IDs cluster well, but the storage engine does not enforce any
-allocation policy.
+Users provide **external IDs**—arbitrary strings up to 64 bytes—to identify their vectors. The
+system maintains an `IdDictionary` that maps each external ID to a system-assigned **internal ID**
+(u64). Internal IDs are used in all index structures (posting lists, metadata indexes) because:
 
-**Collision / upsert behavior:** TBD. A follow-up RFC will define whether writers may overwrite an
-existing `vector_id` or if a prior delete is required. Until then, clients should treat duplicate
-IDs as undefined behavior.
+1. Fixed-width u64 keys enable efficient bitmap operations (RoaringTreemap)
+2. Monotonically increasing IDs improve bitmap compression (sequential IDs cluster well)
+3. Decoupling external from internal IDs allows the system to manage ID lifecycle
+
+**Upsert Behavior:**
+
+When inserting a vector with an external ID that already exists:
+
+1. Look up the existing internal ID from `IdDictionary`
+2. Delete the old vector: add internal ID to deleted bitmap, tombstone `VectorData` and `VectorMeta`
+3. Allocate a new internal ID
+4. Write new vector data with the new internal ID
+5. Update `IdDictionary` to point to the new internal ID
+
+This "delete old + insert new" approach ensures that posting lists and metadata indexes are updated
+correctly via merge operators, without requiring expensive read-modify-write cycles to remove the
+old internal ID from every index entry.
+
+### Block-Based ID Allocation
+
+Internal vector IDs are allocated from a monotonically increasing counter using block-based
+allocation (similar to the Log RFC's sequence allocation). Rather than persisting the counter after
+every insert, the writer pre-allocates a block of IDs and records the allocation in a `SeqBlock`
+record.
+
+**Allocation procedure:**
+
+1. On initialization, read the `SeqBlock` record to get the last allocated range `[base, base+size)`
+2. Allocate a new block starting at `base + size` and write a new `SeqBlock` before processing
+3. During normal operation, assign IDs from the current block, incrementing after each insert
+4. When the current block is exhausted, allocate a new block and write an updated `SeqBlock`
+
+**Recovery:**
+
+On crash recovery, read the `SeqBlock` and allocate a fresh block starting after the previous range.
+Any IDs allocated but not used before the crash are skipped. This may create gaps in the ID space,
+but monotonicity is preserved.
+
+**Block sizing:**
+
+Block size is an implementation detail balancing write amplification (larger blocks reduce
+`SeqBlock` write frequency) against ID space efficiency (smaller blocks waste fewer IDs on crash).
 
 ### Standard Key Prefix
 
@@ -178,7 +218,8 @@ with future schema changes that may require sub-type discrimination.
 - `Array<T>`: `count: u16` followed by `count` serialized elements of type `T`.
 - `FixedElementArray<T>`: Serialized elements back-to-back with no count prefix; length derived from
   buffer size divided by element size.
-- `RoaringBitmap`: Standard Roaring bitmap serialization format for compressed u32 integer sets.
+- `RoaringTreemap`: Roaring treemap serialization format for compressed u64 integer sets (64-bit
+  extension of Roaring bitmap).
 
 **Key Encodings** (big-endian for lexicographic ordering):
 
@@ -202,9 +243,11 @@ maintain lexicographic ordering for range scans.
 | `0x01` | `CollectionMeta` | Global schema: dimensions, distance metric, field specs |
 | `0x02` | `CentroidChunk`  | Stores a chunk of cluster centroids for SPANN navigation|
 | `0x03` | `PostingList`    | Maps centroid IDs to vector IDs in that cluster         |
-| `0x04` | `VectorData`     | Stores raw vector bytes keyed by user-provided u32 ID   |
-| `0x05` | `VectorMeta`     | Stores metadata key-value pairs for each vector         |
-| `0x06` | `MetadataIndex`  | Inverted index mapping metadata values to vector IDs    |
+| `0x04` | `IdDictionary`   | Maps external string IDs to internal u64 vector IDs     |
+| `0x05` | `VectorData`     | Stores raw vector bytes keyed by internal u64 ID        |
+| `0x06` | `VectorMeta`     | Stores metadata key-value pairs for each vector         |
+| `0x07` | `MetadataIndex`  | Inverted index mapping metadata values to vector IDs    |
+| `0x08` | `SeqBlock`       | Stores sequence allocation state for internal ID gen    |
 
 ## Record Definitions & Schemas
 
@@ -371,13 +414,13 @@ from candidate sets.
 ┌────────────────────────────────────────────────────────────────┐
 │                     PostingListValue                           │
 ├────────────────────────────────────────────────────────────────┤
-│  vector_ids:  RoaringBitmap                                    │
+│  vector_ids:  RoaringTreemap                                   │
 └────────────────────────────────────────────────────────────────┘
 ```
 
 **Structure:**
 
-- Vector IDs stored as a Roaring bitmap for compression and fast set operations
+- Vector IDs stored as a Roaring treemap for compression and fast set operations (u64 support)
 - Posting lists are balanced by the hierarchical clustering algorithm (target size configurable,
   e.g., 1000-5000 vectors)
 - LIRE maintenance splits oversized postings and merges undersized ones
@@ -388,8 +431,8 @@ from candidate sets.
 
 Posting lists use SlateDB merge operators to avoid read-modify-write amplification:
 
-- **Add vector**: Merge with bitmap containing the new vector ID (bitmap OR)
-- **Remove vector**: Merge with deletion marker (bitmap AND-NOT)
+- **Add vector**: Merge with treemap containing the new vector ID (treemap OR)
+- **Remove vector**: Merge with deletion marker (treemap AND-NOT)
 
 **Write Batching:**
 
@@ -398,9 +441,9 @@ pending entries. Conversely, read-modify-write avoids merge overhead but causes 
 (deserialize, modify, reserialize on every insert).
 
 The solution is a two-layer approach: buffer writes in memory and merge them there (operating on
-`RoaringBitmap` directly), then flush the merged buffer using SlateDB merge operators (operating on
+`RoaringTreemap` directly), then flush the merged buffer using SlateDB merge operators (operating on
 `Bytes`). For example, 100 vector inserts across 10 centroids produce 10 SlateDB merges instead of
-100. Both layers use the same merge logic (bitmap OR / AND-NOT).
+100. Both layers use the same merge logic (treemap OR / AND-NOT).
 
 Trade-offs:
 
@@ -410,11 +453,45 @@ Trade-offs:
 
 **Delete Operation:**
 
-Deleting a vector requires three atomic operations via `WriteBatch`: (1) add vector ID to the
-deleted bitmap (centroid_id = 0), (2) tombstone the vector data, (3) tombstone the vector metadata.
-Metadata index cleanup happens during LIRE maintenance.
+Deleting a vector requires four atomic operations via `WriteBatch`: (1) add vector ID to the
+deleted bitmap (centroid_id = 0), (2) tombstone the vector data, (3) tombstone the vector metadata,
+(4) tombstone the `IdDictionary` entry. Metadata index cleanup happens during LIRE maintenance.
 
-### `VectorData` (`RecordType::VectorData` = `0x04`)
+### `IdDictionary` (`RecordType::IdDictionary` = `0x04`)
+
+Maps user-provided external IDs to internal vector IDs. Enables arbitrary string identifiers while
+maintaining compact u64 internal IDs for efficient bitmap operations.
+
+**Key Layout:**
+
+```
+┌─────────┬─────────────┬─────────────────┐
+│ version │ record_tag  │   external_id   │
+│ 1 byte  │   1 byte    │ TerminatedBytes │
+└─────────┴─────────────┴─────────────────┘
+```
+
+- `external_id`: User-provided identifier (max 64 bytes)
+
+**Value Schema:**
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                     IdDictionaryValue                          │
+├────────────────────────────────────────────────────────────────┤
+│  vector_id:  u64  (internal vector identifier)                 │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Structure:**
+
+- External IDs are encoded using `TerminatedBytes` for correct lexicographic ordering
+- Value is a single u64 internal vector ID (8 bytes, little-endian)
+- On upsert, the dictionary entry is updated to point to the new internal ID (old entry tombstoned,
+  new entry written)
+- During delete, the dictionary entry is tombstoned along with vector data/metadata
+
+### `VectorData` (`RecordType::VectorData` = `0x05`)
 
 Stores the raw vector bytes for a single vector. Vectors are stored individually to enable efficient
 point lookups and partial loading during filtered searches.
@@ -424,11 +501,11 @@ point lookups and partial loading during filtered searches.
 ```
 ┌─────────┬─────────────┬────────────┐
 │ version │ record_tag  │ vector_id  │
-│ 1 byte  │   1 byte    │  4 bytes   │
+│ 1 byte  │   1 byte    │  8 bytes   │
 └─────────┴─────────────┴────────────┘
 ```
 
-- `vector_id` (u32): User-provided identifier for the vector
+- `vector_id` (u64): Internal identifier for the vector (system-assigned)
 
 **Value Schema:**
 
@@ -446,25 +523,24 @@ point lookups and partial loading during filtered searches.
 - Vector stored as contiguous `f32` values in little-endian format
 - Dimensionality obtained from `CollectionMeta`
 - Total value size: `dimensions * 4` bytes
-- Vector ID is user-provided and must be unique per namespace
-- **TBD:** Collision handling behavior (upsert vs reject) to be defined in a future RFC (see
-  "Vector ID Generation")
+- Vector ID is system-assigned via block-based allocation (see "Block-Based ID Allocation")
 
-### `VectorMeta` (`RecordType::VectorMeta` = `0x05`)
+### `VectorMeta` (`RecordType::VectorMeta` = `0x06`)
 
-Stores metadata key-value pairs associated with a vector. Metadata is stored separately from vector
-data to enable efficient metadata-only scans during filtered queries.
+Stores metadata key-value pairs associated with a vector, including the external ID for reverse
+lookup. Metadata is stored separately from vector data to enable efficient metadata-only scans
+during filtered queries.
 
 **Key Layout:**
 
 ```
 ┌─────────┬─────────────┬────────────┐
 │ version │ record_tag  │ vector_id  │
-│ 1 byte  │   1 byte    │  4 bytes   │
+│ 1 byte  │   1 byte    │  8 bytes   │
 └─────────┴─────────────┴────────────┘
 ```
 
-- `vector_id` (u32): User-provided unique identifier for the vector
+- `vector_id` (u64): Internal identifier for the vector (system-assigned)
 
 **Value Schema:**
 
@@ -472,7 +548,8 @@ data to enable efficient metadata-only scans during filtered queries.
 ┌────────────────────────────────────────────────────────────────┐
 │                      VectorMetaValue                           │
 ├────────────────────────────────────────────────────────────────┤
-│  fields:  Array<MetadataField>                                 │
+│  external_id: Utf8  (max 64 bytes, user-provided identifier)   │
+│  fields:      Array<MetadataField>                             │
 │                                                                │
 │  MetadataField                                                 │
 │  ┌──────────────────────────────────────────────────────────┐  │
@@ -490,11 +567,12 @@ data to enable efficient metadata-only scans during filtered queries.
 
 **Structure:**
 
+- `external_id` stored for reverse lookup (internal ID → external ID) during query results
 - Fields carry their canonical name directly, matching entries in `CollectionMeta.metadata_fields`
 - Metadata fields serialized in ascending lexicographic order by `field_name`
 - Field schema defined in `CollectionMeta`; unknown field names are rejected at write time
 
-### `MetadataIndex` (`RecordType::MetadataIndex` = `0x06`)
+### `MetadataIndex` (`RecordType::MetadataIndex` = `0x07`)
 
 Inverted index mapping metadata field/value pairs to the set of vectors with that value. Enables
 efficient filtering during hybrid queries. Only fields marked as `indexed=true` in `CollectionMeta`
@@ -537,21 +615,57 @@ sortable encodings (sign-bit flip + big-endian) to enable efficient range scans.
 ┌────────────────────────────────────────────────────────────────┐
 │                    MetadataIndexValue                          │
 ├────────────────────────────────────────────────────────────────┤
-│  vector_ids:  RoaringBitmap                                    │
+│  vector_ids:  RoaringTreemap                                   │
 └────────────────────────────────────────────────────────────────┘
 ```
 
 **Structure:**
 
-- Roaring bitmap provides efficient compression and set intersection
-- During filtered search, bitmaps for multiple predicates are intersected before vector evaluation
+- Roaring treemap provides efficient compression and set intersection for u64 IDs
+- During filtered search, treemaps for multiple predicates are intersected before vector evaluation
 - SlateDB prefix encoding compresses common field name prefixes
-- Updates use merge operators (same pattern as `PostingList`): bitmap OR to add, bitmap AND-NOT to
+- Updates use merge operators (same pattern as `PostingList`): treemap OR to add, treemap AND-NOT to
   remove
 
-**Known Limitation:** Range predicates (e.g., `price < 100`) require OR-ing bitmaps for all matching
+**Known Limitation:** Range predicates (e.g., `price < 100`) require OR-ing treemaps for all matching
 values. This works well for low-cardinality fields and exact-match filters but is expensive for
 high-cardinality numeric fields. See Future Considerations for planned improvements.
+
+### `SeqBlock` (`RecordType::SeqBlock` = `0x08`)
+
+Stores the sequence allocation state for internal vector ID generation. This is a singleton record
+used for block-based sequence allocation (see "Block-Based ID Allocation").
+
+**Key Layout:**
+
+```
+┌─────────┬─────────────┐
+│ version │ record_tag  │
+│ 1 byte  │   1 byte    │
+└─────────┴─────────────┘
+```
+
+The key contains only the version and record tag—no additional fields. This ensures exactly one
+`SeqBlock` record exists per collection.
+
+**Value Schema:**
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                       SeqBlockValue                            │
+├────────────────────────────────────────────────────────────────┤
+│  base_sequence:  u64  (start of allocated block)               │
+│  block_size:     u64  (number of IDs in block)                 │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Structure:**
+
+- `base_sequence`: First ID in the currently allocated block
+- `block_size`: Number of IDs pre-allocated (implementation-defined, not exposed via config)
+- On initialization, if no `SeqBlock` exists, allocate starting from ID 1
+- The allocated range is `[base_sequence, base_sequence + block_size)`
+- On crash recovery, allocate a fresh block starting at `base_sequence + block_size`
 
 ## Query Execution Overview
 
