@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "common",
     "timeseries",
-    "log",
+    "log", "vector",
 ]
 
 [workspace.package]
