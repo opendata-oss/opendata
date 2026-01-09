@@ -186,7 +186,7 @@ impl Log {
 ```
 
 This would enable use cases such as:
-- Creating checkpoint boundaries aligned with application logic
+- Creating segment boundaries aligned with application logic
 - Attaching metadata accumulated during writes (checksums, record counts, correlation IDs)
 - Aligning segments with external events (e.g., end of business day)
 
