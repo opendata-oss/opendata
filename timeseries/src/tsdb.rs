@@ -181,20 +181,15 @@ impl Tsdb {
                 "Ingesting batch into bucket"
             );
 
-            info!("ingest batch");
-
             let mini = match self.get_or_create_for_ingest(bucket.clone()).await {
                 Ok(mini) => {
-                    info!("load mini successful");
                     mini
                 }
                 Err(err) => {
-                    info!("failed to load mini");
                     error!("failed to load minitsdb: {:?}: {:?}", bucket, err);
                     return Err(err);
                 }
             };
-            info!("ingest batch to mini");
             mini.ingest_batch(&series_list).await?;
 
             tracing::debug!(
