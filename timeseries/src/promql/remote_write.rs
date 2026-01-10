@@ -204,7 +204,7 @@ pub async fn handle_remote_write(
     let total_samples: usize = samples.iter().map(|s| s.samples.len()).sum();
     tracing::Span::current().record("series_count", samples.len());
     tracing::Span::current().record("samples_count", total_samples);
-    
+
     tracing::debug!(
         series_count = samples.len(),
         samples_count = total_samples,
@@ -212,12 +212,28 @@ pub async fn handle_remote_write(
     );
 
     // Ingest samples into the TSDB
-    state.tsdb.ingest_samples(samples).await?;
+    match state.tsdb.ingest_samples(samples).await {
+        Ok(()) => {
+            // Increment successful ingestion counter
+            state
+                .metrics
+                .remote_write_samples_ingested
+                .inc_by(total_samples as u64);
+            tracing::debug!("Successfully ingested remote write request");
 
-    tracing::debug!("Successfully ingested remote write request");
-
-    // Return 204 No Content on success (as per spec: empty response body)
-    Ok(StatusCode::NO_CONTENT)
+            // Return 204 No Content on success (as per spec: empty response body)
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(e) => {
+            // Increment failed ingestion counter
+            state
+                .metrics
+                .remote_write_samples_failed
+                .inc_by(total_samples as u64);
+            tracing::error!("Failed to ingest remote write request: {}", e);
+            Err(e.into())
+        }
+    }
 }
 
 #[cfg(test)]

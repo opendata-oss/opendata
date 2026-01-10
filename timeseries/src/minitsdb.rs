@@ -164,7 +164,7 @@ impl MiniTsdb {
     )]
     pub(crate) async fn ingest_batch(&self, series_list: &[Series]) -> Result<()> {
         let total_samples = series_list.iter().map(|s| s.samples.len()).sum::<usize>();
-        
+
         tracing::debug!(
             bucket = ?self.bucket,
             series_count = series_list.len(),
@@ -199,7 +199,7 @@ impl MiniTsdb {
     /// Ingest a single series with samples.
     /// Note: Ingested data is batched and NOT visible to queries until flush().
     /// Returns an error if any sample timestamp is outside the bucket's time range.
-    /// 
+    ///
     /// For better performance when ingesting multiple series, use ingest_batch() instead.
     pub(crate) async fn ingest(&self, series: &Series) -> Result<()> {
         // Delegate to batch method with a single series

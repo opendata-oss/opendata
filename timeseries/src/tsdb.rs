@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use moka::future::Cache;
-use tracing::{error, info};
 use opendata_common::Storage;
+use tracing::{error, info};
 
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndex, InvertedIndexLookup};
 use crate::minitsdb::MiniTsdb;
@@ -50,10 +50,7 @@ impl Tsdb {
     }
 
     /// Get or create a MiniTsdb for ingestion into a specific bucket.
-    #[tracing::instrument(
-        level = "debug",
-        skip_all,
-    )]
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) async fn get_or_create_for_ingest(
         &self,
         bucket: TimeBucket,
@@ -142,7 +139,7 @@ impl Tsdb {
         for series in series_list {
             let series_sample_count = series.samples.len();
             total_samples += series_sample_count;
-            
+
             // Group samples by bucket for this series
             let mut bucket_samples: HashMap<TimeBucket, Vec<Sample>> = HashMap::new();
 
@@ -163,7 +160,10 @@ impl Tsdb {
                     description: series.description.clone(),
                     samples,
                 };
-                bucket_series_map.entry(bucket).or_default().push(bucket_series);
+                bucket_series_map
+                    .entry(bucket)
+                    .or_default()
+                    .push(bucket_series);
             }
         }
 
@@ -173,7 +173,7 @@ impl Tsdb {
         for (bucket, series_list) in bucket_series_map {
             let series_count = series_list.len();
             let samples_count: usize = series_list.iter().map(|s| s.samples.len()).sum();
-            
+
             tracing::debug!(
                 bucket = ?bucket,
                 series_count = series_count,
@@ -187,7 +187,7 @@ impl Tsdb {
                 Ok(mini) => {
                     info!("load mini successful");
                     mini
-                },
+                }
                 Err(err) => {
                     info!("failed to load mini");
                     error!("failed to load minitsdb: {:?}: {:?}", bucket, err);
@@ -196,7 +196,7 @@ impl Tsdb {
             };
             info!("ingest batch to mini");
             mini.ingest_batch(&series_list).await?;
-            
+
             tracing::debug!(
                 bucket = ?bucket,
                 series_count = series_count,
@@ -208,7 +208,7 @@ impl Tsdb {
         // Record final metrics on the main span
         tracing::Span::current().record("total_samples", total_samples);
         tracing::Span::current().record("buckets_touched", buckets_touched);
-        
+
         tracing::debug!(
             total_samples = total_samples,
             buckets_touched = buckets_touched,

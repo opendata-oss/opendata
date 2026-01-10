@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use bytes::Bytes;
-use slatedb::{
-    Db, DbIterator, DbSnapshot, MergeOperator as SlateDbMergeOperator, MergeOperatorError,
-    WriteBatch,
-};
-use slatedb::config::ScanOptions;
 use crate::{
     BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult,
     storage::{MergeOperator, RecordOp, Storage, StorageSnapshot},
+};
+use async_trait::async_trait;
+use bytes::Bytes;
+use slatedb::config::ScanOptions;
+use slatedb::{
+    Db, DbIterator, DbSnapshot, MergeOperator as SlateDbMergeOperator, MergeOperatorError,
+    WriteBatch,
 };
 
 /// Adapter that wraps our `MergeOperator` trait to implement SlateDB's `MergeOperator` trait.
@@ -104,7 +104,7 @@ impl StorageRead for SlateDbStorage {
                     read_ahead_bytes: 1024 * 1024,
                     cache_blocks: true,
                     max_fetch_tasks: 4,
-                }
+                },
             )
             .await
             .map_err(StorageError::from_storage)?;
@@ -165,7 +165,7 @@ impl StorageRead for SlateDbStorageSnapshot {
                     read_ahead_bytes: 1024 * 1024,
                     cache_blocks: true,
                     max_fetch_tasks: 4,
-                }
+                },
             )
             .await
             .map_err(StorageError::from_storage)?;
