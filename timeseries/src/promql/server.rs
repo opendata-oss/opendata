@@ -31,6 +31,7 @@ use crate::tsdb::Tsdb;
 pub(crate) struct AppState {
     pub(crate) tsdb: Arc<Tsdb>,
     pub(crate) metrics: Arc<Metrics>,
+    pub(crate) flush_interval_secs: u64,
 }
 
 /// Server configuration
@@ -68,6 +69,7 @@ impl PromqlServer {
         let state = AppState {
             tsdb: self.tsdb.clone(),
             metrics: metrics.clone(),
+            flush_interval_secs: self.config.prometheus_config.flush_interval_secs,
         };
 
         // Start the scraper if there are scrape configs
@@ -97,7 +99,7 @@ impl PromqlServer {
             );
             loop {
                 ticker.tick().await;
-                if let Err(e) = tsdb_for_flush.flush().await {
+                if let Err(e) = tsdb_for_flush.flush(flush_interval_secs).await {
                     tracing::error!("Failed to flush TSDB: {}", e);
                 } else {
                     tracing::debug!("Flushed TSDB");

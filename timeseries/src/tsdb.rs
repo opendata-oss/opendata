@@ -112,10 +112,11 @@ impl Tsdb {
     }
 
     /// Flush all dirty buckets in the ingest cache to storage.
-    pub(crate) async fn flush(&self) -> Result<()> {
+    pub(crate) async fn flush(&self, flush_interval_secs: u64) -> Result<()> {
         // Note: moka's iter() returns a clone of the current entries
         for (_, mini) in &self.ingest_cache {
-            mini.flush(self.storage.clone()).await?;
+            mini.flush(self.storage.clone(), flush_interval_secs)
+                .await?;
         }
         Ok(())
     }
@@ -131,7 +132,11 @@ impl Tsdb {
             buckets_touched = tracing::field::Empty
         )
     )]
-    pub(crate) async fn ingest_samples(&self, series_list: Vec<Series>) -> Result<()> {
+    pub(crate) async fn ingest_samples(
+        &self,
+        series_list: Vec<Series>,
+        flush_interval_secs: u64,
+    ) -> Result<()> {
         let mut bucket_series_map: HashMap<TimeBucket, Vec<Series>> = HashMap::new();
         let mut total_samples = 0;
 
@@ -188,7 +193,7 @@ impl Tsdb {
                     return Err(err);
                 }
             };
-            mini.ingest_batch(&series_list).await?;
+            mini.ingest_batch(&series_list, flush_interval_secs).await?;
 
             tracing::debug!(
                 bucket = ?bucket,
@@ -466,10 +471,10 @@ mod tests {
         // Ingest a sample with timestamp in the bucket range (seconds 3600-7199)
         // Using 4000 seconds = 4000000 ms
         let sample = create_sample("http_requests", vec![("env", "prod")], 4000000, 42.0);
-        mini.ingest(&sample).await.unwrap();
+        mini.ingest(&sample, 30).await.unwrap();
 
         // Flush to make data visible
-        tsdb.flush().await.unwrap();
+        tsdb.flush(30).await.unwrap();
 
         // when: query the data with range covering the bucket (seconds 3600-7200)
         let reader = tsdb.query_reader(3600, 7200).await.unwrap();
@@ -517,21 +522,17 @@ mod tests {
             .await
             .unwrap();
         mini1
-            .ingest(&create_sample(
-                "http_requests",
-                vec![("env", "prod")],
-                3_900_000,
-                10.0,
-            ))
+            .ingest(
+                &create_sample("http_requests", vec![("env", "prod")], 3_900_000, 10.0),
+                30,
+            )
             .await
             .unwrap();
         mini1
-            .ingest(&create_sample(
-                "http_requests",
-                vec![("env", "staging")],
-                3_900_001,
-                15.0,
-            ))
+            .ingest(
+                &create_sample("http_requests", vec![("env", "staging")], 3_900_001, 15.0),
+                30,
+            )
             .await
             .unwrap();
 
@@ -540,26 +541,22 @@ mod tests {
             .await
             .unwrap();
         mini2
-            .ingest(&create_sample(
-                "http_requests",
-                vec![("env", "prod")],
-                7_900_000,
-                20.0,
-            ))
+            .ingest(
+                &create_sample("http_requests", vec![("env", "prod")], 7_900_000, 20.0),
+                30,
+            )
             .await
             .unwrap();
         mini2
-            .ingest(&create_sample(
-                "http_requests",
-                vec![("env", "staging")],
-                7_900_001,
-                25.0,
-            ))
+            .ingest(
+                &create_sample("http_requests", vec![("env", "staging")], 7_900_001, 25.0),
+                30,
+            )
             .await
             .unwrap();
 
         // Flush buckets 1 & 2 to storage
-        tsdb.flush().await.unwrap();
+        tsdb.flush(30).await.unwrap();
 
         // Invalidate buckets 1 & 2 from ingest cache so they'll be loaded from query cache
         tsdb.ingest_cache.invalidate(&bucket1).await;
@@ -574,21 +571,17 @@ mod tests {
             .await
             .unwrap();
         mini3
-            .ingest(&create_sample(
-                "http_requests",
-                vec![("env", "prod")],
-                11_900_000,
-                30.0,
-            ))
+            .ingest(
+                &create_sample("http_requests", vec![("env", "prod")], 11_900_000, 30.0),
+                30,
+            )
             .await
             .unwrap();
         mini3
-            .ingest(&create_sample(
-                "http_requests",
-                vec![("env", "staging")],
-                11_900_001,
-                35.0,
-            ))
+            .ingest(
+                &create_sample("http_requests", vec![("env", "staging")], 11_900_001, 35.0),
+                30,
+            )
             .await
             .unwrap();
 
@@ -597,26 +590,22 @@ mod tests {
             .await
             .unwrap();
         mini4
-            .ingest(&create_sample(
-                "http_requests",
-                vec![("env", "prod")],
-                15_900_000,
-                40.0,
-            ))
+            .ingest(
+                &create_sample("http_requests", vec![("env", "prod")], 15_900_000, 40.0),
+                30,
+            )
             .await
             .unwrap();
         mini4
-            .ingest(&create_sample(
-                "http_requests",
-                vec![("env", "staging")],
-                15_900_001,
-                45.0,
-            ))
+            .ingest(
+                &create_sample("http_requests", vec![("env", "staging")], 15_900_001, 45.0),
+                30,
+            )
             .await
             .unwrap();
 
         // Flush buckets 3 & 4 to storage (data is now visible for queries)
-        tsdb.flush().await.unwrap();
+        tsdb.flush(30).await.unwrap();
 
         // Verify cache state: 2 in ingest cache, 0 in query cache (query cache populated on read)
         tsdb.ingest_cache.run_pending_tasks().await;
