@@ -233,7 +233,9 @@ impl Scraper {
 
     /// Ingest samples into the TSDB.
     async fn ingest_samples(&self, samples: Vec<Series>) -> Result<()> {
-        self.tsdb.ingest_samples(samples).await
+        self.tsdb
+            .ingest_samples(samples, self.config.flush_interval_secs)
+            .await
     }
 }
 

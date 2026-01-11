@@ -103,6 +103,10 @@ pub(crate) struct MiniTsdb {
     next_series_id: AtomicU32,
     /// Pending delta accumulating ingested data not yet flushed to storage.
     pending_delta: Mutex<TsdbDelta>,
+    /// Receiver for waiting for updates to pending delta
+    pending_delta_watch_rx: tokio::sync::watch::Receiver<std::time::Instant>,
+    /// Sender for updating the pending delta when flushing.
+    pending_delta_watch_tx: tokio::sync::watch::Sender<std::time::Instant>,
     /// Storage snapshot used for queries.
     snapshot: RwLock<Arc<dyn StorageRead>>,
     /// Mutex to ensure only one flush operation can run at a time.
@@ -139,11 +143,16 @@ impl MiniTsdb {
             })
             .await?;
 
+        // Create tokio::watch channel for pending delta
+        let (tx, rx) = tokio::sync::watch::channel(std::time::Instant::now());
+
         Ok(Self {
             bucket: bucket.clone(),
             series_dict,
             next_series_id: AtomicU32::new(next_series_id),
-            pending_delta: Mutex::new(TsdbDelta::empty(bucket)),
+            pending_delta: Mutex::new(TsdbDelta::empty(bucket.clone())),
+            pending_delta_watch_tx: tx,
+            pending_delta_watch_rx: rx,
             snapshot: RwLock::new(storage),
             flush_mutex: Arc::new(Mutex::new(())),
         })
@@ -153,6 +162,7 @@ impl MiniTsdb {
     /// This is more efficient than calling ingest() multiple times as it creates only one delta builder.
     /// Note: Ingested data is batched and NOT visible to queries until flush().
     /// Returns an error if any sample timestamp is outside the bucket's time range.
+    /// Blocks if the pending delta is older than 2 * flush_interval_secs.
     #[tracing::instrument(
         level = "debug",
         skip_all,
@@ -162,7 +172,11 @@ impl MiniTsdb {
             total_samples = series_list.iter().map(|s| s.samples.len()).sum::<usize>()
         )
     )]
-    pub(crate) async fn ingest_batch(&self, series_list: &[Series]) -> Result<()> {
+    pub(crate) async fn ingest_batch(
+        &self,
+        series_list: &[Series],
+        flush_interval_secs: u64,
+    ) -> Result<()> {
         let total_samples = series_list.iter().map(|s| s.samples.len()).sum::<usize>();
 
         tracing::debug!(
@@ -171,6 +185,14 @@ impl MiniTsdb {
             total_samples = total_samples,
             "Starting MiniTsdb batch ingest"
         );
+
+        // Block until the pending delta is young enough (not older than 2 * flush_interval_secs)
+        let max_age = std::time::Duration::from_secs(2 * flush_interval_secs);
+        let mut receiver = self.pending_delta_watch_rx.clone();
+        receiver
+            .wait_for(|t| t.elapsed() <= max_age)
+            .await
+            .map_err(|_e| "pending delta watch_rx disconnected")?;
 
         let mut builder =
             TsdbDeltaBuilder::new(self.bucket.clone(), &self.series_dict, &self.next_series_id);
@@ -183,8 +205,10 @@ impl MiniTsdb {
         let delta = builder.build();
 
         // Accumulate into pending delta
-        let mut pending = self.pending_delta.lock().await;
-        pending.merge(delta);
+        {
+            let mut pending = self.pending_delta.lock().await;
+            pending.merge(delta);
+        }
 
         tracing::debug!(
             bucket = ?self.bucket,
@@ -201,26 +225,40 @@ impl MiniTsdb {
     /// Returns an error if any sample timestamp is outside the bucket's time range.
     ///
     /// For better performance when ingesting multiple series, use ingest_batch() instead.
-    pub(crate) async fn ingest(&self, series: &Series) -> Result<()> {
+    pub(crate) async fn ingest(&self, series: &Series, flush_interval_secs: u64) -> Result<()> {
         // Delegate to batch method with a single series
-        self.ingest_batch(std::slice::from_ref(series)).await
+        self.ingest_batch(std::slice::from_ref(series), flush_interval_secs)
+            .await
     }
 
     /// Flush pending data to storage, making it durable and visible to queries.
-    pub(crate) async fn flush(&self, storage: Arc<dyn Storage>) -> Result<()> {
+    pub(crate) async fn flush(
+        &self,
+        storage: Arc<dyn Storage>,
+        _flush_interval_secs: u64,
+    ) -> Result<()> {
         let _flush_guard = self.flush_mutex.lock().await;
 
         // Take the pending delta (replace with empty) - after this blocking
         // section we can continue accepting ingestion while we flush to
         // storage
-        let delta = {
+        let (delta, created_at) = {
             let mut pending = self.pending_delta.lock().await;
             if pending.is_empty() {
                 return Ok(());
             }
 
-            std::mem::replace(&mut *pending, TsdbDelta::empty(self.bucket.clone()))
+            let delta = std::mem::replace(&mut *pending, TsdbDelta::empty(self.bucket.clone()));
+            (delta, std::time::Instant::now())
         };
+        self.pending_delta_watch_tx.send_if_modified(|current| {
+            if created_at > *current {
+                *current = created_at;
+                true
+            } else {
+                false
+            }
+        });
 
         let mut ops = Vec::new();
         ops.push(storage.merge_bucket_list(self.bucket.clone())?);
