@@ -46,11 +46,12 @@ mod error;
 mod log;
 mod model;
 mod reader;
+mod segment;
 mod sequence;
 mod serde;
 
-pub use config::{Config, CountOptions, ScanOptions, WriteOptions};
+pub use config::{Config, CountOptions, ScanOptions, SegmentConfig, WriteOptions};
 pub use error::{Error, Result};
-pub use log::{Log, LogIterator};
+pub use log::Log;
 pub use model::{LogEntry, Record};
-pub use reader::{LogRead, LogReader};
+pub use reader::{LogIterator, LogRead, LogReader};

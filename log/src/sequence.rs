@@ -68,9 +68,9 @@ impl SeqBlockStore {
     ///
     /// This must be called once at startup before calling [`allocate`](Self::allocate).
     pub async fn initialize(&self) -> Result<()> {
-        let key = LastSeqBlockKey.encode();
+        let key = LastSeqBlockKey.serialize();
         let block = match self.storage.get(key).await? {
-            Some(record) => Some(SeqBlock::decode(&record.value)?),
+            Some(record) => Some(SeqBlock::deserialize(&record.value)?),
             None => None,
         };
         *self.last_block.lock().await = block;
@@ -93,8 +93,8 @@ impl SeqBlockStore {
         let block_size = min_count.max(DEFAULT_BLOCK_SIZE);
         let new_block = SeqBlock::new(base_sequence, block_size);
 
-        let key: Bytes = LastSeqBlockKey.encode();
-        let value: Bytes = new_block.encode();
+        let key: Bytes = LastSeqBlockKey.serialize();
+        let value: Bytes = new_block.serialize();
         self.storage.put(vec![Record::new(key, value)]).await?;
 
         *last_block = Some(new_block.clone());
@@ -157,6 +157,14 @@ impl SequenceAllocator {
     /// After initialization, [`allocate`] can be called.
     pub async fn initialize(&self) -> Result<()> {
         self.block_store.initialize().await
+    }
+
+    /// Returns the next sequence number that would be allocated.
+    ///
+    /// This does not consume any sequences; it just peeks at the current state.
+    pub async fn peek_next_sequence(&self) -> u64 {
+        let block = self.block.lock().await;
+        block.next_sequence
     }
 
     /// Allocates a single sequence number.

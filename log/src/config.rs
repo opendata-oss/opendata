@@ -3,6 +3,8 @@
 //! This module defines the configuration and options structs that control
 //! the behavior of the log, including storage setup and operation parameters.
 
+use std::time::Duration;
+
 use common::StorageConfig;
 
 /// Configuration for opening a [`Log`](crate::Log).
@@ -18,6 +20,7 @@ use common::StorageConfig;
 ///
 /// let config = Config {
 ///     storage: StorageConfig::default(),
+///     segmentation: SegmentConfig::default(),
 /// };
 /// let log = Log::open(config).await?;
 /// ```
@@ -28,6 +31,41 @@ pub struct Config {
     /// Determines where and how log data is persisted. See [`StorageConfig`]
     /// for available options including in-memory and SlateDB backends.
     pub storage: StorageConfig,
+
+    /// Segmentation configuration.
+    ///
+    /// Controls how the log is partitioned into segments for efficient
+    /// time-based queries and retention management.
+    pub segmentation: SegmentConfig,
+}
+
+/// Configuration for log segmentation.
+///
+/// Segments partition the log into time-based chunks, enabling efficient
+/// range queries and retention management. See RFC 0002 for details.
+#[derive(Debug, Clone, Default)]
+pub struct SegmentConfig {
+    /// Interval for automatic segment sealing based on wall-clock time.
+    ///
+    /// When set, a new segment is created after the specified duration has
+    /// elapsed since the current segment was created. This enables time-based
+    /// partitioning for efficient queries and retention.
+    ///
+    /// When `None` (the default), automatic sealing is disabled and all
+    /// entries are written to segment 0 indefinitely.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    /// use log::SegmentConfig;
+    ///
+    /// // Create a new segment every hour
+    /// let config = SegmentConfig {
+    ///     seal_interval: Some(Duration::from_secs(3600)),
+    /// };
+    /// ```
+    pub seal_interval: Option<Duration>,
 }
 
 /// Options for write operations.
