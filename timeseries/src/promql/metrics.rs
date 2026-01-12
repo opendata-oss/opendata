@@ -61,6 +61,12 @@ pub struct Metrics {
 
     /// Counter of HTTP requests.
     pub http_requests_total: Family<HttpLabelsWithStatus, Counter>,
+
+    /// Counter of samples successfully ingested via remote write.
+    pub remote_write_samples_ingested: Counter,
+
+    /// Counter of samples that failed to ingest via remote write.
+    pub remote_write_samples_failed: Counter,
 }
 
 impl Default for Metrics {
@@ -98,11 +104,29 @@ impl Metrics {
             http_requests_total.clone(),
         );
 
+        // Remote write samples ingested counter
+        let remote_write_samples_ingested = Counter::default();
+        registry.register(
+            "remote_write_samples_ingested_total",
+            "Total number of samples successfully ingested via remote write",
+            remote_write_samples_ingested.clone(),
+        );
+
+        // Remote write samples failed counter
+        let remote_write_samples_failed = Counter::default();
+        registry.register(
+            "remote_write_samples_failed_total",
+            "Total number of samples that failed to ingest via remote write",
+            remote_write_samples_failed.clone(),
+        );
+
         Self {
             registry,
             scrape_samples_scraped,
             scrape_samples_failed,
             http_requests_total,
+            remote_write_samples_ingested,
+            remote_write_samples_failed,
         }
     }
 
@@ -128,6 +152,8 @@ mod tests {
         let encoded = metrics.encode();
         assert!(encoded.contains("# HELP scrape_samples_scraped"));
         assert!(encoded.contains("# HELP http_requests_total"));
+        assert!(encoded.contains("# HELP remote_write_samples_ingested_total"));
+        assert!(encoded.contains("# HELP remote_write_samples_failed_total"));
     }
 
     #[test]
