@@ -599,7 +599,7 @@ mod tests {
         let next_series_id_a = next_series_id.clone();
         let mut attributes_a = labels.clone();
         attributes_a.sort_by(|a, b| a.name.cmp(&b.name));
-        let bucket_a = bucket.clone();
+        let bucket_a = bucket;
         let unit = Some("bytes".to_string());
 
         let handle_a = thread::spawn(move || {
@@ -623,7 +623,7 @@ mod tests {
         let next_series_id_b = next_series_id.clone();
         let mut attributes_b = labels.clone();
         attributes_b.sort_by(|a, b| a.name.cmp(&b.name));
-        let bucket_b = bucket.clone();
+        let bucket_b = bucket;
         let unit_b = Some("bytes".to_string());
 
         let handle_b = thread::spawn(move || {

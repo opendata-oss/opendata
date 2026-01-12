@@ -110,12 +110,12 @@ impl TsdbHead {
         let mut ops = Vec::new();
 
         // Merge bucket list
-        ops.push(storage.merge_bucket_list(self.bucket.clone())?);
+        ops.push(storage.merge_bucket_list(self.bucket)?);
 
         // Insert series dictionary entries
         for entry in self.series_dict.iter() {
             ops.push(storage.insert_series_id(
-                self.bucket.clone(),
+                self.bucket,
                 *entry.key(),
                 *entry.value(),
             )?);
@@ -124,7 +124,7 @@ impl TsdbHead {
         // Insert forward index entries
         for entry in self.forward_index.series.iter() {
             ops.push(storage.insert_forward_index(
-                self.bucket.clone(),
+                self.bucket,
                 *entry.key(),
                 entry.value().clone(),
             )?);
@@ -133,7 +133,7 @@ impl TsdbHead {
         // Merge inverted index entries
         for entry in self.inverted_index.postings.iter() {
             ops.push(storage.merge_inverted_index(
-                self.bucket.clone(),
+                self.bucket,
                 entry.key().clone(),
                 entry.value().clone(),
             )?);
@@ -142,7 +142,7 @@ impl TsdbHead {
         // Merge samples
         for entry in self.samples.iter() {
             ops.push(storage.merge_samples(
-                self.bucket.clone(),
+                self.bucket,
                 *entry.key(),
                 entry.value().clone(),
             )?);

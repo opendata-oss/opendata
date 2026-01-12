@@ -3,35 +3,39 @@
 use async_trait::async_trait;
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
-use crate::model::SeriesId;
 use crate::model::{Label, Sample};
+use crate::model::{SeriesId, TimeBucket};
 use crate::util::Result;
 
-/// Trait for read-only queries across all data tiers.
-/// Implementations hide the details of how data is stored and retrieved.
+/// Trait for read-only queries within a single time bucket.
+/// This is the bucket-scoped interface that works with bucket-local series IDs.
 #[async_trait]
-pub(crate) trait QueryReader: Send + Sync {
+pub(crate) trait BucketQueryReader: Send + Sync {
     /// Get a view into forward index data for the specified series IDs.
     /// This avoids cloning from head/frozen tiers - only storage data is loaded.
     async fn forward_index(
         &self,
         series_ids: &[SeriesId],
-    ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + '_>>;
+    ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>>;
 
     /// Get a view into all forward index data.
     /// Used when no match[] filter is provided to retrieve all series.
-    async fn all_forward_index(&self) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + '_>>;
+    async fn all_forward_index(
+        &self,
+    ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>>;
 
     /// Get a view into inverted index data for the specified terms.
     /// This avoids cloning bitmaps upfront - only storage data is pre-loaded.
     async fn inverted_index(
         &self,
         terms: &[Label],
-    ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + '_>>;
+    ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>>;
 
     /// Get a view into all inverted index data.
     /// Used for labels/label_values queries to access all attribute keys.
-    async fn all_inverted_index(&self) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + '_>>;
+    async fn all_inverted_index(
+        &self,
+    ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>>;
 
     /// Get all unique values for a specific label name.
     /// This is more efficient than loading all inverted index data when
@@ -42,6 +46,46 @@ pub(crate) trait QueryReader: Send + Sync {
     /// Returns samples sorted by timestamp with duplicates removed (head takes priority).
     async fn samples(&self, series_id: SeriesId, start_ms: i64, end_ms: i64)
     -> Result<Vec<Sample>>;
+}
+
+/// Trait for read-only queries that may span multiple time buckets.
+/// This is the high-level interface that properly handles bucket-scoped series IDs.
+#[async_trait]
+pub(crate) trait QueryReader: Send + Sync {
+    /// Get available time buckets that this reader contains.
+    async fn list_buckets(&self) -> Result<Vec<TimeBucket>>;
+
+    /// Get a view into forward index data for the specified series IDs within a specific bucket.
+    async fn forward_index(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>>;
+
+    /// Get a view into inverted index data for the specified terms within a specific bucket.
+    async fn inverted_index(
+        &self,
+        bucket: &TimeBucket,
+        terms: &[Label],
+    ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>>;
+
+    /// Get a view into inverted index data for the specified bucket
+    async fn all_inverted_index(
+        &self,
+        bucket: &TimeBucket,
+    ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>>;
+
+    /// Get all unique values for a specific label name within a specific bucket.
+    async fn label_values(&self, bucket: &TimeBucket, label_name: &str) -> Result<Vec<String>>;
+
+    /// Get samples for a series within a time range from a specific bucket.
+    async fn samples(
+        &self,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Sample>>;
 }
 
 #[cfg(test)]
@@ -62,33 +106,58 @@ pub(crate) mod test_utils {
 
     #[async_trait]
     impl QueryReader for MockQueryReader {
-        async fn forward_index(
-            &self,
-            _series_ids: &[SeriesId],
-        ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + '_>> {
-            Ok(Box::new(self.forward_index.clone()))
+        async fn list_buckets(&self) -> Result<Vec<TimeBucket>> {
+            Ok(vec![self.bucket])
         }
 
-        async fn all_forward_index(
+        async fn forward_index(
             &self,
-        ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + '_>> {
+            bucket: &TimeBucket,
+            _series_ids: &[SeriesId],
+        ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
+            if bucket != &self.bucket {
+                return Err(crate::error::Error::InvalidInput(format!(
+                    "MockQueryReader only supports bucket {:?}, got {:?}",
+                    self.bucket, bucket
+                )));
+            }
             Ok(Box::new(self.forward_index.clone()))
         }
 
         async fn inverted_index(
             &self,
+            bucket: &TimeBucket,
             _terms: &[Label],
-        ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + '_>> {
+        ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
+            if bucket != &self.bucket {
+                return Err(crate::error::Error::InvalidInput(format!(
+                    "MockQueryReader only supports bucket {:?}, got {:?}",
+                    self.bucket, bucket
+                )));
+            }
             Ok(Box::new(self.inverted_index.clone()))
         }
 
         async fn all_inverted_index(
             &self,
-        ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + '_>> {
+            bucket: &TimeBucket,
+        ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
+            if bucket != &self.bucket {
+                return Err(crate::error::Error::InvalidInput(format!(
+                    "MockQueryReader only supports bucket {:?}, got {:?}",
+                    self.bucket, bucket
+                )));
+            }
             Ok(Box::new(self.inverted_index.clone()))
         }
 
-        async fn label_values(&self, label_name: &str) -> Result<Vec<String>> {
+        async fn label_values(&self, bucket: &TimeBucket, label_name: &str) -> Result<Vec<String>> {
+            if bucket != &self.bucket {
+                return Err(crate::error::Error::InvalidInput(format!(
+                    "MockQueryReader only supports bucket {:?}, got {:?}",
+                    self.bucket, bucket
+                )));
+            }
             let values: Vec<String> = self
                 .inverted_index
                 .postings
@@ -101,10 +170,17 @@ pub(crate) mod test_utils {
 
         async fn samples(
             &self,
+            bucket: &TimeBucket,
             series_id: SeriesId,
             start_ms: i64,
             end_ms: i64,
         ) -> Result<Vec<Sample>> {
+            if bucket != &self.bucket {
+                return Err(crate::error::Error::InvalidInput(format!(
+                    "MockQueryReader only supports bucket {:?}, got {:?}",
+                    self.bucket, bucket
+                )));
+            }
             let samples = self
                 .samples
                 .get(&series_id)
