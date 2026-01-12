@@ -56,10 +56,7 @@ impl BucketQueryReader for MiniQueryReader {
     async fn all_inverted_index(
         &self,
     ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
-        let inverted_index = self
-            .snapshot
-            .get_inverted_index(self.bucket)
-            .await?;
+        let inverted_index = self.snapshot.get_inverted_index(self.bucket).await?;
         Ok(Box::new(inverted_index))
     }
 

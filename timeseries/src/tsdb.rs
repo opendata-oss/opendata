@@ -472,10 +472,7 @@ mod tests {
         // Sample timestamps should be well within the bucket and reachable by lookback
         // Bucket 60: covers 3,600,000-7,199,999 ms -> sample at 3,900,000 ms (3900s)
         // Bucket 120: covers 7,200,000-10,799,999 ms -> sample at 7,900,000 ms (7900s)
-        let mini1 = tsdb
-            .get_or_create_for_ingest(bucket1)
-            .await
-            .unwrap();
+        let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
         mini1
             .ingest(
                 &create_sample("http_requests", vec![("env", "prod")], 3_900_000, 10.0),
@@ -491,10 +488,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mini2 = tsdb
-            .get_or_create_for_ingest(bucket2)
-            .await
-            .unwrap();
+        let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
         mini2
             .ingest(
                 &create_sample("http_requests", vec![("env", "prod")], 7_900_000, 20.0),
@@ -521,10 +515,7 @@ mod tests {
         // Ingest data into buckets 3 & 4 (these stay in ingest cache)
         // Bucket 180: covers 10,800,000-14,399,999 ms -> sample at 11,900,000 ms (11900s)
         // Bucket 240: covers 14,400,000-17,999,999 ms -> sample at 15,900,000 ms (15900s)
-        let mini3 = tsdb
-            .get_or_create_for_ingest(bucket3)
-            .await
-            .unwrap();
+        let mini3 = tsdb.get_or_create_for_ingest(bucket3).await.unwrap();
         mini3
             .ingest(
                 &create_sample("http_requests", vec![("env", "prod")], 11_900_000, 30.0),
@@ -540,10 +531,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mini4 = tsdb
-            .get_or_create_for_ingest(bucket4)
-            .await
-            .unwrap();
+        let mini4 = tsdb.get_or_create_for_ingest(bucket4).await.unwrap();
         mini4
             .ingest(
                 &create_sample("http_requests", vec![("env", "prod")], 15_900_000, 40.0),
@@ -637,10 +625,7 @@ mod tests {
         let tsdb = Tsdb::new(storage);
         // Bucket 1: hour 60 (covers 3,600,000-7,199,999 ms)
         let bucket1 = TimeBucket::hour(60);
-        let mini1 = tsdb
-            .get_or_create_for_ingest(bucket1)
-            .await
-            .unwrap();
+        let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
         // Add series in bucket 1: foo{a="b",x="y"} and foo{a="c",x="z"}
         mini1
             .ingest(
@@ -658,10 +643,7 @@ mod tests {
             .unwrap();
         // Bucket 2: hour 120 (covers 7,200,000-10,799,999 ms)
         let bucket2 = TimeBucket::hour(120);
-        let mini2 = tsdb
-            .get_or_create_for_ingest(bucket2)
-            .await
-            .unwrap();
+        let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
         // Add series in bucket 2: foo{a="c",x="z"} and foo{a="d",x="w"}
         mini2
             .ingest(

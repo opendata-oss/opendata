@@ -114,11 +114,7 @@ impl TsdbHead {
 
         // Insert series dictionary entries
         for entry in self.series_dict.iter() {
-            ops.push(storage.insert_series_id(
-                self.bucket,
-                *entry.key(),
-                *entry.value(),
-            )?);
+            ops.push(storage.insert_series_id(self.bucket, *entry.key(), *entry.value())?);
         }
 
         // Insert forward index entries
@@ -141,11 +137,7 @@ impl TsdbHead {
 
         // Merge samples
         for entry in self.samples.iter() {
-            ops.push(storage.merge_samples(
-                self.bucket,
-                *entry.key(),
-                entry.value().clone(),
-            )?);
+            ops.push(storage.merge_samples(self.bucket, *entry.key(), entry.value().clone())?);
         }
 
         storage.apply(ops).await?;
