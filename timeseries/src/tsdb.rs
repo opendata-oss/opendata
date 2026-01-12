@@ -443,8 +443,7 @@ mod tests {
         assert_eq!(series_ids.len(), 1);
     }
 
-    // TODO(rohan): re-enable me once we support cross-bucket queries
-    // #[tokio::test]
+    #[tokio::test]
     async fn should_query_across_multiple_buckets_with_evaluator() {
         use crate::promql::evaluator::Evaluator;
         use crate::test_utils::assertions::assert_approx_eq;
@@ -613,8 +612,7 @@ mod tests {
         }
     }
 
-    // TODO(rohan): re-enable me once we support cross-bucket queries
-    // #[tokio::test]
+    #[tokio::test]
     async fn should_query_across_multiple_buckets_with_different_series_id_mappings() {
         use crate::promql::evaluator::Evaluator;
         use promql_parser::parser::EvalStmt;
@@ -683,7 +681,7 @@ mod tests {
         let expected = vec![EvalSample {
             timestamp_ms: 7_900_000,
             value: 3.0,
-            labels: [("a", "c"), ("x", "z")]
+            labels: [("a", "c"), ("x", "z"), ("__name__", "foo")]
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),

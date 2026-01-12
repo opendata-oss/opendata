@@ -162,68 +162,70 @@ impl<'a, R: QueryReader> Evaluator<'a, R> {
             .as_millis() as i64;
         let start_ms = end_ms - (lookback_delta.as_millis() as i64);
 
-        // Use the selector module to find matching series
-        // Get the bucket to use for queries (for single-bucket operations, this will be the one bucket)
-        let buckets = self.reader.list_buckets().await?;
-        let bucket = if buckets.len() != 1 {
-            return Err(EvaluationError::InternalError(format!(
-                "Expected exactly 1 bucket for evaluation, got {}",
-                buckets.len()
-            )));
-        } else {
-            buckets[0]
-        };
-
-        let candidates = crate::promql::selector::evaluate_selector_with_reader(
-            self.reader,
-            bucket,
-            vector_selector,
-        )
-        .await
-        .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
-
-        // Batch load forward index for all candidates upfront
-        let candidates_vec: Vec<_> = candidates.into_iter().collect();
-        let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
+        // Get all buckets and sort by start time in reverse order (newest first)
+        let mut buckets = self.reader.list_buckets().await?;
+        buckets.sort_by(|a, b| b.start.cmp(&a.start)); // newest first
 
         let mut series_with_results: HashSet<SeriesFingerprint> = HashSet::new();
         let mut samples = Vec::new();
 
-        for series_id in candidates_vec {
-            // Get series spec from forward index view (batched lookup)
-            let series_spec = match forward_index_view.get_spec(&series_id) {
-                Some(spec) => spec,
-                None => {
-                    return Err(EvaluationError::InternalError(format!(
-                        "Series {} not found in any layer",
-                        series_id
-                    )));
-                }
-            };
-            let fingerprint = self.compute_fingerprint(&series_spec.labels);
+        // Iterate through buckets in reverse time order (newest first)
+        for bucket in buckets {
+            // Find matching series in this bucket
+            let candidates = crate::promql::selector::evaluate_selector_with_reader(
+                self.reader,
+                bucket,
+                vector_selector,
+            )
+            .await
+            .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
 
-            if series_with_results.contains(&fingerprint) {
+            if candidates.is_empty() {
                 continue;
             }
 
-            // Read and merge timeseries data from all layers
-            let sample_data = self
-                .reader
-                .samples(&bucket, series_id, start_ms, end_ms)
-                .await?;
+            // Batch load forward index for all candidates upfront
+            let candidates_vec: Vec<_> = candidates.into_iter().collect();
+            let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
 
-            // Find the best (latest) point in the time range
-            if let Some(best_sample) = sample_data.last() {
-                // Convert attributes to labels HashMap
-                let labels = self.labels_to_hashmap(&series_spec.labels);
+            for series_id in candidates_vec {
+                // Get series spec from forward index view (batched lookup)
+                let series_spec = match forward_index_view.get_spec(&series_id) {
+                    Some(spec) => spec,
+                    None => {
+                        return Err(EvaluationError::InternalError(format!(
+                            "Series {} not found in bucket {:?}",
+                            series_id, bucket
+                        )));
+                    }
+                };
+                let fingerprint = self.compute_fingerprint(&series_spec.labels);
 
-                samples.push(EvalSample {
-                    timestamp_ms: best_sample.timestamp_ms,
-                    value: best_sample.value,
-                    labels,
-                });
+                // Skip if we already found a sample for this series in a newer bucket
+                if series_with_results.contains(&fingerprint) {
+                    continue;
+                }
 
-                series_with_results.insert(fingerprint);
+                // Read samples from this bucket within the lookback window
+                let sample_data = self
+                    .reader
+                    .samples(&bucket, series_id, start_ms, end_ms)
+                    .await?;
+
+                // Find the best (latest) point in the time range
+                if let Some(best_sample) = sample_data.last() {
+                    // Convert attributes to labels HashMap
+                    let labels = self.labels_to_hashmap(&series_spec.labels);
+
+                    samples.push(EvalSample {
+                        timestamp_ms: best_sample.timestamp_ms,
+                        value: best_sample.value,
+                        labels,
+                    });
+
+                    // Mark this series fingerprint as found so we don't add it again from older buckets
+                    series_with_results.insert(fingerprint);
+                }
             }
         }
 
@@ -585,10 +587,21 @@ mod tests {
     use promql_parser::label::METRIC_NAME;
     use promql_parser::parser::EvalStmt;
     use rstest::rstest;
+
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     /// Type alias for test data: (metric_name, labels, timestamp_offset_ms, value)
     type TestSampleData = Vec<(&'static str, Vec<(&'static str, &'static str)>, i64, f64)>;
+
+    // Type aliases for vector selector test to reduce complexity warnings
+    type VectorSelectorTestData = Vec<(
+        TimeBucket,
+        &'static str,
+        Vec<(&'static str, &'static str)>,
+        i64,
+        f64,
+    )>;
+    type VectorSelectorExpectedResults = Vec<(f64, Vec<(&'static str, &'static str)>)>;
 
     /// Helper to parse a PromQL query and evaluate it
     async fn parse_and_evaluate<R: QueryReader>(
@@ -1238,5 +1251,170 @@ mod tests {
                 .to_string()
                 .contains("unsupported result type: scalar")
         );
+    }
+
+    #[allow(clippy::type_complexity)]
+    #[rstest]
+    #[case(
+        "single_bucket_selector", 
+        vec![
+            (TimeBucket::hour(100), "http_requests", vec![("env", "prod")], 6_000_001, 10.0),
+            (TimeBucket::hour(100), "http_requests", vec![("env", "staging")], 6_000_002, 20.0),
+        ],
+        6_300_000, // query time 
+        300_000,   // 5 min lookback
+        vec![(10.0, vec![("__name__", "http_requests"), ("env", "prod")]), (20.0, vec![("__name__", "http_requests"), ("env", "staging")])]
+    )]
+    #[case(
+        "multi_bucket_latest_wins", 
+        vec![
+            // Same series in bucket 100 (older)
+            (TimeBucket::hour(100), "cpu_usage", vec![("host", "server1")], 6_000_000, 50.0),
+            // Same series in bucket 200 (newer) - this should win
+            (TimeBucket::hour(200), "cpu_usage", vec![("host", "server1")], 12_000_000, 75.0),
+        ],
+        12_300_000, // query time in bucket 200
+        600_000,    // 10 min lookback covers both buckets
+        vec![(75.0, vec![("__name__", "cpu_usage"), ("host", "server1")])] // only the newer value
+    )]
+    #[case(
+        "multi_bucket_different_series_different_buckets", 
+        vec![
+            // Series A: sample in bucket 100 is outside lookback, sample in bucket 200 is within lookback
+            (TimeBucket::hour(100), "memory", vec![("app", "frontend")], 6_000_000, 100.0), // outside lookback window
+            (TimeBucket::hour(200), "memory", vec![("app", "frontend")], 10_000_000, 80.0), // within lookback window
+            // Series B: latest sample in bucket 200 within lookback
+            (TimeBucket::hour(100), "memory", vec![("app", "backend")], 5_000_000, 150.0), // outside lookback window
+            (TimeBucket::hour(200), "memory", vec![("app", "backend")], 12_000_000, 200.0), // within lookback window
+        ],
+        12_300_000, // query time
+        3_600_000,  // 1 hour lookback: (8,700,000, 12,300,000]
+        vec![
+            (80.0, vec![("__name__", "memory"), ("app", "frontend")]),  // latest within lookback from bucket 200
+            (200.0, vec![("__name__", "memory"), ("app", "backend")])   // latest within lookback from bucket 200
+        ]
+    )]
+    #[tokio::test]
+    async fn should_evaluate_vector_selector(
+        #[case] _test_name: &str,
+        #[case] data: VectorSelectorTestData,
+        #[case] query_time_ms: i64,
+        #[case] lookback_ms: i64,
+        #[case] expected: VectorSelectorExpectedResults,
+    ) {
+        use crate::query::test_utils::MockMultiBucketQueryReaderBuilder;
+        use promql_parser::label::{METRIC_NAME, Matchers};
+        use promql_parser::parser::VectorSelector;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // Extract metric name from first sample for selector before consuming data
+        let metric_name = if let Some((_, name, _, _, _)) = data.first() {
+            name.to_string()
+        } else {
+            "test_metric".to_string()
+        };
+
+        // given: build mock reader with test data
+        let mut builder = MockMultiBucketQueryReaderBuilder::new();
+
+        for (bucket, metric_name, label_pairs, timestamp_ms, value) in data {
+            let mut labels = vec![Label {
+                name: METRIC_NAME.to_string(),
+                value: metric_name.to_string(),
+            }];
+            for (key, val) in label_pairs {
+                labels.push(Label {
+                    name: key.to_string(),
+                    value: val.to_string(),
+                });
+            }
+
+            builder.add_sample(
+                bucket,
+                labels,
+                MetricType::Gauge,
+                Sample {
+                    timestamp_ms,
+                    value,
+                },
+            );
+        }
+
+        let reader = builder.build();
+        let evaluator = Evaluator::new(&reader);
+
+        // when: evaluate vector selector
+        let query_time = UNIX_EPOCH + Duration::from_millis(query_time_ms as u64);
+        let lookback_delta = Duration::from_millis(lookback_ms as u64);
+
+        let selector = VectorSelector {
+            name: Some(metric_name),
+            matchers: Matchers {
+                matchers: vec![],
+                or_matchers: vec![],
+            },
+            offset: None,
+            at: None,
+        };
+
+        let result = evaluator
+            .evaluate_vector_selector(&selector, query_time, lookback_delta)
+            .await
+            .unwrap();
+
+        // then: verify results
+        if let ExprResult::InstantVector(samples) = result {
+            assert_eq!(samples.len(), expected.len(), "Result count mismatch");
+
+            // Sort both actual and expected results for comparison
+            let mut actual_sorted = samples;
+            actual_sorted.sort_by(|a, b| {
+                let mut a_labels: Vec<_> = a.labels.iter().collect();
+                let mut b_labels: Vec<_> = b.labels.iter().collect();
+                a_labels.sort();
+                b_labels.sort();
+                a_labels.cmp(&b_labels)
+            });
+
+            let mut expected_sorted = expected;
+            expected_sorted.sort_by(|a, b| {
+                let mut a_labels: Vec<(String, String)> =
+                    a.1.iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                let mut b_labels: Vec<(String, String)> =
+                    b.1.iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                a_labels.sort();
+                b_labels.sort();
+                a_labels.cmp(&b_labels)
+            });
+
+            for (i, (actual, (expected_value, expected_labels))) in
+                actual_sorted.iter().zip(expected_sorted.iter()).enumerate()
+            {
+                assert!(
+                    (actual.value - expected_value).abs() < 0.0001,
+                    "Sample {} value mismatch: got {}, expected {}",
+                    i,
+                    actual.value,
+                    expected_value
+                );
+
+                for (key, value) in expected_labels {
+                    assert_eq!(
+                        actual.labels.get(*key),
+                        Some(&value.to_string()),
+                        "Sample {} missing label {}={}",
+                        i,
+                        key,
+                        value
+                    );
+                }
+            }
+        } else {
+            panic!("Expected InstantVector result");
+        }
     }
 }

@@ -95,19 +95,22 @@ pub(crate) mod test_utils {
     use crate::model::{MetricType, TimeBucket};
     use std::collections::HashMap;
 
+    /// Type alias for bucket data to reduce complexity
+    type BucketData =
+        HashMap<TimeBucket, (ForwardIndex, InvertedIndex, HashMap<SeriesId, Vec<Sample>>)>;
+
     /// A mock QueryReader for testing that holds data in memory.
+    /// Supports both single and multi-bucket scenarios.
     /// Use `MockQueryReaderBuilder` to construct instances.
     pub(crate) struct MockQueryReader {
-        bucket: TimeBucket,
-        forward_index: ForwardIndex,
-        inverted_index: InvertedIndex,
-        samples: HashMap<SeriesId, Vec<Sample>>,
+        /// Map from bucket to its data
+        bucket_data: BucketData,
     }
 
     #[async_trait]
     impl QueryReader for MockQueryReader {
         async fn list_buckets(&self) -> Result<Vec<TimeBucket>> {
-            Ok(vec![self.bucket])
+            Ok(self.bucket_data.keys().cloned().collect())
         }
 
         async fn forward_index(
@@ -115,13 +118,14 @@ pub(crate) mod test_utils {
             bucket: &TimeBucket,
             _series_ids: &[SeriesId],
         ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
-            if bucket != &self.bucket {
-                return Err(crate::error::Error::InvalidInput(format!(
-                    "MockQueryReader only supports bucket {:?}, got {:?}",
-                    self.bucket, bucket
-                )));
+            if let Some((forward_index, _, _)) = self.bucket_data.get(bucket) {
+                Ok(Box::new(forward_index.clone()))
+            } else {
+                Err(crate::error::Error::InvalidInput(format!(
+                    "MockQueryReader does not have bucket {:?}",
+                    bucket
+                )))
             }
-            Ok(Box::new(self.forward_index.clone()))
         }
 
         async fn inverted_index(
@@ -129,43 +133,45 @@ pub(crate) mod test_utils {
             bucket: &TimeBucket,
             _terms: &[Label],
         ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
-            if bucket != &self.bucket {
-                return Err(crate::error::Error::InvalidInput(format!(
-                    "MockQueryReader only supports bucket {:?}, got {:?}",
-                    self.bucket, bucket
-                )));
+            if let Some((_, inverted_index, _)) = self.bucket_data.get(bucket) {
+                Ok(Box::new(inverted_index.clone()))
+            } else {
+                Err(crate::error::Error::InvalidInput(format!(
+                    "MockQueryReader does not have bucket {:?}",
+                    bucket
+                )))
             }
-            Ok(Box::new(self.inverted_index.clone()))
         }
 
         async fn all_inverted_index(
             &self,
             bucket: &TimeBucket,
         ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
-            if bucket != &self.bucket {
-                return Err(crate::error::Error::InvalidInput(format!(
-                    "MockQueryReader only supports bucket {:?}, got {:?}",
-                    self.bucket, bucket
-                )));
+            if let Some((_, inverted_index, _)) = self.bucket_data.get(bucket) {
+                Ok(Box::new(inverted_index.clone()))
+            } else {
+                Err(crate::error::Error::InvalidInput(format!(
+                    "MockQueryReader does not have bucket {:?}",
+                    bucket
+                )))
             }
-            Ok(Box::new(self.inverted_index.clone()))
         }
 
         async fn label_values(&self, bucket: &TimeBucket, label_name: &str) -> Result<Vec<String>> {
-            if bucket != &self.bucket {
-                return Err(crate::error::Error::InvalidInput(format!(
-                    "MockQueryReader only supports bucket {:?}, got {:?}",
-                    self.bucket, bucket
-                )));
+            if let Some((_, inverted_index, _)) = self.bucket_data.get(bucket) {
+                let values: Vec<String> = inverted_index
+                    .postings
+                    .iter()
+                    .filter(|entry| entry.key().name == label_name)
+                    .map(|entry| entry.key().value.clone())
+                    .collect();
+                Ok(values)
+            } else {
+                Err(crate::error::Error::InvalidInput(format!(
+                    "MockQueryReader does not have bucket {:?}",
+                    bucket
+                )))
             }
-            let values: Vec<String> = self
-                .inverted_index
-                .postings
-                .iter()
-                .filter(|entry| entry.key().name == label_name)
-                .map(|entry| entry.key().value.clone())
-                .collect();
-            Ok(values)
         }
 
         async fn samples(
@@ -175,48 +181,40 @@ pub(crate) mod test_utils {
             start_ms: i64,
             end_ms: i64,
         ) -> Result<Vec<Sample>> {
-            if bucket != &self.bucket {
-                return Err(crate::error::Error::InvalidInput(format!(
-                    "MockQueryReader only supports bucket {:?}, got {:?}",
-                    self.bucket, bucket
-                )));
+            if let Some((_, _, samples_map)) = self.bucket_data.get(bucket) {
+                let samples = samples_map
+                    .get(&series_id)
+                    .map(|s| {
+                        s.iter()
+                            .filter(|sample| {
+                                sample.timestamp_ms > start_ms && sample.timestamp_ms <= end_ms
+                            })
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(samples)
+            } else {
+                Err(crate::error::Error::InvalidInput(format!(
+                    "MockQueryReader does not have bucket {:?}",
+                    bucket
+                )))
             }
-            let samples = self
-                .samples
-                .get(&series_id)
-                .map(|s| {
-                    s.iter()
-                        .filter(|sample| {
-                            sample.timestamp_ms > start_ms && sample.timestamp_ms <= end_ms
-                        })
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-            Ok(samples)
         }
     }
 
     /// Builder for creating MockQueryReader instances from test data.
+    /// Convenience wrapper for single-bucket scenarios.
     pub(crate) struct MockQueryReaderBuilder {
+        inner: MockMultiBucketQueryReaderBuilder,
         bucket: TimeBucket,
-        forward_index: ForwardIndex,
-        inverted_index: InvertedIndex,
-        samples: HashMap<SeriesId, Vec<Sample>>,
-        next_series_id: SeriesId,
-        /// Maps fingerprint (sorted attributes) to series ID for deduplication
-        fingerprint_to_id: HashMap<Vec<Label>, SeriesId>,
     }
 
     impl MockQueryReaderBuilder {
         pub(crate) fn new(bucket: TimeBucket) -> Self {
             Self {
+                inner: MockMultiBucketQueryReaderBuilder::new(),
                 bucket,
-                forward_index: ForwardIndex::default(),
-                inverted_index: InvertedIndex::default(),
-                samples: HashMap::new(),
-                next_series_id: 0,
-                fingerprint_to_id: HashMap::new(),
             }
         }
 
@@ -228,20 +226,73 @@ pub(crate) mod test_utils {
             metric_type: MetricType,
             sample: Sample,
         ) -> &mut Self {
+            self.inner
+                .add_sample(self.bucket, labels, metric_type, sample);
+            self
+        }
+
+        pub(crate) fn build(self) -> MockQueryReader {
+            self.inner.build()
+        }
+    }
+
+    /// Builder for creating MockQueryReader instances from test data.
+    /// Supports multi-bucket scenarios.
+    pub(crate) struct MockMultiBucketQueryReaderBuilder {
+        bucket_data: BucketData,
+        /// Global series ID counter to ensure unique IDs across all buckets
+        next_global_series_id: SeriesId,
+        /// Maps label fingerprint to series ID for global deduplication
+        global_fingerprint_to_id: HashMap<Vec<Label>, SeriesId>,
+    }
+
+    impl MockMultiBucketQueryReaderBuilder {
+        pub(crate) fn new() -> Self {
+            Self {
+                bucket_data: HashMap::new(),
+                next_global_series_id: 0,
+                global_fingerprint_to_id: HashMap::new(),
+            }
+        }
+
+        /// Add a sample with labels to a specific bucket. If a series with the same labels already exists globally,
+        /// the existing series ID is reused. Otherwise, a new series is created with a global ID.
+        pub(crate) fn add_sample(
+            &mut self,
+            bucket: TimeBucket,
+            labels: Vec<Label>,
+            metric_type: MetricType,
+            sample: Sample,
+        ) -> &mut Self {
             // Sort labels for consistent fingerprinting
             let mut sorted_attrs = labels.clone();
             sorted_attrs.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.value.cmp(&b.value)));
 
-            // Get or create series ID
-            let series_id = if let Some(&id) = self.fingerprint_to_id.get(&sorted_attrs) {
+            // Get or create global series ID
+            let series_id = if let Some(&id) = self.global_fingerprint_to_id.get(&sorted_attrs) {
                 id
             } else {
-                let id = self.next_series_id;
-                self.next_series_id += 1;
+                let id = self.next_global_series_id;
+                self.next_global_series_id += 1;
+                self.global_fingerprint_to_id
+                    .insert(sorted_attrs.clone(), id);
+                id
+            };
 
-                // Add to forward index
-                self.forward_index.series.insert(
-                    id,
+            // Get or create bucket data
+            let (forward_index, inverted_index, samples_map) =
+                self.bucket_data.entry(bucket).or_insert_with(|| {
+                    (
+                        ForwardIndex::default(),
+                        InvertedIndex::default(),
+                        HashMap::new(),
+                    )
+                });
+
+            // Add to forward index for this bucket if not already present
+            if !forward_index.series.contains_key(&series_id) {
+                forward_index.series.insert(
+                    series_id,
                     SeriesSpec {
                         unit: None,
                         metric_type: Some(metric_type),
@@ -249,31 +300,25 @@ pub(crate) mod test_utils {
                     },
                 );
 
-                // Add to inverted index
+                // Add to inverted index for this bucket
                 for label in &labels {
-                    self.inverted_index
+                    inverted_index
                         .postings
                         .entry(label.clone())
                         .or_default()
-                        .insert(id);
+                        .insert(series_id);
                 }
+            }
 
-                self.fingerprint_to_id.insert(sorted_attrs, id);
-                id
-            };
-
-            // Add sample
-            self.samples.entry(series_id).or_default().push(sample);
+            // Add sample to this bucket
+            samples_map.entry(series_id).or_default().push(sample);
 
             self
         }
 
         pub(crate) fn build(self) -> MockQueryReader {
             MockQueryReader {
-                bucket: self.bucket,
-                forward_index: self.forward_index,
-                inverted_index: self.inverted_index,
-                samples: self.samples,
+                bucket_data: self.bucket_data,
             }
         }
     }
