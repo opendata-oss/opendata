@@ -92,18 +92,20 @@ pub mod var_u32 {
         let len_code = length_code(value);
         let total_bytes = len_code as usize + 1;
 
+        // Build all bytes into a stack-allocated array
+        let mut bytes = [0u8; 5]; // max 5 bytes for var_u32
+
         // First byte: [LLL][DDDDD] - 3 bits length, 5 bits data
-        // Shift right to get top 5 data bits for first byte
         let shift = 8 * (total_bytes - 1);
         let first_data_bits = ((value as u64) >> shift) as u8 & FIRST_BYTE_DATA_MASK;
-        let first_byte = (len_code << FIRST_BYTE_DATA_BITS) | first_data_bits;
-        buf.put_u8(first_byte);
+        bytes[0] = (len_code << FIRST_BYTE_DATA_BITS) | first_data_bits;
 
         // Remaining bytes in big-endian order
-        for i in (0..total_bytes - 1).rev() {
-            let byte = ((value >> (8 * i)) & 0xFF) as u8;
-            buf.put_u8(byte);
+        for i in 1..total_bytes {
+            bytes[i] = ((value >> (8 * (total_bytes - 1 - i))) & 0xFF) as u8;
         }
+
+        buf.put_slice(&bytes[..total_bytes]);
     }
 
     /// Deserializes a var_u32 from a buffer, advancing past the consumed bytes.
@@ -326,22 +328,24 @@ pub mod var_u64 {
         let len_code = length_code(value);
         let total_bytes = len_code as usize + 1;
 
+        // Build all bytes into a stack-allocated array
+        let mut bytes = [0u8; 9]; // max 9 bytes for var_u64
+
         // First byte: [LLLL][DDDD] - 4 bits length, 4 bits data
-        // Shift right to get top 4 data bits for first byte
         let shift = 8 * (total_bytes - 1);
         let first_data_bits = if shift >= 64 {
             0
         } else {
             (value >> shift) as u8 & 0x0F
         };
-        let first_byte = (len_code << 4) | first_data_bits;
-        buf.put_u8(first_byte);
+        bytes[0] = (len_code << 4) | first_data_bits;
 
         // Remaining bytes in big-endian order
-        for i in (0..total_bytes - 1).rev() {
-            let byte = ((value >> (8 * i)) & 0xFF) as u8;
-            buf.put_u8(byte);
+        for i in 1..total_bytes {
+            bytes[i] = ((value >> (8 * (total_bytes - 1 - i))) & 0xFF) as u8;
         }
+
+        buf.put_slice(&bytes[..total_bytes]);
     }
 
     /// Deserializes a var_u64 from a buffer, advancing past the consumed bytes.
