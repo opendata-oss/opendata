@@ -100,7 +100,10 @@ pub mod var_u32 {
         let first_data_bits = ((value as u64) >> shift) as u8 & FIRST_BYTE_DATA_MASK;
         bytes[0] = (len_code << FIRST_BYTE_DATA_BITS) | first_data_bits;
 
-        // Remaining bytes in big-endian order
+        // Remaining bytes in big-endian order.
+        // Using indexed loop instead of iter_mut().enumerate() for better performance;
+        // the compiler optimizes bounds checks better with direct indexing here.
+        #[allow(clippy::needless_range_loop)]
         for i in 1..total_bytes {
             bytes[i] = ((value >> (8 * (total_bytes - 1 - i))) & 0xFF) as u8;
         }
@@ -340,7 +343,10 @@ pub mod var_u64 {
         };
         bytes[0] = (len_code << 4) | first_data_bits;
 
-        // Remaining bytes in big-endian order
+        // Remaining bytes in big-endian order.
+        // Using indexed loop instead of iter_mut().enumerate() for better performance;
+        // the compiler optimizes bounds checks better with direct indexing here.
+        #[allow(clippy::needless_range_loop)]
         for i in 1..total_bytes {
             bytes[i] = ((value >> (8 * (total_bytes - 1 - i))) & 0xFF) as u8;
         }
