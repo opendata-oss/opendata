@@ -3,7 +3,7 @@
 //! This module defines [`Error`], the primary error type for all log
 //! operations, along with a convenient [`Result`] type alias.
 
-use common::StorageError;
+use common::{SeqBlockError, StorageError};
 
 /// Error type for OpenData Log operations.
 ///
@@ -66,6 +66,15 @@ impl From<StorageError> for Error {
         match err {
             StorageError::Storage(msg) => Error::Storage(msg),
             StorageError::Internal(msg) => Error::Internal(msg),
+        }
+    }
+}
+
+impl From<SeqBlockError> for Error {
+    fn from(err: SeqBlockError) -> Self {
+        match err {
+            SeqBlockError::Storage(storage_err) => Error::from(storage_err),
+            SeqBlockError::Deserialize(de_err) => Error::Encoding(de_err.message),
         }
     }
 }

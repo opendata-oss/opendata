@@ -18,8 +18,9 @@ use crate::error::{Error, Result};
 use crate::model::Record;
 use crate::reader::{LogIterator, LogIteratorBuilder, LogRead};
 use crate::segment::SegmentStore;
-use crate::sequence::{SeqBlockStore, SequenceAllocator};
+use crate::sequence::create_sequence_allocator;
 use crate::serde::LogEntryKey;
+use common::SequenceAllocator;
 
 /// The main log interface providing read and write operations.
 ///
@@ -101,8 +102,7 @@ impl Log {
 
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
-        let block_store = SeqBlockStore::new(Arc::clone(&storage));
-        let sequence_allocator = SequenceAllocator::new(block_store);
+        let sequence_allocator = create_sequence_allocator(Arc::clone(&storage));
         sequence_allocator.initialize().await?;
 
         let segment_store =
@@ -249,8 +249,7 @@ impl Log {
     pub(crate) async fn new(storage: Arc<dyn Storage>) -> Result<Self> {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
-        let block_store = SeqBlockStore::new(Arc::clone(&storage));
-        let sequence_allocator = SequenceAllocator::new(block_store);
+        let sequence_allocator = create_sequence_allocator(Arc::clone(&storage));
         sequence_allocator.initialize().await?;
 
         let segment_store = SegmentStore::open(Arc::clone(&storage), Default::default()).await?;
