@@ -52,9 +52,16 @@ A vector is the primary unit of ingestion, combining an ID, embedding values, an
 /// # Identity
 ///
 /// A vector is uniquely identified by its `id` within a namespace. The ID is
-/// a user-provided u32 that must be unique. Writing to an existing ID or a
-/// previously deleted ID is undefined behavior; callers must ensure IDs are
-/// never reused.
+/// a user-provided string (max 64 bytes UTF-8) that serves as an external
+/// identifier. The system internally maps external IDs to compact u64 internal
+/// IDs for efficient storage and indexing.
+///
+/// # Upsert Semantics
+///
+/// Writing a vector with an existing ID replaces the previous vector. The old
+/// vector is marked as deleted and a new internal ID is allocated. This ensures
+/// posting lists and metadata indexes are updated correctly without expensive
+/// read-modify-write cycles.
 ///
 /// # Embedding Values
 ///
@@ -63,8 +70,8 @@ A vector is the primary unit of ingestion, combining an ID, embedding values, an
 /// was created.
 #[derive(Debug, Clone)]
 pub struct Vector {
-    /// User-provided unique identifier.
-    pub id: u32,
+    /// User-provided unique identifier (max 64 bytes UTF-8).
+    pub id: String,
 
     /// The embedding vector (f32 values).
     pub values: Vec<f32>,
@@ -75,10 +82,10 @@ pub struct Vector {
 
 impl Vector {
     /// Creates a new vector with no attributes.
-    pub fn new(id: u32, values: Vec<f32>) -> Self;
+    pub fn new(id: impl Into<String>, values: Vec<f32>) -> Self;
 
     /// Builder-style construction for vectors with attributes.
-    pub fn builder(id: u32, values: Vec<f32>) -> VectorBuilder;
+    pub fn builder(id: impl Into<String>, values: Vec<f32>) -> VectorBuilder;
 }
 
 pub struct VectorBuilder {
@@ -153,11 +160,11 @@ impl From<bool> for AttributeValue { ... }
 ///     let db = VectorDb::open(config).await?;
 ///
 ///     let vectors = vec![
-///         Vector::builder(1, vec![0.1; 384])
+///         Vector::builder("product-001", vec![0.1; 384])
 ///             .attribute("category", "electronics")
 ///             .attribute("price", 99i64)
 ///             .build(),
-///         Vector::builder(2, vec![0.2; 384])
+///         Vector::builder("product-002", vec![0.2; 384])
 ///             .attribute("category", "clothing")
 ///             .attribute("price", 49i64)
 ///             .build(),
@@ -280,11 +287,13 @@ impl VectorDb {
     /// This operation is atomic: either all vectors in the batch are accepted,
     /// or none are. This matches the behavior of `TimeSeries::write()`.
     ///
-    /// # ID Uniqueness
+    /// # Upsert Semantics
     ///
-    /// Writing a vector with an ID that already exists or was previously
-    /// deleted is undefined behavior. Callers must ensure IDs are never
-    /// reused within a namespace.
+    /// Writing a vector with an ID that already exists performs an upsert:
+    /// the old vector is deleted and replaced with the new one. The system
+    /// allocates a new internal ID for the updated vector and marks the old
+    /// internal ID as deleted. This ensures index structures are updated
+    /// correctly without expensive read-modify-write cycles.
     ///
     /// # Validation
     ///
@@ -297,11 +306,11 @@ impl VectorDb {
     ///
     /// ```rust
     /// let vectors = vec![
-    ///     Vector::builder(1, embedding_1)
+    ///     Vector::builder("shoe-123", embedding_1)
     ///         .attribute("category", "shoes")
     ///         .attribute("price", 79i64)
     ///         .build(),
-    ///     Vector::builder(2, embedding_2)
+    ///     Vector::builder("shirt-456", embedding_2)
     ///         .attribute("category", "shirts")
     ///         .attribute("price", 45i64)
     ///         .build(),
@@ -356,26 +365,29 @@ impl VectorDb {
     ///
     /// # Implementation
     ///
-    /// Deletion is a soft delete: vector IDs are added to a deleted bitmap
-    /// that is checked during search. The actual data is cleaned up during
-    /// background LIRE maintenance.
+    /// Deletion is a soft delete:
+    /// 1. The external ID is looked up in the IdDictionary to find the internal ID
+    /// 2. The internal ID is added to the deleted bitmap (centroid_id=0)
+    /// 3. VectorData and VectorMeta records are tombstoned
+    /// 4. The IdDictionary entry is tombstoned
+    /// 5. Metadata index cleanup happens during background LIRE maintenance
     ///
     /// # ID Reuse
     ///
-    /// Deleted IDs cannot be reused. The deleted bitmap persists until LIRE
-    /// maintenance, and re-inserting a deleted ID would cause the new vector
-    /// to be incorrectly filtered from search results.
+    /// Deleted external IDs can be reused. Writing a vector with a previously
+    /// deleted ID will succeed and create a new vector with a new internal ID.
+    /// The old internal ID remains in the deleted bitmap until LIRE maintenance.
     ///
     /// # Example
     ///
     /// ```rust
     /// // Delete specific vectors
-    /// db.delete(vec![1, 2, 3]).await?;
+    /// db.delete(vec!["product-001", "product-002", "product-003"]).await?;
     ///
     /// // Idempotent - deleting again is fine
-    /// db.delete(vec![1, 2, 3]).await?;
+    /// db.delete(vec!["product-001", "product-002", "product-003"]).await?;
     /// ```
-    pub async fn delete(&self, ids: Vec<u32>) -> Result<()>;
+    pub async fn delete(&self, ids: Vec<String>) -> Result<()>;
 }
 ```
 
@@ -404,8 +416,14 @@ When `write()` is called, the following operations occur:
 
 1. **Validation**: Check that all vectors have the correct dimensions and valid attributes
 2. **For each vector**:
-    - Write `VectorData` record with the embedding values
-    - Write `VectorMeta` record with the attributes
+    - Look up the external ID in `IdDictionary`
+    - If found (upsert case):
+        - Delete the old vector: add old internal ID to deleted bitmap (centroid_id=0)
+        - Tombstone old `VectorData` and `VectorMeta` records
+    - Allocate a new internal ID using block-based sequence allocation (see `SeqBlock` in storage RFC)
+    - Write `VectorData` record with the embedding values (keyed by new internal ID)
+    - Write `VectorMeta` record with the external ID and attributes (keyed by new internal ID)
+    - Update or create `IdDictionary` entry mapping external ID → new internal ID
     - Update `MetadataIndex` entries via merge operators for indexed fields
     - Assign to nearest centroid(s) and update `PostingList` via merge operators
 3. **Return**: Success after buffering (or after flush if `await_durable`)
@@ -414,9 +432,10 @@ When `write()` is called, the following operations occur:
 
 When `delete()` is called:
 
-1. **Add to deleted bitmap**: Vector IDs are added to the special posting list at `centroid_id=0`
-2. **Tombstone records**: `VectorData` and `VectorMeta` records are tombstoned
-3. **Deferred cleanup**: Metadata index entries and posting list entries are cleaned up during LIRE
+1. **Look up internal IDs**: For each external ID, look up the internal ID in `IdDictionary`
+2. **Add to deleted bitmap**: Internal IDs are added to the special posting list at `centroid_id=0`
+3. **Tombstone records**: `VectorData`, `VectorMeta`, and `IdDictionary` records are tombstoned
+4. **Deferred cleanup**: Metadata index entries and posting list entries are cleaned up during LIRE
    maintenance
 
 ### Comparison with TimeSeries API
@@ -427,10 +446,10 @@ When `delete()` is called:
 | Primary write method | `write(Vec<Series>)`                 | `write(Vec<Vector>)`                |
 | Options variant      | `write_with_options()`               | `write_with_options()`              |
 | Data unit            | `Series` (labels + samples)          | `Vector` (id + values + attributes) |
-| Identification       | Labels (including `__name__`)        | `id: u32`                           |
+| Identification       | Labels (including `__name__`)        | `id: String` (external ID)          |
 | Metadata             | `metric_type`, `unit`, `description` | `attributes: Vec<Attribute>`        |
-| Write semantics      | Append samples                       | Insert (no duplicates)              |
-| Delete method        | N/A                                  | `delete(Vec<u32>)`                  |
+| Write semantics      | Append samples                       | Upsert (replace existing)           |
+| Delete method        | N/A                                  | `delete(Vec<String>)`               |
 | Durability control   | `WriteOptions::await_durable`        | `WriteOptions::await_durable`       |
 | Reader access        | `fn reader() -> TimeSeriesReader`    | `fn reader() -> VectorDbReader`     |
 
@@ -438,33 +457,27 @@ When `delete()` is called:
 
 ### Upsert Semantics
 
-**Alternative**: Writing a vector with an existing ID overwrites the previous vector and metadata
-automatically.
+**Decision**: Upsert semantics are supported by default.
 
-**Rationale for rejection**: Upsert requires finding and removing stale index entries, which is
-expensive:
+**Implementation**: When writing a vector with an existing external ID, the system:
+1. Looks up the old internal ID from `IdDictionary`
+2. Marks the old internal ID as deleted (adds to centroid_id=0 bitmap)
+3. Tombstones the old `VectorData` and `VectorMeta` records
+4. Allocates a new internal ID for the updated vector
+5. Writes new records with the new internal ID
+6. Updates `IdDictionary` to point external ID → new internal ID
 
-1. **Posting list cleanup**: The old vector may be assigned to different centroids than the new one.
-   To remove stale posting list entries, we must either:
-   - Store a reverse index (`vector_id → centroid_ids`) adding storage overhead and write
-     amplification
-   - Store centroid assignments in `VectorMeta`, requiring a read before every write
-   - Scan all posting lists (prohibitively expensive)
+This "delete old + insert new" approach avoids expensive read-modify-write cycles. Stale posting
+list entries and metadata index entries are filtered at query time using the deleted bitmap, and
+cleaned up during background LIRE maintenance.
 
-2. **Metadata index cleanup**: If indexed attribute values change, we must remove the vector from
-   old `MetadataIndex` bitmaps and add to new ones. This requires reading old metadata to determine
-   which entries to remove.
+**Cost**: Upserts have the same write cost as inserts (no additional reads required). The trade-off
+is that deleted internal IDs accumulate and require periodic cleanup, but this is handled
+asynchronously by LIRE maintenance without blocking writes.
 
-3. **Cost per upsert**: At minimum, upsert requires O(1) reads + O(k) posting list updates + O(m)
-   metadata index updates, where k is the number of centroid assignments (~2) and m is the number
-   of changed indexed attributes. This is significantly more expensive than insert.
-
-Note that delete-then-reinsert is also not supported: deleted IDs remain in the deleted bitmap until
-LIRE maintenance, so a re-inserted vector would be incorrectly filtered from search results.
-
-**Future consideration**: A future RFC may add upsert support with explicit cost documentation,
-potentially via a `VectorCentroids` reverse index record type to track centroid assignments and
-enable efficient cleanup of both posting lists and the deleted bitmap.
+**Alternative considered**: Require explicit delete-then-insert from callers. Rejected because it
+would require callers to issue two separate API calls, losing atomicity and complicating error
+handling.
 
 ### Partial Success on Batch Writes
 
@@ -485,14 +498,24 @@ doesn't handle rejections correctly.
 
 ### String IDs Instead of u32
 
-**Alternative**: Use string IDs for vectors instead of u32.
+**Decision**: String external IDs are used in the public API.
 
-**Rationale for rejection**: The storage layer uses u32 for efficient bitmap compression (
-RoaringBitmap). String IDs would require an additional mapping layer and reduce storage efficiency.
-Applications needing string IDs can maintain their own mapping.
+**Implementation**: The system maintains an `IdDictionary` that maps user-provided string external
+IDs (max 64 bytes UTF-8) to system-assigned u64 internal IDs. Benefits:
 
-**Trade-offs**: Users must manage ID allocation and uniqueness. For many workloads, this is
-acceptable since they already have compact ID schemes or can maintain a simple mapping table.
+1. **User convenience**: Callers can use natural identifiers (product SKUs, document UUIDs, etc.)
+   without maintaining a separate mapping
+2. **Storage efficiency**: Internal u64 IDs enable efficient bitmap compression (RoaringTreemap)
+   and monotonic ordering for better compression
+3. **Decoupled lifecycle**: The system can manage internal ID allocation and reuse independently
+   of user-visible identifiers
+
+**Cost**: One additional KV lookup per write (`IdDictionary` read) and one additional record per
+vector (`IdDictionary` entry). For workloads with stable vector sets, the amortized cost is low.
+
+**Alternative considered**: Use u32 IDs in the public API. Rejected because it pushes ID management
+complexity onto callers, and many applications naturally work with string identifiers (UUIDs,
+composite keys, etc.).
 
 ### Native Delete-by-Filter
 
