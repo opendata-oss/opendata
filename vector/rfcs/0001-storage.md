@@ -225,12 +225,7 @@ with future schema changes that may require sub-type discrimination.
 
 - `TerminatedBytes`: Variable-length bytes with escape sequences and `0x00` terminator for
   lexicographic ordering. Using `0x00` as terminator ensures shorter keys sort before longer
-  keys with the same prefix (e.g., `/foo` < `/foo/bar`):
-  - `0x00` in payload → `0x01 0x01` (escaped terminator)
-  - `0x01` in payload → `0x01 0x02` (escaped escape byte)
-  - `0xFF` in payload → `0x01 0x03` (escaped range-end byte)
-  - All other bytes unchanged
-  - Terminated with `0x00`
+  keys with the same prefix (e.g., `/foo` < `/foo/bar`). See the [TerminatedBytes](../common/src/serde/terminated_bytes.rs) module for more details.
 
 **Note on Endianness**: Value schemas use little-endian encoding. Key schemas use big-endian to
 maintain lexicographic ordering for range scans.
