@@ -419,11 +419,9 @@ impl PromqlRouter for Tsdb {
     }
 
     async fn labels(&self, request: LabelsRequest) -> LabelsResponse {
-        // Calculate time range (use defaults if not provided)
         let start_secs = request.start.unwrap_or(0);
         let end_secs = request.end.unwrap_or(i64::MAX);
 
-        // Get query reader for time range
         let reader = match self.query_reader(start_secs, end_secs).await {
             Ok(reader) => reader,
             Err(e) => {
@@ -437,7 +435,6 @@ impl PromqlRouter for Tsdb {
             }
         };
 
-        // Validate that query touches only one bucket
         let buckets = match reader.list_buckets().await {
             Ok(buckets) => buckets,
             Err(e) => {
@@ -451,21 +448,6 @@ impl PromqlRouter for Tsdb {
             }
         };
 
-        if buckets.len() > 1 {
-            let err = ErrorResponse::bad_data(format!(
-                "Query spans multiple buckets ({} buckets), which is not supported. Query time range: {} to {} seconds.",
-                buckets.len(),
-                start_secs,
-                end_secs
-            ));
-            return LabelsResponse {
-                status: err.status,
-                data: None,
-                error: Some(err.error),
-                error_type: Some(err.error_type),
-            };
-        }
-
         if buckets.is_empty() {
             // No buckets means no data, return empty result
             return LabelsResponse {
@@ -476,63 +458,70 @@ impl PromqlRouter for Tsdb {
             };
         }
 
-        let bucket = buckets[0];
-
-        // Collect label names using hybrid approach:
-        // - Filtered (match[]): use forward index (targeted I/O for matching series)
-        // - Unfiltered: use inverted index (direct access to all label keys)
         let mut label_names: HashSet<String> = HashSet::new();
 
         match &request.matches {
             Some(matches) if !matches.is_empty() => {
-                // Filtered: use forward index for targeted I/O
-                let series_ids = match get_matching_series(&reader, bucket, matches).await {
-                    Ok(ids) => ids,
-                    Err(e) => {
-                        let err = ErrorResponse::bad_data(e);
-                        return LabelsResponse {
-                            status: err.status,
-                            data: None,
-                            error: Some(err.error),
-                            error_type: Some(err.error_type),
-                        };
+                let bucket_series_map =
+                    match get_matching_series_multi_bucket(&reader, &buckets, matches).await {
+                        Ok(map) => map,
+                        Err(e) => {
+                            let err = ErrorResponse::bad_data(e);
+                            return LabelsResponse {
+                                status: err.status,
+                                data: None,
+                                error: Some(err.error),
+                                error_type: Some(err.error_type),
+                            };
+                        }
+                    };
+
+                // Collect label names from all matching series across buckets
+                for (bucket, series_ids) in bucket_series_map {
+                    let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
+
+                    if series_ids_vec.is_empty() {
+                        continue;
                     }
-                };
-                let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-                let forward_index = match reader.forward_index(&bucket, &series_ids_vec).await {
-                    Ok(index) => index,
-                    Err(e) => {
-                        let err = ErrorResponse::internal(e.to_string());
-                        return LabelsResponse {
-                            status: err.status,
-                            data: None,
-                            error: Some(err.error),
-                            error_type: Some(err.error_type),
-                        };
-                    }
-                };
-                for (_id, spec) in forward_index.all_series() {
-                    for attr in &spec.labels {
-                        label_names.insert(attr.name.clone());
+
+                    let forward_index = match reader.forward_index(&bucket, &series_ids_vec).await {
+                        Ok(index) => index,
+                        Err(e) => {
+                            let err = ErrorResponse::internal(e.to_string());
+                            return LabelsResponse {
+                                status: err.status,
+                                data: None,
+                                error: Some(err.error),
+                                error_type: Some(err.error_type),
+                            };
+                        }
+                    };
+
+                    for (_id, spec) in forward_index.all_series() {
+                        for attr in &spec.labels {
+                            label_names.insert(attr.name.clone());
+                        }
                     }
                 }
             }
             _ => {
-                // Unfiltered: use inverted index for direct key access
-                let inverted_index = match reader.all_inverted_index(&bucket).await {
-                    Ok(index) => index,
-                    Err(e) => {
-                        let err = ErrorResponse::internal(e.to_string());
-                        return LabelsResponse {
-                            status: err.status,
-                            data: None,
-                            error: Some(err.error),
-                            error_type: Some(err.error_type),
-                        };
+                // Unfiltered: use inverted index to pull all label kv pairs in bucket
+                for bucket in buckets {
+                    let inverted_index = match reader.all_inverted_index(&bucket).await {
+                        Ok(index) => index,
+                        Err(e) => {
+                            let err = ErrorResponse::internal(e.to_string());
+                            return LabelsResponse {
+                                status: err.status,
+                                data: None,
+                                error: Some(err.error),
+                                error_type: Some(err.error_type),
+                            };
+                        }
+                    };
+                    for attr in inverted_index.all_keys() {
+                        label_names.insert(attr.name);
                     }
-                };
-                for attr in inverted_index.all_keys() {
-                    label_names.insert(attr.name);
                 }
             }
         };
@@ -1385,5 +1374,228 @@ mod tests {
         for series in &data {
             assert_eq!(series.get("__name__"), Some(&"requests".to_string()));
         }
+    }
+
+    #[tokio::test]
+    async fn should_return_labels_from_multiple_buckets() {
+        // given: labels spanning multiple time buckets
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+        let bucket1 = TimeBucket::hour(60);
+        let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
+        let bucket2 = TimeBucket::hour(120);
+        let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
+        mini1
+            .ingest(
+                &create_sample(
+                    "http_requests",
+                    vec![("env", "prod"), ("service", "web")],
+                    4_000_000,
+                    10.0,
+                ),
+                30,
+            )
+            .await
+            .unwrap();
+        mini2
+            .ingest(
+                &create_sample(
+                    "db_queries",
+                    vec![("env", "staging"), ("database", "postgres")],
+                    8_000_000,
+                    20.0,
+                ),
+                30,
+            )
+            .await
+            .unwrap();
+
+        tsdb.flush(30).await.unwrap();
+
+        // when: query labels across both buckets (no match filter)
+        let request = LabelsRequest {
+            matches: None,
+            start: Some(3600), // Covers bucket 1
+            end: Some(10800),  // Covers bucket 2
+            limit: None,
+        };
+        let response = tsdb.labels(request).await;
+
+        // then: should return all label names from both buckets
+        assert_eq!(response.status, "success");
+        let data = response.data.unwrap();
+        // Should contain labels from both buckets
+        assert!(data.contains(&"__name__".to_string()));
+        assert!(data.contains(&"env".to_string()));
+        assert!(data.contains(&"service".to_string())); // From bucket 1
+        assert!(data.contains(&"database".to_string())); // From bucket 2
+    }
+
+    #[tokio::test]
+    async fn should_deduplicate_labels_across_buckets() {
+        // given: same label names appearing in multiple buckets
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+        let bucket1 = TimeBucket::hour(60);
+        let bucket2 = TimeBucket::hour(120);
+        let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
+        let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
+        mini1
+            .ingest(
+                &create_sample("metric_a", vec![("env", "prod")], 4_000_000, 10.0),
+                30,
+            )
+            .await
+            .unwrap();
+        mini2
+            .ingest(
+                &create_sample("metric_b", vec![("env", "staging")], 8_000_000, 20.0),
+                30,
+            )
+            .await
+            .unwrap();
+        tsdb.flush(30).await.unwrap();
+
+        // when: query labels across both buckets
+        let request = LabelsRequest {
+            matches: None,
+            start: Some(3600),
+            end: Some(10800),
+            limit: None,
+        };
+        let response = tsdb.labels(request).await;
+
+        // then: should return deduplicated label names
+        assert_eq!(response.status, "success");
+        let data = response.data.unwrap();
+        // Should contain each label name only once despite appearing in multiple buckets
+        assert!(data.contains(&"__name__".to_string()));
+        assert!(data.contains(&"env".to_string()));
+        assert_eq!(data.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn should_filter_labels_by_match_across_buckets() {
+        // given: different metrics across multiple buckets
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+        let bucket1 = TimeBucket::hour(60);
+        let bucket2 = TimeBucket::hour(120);
+        let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
+        let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
+        mini1
+            .ingest(
+                &create_sample(
+                    "http_requests",
+                    vec![("env", "prod"), ("method", "GET")],
+                    4_000_000,
+                    10.0,
+                ),
+                30,
+            )
+            .await
+            .unwrap();
+        mini2
+            .ingest(
+                &create_sample(
+                    "http_requests",
+                    vec![("env", "staging"), ("path", "/api/v1")],
+                    8_000_000,
+                    20.0,
+                ),
+                30,
+            )
+            .await
+            .unwrap();
+        mini2
+            .ingest(
+                &create_sample(
+                    "db_queries",
+                    vec![("env", "prod"), ("table", "users")],
+                    8_000_000,
+                    30.0,
+                ),
+                30,
+            )
+            .await
+            .unwrap();
+        tsdb.flush(30).await.unwrap();
+
+        // when: query labels with match[] filter for http_requests only
+        let request = LabelsRequest {
+            matches: Some(vec!["http_requests".to_string()]),
+            start: Some(3600),
+            end: Some(10800),
+            limit: None,
+        };
+        let response = tsdb.labels(request).await;
+
+        // then: should only return labels from http_requests across both buckets
+        assert_eq!(response.status, "success");
+        let data = response.data.unwrap();
+        assert!(data.contains(&"__name__".to_string()));
+        assert!(data.contains(&"env".to_string()));
+        assert!(data.contains(&"method".to_string()));
+        assert!(data.contains(&"path".to_string()));
+        assert!(!data.contains(&"table".to_string()));
+        assert_eq!(data.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn should_apply_limit_across_multi_bucket_labels() {
+        // given: many different labels across multiple buckets
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+        let bucket1 = TimeBucket::hour(60);
+        let bucket2 = TimeBucket::hour(120);
+        let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
+        let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
+        mini1
+            .ingest(
+                &create_sample(
+                    "metric1",
+                    vec![
+                        ("label_a", "value"),
+                        ("label_b", "value"),
+                        ("label_c", "value"),
+                    ],
+                    4_000_000,
+                    10.0,
+                ),
+                30,
+            )
+            .await
+            .unwrap();
+        mini2
+            .ingest(
+                &create_sample(
+                    "metric2",
+                    vec![
+                        ("label_d", "value"),
+                        ("label_e", "value"),
+                        ("label_f", "value"),
+                    ],
+                    8_000_000,
+                    20.0,
+                ),
+                30,
+            )
+            .await
+            .unwrap();
+        tsdb.flush(30).await.unwrap();
+
+        // when: query labels with a limit
+        let request = LabelsRequest {
+            matches: None,
+            start: Some(3600),
+            end: Some(10800),
+            limit: Some(3),
+        };
+        let response = tsdb.labels(request).await;
+
+        // then: should return exactly 3 labels (respecting the limit)
+        assert_eq!(response.status, "success");
+        let data = response.data.unwrap();
+        assert_eq!(data.len(), 3); // Should be limited to 3 labels
     }
 }
