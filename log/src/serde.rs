@@ -34,7 +34,7 @@
 //! keys with the same prefix (e.g., "/foo" < "/foo/bar"). This simplifies
 //! prefix-based range queries: start at `prefix + 0x00`, end at `prefix + 0xFF`.
 
-use std::ops::{Bound, RangeBounds};
+use std::ops::{Bound, Range, RangeBounds};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
@@ -42,6 +42,7 @@ use common::serde::terminated_bytes;
 use common::serde::varint::var_u64;
 
 use crate::error::Error;
+use crate::segment::LogSegment;
 
 impl From<common::serde::DeserializeError> for Error {
     fn from(err: common::serde::DeserializeError) -> Self {
@@ -85,15 +86,17 @@ impl RecordType {
 
 /// Key for a log entry record.
 ///
-/// The key serializes the segment ID, user key, and sequence number in a format
+/// The key serializes the segment ID, user key, and relative sequence number in a format
 /// that preserves lexicographic ordering:
 ///
 /// ```text
-/// | version (u8) | type (u8) | segment_id (u32 BE) | terminated_key | sequence (var_u64) |
+/// | version (u8) | type (u8) | segment_id (u32 BE) | terminated_key | relative_seq (var_u64) |
 /// ```
 ///
-/// The sequence number uses variable-length encoding (see [`common::serde::varint::var_u64`])
-/// to keep keys compact for small sequence numbers.
+/// The `relative_seq` is the entry's sequence number relative to the segment's `start_seq`
+/// (i.e., it resets to 0 at the start of each segment). This keeps keys compact since most
+/// relative offsets within a segment are small. The sequence number uses variable-length
+/// encoding (see [`common::serde::varint::var_u64`]).
 ///
 /// The ordering (segment_id before key) ensures entries are grouped by segment,
 /// enabling efficient scans within a single segment.
@@ -118,18 +121,26 @@ impl LogEntryKey {
     }
 
     /// Serializes the key to bytes for storage.
-    pub fn serialize(&self) -> Bytes {
+    ///
+    /// The sequence number is stored relative to `segment_start_seq`, so the
+    /// caller must provide the segment's start sequence.
+    pub fn serialize(&self, segment_start_seq: u64) -> Bytes {
+        let relative_seq = self.sequence - segment_start_seq;
         let mut buf = BytesMut::new();
         buf.put_u8(KEY_VERSION);
         buf.put_u8(RecordType::LogEntry.id());
         buf.put_u32(self.segment_id);
         terminated_bytes::serialize(&self.key, &mut buf);
-        var_u64::serialize(self.sequence, &mut buf);
+        var_u64::serialize(relative_seq, &mut buf);
         buf.freeze()
     }
 
     /// Deserializes a log entry key from bytes.
-    pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
+    ///
+    /// The sequence number is stored relative to `segment_start_seq`, so the
+    /// caller must provide the segment's start sequence to recover the absolute
+    /// sequence number.
+    pub fn deserialize(data: &[u8], segment_start_seq: u64) -> Result<Self, Error> {
         if data.len() < 6 {
             return Err(Error::Encoding(
                 "buffer too short for new log entry key".to_string(),
@@ -155,7 +166,8 @@ impl LogEntryKey {
 
         let mut buf = &data[6..];
         let key = terminated_bytes::deserialize(&mut buf)?;
-        let sequence = var_u64::deserialize(&mut buf)?;
+        let relative_seq = var_u64::deserialize(&mut buf)?;
+        let sequence = segment_start_seq + relative_seq;
 
         Ok(LogEntryKey {
             segment_id,
@@ -164,64 +176,27 @@ impl LogEntryKey {
         })
     }
 
-    /// Creates a prefix for scanning all entries in a segment for a given key.
-    pub fn segment_key_prefix(segment_id: SegmentId, key: &[u8]) -> Bytes {
-        let mut buf = BytesMut::new();
-        buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordType::LogEntry.id());
-        buf.put_u32(segment_id);
-        terminated_bytes::serialize(key, &mut buf);
-        buf.freeze()
-    }
-
     /// Creates a storage key range for scanning entries within a segment.
     ///
     /// Returns a range that matches all entries for the given segment and key
-    /// whose sequence numbers fall within the specified bounds.
-    pub fn scan_range(
-        segment_id: SegmentId,
-        key: &[u8],
-        seq_range: impl RangeBounds<u64>,
-    ) -> BytesRange {
-        let prefix = Self::segment_key_prefix(segment_id, key);
+    /// whose sequence numbers fall within the specified range (inclusive start,
+    /// exclusive end).
+    pub fn scan_range(segment: &LogSegment, key: &[u8], seq_range: Range<u64>) -> BytesRange {
+        let start_key = Self::build_scan_key(segment, key, seq_range.start);
+        let end_key = Self::build_scan_key(segment, key, seq_range.end);
+        BytesRange::new(Bound::Included(start_key), Bound::Excluded(end_key))
+    }
 
-        let start = match seq_range.start_bound() {
-            Bound::Included(&seq) => {
-                let mut start_key = BytesMut::from(prefix.as_ref());
-                var_u64::serialize(seq, &mut start_key);
-                Bound::Included(start_key.freeze())
-            }
-            Bound::Excluded(&seq) => {
-                let mut start_key = BytesMut::from(prefix.as_ref());
-                var_u64::serialize(seq, &mut start_key);
-                Bound::Excluded(start_key.freeze())
-            }
-            Bound::Unbounded => {
-                let mut start_key = BytesMut::from(prefix.as_ref());
-                var_u64::serialize(0, &mut start_key);
-                Bound::Included(start_key.freeze())
-            }
-        };
-
-        let end = match seq_range.end_bound() {
-            Bound::Included(&seq) => {
-                let mut end_key = BytesMut::from(prefix.as_ref());
-                var_u64::serialize(seq, &mut end_key);
-                Bound::Included(end_key.freeze())
-            }
-            Bound::Excluded(&seq) => {
-                let mut end_key = BytesMut::from(prefix.as_ref());
-                var_u64::serialize(seq, &mut end_key);
-                Bound::Excluded(end_key.freeze())
-            }
-            Bound::Unbounded => {
-                let mut end_key = BytesMut::from(prefix.as_ref());
-                var_u64::serialize(u64::MAX, &mut end_key);
-                Bound::Included(end_key.freeze())
-            }
-        };
-
-        BytesRange::new(start, end)
+    /// Builds a complete scan key with segment prefix and relative sequence.
+    fn build_scan_key(segment: &LogSegment, key: &[u8], seq: u64) -> Bytes {
+        let relative_seq = seq.saturating_sub(segment.meta().start_seq);
+        let mut buf = BytesMut::new();
+        buf.put_u8(KEY_VERSION);
+        buf.put_u8(RecordType::LogEntry.id());
+        buf.put_u32(segment.id());
+        terminated_bytes::serialize(key, &mut buf);
+        var_u64::serialize(relative_seq, &mut buf);
+        buf.freeze()
     }
 }
 
@@ -574,11 +549,12 @@ mod tests {
     #[test]
     fn should_serialize_and_deserialize_log_entry_key() {
         // given
+        let segment_start_seq = 10000;
         let key = LogEntryKey::new(42, Bytes::from("test_key"), 12345);
 
         // when
-        let serialized = key.serialize();
-        let deserialized = LogEntryKey::deserialize(&serialized).unwrap();
+        let serialized = key.serialize(segment_start_seq);
+        let deserialized = LogEntryKey::deserialize(&serialized, segment_start_seq).unwrap();
 
         // then
         assert_eq!(deserialized.segment_id, 42);
@@ -589,13 +565,14 @@ mod tests {
     #[test]
     fn should_serialize_log_entry_key_with_correct_structure() {
         // given
+        let segment_start_seq = 0;
         let key = LogEntryKey::new(1, Bytes::from("k"), 100);
 
         // when
-        let serialized = key.serialize();
+        let serialized = key.serialize(segment_start_seq);
 
         // then
-        // version (1) + type (1) + segment_id (4) + key "k" (1) + terminator (1) + sequence (varint, 2 bytes for 100) = 10
+        // version (1) + type (1) + segment_id (4) + key "k" (1) + terminator (1) + relative_seq (varint, 2 bytes for 100) = 10
         assert_eq!(serialized.len(), 10);
         assert_eq!(serialized[0], KEY_VERSION);
         assert_eq!(serialized[1], RecordType::LogEntry.id());
@@ -604,25 +581,45 @@ mod tests {
         // key "k" + terminator
         assert_eq!(serialized[6], b'k');
         assert_eq!(serialized[7], 0x00); // terminator
-        // sequence = 100 as varint: length code 1 (2 bytes total), value 100
+        // relative_seq = 100 as varint: length code 1 (2 bytes total), value 100
         // First byte: (1 << 4) | (100 >> 8) = 0x10
         // Second byte: 100 & 0xFF = 0x64
         assert_eq!(&serialized[8..10], &[0x10, 0x64]);
     }
 
     #[test]
-    fn should_order_log_entries_by_segment_then_key_then_sequence() {
+    fn should_serialize_relative_sequence() {
         // given
+        let segment_start_seq = 1000;
+        let key = LogEntryKey::new(1, Bytes::from("k"), 1005); // relative_seq = 5
+
+        // when
+        let serialized = key.serialize(segment_start_seq);
+
+        // then
+        // relative_seq = 5 fits in 1 byte (length code 0)
+        // version (1) + type (1) + segment_id (4) + key "k" (1) + terminator (1) + relative_seq (1) = 9
+        assert_eq!(serialized.len(), 9);
+        // relative_seq = 5 as varint: length code 0, value 5
+        assert_eq!(serialized[8], 0x05);
+    }
+
+    #[test]
+    fn should_order_log_entries_by_segment_then_key_then_sequence() {
+        // given - all in segment 0 with start_seq 0
+        let segment_start_seq = 0;
         let key1 = LogEntryKey::new(0, Bytes::from("a"), 1);
         let key2 = LogEntryKey::new(0, Bytes::from("a"), 2);
         let key3 = LogEntryKey::new(0, Bytes::from("b"), 1);
-        let key4 = LogEntryKey::new(1, Bytes::from("a"), 1);
+        // segment 1 has its own start_seq
+        let segment1_start_seq = 100;
+        let key4 = LogEntryKey::new(1, Bytes::from("a"), 101);
 
         // when
-        let s1 = key1.serialize();
-        let s2 = key2.serialize();
-        let s3 = key3.serialize();
-        let s4 = key4.serialize();
+        let s1 = key1.serialize(segment_start_seq);
+        let s2 = key2.serialize(segment_start_seq);
+        let s3 = key3.serialize(segment_start_seq);
+        let s4 = key4.serialize(segment1_start_seq);
 
         // then - segment_id ordering takes precedence
         assert!(s1 < s2, "same segment/key, seq 1 < seq 2");
@@ -631,33 +628,39 @@ mod tests {
     }
 
     #[test]
-    fn should_generate_segment_key_prefix() {
-        // given
-        let segment_id = 5;
-        let key = b"orders";
-
-        // when
-        let prefix = LogEntryKey::segment_key_prefix(segment_id, key);
-
-        // then
-        // version (1) + type (1) + segment_id (4) + key (6) + terminator (1) = 13
-        assert_eq!(prefix.len(), 13);
-        assert_eq!(prefix[0], KEY_VERSION);
-        assert_eq!(prefix[1], RecordType::LogEntry.id());
-        assert_eq!(&prefix[2..6], &[0, 0, 0, 5]); // segment_id
-        assert_eq!(&prefix[6..12], b"orders");
-        assert_eq!(prefix[12], 0x00); // terminator
-    }
-
-    #[test]
     fn should_fail_deserialize_log_entry_key_too_short() {
         // given
         let data = vec![KEY_VERSION, RecordType::LogEntry.id(), 0, 0, 0]; // only 5 bytes
 
         // when
-        let result = LogEntryKey::deserialize(&data);
+        let result = LogEntryKey::deserialize(&data, 0);
 
         // then
         assert!(result.is_err());
+    }
+
+    mod proptests {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        proptest! {
+            #[test]
+            fn should_preserve_sequence_ordering(a: u64, b: u64) {
+                let segment_start_seq = 0;
+                let key_a = LogEntryKey::new(0, Bytes::from("key"), a);
+                let key_b = LogEntryKey::new(0, Bytes::from("key"), b);
+
+                let enc_a = key_a.serialize(segment_start_seq);
+                let enc_b = key_b.serialize(segment_start_seq);
+
+                prop_assert_eq!(
+                    a.cmp(&b),
+                    enc_a.cmp(&enc_b),
+                    "ordering mismatch: a={}, b={}, enc_a={:?}, enc_b={:?}",
+                    a, b, enc_a.as_ref(), enc_b.as_ref()
+                );
+            }
+        }
     }
 }

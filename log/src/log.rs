@@ -196,13 +196,14 @@ impl Log {
             .await?;
 
         // Build storage records with encoded keys
+        let segment_start_seq = segment.meta().start_seq;
         let storage_records: Vec<StorageRecord> = records
             .into_iter()
             .enumerate()
             .map(|(i, record)| {
                 let sequence = base_sequence + i as u64;
                 let entry_key = LogEntryKey::new(segment.id(), record.key, sequence);
-                StorageRecord::new(entry_key.serialize(), record.value)
+                StorageRecord::new(entry_key.serialize(segment_start_seq), record.value)
             })
             .collect();
 
@@ -364,10 +365,10 @@ mod tests {
         // Should have 5 records: SeqBlock + SegmentMeta + 3 LogEntries
         assert_eq!(stored.len(), 5);
 
-        // Deserialize and verify sequence numbers
+        // Deserialize and verify sequence numbers (segment 0 starts at seq 0)
         let log_entries: Vec<_> = stored
             .iter()
-            .filter_map(|r| LogEntryKey::deserialize(&r.key).ok())
+            .filter_map(|r| LogEntryKey::deserialize(&r.key, 0).ok())
             .collect();
         assert_eq!(log_entries.len(), 3);
         assert_eq!(log_entries[0].sequence, 0);
@@ -424,7 +425,7 @@ mod tests {
 
         let mut log_entries: Vec<_> = stored
             .iter()
-            .filter_map(|r| LogEntryKey::deserialize(&r.key).ok())
+            .filter_map(|r| LogEntryKey::deserialize(&r.key, 0).ok())
             .collect();
         log_entries.sort_by_key(|e| e.sequence);
 
@@ -458,7 +459,7 @@ mod tests {
         let log_records: Vec<_> = stored
             .iter()
             .filter_map(|r| {
-                LogEntryKey::deserialize(&r.key)
+                LogEntryKey::deserialize(&r.key, 0)
                     .ok()
                     .map(|k| (k, r.value.clone()))
             })

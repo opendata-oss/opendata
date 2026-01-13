@@ -9,3 +9,6 @@ bytes.workspace = true
 common.workspace = true
 slatedb.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

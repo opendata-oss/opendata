@@ -1676,6 +1676,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "common",
+ "proptest",
  "slatedb",
  "tokio",
 ]

@@ -270,11 +270,20 @@ use crate::segment::LogSegment;
 struct SegmentIterator {
     inner: Box<dyn StorageIterator + Send>,
     seq_range: std::ops::Range<u64>,
+    segment_start_seq: u64,
 }
 
 impl SegmentIterator {
-    fn new(inner: Box<dyn StorageIterator + Send>, seq_range: std::ops::Range<u64>) -> Self {
-        Self { inner, seq_range }
+    fn new(
+        inner: Box<dyn StorageIterator + Send>,
+        seq_range: std::ops::Range<u64>,
+        segment_start_seq: u64,
+    ) -> Self {
+        Self {
+            inner,
+            seq_range,
+            segment_start_seq,
+        }
     }
 
     /// Returns the next log entry within the sequence range, or None if exhausted.
@@ -289,7 +298,7 @@ impl SegmentIterator {
                 return Ok(None);
             };
 
-            let entry_key = LogEntryKey::deserialize(&record.key)?;
+            let entry_key = LogEntryKey::deserialize(&record.key, self.segment_start_seq)?;
 
             // Skip entries outside our sequence range
             if entry_key.sequence < self.seq_range.start {
@@ -424,19 +433,24 @@ impl LogIterator {
         }
 
         let segment = &self.segments[self.current_segment_idx];
+        let segment_start_seq = segment.meta().start_seq;
         let range = self.segment_scan_range(segment);
         let inner = self
             .storage
             .scan_iter(range)
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
-        self.current_iter = Some(SegmentIterator::new(inner, self.seq_range.clone()));
+        self.current_iter = Some(SegmentIterator::new(
+            inner,
+            self.seq_range.clone(),
+            segment_start_seq,
+        ));
         Ok(true)
     }
 
     /// Computes the storage key range for scanning a segment.
     fn segment_scan_range(&self, segment: &LogSegment) -> common::BytesRange {
-        LogEntryKey::scan_range(segment.id(), &self.key, self.seq_range.clone())
+        LogEntryKey::scan_range(segment, &self.key, self.seq_range.clone())
     }
 }
 
@@ -453,10 +467,11 @@ mod tests {
         key: &[u8],
         seq: u64,
         value: &[u8],
+        segment_start_seq: u64,
     ) {
         let entry_key = LogEntryKey::new(segment_id, Bytes::copy_from_slice(key), seq);
         let record = common::Record {
-            key: entry_key.serialize(),
+            key: entry_key.serialize(segment_start_seq),
             value: Bytes::copy_from_slice(value),
         };
         storage.put(vec![record]).await.unwrap();
@@ -475,9 +490,9 @@ mod tests {
     #[tokio::test]
     async fn should_iterate_entries_in_single_segment() {
         let storage = Arc::new(InMemoryStorage::new());
-        write_entry(&storage, 0, b"key", 0, b"value0").await;
-        write_entry(&storage, 0, b"key", 1, b"value1").await;
-        write_entry(&storage, 0, b"key", 2, b"value2").await;
+        write_entry(&storage, 0, b"key", 0, b"value0", 0).await;
+        write_entry(&storage, 0, b"key", 1, b"value1", 0).await;
+        write_entry(&storage, 0, b"key", 2, b"value2", 0).await;
 
         let segments = vec![LogSegment::new(0, SegmentMeta::new(0, 1000))];
 
@@ -501,12 +516,12 @@ mod tests {
     #[tokio::test]
     async fn should_iterate_entries_across_multiple_segments() {
         let storage = Arc::new(InMemoryStorage::new());
-        // Entries in segment 0
-        write_entry(&storage, 0, b"key", 0, b"value0").await;
-        write_entry(&storage, 0, b"key", 1, b"value1").await;
-        // Entries in segment 1
-        write_entry(&storage, 1, b"key", 100, b"value100").await;
-        write_entry(&storage, 1, b"key", 101, b"value101").await;
+        // Entries in segment 0 (start_seq = 0)
+        write_entry(&storage, 0, b"key", 0, b"value0", 0).await;
+        write_entry(&storage, 0, b"key", 1, b"value1", 0).await;
+        // Entries in segment 1 (start_seq = 100)
+        write_entry(&storage, 1, b"key", 100, b"value100", 100).await;
+        write_entry(&storage, 1, b"key", 101, b"value101", 100).await;
 
         let segments = vec![
             LogSegment::new(0, SegmentMeta::new(0, 1000)),
@@ -539,10 +554,10 @@ mod tests {
     #[tokio::test]
     async fn should_filter_by_sequence_range() {
         let storage = Arc::new(InMemoryStorage::new());
-        write_entry(&storage, 0, b"key", 0, b"value0").await;
-        write_entry(&storage, 0, b"key", 1, b"value1").await;
-        write_entry(&storage, 0, b"key", 2, b"value2").await;
-        write_entry(&storage, 0, b"key", 3, b"value3").await;
+        write_entry(&storage, 0, b"key", 0, b"value0", 0).await;
+        write_entry(&storage, 0, b"key", 1, b"value1", 0).await;
+        write_entry(&storage, 0, b"key", 2, b"value2", 0).await;
+        write_entry(&storage, 0, b"key", 3, b"value3", 0).await;
 
         let segments = vec![LogSegment::new(0, SegmentMeta::new(0, 1000))];
 
@@ -560,10 +575,10 @@ mod tests {
     #[tokio::test]
     async fn should_filter_entries_for_specified_key() {
         let storage = Arc::new(InMemoryStorage::new());
-        write_entry(&storage, 0, b"key1", 0, b"k1v0").await;
-        write_entry(&storage, 0, b"key2", 0, b"k2v0").await;
-        write_entry(&storage, 0, b"key1", 1, b"k1v1").await;
-        write_entry(&storage, 0, b"key2", 1, b"k2v1").await;
+        write_entry(&storage, 0, b"key1", 0, b"k1v0", 0).await;
+        write_entry(&storage, 0, b"key2", 0, b"k2v0", 0).await;
+        write_entry(&storage, 0, b"key1", 1, b"k1v1", 0).await;
+        write_entry(&storage, 0, b"key2", 1, b"k2v1", 0).await;
 
         let segments = vec![LogSegment::new(0, SegmentMeta::new(0, 1000))];
 
@@ -583,8 +598,8 @@ mod tests {
     #[tokio::test]
     async fn should_return_none_when_no_entries_in_range() {
         let storage = Arc::new(InMemoryStorage::new());
-        write_entry(&storage, 0, b"key", 0, b"value0").await;
-        write_entry(&storage, 0, b"key", 1, b"value1").await;
+        write_entry(&storage, 0, b"key", 0, b"value0", 0).await;
+        write_entry(&storage, 0, b"key", 1, b"value1", 0).await;
 
         let segments = vec![LogSegment::new(0, SegmentMeta::new(0, 1000))];
 
