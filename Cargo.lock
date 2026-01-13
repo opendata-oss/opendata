@@ -3501,6 +3501,8 @@ dependencies = [
  "prometheus-client",
  "promql-parser",
  "prost",
+ "regex",
+ "regex-syntax",
  "reqwest",
  "roaring 0.7.0",
  "rstest",
