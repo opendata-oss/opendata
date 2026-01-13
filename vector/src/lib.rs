@@ -34,14 +34,12 @@
 
 pub mod db;
 pub mod delta;
-pub mod dictionary;
 pub mod model;
 pub mod serde;
 pub(crate) mod storage;
 
 // Public API exports
 pub use db::VectorDb;
-pub use dictionary::Dictionary;
 pub use model::{
     Attribute, AttributeValue, Config, DistanceMetric, FieldType, MetadataFieldSpec, Vector,
     VectorBuilder,

@@ -7,7 +7,7 @@
 //! ## Key Design
 //!
 //! - Delta is keyed by **external_id** (String), not internal ID
-//! - Dictionary is **read-only** during delta building
+//! - ID dictionary lookups happen at flush time, not during write
 //! - No ID allocation during write() - deferred to flush time
 //! - Later writes to the same external_id override earlier ones
 

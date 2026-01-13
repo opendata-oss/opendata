@@ -13,17 +13,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use common::sequence::{SeqBlockStore, SequenceAllocator};
 use common::storage::{Storage, StorageRead};
 use roaring::RoaringTreemap;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::delta::{VectorDbDelta, VectorDbDeltaBuilder};
-use crate::dictionary::Dictionary;
 use crate::model::{Config, Vector};
 use crate::serde::key::SeqBlockKey;
-use crate::storage::VectorDbStorageExt;
+use crate::storage::{VectorDbStorageExt, VectorDbStorageReadExt};
 
 /// Vector database for storing and querying embedding vectors.
 ///
@@ -33,7 +31,6 @@ use crate::storage::VectorDbStorageExt;
 pub struct VectorDb {
     config: Config,
     storage: Arc<dyn Storage>,
-    dictionary: Arc<Dictionary>,
     id_allocator: Arc<SequenceAllocator>,
 
     /// Pending delta accumulating ingested data not yet flushed to storage.
@@ -60,9 +57,6 @@ impl VectorDb {
     pub async fn open(config: Config) -> Result<Self> {
         let storage = Arc::clone(&config.storage);
 
-        // Initialize dictionary for external ID → internal ID mapping
-        let dictionary = Arc::new(Dictionary::new(Arc::clone(&storage)).await?);
-
         // Initialize sequence allocator for internal ID generation
         let seq_key = SeqBlockKey.encode();
         let block_store = SeqBlockStore::new(Arc::clone(&storage), seq_key);
@@ -78,7 +72,6 @@ impl VectorDb {
         Ok(Self {
             config,
             storage,
-            dictionary,
             id_allocator,
             pending_delta: Mutex::new(VectorDbDelta::empty()),
             pending_delta_watch_tx: tx,
@@ -146,12 +139,12 @@ impl VectorDb {
     /// # Atomic Flush
     ///
     /// The flush operation is atomic:
-    /// 1. Lookup old internal IDs from dictionary (if they exist)
+    /// 1. Lookup old internal IDs from storage (if they exist)
     /// 2. Allocate new internal IDs from sequence allocator
-    /// 3. Build all RecordOps (dictionary updates, deletes, new records)
+    /// 3. Build all RecordOps (ID dictionary updates, deletes, new records)
     /// 4. Apply everything in one atomic batch via `storage.apply()`
     ///
-    /// This ensures dictionary updates, deletes, and new records are all
+    /// This ensures ID dictionary updates, deletes, and new records are all
     /// applied together, maintaining consistency.
     pub async fn flush(&self) -> Result<()> {
         let _flush_guard = self.flush_mutex.lock().await;
@@ -185,9 +178,8 @@ impl VectorDb {
         let mut deleted_vectors = RoaringTreemap::new();
 
         for (external_id, pending_vec) in delta.vectors {
-            // 1. Lookup old internal_id (if exists)
-            let external_id_bytes = Bytes::from(external_id.clone());
-            let old_internal_id = self.dictionary.lookup(external_id_bytes.clone()).await?;
+            // 1. Lookup old internal_id (if exists) from ID dictionary
+            let old_internal_id = self.storage.lookup_internal_id(&external_id).await?;
 
             // 2. Allocate new internal_id
             let new_internal_id = self.id_allocator.allocate_one().await?;

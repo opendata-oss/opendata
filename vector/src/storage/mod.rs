@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::BytesMut;
 use common::storage::RecordOp;
@@ -17,6 +17,21 @@ pub(crate) mod merge_operator;
 /// Extension trait for StorageRead that provides vector database-specific loading methods.
 #[async_trait]
 pub(crate) trait VectorDbStorageReadExt: StorageRead {
+    /// Look up internal ID from external ID in the ID dictionary.
+    async fn lookup_internal_id(&self, external_id: &str) -> Result<Option<u64>> {
+        let key = IdDictionaryKey::new(external_id).encode();
+        let record = self.get(key).await?;
+        match record {
+            Some(record) => {
+                let mut slice = record.value.as_ref();
+                let internal_id = common::serde::encoding::decode_u64(&mut slice)
+                    .context("failed to decode internal ID from ID dictionary")?;
+                Ok(Some(internal_id))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Load a vector's data by internal ID.
     async fn get_vector_data(&self, internal_id: u64) -> Result<Option<VectorDataValue>> {
         let key = VectorDataKey::new(internal_id).encode();
