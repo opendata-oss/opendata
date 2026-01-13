@@ -53,38 +53,38 @@ pub const DEFAULT_BLOCK_SIZE: u64 = 4096;
 
 /// Error type for sequence allocation operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SeqBlockError {
+pub enum SequenceError {
     /// Storage operation failed
     Storage(StorageError),
     /// Deserialization failed
     Deserialize(DeserializeError),
 }
 
-impl std::error::Error for SeqBlockError {}
+impl std::error::Error for SequenceError {}
 
-impl std::fmt::Display for SeqBlockError {
+impl std::fmt::Display for SequenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            SeqBlockError::Storage(e) => write!(f, "storage error: {}", e),
-            SeqBlockError::Deserialize(e) => write!(f, "deserialize error: {}", e),
+            SequenceError::Storage(e) => write!(f, "storage error: {}", e),
+            SequenceError::Deserialize(e) => write!(f, "deserialize error: {}", e),
         }
     }
 }
 
-impl From<StorageError> for SeqBlockError {
+impl From<StorageError> for SequenceError {
     fn from(err: StorageError) -> Self {
-        SeqBlockError::Storage(err)
+        SequenceError::Storage(err)
     }
 }
 
-impl From<DeserializeError> for SeqBlockError {
+impl From<DeserializeError> for SequenceError {
     fn from(err: DeserializeError) -> Self {
-        SeqBlockError::Deserialize(err)
+        SequenceError::Deserialize(err)
     }
 }
 
 /// Result type alias for sequence allocation operations.
-pub type SeqBlockResult<T> = std::result::Result<T, SeqBlockError>;
+pub type SequenceResult<T> = std::result::Result<T, SequenceError>;
 
 /// Persists and retrieves sequence block allocations.
 ///
@@ -126,7 +126,7 @@ impl SeqBlockStore {
     /// Initializes the store by reading the last allocated block from storage.
     ///
     /// This must be called once at startup before calling [`allocate`](Self::allocate).
-    pub async fn initialize(&self) -> SeqBlockResult<()> {
+    pub async fn initialize(&self) -> SequenceResult<()> {
         let block = match self.storage.get(self.key.clone()).await? {
             Some(record) => Some(SeqBlock::deserialize(&record.value)?),
             None => None,
@@ -145,7 +145,7 @@ impl SeqBlockStore {
     /// The new block starts immediately after the previous block (or at 0 for
     /// the first allocation). The block size is the maximum of `min_count` and
     /// [`DEFAULT_BLOCK_SIZE`]. The block is persisted to storage before returning.
-    pub async fn allocate(&self, min_count: u64) -> SeqBlockResult<SeqBlock> {
+    pub async fn allocate(&self, min_count: u64) -> SequenceResult<SeqBlock> {
         let mut last_block = self.last_block.lock().await;
 
         let base_sequence = match &*last_block {
@@ -219,7 +219,7 @@ impl SequenceAllocator {
     /// store, which reads the last allocated block from storage.
     ///
     /// After initialization, [`allocate`] can be called.
-    pub async fn initialize(&self) -> SeqBlockResult<()> {
+    pub async fn initialize(&self) -> SequenceResult<()> {
         self.block_store.initialize().await
     }
 
@@ -234,7 +234,7 @@ impl SequenceAllocator {
     /// Allocates a single sequence number.
     ///
     /// Convenience method equivalent to `allocate(1)`.
-    pub async fn allocate_one(&self) -> SeqBlockResult<u64> {
+    pub async fn allocate_one(&self) -> SequenceResult<u64> {
         self.allocate(1).await
     }
 
@@ -251,7 +251,7 @@ impl SequenceAllocator {
     /// # Errors
     ///
     /// Returns an error if block allocation fails (e.g., storage error).
-    pub async fn allocate(&self, count: u64) -> SeqBlockResult<u64> {
+    pub async fn allocate(&self, count: u64) -> SequenceResult<u64> {
         let mut block = self.block.lock().await;
 
         let remaining = block.remaining();

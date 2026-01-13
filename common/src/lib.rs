@@ -7,7 +7,7 @@ pub mod storage;
 pub use bytes::BytesRange;
 pub use clock::Clock;
 pub use sequence::{
-    DEFAULT_BLOCK_SIZE, SeqBlockError, SeqBlockResult, SeqBlockStore, SequenceAllocator,
+    DEFAULT_BLOCK_SIZE, SeqBlockStore, SequenceAllocator, SequenceError, SequenceResult,
 };
 pub use serde::seq_block::SeqBlock;
 pub use storage::config::StorageConfig;

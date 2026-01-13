@@ -180,8 +180,8 @@ pub struct SeqBlockStore { /* ... */ }
 
 impl SeqBlockStore {
     pub fn new(storage: Arc<dyn Storage>, key: Bytes) -> Self;
-    pub async fn initialize(&self) -> SeqBlockResult<()>;
-    pub async fn allocate(&self, min_count: u64) -> SeqBlockResult<SeqBlock>;
+    pub async fn initialize(&self) -> SequenceResult<()>;
+    pub async fn allocate(&self, min_count: u64) -> SequenceResult<SeqBlock>;
     pub async fn last_block(&self) -> Option<SeqBlock>;
 }
 
@@ -190,9 +190,9 @@ pub struct SequenceAllocator { /* ... */ }
 
 impl SequenceAllocator {
     pub fn new(block_store: SeqBlockStore) -> Self;
-    pub async fn initialize(&self) -> SeqBlockResult<()>;
-    pub async fn allocate(&self, count: u64) -> SeqBlockResult<u64>;
-    pub async fn allocate_one(&self) -> SeqBlockResult<u64>;
+    pub async fn initialize(&self) -> SequenceResult<()>;
+    pub async fn allocate(&self, count: u64) -> SequenceResult<u64>;
+    pub async fn allocate_one(&self) -> SequenceResult<u64>;
     pub async fn peek_next_sequence(&self) -> u64;
 }
 
