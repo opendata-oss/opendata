@@ -16,3 +16,8 @@ serde.workspace = true
 tokio.workspace = true
 serde_yaml.workspace = true
 proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "varint"
+harness = false
