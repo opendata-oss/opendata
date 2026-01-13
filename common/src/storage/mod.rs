@@ -31,6 +31,7 @@ impl Record {
 pub enum RecordOp {
     Put(Record),
     Merge(Record),
+    Delete(Bytes),
 }
 
 /// Options for write operations.

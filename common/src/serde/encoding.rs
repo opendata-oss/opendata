@@ -159,6 +159,29 @@ pub fn validate_fixed_element_array_len(
     Ok(buf_len / element_size)
 }
 
+/// Encode a u64 value as 8-byte little-endian.
+///
+/// Format: 8 bytes in little-endian byte order
+pub fn encode_u64(value: u64, buf: &mut BytesMut) {
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Decode a u64 value from 8-byte little-endian.
+///
+/// Format: 8 bytes in little-endian byte order
+pub fn decode_u64(buf: &mut &[u8]) -> Result<u64, EncodingError> {
+    if buf.len() < 8 {
+        return Err(EncodingError {
+            message: format!("Buffer too short for u64: need 8 bytes, have {}", buf.len()),
+        });
+    }
+    let bytes: [u8; 8] = buf[..8].try_into().map_err(|_| EncodingError {
+        message: "Failed to extract 8 bytes for u64".to_string(),
+    })?;
+    *buf = &buf[8..];
+    Ok(u64::from_le_bytes(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +260,69 @@ mod tests {
         // when
         let mut slice = buf.as_ref();
         let result = decode_utf8(&mut slice);
+
+        // then
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("Buffer too short"));
+    }
+
+    #[test]
+    fn should_encode_and_decode_u64() {
+        // given
+        let value = 0x0123456789ABCDEFu64;
+        let mut buf = BytesMut::new();
+
+        // when
+        encode_u64(value, &mut buf);
+        let mut slice = buf.as_ref();
+        let decoded = decode_u64(&mut slice).unwrap();
+
+        // then
+        assert_eq!(decoded, value);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
+    fn should_encode_and_decode_u64_zero() {
+        // given
+        let value = 0u64;
+        let mut buf = BytesMut::new();
+
+        // when
+        encode_u64(value, &mut buf);
+        let mut slice = buf.as_ref();
+        let decoded = decode_u64(&mut slice).unwrap();
+
+        // then
+        assert_eq!(decoded, value);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
+    fn should_encode_and_decode_u64_max() {
+        // given
+        let value = u64::MAX;
+        let mut buf = BytesMut::new();
+
+        // when
+        encode_u64(value, &mut buf);
+        let mut slice = buf.as_ref();
+        let decoded = decode_u64(&mut slice).unwrap();
+
+        // then
+        assert_eq!(decoded, value);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
+    fn should_return_error_for_truncated_u64() {
+        // given
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[1, 2, 3]); // only 3 bytes
+
+        // when
+        let mut slice = buf.as_ref();
+        let result = decode_u64(&mut slice);
 
         // then
         assert!(result.is_err());
