@@ -17,7 +17,7 @@
 //! # Record Types
 //!
 //! - `LogEntry` (0x01): User data entries with key and sequence number
-//! - `SeqBlock` (0x02): Sequence number block allocation tracking
+//! - `SeqBlock` (0x02): Sequence number block allocation tracking (value type in `common` crate)
 //!
 //! # TerminatedBytes Encoding
 //!
@@ -230,111 +230,6 @@ impl LogEntryKey {
     }
 }
 
-/// Key for the SeqBlock record (static, singleton key).
-///
-/// ```text
-/// | version (u8) | type (u8) |
-/// ```
-///
-/// There is exactly one SeqBlock record in the database.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LastSeqBlockKey;
-
-impl LastSeqBlockKey {
-    /// Encodes the SeqBlock key
-    pub fn serialize(&self) -> Bytes {
-        Bytes::from(vec![KEY_VERSION, RecordType::SeqBlock.id()])
-    }
-
-    /// Decodes and validates a SeqBlock key
-    pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
-        if data.len() < 2 {
-            return Err(Error::Encoding(
-                "buffer too short for SeqBlock key".to_string(),
-            ));
-        }
-
-        if data[0] != KEY_VERSION {
-            return Err(Error::Encoding(format!(
-                "invalid key version: expected 0x{:02x}, got 0x{:02x}",
-                KEY_VERSION, data[0]
-            )));
-        }
-
-        let record_type = RecordType::from_id(data[1])?;
-        if record_type != RecordType::SeqBlock {
-            return Err(Error::Encoding(format!(
-                "invalid record type: expected SeqBlock, got {:?}",
-                record_type
-            )));
-        }
-
-        Ok(LastSeqBlockKey)
-    }
-}
-
-/// Value for the SeqBlock record.
-///
-/// Stores the current sequence block allocation:
-///
-/// ```text
-/// | base_sequence (u64 BE) | block_size (u64 BE) |
-/// ```
-///
-/// The allocated range is `[base_sequence, base_sequence + block_size)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SeqBlock {
-    /// Base sequence number of the allocated block
-    pub base_sequence: u64,
-    /// Size of the allocated block
-    pub block_size: u64,
-}
-
-impl SeqBlock {
-    /// Creates a new SeqBlock value
-    pub fn new(base_sequence: u64, block_size: u64) -> Self {
-        Self {
-            base_sequence,
-            block_size,
-        }
-    }
-
-    /// Encodes the value to bytes
-    pub fn serialize(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(16);
-        buf.put_u64(self.base_sequence);
-        buf.put_u64(self.block_size);
-        buf.freeze()
-    }
-
-    /// Decodes a SeqBlock value from bytes
-    pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
-        if data.len() < 16 {
-            return Err(Error::Encoding(format!(
-                "buffer too short for SeqBlock value: need 16 bytes, got {}",
-                data.len()
-            )));
-        }
-
-        let base_sequence = u64::from_be_bytes([
-            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-        ]);
-        let block_size = u64::from_be_bytes([
-            data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
-        ]);
-
-        Ok(SeqBlock {
-            base_sequence,
-            block_size,
-        })
-    }
-
-    /// Returns the next sequence number after this block
-    pub fn next_base(&self) -> u64 {
-        self.base_sequence + self.block_size
-    }
-}
-
 /// Segment identifier type.
 pub type SegmentId = u32;
 
@@ -490,90 +385,6 @@ mod tests {
 
         // then
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn should_serialize_and_deserialize_seq_block_key() {
-        // given
-        let key = LastSeqBlockKey;
-
-        // when
-        let serialized = key.serialize();
-        let deserialized = LastSeqBlockKey::deserialize(&serialized).unwrap();
-
-        // then
-        assert_eq!(deserialized, key);
-        assert_eq!(serialized.len(), 2);
-        assert_eq!(serialized[0], KEY_VERSION);
-        assert_eq!(serialized[1], RecordType::SeqBlock.id());
-    }
-
-    #[test]
-    fn should_fail_deserialize_seq_block_key_with_wrong_type() {
-        // given
-        let data = vec![KEY_VERSION, RecordType::LogEntry.id()];
-
-        // when
-        let result = LastSeqBlockKey::deserialize(&data);
-
-        // then
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn should_serialize_and_deserialize_seq_block_value() {
-        // given
-        let value = SeqBlock::new(1000, 100);
-
-        // when
-        let serialized = value.serialize();
-        let deserialized = SeqBlock::deserialize(&serialized).unwrap();
-
-        // then
-        assert_eq!(deserialized, value);
-        assert_eq!(serialized.len(), 16);
-    }
-
-    #[test]
-    fn should_calculate_next_base() {
-        // given
-        let value = SeqBlock::new(1000, 100);
-
-        // when
-        let next = value.next_base();
-
-        // then
-        assert_eq!(next, 1100);
-    }
-
-    #[test]
-    fn should_fail_deserialize_seq_block_value_too_short() {
-        // given
-        let data = vec![0u8; 15]; // need 16 bytes
-
-        // when
-        let result = SeqBlock::deserialize(&data);
-
-        // then
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn should_serialize_seq_block_value_in_big_endian() {
-        // given
-        let value = SeqBlock::new(0x0102030405060708, 0x1112131415161718);
-
-        // when
-        let serialized = value.serialize();
-
-        // then
-        assert_eq!(
-            serialized.as_ref(),
-            &[
-                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // base_sequence
-                0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // block_size
-            ]
-        );
     }
 
     #[test]
