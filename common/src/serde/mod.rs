@@ -1,5 +1,6 @@
 //! Serialization utilities for OpenData.
 
+pub mod key_prefix;
 pub mod seq_block;
 pub mod terminated_bytes;
 pub mod varint;

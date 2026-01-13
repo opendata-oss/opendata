@@ -1,9 +1,10 @@
 // Key structures with big-endian encoding
 
 use super::*;
-use crate::model::{BucketSize, BucketStart, RecordTag, SeriesFingerprint, SeriesId};
+use crate::model::{BucketSize, BucketStart, SeriesFingerprint, SeriesId};
 use bytes::{Bytes, BytesMut};
 use common::BytesRange;
+use common::serde::key_prefix::KeyPrefix;
 
 /// BucketList key (global-scoped)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,36 +12,21 @@ pub struct BucketListKey;
 
 impl BucketListKey {
     pub fn encode(&self) -> Bytes {
-        Bytes::from(vec![
-            KEY_VERSION,
-            RecordTag::new_global_scoped(RecordType::BucketList).as_byte(),
-        ])
+        RecordType::BucketList.prefix().to_bytes()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 2 {
-            return Err(EncodingError {
-                message: "Buffer too short for BucketListKey".to_string(),
-            });
-        }
-        if buf[0] != KEY_VERSION {
+        let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
+        let record_type = record_type_from_tag(prefix.tag())?;
+        if record_type != RecordType::BucketList {
             return Err(EncodingError {
                 message: format!(
-                    "Invalid key version: expected 0x{:02x}, got 0x{:02x}",
-                    KEY_VERSION, buf[0]
+                    "invalid record type: expected BucketList, got {:?}",
+                    record_type
                 ),
             });
         }
-        let record_tag = RecordTag::from_byte(buf[1])?;
-        if record_tag.record_type()? != RecordType::BucketList {
-            return Err(EncodingError {
-                message: format!(
-                    "Invalid record type: expected BucketList, got {:?}",
-                    record_tag.record_type()?
-                ),
-            });
-        }
-        if record_tag.bucket_size().is_some() {
+        if bucket_size_from_tag(prefix.tag()).is_some() {
             return Err(EncodingError {
                 message: "BucketListKey should be global-scoped (bucket_size should be None)"
                     .to_string(),
@@ -61,10 +47,9 @@ pub struct SeriesDictionaryKey {
 impl SeriesDictionaryKey {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        buf.extend_from_slice(&[
-            KEY_VERSION,
-            RecordTag::new_bucket_scoped(RecordType::SeriesDictionary, self.bucket_size).as_byte(),
-        ]);
+        RecordType::SeriesDictionary
+            .prefix_with_bucket_size(self.bucket_size)
+            .write_to(&mut buf);
         buf.extend_from_slice(&self.time_bucket.to_be_bytes());
         buf.extend_from_slice(&self.series_fingerprint.to_be_bytes());
         buf.freeze()
@@ -76,24 +61,17 @@ impl SeriesDictionaryKey {
                 message: "Buffer too short for SeriesDictionaryKey".to_string(),
             });
         }
-        if buf[0] != KEY_VERSION {
+        let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
+        let record_type = record_type_from_tag(prefix.tag())?;
+        if record_type != RecordType::SeriesDictionary {
             return Err(EncodingError {
                 message: format!(
-                    "Invalid key version: expected 0x{:02x}, got 0x{:02x}",
-                    KEY_VERSION, buf[0]
+                    "invalid record type: expected SeriesDictionary, got {:?}",
+                    record_type
                 ),
             });
         }
-        let record_tag = RecordTag::from_byte(buf[1])?;
-        if record_tag.record_type()? != RecordType::SeriesDictionary {
-            return Err(EncodingError {
-                message: format!(
-                    "Invalid record type: expected SeriesDictionary, got {:?}",
-                    record_tag.record_type()?
-                ),
-            });
-        }
-        let bucket_size = record_tag.bucket_size().ok_or_else(|| EncodingError {
+        let bucket_size = bucket_size_from_tag(prefix.tag()).ok_or_else(|| EncodingError {
             message: "SeriesDictionaryKey should be bucket-scoped".to_string(),
         })?;
 
@@ -135,10 +113,9 @@ pub struct ForwardIndexKey {
 impl ForwardIndexKey {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        buf.extend_from_slice(&[
-            KEY_VERSION,
-            RecordTag::new_bucket_scoped(RecordType::ForwardIndex, self.bucket_size).as_byte(),
-        ]);
+        RecordType::ForwardIndex
+            .prefix_with_bucket_size(self.bucket_size)
+            .write_to(&mut buf);
         buf.extend_from_slice(&self.time_bucket.to_be_bytes());
         buf.extend_from_slice(&self.series_id.to_be_bytes());
         buf.freeze()
@@ -150,24 +127,17 @@ impl ForwardIndexKey {
                 message: "Buffer too short for ForwardIndexKey".to_string(),
             });
         }
-        if buf[0] != KEY_VERSION {
+        let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
+        let record_type = record_type_from_tag(prefix.tag())?;
+        if record_type != RecordType::ForwardIndex {
             return Err(EncodingError {
                 message: format!(
-                    "Invalid key version: expected 0x{:02x}, got 0x{:02x}",
-                    KEY_VERSION, buf[0]
+                    "invalid record type: expected ForwardIndex, got {:?}",
+                    record_type
                 ),
             });
         }
-        let record_tag = RecordTag::from_byte(buf[1])?;
-        if record_tag.record_type()? != RecordType::ForwardIndex {
-            return Err(EncodingError {
-                message: format!(
-                    "Invalid record type: expected ForwardIndex, got {:?}",
-                    record_tag.record_type()?
-                ),
-            });
-        }
-        let bucket_size = record_tag.bucket_size().ok_or_else(|| EncodingError {
+        let bucket_size = bucket_size_from_tag(prefix.tag()).ok_or_else(|| EncodingError {
             message: "ForwardIndexKey should be bucket-scoped".to_string(),
         })?;
 
@@ -207,10 +177,9 @@ pub struct InvertedIndexKey {
 impl InvertedIndexKey {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        buf.extend_from_slice(&[
-            KEY_VERSION,
-            RecordTag::new_bucket_scoped(RecordType::InvertedIndex, self.bucket_size).as_byte(),
-        ]);
+        RecordType::InvertedIndex
+            .prefix_with_bucket_size(self.bucket_size)
+            .write_to(&mut buf);
         buf.extend_from_slice(&self.time_bucket.to_be_bytes());
         encode_utf8(&self.attribute, &mut buf);
         encode_utf8(&self.value, &mut buf);
@@ -221,10 +190,9 @@ impl InvertedIndexKey {
     /// within a given bucket. This allows efficient scanning for all values of a label.
     pub fn attribute_range(bucket: &crate::model::TimeBucket, attribute: &str) -> BytesRange {
         let mut buf = BytesMut::new();
-        buf.extend_from_slice(&[
-            KEY_VERSION,
-            RecordTag::new_bucket_scoped(RecordType::InvertedIndex, bucket.size).as_byte(),
-        ]);
+        RecordType::InvertedIndex
+            .prefix_with_bucket_size(bucket.size)
+            .write_to(&mut buf);
         buf.extend_from_slice(&bucket.start.to_be_bytes());
         encode_utf8(attribute, &mut buf);
         BytesRange::prefix(buf.freeze())
@@ -236,24 +204,17 @@ impl InvertedIndexKey {
                 message: "Buffer too short for InvertedIndexKey".to_string(),
             });
         }
-        if buf[0] != KEY_VERSION {
+        let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
+        let record_type = record_type_from_tag(prefix.tag())?;
+        if record_type != RecordType::InvertedIndex {
             return Err(EncodingError {
                 message: format!(
-                    "Invalid key version: expected 0x{:02x}, got 0x{:02x}",
-                    KEY_VERSION, buf[0]
+                    "invalid record type: expected InvertedIndex, got {:?}",
+                    record_type
                 ),
             });
         }
-        let record_tag = RecordTag::from_byte(buf[1])?;
-        if record_tag.record_type()? != RecordType::InvertedIndex {
-            return Err(EncodingError {
-                message: format!(
-                    "Invalid record type: expected InvertedIndex, got {:?}",
-                    record_tag.record_type()?
-                ),
-            });
-        }
-        let bucket_size = record_tag.bucket_size().ok_or_else(|| EncodingError {
+        let bucket_size = bucket_size_from_tag(prefix.tag()).ok_or_else(|| EncodingError {
             message: "InvertedIndexKey should be bucket-scoped".to_string(),
         })?;
 
@@ -297,10 +258,9 @@ pub struct TimeSeriesKey {
 impl TimeSeriesKey {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        buf.extend_from_slice(&[
-            KEY_VERSION,
-            RecordTag::new_bucket_scoped(RecordType::TimeSeries, self.bucket_size).as_byte(),
-        ]);
+        RecordType::TimeSeries
+            .prefix_with_bucket_size(self.bucket_size)
+            .write_to(&mut buf);
         buf.extend_from_slice(&self.time_bucket.to_be_bytes());
         buf.extend_from_slice(&self.series_id.to_be_bytes());
         buf.freeze()
@@ -312,24 +272,17 @@ impl TimeSeriesKey {
                 message: "Buffer too short for TimeSeriesKey".to_string(),
             });
         }
-        if buf[0] != KEY_VERSION {
+        let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
+        let record_type = record_type_from_tag(prefix.tag())?;
+        if record_type != RecordType::TimeSeries {
             return Err(EncodingError {
                 message: format!(
-                    "Invalid key version: expected 0x{:02x}, got 0x{:02x}",
-                    KEY_VERSION, buf[0]
+                    "invalid record type: expected TimeSeries, got {:?}",
+                    record_type
                 ),
             });
         }
-        let record_tag = RecordTag::from_byte(buf[1])?;
-        if record_tag.record_type()? != RecordType::TimeSeries {
-            return Err(EncodingError {
-                message: format!(
-                    "Invalid record type: expected TimeSeries, got {:?}",
-                    record_tag.record_type()?
-                ),
-            });
-        }
-        let bucket_size = record_tag.bucket_size().ok_or_else(|| EncodingError {
+        let bucket_size = bucket_size_from_tag(prefix.tag()).ok_or_else(|| EncodingError {
             message: "TimeSeriesKey should be bucket-scoped".to_string(),
         })?;
 
