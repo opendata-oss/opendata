@@ -157,7 +157,7 @@ impl From<bool> for AttributeValue {
 }
 
 /// Configuration for a VectorDb instance.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// Storage backend configuration.
     pub storage: Arc<dyn Storage>,

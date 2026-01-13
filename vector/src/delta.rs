@@ -13,9 +13,8 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use crate::dictionary::Dictionary;
 use crate::model::{AttributeValue, Config, Vector, attributes_to_map};
 
 /// Builder for accumulating vector writes into a delta.
@@ -24,13 +23,12 @@ use crate::model::{AttributeValue, Config, Vector, attributes_to_map};
 /// internal IDs. ID allocation happens atomically during flush.
 pub(crate) struct VectorDbDeltaBuilder<'a> {
     config: &'a Config,
-    dictionary: &'a Dictionary,
     pending_vectors: HashMap<String, PendingVector>,
 }
 
 /// A pending vector write buffered in memory.
 #[derive(Debug, Clone)]
-struct PendingVector {
+pub(crate) struct PendingVector {
     external_id: String,
     values: Vec<f32>,
     metadata: HashMap<String, AttributeValue>,
@@ -38,10 +36,9 @@ struct PendingVector {
 
 impl<'a> VectorDbDeltaBuilder<'a> {
     /// Creates a new delta builder.
-    pub(crate) fn new(config: &'a Config, dictionary: &'a Dictionary) -> Self {
+    pub(crate) fn new(config: &'a Config) -> Self {
         Self {
             config,
-            dictionary,
             pending_vectors: HashMap::new(),
         }
     }
@@ -205,9 +202,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    async fn create_test_builder() -> (Config, Dictionary, VectorDbDeltaBuilder<'static>) {
+    async fn create_test_builder() -> VectorDbDeltaBuilder<'static> {
         let storage: Arc<dyn common::Storage> = Arc::new(InMemoryStorage::new());
-        let dictionary = Dictionary::new(Arc::clone(&storage)).await.unwrap();
 
         let config = Config {
             storage: storage.clone(),
@@ -221,18 +217,15 @@ mod tests {
         };
 
         // Leak to get 'static lifetime for test
-        let config_static = Box::leak(Box::new(config.clone()));
-        let dict_static = Box::leak(Box::new(dictionary));
+        let config_static = Box::leak(Box::new(config));
 
-        let builder = VectorDbDeltaBuilder::new(config_static, dict_static);
-
-        (config, Dictionary::new(storage).await.unwrap(), builder)
+        VectorDbDeltaBuilder::new(config_static)
     }
 
     #[tokio::test]
     async fn should_write_valid_vector_to_delta() {
         // given
-        let (_config, _dict, mut builder) = create_test_builder().await;
+        let mut builder = create_test_builder().await;
         let vector = Vector::builder("vec-1", vec![1.0, 2.0, 3.0])
             .attribute("category", "shoes")
             .attribute("price", 99i64)
@@ -251,7 +244,7 @@ mod tests {
     #[tokio::test]
     async fn should_reject_vector_with_wrong_dimensions() {
         // given
-        let (_config, _dict, mut builder) = create_test_builder().await;
+        let mut builder = create_test_builder().await;
         let vector = Vector::new("vec-1", vec![1.0, 2.0]); // Wrong: 2 instead of 3
 
         // when
@@ -270,7 +263,7 @@ mod tests {
     #[tokio::test]
     async fn should_reject_vector_with_unknown_field() {
         // given
-        let (_config, _dict, mut builder) = create_test_builder().await;
+        let mut builder = create_test_builder().await;
         let vector = Vector::builder("vec-1", vec![1.0, 2.0, 3.0])
             .attribute("unknown_field", "value")
             .build();
@@ -286,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn should_reject_vector_with_wrong_type() {
         // given
-        let (_config, _dict, mut builder) = create_test_builder().await;
+        let mut builder = create_test_builder().await;
         let vector = Vector::builder("vec-1", vec![1.0, 2.0, 3.0])
             .attribute("price", "not a number") // Wrong: should be i64
             .build();
@@ -302,7 +295,7 @@ mod tests {
     #[tokio::test]
     async fn should_override_earlier_write_with_same_id() {
         // given
-        let (_config, _dict, mut builder) = create_test_builder().await;
+        let mut builder = create_test_builder().await;
         let vector1 = Vector::builder("vec-1", vec![1.0, 2.0, 3.0])
             .attribute("category", "shoes")
             .attribute("price", 99i64)
@@ -377,7 +370,7 @@ mod tests {
     #[tokio::test]
     async fn should_reject_external_id_too_long() {
         // given
-        let (_config, _dict, mut builder) = create_test_builder().await;
+        let mut builder = create_test_builder().await;
         let long_id = "a".repeat(65); // 65 bytes, exceeds max of 64
         let vector = Vector::new(long_id, vec![1.0, 2.0, 3.0]);
 
