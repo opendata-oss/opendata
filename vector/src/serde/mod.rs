@@ -8,7 +8,6 @@ pub mod id_dictionary;
 pub mod key;
 pub mod metadata_index;
 pub mod posting_list;
-pub mod seq_block;
 pub mod vector_data;
 pub mod vector_meta;
 
