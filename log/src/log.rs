@@ -9,88 +9,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use common::clock::{Clock, SystemClock};
 use common::storage::factory::create_storage;
-use common::{
-    BytesRange, Record as StorageRecord, Storage, StorageIterator, StorageRead,
-    WriteOptions as StorageWriteOptions,
-};
+use common::{Record as StorageRecord, Storage, WriteOptions as StorageWriteOptions};
 
 use crate::config::{CountOptions, ScanOptions, WriteOptions};
 use crate::error::{Error, Result};
-use crate::model::{LogEntry, Record};
-use crate::reader::LogRead;
+use crate::model::Record;
+use crate::reader::{LogIterator, LogIteratorBuilder, LogRead};
+use crate::segment::SegmentStore;
 use crate::sequence::{SeqBlockStore, SequenceAllocator};
 use crate::serde::LogEntryKey;
-
-/// An iterator over log entries for a specific key.
-///
-/// Created by [`LogRead::scan`] or [`LogRead::scan_with_options`]. Yields
-/// entries in sequence number order within the specified range.
-///
-/// # Streaming Behavior
-///
-/// The iterator fetches entries lazily as they are consumed. Large scans
-/// do not load all entries into memory at once.
-///
-/// # Example
-///
-/// ```ignore
-/// let mut iter = log.scan(Bytes::from("orders"), 100..);
-/// while let Some(entry) = iter.next().await? {
-///     process_entry(entry);
-/// }
-/// ```
-pub struct LogIterator {
-    /// The underlying storage iterator
-    inner: Box<dyn StorageIterator + Send>,
-}
-
-impl LogIterator {
-    /// Opens a new LogIterator for the given storage and key range.
-    ///
-    /// This initializes the underlying storage iterator immediately.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the storage iterator cannot be created.
-    pub(crate) async fn open(storage: Arc<dyn StorageRead>, range: BytesRange) -> Result<Self> {
-        let inner = storage
-            .scan_iter(range)
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    /// Advances the iterator and returns the next log entry.
-    ///
-    /// Returns `Ok(Some(entry))` if there is another entry in the range,
-    /// `Ok(None)` if the iteration is complete, or `Err` if an error occurred.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if there is a storage failure while reading entries.
-    pub async fn next(&mut self) -> Result<Option<LogEntry>> {
-        let inner = &mut self.inner;
-
-        // Get next record from storage
-        let Some(record) = inner
-            .next()
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?
-        else {
-            return Ok(None);
-        };
-
-        // Decode the key to get the user key and sequence
-        let entry_key = LogEntryKey::decode(&record.key)?;
-
-        Ok(Some(LogEntry {
-            key: entry_key.key,
-            sequence: entry_key.sequence,
-            value: record.value,
-        }))
-    }
-}
 
 /// The main log interface providing read and write operations.
 ///
@@ -139,7 +68,9 @@ impl LogIterator {
 /// ```
 pub struct Log {
     storage: Arc<dyn Storage>,
+    clock: Arc<dyn Clock>,
     sequence_allocator: SequenceAllocator,
+    segment_store: SegmentStore,
 }
 
 impl Log {
@@ -168,13 +99,20 @@ impl Log {
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
 
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+
         let block_store = SeqBlockStore::new(Arc::clone(&storage));
         let sequence_allocator = SequenceAllocator::new(block_store);
         sequence_allocator.initialize().await?;
 
+        let segment_store =
+            SegmentStore::open(Arc::clone(&storage), config.segmentation.clone()).await?;
+
         Ok(Self {
             storage,
+            clock,
             sequence_allocator,
+            segment_store,
         })
     }
 
@@ -250,14 +188,21 @@ impl Log {
             .allocate(records.len() as u64)
             .await?;
 
+        // Get the current segment, rolling if necessary
+        let current_time_ms = self.current_time_ms();
+        let segment = self
+            .segment_store
+            .ensure_latest(current_time_ms, base_sequence)
+            .await?;
+
         // Build storage records with encoded keys
         let storage_records: Vec<StorageRecord> = records
             .into_iter()
             .enumerate()
             .map(|(i, record)| {
                 let sequence = base_sequence + i as u64;
-                let entry_key = LogEntryKey::new(record.key, sequence);
-                StorageRecord::new(entry_key.encode(), record.value)
+                let entry_key = LogEntryKey::new(segment.id(), record.key, sequence);
+                StorageRecord::new(entry_key.serialize(), record.value)
             })
             .collect();
 
@@ -275,16 +220,46 @@ impl Log {
         Ok(())
     }
 
+    /// Returns the current time in milliseconds since Unix epoch.
+    fn current_time_ms(&self) -> i64 {
+        self.clock
+            .now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    }
+
+    /// Forces creation of a new segment, sealing the current one.
+    ///
+    /// This is an internal API for testing multi-segment scenarios. It forces
+    /// subsequent appends to write to a new segment, regardless of any
+    /// configured seal interval.
+    #[cfg(test)]
+    pub(crate) async fn seal_segment(&self) -> Result<()> {
+        let current_time_ms = self.current_time_ms();
+        let next_seq = self.sequence_allocator.peek_next_sequence().await;
+        self.segment_store
+            .seal_current(current_time_ms, next_seq)
+            .await?;
+        Ok(())
+    }
+
     /// Creates a Log from an existing storage implementation.
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn Storage>) -> Result<Self> {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+
         let block_store = SeqBlockStore::new(Arc::clone(&storage));
         let sequence_allocator = SequenceAllocator::new(block_store);
         sequence_allocator.initialize().await?;
 
+        let segment_store = SegmentStore::open(Arc::clone(&storage), Default::default()).await?;
+
         Ok(Self {
             storage,
+            clock,
             sequence_allocator,
+            segment_store,
         })
     }
 }
@@ -297,8 +272,9 @@ impl LogRead for Log {
         seq_range: impl RangeBounds<u64> + Send,
         _options: ScanOptions,
     ) -> Result<LogIterator> {
-        let range = LogEntryKey::scan_range(&key, seq_range);
-        LogIterator::open(Arc::clone(&self.storage) as Arc<dyn StorageRead>, range).await
+        LogIteratorBuilder::new(&self.segment_store, key, seq_range)
+            .build()
+            .await
     }
 
     async fn count_with_options(
@@ -321,6 +297,7 @@ mod tests {
     fn test_config() -> Config {
         Config {
             storage: StorageConfig::InMemory,
+            ..Default::default()
         }
     }
 
@@ -353,8 +330,8 @@ mod tests {
 
         // verify record was stored
         let stored = log.storage.scan(BytesRange::unbounded()).await.unwrap();
-        // Should have 2 records: the SeqBlock and the LogEntry
-        assert_eq!(stored.len(), 2);
+        // Should have 3 records: SeqBlock + SegmentMeta + LogEntry
+        assert_eq!(stored.len(), 3);
     }
 
     #[tokio::test]
@@ -384,13 +361,13 @@ mod tests {
 
         // verify records were stored with sequential sequence numbers
         let stored = log.storage.scan(BytesRange::unbounded()).await.unwrap();
-        // Should have 4 records: 1 SeqBlock + 3 LogEntries
-        assert_eq!(stored.len(), 4);
+        // Should have 5 records: SeqBlock + SegmentMeta + 3 LogEntries
+        assert_eq!(stored.len(), 5);
 
-        // Decode and verify sequence numbers
+        // Deserialize and verify sequence numbers
         let log_entries: Vec<_> = stored
             .iter()
-            .filter_map(|r| LogEntryKey::decode(&r.key).ok())
+            .filter_map(|r| LogEntryKey::deserialize(&r.key).ok())
             .collect();
         assert_eq!(log_entries.len(), 3);
         assert_eq!(log_entries[0].sequence, 0);
@@ -447,7 +424,7 @@ mod tests {
 
         let mut log_entries: Vec<_> = stored
             .iter()
-            .filter_map(|r| LogEntryKey::decode(&r.key).ok())
+            .filter_map(|r| LogEntryKey::deserialize(&r.key).ok())
             .collect();
         log_entries.sort_by_key(|e| e.sequence);
 
@@ -481,7 +458,7 @@ mod tests {
         let log_records: Vec<_> = stored
             .iter()
             .filter_map(|r| {
-                LogEntryKey::decode(&r.key)
+                LogEntryKey::deserialize(&r.key)
                     .ok()
                     .map(|k| (k, r.value.clone()))
             })
@@ -760,7 +737,7 @@ mod tests {
         .unwrap();
 
         // when - create LogReader sharing the same storage
-        let reader = LogReader::new(storage);
+        let reader = LogReader::new(storage).await.unwrap();
         let mut iter = reader.scan(Bytes::from("orders"), ..).await.unwrap();
         let mut entries = vec![];
         while let Some(entry) = iter.next().await.unwrap() {
@@ -775,5 +752,174 @@ mod tests {
         assert_eq!(entries[1].value, Bytes::from("order-2"));
         assert_eq!(entries[2].sequence, 2);
         assert_eq!(entries[2].value, Bytes::from("order-3"));
+    }
+
+    #[tokio::test]
+    async fn should_scan_across_multiple_segments() {
+        // given - log with entries across multiple segments
+        let log = Log::open(test_config()).await.unwrap();
+
+        // write to segment 0
+        log.append(vec![
+            Record {
+                key: Bytes::from("events"),
+                value: Bytes::from("event-0"),
+            },
+            Record {
+                key: Bytes::from("events"),
+                value: Bytes::from("event-1"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // seal and create segment 1
+        log.seal_segment().await.unwrap();
+
+        // write to segment 1
+        log.append(vec![
+            Record {
+                key: Bytes::from("events"),
+                value: Bytes::from("event-2"),
+            },
+            Record {
+                key: Bytes::from("events"),
+                value: Bytes::from("event-3"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when - scan all entries
+        let mut iter = log.scan(Bytes::from("events"), ..).await.unwrap();
+        let mut entries = vec![];
+        while let Some(entry) = iter.next().await.unwrap() {
+            entries.push(entry);
+        }
+
+        // then - should see all 4 entries in order
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].sequence, 0);
+        assert_eq!(entries[0].value, Bytes::from("event-0"));
+        assert_eq!(entries[1].sequence, 1);
+        assert_eq!(entries[1].value, Bytes::from("event-1"));
+        assert_eq!(entries[2].sequence, 2);
+        assert_eq!(entries[2].value, Bytes::from("event-2"));
+        assert_eq!(entries[3].sequence, 3);
+        assert_eq!(entries[3].value, Bytes::from("event-3"));
+    }
+
+    #[tokio::test]
+    async fn should_scan_range_spanning_segments() {
+        // given - log with entries across multiple segments
+        let log = Log::open(test_config()).await.unwrap();
+
+        // segment 0: seq 0, 1
+        log.append(vec![
+            Record {
+                key: Bytes::from("data"),
+                value: Bytes::from("seg0-0"),
+            },
+            Record {
+                key: Bytes::from("data"),
+                value: Bytes::from("seg0-1"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        log.seal_segment().await.unwrap();
+
+        // segment 1: seq 2, 3
+        log.append(vec![
+            Record {
+                key: Bytes::from("data"),
+                value: Bytes::from("seg1-2"),
+            },
+            Record {
+                key: Bytes::from("data"),
+                value: Bytes::from("seg1-3"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        log.seal_segment().await.unwrap();
+
+        // segment 2: seq 4, 5
+        log.append(vec![
+            Record {
+                key: Bytes::from("data"),
+                value: Bytes::from("seg2-4"),
+            },
+            Record {
+                key: Bytes::from("data"),
+                value: Bytes::from("seg2-5"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when - scan range 1..5 (spans segments 0, 1, 2)
+        let mut iter = log.scan(Bytes::from("data"), 1..5).await.unwrap();
+        let mut entries = vec![];
+        while let Some(entry) = iter.next().await.unwrap() {
+            entries.push(entry);
+        }
+
+        // then - should see entries 1, 2, 3, 4
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[1].sequence, 2);
+        assert_eq!(entries[2].sequence, 3);
+        assert_eq!(entries[3].sequence, 4);
+    }
+
+    #[tokio::test]
+    async fn should_scan_single_segment_in_multi_segment_log() {
+        // given - log with entries across multiple segments
+        let log = Log::open(test_config()).await.unwrap();
+
+        // segment 0: seq 0, 1
+        log.append(vec![
+            Record {
+                key: Bytes::from("key"),
+                value: Bytes::from("v0"),
+            },
+            Record {
+                key: Bytes::from("key"),
+                value: Bytes::from("v1"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        log.seal_segment().await.unwrap();
+
+        // segment 1: seq 2, 3
+        log.append(vec![
+            Record {
+                key: Bytes::from("key"),
+                value: Bytes::from("v2"),
+            },
+            Record {
+                key: Bytes::from("key"),
+                value: Bytes::from("v3"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when - scan only segment 1's range
+        let mut iter = log.scan(Bytes::from("key"), 2..4).await.unwrap();
+        let mut entries = vec![];
+        while let Some(entry) = iter.next().await.unwrap() {
+            entries.push(entry);
+        }
+
+        // then - should see only segment 1's entries
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sequence, 2);
+        assert_eq!(entries[1].sequence, 3);
     }
 }
