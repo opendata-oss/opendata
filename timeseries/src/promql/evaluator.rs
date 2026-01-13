@@ -64,7 +64,12 @@ impl<'a, R: QueryReader> Evaluator<'a, R> {
     }
 
     pub(crate) async fn evaluate(&self, stmt: EvalStmt) -> EvalResult<Vec<EvalSample>> {
-        assert_eq!(stmt.start, stmt.end);
+        if stmt.start != stmt.end {
+            return Err(EvaluationError::InternalError(format!(
+                "evaluation must always be done at an instant.got start({:?}), end({:?})",
+                stmt.start, stmt.end
+            )));
+        }
         let result = self
             .evaluate_expr(
                 &stmt.expr,
