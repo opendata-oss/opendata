@@ -37,6 +37,7 @@ pub mod delta;
 pub mod dictionary;
 pub mod model;
 pub mod serde;
+pub(crate) mod storage;
 
 // Public API exports
 pub use db::VectorDb;

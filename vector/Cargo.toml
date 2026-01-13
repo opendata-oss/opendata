@@ -5,9 +5,11 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 common.workspace = true
 bytes.workspace = true
 fail.workspace = true
 hnsw_rs = "0.3"
 roaring.workspace = true
+rstest.workspace = true
 tokio.workspace = true

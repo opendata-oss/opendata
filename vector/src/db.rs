@@ -286,44 +286,13 @@ mod tests {
     use crate::model::{MetadataFieldSpec, Vector};
     use crate::serde::FieldType;
     use crate::serde::collection_meta::DistanceMetric;
-    use common::storage::MergeOperator;
+    use crate::storage::merge_operator::VectorDbMergeOperator;
     use common::storage::in_memory::InMemoryStorage;
-    use std::io::Cursor;
     use std::time::Duration;
-
-    /// Simple merge operator that unions RoaringTreemaps.
-    /// This is used for posting lists and deleted bitmaps.
-    struct RoaringTreemapMergeOperator;
-
-    impl MergeOperator for RoaringTreemapMergeOperator {
-        fn merge(&self, _key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
-            // Deserialize new value
-            let new_bitmap = RoaringTreemap::deserialize_from(Cursor::new(new_value.as_ref()))
-                .expect("deserialize new bitmap");
-
-            // If there's an existing value, union it with the new value
-            let merged_bitmap = if let Some(existing) = existing_value {
-                let mut existing_bitmap =
-                    RoaringTreemap::deserialize_from(Cursor::new(existing.as_ref()))
-                        .expect("deserialize existing bitmap");
-                existing_bitmap |= &new_bitmap;
-                existing_bitmap
-            } else {
-                new_bitmap
-            };
-
-            // Serialize result
-            let mut buf = Vec::new();
-            merged_bitmap
-                .serialize_into(&mut buf)
-                .expect("serialize merged bitmap");
-            Bytes::from(buf)
-        }
-    }
 
     fn create_test_config() -> Config {
         let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            RoaringTreemapMergeOperator,
+            VectorDbMergeOperator,
         )));
         Config {
             storage,

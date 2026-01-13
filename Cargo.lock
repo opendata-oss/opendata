@@ -4176,11 +4176,13 @@ name = "vector"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "common",
  "fail",
  "hnsw_rs",
  "roaring 0.10.12",
+ "rstest",
  "tokio",
 ]
 
