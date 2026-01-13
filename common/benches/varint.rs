@@ -4,7 +4,7 @@
 //! encoding against fixed-length big-endian encoding for u32 and u64 values.
 
 use bytes::{BufMut, BytesMut};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use common::serde::varint::{var_u32, var_u64};
 
@@ -24,24 +24,24 @@ const U32_VALUES: &[u32] = &[
 
 /// Values spanning var_u64 length codes 0-8
 const U64_VALUES: &[u64] = &[
-    0,                          // length code 0 (1 byte)
-    15,                         // length code 0 boundary
-    16,                         // length code 1 (2 bytes)
-    4_095,                      // length code 1 boundary
-    4_096,                      // length code 2 (3 bytes)
-    1_048_575,                  // length code 2 boundary
-    1_048_576,                  // length code 3 (4 bytes)
-    268_435_455,                // length code 3 boundary
-    268_435_456,                // length code 4 (5 bytes)
-    68_719_476_735,             // length code 4 boundary
-    68_719_476_736,             // length code 5 (6 bytes)
-    17_592_186_044_415,         // length code 5 boundary
-    17_592_186_044_416,         // length code 6 (7 bytes)
-    4_503_599_627_370_495,      // length code 6 boundary
-    4_503_599_627_370_496,      // length code 7 (8 bytes)
-    1_152_921_504_606_846_975,  // length code 7 boundary
-    1_152_921_504_606_846_976,  // length code 8 (9 bytes)
-    u64::MAX,                   // length code 8 boundary
+    0,                         // length code 0 (1 byte)
+    15,                        // length code 0 boundary
+    16,                        // length code 1 (2 bytes)
+    4_095,                     // length code 1 boundary
+    4_096,                     // length code 2 (3 bytes)
+    1_048_575,                 // length code 2 boundary
+    1_048_576,                 // length code 3 (4 bytes)
+    268_435_455,               // length code 3 boundary
+    268_435_456,               // length code 4 (5 bytes)
+    68_719_476_735,            // length code 4 boundary
+    68_719_476_736,            // length code 5 (6 bytes)
+    17_592_186_044_415,        // length code 5 boundary
+    17_592_186_044_416,        // length code 6 (7 bytes)
+    4_503_599_627_370_495,     // length code 6 boundary
+    4_503_599_627_370_496,     // length code 7 (8 bytes)
+    1_152_921_504_606_846_975, // length code 7 boundary
+    1_152_921_504_606_846_976, // length code 8 (9 bytes)
+    u64::MAX,                  // length code 8 boundary
 ];
 
 fn fixed_u32_serialize(value: u32, buf: &mut BytesMut) {
