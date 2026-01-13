@@ -1,6 +1,8 @@
 //! Serialization utilities for OpenData.
 
+pub mod encoding;
 pub mod seq_block;
+pub mod sortable;
 pub mod terminated_bytes;
 
 /// Error type for deserialization failures.

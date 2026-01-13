@@ -4,3 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+common.workspace = true
+bytes.workspace = true
+roaring.workspace = true
