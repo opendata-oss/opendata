@@ -269,7 +269,7 @@ mod tests {
             vec![
                 MetadataField::string("s", "hello"),
                 MetadataField::int64("i", -42),
-                MetadataField::float64("f", 3.14),
+                MetadataField::float64("f", 1.23),
                 MetadataField::bool("b", false),
             ],
         );
@@ -281,7 +281,7 @@ mod tests {
         // then
         assert_eq!(decoded.get_string("s"), Some("hello"));
         assert_eq!(decoded.get_int64("i"), Some(-42));
-        assert_eq!(decoded.get_float64("f"), Some(3.14));
+        assert_eq!(decoded.get_float64("f"), Some(1.23));
         assert_eq!(decoded.get_bool("b"), Some(false));
     }
 

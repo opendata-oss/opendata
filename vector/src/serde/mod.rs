@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn should_encode_and_decode_f32() {
         // given
-        let value = 3.14159f32;
+        let value = 1.23456f32;
         let mut buf = BytesMut::new();
 
         // when

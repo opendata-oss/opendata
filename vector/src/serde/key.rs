@@ -611,7 +611,7 @@ mod tests {
     #[test]
     fn should_encode_and_decode_metadata_index_key_float64() {
         // given
-        let key = MetadataIndexKey::new("score", FieldValue::Float64(3.14));
+        let key = MetadataIndexKey::new("score", FieldValue::Float64(1.23));
 
         // when
         let encoded = key.encode();
