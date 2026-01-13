@@ -1,5 +1,5 @@
-use async_trait::async_trait;
 use anyhow::Result;
+use async_trait::async_trait;
 use bytes::BytesMut;
 use common::storage::RecordOp;
 use common::{Record, Storage, StorageRead};

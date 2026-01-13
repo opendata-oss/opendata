@@ -13,23 +13,17 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use bytes::{Bytes, BytesMut};
-use common::Record;
+use bytes::Bytes;
 use common::sequence::{SeqBlockStore, SequenceAllocator};
-use common::storage::{RecordOp, Storage, StorageRead};
+use common::storage::{Storage, StorageRead};
 use roaring::RoaringTreemap;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::delta::{VectorDbDelta, VectorDbDeltaBuilder};
 use crate::dictionary::Dictionary;
-use crate::model::{Config, Vector, attribute_value_to_field_value};
-use crate::serde::Encode;
-use crate::serde::key::{
-    IdDictionaryKey, PostingListKey, SeqBlockKey, VectorDataKey, VectorMetaKey,
-};
-use crate::serde::posting_list::PostingListValue;
-use crate::serde::vector_data::VectorDataValue;
-use crate::serde::vector_meta::{MetadataField, VectorMetaValue};
+use crate::model::{Config, Vector};
+use crate::serde::key::SeqBlockKey;
+use crate::storage::VectorDbStorageExt;
 
 /// Vector database for storing and querying embedding vectors.
 ///
@@ -200,16 +194,12 @@ impl VectorDb {
 
             // 3. Update IdDictionary
             if old_internal_id.is_some() {
-                ops.push(RecordOp::Delete(
-                    IdDictionaryKey::new(&external_id).encode(),
-                ));
+                ops.push(self.storage.delete_id_dictionary(&external_id)?);
             }
-            let mut id_value_buf = BytesMut::with_capacity(8);
-            new_internal_id.encode(&mut id_value_buf);
-            ops.push(RecordOp::Put(Record::new(
-                IdDictionaryKey::new(&external_id).encode(),
-                id_value_buf.freeze(),
-            )));
+            ops.push(
+                self.storage
+                    .put_id_dictionary(&external_id, new_internal_id)?,
+            );
 
             // 4. Handle old vector deletion (if upsert)
             if let Some(old_id) = old_internal_id {
@@ -217,31 +207,28 @@ impl VectorDb {
                 deleted_vectors.insert(old_id);
 
                 // Tombstone old records
-                ops.push(RecordOp::Delete(VectorDataKey::new(old_id).encode()));
-                ops.push(RecordOp::Delete(VectorMetaKey::new(old_id).encode()));
+                ops.push(self.storage.delete_vector_data(old_id)?);
+                ops.push(self.storage.delete_vector_meta(old_id)?);
             }
 
             // 5. Write new vector records
             // VectorData
-            let vector_data = VectorDataValue::new(pending_vec.values().to_vec());
-            ops.push(RecordOp::Put(Record::new(
-                VectorDataKey::new(new_internal_id).encode(),
-                vector_data.encode_to_bytes(),
-            )));
+            ops.push(
+                self.storage
+                    .put_vector_data(new_internal_id, pending_vec.values().to_vec())?,
+            );
 
             // VectorMeta
-            let fields: Vec<MetadataField> = pending_vec
+            let metadata: Vec<_> = pending_vec
                 .metadata()
                 .iter()
-                .map(|(name, value)| {
-                    MetadataField::new(name, attribute_value_to_field_value(value))
-                })
+                .map(|(name, value)| (name.clone(), value.clone()))
                 .collect();
-            let vector_meta = VectorMetaValue::new(pending_vec.external_id(), fields);
-            ops.push(RecordOp::Put(Record::new(
-                VectorMetaKey::new(new_internal_id).encode(),
-                vector_meta.encode_to_bytes(),
-            )));
+            ops.push(self.storage.put_vector_meta(
+                new_internal_id,
+                pending_vec.external_id(),
+                &metadata,
+            )?);
 
             // 6. Batch PostingList assignment to centroid_id=1 (STUB)
             // TODO: Real centroid assignment via HNSW
@@ -253,19 +240,11 @@ impl VectorDb {
 
         // Serialize and merge batched posting lists
         if !deleted_vectors.is_empty() {
-            let deleted_value = PostingListValue::from_treemap(deleted_vectors);
-            ops.push(RecordOp::Merge(Record::new(
-                PostingListKey::deleted_vectors().encode(),
-                deleted_value.encode_to_bytes()?,
-            )));
+            ops.push(self.storage.merge_deleted_vectors(deleted_vectors)?);
         }
 
         for (centroid_id, bitmap) in posting_lists {
-            let posting_value = PostingListValue::from_treemap(bitmap);
-            ops.push(RecordOp::Merge(Record::new(
-                PostingListKey::new(centroid_id).encode(),
-                posting_value.encode_to_bytes()?,
-            )));
+            ops.push(self.storage.merge_posting_list(centroid_id, bitmap)?);
         }
 
         // ATOMIC: Apply all operations in one batch
@@ -286,6 +265,8 @@ mod tests {
     use crate::model::{MetadataFieldSpec, Vector};
     use crate::serde::FieldType;
     use crate::serde::collection_meta::DistanceMetric;
+    use crate::serde::key::{IdDictionaryKey, VectorDataKey, VectorMetaKey};
+    use crate::serde::vector_data::VectorDataValue;
     use crate::storage::merge_operator::VectorDbMergeOperator;
     use common::storage::in_memory::InMemoryStorage;
     use std::time::Duration;

@@ -34,8 +34,8 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
             RecordTag::from_byte(key[1]).expect("Failed to decode record tag from key");
 
         let record_type_id = record_tag.record_type();
-        let record_type = RecordType::from_id(record_type_id)
-            .expect("Failed to get record type from record tag");
+        let record_type =
+            RecordType::from_id(record_type_id).expect("Failed to get record type from record tag");
 
         match record_type {
             RecordType::PostingList | RecordType::MetadataIndex => {
