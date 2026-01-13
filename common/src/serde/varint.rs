@@ -300,14 +300,14 @@ pub mod var_u64 {
 
     /// Thresholds for each length code. Value < THRESHOLDS[i] uses length code i.
     const THRESHOLDS: [u64; 9] = [
-        1 << 4,  // 16
-        1 << 12, // 4,096
-        1 << 20, // 1,048,576
-        1 << 28, // 268,435,456
-        1 << 36, // 68,719,476,736
-        1 << 44, // 17,592,186,044,416
-        1 << 52, // 4,503,599,627,370,496
-        1 << 60, // 1,152,921,504,606,846,976
+        1 << 4,   // 16
+        1 << 12,  // 4,096
+        1 << 20,  // 1,048,576
+        1 << 28,  // 268,435,456
+        1 << 36,  // 68,719,476,736
+        1 << 44,  // 17,592,186,044,416
+        1 << 52,  // 4,503,599,627,370,496
+        1 << 60,  // 1,152,921,504,606,846,976
         u64::MAX, // Sentinel: length code 8 covers all remaining values
     ];
 
@@ -504,7 +504,18 @@ pub mod var_u64 {
         fn should_fail_deserialize_invalid_length_code() {
             // Length codes 9-15 are invalid for u64
             for len_code in 9..=15u8 {
-                let data = &[len_code << 4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+                let data = &[
+                    len_code << 4,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                ];
                 let mut slice = &data[..];
                 assert!(deserialize(&mut slice).is_err());
             }

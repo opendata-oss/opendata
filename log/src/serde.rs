@@ -39,6 +39,7 @@ use std::ops::{Bound, RangeBounds};
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
 use common::serde::terminated_bytes;
+use common::serde::varint::var_u64;
 
 use crate::error::Error;
 
@@ -88,8 +89,11 @@ impl RecordType {
 /// that preserves lexicographic ordering:
 ///
 /// ```text
-/// | version (u8) | type (u8) | segment_id (u32 BE) | terminated_key | sequence (u64 BE) |
+/// | version (u8) | type (u8) | segment_id (u32 BE) | terminated_key | sequence (var_u64) |
 /// ```
+///
+/// The sequence number uses variable-length encoding (see [`common::serde::varint::var_u64`])
+/// to keep keys compact for small sequence numbers.
 ///
 /// The ordering (segment_id before key) ensures entries are grouped by segment,
 /// enabling efficient scans within a single segment.
@@ -120,7 +124,7 @@ impl LogEntryKey {
         buf.put_u8(RecordType::LogEntry.id());
         buf.put_u32(self.segment_id);
         terminated_bytes::serialize(&self.key, &mut buf);
-        buf.put_u64(self.sequence);
+        var_u64::serialize(self.sequence, &mut buf);
         buf.freeze()
     }
 
@@ -151,16 +155,7 @@ impl LogEntryKey {
 
         let mut buf = &data[6..];
         let key = terminated_bytes::deserialize(&mut buf)?;
-
-        if buf.len() < 8 {
-            return Err(Error::Encoding(
-                "buffer too short for sequence number".to_string(),
-            ));
-        }
-
-        let sequence = u64::from_be_bytes([
-            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-        ]);
+        let sequence = var_u64::deserialize(&mut buf)?;
 
         Ok(LogEntryKey {
             segment_id,
@@ -193,17 +188,17 @@ impl LogEntryKey {
         let start = match seq_range.start_bound() {
             Bound::Included(&seq) => {
                 let mut start_key = BytesMut::from(prefix.as_ref());
-                start_key.put_u64(seq);
+                var_u64::serialize(seq, &mut start_key);
                 Bound::Included(start_key.freeze())
             }
             Bound::Excluded(&seq) => {
                 let mut start_key = BytesMut::from(prefix.as_ref());
-                start_key.put_u64(seq);
+                var_u64::serialize(seq, &mut start_key);
                 Bound::Excluded(start_key.freeze())
             }
             Bound::Unbounded => {
                 let mut start_key = BytesMut::from(prefix.as_ref());
-                start_key.put_u64(0);
+                var_u64::serialize(0, &mut start_key);
                 Bound::Included(start_key.freeze())
             }
         };
@@ -211,17 +206,17 @@ impl LogEntryKey {
         let end = match seq_range.end_bound() {
             Bound::Included(&seq) => {
                 let mut end_key = BytesMut::from(prefix.as_ref());
-                end_key.put_u64(seq);
+                var_u64::serialize(seq, &mut end_key);
                 Bound::Included(end_key.freeze())
             }
             Bound::Excluded(&seq) => {
                 let mut end_key = BytesMut::from(prefix.as_ref());
-                end_key.put_u64(seq);
+                var_u64::serialize(seq, &mut end_key);
                 Bound::Excluded(end_key.freeze())
             }
             Bound::Unbounded => {
                 let mut end_key = BytesMut::from(prefix.as_ref());
-                end_key.put_u64(u64::MAX);
+                var_u64::serialize(u64::MAX, &mut end_key);
                 Bound::Included(end_key.freeze())
             }
         };
@@ -600,7 +595,8 @@ mod tests {
         let serialized = key.serialize();
 
         // then
-        // version (1) + type (1) + segment_id (4) + key "k" (1) + terminator (1) + sequence (8) = 16
+        // version (1) + type (1) + segment_id (4) + key "k" (1) + terminator (1) + sequence (varint, 2 bytes for 100) = 10
+        assert_eq!(serialized.len(), 10);
         assert_eq!(serialized[0], KEY_VERSION);
         assert_eq!(serialized[1], RecordType::LogEntry.id());
         // segment_id = 1 in big endian
@@ -608,8 +604,10 @@ mod tests {
         // key "k" + terminator
         assert_eq!(serialized[6], b'k');
         assert_eq!(serialized[7], 0x00); // terminator
-        // sequence = 100 in big endian
-        assert_eq!(&serialized[8..16], &[0, 0, 0, 0, 0, 0, 0, 100]);
+        // sequence = 100 as varint: length code 1 (2 bytes total), value 100
+        // First byte: (1 << 4) | (100 >> 8) = 0x10
+        // Second byte: 100 & 0xFF = 0x64
+        assert_eq!(&serialized[8..10], &[0x10, 0x64]);
     }
 
     #[test]
