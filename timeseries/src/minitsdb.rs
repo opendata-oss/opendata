@@ -11,57 +11,58 @@ use crate::delta::{TsdbDelta, TsdbDeltaBuilder};
 use crate::error::Error;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::model::{Label, Sample, Series, SeriesFingerprint, SeriesId, TimeBucket};
-use crate::query::QueryReader;
+use crate::query::BucketQueryReader;
 use crate::serde::key::TimeSeriesKey;
 use crate::serde::timeseries::TimeSeriesIterator;
 use crate::storage::{OpenTsdbStorageExt, OpenTsdbStorageReadExt};
 use crate::util::Result;
 
-pub(crate) struct MiniQueryReader<'a> {
-    bucket: &'a TimeBucket,
+pub(crate) struct MiniQueryReader {
+    bucket: TimeBucket,
     snapshot: Arc<dyn StorageRead>,
 }
 
 #[async_trait]
-impl<'a> QueryReader for MiniQueryReader<'a> {
+impl BucketQueryReader for MiniQueryReader {
     async fn forward_index(
         &self,
         series_ids: &[SeriesId],
-    ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + '_>> {
+    ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
         let forward_index = self
             .snapshot
-            .get_forward_index_series(self.bucket, series_ids)
+            .get_forward_index_series(&self.bucket, series_ids)
             .await?;
         Ok(Box::new(forward_index))
     }
 
-    async fn all_forward_index(&self) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + '_>> {
-        let forward_index = self.snapshot.get_forward_index(self.bucket.clone()).await?;
+    async fn all_forward_index(
+        &self,
+    ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
+        let forward_index = self.snapshot.get_forward_index(self.bucket).await?;
         Ok(Box::new(forward_index))
     }
 
     async fn inverted_index(
         &self,
         terms: &[Label],
-    ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + '_>> {
+    ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
         let inverted_index = self
             .snapshot
-            .get_inverted_index_terms(self.bucket, terms)
+            .get_inverted_index_terms(&self.bucket, terms)
             .await?;
         Ok(Box::new(inverted_index))
     }
 
-    async fn all_inverted_index(&self) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + '_>> {
-        let inverted_index = self
-            .snapshot
-            .get_inverted_index(self.bucket.clone())
-            .await?;
+    async fn all_inverted_index(
+        &self,
+    ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
+        let inverted_index = self.snapshot.get_inverted_index(self.bucket).await?;
         Ok(Box::new(inverted_index))
     }
 
     async fn label_values(&self, label_name: &str) -> Result<Vec<String>> {
         self.snapshot
-            .get_label_values(self.bucket, label_name)
+            .get_label_values(&self.bucket, label_name)
             .await
     }
 
@@ -120,7 +121,7 @@ impl MiniTsdb {
     }
 
     /// Create a query reader for read operations.
-    pub(crate) async fn query_reader(&self) -> MiniQueryReader<'_> {
+    pub(crate) async fn query_reader(&self) -> MiniQueryReader {
         // TODO: right now the data that is not flushed to storage
         // (sitting in the pending delta) is not visible to queries,
         // we should improve this by adding a tiered reader where we
@@ -130,7 +131,7 @@ impl MiniTsdb {
         // meaning we can't finish a flush operation
         let snapshot = self.snapshot.read().await.clone();
         MiniQueryReader {
-            bucket: &self.bucket,
+            bucket: self.bucket,
             snapshot,
         }
     }
@@ -147,10 +148,10 @@ impl MiniTsdb {
         let (tx, rx) = tokio::sync::watch::channel(std::time::Instant::now());
 
         Ok(Self {
-            bucket: bucket.clone(),
+            bucket,
             series_dict,
             next_series_id: AtomicU32::new(next_series_id),
-            pending_delta: Mutex::new(TsdbDelta::empty(bucket.clone())),
+            pending_delta: Mutex::new(TsdbDelta::empty(bucket)),
             pending_delta_watch_tx: tx,
             pending_delta_watch_rx: rx,
             snapshot: RwLock::new(storage),
@@ -195,7 +196,7 @@ impl MiniTsdb {
             .map_err(|_e| "pending delta watch_rx disconnected")?;
 
         let mut builder =
-            TsdbDeltaBuilder::new(self.bucket.clone(), &self.series_dict, &self.next_series_id);
+            TsdbDeltaBuilder::new(self.bucket, &self.series_dict, &self.next_series_id);
 
         // Ingest all series into the same delta builder
         for series in series_list {
@@ -248,7 +249,7 @@ impl MiniTsdb {
                 return Ok(());
             }
 
-            let delta = std::mem::replace(&mut *pending, TsdbDelta::empty(self.bucket.clone()));
+            let delta = std::mem::replace(&mut *pending, TsdbDelta::empty(self.bucket));
             (delta, std::time::Instant::now())
         };
         self.pending_delta_watch_tx.send_if_modified(|current| {
@@ -261,15 +262,15 @@ impl MiniTsdb {
         });
 
         let mut ops = Vec::new();
-        ops.push(storage.merge_bucket_list(self.bucket.clone())?);
+        ops.push(storage.merge_bucket_list(self.bucket)?);
 
         for (fingerprint, series_id) in &delta.series_dict {
-            ops.push(storage.insert_series_id(self.bucket.clone(), *fingerprint, *series_id)?);
+            ops.push(storage.insert_series_id(self.bucket, *fingerprint, *series_id)?);
         }
 
         for entry in delta.forward_index.series.iter() {
             ops.push(storage.insert_forward_index(
-                self.bucket.clone(),
+                self.bucket,
                 *entry.key(),
                 entry.value().clone(),
             )?);
@@ -277,14 +278,14 @@ impl MiniTsdb {
 
         for entry in delta.inverted_index.postings.iter() {
             ops.push(storage.merge_inverted_index(
-                self.bucket.clone(),
+                self.bucket,
                 entry.key().clone(),
                 entry.value().clone(),
             )?);
         }
 
         for (series_id, samples) in delta.samples {
-            ops.push(storage.merge_samples(self.bucket.clone(), series_id, samples)?);
+            ops.push(storage.merge_samples(self.bucket, series_id, samples)?);
         }
 
         storage.apply(ops).await?;

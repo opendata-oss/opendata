@@ -42,7 +42,7 @@ impl From<crate::error::Error> for EvaluationError {
 pub(crate) type EvalResult<T> = std::result::Result<T, EvaluationError>;
 
 // ToDo(cadonna): Add histogram samples
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EvalSample {
     pub(crate) timestamp_ms: i64,
     pub(crate) value: f64,
@@ -64,6 +64,12 @@ impl<'a, R: QueryReader> Evaluator<'a, R> {
     }
 
     pub(crate) async fn evaluate(&self, stmt: EvalStmt) -> EvalResult<Vec<EvalSample>> {
+        if stmt.start != stmt.end {
+            return Err(EvaluationError::InternalError(format!(
+                "evaluation must always be done at an instant.got start({:?}), end({:?})",
+                stmt.start, stmt.end
+            )));
+        }
         let result = self
             .evaluate_expr(
                 &stmt.expr,
@@ -157,14 +163,28 @@ impl<'a, R: QueryReader> Evaluator<'a, R> {
         let start_ms = end_ms - (lookback_delta.as_millis() as i64);
 
         // Use the selector module to find matching series
-        let candidates =
-            crate::promql::selector::evaluate_selector_with_reader(self.reader, vector_selector)
-                .await
-                .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+        // Get the bucket to use for queries (for single-bucket operations, this will be the one bucket)
+        let buckets = self.reader.list_buckets().await?;
+        let bucket = if buckets.len() != 1 {
+            return Err(EvaluationError::InternalError(format!(
+                "Expected exactly 1 bucket for evaluation, got {}",
+                buckets.len()
+            )));
+        } else {
+            buckets[0]
+        };
+
+        let candidates = crate::promql::selector::evaluate_selector_with_reader(
+            self.reader,
+            bucket,
+            vector_selector,
+        )
+        .await
+        .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
 
         // Batch load forward index for all candidates upfront
         let candidates_vec: Vec<_> = candidates.into_iter().collect();
-        let forward_index_view = self.reader.forward_index(&candidates_vec).await?;
+        let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
 
         let mut series_with_results: HashSet<SeriesFingerprint> = HashSet::new();
         let mut samples = Vec::new();
@@ -187,7 +207,10 @@ impl<'a, R: QueryReader> Evaluator<'a, R> {
             }
 
             // Read and merge timeseries data from all layers
-            let sample_data = self.reader.samples(series_id, start_ms, end_ms).await?;
+            let sample_data = self
+                .reader
+                .samples(&bucket, series_id, start_ms, end_ms)
+                .await?;
 
             // Find the best (latest) point in the time range
             if let Some(best_sample) = sample_data.last() {

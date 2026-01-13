@@ -326,7 +326,7 @@ impl SeriesBuilder {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct TimeBucket {
     pub(crate) start: BucketStart,
     pub(crate) size: BucketSize,

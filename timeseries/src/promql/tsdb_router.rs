@@ -2,10 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use async_trait::async_trait;
-use common::clock::SystemClock;
-use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
-
 use super::evaluator::Evaluator;
 use super::parser::Parseable;
 use super::request::{
@@ -19,10 +15,15 @@ use super::response::{
 };
 use super::router::PromqlRouter;
 use super::selector::evaluate_selector_with_reader;
+use crate::index::InvertedIndexLookup;
 use crate::model::Label;
 use crate::model::SeriesId;
+use crate::model::TimeBucket;
 use crate::query::QueryReader;
 use crate::tsdb::Tsdb;
+use async_trait::async_trait;
+use common::clock::SystemClock;
+use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 
 /// Parse a match[] selector string into a VectorSelector
 fn parse_selector(selector: &str) -> Result<VectorSelector, String> {
@@ -36,13 +37,14 @@ fn parse_selector(selector: &str) -> Result<VectorSelector, String> {
 /// Get all series IDs matching any of the given selectors (UNION)
 async fn get_matching_series<R: QueryReader>(
     reader: &R,
+    bucket: TimeBucket,
     matches: &[String],
 ) -> Result<HashSet<SeriesId>, String> {
     let mut all_series = HashSet::new();
 
     for selector_str in matches {
         let selector = parse_selector(selector_str)?;
-        let series = evaluate_selector_with_reader(reader, &selector)
+        let series = evaluate_selector_with_reader(reader, bucket, &selector)
             .await
             .map_err(|e| e.to_string())?;
         all_series.extend(series);
@@ -291,8 +293,49 @@ impl PromqlRouter for Tsdb {
             }
         };
 
+        // Validate that query touches only one bucket
+        let buckets = match reader.list_buckets().await {
+            Ok(buckets) => buckets,
+            Err(e) => {
+                let err = ErrorResponse::internal(e.to_string());
+                return SeriesResponse {
+                    status: err.status,
+                    data: None,
+                    error: Some(err.error),
+                    error_type: Some(err.error_type),
+                };
+            }
+        };
+
+        if buckets.len() > 1 {
+            let err = ErrorResponse::bad_data(format!(
+                "Query spans multiple buckets ({} buckets), which is not supported. Query time range: {} to {} seconds.",
+                buckets.len(),
+                start_secs,
+                end_secs
+            ));
+            return SeriesResponse {
+                status: err.status,
+                data: None,
+                error: Some(err.error),
+                error_type: Some(err.error_type),
+            };
+        }
+
+        if buckets.is_empty() {
+            // No buckets means no data, return empty result
+            return SeriesResponse {
+                status: "success".to_string(),
+                data: Some(vec![]),
+                error: None,
+                error_type: None,
+            };
+        }
+
+        let bucket = buckets[0];
+
         // Get all matching series IDs (UNION)
-        let series_ids = match get_matching_series(&reader, &request.matches).await {
+        let series_ids = match get_matching_series(&reader, bucket, &request.matches).await {
             Ok(ids) => ids,
             Err(e) => {
                 let err = ErrorResponse::bad_data(e);
@@ -307,7 +350,7 @@ impl PromqlRouter for Tsdb {
 
         // Get forward index for all series
         let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-        let forward_index = match reader.forward_index(&series_ids_vec).await {
+        let forward_index = match reader.forward_index(&bucket, &series_ids_vec).await {
             Ok(index) => index,
             Err(e) => {
                 let err = ErrorResponse::internal(e.to_string());
@@ -359,6 +402,47 @@ impl PromqlRouter for Tsdb {
             }
         };
 
+        // Validate that query touches only one bucket
+        let buckets = match reader.list_buckets().await {
+            Ok(buckets) => buckets,
+            Err(e) => {
+                let err = ErrorResponse::internal(e.to_string());
+                return LabelsResponse {
+                    status: err.status,
+                    data: None,
+                    error: Some(err.error),
+                    error_type: Some(err.error_type),
+                };
+            }
+        };
+
+        if buckets.len() > 1 {
+            let err = ErrorResponse::bad_data(format!(
+                "Query spans multiple buckets ({} buckets), which is not supported. Query time range: {} to {} seconds.",
+                buckets.len(),
+                start_secs,
+                end_secs
+            ));
+            return LabelsResponse {
+                status: err.status,
+                data: None,
+                error: Some(err.error),
+                error_type: Some(err.error_type),
+            };
+        }
+
+        if buckets.is_empty() {
+            // No buckets means no data, return empty result
+            return LabelsResponse {
+                status: "success".to_string(),
+                data: Some(vec![]),
+                error: None,
+                error_type: None,
+            };
+        }
+
+        let bucket = buckets[0];
+
         // Collect label names using hybrid approach:
         // - Filtered (match[]): use forward index (targeted I/O for matching series)
         // - Unfiltered: use inverted index (direct access to all label keys)
@@ -367,7 +451,7 @@ impl PromqlRouter for Tsdb {
         match &request.matches {
             Some(matches) if !matches.is_empty() => {
                 // Filtered: use forward index for targeted I/O
-                let series_ids = match get_matching_series(&reader, matches).await {
+                let series_ids = match get_matching_series(&reader, bucket, matches).await {
                     Ok(ids) => ids,
                     Err(e) => {
                         let err = ErrorResponse::bad_data(e);
@@ -380,7 +464,7 @@ impl PromqlRouter for Tsdb {
                     }
                 };
                 let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-                let forward_index = match reader.forward_index(&series_ids_vec).await {
+                let forward_index = match reader.forward_index(&bucket, &series_ids_vec).await {
                     Ok(index) => index,
                     Err(e) => {
                         let err = ErrorResponse::internal(e.to_string());
@@ -400,7 +484,7 @@ impl PromqlRouter for Tsdb {
             }
             _ => {
                 // Unfiltered: use inverted index for direct key access
-                let inverted_index = match reader.all_inverted_index().await {
+                let inverted_index = match reader.all_inverted_index(&bucket).await {
                     Ok(index) => index,
                     Err(e) => {
                         let err = ErrorResponse::internal(e.to_string());
@@ -452,6 +536,47 @@ impl PromqlRouter for Tsdb {
             }
         };
 
+        // Validate that query touches only one bucket
+        let buckets = match reader.list_buckets().await {
+            Ok(buckets) => buckets,
+            Err(e) => {
+                let err = ErrorResponse::internal(e.to_string());
+                return LabelValuesResponse {
+                    status: err.status,
+                    data: None,
+                    error: Some(err.error),
+                    error_type: Some(err.error_type),
+                };
+            }
+        };
+
+        if buckets.len() > 1 {
+            let err = ErrorResponse::bad_data(format!(
+                "Query spans multiple buckets ({} buckets), which is not supported. Query time range: {} to {} seconds.",
+                buckets.len(),
+                start_secs,
+                end_secs
+            ));
+            return LabelValuesResponse {
+                status: err.status,
+                data: None,
+                error: Some(err.error),
+                error_type: Some(err.error_type),
+            };
+        }
+
+        if buckets.is_empty() {
+            // No buckets means no data, return empty result
+            return LabelValuesResponse {
+                status: "success".to_string(),
+                data: Some(vec![]),
+                error: None,
+                error_type: None,
+            };
+        }
+
+        let bucket = buckets[0];
+
         // Collect label values using hybrid approach:
         // - Filtered (match[]): use forward index (targeted I/O for matching series)
         // - Unfiltered: use inverted index (direct access to all label keys)
@@ -460,7 +585,7 @@ impl PromqlRouter for Tsdb {
         match &request.matches {
             Some(matches) if !matches.is_empty() => {
                 // Filtered: use forward index for targeted I/O
-                let series_ids = match get_matching_series(&reader, matches).await {
+                let series_ids = match get_matching_series(&reader, bucket, matches).await {
                     Ok(ids) => ids,
                     Err(e) => {
                         let err = ErrorResponse::bad_data(e);
@@ -473,7 +598,7 @@ impl PromqlRouter for Tsdb {
                     }
                 };
                 let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-                let forward_index = match reader.forward_index(&series_ids_vec).await {
+                let forward_index = match reader.forward_index(&bucket, &series_ids_vec).await {
                     Ok(index) => index,
                     Err(e) => {
                         let err = ErrorResponse::internal(e.to_string());
@@ -495,7 +620,7 @@ impl PromqlRouter for Tsdb {
             }
             _ => {
                 // Unfiltered: use optimized label_values that scans only keys for this label
-                let label_values = match reader.label_values(&request.label_name).await {
+                let label_values = match reader.label_values(&bucket, &request.label_name).await {
                     Ok(vals) => vals,
                     Err(e) => {
                         let err = ErrorResponse::internal(e.to_string());

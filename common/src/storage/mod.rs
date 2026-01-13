@@ -27,6 +27,7 @@ impl Record {
     }
 }
 
+#[derive(Clone, Debug)]
 pub enum RecordOp {
     Put(Record),
     Merge(Record),
