@@ -17,12 +17,30 @@
 use bytes::{BufMut, Bytes, BytesMut};
 
 use super::DeserializeError;
+use crate::BytesRange;
+use crate::bytes::lex_increment;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 
 /// Terminator byte for terminated bytes encoding (lowest byte value)
 const TERMINATOR_BYTE: u8 = 0x00;
 
 /// Escape character for terminated bytes encoding
 const ESCAPE_BYTE: u8 = 0x01;
+
+/// Serializes raw bytes with escape sequences and `0x00` terminator.
+///
+/// Writes directly to the provided buffer. The encoding:
+/// - `0x00` → `0x01 0x01`
+/// - `0x01` → `0x01 0x02`
+/// - All other bytes unchanged
+/// - Terminated with `0x00`
+///
+/// This encoding preserves lexicographic ordering of the original byte sequences.
+pub fn serialize_to_bytes(data: &[u8]) -> Bytes {
+    let mut buf = BytesMut::new();
+    serialize(data, &mut buf);
+    buf.freeze()
+}
 
 /// Serializes raw bytes with escape sequences and `0x00` terminator.
 ///
@@ -103,6 +121,30 @@ pub fn deserialize(buf: &mut &[u8]) -> Result<Bytes, DeserializeError> {
     })
 }
 
+/// Creates a [`BytesRange`] for scanning all keys with the given logical prefix.
+///
+/// The prefix is first incremented using [`lex_increment`], then both bounds
+/// are serialized using [`serialize`].
+///
+/// # Examples
+///
+/// ```ignore
+/// // Find all keys starting with "user:"
+/// let range = prefix_range(b"user:");
+/// storage.scan(range).await?;
+/// ```
+pub fn prefix_range(prefix: &[u8]) -> BytesRange {
+    if prefix.is_empty() {
+        BytesRange::unbounded()
+    } else {
+        let start = serialize_to_bytes(prefix);
+        match lex_increment(prefix) {
+            Some(end) => BytesRange::new(Included(start), Excluded(serialize_to_bytes(&end))),
+            None => BytesRange::new(Included(start), Unbounded),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
@@ -139,6 +181,25 @@ mod tests {
                 b,
                 buf_a.as_ref(),
                 buf_b.as_ref()
+            );
+        }
+
+        #[test]
+        fn should_prefix_range_contain_all_prefixed_keys(prefix: Vec<u8>, suffix: Vec<u8>) {
+            prop_assume!(!prefix.is_empty());
+
+            let mut full_key = prefix.clone();
+            full_key.extend(&suffix);
+
+            let range = prefix_range(&prefix);
+            let serialized = serialize_to_bytes(&full_key);
+
+            prop_assert!(
+                range.contains(&serialized),
+                "prefix_range({:?}) should contain {:?} (serialized: {:?})",
+                prefix,
+                full_key,
+                serialized
             );
         }
     }

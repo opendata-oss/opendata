@@ -59,8 +59,6 @@ impl BytesRange {
     }
 
     /// Creates a range that includes all keys with the given prefix.
-    ///
-    /// Uses [`lex_increment`] to compute the exclusive upper bound.
     pub fn prefix(prefix: Bytes) -> Self {
         if prefix.is_empty() {
             Self::unbounded()
