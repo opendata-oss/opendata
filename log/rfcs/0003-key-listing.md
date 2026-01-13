@@ -72,10 +72,14 @@ This approach avoids read-before-write overhead in the ingest path. When writers
 The `list` API returns an iterator over distinct keys within a sequence number range:
 
 ```rust
+struct LogKey {
+    key: Bytes,
+}
+
 struct LogKeyIterator { ... }
 
 impl LogKeyIterator {
-    async fn next(&mut self) -> Result<Option<Bytes>, Error>;
+    async fn next(&mut self) -> Result<Option<LogKey>, Error>;
 }
 
 #[derive(Default)]
