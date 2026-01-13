@@ -4,11 +4,12 @@
 //! record type encoded in the key.
 
 use bytes::Bytes;
+use common::serde::key_prefix::RecordTag;
 use roaring::RoaringTreemap;
 use std::io::Cursor;
 
 use crate::serde::posting_list::PostingListValue;
-use crate::serde::{EncodingError, RecordTag, RecordType};
+use crate::serde::{EncodingError, RecordType};
 
 /// Merge operator for vector database that handles merging of different record types.
 ///
@@ -32,8 +33,8 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
         let record_tag =
             RecordTag::from_byte(key[1]).expect("Failed to decode record tag from key");
 
-        let record_type = record_tag
-            .record_type()
+        let record_type_id = record_tag.record_type();
+        let record_type = RecordType::from_id(record_type_id)
             .expect("Failed to get record type from record tag");
 
         match record_type {
