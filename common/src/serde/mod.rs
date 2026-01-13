@@ -1,6 +1,7 @@
 //! Serialization utilities for OpenData.
 
 pub mod terminated_bytes;
+pub mod varint;
 
 /// Error type for deserialization failures.
 #[derive(Debug, Clone, PartialEq, Eq)]

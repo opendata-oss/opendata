@@ -55,7 +55,7 @@ Log Entry:
 
 The `segment_id` is a 32-bit identifier, allowing up to ~4 billion segments. Future versions can expand this to 64 bits if needed.
 
-The `relative_seq` is the entry's sequence number relative to the segment's `start_seq` (i.e., it resets to 0 at the start of each segment). Using variable-length encoding keeps keys compact since most relative offsets within a segment are small.
+The `relative_seq` is the entry's sequence number relative to the segment's `start_seq` (i.e., it resets to 0 at the start of each segment). Using variable-length encoding keeps keys compact since most relative offsets within a segment are small. See [`common::serde::varint`](../../common/src/serde/varint.rs) for the encoding specification.
 
 This encoding ensures:
 
@@ -195,3 +195,4 @@ This would enable use cases such as:
 | Date       | Description |
 |------------|-------------|
 | 2026-01-07 | Initial draft |
+| 2026-01-12 | Added link to varint implementation |

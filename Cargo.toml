@@ -35,4 +35,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = "1.14.0"
 prost = "0.13"
+proptest = "1"
 snap = "1"
