@@ -161,6 +161,9 @@ impl Storage for InMemoryStorage {
                     );
                     data.insert(record.key, merged_value);
                 }
+                RecordOp::Delete(key) => {
+                    data.remove(&key);
+                }
             }
         }
 

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 common.workspace = true
 bytes.workspace = true
+fail.workspace = true
 roaring.workspace = true
+tokio.workspace = true

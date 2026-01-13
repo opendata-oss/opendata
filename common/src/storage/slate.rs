@@ -184,6 +184,7 @@ impl Storage for SlateDbStorage {
             match op {
                 RecordOp::Put(record) => batch.put(record.key, record.value),
                 RecordOp::Merge(record) => batch.merge(record.key, record.value),
+                RecordOp::Delete(key) => batch.delete(key),
             }
         }
         self.db
