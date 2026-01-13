@@ -6,7 +6,7 @@ use crate::model::RecordTag;
 use crate::serde::bucket_list::BucketListValue;
 use crate::serde::inverted_index::InvertedIndexValue;
 use crate::serde::timeseries::merge_time_series;
-use crate::serde::{EncodingError, RecordType};
+use crate::serde::{EncodingError, RecordType, record_type_from_tag};
 
 /// Merge operator for OpenTSDB that handles merging of different record types.
 ///
@@ -29,9 +29,8 @@ impl common::storage::MergeOperator for OpenTsdbMergeOperator {
         let record_tag =
             RecordTag::from_byte(key[1]).expect("Failed to decode record tag from key");
 
-        let record_type = record_tag
-            .record_type()
-            .expect("Failed to get record type from record tag");
+        let record_type =
+            record_type_from_tag(record_tag).expect("Failed to get record type from record tag");
 
         match record_type {
             RecordType::InvertedIndex => {

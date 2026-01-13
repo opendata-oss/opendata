@@ -39,6 +39,14 @@ impl std::fmt::Display for EncodingError {
     }
 }
 
+impl From<super::DeserializeError> for EncodingError {
+    fn from(err: super::DeserializeError) -> Self {
+        EncodingError {
+            message: err.message,
+        }
+    }
+}
+
 /// Encode a UTF-8 string.
 ///
 /// Format: `len: u16` (little-endian) + `len` bytes of UTF-8

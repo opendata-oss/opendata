@@ -16,10 +16,8 @@ pub(crate) type BucketStart = u32;
 /// Time bucket size (1-15, exponential: 1=1h, 2=2h, 3=4h, 4=8h, etc. = 2^(n-1) hours)
 pub(crate) type BucketSize = u8;
 
-/// Record tag combining record type and optional bucket size
-/// Encoded as a single byte with high 4 bits for type and low 4 bits for bucket size (or reserved).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RecordTag(pub(crate) u8);
+// Re-export common RecordTag for internal use
+pub(crate) use common::serde::key_prefix::RecordTag;
 
 /// A label is a key-value pair that identifies a time series.
 ///
