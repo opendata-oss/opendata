@@ -17,6 +17,7 @@ use bytes::BytesMut;
 pub use common::serde::encoding::{
     EncodingError, decode_optional_utf8, decode_utf8, encode_optional_utf8, encode_utf8,
 };
+use common::serde::key_prefix::{KeyPrefix, RecordTag};
 
 /// Key format version (currently 0x01)
 pub const KEY_VERSION: u8 = 0x01;
@@ -56,52 +57,21 @@ impl RecordType {
             }),
         }
     }
+
+    /// Creates a RecordTag for this record type (reserved bits = 0).
+    pub fn tag(&self) -> RecordTag {
+        RecordTag::new(self.id(), 0)
+    }
+
+    /// Creates a KeyPrefix with the current version for this record type.
+    pub fn prefix(&self) -> KeyPrefix {
+        KeyPrefix::new(KEY_VERSION, self.tag())
+    }
 }
 
-/// Record tag byte that encodes record type and reserved bits.
-///
-/// Layout:
-/// - bits 7-4: record type ID (1-15)
-/// - bits 3-0: reserved (must be 0)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecordTag(u8);
-
-impl RecordTag {
-    /// Creates a new record tag for the given record type.
-    pub fn new(record_type: RecordType) -> Self {
-        let type_id = record_type.id();
-        debug_assert!(
-            type_id <= 0x0F,
-            "Record type ID {} exceeds 4-bit range",
-            type_id
-        );
-        RecordTag(type_id << 4)
-    }
-
-    /// Creates a RecordTag from a byte.
-    pub fn from_byte(byte: u8) -> Result<Self, EncodingError> {
-        // Validate reserved bits are zero
-        if byte & 0x0F != 0 {
-            return Err(EncodingError {
-                message: format!(
-                    "Invalid record tag: reserved bits must be 0, got 0x{:02x}",
-                    byte
-                ),
-            });
-        }
-        Ok(RecordTag(byte))
-    }
-
-    /// Extracts the record type from this tag.
-    pub fn record_type(&self) -> Result<RecordType, EncodingError> {
-        let type_id = (self.0 & 0xF0) >> 4;
-        RecordType::from_id(type_id)
-    }
-
-    /// Returns the byte representation of this tag.
-    pub fn as_byte(&self) -> u8 {
-        self.0
-    }
+/// Extracts the RecordType from a RecordTag.
+pub fn record_type_from_tag(tag: RecordTag) -> Result<RecordType, EncodingError> {
+    RecordType::from_id(tag.record_type())
 }
 
 /// Trait for record keys that have a record type.
@@ -574,7 +544,7 @@ mod tests {
     #[test]
     fn should_encode_and_decode_record_tag() {
         // given
-        let record_tag = RecordTag::new(RecordType::CollectionMeta);
+        let record_tag = RecordType::CollectionMeta.tag();
 
         // when
         let encoded = record_tag.as_byte();
@@ -582,20 +552,10 @@ mod tests {
 
         // then
         assert_eq!(decoded.as_byte(), record_tag.as_byte());
-        assert_eq!(decoded.record_type().unwrap(), RecordType::CollectionMeta);
-    }
-
-    #[test]
-    fn should_reject_record_tag_with_reserved_bits_set() {
-        // given
-        let invalid_byte = 0x11; // type=1, reserved=1
-
-        // when
-        let result = RecordTag::from_byte(invalid_byte);
-
-        // then
-        assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("reserved bits"));
+        assert_eq!(
+            record_type_from_tag(decoded).unwrap(),
+            RecordType::CollectionMeta
+        );
     }
 
     #[test]

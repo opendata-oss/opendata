@@ -2,9 +2,10 @@
 //!
 //! All keys use big-endian encoding for lexicographic ordering.
 
-use super::{EncodingError, FieldValue, KEY_VERSION, RecordKey, RecordTag, RecordType};
+use super::{EncodingError, FieldValue, KEY_VERSION, RecordKey, RecordType, record_type_from_tag};
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
+use common::serde::key_prefix::KeyPrefix;
 use common::serde::terminated_bytes;
 
 /// CollectionMeta key - singleton record storing collection schema.
@@ -20,8 +21,7 @@ impl RecordKey for CollectionMetaKey {
 impl CollectionMetaKey {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(2);
-        buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordTag::new(Self::RECORD_TYPE).as_byte());
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
         buf.freeze()
     }
 
@@ -55,8 +55,7 @@ impl CentroidChunkKey {
 
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(6);
-        buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordTag::new(Self::RECORD_TYPE).as_byte());
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
         buf.put_u32(self.chunk_id); // Big-endian
         buf.freeze()
     }
@@ -75,8 +74,7 @@ impl CentroidChunkKey {
     /// Returns a range covering all centroid chunk keys.
     pub fn all_chunks_range() -> BytesRange {
         let mut buf = BytesMut::with_capacity(2);
-        buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordTag::new(Self::RECORD_TYPE).as_byte());
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
         BytesRange::prefix(buf.freeze())
     }
 }
@@ -113,8 +111,7 @@ impl PostingListKey {
 
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(6);
-        buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordTag::new(Self::RECORD_TYPE).as_byte());
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
         buf.put_u32(self.centroid_id); // Big-endian
         buf.freeze()
     }
@@ -133,8 +130,7 @@ impl PostingListKey {
     /// Returns a range covering all posting list keys.
     pub fn all_posting_lists_range() -> BytesRange {
         let mut buf = BytesMut::with_capacity(2);
-        buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordTag::new(Self::RECORD_TYPE).as_byte());
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
         BytesRange::prefix(buf.freeze())
     }
 }
@@ -160,8 +156,7 @@ impl IdDictionaryKey {
 
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordTag::new(Self::RECORD_TYPE).as_byte());
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
         terminated_bytes::serialize(self.external_id.as_bytes(), &mut buf);
         buf.freeze()
     }
@@ -192,8 +187,7 @@ impl IdDictionaryKey {
     /// Returns a range covering all ID dictionary keys.
     pub fn all_ids_range() -> BytesRange {
         let mut buf = BytesMut::with_capacity(2);
-        buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordTag::new(Self::RECORD_TYPE).as_byte());
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
         BytesRange::prefix(buf.freeze())
     }
 
@@ -204,8 +198,7 @@ impl IdDictionaryKey {
     /// all IDs that start with the given string prefix.
     pub fn prefix_range(prefix: &str) -> BytesRange {
         let mut buf = BytesMut::new();
-        buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordTag::new(Self::RECORD_TYPE).as_byte());
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
         terminated_bytes::serialize(prefix.as_bytes(), &mut buf);
         BytesRange::prefix(buf.freeze())
     }
@@ -230,8 +223,7 @@ impl VectorDataKey {
 
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(10);
-        buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordTag::new(Self::RECORD_TYPE).as_byte());
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
         buf.put_u64(self.vector_id); // Big-endian
         buf.freeze()
     }
@@ -252,8 +244,7 @@ impl VectorDataKey {
     /// Returns a range covering all vector data keys.
     pub fn all_vectors_range() -> BytesRange {
         let mut buf = BytesMut::with_capacity(2);
-        buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordTag::new(Self::RECORD_TYPE).as_byte());
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
         BytesRange::prefix(buf.freeze())
     }
 }
@@ -277,8 +268,7 @@ impl VectorMetaKey {
 
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(10);
-        buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordTag::new(Self::RECORD_TYPE).as_byte());
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
         buf.put_u64(self.vector_id); // Big-endian
         buf.freeze()
     }
@@ -299,8 +289,7 @@ impl VectorMetaKey {
     /// Returns a range covering all vector metadata keys.
     pub fn all_metadata_range() -> BytesRange {
         let mut buf = BytesMut::with_capacity(2);
-        buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordTag::new(Self::RECORD_TYPE).as_byte());
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
         BytesRange::prefix(buf.freeze())
     }
 }
@@ -328,8 +317,7 @@ impl MetadataIndexKey {
 
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordTag::new(Self::RECORD_TYPE).as_byte());
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
         terminated_bytes::serialize(self.field.as_bytes(), &mut buf);
         self.value.encode_sortable(&mut buf);
         buf.freeze()
@@ -362,8 +350,7 @@ impl MetadataIndexKey {
     /// Returns a range covering all metadata index keys for a specific field.
     pub fn field_range(field: &str) -> BytesRange {
         let mut buf = BytesMut::new();
-        buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordTag::new(Self::RECORD_TYPE).as_byte());
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
         terminated_bytes::serialize(field.as_bytes(), &mut buf);
         BytesRange::prefix(buf.freeze())
     }
@@ -371,8 +358,7 @@ impl MetadataIndexKey {
     /// Returns a range covering all metadata index keys.
     pub fn all_indexes_range() -> BytesRange {
         let mut buf = BytesMut::with_capacity(2);
-        buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordTag::new(Self::RECORD_TYPE).as_byte());
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
         BytesRange::prefix(buf.freeze())
     }
 }
@@ -390,8 +376,7 @@ impl RecordKey for SeqBlockKey {
 impl SeqBlockKey {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(2);
-        buf.put_u8(KEY_VERSION);
-        buf.put_u8(RecordTag::new(Self::RECORD_TYPE).as_byte());
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
         buf.freeze()
     }
 
@@ -408,17 +393,8 @@ impl SeqBlockKey {
 
 /// Validates the key prefix (version and record tag).
 fn validate_key_prefix<T: RecordKey>(buf: &[u8]) -> Result<(), EncodingError> {
-    if buf[0] != KEY_VERSION {
-        return Err(EncodingError {
-            message: format!(
-                "Invalid key version: expected 0x{:02x}, got 0x{:02x}",
-                KEY_VERSION, buf[0]
-            ),
-        });
-    }
-
-    let tag = RecordTag::from_byte(buf[1])?;
-    let record_type = tag.record_type()?;
+    let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
+    let record_type = record_type_from_tag(prefix.tag())?;
 
     if record_type != T::RECORD_TYPE {
         return Err(EncodingError {
@@ -701,13 +677,13 @@ mod tests {
         // given
         let mut buf = BytesMut::new();
         buf.put_u8(0x99); // Wrong version
-        buf.put_u8(RecordTag::new(RecordType::CollectionMeta).as_byte());
+        buf.put_u8(RecordType::CollectionMeta.tag().as_byte());
 
         // when
         let result = CollectionMetaKey::decode(&buf);
 
         // then
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("Invalid key version"));
+        assert!(result.unwrap_err().message.contains("version"));
     }
 }
