@@ -2,18 +2,19 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{FromRequest, Path, Query, State};
+use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 #[cfg(feature = "remote-write")]
 use axum::routing::post;
+use axum::{Form, extract::Request};
 use axum::{Json, Router};
 use tokio::time::interval;
 
 use super::config::PrometheusConfig;
 use super::metrics::Metrics;
-use super::middleware::MetricsLayer;
+use super::middleware::{MetricsLayer, TracingLayer};
 use super::request::{
     LabelValuesParams, LabelsParams, LabelsRequest, QueryParams, QueryRangeParams,
     QueryRangeRequest, QueryRequest, SeriesParams, SeriesRequest,
@@ -125,7 +126,10 @@ impl PromqlServer {
             post(super::remote_write::handle_remote_write),
         );
 
-        let app = app.layer(MetricsLayer::new(metrics)).with_state(state);
+        let app = app
+            .layer(TracingLayer::new())
+            .layer(MetricsLayer::new(metrics))
+            .with_state(state);
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.port));
         tracing::info!("Starting Prometheus-compatible server on {}", addr);
@@ -166,28 +170,103 @@ impl From<Error> for ApiError {
 /// Handle /api/v1/query
 async fn handle_query(
     State(state): State<AppState>,
-    Query(params): Query<QueryParams>,
+    request: Request,
 ) -> Result<Json<QueryResponse>, ApiError> {
-    let request: QueryRequest = params.try_into()?;
-    Ok(Json(state.tsdb.query(request).await))
+    let method = request.method().clone();
+
+    let query_request: QueryRequest = match method {
+        Method::GET => {
+            // For GET requests, extract from query parameters
+            let Query(params) = Query::<QueryParams>::from_request(request, &state)
+                .await
+                .map_err(|e| {
+                    Error::InvalidInput(format!("Failed to parse query parameters: {}", e))
+                })?;
+            params.try_into()?
+        }
+        Method::POST => {
+            // For POST requests, extract from form body
+            let Form(params) = Form::<QueryParams>::from_request(request, &state)
+                .await
+                .map_err(|e| Error::InvalidInput(format!("Failed to parse form body: {}", e)))?;
+            params.try_into()?
+        }
+        _ => {
+            return Err(ApiError(Error::InvalidInput(
+                "Only GET and POST methods are supported".to_string(),
+            )));
+        }
+    };
+
+    Ok(Json(state.tsdb.query(query_request).await))
 }
 
 /// Handle /api/v1/query_range
 async fn handle_query_range(
     State(state): State<AppState>,
-    Query(params): Query<QueryRangeParams>,
+    request: Request,
 ) -> Result<Json<QueryRangeResponse>, ApiError> {
-    let request: QueryRangeRequest = params.try_into()?;
-    Ok(Json(state.tsdb.query_range(request).await))
+    let method = request.method().clone();
+
+    let query_request: QueryRangeRequest = match method {
+        Method::GET => {
+            // For GET requests, extract from query parameters
+            let Query(params) = Query::<QueryRangeParams>::from_request(request, &state)
+                .await
+                .map_err(|e| {
+                    Error::InvalidInput(format!("Failed to parse query parameters: {}", e))
+                })?;
+            params.try_into()?
+        }
+        Method::POST => {
+            // For POST requests, extract from form body
+            let Form(params) = Form::<QueryRangeParams>::from_request(request, &state)
+                .await
+                .map_err(|e| Error::InvalidInput(format!("Failed to parse form body: {}", e)))?;
+            params.try_into()?
+        }
+        _ => {
+            return Err(ApiError(Error::InvalidInput(
+                "Only GET and POST methods are supported".to_string(),
+            )));
+        }
+    };
+
+    Ok(Json(state.tsdb.query_range(query_request).await))
 }
 
 /// Handle /api/v1/series
 async fn handle_series(
     State(state): State<AppState>,
-    Query(params): Query<SeriesParams>,
+    request: Request,
 ) -> Result<Json<SeriesResponse>, ApiError> {
-    let request: SeriesRequest = params.try_into()?;
-    Ok(Json(state.tsdb.series(request).await))
+    let method = request.method().clone();
+
+    let series_request: SeriesRequest = match method {
+        Method::GET => {
+            // For GET requests, extract from query parameters
+            let Query(params) = Query::<SeriesParams>::from_request(request, &state)
+                .await
+                .map_err(|e| {
+                    Error::InvalidInput(format!("Failed to parse query parameters: {}", e))
+                })?;
+            params.try_into()?
+        }
+        Method::POST => {
+            // For POST requests, extract from form body
+            let Form(params) = Form::<SeriesParams>::from_request(request, &state)
+                .await
+                .map_err(|e| Error::InvalidInput(format!("Failed to parse form body: {}", e)))?;
+            params.try_into()?
+        }
+        _ => {
+            return Err(ApiError(Error::InvalidInput(
+                "Only GET and POST methods are supported".to_string(),
+            )));
+        }
+    };
+
+    Ok(Json(state.tsdb.series(series_request).await))
 }
 
 /// Handle /api/v1/labels

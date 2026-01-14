@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use super::evaluator::{CachedQueryReader, Evaluator};
+use super::evaluator::{CachedQueryReader, Evaluator, ExprResult};
 use super::parser::Parseable;
 use super::request::{
     FederateRequest, LabelValuesRequest, LabelsRequest, MetadataRequest, QueryRangeRequest,
@@ -112,7 +112,7 @@ impl PromqlRouter for Tsdb {
             .checked_sub(stmt.lookback_delta)
             .unwrap_or(std::time::UNIX_EPOCH)
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(Duration::from_secs(0))
             .as_secs() as i64;
 
         // Get query reader for the time range
@@ -134,8 +134,8 @@ impl PromqlRouter for Tsdb {
 
         // Wrap reader with cache and evaluate the query
         let mut evaluator = Evaluator::new(&reader);
-        let samples = match evaluator.evaluate(stmt).await {
-            Ok(samples) => samples,
+        let result = match evaluator.evaluate(stmt).await {
+            Ok(result) => result,
             Err(e) => {
                 let err = ErrorResponse::execution(e.to_string());
                 return QueryResponse {
@@ -147,27 +147,46 @@ impl PromqlRouter for Tsdb {
             }
         };
 
-        // Convert EvalSamples to VectorSeries format
-        let result: Vec<VectorSeries> = samples
-            .into_iter()
-            .map(|sample| VectorSeries {
-                metric: sample.labels,
-                value: (
-                    sample.timestamp_ms as f64 / 1000.0, // Convert ms to seconds
-                    sample.value.to_string(),
-                ),
-            })
-            .collect();
+        match result {
+            ExprResult::Scalar(value) => {
+                // Format as scalar result
+                let query_time_secs = query_time_secs as f64;
+                let scalar_result = (query_time_secs, value.to_string());
 
-        // Return success response
-        QueryResponse {
-            status: "success".to_string(),
-            data: Some(QueryResult {
-                result_type: "vector".to_string(),
-                result: serde_json::to_value(result).unwrap(),
-            }),
-            error: None,
-            error_type: None,
+                QueryResponse {
+                    status: "success".to_string(),
+                    data: Some(QueryResult {
+                        result_type: "scalar".to_string(),
+                        result: serde_json::to_value(scalar_result).unwrap(),
+                    }),
+                    error: None,
+                    error_type: None,
+                }
+            }
+            ExprResult::InstantVector(samples) => {
+                // Convert EvalSamples to VectorSeries format
+                let result: Vec<VectorSeries> = samples
+                    .into_iter()
+                    .map(|sample| VectorSeries {
+                        metric: sample.labels,
+                        value: (
+                            sample.timestamp_ms as f64 / 1000.0, // Convert ms to seconds
+                            sample.value.to_string(),
+                        ),
+                    })
+                    .collect();
+
+                // Return success response
+                QueryResponse {
+                    status: "success".to_string(),
+                    data: Some(QueryResult {
+                        result_type: "vector".to_string(),
+                        result: serde_json::to_value(result).unwrap(),
+                    }),
+                    error: None,
+                    error_type: None,
+                }
+            }
         }
     }
 
@@ -194,7 +213,7 @@ impl PromqlRouter for Tsdb {
             .checked_sub(stmt.lookback_delta)
             .unwrap_or(UNIX_EPOCH)
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(Duration::from_secs(0))
             .as_secs() as i64;
         let end_secs = stmt.end.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
 
@@ -231,20 +250,30 @@ impl PromqlRouter for Tsdb {
             };
 
             match evaluator.evaluate(instant_stmt).await {
-                Ok(samples) => {
+                Ok(result) => {
                     let timestamp_secs = current_time
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_secs_f64();
 
-                    for sample in samples {
-                        // Convert labels to sorted vec for use as key
-                        let mut labels_key: Vec<(String, String)> =
-                            sample.labels.into_iter().collect();
-                        labels_key.sort();
+                    match result {
+                        ExprResult::InstantVector(samples) => {
+                            for sample in samples {
+                                // Convert labels to sorted vec for use as key
+                                let mut labels_key: Vec<(String, String)> =
+                                    sample.labels.into_iter().collect();
+                                labels_key.sort();
 
-                        let values = series_map.entry(labels_key).or_default();
-                        values.push((timestamp_secs, sample.value.to_string()));
+                                let values = series_map.entry(labels_key).or_default();
+                                values.push((timestamp_secs, sample.value.to_string()));
+                            }
+                        }
+                        ExprResult::Scalar(value) => {
+                            // For scalar results in range queries, create a single series with empty labels
+                            let labels_key = vec![];
+                            let values = series_map.entry(labels_key).or_default();
+                            values.push((timestamp_secs, value.to_string()));
+                        }
                     }
                 }
                 Err(e) => {
@@ -711,6 +740,26 @@ mod tests {
         );
         series.metric_type = Some(MetricType::Gauge);
         series
+    }
+
+    #[tokio::test]
+    async fn should_return_success_for_grafana_test_query() {
+        // given:
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+        let request = QueryRequest {
+            query: "1+1".to_string(),
+            time: Some(UNIX_EPOCH + Duration::from_secs(4)),
+            timeout: None,
+        };
+
+        // when
+        let response = tsdb.query(request).await;
+
+        // then
+        assert_eq!(response.status, "success");
+        assert!(response.error.is_none());
+        assert!(response.data.is_some());
     }
 
     #[tokio::test]

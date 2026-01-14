@@ -318,9 +318,29 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
     }
 }
 
-enum ExprResult {
+#[derive(Debug)]
+pub(crate) enum ExprResult {
     Scalar(f64),
     InstantVector(Vec<EvalSample>),
+}
+
+impl ExprResult {
+    /// Extract the instant vector samples, returning None if this is a scalar result
+    pub(crate) fn into_instant_vector(self) -> Option<Vec<EvalSample>> {
+        match self {
+            ExprResult::InstantVector(samples) => Some(samples),
+            ExprResult::Scalar(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    /// Extract instant vector samples, panicking if this is a scalar result
+    pub(crate) fn expect_instant_vector(self, msg: &str) -> Vec<EvalSample> {
+        match self {
+            ExprResult::InstantVector(samples) => samples,
+            ExprResult::Scalar(_) => panic!("{}", msg),
+        }
+    }
 }
 
 impl<'reader, R: QueryReader> Evaluator<'reader, R> {
@@ -333,28 +353,21 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         }
     }
 
-    pub(crate) async fn evaluate(&mut self, stmt: EvalStmt) -> EvalResult<Vec<EvalSample>> {
+    pub(crate) async fn evaluate(&mut self, stmt: EvalStmt) -> EvalResult<ExprResult> {
         if stmt.start != stmt.end {
             return Err(EvaluationError::InternalError(format!(
                 "evaluation must always be done at an instant.got start({:?}), end({:?})",
                 stmt.start, stmt.end
             )));
         }
-        let result = self
-            .evaluate_expr(
-                &stmt.expr,
-                stmt.start,
-                stmt.end,
-                stmt.interval,
-                stmt.lookback_delta,
-            )
-            .await?;
-        match result {
-            ExprResult::InstantVector(vector) => Ok(vector),
-            ExprResult::Scalar(_) => Err(EvaluationError::InternalError(
-                "unsupported result type: scalar".to_string(),
-            )),
-        }
+        self.evaluate_expr(
+            &stmt.expr,
+            stmt.start,
+            stmt.end,
+            stmt.interval,
+            stmt.lookback_delta,
+        )
+        .await
     }
 
     // this call recurses to evaluate sub-expressions, so it needs to return a boxed future
@@ -888,7 +901,10 @@ mod tests {
             lookback_delta,
         };
 
-        evaluator.evaluate(stmt).await
+        evaluator
+            .evaluate(stmt)
+            .await
+            .map(|result| result.expect_instant_vector("Expected instant vector result"))
     }
 
     /// Helper to convert label vec to HashMap for comparison
@@ -1525,9 +1541,17 @@ mod tests {
             lookback_delta,
         };
         // First evaluation
-        let result1 = evaluator.evaluate(stmt.clone()).await.unwrap();
+        let result1 = evaluator
+            .evaluate(stmt.clone())
+            .await
+            .unwrap()
+            .expect_instant_vector("Expected instant vector result");
         // Second evaluation - should use cached data
-        let result2 = evaluator.evaluate(stmt.clone()).await.unwrap();
+        let result2 = evaluator
+            .evaluate(stmt.clone())
+            .await
+            .unwrap()
+            .expect_instant_vector("Expected instant vector result");
 
         // then: results should be identical (sample caching disabled for now)
         assert_eq!(result1.len(), 1);
@@ -1564,14 +1588,12 @@ mod tests {
 
         let result = evaluator.evaluate(stmt).await;
 
-        // then: should return error for scalar result
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("unsupported result type: scalar")
-        );
+        // then: should return scalar result with value 42.0
+        assert!(result.is_ok());
+        match result.unwrap() {
+            ExprResult::Scalar(value) => assert_eq!(value, 42.0),
+            ExprResult::InstantVector(_) => panic!("Expected scalar result, got vector"),
+        }
     }
 
     #[allow(clippy::type_complexity)]

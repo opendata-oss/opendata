@@ -591,7 +591,11 @@ mod tests {
                 lookback_delta: lookback,
             };
 
-            let mut results = evaluator.evaluate(stmt).await.unwrap();
+            let mut results = evaluator
+                .evaluate(stmt)
+                .await
+                .unwrap()
+                .expect_instant_vector("Expected instant vector result");
             results.sort_by(|a, b| a.labels.get("env").cmp(&b.labels.get("env")));
 
             assert_eq!(
@@ -675,7 +679,11 @@ mod tests {
             interval: Duration::from_secs(0),
             lookback_delta: lookback,
         };
-        let results = evaluator.evaluate(stmt).await.unwrap();
+        let results = evaluator
+            .evaluate(stmt)
+            .await
+            .unwrap()
+            .expect_instant_vector("Expected instant vector result");
 
         // then: we should only get the series foo{a="c",x="z"} with value 3.0
         let expected = vec![EvalSample {
