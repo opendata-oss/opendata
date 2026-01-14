@@ -49,15 +49,27 @@ while let Some(entry) = iter.next().await? {
 let mut iter = reader.scan(Bytes::from("orders"), checkpoint..).await?;
 ```
 
-## Concepts
+## Architecture
 
-**Key** — Identifies an independent log stream. Variable-length bytes.
+The diagram below shows a simplified representation of the log structure in the LSM.
 
-**Sequence** — A global 64-bit counter assigned at write time. Within each key, sequences are guaranteed to increase monotonically, but they are not contiguous—gaps appear when writes to other keys are interleaved.
+```text
+sorted by (key, seq) ─────────────►
 
-**Log Entry** — A record read from the log, containing the key, sequence, and value.
+Segment 1    ┌───────┬───────┬───────┬───────┬───────┐
+(seq 5–9)    │ A:6   │ B:5   │ B:7   │ C:8   │ C:9   │
+             └───────┴───────┴───────┴───────┴───────┘
 
-**Segment** — Logical partitions of the sequence space, created periodically. Used internally for retention and efficient seeking.
+Segment 0    ┌───────┬───────┬───────┬───────┬───────┐
+(seq 0–4)    │ A:0   │ A:3   │ B:1   │ C:2   │ C:4   │
+             └───────┴───────┴───────┴───────┴───────┘
+
+Each cell: key:sequence
+```
+
+Each log entry contains a key, sequence, and value. Entries are stored as `(segment_id, key, sequence)`, where the sequence is a global counter that increases monotonically per key but is not contiguous.
+
+Segments partition the sequence space and scope compaction—entries within a segment are sorted by key, then sequence. The `seal_interval` controls segment boundaries: smaller intervals reduce write amplification at the cost of read locality.
 
 ## Roadmap
 
