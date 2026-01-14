@@ -4,12 +4,12 @@
 //! record type encoded in the key.
 
 use bytes::Bytes;
-use common::serde::key_prefix::RecordTag;
+use common::serde::key_prefix::KeyPrefix;
 use roaring::RoaringTreemap;
 use std::io::Cursor;
 
 use crate::serde::posting_list::PostingListValue;
-use crate::serde::{EncodingError, RecordType};
+use crate::serde::{EncodingError, KEY_VERSION, RecordType};
 
 /// Merge operator for vector database that handles merging of different record types.
 ///
@@ -26,13 +26,10 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
             return new_value;
         };
 
-        // Decode record type from key
-        if key.len() < 2 {
-            panic!("Invalid key: key length is less than 2 bytes");
-        }
+        let prefix = KeyPrefix::from_bytes_versioned(key, KEY_VERSION)
+            .expect("Failed to decode key prefix");
 
-        let record_tag =
-            RecordTag::from_byte(key[1]).expect("Failed to decode record tag from key");
+        let record_tag = prefix.tag();
 
         let record_type_id = record_tag.record_type();
         let record_type =
