@@ -25,7 +25,7 @@ Each log entry contains a key, sequence, and value. Entries are stored as `(segm
 > [!IMPORTANT]
 > Compared to the Kafka data model, our "key" is closer to a topic partition. The key identifies the log stream; the value is the payload. We have no separate notion of keys which distinguish entries within the same log stream.
 
-Segments partition the sequence space and scope compaction—entries within a segment are sorted by key, then sequence. The `seal_interval` configuration controls segment boundaries: smaller intervals reduce write amplification at the cost of read locality.
+Segments partition the sequence space and scope compaction—entries within a segment are sorted by key, then sequence. The `seal_interval` configuration controls segment boundaries: smaller intervals reduce write amplification at the cost of read locality. Conceptually, each segment represents a window of time across all keys. In the future, we may support size-based segmentation as well.
 
 What that buys us:
 - **Many independent logs, zero provisioning** — each `key` is its own log stream; creating new streams is just writing new keys (no pre-allocation or reconfiguration)
