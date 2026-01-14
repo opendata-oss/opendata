@@ -26,8 +26,8 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
             return new_value;
         };
 
-        let prefix = KeyPrefix::from_bytes_versioned(key, KEY_VERSION)
-            .expect("Failed to decode key prefix");
+        let prefix =
+            KeyPrefix::from_bytes_versioned(key, KEY_VERSION).expect("Failed to decode key prefix");
 
         let record_tag = prefix.tag();
 
