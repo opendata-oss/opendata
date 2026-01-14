@@ -22,7 +22,7 @@ Each cell: key:sequence
 
 Each log entry contains a key, sequence, and value. Entries are stored as `(segment_id, key, sequence)`, where the sequence is a global counter that increases monotonically per key but is not contiguous.
 
-Segments partition the sequence space and scope compaction—entries within a segment are sorted by key, then sequence. The `seal_interval` controls segment boundaries: smaller intervals reduce write amplification at the cost of read locality.
+Segments partition the sequence space and scope compaction—entries within a segment are sorted by key, then sequence. The `seal_interval` configuration controls segment boundaries: smaller intervals reduce write amplification at the cost of read locality.
 
 What that buys us:
 - **Many independent logs, zero provisioning** — each `key` is its own log stream; creating new streams is just writing new keys (no pre-allocation or reconfiguration)
