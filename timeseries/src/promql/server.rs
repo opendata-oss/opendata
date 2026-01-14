@@ -13,7 +13,7 @@ use tokio::time::interval;
 
 use super::config::PrometheusConfig;
 use super::metrics::Metrics;
-use super::middleware::MetricsLayer;
+use super::middleware::{MetricsLayer, TracingLayer};
 use super::request::{
     LabelValuesParams, LabelsParams, LabelsRequest, QueryParams, QueryRangeParams,
     QueryRangeRequest, QueryRequest, SeriesParams, SeriesRequest,
@@ -125,7 +125,10 @@ impl PromqlServer {
             post(super::remote_write::handle_remote_write),
         );
 
-        let app = app.layer(MetricsLayer::new(metrics)).with_state(state);
+        let app = app
+            .layer(TracingLayer::new())
+            .layer(MetricsLayer::new(metrics))
+            .with_state(state);
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.port));
         tracing::info!("Starting Prometheus-compatible server on {}", addr);
