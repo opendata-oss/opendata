@@ -4,7 +4,25 @@ A key-oriented log database built on an LSM tree (SlateDB).
 
 ## Design
 
-The log database leans into its LSM representation: each stream is an arbitrary `key`, and entries are stored in a single global keyspace as `(key, sequence)`.
+The log database leans into its LSM representation: log streams are indexed by arbitrary byte keys within a shared global keyspace. The diagram below shows a simplified representation of the log structure within the LSM.
+
+```text
+sorted by (key, seq) ─────────────►
+
+Segment 1    ┌───────┬───────┬───────┬───────┬───────┐
+(seq 5–9)    │ A:6   │ B:5   │ B:7   │ C:8   │ C:9   │
+             └───────┴───────┴───────┴───────┴───────┘
+
+Segment 0    ┌───────┬───────┬───────┬───────┬───────┐
+(seq 0–4)    │ A:0   │ A:3   │ B:1   │ C:2   │ C:4   │
+             └───────┴───────┴───────┴───────┴───────┘
+
+Each cell: key:sequence
+```
+
+Each log entry contains a key, sequence, and value. Entries are stored as `(segment_id, key, sequence)`, where the sequence is a global counter that increases monotonically per key but is not contiguous.
+
+Segments partition the sequence space and scope compaction—entries within a segment are sorted by key, then sequence. The `seal_interval` controls segment boundaries: smaller intervals reduce write amplification at the cost of read locality.
 
 What that buys us:
 - **Many independent logs, zero provisioning** — each `key` is its own log stream; creating new streams is just writing new keys (no pre-allocation or reconfiguration)
@@ -48,28 +66,6 @@ while let Some(entry) = iter.next().await? {
 // Scan from a checkpoint
 let mut iter = reader.scan(Bytes::from("orders"), checkpoint..).await?;
 ```
-
-## Architecture
-
-The diagram below shows a simplified representation of the log structure in the LSM.
-
-```text
-sorted by (key, seq) ─────────────►
-
-Segment 1    ┌───────┬───────┬───────┬───────┬───────┐
-(seq 5–9)    │ A:6   │ B:5   │ B:7   │ C:8   │ C:9   │
-             └───────┴───────┴───────┴───────┴───────┘
-
-Segment 0    ┌───────┬───────┬───────┬───────┬───────┐
-(seq 0–4)    │ A:0   │ A:3   │ B:1   │ C:2   │ C:4   │
-             └───────┴───────┴───────┴───────┴───────┘
-
-Each cell: key:sequence
-```
-
-Each log entry contains a key, sequence, and value. Entries are stored as `(segment_id, key, sequence)`, where the sequence is a global counter that increases monotonically per key but is not contiguous.
-
-Segments partition the sequence space and scope compaction—entries within a segment are sorted by key, then sequence. The `seal_interval` controls segment boundaries: smaller intervals reduce write amplification at the cost of read locality.
 
 ## Roadmap
 
