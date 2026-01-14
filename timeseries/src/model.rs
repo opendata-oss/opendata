@@ -40,6 +40,7 @@ pub(crate) use common::serde::key_prefix::RecordTag;
 /// let label = Label::new("env", "production");
 /// let name = Label::metric_name("http_requests_total");
 /// ```
+//TODO(rohan): make this impl PartialOrd/Ord so it can be sorted easily
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Label {
     /// The label name (key).

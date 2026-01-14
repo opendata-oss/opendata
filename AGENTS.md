@@ -1,14 +1,29 @@
 # AGENTS.md
 
+**Start here**: Read [CONTRIBUTING.md](CONTRIBUTING.md) for development workflow, RFC process, code style, and testing patterns.
+
 ## Project Overview
 
-OpenData is a collection of deployable database systems that share common infrastructure. Each database is its own crate but leverages shared logic from `common`.
+OpenData is a collection of deployable database systems that share common infrastructure. Each database is its own crate but leverages shared logic from `common`. All databases are built on [SlateDB](https://github.com/slatedb/slatedb).
+
+**Important**: When working on a specific database, focus on that crate's directory. Each database has its own `AGENTS.md` with architecture details. Avoid loading context from other database crates unless explicitly needed.
 
 ### Crates
 
-- **common**: Shared library containing common utilities and abstractions used by all database implementations
-- **timeseries**: A timeseries database optimized for time-ordered data
-- **log**: A Kafka-like log abstraction for append-only event streams
+- **common**: Shared library containing storage abstractions, serde utilities, and sequence allocation
+- **timeseries**: Time series database with Prometheus-compatible semantics (time buckets, inverted indexes, Gorilla compression)
+- **vector**: Vector database with SPANN-style ANN search (centroids, posting lists, metadata filtering)
+- **log**: Kafka-like log with per-key streams and global sequence ordering
+
+### Shared Architectural Patterns
+
+All databases follow these patterns (see RFCs in each crate's `rfcs/` directory):
+
+1. **Key encoding**: 2-byte prefix (version u8 + record_tag u8), big-endian for lexicographic ordering
+2. **Value encoding**: Little-endian for performance on common architectures
+3. **Common types**: `Utf8`, `Array<T>`, `FixedElementArray<T>`, `TerminatedBytes`, `RoaringBitmap/Treemap`
+4. **Sequence allocation**: Block-based `SeqBlock` for crash-safe ID generation (see `common/src/sequence.rs`)
+5. **Storage abstraction**: `Storage` trait in common wraps SlateDB with merge operators
 
 ## Development
 

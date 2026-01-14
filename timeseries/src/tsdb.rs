@@ -566,7 +566,7 @@ mod tests {
         assert_eq!(tsdb.query_cache.entry_count(), 2);
 
         // Use the evaluator to run 4 separate instant queries, one per bucket
-        let evaluator = Evaluator::new(&reader);
+        let mut evaluator = Evaluator::new(&reader);
         let query = r#"http_requests"#;
         let lookback = Duration::from_secs(1000);
 
@@ -662,7 +662,7 @@ mod tests {
 
         // when: Execute a PromQL query that filters by a="c"
         let reader = tsdb.query_reader(3000, 8000).await.unwrap();
-        let evaluator = Evaluator::new(&reader);
+        let mut evaluator = Evaluator::new(&reader);
         // Query for foo{a="c"} at time 8000 seconds (in bucket 2)
         let query = r#"foo{a="c"}"#;
         let query_time = UNIX_EPOCH + Duration::from_secs(8000);
