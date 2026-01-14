@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndex, InvertedIndexLookup};
 use crate::model::Label;
 use crate::model::SeriesId;
+use crate::promql::evaluator::CachedQueryReader;
 use crate::query::QueryReader;
 use crate::util::Result;
 use promql_parser::label::{METRIC_NAME, MatchOp};
@@ -58,8 +59,8 @@ fn parse_limited_regex(pattern: &str) -> std::result::Result<Vec<String>, String
 }
 
 /// Find candidate series IDs using a QueryReader
-async fn find_candidates_with_reader<R: QueryReader>(
-    reader: &R,
+async fn find_candidates_with_reader<'reader, R: QueryReader>(
+    reader: &mut CachedQueryReader<'reader, R>,
     bucket: &crate::model::TimeBucket,
     selector: &VectorSelector,
 ) -> Result<Vec<SeriesId>> {
@@ -145,8 +146,8 @@ async fn find_candidates_with_reader<R: QueryReader>(
 
 /// Evaluates a PromQL vector selector using a QueryReader.
 /// This is the core implementation that can be tested independently.
-pub(crate) async fn evaluate_selector_with_reader<R: QueryReader>(
-    reader: &R,
+pub(crate) async fn evaluate_selector_with_reader<'reader, R: QueryReader>(
+    reader: &mut CachedQueryReader<'reader, R>,
     bucket: crate::model::TimeBucket,
     selector: &VectorSelector,
 ) -> Result<HashSet<SeriesId>> {
@@ -159,7 +160,7 @@ pub(crate) async fn evaluate_selector_with_reader<R: QueryReader>(
 
     // Get forward index view for candidates to apply negative filtering
     let forward_index_view = reader.forward_index(&bucket, &candidates).await?;
-    let filtered = apply_negative_matchers(&forward_index_view, candidates, selector)
+    let filtered = apply_negative_matchers(forward_index_view.as_ref(), candidates, selector)
         .map_err(crate::error::Error::InvalidInput)?;
 
     Ok(filtered.into_iter().collect())
@@ -296,7 +297,7 @@ fn has_negative_matchers(selector: &VectorSelector) -> bool {
 
 /// Apply negative matchers (not-equal, not-regex) using any ForwardIndexLookup implementation.
 fn apply_negative_matchers(
-    index: &impl ForwardIndexLookup,
+    index: &dyn ForwardIndexLookup,
     candidates: Vec<SeriesId>,
     selector: &VectorSelector,
 ) -> std::result::Result<Vec<SeriesId>, String> {
@@ -802,7 +803,8 @@ mod tests {
             offset: None,
             at: None,
         };
-        let result = evaluate_selector_with_reader(&reader, bucket, &selector)
+        let mut cached_reader = CachedQueryReader::new(&reader);
+        let result = evaluate_selector_with_reader(&mut cached_reader, bucket, &selector)
             .await
             .unwrap();
 
@@ -909,7 +911,8 @@ mod tests {
             offset: None,
             at: None,
         };
-        let result = evaluate_selector_with_reader(&reader, bucket, &selector)
+        let mut cached_reader = CachedQueryReader::new(&reader);
+        let result = evaluate_selector_with_reader(&mut cached_reader, bucket, &selector)
             .await
             .unwrap();
 
@@ -1015,7 +1018,8 @@ mod tests {
             offset: None,
             at: None,
         };
-        let result = evaluate_selector_with_reader(&reader, bucket, &selector)
+        let mut cached_reader = CachedQueryReader::new(&reader);
+        let result = evaluate_selector_with_reader(&mut cached_reader, bucket, &selector)
             .await
             .unwrap();
 

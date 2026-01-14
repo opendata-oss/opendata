@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use super::evaluator::Evaluator;
+use super::evaluator::{CachedQueryReader, Evaluator};
 use super::parser::Parseable;
 use super::request::{
     FederateRequest, LabelValuesRequest, LabelsRequest, MetadataRequest, QueryRangeRequest,
@@ -42,9 +42,10 @@ async fn get_matching_series<R: QueryReader>(
 ) -> Result<HashSet<SeriesId>, String> {
     let mut all_series = HashSet::new();
 
+    let mut cached_reader = CachedQueryReader::new(reader);
     for selector_str in matches {
         let selector = parse_selector(selector_str)?;
-        let series = evaluate_selector_with_reader(reader, bucket, &selector)
+        let series = evaluate_selector_with_reader(&mut cached_reader, bucket, &selector)
             .await
             .map_err(|e| e.to_string())?;
         all_series.extend(series);
@@ -131,8 +132,8 @@ impl PromqlRouter for Tsdb {
             }
         };
 
-        // Evaluate the query
-        let evaluator = Evaluator::new(&reader);
+        // Wrap reader with cache and evaluate the query
+        let mut evaluator = Evaluator::new(&reader);
         let samples = match evaluator.evaluate(stmt).await {
             Ok(samples) => samples,
             Err(e) => {
@@ -216,7 +217,7 @@ impl PromqlRouter for Tsdb {
         // Use sorted Vec as key since HashMap doesn't implement Hash
         let mut series_map: HashMap<Vec<(String, String)>, Vec<(f64, String)>> = HashMap::new();
 
-        let evaluator = Evaluator::new(&reader);
+        let mut evaluator = Evaluator::new(&reader);
         let mut current_time = stmt.start;
 
         while current_time <= stmt.end {
