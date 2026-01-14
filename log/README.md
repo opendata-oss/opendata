@@ -4,7 +4,7 @@ A key-oriented log database built on an LSM tree (SlateDB).
 
 ## Design
 
-The log database leans into its LSM representation: log streams are indexed by arbitrary byte keys within a shared global keyspace. The diagram below shows a simplified representation of the log structure within the LSM.
+The log database leans into its LSM representation: log streams are indexed by arbitrary byte keys within a shared global keyspace. The diagram below shows a simplified representation of the key structure within the LSM.
 
 ```text
 sorted by (key, seq) ─────────────►
