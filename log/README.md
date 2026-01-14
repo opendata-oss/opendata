@@ -55,6 +55,8 @@ let mut iter = reader.scan(Bytes::from("orders"), checkpoint..).await?;
 
 **Sequence** — A global 64-bit counter assigned at write time. Within each key, sequences are guaranteed to increase monotonically, but they are not contiguous—gaps appear when writes to other keys are interleaved.
 
+**Log Entry** — A record read from the log, containing the key, sequence, and value.
+
 **Segment** — Logical partitions of the sequence space, created periodically. Used internally for retention and efficient seeking.
 
 ## Roadmap
