@@ -1,5 +1,7 @@
 # AGENTS.md
 
+**Start here**: Read [CONTRIBUTING.md](CONTRIBUTING.md) for development workflow, RFC process, code style, and testing patterns.
+
 ## Project Overview
 
 OpenData is a collection of deployable database systems that share common infrastructure. Each database is its own crate but leverages shared logic from `common`. All databases are built on [SlateDB](https://github.com/slatedb/slatedb).
