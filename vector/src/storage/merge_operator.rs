@@ -16,6 +16,7 @@ use crate::serde::{EncodingError, RecordType};
 /// Currently supports:
 /// - PostingList: Unions RoaringTreemaps for centroid assignments
 /// - MetadataIndex: Unions RoaringTreemaps for metadata filtering
+#[allow(dead_code)]
 pub struct VectorDbMergeOperator;
 
 impl common::storage::MergeOperator for VectorDbMergeOperator {
@@ -56,6 +57,7 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
 /// Used for:
 /// - PostingList: Union vector IDs assigned to a centroid
 /// - MetadataIndex: Union vector IDs matching a metadata filter
+#[allow(dead_code)]
 fn merge_roaring_treemap(existing: Bytes, new_value: Bytes) -> Result<Bytes, EncodingError> {
     // Deserialize both bitmaps
     let existing_bitmap = RoaringTreemap::deserialize_from(Cursor::new(existing.as_ref()))
@@ -228,7 +230,7 @@ mod tests {
     #[case(RecordType::PostingList, create_posting_list_key, "PostingList")]
     #[case(RecordType::MetadataIndex, create_metadata_index_key, "MetadataIndex")]
     fn should_route_to_correct_merge_function(
-        #[case] record_type: RecordType,
+        #[case] _record_type: RecordType,
         #[case] key_fn: fn() -> Bytes,
         #[case] description: &str,
     ) {

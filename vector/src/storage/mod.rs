@@ -33,6 +33,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     }
 
     /// Load a vector's data by internal ID.
+    #[allow(dead_code)]
     async fn get_vector_data(&self, internal_id: u64) -> Result<Option<VectorDataValue>> {
         let key = VectorDataKey::new(internal_id).encode();
         let record = self.get(key).await?;
@@ -46,6 +47,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     }
 
     /// Load a vector's metadata by internal ID.
+    #[allow(dead_code)]
     async fn get_vector_meta(&self, internal_id: u64) -> Result<Option<VectorMetaValue>> {
         let key = VectorMetaKey::new(internal_id).encode();
         let record = self.get(key).await?;
@@ -59,6 +61,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     }
 
     /// Load a posting list for a centroid.
+    #[allow(dead_code)]
     async fn get_posting_list(&self, centroid_id: u32) -> Result<PostingListValue> {
         let key = PostingListKey::new(centroid_id).encode();
         let record = self.get(key).await?;
@@ -72,6 +75,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     }
 
     /// Load the deleted vectors bitmap (centroid_id = 0).
+    #[allow(dead_code)]
     async fn get_deleted_vectors(&self) -> Result<RoaringTreemap> {
         let key = PostingListKey::deleted_vectors().encode();
         let record = self.get(key).await?;

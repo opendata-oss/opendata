@@ -224,10 +224,7 @@ impl VectorDb {
 
             // 6. Batch PostingList assignment to centroid_id=1 (STUB)
             // TODO: Real centroid assignment via HNSW
-            posting_lists
-                .entry(1)
-                .or_insert_with(RoaringTreemap::new)
-                .insert(new_internal_id);
+            posting_lists.entry(1).or_default().insert(new_internal_id);
         }
 
         // Serialize and merge batched posting lists
