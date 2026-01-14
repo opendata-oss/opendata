@@ -22,6 +22,9 @@ Each cell: key:sequence
 
 Each log entry contains a key, sequence, and value. Entries are stored as `(segment_id, key, sequence)`, where the sequence is a global counter that increases monotonically per key but is not contiguous.
 
+> [!IMPORTANT]
+> Compared to the Kafka data model, our "key" is closer to a topic partition. The key identifies the log stream; the value is the payload. We have no separate notion of keys which distinguish entries within the same log stream.
+
 Segments partition the sequence space and scope compaction—entries within a segment are sorted by key, then sequence. The `seal_interval` configuration controls segment boundaries: smaller intervals reduce write amplification at the cost of read locality.
 
 What that buys us:
@@ -30,7 +33,7 @@ What that buys us:
 - **Simple mental model** — scaling isn’t “partition management”; it’s just “write and read by key”
 
 Trade-offs:
-- **Write amplification** — LSM compaction rewrites data, which increases total bytes written compared to pure append-only layouts.
+- **Write amplification** — LSM compaction rewrites data, which increases total bytes written compared to pure append-only layouts. This behavior can be controlled with windowed compaction strategies based on segment configuration.
 
 ## Usage
 
