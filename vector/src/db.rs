@@ -999,7 +999,7 @@ mod tests {
         let results = db.search(&[0.7, 0.7], 10).await.unwrap();
 
         // then - should find vectors from multiple centroids
-        assert!(results.len() > 0);
+        assert!(!results.is_empty());
         // The algorithm expands to multiple centroids, so we should get results
         // from both cluster 1 and cluster 2
     }

@@ -273,7 +273,7 @@ mod tests {
 
         // when - build graph and search for k=10
         let graph = CentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
-        let results = graph.search(&vec![1.5], 10);
+        let results = graph.search(&[1.5], 10);
 
         // then - should return all 2 centroids
         assert_eq!(results.len(), 2);
