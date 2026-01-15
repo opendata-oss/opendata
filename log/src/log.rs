@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 use crate::listing::ListingCache;
 use crate::listing::LogKeyIterator;
 use crate::model::Record;
+use crate::range::normalize;
 use crate::reader::{LogIterator, LogRead, list_keys_in_segments};
 use crate::segment::SegmentCache;
 use crate::sequence::SequenceAllocator;
@@ -323,6 +324,7 @@ impl LogRead for Log {
         seq_range: impl RangeBounds<u64> + Send,
         _options: ScanOptions,
     ) -> Result<LogIterator> {
+        let seq_range = normalize(&seq_range);
         let inner = self.inner.read().await;
         Ok(LogIterator::open(
             self.storage.as_read(),
@@ -346,6 +348,7 @@ impl LogRead for Log {
         seq_range: impl RangeBounds<u64> + Send,
         _options: ListOptions,
     ) -> Result<LogKeyIterator> {
+        let seq_range = normalize(&seq_range);
         let inner = self.inner.read().await;
         let segments = inner.segment_cache.find_covering(&seq_range);
         list_keys_in_segments(&self.storage.as_read(), &segments).await

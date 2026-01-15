@@ -34,7 +34,7 @@
 //! keys with the same prefix (e.g., "/foo" < "/foo/bar"). This simplifies
 //! prefix-based range queries: start at `prefix + 0x00`, end at `prefix + 0xFF`.
 
-use std::ops::{Bound, Range, RangeBounds};
+use std::ops::{Bound, Range};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
@@ -266,19 +266,9 @@ impl SegmentMetaKey {
     }
 
     /// Creates a storage key range for scanning segment metadata within a segment ID range.
-    pub fn scan_range(range: impl RangeBounds<SegmentId>) -> BytesRange {
-        let start = match range.start_bound() {
-            Bound::Included(&id) => Bound::Included(SegmentMetaKey::new(id).serialize()),
-            Bound::Excluded(&id) => Bound::Excluded(SegmentMetaKey::new(id).serialize()),
-            Bound::Unbounded => Bound::Included(SegmentMetaKey::new(0).serialize()),
-        };
-
-        let end = match range.end_bound() {
-            Bound::Included(&id) => Bound::Included(SegmentMetaKey::new(id).serialize()),
-            Bound::Excluded(&id) => Bound::Excluded(SegmentMetaKey::new(id).serialize()),
-            Bound::Unbounded => Bound::Included(SegmentMetaKey::new(SegmentId::MAX).serialize()),
-        };
-
+    pub fn scan_range(range: Range<SegmentId>) -> BytesRange {
+        let start = Bound::Included(SegmentMetaKey::new(range.start).serialize());
+        let end = Bound::Excluded(SegmentMetaKey::new(range.end).serialize());
         BytesRange::new(start, end)
     }
 }
@@ -492,6 +482,7 @@ impl LogEntryBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::RangeBounds;
 
     #[test]
     fn should_convert_record_type_to_id_and_back() {

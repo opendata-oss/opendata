@@ -5,7 +5,6 @@
 //! and segment metadata access.
 
 use std::ops::Range;
-use std::ops::RangeBounds;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -24,13 +23,13 @@ use crate::serde::{LogEntryKey, SEQ_BLOCK_KEY, SegmentId, SegmentMeta, SegmentMe
 /// Wraps `Arc<dyn StorageRead>` with log-specific read operations
 /// for segments and key listings.
 #[derive(Clone)]
-pub struct LogStorageRead {
+pub(crate) struct LogStorageRead {
     storage: Arc<dyn StorageRead>,
 }
 
 impl LogStorageRead {
     /// Creates a new read-only log storage wrapper.
-    pub fn new(storage: Arc<dyn StorageRead>) -> Self {
+    pub(crate) fn new(storage: Arc<dyn StorageRead>) -> Self {
         Self { storage }
     }
 
@@ -62,9 +61,9 @@ impl LogStorageRead {
     ///
     /// Keys are deduplicated and returned in lexicographic order.
     /// The segment range is half-open: [start, end).
-    pub async fn list_keys(
+    pub(crate) async fn list_keys(
         &self,
-        segment_range: std::ops::Range<SegmentId>,
+        segment_range: Range<SegmentId>,
     ) -> Result<LogKeyIterator> {
         LogKeyIterator::open(Arc::clone(&self.storage), segment_range).await
     }
@@ -72,10 +71,7 @@ impl LogStorageRead {
     /// Scans segment metadata records within the given segment ID range.
     ///
     /// Returns segments ordered by segment ID.
-    pub async fn scan_segments(
-        &self,
-        range: impl RangeBounds<SegmentId>,
-    ) -> Result<Vec<LogSegment>> {
+    pub(crate) async fn scan_segments(&self, range: Range<SegmentId>) -> Result<Vec<LogSegment>> {
         let scan_range = SegmentMetaKey::scan_range(range);
         let mut iter = self.storage.scan_iter(scan_range).await?;
 
@@ -92,7 +88,7 @@ impl LogStorageRead {
     /// Scans log entries for a key within a segment and sequence range.
     ///
     /// Returns an iterator that yields `LogEntry` values in sequence order.
-    pub async fn scan_entries(
+    pub(crate) async fn scan_entries(
         &self,
         segment: &LogSegment,
         key: &Bytes,
@@ -112,7 +108,7 @@ impl LogStorageRead {
 ///
 /// Wraps a `StorageIterator` and handles range validation and `LogEntry`
 /// deserialization.
-pub struct SegmentIterator {
+pub(crate) struct SegmentIterator {
     inner: Box<dyn StorageIterator + Send>,
     seq_range: Range<u64>,
     segment_start_seq: u64,
@@ -132,7 +128,7 @@ impl SegmentIterator {
     }
 
     /// Returns the next log entry within the sequence range, or None if exhausted.
-    pub async fn next(&mut self) -> Result<Option<LogEntry>> {
+    pub(crate) async fn next(&mut self) -> Result<Option<LogEntry>> {
         loop {
             let Some(record) = self
                 .inner
@@ -166,13 +162,13 @@ impl SegmentIterator {
 ///
 /// Wraps `Arc<dyn Storage>` with log-specific operations.
 #[derive(Clone)]
-pub struct LogStorage {
+pub(crate) struct LogStorage {
     storage: Arc<dyn Storage>,
 }
 
 impl LogStorage {
     /// Creates a new log storage wrapper.
-    pub fn new(storage: Arc<dyn Storage>) -> Self {
+    pub(crate) fn new(storage: Arc<dyn Storage>) -> Self {
         Self { storage }
     }
 
@@ -184,12 +180,12 @@ impl LogStorage {
     }
 
     /// Returns a read-only view of this storage.
-    pub fn as_read(&self) -> LogStorageRead {
+    pub(crate) fn as_read(&self) -> LogStorageRead {
         LogStorageRead::new(Arc::clone(&self.storage) as Arc<dyn StorageRead>)
     }
 
     /// Writes records to storage with options.
-    pub async fn put_with_options(
+    pub(crate) async fn put_with_options(
         &self,
         records: Vec<common::Record>,
         options: common::WriteOptions,
@@ -288,7 +284,7 @@ mod tests {
         storage.write_segment(&seg1).await.unwrap();
 
         // when
-        let segments = storage.as_read().scan_segments(..).await.unwrap();
+        let segments = storage.as_read().scan_segments(0..u32::MAX).await.unwrap();
 
         // then
         assert_eq!(segments.len(), 3);

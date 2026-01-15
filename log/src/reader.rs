@@ -4,7 +4,7 @@
 //! - [`LogRead`]: The trait defining read operations on the log.
 //! - [`LogReader`]: A read-only view of the log that implements `LogRead`.
 
-use std::ops::RangeBounds;
+use std::ops::{Range, RangeBounds};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -18,7 +18,8 @@ use crate::config::{Config, CountOptions, ListOptions, ScanOptions, SegmentConfi
 use crate::error::{Error, Result};
 use crate::listing::LogKeyIterator;
 use crate::model::LogEntry;
-use crate::segment::{LogSegment, SegmentCache, normalize_range};
+use crate::range::normalize;
+use crate::segment::{LogSegment, SegmentCache};
 use crate::storage::{LogStorageRead, SegmentIterator};
 
 /// Trait for read operations on the log.
@@ -297,6 +298,7 @@ impl LogRead for LogReader {
         seq_range: impl RangeBounds<u64> + Send,
         _options: ScanOptions,
     ) -> Result<LogIterator> {
+        let seq_range = normalize(&seq_range);
         let segments = self.segments.read().await;
         Ok(LogIterator::open(
             self.storage.clone(),
@@ -320,6 +322,7 @@ impl LogRead for LogReader {
         seq_range: impl RangeBounds<u64> + Send,
         _options: ListOptions,
     ) -> Result<LogKeyIterator> {
+        let seq_range = normalize(&seq_range);
         let segments = self.segments.read().await.find_covering(&seq_range);
         list_keys_in_segments(&self.storage, &segments).await
     }
@@ -329,7 +332,7 @@ impl LogRead for LogReader {
 ///
 /// Returns a range from the first segment ID to one past the last segment ID.
 /// If the list is empty, returns an empty range (0..0).
-pub(crate) fn segments_to_range(segments: &[LogSegment]) -> std::ops::Range<u32> {
+pub(crate) fn segments_to_range(segments: &[LogSegment]) -> Range<u32> {
     if segments.is_empty() {
         return 0..0;
     }
@@ -359,7 +362,7 @@ pub struct LogIterator {
     storage: LogStorageRead,
     segments: Vec<LogSegment>,
     key: Bytes,
-    seq_range: std::ops::Range<u64>,
+    seq_range: Range<u64>,
     current_segment_idx: usize,
     current_iter: Option<SegmentIterator>,
 }
@@ -370,15 +373,14 @@ impl LogIterator {
         storage: LogStorageRead,
         segment_cache: &SegmentCache,
         key: Bytes,
-        seq_range: impl RangeBounds<u64>,
+        seq_range: Range<u64>,
     ) -> Self {
-        let range = normalize_range(&seq_range);
-        let segments = segment_cache.find_covering(&range);
+        let segments = segment_cache.find_covering(&seq_range);
         Self {
             storage,
             segments,
             key,
-            seq_range: range,
+            seq_range,
             current_segment_idx: 0,
             current_iter: None,
         }
@@ -390,7 +392,7 @@ impl LogIterator {
         storage: LogStorageRead,
         segments: Vec<LogSegment>,
         key: Bytes,
-        seq_range: std::ops::Range<u64>,
+        seq_range: Range<u64>,
     ) -> Self {
         Self {
             storage,
@@ -644,59 +646,5 @@ mod tests {
             LogIterator::new(storage.as_read(), vec![segment], Bytes::from("key"), 10..20);
 
         assert!(iter.next().await.unwrap().is_none());
-    }
-
-    mod normalize_range_tests {
-        use super::*;
-
-        #[test]
-        fn should_normalize_full_range() {
-            let range = normalize_range(&(..));
-            assert_eq!(range, 0..u64::MAX);
-        }
-
-        #[test]
-        fn should_normalize_range_from() {
-            let range = normalize_range(&(100u64..));
-            assert_eq!(range, 100..u64::MAX);
-        }
-
-        #[test]
-        fn should_normalize_range_to() {
-            let range = normalize_range(&(..100u64));
-            assert_eq!(range, 0..100);
-        }
-
-        #[test]
-        fn should_normalize_range() {
-            let range = normalize_range(&(50u64..150));
-            assert_eq!(range, 50..150);
-        }
-
-        #[test]
-        fn should_normalize_range_inclusive() {
-            let range = normalize_range(&(50u64..=150));
-            assert_eq!(range, 50..151);
-        }
-
-        #[test]
-        fn should_normalize_range_to_inclusive() {
-            let range = normalize_range(&(..=100u64));
-            assert_eq!(range, 0..101);
-        }
-
-        #[test]
-        fn should_handle_max_value_inclusive() {
-            let range = normalize_range(&(0..=u64::MAX));
-            // saturating_add prevents overflow
-            assert_eq!(range, 0..u64::MAX);
-        }
-
-        #[test]
-        fn should_handle_excluded_start() {
-            use std::ops::Bound;
-            let range = normalize_range(&(Bound::Excluded(10u64), Bound::Unbounded));
-            assert_eq!(range, 11..u64::MAX);
-        }
     }
 }

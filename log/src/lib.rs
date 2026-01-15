@@ -46,6 +46,7 @@ mod error;
 mod listing;
 mod log;
 mod model;
+mod range;
 mod reader;
 mod segment;
 mod sequence;

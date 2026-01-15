@@ -7,7 +7,7 @@
 //! that enable efficient seeking, retention management, and cross-key operations.
 
 use std::collections::BTreeMap;
-use std::ops::{Bound, RangeBounds};
+use std::ops::Range;
 use std::time::Duration;
 
 use common::Record;
@@ -15,21 +15,6 @@ use common::Record;
 use crate::config::SegmentConfig;
 use crate::error::Result;
 use crate::serde::{SegmentId, SegmentMeta, SegmentMetaKey};
-
-/// Converts any `RangeBounds<u64>` to a normalized `Range<u64>`.
-pub(crate) fn normalize_range<R: RangeBounds<u64>>(range: &R) -> std::ops::Range<u64> {
-    let start = match range.start_bound() {
-        Bound::Included(&s) => s,
-        Bound::Excluded(&s) => s.saturating_add(1),
-        Bound::Unbounded => 0,
-    };
-    let end = match range.end_bound() {
-        Bound::Included(&e) => e.saturating_add(1),
-        Bound::Excluded(&e) => e,
-        Bound::Unbounded => u64::MAX,
-    };
-    start..end
-}
 
 /// A logical segment of the log.
 ///
@@ -109,7 +94,7 @@ impl SegmentCache {
         storage: &crate::storage::LogStorageRead,
         config: SegmentConfig,
     ) -> Result<Self> {
-        let loaded = storage.scan_segments(..).await?;
+        let loaded = storage.scan_segments(0..u32::MAX).await?;
 
         let mut segments = BTreeMap::new();
         for segment in loaded {
@@ -139,8 +124,7 @@ impl SegmentCache {
     }
 
     /// Finds segments covering the given sequence range.
-    pub(crate) fn find_covering<R: RangeBounds<u64>>(&self, range: &R) -> Vec<LogSegment> {
-        let range = normalize_range(range);
+    pub(crate) fn find_covering(&self, range: &Range<u64>) -> Vec<LogSegment> {
         if range.start >= range.end {
             return Vec::new();
         }
@@ -180,8 +164,12 @@ impl SegmentCache {
         after_segment_id: Option<SegmentId>,
     ) -> Result<()> {
         let loaded = match after_segment_id {
-            Some(id) => storage.scan_segments(id.saturating_add(1)..).await?,
-            None => storage.scan_segments(..).await?,
+            Some(id) => {
+                storage
+                    .scan_segments(id.saturating_add(1)..u32::MAX)
+                    .await?
+            }
+            None => storage.scan_segments(0..u32::MAX).await?,
         };
 
         if after_segment_id.is_none() {
