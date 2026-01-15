@@ -118,8 +118,21 @@ impl Attribute {
 ///
 /// These types align with the metadata field types defined in the storage
 /// layer (CollectionMeta). Type mismatches at write time will return an error.
+///
+/// The Vector variant stores embedding vectors and enables treating the vector
+/// as a special attribute alongside other metadata fields. This provides a unified
+/// data model where all attributes (including the vector) can be stored and retrieved
+/// consistently.
+///
+/// Vector is an API-level abstraction—at the storage layer, embeddings are stored in
+/// VectorData records. Metadata types (String, Int64, Float64, Bool) map to storage
+/// layer type IDs in VectorMeta (RFC 0001): String=0, Int64=1, Float64=2, Bool=3.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AttributeValue {
+    /// Vector embedding (f32 array). This enables treating the embedding vector as
+    /// a special attribute with the reserved field name "vector". Stored in VectorData,
+    /// not VectorMeta.
+    Vector(Vec<f32>),
     String(String),
     Int64(i64),
     Float64(f64),
@@ -127,6 +140,7 @@ pub enum AttributeValue {
 }
 
 // Convenience From implementations
+impl From<Vec<f32>> for AttributeValue { ... }
 impl From<String> for AttributeValue { ... }
 impl From<&str> for AttributeValue { ... }
 impl From<i64> for AttributeValue { ... }
@@ -265,6 +279,9 @@ pub struct MetadataFieldSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataFieldType {
+    /// Vector embedding type. Use the reserved field name "vector" to define
+    /// the embedding field in the schema. API-level only; stored in VectorData.
+    Vector,
     String,
     Int64,
     Float64,
@@ -534,3 +551,6 @@ metadata). It can be added in the query RFC as a convenience method built on top
 | Date       | Description                                                    |
 |------------|----------------------------------------------------------------|
 | 2026-01-07 | Initial draft                                                  |
+| 2026-01-14 | Add AttributeValue::Vector and MetadataFieldType::Vector to    |
+|            | support treating embeddings as attributes. Vector is API-only; |
+|            | stored in VectorData, not VectorMeta.                          |
