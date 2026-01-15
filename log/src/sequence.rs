@@ -22,7 +22,7 @@
 //! // ... write records atomically ...
 //!
 //! // Apply delta to update allocator state
-//! seq_allocator.apply_delta(&seq_delta);
+//! seq_allocator.apply_delta(seq_delta);
 //! ```
 
 use bytes::Bytes;
@@ -154,11 +154,11 @@ impl SequenceAllocator {
     /// Applies a delta to update internal state.
     ///
     /// Call this after the storage write succeeds.
-    pub(crate) fn apply_delta(&mut self, delta: &SequenceDelta) {
-        if let Some(ref new_block) = delta.new_block {
-            self.current_block = Some(new_block.clone());
-        }
+    pub(crate) fn apply_delta(&mut self, delta: SequenceDelta) {
         self.next_sequence = delta.base_sequence + delta.count;
+        if delta.new_block.is_some() {
+            self.current_block = delta.new_block;
+        }
     }
 
     /// Returns the number of sequences remaining in the current block.
@@ -201,7 +201,7 @@ mod tests {
 
         // First allocation creates a block
         let delta1 = allocator.build_delta(10, &mut records1);
-        allocator.apply_delta(&delta1);
+        allocator.apply_delta(delta1);
 
         // when - second allocation within same block
         let mut records2 = Vec::new();
@@ -223,7 +223,7 @@ mod tests {
 
         // Allocate the entire first block
         let delta1 = allocator.build_delta(DEFAULT_BLOCK_SIZE, &mut records1);
-        allocator.apply_delta(&delta1);
+        allocator.apply_delta(delta1);
 
         // when - need more sequences
         let mut records2 = Vec::new();
@@ -244,7 +244,7 @@ mod tests {
 
         // Allocate most of first block
         let delta1 = allocator.build_delta(DEFAULT_BLOCK_SIZE - 10, &mut records1);
-        allocator.apply_delta(&delta1);
+        allocator.apply_delta(delta1);
 
         // when - request more than remaining
         let mut records2 = Vec::new();
@@ -266,7 +266,7 @@ mod tests {
         let delta = allocator.build_delta(10, &mut records);
 
         // when
-        allocator.apply_delta(&delta);
+        allocator.apply_delta(delta);
 
         // then
         assert_eq!(allocator.peek_next_sequence(), 10);

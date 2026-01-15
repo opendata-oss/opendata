@@ -240,9 +240,9 @@ impl SegmentCache {
     ///
     /// Call this after the storage write succeeds. Only updates the cache
     /// if the delta indicates a new segment was created.
-    pub(crate) fn apply_delta(&mut self, delta: &SegmentDelta) {
+    pub(crate) fn apply_delta(&mut self, delta: SegmentDelta) {
         if delta.is_new {
-            self.insert(delta.segment.clone());
+            self.insert(delta.segment);
         }
     }
 
@@ -737,7 +737,7 @@ mod tests {
         let delta = cache.build_delta(1000, 0, &mut records);
 
         // when
-        cache.apply_delta(&delta);
+        cache.apply_delta(delta);
 
         // then: cache is updated
         let latest = cache.latest().unwrap();
@@ -760,7 +760,7 @@ mod tests {
         assert!(!delta.is_new());
 
         // apply should be a no-op
-        cache.apply_delta(&delta);
+        cache.apply_delta(delta);
 
         // then: still only one segment
         let all = cache.all();

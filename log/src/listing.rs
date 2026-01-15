@@ -117,7 +117,7 @@ pub(crate) struct ListingDelta {
 /// // ... write records to storage ...
 ///
 /// // Apply delta to cache
-/// listing_cache.apply_delta(&listing_delta);
+/// listing_cache.apply_delta(listing_delta);
 /// ```
 pub(crate) struct ListingCache {
     /// The segment ID this cache is tracking.
@@ -179,14 +179,12 @@ impl ListingCache {
     ///
     /// If the delta's segment differs from the cached segment, the cache
     /// is reset before applying.
-    pub(crate) fn apply_delta(&mut self, delta: &ListingDelta) {
+    pub(crate) fn apply_delta(&mut self, delta: ListingDelta) {
         if self.current_segment_id != Some(delta.segment_id) {
-            self.keys.clear();
+            self.keys = delta.new_keys;
             self.current_segment_id = Some(delta.segment_id);
-        }
-
-        for key in &delta.new_keys {
-            self.keys.insert(key.clone());
+        } else {
+            self.keys.extend(delta.new_keys);
         }
     }
 
@@ -388,7 +386,7 @@ mod tests {
 
             // First batch
             let delta1 = cache.build_delta(&seg_delta, &keys1, &mut records1);
-            cache.apply_delta(&delta1);
+            cache.apply_delta(delta1);
 
             // when - second batch with overlap
             let keys2 = vec![Bytes::from("key2"), Bytes::from("key3")];
@@ -431,7 +429,7 @@ mod tests {
             let seg_delta0 = test_seg_delta(0);
             let mut records0 = Vec::new();
             let delta0 = cache.build_delta(&seg_delta0, &keys, &mut records0);
-            cache.apply_delta(&delta0);
+            cache.apply_delta(delta0);
 
             // when - new segment with same keys
             let seg_delta1 = test_seg_delta(1);
@@ -450,13 +448,13 @@ mod tests {
             let seg_delta0 = test_seg_delta(0);
             let mut records0 = Vec::new();
             let delta0 = cache.build_delta(&seg_delta0, &[Bytes::from("key1")], &mut records0);
-            cache.apply_delta(&delta0);
+            cache.apply_delta(delta0);
 
             // when - apply delta for different segment
             let seg_delta1 = test_seg_delta(1);
             let mut records1 = Vec::new();
             let delta1 = cache.build_delta(&seg_delta1, &[Bytes::from("key2")], &mut records1);
-            cache.apply_delta(&delta1);
+            cache.apply_delta(delta1);
 
             // then - key1 should be new again (cache cleared)
             assert!(cache.is_new(1, &Bytes::from("key1")));

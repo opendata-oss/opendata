@@ -241,9 +241,9 @@ impl Log {
             .await?;
 
         // 6. Apply deltas
-        inner.sequence_allocator.apply_delta(&seq_delta);
-        inner.segment_cache.apply_delta(&seg_delta);
-        inner.listing_cache.apply_delta(&listing_delta);
+        inner.sequence_allocator.apply_delta(seq_delta);
+        inner.segment_cache.apply_delta(seg_delta);
+        inner.listing_cache.apply_delta(listing_delta);
 
         Ok(())
     }
