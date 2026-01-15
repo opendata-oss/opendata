@@ -98,7 +98,7 @@ pub(crate) struct ListingDelta {
     /// The segment ID these entries belong to.
     segment_id: SegmentId,
     /// Keys that are new to this segment.
-    new_keys: Vec<Bytes>,
+    new_keys: BTreeSet<Bytes>,
 }
 
 /// In-memory cache of keys seen in the current segment.
@@ -151,25 +151,19 @@ impl ListingCache {
         records: &mut Vec<Record>,
     ) -> ListingDelta {
         let segment_id = seg_delta.segment().id();
-        let mut new_keys = Vec::new();
-        let mut seen_in_batch: BTreeSet<Bytes> = BTreeSet::new();
+        let mut new_keys = BTreeSet::new();
         let value = ListingEntryValue::new().serialize();
 
         for key in keys {
-            // Skip if already seen in this batch
-            if seen_in_batch.contains(key) {
+            // Skip if already seen in this batch or cached
+            if new_keys.contains(key) || !self.is_new(segment_id, key) {
                 continue;
             }
 
-            // Check if new for segment
-            if self.is_new(segment_id, key) {
-                // Add listing entry record
-                let storage_key = ListingEntryKey::new(segment_id, key.clone()).serialize();
-                records.push(Record::new(storage_key, value.clone()));
-
-                new_keys.push(key.clone());
-                seen_in_batch.insert(key.clone());
-            }
+            // Add listing entry record
+            let storage_key = ListingEntryKey::new(segment_id, key.clone()).serialize();
+            records.push(Record::new(storage_key, value.clone()));
+            new_keys.insert(key.clone());
         }
 
         ListingDelta {
@@ -403,7 +397,7 @@ mod tests {
 
             // then - only key3 is new
             assert_eq!(delta2.new_keys.len(), 1);
-            assert_eq!(delta2.new_keys[0], Bytes::from("key3"));
+            assert!(delta2.new_keys.contains(&Bytes::from("key3")));
             assert_eq!(records2.len(), 1);
         }
 
