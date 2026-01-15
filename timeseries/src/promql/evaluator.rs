@@ -44,6 +44,10 @@ impl From<crate::error::Error> for EvaluationError {
 
 pub(crate) type EvalResult<T> = std::result::Result<T, EvaluationError>;
 
+/// Type alias for complex HashMap used in matrix selector evaluation.
+/// Maps from label key (sorted vector of label pairs) to samples vector
+type SeriesMap = HashMap<Vec<Label>, Vec<Sample>>;
+
 pub(crate) struct QueryReaderBucketEvalCache {
     // Map from terms (series_ids for forward, labels for inverted) to cached results
     forward_index_cache:
@@ -193,6 +197,12 @@ pub struct EvalSample {
     pub(crate) labels: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalSamples {
+    pub(crate) values: Vec<Sample>,
+    pub(crate) labels: HashMap<String, String>,
+}
+
 pub(crate) struct Evaluator<'reader, R: QueryReader> {
     reader: CachedQueryReader<'reader, R>,
 }
@@ -322,23 +332,32 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
 pub(crate) enum ExprResult {
     Scalar(f64),
     InstantVector(Vec<EvalSample>),
+    RangeVector(Vec<EvalSamples>),
 }
 
 impl ExprResult {
-    /// Extract the instant vector samples, returning None if this is a scalar result
+    /// Extract the instant vector samples, returning None if this is a scalar or range vector result
     pub(crate) fn into_instant_vector(self) -> Option<Vec<EvalSample>> {
         match self {
             ExprResult::InstantVector(samples) => Some(samples),
-            ExprResult::Scalar(_) => None,
+            ExprResult::Scalar(_) | ExprResult::RangeVector(_) => None,
+        }
+    }
+
+    /// Extract the range vector samples, returning None if this is not a range vector result
+    pub(crate) fn into_range_vector(self) -> Option<Vec<EvalSamples>> {
+        match self {
+            ExprResult::RangeVector(samples) => Some(samples),
+            ExprResult::Scalar(_) | ExprResult::InstantVector(_) => None,
         }
     }
 
     #[cfg(test)]
-    /// Extract instant vector samples, panicking if this is a scalar result
+    /// Extract instant vector samples, panicking if this is not an instant vector result
     pub(crate) fn expect_instant_vector(self, msg: &str) -> Vec<EvalSample> {
         match self {
             ExprResult::InstantVector(samples) => samples,
-            ExprResult::Scalar(_) => panic!("{}", msg),
+            ExprResult::Scalar(_) | ExprResult::RangeVector(_) => panic!("{}", msg),
         }
     }
 }
@@ -410,7 +429,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 Box::pin(fut)
             }
             Expr::MatrixSelector(matrix_selector) => {
-                let fut = self.evaluate_matrix_selector(matrix_selector.clone());
+                let fut = self.evaluate_matrix_selector(matrix_selector.clone(), end);
                 Box::pin(fut)
             }
             Expr::Call(call) => {
@@ -426,11 +445,82 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     async fn evaluate_matrix_selector(
         &mut self,
         matrix_selector: MatrixSelector,
+        end: SystemTime,
     ) -> EvalResult<ExprResult> {
-        let _vector_selector = matrix_selector.vs;
-        todo!()
-        // let labels = self.evaluate_matchers(vector_selector);
-        // self.storage.get(&labels).await
+        let vector_selector = &matrix_selector.vs;
+        let range = matrix_selector.range;
+
+        let start = end - range;
+
+        let end_ms = end
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let start_ms = start
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // order buckets in chronological order
+        let mut buckets = self.reader.list_buckets().await?;
+        buckets.sort_by(|a, b| a.start.cmp(&b.start));
+
+        // Group samples by series (using sorted label vector as key since HashMap doesn't impl Hash)
+        let mut series_map: SeriesMap = HashMap::new();
+
+        for bucket in buckets {
+            // Check if bucket overlaps with our time range
+            let bucket_start_ms = (bucket.start as i64) * 60 * 1000; // Convert minutes to milliseconds
+            let bucket_end_ms = bucket_start_ms + (bucket.size_in_mins() as i64) * 60 * 1000;
+            if bucket_end_ms < start_ms || bucket_start_ms > end_ms {
+                continue;
+            }
+
+            let candidates =
+                evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
+                    .await
+                    .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+
+            if candidates.is_empty() {
+                continue;
+            }
+
+            let candidates_vec: Vec<_> = candidates.into_iter().collect();
+            let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
+
+            for series_id in candidates_vec {
+                let series_spec = match forward_index_view.get_spec(&series_id) {
+                    Some(spec) => spec,
+                    None => {
+                        return Err(EvaluationError::InternalError(format!(
+                            "Series {} not found in bucket {:?}",
+                            series_id, bucket
+                        )));
+                    }
+                };
+
+                let sample_data = self
+                    .reader
+                    .samples(&bucket, series_id, start_ms, end_ms)
+                    .await?;
+
+                let mut labels_key: Vec<Label> = series_spec.labels.clone();
+                labels_key.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.value.cmp(&b.value)));
+
+                let values = series_map.entry(labels_key).or_default();
+                for sample in sample_data {
+                    values.push(sample);
+                }
+            }
+        }
+
+        let mut range_vector = Vec::new();
+        for (labels, values) in series_map {
+            let labels = self.labels_to_hashmap(&labels);
+            range_vector.push(EvalSamples { values, labels });
+        }
+
+        Ok(ExprResult::RangeVector(range_vector))
     }
 
     async fn evaluate_vector_selector(
@@ -542,16 +632,25 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         interval: Duration,
         lookback_delta: Duration,
     ) -> EvalResult<ExprResult> {
-        // Evaluate the argument first (before creating registry to avoid Send issues)
-        let arg_samples = self
-            .eval_single_argument(call, start, end, interval, lookback_delta)
+        if call.args.args.len() != 1 {
+            return Err(EvaluationError::InternalError(format!(
+                "{} function requires exactly one argument",
+                call.func.name
+            )));
+        }
+
+        // Evaluate the argument first
+        let arg_result = self
+            .evaluate_expr(
+                call.args.args[0].as_ref(),
+                start,
+                end,
+                interval,
+                lookback_delta,
+            )
             .await?;
 
-        // Get the function from the registry and apply it
         let registry = FunctionRegistry::new();
-        let func = registry.get(call.func.name).ok_or_else(|| {
-            EvaluationError::InternalError(format!("Unknown function: {}", call.func.name))
-        })?;
 
         // Calculate evaluation timestamp in milliseconds
         let eval_timestamp_ms = end
@@ -559,9 +658,35 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             .unwrap()
             .as_millis() as i64;
 
-        // Apply the function with the evaluation timestamp
-        let result = func.apply(arg_samples, eval_timestamp_ms)?;
-        Ok(ExprResult::InstantVector(result))
+        match arg_result {
+            ExprResult::InstantVector(samples) => {
+                // Try instant vector function first
+                if let Some(func) = registry.get(call.func.name) {
+                    let result = func.apply(samples, eval_timestamp_ms)?;
+                    Ok(ExprResult::InstantVector(result))
+                } else {
+                    Err(EvaluationError::InternalError(format!(
+                        "Unknown instant vector function: {}",
+                        call.func.name
+                    )))
+                }
+            }
+            ExprResult::RangeVector(samples) => {
+                // Try range vector function
+                if let Some(func) = registry.get_range_function(call.func.name) {
+                    let result = func.apply(samples, eval_timestamp_ms)?;
+                    Ok(ExprResult::InstantVector(result))
+                } else {
+                    Err(EvaluationError::InternalError(format!(
+                        "Unknown range vector function: {}",
+                        call.func.name
+                    )))
+                }
+            }
+            ExprResult::Scalar(_) => Err(EvaluationError::InternalError(
+                "Scalar function arguments not yet supported".to_string(),
+            )),
+        }
     }
 
     async fn eval_single_argument(
@@ -595,6 +720,9 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 "unsupported scalar result".to_string(),
             )),
             ExprResult::InstantVector(v) => Ok(v),
+            ExprResult::RangeVector(_) => Err(EvaluationError::InternalError(
+                "range vector handling not yet implemented in eval_single_argument".to_string(),
+            )),
         }
     }
 
@@ -722,6 +850,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 let result_value = self.apply_binary_op(op, left, right)?;
                 Ok(ExprResult::Scalar(result_value))
             }
+            // RangeVector operations not yet supported
+            (ExprResult::RangeVector(_), _) | (_, ExprResult::RangeVector(_)) => {
+                Err(EvaluationError::InternalError(
+                    "Binary operations with range vectors not yet supported".to_string(),
+                ))
+            }
         }
     }
 
@@ -797,6 +931,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     "Cannot aggregate scalar values".to_string(),
                 ));
             }
+            ExprResult::RangeVector(_) => {
+                return Err(EvaluationError::InternalError(
+                    "Cannot aggregate range vectors directly - use functions like rate() first"
+                        .to_string(),
+                ));
+            }
         };
 
         // If there are no samples, return empty result
@@ -864,7 +1004,7 @@ mod tests {
     use crate::model::{Label, MetricType, Sample};
     use crate::query::test_utils::MockQueryReaderBuilder;
     use crate::test_utils::assertions::approx_eq;
-    use promql_parser::label::METRIC_NAME;
+    use promql_parser::label::{METRIC_NAME, Matchers};
     use promql_parser::parser::EvalStmt;
     use rstest::rstest;
 
@@ -1593,6 +1733,7 @@ mod tests {
         match result.unwrap() {
             ExprResult::Scalar(value) => assert_eq!(value, 42.0),
             ExprResult::InstantVector(_) => panic!("Expected scalar result, got vector"),
+            ExprResult::RangeVector(_) => panic!("Expected scalar result, got range vector"),
         }
     }
 
@@ -1758,6 +1899,305 @@ mod tests {
             }
         } else {
             panic!("Expected InstantVector result");
+        }
+    }
+
+    // Matrix Selector Tests
+
+    type MatrixSelectorTestData = Vec<(
+        TimeBucket,
+        &'static str,
+        Vec<(&'static str, &'static str)>,
+        i64,
+        f64,
+    )>;
+    type MatrixSelectorExpectedResults = Vec<(Vec<(&'static str, &'static str)>, Vec<(i64, f64)>)>;
+
+    #[rstest]
+    #[case(
+        "single_series_multiple_samples",
+        vec![
+            // One series with multiple samples across time
+            (TimeBucket::hour(100), "cpu_usage", vec![("host", "server1")], 6_000_000, 10.0),
+            (TimeBucket::hour(100), "cpu_usage", vec![("host", "server1")], 6_060_000, 15.0), // 1 min later
+            (TimeBucket::hour(100), "cpu_usage", vec![("host", "server1")], 6_120_000, 20.0), // 2 min later
+        ],
+        6_150_000, // query time: 2.5 min after first sample
+        Duration::from_secs(180), // 3 min range: covers all 3 samples
+        vec![
+            (vec![("__name__", "cpu_usage"), ("host", "server1")], vec![(6_000_000, 10.0), (6_060_000, 15.0), (6_120_000, 20.0)])
+        ]
+    )]
+    #[case(
+        "multiple_series_same_time_range",
+        vec![
+            // Two different series with samples in the range
+            (TimeBucket::hour(100), "memory", vec![("app", "frontend")], 6_000_000, 100.0),
+            (TimeBucket::hour(100), "memory", vec![("app", "frontend")], 6_060_000, 110.0),
+            (TimeBucket::hour(100), "memory", vec![("app", "backend")], 6_030_000, 200.0),
+            (TimeBucket::hour(100), "memory", vec![("app", "backend")], 6_090_000, 220.0),
+        ],
+        6_100_000, // query time
+        Duration::from_secs(120), // 2 min range
+        vec![
+            (vec![("__name__", "memory"), ("app", "backend")], vec![(6_030_000, 200.0), (6_090_000, 220.0)]),
+            (vec![("__name__", "memory"), ("app", "frontend")], vec![(6_000_000, 100.0), (6_060_000, 110.0)])
+        ]
+    )]
+    #[case(
+        "single_bucket_all_samples_in_range",
+        vec![
+            // All samples in same bucket within the range
+            (TimeBucket::hour(100), "disk_io", vec![("device", "sda")], 6_000_000, 50.0),
+            (TimeBucket::hour(100), "disk_io", vec![("device", "sda")], 6_030_000, 55.0),
+            (TimeBucket::hour(100), "disk_io", vec![("device", "sda")], 6_060_000, 60.0),
+            (TimeBucket::hour(100), "disk_io", vec![("device", "sda")], 6_090_000, 65.0),
+        ],
+        6_100_000, // query time
+        Duration::from_secs(120), // 2 min range: should include last 3 samples
+        vec![
+            (vec![("__name__", "disk_io"), ("device", "sda")], vec![(6_000_000, 50.0), (6_030_000, 55.0), (6_060_000, 60.0), (6_090_000, 65.0)])
+        ]
+    )]
+    #[case(
+        "partial_time_range_filtering",
+        vec![
+            // Some samples outside the range should be filtered out
+            (TimeBucket::hour(100), "requests", vec![("method", "GET")], 5_900_000, 100.0), // too old
+            (TimeBucket::hour(100), "requests", vec![("method", "GET")], 6_000_000, 110.0), // in range
+            (TimeBucket::hour(100), "requests", vec![("method", "GET")], 6_030_000, 120.0), // in range  
+            (TimeBucket::hour(100), "requests", vec![("method", "GET")], 6_200_000, 130.0), // too new
+        ],
+        6_100_000, // query time
+        Duration::from_secs(90), // 1.5 min range: end-90s to end, so 6_010_000 to 6_100_000
+        vec![
+            (vec![("__name__", "requests"), ("method", "GET")], vec![(6_030_000, 120.0)]) // only middle samples in range
+        ]
+    )]
+    #[tokio::test]
+    async fn should_evaluate_matrix_selector(
+        #[case] test_name: &str,
+        #[case] data: MatrixSelectorTestData,
+        #[case] query_time_ms: i64,
+        #[case] range: Duration,
+        #[case] expected: MatrixSelectorExpectedResults,
+    ) {
+        // given:
+        let bucket = TimeBucket::hour(100);
+        let mut builder = MockQueryReaderBuilder::new(bucket);
+        for (_test_bucket, metric_name, label_pairs, timestamp_ms, value) in data {
+            let mut labels = vec![Label {
+                name: "__name__".to_string(),
+                value: metric_name.to_string(),
+            }];
+            for (key, val) in label_pairs {
+                labels.push(Label {
+                    name: key.to_string(),
+                    value: val.to_string(),
+                });
+            }
+            builder.add_sample(
+                labels,
+                MetricType::Gauge,
+                Sample {
+                    timestamp_ms,
+                    value,
+                },
+            );
+        }
+        let reader = builder.build();
+        let mut evaluator = Evaluator::new(&reader);
+
+        // when: evaluate matrix selector
+        let query_time = UNIX_EPOCH + Duration::from_millis(query_time_ms as u64);
+        let metric_name = match expected.first() {
+            Some((labels, _)) => labels
+                .iter()
+                .find(|(k, _)| k == &"__name__")
+                .map(|(_, v)| v.as_ref())
+                .unwrap_or("cpu_usage"),
+            None => "cpu_usage", // default fallback
+        };
+        let matrix_selector = MatrixSelector {
+            vs: VectorSelector {
+                name: Some(metric_name.to_string()),
+                matchers: Matchers {
+                    matchers: vec![],
+                    or_matchers: vec![],
+                },
+                offset: None,
+                at: None,
+            },
+            range,
+        };
+        let result = evaluator
+            .evaluate_matrix_selector(matrix_selector, query_time)
+            .await
+            .unwrap();
+
+        // then: verify results
+        if let ExprResult::RangeVector(range_samples) = result {
+            assert_eq!(
+                range_samples.len(),
+                expected.len(),
+                "Test '{}': Expected {} series, got {}",
+                test_name,
+                expected.len(),
+                range_samples.len()
+            );
+            let mut actual_sorted = range_samples;
+            actual_sorted.sort_by(|a, b| {
+                let mut a_labels: Vec<_> = a.labels.iter().collect();
+                let mut b_labels: Vec<_> = b.labels.iter().collect();
+                a_labels.sort();
+                b_labels.sort();
+                a_labels.cmp(&b_labels)
+            });
+            let mut expected_sorted = expected;
+            expected_sorted.sort_by(|a, b| {
+                let mut a_labels: Vec<(String, String)> =
+                    a.0.iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                let mut b_labels: Vec<(String, String)> =
+                    b.0.iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                a_labels.sort();
+                b_labels.sort();
+                a_labels.cmp(&b_labels)
+            });
+
+            // Compare each series
+            for (i, (actual, expected)) in
+                actual_sorted.iter().zip(expected_sorted.iter()).enumerate()
+            {
+                // Check that the series has the expected labels
+                for (key, expected_value) in &expected.0 {
+                    assert_eq!(
+                        actual.labels.get(*key),
+                        Some(&expected_value.to_string()),
+                        "Test '{}': Series {} missing label {}={}",
+                        test_name,
+                        i,
+                        key,
+                        expected_value
+                    );
+                }
+                // Check that the series has the expected number of samples
+                assert_eq!(
+                    actual.values.len(),
+                    expected.1.len(),
+                    "Test '{}': Series {} expected {} samples, got {}",
+                    test_name,
+                    i,
+                    expected.1.len(),
+                    actual.values.len()
+                );
+                // Check each sample's timestamp and value
+                for (j, (actual, (expected_ts, expected_val))) in
+                    actual.values.iter().zip(expected.1.iter()).enumerate()
+                {
+                    assert_eq!(
+                        actual.timestamp_ms, *expected_ts,
+                        "Test '{}': Series {} sample {} timestamp mismatch: expected {}, got {}",
+                        test_name, i, j, expected_ts, actual.timestamp_ms
+                    );
+                    assert_eq!(
+                        actual.value, *expected_val,
+                        "Test '{}': Series {} sample {} value mismatch: expected {}, got {}",
+                        test_name, i, j, expected_val, actual.value
+                    );
+                }
+            }
+        } else {
+            panic!(
+                "Test '{}': Expected RangeVector result, got {:?}",
+                test_name, result
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_rate_function_with_matrix_selector() {
+        // given: mock reader with counter data over time
+        let bucket = TimeBucket::hour(100);
+        let mut builder = MockQueryReaderBuilder::new(bucket);
+        let labels = vec![
+            Label {
+                name: "__name__".to_string(),
+                value: "http_requests_total".to_string(),
+            },
+            Label {
+                name: "job".to_string(),
+                value: "webapp".to_string(),
+            },
+        ];
+        builder
+            .add_sample(
+                labels.clone(),
+                MetricType::Sum {
+                    monotonic: true,
+                    temporality: crate::model::Temporality::Cumulative,
+                },
+                Sample {
+                    timestamp_ms: 6_000_000, // t=0s, counter at 100
+                    value: 100.0,
+                },
+            )
+            .add_sample(
+                labels.clone(),
+                MetricType::Sum {
+                    monotonic: true,
+                    temporality: crate::model::Temporality::Cumulative,
+                },
+                Sample {
+                    timestamp_ms: 6_030_000, // t=30s, counter at 115
+                    value: 115.0,
+                },
+            )
+            .add_sample(
+                labels.clone(),
+                MetricType::Sum {
+                    monotonic: true,
+                    temporality: crate::model::Temporality::Cumulative,
+                },
+                Sample {
+                    timestamp_ms: 6_060_000, // t=60s, counter at 130
+                    value: 130.0,
+                },
+            );
+        let reader = builder.build();
+        let mut evaluator = Evaluator::new(&reader);
+
+        // when: evaluate rate(http_requests_total[1m])
+        let query_time = UNIX_EPOCH + Duration::from_millis(6_060_000);
+        let query = "rate(http_requests_total[1m])";
+        let expr = promql_parser::parser::parse(query).expect("Failed to parse query");
+        let pipeline_result = evaluator
+            .evaluate_expr(
+                &expr,
+                query_time - Duration::from_secs(60),
+                query_time,
+                Duration::from_secs(15), // 15s step
+                Duration::from_secs(5),  // 5s lookback
+            )
+            .await
+            .unwrap();
+
+        if let ExprResult::InstantVector(instant_samples) = pipeline_result {
+            assert_eq!(instant_samples.len(), 1, "Expected 1 result from pipeline");
+            // The pipeline should give the same rate as the direct function call
+            assert!(instant_samples[0].value > 0.0, "Rate should be positive");
+            assert_eq!(
+                instant_samples[0].labels.get("job"),
+                Some(&"webapp".to_string())
+            );
+        } else {
+            panic!(
+                "Expected InstantVector result from rate function pipeline, got {:?}",
+                pipeline_result
+            );
         }
     }
 }
