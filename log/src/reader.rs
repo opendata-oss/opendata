@@ -4,20 +4,22 @@
 //! - [`LogRead`]: The trait defining read operations on the log.
 //! - [`LogReader`]: A read-only view of the log that implements `LogRead`.
 
-use std::ops::{Bound, RangeBounds};
+use std::ops::RangeBounds;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use tokio::sync::RwLock;
 
-use std::sync::Arc;
-
+use common::StorageRead;
 use common::storage::factory::create_storage;
-use common::{StorageIterator, StorageRead};
 
-use crate::config::{Config, CountOptions, ScanOptions};
+use crate::config::{Config, CountOptions, ListOptions, ScanOptions, SegmentConfig};
 use crate::error::{Error, Result};
-use crate::segment::{SegmentRead, SegmentReader};
-use crate::serde::LogEntryKey;
+use crate::listing::LogKeyIterator;
+use crate::model::LogEntry;
+use crate::segment::{LogSegment, SegmentCache, normalize_range};
+use crate::storage::{LogStorageRead, SegmentIterator};
 
 /// Trait for read operations on the log.
 ///
@@ -142,6 +144,47 @@ pub trait LogRead {
         seq_range: impl RangeBounds<u64> + Send,
         options: CountOptions,
     ) -> Result<u64>;
+
+    /// Lists distinct keys within a sequence number range.
+    ///
+    /// Returns an iterator over keys that have entries in the specified range.
+    /// Each key is returned exactly once, even if it appears in multiple segments.
+    ///
+    /// This method uses default list options. Use [`list_with_options`] for
+    /// custom behavior.
+    ///
+    /// # Arguments
+    ///
+    /// * `seq_range` - The sequence number range to list keys from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the list operation fails due to storage issues.
+    ///
+    /// [`list_with_options`]: LogRead::list_with_options
+    async fn list(&self, seq_range: impl RangeBounds<u64> + Send) -> Result<LogKeyIterator> {
+        self.list_with_options(seq_range, ListOptions::default())
+            .await
+    }
+
+    /// Lists distinct keys within a sequence number range with custom options.
+    ///
+    /// Returns an iterator over keys that have entries in the specified range.
+    /// Each key is returned exactly once, even if it appears in multiple segments.
+    ///
+    /// # Arguments
+    ///
+    /// * `seq_range` - The sequence number range to list keys from.
+    /// * `options` - List options controlling behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the list operation fails due to storage issues.
+    async fn list_with_options(
+        &self,
+        seq_range: impl RangeBounds<u64> + Send,
+        options: ListOptions,
+    ) -> Result<LogKeyIterator>;
 }
 
 /// A read-only view of the log.
@@ -192,7 +235,8 @@ pub trait LogRead {
 /// }
 /// ```
 pub struct LogReader {
-    segment_reader: SegmentReader,
+    storage: LogStorageRead,
+    segments: RwLock<SegmentCache>,
 }
 
 impl LogReader {
@@ -225,15 +269,23 @@ impl LogReader {
         let storage: Arc<dyn StorageRead> = create_storage(&config.storage, None)
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let segment_reader = SegmentReader::open(storage).await?;
-        Ok(Self { segment_reader })
+        let log_storage = LogStorageRead::new(storage);
+        let segments = SegmentCache::open(&log_storage, SegmentConfig::default()).await?;
+        Ok(Self {
+            storage: log_storage,
+            segments: RwLock::new(segments),
+        })
     }
 
     /// Creates a LogReader from an existing storage implementation.
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn StorageRead>) -> Result<Self> {
-        let segment_reader = SegmentReader::open(storage).await?;
-        Ok(Self { segment_reader })
+        let log_storage = LogStorageRead::new(storage);
+        let segments = SegmentCache::open(&log_storage, SegmentConfig::default()).await?;
+        Ok(Self {
+            storage: log_storage,
+            segments: RwLock::new(segments),
+        })
     }
 }
 
@@ -245,9 +297,13 @@ impl LogRead for LogReader {
         seq_range: impl RangeBounds<u64> + Send,
         _options: ScanOptions,
     ) -> Result<LogIterator> {
-        LogIteratorBuilder::new(&self.segment_reader, key, seq_range)
-            .build()
-            .await
+        let segments = self.segments.read().await;
+        Ok(LogIterator::open(
+            self.storage.clone(),
+            &segments,
+            key,
+            seq_range,
+        ))
     }
 
     async fn count_with_options(
@@ -258,117 +314,40 @@ impl LogRead for LogReader {
     ) -> Result<u64> {
         todo!()
     }
+
+    async fn list_with_options(
+        &self,
+        seq_range: impl RangeBounds<u64> + Send,
+        _options: ListOptions,
+    ) -> Result<LogKeyIterator> {
+        let segments = self.segments.read().await.find_covering(&seq_range);
+        list_keys_in_segments(&self.storage, &segments).await
+    }
 }
 
-use crate::model::LogEntry;
-use crate::segment::LogSegment;
-
-/// Iterator over log entries within a single segment.
+/// Converts a list of segments to a segment ID range.
 ///
-/// Wraps a `StorageIterator` and handles range validation and `LogEntry`
-/// deserialization.
-struct SegmentIterator {
-    inner: Box<dyn StorageIterator + Send>,
-    seq_range: std::ops::Range<u64>,
-    segment_start_seq: u64,
-}
-
-impl SegmentIterator {
-    fn new(
-        inner: Box<dyn StorageIterator + Send>,
-        seq_range: std::ops::Range<u64>,
-        segment_start_seq: u64,
-    ) -> Self {
-        Self {
-            inner,
-            seq_range,
-            segment_start_seq,
-        }
+/// Returns a range from the first segment ID to one past the last segment ID.
+/// If the list is empty, returns an empty range (0..0).
+pub(crate) fn segments_to_range(segments: &[LogSegment]) -> std::ops::Range<u32> {
+    if segments.is_empty() {
+        return 0..0;
     }
-
-    /// Returns the next log entry within the sequence range, or None if exhausted.
-    async fn next(&mut self) -> Result<Option<LogEntry>> {
-        loop {
-            let Some(record) = self
-                .inner
-                .next()
-                .await
-                .map_err(|e| Error::Storage(e.to_string()))?
-            else {
-                return Ok(None);
-            };
-
-            let entry_key = LogEntryKey::deserialize(&record.key, self.segment_start_seq)?;
-
-            // Skip entries outside our sequence range
-            if entry_key.sequence < self.seq_range.start {
-                continue;
-            }
-            if entry_key.sequence >= self.seq_range.end {
-                return Ok(None);
-            }
-
-            return Ok(Some(LogEntry {
-                key: entry_key.key,
-                sequence: entry_key.sequence,
-                value: record.value,
-            }));
-        }
-    }
-}
-
-/// Converts any `RangeBounds<u64>` to a normalized `Range<u64>`.
-fn normalize_range(seq_range: impl RangeBounds<u64>) -> std::ops::Range<u64> {
-    let start = match seq_range.start_bound() {
-        Bound::Included(&s) => s,
-        Bound::Excluded(&s) => s.saturating_add(1),
-        Bound::Unbounded => 0,
-    };
-    let end = match seq_range.end_bound() {
-        Bound::Included(&e) => e.saturating_add(1),
-        Bound::Excluded(&e) => e,
-        Bound::Unbounded => u64::MAX,
-    };
+    let start = segments.first().unwrap().id();
+    let end = segments.last().unwrap().id() + 1;
     start..end
 }
 
-/// Builder for creating a `LogIterator`.
+/// Lists keys from the given segments.
 ///
-/// Handles the conversion from `RangeBounds<u64>` to `Range<u64>` and performs
-/// segment lookup when building.
-pub(crate) struct LogIteratorBuilder<'a> {
-    segments: &'a dyn SegmentRead,
-    key: Bytes,
-    range: std::ops::Range<u64>,
-}
-
-impl<'a> LogIteratorBuilder<'a> {
-    /// Creates a new builder.
-    pub fn new(
-        segments: &'a dyn SegmentRead,
-        key: Bytes,
-        seq_range: impl RangeBounds<u64>,
-    ) -> Self {
-        Self {
-            segments,
-            key,
-            range: normalize_range(seq_range),
-        }
-    }
-
-    /// Builds the `LogIterator`, performing segment lookup.
-    pub async fn build(self) -> Result<LogIterator> {
-        let storage = self.segments.storage();
-        let segments = self.segments.find_covering(self.range.clone()).await?;
-        Ok(LogIterator {
-            storage,
-            segments,
-            key: self.key,
-            seq_range: self.range,
-            current_segment_idx: 0,
-            current_iter: None,
-        })
-    }
+/// Helper for `list_with_options` implementations that handles the common
+/// pattern of converting segments to a range and listing keys.
+pub(crate) async fn list_keys_in_segments(
+    storage: &LogStorageRead,
+    segments: &[LogSegment],
+) -> Result<LogKeyIterator> {
+    let segment_range = segments_to_range(segments);
+    storage.list_keys(segment_range).await
 }
 
 /// Iterator over log entries across multiple segments.
@@ -377,7 +356,7 @@ impl<'a> LogIteratorBuilder<'a> {
 /// within the sequence range. Instantiates a `SegmentIterator` for each
 /// segment as needed.
 pub struct LogIterator {
-    storage: Arc<dyn StorageRead>,
+    storage: LogStorageRead,
     segments: Vec<LogSegment>,
     key: Bytes,
     seq_range: std::ops::Range<u64>,
@@ -386,10 +365,29 @@ pub struct LogIterator {
 }
 
 impl LogIterator {
+    /// Opens a new iterator by looking up segments covering the sequence range.
+    pub(crate) fn open(
+        storage: LogStorageRead,
+        segment_cache: &SegmentCache,
+        key: Bytes,
+        seq_range: impl RangeBounds<u64>,
+    ) -> Self {
+        let range = normalize_range(&seq_range);
+        let segments = segment_cache.find_covering(&range);
+        Self {
+            storage,
+            segments,
+            key,
+            seq_range: range,
+            current_segment_idx: 0,
+            current_iter: None,
+        }
+    }
+
     /// Creates a new iterator over the given segments.
     #[cfg(test)]
     pub(crate) fn new(
-        storage: Arc<dyn StorageRead>,
+        storage: LogStorageRead,
         segments: Vec<LogSegment>,
         key: Bytes,
         seq_range: std::ops::Range<u64>,
@@ -433,24 +431,12 @@ impl LogIterator {
         }
 
         let segment = &self.segments[self.current_segment_idx];
-        let segment_start_seq = segment.meta().start_seq;
-        let range = self.segment_scan_range(segment);
-        let inner = self
+        let iter = self
             .storage
-            .scan_iter(range)
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        self.current_iter = Some(SegmentIterator::new(
-            inner,
-            self.seq_range.clone(),
-            segment_start_seq,
-        ));
+            .scan_entries(segment, &self.key, self.seq_range.clone())
+            .await?;
+        self.current_iter = Some(iter);
         Ok(true)
-    }
-
-    /// Computes the storage key range for scanning a segment.
-    fn segment_scan_range(&self, segment: &LogSegment) -> common::BytesRange {
-        LogEntryKey::scan_range(segment, &self.key, self.seq_range.clone())
     }
 }
 
@@ -458,45 +444,50 @@ impl LogIterator {
 mod tests {
     use super::*;
     use crate::serde::SegmentMeta;
-    use common::Storage;
-    use common::storage::in_memory::InMemoryStorage;
+    use crate::storage::LogStorage;
 
-    async fn write_entry(
-        storage: &InMemoryStorage,
-        segment_id: u32,
-        key: &[u8],
-        seq: u64,
-        value: &[u8],
-        segment_start_seq: u64,
-    ) {
-        let entry_key = LogEntryKey::new(segment_id, Bytes::copy_from_slice(key), seq);
-        let record = common::Record {
-            key: entry_key.serialize(segment_start_seq),
+    fn entry(key: &[u8], seq: u64, value: &[u8]) -> LogEntry {
+        LogEntry {
+            key: Bytes::copy_from_slice(key),
+            sequence: seq,
             value: Bytes::copy_from_slice(value),
-        };
-        storage.put(vec![record]).await.unwrap();
+        }
     }
 
     #[tokio::test]
     async fn should_return_none_when_no_segments() {
-        let storage = Arc::new(InMemoryStorage::new());
+        let storage = LogStorage::in_memory();
         let segments = vec![];
 
-        let mut iter = LogIterator::new(storage, segments, Bytes::from("key"), 0..u64::MAX);
+        let mut iter =
+            LogIterator::new(storage.as_read(), segments, Bytes::from("key"), 0..u64::MAX);
 
         assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn should_iterate_entries_in_single_segment() {
-        let storage = Arc::new(InMemoryStorage::new());
-        write_entry(&storage, 0, b"key", 0, b"value0", 0).await;
-        write_entry(&storage, 0, b"key", 1, b"value1", 0).await;
-        write_entry(&storage, 0, b"key", 2, b"value2", 0).await;
+        let storage = LogStorage::in_memory();
+        let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
+        storage
+            .write_entry(&segment, &entry(b"key", 0, b"value0"))
+            .await
+            .unwrap();
+        storage
+            .write_entry(&segment, &entry(b"key", 1, b"value1"))
+            .await
+            .unwrap();
+        storage
+            .write_entry(&segment, &entry(b"key", 2, b"value2"))
+            .await
+            .unwrap();
 
-        let segments = vec![LogSegment::new(0, SegmentMeta::new(0, 1000))];
-
-        let mut iter = LogIterator::new(storage, segments, Bytes::from("key"), 0..u64::MAX);
+        let mut iter = LogIterator::new(
+            storage.as_read(),
+            vec![segment],
+            Bytes::from("key"),
+            0..u64::MAX,
+        );
 
         let entry = iter.next().await.unwrap().unwrap();
         assert_eq!(entry.sequence, 0);
@@ -515,20 +506,34 @@ mod tests {
 
     #[tokio::test]
     async fn should_iterate_entries_across_multiple_segments() {
-        let storage = Arc::new(InMemoryStorage::new());
+        let storage = LogStorage::in_memory();
+        let segment0 = LogSegment::new(0, SegmentMeta::new(0, 1000));
+        let segment1 = LogSegment::new(1, SegmentMeta::new(100, 2000));
         // Entries in segment 0 (start_seq = 0)
-        write_entry(&storage, 0, b"key", 0, b"value0", 0).await;
-        write_entry(&storage, 0, b"key", 1, b"value1", 0).await;
+        storage
+            .write_entry(&segment0, &entry(b"key", 0, b"value0"))
+            .await
+            .unwrap();
+        storage
+            .write_entry(&segment0, &entry(b"key", 1, b"value1"))
+            .await
+            .unwrap();
         // Entries in segment 1 (start_seq = 100)
-        write_entry(&storage, 1, b"key", 100, b"value100", 100).await;
-        write_entry(&storage, 1, b"key", 101, b"value101", 100).await;
+        storage
+            .write_entry(&segment1, &entry(b"key", 100, b"value100"))
+            .await
+            .unwrap();
+        storage
+            .write_entry(&segment1, &entry(b"key", 101, b"value101"))
+            .await
+            .unwrap();
 
-        let segments = vec![
-            LogSegment::new(0, SegmentMeta::new(0, 1000)),
-            LogSegment::new(1, SegmentMeta::new(100, 2000)),
-        ];
-
-        let mut iter = LogIterator::new(storage, segments, Bytes::from("key"), 0..u64::MAX);
+        let mut iter = LogIterator::new(
+            storage.as_read(),
+            vec![segment0, segment1],
+            Bytes::from("key"),
+            0..u64::MAX,
+        );
 
         // Entries from segment 0
         let entry = iter.next().await.unwrap().unwrap();
@@ -553,15 +558,26 @@ mod tests {
 
     #[tokio::test]
     async fn should_filter_by_sequence_range() {
-        let storage = Arc::new(InMemoryStorage::new());
-        write_entry(&storage, 0, b"key", 0, b"value0", 0).await;
-        write_entry(&storage, 0, b"key", 1, b"value1", 0).await;
-        write_entry(&storage, 0, b"key", 2, b"value2", 0).await;
-        write_entry(&storage, 0, b"key", 3, b"value3", 0).await;
+        let storage = LogStorage::in_memory();
+        let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
+        storage
+            .write_entry(&segment, &entry(b"key", 0, b"value0"))
+            .await
+            .unwrap();
+        storage
+            .write_entry(&segment, &entry(b"key", 1, b"value1"))
+            .await
+            .unwrap();
+        storage
+            .write_entry(&segment, &entry(b"key", 2, b"value2"))
+            .await
+            .unwrap();
+        storage
+            .write_entry(&segment, &entry(b"key", 3, b"value3"))
+            .await
+            .unwrap();
 
-        let segments = vec![LogSegment::new(0, SegmentMeta::new(0, 1000))];
-
-        let mut iter = LogIterator::new(storage, segments, Bytes::from("key"), 1..3);
+        let mut iter = LogIterator::new(storage.as_read(), vec![segment], Bytes::from("key"), 1..3);
 
         let entry = iter.next().await.unwrap().unwrap();
         assert_eq!(entry.sequence, 1);
@@ -574,15 +590,31 @@ mod tests {
 
     #[tokio::test]
     async fn should_filter_entries_for_specified_key() {
-        let storage = Arc::new(InMemoryStorage::new());
-        write_entry(&storage, 0, b"key1", 0, b"k1v0", 0).await;
-        write_entry(&storage, 0, b"key2", 0, b"k2v0", 0).await;
-        write_entry(&storage, 0, b"key1", 1, b"k1v1", 0).await;
-        write_entry(&storage, 0, b"key2", 1, b"k2v1", 0).await;
+        let storage = LogStorage::in_memory();
+        let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
+        storage
+            .write_entry(&segment, &entry(b"key1", 0, b"k1v0"))
+            .await
+            .unwrap();
+        storage
+            .write_entry(&segment, &entry(b"key2", 0, b"k2v0"))
+            .await
+            .unwrap();
+        storage
+            .write_entry(&segment, &entry(b"key1", 1, b"k1v1"))
+            .await
+            .unwrap();
+        storage
+            .write_entry(&segment, &entry(b"key2", 1, b"k2v1"))
+            .await
+            .unwrap();
 
-        let segments = vec![LogSegment::new(0, SegmentMeta::new(0, 1000))];
-
-        let mut iter = LogIterator::new(storage, segments, Bytes::from("key1"), 0..u64::MAX);
+        let mut iter = LogIterator::new(
+            storage.as_read(),
+            vec![segment],
+            Bytes::from("key1"),
+            0..u64::MAX,
+        );
 
         let entry = iter.next().await.unwrap().unwrap();
         assert_eq!(entry.key.as_ref(), b"key1");
@@ -597,13 +629,19 @@ mod tests {
 
     #[tokio::test]
     async fn should_return_none_when_no_entries_in_range() {
-        let storage = Arc::new(InMemoryStorage::new());
-        write_entry(&storage, 0, b"key", 0, b"value0", 0).await;
-        write_entry(&storage, 0, b"key", 1, b"value1", 0).await;
+        let storage = LogStorage::in_memory();
+        let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
+        storage
+            .write_entry(&segment, &entry(b"key", 0, b"value0"))
+            .await
+            .unwrap();
+        storage
+            .write_entry(&segment, &entry(b"key", 1, b"value1"))
+            .await
+            .unwrap();
 
-        let segments = vec![LogSegment::new(0, SegmentMeta::new(0, 1000))];
-
-        let mut iter = LogIterator::new(storage, segments, Bytes::from("key"), 10..20);
+        let mut iter =
+            LogIterator::new(storage.as_read(), vec![segment], Bytes::from("key"), 10..20);
 
         assert!(iter.next().await.unwrap().is_none());
     }
@@ -613,43 +651,43 @@ mod tests {
 
         #[test]
         fn should_normalize_full_range() {
-            let range = normalize_range(..);
+            let range = normalize_range(&(..));
             assert_eq!(range, 0..u64::MAX);
         }
 
         #[test]
         fn should_normalize_range_from() {
-            let range = normalize_range(100..);
+            let range = normalize_range(&(100u64..));
             assert_eq!(range, 100..u64::MAX);
         }
 
         #[test]
         fn should_normalize_range_to() {
-            let range = normalize_range(..100);
+            let range = normalize_range(&(..100u64));
             assert_eq!(range, 0..100);
         }
 
         #[test]
         fn should_normalize_range() {
-            let range = normalize_range(50..150);
+            let range = normalize_range(&(50u64..150));
             assert_eq!(range, 50..150);
         }
 
         #[test]
         fn should_normalize_range_inclusive() {
-            let range = normalize_range(50..=150);
+            let range = normalize_range(&(50u64..=150));
             assert_eq!(range, 50..151);
         }
 
         #[test]
         fn should_normalize_range_to_inclusive() {
-            let range = normalize_range(..=100);
+            let range = normalize_range(&(..=100u64));
             assert_eq!(range, 0..101);
         }
 
         #[test]
         fn should_handle_max_value_inclusive() {
-            let range = normalize_range(0..=u64::MAX);
+            let range = normalize_range(&(0..=u64::MAX));
             // saturating_add prevents overflow
             assert_eq!(range, 0..u64::MAX);
         }
@@ -657,7 +695,7 @@ mod tests {
         #[test]
         fn should_handle_excluded_start() {
             use std::ops::Bound;
-            let range = normalize_range((Bound::Excluded(10), Bound::Unbounded));
+            let range = normalize_range(&(Bound::Excluded(10u64), Bound::Unbounded));
             assert_eq!(range, 11..u64::MAX);
         }
     }

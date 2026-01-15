@@ -7,29 +7,28 @@
 //! that enable efficient seeking, retention management, and cross-key operations.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::ops::{Bound, RangeBounds};
+use std::time::Duration;
 
-use async_trait::async_trait;
-use common::{Record, Storage, StorageRead};
-use tokio::sync::RwLock;
+use common::Record;
 
+use crate::config::SegmentConfig;
 use crate::error::Result;
 use crate::serde::{SegmentId, SegmentMeta, SegmentMetaKey};
 
-/// Read-only operations for segments.
-#[async_trait]
-pub(crate) trait SegmentRead: Send + Sync {
-    /// Returns the underlying storage.
-    fn storage(&self) -> Arc<dyn StorageRead>;
-
-    /// Returns the latest segment, if any exist.
-    async fn latest(&self) -> Result<Option<LogSegment>>;
-
-    /// Returns all segments ordered by start sequence.
-    async fn all(&self) -> Result<Vec<LogSegment>>;
-
-    /// Finds segments covering the given sequence range.
-    async fn find_covering(&self, range: std::ops::Range<u64>) -> Result<Vec<LogSegment>>;
+/// Converts any `RangeBounds<u64>` to a normalized `Range<u64>`.
+pub(crate) fn normalize_range<R: RangeBounds<u64>>(range: &R) -> std::ops::Range<u64> {
+    let start = match range.start_bound() {
+        Bound::Included(&s) => s,
+        Bound::Excluded(&s) => s.saturating_add(1),
+        Bound::Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        Bound::Included(&e) => e.saturating_add(1),
+        Bound::Excluded(&e) => e,
+        Bound::Unbounded => u64::MAX,
+    };
+    start..end
 }
 
 /// A logical segment of the log.
@@ -62,61 +61,86 @@ impl LogSegment {
     }
 }
 
+/// Delta representing segment state changes.
+///
+/// Produced by [`SegmentCache::build_delta`] and consumed by [`SegmentCache::apply_delta`].
+#[derive(Debug, Clone)]
+pub(crate) struct SegmentDelta {
+    /// The segment for this write.
+    segment: LogSegment,
+    /// Whether this is a newly created segment.
+    is_new: bool,
+}
+
+impl SegmentDelta {
+    /// Creates a new segment delta.
+    pub(crate) fn new(segment: LogSegment, is_new: bool) -> Self {
+        Self { segment, is_new }
+    }
+
+    /// Returns the segment.
+    pub(crate) fn segment(&self) -> &LogSegment {
+        &self.segment
+    }
+
+    /// Returns whether this is a newly created segment.
+    pub(crate) fn is_new(&self) -> bool {
+        self.is_new
+    }
+}
+
 /// In-memory cache of segments loaded from storage.
 ///
-/// Used by both [`SegmentReader`] and [`SegmentStore`] to provide
-/// fast access to segment metadata without repeated storage reads.
+/// Provides fast access to segment metadata without repeated storage reads.
+/// Also implements the delta pattern for batched writes via `build_delta`
+/// and `apply_delta`.
 ///
 /// Keyed by `start_seq` to optimize `find_covering` queries.
-struct SegmentCache {
+pub(crate) struct SegmentCache {
     /// Segments keyed by their starting sequence number.
-    segments: RwLock<BTreeMap<u64, LogSegment>>,
+    segments: BTreeMap<u64, LogSegment>,
+    /// Configuration for segment management.
+    config: SegmentConfig,
 }
 
 impl SegmentCache {
     /// Creates a new cache by loading all segments from storage.
-    async fn open(storage: &dyn StorageRead) -> Result<Self> {
-        let range = SegmentMetaKey::scan_range(..);
-        let records = storage.scan(range).await?;
+    pub(crate) async fn open(
+        storage: &crate::storage::LogStorageRead,
+        config: SegmentConfig,
+    ) -> Result<Self> {
+        let loaded = storage.scan_segments(..).await?;
 
         let mut segments = BTreeMap::new();
-        for record in records {
-            let key = SegmentMetaKey::deserialize(&record.key)?;
-            let meta = SegmentMeta::deserialize(&record.value)?;
-            let start_seq = meta.start_seq;
-            let segment = LogSegment::new(key.segment_id, meta);
-            segments.insert(start_seq, segment);
+        for segment in loaded {
+            segments.insert(segment.meta.start_seq, segment);
         }
 
-        Ok(Self {
-            segments: RwLock::new(segments),
-        })
+        Ok(Self { segments, config })
     }
 
     /// Creates an empty cache for testing.
     #[cfg(test)]
     fn new() -> Self {
         Self {
-            segments: RwLock::new(BTreeMap::new()),
+            segments: BTreeMap::new(),
+            config: SegmentConfig::default(),
         }
     }
 
     /// Returns the latest segment, if any exist.
-    async fn latest(&self) -> Option<LogSegment> {
-        let segments = self.segments.read().await;
-        segments.values().next_back().cloned()
+    pub(crate) fn latest(&self) -> Option<LogSegment> {
+        self.segments.values().next_back().cloned()
     }
 
     /// Returns all segments ordered by start sequence.
-    async fn all(&self) -> Vec<LogSegment> {
-        let segments = self.segments.read().await;
-        segments.values().cloned().collect()
+    pub(crate) fn all(&self) -> Vec<LogSegment> {
+        self.segments.values().cloned().collect()
     }
 
     /// Finds segments covering the given sequence range.
-    async fn find_covering(&self, range: std::ops::Range<u64>) -> Vec<LogSegment> {
-        let segments = self.segments.read().await;
-
+    pub(crate) fn find_covering<R: RangeBounds<u64>>(&self, range: &R) -> Vec<LogSegment> {
+        let range = normalize_range(range);
         if range.start >= range.end {
             return Vec::new();
         }
@@ -124,14 +148,17 @@ impl SegmentCache {
         // Find the first segment that could contain range.start.
         // This is the segment with the largest start_seq <= range.start.
         let mut result = Vec::new();
-        let mut iter = segments.range(..=range.start).rev();
+        let mut iter = self.segments.range(..=range.start).rev();
 
         if let Some((_, first_seg)) = iter.next() {
             result.push(first_seg.clone());
         }
 
         // Add all segments starting within our query range
-        for (_, seg) in segments.range(range.start.saturating_add(1)..range.end) {
+        for (_, seg) in self
+            .segments
+            .range(range.start.saturating_add(1)..range.end)
+        {
             result.push(seg.clone());
         }
 
@@ -139,266 +166,139 @@ impl SegmentCache {
     }
 
     /// Adds a segment to the cache.
-    async fn insert(&self, segment: LogSegment) {
-        let mut segments = self.segments.write().await;
-        segments.insert(segment.meta.start_seq, segment);
+    pub(crate) fn insert(&mut self, segment: LogSegment) {
+        self.segments.insert(segment.meta.start_seq, segment);
     }
 
     /// Refreshes the cache by loading segments from storage.
     ///
     /// If `after_segment_id` is `Some(id)`, only loads segments with id > `id` and appends them.
     /// If `after_segment_id` is `None`, reloads all segments.
-    async fn refresh(
-        &self,
-        storage: &dyn StorageRead,
+    pub(crate) async fn refresh(
+        &mut self,
+        storage: &crate::storage::LogStorageRead,
         after_segment_id: Option<SegmentId>,
     ) -> Result<()> {
-        let range = match after_segment_id {
-            Some(id) => SegmentMetaKey::scan_range(id.saturating_add(1)..),
-            None => SegmentMetaKey::scan_range(..),
+        let loaded = match after_segment_id {
+            Some(id) => storage.scan_segments(id.saturating_add(1)..).await?,
+            None => storage.scan_segments(..).await?,
         };
-        let records = storage.scan(range).await?;
 
-        let mut segments = self.segments.write().await;
         if after_segment_id.is_none() {
-            segments.clear();
+            self.segments.clear();
         }
 
-        for record in records {
-            let key = SegmentMetaKey::deserialize(&record.key)?;
-            let meta = SegmentMeta::deserialize(&record.value)?;
-            let start_seq = meta.start_seq;
-            let segment = LogSegment::new(key.segment_id, meta);
-            segments.insert(start_seq, segment);
+        for segment in loaded {
+            self.segments.insert(segment.meta.start_seq, segment);
         }
 
         Ok(())
     }
-}
 
-/// Read-only access to segments.
-///
-/// `SegmentReader` provides read-only operations for discovering and
-/// loading segments from storage. Used by `LogReader` and other components
-/// that don't need write access.
-pub(crate) struct SegmentReader {
-    storage: Arc<dyn StorageRead>,
-    cache: SegmentCache,
-}
+    /// Builds a delta for segment state, adding a segment record if needed.
+    ///
+    /// Determines whether to use an existing segment or create a new one based on
+    /// the seal interval configuration. If a new segment is needed, adds the segment
+    /// metadata record to `records`.
+    ///
+    /// Does NOT update the cache - call `apply_delta()` after the storage write succeeds.
+    ///
+    /// # Parameters
+    /// - `current_time_ms`: Current wall-clock time in milliseconds since Unix epoch
+    /// - `start_seq`: The starting sequence number for a new segment if one is created
+    /// - `records`: Mutable vec to append the segment meta record to (if new segment)
+    ///
+    /// # Returns
+    /// A `SegmentDelta` containing the segment to use and whether it's new.
+    pub(crate) fn build_delta(
+        &self,
+        current_time_ms: i64,
+        start_seq: u64,
+        records: &mut Vec<Record>,
+    ) -> SegmentDelta {
+        let latest = self.latest();
+        let needs_new_segment =
+            Self::should_roll(self.config.seal_interval, current_time_ms, latest.as_ref());
 
-impl SegmentReader {
-    /// Opens a segment reader, loading all segments into cache.
-    pub(crate) async fn open(storage: Arc<dyn StorageRead>) -> Result<Self> {
-        let cache = SegmentCache::open(&*storage).await?;
-        Ok(Self { storage, cache })
-    }
+        if needs_new_segment {
+            let segment_id = latest.map(|s| s.id + 1).unwrap_or(0);
+            let meta = SegmentMeta::new(start_seq, current_time_ms);
+            let key = SegmentMetaKey::new(segment_id).serialize();
+            let value = meta.serialize();
+            records.push(Record::new(key, value));
 
-    /// Creates a new segment reader for testing.
-    #[cfg(test)]
-    pub(crate) fn new(storage: Arc<dyn StorageRead>) -> Self {
-        Self {
-            storage,
-            cache: SegmentCache::new(),
+            let segment = LogSegment::new(segment_id, meta);
+            SegmentDelta::new(segment, true)
+        } else {
+            // Safe to unwrap: should_roll returns true if latest is None
+            let segment = latest.unwrap();
+            SegmentDelta::new(segment, false)
         }
     }
 
-    /// Refreshes the segment cache by loading new segments from storage.
+    /// Applies a delta to update the segment cache.
     ///
-    /// Only scans for segments newer than the latest cached segment.
-    // TODO: Add periodic refresh to scan for new segments from storage.
-    pub(crate) async fn refresh(&self) -> Result<()> {
-        let after = self.cache.latest().await.map(|s| s.id);
-        self.cache.refresh(&*self.storage, after).await
-    }
-}
-
-#[async_trait]
-impl SegmentRead for SegmentReader {
-    fn storage(&self) -> Arc<dyn StorageRead> {
-        Arc::clone(&self.storage)
-    }
-
-    async fn latest(&self) -> Result<Option<LogSegment>> {
-        Ok(self.cache.latest().await)
-    }
-
-    async fn all(&self) -> Result<Vec<LogSegment>> {
-        Ok(self.cache.all().await)
-    }
-
-    async fn find_covering(&self, range: std::ops::Range<u64>) -> Result<Vec<LogSegment>> {
-        Ok(self.cache.find_covering(range).await)
-    }
-}
-
-/// Manages segment persistence and lifecycle.
-///
-/// `SegmentStore` handles creating new segments and tracking the active segment.
-/// For read-only access, use [`SegmentReader`].
-pub(crate) struct SegmentStore {
-    storage: Arc<dyn Storage>,
-    cache: SegmentCache,
-    config: crate::config::SegmentConfig,
-}
-
-impl SegmentStore {
-    /// Opens the segment store, loading all existing segments into cache.
-    pub(crate) async fn open(
-        storage: Arc<dyn Storage>,
-        config: crate::config::SegmentConfig,
-    ) -> Result<Self> {
-        let cache = SegmentCache::open(&*storage).await?;
-        Ok(Self {
-            storage,
-            cache,
-            config,
-        })
-    }
-
-    /// Creates a new segment store for testing.
-    #[cfg(test)]
-    pub(crate) fn new(storage: Arc<dyn Storage>) -> Self {
-        Self {
-            storage,
-            cache: SegmentCache::new(),
-            config: crate::config::SegmentConfig::default(),
+    /// Call this after the storage write succeeds. Only updates the cache
+    /// if the delta indicates a new segment was created.
+    pub(crate) fn apply_delta(&mut self, delta: &SegmentDelta) {
+        if delta.is_new {
+            self.insert(delta.segment.clone());
         }
     }
 
-    /// Writes a new segment.
-    ///
-    /// The new segment ID is derived from the latest existing segment.
-    /// Returns the newly created segment.
-    pub(crate) async fn write(&self, meta: SegmentMeta) -> Result<LogSegment> {
-        let segment_id = match self.cache.latest().await {
-            Some(latest) => latest.id + 1,
-            None => 0,
-        };
-
-        let key = SegmentMetaKey::new(segment_id).serialize();
-        let value = meta.serialize();
-        self.storage.put(vec![Record::new(key, value)]).await?;
-
-        let segment = LogSegment::new(segment_id, meta);
-        self.cache.insert(segment.clone()).await;
-
-        Ok(segment)
-    }
-
-    /// Checks if the current segment should be rolled based on the seal interval.
-    ///
-    /// Returns `true` if:
-    /// - A seal interval is configured, AND
-    /// - Either no segment exists, OR the current segment has exceeded the seal interval
-    ///
-    /// The `current_time_ms` parameter is the current wall-clock time in milliseconds
-    /// since the Unix epoch.
-    pub(crate) async fn should_roll(&self, current_time_ms: i64) -> bool {
-        let Some(seal_interval) = self.config.seal_interval else {
-            return false;
-        };
-
-        let Some(latest) = self.cache.latest().await else {
-            // No segments exist yet
+    /// Checks if a new segment should be created based on seal interval.
+    fn should_roll(
+        seal_interval: Option<Duration>,
+        current_time_ms: i64,
+        latest: Option<&LogSegment>,
+    ) -> bool {
+        // No latest segment means we need to create the first one
+        let Some(latest) = latest else {
             return true;
+        };
+
+        // No seal interval means we never roll (use existing segment)
+        let Some(seal_interval) = seal_interval else {
+            return false;
         };
 
         let seal_interval_ms = seal_interval.as_millis() as i64;
         let segment_age_ms = current_time_ms - latest.meta().start_time_ms;
         segment_age_ms >= seal_interval_ms
     }
-
-    /// Forces creation of a new segment, sealing the current one.
-    ///
-    /// This unconditionally creates a new segment regardless of seal interval.
-    /// Used for testing and manual segment management.
-    ///
-    /// # Parameters
-    /// - `current_time_ms`: Current wall-clock time in milliseconds since Unix epoch
-    /// - `start_seq`: The starting sequence number for the new segment
-    ///
-    /// # Returns
-    /// The newly created segment.
-    pub(crate) async fn seal_current(
-        &self,
-        current_time_ms: i64,
-        start_seq: u64,
-    ) -> Result<LogSegment> {
-        self.write(SegmentMeta::new(start_seq, current_time_ms))
-            .await
-    }
-
-    /// Ensures a segment is available for writing, rolling if necessary.
-    ///
-    /// If no segment exists or the current segment has exceeded the seal interval,
-    /// a new segment is created. This method should be used when appending entries
-    /// to ensure writes go to the appropriate segment.
-    ///
-    /// # Parameters
-    /// - `current_time_ms`: Current wall-clock time in milliseconds since Unix epoch
-    /// - `start_seq`: The starting sequence number for a new segment if one is created
-    ///
-    /// # Returns
-    /// The segment that should receive new writes.
-    pub(crate) async fn ensure_latest(
-        &self,
-        current_time_ms: i64,
-        start_seq: u64,
-    ) -> Result<LogSegment> {
-        if self.should_roll(current_time_ms).await {
-            return self
-                .write(SegmentMeta::new(start_seq, current_time_ms))
-                .await;
-        }
-
-        // should_roll returned false. Either:
-        // 1. seal_interval is None - use latest or create first segment
-        // 2. seal_interval is Some but segment is young - use latest (which must exist)
-        match self.cache.latest().await {
-            Some(segment) => Ok(segment),
-            None => {
-                self.write(SegmentMeta::new(start_seq, current_time_ms))
-                    .await
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl SegmentRead for SegmentStore {
-    fn storage(&self) -> Arc<dyn StorageRead> {
-        Arc::clone(&self.storage) as Arc<dyn StorageRead>
-    }
-
-    async fn latest(&self) -> Result<Option<LogSegment>> {
-        Ok(self.cache.latest().await)
-    }
-
-    async fn all(&self) -> Result<Vec<LogSegment>> {
-        Ok(self.cache.all().await)
-    }
-
-    async fn find_covering(&self, range: std::ops::Range<u64>) -> Result<Vec<LogSegment>> {
-        Ok(self.cache.find_covering(range).await)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SegmentConfig;
-    use common::storage::in_memory::InMemoryStorage;
+    use crate::storage::LogStorage;
+
+    // Helper to create a segment and write it to storage + cache
+    async fn write_segment(
+        storage: &LogStorage,
+        cache: &mut SegmentCache,
+        meta: SegmentMeta,
+    ) -> LogSegment {
+        let segment_id = match cache.latest() {
+            Some(latest) => latest.id + 1,
+            None => 0,
+        };
+        let segment = LogSegment::new(segment_id, meta);
+        storage.write_segment(&segment).await.unwrap();
+        cache.insert(segment.clone());
+        segment
+    }
 
     #[tokio::test]
     async fn should_return_none_when_no_segments_exist() {
         // given
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage, Default::default())
+        let storage = LogStorage::in_memory();
+        let cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
 
         // when
-        let latest = store.latest().await.unwrap();
+        let latest = cache.latest();
 
         // then
         assert!(latest.is_none());
@@ -407,14 +307,14 @@ mod tests {
     #[tokio::test]
     async fn should_write_first_segment_with_id_zero() {
         // given
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage, Default::default())
+        let storage = LogStorage::in_memory();
+        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
         let meta = SegmentMeta::new(0, 1000);
 
         // when
-        let segment = store.write(meta.clone()).await.unwrap();
+        let segment = write_segment(&storage, &mut cache, meta.clone()).await;
 
         // then
         assert_eq!(segment.id(), 0);
@@ -424,15 +324,15 @@ mod tests {
     #[tokio::test]
     async fn should_increment_segment_id_on_subsequent_writes() {
         // given
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage, Default::default())
+        let storage = LogStorage::in_memory();
+        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
 
         // when
-        let seg0 = store.write(SegmentMeta::new(0, 1000)).await.unwrap();
-        let seg1 = store.write(SegmentMeta::new(100, 2000)).await.unwrap();
-        let seg2 = store.write(SegmentMeta::new(200, 3000)).await.unwrap();
+        let seg0 = write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
+        let seg1 = write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
+        let seg2 = write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // then
         assert_eq!(seg0.id(), 0);
@@ -443,15 +343,15 @@ mod tests {
     #[tokio::test]
     async fn should_return_latest_segment() {
         // given
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage, Default::default())
+        let storage = LogStorage::in_memory();
+        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
-        store.write(SegmentMeta::new(100, 2000)).await.unwrap();
+        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
 
         // when
-        let latest = store.latest().await.unwrap();
+        let latest = cache.latest();
 
         // then
         assert_eq!(latest.unwrap().id(), 1);
@@ -460,16 +360,16 @@ mod tests {
     #[tokio::test]
     async fn should_scan_all_segments() {
         // given
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage, Default::default())
+        let storage = LogStorage::in_memory();
+        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
-        store.write(SegmentMeta::new(100, 2000)).await.unwrap();
-        store.write(SegmentMeta::new(200, 3000)).await.unwrap();
+        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // when
-        let segments = store.all().await.unwrap();
+        let segments = cache.all();
 
         // then
         assert_eq!(segments.len(), 3);
@@ -481,18 +381,18 @@ mod tests {
     #[tokio::test]
     async fn should_persist_segments_to_storage() {
         // given
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage.clone(), Default::default())
+        let storage = LogStorage::in_memory();
+        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
-        store.write(SegmentMeta::new(100, 2000)).await.unwrap();
+        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
 
-        // when - reopen from same storage
-        let store2 = SegmentStore::open(storage, Default::default())
+        // when - reopen cache from same storage
+        let cache2 = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
-        let segments = store2.all().await.unwrap();
+        let segments = cache2.all();
 
         // then
         assert_eq!(segments.len(), 2);
@@ -503,38 +403,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_load_segments_on_reader_open() {
-        // given
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage.clone(), Default::default())
-            .await
-            .unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
-        store.write(SegmentMeta::new(100, 2000)).await.unwrap();
-
-        // when
-        let reader = SegmentReader::open(storage).await.unwrap();
-        let segments = reader.all().await.unwrap();
-
-        // then
-        assert_eq!(segments.len(), 2);
-    }
-
-    #[tokio::test]
     async fn should_find_segments_by_seq_range_all() {
         // given: segments at seq 0, 100, 200
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage.clone(), Default::default())
+        let storage = LogStorage::in_memory();
+        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
-        store.write(SegmentMeta::new(100, 2000)).await.unwrap();
-        store.write(SegmentMeta::new(200, 3000)).await.unwrap();
-
-        let reader = SegmentReader::open(storage).await.unwrap();
+        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // when: query all sequences
-        let segments = reader.find_covering(0..u64::MAX).await.unwrap();
+        let segments = cache.find_covering(&(0..u64::MAX));
 
         // then: all segments match
         assert_eq!(segments.len(), 3);
@@ -543,18 +423,16 @@ mod tests {
     #[tokio::test]
     async fn should_find_segments_by_seq_range_single() {
         // given: segments at seq 0, 100, 200
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage.clone(), Default::default())
+        let storage = LogStorage::in_memory();
+        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
-        store.write(SegmentMeta::new(100, 2000)).await.unwrap();
-        store.write(SegmentMeta::new(200, 3000)).await.unwrap();
-
-        let reader = SegmentReader::open(storage).await.unwrap();
+        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // when: query seq 50..60 (within first segment)
-        let segments = reader.find_covering(50..60).await.unwrap();
+        let segments = cache.find_covering(&(50..60));
 
         // then: only first segment matches
         assert_eq!(segments.len(), 1);
@@ -564,18 +442,16 @@ mod tests {
     #[tokio::test]
     async fn should_find_segments_by_seq_range_spanning() {
         // given: segments at seq 0, 100, 200
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage.clone(), Default::default())
+        let storage = LogStorage::in_memory();
+        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
-        store.write(SegmentMeta::new(100, 2000)).await.unwrap();
-        store.write(SegmentMeta::new(200, 3000)).await.unwrap();
-
-        let reader = SegmentReader::open(storage).await.unwrap();
+        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // when: query seq 50..150 (spans first and second segment)
-        let segments = reader.find_covering(50..150).await.unwrap();
+        let segments = cache.find_covering(&(50..150));
 
         // then: first two segments match
         assert_eq!(segments.len(), 2);
@@ -586,18 +462,16 @@ mod tests {
     #[tokio::test]
     async fn should_find_segments_by_seq_range_unbounded_end() {
         // given: segments at seq 0, 100, 200
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage.clone(), Default::default())
+        let storage = LogStorage::in_memory();
+        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
-        store.write(SegmentMeta::new(100, 2000)).await.unwrap();
-        store.write(SegmentMeta::new(200, 3000)).await.unwrap();
-
-        let reader = SegmentReader::open(storage).await.unwrap();
+        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // when: query seq 150.. (from middle of second segment to end)
-        let segments = reader.find_covering(150..u64::MAX).await.unwrap();
+        let segments = cache.find_covering(&(150..u64::MAX));
 
         // then: second and third segments match
         assert_eq!(segments.len(), 2);
@@ -608,16 +482,14 @@ mod tests {
     #[tokio::test]
     async fn should_find_no_segments_when_range_before_all() {
         // given: segments starting at seq 100
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage.clone(), Default::default())
+        let storage = LogStorage::in_memory();
+        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
-        store.write(SegmentMeta::new(100, 1000)).await.unwrap();
-
-        let reader = SegmentReader::open(storage).await.unwrap();
+        write_segment(&storage, &mut cache, SegmentMeta::new(100, 1000)).await;
 
         // when: query seq 0..50 (before any segment data)
-        let segments = reader.find_covering(0..50).await.unwrap();
+        let segments = cache.find_covering(&(0..50));
 
         // then: no segments match (segment starts at 100)
         assert_eq!(segments.len(), 0);
@@ -626,11 +498,13 @@ mod tests {
     #[tokio::test]
     async fn should_find_no_segments_when_storage_empty() {
         // given: no segments
-        let storage = Arc::new(InMemoryStorage::new());
-        let reader = SegmentReader::open(storage).await.unwrap();
+        let storage = LogStorage::in_memory();
+        let cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+            .await
+            .unwrap();
 
         // when: query any range
-        let segments = reader.find_covering(0..u64::MAX).await.unwrap();
+        let segments = cache.find_covering(&(0..u64::MAX));
 
         // then: no segments
         assert_eq!(segments.len(), 0);
@@ -639,18 +513,16 @@ mod tests {
     #[tokio::test]
     async fn should_find_last_segment_when_range_after_all() {
         // given: segments at seq 0, 100, 200
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage.clone(), Default::default())
+        let storage = LogStorage::in_memory();
+        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
-        store.write(SegmentMeta::new(100, 2000)).await.unwrap();
-        store.write(SegmentMeta::new(200, 3000)).await.unwrap();
-
-        let reader = SegmentReader::open(storage).await.unwrap();
+        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // when: query seq 500..600 (after all segment starts)
-        let segments = reader.find_covering(500..600).await.unwrap();
+        let segments = cache.find_covering(&(500..600));
 
         // then: last segment matches (it could contain seqs 200+)
         assert_eq!(segments.len(), 1);
@@ -660,18 +532,16 @@ mod tests {
     #[tokio::test]
     async fn should_find_segment_when_query_starts_at_boundary() {
         // given: segments at seq 0, 100, 200
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage.clone(), Default::default())
+        let storage = LogStorage::in_memory();
+        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
-        store.write(SegmentMeta::new(100, 2000)).await.unwrap();
-        store.write(SegmentMeta::new(200, 3000)).await.unwrap();
-
-        let reader = SegmentReader::open(storage).await.unwrap();
+        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // when: query starting exactly at segment boundary
-        let segments = reader.find_covering(100..150).await.unwrap();
+        let segments = cache.find_covering(&(100..150));
 
         // then: only the segment starting at 100 matches
         assert_eq!(segments.len(), 1);
@@ -681,38 +551,16 @@ mod tests {
     #[tokio::test]
     async fn should_find_segments_with_unbounded_start() {
         // given: segments at seq 0, 100, 200
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage.clone(), Default::default())
+        let storage = LogStorage::in_memory();
+        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
-        store.write(SegmentMeta::new(100, 2000)).await.unwrap();
-        store.write(SegmentMeta::new(200, 3000)).await.unwrap();
-
-        let reader = SegmentReader::open(storage).await.unwrap();
+        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // when: query with unbounded start ..150
-        let segments = reader.find_covering(0..150).await.unwrap();
-
-        // then: first two segments match
-        assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].id(), 0);
-        assert_eq!(segments[1].id(), 1);
-    }
-
-    #[tokio::test]
-    async fn should_find_covering_via_segment_store() {
-        // given: segments at seq 0, 100, 200
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage, Default::default())
-            .await
-            .unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
-        store.write(SegmentMeta::new(100, 2000)).await.unwrap();
-        store.write(SegmentMeta::new(200, 3000)).await.unwrap();
-
-        // when: query via store (not reader)
-        let segments = store.find_covering(50..150).await.unwrap();
+        let segments = cache.find_covering(&(0..150));
 
         // then: first two segments match
         assert_eq!(segments.len(), 2);
@@ -722,30 +570,20 @@ mod tests {
 
     #[tokio::test]
     async fn should_roll_returns_false_when_no_seal_interval() {
-        // given: store without seal interval
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage, Default::default())
-            .await
-            .unwrap();
+        // given: no seal interval, no latest segment
+        let should_roll = SegmentCache::should_roll(None, 1000, None);
 
-        // when
-        let should_roll = store.should_roll(1000).await;
-
-        // then
-        assert!(!should_roll);
+        // then: should roll (no segment exists)
+        assert!(should_roll);
     }
 
     #[tokio::test]
     async fn should_roll_returns_true_when_no_segments_exist() {
-        // given: store with seal interval but no segments
-        let storage = Arc::new(InMemoryStorage::new());
-        let config = SegmentConfig {
-            seal_interval: Some(std::time::Duration::from_secs(3600)),
-        };
-        let store = SegmentStore::open(storage, config).await.unwrap();
+        // given: seal interval configured but no segments
+        let seal_interval = Some(Duration::from_secs(3600));
 
         // when
-        let should_roll = store.should_roll(1000).await;
+        let should_roll = SegmentCache::should_roll(seal_interval, 1000, None);
 
         // then: should roll to create first segment
         assert!(should_roll);
@@ -754,16 +592,12 @@ mod tests {
     #[tokio::test]
     async fn should_roll_returns_false_when_within_interval() {
         // given: segment created at time 1000, seal interval 1 hour
-        let storage = Arc::new(InMemoryStorage::new());
-        let config = SegmentConfig {
-            seal_interval: Some(std::time::Duration::from_secs(3600)),
-        };
-        let store = SegmentStore::open(storage, config).await.unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
+        let seal_interval = Some(Duration::from_secs(3600));
+        let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
 
         // when: current time is 1000 + 30 minutes
         let current_time_ms = 1000 + 30 * 60 * 1000;
-        let should_roll = store.should_roll(current_time_ms).await;
+        let should_roll = SegmentCache::should_roll(seal_interval, current_time_ms, Some(&segment));
 
         // then
         assert!(!should_roll);
@@ -772,16 +606,12 @@ mod tests {
     #[tokio::test]
     async fn should_roll_returns_true_when_interval_exceeded() {
         // given: segment created at time 1000, seal interval 1 hour
-        let storage = Arc::new(InMemoryStorage::new());
-        let config = SegmentConfig {
-            seal_interval: Some(std::time::Duration::from_secs(3600)),
-        };
-        let store = SegmentStore::open(storage, config).await.unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
+        let seal_interval = Some(Duration::from_secs(3600));
+        let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
 
         // when: current time is 1000 + 2 hours
         let current_time_ms = 1000 + 2 * 60 * 60 * 1000;
-        let should_roll = store.should_roll(current_time_ms).await;
+        let should_roll = SegmentCache::should_roll(seal_interval, current_time_ms, Some(&segment));
 
         // then
         assert!(should_roll);
@@ -790,178 +620,172 @@ mod tests {
     #[tokio::test]
     async fn should_roll_returns_true_when_exactly_at_interval() {
         // given: segment created at time 1000, seal interval 1 hour
-        let storage = Arc::new(InMemoryStorage::new());
-        let config = SegmentConfig {
-            seal_interval: Some(std::time::Duration::from_secs(3600)),
-        };
-        let store = SegmentStore::open(storage, config).await.unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
+        let seal_interval = Some(Duration::from_secs(3600));
+        let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
 
         // when: current time is exactly at the interval boundary
         let current_time_ms = 1000 + 60 * 60 * 1000;
-        let should_roll = store.should_roll(current_time_ms).await;
+        let should_roll = SegmentCache::should_roll(seal_interval, current_time_ms, Some(&segment));
 
         // then: at boundary should roll
         assert!(should_roll);
     }
 
     #[tokio::test]
-    async fn ensure_latest_creates_first_segment_when_none_exist_without_seal_interval() {
-        // given: no segments, no seal interval
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage, Default::default())
+    async fn should_roll_returns_false_without_seal_interval_when_segment_exists() {
+        // given: no seal interval, segment exists
+        let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
+
+        // when
+        let should_roll = SegmentCache::should_roll(None, 999999999, Some(&segment));
+
+        // then: never rolls without seal_interval when segment exists
+        assert!(!should_roll);
+    }
+
+    #[tokio::test]
+    async fn build_delta_creates_first_segment_when_none_exist() {
+        // given
+        let storage = LogStorage::in_memory();
+        let cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
+        let mut records = Vec::new();
 
         // when
-        let segment = store.ensure_latest(1000, 0).await.unwrap();
+        let delta = cache.build_delta(1000, 0, &mut records);
 
-        // then: creates segment 0
-        assert_eq!(segment.id(), 0);
-        assert_eq!(segment.meta().start_seq, 0);
-        assert_eq!(segment.meta().start_time_ms, 1000);
+        // then
+        assert!(delta.is_new());
+        assert_eq!(delta.segment().id(), 0);
+        assert_eq!(delta.segment().meta().start_seq, 0);
+        assert_eq!(delta.segment().meta().start_time_ms, 1000);
+        assert_eq!(records.len(), 1); // segment meta record added
     }
 
     #[tokio::test]
-    async fn ensure_latest_creates_first_segment_when_none_exist_with_seal_interval() {
-        // given: no segments, seal interval configured
-        let storage = Arc::new(InMemoryStorage::new());
+    async fn build_delta_returns_existing_segment_when_within_interval() {
+        // given: segment exists, within seal interval
+        let storage = LogStorage::in_memory();
         let config = SegmentConfig {
-            seal_interval: Some(std::time::Duration::from_secs(3600)),
+            seal_interval: Some(Duration::from_secs(3600)),
         };
-        let store = SegmentStore::open(storage, config).await.unwrap();
+        let mut cache = SegmentCache::open(&storage.as_read(), config)
+            .await
+            .unwrap();
+        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
+        let mut records = Vec::new();
 
-        // when
-        let segment = store.ensure_latest(1000, 0).await.unwrap();
-
-        // then: creates segment 0
-        assert_eq!(segment.id(), 0);
-        assert_eq!(segment.meta().start_seq, 0);
-        assert_eq!(segment.meta().start_time_ms, 1000);
-    }
-
-    #[tokio::test]
-    async fn ensure_latest_returns_existing_segment_when_within_interval() {
-        // given: segment at time 1000, seal interval 1 hour
-        let storage = Arc::new(InMemoryStorage::new());
-        let config = SegmentConfig {
-            seal_interval: Some(std::time::Duration::from_secs(3600)),
-        };
-        let store = SegmentStore::open(storage, config).await.unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
-
-        // when: request at 30 minutes later
+        // when: request 30 minutes later
         let current_time_ms = 1000 + 30 * 60 * 1000;
-        let segment = store.ensure_latest(current_time_ms, 100).await.unwrap();
+        let delta = cache.build_delta(current_time_ms, 100, &mut records);
 
-        // then: returns existing segment (not rolled)
-        assert_eq!(segment.id(), 0);
-        assert_eq!(segment.meta().start_seq, 0);
+        // then: returns existing segment, no new record
+        assert!(!delta.is_new());
+        assert_eq!(delta.segment().id(), 0);
+        assert_eq!(records.len(), 0);
     }
 
     #[tokio::test]
-    async fn ensure_latest_rolls_to_new_segment_when_interval_exceeded() {
+    async fn build_delta_creates_new_segment_when_interval_exceeded() {
         // given: segment at time 1000, seal interval 1 hour
-        let storage = Arc::new(InMemoryStorage::new());
+        let storage = LogStorage::in_memory();
         let config = SegmentConfig {
-            seal_interval: Some(std::time::Duration::from_secs(3600)),
+            seal_interval: Some(Duration::from_secs(3600)),
         };
-        let store = SegmentStore::open(storage, config).await.unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
+        let mut cache = SegmentCache::open(&storage.as_read(), config)
+            .await
+            .unwrap();
+        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
+        let mut records = Vec::new();
 
-        // when: request at 2 hours later
+        // when: request 2 hours later
         let current_time_ms = 1000 + 2 * 60 * 60 * 1000;
-        let segment = store.ensure_latest(current_time_ms, 100).await.unwrap();
+        let delta = cache.build_delta(current_time_ms, 100, &mut records);
 
         // then: creates new segment
-        assert_eq!(segment.id(), 1);
-        assert_eq!(segment.meta().start_seq, 100);
-        assert_eq!(segment.meta().start_time_ms, current_time_ms);
+        assert!(delta.is_new());
+        assert_eq!(delta.segment().id(), 1);
+        assert_eq!(delta.segment().meta().start_seq, 100);
+        assert_eq!(records.len(), 1);
     }
 
     #[tokio::test]
-    async fn ensure_latest_returns_existing_segment_without_seal_interval() {
-        // given: segment exists, no seal interval
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage, Default::default())
+    async fn build_delta_does_not_update_cache() {
+        // given
+        let storage = LogStorage::in_memory();
+        let cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
+        let mut records = Vec::new();
 
-        // when: request at any time
-        let segment = store.ensure_latest(999999999, 100).await.unwrap();
+        // when
+        let _delta = cache.build_delta(1000, 0, &mut records);
 
-        // then: returns existing segment (never rolls without seal_interval)
-        assert_eq!(segment.id(), 0);
-        assert_eq!(segment.meta().start_seq, 0);
+        // then: cache is not updated
+        assert!(cache.latest().is_none());
     }
 
     #[tokio::test]
-    async fn refresh_should_load_new_segments_after_id() {
-        // given: reader with segment 0 cached
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage.clone(), Default::default())
+    async fn apply_delta_updates_cache_for_new_segment() {
+        // given
+        let storage = LogStorage::in_memory();
+        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
+        let mut records = Vec::new();
+        let delta = cache.build_delta(1000, 0, &mut records);
 
-        let reader = SegmentReader::open(storage.clone()).await.unwrap();
-        assert_eq!(reader.all().await.unwrap().len(), 1);
+        // when
+        cache.apply_delta(&delta);
 
-        // when: new segments are written and reader refreshes
-        store.write(SegmentMeta::new(100, 2000)).await.unwrap();
-        store.write(SegmentMeta::new(200, 3000)).await.unwrap();
-        reader.refresh().await.unwrap();
-
-        // then: reader sees all three segments
-        let segments = reader.all().await.unwrap();
-        assert_eq!(segments.len(), 3);
-        assert_eq!(segments[0].id(), 0);
-        assert_eq!(segments[1].id(), 1);
-        assert_eq!(segments[2].id(), 2);
+        // then: cache is updated
+        let latest = cache.latest().unwrap();
+        assert_eq!(latest.id(), 0);
+        assert_eq!(latest.meta().start_seq, 0);
     }
 
     #[tokio::test]
-    async fn refresh_should_load_all_when_cache_empty() {
-        // given: reader with empty cache, segments in storage
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage.clone(), Default::default())
+    async fn apply_delta_is_noop_for_existing_segment() {
+        // given: segment exists
+        let storage = LogStorage::in_memory();
+        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
-        store.write(SegmentMeta::new(100, 2000)).await.unwrap();
+        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
+        let mut records = Vec::new();
 
-        let reader = SegmentReader::new(storage.clone());
-        assert_eq!(reader.all().await.unwrap().len(), 0);
+        // when: build delta returns existing segment
+        let delta = cache.build_delta(2000, 100, &mut records);
+        assert!(!delta.is_new());
 
-        // when: refresh with empty cache
-        reader.refresh().await.unwrap();
+        // apply should be a no-op
+        cache.apply_delta(&delta);
 
-        // then: all segments loaded
-        let segments = reader.all().await.unwrap();
-        assert_eq!(segments.len(), 2);
+        // then: still only one segment
+        let all = cache.all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id(), 0);
     }
 
     #[tokio::test]
-    async fn refresh_should_be_idempotent_when_no_new_segments() {
-        // given: reader with all segments cached
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SegmentStore::open(storage.clone(), Default::default())
+    async fn build_delta_creates_correct_segment_meta_record() {
+        // given
+        let storage = LogStorage::in_memory();
+        let cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
-        store.write(SegmentMeta::new(0, 1000)).await.unwrap();
-        store.write(SegmentMeta::new(100, 2000)).await.unwrap();
+        let mut records = Vec::new();
 
-        let reader = SegmentReader::open(storage).await.unwrap();
-        assert_eq!(reader.all().await.unwrap().len(), 2);
+        // when
+        let delta = cache.build_delta(5000, 42, &mut records);
 
-        // when: refresh with no new segments
-        reader.refresh().await.unwrap();
-
-        // then: same segments, no duplicates
-        let segments = reader.all().await.unwrap();
-        assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].id(), 0);
-        assert_eq!(segments[1].id(), 1);
+        // then: verify the record can be deserialized
+        assert_eq!(records.len(), 1);
+        let key = SegmentMetaKey::deserialize(&records[0].key).unwrap();
+        let meta = SegmentMeta::deserialize(&records[0].value).unwrap();
+        assert_eq!(key.segment_id, delta.segment().id());
+        assert_eq!(meta.start_seq, 42);
+        assert_eq!(meta.start_time_ms, 5000);
     }
 }

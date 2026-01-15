@@ -11,16 +11,29 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use common::clock::{Clock, SystemClock};
 use common::storage::factory::create_storage;
-use common::{Record as StorageRecord, Storage, WriteOptions as StorageWriteOptions};
+use common::{Record as StorageRecord, WriteOptions as StorageWriteOptions};
+use tokio::sync::RwLock;
 
-use crate::config::{CountOptions, ScanOptions, WriteOptions};
+use crate::config::{CountOptions, ListOptions, ScanOptions, WriteOptions};
 use crate::error::{Error, Result};
+use crate::listing::ListingCache;
+use crate::listing::LogKeyIterator;
 use crate::model::Record;
-use crate::reader::{LogIterator, LogIteratorBuilder, LogRead};
-use crate::segment::SegmentStore;
-use crate::sequence::create_sequence_allocator;
-use crate::serde::LogEntryKey;
-use common::SequenceAllocator;
+use crate::reader::{LogIterator, LogRead, list_keys_in_segments};
+use crate::segment::SegmentCache;
+use crate::sequence::SequenceAllocator;
+use crate::serde::LogEntryBuilder;
+use crate::storage::LogStorage;
+
+/// Inner state for the write path.
+///
+/// Wrapped in a single `RwLock` for simplicity. A more sophisticated
+/// concurrency strategy may be needed for high-throughput scenarios.
+struct LogInner {
+    sequence_allocator: SequenceAllocator,
+    segment_cache: SegmentCache,
+    listing_cache: ListingCache,
+}
 
 /// The main log interface providing read and write operations.
 ///
@@ -68,10 +81,9 @@ use common::SequenceAllocator;
 /// }
 /// ```
 pub struct Log {
-    storage: Arc<dyn Storage>,
+    storage: LogStorage,
     clock: Arc<dyn Clock>,
-    sequence_allocator: SequenceAllocator,
-    segment_store: SegmentStore,
+    inner: RwLock<LogInner>,
 }
 
 impl Log {
@@ -99,20 +111,25 @@ impl Log {
         let storage = create_storage(&config.storage, None)
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
+        let log_storage = LogStorage::new(storage);
 
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
-        let sequence_allocator = create_sequence_allocator(Arc::clone(&storage));
-        sequence_allocator.initialize().await?;
+        let log_storage_read = log_storage.as_read();
+        let sequence_allocator = SequenceAllocator::open(&log_storage_read).await?;
+        let segment_cache = SegmentCache::open(&log_storage_read, config.segmentation).await?;
+        let listing_cache = ListingCache::new();
 
-        let segment_store =
-            SegmentStore::open(Arc::clone(&storage), config.segmentation.clone()).await?;
+        let inner = LogInner {
+            sequence_allocator,
+            segment_cache,
+            listing_cache,
+        };
 
         Ok(Self {
-            storage,
+            storage: log_storage,
             clock,
-            sequence_allocator,
-            segment_store,
+            inner: RwLock::new(inner),
         })
     }
 
@@ -182,41 +199,51 @@ impl Log {
             return Ok(());
         }
 
-        // Allocate sequence numbers for all records in the batch
-        let base_sequence = self
-            .sequence_allocator
-            .allocate(records.len() as u64)
-            .await?;
-
-        // Get the current segment, rolling if necessary
         let current_time_ms = self.current_time_ms();
-        let segment = self
-            .segment_store
-            .ensure_latest(current_time_ms, base_sequence)
-            .await?;
+        let mut inner = self.inner.write().await;
 
-        // Build storage records with encoded keys
-        let segment_start_seq = segment.meta().start_seq;
-        let storage_records: Vec<StorageRecord> = records
-            .into_iter()
-            .enumerate()
-            .map(|(i, record)| {
-                let sequence = base_sequence + i as u64;
-                let entry_key = LogEntryKey::new(segment.id(), record.key, sequence);
-                StorageRecord::new(entry_key.serialize(segment_start_seq), record.value)
-            })
-            .collect();
+        // Build all deltas, accumulating records
+        let mut storage_records: Vec<StorageRecord> = Vec::new();
 
-        // Convert log write options to storage write options
+        // 1. Allocate sequences
+        let seq_delta = inner
+            .sequence_allocator
+            .build_delta(records.len() as u64, &mut storage_records);
+
+        // 2. Get/create segment
+        let seg_delta = inner.segment_cache.build_delta(
+            current_time_ms,
+            seq_delta.base_sequence(),
+            &mut storage_records,
+        );
+
+        // 3. Build listing entries
+        let keys: Vec<_> = records.iter().map(|r| r.key.clone()).collect();
+        let listing_delta =
+            inner
+                .listing_cache
+                .build_delta(&seg_delta, &keys, &mut storage_records);
+
+        // 4. Build log entry records
+        LogEntryBuilder::build(
+            seg_delta.segment(),
+            seq_delta.base_sequence(),
+            &records,
+            &mut storage_records,
+        );
+
+        // 5. Write atomically
         let storage_options = StorageWriteOptions {
             await_durable: options.await_durable,
         };
-
-        // Write to storage
         self.storage
             .put_with_options(storage_records, storage_options)
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .await?;
+
+        // 6. Apply deltas
+        inner.sequence_allocator.apply_delta(&seq_delta);
+        inner.segment_cache.apply_delta(&seg_delta);
+        inner.listing_cache.apply_delta(&listing_delta);
 
         Ok(())
     }
@@ -237,29 +264,53 @@ impl Log {
     /// configured seal interval.
     #[cfg(test)]
     pub(crate) async fn seal_segment(&self) -> Result<()> {
+        use crate::segment::LogSegment;
+        use crate::serde::SegmentMeta;
+
         let current_time_ms = self.current_time_ms();
-        let next_seq = self.sequence_allocator.peek_next_sequence().await;
-        self.segment_store
-            .seal_current(current_time_ms, next_seq)
-            .await?;
+        let mut inner = self.inner.write().await;
+        let next_seq = inner.sequence_allocator.peek_next_sequence();
+
+        // Determine next segment ID
+        let segment_id = match inner.segment_cache.latest() {
+            Some(latest) => latest.id() + 1,
+            None => 0,
+        };
+
+        // Create and write the new segment
+        let meta = SegmentMeta::new(next_seq, current_time_ms);
+        let segment = LogSegment::new(segment_id, meta);
+        self.storage.write_segment(&segment).await?;
+
+        // Update cache
+        inner.segment_cache.insert(segment);
+
         Ok(())
     }
 
     /// Creates a Log from an existing storage implementation.
     #[cfg(test)]
-    pub(crate) async fn new(storage: Arc<dyn Storage>) -> Result<Self> {
+    pub(crate) async fn new(storage: Arc<dyn common::Storage>) -> Result<Self> {
+        use crate::config::SegmentConfig;
+
+        let log_storage = LogStorage::new(storage);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
-        let sequence_allocator = create_sequence_allocator(Arc::clone(&storage));
-        sequence_allocator.initialize().await?;
+        let log_storage_read = log_storage.as_read();
+        let sequence_allocator = SequenceAllocator::open(&log_storage_read).await?;
+        let segment_cache = SegmentCache::open(&log_storage_read, SegmentConfig::default()).await?;
+        let listing_cache = ListingCache::new();
 
-        let segment_store = SegmentStore::open(Arc::clone(&storage), Default::default()).await?;
+        let inner = LogInner {
+            sequence_allocator,
+            segment_cache,
+            listing_cache,
+        };
 
         Ok(Self {
-            storage,
+            storage: log_storage,
             clock,
-            sequence_allocator,
-            segment_store,
+            inner: RwLock::new(inner),
         })
     }
 }
@@ -272,9 +323,13 @@ impl LogRead for Log {
         seq_range: impl RangeBounds<u64> + Send,
         _options: ScanOptions,
     ) -> Result<LogIterator> {
-        LogIteratorBuilder::new(&self.segment_store, key, seq_range)
-            .build()
-            .await
+        let inner = self.inner.read().await;
+        Ok(LogIterator::open(
+            self.storage.as_read(),
+            &inner.segment_cache,
+            key,
+            seq_range,
+        ))
     }
 
     async fn count_with_options(
@@ -285,14 +340,27 @@ impl LogRead for Log {
     ) -> Result<u64> {
         todo!()
     }
+
+    async fn list_with_options(
+        &self,
+        seq_range: impl RangeBounds<u64> + Send,
+        _options: ListOptions,
+    ) -> Result<LogKeyIterator> {
+        let inner = self.inner.read().await;
+        let segments = inner.segment_cache.find_covering(&seq_range);
+        list_keys_in_segments(&self.storage.as_read(), &segments).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use common::{BytesRange, StorageConfig};
+    use common::StorageConfig;
+    use common::storage::factory::create_storage;
 
     use super::*;
     use crate::config::Config;
+    use crate::config::ListOptions;
+    use crate::reader::LogReader;
 
     fn test_config() -> Config {
         Config {
@@ -323,15 +391,14 @@ mod tests {
         }];
 
         // when
-        let result = log.append(records).await;
+        log.append(records).await.unwrap();
 
-        // then
-        assert!(result.is_ok());
-
-        // verify record was stored
-        let stored = log.storage.scan(BytesRange::unbounded()).await.unwrap();
-        // Should have 3 records: SeqBlock + SegmentMeta + LogEntry
-        assert_eq!(stored.len(), 3);
+        // then - verify entry can be read back
+        let mut iter = log.scan(Bytes::from("orders"), ..).await.unwrap();
+        let entry = iter.next().await.unwrap().unwrap();
+        assert_eq!(entry.sequence, 0);
+        assert_eq!(entry.value, Bytes::from("order-1"));
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -354,25 +421,24 @@ mod tests {
         ];
 
         // when
-        let result = log.append(records).await;
+        log.append(records).await.unwrap();
 
-        // then
-        assert!(result.is_ok());
+        // then - verify entries with sequential sequence numbers
+        let mut iter = log.scan(Bytes::from("orders"), ..).await.unwrap();
 
-        // verify records were stored with sequential sequence numbers
-        let stored = log.storage.scan(BytesRange::unbounded()).await.unwrap();
-        // Should have 5 records: SeqBlock + SegmentMeta + 3 LogEntries
-        assert_eq!(stored.len(), 5);
+        let entry0 = iter.next().await.unwrap().unwrap();
+        assert_eq!(entry0.sequence, 0);
+        assert_eq!(entry0.value, Bytes::from("order-1"));
 
-        // Deserialize and verify sequence numbers (segment 0 starts at seq 0)
-        let log_entries: Vec<_> = stored
-            .iter()
-            .filter_map(|r| LogEntryKey::deserialize(&r.key, 0).ok())
-            .collect();
-        assert_eq!(log_entries.len(), 3);
-        assert_eq!(log_entries[0].sequence, 0);
-        assert_eq!(log_entries[1].sequence, 1);
-        assert_eq!(log_entries[2].sequence, 2);
+        let entry1 = iter.next().await.unwrap().unwrap();
+        assert_eq!(entry1.sequence, 1);
+        assert_eq!(entry1.value, Bytes::from("order-2"));
+
+        let entry2 = iter.next().await.unwrap().unwrap();
+        assert_eq!(entry2.sequence, 2);
+        assert_eq!(entry2.value, Bytes::from("order-3"));
+
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -387,9 +453,9 @@ mod tests {
         // then
         assert!(result.is_ok());
 
-        // verify no records were stored (except possibly none)
-        let stored = log.storage.scan(BytesRange::unbounded()).await.unwrap();
-        assert_eq!(stored.len(), 0);
+        // verify no entries exist
+        let mut iter = log.scan(Bytes::from("any-key"), ..).await.unwrap();
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -400,12 +466,12 @@ mod tests {
         // when - first append
         log.append(vec![
             Record {
-                key: Bytes::from("key1"),
-                value: Bytes::from("value1"),
+                key: Bytes::from("events"),
+                value: Bytes::from("event-1"),
             },
             Record {
-                key: Bytes::from("key2"),
-                value: Bytes::from("value2"),
+                key: Bytes::from("events"),
+                value: Bytes::from("event-2"),
             },
         ])
         .await
@@ -413,25 +479,25 @@ mod tests {
 
         // when - second append
         log.append(vec![Record {
-            key: Bytes::from("key3"),
-            value: Bytes::from("value3"),
+            key: Bytes::from("events"),
+            value: Bytes::from("event-3"),
         }])
         .await
         .unwrap();
 
-        // then - verify sequences are 0, 1, 2
-        let stored = log.storage.scan(BytesRange::unbounded()).await.unwrap();
+        // then - verify sequences are 0, 1, 2 across appends
+        let mut iter = log.scan(Bytes::from("events"), ..).await.unwrap();
 
-        let mut log_entries: Vec<_> = stored
-            .iter()
-            .filter_map(|r| LogEntryKey::deserialize(&r.key, 0).ok())
-            .collect();
-        log_entries.sort_by_key(|e| e.sequence);
+        let entry0 = iter.next().await.unwrap().unwrap();
+        assert_eq!(entry0.sequence, 0);
 
-        assert_eq!(log_entries.len(), 3);
-        assert_eq!(log_entries[0].sequence, 0);
-        assert_eq!(log_entries[1].sequence, 1);
-        assert_eq!(log_entries[2].sequence, 2);
+        let entry1 = iter.next().await.unwrap().unwrap();
+        assert_eq!(entry1.sequence, 1);
+
+        let entry2 = iter.next().await.unwrap().unwrap();
+        assert_eq!(entry2.sequence, 2);
+
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -452,28 +518,19 @@ mod tests {
         // when
         log.append(records).await.unwrap();
 
-        // then - verify keys and values are correctly stored
-        let stored = log.storage.scan(BytesRange::unbounded()).await.unwrap();
+        // then - verify entries for topic-a
+        let mut iter_a = log.scan(Bytes::from("topic-a"), ..).await.unwrap();
+        let entry_a = iter_a.next().await.unwrap().unwrap();
+        assert_eq!(entry_a.key, Bytes::from("topic-a"));
+        assert_eq!(entry_a.value, Bytes::from("message-a"));
+        assert!(iter_a.next().await.unwrap().is_none());
 
-        let log_records: Vec<_> = stored
-            .iter()
-            .filter_map(|r| {
-                LogEntryKey::deserialize(&r.key, 0)
-                    .ok()
-                    .map(|k| (k, r.value.clone()))
-            })
-            .collect();
-
-        assert_eq!(log_records.len(), 2);
-
-        // Find by sequence and verify
-        let entry_0 = log_records.iter().find(|(k, _)| k.sequence == 0).unwrap();
-        assert_eq!(entry_0.0.key, Bytes::from("topic-a"));
-        assert_eq!(entry_0.1, Bytes::from("message-a"));
-
-        let entry_1 = log_records.iter().find(|(k, _)| k.sequence == 1).unwrap();
-        assert_eq!(entry_1.0.key, Bytes::from("topic-b"));
-        assert_eq!(entry_1.1, Bytes::from("message-b"));
+        // then - verify entries for topic-b
+        let mut iter_b = log.scan(Bytes::from("topic-b"), ..).await.unwrap();
+        let entry_b = iter_b.next().await.unwrap().unwrap();
+        assert_eq!(entry_b.key, Bytes::from("topic-b"));
+        assert_eq!(entry_b.value, Bytes::from("message-b"));
+        assert!(iter_b.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -711,9 +768,6 @@ mod tests {
 
     #[tokio::test]
     async fn should_scan_entries_via_log_reader() {
-        use crate::reader::LogReader;
-        use common::storage::factory::create_storage;
-
         // given - create shared storage
         let storage = create_storage(&StorageConfig::InMemory, None)
             .await
@@ -921,5 +975,318 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].sequence, 2);
         assert_eq!(entries[1].sequence, 3);
+    }
+
+    #[tokio::test]
+    async fn should_list_keys_returns_iterator() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+        log.append(vec![
+            Record {
+                key: Bytes::from("key-a"),
+                value: Bytes::from("value-a"),
+            },
+            Record {
+                key: Bytes::from("key-b"),
+                value: Bytes::from("value-b"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when
+        let _iter = log.list(..).await.unwrap();
+
+        // then - iterator is returned (full iteration tested when LogKeyIterator is implemented)
+    }
+
+    #[tokio::test]
+    async fn should_list_with_options_returns_iterator() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+        log.append(vec![Record {
+            key: Bytes::from("key"),
+            value: Bytes::from("value"),
+        }])
+        .await
+        .unwrap();
+
+        // when
+        let _iter = log
+            .list_with_options(.., ListOptions::default())
+            .await
+            .unwrap();
+
+        // then - iterator is returned
+    }
+
+    #[tokio::test]
+    async fn should_list_via_log_reader() {
+        // given - create shared storage
+        let storage = create_storage(&StorageConfig::InMemory, None)
+            .await
+            .unwrap();
+        let log = Log::new(storage.clone()).await.unwrap();
+        log.append(vec![
+            Record {
+                key: Bytes::from("key-a"),
+                value: Bytes::from("value-a"),
+            },
+            Record {
+                key: Bytes::from("key-b"),
+                value: Bytes::from("value-b"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when - create LogReader sharing the same storage
+        let reader = LogReader::new(storage).await.unwrap();
+        let _iter = reader.list(..).await.unwrap();
+
+        // then - iterator is returned
+    }
+
+    #[tokio::test]
+    async fn should_list_keys_in_single_segment() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+        log.append(vec![
+            Record {
+                key: Bytes::from("key-a"),
+                value: Bytes::from("value-a"),
+            },
+            Record {
+                key: Bytes::from("key-b"),
+                value: Bytes::from("value-b"),
+            },
+            Record {
+                key: Bytes::from("key-c"),
+                value: Bytes::from("value-c"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when
+        let mut iter = log.list(..).await.unwrap();
+        let mut keys = vec![];
+        while let Some(key) = iter.next().await.unwrap() {
+            keys.push(key.key);
+        }
+
+        // then - keys returned in lexicographic order
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0], Bytes::from("key-a"));
+        assert_eq!(keys[1], Bytes::from("key-b"));
+        assert_eq!(keys[2], Bytes::from("key-c"));
+    }
+
+    #[tokio::test]
+    async fn should_list_keys_across_segments_after_roll() {
+        // given - log with entries across multiple segments
+        let log = Log::open(test_config()).await.unwrap();
+
+        // write to segment 0
+        log.append(vec![
+            Record {
+                key: Bytes::from("key-a"),
+                value: Bytes::from("value-a-0"),
+            },
+            Record {
+                key: Bytes::from("key-b"),
+                value: Bytes::from("value-b-0"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // seal and create segment 1
+        log.seal_segment().await.unwrap();
+
+        // write to segment 1 with different keys
+        log.append(vec![
+            Record {
+                key: Bytes::from("key-c"),
+                value: Bytes::from("value-c-1"),
+            },
+            Record {
+                key: Bytes::from("key-d"),
+                value: Bytes::from("value-d-1"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when
+        let mut iter = log.list(..).await.unwrap();
+        let mut keys = vec![];
+        while let Some(key) = iter.next().await.unwrap() {
+            keys.push(key.key);
+        }
+
+        // then - all keys from both segments
+        assert_eq!(keys.len(), 4);
+        assert_eq!(keys[0], Bytes::from("key-a"));
+        assert_eq!(keys[1], Bytes::from("key-b"));
+        assert_eq!(keys[2], Bytes::from("key-c"));
+        assert_eq!(keys[3], Bytes::from("key-d"));
+    }
+
+    #[tokio::test]
+    async fn should_deduplicate_keys_across_segments() {
+        // given - same key written to multiple segments
+        let log = Log::open(test_config()).await.unwrap();
+
+        // write to segment 0
+        log.append(vec![Record {
+            key: Bytes::from("shared-key"),
+            value: Bytes::from("value-0"),
+        }])
+        .await
+        .unwrap();
+
+        // seal and create segment 1
+        log.seal_segment().await.unwrap();
+
+        // write same key to segment 1
+        log.append(vec![Record {
+            key: Bytes::from("shared-key"),
+            value: Bytes::from("value-1"),
+        }])
+        .await
+        .unwrap();
+
+        // seal and create segment 2
+        log.seal_segment().await.unwrap();
+
+        // write same key to segment 2
+        log.append(vec![Record {
+            key: Bytes::from("shared-key"),
+            value: Bytes::from("value-2"),
+        }])
+        .await
+        .unwrap();
+
+        // when
+        let mut iter = log.list(..).await.unwrap();
+        let mut keys = vec![];
+        while let Some(key) = iter.next().await.unwrap() {
+            keys.push(key.key);
+        }
+
+        // then - key appears only once despite being in 3 segments
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], Bytes::from("shared-key"));
+    }
+
+    #[tokio::test]
+    async fn should_list_keys_in_lexicographic_order() {
+        // given - keys inserted out of order
+        let log = Log::open(test_config()).await.unwrap();
+        log.append(vec![
+            Record {
+                key: Bytes::from("zebra"),
+                value: Bytes::from("value"),
+            },
+            Record {
+                key: Bytes::from("apple"),
+                value: Bytes::from("value"),
+            },
+            Record {
+                key: Bytes::from("mango"),
+                value: Bytes::from("value"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when
+        let mut iter = log.list(..).await.unwrap();
+        let mut keys = vec![];
+        while let Some(key) = iter.next().await.unwrap() {
+            keys.push(key.key);
+        }
+
+        // then - sorted lexicographically
+        assert_eq!(keys[0], Bytes::from("apple"));
+        assert_eq!(keys[1], Bytes::from("mango"));
+        assert_eq!(keys[2], Bytes::from("zebra"));
+    }
+
+    #[tokio::test]
+    async fn should_list_empty_when_no_entries() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+
+        // when
+        let mut iter = log.list(..).await.unwrap();
+
+        // then
+        assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn should_list_keys_respects_sequence_range() {
+        // given - entries in different segments with known sequences
+        let log = Log::open(test_config()).await.unwrap();
+
+        // segment 0: sequences 0, 1
+        log.append(vec![
+            Record {
+                key: Bytes::from("key-seg0"),
+                value: Bytes::from("value"),
+            },
+            Record {
+                key: Bytes::from("key-seg0-b"),
+                value: Bytes::from("value"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        log.seal_segment().await.unwrap();
+
+        // segment 1: sequences 2, 3
+        log.append(vec![
+            Record {
+                key: Bytes::from("key-seg1"),
+                value: Bytes::from("value"),
+            },
+            Record {
+                key: Bytes::from("key-seg1-b"),
+                value: Bytes::from("value"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        log.seal_segment().await.unwrap();
+
+        // segment 2: sequences 4, 5
+        log.append(vec![
+            Record {
+                key: Bytes::from("key-seg2"),
+                value: Bytes::from("value"),
+            },
+            Record {
+                key: Bytes::from("key-seg2-b"),
+                value: Bytes::from("value"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when - list only keys from segment 1 (sequences 2..4)
+        let mut iter = log.list(2..4).await.unwrap();
+        let mut keys = vec![];
+        while let Some(key) = iter.next().await.unwrap() {
+            keys.push(key.key);
+        }
+
+        // then - only keys from segment 1
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], Bytes::from("key-seg1"));
+        assert_eq!(keys[1], Bytes::from("key-seg1-b"));
     }
 }

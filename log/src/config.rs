@@ -113,3 +113,13 @@ pub struct CountOptions {
     /// the relevant index entries.
     pub approximate: bool,
 }
+
+/// Options for list operations.
+///
+/// Controls the behavior of [`LogRead::list`](crate::LogRead::list) and
+/// [`LogRead::list_with_options`](crate::LogRead::list_with_options).
+#[derive(Debug, Clone, Default)]
+pub struct ListOptions {
+    // Reserved for future options such as:
+    // - prefix: filter keys by prefix
+}

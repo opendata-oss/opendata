@@ -54,6 +54,9 @@ impl From<common::serde::DeserializeError> for Error {
 /// Key format version (currently 0x01)
 pub const KEY_VERSION: u8 = 0x01;
 
+/// Storage key for the SeqBlock record.
+pub const SEQ_BLOCK_KEY: [u8; 2] = [KEY_VERSION, 0x02]; // RecordType::SeqBlock
+
 /// Record type discriminators for log storage.
 ///
 /// Record types are encoded in the high 4 bits of the record tag byte,
@@ -67,6 +70,8 @@ pub enum RecordType {
     SeqBlock = 0x02,
     /// Segment metadata record
     SegmentMeta = 0x03,
+    /// Listing entry record for key discovery
+    ListingEntry = 0x04,
 }
 
 impl RecordType {
@@ -81,6 +86,7 @@ impl RecordType {
             0x01 => Ok(RecordType::LogEntry),
             0x02 => Ok(RecordType::SeqBlock),
             0x03 => Ok(RecordType::SegmentMeta),
+            0x04 => Ok(RecordType::ListingEntry),
             _ => Err(Error::Encoding(format!(
                 "invalid record type: 0x{:02x}",
                 id
@@ -330,6 +336,159 @@ impl SegmentMeta {
     }
 }
 
+/// Key for a listing entry record.
+///
+/// Tracks key presence within a segment for efficient key enumeration.
+/// The key format places segment_id before the user key, ensuring all
+/// listing records for a segment are contiguous for efficient prefix scans.
+///
+/// ```text
+/// | version (u8) | type (u8=0x04) | segment_id (u32 BE) | key (Bytes) |
+/// ```
+///
+/// Unlike log entry keys, the user key is stored as raw bytes without
+/// terminated encoding since it occupies the suffix position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingEntryKey {
+    /// The segment this listing entry belongs to
+    pub segment_id: SegmentId,
+    /// The user-provided key
+    pub key: Bytes,
+}
+
+impl ListingEntryKey {
+    /// Creates a new listing entry key.
+    pub fn new(segment_id: SegmentId, key: Bytes) -> Self {
+        Self { segment_id, key }
+    }
+
+    /// Serializes the key to bytes for storage.
+    pub fn serialize(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        RecordType::ListingEntry.prefix().write_to(&mut buf);
+        buf.put_u32(self.segment_id);
+        buf.put_slice(&self.key);
+        buf.freeze()
+    }
+
+    /// Deserializes a listing entry key from bytes.
+    pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
+        let prefix = KeyPrefix::from_bytes_versioned(data, KEY_VERSION)?;
+        let record_type = RecordType::from_id(prefix.tag().record_type())?;
+        if record_type != RecordType::ListingEntry {
+            return Err(Error::Encoding(format!(
+                "invalid record type: expected ListingEntry, got {:?}",
+                record_type
+            )));
+        }
+
+        if data.len() < 6 {
+            return Err(Error::Encoding(
+                "buffer too short for listing entry key".to_string(),
+            ));
+        }
+
+        let segment_id = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+        let key = Bytes::copy_from_slice(&data[6..]);
+
+        Ok(ListingEntryKey { segment_id, key })
+    }
+
+    /// Creates a storage key range for scanning listing entries across segments.
+    ///
+    /// Returns a range that matches all listing entries for segments within
+    /// the specified range [start, end).
+    pub fn scan_range(range: Range<SegmentId>) -> BytesRange {
+        let start = Bound::Included(Self::segment_prefix(range.start));
+        let end = Bound::Excluded(Self::segment_prefix(range.end));
+        BytesRange::new(start, end)
+    }
+
+    /// Returns the prefix key for a segment (smallest possible key for segment).
+    fn segment_prefix(segment_id: SegmentId) -> Bytes {
+        let mut buf = BytesMut::with_capacity(6);
+        RecordType::ListingEntry.prefix().write_to(&mut buf);
+        buf.put_u32(segment_id);
+        buf.freeze()
+    }
+}
+
+/// Value for a listing entry record.
+///
+/// The value is empty—presence of the record indicates the key exists
+/// in the segment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListingEntryValue;
+
+impl ListingEntryValue {
+    /// Creates a new listing entry value.
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Serializes the value to bytes for storage.
+    pub fn serialize(&self) -> Bytes {
+        Bytes::new()
+    }
+
+    /// Deserializes a listing entry value from bytes.
+    pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
+        if !data.is_empty() {
+            return Err(Error::Encoding(format!(
+                "listing entry value should be empty, got {} bytes",
+                data.len()
+            )));
+        }
+        Ok(ListingEntryValue)
+    }
+}
+
+/// Builder for log entry storage records.
+///
+/// Converts user records into storage records with properly encoded keys.
+/// Uses the delta pattern: receives segment and sequence info from their
+/// respective deltas and produces storage records to be written atomically.
+///
+/// # Usage
+///
+/// ```ignore
+/// use common::Record as StorageRecord;
+///
+/// let mut records = Vec::new();
+/// // ... build sequence and segment deltas ...
+///
+/// LogEntryBuilder::build(&seg_delta, &seq_delta, &user_records, &mut records);
+/// ```
+pub(crate) struct LogEntryBuilder;
+
+impl LogEntryBuilder {
+    /// Builds log entry storage records from user records.
+    ///
+    /// For each user record, creates a storage record with:
+    /// - Key: Encoded `LogEntryKey` with segment_id, user key, and sequence
+    /// - Value: The user-provided value (unchanged)
+    ///
+    /// Records are appended to the provided `records` vec.
+    pub(crate) fn build(
+        segment: &crate::segment::LogSegment,
+        base_sequence: u64,
+        user_records: &[crate::model::Record],
+        records: &mut Vec<common::Record>,
+    ) {
+        let segment_start_seq = segment.meta().start_seq;
+
+        for (i, user_record) in user_records.iter().enumerate() {
+            let sequence = base_sequence + i as u64;
+            let entry_key = LogEntryKey::new(segment.id(), user_record.key.clone(), sequence);
+            let storage_record = common::Record::new(
+                entry_key.serialize(segment_start_seq),
+                user_record.value.clone(),
+            );
+            records.push(storage_record);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,12 +498,18 @@ mod tests {
         // given
         let log_entry = RecordType::LogEntry;
         let seq_block = RecordType::SeqBlock;
+        let segment_meta = RecordType::SegmentMeta;
+        let listing_entry = RecordType::ListingEntry;
 
         // when/then
         assert_eq!(log_entry.id(), 0x01);
         assert_eq!(seq_block.id(), 0x02);
+        assert_eq!(segment_meta.id(), 0x03);
+        assert_eq!(listing_entry.id(), 0x04);
         assert_eq!(RecordType::from_id(0x01).unwrap(), RecordType::LogEntry);
         assert_eq!(RecordType::from_id(0x02).unwrap(), RecordType::SeqBlock);
+        assert_eq!(RecordType::from_id(0x03).unwrap(), RecordType::SegmentMeta);
+        assert_eq!(RecordType::from_id(0x04).unwrap(), RecordType::ListingEntry);
     }
 
     #[test]
@@ -448,11 +613,13 @@ mod tests {
         let log_entry_tag = RecordType::LogEntry.tag();
         let seq_block_tag = RecordType::SeqBlock.tag();
         let segment_meta_tag = RecordType::SegmentMeta.tag();
+        let listing_entry_tag = RecordType::ListingEntry.tag();
 
         // then - record type in high 4 bits, reserved (0) in low 4 bits
         assert_eq!(log_entry_tag.as_byte(), 0x10);
         assert_eq!(seq_block_tag.as_byte(), 0x20);
         assert_eq!(segment_meta_tag.as_byte(), 0x30);
+        assert_eq!(listing_entry_tag.as_byte(), 0x40);
     }
 
     #[test]
@@ -462,6 +629,134 @@ mod tests {
 
         // when
         let result = LogEntryKey::deserialize(&data, 0);
+
+        // then
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn should_serialize_and_deserialize_listing_entry_key() {
+        // given
+        let key = ListingEntryKey::new(42, Bytes::from("test_key"));
+
+        // when
+        let serialized = key.serialize();
+        let deserialized = ListingEntryKey::deserialize(&serialized).unwrap();
+
+        // then
+        assert_eq!(deserialized.segment_id, 42);
+        assert_eq!(deserialized.key, Bytes::from("test_key"));
+    }
+
+    #[test]
+    fn should_serialize_listing_entry_key_with_correct_structure() {
+        // given
+        let key = ListingEntryKey::new(1, Bytes::from("k"));
+
+        // when
+        let serialized = key.serialize();
+
+        // then
+        // version (1) + tag (1) + segment_id (4) + key "k" (1) = 7
+        assert_eq!(serialized.len(), 7);
+        assert_eq!(serialized[0], KEY_VERSION);
+        // Record tag: type 0x04 in high nibble, reserved 0x00 in low nibble = 0x40
+        assert_eq!(serialized[1], RecordType::ListingEntry.tag().as_byte());
+        assert_eq!(serialized[1], 0x40);
+        // segment_id = 1 in big endian
+        assert_eq!(&serialized[2..6], &[0, 0, 0, 1]);
+        // key "k" (raw bytes, no terminator)
+        assert_eq!(serialized[6], b'k');
+    }
+
+    #[test]
+    fn should_serialize_listing_entry_key_with_empty_key() {
+        // given
+        let key = ListingEntryKey::new(1, Bytes::new());
+
+        // when
+        let serialized = key.serialize();
+        let deserialized = ListingEntryKey::deserialize(&serialized).unwrap();
+
+        // then
+        assert_eq!(serialized.len(), 6); // version + tag + segment_id only
+        assert_eq!(deserialized.segment_id, 1);
+        assert_eq!(deserialized.key, Bytes::new());
+    }
+
+    #[test]
+    fn should_order_listing_entries_by_segment_then_key() {
+        // given
+        let key1 = ListingEntryKey::new(0, Bytes::from("a"));
+        let key2 = ListingEntryKey::new(0, Bytes::from("b"));
+        let key3 = ListingEntryKey::new(1, Bytes::from("a"));
+
+        // when
+        let s1 = key1.serialize();
+        let s2 = key2.serialize();
+        let s3 = key3.serialize();
+
+        // then
+        assert!(s1 < s2, "same segment, key 'a' < key 'b'");
+        assert!(s2 < s3, "segment 0 < segment 1");
+    }
+
+    #[test]
+    fn should_create_listing_entry_scan_range() {
+        // given
+        let range = 1..3;
+
+        // when
+        let scan_range = ListingEntryKey::scan_range(range);
+
+        // then
+        let start_key = ListingEntryKey::new(1, Bytes::new()).serialize();
+        let end_key = ListingEntryKey::new(3, Bytes::new()).serialize();
+
+        // Range should be [segment 1 prefix, segment 3 prefix)
+        assert_eq!(scan_range.start_bound(), Bound::Included(&start_key));
+        assert_eq!(scan_range.end_bound(), Bound::Excluded(&end_key));
+    }
+
+    #[test]
+    fn should_serialize_and_deserialize_listing_entry_value() {
+        // given
+        let value = ListingEntryValue::new();
+
+        // when
+        let serialized = value.serialize();
+        let deserialized = ListingEntryValue::deserialize(&serialized).unwrap();
+
+        // then
+        assert!(serialized.is_empty());
+        assert_eq!(deserialized, ListingEntryValue);
+    }
+
+    #[test]
+    fn should_fail_deserialize_listing_entry_value_with_data() {
+        // given
+        let data = vec![0x01, 0x02];
+
+        // when
+        let result = ListingEntryValue::deserialize(&data);
+
+        // then
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn should_fail_deserialize_listing_entry_key_too_short() {
+        // given
+        let data = vec![
+            KEY_VERSION,
+            RecordType::ListingEntry.tag().as_byte(),
+            0,
+            0,
+            0,
+        ]; // only 5 bytes
+
+        // when
+        let result = ListingEntryKey::deserialize(&data);
 
         // then
         assert!(result.is_err());
@@ -487,6 +782,32 @@ mod tests {
                     enc_a.cmp(&enc_b),
                     "ordering mismatch: a={}, b={}, enc_a={:?}, enc_b={:?}",
                     a, b, enc_a.as_ref(), enc_b.as_ref()
+                );
+            }
+
+            #[test]
+            fn should_include_listing_entry_in_scan_range(
+                start in 0u32..1000,
+                range_size in 1u32..100,
+                offset in 0u32..100,
+                key_bytes in prop::collection::vec(any::<u8>(), 1..100),
+            ) {
+                let end = start.saturating_add(range_size);
+                let segment_id = start.saturating_add(offset % range_size);
+
+                let key = ListingEntryKey::new(segment_id, Bytes::from(key_bytes));
+                let serialized = key.serialize();
+
+                let scan_range = ListingEntryKey::scan_range(start..end);
+
+                prop_assert!(
+                    scan_range.contains(&serialized),
+                    "listing entry for segment {} with key should be in range {}..{}, \
+                     serialized={:?}, range_start={:?}, range_end={:?}",
+                    segment_id, start, end,
+                    serialized.as_ref(),
+                    scan_range.start_bound(),
+                    scan_range.end_bound()
                 );
             }
         }
