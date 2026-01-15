@@ -65,7 +65,7 @@ On append(key, value):
 
 When a new segment starts, the cache is cleared.
 
-This approach avoids read-before-write overhead in the ingest path. When writers change (e.g., after failover), the new writer starts with an empty cache and may re-insert listing records for keys already present in the segment. However, since SlateDB overwrites duplicate keys, no additional storage overhead results from this.
+This approach avoids read-before-write overhead in the ingest path. When writers change (e.g., after failover), the new writer starts with an empty cache and may re-insert listing records for keys already present in the segment. SlateDB will overwrite duplicate keys, though the duplicates exist until compaction removes them. Since writers should not change frequently, we do not expect this to be a significant concern. If it does become problematic, we can introduce read-before-write in the future.
 
 ### List API
 
@@ -107,7 +107,9 @@ The sequence number range is mapped internally to the corresponding segment rang
 
 ### Deduplication
 
-The iterator deduplicates keys before returning them to the caller. Within a single segment, SlateDB's key-value semantics ensure that only one `ListingEntry` record exists per key—duplicate writes (e.g., from writer failover) simply overwrite the existing record. However, the same key may appear in multiple segments within the query range. The iterator must track seen keys across segments to ensure each key is returned exactly once.
+The iterator deduplicates keys before returning them to the caller. Within a single segment, SlateDB's key-value semantics ensure that only one `ListingEntry` record exists per key—duplicate writes (e.g., from writer failover) simply overwrite the existing record. However, the same key may appear in multiple segments within the query range.
+
+The initial implementation collects all keys from the listing scan, deduplicates them in memory, and then returns the deduplicated collection to the caller. This approach is simple and enables sorted iteration order, though memory usage scales with the distinct key count. Future iterations may explore streaming approaches if memory becomes a concern for large keyspaces.
 
 ## Alternatives
 
@@ -129,18 +131,6 @@ Writing a listing record on every append (not just first occurrence) would simpl
 ### Global Key Index
 
 Maintaining a single global index of all keys (outside the segment structure) would simplify queries but complicates retention. When segments are deleted, identifying which keys are no longer present requires scanning the remaining segments. Per-segment listings naturally handle this—deleting a segment removes its listing records, and keys fall out of scope when their last segment is removed.
-
-## Open Questions
-
-### Deduplication Strategy
-
-The deduplication mechanism has two main approaches:
-
-1. **In-memory collection**: Accumulate all keys in memory, deduplicate, then return. Simple but memory usage scales with distinct key count. Enables sorted iteration order.
-
-2. **Streaming with tracking**: Return keys as encountered, tracking seen keys to skip duplicates. Lower memory latency for first results, but still requires tracking state. Order depends on segment/key ordering in storage.
-
-The choice affects memory usage, latency characteristics, and whether keys can be returned in sorted order. Input welcome on which approach better serves expected use cases.
 
 ## Updates
 
