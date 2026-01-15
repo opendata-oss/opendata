@@ -901,7 +901,10 @@ mod tests {
             lookback_delta,
         };
 
-        evaluator.evaluate(stmt).await.map(|result| result.expect_instant_vector("Expected instant vector result"))
+        evaluator
+            .evaluate(stmt)
+            .await
+            .map(|result| result.expect_instant_vector("Expected instant vector result"))
     }
 
     /// Helper to convert label vec to HashMap for comparison
@@ -1538,9 +1541,17 @@ mod tests {
             lookback_delta,
         };
         // First evaluation
-        let result1 = evaluator.evaluate(stmt.clone()).await.unwrap().expect_instant_vector("Expected instant vector result");
+        let result1 = evaluator
+            .evaluate(stmt.clone())
+            .await
+            .unwrap()
+            .expect_instant_vector("Expected instant vector result");
         // Second evaluation - should use cached data
-        let result2 = evaluator.evaluate(stmt.clone()).await.unwrap().expect_instant_vector("Expected instant vector result");
+        let result2 = evaluator
+            .evaluate(stmt.clone())
+            .await
+            .unwrap()
+            .expect_instant_vector("Expected instant vector result");
 
         // then: results should be identical (sample caching disabled for now)
         assert_eq!(result1.len(), 1);
