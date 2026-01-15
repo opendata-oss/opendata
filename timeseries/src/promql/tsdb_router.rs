@@ -187,6 +187,17 @@ impl PromqlRouter for Tsdb {
                     error_type: None,
                 }
             }
+            ExprResult::RangeVector(_) => {
+                let err = ErrorResponse::execution(
+                    "Range vectors not supported for instant queries".to_string(),
+                );
+                QueryResponse {
+                    status: err.status,
+                    data: None,
+                    error: Some(err.error),
+                    error_type: Some(err.error_type),
+                }
+            }
         }
     }
 
@@ -273,6 +284,17 @@ impl PromqlRouter for Tsdb {
                             let labels_key = vec![];
                             let values = series_map.entry(labels_key).or_default();
                             values.push((timestamp_secs, value.to_string()));
+                        }
+                        ExprResult::RangeVector(_) => {
+                            let err = ErrorResponse::execution(
+                                "Range vectors not supported in range query evaluation".to_string(),
+                            );
+                            return QueryRangeResponse {
+                                status: err.status,
+                                data: None,
+                                error: Some(err.error),
+                                error_type: Some(err.error_type),
+                            };
                         }
                     }
                 }
