@@ -72,3 +72,14 @@ buckets. Each bucket contains indexes for efficient label-based querying
 (inverted index mapping label/value pairs to series IDs) and Gorilla-compressed
 time series samples. For detailed storage specifications, see [RFC 0001: Timeseries
 Storage](rfcs/0001-tsdb-storage.md).
+
+## Roadmap
+
+- [ ] **Full PromQL Compatibility** - Support the full PromQL query specification (in-progress)
+- [ ] **Full Prometheus API Compatibility** - Support the full Prometheus API specification (in-progress)
+- [ ] **Retention Policies/Rollups** - Specify policies for cleaning up or rolling up old data
+- [ ] **Bucket Compaction** - Compact adjacent buckets together to reduce index overhead
+- [ ] **Recording Rules** - Prometheus-style recording rules to manage high-cardinality data
+- [ ] **Service Discovery for Targets** - Support Prometheus-style target service discovery
+- [ ] **OTLP Export Protocol Ingestion** - Support accepting samples over the OTLP export protocol
+- [ ] **Read-Only Clients** - Support read-only clients that can run queries decoupled from ingest
