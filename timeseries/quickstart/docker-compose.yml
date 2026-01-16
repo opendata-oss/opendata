@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  timeseries-server:
+    build:
+      context: ../..
+      dockerfile: timeseries/quickstart/Dockerfile.timeseries
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yaml:/app/prometheus.yaml
+      - timeseries-data:/app/data
+    environment:
+      - RUST_LOG=info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    ports:
+      - "9100:9100"
+    command:
+      - '--path.rootfs=/host'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - '/:/host:ro'
+    restart: unless-stopped
+
+  mock-metrics:
+    build:
+      context: .
+      dockerfile: Dockerfile.mock-metrics
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana-provisioning:/etc/grafana/provisioning
+      - ./dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      timeseries-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  timeseries-data:
+  grafana-data:

@@ -1,0 +1,19 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copy the mock metrics server script
+COPY mock_metrics_server.py .
+
+# Make the script executable
+RUN chmod +x mock_metrics_server.py
+
+# Expose port 8080
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')" || exit 1
+
+# Run the mock metrics server
+CMD ["python3", "mock_metrics_server.py", "--port", "8080"]

@@ -1,0 +1,53 @@
+# OpenData Timeseries Configuration
+# This configuration sets up scraping from node_exporter
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+# Scrape configuration
+scrape_configs:
+  # Node Exporter - System metrics
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+    scrape_interval: 5s
+    scrape_timeout: 4s
+    metrics_path: /metrics
+    scheme: http
+
+  # Self-monitoring - Timeseries server metrics
+  - job_name: 'timeseries-server'
+    static_configs:
+      - targets: ['localhost:9090']
+    scrape_interval: 10s
+    scrape_timeout: 5s
+    metrics_path: /metrics
+    scheme: http
+
+  # Mock application metrics
+  - job_name: 'mock-metrics'
+    static_configs:
+      - targets: ['mock-metrics:8080']
+    scrape_interval: 5s
+    scrape_timeout: 4s
+    metrics_path: /metrics
+    scheme: http
+
+# Storage configuration
+storage:
+  type: SlateDb
+  path: data
+  object_store:
+    type: Local
+    path: /app/data
+
+# Flush interval for persisting data
+flush_interval_secs: 30
+
+# Optional: Add more scrape targets here
+# Example for custom application:
+#  - job_name: 'my-app'
+#    static_configs:
+#      - targets: ['my-app:8080']
+#    scrape_interval: 10s
