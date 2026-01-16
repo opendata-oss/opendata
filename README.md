@@ -29,7 +29,7 @@ The flip side of this decoupled architecture is that you have higher end-to-end 
 
 # Quick Start
 
-* [TSDB][./timeseries/README.md]
+* [TSDB](./timeseries/README.md)
 * Log: TODO
 * Vector: TODO
 
