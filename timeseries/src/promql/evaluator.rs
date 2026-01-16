@@ -411,8 +411,9 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 let fut = self.evaluate_binary_expr(b, start, end, interval, lookback_delta);
                 Box::pin(fut)
             }
-            Expr::Paren(_p) => {
-                todo!()
+            Expr::Paren(p) => {
+                let fut = self.evaluate_expr(&p.expr, start, end, interval, lookback_delta);
+                Box::pin(fut)
             }
             Expr::Subquery(_q) => {
                 todo!()

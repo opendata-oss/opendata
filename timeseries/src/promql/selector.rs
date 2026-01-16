@@ -80,10 +80,14 @@ async fn find_candidates_with_reader<'reader, R: QueryReader>(
     for matcher in &selector.matchers.matchers {
         match &matcher.op {
             MatchOp::Equal => {
-                and_terms.push(Label {
-                    name: matcher.name.clone(),
-                    value: matcher.value.clone(),
-                });
+                // For empty string matchers, we skip adding them to and_terms
+                // and handle them later with post-filtering
+                if !matcher.value.is_empty() {
+                    and_terms.push(Label {
+                        name: matcher.name.clone(),
+                        value: matcher.value.clone(),
+                    });
+                }
             }
             MatchOp::Re(_) => {
                 let values = parse_limited_regex(&matcher.value)
@@ -103,8 +107,34 @@ async fn find_candidates_with_reader<'reader, R: QueryReader>(
         }
     }
 
+    // If we have no positive matchers but have empty string matchers, we need to get all series
+    // Otherwise, if we have no positive matchers and no empty string matchers, return empty
     if and_terms.is_empty() && or_groups.is_empty() {
-        return Ok(Vec::new());
+        if !has_empty_string_matchers(selector) {
+            return Ok(Vec::new());
+        }
+        // For empty string matchers only, we need to get all series to filter later
+        // We'll get all series by getting the metric name (if specified) or all series
+        if let Some(ref name) = selector.name {
+            let metric_term = Label {
+                name: METRIC_NAME.to_string(),
+                value: name.clone(),
+            };
+            let inverted_index_view = reader
+                .inverted_index(bucket, std::slice::from_ref(&metric_term))
+                .await?;
+            let result_set: Vec<SeriesId> = inverted_index_view
+                .intersect(vec![metric_term])
+                .iter()
+                .collect();
+            return Ok(result_set);
+        } else {
+            // No metric name specified - this would match all series, but that's expensive
+            // For now, return error
+            return Err(crate::error::Error::InvalidInput(
+                "must specify a metric name when using empty label matcher".to_string(),
+            ));
+        }
     }
 
     let all_terms = or_groups
@@ -153,15 +183,28 @@ pub(crate) async fn evaluate_selector_with_reader<'reader, R: QueryReader>(
 ) -> Result<HashSet<SeriesId>> {
     let candidates = find_candidates_with_reader(reader, &bucket, selector).await?;
 
-    // If there are not-equal or regex-not matchers, we need to filter using forward index
-    if candidates.is_empty() || !has_negative_matchers(selector) {
+    // If there are negative matchers or empty string matchers, we need to filter using forward index
+    if candidates.is_empty()
+        || (!has_negative_matchers(selector) && !has_empty_string_matchers(selector))
+    {
         return Ok(candidates.into_iter().collect());
     }
 
-    // Get forward index view for candidates to apply negative filtering
+    // Get forward index view for candidates to apply filtering
     let forward_index_view = reader.forward_index(&bucket, &candidates).await?;
-    let filtered = apply_negative_matchers(forward_index_view.as_ref(), candidates, selector)
-        .map_err(crate::error::Error::InvalidInput)?;
+    let mut filtered = candidates;
+
+    // Apply negative matchers
+    if has_negative_matchers(selector) {
+        filtered = apply_negative_matchers(forward_index_view.as_ref(), filtered, selector)
+            .map_err(crate::error::Error::InvalidInput)?;
+    }
+
+    // Apply empty string matchers
+    if has_empty_string_matchers(selector) {
+        filtered = apply_empty_string_matchers(forward_index_view.as_ref(), filtered, selector)
+            .map_err(crate::error::Error::InvalidInput)?;
+    }
 
     Ok(filtered.into_iter().collect())
 }
@@ -174,11 +217,24 @@ fn evaluate_on_indexes(
 ) -> std::result::Result<Vec<SeriesId>, String> {
     // Handle regex and equality matchers separately to support OR logic for regex
     let candidates = find_candidates_with_regex_support(inverted_index, selector)?;
-    if candidates.is_empty() || !has_negative_matchers(selector) {
+    if candidates.is_empty()
+        || (!has_negative_matchers(selector) && !has_empty_string_matchers(selector))
+    {
         return Ok(candidates);
     }
 
-    let filtered = apply_negative_matchers(forward_index, candidates, selector)?;
+    let mut filtered = candidates;
+
+    // Apply negative matchers
+    if has_negative_matchers(selector) {
+        filtered = apply_negative_matchers(forward_index, filtered, selector)?;
+    }
+
+    // Apply empty string matchers
+    if has_empty_string_matchers(selector) {
+        filtered = apply_empty_string_matchers(forward_index, filtered, selector)?;
+    }
+
     Ok(filtered)
 }
 
@@ -205,10 +261,14 @@ fn find_candidates_with_regex_support(
     for matcher in &selector.matchers.matchers {
         match &matcher.op {
             MatchOp::Equal => {
-                and_terms.push(Label {
-                    name: matcher.name.clone(),
-                    value: matcher.value.clone(),
-                });
+                // For empty string matchers, we skip adding them to and_terms
+                // and handle them later with post-filtering
+                if !matcher.value.is_empty() {
+                    and_terms.push(Label {
+                        name: matcher.name.clone(),
+                        value: matcher.value.clone(),
+                    });
+                }
             }
             MatchOp::Re(_) => {
                 // Validate and expand regex pattern
@@ -228,8 +288,27 @@ fn find_candidates_with_regex_support(
         }
     }
 
+    // If we have no positive matchers but have empty string matchers, we need to get all series
+    // Otherwise, if we have no positive matchers and no empty string matchers, return empty
     if and_terms.is_empty() && or_groups.is_empty() {
-        return Ok(Vec::new());
+        if !has_empty_string_matchers(selector) {
+            return Ok(Vec::new());
+        }
+        // For empty string matchers only, we need to get all series to filter later
+        // We'll get all series by getting the metric name (if specified)
+        if let Some(ref name) = selector.name {
+            let metric_term = Label {
+                name: METRIC_NAME.to_string(),
+                value: name.clone(),
+            };
+            let result_set: Vec<SeriesId> =
+                inverted_index.intersect(vec![metric_term]).iter().collect();
+            return Ok(result_set);
+        } else {
+            // No metric name specified - this would match all series, but that's expensive
+            // For now, return empty as this case should be rare
+            return Ok(Vec::new());
+        }
     }
 
     // Start with AND terms intersection
@@ -269,10 +348,14 @@ fn extract_equality_terms(selector: &VectorSelector) -> std::result::Result<Vec<
     for matcher in &selector.matchers.matchers {
         match &matcher.op {
             MatchOp::Equal => {
-                terms.push(Label {
-                    name: matcher.name.clone(),
-                    value: matcher.value.clone(),
-                });
+                // For empty string matchers, we skip adding them to terms
+                // and handle them later with post-filtering
+                if !matcher.value.is_empty() {
+                    terms.push(Label {
+                        name: matcher.name.clone(),
+                        value: matcher.value.clone(),
+                    });
+                }
             }
             MatchOp::Re(_) => {
                 // Regex validation only - actual handling done in find_candidates_with_regex_support
@@ -293,6 +376,42 @@ fn has_negative_matchers(selector: &VectorSelector) -> bool {
         .matchers
         .iter()
         .any(|m| matches!(m.op, MatchOp::NotEqual | MatchOp::NotRe(_)))
+}
+
+fn has_empty_string_matchers(selector: &VectorSelector) -> bool {
+    selector
+        .matchers
+        .matchers
+        .iter()
+        .any(|m| matches!(m.op, MatchOp::Equal) && m.value.is_empty())
+}
+
+/// Apply empty string matchers using any ForwardIndexLookup implementation.
+/// For empty string matchers (label=""), include series that either:
+/// - Have the label set to an empty string
+/// - Don't have the label at all
+fn apply_empty_string_matchers(
+    index: &dyn ForwardIndexLookup,
+    candidates: Vec<SeriesId>,
+    selector: &VectorSelector,
+) -> std::result::Result<Vec<SeriesId>, String> {
+    let mut result = candidates;
+
+    for matcher in &selector.matchers.matchers {
+        if matches!(matcher.op, MatchOp::Equal) && matcher.value.is_empty() {
+            result.retain(|id| {
+                index
+                    .get_spec(id)
+                    .map(|spec| {
+                        // Include if the label is missing OR set to empty string
+                        !has_label_with_non_empty_value(&spec.labels, &matcher.name)
+                    })
+                    .unwrap_or(false)
+            });
+        }
+    }
+
+    Ok(result)
 }
 
 /// Apply negative matchers (not-equal, not-regex) using any ForwardIndexLookup implementation.
@@ -340,6 +459,12 @@ fn has_label(labels: &[Label], name: &str, value: &str) -> bool {
     labels
         .iter()
         .any(|label| label.name == name && label.value == value)
+}
+
+fn has_label_with_non_empty_value(labels: &[Label], name: &str) -> bool {
+    labels
+        .iter()
+        .any(|label| label.name == name && !label.value.is_empty())
 }
 
 #[cfg(test)]
@@ -918,6 +1043,247 @@ mod tests {
 
         // then: should find exactly 3 series (excluding host-50)
         assert_eq!(result.len(), 3, "Should find 3 matching series");
+    }
+
+    #[tokio::test]
+    async fn should_handle_empty_label_selector() {
+        use crate::model::TimeBucket;
+        use crate::query::test_utils::MockQueryReaderBuilder;
+        // given:
+        let bucket = TimeBucket::hour(1000);
+        let mut builder = MockQueryReaderBuilder::new(bucket);
+        builder.add_sample(
+            vec![
+                Label {
+                    name: METRIC_NAME.to_string(),
+                    value: "http_requests_total".to_string(),
+                },
+                Label {
+                    name: "foo".to_string(),
+                    value: "bar".to_string(),
+                },
+            ],
+            MetricType::Gauge,
+            Sample {
+                timestamp_ms: 1000,
+                value: 10.0,
+            },
+        );
+        builder.add_sample(
+            vec![
+                Label {
+                    name: METRIC_NAME.to_string(),
+                    value: "http_requests_total".to_string(),
+                },
+                Label {
+                    name: "foo".to_string(),
+                    value: "".to_string(),
+                },
+            ],
+            MetricType::Gauge,
+            Sample {
+                timestamp_ms: 2000,
+                value: 20.0,
+            },
+        );
+        builder.add_sample(
+            vec![
+                Label {
+                    name: METRIC_NAME.to_string(),
+                    value: "http_requests_total".to_string(),
+                },
+                Label {
+                    name: "method".to_string(),
+                    value: "GET".to_string(),
+                },
+            ],
+            MetricType::Gauge,
+            Sample {
+                timestamp_ms: 3000,
+                value: 30.0,
+            },
+        );
+        let reader = builder.build();
+
+        // when: query with foo=""
+        let selector = VectorSelector {
+            name: Some("http_requests_total".to_string()),
+            matchers: Matchers {
+                matchers: vec![Matcher::new(MatchOp::Equal, "foo", "")],
+                or_matchers: vec![],
+            },
+            offset: None,
+            at: None,
+        };
+        let mut cached_reader = CachedQueryReader::new(&reader);
+        let result = evaluate_selector_with_reader(&mut cached_reader, bucket, &selector)
+            .await
+            .unwrap();
+
+        // then: should find 2 series (foo="" and no foo label), but NOT foo="bar"
+        assert_eq!(
+            result.len(),
+            2,
+            "Should find 2 series: foo='' and no foo label"
+        );
+    }
+
+    #[test]
+    fn should_handle_empty_label_with_mixed_matchers() {
+        // Test empty label selector combined with regular matchers
+        let forward = ForwardIndex::default();
+        let inverted = InvertedIndex::default();
+
+        // Series with foo="", env="prod" (should match)
+        let series1_labels = vec![
+            Label {
+                name: METRIC_NAME.to_string(),
+                value: "test_metric".to_string(),
+            },
+            Label {
+                name: "foo".to_string(),
+                value: "".to_string(),
+            },
+            Label {
+                name: "env".to_string(),
+                value: "prod".to_string(),
+            },
+        ];
+        forward.series.insert(
+            1,
+            SeriesSpec {
+                unit: None,
+                metric_type: Some(MetricType::Gauge),
+                labels: series1_labels.clone(),
+            },
+        );
+        for label in series1_labels {
+            inverted
+                .postings
+                .entry(label)
+                .or_default()
+                .value_mut()
+                .insert(1);
+        }
+
+        // Series with no foo, env="prod" (should match)
+        let series2_labels = vec![
+            Label {
+                name: METRIC_NAME.to_string(),
+                value: "test_metric".to_string(),
+            },
+            Label {
+                name: "env".to_string(),
+                value: "prod".to_string(),
+            },
+        ];
+        forward.series.insert(
+            2,
+            SeriesSpec {
+                unit: None,
+                metric_type: Some(MetricType::Gauge),
+                labels: series2_labels.clone(),
+            },
+        );
+        for label in series2_labels {
+            inverted
+                .postings
+                .entry(label)
+                .or_default()
+                .value_mut()
+                .insert(2);
+        }
+
+        // Series with foo="bar", env="prod" (should NOT match)
+        let series3_labels = vec![
+            Label {
+                name: METRIC_NAME.to_string(),
+                value: "test_metric".to_string(),
+            },
+            Label {
+                name: "foo".to_string(),
+                value: "bar".to_string(),
+            },
+            Label {
+                name: "env".to_string(),
+                value: "prod".to_string(),
+            },
+        ];
+        forward.series.insert(
+            3,
+            SeriesSpec {
+                unit: None,
+                metric_type: Some(MetricType::Gauge),
+                labels: series3_labels.clone(),
+            },
+        );
+        for label in series3_labels {
+            inverted
+                .postings
+                .entry(label)
+                .or_default()
+                .value_mut()
+                .insert(3);
+        }
+
+        // Series with foo="", env="staging" (should NOT match)
+        let series4_labels = vec![
+            Label {
+                name: METRIC_NAME.to_string(),
+                value: "test_metric".to_string(),
+            },
+            Label {
+                name: "foo".to_string(),
+                value: "".to_string(),
+            },
+            Label {
+                name: "env".to_string(),
+                value: "staging".to_string(),
+            },
+        ];
+        forward.series.insert(
+            4,
+            SeriesSpec {
+                unit: None,
+                metric_type: Some(MetricType::Gauge),
+                labels: series4_labels.clone(),
+            },
+        );
+        for label in series4_labels {
+            inverted
+                .postings
+                .entry(label)
+                .or_default()
+                .value_mut()
+                .insert(4);
+        }
+
+        // when: query with foo="" AND env="prod"
+        let selector = VectorSelector {
+            name: Some("test_metric".to_string()),
+            matchers: Matchers {
+                matchers: vec![
+                    Matcher::new(MatchOp::Equal, "foo", ""),
+                    Matcher::new(MatchOp::Equal, "env", "prod"),
+                ],
+                or_matchers: vec![],
+            },
+            offset: None,
+            at: None,
+        };
+
+        let result = evaluate_on_indexes(&forward, &inverted, &selector).unwrap();
+
+        // then: should find only 2 series that match both conditions
+        assert_eq!(
+            result.len(),
+            2,
+            "Should find 2 series matching both foo='' and env='prod'"
+        );
+        assert!(result.contains(&1)); // foo="", env="prod"
+        assert!(result.contains(&2)); // no foo label, env="prod"
+        assert!(!result.contains(&3)); // foo="bar", env="prod" - fails foo=""
+        assert!(!result.contains(&4)); // foo="", env="staging" - fails env="prod"
     }
 
     #[tokio::test]
