@@ -203,29 +203,24 @@ impl Log {
         let current_time_ms = self.current_time_ms();
         let mut inner = self.inner.write().await;
 
-        // Build all deltas, accumulating records
-        let mut storage_records: Vec<StorageRecord> = Vec::new();
+        // Three-phase commit: build (fallible) → write (fatal) → apply (infallible).
+        // Deltas capture intent without mutating state, allowing clean abort on build errors.
 
-        // 1. Allocate sequences
+        // Build phase: accumulate deltas and storage records.
+        let mut storage_records: Vec<StorageRecord> = Vec::new();
         let seq_delta = inner
             .sequence_allocator
             .build_delta(records.len() as u64, &mut storage_records);
-
-        // 2. Get/create segment
         let seg_delta = inner.segment_cache.build_delta(
             current_time_ms,
             seq_delta.base_sequence(),
             &mut storage_records,
         );
-
-        // 3. Build listing entries
         let keys: Vec<_> = records.iter().map(|r| r.key.clone()).collect();
         let listing_delta =
             inner
                 .listing_cache
                 .build_delta(&seg_delta, &keys, &mut storage_records);
-
-        // 4. Build log entry records
         LogEntryBuilder::build(
             seg_delta.segment(),
             seq_delta.base_sequence(),
@@ -233,7 +228,7 @@ impl Log {
             &mut storage_records,
         );
 
-        // 5. Write atomically
+        // Write phase: atomic write to storage.
         let storage_options = StorageWriteOptions {
             await_durable: options.await_durable,
         };
@@ -241,7 +236,7 @@ impl Log {
             .put_with_options(storage_records, storage_options)
             .await?;
 
-        // 6. Apply deltas
+        // Apply phase: update in-memory caches.
         inner.sequence_allocator.apply_delta(seq_delta);
         inner.segment_cache.apply_delta(seg_delta);
         inner.listing_cache.apply_delta(listing_delta);
