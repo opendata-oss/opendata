@@ -426,10 +426,9 @@ impl PromqlRouter for Tsdb {
             // Extract label sets and deduplicate by labels
             for id in &series_ids_vec {
                 if let Some(spec) = forward_index.get_spec(id) {
-                    // Create sorted labels for deduplication
+                    // Sort by canonical Label ordering (name, then value) for deduplication
                     let mut sorted_labels = spec.labels.clone();
-                    sorted_labels
-                        .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.value.cmp(&b.value)));
+                    sorted_labels.sort();
 
                     if let std::collections::hash_map::Entry::Vacant(e) =
                         unique_series.entry(sorted_labels)

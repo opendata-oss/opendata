@@ -255,7 +255,8 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         terms: &[Label],
     ) -> Result<Arc<dyn InvertedIndexLookup + Send + Sync + 'static>> {
         let mut terms = terms.to_vec();
-        terms.sort_by(|l, r| l.name.cmp(&r.name).then_with(|| l.value.cmp(&r.value)));
+        // Sort by canonical Label ordering (name, then value) for cache key consistency
+        terms.sort();
         // Check cache first
         if let Some(cached_result) = self.cache.get_inverted_index(bucket, &terms) {
             return Ok(cached_result);
@@ -506,7 +507,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     .await?;
 
                 let mut labels_key: Vec<Label> = series_spec.labels.clone();
-                labels_key.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.value.cmp(&b.value)));
+                // Sort by canonical Label ordering (name, then value) for series grouping
+                labels_key.sort();
 
                 let values = series_map.entry(labels_key).or_default();
                 for sample in sample_data {

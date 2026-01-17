@@ -266,7 +266,8 @@ pub(crate) mod test_utils {
         ) -> &mut Self {
             // Sort labels for consistent fingerprinting
             let mut sorted_attrs = labels.clone();
-            sorted_attrs.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.value.cmp(&b.value)));
+            // Sort by canonical Label ordering (name, then value) for fingerprinting
+            sorted_attrs.sort();
 
             // Get or create global series ID
             let series_id = if let Some(&id) = self.global_fingerprint_to_id.get(&sorted_attrs) {
