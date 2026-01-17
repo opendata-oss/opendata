@@ -9,13 +9,13 @@ OpenData is a collection of databases built on a shared foundation. Same storage
 
 ## The Problem OpenData is solving
 
-When you're starting out, everything fits in Postgres. Operations are simple. You have one database to learn, one to operate, one to tune.
+When you're starting out, all your data fits in Postgres. Operations are simple. You have one database to learn, one to operate, one to tune.
 
 Then you hit scale. You need timeseries for metrics, a log store for events, vector search for embeddings. Postgres can technically do all of these, but not well at scale. So you unbundle and fall off an operational cliff.
 
 Each new database has its own storage engine, its own replication story, its own operational quirks. Suddenly you're hiring specialists or paying vendors 80% margins to manage complexity that didn't exist when it was "just Postgres." The cost isn't in the software. It's in the operations.
 
-OpenData is building a middle ground. Not as simple as single-node Postgres, but nowhere near the complexity of running five unrelated databases. A shared foundation that lets you add capabilities without multiplying operational burden.
+OpenData is building a middle ground. Our databases may not as simple to operate as as single-node Postgres, but they are nowhere near the complexity of running five unrelated distributed databases. OpenData databases are all built on a shared foundation that lets you add capabilities without multiplying operational burden.
 
 ## The OpenData Approach
 
@@ -36,7 +36,7 @@ Object storage has been around for years, but two recent S3 primitives make this
 - **Compare-and-set**: Enables atomic metadata updates without external coordination. This is how SlateDB provides snapshot isolation—manifest updates are atomic, so readers and writers stay consistent without a separate lock service.
 - **Express One Zone**: Drops latency enough that object-store-native databases can serve workloads that previously required local disk.
 
-SlateDB is capitalizing on these primitives to build a correct, performant storage substrate. We're building on SlateDB to deliver operational leverage across multiple databases.
+SlateDB is capitalizing on these primitives to build a correct, performant storage substrate. OpenData is building on SlateDB to deliver operational leverage across multiple databases.
 
 ## Tradeoffs
 
