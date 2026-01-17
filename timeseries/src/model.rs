@@ -73,7 +73,9 @@ impl Label {
 /// for fingerprint computation and series identification.
 impl Ord for Label {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.name.cmp(&other.name).then_with(|| self.value.cmp(&other.value))
+        self.name
+            .cmp(&other.name)
+            .then_with(|| self.value.cmp(&other.value))
     }
 }
 
