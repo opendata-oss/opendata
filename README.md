@@ -5,43 +5,78 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289DA?style=flat-square&logo=discord)](https://discord.gg/EUv3Bqcv)
 [![GitHub License](https://img.shields.io/github/license/opendata-oss/opendata?style=flat-square)](LICENSE)
 
-# The Problem we are solving
+OpenData is a collection of databases built on a shared foundation. Same storage layer, same operational patterns, same tooling. The goal: make running multiple specialized databases feel like running one system.
 
-   * Typical progression of a database stack: everything is postgres. But every successfull company eventually outgrows postgres. You start adding timeseries, log, vector, search, and other databases. Each of these databases have to solve very similar problems, from data storage replication, metadata management, control plane operations, administrative tooling, test tooling, etc. And so each of these databases has their own unique operational challeges. You end up either paying lots of people to operate these databases in your company, or you pay a vendor a premium to manage them for you. And these vendors aim for 80% margins, and bloat their software to justify these margins. No matter how you slice it, your data stack gets expensive. 
-   * OpenData is solving this problem by building each of these databases on a shared foundation, from the core storage, to the control plane, to administrative controls, test tools, and beyond. This makes every OpenData database focused on well defined use cases, and all of them are similar to develop, operate, and tune. No need to hire an army of engineers to keep your databases online. One will do. The costs of running your data stack will fall. 
+## The Problem OpenData is solving
 
-# How is Open Data solving this problem
+When you're starting out, everything fits in Postgres. Operations are simple. You have one database to learn, one to operate, one to tune.
 
-   * OpenData relies heavily on SlateDB as the common foundation for storage. Our databases can be thought of as data structures implemented on top of SlateDB's object store native LSM tree. SlateDB provides the core storage engine that batches and caches data on top of ojbect storage. It also provides a metadata management layer which provides basic snapshot isolation to OpenData databases.
-   * Similarly, OpenData databases have shared foundations for deployment runtimes, admin tooling, service registry, test tooling, and more. The roadmap section below has more information.
-   * By leveraging common foundatiotns and in many cases identical solutions for major parts of the architecture of each database, each database can focus on doing one job well, and a group of OpenData Databases are remarkably easy to operate without needing specialized knowledge of any particular database. 
+Then you hit scale. You need timeseries for metrics, a log store for events, vector search for embeddings. Postgres can technically do all of these, but not well at scale. So you unbundle and fall off an operational cliff.
 
-# Our Roadmap
+Each new database has its own storage engine, its own replication story, its own operational quirks. Suddenly you're hiring specialists or paying vendors 80% margins to manage complexity that didn't exist when it was "just Postgres." The cost isn't in the software. It's in the operations.
 
-## Our Databases
+OpenData is building a middle ground. Not as simple as single-node Postgres, but nowhere near the complexity of running five unrelated databases. A shared foundation that lets you add capabilities without multiplying operational burden.
 
-Each Opendata database is responsible for its own data layout on top of slateDB, its query implementation, and metadata tracking. Each database has its own roadmp for its specific features along these dimensions. Check out our databases to learn more about their design, how to use it, and what's coming up next.
+## The OpenData Approach
 
-## Shared Foundations
+Two things make OpenData work:
 
-Here are the common layers we need to build across every database: 
+**SlateDB as the storage substrate.** [SlateDB](https://www.slatedb.io) is an object-store-native LSM tree that handles write batching, tiered caching, and compaction. It provides snapshot isolation via atomic manifest updates using S3's compare-and-set. Each OpenData database is essentially a data structure built on top of SlateDB—defining its own data layout and query implementation while inheriting the storage fundamentals.
 
-[] Common service infrastructure: how to make every OpenData DB a service accessed over the network. this includes things like pluggable protocol support, shared metrics infrastructure, standardized health checks, extensible API routing, etc. etc. The current RFC does this well.
-[] A common solution for distributed mode. If DBs are shared, how to route requests to the right shard, etc.
-[] A common 'registry': How to browse your deployed DBs, access them, etc. 
-[] Common admin tooling: deploy, tear down, roll, upgrade, inspect, move, etc.
-[] Benchmark tooling
-[] Regression testing framework: run a fixed set of queries across db versions to catch functional regressions.
-[] Deterministic simulation testing. 
+This alone is massive leverage. Tuning and configuring storage is where a bulk of database operational complexity lives. Buffer pools, write-ahead logs, compaction strategies, cache hierarchies, replication—each database handles these differently, and each requires specialized knowledge to operate well. With OpenData, there's exactly one storage system to understand. One set of knobs. One tuning methodology.
 
-Some of the other bigger ideas that we are thinking of include: 
+**OpenData as the operational layer.** OpenData extends that same leverage to everything above storage: deployment patterns, admin tooling (deploy, upgrade, rollback, inspect), service infrastructure (health checks, metrics, protocol handling), configuration systems, and testing frameworks. When every database deploys the same way, scales the same way, and exposes the same admin interface, you stop needing a specialist for each one.
 
-[] A shared ingest layer: writes hit a product-specific api, but then get persisted and indexed and made queryable using a standard layer that's pluggable. Here is where a shared WAL, background compactors, etc. fit in. 
-[] A common way to run DBs multiple modes: embedded writers and readers, embedded writes hosted readers, etc.
+The combination is a unified storage and operational stack. Individual databases focus only on what makes them unique—query semantics, data layout, use-case optimizations—while inheriting everything else.
 
-# How to get involved
+## Why Now
 
-We are just getting started with OpenData. We'd love to hear from, whether you'd like to help build OpenData, or if you have feature requests, or whether you have entire databases you wish existed under the OpenData umbrella.. let us know! hop on our discord or file an issue.
+Object storage has been around for years, but two recent S3 primitives make this architecture viable:
 
+- **Compare-and-set**: Enables atomic metadata updates without external coordination. This is how SlateDB provides snapshot isolation—manifest updates are atomic, so readers and writers stay consistent without a separate lock service.
+- **Express One Zone**: Drops latency enough that object-store-native databases can serve workloads that previously required local disk.
+
+SlateDB is capitalizing on these primitives to build a correct, performant storage substrate. We're building on SlateDB to deliver operational leverage across multiple databases.
+
+## Tradeoffs
+
+OpenData databases sit between OLTP (Postgres) and analytics (ClickHouse, Snowflake). Object storage is the sole persistence layer, which means:
+
+- Higher end-to-end latency between writes and reads (seconds, not milliseconds)
+- Not suitable for workloads where users must read their own writes immediately
+
+But if your workload can tolerate that latency—and many can—you get meaningful flexibility: tune cost/latency/durability per workload, scale readers and writers independently (including to zero), and choose your deployment model (embedded, distributed, or hybrid).
+
+## Databases
+
+Three databases today, more coming:
+
+- **[TSDB](timeseries/rfcs/0001-tsdb-storage.md)**: Object-store-native timeseries. Prometheus remote-write compatible.
+- **[Log](log/rfcs/0001-storage.md)**: Event streaming with millions of partitions. Replayable log per key.
+- **[Vector](vector/rfcs/0001-storage.md)**: SPANN-style ANN search. Centroids in memory, posting lists on disk.
+
+## Roadmap
+
+### Shared Infrastructure (now)
+- [ ] Common service layer: pluggable protocols, shared metrics, health checks, routing
+- [ ] Distributed mode: sharding and request routing
+- [ ] Registry: discover and browse deployed databases
+- [ ] Admin tooling: deploy, teardown, upgrade, inspect, migrate
+- [ ] Benchmark and regression testing frameworks
+
+### Bigger Ideas (later)
+- [ ] Shared ingest layer with common WAL and compaction
+- [ ] Flexible deployment modes: embedded writers + hosted readers, fully embedded, fully distributed
+- [ ] Deterministic simulation testing
+
+## Get Involved
+
+We're early and building in the open.
+
+**Want to build?** Check out the open RFCs, these are the active design efforts. Or you can check out issues labeled `good-first-issue` to get codin right away. Or simply file a bug or add a feature request!
+
+**Have opinions?** What databases should exist under OpenData? What operational problems matter most? Open an issue or find us on [Discord](https://discord.gg/EUv3Bqcv).
+
+**Want to follow along?** Star the repo, join [Discord](https://discord.gg/EUv3Bqcv), or [sign the manifesto](https://www.opendata.dev/manifesto).
 
 
