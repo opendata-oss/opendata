@@ -774,27 +774,6 @@ This is useful for:
 - Pipelines that perform a coarse search first, then refine with additional filters
 - Queries where the vector embedding is not needed in results
 
-## Comparison with LogRead
-
-| Aspect                  | LogRead                          | VectorDbRead                       |
-|-------------------------|----------------------------------|------------------------------------|
-| Primary operation       | `scan(key, seq_range)`           | `search(query)`                    |
-| Query parameters        | Key + sequence range             | Vector + limit + filter            |
-| Result ordering         | Sequence number (ascending)      | Similarity score (best first)      |
-| Iterator support        | `LogIterator` for streaming      | Vectorized results (no iterator)   |
-| Options variant         | `scan_with_options()`            | Builder pattern on `Query`         |
-| Point lookup            | N/A (scan with range)            | `get(id)`                          |
-| Batch retrieval         | N/A                              | Not provided (can add if needed)   |
-| Filtering               | N/A                              | Metadata filters with predicates   |
-| Field selection         | N/A                              | `FieldSelection` enum              |
-| Count operation         | `count(key, seq_range)`          | Not provided (can add if needed)   |
-| Lazy initialization     | N/A                              | Centroids loaded on first query    |
-| Thread safety           | Methods take `&self`             | Methods take `&self`               |
-| Snapshot semantics      | Reader operates on snapshot      | Reader operates on snapshot        |
-
-Both follow the same architectural pattern of separating read-only concerns from read-write
-operations.
-
 ## Examples
 
 ### Basic Search
