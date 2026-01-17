@@ -82,4 +82,5 @@ Storage](rfcs/0001-tsdb-storage.md).
 - [ ] **Recording Rules** - Prometheus-style recording rules to manage high-cardinality data
 - [ ] **Service Discovery for Targets** - Support Prometheus-style target service discovery
 - [ ] **OTLP Export Protocol Ingestion** - Support accepting samples over the OTLP export protocol
+- [ ] **Log Native Ingestion** - Ingest directly from OpenData Log
 - [ ] **Read-Only Clients** - Support read-only clients that can run queries decoupled from ingest
