@@ -7,3 +7,4 @@ To sign, open a pull request to add your name to the list.
 - [Davis Treybig](https://github.com/DavisTrey)
 - [Rohan Desai](https://github.com/rodesai)
 - [Bruno Cadonna](https://github.com/cadonna)
+- [Alex Sward](https://github.com/alexsward)
