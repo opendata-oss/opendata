@@ -6,19 +6,19 @@
 [![GitHub License](https://img.shields.io/github/license/opendata-oss/opendata?style=flat-square)](LICENSE)
 
 OpenData is a collection of open source databases built on a common storage and infrastructure foundation. This shared
-foundation means every database has a similar operational profile, which makes our database fleet materially 
+foundation means every database has a virtually identical operational profile, which makes our database fleet materially 
 easier and cheaper to operate. 
 
-The common foundation has two components, storage and service infrastructure.
+The common foundation has two distinct components:
 
-**SlateDB as the common storage substrate:** [SlateDB](https://www.slatedb.io) is an object-store-native LSM tree that
+**SlateDB as the common storage layer:** [SlateDB](https://www.slatedb.io) is an object-store-native LSM tree that
 handles write batching, tiered caching, and compaction. It provides snapshot isolation via atomic manifest updates 
 using S3's compare-and-set. Each OpenData database is essentially a data structure built on top of SlateDB—defining 
 its own data layout and query implementation while inheriting the storage fundamentals. 
 
-**OpenData as the common infrastructure layer:** OpenData is the shared foundation for the layers above storage: 
-distributed state infrastructure, admin tooling (deploy, upgrade, rollback, inspect), service infrastructure (health checks, 
-metrics, protocol handling), configuration systems, and testing frameworks. 
+**OpenData as the common infrastructure layer:** OpenData is the shared foundation for the layers above storage:
+service infrastructure, service catalog,  admin tooling, distributed state infrastructure, configuration systems, 
+and testing frameworks. 
 
 Taken together, with OpenData there is only one storage engine and one set of operational tooling to learn across
 every database. Individual databases focus only on what makes them unique—query semantics, data layout, use-case 
