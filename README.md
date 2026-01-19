@@ -9,8 +9,6 @@ OpenData is a collection of open source databases built on a common storage and 
 foundation means every database has a similar operational profile, which makes our database fleet materially 
 easier and cheaper to operate. 
 
-# The OpenData Approach to Databases
-
 The common foundation has two components, storage and service infrastructure.
 
 **SlateDB as the common storage substrate:** [SlateDB](https://www.slatedb.io) is an object-store-native LSM tree that
