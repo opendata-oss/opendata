@@ -5,7 +5,7 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289DA?style=flat-square&logo=discord)](https://discord.gg/EUv3Bqcv)
 [![GitHub License](https://img.shields.io/github/license/opendata-oss/opendata?style=flat-square)](LICENSE)
 
-OpenData is a collection of open source databases built on a common storage and infrastructure foundation. This shared
+OpenData is a collection of open source databases built on a common, object-native storage and infrastructure foundation. This shared
 foundation means every database has a virtually identical operational profile, which makes our database fleet materially 
 easier and cheaper to operate. 
 
