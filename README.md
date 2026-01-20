@@ -2,27 +2,27 @@
 
 <img src="https://github.com/opendata-oss/opendata/blob/main/public/github-banner.png?raw=true" alt="OpenData" width="100%">
 
-[![Discord](https://img.shields.io/badge/discord-join-7289DA?style=flat-square&logo=discord)](https://discord.gg/EUv3Bqcv)
+[![Discord](https://img.shields.io/badge/discord-join-7289DA?style=flat-square&logo=discord)](https://discord.gg/CsAQJ2AJGU)
 [![GitHub License](https://img.shields.io/github/license/opendata-oss/opendata?style=flat-square)](LICENSE)
 
-OpenData is a collection of open source databases built on a common, object-native storage and infrastructure foundation. This shared
-foundation means every database has a virtually identical operational profile, which makes our database fleet materially 
-easier and cheaper to operate than alternatives. 
+OpenData is a collection of open source databases built on a common, object-native storage and infrastructure 
+foundation. This shared foundation means every database has a virtually identical operational profile, which makes
+our database fleet materially easier and cheaper to operate than alternatives. 
 
 The common foundation has two distinct components:
 
 **SlateDB as the common storage layer:** [SlateDB](https://www.slatedb.io) is an object-store-native LSM tree that
 handles write batching, tiered caching, and compaction. It provides snapshot isolation via atomic manifest updates 
-using S3's compare-and-set. Each OpenData database is essentially a data structure built on top of SlateDB—defining 
-its own data layout and query implementation while inheriting the storage fundamentals. 
+using S3's compare-and-set. Each individual OpenData database implements its own domain-specific data structure and 
+query layer on top of SlateDB. 
 
 **OpenData as the common infrastructure layer:** OpenData is the shared foundation for the layers above storage:
 service infrastructure, service catalog,  admin tooling, distributed state infrastructure, configuration systems, 
 and testing frameworks. 
 
-Taken together, with OpenData there is only one storage engine and one set of operational tooling to learn across
-every database. Individual databases focus only on what makes them unique—query semantics, data layout, use-case 
-optimizations—while inheriting everything else.
+Taken together, with OpenData there is only one storage engine and one set of operational tooling to learn across all
+systems. By inheriting these key components, individual databases focus only on the unique query semantics, data 
+layout and optimizations.
 
 # OpenData Databases
 
@@ -48,14 +48,14 @@ the pipe for the rest of the shared foundation:
 
 # Get Involved
 
-We're early and building in the open.
+We are early and building in the open, with most discussions happening on [Discord](https://discord.gg/CsAQJ2AJGU).
 
 **Want to build?** Check out the open RFCs, these are the active design efforts. Or you can check out issues 
 labeled `good-first-issue` to get coding right away. Or simply file a bug or add a feature request!
 
 **Have opinions?** What databases should exist under OpenData? What operational problems matter most? Open 
-an issue or find us on [Discord](https://discord.gg/EUv3Bqcv).
+an issue or find us on [Discord](https://discord.gg/CsAQJ2AJGU).
 
-**Want to follow along?** Star the repo, join [Discord](https://discord.gg/EUv3Bqcv), or [sign the manifesto](https://www.opendata.dev/manifesto).
+**Want to follow along?** Star the repo, join [Discord](https://discord.gg/CsAQJ2AJGU), or [sign the manifesto](https://www.opendata.dev/manifesto).
 
 
