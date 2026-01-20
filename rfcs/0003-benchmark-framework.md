@@ -80,6 +80,7 @@ adding meaningful benchmarks.
 
 *To be detailed in subsequent revisions. Initial design considerations include:*
 
+- Separate `bencher` crate in the workspace
 - CLI-based benchmark runner with subcommands per system
 - TOML-based configuration with CLI overrides
 - Trait-based workload abstraction
@@ -129,15 +130,12 @@ The benchmark pipeline integrates with GitHub Actions workflows:
 
 ## Open Questions
 
-1. Should the benchmark framework live as a separate crate in the workspace, or
-   as a module within `common`?
-
-2. What specific telemetry should be collected by default? Throughput and
+1. What specific telemetry should be collected by default? Throughput and
    latency percentiles seem essential—what else?
 
-3. Where should we store periodic bench results in the repository?
+2. Where should we store periodic bench results in the repository?
 
-4. What is the minimum viable interface a system must implement to plug into
+3. What is the minimum viable interface a system must implement to plug into
    the framework?
 
 ## Updates
