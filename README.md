@@ -7,7 +7,7 @@
 
 OpenData is a collection of open source databases built on a common, object-native storage and infrastructure foundation. This shared
 foundation means every database has a virtually identical operational profile, which makes our database fleet materially 
-easier and cheaper to operate. 
+easier and cheaper to operate than alternatives. 
 
 The common foundation has two distinct components:
 
