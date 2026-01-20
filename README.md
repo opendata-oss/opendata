@@ -57,5 +57,3 @@ labeled `good-first-issue` to get coding right away. Or simply file a bug or add
 an issue or find us on [Discord](https://discord.gg/CsAQJ2AJGU).
 
 **Want to follow along?** Star the repo, join [Discord](https://discord.gg/CsAQJ2AJGU), or [sign the manifesto](https://www.opendata.dev/manifesto).
-
-

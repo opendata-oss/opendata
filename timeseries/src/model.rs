@@ -67,6 +67,25 @@ impl Label {
     }
 }
 
+/// Canonical ordering for `Label`: first by `name`, then by `value`.
+///
+/// This ordering ensures consistent sorting of label sets, which is required
+/// for fingerprint computation and series identification.
+impl Ord for Label {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.name
+            .cmp(&other.name)
+            .then_with(|| self.value.cmp(&other.value))
+    }
+}
+
+/// Delegates to [`Ord::cmp`] for total ordering.
+impl PartialOrd for Label {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// A single data point in a time series.
 ///
 /// Samples represent individual measurements at specific points in time.

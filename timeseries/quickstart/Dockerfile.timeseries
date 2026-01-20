@@ -1,0 +1,47 @@
+# Multi-stage build for OpenData Timeseries
+FROM rust:latest as builder
+
+# Install dependencies for building
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY . ./
+
+# Build the timeseries binary
+RUN cargo build --release -p timeseries
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the built binary
+COPY --from=builder /app/target/release/timeseries /app/timeseries
+
+# Create data directory
+RUN mkdir -p /app/data
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:9090/metrics || exit 1
+
+# Expose the default port
+EXPOSE 9090
+
+# Set environment variables
+ENV RUST_LOG=info
+ENV TIMESERIES_DATA_PATH=/app/data
+
+# Run the timeseries server
+CMD ["./timeseries", "--config", "/app/prometheus.yaml", "--port", "9090"]

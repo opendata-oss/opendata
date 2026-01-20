@@ -230,6 +230,18 @@ pub(crate) fn attribute_value_to_field_value(attr: &AttributeValue) -> crate::se
     }
 }
 
+/// Helper to convert the serde layer's FieldValue to AttributeValue.
+///
+/// This is used internally when decoding metadata from storage.
+pub(crate) fn field_value_to_attribute_value(field: &crate::serde::FieldValue) -> AttributeValue {
+    match field {
+        crate::serde::FieldValue::String(s) => AttributeValue::String(s.clone()),
+        crate::serde::FieldValue::Int64(v) => AttributeValue::Int64(*v),
+        crate::serde::FieldValue::Float64(v) => AttributeValue::Float64(*v),
+        crate::serde::FieldValue::Bool(v) => AttributeValue::Bool(*v),
+    }
+}
+
 /// Helper to build a metadata map from attributes.
 pub(crate) fn attributes_to_map(attributes: &[Attribute]) -> HashMap<String, AttributeValue> {
     attributes

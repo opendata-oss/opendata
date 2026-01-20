@@ -1,0 +1,13 @@
+apiVersion: 1
+
+datasources:
+  - name: OpenData Timeseries
+    type: prometheus
+    access: proxy
+    url: http://timeseries-server:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      tlsSkipVerify: true
+      httpMethod: POST
+    version: 1

@@ -323,10 +323,10 @@ and similarly for `B=2`.
 
 **Key Layout:**
 ```
-┌─────────┬──────────────┬─────────────┬────────────┬─────────────┐
-│ version │  record_tag  │ time_bucket │   label    │   value     │
-│ 1 byte  │   8 bits     │   4 bytes   │   utf8     │   utf8      │
-└─────────┴──────────────┴─────────────┴────────────┴─────────────┘
+┌─────────┬──────────────┬─────────────┬──────────────────┬─────────────┐
+│ version │  record_tag  │ time_bucket │      label       │   value     │
+│ 1 byte  │   8 bits     │   4 bytes   │ terminated bytes │  raw utf8   │
+└─────────┴──────────────┴─────────────┴──────────────────┴─────────────┘
 ```
 
 **Key Fields:**
@@ -334,9 +334,22 @@ and similarly for `B=2`.
 - `record_tag` (u8): Record tag encoding the record type and bucket size
   - `bits 7-4` (u4): Record type (`0x04` for `InvertedIndex`)
   - `bits 3-0` (u4): Bucket size in hours
-- `time_bucket` (u32): The number of minutes since the UNIX epoch
-- `label` (`Utf8`): Label name.
-- `value` (`Utf8`): Label value.
+- `time_bucket` (u32): The number of minutes since the UNIX epoch (big-endian)
+- `label` (terminated bytes): Label name encoded using `terminated_bytes::serialize`,
+  which escapes `0x00` and `0x01` bytes and appends a `0x00` terminator. This
+  preserves lexicographical ordering and unambiguously separates the label from
+  the value.
+- `value` (raw UTF-8): Label value stored as raw UTF-8 bytes without a terminator.
+  Since this is the last field in the key, the end of the key implicitly delimits
+  the value.
+
+**Encoding Rationale:**
+
+Only the label (attribute) field uses terminated encoding because it must be
+unambiguously separated from the value field. The value does not require a
+terminator since it extends to the end of the key. This minimizes key size while
+preserving the ability to do efficient prefix scans by label name.
+
 
 Note that since the label names and values are stored lexicographically,
 SlateDB's prefix encoding will be very effective without the use of a
@@ -512,3 +525,4 @@ This was rejected in favor of separate deployments per namespace:
 | Date       | Description |
 |------------|-------------|
 | 2025-12-17 | Initial draft |
+| 2026-01-18 | Updated InvertedIndex key encoding: attribute uses terminated bytes, value uses raw UTF-8 (backward incompatible) |

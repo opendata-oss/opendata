@@ -5,6 +5,7 @@ use crate::model::{BucketSize, BucketStart, SeriesFingerprint, SeriesId};
 use bytes::{Bytes, BytesMut};
 use common::BytesRange;
 use common::serde::key_prefix::KeyPrefix;
+use common::serde::terminated_bytes;
 
 /// BucketList key (global-scoped)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,8 +182,10 @@ impl InvertedIndexKey {
             .prefix_with_bucket_size(self.bucket_size)
             .write_to(&mut buf);
         buf.extend_from_slice(&self.time_bucket.to_be_bytes());
-        encode_utf8(&self.attribute, &mut buf);
-        encode_utf8(&self.value, &mut buf);
+        // Attribute uses terminated encoding to delimit from value
+        terminated_bytes::serialize(self.attribute.as_bytes(), &mut buf);
+        // Value is raw UTF-8 (no terminator needed - end of key acts as delimiter)
+        buf.extend_from_slice(self.value.as_bytes());
         buf.freeze()
     }
 
@@ -194,7 +197,7 @@ impl InvertedIndexKey {
             .prefix_with_bucket_size(bucket.size)
             .write_to(&mut buf);
         buf.extend_from_slice(&bucket.start.to_be_bytes());
-        encode_utf8(attribute, &mut buf);
+        terminated_bytes::serialize(attribute.as_bytes(), &mut buf);
         BytesRange::prefix(buf.freeze())
     }
 
@@ -222,8 +225,16 @@ impl InvertedIndexKey {
         let time_bucket = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
         slice = &slice[4..];
 
-        let attribute = decode_utf8(&mut slice)?;
-        let value = decode_utf8(&mut slice)?;
+        // Attribute uses terminated encoding
+        let attribute_bytes = terminated_bytes::deserialize(&mut slice)?;
+        let attribute = String::from_utf8(attribute_bytes.to_vec()).map_err(|e| EncodingError {
+            message: format!("Invalid UTF-8 in attribute: {}", e),
+        })?;
+
+        // Value is the remaining bytes (raw UTF-8, no terminator)
+        let value = String::from_utf8(slice.to_vec()).map_err(|e| EncodingError {
+            message: format!("Invalid UTF-8 in value: {}", e),
+        })?;
 
         Ok(InvertedIndexKey {
             time_bucket,
@@ -435,7 +446,7 @@ mod tests {
     fn should_not_match_shorter_attribute_with_value_that_looks_like_suffix() {
         // given - searching for "hostname" should NOT match a key with
         // attribute "host" and value "name" even though "host" + "name" = "hostname"
-        // The length-prefix encoding should prevent this collision.
+        // The tuple-style delimiter encoding should prevent this collision.
         let bucket = crate::model::TimeBucket {
             start: 12345,
             size: 1,
@@ -454,32 +465,30 @@ mod tests {
         assert!(
             !range.contains(&host_name_key.encode()),
             "attribute_range for 'hostname' should not match key with attribute='host' value='name'. \
-             The length-prefix encoding should differentiate them: \
-             'hostname' encodes as [len=8, ...] while 'host' encodes as [len=4, ...]"
+             The delimiter-based encoding should differentiate them."
         );
     }
 
     #[test]
     fn should_not_match_when_value_bytes_could_mimic_attribute_continuation() {
-        // given - test a more contrived case where the value length bytes
-        // might numerically match what would be expected for a longer attribute
+        // given - test a more contrived case where naive concatenation
+        // might produce a collision
         let bucket = crate::model::TimeBucket {
             start: 12345,
             size: 1,
         };
 
-        // Key with short attribute and value whose length encoding could be confused
-        // attribute "ab" (len=2) with value of length that starts with same byte
+        // Key with short attribute and value that concatenates to a different attribute
         let short_attr_key = InvertedIndexKey {
             time_bucket: 12345,
             attribute: "ab".to_string(),
-            value: "cdef".to_string(), // len=4, encoded as [0x04, 0x00] in little-endian
+            value: "cdef".to_string(),
             bucket_size: 1,
         };
 
-        // Search for "abcdef" (len=6)
+        // Search for "abcdef"
         // If encoding was naive concatenation, "ab" + "cdef" might look like "abcdef"
-        // But with length-prefix: [len=2][ab][len=4][cdef] vs [len=6][abcdef]
+        // But with tuple-style encoding, each element is delimited separately
 
         // when
         let range = InvertedIndexKey::attribute_range(&bucket, "abcdef");
@@ -488,6 +497,47 @@ mod tests {
         assert!(
             !range.contains(&short_attr_key.encode()),
             "attribute_range for 'abcdef' should not match key with attribute='ab' value='cdef'"
+        );
+    }
+
+    #[test]
+    fn should_encode_attribute_with_terminator_and_value_without() {
+        // This test demonstrates and verifies that:
+        // - Only the attribute uses terminated encoding (with 0x00 delimiter)
+        // - The value uses raw UTF-8 (no terminator, delimited by end of key)
+        //
+        // This is sufficient because the attribute terminator separates attribute
+        // from value, and the value extends to the end of the key.
+
+        let key = InvertedIndexKey {
+            time_bucket: 12345,
+            attribute: "host".to_string(),
+            value: "server1".to_string(),
+            bucket_size: 1,
+        };
+
+        let encoded = key.encode();
+
+        // Verify it round-trips correctly
+        let decoded = InvertedIndexKey::decode(&encoded).unwrap();
+        assert_eq!(decoded.attribute, "host");
+        assert_eq!(decoded.value, "server1");
+
+        // Verify the key ends with raw "server1" bytes (no trailing 0x00)
+        let value_bytes = b"server1";
+        assert!(
+            encoded.ends_with(value_bytes),
+            "Encoded key should end with raw value bytes (no terminator)"
+        );
+
+        // The encoded key should contain the 0x00 terminator after the attribute
+        // but NOT after the value. We can verify by checking the byte before "server1"
+        // is 0x00 (the attribute terminator).
+        let value_start = encoded.len() - value_bytes.len();
+        assert_eq!(
+            encoded[value_start - 1],
+            0x00,
+            "Byte before value should be 0x00 (attribute terminator)"
         );
     }
 }

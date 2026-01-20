@@ -1,0 +1,10 @@
+# Rust build output
+target
+**/target
+
+# Git + editor junk
+.git
+**/.git
+.gitignore
+**/.DS_Store
+

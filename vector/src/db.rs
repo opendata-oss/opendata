@@ -18,8 +18,13 @@ use common::storage::{Storage, StorageRead};
 use roaring::RoaringTreemap;
 use tokio::sync::{Mutex, RwLock};
 
+use std::collections::HashMap;
+
 use crate::delta::{VectorDbDelta, VectorDbDeltaBuilder};
-use crate::model::{Config, Vector};
+use crate::distance;
+use crate::hnsw::CentroidGraph;
+use crate::model::{AttributeValue, Config, Vector};
+use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::key::SeqBlockKey;
 use crate::storage::{VectorDbStorageExt, VectorDbStorageReadExt};
 
@@ -43,6 +48,27 @@ pub struct VectorDb {
     snapshot: RwLock<Arc<dyn StorageRead>>,
     /// Mutex to ensure only one flush operation can run at a time.
     flush_mutex: Arc<Mutex<()>>,
+    /// In-memory HNSW graph for centroid search (loaded lazily).
+    centroid_graph: RwLock<Option<CentroidGraph>>,
+}
+
+/// A search result with vector, score, and metadata.
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    /// Internal vector ID
+    pub internal_id: u64,
+    /// External vector ID (user-provided)
+    pub external_id: String,
+    /// Similarity score (interpretation depends on distance metric)
+    ///
+    /// - L2: Lower scores = more similar
+    /// - Cosine: Higher scores = more similar (range: -1 to 1)
+    /// - DotProduct: Higher scores = more similar
+    pub score: f32,
+    /// Vector values
+    pub values: Vec<f32>,
+    /// Metadata key-value pairs
+    pub metadata: HashMap<String, AttributeValue>,
 }
 
 impl VectorDb {
@@ -78,6 +104,7 @@ impl VectorDb {
             pending_delta_watch_rx: rx,
             snapshot: RwLock::new(snapshot),
             flush_mutex: Arc::new(Mutex::new(())),
+            centroid_graph: RwLock::new(None),
         })
     }
 
@@ -222,9 +249,12 @@ impl VectorDb {
                 &metadata,
             )?);
 
-            // 6. Batch PostingList assignment to centroid_id=1 (STUB)
-            // TODO: Real centroid assignment via HNSW
-            posting_lists.entry(1).or_default().insert(new_internal_id);
+            // 6. Assign vector to nearest centroid using HNSW
+            let centroid_id = self.assign_to_centroid(pending_vec.values()).await?;
+            posting_lists
+                .entry(centroid_id)
+                .or_default()
+                .insert(new_internal_id);
         }
 
         // Serialize and merge batched posting lists
@@ -245,6 +275,312 @@ impl VectorDb {
         *snapshot_guard = new_snapshot;
 
         Ok(())
+    }
+
+    /// Bootstrap centroids from vectors (for testing).
+    ///
+    /// This method writes centroid chunks to storage and builds the in-memory
+    /// HNSW graph. It's primarily intended for testing to initialize a known
+    /// set of centroids without running clustering algorithms.
+    ///
+    /// # Arguments
+    /// * `centroids` - Vector of centroid entries with their IDs and vectors
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - Centroid dimensions don't match the collection's configured dimensions
+    /// - Storage write fails
+    /// - HNSW graph construction fails
+    pub async fn bootstrap_centroids(&self, centroids: Vec<CentroidEntry>) -> Result<()> {
+        // Validate centroid dimensions
+        for centroid in &centroids {
+            if centroid.dimensions() != self.config.dimensions as usize {
+                return Err(anyhow::anyhow!(
+                    "Centroid dimension mismatch: expected {}, got {}",
+                    self.config.dimensions,
+                    centroid.dimensions()
+                ));
+            }
+        }
+
+        // Validate we don't exceed max chunk size (default 4096)
+        // TODO: Support splitting centroids across multiple chunks when count > chunk_target
+        const DEFAULT_CHUNK_TARGET: usize = 4096;
+        if centroids.len() > DEFAULT_CHUNK_TARGET {
+            return Err(anyhow::anyhow!(
+                "Too many centroids for single chunk: {} > {}. Multi-chunk support not yet implemented.",
+                centroids.len(),
+                DEFAULT_CHUNK_TARGET
+            ));
+        }
+
+        // Write centroids to storage (single chunk for simplicity)
+        let op = self.storage.put_centroid_chunk(
+            0,
+            centroids.clone(),
+            self.config.dimensions as usize,
+        )?;
+        self.storage.apply(vec![op]).await?;
+
+        // Build HNSW graph
+        let graph = CentroidGraph::build(centroids, self.config.distance_metric)?;
+        let mut graph_guard = self.centroid_graph.write().await;
+        *graph_guard = Some(graph);
+
+        Ok(())
+    }
+
+    /// Load centroids from storage and build HNSW graph.
+    ///
+    /// This method scans all centroid chunks from storage and constructs
+    /// the in-memory HNSW graph for fast centroid search during queries.
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - Storage read fails
+    /// - No centroids found in storage
+    /// - HNSW graph construction fails
+    pub async fn load_centroids(&self) -> Result<()> {
+        let snapshot = self.snapshot.read().await;
+        let centroids = snapshot
+            .scan_all_centroids(self.config.dimensions as usize)
+            .await?;
+
+        if centroids.is_empty() {
+            return Err(anyhow::anyhow!("No centroids found in storage"));
+        }
+
+        let graph = CentroidGraph::build(centroids, self.config.distance_metric)?;
+        let mut graph_guard = self.centroid_graph.write().await;
+        *graph_guard = Some(graph);
+
+        Ok(())
+    }
+
+    /// Ensure centroids are loaded, loading them if needed.
+    ///
+    /// This is called lazily from search() to load centroids on first query.
+    async fn ensure_centroids_loaded(&self) -> Result<()> {
+        let guard = self.centroid_graph.read().await;
+        if guard.is_some() {
+            return Ok(());
+        }
+        drop(guard);
+
+        // Try to load centroids from storage
+        match self.load_centroids().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // If no centroids in storage, that's okay - they can be bootstrapped later
+                if e.to_string().contains("No centroids found") {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Assign a vector to its nearest centroid using HNSW search.
+    ///
+    /// # Arguments
+    /// * `vector` - Vector to assign
+    ///
+    /// # Returns
+    /// The centroid_id of the nearest centroid, or 1 if no centroids are loaded
+    async fn assign_to_centroid(&self, vector: &[f32]) -> Result<u32> {
+        let graph_guard = self.centroid_graph.read().await;
+
+        match &*graph_guard {
+            Some(graph) => {
+                let results = graph.search(vector, 1);
+                results
+                    .first()
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("No centroids available"))
+            }
+            None => {
+                // Fallback: If no centroids loaded yet, assign to centroid_id=1
+                // This maintains backward compatibility with current stub
+                // TODO: Remove this fallback once LIRE centroid splitting is implemented
+                // and centroids are always initialized on collection creation
+                Ok(1)
+            }
+        }
+    }
+
+    /// Search for k-nearest neighbors to a query vector.
+    ///
+    /// This implements the SPANN-style query algorithm:
+    /// 1. Search HNSW for nearest centroids
+    /// 2. Load posting lists for those centroids
+    /// 3. Filter deleted vectors
+    /// 4. Score candidates and return top-k
+    ///
+    /// # Arguments
+    /// * `query` - Query vector
+    /// * `k` - Number of nearest neighbors to return
+    ///
+    /// # Returns
+    /// Vector of SearchResults sorted by similarity (best first)
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - Query dimensions don't match collection dimensions
+    /// - No centroids are loaded
+    /// - Storage read fails
+    pub async fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        // 1. Validate query dimensions
+        if query.len() != self.config.dimensions as usize {
+            return Err(anyhow::anyhow!(
+                "Query dimension mismatch: expected {}, got {}",
+                self.config.dimensions,
+                query.len()
+            ));
+        }
+
+        // 2. Ensure centroids are loaded
+        self.ensure_centroids_loaded().await?;
+
+        // Check if centroids are actually loaded
+        let graph_guard = self.centroid_graph.read().await;
+        if graph_guard.is_none() {
+            return Ok(Vec::new());
+        }
+        drop(graph_guard);
+
+        // 3. Search HNSW for nearest centroids (expand by ~10-100x for recall)
+        // clamp(10, 100) ensures we search at least 10 centroids (for small k)
+        // and at most 100 centroids (to cap memory/latency for large k)
+        let num_centroids = k.clamp(10, 100);
+        let centroid_ids = self.search_centroids(query, num_centroids).await?;
+
+        if centroid_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 4. Load posting lists and deleted vectors
+        let snapshot = self.snapshot.read().await;
+        let candidate_ids = self.load_candidates(&centroid_ids, &**snapshot).await?;
+
+        if candidate_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 5. Load deleted vectors bitmap and filter
+        let deleted = snapshot.get_deleted_vectors().await?;
+        let candidate_ids: Vec<u64> = candidate_ids
+            .into_iter()
+            .filter(|id| !deleted.contains(*id))
+            .collect();
+
+        // 6. Score candidates and return top-k
+        let results = self
+            .score_and_rank(query, &candidate_ids, k, &**snapshot)
+            .await?;
+
+        Ok(results)
+    }
+
+    /// Search HNSW graph for nearest centroids.
+    async fn search_centroids(&self, query: &[f32], k: usize) -> Result<Vec<u32>> {
+        let graph_guard = self.centroid_graph.read().await;
+
+        match &*graph_guard {
+            Some(graph) => Ok(graph.search(query, k)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Load candidate vector IDs from posting lists.
+    async fn load_candidates(
+        &self,
+        centroid_ids: &[u32],
+        snapshot: &dyn StorageRead,
+    ) -> Result<Vec<u64>> {
+        let mut all_candidates = Vec::new();
+
+        for &centroid_id in centroid_ids {
+            let posting_list = snapshot.get_posting_list(centroid_id).await?;
+            all_candidates.extend(posting_list.vector_ids.iter());
+        }
+
+        Ok(all_candidates)
+    }
+
+    /// Score candidates and return top-k results.
+    ///
+    /// TODO: Use a min/max heap to maintain only top-k results in memory instead of
+    /// materializing all candidates. This would reduce memory usage for large candidate sets.
+    ///
+    /// TODO: Consider pipelining this operation so we load and score candidates in batches,
+    /// keeping only the current top-k in memory. This would enable processing arbitrarily
+    /// large candidate sets without loading them all at once.
+    async fn score_and_rank(
+        &self,
+        query: &[f32],
+        candidate_ids: &[u64],
+        k: usize,
+        snapshot: &dyn StorageRead,
+    ) -> Result<Vec<SearchResult>> {
+        let mut scored_results = Vec::new();
+
+        // Load and score each candidate
+        for &internal_id in candidate_ids {
+            // Load vector data
+            let vector_data = snapshot.get_vector_data(internal_id).await?;
+            if vector_data.is_none() {
+                continue; // Skip if vector not found (shouldn't happen)
+            }
+            let vector_data = vector_data.unwrap();
+
+            // Load vector metadata
+            let vector_meta = snapshot.get_vector_meta(internal_id).await?;
+            if vector_meta.is_none() {
+                continue; // Skip if metadata not found
+            }
+            let vector_meta = vector_meta.unwrap();
+
+            // Compute distance/similarity score
+            let score =
+                distance::compute_distance(query, &vector_data.vector, self.config.distance_metric);
+
+            // Convert metadata fields to HashMap
+            let metadata: HashMap<String, AttributeValue> = vector_meta
+                .fields
+                .into_iter()
+                .map(|field| {
+                    (
+                        field.field_name,
+                        crate::model::field_value_to_attribute_value(&field.value),
+                    )
+                })
+                .collect();
+
+            scored_results.push(SearchResult {
+                internal_id,
+                external_id: vector_meta.external_id,
+                score,
+                values: vector_data.vector,
+                metadata,
+            });
+        }
+
+        // Sort by score
+        // For L2, lower is better; for Cosine/DotProduct, higher is better
+        match self.config.distance_metric {
+            crate::serde::collection_meta::DistanceMetric::L2 => {
+                scored_results.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
+            }
+            crate::serde::collection_meta::DistanceMetric::Cosine
+            | crate::serde::collection_meta::DistanceMetric::DotProduct => {
+                scored_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+            }
+        }
+
+        // Return top-k
+        scored_results.truncate(k);
+        Ok(scored_results)
     }
 }
 
@@ -399,5 +735,272 @@ mod tests {
 
         // then
         assert!(result.is_ok());
+    }
+
+    // End-to-end search tests
+
+    fn create_test_config_with_dimensions(dimensions: u16) -> Config {
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            VectorDbMergeOperator,
+        )));
+        Config {
+            storage,
+            dimensions,
+            distance_metric: DistanceMetric::Cosine,
+            flush_interval: Duration::from_secs(60),
+            metadata_fields: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn should_bootstrap_and_query_vectors() {
+        // given - create test database with 128 dimensions
+        let config = create_test_config_with_dimensions(128);
+        let db = VectorDb::open(config).await.unwrap();
+
+        // given - create 4 clusters of 25 vectors each
+        let mut all_vectors = Vec::new();
+        let cluster_centers = vec![
+            vec![1.0; 128],  // Cluster 1: all ones
+            vec![-1.0; 128], // Cluster 2: all negative ones
+            {
+                let mut v = vec![0.0; 128];
+                v[0] = 10.0;
+                v
+            }, // Cluster 3: sparse
+            {
+                let mut v = vec![0.0; 128];
+                for i in (0..128).step_by(2) {
+                    v[i] = 1.0;
+                }
+                v
+            }, // Cluster 4: alternating
+        ];
+
+        for (cluster_id, center) in cluster_centers.iter().enumerate() {
+            for i in 0..25 {
+                let mut v = center.clone();
+                // Add small noise
+                v[0] += (i as f32) * 0.01;
+
+                let vector = Vector::new(format!("vec-{}-{}", cluster_id, i), v);
+                all_vectors.push(vector);
+            }
+        }
+
+        // when - write vectors and flush
+        db.write(all_vectors.clone()).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when - bootstrap centroids (use cluster centers)
+        let centroids: Vec<CentroidEntry> = cluster_centers
+            .into_iter()
+            .enumerate()
+            .map(|(i, vector)| CentroidEntry::new((i + 1) as u32, vector))
+            .collect();
+        db.bootstrap_centroids(centroids).await.unwrap();
+
+        // when - search for vector similar to cluster 0
+        let query = vec![1.0; 128];
+        let results = db.search(&query, 10).await.unwrap();
+
+        // then - should find vectors from cluster 0
+        assert_eq!(results.len(), 10);
+
+        // Verify all results are from cluster 0 (external_id starts with "vec-0-")
+        for result in &results {
+            assert!(
+                result.external_id.starts_with("vec-0-"),
+                "Expected cluster 0 vector, got: {}",
+                result.external_id
+            );
+        }
+
+        // Verify results are sorted by score (cosine similarity, higher = better)
+        for i in 1..results.len() {
+            assert!(
+                results[i - 1].score >= results[i].score,
+                "Results not sorted by score"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn should_handle_deleted_vectors_in_search() {
+        // given - create database and bootstrap centroids
+        let config = create_test_config_with_dimensions(3);
+        let db = VectorDb::open(config).await.unwrap();
+
+        let centroids = vec![CentroidEntry::new(1, vec![1.0, 0.0, 0.0])];
+        db.bootstrap_centroids(centroids).await.unwrap();
+
+        // given - write initial vector
+        let vector1 = Vector::new("vec-1", vec![1.0, 0.0, 0.0]);
+        db.write(vec![vector1]).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when - upsert the same vector (old version should be marked as deleted)
+        let vector2 = Vector::new("vec-1", vec![0.9, 0.1, 0.0]);
+        db.write(vec![vector2]).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when - search
+        let results = db.search(&[1.0, 0.0, 0.0], 10).await.unwrap();
+
+        // then - should only return the new version (not the deleted one)
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].external_id, "vec-1");
+        assert_eq!(results[0].values, vec![0.9, 0.1, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn should_search_with_l2_distance_metric() {
+        // given - create database with L2 metric
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            VectorDbMergeOperator,
+        )));
+        let config = Config {
+            storage,
+            dimensions: 3,
+            distance_metric: DistanceMetric::L2,
+            flush_interval: Duration::from_secs(60),
+            metadata_fields: vec![],
+        };
+        let db = VectorDb::open(config).await.unwrap();
+
+        // given - bootstrap centroids
+        let centroids = vec![CentroidEntry::new(1, vec![0.0, 0.0, 0.0])];
+        db.bootstrap_centroids(centroids).await.unwrap();
+
+        // given - write vectors at different distances from origin
+        let vectors = vec![
+            Vector::new("close", vec![0.1, 0.1, 0.1]), // Close to origin
+            Vector::new("medium", vec![1.0, 1.0, 1.0]), // Medium distance
+            Vector::new("far", vec![5.0, 5.0, 5.0]),   // Far from origin
+        ];
+        db.write(vectors).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when - search for vectors near origin
+        let results = db.search(&[0.0, 0.0, 0.0], 3).await.unwrap();
+
+        // then - should be sorted by L2 distance (lower = better)
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].external_id, "close");
+        assert_eq!(results[1].external_id, "medium");
+        assert_eq!(results[2].external_id, "far");
+
+        // Verify scores are increasing (L2 distance)
+        for i in 1..results.len() {
+            assert!(
+                results[i - 1].score <= results[i].score,
+                "L2 distances not sorted correctly"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn should_reject_query_with_wrong_dimensions() {
+        // given - database with 3 dimensions
+        let config = create_test_config_with_dimensions(3);
+        let db = VectorDb::open(config).await.unwrap();
+
+        // when - query with wrong dimensions
+        let result = db.search(&[1.0, 2.0], 10).await;
+
+        // then - should fail
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Query dimension mismatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn should_return_empty_results_when_no_centroids() {
+        // given - database without centroids
+        let config = create_test_config_with_dimensions(3);
+        let db = VectorDb::open(config).await.unwrap();
+
+        // when - search
+        let results = db.search(&[1.0, 0.0, 0.0], 10).await.unwrap();
+
+        // then - should return empty results
+        assert_eq!(results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_return_empty_results_when_no_vectors() {
+        // given - database with centroids but no vectors
+        let config = create_test_config_with_dimensions(3);
+        let db = VectorDb::open(config).await.unwrap();
+
+        let centroids = vec![CentroidEntry::new(1, vec![1.0, 0.0, 0.0])];
+        db.bootstrap_centroids(centroids).await.unwrap();
+
+        // when - search
+        let results = db.search(&[1.0, 0.0, 0.0], 10).await.unwrap();
+
+        // then - should return empty results
+        assert_eq!(results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_limit_results_to_k() {
+        // given - database with many vectors
+        let config = create_test_config_with_dimensions(2);
+        let db = VectorDb::open(config).await.unwrap();
+
+        let centroids = vec![CentroidEntry::new(1, vec![1.0, 0.0])];
+        db.bootstrap_centroids(centroids).await.unwrap();
+
+        // Insert 20 vectors
+        let vectors: Vec<Vector> = (0..20)
+            .map(|i| Vector::new(format!("vec-{}", i), vec![1.0 + (i as f32) * 0.01, 0.0]))
+            .collect();
+        db.write(vectors).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when - search for k=5
+        let results = db.search(&[1.0, 0.0], 5).await.unwrap();
+
+        // then - should return exactly 5 results
+        assert_eq!(results.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn should_search_across_multiple_centroids() {
+        // given - database with 3 centroids
+        let config = create_test_config_with_dimensions(2);
+        let db = VectorDb::open(config).await.unwrap();
+
+        let centroids = vec![
+            CentroidEntry::new(1, vec![1.0, 0.0]),
+            CentroidEntry::new(2, vec![0.0, 1.0]),
+            CentroidEntry::new(3, vec![-1.0, 0.0]),
+        ];
+        db.bootstrap_centroids(centroids).await.unwrap();
+
+        // Insert vectors in each cluster
+        let vectors = vec![
+            Vector::new("c1-1", vec![0.9, 0.0]),
+            Vector::new("c1-2", vec![1.1, 0.0]),
+            Vector::new("c2-1", vec![0.0, 0.9]),
+            Vector::new("c2-2", vec![0.0, 1.1]),
+            Vector::new("c3-1", vec![-0.9, 0.0]),
+            Vector::new("c3-2", vec![-1.1, 0.0]),
+        ];
+        db.write(vectors).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when - search in between centroids 1 and 2
+        let results = db.search(&[0.7, 0.7], 10).await.unwrap();
+
+        // then - should find vectors from multiple centroids
+        assert!(!results.is_empty());
+        // The algorithm expands to multiple centroids, so we should get results
+        // from both cluster 1 and cluster 2
     }
 }

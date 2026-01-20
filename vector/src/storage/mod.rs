@@ -7,7 +7,10 @@ use roaring::RoaringTreemap;
 
 use crate::model::AttributeValue;
 use crate::serde::Encode;
-use crate::serde::key::{IdDictionaryKey, PostingListKey, VectorDataKey, VectorMetaKey};
+use crate::serde::centroid_chunk::CentroidChunkValue;
+use crate::serde::key::{
+    CentroidChunkKey, IdDictionaryKey, PostingListKey, VectorDataKey, VectorMetaKey,
+};
 use crate::serde::posting_list::PostingListValue;
 use crate::serde::vector_data::VectorDataValue;
 use crate::serde::vector_meta::{MetadataField, VectorMetaValue};
@@ -15,6 +18,11 @@ use crate::serde::vector_meta::{MetadataField, VectorMetaValue};
 pub(crate) mod merge_operator;
 
 /// Extension trait for StorageRead that provides vector database-specific loading methods.
+///
+/// These methods are marked as `#[allow(dead_code)]` because they are used by the query path
+/// (VectorDb::search and related methods) which is only called in tests and during actual
+/// queries. The compiler doesn't see them as used during compilation of the library crate
+/// alone, but they are essential for the search functionality.
 #[async_trait]
 pub(crate) trait VectorDbStorageReadExt: StorageRead {
     /// Look up internal ID from external ID in the ID dictionary.
@@ -86,6 +94,53 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
             }
             None => Ok(RoaringTreemap::new()),
         }
+    }
+
+    /// Load a centroid chunk by chunk_id.
+    #[allow(dead_code)]
+    async fn get_centroid_chunk(
+        &self,
+        chunk_id: u32,
+        dimensions: usize,
+    ) -> Result<Option<CentroidChunkValue>> {
+        let key = CentroidChunkKey::new(chunk_id).encode();
+        let record = self.get(key).await?;
+        match record {
+            Some(record) => {
+                let value = CentroidChunkValue::decode_from_bytes(&record.value, dimensions)?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Scan all centroid chunks to load centroids.
+    ///
+    /// This scans all records with the CentroidChunk prefix and collects
+    /// all centroid entries from all chunks.
+    #[allow(dead_code)]
+    async fn scan_all_centroids(
+        &self,
+        dimensions: usize,
+    ) -> Result<Vec<crate::serde::centroid_chunk::CentroidEntry>> {
+        // Create prefix for all CentroidChunk records
+        let mut prefix_buf = bytes::BytesMut::with_capacity(2);
+        crate::serde::RecordType::CentroidChunk
+            .prefix()
+            .write_to(&mut prefix_buf);
+        let prefix = prefix_buf.freeze();
+
+        // Use BytesRange::prefix to create the scan range
+        let range = common::BytesRange::prefix(prefix);
+        let records = self.scan(range).await?;
+
+        let mut all_centroids = Vec::new();
+        for record in records {
+            let chunk = CentroidChunkValue::decode_from_bytes(&record.value, dimensions)?;
+            all_centroids.extend(chunk.entries);
+        }
+
+        Ok(all_centroids)
     }
 }
 
@@ -159,6 +214,25 @@ pub(crate) trait VectorDbStorageExt: Storage {
         let key = PostingListKey::deleted_vectors().encode();
         let value = PostingListValue::from_treemap(vector_ids).encode_to_bytes()?;
         Ok(RecordOp::Merge(Record::new(key, value)))
+    }
+
+    /// Create a RecordOp to write a centroid chunk.
+    fn put_centroid_chunk(
+        &self,
+        chunk_id: u32,
+        entries: Vec<crate::serde::centroid_chunk::CentroidEntry>,
+        dimensions: usize,
+    ) -> Result<RecordOp> {
+        let key = CentroidChunkKey::new(chunk_id).encode();
+        let value = CentroidChunkValue::new(entries).encode_to_bytes(dimensions);
+        Ok(RecordOp::Put(Record::new(key, value)))
+    }
+
+    /// Create a RecordOp to delete a centroid chunk.
+    #[allow(dead_code)]
+    fn delete_centroid_chunk(&self, chunk_id: u32) -> Result<RecordOp> {
+        let key = CentroidChunkKey::new(chunk_id).encode();
+        Ok(RecordOp::Delete(key))
     }
 }
 
