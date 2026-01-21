@@ -5,6 +5,52 @@
 
 use bytes::Bytes;
 
+/// Unique identifier for a segment.
+///
+/// Segment IDs are monotonically increasing integers assigned when segments
+/// are created. Use with [`LogRead::list_keys`](crate::LogRead::list_keys)
+/// to query keys within specific segments.
+pub type SegmentId = u32;
+
+/// Global sequence number for log entries.
+///
+/// Sequence numbers are monotonically increasing integers assigned to each
+/// entry at append time. They provide a total ordering across all keys in
+/// the log.
+pub type Sequence = u64;
+
+/// A segment of the log.
+///
+/// Segments partition the log into coarse-grained chunks based on time or
+/// other policies. Each segment has a unique identifier and tracks the
+/// starting sequence number for entries it contains.
+///
+/// Segments are the natural boundary for attaching metadata such as key
+/// listings. See [`LogRead::list_segments`](crate::LogRead::list_segments)
+/// for querying segments.
+///
+/// # Example
+///
+/// ```ignore
+/// // List all segments
+/// let segments = log.list_segments(..).await?;
+/// for segment in segments {
+///     println!(
+///         "segment {}: start_seq={}, created at {}",
+///         segment.id, segment.start_seq, segment.start_time_ms
+///     );
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment {
+    /// Unique segment identifier (monotonically increasing).
+    pub id: SegmentId,
+    /// First sequence number in this segment.
+    pub start_seq: Sequence,
+    /// Wall-clock time when this segment was created (ms since epoch).
+    pub start_time_ms: i64,
+}
+
 /// A record to be appended to the log.
 ///
 /// Records are the unit of data written to the log. Each record consists of
@@ -78,7 +124,7 @@ pub struct LogEntry {
     ///
     /// Sequence numbers are monotonically increasing within a key's log
     /// and globally unique across all keys.
-    pub sequence: u64,
+    pub sequence: Sequence,
 
     /// The record value.
     pub value: Bytes,

@@ -19,8 +19,9 @@ use bytes::Bytes;
 use common::{Record, StorageRead};
 
 use crate::error::{Error, Result};
+use crate::model::SegmentId;
 use crate::segment::SegmentDelta;
-use crate::serde::{ListingEntryKey, ListingEntryValue, SegmentId};
+use crate::serde::{ListingEntryKey, ListingEntryValue};
 
 /// A key returned from the listing iterator.
 #[derive(Debug, Clone, PartialEq, Eq)]

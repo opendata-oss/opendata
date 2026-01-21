@@ -14,9 +14,9 @@ use common::SeqBlock;
 
 use crate::error::{Error, Result};
 use crate::listing::LogKeyIterator;
-use crate::model::LogEntry;
+use crate::model::{LogEntry, SegmentId};
 use crate::segment::LogSegment;
-use crate::serde::{LogEntryKey, SEQ_BLOCK_KEY, SegmentId, SegmentMeta, SegmentMetaKey};
+use crate::serde::{LogEntryKey, SEQ_BLOCK_KEY, SegmentMeta, SegmentMetaKey};
 
 /// Read-only log storage operations.
 ///

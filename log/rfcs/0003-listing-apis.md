@@ -84,11 +84,6 @@ pub struct Segment {
     /// Wall-clock time when this segment was created (ms since epoch).
     pub start_time_ms: i64,
 }
-
-#[derive(Default)]
-struct ListSegmentsOptions {
-    // Reserved for future options
-}
 ```
 
 The segment listing API is added to the `LogRead` trait:
@@ -101,16 +96,12 @@ trait LogRead {
         &self,
         seq_range: impl RangeBounds<u64>,
     ) -> Result<Vec<Segment>>;
-
-    fn list_segments_with_options(
-        &self,
-        seq_range: impl RangeBounds<u64>,
-        options: ListSegmentsOptions,
-    ) -> Result<Vec<Segment>>;
 }
 ```
 
 The `list_segments` method returns all segments that overlap the given sequence range. This is a precise operation—segments have well-defined boundaries, so there is no approximation. Pass `..` to list all segments.
+
+> **Note**: A `list_segments_with_options` variant can be added when options are needed.
 
 ### List Keys API
 
@@ -126,11 +117,6 @@ struct LogKeyIterator { ... }
 impl LogKeyIterator {
     async fn next(&mut self) -> Result<Option<LogKey>, Error>;
 }
-
-#[derive(Default)]
-struct ListKeysOptions {
-    // Reserved for future options (e.g., prefix filtering)
-}
 ```
 
 The API is added to the `LogRead` trait:
@@ -143,18 +129,14 @@ trait LogRead {
         &self,
         segment_range: impl RangeBounds<u32>,
     ) -> LogKeyIterator;
-
-    fn list_keys_with_options(
-        &self,
-        segment_range: impl RangeBounds<u32>,
-        options: ListKeysOptions,
-    ) -> LogKeyIterator;
 }
 ```
 
 The segment range specifies which segments to scan for keys. Using segment IDs rather than sequence numbers ensures precise results—the iterator returns exactly the keys present in the specified segments, with no approximation. Pass `..` to list keys from all segments.
 
 Users who want to query by sequence range can use `list_segments` to find the relevant segments, then pass those segment IDs to `list_keys`. This two-step approach makes the segment-granular nature of key tracking explicit.
+
+> **Note**: A `list_keys_with_options` variant can be added when options are needed (e.g., prefix filtering).
 
 ### Deduplication
 

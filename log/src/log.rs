@@ -14,13 +14,13 @@ use common::storage::factory::create_storage;
 use common::{Record as StorageRecord, WriteOptions as StorageWriteOptions};
 use tokio::sync::RwLock;
 
-use crate::config::{CountOptions, ListOptions, ScanOptions, WriteOptions};
+use crate::config::{CountOptions, ScanOptions, WriteOptions};
 use crate::error::{Error, Result};
 use crate::listing::ListingCache;
 use crate::listing::LogKeyIterator;
-use crate::model::Record;
-use crate::range::normalize;
-use crate::reader::{LogIterator, LogRead, list_keys_in_segments};
+use crate::model::{Record, Segment, SegmentId, Sequence};
+use crate::range::{normalize_segment_id, normalize_sequence};
+use crate::reader::{LogIterator, LogRead};
 use crate::segment::SegmentCache;
 use crate::sequence::SequenceAllocator;
 use crate::serde::LogEntryBuilder;
@@ -316,10 +316,10 @@ impl LogRead for Log {
     async fn scan_with_options(
         &self,
         key: Bytes,
-        seq_range: impl RangeBounds<u64> + Send,
+        seq_range: impl RangeBounds<Sequence> + Send,
         _options: ScanOptions,
     ) -> Result<LogIterator> {
-        let seq_range = normalize(&seq_range);
+        let seq_range = normalize_sequence(&seq_range);
         let inner = self.inner.read().await;
         Ok(LogIterator::open(
             self.storage.as_read(),
@@ -332,21 +332,28 @@ impl LogRead for Log {
     async fn count_with_options(
         &self,
         _key: Bytes,
-        _seq_range: impl RangeBounds<u64> + Send,
+        _seq_range: impl RangeBounds<Sequence> + Send,
         _options: CountOptions,
     ) -> Result<u64> {
         todo!()
     }
 
-    async fn list_with_options(
+    async fn list_keys(
         &self,
-        seq_range: impl RangeBounds<u64> + Send,
-        _options: ListOptions,
+        segment_range: impl RangeBounds<SegmentId> + Send,
     ) -> Result<LogKeyIterator> {
-        let seq_range = normalize(&seq_range);
+        let segment_range = normalize_segment_id(&segment_range);
+        self.storage.as_read().list_keys(segment_range).await
+    }
+
+    async fn list_segments(
+        &self,
+        seq_range: impl RangeBounds<Sequence> + Send,
+    ) -> Result<Vec<Segment>> {
+        let seq_range = normalize_sequence(&seq_range);
         let inner = self.inner.read().await;
         let segments = inner.segment_cache.find_covering(&seq_range);
-        list_keys_in_segments(&self.storage.as_read(), &segments).await
+        Ok(segments.into_iter().map(|s| s.into()).collect())
     }
 }
 
@@ -357,7 +364,6 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
-    use crate::config::ListOptions;
     use crate::reader::LogReader;
 
     fn test_config() -> Config {
@@ -993,33 +999,13 @@ mod tests {
         .unwrap();
 
         // when
-        let _iter = log.list(..).await.unwrap();
+        let _iter = log.list_keys(..).await.unwrap();
 
         // then - iterator is returned (full iteration tested when LogKeyIterator is implemented)
     }
 
     #[tokio::test]
-    async fn should_list_with_options_returns_iterator() {
-        // given
-        let log = Log::open(test_config()).await.unwrap();
-        log.append(vec![Record {
-            key: Bytes::from("key"),
-            value: Bytes::from("value"),
-        }])
-        .await
-        .unwrap();
-
-        // when
-        let _iter = log
-            .list_with_options(.., ListOptions::default())
-            .await
-            .unwrap();
-
-        // then - iterator is returned
-    }
-
-    #[tokio::test]
-    async fn should_list_via_log_reader() {
+    async fn should_list_keys_via_log_reader() {
         // given - create shared storage
         let storage = create_storage(&StorageConfig::InMemory, None)
             .await
@@ -1040,7 +1026,7 @@ mod tests {
 
         // when - create LogReader sharing the same storage
         let reader = LogReader::new(storage).await.unwrap();
-        let _iter = reader.list(..).await.unwrap();
+        let _iter = reader.list_keys(..).await.unwrap();
 
         // then - iterator is returned
     }
@@ -1067,7 +1053,7 @@ mod tests {
         .unwrap();
 
         // when
-        let mut iter = log.list(..).await.unwrap();
+        let mut iter = log.list_keys(..).await.unwrap();
         let mut keys = vec![];
         while let Some(key) = iter.next().await.unwrap() {
             keys.push(key.key);
@@ -1117,7 +1103,7 @@ mod tests {
         .unwrap();
 
         // when
-        let mut iter = log.list(..).await.unwrap();
+        let mut iter = log.list_keys(..).await.unwrap();
         let mut keys = vec![];
         while let Some(key) = iter.next().await.unwrap() {
             keys.push(key.key);
@@ -1167,7 +1153,7 @@ mod tests {
         .unwrap();
 
         // when
-        let mut iter = log.list(..).await.unwrap();
+        let mut iter = log.list_keys(..).await.unwrap();
         let mut keys = vec![];
         while let Some(key) = iter.next().await.unwrap() {
             keys.push(key.key);
@@ -1200,7 +1186,7 @@ mod tests {
         .unwrap();
 
         // when
-        let mut iter = log.list(..).await.unwrap();
+        let mut iter = log.list_keys(..).await.unwrap();
         let mut keys = vec![];
         while let Some(key) = iter.next().await.unwrap() {
             keys.push(key.key);
@@ -1218,18 +1204,18 @@ mod tests {
         let log = Log::open(test_config()).await.unwrap();
 
         // when
-        let mut iter = log.list(..).await.unwrap();
+        let mut iter = log.list_keys(..).await.unwrap();
 
         // then
         assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn should_list_keys_respects_sequence_range() {
-        // given - entries in different segments with known sequences
+    async fn should_list_keys_respects_segment_range() {
+        // given - entries in different segments
         let log = Log::open(test_config()).await.unwrap();
 
-        // segment 0: sequences 0, 1
+        // segment 0
         log.append(vec![
             Record {
                 key: Bytes::from("key-seg0"),
@@ -1245,7 +1231,7 @@ mod tests {
 
         log.seal_segment().await.unwrap();
 
-        // segment 1: sequences 2, 3
+        // segment 1
         log.append(vec![
             Record {
                 key: Bytes::from("key-seg1"),
@@ -1261,7 +1247,7 @@ mod tests {
 
         log.seal_segment().await.unwrap();
 
-        // segment 2: sequences 4, 5
+        // segment 2
         log.append(vec![
             Record {
                 key: Bytes::from("key-seg2"),
@@ -1275,8 +1261,8 @@ mod tests {
         .await
         .unwrap();
 
-        // when - list only keys from segment 1 (sequences 2..4)
-        let mut iter = log.list(2..4).await.unwrap();
+        // when - list only keys from segment 1
+        let mut iter = log.list_keys(1..2).await.unwrap();
         let mut keys = vec![];
         while let Some(key) = iter.next().await.unwrap() {
             keys.push(key.key);
@@ -1286,5 +1272,196 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0], Bytes::from("key-seg1"));
         assert_eq!(keys[1], Bytes::from("key-seg1-b"));
+    }
+
+    #[tokio::test]
+    async fn should_list_segments_returns_empty_when_no_segments() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+
+        // when
+        let segments = log.list_segments(..).await.unwrap();
+
+        // then
+        assert!(segments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_list_segments_returns_single_segment() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+        log.append(vec![Record {
+            key: Bytes::from("key"),
+            value: Bytes::from("value"),
+        }])
+        .await
+        .unwrap();
+
+        // when
+        let segments = log.list_segments(..).await.unwrap();
+
+        // then
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].id, 0);
+        assert_eq!(segments[0].start_seq, 0);
+    }
+
+    #[tokio::test]
+    async fn should_list_segments_returns_multiple_segments() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+
+        // segment 0
+        log.append(vec![Record {
+            key: Bytes::from("key"),
+            value: Bytes::from("value-0"),
+        }])
+        .await
+        .unwrap();
+
+        log.seal_segment().await.unwrap();
+
+        // segment 1
+        log.append(vec![Record {
+            key: Bytes::from("key"),
+            value: Bytes::from("value-1"),
+        }])
+        .await
+        .unwrap();
+
+        log.seal_segment().await.unwrap();
+
+        // segment 2
+        log.append(vec![Record {
+            key: Bytes::from("key"),
+            value: Bytes::from("value-2"),
+        }])
+        .await
+        .unwrap();
+
+        // when
+        let segments = log.list_segments(..).await.unwrap();
+
+        // then
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].id, 0);
+        assert_eq!(segments[0].start_seq, 0);
+        assert_eq!(segments[1].id, 1);
+        assert_eq!(segments[1].start_seq, 1);
+        assert_eq!(segments[2].id, 2);
+        assert_eq!(segments[2].start_seq, 2);
+    }
+
+    #[tokio::test]
+    async fn should_list_segments_filters_by_sequence_range() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+
+        // segment 0: seq 0, 1
+        log.append(vec![
+            Record {
+                key: Bytes::from("key"),
+                value: Bytes::from("v0"),
+            },
+            Record {
+                key: Bytes::from("key"),
+                value: Bytes::from("v1"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        log.seal_segment().await.unwrap();
+
+        // segment 1: seq 2, 3
+        log.append(vec![
+            Record {
+                key: Bytes::from("key"),
+                value: Bytes::from("v2"),
+            },
+            Record {
+                key: Bytes::from("key"),
+                value: Bytes::from("v3"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        log.seal_segment().await.unwrap();
+
+        // segment 2: seq 4, 5
+        log.append(vec![
+            Record {
+                key: Bytes::from("key"),
+                value: Bytes::from("v4"),
+            },
+            Record {
+                key: Bytes::from("key"),
+                value: Bytes::from("v5"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when - query range that spans segment 1
+        let segments = log.list_segments(2..4).await.unwrap();
+
+        // then - only segment 1 matches
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].id, 1);
+        assert_eq!(segments[0].start_seq, 2);
+    }
+
+    #[tokio::test]
+    async fn should_list_segments_via_log_reader() {
+        // given
+        let storage = create_storage(&StorageConfig::InMemory, None)
+            .await
+            .unwrap();
+        let log = Log::new(storage.clone()).await.unwrap();
+
+        log.append(vec![Record {
+            key: Bytes::from("key"),
+            value: Bytes::from("value-0"),
+        }])
+        .await
+        .unwrap();
+
+        log.seal_segment().await.unwrap();
+
+        log.append(vec![Record {
+            key: Bytes::from("key"),
+            value: Bytes::from("value-1"),
+        }])
+        .await
+        .unwrap();
+
+        // when
+        let reader = LogReader::new(storage).await.unwrap();
+        let segments = reader.list_segments(..).await.unwrap();
+
+        // then
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].id, 0);
+        assert_eq!(segments[1].id, 1);
+    }
+
+    #[tokio::test]
+    async fn should_list_segments_includes_start_time() {
+        // given
+        let log = Log::open(test_config()).await.unwrap();
+        log.append(vec![Record {
+            key: Bytes::from("key"),
+            value: Bytes::from("value"),
+        }])
+        .await
+        .unwrap();
+
+        // when
+        let segments = log.list_segments(..).await.unwrap();
+
+        // then - start_time_ms should be a reasonable timestamp (after year 2020)
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].start_time_ms > 1577836800000); // 2020-01-01
     }
 }
