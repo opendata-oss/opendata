@@ -36,6 +36,20 @@ The listing APIs address this by exposing segment metadata directly and maintain
 
 ## Design
 
+### Type Aliases
+
+The API introduces two type aliases to make range parameters self-documenting:
+
+```rust
+/// Global sequence number for log entries.
+pub type Sequence = u64;
+
+/// Unique identifier for a segment.
+pub type SegmentId = u32;
+```
+
+These types clarify the intent of range parameters throughout the API. For example, `list_segments` accepts a `RangeBounds<Sequence>` while `list_keys` accepts a `RangeBounds<SegmentId>`.
+
 ### ListingEntry Record
 
 A new record type `ListingEntry` (type discriminator `0x04`) tracks key presence within a segment:
@@ -78,9 +92,9 @@ Exposing segments publicly allows users to understand these boundaries and query
 /// A segment of the log.
 pub struct Segment {
     /// Unique segment identifier (monotonically increasing).
-    pub id: u32,
+    pub id: SegmentId,
     /// First sequence number in this segment.
-    pub start_seq: u64,
+    pub start_seq: Sequence,
     /// Wall-clock time when this segment was created (ms since epoch).
     pub start_time_ms: i64,
 }
@@ -94,7 +108,7 @@ trait LogRead {
 
     fn list_segments(
         &self,
-        seq_range: impl RangeBounds<u64>,
+        seq_range: impl RangeBounds<Sequence>,
     ) -> Result<Vec<Segment>>;
 }
 ```
@@ -127,12 +141,12 @@ trait LogRead {
 
     fn list_keys(
         &self,
-        segment_range: impl RangeBounds<u32>,
+        segment_range: impl RangeBounds<SegmentId>,
     ) -> LogKeyIterator;
 }
 ```
 
-The segment range specifies which segments to scan for keys. Using segment IDs rather than sequence numbers ensures precise results—the iterator returns exactly the keys present in the specified segments, with no approximation. Pass `..` to list keys from all segments.
+The segment range specifies which segments to scan for keys. Using `SegmentId` rather than `Sequence` ensures precise results—the iterator returns exactly the keys present in the specified segments, with no approximation. Pass `..` to list keys from all segments.
 
 Users who want to query by sequence range can use `list_segments` to find the relevant segments, then pass those segment IDs to `list_keys`. This two-step approach makes the segment-granular nature of key tracking explicit.
 
@@ -171,3 +185,4 @@ Maintaining a single global index of all keys (outside the segment structure) wo
 |------------|-------------|
 | 2026-01-13 | Initial draft |
 | 2026-01-20 | Broaden scope to listing APIs; expose segments as first-class concept; key listing uses segment ranges |
+
