@@ -1020,6 +1020,7 @@ mod tests {
     use crate::query::test_utils::MockQueryReaderBuilder;
     use crate::test_utils::assertions::approx_eq;
     use promql_parser::label::{METRIC_NAME, Matchers};
+    use promql_parser::parser::value::ValueType;
     use promql_parser::parser::EvalStmt;
     use rstest::rstest;
 
@@ -1800,7 +1801,7 @@ mod tests {
                     name: "label_replace",
                     arg_types: vec![],
                     variadic: false,
-                    return_type: promql_parser::parser::ValueType::Vector,
+                    return_type: ValueType::Vector,
                 },
                 args: promql_parser::parser::FunctionArgs {
                     args: vec![Box::new(promql_parser::parser::Expr::StringLiteral(
