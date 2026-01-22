@@ -14,6 +14,7 @@ edition = "2024"
 anyhow = "1.0"
 async-trait = "0.1"
 axum = "0.8"
+base64 = "0.22"
 bytes = "1.0"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }

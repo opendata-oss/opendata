@@ -51,6 +51,7 @@ mod reader;
 mod segment;
 mod sequence;
 mod serde;
+pub mod server;
 mod storage;
 
 pub use config::{Config, CountOptions, ListOptions, ScanOptions, SegmentConfig, WriteOptions};

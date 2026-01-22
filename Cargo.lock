@@ -1924,11 +1924,21 @@ name = "log"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
+ "base64 0.22.1",
  "bytes",
+ "clap",
  "common",
+ "prometheus-client",
  "proptest",
+ "reqwest",
+ "serde",
+ "serde_json",
  "slatedb",
  "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
