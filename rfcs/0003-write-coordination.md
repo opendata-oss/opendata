@@ -1,0 +1,386 @@
+# RFC 0003: Write Coordination
+
+**Status**: Draft
+
+**Authors**:
+
+- [Almog Gavra](https://github.com/agavra)
+- [Jason Gustafson](https://github.com/hachikuji)
+
+## Summary
+
+This RFC proposes a reusable write coordination component for opendata systems. The coordinator
+enables systems to implement their own in-memory representation of state that is accumulated
+across multiple writes before flushing to a persistent store (similar to the SlateDB memtable).
+It handles batching, serializability, and coordination between writers and readers.
+
+## Motivation
+
+Existing opendata systems like `timeseries` and `vector` both implement their own in-memory buffer
+before flushing data to SlateDB to reduce the serialization overhead of frequent merge operations.
+This pattern is challenging to implement correctly and has caused various issues such as:
+
+- [#82](https://github.com/opendata-oss/opendata/issues/82)
+- [#95](https://github.com/opendata-oss/opendata/issues/95)
+
+In both of those tickets, data was not properly synchronized between writers causing potential
+corruption and correctness issues. In addition to fixing issues, this RFC sets the stage for
+reusable components such as a backpressure mechanism and durability semantics that can be 
+leveraged by various systems.
+
+## Goals
+
+- Implement correct, serializable write coordination semantics
+- Composable design that can be leveraged by any opendata system
+- Backpressure mechanism to prevent system degradation
+- Clear epoch-based durability guarantees
+
+## Non-Goals
+
+- Reader/Writer coordination (this RFC sets the stage for this)
+- Distributed write coordination
+
+## Design
+
+### Components & Terminology
+
+- `Write` is an insertion of data into the system
+- `WriteQueue` is a queue that accepts `Write` as input and applys an epoch-based ordering
+- `WriteBatch` is a collection of `Write`s each stamped with an epoch
+- `Snapshot` is a point-in-time reference to the storage state
+- `Image` is a view of the `Snapshot` with paritally materialized in-memory models
+- `Delta` is the result of applying (multiple) `WriteBatch` to an `Image`
+
+### Architecture
+
+```
+                ┌─────────┐ ┌─────────┐ ┌─────────┐                                          
+                │  Write  │ │  Write  │ │  Write  │                                          
+                └─────────┘ └─────────┘ └─────────┘                                          
+                     │           │           │                                               
+                     └───────────┼───────────┘                                               
+                                 ▼                                                           
+                     ┌───────────────────────┐                                               
+                     │      Write Queue      │                                               
+                     └───────────────────────┘                                               
+                                 │                                                           
+                                 ▼                                                           
+┌Write Coordinator────────────────────────────────────────────────┐                          
+│ ┌─────────────────────────────┐ ┌──────────────┐┌──────────────┐│             ┌───────────┐
+│ │        select! loop         │ │ EpochTracker ││   Flusher    │├──broadcast─▶│  Reader   │
+│ ├─────────────────────────────┤ └──────────────┘└───────▲──────┘│             └───────────┘
+│ │                             │         ┌───────────────┤       │                          
+│ │                             │ ┌Delta──┴──────┐┌Image──┴──────┐│                          
+│ │1 ─► handle flush complete   │ │ ┌──────────┐ ││┌────────────┐││                          
+│ │2 ─► flush (on command)      │ │ │WriteBatch│ │││Materialized│││                          
+│ │3 ─► apply queued writes     │ │ └──────────┘ ││└────────────┘││                          
+│ │4 ─► flush (on timer)        │ │ ┌──────────┐ ││┌────────────┐││                          
+│ │                             │ │ │WriteBatch│ │││  Snapshot  │││                          
+│ │                             │ │ └──────────┘ ││└────────────┘││                          
+│ └─────────────────────────────┘ └──────────────┘└──────────────┘│                          
+└─────────────────────────────────────────────────────────────────┘                                                                     
+```
+
+### APIs
+
+The main ingestion loop has the following sequence:
+
+1. `Order`: Writes are enqueued on to the `WriteQueue`
+2. `Buffer`: Writes are dequeued and batched into a `WriteBatch`
+3. `Apply`: The `WriteBatch` is applied to the single pending `Delta`
+4. `Flush`: The pending delta is taken and passed to `Flusher::flush()`
+
+These actions are pluggable, so different systems can compose them however they see fit. Here are
+the APIs provided by this RFC:
+
+```rust
+pub struct WriteBatch<W> {
+    pub writes: Vec<W>,
+    pub max_epoch: u64,
+}
+
+pub trait Delta: Send + 'static {
+    type Image: Send + Sync + Clone + 'static;
+    type Write: Send + 'static;
+
+    /// Initialize the delta with shared state from the image.
+    fn init(&mut self, image: &Self::Image);
+    /// Apply a batch of writes to this delta.
+    fn apply(&mut self, batch: WriteBatch<Self::Write>) -> Result<()>;
+    /// Estimate the memory size of this delta for backpressure.
+    fn estimate_size(&self) -> usize;
+}
+
+pub trait Flusher: Send + Sync + 'static {
+    type Image: Send + Sync + Clone + 'static;
+    type Delta: Delta<Image = Self::Image>;
+
+    /// Flush a delta to storage and return the new image.
+    fn flush(
+        &self,
+        delta: Self::Delta,
+        image: &Self::Image,
+    ) -> impl Future<Output = Result<Self::Image>> + Send;
+}
+```
+
+The `WriteCoordinator` itself has the following APIs:
+
+```rust
+/// Durability levels for write acknowledgment.
+pub enum Durability {
+    /// Write has been applied to an in-memory delta.
+    Applied,
+    /// Write has been flushed to SlateDB memtable.
+    Flushed,
+    /// Write has been persisted to object storage.
+    Durable,
+}
+
+/// Handle returned from a write operation for tracking durability.
+pub struct WriteHandle { /* ... */ }
+
+impl WriteHandle {
+    /// Returns the epoch assigned to this write.
+    pub fn epoch(&self) -> u64 { /* ... */ }
+    /// Wait until the write reaches the specified durability level.
+    pub async fn wait(&self, durability: Durability) -> Result<()> { /* ... */ }
+}
+
+/// Handle for interacting with the write coordinator.
+pub struct WriteCoordinatorHandle<D: Delta> { /* ... */ }
+
+impl<D: Delta> WriteCoordinatorHandle<D> {
+    /// Submit a write and receive a handle to track its durability.
+    pub async fn write(&self, event: D::Write) -> Result<WriteHandle> { /* ... */ }
+    /// Request a flush up to the specified epoch (or all pending if None).
+    pub async fn flush(&self, epoch: Option<u64>) -> Result<()> { /* ... */ }
+    /// Subscribe to image updates.
+    pub fn subscribe(&self) -> watch::Receiver<Arc<D::Image>> { /* ... */ }
+}
+```
+
+The `WriteHandle` is used to allow readers to wait for the following durability guarantees:
+
+| Watermark | Meaning                                                                 |
+|-----------|-------------------------------------------------------------------------|
+| `applied` | Highest epoch that has been applied to the pending delta                |
+| `flushed` | Highest epoch reflected in the current image (delta applied to SlateDB) |
+| `durable` | Highest epoch persisted to object storage (SlateDB WAL flush complete)  |
+
+### Implementation
+
+The coordinator runs as a single-threaded async loop that processes commands and manages flushes.
+
+1. **Ordering**: all writes are serialized through a single `mpsc` channel (`WriteQueue`)
+2. **Non-Blocking Flush**: when a flush starts, writes are accumulated into a new buffer and are
+   only delayed when backpressure kicks in
+3. **Flush Triggers**: flushes can be triggered manually via `flush()` or based on conditions
+   evaluated on a timer
+4. **Epoch Tracking**: write handles are enqueued on a `BTreeMap` sorted by `epoch` so that we can
+   notify readers when an epoch is flushed and/or durable. Watchers are removed after notifying of
+   the `durable` watermark.
+5. **Failure Propagation**: there are two modes of failure:
+    1. failures that occur when applying a `Write` to the delta will be propagated to the caller via
+       `WriteHandle::wait()`
+    2. failures that happen during flushing are considered fatal and will cause coordinator to panic
+6. **Backpressure**: backpressure is applied by both the channel capacity and the size of pending
+   deltas. Flushes will be attempted on the ticker interval until backpressure conditions are
+   released, during which time writes will fail with `Err(WriteError::Backpressure)`.
+
+### Subsystem Implementations
+
+#### TimeSeries
+
+TimeSeries identifies each series by a fingerprint (hash of sorted labels). During `init()`, the
+delta gets access to the shared series dictionary and ID allocator from the image. During `apply()`,
+it looks up or creates a series ID for each fingerprint and appends samples — multiple writes to
+the same series accumulate.
+
+```rust
+impl Delta for TsdbDelta {
+    type Image = TsdbImage;
+    type Write = Series;
+
+    fn init(&mut self, image: &Self::Image) {
+        self.series_dict = image.series_dict.clone();       // Arc<DashMap<Fingerprint, SeriesId>>
+        self.next_series_id = image.next_series_id.clone(); // Arc<AtomicU32>
+    }
+
+    fn apply(&mut self, batch: WriteBatch<Self::Write>) -> Result<()> {
+        for series in batch.writes {
+            let fp = series.labels.fingerprint();
+            let id = *self.series_dict.entry(fp).or_insert_with(|| {
+                self.next_series_id.fetch_add(1, Ordering::SeqCst)
+            });
+            self.samples.entry(id).or_default().extend(series.samples);
+        }
+        Ok(())
+    }
+}
+```
+
+The flusher converts the delta into storage records: forward index (series metadata), inverted
+index (label to series ID mappings), and sample data. Since IDs were allocated during `apply()`,
+the flusher just needs to persist everything atomically.
+
+```rust
+impl Flusher for TsdbFlusher {
+    async fn flush(&self, delta: TsdbDelta, image: &TsdbImage) -> Result<TsdbImage> {
+        let forward_index = build_forward_index(delta);
+        let inverted_index = build_inverted_index(delta);
+        
+        let mut batch = WriteBatch::new();
+        for (id, samples) in delta.samples() {
+            batch.merge(samples_key(id), encode_samples(&samples));
+        }
+        for (id, spec) in forward_index {
+            batch.put(forward_key(id), encode_spec(&spec));
+        }
+        for (label, ids) in inverted_index {
+            batch.merge(inverted_key(&label), encode_bitmap(&ids));
+        }
+        
+        self.db.write(batch).await?;
+        Ok(image.with_snapshot(self.db.snapshot()))
+    }
+}
+```
+
+#### Vector
+
+Vector identifies records by an external string ID provided by the user. During `init()`, the delta
+gets the collection config for validation. During `apply()`, vectors are keyed by external ID with
+last-write-wins semantics — if the same ID is written twice, the later write replaces the earlier
+one. Internal ID allocation and upsert handling (marking old vectors as deleted) happen at flush
+time in the `Flusher`.
+
+```rust
+impl Delta for VectorDelta {
+    type Image = VectorImage;
+    type Write = Vector;
+
+    fn init(&mut self, image: &Self::Image) {
+        self.config = image.config.clone();
+    }
+
+    fn apply(&mut self, batch: WriteBatch<Self::Write>) -> Result<()> {
+        for vector in batch.writes {
+            self.vectors.insert(vector.id.clone(), vector);  // last write wins
+        }
+        Ok(())
+    }
+}
+```
+
+The flusher handles internal ID allocation and upsert logic. For each vector, it checks if the
+external ID already exists (upsert case), allocates a new internal ID, and marks the old vector
+as deleted if necessary.
+
+```rust
+impl Flusher for VectorFlusher {
+    async fn flush(&self, delta: VectorDelta, image: &VectorImage) -> Result<VectorImage> {
+        let mut batch = WriteBatch::new();
+        for (external_id, vector) in delta.vectors {
+            let old_id = self.db.get(id_mapping_key(&external_id)).await?;
+            let new_id = self.id_allocator.next();
+
+            batch.put(id_mapping_key(&external_id), new_id);
+            batch.put(vector_key(new_id), encode_vector(&vector));
+
+            if let Some(old_id) = old_id {
+                batch.merge(deleted_bitmap_key(), encode_id(old_id));
+                batch.delete(vector_key(old_id));
+            }
+        }
+        self.db.write(batch).await?;
+        Ok(image.with_snapshot(self.db.snapshot()))
+    }
+}
+```
+
+## Alternatives
+
+### Simple Buffer Without Intermediate Processing
+
+An earlier version of this RFC proposed a simpler model where the delta is just a buffer of writes
+with no processing during `apply()`. All logic (ID allocation, deduplication, index building) would
+happen at flush time. The delta would be keyed by natural identifiers (fingerprint for timeseries,
+external_id for vector) and required a `merge()` method to combine writes to the same key.
+
+This was rejected because:
+- Processing during `apply` allows validation errors to be returned as non-fatal
+- Subsystems may need to maintain invariants (e.g., series dictionary) across writes
+
+### Mutex-Protected Delta
+
+Instead of a queue, writes could directly acquire a mutex to apply to the delta:
+
+```rust
+impl WriteCoordinator {
+    async fn write(&self, w: Write) -> Result<WriteHandle> {
+        let mut delta = self.delta.lock().await;
+        delta.apply(w)?;
+        Ok(WriteHandle::new(self.epoch.fetch_add(1)))
+    }
+}
+```
+
+This was rejected because:
+- Mutex contention under high write load
+- Harder to implement batching (writes are applied one at a time)
+- Backpressure is less natural (blocking on mutex vs. failing fast on full queue)
+
+### Concurrent Writes (Current Code)
+
+The current `timeseries` and `vector` implementations allow concurrent writes using lock-free
+structures (`DashMap`, `AtomicU32`) with a separate flush mutex:
+
+```rust
+// Current pattern (simplified)
+struct Db {
+    delta: DashMap<Key, Value>,
+    flush_mutex: Mutex<()>,
+}
+
+async fn write(&self, k: Key, v: Value) {
+    self.delta.insert(k, v);  // concurrent writes OK
+}
+
+async fn flush(&self) {
+    let _guard = self.flush_mutex.lock().await;  // serialize flushes
+    // ... flush delta to storage
+}
+```
+
+This was rejected because:
+- Race conditions between concurrent writers (issues #82, #95)
+- Ambiguous flush semantics — a `write()` followed by `flush()` may not include that write
+- No clear epoch-based durability guarantees
+- Harder to reason about correctness
+
+## Future Considerations
+
+### Reading from the Pending Delta
+
+This RFC scopes reads to flushed snapshots only — queries do not see unflushed data in the pending
+delta. A future enhancement could expose the delta to readers, enabling read-your-writes semantics
+and lower-latency queries.
+
+The key challenge is synchronization: readers need a consistent view of both the snapshot and the
+delta. Since the coordinator loop is single-threaded, we can leverage epochs to provide consistency:
+
+1. Attach an epoch watermark to both the snapshot and the pending delta
+2. When a reader subscribes, they receive `(snapshot, delta_ref, read_epoch)`
+3. The reader merges results from both, filtering the delta to only include writes ≤ `read_epoch`
+4. When a flush completes, the snapshot advances and the delta is cleared atomically (from the
+   reader's perspective)
+
+This approach allows read-your-writes without complex locking, but is deferred until there's a
+concrete use case requiring sub-flush-interval read latency.
+
+## Updates
+
+| Date       | Description   |
+|------------|---------------|
+| 2026-01-27 | Initial draft |
