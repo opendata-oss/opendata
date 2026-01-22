@@ -43,6 +43,7 @@ use common::serde::terminated_bytes;
 use common::serde::varint::var_u64;
 
 use crate::error::Error;
+use crate::model::SegmentId;
 use crate::segment::LogSegment;
 
 impl From<common::serde::DeserializeError> for Error {
@@ -214,9 +215,6 @@ impl LogEntryKey {
         buf.freeze()
     }
 }
-
-/// Segment identifier type.
-pub type SegmentId = u32;
 
 /// Key for a segment metadata record.
 ///

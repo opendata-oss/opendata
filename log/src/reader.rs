@@ -14,11 +14,11 @@ use tokio::sync::RwLock;
 use common::StorageRead;
 use common::storage::factory::create_storage;
 
-use crate::config::{Config, CountOptions, ListOptions, ScanOptions, SegmentConfig};
+use crate::config::{Config, CountOptions, ScanOptions, SegmentConfig};
 use crate::error::{Error, Result};
 use crate::listing::LogKeyIterator;
-use crate::model::LogEntry;
-use crate::range::normalize;
+use crate::model::{LogEntry, Segment, SegmentId, Sequence};
+use crate::range::{normalize_segment_id, normalize_sequence};
 use crate::segment::{LogSegment, SegmentCache};
 use crate::storage::{LogStorageRead, SegmentIterator};
 
@@ -78,7 +78,7 @@ pub trait LogRead {
     async fn scan(
         &self,
         key: Bytes,
-        seq_range: impl RangeBounds<u64> + Send,
+        seq_range: impl RangeBounds<Sequence> + Send,
     ) -> Result<LogIterator> {
         self.scan_with_options(key, seq_range, ScanOptions::default())
             .await
@@ -101,7 +101,7 @@ pub trait LogRead {
     async fn scan_with_options(
         &self,
         key: Bytes,
-        seq_range: impl RangeBounds<u64> + Send,
+        seq_range: impl RangeBounds<Sequence> + Send,
         options: ScanOptions,
     ) -> Result<LogIterator>;
 
@@ -123,7 +123,7 @@ pub trait LogRead {
     /// Returns an error if the count fails due to storage issues.
     ///
     /// [`count_with_options`]: LogRead::count_with_options
-    async fn count(&self, key: Bytes, seq_range: impl RangeBounds<u64> + Send) -> Result<u64> {
+    async fn count(&self, key: Bytes, seq_range: impl RangeBounds<Sequence> + Send) -> Result<u64> {
         self.count_with_options(key, seq_range, CountOptions::default())
             .await
     }
@@ -142,50 +142,71 @@ pub trait LogRead {
     async fn count_with_options(
         &self,
         key: Bytes,
-        seq_range: impl RangeBounds<u64> + Send,
+        seq_range: impl RangeBounds<Sequence> + Send,
         options: CountOptions,
     ) -> Result<u64>;
 
-    /// Lists distinct keys within a sequence number range.
+    /// Lists distinct keys within a segment range.
     ///
-    /// Returns an iterator over keys that have entries in the specified range.
+    /// Returns an iterator over keys that have entries in the specified segments.
     /// Each key is returned exactly once, even if it appears in multiple segments.
     ///
-    /// This method uses default list options. Use [`list_with_options`] for
-    /// custom behavior.
+    /// Pass `..` to list keys from all segments.
     ///
     /// # Arguments
     ///
-    /// * `seq_range` - The sequence number range to list keys from.
+    /// * `segment_range` - The segment ID range to list keys from.
     ///
     /// # Errors
     ///
     /// Returns an error if the list operation fails due to storage issues.
     ///
-    /// [`list_with_options`]: LogRead::list_with_options
-    async fn list(&self, seq_range: impl RangeBounds<u64> + Send) -> Result<LogKeyIterator> {
-        self.list_with_options(seq_range, ListOptions::default())
-            .await
-    }
-
-    /// Lists distinct keys within a sequence number range with custom options.
+    /// # Example
     ///
-    /// Returns an iterator over keys that have entries in the specified range.
-    /// Each key is returned exactly once, even if it appears in multiple segments.
+    /// ```ignore
+    /// // List all keys
+    /// let mut iter = log.list_keys(..).await?;
     ///
-    /// # Arguments
-    ///
-    /// * `seq_range` - The sequence number range to list keys from.
-    /// * `options` - List options controlling behavior.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the list operation fails due to storage issues.
-    async fn list_with_options(
+    /// // List keys from specific segments
+    /// let segments = log.list_segments(100..200).await?;
+    /// let start = segments.first().map(|s| s.id).unwrap_or(0);
+    /// let end = segments.last().map(|s| s.id + 1).unwrap_or(0);
+    /// let mut iter = log.list_keys(start..end).await?;
+    /// ```
+    async fn list_keys(
         &self,
-        seq_range: impl RangeBounds<u64> + Send,
-        options: ListOptions,
+        segment_range: impl RangeBounds<SegmentId> + Send,
     ) -> Result<LogKeyIterator>;
+
+    /// Lists segments overlapping a sequence number range.
+    ///
+    /// Returns all segments that overlap the specified sequence range. This is
+    /// a precise operation—segments have well-defined boundaries, so there is
+    /// no approximation.
+    ///
+    /// Pass `..` to list all segments.
+    ///
+    /// # Arguments
+    ///
+    /// * `seq_range` - The sequence number range to filter segments by.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails due to storage issues.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // List all segments
+    /// let segments = log.list_segments(..).await?;
+    ///
+    /// // List segments overlapping a specific range
+    /// let segments = log.list_segments(100..200).await?;
+    /// ```
+    async fn list_segments(
+        &self,
+        seq_range: impl RangeBounds<Sequence> + Send,
+    ) -> Result<Vec<Segment>>;
 }
 
 /// A read-only view of the log.
@@ -295,10 +316,10 @@ impl LogRead for LogReader {
     async fn scan_with_options(
         &self,
         key: Bytes,
-        seq_range: impl RangeBounds<u64> + Send,
+        seq_range: impl RangeBounds<Sequence> + Send,
         _options: ScanOptions,
     ) -> Result<LogIterator> {
-        let seq_range = normalize(&seq_range);
+        let seq_range = normalize_sequence(&seq_range);
         let segments = self.segments.read().await;
         Ok(LogIterator::open(
             self.storage.clone(),
@@ -311,46 +332,28 @@ impl LogRead for LogReader {
     async fn count_with_options(
         &self,
         _key: Bytes,
-        _seq_range: impl RangeBounds<u64> + Send,
+        _seq_range: impl RangeBounds<Sequence> + Send,
         _options: CountOptions,
     ) -> Result<u64> {
         todo!()
     }
 
-    async fn list_with_options(
+    async fn list_keys(
         &self,
-        seq_range: impl RangeBounds<u64> + Send,
-        _options: ListOptions,
+        segment_range: impl RangeBounds<SegmentId> + Send,
     ) -> Result<LogKeyIterator> {
-        let seq_range = normalize(&seq_range);
+        let segment_range = normalize_segment_id(&segment_range);
+        self.storage.list_keys(segment_range).await
+    }
+
+    async fn list_segments(
+        &self,
+        seq_range: impl RangeBounds<Sequence> + Send,
+    ) -> Result<Vec<Segment>> {
+        let seq_range = normalize_sequence(&seq_range);
         let segments = self.segments.read().await.find_covering(&seq_range);
-        list_keys_in_segments(&self.storage, &segments).await
+        Ok(segments.into_iter().map(|s| s.into()).collect())
     }
-}
-
-/// Converts a list of segments to a segment ID range.
-///
-/// Returns a range from the first segment ID to one past the last segment ID.
-/// If the list is empty, returns an empty range (0..0).
-pub(crate) fn segments_to_range(segments: &[LogSegment]) -> Range<u32> {
-    if segments.is_empty() {
-        return 0..0;
-    }
-    let start = segments.first().unwrap().id();
-    let end = segments.last().unwrap().id() + 1;
-    start..end
-}
-
-/// Lists keys from the given segments.
-///
-/// Helper for `list_with_options` implementations that handles the common
-/// pattern of converting segments to a range and listing keys.
-pub(crate) async fn list_keys_in_segments(
-    storage: &LogStorageRead,
-    segments: &[LogSegment],
-) -> Result<LogKeyIterator> {
-    let segment_range = segments_to_range(segments);
-    storage.list_keys(segment_range).await
 }
 
 /// Iterator over log entries across multiple segments.
@@ -362,7 +365,7 @@ pub struct LogIterator {
     storage: LogStorageRead,
     segments: Vec<LogSegment>,
     key: Bytes,
-    seq_range: Range<u64>,
+    seq_range: Range<Sequence>,
     current_segment_idx: usize,
     current_iter: Option<SegmentIterator>,
 }
@@ -373,7 +376,7 @@ impl LogIterator {
         storage: LogStorageRead,
         segment_cache: &SegmentCache,
         key: Bytes,
-        seq_range: Range<u64>,
+        seq_range: Range<Sequence>,
     ) -> Self {
         let segments = segment_cache.find_covering(&seq_range);
         Self {
@@ -392,7 +395,7 @@ impl LogIterator {
         storage: LogStorageRead,
         segments: Vec<LogSegment>,
         key: Bytes,
-        seq_range: Range<u64>,
+        seq_range: Range<Sequence>,
     ) -> Self {
         Self {
             storage,

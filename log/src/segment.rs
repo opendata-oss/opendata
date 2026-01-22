@@ -14,7 +14,9 @@ use common::Record;
 
 use crate::config::SegmentConfig;
 use crate::error::Result;
-use crate::serde::{SegmentId, SegmentMeta, SegmentMetaKey};
+use crate::model::Segment;
+use crate::model::SegmentId;
+use crate::serde::{SegmentMeta, SegmentMetaKey};
 
 /// A logical segment of the log.
 ///
@@ -43,6 +45,16 @@ impl LogSegment {
     /// Returns the segment's metadata.
     pub fn meta(&self) -> &SegmentMeta {
         &self.meta
+    }
+}
+
+impl From<LogSegment> for Segment {
+    fn from(seg: LogSegment) -> Self {
+        Segment {
+            id: seg.id,
+            start_seq: seg.meta.start_seq,
+            start_time_ms: seg.meta.start_time_ms,
+        }
     }
 }
 
