@@ -35,15 +35,33 @@ impl ScanParams {
 /// Query parameters for list keys requests.
 #[derive(Debug, Deserialize)]
 pub struct ListKeysParams {
-    /// Start sequence number (inclusive).
-    pub start_seq: Option<u64>,
-    /// End sequence number (exclusive).
-    pub end_seq: Option<u64>,
+    /// Start segment ID (inclusive).
+    pub start_segment: Option<u32>,
+    /// End segment ID (exclusive).
+    pub end_segment: Option<u32>,
     /// Maximum number of keys to return.
     pub limit: Option<usize>,
 }
 
 impl ListKeysParams {
+    /// Get the segment range as start..end.
+    pub fn segment_range(&self) -> std::ops::Range<u32> {
+        let start = self.start_segment.unwrap_or(0);
+        let end = self.end_segment.unwrap_or(u32::MAX);
+        start..end
+    }
+}
+
+/// Query parameters for list segments requests.
+#[derive(Debug, Deserialize)]
+pub struct ListSegmentsParams {
+    /// Start sequence number (inclusive).
+    pub start_seq: Option<u64>,
+    /// End sequence number (exclusive).
+    pub end_seq: Option<u64>,
+}
+
+impl ListSegmentsParams {
     /// Get the sequence range as start..end.
     pub fn seq_range(&self) -> std::ops::Range<u64> {
         let start = self.start_seq.unwrap_or(0);

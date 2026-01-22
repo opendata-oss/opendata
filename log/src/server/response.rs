@@ -89,6 +89,36 @@ impl ListKeysResponse {
     }
 }
 
+/// A segment entry in a list segments response.
+#[derive(Debug, Serialize)]
+pub struct SegmentEntry {
+    /// Unique segment identifier.
+    pub id: u32,
+    /// First sequence number in this segment.
+    pub start_seq: u64,
+    /// Wall-clock time when this segment was created (ms since epoch).
+    pub start_time_ms: i64,
+}
+
+/// Response for list segments requests.
+#[derive(Debug, Serialize)]
+pub struct ListSegmentsResponse {
+    /// Status of the response.
+    pub status: String,
+    /// Segments in the log.
+    pub segments: Vec<SegmentEntry>,
+}
+
+impl ListSegmentsResponse {
+    /// Create a successful list segments response.
+    pub fn success(segments: Vec<SegmentEntry>) -> Self {
+        Self {
+            status: "success".to_string(),
+            segments,
+        }
+    }
+}
+
 /// Response for count requests.
 #[derive(Debug, Serialize)]
 pub struct CountResponse {

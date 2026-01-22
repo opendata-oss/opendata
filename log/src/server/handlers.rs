@@ -7,9 +7,10 @@ use axum::extract::{Query, State};
 
 use super::error::ApiError;
 use super::metrics::{AppendLabels, Metrics, OperationStatus, ScanLabels};
-use super::request::{AppendBody, CountParams, ListKeysParams, ScanParams};
+use super::request::{AppendBody, CountParams, ListKeysParams, ListSegmentsParams, ScanParams};
 use super::response::{
-    AppendResponse, CountResponse, KeyEntry, ListKeysResponse, ScanEntry, ScanResponse,
+    AppendResponse, CountResponse, KeyEntry, ListKeysResponse, ListSegmentsResponse, ScanEntry,
+    ScanResponse, SegmentEntry,
 };
 use crate::config::WriteOptions;
 use crate::{Log, LogRead};
@@ -109,10 +110,10 @@ pub async fn handle_list_keys(
     State(state): State<AppState>,
     Query(params): Query<ListKeysParams>,
 ) -> Result<Json<ListKeysResponse>, ApiError> {
-    let range = params.seq_range();
+    let segment_range = params.segment_range();
     let limit = params.limit.unwrap_or(1000);
 
-    let mut iter = state.log.list(range).await?;
+    let mut iter = state.log.list_keys(segment_range).await?;
     let mut keys = Vec::new();
 
     while let Some(log_key) = iter.next().await.map_err(ApiError::from)? {
@@ -125,6 +126,26 @@ pub async fn handle_list_keys(
     }
 
     Ok(Json(ListKeysResponse::success(keys)))
+}
+
+/// Handle GET /api/v1/log/segments
+pub async fn handle_list_segments(
+    State(state): State<AppState>,
+    Query(params): Query<ListSegmentsParams>,
+) -> Result<Json<ListSegmentsResponse>, ApiError> {
+    let seq_range = params.seq_range();
+
+    let segments = state.log.list_segments(seq_range).await?;
+    let segment_entries: Vec<SegmentEntry> = segments
+        .into_iter()
+        .map(|s| SegmentEntry {
+            id: s.id,
+            start_seq: s.start_seq,
+            start_time_ms: s.start_time_ms,
+        })
+        .collect();
+
+    Ok(Json(ListSegmentsResponse::success(segment_entries)))
 }
 
 /// Handle GET /api/v1/log/count
