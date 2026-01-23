@@ -405,8 +405,15 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 let fut = self.evaluate_aggregate(aggregate, start, end, interval, lookback_delta);
                 Box::pin(fut)
             }
-            Expr::Unary(_u) => {
-                todo!()
+            Expr::Unary(u) => {
+                let fut = async move {
+                    let inner = self
+                        .evaluate_expr(&u.expr, start, end, interval, lookback_delta)
+                        .await?;
+
+                    Ok(self.apply_unary_negation(inner))
+                };
+                Box::pin(fut)
             }
             Expr::Binary(b) => {
                 let fut = self.evaluate_binary_expr(b, start, end, interval, lookback_delta);
@@ -900,6 +907,28 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         }
     }
 
+    fn apply_unary_negation(&self, result: ExprResult) -> ExprResult {
+        match result {
+            ExprResult::Scalar(v) => ExprResult::Scalar(-v),
+
+            ExprResult::InstantVector(mut samples) => {
+                for s in &mut samples {
+                    s.value = -s.value;
+                }
+                ExprResult::InstantVector(samples)
+            }
+
+            ExprResult::RangeVector(mut series) => {
+                for s in &mut series {
+                    for sample in &mut s.values {
+                        sample.value = -sample.value;
+                    }
+                }
+                ExprResult::RangeVector(series)
+            }
+        }
+    }
+
     fn compute_grouping_labels(
         mut labels: HashMap<String, String>,
         modifier: Option<&LabelModifier>,
@@ -1273,6 +1302,26 @@ mod tests {
         ],
         vec![
             (100.0, vec![("__name__", "memory_bytes"), ("env", "prod")]),
+        ]
+    )]
+    #[case(
+        "unary_minus_vector",
+        "-memory_bytes",
+        vec![
+            ("memory_bytes", vec![("env", "prod")], 0, 100.0),
+        ],
+        vec![
+            (-100.0, vec![("__name__", "memory_bytes"), ("env", "prod")]),
+        ]
+    )]
+    #[case(
+        "unary_inside_expression",
+        "-memory_bytes + 50",
+        vec![
+            ("memory_bytes", vec![("env", "prod")], 0, 100.0),
+        ],
+        vec![
+            (-50.0, vec![("__name__", "memory_bytes"), ("env", "prod")]),
         ]
     )]
     // Function Calls - Unary Math
@@ -1754,6 +1803,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_evaluate_unary_scalar_literal() {
+        let bucket = TimeBucket::hour(1000);
+        let reader = MockQueryReaderBuilder::new(bucket).build();
+        let mut evaluator = Evaluator::new(&reader);
+
+        let end_time = UNIX_EPOCH + Duration::from_secs(2000);
+
+        let expr = promql_parser::parser::parse("-5").unwrap();
+        let stmt = EvalStmt {
+            expr,
+            start: end_time,
+            end: end_time,
+            interval: Duration::from_secs(0),
+            lookback_delta: Duration::from_secs(300),
+        };
+
+        let result = evaluator.evaluate(stmt).await.unwrap();
+
+        match result {
+            ExprResult::Scalar(v) => assert_eq!(v, -5.0),
+            _ => panic!("Expected scalar result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_unary_vector() {
+        let bucket = TimeBucket::hour(1000);
+        let mut builder = MockQueryReaderBuilder::new(bucket);
+
+        let labels = vec![
+            Label {
+                name: "__name__".to_string(),
+                value: "memory_bytes".to_string(),
+            },
+            Label {
+                name: "env".to_string(),
+                value: "prod".to_string(),
+            },
+        ];
+
+        builder.add_sample(
+            labels,
+            MetricType::Gauge,
+            Sample {
+                timestamp_ms: 300001,
+                value: 100.0,
+            },
+        );
+
+        let reader = builder.build();
+        let mut evaluator = Evaluator::new(&reader);
+
+        let end_time = UNIX_EPOCH + Duration::from_millis(300002);
+
+        let expr = promql_parser::parser::parse("-memory_bytes").unwrap();
+        let stmt = EvalStmt {
+            expr,
+            start: end_time,
+            end: end_time,
+            interval: Duration::from_secs(0),
+            lookback_delta: Duration::from_secs(300),
+        };
+
+        let result = evaluator.evaluate(stmt).await.unwrap();
+
+        match result {
+            ExprResult::InstantVector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].value, -100.0);
+            }
+            _ => panic!("Expected InstantVector"),
+        }
+    }
+
+    #[tokio::test]
     async fn should_error_on_string_literal() {
         // given: create an empty mock reader
         let bucket = TimeBucket::hour(1000);
@@ -1834,17 +1958,17 @@ mod tests {
     #[allow(clippy::type_complexity)]
     #[rstest]
     #[case(
-        "single_bucket_selector", 
+        "single_bucket_selector",
         vec![
             (TimeBucket::hour(100), "http_requests", vec![("env", "prod")], 6_000_001, 10.0),
             (TimeBucket::hour(100), "http_requests", vec![("env", "staging")], 6_000_002, 20.0),
         ],
-        6_300_000, // query time 
+        6_300_000, // query time
         300_000,   // 5 min lookback
         vec![(10.0, vec![("__name__", "http_requests"), ("env", "prod")]), (20.0, vec![("__name__", "http_requests"), ("env", "staging")])]
     )]
     #[case(
-        "multi_bucket_latest_wins", 
+        "multi_bucket_latest_wins",
         vec![
             // Same series in bucket 100 (older)
             (TimeBucket::hour(100), "cpu_usage", vec![("host", "server1")], 6_000_000, 50.0),
@@ -1856,7 +1980,7 @@ mod tests {
         vec![(75.0, vec![("__name__", "cpu_usage"), ("host", "server1")])] // only the newer value
     )]
     #[case(
-        "multi_bucket_different_series_different_buckets", 
+        "multi_bucket_different_series_different_buckets",
         vec![
             // Series A: sample in bucket 100 is outside lookback, sample in bucket 200 is within lookback
             (TimeBucket::hour(100), "memory", vec![("app", "frontend")], 6_000_000, 100.0), // outside lookback window
@@ -2059,7 +2183,7 @@ mod tests {
             // Some samples outside the range should be filtered out
             (TimeBucket::hour(100), "requests", vec![("method", "GET")], 5_900_000, 100.0), // too old
             (TimeBucket::hour(100), "requests", vec![("method", "GET")], 6_000_000, 110.0), // in range
-            (TimeBucket::hour(100), "requests", vec![("method", "GET")], 6_030_000, 120.0), // in range  
+            (TimeBucket::hour(100), "requests", vec![("method", "GET")], 6_030_000, 120.0), // in range
             (TimeBucket::hour(100), "requests", vec![("method", "GET")], 6_200_000, 130.0), // too new
         ],
         6_100_000, // query time
