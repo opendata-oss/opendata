@@ -1,0 +1,15 @@
+[package]
+name = "bencher"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+common.workspace = true
+timeseries = { path = "../timeseries" }
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+clap.workspace = true
+chrono.workspace = true
+toml.workspace = true
