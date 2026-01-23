@@ -411,7 +411,20 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                         .evaluate_expr(&u.expr, start, end, interval, lookback_delta)
                         .await?;
 
-                    Ok(self.apply_unary_negation(inner))
+                    match inner {
+                        ExprResult::Scalar(v) => Ok(ExprResult::Scalar(-v)),
+
+                        ExprResult::InstantVector(mut samples) => {
+                            for s in &mut samples {
+                                s.value = -s.value;
+                            }
+                            Ok(ExprResult::InstantVector(samples))
+                        }
+
+                        ExprResult::RangeVector(_) => Err(EvaluationError::InternalError(
+                            "Unary operators are not supported for range vectors".to_string(),
+                        )),
+                    }
                 };
                 Box::pin(fut)
             }
@@ -1874,6 +1887,45 @@ mod tests {
                 assert_eq!(samples[0].value, -100.0);
             }
             _ => panic!("Expected InstantVector"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_fail_unary_on_range_vector() {
+        let bucket = TimeBucket::hour(1000);
+        let mut builder = MockQueryReaderBuilder::new(bucket);
+
+        let labels = vec![Label {
+            name: "__name__".to_string(),
+            value: "cpu_usage".to_string(),
+        }];
+
+        builder.add_sample(
+            labels,
+            MetricType::Gauge,
+            Sample {
+                timestamp_ms: 300000,
+                value: 10.0,
+            },
+        );
+
+        let query = "-cpu_usage[5m]";
+
+        // Parser should fail
+        let parse_result = promql_parser::parser::parse(query);
+
+        assert!(
+            parse_result.is_err(),
+            "Expected parse error for unary operator on range vector"
+        );
+
+        // Verifying error message
+        if let Err(err) = parse_result {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("unary expression"),
+                "Unexpected parse error message: {msg}"
+            );
         }
     }
 
