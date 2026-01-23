@@ -12,7 +12,7 @@ payloads.
 
 ## Motivation
 
-A native HTTP API will make OpenData-Log maximally accessible to developers, enabling access to the long in any language
+A native HTTP API will make OpenData-Log maximally accessible to developers, enabling access to the log in any language
 and programming framework. By being the most accessible protocol and by supporting a text payload format, the HTTP API
 will improve the out-of-the-box developer experience. It does not preclude more performant binary APIs from being added
 later.
@@ -23,10 +23,13 @@ later.
 
 ## Non-Goals
 
-- Supporting binary keys and value via HTTP.
-- Non-HTTP APIs over protocols like GRPC, etc.
+- Supporting binary keys and values via HTTP.
+- Non-HTTP APIs over protocols like gRPC, etc.
+- Streaming APIs (e.g., pushing a stream of log entries, subscribing to the log as a stream). These are valuable but deferred to a future RFC.
 
 ## Design
+
+The HTTP server will use HTTP/2 as the transport protocol.
 
 ### Log HTTP Server API Summary
 
@@ -79,8 +82,14 @@ Request Body:
 **Success Response (200):**
 
 ```json
-{ "status": "success", "records_appended": 1 }
+{
+  "status": "success",
+  "records_appended": 1,
+  "start_sequence": 0,
+}
 ```
+
+The `start_sequence` is the sequence number assigned to the first record (inclusive).
 
 **Error Responses:**
 - `400` - Invalid request body or empty records array
@@ -106,8 +115,9 @@ Query Parameters:
 ```json
 {
   "status": "success",
+  "key": "my-key",
   "entries": [
-    { "key": "my-key", "sequence": 0, "value": "my-value" }
+    { "sequence": 0, "value": "my-value" }
   ]
 }
 ```
@@ -130,6 +140,7 @@ Query Parameters:
 |-------|------|----------|-------------|
 | start_seq | u64 | no | Start sequence (inclusive), default: 0 |
 | end_seq | u64 | no | End sequence (exclusive), default: u64::MAX |
+| limit | usize | no | Max segments to return, default: 1000 |
 
 **Success Response (200):**
 
