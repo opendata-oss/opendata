@@ -39,6 +39,37 @@ later.
 | `/api/v1/log/count` | GET | Count entries for a key |
 | `/metrics` | GET | Prometheus metrics |
 
+### HTTP Status Codes
+
+| Status Code | Description |
+|-------------|-------------|
+| 200 | Success |
+| 400 | Bad Request - Invalid input parameters (missing required params, malformed values) |
+| 500 | Internal Server Error - Storage errors, encoding errors, or internal failures |
+
+### Error Response Format
+
+All error responses follow this format:
+
+```json
+{
+  "status": "error",
+  "error": {
+    "code": "invalid_input",
+    "message": "Missing required parameter: key"
+  }
+}
+```
+
+Error codes:
+
+| Code | HTTP Status | Description |
+|------|-------------|-------------|
+| `invalid_input` | 400 | Invalid or missing request parameters |
+| `storage_error` | 500 | Underlying storage layer failure |
+| `encoding_error` | 500 | Serialization/deserialization failure |
+| `internal_error` | 500 | Unexpected internal error |
+
 ### APIs 
 
 #### Append
@@ -47,19 +78,25 @@ later.
 Append records to the log.
 
 Request Body:
-```json 
+
+```json
 {
-"records": [
-   { "key": "my-key", "value": "my-value" }
-],
-"await_durable": false
+  "records": [
+    { "key": "my-key", "value": "my-value" }
+  ],
+  "await_durable": false
 }
 ```
 
-Response:
+**Success Response (200):**
+
 ```json
 { "status": "success", "records_appended": 1 }
 ```
+
+**Error Responses:**
+- `400` - Invalid request body or empty records array
+- `500` - Storage write failure
 
 #### Scan
 
@@ -76,7 +113,7 @@ Query Parameters:
 | end_seq | u64 | no | End sequence (exclusive), default: u64::MAX |
 | limit | usize | no | Max entries to return, default: 1000 |
 
-Response:
+**Success Response (200):**
 
 ```json
 {
@@ -84,9 +121,12 @@ Response:
   "entries": [
     { "key": "my-key", "sequence": 0, "value": "my-value" }
   ]
-} 
+}
 ```
 
+**Error Responses:**
+- `400` - Missing required `key` parameter or invalid sequence range
+- `500` - Storage read failure
 
 ---
 
@@ -103,7 +143,7 @@ Query Parameters:
 | start_seq | u64 | no | Start sequence (inclusive), default: 0 |
 | end_seq | u64 | no | End sequence (exclusive), default: u64::MAX |
 
-Response:
+**Success Response (200):**
 
 ```json
 {
@@ -114,6 +154,10 @@ Response:
   ]
 }
 ```
+
+**Error Responses:**
+- `400` - Invalid sequence range parameters
+- `500` - Storage read failure
 
 ---
 
@@ -131,7 +175,7 @@ Query Parameters:
 | end_segment | u32 | no | End segment ID (exclusive), default: u32::MAX |
 | limit | usize | no | Max keys to return, default: 1000 |
 
-Response:
+**Success Response (200):**
 
 ```json
 {
@@ -142,6 +186,10 @@ Response:
   ]
 }
 ```
+
+**Error Responses:**
+- `400` - Invalid segment range parameters
+- `500` - Storage read failure
 
 ---
 
@@ -159,11 +207,15 @@ Query Parameters:
 | start_seq | u64 | no | Start sequence (inclusive), default: 0 |
 | end_seq | u64 | no | End sequence (exclusive), default: u64::MAX |
 
-Response:
+**Success Response (200):**
 
 ```json
 { "status": "success", "count": 42 }
 ```
+
+**Error Responses:**
+- `400` - Missing required `key` parameter or invalid sequence range
+- `500` - Storage read failure
 
 ## Alternatives
 
