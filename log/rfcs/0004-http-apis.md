@@ -54,21 +54,9 @@ All error responses follow this format:
 ```json
 {
   "status": "error",
-  "error": {
-    "code": "invalid_input",
-    "message": "Missing required parameter: key"
-  }
+  "message": "Missing required parameter: key"
 }
 ```
-
-Error codes:
-
-| Code | HTTP Status | Description |
-|------|-------------|-------------|
-| `invalid_input` | 400 | Invalid or missing request parameters |
-| `storage_error` | 500 | Underlying storage layer failure |
-| `encoding_error` | 500 | Serialization/deserialization failure |
-| `internal_error` | 500 | Unexpected internal error |
 
 ### APIs 
 
