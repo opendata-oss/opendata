@@ -7,62 +7,35 @@
 
 ## Summary
 
-This RFC proposes a common benchmark framework for opendata that standardizes
-provisioning and configuration aspects while remaining flexible enough to
-accommodate the diverse needs of each database system (TSDB, Log, Vector, etc.). The
-framework introduces minimal abstractions, allowing each system to plug in its
-own workload generators and measurement concerns. Cross-cutting capabilities
-like telemetry collection are handled by the framework, and benchmark results
-can be periodically checked into the repository for regression analysis.
+This RFC proposes a minimal benchmark framework for OpenData that handles
+environment concerns—storage initialization/cleanup and metrics export—while
+leaving workload structure entirely to benchmark authors. The framework produces
+machine-readable output suitable for CI execution and regression analysis.
 
 ## Motivation
 
-As opendata grows to encompass multiple database systems (TSDB, Log, Vector)
-built on a shared storage substrate, we need a consistent way to measure and
-track performance. Each system has distinct performance characteristics worth
-measuring, but they share common cross-cutting concerns: provisioning (storage
-setup, data loading, cleanup), data collection (metrics, telemetry, structured
-output), and interpretation of results (regression detection, historical
-tracking). A survey of existing crates did not reveal obvious candidates—SlateDB
-rolled its own bencher for similar reasons. A common framework that handles
-these shared concerns while remaining flexible enough to accommodate
-system-specific workloads reduces duplicated effort and lowers the barrier to
-adding meaningful benchmarks.
+OpenData's database systems (TSDB, Log, Vector, etc.) share a common storage substrate
+and need consistent performance measurement. While each system has distinct
+workloads worth benchmarking, they share environment concerns: initializing
+storage, recording metrics, and exporting results for analysis. A minimal
+framework that handles these concerns reduces boilerplate without constraining
+how benchmarks are written.
 
 ## Goals
 
-- **Standardize provisioning and configuration**: Provide common abstractions
-  for setting up storage backends, initializing databases, and managing
-  benchmark lifecycle (setup, run, teardown).
+- **Handle environment, not workload**: The framework handles common environment
+  concerns—initializing and cleaning up storage, collecting and exporting
+  metrics. It does not dictate what a benchmark does or how it structures its
+  workload.
 
-- **Minimal framework abstractions**: Define only the essential traits and types
-  needed to plug in system-specific workloads. Avoid over-engineering or
-  imposing rigid structure on what benchmarks must look like.
-
-- **Support common benchmark patterns**: Enable pure ingest benchmarks that
-  measure write throughput, and query benchmarks that may involve a loading
-  phase followed by read operations. However, do not require benchmarks to fit
-  either pattern—allow flexibility for system-specific needs.
-
-- **Telemetry collection as a cross-cutting concern**: The framework should
-  handle metrics collection (throughput, latency percentiles, resource usage)
-  so individual benchmarks don't need to implement this repeatedly.
-
-- **Machine-readable output**: Produce CSV output tagged by git commit that can
-  be checked into the repository and consumed by external analysis tools.
-
-- **CI integration readiness**: Design for periodic execution in CI, with
-  results stored in a format amenable to automated regression analysis.
-
-- **Enable AI-assisted regression analysis**: Integrate with
-  [Apache Otava](https://otava.apache.org/) for statistical change-point
-  detection, and structure results so that an AI agent can correlate identified
-  regressions with specific commits.
+- **CI and regression analysis ready**: Produce machine-readable output (CSV)
+  tagged by git commit, suitable for periodic CI execution and consumption by
+  regression analysis tools like [Apache Otava](https://otava.apache.org/).
 
 ## Non-Goals
 
 - **Built-in regression analysis**: The framework produces data; analysis is
-  handled externally (by AI agents or other tools). We don't build statistical
+  handled externally (by Apache Otava or other tools). We don't build statistical
   analysis or alerting into the framework itself.
 
 - **Replacing Criterion for micro-benchmarks**: Criterion remains appropriate
@@ -78,51 +51,134 @@ adding meaningful benchmarks.
 
 ## Design
 
-*To be detailed in subsequent revisions. Initial design considerations include:*
+### Crate Structure
 
-- Separate `bencher` crate in the workspace
-- CLI-based benchmark runner with subcommands per system
-- TOML-based configuration with CLI overrides
-- Trait-based workload abstraction
-- Pluggable storage backend provisioning
-- CSV output format compatible with Apache Otava
-- Integration with existing Prometheus metrics where applicable
+A separate `bencher` crate in the `common` workspace provides the core framework.
+System-specific benchmarks live in each system's crate (e.g., `log/benches/`,
+`timeseries/benches/`) and depend on `bencher` for common infrastructure.
 
-### Regression Analysis Stack
+### Core API
 
-The regression analysis pipeline consists of three components:
+The framework provides two structs—no traits required for benchmark authors:
 
-1. **Opendata Bencher**: Writes benchmark results to CSV files. Each row
-   includes a timestamp, metric values (throughput, latency percentiles, etc.),
-   and attributes such as git commit SHA or version tag. Results are checked
-   into the repository periodically.
+```rust
+/// Configuration for the bencher.
+pub struct BencherConfig {
+    /// Object store for both benchmark storage and metrics export.
+    pub object_store: ObjectStoreConfig,
+    /// Output format for metrics.
+    pub output: OutputFormat,
+}
 
-2. **Apache Otava**: Performs statistical change-point detection on the CSV
-   history using the e-divisive algorithm. Otava identifies points in time
-   where metrics changed significantly and provides a P-value indicating
-   confidence that the change was not due to random variance.
+/// Metrics output format.
+pub enum OutputFormat {
+    /// Write CSV files.
+    Csv,
+    /// Write to timeseries format.
+    Timeseries,
+}
 
-3. **AI Agent**: Consumes Otava's analysis output and the raw benchmark results.
-   When Otava detects a change point, the agent uses the associated commit
-   attribute as a reference point in the git log to build a list of candidate
-   commits that may have caused the regression. The agent could potentially
-   rerun benchmarks to confirm a regression, or use git bisect to narrow down
-   the culprit.
+/// Provided by the framework. Initializes storage and metrics reporting.
+pub struct Bencher {
+    config: BencherConfig,
+}
 
-### CI Integration
+impl Bencher {
+    pub fn new(config: BencherConfig) -> Self;
 
-The benchmark pipeline integrates with GitHub Actions workflows:
+    /// Start a new benchmark run with the given labels.
+    pub fn bench(&self, labels: Vec<Label>) -> Bench;
+}
 
-- **Scheduled runs**: Benchmarks run nightly (or on another configurable
-  schedule) against the latest main branch. Results are committed to the
-  repository and Otava analysis is triggered.
+/// Represents a single benchmark run.
+pub struct Bench {
+    // ...
+}
 
-- **Manual triggers**: Workflows can be manually dispatched via `workflow_dispatch`
-  for ad-hoc benchmarking (e.g., before a release or to investigate a suspected
-  regression).
+impl Bench {
+    /// Access the storage backend.
+    pub fn storage(&self) -> &StorageConfig;
 
-- **AI agent invocation**: After Otava analysis completes, the workflow invokes
-  the AI agent to review results and open an issue if regressions are detected.
+    /// Record a metric sample. Labels were set when the bench was created.
+    pub fn record(&self, metric: &str, sample: Sample);
+
+    /// Mark the run as complete and flush metrics.
+    pub fn close(self);
+}
+
+/// Entry point for a benchmark. Implemented by benchmark authors.
+pub trait Benchmark {
+    /// Run the benchmark using the provided bencher.
+    async fn run(&self, bencher: Bencher) -> Result<()>;
+}
+```
+
+A harness (not defined here) is responsible for instantiating the `Bencher`
+from configuration and invoking `Benchmark::run`. The benchmark author controls
+iteration over parameter space, setup, and teardown.
+
+### CSV Output Format
+
+Results are written as CSV compatible with Apache Otava's expected format:
+
+```csv
+timestamp,benchmark,commit,ops_per_sec,bytes_per_sec,p50_us,p99_us,p999_us
+2026-01-22T10:30:00Z,log_append_throughput,abc123,150000,78643200,45,120,450
+2026-01-22T10:31:00Z,log_scan_throughput,abc123,50000,52428800,200,500,1200
+```
+
+The `commit` column serves as the attribute Otava uses to correlate change
+points with git history.
+
+### Results Storage
+
+Benchmark results can be exported to:
+
+- **CSV on S3**: For consumption by Apache Otava and other analysis tools.
+- **Timeseries database**: For querying with PromQL and visualization in Grafana.
+
+Using the timeseries data model for metrics enables both export paths without
+conversion.
+
+### Example Usage
+
+```rust
+use bencher::{Benchmark, Bencher, Bench};
+use timeseries::{Label, Sample};
+
+pub struct LogAppendBenchmark;
+
+impl Benchmark for LogAppendBenchmark {
+    async fn run(&self, bencher: Bencher) -> Result<()> {
+        for record_size in [64, 256, 1024, 4096] {
+            let labels = vec![
+                Label::new("benchmark", "log_append"),
+                Label::new("record_size", record_size.to_string()),
+            ];
+
+            let bench = bencher.bench(labels);
+            let mut log = Log::open(bench.storage()).await?;
+            let data = vec![0u8; record_size];
+
+            for _ in 0..1000 {
+                let start = Instant::now();
+                log.append(&data).await?;
+                bench.record("latency_us", Sample::now(start.elapsed().as_micros() as f64));
+            }
+
+            bench.close();
+        }
+        Ok(())
+    }
+}
+```
+
+### Future Work
+
+The CSV output format enables regression analysis through tools like
+[Apache Otava](https://otava.apache.org/), which performs statistical
+change-point detection. CI integration and tooling for automated regression
+detection will be addressed in subsequent work.
 
 ## Alternatives
 
@@ -130,16 +186,10 @@ The benchmark pipeline integrates with GitHub Actions workflows:
 
 ## Open Questions
 
-1. What specific telemetry should be collected by default? Throughput and
-   latency percentiles seem essential—what else?
-
-2. Where should we store periodic bench results in the repository?
-
-3. What is the minimum viable interface a system must implement to plug into
-   the framework?
+*None at this time.*
 
 ## Updates
 
-| Date       | Description   |
-|------------|---------------|
-| 2026-01-16 | Initial draft |
+| Date       | Description                |
+|------------|----------------------------|
+| 2026-01-16 | Initial draft              |
