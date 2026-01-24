@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use crate::config::{Config, DataConfig, OutputFormat, ResultsConfig};
+use crate::config::{Config, DataConfig};
 
 /// CLI arguments for the bencher.
 #[derive(Parser, Debug)]
@@ -47,10 +47,7 @@ impl Config {
             data: DataConfig {
                 storage: StorageConfig::InMemory,
             },
-            results: ResultsConfig {
-                object_store: None,
-                format: OutputFormat::Csv,
-            },
+            reporter: None,
         }
     }
 }

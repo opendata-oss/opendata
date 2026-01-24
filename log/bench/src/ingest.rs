@@ -2,9 +2,11 @@
 
 use std::time::Instant;
 
-use bencher::{Benchmark, Bencher, Label, Metric, MetricType};
+use bencher::{Benchmark, Bencher, Label, Summary};
 use bytes::Bytes;
 use log::{Config, Log, Record};
+
+const MICROS_PER_SEC: f64 = 1_000_000.0;
 
 /// Parameters for the ingest benchmark.
 #[derive(Debug, Clone)]
@@ -89,6 +91,11 @@ impl Benchmark for IngestBenchmark {
         for params in &self.params {
             let bench = bencher.bench(params);
 
+            // Live metrics - updated during the benchmark
+            let records_counter = bench.counter("records");
+            let bytes_counter = bench.counter("bytes");
+            let batch_latency = bench.histogram("batch_latency_us");
+
             // Initialize log with fresh in-memory storage
             let config = Config {
                 storage: bencher.data_config().storage.clone(),
@@ -106,6 +113,7 @@ impl Benchmark for IngestBenchmark {
 
             // Generate value template
             let value = Bytes::from(vec![b'x'; params.value_size]);
+            let record_size = params.key_length + params.value_size;
 
             // Run append loop
             let start = Instant::now();
@@ -113,7 +121,8 @@ impl Benchmark for IngestBenchmark {
             let mut key_idx = 0;
 
             while records_written < params.total_records {
-                let batch_size = std::cmp::min(params.batch_size, params.total_records - records_written);
+                let batch_size =
+                    std::cmp::min(params.batch_size, params.total_records - records_written);
                 let records: Vec<Record> = (0..batch_size)
                     .map(|_| {
                         let key = keys[key_idx % keys.len()].clone();
@@ -125,30 +134,32 @@ impl Benchmark for IngestBenchmark {
                     })
                     .collect();
 
+                let batch_start = Instant::now();
                 log.append(records).await?;
+                let batch_elapsed = batch_start.elapsed();
+
+                // Update live metrics
+                records_counter.increment(batch_size as u64);
+                bytes_counter.increment((batch_size * record_size) as u64);
+                batch_latency.record(batch_elapsed.as_secs_f64() * MICROS_PER_SEC);
+
                 records_written += batch_size;
             }
 
             let elapsed = start.elapsed();
             let elapsed_secs = elapsed.as_secs_f64();
 
-            // Record metrics
+            // Summary metrics - computed at the end
             let ops_per_sec = params.total_records as f64 / elapsed_secs;
-            let bytes_per_sec =
-                (params.total_records * (params.key_length + params.value_size)) as f64 / elapsed_secs;
+            let bytes_per_sec = (params.total_records * record_size) as f64 / elapsed_secs;
 
             bench
-                .record([
-                    Metric::new("ops_per_sec", ops_per_sec)
-                        .with_type(MetricType::Gauge)
-                        .with_unit("1/s"),
-                    Metric::new("bytes_per_sec", bytes_per_sec)
-                        .with_type(MetricType::Gauge)
-                        .with_unit("bytes/s"),
-                    Metric::new("elapsed_ms", elapsed.as_millis() as f64)
-                        .with_type(MetricType::Gauge)
-                        .with_unit("ms"),
-                ])
+                .summarize(
+                    Summary::new()
+                        .add("throughput_ops", ops_per_sec)
+                        .add("throughput_bytes", bytes_per_sec)
+                        .add("elapsed_ms", elapsed.as_millis() as f64),
+                )
                 .await?;
 
             bench.close().await?;

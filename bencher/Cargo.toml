@@ -13,3 +13,6 @@ serde.workspace = true
 clap.workspace = true
 chrono.workspace = true
 toml.workspace = true
+metrics = "0.24"
+metrics-util = "0.18"
+humantime-serde = "1"
