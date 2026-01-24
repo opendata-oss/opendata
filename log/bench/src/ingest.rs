@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use bencher::{Benchmark, Bencher, Label, Summary};
+use bencher::{Bencher, Benchmark, Label, Summary};
 use bytes::Bytes;
 use log::{Config, Log, Record};
 

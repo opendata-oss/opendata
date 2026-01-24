@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig};
 use common::StorageConfig;
+use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the bencher.

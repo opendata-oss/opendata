@@ -3,8 +3,8 @@
 use std::sync::atomic::Ordering;
 
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
-use metrics_util::registry::{AtomicStorage, Registry};
 use metrics_util::Summary;
+use metrics_util::registry::{AtomicStorage, Registry};
 use timeseries::{Label, MetricType, Sample, Series, Temporality};
 
 /// Standard quantiles to export for histograms.
@@ -317,7 +317,9 @@ mod tests {
             .iter()
             .find(|s| {
                 s.name() == "latency_us"
-                    && s.labels.iter().any(|l| l.name == "quantile" && l.value == "0.5")
+                    && s.labels
+                        .iter()
+                        .any(|l| l.name == "quantile" && l.value == "0.5")
             })
             .expect("should have p50 series");
         // p50 should be around 50-55 for uniform distribution

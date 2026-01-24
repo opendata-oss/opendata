@@ -126,24 +126,20 @@ impl Bencher {
         if let Ok(output) = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .output()
+            && output.status.success()
+            && let Ok(commit) = String::from_utf8(output.stdout)
         {
-            if output.status.success() {
-                if let Ok(commit) = String::from_utf8(output.stdout) {
-                    labels.push(Label::new("commit", commit.trim()));
-                }
-            }
+            labels.push(Label::new("commit", commit.trim()));
         }
 
         // Git branch
         if let Ok(output) = std::process::Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .output()
+            && output.status.success()
+            && let Ok(branch) = String::from_utf8(output.stdout)
         {
-            if output.status.success() {
-                if let Ok(branch) = String::from_utf8(output.stdout) {
-                    labels.push(Label::new("branch", branch.trim()));
-                }
-            }
+            labels.push(Label::new("branch", branch.trim()));
         }
 
         labels
@@ -317,7 +313,10 @@ impl Bench {
 
         // Print params header
         if !params.is_empty() {
-            let params_str: Vec<_> = params.iter().map(|l| format!("{}={}", l.name, l.value)).collect();
+            let params_str: Vec<_> = params
+                .iter()
+                .map(|l| format!("{}={}", l.name, l.value))
+                .collect();
             println!("  [{}]", params_str.join(", "));
         }
 
@@ -331,7 +330,12 @@ impl Bench {
 
         // Print metrics with aligned formatting
         for (name, value) in &summary.metrics {
-            println!("    {:<width$}  {}", name, format_number(*value), width = max_name_len);
+            println!(
+                "    {:<width$}  {}",
+                name,
+                format_number(*value),
+                width = max_name_len
+            );
         }
     }
 
@@ -463,11 +467,7 @@ pub async fn run(benchmarks: Vec<Box<dyn Benchmark>>) -> anyhow::Result<()> {
 
     let benchmarks: Vec<_> = benchmarks
         .into_iter()
-        .filter(|b| {
-            args.benchmark
-                .as_ref()
-                .is_none_or(|name| b.name() == name)
-        })
+        .filter(|b| args.benchmark.as_ref().is_none_or(|name| b.name() == name))
         .collect();
 
     for benchmark in benchmarks {
@@ -485,10 +485,7 @@ mod tests {
     use std::time::Duration;
 
     fn create_test_bench(reporter: Arc<MemoryReporter>) -> Bench {
-        let labels = vec![
-            Label::new("benchmark", "test"),
-            Label::new("env", "ci"),
-        ];
+        let labels = vec![Label::new("benchmark", "test"), Label::new("env", "ci")];
         // Use a long interval so background reporting doesn't interfere
         Bench::with_reporter(labels, reporter, Duration::from_secs(3600))
     }
@@ -513,10 +510,12 @@ mod tests {
             .expect("should have requests series");
 
         assert_eq!(request_series.samples[0].value, 15.0);
-        assert!(request_series
-            .labels
-            .iter()
-            .any(|l| l.name == "benchmark" && l.value == "test"));
+        assert!(
+            request_series
+                .labels
+                .iter()
+                .any(|l| l.name == "benchmark" && l.value == "test")
+        );
     }
 
     #[tokio::test]
@@ -561,7 +560,9 @@ mod tests {
             .iter()
             .find(|s| {
                 s.name() == "latency_us"
-                    && s.labels.iter().any(|l| l.name == "quantile" && l.value == "0.5")
+                    && s.labels
+                        .iter()
+                        .any(|l| l.name == "quantile" && l.value == "0.5")
             })
             .expect("should have p50 series");
         assert!(p50.samples[0].value >= 40.0 && p50.samples[0].value <= 60.0);
