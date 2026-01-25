@@ -555,32 +555,31 @@ lookup, and the actual vector data.
 **Value Schema:**
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                      VectorMetaValue                           │
-├────────────────────────────────────────────────────────────────┤
-│  external_id: Utf8  (max 64 bytes, user-provided identifier)   │
-│  vector:      Vector<D>                                        │
-│  fields:      Array<MetadataField>                             │
-│                                                                │
-│  MetadataField                                                 │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  field_name:  Utf8                                       │  │
-│  │  value:       MetadataValue                              │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│                                                                │
-│  MetadataValue (tagged union)                                  │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  tag:    u8  (0=string, 1=int64, 2=float64, 3=bool)      │  │
-│  │  value:  Utf8 | i64 | f64 | u8                           │  │
-│  └──────────────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                      VectorDataValue                                   │
+├────────────────────────────────────────────────────────────────────────┤
+│  external_id: Utf8  (max 64 bytes, user-provided identifier)           │
+│  fields:      Array<Field>                                             │
+│                                                                        │
+│  Field                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │  field_name:  Utf8                                               │  │
+│  │  value:       FieldValue                                         │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                        │
+│  FieldValue (tagged union)                                             │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │  tag:    u8  (0=string, 1=int64, 2=float64, 3=bool, 255=vector)  │  │
+│  │  value:  Utf8 | i64 | f64 | u8 | Vector<D>                       │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Structure:**
 
 - `external_id` stored for reverse lookup (internal ID → external ID) during query results
-- `vector` stores the raw vector data
-- Fields carry their canonical name directly, matching entries in `CollectionMeta.metadata_fields`
+- Fields carry their canonical name directly, matching entries in `CollectionMeta.metadata_fields`, except for
+  the special field "vector" which always has the tag `0xff` and stores the raw vector data.
 - Metadata fields serialized in ascending lexicographic order by `field_name`
 - Field schema defined in `CollectionMeta`; unknown field names are rejected at write time
 
