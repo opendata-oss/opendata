@@ -65,23 +65,20 @@ A vector is the primary unit of ingestion, combining an ID, embedding values, an
 ///
 /// # Embedding Values
 ///
-/// The `values` field contains the embedding vector as f32 values. The length
-/// must match the `dimensions` specified in the `Config` when the database
-/// was created.
+/// The `attributes` field contains the embedding vector as f32 values under the
+/// attribute named "vector". The length must match the `dimensions` specified
+/// in the `Config` when the database was created.
 #[derive(Debug, Clone)]
 pub struct Vector {
     /// User-provided unique identifier (max 64 bytes UTF-8).
     pub id: String,
-
-    /// The embedding vector (f32 values).
-    pub values: Vec<f32>,
 
     /// Metadata attributes for filtering.
     pub attributes: Vec<Attribute>,
 }
 
 impl Vector {
-    /// Creates a new vector with no attributes.
+    /// Creates a new vector with no metadata attributes.
     pub fn new(id: impl Into<String>, values: Vec<f32>) -> Self;
 
     /// Builder-style construction for vectors with attributes.
@@ -123,15 +120,10 @@ impl Attribute {
 /// as a special attribute alongside other metadata fields. This provides a unified
 /// data model where all attributes (including the vector) can be stored and retrieved
 /// consistently.
-///
-/// Vector is an API-level abstraction—at the storage layer, embeddings are stored in
-/// VectorData records. Metadata types (String, Int64, Float64, Bool) map to storage
-/// layer type IDs in VectorMeta (RFC 0001): String=0, Int64=1, Float64=2, Bool=3.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AttributeValue {
     /// Vector embedding (f32 array). This enables treating the embedding vector as
-    /// a special attribute with the reserved field name "vector". Stored in VectorData,
-    /// not VectorMeta.
+    /// a special attribute with the reserved field name "vector".
     Vector(Vec<f32>),
     String(String),
     Int64(i64),
@@ -280,7 +272,7 @@ pub struct MetadataFieldSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataFieldType {
     /// Vector embedding type. Use the reserved field name "vector" to define
-    /// the embedding field in the schema. API-level only; stored in VectorData.
+    /// the embedding field in the schema.
     Vector,
     String,
     Int64,
@@ -384,16 +376,16 @@ impl VectorDb {
     ///
     /// Deletion is a soft delete:
     /// 1. The external ID is looked up in the IdDictionary to find the internal ID
-    /// 2. The internal ID is added to the deleted bitmap (centroid_id=0)
-    /// 3. VectorData and VectorMeta records are tombstoned
+    /// 2. The internal ID is added to the deleted bitmap
+    /// 3. VectorData records are tombstoned
     /// 4. The IdDictionary entry is tombstoned
-    /// 5. Metadata index cleanup happens during background LIRE maintenance
+    /// 5. Metadata index and postings cleanup happens during background maintenance
     ///
     /// # ID Reuse
     ///
     /// Deleted external IDs can be reused. Writing a vector with a previously
     /// deleted ID will succeed and create a new vector with a new internal ID.
-    /// The old internal ID remains in the deleted bitmap until LIRE maintenance.
+    /// The old internal ID remains in the deleted bitmap until background maintenance.
     ///
     /// # Example
     ///
@@ -435,11 +427,10 @@ When `write()` is called, the following operations occur:
 2. **For each vector**:
     - Look up the external ID in `IdDictionary`
     - If found (upsert case):
-        - Delete the old vector: add old internal ID to deleted bitmap (centroid_id=0)
-        - Tombstone old `VectorData` and `VectorMeta` records
+        - Delete the old vector: add old internal ID to deleted bitmap
+        - Tombstone old `VectorData` record
     - Allocate a new internal ID using block-based sequence allocation (see `SeqBlock` in storage RFC)
-    - Write `VectorData` record with the embedding values (keyed by new internal ID)
-    - Write `VectorMeta` record with the external ID and attributes (keyed by new internal ID)
+    - Write `VectorData` record with the external ID and attributes (keyed by new internal ID)
     - Update or create `IdDictionary` entry mapping external ID → new internal ID
     - Update `MetadataIndex` entries via merge operators for indexed fields
     - Assign to nearest centroid(s) and update `PostingList` via merge operators
@@ -450,9 +441,9 @@ When `write()` is called, the following operations occur:
 When `delete()` is called:
 
 1. **Look up internal IDs**: For each external ID, look up the internal ID in `IdDictionary`
-2. **Add to deleted bitmap**: Internal IDs are added to the special posting list at `centroid_id=0`
-3. **Tombstone records**: `VectorData`, `VectorMeta`, and `IdDictionary` records are tombstoned
-4. **Deferred cleanup**: Metadata index entries and posting list entries are cleaned up during LIRE
+2. **Add to deleted bitmap**: Internal IDs are added to the deletion bitmap under the `Deletions` key. 
+3. **Tombstone records**: `VectorData`, and `IdDictionary` records are tombstoned
+4. **Deferred cleanup**: Metadata index entries and posting list entries are cleaned up during background
    maintenance
 
 ### Comparison with TimeSeries API
@@ -479,18 +470,18 @@ When `delete()` is called:
 **Implementation**: When writing a vector with an existing external ID, the system:
 1. Looks up the old internal ID from `IdDictionary`
 2. Marks the old internal ID as deleted (adds to centroid_id=0 bitmap)
-3. Tombstones the old `VectorData` and `VectorMeta` records
+3. Tombstones the old `VectorData` records
 4. Allocates a new internal ID for the updated vector
 5. Writes new records with the new internal ID
 6. Updates `IdDictionary` to point external ID → new internal ID
 
 This "delete old + insert new" approach avoids expensive read-modify-write cycles. Stale posting
 list entries and metadata index entries are filtered at query time using the deleted bitmap, and
-cleaned up during background LIRE maintenance.
+cleaned up during background maintenance.
 
 **Cost**: Upserts have the same write cost as inserts (no additional reads required). The trade-off
 is that deleted internal IDs accumulate and require periodic cleanup, but this is handled
-asynchronously by LIRE maintenance without blocking writes.
+asynchronously in the background without blocking writes.
 
 **Alternative considered**: Require explicit delete-then-insert from callers. Rejected because it
 would require callers to issue two separate API calls, losing atomicity and complicating error
@@ -554,3 +545,4 @@ metadata). It can be added in the query RFC as a convenience method built on top
 | 2026-01-14 | Add AttributeValue::Vector and MetadataFieldType::Vector to    |
 |            | support treating embeddings as attributes. Vector is API-only; |
 |            | stored in VectorData, not VectorMeta.                          |
+| 2026-01-24 | Update to reflect that all attributes are stored in VectorData |
