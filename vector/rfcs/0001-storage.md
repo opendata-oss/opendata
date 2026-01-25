@@ -78,7 +78,6 @@ index structures are stored as key-value pairs in the LSM tree.
 │   │   Posting Lists: centroid_id →                      │   │
 │   │                  [(vector_id, f32[dimensions])]     │   │
 │   │                                                     │   │
-│   │   Deleted:       centroid_id=0 → deleted vector IDs │   │
 │   └─────────────────────────────────────────────────────┘   │
 │                                                             │
 │   ┌─────────────────────────────────────────────────────┐   │
@@ -89,6 +88,7 @@ index structures are stored as key-value pairs in the LSM tree.
 │   │                  external_id + metadata             │   │
 │   │                    + f32[dimensions]                │   │
 │   │   MetadataIndex: (field, value) → vector IDs        │   │
+│   │   Deletions:     deleted vector IDs                 │   │
 │   └─────────────────────────────────────────────────────┘   │
 │                                                             │
 │   ┌─────────────────────────────────────────────────────┐   │
@@ -98,6 +98,13 @@ index structures are stored as key-value pairs in the LSM tree.
 │   │   - Merge undersized posting lists                  │   │
 │   │   - Reassign boundary vectors                       │   │
 │   │   - Clean up deleted vectors                        │   │
+│   └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│   ┌─────────────────────────────────────────────────────┐   │
+│   │              Compaction Filters (background)        │   │
+│   │                                                     │   │
+│   │   - Clean up deleted vectors                        │   │
+│   │   - Clean up Deletions                              │   │
 │   └─────────────────────────────────────────────────────┘   │
 │                                                             │
 │   Storage: SlateDB (LSM KV Store)                           │
@@ -161,9 +168,10 @@ Trade-offs:
 
 **Delete Operation:**
 
-Deleting a vector requires four atomic operations via `WriteBatch`: (1) add vector ID to the
-deleted bitmap (centroid_id = 0), (2) tombstone the vector data, (3) tombstone the vector metadata,
-(4) tombstone the `IdDictionary` entry. Metadata index cleanup happens during LIRE maintenance.
+Deleting a vector requires 3 atomic operations via `WriteBatch`: (1) add vector ID to the
+deleted bitmap, (2) tombstone the vector data, (3) tombstone the `IdDictionary` entry.
+Metadata index and postings cleanup happens during compaction and LIRE maintenance. These details
+are left to a future RFC.
 
 ### Record Layout
 
