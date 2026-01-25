@@ -755,7 +755,9 @@ Future RFCs will address:
 
 | Date       | Description                                                          |
 |------------|----------------------------------------------------------------------|
-| 2025-01-07 | Initial draft                                                        |
+| 2026-01-07 | Initial draft                                                        |
+| 2026-01-24 | Store full vectors in postings. Store all attributes in `VectorData` |
+|            | and drop `VectorMeta`                                                |
 
 ## References
 
