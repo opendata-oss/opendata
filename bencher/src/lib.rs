@@ -301,23 +301,14 @@ impl Bench {
 
     /// Print summary to console with nice formatting.
     fn print_summary(&self, summary: &Summary) {
-        // Environment labels to exclude from params display
-        const ENV_LABELS: &[&str] = &["benchmark", "commit", "branch", "__name__"];
-
-        // Extract params from labels (excluding env labels)
-        let params: Vec<_> = self
-            .labels
-            .iter()
-            .filter(|l| !ENV_LABELS.contains(&l.name.as_str()))
-            .collect();
-
-        // Print params header
-        if !params.is_empty() {
-            let params_str: Vec<_> = params
+        // Print labels header
+        if !self.labels.is_empty() {
+            let labels_str: Vec<_> = self
+                .labels
                 .iter()
                 .map(|l| format!("{}={}", l.name, l.value))
                 .collect();
-            println!("  [{}]", params_str.join(", "));
+            println!("  [{}]", labels_str.join(", "));
         }
 
         // Find max metric name length for alignment
