@@ -23,8 +23,7 @@ later.
 
 ## Non-Goals
 
-- Supporting binary keys and values via HTTP.
-- Non-HTTP APIs over protocols like gRPC, etc.
+- gRPC service endpoints. The protobuf schema defined in this RFC is designed to be compatible with a future gRPC API, which will be proposed in a separate RFC.
 - Streaming APIs (e.g., pushing a stream of log entries, subscribing to the log as a stream). These are valuable but deferred to a future RFC.
 
 ## Design
@@ -33,7 +32,8 @@ The HTTP server will use HTTP/2 as the transport protocol.
 
 ### Message Format
 
-The API supports both binary protobuf and ProtoJSON formats, with a single protobuf schema serving as the source of truth for all message definitions. This enables interoperability between Rust clients using binary protobuf and HTTP clients using JSON.
+The API supports both binary protobuf and ProtoJSON formats, with a single protobuf schema serving as the source of 
+truth for all message definitions. 
 
 **Content Types:**
 - Binary protobuf: `Content-Type: application/x-protobuf`
@@ -55,8 +55,8 @@ message AppendRequest {
 }
 
 message Record {
-  string key = 1;
-  string value = 2;
+  bytes key = 1;
+  bytes value = 2;
 }
 
 message AppendResponse {
@@ -68,13 +68,13 @@ message AppendResponse {
 
 message ScanResponse {
   string status = 1;
-  string key = 2;
+  bytes key = 2;
   repeated Entry entries = 3;
 }
 
 message Entry {
   uint64 sequence = 1;
-  string value = 2;
+  bytes value = 2;
 }
 
 message SegmentsResponse {
@@ -90,7 +90,7 @@ message Segment {
 
 message KeysResponse {
   string status = 1;
-  repeated string keys = 2;
+  repeated bytes keys = 2;
 }
 
 message CountResponse {
@@ -126,12 +126,17 @@ client.post("/api/v1/log/append")
 curl -X POST http://localhost:8080/api/v1/log/append \
   -H "Content-Type: application/json" \
   -d '{
-    "records": [{"key": "my-key", "value": "my-value"}],
+    "records": [{"key": "bXkta2V5", "value": "bXktdmFsdWU="}],
     "awaitDurable": false
   }'
 ```
 
 Both produce the same logical message that can be read by either client type.
+
+**Note:** Since `key` and `value` are `bytes` fields in the proto schema, JSON clients must use base64 encoding per the
+[ProtoJSON specification](https://protobuf.dev/programming-guides/proto3/#json). The examples above use base64-encoded
+versions of "my-key" (`bXkta2V5`) and "my-value" (`bXktdmFsdWU=`).
+
 
 ### Log HTTP Server API Summary
 
@@ -175,11 +180,13 @@ Request Body:
 ```json
 {
   "records": [
-    { "key": "my-key", "value": "my-value" }
+    { "key": "bXkta2V5", "value": "bXktdmFsdWU=" }
   ],
   "awaitDurable": false
 }
 ```
+
+Keys and values are base64-encoded in JSON (ProtoJSON spec for `bytes` fields).
 
 **Success Response (200):**
 
@@ -217,12 +224,14 @@ Query Parameters:
 ```json
 {
   "status": "success",
-  "key": "my-key",
+  "key": "bXkta2V5",
   "entries": [
-    { "sequence": 0, "value": "my-value" }
+    { "sequence": 0, "value": "bXktdmFsdWU=" }
   ]
 }
 ```
+
+Keys and values are base64-encoded in JSON.
 
 **Error Responses:**
 - `400` - Missing required `key` parameter or invalid sequence range
@@ -281,9 +290,11 @@ Query Parameters:
 ```json
 {
   "status": "success",
-  "keys": ["events", "orders"]
+  "keys": ["ZXZlbnRz", "b3JkZXJz"]
 }
 ```
+
+Keys are base64-encoded in JSON.
 
 **Error Responses:**
 - `400` - Invalid segment range parameters
