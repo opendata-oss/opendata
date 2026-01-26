@@ -330,7 +330,7 @@ Query Parameters:
 
 ### Supporting plain JSON over HTTP
 
-The current proposal adopts `ProtoJSON` as the the JSON format. This brings support for binary payloads. It also means
+The current proposal adopts `ProtoJSON` as the JSON format. This brings support for binary payloads. It also means
 that keys and values are base64 encoded. The alternative was to allow plain JSON over HTTP without any protobuf schema.
 The latter approach was rejected because we will to support typed binary payloads for the log, and moving from a
 flexible JSON payload will make the transition to a properly typed payload with a fixed schema impossible.  
