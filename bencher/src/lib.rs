@@ -146,7 +146,7 @@ impl Bencher {
     }
 
     /// Access the data storage configuration.
-    pub fn data_config(&self) -> &DataConfig {
+    pub fn data(&self) -> &DataConfig {
         &self.config.data
     }
 

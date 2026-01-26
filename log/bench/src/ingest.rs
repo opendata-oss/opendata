@@ -64,12 +64,13 @@ impl IngestBenchmark {
         Self {
             params: vec![
                 // Vary batch size
-                Params::new(1, 256, 16, 10, 1000),
-                Params::new(10, 256, 16, 10, 1000),
-                Params::new(100, 256, 16, 10, 1000),
+                Params::new(1, 256, 16, 10, 50_000),
+                Params::new(10, 256, 16, 10, 50_000),
+                Params::new(100, 256, 16, 10, 50_000),
                 // Vary value size
-                Params::new(10, 64, 16, 10, 1000),
-                Params::new(10, 1024, 16, 10, 1000),
+                Params::new(100, 64, 16, 10, 50_000),
+                Params::new(100, 512, 16, 10, 50_000),
+                Params::new(100, 1024, 16, 10, 50_000),
             ],
         }
     }
@@ -98,7 +99,7 @@ impl Benchmark for IngestBenchmark {
 
             // Initialize log with fresh in-memory storage
             let config = Config {
-                storage: bencher.data_config().storage.clone(),
+                storage: bencher.data().storage.clone(),
                 ..Default::default()
             };
             let log = Log::open(config).await?;
