@@ -31,6 +31,108 @@ later.
 
 The HTTP server will use HTTP/2 as the transport protocol.
 
+### Message Format
+
+The API supports both binary protobuf and ProtoJSON formats, with a single protobuf schema serving as the source of truth for all message definitions. This enables interoperability between Rust clients using binary protobuf and HTTP clients using JSON.
+
+**Content Types:**
+- Binary protobuf: `Content-Type: application/x-protobuf`
+- JSON: `Content-Type: application/json`
+
+**Field Naming:**
+- JSON field names use `lowerCamelCase` per the ProtoJSON specification
+- URL query parameters remain `snake_case` (standard URL convention)
+
+#### Proto Schema
+
+```protobuf
+syntax = "proto3";
+package opendata.log.v1;
+
+message AppendRequest {
+  repeated Record records = 1;
+  bool await_durable = 2;
+}
+
+message Record {
+  string key = 1;
+  string value = 2;
+}
+
+message AppendResponse {
+  string status = 1;
+  int32 records_appended = 2;
+  uint64 start_sequence = 3;
+  uint64 end_sequence = 4;
+}
+
+message ScanResponse {
+  string status = 1;
+  string key = 2;
+  repeated Entry entries = 3;
+}
+
+message Entry {
+  uint64 sequence = 1;
+  string value = 2;
+}
+
+message SegmentsResponse {
+  string status = 1;
+  repeated Segment segments = 2;
+}
+
+message Segment {
+  uint32 id = 1;
+  uint64 start_seq = 2;
+  int64 start_time_ms = 3;
+}
+
+message KeysResponse {
+  string status = 1;
+  repeated string keys = 2;
+}
+
+message CountResponse {
+  string status = 1;
+  uint64 count = 2;
+}
+
+message ErrorResponse {
+  string status = 1;
+  string message = 2;
+}
+```
+
+#### Interoperability Example
+
+The same logical message can be produced and consumed by both Rust clients (binary) and HTTP clients (JSON):
+
+**Rust client writing binary protobuf:**
+```rust
+let request = AppendRequest {
+    records: vec![Record { key: "my-key".into(), value: "my-value".into() }],
+    await_durable: false,
+};
+let binary = request.encode_to_vec();
+client.post("/api/v1/log/append")
+    .header("Content-Type", "application/x-protobuf")
+    .body(binary)
+    .send();
+```
+
+**HTTP client writing JSON:**
+```bash
+curl -X POST http://localhost:8080/api/v1/log/append \
+  -H "Content-Type: application/json" \
+  -d '{
+    "records": [{"key": "my-key", "value": "my-value"}],
+    "awaitDurable": false
+  }'
+```
+
+Both produce the same logical message that can be read by either client type.
+
 ### Log HTTP Server API Summary
 
 | Endpoint | Method | Description |
@@ -75,7 +177,7 @@ Request Body:
   "records": [
     { "key": "my-key", "value": "my-value" }
   ],
-  "await_durable": false
+  "awaitDurable": false
 }
 ```
 
@@ -84,12 +186,12 @@ Request Body:
 ```json
 {
   "status": "success",
-  "records_appended": 1,
-  "start_sequence": 0,
+  "recordsAppended": 1,
+  "startSequence": 0
 }
 ```
 
-The `start_sequence` is the sequence number assigned to the first record (inclusive).
+The `startSequence` is the sequence number assigned to the first record (inclusive).
 
 **Error Responses:**
 - `400` - Invalid request body or empty records array
@@ -148,8 +250,8 @@ Query Parameters:
 {
   "status": "success",
   "segments": [
-    { "id": 0, "start_seq": 0, "start_time_ms": 1705766400000 },
-    { "id": 1, "start_seq": 100, "start_time_ms": 1705766460000 }
+    { "id": 0, "startSeq": 0, "startTimeMs": 1705766400000 },
+    { "id": 1, "startSeq": 100, "startTimeMs": 1705766460000 }
   ]
 }
 ```
@@ -179,10 +281,7 @@ Query Parameters:
 ```json
 {
   "status": "success",
-  "keys": [
-    { "key": "events" },
-    { "key": "orders" }
-  ]
+  "keys": ["events", "orders"]
 }
 ```
 
