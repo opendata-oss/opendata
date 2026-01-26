@@ -328,12 +328,13 @@ Query Parameters:
 
 ## Alternatives
 
-### Supporting binary protocols and payloads
+### Supporting plain JSON over HTTP
 
-We should support binary APIs and protocols in the future, but they can complement the HTTP API. Similarly support
-for a non json payloads within the HTTP protocol can be added as a future extension. 
-
-
+The current proposal adopts `ProtoJSON` as the the JSON format. This brings support for binary payloads. It also means
+that keys and values are base64 encoded. The alternative was to allow plain JSON over HTTP without any protobuf schema.
+The latter approach was rejected because we will to support typed binary payloads for the log, and moving from a
+flexible JSON payload will make the transition to a properly typed payload with a fixed schema impossible.  
+]
 ## Open Questions
 
    * The proposal as presented mimics the Rust API for OpenData-Log. Should we consider APIs that are more HTTP-native? 
