@@ -300,6 +300,17 @@ If the current timestamp exceeds the `done at` timestamp plus the retention dura
 removed from the array of done messages in the `DoneMessages` value.
 A retention duration of `0` means infinite retention.
 
+### Record types overview
+
+| type discriminator | Description     |
+|--------------------|-----------------|
+| `0x01`             | message payload |
+| `0x02`             | active messages |
+| `0x03`             | done messages   |
+| `0x04`             | failed messages |
+| `0x05`             | attempts        |
+| `0x06`             | queue config    |
+
 ### Workflow overview
 
 The OpenData-Queue has the following rough workflow
