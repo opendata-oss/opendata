@@ -21,9 +21,10 @@ pub struct Config {
 }
 
 /// Configuration for benchmark data storage.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DataConfig {
     /// Storage configuration for benchmark data.
+    #[serde(default)]
     pub storage: StorageConfig,
 }
 

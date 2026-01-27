@@ -20,12 +20,12 @@
 //! # Example
 //!
 //! ```ignore
-//! use bencher::{Benchmark, Bencher, Params, Summary};
+//! use bencher::{Bench, Benchmark, Params, Summary};
 //!
-//! fn params(record_size: usize) -> Params {
-//!     let mut labels = Params::new();
-//!     labels.insert("record_size", record_size.to_string());
-//!     labels
+//! fn make_params(record_size: usize) -> Params {
+//!     let mut p = Params::new();
+//!     p.insert("record_size", record_size.to_string());
+//!     p
 //! }
 //!
 //! struct LogAppendBenchmark;
@@ -35,31 +35,24 @@
 //!     fn name(&self) -> &str { "log_append" }
 //!
 //!     fn default_params(&self) -> Vec<Params> {
-//!         vec![params(64), params(256), params(1024)]
+//!         vec![make_params(64), make_params(256), make_params(1024)]
 //!     }
 //!
-//!     async fn run(&self, bencher: &Bencher, params: Vec<Params>) -> anyhow::Result<()> {
-//!         for labels in params {
-//!             let record_size: usize = labels.get_parse("record_size")?;
-//!             let bench = bencher.bench(labels);
+//!     async fn run(&self, bench: Bench) -> anyhow::Result<()> {
+//!         let record_size: usize = bench.spec().params().get_parse("record_size")?;
 //!
-//!             // Ongoing metrics - updated during benchmark, snapshotted periodically
-//!             let ops = bench.counter("operations");
-//!             let latency = bench.histogram("latency_us");
+//!         // Ongoing metrics - updated during benchmark, snapshotted periodically
+//!         let ops = bench.counter("operations");
+//!         let latency = bench.histogram("latency_us");
 //!
-//!             // ... run workload, updating metrics ...
+//!         // Run until the framework signals to stop
+//!         while bench.keep_running() {
+//!             // ... do work ...
 //!             ops.increment(1);
 //!             latency.record(42.0);
-//!
-//!             // Summary metrics - one-off results at the end
-//!             bench.summarize(
-//!                 Summary::new()
-//!                     .add("throughput_mb_s", 123.4)
-//!                     .add("elapsed_ms", 42.0)
-//!             ).await?;
-//!
-//!             bench.close().await?;
 //!         }
+//!
+//!         bench.close().await?;
 //!         Ok(())
 //!     }
 //! }
@@ -227,24 +220,70 @@ impl Bencher {
     }
 
     /// Start a new benchmark run with the given parameters.
-    ///
-    /// Parameters are converted to labels and combined with the Bencher's
-    /// static labels. Starts background reporting at the configured interval
-    /// if a reporter is configured.
-    pub fn bench(&self, params: impl Into<Vec<Label>>) -> Bench {
-        let mut labels = self.labels.clone();
-        labels.extend(params.into());
+    fn bench(&self, params: Params, duration: std::time::Duration) -> Bench {
+        let spec = BenchSpec::new(
+            params,
+            self.config.data.clone(),
+            self.labels.clone(),
+            duration,
+        );
         let interval = self.config.reporter.as_ref().map(|r| r.interval);
-        Bench::start(labels, self.reporter.clone(), interval)
+        Bench::start(spec, self.reporter.clone(), interval)
     }
 }
 
-/// Represents a single benchmark run with pre-set labels.
+/// Specification for a benchmark run.
 ///
-/// Created via [`Bencher::bench()`]. Records samples to the reporter
-/// and finalizes on [`close()`](Bench::close).
-pub struct Bench {
+/// Contains the parameters, data configuration, and labels for a benchmark.
+pub struct BenchSpec {
+    params: Params,
+    data: DataConfig,
     labels: Vec<Label>,
+    duration: std::time::Duration,
+}
+
+impl BenchSpec {
+    fn new(
+        params: Params,
+        data: DataConfig,
+        labels: Vec<Label>,
+        duration: std::time::Duration,
+    ) -> Self {
+        Self {
+            params,
+            data,
+            labels,
+            duration,
+        }
+    }
+
+    /// Access the benchmark parameters.
+    pub fn params(&self) -> &Params {
+        &self.params
+    }
+
+    /// Access the data storage configuration.
+    pub fn data(&self) -> &DataConfig {
+        &self.data
+    }
+
+    /// Get all labels (static labels + parameter labels).
+    fn all_labels(&self) -> Vec<Label> {
+        let mut labels = self.labels.clone();
+        let param_labels: Vec<Label> = self.params.clone().into();
+        labels.extend(param_labels);
+        labels
+    }
+}
+
+/// Runtime for recording benchmark metrics.
+///
+/// Created by the framework for each parameter combination.
+/// Provides access to the spec and metrics recording.
+pub struct Bench {
+    spec: BenchSpec,
+    start: std::time::Instant,
+    deadline: std::time::Instant,
     recorder: Arc<BenchRecorder>,
     reporter: Option<Arc<dyn Reporter>>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -253,19 +292,21 @@ pub struct Bench {
 
 impl Bench {
     fn start(
-        labels: Vec<Label>,
+        spec: BenchSpec,
         reporter: Option<Arc<dyn Reporter>>,
         interval: Option<std::time::Duration>,
     ) -> Self {
         let recorder = Arc::new(BenchRecorder::new());
+        let start = std::time::Instant::now();
+        let deadline = start + spec.duration;
 
-        // Only start background reporting if a reporter is configured
+        // Start background reporting if a reporter and interval are configured
         let (shutdown_tx, report_task) = match (&reporter, interval) {
             (Some(rep), Some(interval_duration)) => {
                 let (tx, mut rx) = tokio::sync::oneshot::channel();
                 let task_recorder = Arc::clone(&recorder);
                 let task_reporter = Arc::clone(rep);
-                let task_labels = labels.clone();
+                let task_labels = spec.all_labels();
 
                 let task = tokio::spawn(async move {
                     let mut interval = tokio::time::interval(interval_duration);
@@ -291,12 +332,32 @@ impl Bench {
         };
 
         Self {
-            labels,
+            spec,
+            start,
+            deadline,
             recorder,
             reporter,
             shutdown_tx,
             report_task,
         }
+    }
+
+    /// Access the benchmark specification.
+    pub fn spec(&self) -> &BenchSpec {
+        &self.spec
+    }
+
+    /// Get the elapsed time since the benchmark started.
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.start.elapsed()
+    }
+
+    /// Check if the benchmark should continue running.
+    ///
+    /// Returns `true` if the benchmark duration has not elapsed.
+    /// Benchmarks should call this in their main loop.
+    pub fn keep_running(&self) -> bool {
+        std::time::Instant::now() < self.deadline
     }
 
     /// Get a counter handle for recording incremental values.
@@ -360,7 +421,7 @@ impl Bench {
                 .into_iter()
                 .map(|(name, value)| {
                     let mut labels = vec![Label::metric_name(name)];
-                    labels.extend(self.labels.clone());
+                    labels.extend(self.spec.all_labels());
                     Series {
                         labels,
                         metric_type: Some(MetricType::Gauge),
@@ -378,9 +439,9 @@ impl Bench {
     /// Print summary to console with nice formatting.
     fn print_summary(&self, summary: &Summary) {
         // Print labels header
-        if !self.labels.is_empty() {
-            let labels_str: Vec<_> = self
-                .labels
+        let all_labels = self.spec.all_labels();
+        if !all_labels.is_empty() {
+            let labels_str: Vec<_> = all_labels
                 .iter()
                 .map(|l| format!("{}={}", l.name, l.value))
                 .collect();
@@ -422,7 +483,7 @@ impl Bench {
 
         // Final snapshot and report (only if reporter configured)
         if let Some(ref reporter) = self.reporter {
-            let series = self.recorder.snapshot(&self.labels);
+            let series = self.recorder.snapshot(&self.spec.all_labels());
             if !series.is_empty() {
                 reporter.write(series).await?;
             }
@@ -508,7 +569,13 @@ impl Bench {
         reporter: Arc<dyn Reporter>,
         interval: std::time::Duration,
     ) -> Self {
-        Self::start(labels, Some(reporter), Some(interval))
+        let spec = BenchSpec::new(
+            Params::new(),
+            DataConfig::default(),
+            labels,
+            std::time::Duration::from_secs(10),
+        );
+        Self::start(spec, Some(reporter), Some(interval))
     }
 }
 
@@ -531,12 +598,11 @@ pub trait Benchmark: Send + Sync {
         vec![]
     }
 
-    /// Run the benchmark with the provided parameterizations.
+    /// Run a single benchmark iteration with the given bench context.
     ///
-    /// Each `Params` represents one parameter combination.
-    /// Benchmarks should iterate over these and convert each to their
-    /// concrete `Params` type using `TryFrom<&Params>`.
-    async fn run(&self, bencher: &Bencher, params: Vec<Params>) -> anyhow::Result<()>;
+    /// The framework calls this once for each parameter combination.
+    /// Access parameters via `bench.params()` and storage config via `bench.data()`.
+    async fn run(&self, bench: Bench) -> anyhow::Result<()>;
 }
 
 /// Run a set of benchmarks.
@@ -549,12 +615,16 @@ pub async fn run(benchmarks: Vec<Box<dyn Benchmark>>) -> anyhow::Result<()> {
         .filter(|b| args.benchmark.as_ref().is_none_or(|name| b.name() == name))
         .collect();
 
+    let duration = args.duration();
+
     for benchmark in benchmarks {
         println!("Running benchmark: {}", benchmark.name());
         let bencher = Bencher::new(config.clone(), benchmark.name(), benchmark.labels()).await?;
         // TODO: Allow params to be provided externally (config file, CLI)
         let params = benchmark.default_params();
-        benchmark.run(&bencher, params).await?;
+        for p in params {
+            benchmark.run(bencher.bench(p, duration)).await?;
+        }
     }
 
     Ok(())

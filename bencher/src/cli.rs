@@ -1,6 +1,7 @@
 //! Command-line interface for the bencher.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 
@@ -17,12 +18,21 @@ pub struct Args {
     /// Run only the benchmark with this name.
     #[arg(short, long)]
     pub benchmark: Option<String>,
+
+    /// Duration for each benchmark run in seconds.
+    #[arg(short, long, default_value = "5")]
+    pub duration: u64,
 }
 
 impl Args {
     /// Parse CLI arguments.
     pub fn parse_args() -> Self {
         Self::parse()
+    }
+
+    /// Get the benchmark duration.
+    pub fn duration(&self) -> Duration {
+        Duration::from_secs(self.duration)
     }
 
     /// Load configuration from file or use defaults.
