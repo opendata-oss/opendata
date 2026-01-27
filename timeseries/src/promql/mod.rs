@@ -6,11 +6,11 @@ mod functions;
 pub(crate) mod metrics;
 mod middleware;
 pub(crate) mod openmetrics;
+#[cfg(feature = "otlp")]
+pub mod otlp;
 mod parser;
 #[cfg(feature = "remote-write")]
 pub(crate) mod remote_write;
-#[cfg(feature = "otlp")]
-pub mod otlp;
 
 mod request;
 mod response;

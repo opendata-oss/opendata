@@ -57,7 +57,11 @@ fn convert_otlp_request(req: ExportMetricsServiceRequest) -> Vec<Series> {
                                 .iter()
                                 .map(|kv| Label {
                                     name: kv.key.clone(),
-                                    value: kv.value.as_ref().map(otlp_value_to_string).unwrap_or_default(),
+                                    value: kv
+                                        .value
+                                        .as_ref()
+                                        .map(otlp_value_to_string)
+                                        .unwrap_or_default(),
                                 })
                                 .collect();
 
@@ -99,10 +103,7 @@ fn convert_otlp_request(req: ExportMetricsServiceRequest) -> Vec<Series> {
     series_list
 }
 
-pub async fn handle_otlp_metrics(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> StatusCode {
+pub async fn handle_otlp_metrics(State(state): State<AppState>, body: Bytes) -> StatusCode {
     #[cfg(feature = "otlp")]
     {
         let request = match decode_otlp_request(&body) {

@@ -127,10 +127,7 @@ impl PromqlServer {
         );
 
         #[cfg(feature = "otlp")]
-        let app = app.route(
-            "/v1/metrics",
-            post(super::otlp::handle_otlp_metrics),
-        );
+        let app = app.route("/v1/metrics", post(super::otlp::handle_otlp_metrics));
 
         let app = app
             .layer(TracingLayer::new())
