@@ -92,6 +92,28 @@ pub struct Record {
     pub value: Bytes,
 }
 
+/// Result of an append operation.
+///
+/// Contains metadata about the appended records, including the starting
+/// sequence number assigned to the first record in the batch.
+///
+/// # Example
+///
+/// ```ignore
+/// let result = log.append(records).await?;
+/// println!(
+///     "Appended {} records starting at sequence {}",
+///     result.records_appended, result.start_sequence
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendResult {
+    /// Sequence number assigned to the first record in the batch.
+    pub start_sequence: Sequence,
+    /// Number of records that were appended.
+    pub records_appended: usize,
+}
+
 /// An entry read from the log.
 ///
 /// Log entries are returned by [`LogIterator`](crate::LogIterator) and contain

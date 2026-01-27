@@ -5,10 +5,11 @@
 
 mod config;
 mod error;
-mod handlers;
+pub mod handlers;
 mod http;
-mod metrics;
+pub mod metrics;
 mod middleware;
+pub mod proto;
 mod request;
 mod response;
 

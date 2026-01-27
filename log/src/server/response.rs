@@ -1,87 +1,217 @@
 //! HTTP response types for the log server.
 
+use axum::Json;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use prost::Message;
 use serde::Serialize;
+use serde_with::{base64::Base64, serde_as};
 
+use super::proto;
 use crate::LogEntry;
 
-/// A single entry in a scan response.
-#[derive(Debug, Serialize)]
-pub struct ScanEntry {
-    /// Key (UTF-8 string).
-    pub key: String,
-    /// Sequence number.
-    pub sequence: u64,
-    /// Value (UTF-8 string).
-    pub value: String,
+/// Content type for binary protobuf.
+const CONTENT_TYPE_PROTOBUF: &str = "application/x-protobuf";
+
+/// Desired response format based on Accept header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseFormat {
+    Json,
+    Protobuf,
 }
 
-impl From<&LogEntry> for ScanEntry {
-    fn from(entry: &LogEntry) -> Self {
+impl ResponseFormat {
+    /// Determine response format from request headers.
+    pub fn from_headers(headers: &HeaderMap) -> Self {
+        let wants_protobuf = headers
+            .get(header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.contains(CONTENT_TYPE_PROTOBUF))
+            .unwrap_or(false);
+
+        if wants_protobuf {
+            ResponseFormat::Protobuf
+        } else {
+            ResponseFormat::Json
+        }
+    }
+}
+
+/// Response type that can be either JSON or protobuf.
+pub enum ApiResponse {
+    Json(Json<serde_json::Value>),
+    Protobuf(Vec<u8>),
+}
+
+impl IntoResponse for ApiResponse {
+    fn into_response(self) -> Response {
+        match self {
+            ApiResponse::Json(json) => json.into_response(),
+            ApiResponse::Protobuf(bytes) => {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, CONTENT_TYPE_PROTOBUF)],
+                    bytes,
+                )
+                    .into_response()
+            }
+        }
+    }
+}
+
+/// Trait for response types that can be converted to ApiResponse.
+///
+/// Implementors provide conversion to both JSON and protobuf formats,
+/// allowing handlers to delegate format selection to the response type.
+pub trait IntoApiResponse {
+    /// The protobuf message type for this response.
+    type Proto: Message;
+
+    /// Convert to the protobuf representation.
+    fn into_proto(self) -> Self::Proto;
+
+    /// Convert to ApiResponse in the specified format.
+    fn into_api_response(self, format: ResponseFormat) -> ApiResponse
+    where
+        Self: Sized + Serialize,
+    {
+        match format {
+            ResponseFormat::Json => {
+                ApiResponse::Json(Json(serde_json::to_value(self).unwrap()))
+            }
+            ResponseFormat::Protobuf => {
+                ApiResponse::Protobuf(self.into_proto().encode_to_vec())
+            }
+        }
+    }
+}
+
+/// A single entry in a scan response.
+///
+/// Per RFC 0004, entries only contain sequence and value (not key).
+/// The key is included at the top level of the ScanResponse.
+#[serde_as]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanEntry {
+    /// Sequence number.
+    pub sequence: u64,
+    /// Value (base64-encoded bytes).
+    #[serde_as(as = "Base64")]
+    pub value: Bytes,
+}
+
+impl ScanEntry {
+    /// Create a scan entry from a LogEntry.
+    pub fn from_log_entry(entry: &LogEntry) -> Self {
         Self {
-            key: String::from_utf8_lossy(&entry.key).into_owned(),
             sequence: entry.sequence,
-            value: String::from_utf8_lossy(&entry.value).into_owned(),
+            value: entry.value.clone(),
         }
     }
 }
 
 /// Response for scan requests.
+///
+/// Per RFC 0004, the key is at the top level and entries contain only sequence + value.
+#[serde_as]
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScanResponse {
     /// Status of the response.
     pub status: String,
+    /// The key that was scanned (base64-encoded bytes).
+    #[serde_as(as = "Base64")]
+    pub key: Bytes,
     /// Entries returned by the scan.
     pub entries: Vec<ScanEntry>,
 }
 
 impl ScanResponse {
     /// Create a successful scan response.
-    pub fn success(entries: Vec<ScanEntry>) -> Self {
+    pub fn success(key: Bytes, entries: Vec<ScanEntry>) -> Self {
         Self {
             status: "success".to_string(),
+            key,
             entries,
         }
     }
 }
 
+impl IntoApiResponse for ScanResponse {
+    type Proto = proto::ScanResponse;
+
+    fn into_proto(self) -> Self::Proto {
+        proto::ScanResponse {
+            status: self.status,
+            key: self.key,
+            entries: self
+                .entries
+                .into_iter()
+                .map(|e| proto::Entry {
+                    sequence: e.sequence,
+                    value: e.value,
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Response for append requests.
+///
+/// Per RFC 0004, includes the starting sequence number.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppendResponse {
     /// Status of the response.
     pub status: String,
     /// Number of records appended.
     pub records_appended: usize,
+    /// Sequence number of the first appended record.
+    pub start_sequence: u64,
 }
 
 impl AppendResponse {
     /// Create a successful append response.
-    pub fn success(records_appended: usize) -> Self {
+    pub fn success(records_appended: usize, start_sequence: u64) -> Self {
         Self {
             status: "success".to_string(),
             records_appended,
+            start_sequence,
         }
     }
 }
 
-/// A key entry in a list keys response.
-#[derive(Debug, Serialize)]
-pub struct KeyEntry {
-    /// Key (UTF-8 string).
-    pub key: String,
+impl IntoApiResponse for AppendResponse {
+    type Proto = proto::AppendResponse;
+
+    fn into_proto(self) -> Self::Proto {
+        proto::AppendResponse {
+            status: self.status,
+            records_appended: self.records_appended as i32,
+            start_sequence: self.start_sequence,
+        }
+    }
 }
 
 /// Response for list keys requests.
+///
+/// Per RFC 0004, keys is an array of base64-encoded strings.
+#[serde_as]
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListKeysResponse {
     /// Status of the response.
     pub status: String,
-    /// Keys in the log.
-    pub keys: Vec<KeyEntry>,
+    /// Keys in the log (base64-encoded bytes).
+    #[serde_as(as = "Vec<Base64>")]
+    pub keys: Vec<Bytes>,
 }
 
 impl ListKeysResponse {
     /// Create a successful list keys response.
-    pub fn success(keys: Vec<KeyEntry>) -> Self {
+    pub fn success(keys: Vec<Bytes>) -> Self {
         Self {
             status: "success".to_string(),
             keys,
@@ -89,8 +219,22 @@ impl ListKeysResponse {
     }
 }
 
+impl IntoApiResponse for ListKeysResponse {
+    type Proto = proto::KeysResponse;
+
+    fn into_proto(self) -> Self::Proto {
+        proto::KeysResponse {
+            status: self.status,
+            keys: self.keys,
+        }
+    }
+}
+
 /// A segment entry in a list segments response.
+///
+/// Per RFC 0004, uses camelCase field names.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SegmentEntry {
     /// Unique segment identifier.
     pub id: u32,
@@ -102,6 +246,7 @@ pub struct SegmentEntry {
 
 /// Response for list segments requests.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListSegmentsResponse {
     /// Status of the response.
     pub status: String,
@@ -119,8 +264,28 @@ impl ListSegmentsResponse {
     }
 }
 
+impl IntoApiResponse for ListSegmentsResponse {
+    type Proto = proto::SegmentsResponse;
+
+    fn into_proto(self) -> Self::Proto {
+        proto::SegmentsResponse {
+            status: self.status,
+            segments: self
+                .segments
+                .into_iter()
+                .map(|s| proto::Segment {
+                    id: s.id,
+                    start_seq: s.start_seq,
+                    start_time_ms: s.start_time_ms,
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Response for count requests.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CountResponse {
     /// Status of the response.
     pub status: String,
@@ -138,10 +303,20 @@ impl CountResponse {
     }
 }
 
+impl IntoApiResponse for CountResponse {
+    type Proto = proto::CountResponse;
+
+    fn into_proto(self) -> Self::Proto {
+        proto::CountResponse {
+            status: self.status,
+            count: self.count,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
 
     #[test]
     fn should_convert_log_entry_to_scan_entry() {
@@ -153,38 +328,107 @@ mod tests {
         };
 
         // when
-        let scan_entry = ScanEntry::from(&entry);
+        let scan_entry = ScanEntry::from_log_entry(&entry);
 
         // then
-        assert_eq!(scan_entry.key, "test-key");
         assert_eq!(scan_entry.sequence, 42);
-        assert_eq!(scan_entry.value, "test-value");
+        assert_eq!(scan_entry.value, Bytes::from("test-value"));
     }
 
     #[test]
     fn should_create_success_scan_response() {
         // given
         let entries = vec![ScanEntry {
-            key: "key".to_string(),
             sequence: 0,
-            value: "value".to_string(),
+            value: Bytes::from("value"),
         }];
 
         // when
-        let response = ScanResponse::success(entries);
+        let response = ScanResponse::success(Bytes::from("key"), entries);
 
         // then
         assert_eq!(response.status, "success");
+        assert_eq!(response.key, Bytes::from("key"));
         assert_eq!(response.entries.len(), 1);
+    }
+
+    #[test]
+    fn should_serialize_scan_response_with_camel_case() {
+        // given
+        let response = ScanResponse::success(
+            Bytes::from("test-key"),
+            vec![ScanEntry {
+                sequence: 42,
+                value: Bytes::from("test-value"),
+            }],
+        );
+
+        // when
+        let json = serde_json::to_string(&response).unwrap();
+
+        // then
+        // "test-key" -> "dGVzdC1rZXk=", "test-value" -> "dGVzdC12YWx1ZQ=="
+        assert!(json.contains(r#""status":"success""#));
+        assert!(json.contains(r#""key":"dGVzdC1rZXk=""#));
+        assert!(json.contains(r#""sequence":42"#));
+        assert!(json.contains(r#""value":"dGVzdC12YWx1ZQ==""#));
     }
 
     #[test]
     fn should_create_success_append_response() {
         // given/when
-        let response = AppendResponse::success(5);
+        let response = AppendResponse::success(5, 100);
 
         // then
         assert_eq!(response.status, "success");
         assert_eq!(response.records_appended, 5);
+        assert_eq!(response.start_sequence, 100);
+    }
+
+    #[test]
+    fn should_serialize_append_response_with_camel_case() {
+        // given
+        let response = AppendResponse::success(3, 42);
+
+        // when
+        let json = serde_json::to_string(&response).unwrap();
+
+        // then
+        assert!(json.contains(r#""recordsAppended":3"#));
+        assert!(json.contains(r#""startSequence":42"#));
+    }
+
+    #[test]
+    fn should_serialize_list_keys_response_with_base64() {
+        // given
+        let response = ListKeysResponse::success(vec![
+            Bytes::from("events"),
+            Bytes::from("orders"),
+        ]);
+
+        // when
+        let json = serde_json::to_string(&response).unwrap();
+
+        // then
+        // "events" -> "ZXZlbnRz", "orders" -> "b3JkZXJz"
+        assert!(json.contains(r#""keys":["ZXZlbnRz","b3JkZXJz"]"#));
+    }
+
+    #[test]
+    fn should_serialize_segments_response_with_camel_case() {
+        // given
+        let response = ListSegmentsResponse::success(vec![SegmentEntry {
+            id: 0,
+            start_seq: 100,
+            start_time_ms: 1705766400000,
+        }]);
+
+        // when
+        let json = serde_json::to_string(&response).unwrap();
+
+        // then
+        assert!(json.contains(r#""id":0"#));
+        assert!(json.contains(r#""startSeq":100"#));
+        assert!(json.contains(r#""startTimeMs":1705766400000"#));
     }
 }

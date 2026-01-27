@@ -1,9 +1,25 @@
 //! HTTP request types for the log server.
 
+use axum::http::{HeaderMap, header};
 use bytes::Bytes;
+use prost::Message;
 use serde::Deserialize;
+use serde_with::{base64::Base64, serde_as};
 
+use super::proto;
 use crate::Error;
+
+/// Content type for binary protobuf.
+const CONTENT_TYPE_PROTOBUF: &str = "application/x-protobuf";
+
+/// Check if the request body is protobuf based on Content-Type header.
+fn is_protobuf_content(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.contains(CONTENT_TYPE_PROTOBUF))
+        .unwrap_or(false)
+}
 
 /// Query parameters for scan requests.
 #[derive(Debug, Deserialize)]
@@ -95,45 +111,117 @@ impl CountParams {
     }
 }
 
-/// A single record in an append request.
+/// A single record in a JSON append request.
+///
+/// Uses camelCase field names and base64-encoded bytes per RFC 0004.
+#[serde_as]
 #[derive(Debug, Deserialize)]
-pub struct AppendRecord {
-    /// Key (plain string).
-    pub key: String,
-    /// Value (plain string).
-    pub value: String,
+#[serde(rename_all = "camelCase")]
+struct AppendRecordJson {
+    /// Key (base64-encoded bytes).
+    #[serde_as(as = "Base64")]
+    pub key: Bytes,
+    /// Value (base64-encoded bytes).
+    #[serde_as(as = "Base64")]
+    pub value: Bytes,
 }
 
-impl AppendRecord {
-    /// Convert to a log Record.
-    pub fn to_record(&self) -> Result<crate::Record, Error> {
-        Ok(crate::Record {
-            key: Bytes::from(self.key.clone()),
-            value: Bytes::from(self.value.clone()),
-        })
-    }
-}
-
-/// Request body for append operations.
+/// JSON request body for append operations.
+///
+/// Uses camelCase field names per RFC 0004.
 #[derive(Debug, Deserialize)]
-pub struct AppendBody {
+#[serde(rename_all = "camelCase")]
+struct AppendBodyJson {
     /// Records to append.
-    pub records: Vec<AppendRecord>,
+    pub records: Vec<AppendRecordJson>,
     /// Whether to wait for durable write.
     #[serde(default)]
     pub await_durable: bool,
 }
 
-impl AppendBody {
-    /// Convert all records to log Records.
-    pub fn to_records(&self) -> Result<Vec<crate::Record>, Error> {
-        self.records.iter().map(|r| r.to_record()).collect()
+/// Unified append request that can be parsed from either JSON or protobuf.
+///
+/// Per RFC 0004, supports both `Content-Type: application/json` (ProtoJSON)
+/// and `Content-Type: application/x-protobuf` (binary protobuf).
+#[derive(Debug)]
+pub struct AppendRequest {
+    /// Records to append.
+    pub records: Vec<crate::Record>,
+    /// Whether to wait for durable write.
+    pub await_durable: bool,
+}
+
+impl AppendRequest {
+    /// Parse an append request from the raw body based on Content-Type header.
+    ///
+    /// - `application/x-protobuf`: Parse as binary protobuf
+    /// - `application/json` (or other): Parse as ProtoJSON
+    pub fn from_body(headers: &HeaderMap, body: &[u8]) -> Result<Self, Error> {
+        if is_protobuf_content(headers) {
+            Self::from_protobuf(body)
+        } else {
+            Self::from_json(body)
+        }
+    }
+
+    /// Parse from binary protobuf.
+    fn from_protobuf(body: &[u8]) -> Result<Self, Error> {
+        let proto_request = proto::AppendRequest::decode(body)
+            .map_err(|e| Error::InvalidInput(format!("Invalid protobuf: {}", e)))?;
+
+        let records = proto_request
+            .records
+            .into_iter()
+            .map(|r| crate::Record {
+                key: r.key,
+                value: r.value,
+            })
+            .collect();
+
+        Ok(Self {
+            records,
+            await_durable: proto_request.await_durable,
+        })
+    }
+
+    /// Parse from JSON (ProtoJSON format).
+    fn from_json(body: &[u8]) -> Result<Self, Error> {
+        let json_body: AppendBodyJson = serde_json::from_slice(body)
+            .map_err(|e| Error::InvalidInput(format!("Invalid JSON: {}", e)))?;
+
+        let records = json_body
+            .records
+            .into_iter()
+            .map(|r| crate::Record {
+                key: r.key,
+                value: r.value,
+            })
+            .collect();
+
+        Ok(Self {
+            records,
+            await_durable: json_body.await_durable,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use axum::http::HeaderValue;
+
     use super::*;
+
+    fn json_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers
+    }
+
+    fn protobuf_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/x-protobuf"));
+        headers
+    }
 
     #[test]
     fn should_get_key_as_bytes() {
@@ -153,19 +241,84 @@ mod tests {
     }
 
     #[test]
-    fn should_convert_append_record() {
-        // given
-        let record = AppendRecord {
-            key: "events".to_string(),
-            value: r#"{"event": "click"}"#.to_string(),
-        };
+    fn should_parse_append_request_from_json() {
+        // given - camelCase JSON with base64 encoded bytes
+        // "test-key" -> "dGVzdC1rZXk=", "test-value" -> "dGVzdC12YWx1ZQ=="
+        let json = br#"{
+            "records": [{"key": "dGVzdC1rZXk=", "value": "dGVzdC12YWx1ZQ=="}],
+            "awaitDurable": true
+        }"#;
 
         // when
-        let log_record = record.to_record().unwrap();
+        let request = AppendRequest::from_body(&json_headers(), json).unwrap();
 
         // then
-        assert_eq!(log_record.key.as_ref(), b"events");
-        assert_eq!(log_record.value.as_ref(), br#"{"event": "click"}"#);
+        assert_eq!(request.records.len(), 1);
+        assert_eq!(request.records[0].key, Bytes::from("test-key"));
+        assert_eq!(request.records[0].value, Bytes::from("test-value"));
+        assert!(request.await_durable);
+    }
+
+    #[test]
+    fn should_parse_append_request_from_json_without_await_durable() {
+        // given - awaitDurable defaults to false when not specified
+        let json = br#"{
+            "records": [{"key": "a2V5", "value": "dmFsdWU="}]
+        }"#;
+
+        // when
+        let request = AppendRequest::from_body(&json_headers(), json).unwrap();
+
+        // then
+        assert!(!request.await_durable);
+    }
+
+    #[test]
+    fn should_parse_append_request_from_protobuf() {
+        // given
+        let proto_request = proto::AppendRequest {
+            records: vec![proto::Record {
+                key: Bytes::from("proto-key"),
+                value: Bytes::from("proto-value"),
+            }],
+            await_durable: true,
+        };
+        let body = proto_request.encode_to_vec();
+
+        // when
+        let request = AppendRequest::from_body(&protobuf_headers(), &body).unwrap();
+
+        // then
+        assert_eq!(request.records.len(), 1);
+        assert_eq!(request.records[0].key, Bytes::from("proto-key"));
+        assert_eq!(request.records[0].value, Bytes::from("proto-value"));
+        assert!(request.await_durable);
+    }
+
+    #[test]
+    fn should_return_error_for_invalid_json() {
+        // given
+        let body = b"not valid json";
+
+        // when
+        let result = AppendRequest::from_body(&json_headers(), body);
+
+        // then
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid JSON"));
+    }
+
+    #[test]
+    fn should_return_error_for_invalid_protobuf() {
+        // given
+        let body = &[0xFF, 0xFF, 0xFF];
+
+        // when
+        let result = AppendRequest::from_body(&protobuf_headers(), body);
+
+        // then
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid protobuf"));
     }
 
     #[test]

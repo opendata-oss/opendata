@@ -1,19 +1,24 @@
 //! HTTP route handlers for the log server.
+//!
+//! Per RFC 0004, handlers support both binary protobuf (`application/x-protobuf`)
+//! and ProtoJSON (`application/json`) formats.
 
 use std::sync::Arc;
 
-use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Query, State};
+use axum::http::HeaderMap;
 
 use super::error::ApiError;
 use super::metrics::{AppendLabels, Metrics, OperationStatus, ScanLabels};
-use super::request::{AppendBody, CountParams, ListKeysParams, ListSegmentsParams, ScanParams};
+use super::request::{AppendRequest, CountParams, ListKeysParams, ListSegmentsParams, ScanParams};
 use super::response::{
-    AppendResponse, CountResponse, KeyEntry, ListKeysResponse, ListSegmentsResponse, ScanEntry,
-    ScanResponse, SegmentEntry,
+    ApiResponse, AppendResponse, CountResponse, IntoApiResponse, ListKeysResponse,
+    ListSegmentsResponse, ResponseFormat, ScanEntry, ScanResponse, SegmentEntry,
 };
 use crate::config::WriteOptions;
-use crate::{Log, LogRead};
+use crate::reader::LogRead;
+use crate::Log;
 
 /// Shared application state.
 #[derive(Clone)]
@@ -23,20 +28,26 @@ pub struct AppState {
 }
 
 /// Handle POST /api/v1/log/append
+///
+/// Supports both `Content-Type: application/x-protobuf` and `Content-Type: application/json`.
+/// Returns response in format matching the `Accept` header.
 pub async fn handle_append(
     State(state): State<AppState>,
-    Json(body): Json<AppendBody>,
-) -> Result<Json<AppendResponse>, ApiError> {
-    let records = body.to_records()?;
-    let count = records.len();
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<ApiResponse, ApiError> {
+    let format = ResponseFormat::from_headers(&headers);
 
+    // Parse request body based on Content-Type
+    let request = AppendRequest::from_body(&headers, &body)?;
+
+    let count = request.records.len();
     let options = WriteOptions {
-        await_durable: body.await_durable,
+        await_durable: request.await_durable,
     };
 
-    match state.log.append_with_options(records, options).await {
-        Ok(()) => {
-            // Record metrics
+    match state.log.append_with_options(request.records, options).await {
+        Ok(result) => {
             state.metrics.log_append_records_total.inc_by(count as u64);
             state
                 .metrics
@@ -46,7 +57,8 @@ pub async fn handle_append(
                 })
                 .inc();
 
-            Ok(Json(AppendResponse::success(count)))
+            let response = AppendResponse::success(result.records_appended, result.start_sequence);
+            Ok(response.into_api_response(format))
         }
         Err(e) => {
             state
@@ -63,19 +75,23 @@ pub async fn handle_append(
 }
 
 /// Handle GET /api/v1/log/scan
+///
+/// Returns response in format matching the `Accept` header.
 pub async fn handle_scan(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<ScanParams>,
-) -> Result<Json<ScanResponse>, ApiError> {
+) -> Result<ApiResponse, ApiError> {
+    let format = ResponseFormat::from_headers(&headers);
     let key = params.key();
     let range = params.seq_range();
     let limit = params.limit.unwrap_or(1000);
 
-    match state.log.scan(key, range).await {
+    match state.log.scan(key.clone(), range).await {
         Ok(mut iter) => {
             let mut entries = Vec::new();
             while let Some(entry) = iter.next().await.map_err(ApiError::from)? {
-                entries.push(ScanEntry::from(&entry));
+                entries.push(entry);
                 if entries.len() >= limit {
                     break;
                 }
@@ -89,7 +105,12 @@ pub async fn handle_scan(
                 })
                 .inc();
 
-            Ok(Json(ScanResponse::success(entries)))
+            let scan_entries: Vec<ScanEntry> = entries
+                .iter()
+                .map(ScanEntry::from_log_entry)
+                .collect();
+            let response = ScanResponse::success(key, scan_entries);
+            Ok(response.into_api_response(format))
         }
         Err(e) => {
             state
@@ -106,33 +127,40 @@ pub async fn handle_scan(
 }
 
 /// Handle GET /api/v1/log/keys
+///
+/// Returns response in format matching the `Accept` header.
 pub async fn handle_list_keys(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<ListKeysParams>,
-) -> Result<Json<ListKeysResponse>, ApiError> {
+) -> Result<ApiResponse, ApiError> {
+    let format = ResponseFormat::from_headers(&headers);
     let segment_range = params.segment_range();
     let limit = params.limit.unwrap_or(1000);
 
     let mut iter = state.log.list_keys(segment_range).await?;
-    let mut keys = Vec::new();
+    let mut keys: Vec<bytes::Bytes> = Vec::new();
 
     while let Some(log_key) = iter.next().await.map_err(ApiError::from)? {
-        keys.push(KeyEntry {
-            key: String::from_utf8_lossy(&log_key.key).into_owned(),
-        });
+        keys.push(log_key.key);
         if keys.len() >= limit {
             break;
         }
     }
 
-    Ok(Json(ListKeysResponse::success(keys)))
+    let response = ListKeysResponse::success(keys);
+    Ok(response.into_api_response(format))
 }
 
 /// Handle GET /api/v1/log/segments
+///
+/// Returns response in format matching the `Accept` header.
 pub async fn handle_list_segments(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<ListSegmentsParams>,
-) -> Result<Json<ListSegmentsResponse>, ApiError> {
+) -> Result<ApiResponse, ApiError> {
+    let format = ResponseFormat::from_headers(&headers);
     let seq_range = params.seq_range();
 
     let segments = state.log.list_segments(seq_range).await?;
@@ -145,20 +173,26 @@ pub async fn handle_list_segments(
         })
         .collect();
 
-    Ok(Json(ListSegmentsResponse::success(segment_entries)))
+    let response = ListSegmentsResponse::success(segment_entries);
+    Ok(response.into_api_response(format))
 }
 
 /// Handle GET /api/v1/log/count
+///
+/// Returns response in format matching the `Accept` header.
 pub async fn handle_count(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<CountParams>,
-) -> Result<Json<CountResponse>, ApiError> {
+) -> Result<ApiResponse, ApiError> {
+    let format = ResponseFormat::from_headers(&headers);
     let key = params.key();
     let range = params.seq_range();
 
     let count = state.log.count(key, range).await?;
 
-    Ok(Json(CountResponse::success(count)))
+    let response = CountResponse::success(count);
+    Ok(response.into_api_response(format))
 }
 
 /// Handle GET /metrics

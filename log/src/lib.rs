@@ -58,5 +58,5 @@ pub use config::{Config, CountOptions, ScanOptions, SegmentConfig, WriteOptions}
 pub use error::{Error, Result};
 pub use listing::{LogKey, LogKeyIterator};
 pub use log::Log;
-pub use model::{LogEntry, Record, Segment, SegmentId, Sequence};
+pub use model::{AppendResult, LogEntry, Record, Segment, SegmentId, Sequence};
 pub use reader::{LogIterator, LogRead, LogReader};

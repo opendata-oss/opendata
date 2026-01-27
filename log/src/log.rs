@@ -18,7 +18,7 @@ use crate::config::{CountOptions, ScanOptions, WriteOptions};
 use crate::error::{Error, Result};
 use crate::listing::ListingCache;
 use crate::listing::LogKeyIterator;
-use crate::model::{Record, Segment, SegmentId, Sequence};
+use crate::model::{AppendResult, Record, Segment, SegmentId, Sequence};
 use crate::range::{normalize_segment_id, normalize_sequence};
 use crate::reader::{LogIterator, LogRead};
 use crate::segment::SegmentCache;
@@ -147,6 +147,11 @@ impl Log {
     /// * `records` - The records to append. Each record specifies its target
     ///   key and value.
     ///
+    /// # Returns
+    ///
+    /// On success, returns an [`AppendResult`] containing the starting sequence
+    /// number and number of records appended.
+    ///
     /// # Errors
     ///
     /// Returns an error if the write fails due to storage issues.
@@ -158,11 +163,12 @@ impl Log {
     ///     Record { key: Bytes::from("events"), value: Bytes::from("event-1") },
     ///     Record { key: Bytes::from("events"), value: Bytes::from("event-2") },
     /// ];
-    /// log.append(records).await?;
+    /// let result = log.append(records).await?;
+    /// println!("Appended {} records at seq {}", result.records_appended, result.start_sequence);
     /// ```
     ///
     /// [`append_with_options`]: Log::append_with_options
-    pub async fn append(&self, records: Vec<Record>) -> Result<()> {
+    pub async fn append(&self, records: Vec<Record>) -> Result<AppendResult> {
         self.append_with_options(records, WriteOptions::default())
             .await
     }
@@ -178,6 +184,11 @@ impl Log {
     ///   key and value.
     /// * `options` - Write options controlling durability behavior.
     ///
+    /// # Returns
+    ///
+    /// On success, returns an [`AppendResult`] containing the starting sequence
+    /// number and number of records appended.
+    ///
     /// # Errors
     ///
     /// Returns an error if the write fails due to storage issues.
@@ -189,15 +200,20 @@ impl Log {
     ///     Record { key: Bytes::from("events"), value: Bytes::from("critical-event") },
     /// ];
     /// let options = WriteOptions { await_durable: true };
-    /// log.append_with_options(records, options).await?;
+    /// let result = log.append_with_options(records, options).await?;
+    /// println!("Started at sequence {}", result.start_sequence);
     /// ```
     pub async fn append_with_options(
         &self,
         records: Vec<Record>,
         options: WriteOptions,
-    ) -> Result<()> {
+    ) -> Result<AppendResult> {
+        let records_appended = records.len();
         if records.is_empty() {
-            return Ok(());
+            return Ok(AppendResult {
+                start_sequence: 0,
+                records_appended: 0,
+            });
         }
 
         let current_time_ms = self.current_time_ms();
@@ -211,6 +227,7 @@ impl Log {
         let seq_delta = inner
             .sequence_allocator
             .build_delta(records.len() as u64, &mut storage_records);
+        let start_sequence = seq_delta.base_sequence();
         let seg_delta = inner.segment_cache.build_delta(
             current_time_ms,
             seq_delta.base_sequence(),
@@ -241,7 +258,10 @@ impl Log {
         inner.segment_cache.apply_delta(seg_delta);
         inner.listing_cache.apply_delta(listing_delta);
 
-        Ok(())
+        Ok(AppendResult {
+            start_sequence,
+            records_appended,
+        })
     }
 
     /// Returns the current time in milliseconds since Unix epoch.

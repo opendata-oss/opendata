@@ -16,8 +16,10 @@ axum.workspace = true
 bytes.workspace = true
 clap.workspace = true
 common.workspace = true
+prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_with.workspace = true
 slatedb.workspace = true
 tokio.workspace = true
 tower.workspace = true
@@ -27,5 +29,6 @@ tracing-subscriber.workspace = true
 prometheus-client = "0.22"
 
 [dev-dependencies]
+base64.workspace = true
 proptest.workspace = true
 reqwest.workspace = true
