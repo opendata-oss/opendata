@@ -6,7 +6,7 @@ use axum::extract::{FromRequest, Path, Query, State};
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-#[cfg(feature = "remote-write")]
+#[cfg(any(feature = "remote-write", feature = "otlp"))]
 use axum::routing::post;
 use axum::{Form, extract::Request};
 use axum::{Json, Router};
@@ -125,6 +125,9 @@ impl PromqlServer {
             "/api/v1/write",
             post(super::remote_write::handle_remote_write),
         );
+
+        #[cfg(feature = "otlp")]
+        let app = app.route("/v1/metrics", post(super::otlp::handle_otlp_metrics));
 
         let app = app
             .layer(TracingLayer::new())
