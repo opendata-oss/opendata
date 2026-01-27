@@ -1,3 +1,4 @@
+#![cfg(feature = "http-server")]
 //! Integration tests for the log HTTP server.
 
 use std::sync::Arc;

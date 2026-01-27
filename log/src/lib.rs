@@ -51,6 +51,7 @@ mod reader;
 mod segment;
 mod sequence;
 mod serde;
+#[cfg(feature = "http-server")]
 pub mod server;
 mod storage;
 

@@ -9,12 +9,15 @@ path = "src/lib.rs"
 [[bin]]
 name = "log"
 path = "src/main.rs"
+required-features = ["http-server"]
+
+[features]
+default = []
+http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prometheus-client"]
 
 [dependencies]
 async-trait.workspace = true
-axum.workspace = true
 bytes.workspace = true
-clap.workspace = true
 common.workspace = true
 prost.workspace = true
 serde.workspace = true
@@ -22,11 +25,14 @@ serde_json.workspace = true
 serde_with.workspace = true
 slatedb.workspace = true
 tokio.workspace = true
-tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-prometheus-client = "0.22"
+# HTTP server dependencies (optional, enabled by http-server feature)
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+prometheus-client = { version = "0.22", optional = true }
 
 [dev-dependencies]
 base64.workspace = true

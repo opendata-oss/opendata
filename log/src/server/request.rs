@@ -7,14 +7,8 @@ use serde::Deserialize;
 use serde_with::{base64::Base64, serde_as};
 
 use super::proto;
-use super::response::KeyJson;
+use super::response::{CONTENT_TYPE_PROTOBUF, CONTENT_TYPE_PROTOJSON, KeyJson};
 use crate::Error;
-
-/// Content type for binary protobuf.
-const CONTENT_TYPE_PROTOBUF: &str = "application/protobuf";
-
-/// Content type for ProtoJSON.
-const CONTENT_TYPE_PROTOJSON: &str = "application/protobuf+json";
 
 /// Check if the request body is protobuf based on Content-Type header.
 /// Only matches `application/protobuf`, not `application/protobuf+json`.

@@ -1,3 +1,4 @@
+#![cfg(feature = "http-server")]
 //! Integration tests for HTTP API with JSON and protobuf formats.
 //!
 //! Tests both ProtoJSON (application/protobuf+json) and binary protobuf (application/protobuf)

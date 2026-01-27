@@ -12,10 +12,10 @@ use super::proto;
 use crate::LogEntry;
 
 /// Content type for binary protobuf.
-const CONTENT_TYPE_PROTOBUF: &str = "application/protobuf";
+pub(super) const CONTENT_TYPE_PROTOBUF: &str = "application/protobuf";
 
 /// Content type for ProtoJSON.
-const CONTENT_TYPE_PROTOJSON: &str = "application/protobuf+json";
+pub(super) const CONTENT_TYPE_PROTOJSON: &str = "application/protobuf+json";
 
 /// Desired response format based on Accept header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

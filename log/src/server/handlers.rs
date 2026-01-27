@@ -89,7 +89,7 @@ pub async fn handle_scan(
     let format = ResponseFormat::from_headers(&headers);
     let key = params.key();
     let range = params.seq_range();
-    let limit = params.limit.unwrap_or(1000);
+    let limit = params.limit.unwrap_or(32);
 
     match state.log.scan(key.clone(), range).await {
         Ok(mut iter) => {
@@ -138,7 +138,7 @@ pub async fn handle_list_keys(
 ) -> Result<ApiResponse, ApiError> {
     let format = ResponseFormat::from_headers(&headers);
     let segment_range = params.segment_range();
-    let limit = params.limit.unwrap_or(1000);
+    let limit = params.limit.unwrap_or(32);
 
     let mut iter = state.log.list_keys(segment_range).await?;
     let mut keys: Vec<bytes::Bytes> = Vec::new();
