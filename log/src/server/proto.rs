@@ -176,10 +176,7 @@ mod tests {
         // given
         let response = KeysResponse {
             status: "success".to_string(),
-            keys: vec![
-                bytes::Bytes::from("key-a"),
-                bytes::Bytes::from("key-b"),
-            ],
+            keys: vec![bytes::Bytes::from("key-a"), bytes::Bytes::from("key-b")],
         };
 
         // when

@@ -16,9 +16,9 @@ use super::response::{
     ApiResponse, AppendResponse, CountResponse, IntoApiResponse, ListKeysResponse,
     ListSegmentsResponse, ResponseFormat, ScanEntry, ScanResponse, SegmentEntry,
 };
+use crate::Log;
 use crate::config::WriteOptions;
 use crate::reader::LogRead;
-use crate::Log;
 
 /// Shared application state.
 #[derive(Clone)]
@@ -46,7 +46,11 @@ pub async fn handle_append(
         await_durable: request.await_durable,
     };
 
-    match state.log.append_with_options(request.records, options).await {
+    match state
+        .log
+        .append_with_options(request.records, options)
+        .await
+    {
         Ok(result) => {
             state.metrics.log_append_records_total.inc_by(count as u64);
             state
@@ -105,10 +109,8 @@ pub async fn handle_scan(
                 })
                 .inc();
 
-            let scan_entries: Vec<ScanEntry> = entries
-                .iter()
-                .map(ScanEntry::from_log_entry)
-                .collect();
+            let scan_entries: Vec<ScanEntry> =
+                entries.iter().map(ScanEntry::from_log_entry).collect();
             let response = ScanResponse::success(key, scan_entries);
             Ok(response.into_api_response(format))
         }

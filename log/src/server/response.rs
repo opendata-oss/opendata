@@ -48,14 +48,12 @@ impl IntoResponse for ApiResponse {
     fn into_response(self) -> Response {
         match self {
             ApiResponse::Json(json) => json.into_response(),
-            ApiResponse::Protobuf(bytes) => {
-                (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, CONTENT_TYPE_PROTOBUF)],
-                    bytes,
-                )
-                    .into_response()
-            }
+            ApiResponse::Protobuf(bytes) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, CONTENT_TYPE_PROTOBUF)],
+                bytes,
+            )
+                .into_response(),
         }
     }
 }
@@ -77,12 +75,8 @@ pub trait IntoApiResponse {
         Self: Sized + Serialize,
     {
         match format {
-            ResponseFormat::Json => {
-                ApiResponse::Json(Json(serde_json::to_value(self).unwrap()))
-            }
-            ResponseFormat::Protobuf => {
-                ApiResponse::Protobuf(self.into_proto().encode_to_vec())
-            }
+            ResponseFormat::Json => ApiResponse::Json(Json(serde_json::to_value(self).unwrap())),
+            ResponseFormat::Protobuf => ApiResponse::Protobuf(self.into_proto().encode_to_vec()),
         }
     }
 }
@@ -401,10 +395,8 @@ mod tests {
     #[test]
     fn should_serialize_list_keys_response_with_base64() {
         // given
-        let response = ListKeysResponse::success(vec![
-            Bytes::from("events"),
-            Bytes::from("orders"),
-        ]);
+        let response =
+            ListKeysResponse::success(vec![Bytes::from("events"), Bytes::from("orders")]);
 
         // when
         let json = serde_json::to_string(&response).unwrap();

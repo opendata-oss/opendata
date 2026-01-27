@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::routing::{get, post};
-use axum::Router;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use common::StorageConfig;
@@ -164,12 +164,16 @@ async fn test_scan_json_response() {
 
     // First entry
     assert_eq!(entries[0]["sequence"], 0);
-    let value_decoded = STANDARD.decode(entries[0]["value"].as_str().unwrap()).unwrap();
+    let value_decoded = STANDARD
+        .decode(entries[0]["value"].as_str().unwrap())
+        .unwrap();
     assert_eq!(value_decoded, b"event-1");
 
     // Second entry
     assert_eq!(entries[1]["sequence"], 1);
-    let value_decoded = STANDARD.decode(entries[1]["value"].as_str().unwrap()).unwrap();
+    let value_decoded = STANDARD
+        .decode(entries[1]["value"].as_str().unwrap())
+        .unwrap();
     assert_eq!(value_decoded, b"event-2");
 }
 
@@ -506,7 +510,12 @@ async fn test_append_protobuf_error_on_invalid_body() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(json["status"], "error");
-    assert!(json["message"].as_str().unwrap().contains("Invalid protobuf"));
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid protobuf")
+    );
 }
 
 // ============================================================================
@@ -555,7 +564,9 @@ async fn test_json_append_then_scan_roundtrip() {
     let entries = json["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
 
-    let value_decoded = STANDARD.decode(entries[0]["value"].as_str().unwrap()).unwrap();
+    let value_decoded = STANDARD
+        .decode(entries[0]["value"].as_str().unwrap())
+        .unwrap();
     assert_eq!(value_decoded, b"roundtrip-value");
 }
 

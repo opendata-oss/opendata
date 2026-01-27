@@ -213,13 +213,19 @@ mod tests {
 
     fn json_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
         headers
     }
 
     fn protobuf_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/x-protobuf"));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-protobuf"),
+        );
         headers
     }
 
