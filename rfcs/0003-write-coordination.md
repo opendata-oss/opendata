@@ -45,40 +45,41 @@ leveraged by various systems.
 ### Components & Terminology
 
 - `Write` is an insertion of data into the system
-- `WriteQueue` is a queue that accepts `Write` as input and applys an epoch-based ordering
+- `WriteQueue` is a queue that accepts `Write` as input and applies an epoch-based ordering
 - `WriteBatch` is a collection of `Write`s each stamped with an epoch
-- `Snapshot` is a point-in-time reference to the storage state
-- `Image` is a view of the `Snapshot` with paritally materialized in-memory models
+- `Snapshot` is a point-in-time reference to the storage state, broadcast to readers after each flush
+- `Image` is the in-memory state needed to initialize a delta (e.g., series dictionary, ID counters);
+  decoupled from `Snapshot` to enable non-blocking flushes
 - `Delta` is the result of applying (multiple) `WriteBatch` to an `Image`
 
 ### Architecture
 
 ```
-                ┌─────────┐ ┌─────────┐ ┌─────────┐                                          
-                │  Write  │ │  Write  │ │  Write  │                                          
-                └─────────┘ └─────────┘ └─────────┘                                          
-                     │           │           │                                               
-                     └───────────┼───────────┘                                               
-                                 ▼                                                           
-                     ┌───────────────────────┐                                               
-                     │      Write Queue      │                                               
-                     └───────────────────────┘                                               
-                                 │                                                           
-                                 ▼                                                           
-┌Write Coordinator────────────────────────────────────────────────┐                          
+                ┌─────────┐ ┌─────────┐ ┌─────────┐
+                │  Write  │ │  Write  │ │  Write  │
+                └─────────┘ └─────────┘ └─────────┘
+                     │           │           │
+                     └───────────┼───────────┘
+                                 ▼
+                     ┌───────────────────────┐
+                     │      Write Queue      │
+                     └───────────────────────┘
+                                 │
+                                 ▼
+┌Write Coordinator────────────────────────────────────────────────┐
 │ ┌─────────────────────────────┐ ┌──────────────┐┌──────────────┐│             ┌───────────┐
-│ │        select! loop         │ │ EpochTracker ││   Flusher    │├──broadcast─▶│  Reader   │
+│ │        select! loop         │ │ EpochTracker ││   Flusher    │├─Snapshot───▶│  Reader   │
 │ ├─────────────────────────────┤ └──────────────┘└───────▲──────┘│             └───────────┘
-│ │                             │         ┌───────────────┤       │                          
-│ │                             │ ┌Delta──┴──────┐┌Image──┴──────┐│                          
-│ │1 ─► handle flush complete   │ │ ┌──────────┐ ││┌────────────┐││                          
-│ │2 ─► flush (on command)      │ │ │WriteBatch│ │││Materialized│││                          
-│ │3 ─► apply queued writes     │ │ └──────────┘ ││└────────────┘││                          
-│ │4 ─► flush (on timer)        │ │ ┌──────────┐ ││┌────────────┐││                          
-│ │                             │ │ │WriteBatch│ │││  Snapshot  │││                          
-│ │                             │ │ └──────────┘ ││└────────────┘││                          
-│ └─────────────────────────────┘ └──────────────┘└──────────────┘│                          
-└─────────────────────────────────────────────────────────────────┘                                                                     
+│ │                             │         ┌───────────────┤       │
+│ │                             │ ┌Delta──┴──────┐┌Image──┴──────┐│
+│ │1 ─► handle flush complete   │ │ ┌──────────┐ ││              ││
+│ │2 ─► flush (on command)      │ │ │WriteBatch│ ││ Materialized ││
+│ │3 ─► apply queued writes     │ │ └──────────┘ ││    State     ││
+│ │4 ─► flush (on timer)        │ │ ┌──────────┐ ││              ││
+│ │                             │ │ │WriteBatch│ ││              ││
+│ │                             │ │ └──────────┘ ││              ││
+│ └─────────────────────────────┘ └──────────────┘└──────────────┘│
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### APIs
@@ -103,24 +104,25 @@ pub trait Delta: Send + 'static {
     type Image: Send + Sync + Clone + 'static;
     type Write: Send + 'static;
 
-    /// Initialize the delta with shared state from the image.
+    /// Initialize the delta with state from the image.
     fn init(&mut self, image: &Self::Image);
     /// Apply a batch of writes to this delta.
     fn apply(&mut self, batch: WriteBatch<Self::Write>) -> Result<()>;
     /// Estimate the memory size of this delta for backpressure.
     fn estimate_size(&self) -> usize;
+    /// Extract state needed for the next delta's initialization.
+    /// Called before flush to enable non-blocking writes.
+    fn fork_image(&self) -> Self::Image;
 }
 
 pub trait Flusher: Send + Sync + 'static {
-    type Image: Send + Sync + Clone + 'static;
-    type Delta: Delta<Image = Self::Image>;
+    type Delta: Delta;
 
-    /// Flush a delta to storage and return the new image.
+    /// Flush a delta to storage and return the new snapshot.
     fn flush(
         &self,
         delta: Self::Delta,
-        image: &Self::Image,
-    ) -> impl Future<Output = Result<Self::Image>> + Send;
+    ) -> impl Future<Output = Result<Snapshot>> + Send;
 }
 ```
 
@@ -155,8 +157,8 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     pub async fn write(&self, event: D::Write) -> Result<WriteHandle> { /* ... */ }
     /// Request a flush up to the specified epoch (or all pending if None).
     pub async fn flush(&self, epoch: Option<u64>) -> Result<()> { /* ... */ }
-    /// Subscribe to image updates.
-    pub fn subscribe(&self) -> watch::Receiver<Arc<D::Image>> { /* ... */ }
+    /// Subscribe to snapshot updates.
+    pub fn subscribe(&self) -> watch::Receiver<Arc<Snapshot>> { /* ... */ }
 }
 ```
 
@@ -172,11 +174,18 @@ The `WriteHandle` is used to allow readers to wait for the following durability 
 
 The coordinator runs as a single-threaded async loop that processes commands and manages flushes.
 
-1. **Ordering**: all writes are serialized through a single `mpsc` channel (`WriteQueue`)
-2. **Non-Blocking Flush**: when a flush starts, writes are accumulated into a new buffer and are
-   only delayed when backpressure kicks in
+1. **Ordering**: all writes are serialized through a single `mpsc` channel (`WriteQueue`). Epochs
+   are assigned atomically when `write()` is called, before any queue blocking, guaranteeing that
+   if `write(A)` returns before `write(B)` is called, then `epoch(A) < epoch(B)`.
+2. **Non-Blocking Flush**: when a flush is triggered:
+   1. `fork_image()` is called on the current delta to extract state for the next delta
+   2. A new delta is created and initialized from the forked image
+   3. The old delta is passed to the flusher (ownership transferred)
+   4. Writes continue to the new delta while the flush runs in the background
+   5. When flush completes, the new snapshot is broadcast to readers
 3. **Flush Triggers**: flushes can be triggered manually via `flush()` or based on conditions
-   evaluated on a timer
+   evaluated on a timer. Flush requests are queued if a flush is in progress. A call to
+   `flush(epoch)` is a no-op if `epoch` ≤ the already-flushed epoch.
 4. **Epoch Tracking**: write handles are enqueued on a `BTreeMap` sorted by `epoch` so that we can
    notify readers when an epoch is flushed and/or durable. Watchers are removed after notifying of
    the `durable` watermark.
@@ -193,9 +202,10 @@ The coordinator runs as a single-threaded async loop that processes commands and
 #### TimeSeries
 
 TimeSeries identifies each series by a fingerprint (hash of sorted labels). During `init()`, the
-delta gets access to the shared series dictionary and ID allocator from the image. During `apply()`,
-it looks up or creates a series ID for each fingerprint and appends samples — multiple writes to
-the same series accumulate.
+delta clones the series dictionary and ID counter from the image. During `apply()`, it looks up or
+creates a series ID for each fingerprint and appends samples — multiple writes to the same series
+accumulate. Before flush, `fork_image()` extracts the current state so a new delta can continue
+accepting writes.
 
 ```rust
 impl Delta for TsdbDelta {
@@ -203,33 +213,44 @@ impl Delta for TsdbDelta {
     type Write = Series;
 
     fn init(&mut self, image: &Self::Image) {
-        self.series_dict = image.series_dict.clone();       // Arc<DashMap<Fingerprint, SeriesId>>
-        self.next_series_id = image.next_series_id.clone(); // Arc<AtomicU32>
+        self.series_dict = image.series_dict.clone();  // HashMap<Fingerprint, SeriesId>
+        self.next_series_id = image.next_series_id;    // u32
     }
 
     fn apply(&mut self, batch: WriteBatch<Self::Write>) -> Result<()> {
         for series in batch.writes {
             let fp = series.labels.fingerprint();
             let id = *self.series_dict.entry(fp).or_insert_with(|| {
-                self.next_series_id.fetch_add(1, Ordering::SeqCst)
+                let id = self.next_series_id;
+                self.next_series_id += 1;
+                id
             });
             self.samples.entry(id).or_default().extend(series.samples);
         }
         Ok(())
+    }
+
+    fn fork_image(&self) -> Self::Image {
+        TsdbImage {
+            series_dict: self.series_dict.clone(),
+            next_series_id: self.next_series_id,
+        }
     }
 }
 ```
 
 The flusher converts the delta into storage records: forward index (series metadata), inverted
 index (label to series ID mappings), and sample data. Since IDs were allocated during `apply()`,
-the flusher just needs to persist everything atomically.
+the flusher just needs to persist everything atomically and return the new snapshot.
 
 ```rust
 impl Flusher for TsdbFlusher {
-    async fn flush(&self, delta: TsdbDelta, image: &TsdbImage) -> Result<TsdbImage> {
-        let forward_index = build_forward_index(delta);
-        let inverted_index = build_inverted_index(delta);
-        
+    type Delta = TsdbDelta;
+
+    async fn flush(&self, delta: TsdbDelta) -> Result<Snapshot> {
+        let forward_index = build_forward_index(&delta);
+        let inverted_index = build_inverted_index(&delta);
+
         let mut batch = WriteBatch::new();
         for (id, samples) in delta.samples() {
             batch.merge(samples_key(id), encode_samples(&samples));
@@ -240,9 +261,9 @@ impl Flusher for TsdbFlusher {
         for (label, ids) in inverted_index {
             batch.merge(inverted_key(&label), encode_bitmap(&ids));
         }
-        
+
         self.db.write(batch).await?;
-        Ok(image.with_snapshot(self.db.snapshot()))
+        Ok(self.db.snapshot())
     }
 }
 ```
@@ -270,6 +291,12 @@ impl Delta for VectorDelta {
         }
         Ok(())
     }
+
+    fn fork_image(&self) -> Self::Image {
+        VectorImage {
+            config: self.config.clone(),
+        }
+    }
 }
 ```
 
@@ -279,7 +306,9 @@ as deleted if necessary.
 
 ```rust
 impl Flusher for VectorFlusher {
-    async fn flush(&self, delta: VectorDelta, image: &VectorImage) -> Result<VectorImage> {
+    type Delta = VectorDelta;
+
+    async fn flush(&self, delta: VectorDelta) -> Result<Snapshot> {
         let mut batch = WriteBatch::new();
         for (external_id, vector) in delta.vectors {
             let old_id = self.db.get(id_mapping_key(&external_id)).await?;
@@ -294,7 +323,7 @@ impl Flusher for VectorFlusher {
             }
         }
         self.db.write(batch).await?;
-        Ok(image.with_snapshot(self.db.snapshot()))
+        Ok(self.db.snapshot())
     }
 }
 ```
