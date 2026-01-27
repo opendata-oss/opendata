@@ -13,6 +13,7 @@ path = "src/main.rs"
 [features]
 default = []
 remote-write = ["dep:prost", "dep:snap"]
+otlp = ["dep:opentelemetry-proto", "dep:prost"]
 
 [dependencies]
 async-trait.workspace = true
@@ -48,6 +49,8 @@ tsz = "0.1"
 # Optional dependencies for remote-write feature
 prost = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
+# Optional dependencies for otlp feature
+opentelemetry-proto = { version = "0.28", features = ["metrics", "gen-tonic-messages"], optional = true }
 
 [dev-dependencies]
 fail.workspace = true

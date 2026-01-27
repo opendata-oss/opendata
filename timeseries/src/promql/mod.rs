@@ -9,6 +9,9 @@ pub(crate) mod openmetrics;
 mod parser;
 #[cfg(feature = "remote-write")]
 pub(crate) mod remote_write;
+#[cfg(feature = "otlp")]
+pub mod otlp;
+
 mod request;
 mod response;
 mod router;
