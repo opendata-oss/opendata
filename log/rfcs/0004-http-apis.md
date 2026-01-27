@@ -36,8 +36,8 @@ The API supports both binary protobuf and ProtoJSON formats, with a single proto
 truth for all message definitions. 
 
 **Content Types:**
-- Binary protobuf: `Content-Type: application/x-protobuf`
-- JSON: `Content-Type: application/json`
+- Binary protobuf: `Content-Type: application/protobuf`
+- JSON: `Content-Type: application/protobuf+json`
 
 **Field Naming:**
 - JSON field names use `lowerCamelCase` per the ProtoJSON specification
@@ -54,8 +54,12 @@ message AppendRequest {
   bool await_durable = 2;
 }
 
+message Key {
+  bytes value = 1;
+}
+
 message Record {
-  bytes key = 1;
+  Key key = 1;
   bytes value = 2;
 }
 
@@ -68,11 +72,11 @@ message AppendResponse {
 
 message ScanResponse {
   string status = 1;
-  bytes key = 2;
-  repeated Entry entries = 3;
+  Key key = 2;
+  repeated Value values = 3;
 }
 
-message Entry {
+message Value {
   uint64 sequence = 1;
   bytes value = 2;
 }
@@ -90,7 +94,13 @@ message Segment {
 
 message KeysResponse {
   string status = 1;
-  repeated bytes keys = 2;
+  repeated Key keys = 2;
+}
+
+message CountRequest {
+  Key key = 1;
+  optional uint64 start_seq = 2;
+  optional uint64 end_seq = 3;
 }
 
 message CountResponse {
@@ -116,7 +126,7 @@ let request = AppendRequest {
 };
 let binary = request.encode_to_vec();
 client.post("/api/v1/log/append")
-    .header("Content-Type", "application/x-protobuf")
+    .header("Content-Type", "application/protobuf")
     .body(binary)
     .send();
 ```
@@ -124,9 +134,9 @@ client.post("/api/v1/log/append")
 **HTTP client writing JSON:**
 ```bash
 curl -X POST http://localhost:8080/api/v1/log/append \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/protobuf+json" \
   -d '{
-    "records": [{"key": "bXkta2V5", "value": "bXktdmFsdWU="}],
+    "records": [{"key": {"value": "bXkta2V5"}, "value": "bXktdmFsdWU="}],
     "awaitDurable": false
   }'
 ```
@@ -180,7 +190,7 @@ Request Body:
 ```json
 {
   "records": [
-    { "key": "bXkta2V5", "value": "bXktdmFsdWU=" }
+    { "key": {"value": "bXkta2V5"}, "value": "bXktdmFsdWU=" }
   ],
   "awaitDurable": false
 }
@@ -224,8 +234,8 @@ Query Parameters:
 ```json
 {
   "status": "success",
-  "key": "bXkta2V5",
-  "entries": [
+  "key": {"value": "bXkta2V5"},
+  "values": [
     { "sequence": 0, "value": "bXktdmFsdWU=" }
   ]
 }
@@ -290,7 +300,7 @@ Query Parameters:
 ```json
 {
   "status": "success",
-  "keys": ["ZXZlbnRz", "b3JkZXJz"]
+  "keys": [{"value": "ZXZlbnRz"}, {"value": "b3JkZXJz"}]
 }
 ```
 
@@ -332,9 +342,8 @@ Query Parameters:
 
 The current proposal adopts `ProtoJSON` as the JSON format. This brings support for binary payloads. It also means
 that keys and values are base64 encoded. The alternative was to allow plain JSON over HTTP without any protobuf schema.
-The latter approach was rejected because we will to support typed binary payloads for the log, and moving from a
-flexible JSON payload will make the transition to a properly typed payload with a fixed schema impossible.  
-]
+The latter approach was rejected because we want to support typed binary payloads for the log, and moving from a
+flexible JSON payload will make the transition to a properly typed payload with a fixed schema impossible.
 ## Open Questions
 
    * The proposal as presented mimics the Rust API for OpenData-Log. Should we consider APIs that are more HTTP-native? 
