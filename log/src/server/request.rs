@@ -7,17 +7,26 @@ use serde::Deserialize;
 use serde_with::{base64::Base64, serde_as};
 
 use super::proto;
+use super::response::KeyJson;
 use crate::Error;
 
 /// Content type for binary protobuf.
-const CONTENT_TYPE_PROTOBUF: &str = "application/x-protobuf";
+const CONTENT_TYPE_PROTOBUF: &str = "application/protobuf";
+
+/// Content type for ProtoJSON.
+const CONTENT_TYPE_PROTOJSON: &str = "application/protobuf+json";
 
 /// Check if the request body is protobuf based on Content-Type header.
+/// Only matches `application/protobuf`, not `application/protobuf+json`.
 fn is_protobuf_content(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.contains(CONTENT_TYPE_PROTOBUF))
+        .map(|s| {
+            // Check for exact match or with parameters (e.g., "application/protobuf; charset=utf-8")
+            // But not application/protobuf+json
+            s.starts_with(CONTENT_TYPE_PROTOBUF) && !s.starts_with(CONTENT_TYPE_PROTOJSON)
+        })
         .unwrap_or(false)
 }
 
@@ -118,9 +127,8 @@ impl CountParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AppendRecordJson {
-    /// Key (base64-encoded bytes).
-    #[serde_as(as = "Base64")]
-    pub key: Bytes,
+    /// Key (wrapped in Key message).
+    pub key: KeyJson,
     /// Value (base64-encoded bytes).
     #[serde_as(as = "Base64")]
     pub value: Bytes,
@@ -173,7 +181,7 @@ impl AppendRequest {
             .records
             .into_iter()
             .map(|r| crate::Record {
-                key: r.key,
+                key: r.key.map(|k| k.value).unwrap_or_default(),
                 value: r.value,
             })
             .collect();
@@ -193,7 +201,7 @@ impl AppendRequest {
             .records
             .into_iter()
             .map(|r| crate::Record {
-                key: r.key,
+                key: r.key.value,
                 value: r.value,
             })
             .collect();
@@ -211,20 +219,20 @@ mod tests {
 
     use super::*;
 
-    fn json_headers() -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        headers
-    }
-
     fn protobuf_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-protobuf"),
+            HeaderValue::from_static("application/protobuf"),
+        );
+        headers
+    }
+
+    fn protojson_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/protobuf+json"),
         );
         headers
     }
@@ -248,15 +256,15 @@ mod tests {
 
     #[test]
     fn should_parse_append_request_from_json() {
-        // given - camelCase JSON with base64 encoded bytes
+        // given - camelCase JSON with base64 encoded bytes wrapped in Key message
         // "test-key" -> "dGVzdC1rZXk=", "test-value" -> "dGVzdC12YWx1ZQ=="
         let json = br#"{
-            "records": [{"key": "dGVzdC1rZXk=", "value": "dGVzdC12YWx1ZQ=="}],
+            "records": [{"key": {"value": "dGVzdC1rZXk="}, "value": "dGVzdC12YWx1ZQ=="}],
             "awaitDurable": true
         }"#;
 
         // when
-        let request = AppendRequest::from_body(&json_headers(), json).unwrap();
+        let request = AppendRequest::from_body(&protojson_headers(), json).unwrap();
 
         // then
         assert_eq!(request.records.len(), 1);
@@ -268,12 +276,13 @@ mod tests {
     #[test]
     fn should_parse_append_request_from_json_without_await_durable() {
         // given - awaitDurable defaults to false when not specified
+        // "key" -> "a2V5", "value" -> "dmFsdWU="
         let json = br#"{
-            "records": [{"key": "a2V5", "value": "dmFsdWU="}]
+            "records": [{"key": {"value": "a2V5"}, "value": "dmFsdWU="}]
         }"#;
 
         // when
-        let request = AppendRequest::from_body(&json_headers(), json).unwrap();
+        let request = AppendRequest::from_body(&protojson_headers(), json).unwrap();
 
         // then
         assert!(!request.await_durable);
@@ -284,7 +293,9 @@ mod tests {
         // given
         let proto_request = proto::AppendRequest {
             records: vec![proto::Record {
-                key: Bytes::from("proto-key"),
+                key: Some(proto::Key {
+                    value: Bytes::from("proto-key"),
+                }),
                 value: Bytes::from("proto-value"),
             }],
             await_durable: true,
@@ -307,7 +318,7 @@ mod tests {
         let body = b"not valid json";
 
         // when
-        let result = AppendRequest::from_body(&json_headers(), body);
+        let result = AppendRequest::from_body(&protojson_headers(), body);
 
         // then
         assert!(result.is_err());

@@ -1,7 +1,7 @@
 //! HTTP route handlers for the log server.
 //!
-//! Per RFC 0004, handlers support both binary protobuf (`application/x-protobuf`)
-//! and ProtoJSON (`application/json`) formats.
+//! Per RFC 0004, handlers support both binary protobuf (`application/protobuf`)
+//! and ProtoJSON (`application/protobuf+json`) formats.
 
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use super::metrics::{AppendLabels, Metrics, OperationStatus, ScanLabels};
 use super::request::{AppendRequest, CountParams, ListKeysParams, ListSegmentsParams, ScanParams};
 use super::response::{
     ApiResponse, AppendResponse, CountResponse, IntoApiResponse, ListKeysResponse,
-    ListSegmentsResponse, ResponseFormat, ScanEntry, ScanResponse, SegmentEntry,
+    ListSegmentsResponse, ResponseFormat, ScanResponse, ScanValue, SegmentEntry,
 };
 use crate::Log;
 use crate::config::WriteOptions;
@@ -29,7 +29,7 @@ pub struct AppState {
 
 /// Handle POST /api/v1/log/append
 ///
-/// Supports both `Content-Type: application/x-protobuf` and `Content-Type: application/json`.
+/// Supports both `Content-Type: application/protobuf` and `Content-Type: application/protobuf+json`.
 /// Returns response in format matching the `Accept` header.
 pub async fn handle_append(
     State(state): State<AppState>,
@@ -109,9 +109,9 @@ pub async fn handle_scan(
                 })
                 .inc();
 
-            let scan_entries: Vec<ScanEntry> =
-                entries.iter().map(ScanEntry::from_log_entry).collect();
-            let response = ScanResponse::success(key, scan_entries);
+            let scan_values: Vec<ScanValue> =
+                entries.iter().map(ScanValue::from_log_entry).collect();
+            let response = ScanResponse::success(key, scan_values);
             Ok(response.into_api_response(format))
         }
         Err(e) => {

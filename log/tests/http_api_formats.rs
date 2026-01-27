@@ -1,6 +1,6 @@
 //! Integration tests for HTTP API with JSON and protobuf formats.
 //!
-//! Tests both ProtoJSON (application/json) and binary protobuf (application/x-protobuf)
+//! Tests both ProtoJSON (application/protobuf+json) and binary protobuf (application/protobuf)
 //! request/response formats per RFC 0004.
 
 use std::sync::Arc;
@@ -57,14 +57,14 @@ async fn test_append_json_request_and_response() {
     let value_b64 = STANDARD.encode("test-value");
 
     let body = format!(
-        r#"{{"records": [{{"key": "{}", "value": "{}"}}], "awaitDurable": false}}"#,
+        r#"{{"records": [{{"key": {{"value": "{}"}}, "value": "{}"}}], "awaitDurable": false}}"#,
         key_b64, value_b64
     );
 
     let request = Request::builder()
         .method("POST")
         .uri("/api/v1/log/append")
-        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_TYPE, "application/protobuf+json")
         .body(Body::from(body))
         .unwrap();
 
@@ -92,14 +92,14 @@ async fn test_append_multiple_records_json() {
     let value2_b64 = STANDARD.encode("value-2");
 
     let body = format!(
-        r#"{{"records": [{{"key": "{}", "value": "{}"}}, {{"key": "{}", "value": "{}"}}], "awaitDurable": false}}"#,
+        r#"{{"records": [{{"key": {{"value": "{}"}}, "value": "{}"}}, {{"key": {{"value": "{}"}}, "value": "{}"}}], "awaitDurable": false}}"#,
         key1_b64, value1_b64, key2_b64, value2_b64
     );
 
     let request = Request::builder()
         .method("POST")
         .uri("/api/v1/log/append")
-        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_TYPE, "application/protobuf+json")
         .body(Body::from(body))
         .unwrap();
 
@@ -138,7 +138,7 @@ async fn test_scan_json_response() {
     let request = Request::builder()
         .method("GET")
         .uri("/api/v1/log/scan?key=events")
-        .header(header::ACCEPT, "application/json")
+        .header(header::ACCEPT, "application/protobuf+json")
         .body(Body::empty())
         .unwrap();
 
@@ -153,26 +153,24 @@ async fn test_scan_json_response() {
 
     assert_eq!(json["status"], "success");
 
-    // Key should be base64 encoded
-    let key_b64 = json["key"].as_str().unwrap();
+    let key_b64 = json["key"]["value"].as_str().unwrap();
     let key_decoded = STANDARD.decode(key_b64).unwrap();
     assert_eq!(key_decoded, b"events");
 
-    // Should have 2 entries
-    let entries = json["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 2);
+    let values = json["values"].as_array().unwrap();
+    assert_eq!(values.len(), 2);
 
-    // First entry
-    assert_eq!(entries[0]["sequence"], 0);
+    // First value
+    assert_eq!(values[0]["sequence"], 0);
     let value_decoded = STANDARD
-        .decode(entries[0]["value"].as_str().unwrap())
+        .decode(values[0]["value"].as_str().unwrap())
         .unwrap();
     assert_eq!(value_decoded, b"event-1");
 
-    // Second entry
-    assert_eq!(entries[1]["sequence"], 1);
+    // Second value
+    assert_eq!(values[1]["sequence"], 1);
     let value_decoded = STANDARD
-        .decode(entries[1]["value"].as_str().unwrap())
+        .decode(values[1]["value"].as_str().unwrap())
         .unwrap();
     assert_eq!(value_decoded, b"event-2");
 }
@@ -197,7 +195,7 @@ async fn test_list_keys_json_response() {
     let request = Request::builder()
         .method("GET")
         .uri("/api/v1/log/keys")
-        .header(header::ACCEPT, "application/json")
+        .header(header::ACCEPT, "application/protobuf+json")
         .body(Body::empty())
         .unwrap();
 
@@ -212,13 +210,12 @@ async fn test_list_keys_json_response() {
 
     assert_eq!(json["status"], "success");
 
-    // Keys should be base64 encoded array
     let keys = json["keys"].as_array().unwrap();
     assert_eq!(keys.len(), 2);
 
     // Keys are returned in lexicographic order: "events" before "orders"
-    let key1_decoded = STANDARD.decode(keys[0].as_str().unwrap()).unwrap();
-    let key2_decoded = STANDARD.decode(keys[1].as_str().unwrap()).unwrap();
+    let key1_decoded = STANDARD.decode(keys[0]["value"].as_str().unwrap()).unwrap();
+    let key2_decoded = STANDARD.decode(keys[1]["value"].as_str().unwrap()).unwrap();
     assert_eq!(key1_decoded, b"events");
     assert_eq!(key2_decoded, b"orders");
 }
@@ -237,7 +234,7 @@ async fn test_list_segments_json_response() {
     let request = Request::builder()
         .method("GET")
         .uri("/api/v1/log/segments")
-        .header(header::ACCEPT, "application/json")
+        .header(header::ACCEPT, "application/protobuf+json")
         .body(Body::empty())
         .unwrap();
 
@@ -269,7 +266,7 @@ async fn test_error_response_json_format() {
     let request = Request::builder()
         .method("POST")
         .uri("/api/v1/log/append")
-        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_TYPE, "application/protobuf+json")
         .body(Body::from("not valid json"))
         .unwrap();
 
@@ -296,7 +293,9 @@ async fn test_append_protobuf_request_and_response() {
 
     let proto_request = proto::AppendRequest {
         records: vec![proto::Record {
-            key: Bytes::from("proto-key"),
+            key: Some(proto::Key {
+                value: Bytes::from("proto-key"),
+            }),
             value: Bytes::from("proto-value"),
         }],
         await_durable: false,
@@ -305,8 +304,8 @@ async fn test_append_protobuf_request_and_response() {
     let request = Request::builder()
         .method("POST")
         .uri("/api/v1/log/append")
-        .header(header::CONTENT_TYPE, "application/x-protobuf")
-        .header(header::ACCEPT, "application/x-protobuf")
+        .header(header::CONTENT_TYPE, "application/protobuf")
+        .header(header::ACCEPT, "application/protobuf")
         .body(Body::from(proto_request.encode_to_vec()))
         .unwrap();
 
@@ -315,7 +314,7 @@ async fn test_append_protobuf_request_and_response() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/x-protobuf"
+        "application/protobuf"
     );
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -330,12 +329,14 @@ async fn test_append_protobuf_request_and_response() {
 
 #[tokio::test]
 async fn test_append_protobuf_request_json_response() {
-    // Test protobuf request with JSON response (Accept: application/json)
+    // Test protobuf request with JSON response (Accept: application/protobuf+json)
     let (app, _log) = setup_test_app().await;
 
     let proto_request = proto::AppendRequest {
         records: vec![proto::Record {
-            key: Bytes::from("mixed-key"),
+            key: Some(proto::Key {
+                value: Bytes::from("mixed-key"),
+            }),
             value: Bytes::from("mixed-value"),
         }],
         await_durable: false,
@@ -344,8 +345,8 @@ async fn test_append_protobuf_request_json_response() {
     let request = Request::builder()
         .method("POST")
         .uri("/api/v1/log/append")
-        .header(header::CONTENT_TYPE, "application/x-protobuf")
-        .header(header::ACCEPT, "application/json")
+        .header(header::CONTENT_TYPE, "application/protobuf")
+        .header(header::ACCEPT, "application/protobuf+json")
         .body(Body::from(proto_request.encode_to_vec()))
         .unwrap();
 
@@ -382,7 +383,7 @@ async fn test_scan_protobuf_response() {
     let request = Request::builder()
         .method("GET")
         .uri("/api/v1/log/scan?key=proto-events")
-        .header(header::ACCEPT, "application/x-protobuf")
+        .header(header::ACCEPT, "application/protobuf")
         .body(Body::empty())
         .unwrap();
 
@@ -391,7 +392,7 @@ async fn test_scan_protobuf_response() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/x-protobuf"
+        "application/protobuf"
     );
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -400,12 +401,15 @@ async fn test_scan_protobuf_response() {
     let proto_response = proto::ScanResponse::decode(body.as_ref()).unwrap();
 
     assert_eq!(proto_response.status, "success");
-    assert_eq!(proto_response.key, Bytes::from("proto-events"));
-    assert_eq!(proto_response.entries.len(), 2);
-    assert_eq!(proto_response.entries[0].sequence, 0);
-    assert_eq!(proto_response.entries[0].value, Bytes::from("event-a"));
-    assert_eq!(proto_response.entries[1].sequence, 1);
-    assert_eq!(proto_response.entries[1].value, Bytes::from("event-b"));
+    assert_eq!(
+        proto_response.key.as_ref().unwrap().value,
+        Bytes::from("proto-events")
+    );
+    assert_eq!(proto_response.values.len(), 2);
+    assert_eq!(proto_response.values[0].sequence, 0);
+    assert_eq!(proto_response.values[0].value, Bytes::from("event-a"));
+    assert_eq!(proto_response.values[1].sequence, 1);
+    assert_eq!(proto_response.values[1].value, Bytes::from("event-b"));
 }
 
 #[tokio::test]
@@ -428,7 +432,7 @@ async fn test_list_keys_protobuf_response() {
     let request = Request::builder()
         .method("GET")
         .uri("/api/v1/log/keys")
-        .header(header::ACCEPT, "application/x-protobuf")
+        .header(header::ACCEPT, "application/protobuf")
         .body(Body::empty())
         .unwrap();
 
@@ -437,7 +441,7 @@ async fn test_list_keys_protobuf_response() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/x-protobuf"
+        "application/protobuf"
     );
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -447,8 +451,8 @@ async fn test_list_keys_protobuf_response() {
 
     assert_eq!(proto_response.status, "success");
     assert_eq!(proto_response.keys.len(), 2);
-    assert_eq!(proto_response.keys[0], Bytes::from("alpha"));
-    assert_eq!(proto_response.keys[1], Bytes::from("beta"));
+    assert_eq!(proto_response.keys[0].value, Bytes::from("alpha"));
+    assert_eq!(proto_response.keys[1].value, Bytes::from("beta"));
 }
 
 #[tokio::test]
@@ -465,7 +469,7 @@ async fn test_list_segments_protobuf_response() {
     let request = Request::builder()
         .method("GET")
         .uri("/api/v1/log/segments")
-        .header(header::ACCEPT, "application/x-protobuf")
+        .header(header::ACCEPT, "application/protobuf")
         .body(Body::empty())
         .unwrap();
 
@@ -474,7 +478,7 @@ async fn test_list_segments_protobuf_response() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/x-protobuf"
+        "application/protobuf"
     );
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -496,7 +500,7 @@ async fn test_append_protobuf_error_on_invalid_body() {
     let request = Request::builder()
         .method("POST")
         .uri("/api/v1/log/append")
-        .header(header::CONTENT_TYPE, "application/x-protobuf")
+        .header(header::CONTENT_TYPE, "application/protobuf")
         .body(Body::from(vec![0xFF, 0xFF, 0xFF])) // Invalid protobuf
         .unwrap();
 
@@ -531,14 +535,14 @@ async fn test_json_append_then_scan_roundtrip() {
     let value_b64 = STANDARD.encode("roundtrip-value");
 
     let append_body = format!(
-        r#"{{"records": [{{"key": "{}", "value": "{}"}}], "awaitDurable": false}}"#,
+        r#"{{"records": [{{"key": {{"value": "{}"}}, "value": "{}"}}], "awaitDurable": false}}"#,
         key_b64, value_b64
     );
 
     let append_request = Request::builder()
         .method("POST")
         .uri("/api/v1/log/append")
-        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_TYPE, "application/protobuf+json")
         .body(Body::from(append_body))
         .unwrap();
 
@@ -549,7 +553,7 @@ async fn test_json_append_then_scan_roundtrip() {
     let scan_request = Request::builder()
         .method("GET")
         .uri("/api/v1/log/scan?key=roundtrip-key")
-        .header(header::ACCEPT, "application/json")
+        .header(header::ACCEPT, "application/protobuf+json")
         .body(Body::empty())
         .unwrap();
 
@@ -561,11 +565,11 @@ async fn test_json_append_then_scan_roundtrip() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    let entries = json["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 1);
+    let values = json["values"].as_array().unwrap();
+    assert_eq!(values.len(), 1);
 
     let value_decoded = STANDARD
-        .decode(entries[0]["value"].as_str().unwrap())
+        .decode(values[0]["value"].as_str().unwrap())
         .unwrap();
     assert_eq!(value_decoded, b"roundtrip-value");
 }
@@ -577,7 +581,9 @@ async fn test_protobuf_append_then_scan_roundtrip() {
     // Append via protobuf
     let proto_request = proto::AppendRequest {
         records: vec![proto::Record {
-            key: Bytes::from("proto-roundtrip"),
+            key: Some(proto::Key {
+                value: Bytes::from("proto-roundtrip"),
+            }),
             value: Bytes::from("proto-roundtrip-value"),
         }],
         await_durable: false,
@@ -586,8 +592,8 @@ async fn test_protobuf_append_then_scan_roundtrip() {
     let append_request = Request::builder()
         .method("POST")
         .uri("/api/v1/log/append")
-        .header(header::CONTENT_TYPE, "application/x-protobuf")
-        .header(header::ACCEPT, "application/x-protobuf")
+        .header(header::CONTENT_TYPE, "application/protobuf")
+        .header(header::ACCEPT, "application/protobuf")
         .body(Body::from(proto_request.encode_to_vec()))
         .unwrap();
 
@@ -598,7 +604,7 @@ async fn test_protobuf_append_then_scan_roundtrip() {
     let scan_request = Request::builder()
         .method("GET")
         .uri("/api/v1/log/scan?key=proto-roundtrip")
-        .header(header::ACCEPT, "application/x-protobuf")
+        .header(header::ACCEPT, "application/protobuf")
         .body(Body::empty())
         .unwrap();
 
@@ -610,9 +616,9 @@ async fn test_protobuf_append_then_scan_roundtrip() {
         .unwrap();
     let proto_response = proto::ScanResponse::decode(body.as_ref()).unwrap();
 
-    assert_eq!(proto_response.entries.len(), 1);
+    assert_eq!(proto_response.values.len(), 1);
     assert_eq!(
-        proto_response.entries[0].value,
+        proto_response.values[0].value,
         Bytes::from("proto-roundtrip-value")
     );
 }
@@ -640,11 +646,13 @@ async fn test_default_response_format_is_json() {
 
     assert_eq!(response.status(), StatusCode::OK);
 
-    // Should be valid JSON
+    // Should be valid JSON with new field names
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(json["status"], "success");
+    // Verify "values" field exists (not "entries")
+    assert!(json["values"].is_array());
 }

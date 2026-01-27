@@ -1,9 +1,16 @@
 //! Protobuf message definitions for the log server HTTP API.
 //!
-//! These types support both binary protobuf encoding (application/x-protobuf)
-//! and ProtoJSON encoding (application/json) per RFC 0004-http-apis.
+//! These types support both binary protobuf encoding (application/protobuf)
+//! and ProtoJSON encoding (application/protobuf+json) per RFC 0004-http-apis.
 
 use prost::Message;
+
+/// Key wraps a bytes value for keys.
+#[derive(Clone, PartialEq, Message)]
+pub struct Key {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub value: bytes::Bytes,
+}
 
 /// AppendRequest is the request body for POST /api/v1/log/append.
 #[derive(Clone, PartialEq, Message)]
@@ -17,8 +24,8 @@ pub struct AppendRequest {
 /// Record represents a single log record with key and value.
 #[derive(Clone, PartialEq, Message)]
 pub struct Record {
-    #[prost(bytes = "bytes", tag = "1")]
-    pub key: bytes::Bytes,
+    #[prost(message, optional, tag = "1")]
+    pub key: Option<Key>,
     #[prost(bytes = "bytes", tag = "2")]
     pub value: bytes::Bytes,
 }
@@ -39,15 +46,15 @@ pub struct AppendResponse {
 pub struct ScanResponse {
     #[prost(string, tag = "1")]
     pub status: String,
-    #[prost(bytes = "bytes", tag = "2")]
-    pub key: bytes::Bytes,
+    #[prost(message, optional, tag = "2")]
+    pub key: Option<Key>,
     #[prost(message, repeated, tag = "3")]
-    pub entries: Vec<Entry>,
+    pub values: Vec<Value>,
 }
 
-/// Entry represents a single log entry in scan results.
+/// Value represents a single log entry in scan results.
 #[derive(Clone, PartialEq, Message)]
-pub struct Entry {
+pub struct Value {
     #[prost(uint64, tag = "1")]
     pub sequence: u64,
     #[prost(bytes = "bytes", tag = "2")]
@@ -79,8 +86,8 @@ pub struct Segment {
 pub struct KeysResponse {
     #[prost(string, tag = "1")]
     pub status: String,
-    #[prost(bytes = "bytes", repeated, tag = "2")]
-    pub keys: Vec<bytes::Bytes>,
+    #[prost(message, repeated, tag = "2")]
+    pub keys: Vec<Key>,
 }
 
 /// CountResponse is the response for GET /api/v1/log/count.
@@ -111,7 +118,9 @@ mod tests {
         // given
         let request = AppendRequest {
             records: vec![Record {
-                key: bytes::Bytes::from("test-key"),
+                key: Some(Key {
+                    value: bytes::Bytes::from("test-key"),
+                }),
                 value: bytes::Bytes::from("test-value"),
             }],
             await_durable: true,
@@ -123,7 +132,10 @@ mod tests {
 
         // then
         assert_eq!(decoded.records.len(), 1);
-        assert_eq!(decoded.records[0].key, bytes::Bytes::from("test-key"));
+        assert_eq!(
+            decoded.records[0].key.as_ref().unwrap().value,
+            bytes::Bytes::from("test-key")
+        );
         assert_eq!(decoded.records[0].value, bytes::Bytes::from("test-value"));
         assert!(decoded.await_durable);
     }
@@ -152,8 +164,10 @@ mod tests {
         // given
         let response = ScanResponse {
             status: "success".to_string(),
-            key: bytes::Bytes::from("my-key"),
-            entries: vec![Entry {
+            key: Some(Key {
+                value: bytes::Bytes::from("my-key"),
+            }),
+            values: vec![Value {
                 sequence: 10,
                 value: bytes::Bytes::from("my-value"),
             }],
@@ -165,10 +179,13 @@ mod tests {
 
         // then
         assert_eq!(decoded.status, "success");
-        assert_eq!(decoded.key, bytes::Bytes::from("my-key"));
-        assert_eq!(decoded.entries.len(), 1);
-        assert_eq!(decoded.entries[0].sequence, 10);
-        assert_eq!(decoded.entries[0].value, bytes::Bytes::from("my-value"));
+        assert_eq!(
+            decoded.key.as_ref().unwrap().value,
+            bytes::Bytes::from("my-key")
+        );
+        assert_eq!(decoded.values.len(), 1);
+        assert_eq!(decoded.values[0].sequence, 10);
+        assert_eq!(decoded.values[0].value, bytes::Bytes::from("my-value"));
     }
 
     #[test]
@@ -176,7 +193,14 @@ mod tests {
         // given
         let response = KeysResponse {
             status: "success".to_string(),
-            keys: vec![bytes::Bytes::from("key-a"), bytes::Bytes::from("key-b")],
+            keys: vec![
+                Key {
+                    value: bytes::Bytes::from("key-a"),
+                },
+                Key {
+                    value: bytes::Bytes::from("key-b"),
+                },
+            ],
         };
 
         // when
@@ -186,8 +210,8 @@ mod tests {
         // then
         assert_eq!(decoded.status, "success");
         assert_eq!(decoded.keys.len(), 2);
-        assert_eq!(decoded.keys[0], bytes::Bytes::from("key-a"));
-        assert_eq!(decoded.keys[1], bytes::Bytes::from("key-b"));
+        assert_eq!(decoded.keys[0].value, bytes::Bytes::from("key-a"));
+        assert_eq!(decoded.keys[1].value, bytes::Bytes::from("key-b"));
     }
 
     #[test]

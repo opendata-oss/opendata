@@ -67,7 +67,6 @@ message AppendResponse {
   string status = 1;
   int32 records_appended = 2;
   uint64 start_sequence = 3;
-  uint64 end_sequence = 4;
 }
 
 message ScanResponse {

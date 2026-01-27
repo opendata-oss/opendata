@@ -12,7 +12,10 @@ use super::proto;
 use crate::LogEntry;
 
 /// Content type for binary protobuf.
-const CONTENT_TYPE_PROTOBUF: &str = "application/x-protobuf";
+const CONTENT_TYPE_PROTOBUF: &str = "application/protobuf";
+
+/// Content type for ProtoJSON.
+const CONTENT_TYPE_PROTOJSON: &str = "application/protobuf+json";
 
 /// Desired response format based on Accept header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,11 +26,16 @@ pub enum ResponseFormat {
 
 impl ResponseFormat {
     /// Determine response format from request headers.
+    /// Returns Protobuf only for `application/protobuf`, not `application/protobuf+json`.
     pub fn from_headers(headers: &HeaderMap) -> Self {
         let wants_protobuf = headers
             .get(header::ACCEPT)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.contains(CONTENT_TYPE_PROTOBUF))
+            .map(|s| {
+                // Check for exact match or with parameters (e.g., "application/protobuf; q=1.0")
+                // But not application/protobuf+json
+                s.contains(CONTENT_TYPE_PROTOBUF) && !s.contains(CONTENT_TYPE_PROTOJSON)
+            })
             .unwrap_or(false);
 
         if wants_protobuf {
@@ -81,14 +89,30 @@ pub trait IntoApiResponse {
     }
 }
 
-/// A single entry in a scan response.
+/// Key wrapper for JSON serialization and deserialization.
+#[serde_as]
+#[derive(Debug, Serialize, serde::Deserialize)]
+pub struct KeyJson {
+    /// Key value (base64-encoded bytes).
+    #[serde_as(as = "Base64")]
+    pub value: Bytes,
+}
+
+impl KeyJson {
+    /// Create a KeyJson from bytes.
+    pub fn new(value: Bytes) -> Self {
+        Self { value }
+    }
+}
+
+/// A single value in a scan response.
 ///
-/// Per RFC 0004, entries only contain sequence and value (not key).
+/// Per RFC 0004, values only contain sequence and value (not key).
 /// The key is included at the top level of the ScanResponse.
 #[serde_as]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ScanEntry {
+pub struct ScanValue {
     /// Sequence number.
     pub sequence: u64,
     /// Value (base64-encoded bytes).
@@ -96,8 +120,8 @@ pub struct ScanEntry {
     pub value: Bytes,
 }
 
-impl ScanEntry {
-    /// Create a scan entry from a LogEntry.
+impl ScanValue {
+    /// Create a scan value from a LogEntry.
     pub fn from_log_entry(entry: &LogEntry) -> Self {
         Self {
             sequence: entry.sequence,
@@ -108,27 +132,25 @@ impl ScanEntry {
 
 /// Response for scan requests.
 ///
-/// Per RFC 0004, the key is at the top level and entries contain only sequence + value.
-#[serde_as]
+/// Per RFC 0004, the key is at the top level and values contain only sequence + value.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanResponse {
     /// Status of the response.
     pub status: String,
-    /// The key that was scanned (base64-encoded bytes).
-    #[serde_as(as = "Base64")]
-    pub key: Bytes,
-    /// Entries returned by the scan.
-    pub entries: Vec<ScanEntry>,
+    /// The key that was scanned (wrapped in Key message).
+    pub key: KeyJson,
+    /// Values returned by the scan.
+    pub values: Vec<ScanValue>,
 }
 
 impl ScanResponse {
     /// Create a successful scan response.
-    pub fn success(key: Bytes, entries: Vec<ScanEntry>) -> Self {
+    pub fn success(key: Bytes, values: Vec<ScanValue>) -> Self {
         Self {
             status: "success".to_string(),
-            key,
-            entries,
+            key: KeyJson::new(key),
+            values,
         }
     }
 }
@@ -139,11 +161,13 @@ impl IntoApiResponse for ScanResponse {
     fn into_proto(self) -> Self::Proto {
         proto::ScanResponse {
             status: self.status,
-            key: self.key,
-            entries: self
-                .entries
+            key: Some(proto::Key {
+                value: self.key.value,
+            }),
+            values: self
+                .values
                 .into_iter()
-                .map(|e| proto::Entry {
+                .map(|e| proto::Value {
                     sequence: e.sequence,
                     value: e.value,
                 })
@@ -191,16 +215,14 @@ impl IntoApiResponse for AppendResponse {
 
 /// Response for list keys requests.
 ///
-/// Per RFC 0004, keys is an array of base64-encoded strings.
-#[serde_as]
+/// Per RFC 0004, keys is an array of Key messages.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListKeysResponse {
     /// Status of the response.
     pub status: String,
-    /// Keys in the log (base64-encoded bytes).
-    #[serde_as(as = "Vec<Base64>")]
-    pub keys: Vec<Bytes>,
+    /// Keys in the log (wrapped in Key messages).
+    pub keys: Vec<KeyJson>,
 }
 
 impl ListKeysResponse {
@@ -208,7 +230,7 @@ impl ListKeysResponse {
     pub fn success(keys: Vec<Bytes>) -> Self {
         Self {
             status: "success".to_string(),
-            keys,
+            keys: keys.into_iter().map(KeyJson::new).collect(),
         }
     }
 }
@@ -219,7 +241,11 @@ impl IntoApiResponse for ListKeysResponse {
     fn into_proto(self) -> Self::Proto {
         proto::KeysResponse {
             status: self.status,
-            keys: self.keys,
+            keys: self
+                .keys
+                .into_iter()
+                .map(|k| proto::Key { value: k.value })
+                .collect(),
         }
     }
 }
@@ -313,7 +339,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_convert_log_entry_to_scan_entry() {
+    fn should_convert_log_entry_to_scan_value() {
         // given
         let entry = LogEntry {
             key: Bytes::from("test-key"),
@@ -322,28 +348,28 @@ mod tests {
         };
 
         // when
-        let scan_entry = ScanEntry::from_log_entry(&entry);
+        let scan_value = ScanValue::from_log_entry(&entry);
 
         // then
-        assert_eq!(scan_entry.sequence, 42);
-        assert_eq!(scan_entry.value, Bytes::from("test-value"));
+        assert_eq!(scan_value.sequence, 42);
+        assert_eq!(scan_value.value, Bytes::from("test-value"));
     }
 
     #[test]
     fn should_create_success_scan_response() {
         // given
-        let entries = vec![ScanEntry {
+        let values = vec![ScanValue {
             sequence: 0,
             value: Bytes::from("value"),
         }];
 
         // when
-        let response = ScanResponse::success(Bytes::from("key"), entries);
+        let response = ScanResponse::success(Bytes::from("key"), values);
 
         // then
         assert_eq!(response.status, "success");
-        assert_eq!(response.key, Bytes::from("key"));
-        assert_eq!(response.entries.len(), 1);
+        assert_eq!(response.key.value, Bytes::from("key"));
+        assert_eq!(response.values.len(), 1);
     }
 
     #[test]
@@ -351,7 +377,7 @@ mod tests {
         // given
         let response = ScanResponse::success(
             Bytes::from("test-key"),
-            vec![ScanEntry {
+            vec![ScanValue {
                 sequence: 42,
                 value: Bytes::from("test-value"),
             }],
@@ -363,9 +389,10 @@ mod tests {
         // then
         // "test-key" -> "dGVzdC1rZXk=", "test-value" -> "dGVzdC12YWx1ZQ=="
         assert!(json.contains(r#""status":"success""#));
-        assert!(json.contains(r#""key":"dGVzdC1rZXk=""#));
+        assert!(json.contains(r#""key":{"value":"dGVzdC1rZXk="}"#));
         assert!(json.contains(r#""sequence":42"#));
         assert!(json.contains(r#""value":"dGVzdC12YWx1ZQ==""#));
+        assert!(json.contains(r#""values":"#));
     }
 
     #[test]
@@ -393,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn should_serialize_list_keys_response_with_base64() {
+    fn should_serialize_list_keys_response_with_wrapped_keys() {
         // given
         let response =
             ListKeysResponse::success(vec![Bytes::from("events"), Bytes::from("orders")]);
@@ -403,7 +430,7 @@ mod tests {
 
         // then
         // "events" -> "ZXZlbnRz", "orders" -> "b3JkZXJz"
-        assert!(json.contains(r#""keys":["ZXZlbnRz","b3JkZXJz"]"#));
+        assert!(json.contains(r#""keys":[{"value":"ZXZlbnRz"},{"value":"b3JkZXJz"}]"#));
     }
 
     #[test]
