@@ -2,77 +2,35 @@
 
 use std::time::Instant;
 
-use bencher::{Bencher, Benchmark, Label, Summary};
+use bencher::{Bencher, Benchmark, Params, Summary};
 use bytes::Bytes;
 use log::{Config, Log, Record};
 
 const MICROS_PER_SEC: f64 = 1_000_000.0;
 
-/// Parameters for the ingest benchmark.
-#[derive(Debug, Clone)]
-pub struct Params {
-    /// Number of records per append call.
-    pub batch_size: usize,
-    /// Size of each record value in bytes.
-    pub value_size: usize,
-    /// Length of keys in bytes.
-    pub key_length: usize,
-    /// Number of distinct keys to write to.
-    pub num_keys: usize,
-    /// Total number of records to write.
-    pub total_records: usize,
-}
-
-impl Params {
-    fn new(
-        batch_size: usize,
-        value_size: usize,
-        key_length: usize,
-        num_keys: usize,
-        total_records: usize,
-    ) -> Self {
-        Self {
-            batch_size,
-            value_size,
-            key_length,
-            num_keys,
-            total_records,
-        }
-    }
-}
-
-impl From<&Params> for Vec<Label> {
-    fn from(p: &Params) -> Vec<Label> {
-        vec![
-            Label::new("batch_size", p.batch_size.to_string()),
-            Label::new("value_size", p.value_size.to_string()),
-            Label::new("key_length", p.key_length.to_string()),
-            Label::new("num_keys", p.num_keys.to_string()),
-            Label::new("total_records", p.total_records.to_string()),
-        ]
-    }
+/// Create a parameter set for the ingest benchmark.
+fn make_params(
+    batch_size: usize,
+    value_size: usize,
+    key_length: usize,
+    num_keys: usize,
+    total_records: usize,
+) -> Params {
+    let mut params = Params::new();
+    params.insert("batch_size", batch_size.to_string());
+    params.insert("value_size", value_size.to_string());
+    params.insert("key_length", key_length.to_string());
+    params.insert("num_keys", num_keys.to_string());
+    params.insert("total_records", total_records.to_string());
+    params
 }
 
 /// Benchmark for log ingest throughput.
-pub struct IngestBenchmark {
-    /// Parameter combinations to sweep.
-    params: Vec<Params>,
-}
+pub struct IngestBenchmark;
 
 impl IngestBenchmark {
     pub fn new() -> Self {
-        Self {
-            params: vec![
-                // Vary batch size
-                Params::new(1, 256, 16, 10, 50_000),
-                Params::new(10, 256, 16, 10, 50_000),
-                Params::new(100, 256, 16, 10, 50_000),
-                // Vary value size
-                Params::new(100, 64, 16, 10, 50_000),
-                Params::new(100, 512, 16, 10, 50_000),
-                Params::new(100, 1024, 16, 10, 50_000),
-            ],
-        }
+        Self
     }
 }
 
@@ -88,9 +46,28 @@ impl Benchmark for IngestBenchmark {
         "ingest"
     }
 
-    async fn run(&self, bencher: &Bencher) -> anyhow::Result<()> {
-        for params in &self.params {
-            let bench = bencher.bench(params);
+    fn default_params(&self) -> Vec<Params> {
+        vec![
+            // Vary batch size
+            make_params(1, 256, 16, 10, 50_000),
+            make_params(10, 256, 16, 10, 50_000),
+            make_params(100, 256, 16, 10, 50_000),
+            // Vary value size
+            make_params(100, 64, 16, 10, 50_000),
+            make_params(100, 512, 16, 10, 50_000),
+            make_params(100, 1024, 16, 10, 50_000),
+        ]
+    }
+
+    async fn run(&self, bencher: &Bencher, params: Vec<Params>) -> anyhow::Result<()> {
+        for p in params {
+            let batch_size: usize = p.get_parse("batch_size")?;
+            let value_size: usize = p.get_parse("value_size")?;
+            let key_length: usize = p.get_parse("key_length")?;
+            let num_keys: usize = p.get_parse("num_keys")?;
+            let total_records: usize = p.get_parse("total_records")?;
+
+            let bench = bencher.bench(p);
 
             // Live metrics - updated during the benchmark
             let records_counter = bench.counter("records");
@@ -105,26 +82,25 @@ impl Benchmark for IngestBenchmark {
             let log = Log::open(config).await?;
 
             // Generate keys
-            let keys: Vec<Bytes> = (0..params.num_keys)
+            let keys: Vec<Bytes> = (0..num_keys)
                 .map(|i| {
-                    let key = format!("{:0>width$}", i, width = params.key_length);
+                    let key = format!("{:0>width$}", i, width = key_length);
                     Bytes::from(key)
                 })
                 .collect();
 
             // Generate value template
-            let value = Bytes::from(vec![b'x'; params.value_size]);
-            let record_size = params.key_length + params.value_size;
+            let value = Bytes::from(vec![b'x'; value_size]);
+            let record_size = key_length + value_size;
 
             // Run append loop
             let start = Instant::now();
             let mut records_written = 0;
             let mut key_idx = 0;
 
-            while records_written < params.total_records {
-                let batch_size =
-                    std::cmp::min(params.batch_size, params.total_records - records_written);
-                let records: Vec<Record> = (0..batch_size)
+            while records_written < total_records {
+                let batch_len = std::cmp::min(batch_size, total_records - records_written);
+                let records: Vec<Record> = (0..batch_len)
                     .map(|_| {
                         let key = keys[key_idx % keys.len()].clone();
                         key_idx += 1;
@@ -140,19 +116,19 @@ impl Benchmark for IngestBenchmark {
                 let batch_elapsed = batch_start.elapsed();
 
                 // Update live metrics
-                records_counter.increment(batch_size as u64);
-                bytes_counter.increment((batch_size * record_size) as u64);
+                records_counter.increment(batch_len as u64);
+                bytes_counter.increment((batch_len * record_size) as u64);
                 batch_latency.record(batch_elapsed.as_secs_f64() * MICROS_PER_SEC);
 
-                records_written += batch_size;
+                records_written += batch_len;
             }
 
             let elapsed = start.elapsed();
             let elapsed_secs = elapsed.as_secs_f64();
 
             // Summary metrics - computed at the end
-            let ops_per_sec = params.total_records as f64 / elapsed_secs;
-            let bytes_per_sec = (params.total_records * record_size) as f64 / elapsed_secs;
+            let ops_per_sec = total_records as f64 / elapsed_secs;
+            let bytes_per_sec = (total_records * record_size) as f64 / elapsed_secs;
 
             bench
                 .summarize(

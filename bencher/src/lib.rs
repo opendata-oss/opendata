@@ -20,14 +20,12 @@
 //! # Example
 //!
 //! ```ignore
-//! use bencher::{Benchmark, Bencher, Label, Summary};
+//! use bencher::{Benchmark, Bencher, Params, Summary};
 //!
-//! struct Params { record_size: usize }
-//!
-//! impl From<&Params> for Vec<Label> {
-//!     fn from(p: &Params) -> Vec<Label> {
-//!         vec![Label::new("record_size", p.record_size.to_string())]
-//!     }
+//! fn params(record_size: usize) -> Params {
+//!     let mut labels = Params::new();
+//!     labels.insert("record_size", record_size.to_string());
+//!     labels
 //! }
 //!
 //! struct LogAppendBenchmark;
@@ -36,9 +34,14 @@
 //! impl Benchmark for LogAppendBenchmark {
 //!     fn name(&self) -> &str { "log_append" }
 //!
-//!     async fn run(&self, bencher: &Bencher) -> anyhow::Result<()> {
-//!         for record_size in [64, 256, 1024] {
-//!             let bench = bencher.bench(&Params { record_size });
+//!     fn default_params(&self) -> Vec<Params> {
+//!         vec![params(64), params(256), params(1024)]
+//!     }
+//!
+//!     async fn run(&self, bencher: &Bencher, params: Vec<Params>) -> anyhow::Result<()> {
+//!         for labels in params {
+//!             let record_size: usize = labels.get_parse("record_size")?;
+//!             let bench = bencher.bench(labels);
 //!
 //!             // Ongoing metrics - updated during benchmark, snapshotted periodically
 //!             let ops = bench.counter("operations");
@@ -67,6 +70,7 @@ mod config;
 mod recorder;
 mod reporter;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -84,6 +88,78 @@ pub use config::{Config, DataConfig, ReporterConfig};
 
 // Re-export timeseries model types
 pub use timeseries::{Label, MetricType, Sample, Series, SeriesBuilder};
+
+/// A collection of benchmark parameters with efficient key lookup.
+///
+/// Provides convenient methods for extracting and parsing parameter values.
+/// Parameters are stored as string key-value pairs and can be converted
+/// to/from `Vec<Label>` for use with the metrics system.
+#[derive(Debug, Clone, Default)]
+pub struct Params {
+    inner: HashMap<String, String>,
+}
+
+impl Params {
+    /// Create an empty Params collection.
+    pub fn new() -> Self {
+        Self {
+            inner: HashMap::new(),
+        }
+    }
+
+    /// Get a label value by name.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.inner.get(name).map(|s| s.as_str())
+    }
+
+    /// Get and parse a label value.
+    pub fn get_parse<T>(&self, name: &str) -> anyhow::Result<T>
+    where
+        T: std::str::FromStr,
+        T::Err: std::error::Error + Send + Sync + 'static,
+    {
+        let value = self
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("missing label: {}", name))?;
+        value
+            .parse()
+            .map_err(|e: T::Err| anyhow::anyhow!("failed to parse label '{}': {}", name, e))
+    }
+
+    /// Insert a label.
+    pub fn insert(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        self.inner.insert(name.into(), value.into());
+    }
+}
+
+impl From<Vec<Label>> for Params {
+    fn from(labels: Vec<Label>) -> Self {
+        Self {
+            inner: labels.into_iter().map(|l| (l.name, l.value)).collect(),
+        }
+    }
+}
+
+impl From<&[Label]> for Params {
+    fn from(labels: &[Label]) -> Self {
+        Self {
+            inner: labels
+                .iter()
+                .map(|l| (l.name.clone(), l.value.clone()))
+                .collect(),
+        }
+    }
+}
+
+impl From<Params> for Vec<Label> {
+    fn from(labels: Params) -> Self {
+        labels
+            .inner
+            .into_iter()
+            .map(|(name, value)| Label::new(name, value))
+            .collect()
+    }
+}
 
 /// Main bencher struct. Handles storage initialization and metrics reporting.
 pub struct Bencher {
@@ -447,8 +523,20 @@ pub trait Benchmark: Send + Sync {
         vec![]
     }
 
-    /// Run the benchmark using the provided bencher.
-    async fn run(&self, bencher: &Bencher) -> anyhow::Result<()>;
+    /// Default parameterizations for this benchmark.
+    ///
+    /// The framework will use these if no external parameterizations are provided.
+    /// Each `Params` represents one parameter combination to run.
+    fn default_params(&self) -> Vec<Params> {
+        vec![]
+    }
+
+    /// Run the benchmark with the provided parameterizations.
+    ///
+    /// Each `Params` represents one parameter combination.
+    /// Benchmarks should iterate over these and convert each to their
+    /// concrete `Params` type using `TryFrom<&Params>`.
+    async fn run(&self, bencher: &Bencher, params: Vec<Params>) -> anyhow::Result<()>;
 }
 
 /// Run a set of benchmarks.
@@ -464,7 +552,9 @@ pub async fn run(benchmarks: Vec<Box<dyn Benchmark>>) -> anyhow::Result<()> {
     for benchmark in benchmarks {
         println!("Running benchmark: {}", benchmark.name());
         let bencher = Bencher::new(config.clone(), benchmark.name(), benchmark.labels()).await?;
-        benchmark.run(&bencher).await?;
+        // TODO: Allow params to be provided externally (config file, CLI)
+        let params = benchmark.default_params();
+        benchmark.run(&bencher, params).await?;
     }
 
     Ok(())
