@@ -198,15 +198,12 @@ mod tests {
     use crate::model::{MetadataFieldSpec, Vector};
     use crate::serde::FieldType;
     use crate::serde::collection_meta::DistanceMetric;
-    use common::storage::in_memory::InMemoryStorage;
-    use std::sync::Arc;
+    use common::StorageConfig;
     use std::time::Duration;
 
     async fn create_test_builder() -> VectorDbDeltaBuilder<'static> {
-        let storage: Arc<dyn common::Storage> = Arc::new(InMemoryStorage::new());
-
         let config = Config {
-            storage: storage.clone(),
+            storage: StorageConfig::InMemory,
             dimensions: 3,
             distance_metric: DistanceMetric::Cosine,
             flush_interval: Duration::from_secs(60),
