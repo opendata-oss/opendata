@@ -5,10 +5,12 @@ metrics reporting while leaving workload structure to benchmark authors.
 
 ## Modules
 
-- **lib.rs** - Core API: `Bencher`, `Bench`, `Summary`, `Benchmark` trait
+- **lib.rs** - Core API: `Bencher`, `Benchmark` trait, `run()` entry point
+- **bench.rs** - Runtime types: `Bench`, `BenchSpec`, `Runner`, `Summary`
+- **params.rs** - Parameter collection: `Params`
 - **config.rs** - Configuration types: `Config`, `DataConfig`, `ReporterConfig`
 - **cli.rs** - CLI argument parsing: `Args`
-- **recorder.rs** - Internal metrics collection using the `metrics` crate
+- **metrics.rs** - Internal metrics collection using the `metrics` crate
 - **reporter.rs** - `Reporter` trait and `TimeSeriesReporter` implementation
 
 ## Usage
