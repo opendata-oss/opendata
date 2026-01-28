@@ -4,10 +4,9 @@ use axum::http::{HeaderMap, header};
 use bytes::Bytes;
 use prost::Message;
 use serde::Deserialize;
-use serde_with::{base64::Base64, serde_as};
 
 use super::proto;
-use super::response::{CONTENT_TYPE_PROTOBUF, CONTENT_TYPE_PROTOJSON, KeyJson};
+use super::response::{CONTENT_TYPE_PROTOBUF, CONTENT_TYPE_PROTOJSON};
 use crate::Error;
 
 /// Check if the request body is protobuf based on Content-Type header.
@@ -114,33 +113,6 @@ impl CountParams {
     }
 }
 
-/// A single record in a JSON append request.
-///
-/// Uses camelCase field names and base64-encoded bytes per RFC 0004.
-#[serde_as]
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AppendRecordJson {
-    /// Key (wrapped in Key message).
-    pub key: KeyJson,
-    /// Value (base64-encoded bytes).
-    #[serde_as(as = "Base64")]
-    pub value: Bytes,
-}
-
-/// JSON request body for append operations.
-///
-/// Uses camelCase field names per RFC 0004.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AppendBodyJson {
-    /// Records to append.
-    pub records: Vec<AppendRecordJson>,
-    /// Whether to wait for durable write.
-    #[serde(default)]
-    pub await_durable: bool,
-}
-
 /// Unified append request that can be parsed from either JSON or protobuf.
 ///
 /// Per RFC 0004, supports both `Content-Type: application/json` (ProtoJSON)
@@ -188,21 +160,21 @@ impl AppendRequest {
 
     /// Parse from JSON (ProtoJSON format).
     fn from_json(body: &[u8]) -> Result<Self, Error> {
-        let json_body: AppendBodyJson = serde_json::from_slice(body)
+        let proto_request: proto::AppendRequest = serde_json::from_slice(body)
             .map_err(|e| Error::InvalidInput(format!("Invalid JSON: {}", e)))?;
 
-        let records = json_body
+        let records = proto_request
             .records
             .into_iter()
             .map(|r| crate::Record {
-                key: r.key.value,
+                key: r.key.map(|k| k.value).unwrap_or_default(),
                 value: r.value,
             })
             .collect();
 
         Ok(Self {
             records,
-            await_durable: json_body.await_durable,
+            await_durable: proto_request.await_durable,
         })
     }
 }

@@ -3,10 +3,8 @@
 use axum::Json;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use bytes::Bytes;
 use prost::Message;
 use serde::Serialize;
-use serde_with::{base64::Base64, serde_as};
 
 /// Content type for binary protobuf.
 pub(super) const CONTENT_TYPE_PROTOBUF: &str = "application/protobuf";
@@ -71,20 +69,10 @@ pub fn to_api_response<T: Message + Serialize>(response: T, format: ResponseForm
     }
 }
 
-/// Key wrapper for JSON serialization and deserialization.
-#[serde_as]
-#[derive(Debug, Serialize, serde::Deserialize)]
-pub struct KeyJson {
-    /// Key value (base64-encoded bytes).
-    #[serde_as(as = "Base64")]
-    pub value: Bytes,
-}
-
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::proto;
+    use bytes::Bytes;
 
     #[test]
     fn should_create_success_scan_response() {

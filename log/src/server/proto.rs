@@ -4,12 +4,12 @@
 //! and ProtoJSON encoding (application/protobuf+json) per RFC 0004-http-apis.
 
 use prost::Message;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_with::{base64::Base64, serde_as};
 
 /// Key wraps a bytes value for keys.
 #[serde_as]
-#[derive(Clone, PartialEq, Message, Serialize)]
+#[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
 pub struct Key {
     #[prost(bytes = "bytes", tag = "1")]
     #[serde_as(as = "Base64")]
@@ -17,20 +17,25 @@ pub struct Key {
 }
 
 /// AppendRequest is the request body for POST /api/v1/log/append.
-#[derive(Clone, PartialEq, Message)]
+#[derive(Clone, PartialEq, Message, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppendRequest {
     #[prost(message, repeated, tag = "1")]
     pub records: Vec<Record>,
     #[prost(bool, tag = "2")]
+    #[serde(default)]
     pub await_durable: bool,
 }
 
 /// Record represents a single log record with key and value.
-#[derive(Clone, PartialEq, Message)]
+#[serde_as]
+#[derive(Clone, PartialEq, Message, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Record {
     #[prost(message, optional, tag = "1")]
     pub key: Option<Key>,
     #[prost(bytes = "bytes", tag = "2")]
+    #[serde_as(as = "Base64")]
     pub value: bytes::Bytes,
 }
 
