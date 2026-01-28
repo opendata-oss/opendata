@@ -6,7 +6,7 @@ use prost::Message;
 use serde::Deserialize;
 
 use super::proto;
-use super::response::{CONTENT_TYPE_PROTOBUF, CONTENT_TYPE_PROTOJSON};
+use super::response::is_binary_protobuf;
 use crate::Error;
 
 /// Check if the request body is protobuf based on Content-Type header.
@@ -15,11 +15,7 @@ fn is_protobuf_content(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            // Check for exact match or with parameters (e.g., "application/protobuf; charset=utf-8")
-            // But not application/protobuf+json
-            s.starts_with(CONTENT_TYPE_PROTOBUF) && !s.starts_with(CONTENT_TYPE_PROTOJSON)
-        })
+        .map(is_binary_protobuf)
         .unwrap_or(false)
 }
 

@@ -12,6 +12,11 @@ pub(super) const CONTENT_TYPE_PROTOBUF: &str = "application/protobuf";
 /// Content type for ProtoJSON.
 pub(super) const CONTENT_TYPE_PROTOJSON: &str = "application/protobuf+json";
 
+/// Check if a media type string indicates binary protobuf (not ProtoJSON).
+pub(super) fn is_binary_protobuf(media_type: &str) -> bool {
+    media_type.contains(CONTENT_TYPE_PROTOBUF) && !media_type.contains(CONTENT_TYPE_PROTOJSON)
+}
+
 /// Desired response format based on Accept header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseFormat {
@@ -26,11 +31,7 @@ impl ResponseFormat {
         let wants_protobuf = headers
             .get(header::ACCEPT)
             .and_then(|v| v.to_str().ok())
-            .map(|s| {
-                // Check for exact match or with parameters (e.g., "application/protobuf; q=1.0")
-                // But not application/protobuf+json
-                s.contains(CONTENT_TYPE_PROTOBUF) && !s.contains(CONTENT_TYPE_PROTOJSON)
-            })
+            .map(is_binary_protobuf)
             .unwrap_or(false);
 
         if wants_protobuf {
