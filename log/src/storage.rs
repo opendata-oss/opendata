@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use common::{Storage, StorageIterator, StorageRead};
-
 use common::SeqBlock;
 
 use crate::error::{Error, Result};
@@ -239,6 +238,11 @@ impl LogStorage {
             value: entry.value.clone(),
         };
         self.storage.put(vec![record]).await?;
+        Ok(())
+    }
+
+    pub async fn flush(&self) -> Result<()> {
+        self.storage.flush().await?;
         Ok(())
     }
 }

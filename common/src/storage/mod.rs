@@ -182,6 +182,13 @@ pub trait Storage: StorageRead {
     /// writes to the underlying storage.
     async fn snapshot(&self) -> StorageResult<Arc<dyn StorageSnapshot>>;
 
+    /// Flushes all pending writes to durable storage.
+    ///
+    /// This ensures that all writes that have been acknowledged are persisted
+    /// to durable storage. For SlateDB, this flushes the memtable to the WAL
+    /// and object store.
+    async fn flush(&self) -> StorageResult<()>;
+
     /// Closes the storage, releasing any resources.
     ///
     /// This method should be called before dropping the storage to ensure

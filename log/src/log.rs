@@ -284,6 +284,16 @@ impl Log {
         Ok(())
     }
 
+    /// Flushes all pending writes to durable storage.
+    ///
+    /// This ensures that all writes that have been acknowledged are persisted
+    /// to durable storage. For SlateDB-backed storage, this flushes the memtable
+    /// to the WAL and object store.
+    pub async fn flush(&self) -> Result<()> {
+        self.storage.flush().await?;
+        Ok(())
+    }
+
     /// Closes the log, releasing any resources.
     ///
     /// This method should be called before dropping the log to ensure

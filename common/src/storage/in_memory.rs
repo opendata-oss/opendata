@@ -253,6 +253,11 @@ impl Storage for InMemoryStorage {
         }))
     }
 
+    async fn flush(&self) -> StorageResult<()> {
+        // No-op for in-memory storage - all writes are immediately visible
+        Ok(())
+    }
+
     async fn close(&self) -> StorageResult<()> {
         // No-op for in-memory storage
         Ok(())

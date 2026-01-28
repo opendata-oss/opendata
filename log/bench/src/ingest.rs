@@ -110,6 +110,7 @@ impl Benchmark for IngestBenchmark {
 
             records_written += batch_size;
         }
+        log.flush().await?;
 
         let elapsed_secs = runner.elapsed().as_secs_f64();
 
