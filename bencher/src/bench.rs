@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use common::display::format_number;
 use metrics::Recorder;
 use timeseries::{Label, MetricType, Sample, Series};
 
@@ -343,33 +344,109 @@ impl Default for Summary {
     }
 }
 
-/// Format a number for display with thousands separators and appropriate precision.
-fn format_number(value: f64) -> String {
-    let abs = value.abs();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
 
-    // Determine appropriate precision based on magnitude
-    let (formatted, suffix) = if abs >= 1_000_000_000.0 {
-        (value / 1_000_000_000.0, "B")
-    } else if abs >= 1_000_000.0 {
-        (value / 1_000_000.0, "M")
-    } else if abs >= 1_000.0 {
-        (value / 1_000.0, "K")
-    } else {
-        (value, "")
-    };
+    #[test]
+    fn runner_should_keep_running_before_deadline() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(60);
+        let runner = Runner::new(start, deadline);
 
-    // Format with appropriate decimal places
-    if suffix.is_empty() {
-        if abs < 0.01 && abs > 0.0 {
-            format!("{:.4}", formatted)
-        } else if abs < 1.0 {
-            format!("{:.2}", formatted)
-        } else if formatted.fract() == 0.0 {
-            format!("{:.0}", formatted)
-        } else {
-            format!("{:.2}", formatted)
-        }
-    } else {
-        format!("{:.2}{}", formatted, suffix)
+        assert!(runner.keep_running());
+    }
+
+    #[test]
+    fn runner_should_stop_after_deadline() {
+        let start = Instant::now() - Duration::from_secs(10);
+        let deadline = start + Duration::from_secs(5); // Deadline is in the past
+        let runner = Runner::new(start, deadline);
+
+        assert!(!runner.keep_running());
+    }
+
+    #[test]
+    fn runner_should_track_elapsed_time() {
+        let start = Instant::now() - Duration::from_millis(100);
+        let deadline = start + Duration::from_secs(60);
+        let runner = Runner::new(start, deadline);
+
+        assert!(runner.elapsed() >= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn bench_spec_should_combine_static_and_param_labels() {
+        let mut params = Params::new();
+        params.insert("batch_size", "100");
+        params.insert("value_size", "256");
+
+        let static_labels = vec![Label::new("benchmark", "ingest"), Label::new("env", "test")];
+
+        let spec = BenchSpec::new(
+            params,
+            DataConfig::default(),
+            static_labels,
+            Duration::from_secs(10),
+        );
+
+        let all_labels = spec.all_labels();
+
+        // Should have both static labels
+        assert!(
+            all_labels
+                .iter()
+                .any(|l| l.name == "benchmark" && l.value == "ingest")
+        );
+        assert!(
+            all_labels
+                .iter()
+                .any(|l| l.name == "env" && l.value == "test")
+        );
+
+        // Should have param labels
+        assert!(
+            all_labels
+                .iter()
+                .any(|l| l.name == "batch_size" && l.value == "100")
+        );
+        assert!(
+            all_labels
+                .iter()
+                .any(|l| l.name == "value_size" && l.value == "256")
+        );
+    }
+
+    #[test]
+    fn bench_spec_should_expose_params() {
+        let mut params = Params::new();
+        params.insert("key", "value");
+
+        let spec = BenchSpec::new(
+            params,
+            DataConfig::default(),
+            vec![],
+            Duration::from_secs(10),
+        );
+
+        assert_eq!(spec.params().get("key"), Some("value"));
+    }
+
+    #[test]
+    fn summary_should_build_with_metrics() {
+        let summary = Summary::new()
+            .add("throughput", 1000.0)
+            .add("latency_p99", 42.5);
+
+        assert_eq!(summary.metrics.len(), 2);
+        assert_eq!(summary.metrics[0], ("throughput".to_string(), 1000.0));
+        assert_eq!(summary.metrics[1], ("latency_p99".to_string(), 42.5));
+    }
+
+    #[test]
+    fn summary_should_be_empty_by_default() {
+        let summary = Summary::new();
+        assert!(summary.metrics.is_empty());
     }
 }
