@@ -3,35 +3,38 @@
 **Status**: Draft
 
 **Authors**:
-- [Bruno Cadonna](https://github.com/cadonna>) 
+- [Bruno Cadonna](https://github.com/cadonna>)
 
 ## Summary
 
-This RFC defines the storage format for OpenData-Queue. 
-The design separates message storage from queue state, where each queue maintains its 
+This RFC defines the storage format for OpenData-Queue.
+The design separates message storage from queue state, where each queue maintains its
 own append-only sequence of records tracking message consumption state.
 
 ## Motivation
 
-OpenData-Queue is a message queue that allows producers to publish messages and 
+OpenData-Queue is a message queue that allows producers to publish messages and
 consumers to receive and process them.
 OpenData-Queue is used when messages are transient.
 Once a message is consumed, the message is gone.
-That is useful when one need to spread work across multiple workers.
-Examples for such use cases are job processing and sending e-mails.
-In contrast to OpenData-Log, OpenData-Queue does not support maintaining a complete history of what happened 
-usually used for event sourcing or reprocessing historical data.
+In other words, the retention of the messages is different compared to a log.
+In a log the retention is time-based whereas in a queue the retention is consumption-based.
+Another aspect in which a queue and a log differ is the order in which messages are consumed.
+A log supports maintaining a complete history of what happened and allows to reprocess historical data.
+Additionally, the order in which the messages are consumed might be different in a queue and a log.
+A queue may re-order messages when messages could not be processed and need to be retried.
+The typical use cases for a queue is spreading work across multiple workers.
 
 OpenData-Queue allows to specify multiple queues.
-When a messages is published, the producer specifies the payload of the message and 
+When a messages is published, the producer specifies the payload of the message and
 data about the message, i.e., the metadata of the message.
 For example, the metadata contains when the message is visible for consumption.
 A published message is assigned to a queue according to user-defined rules.
 User defined rules are formulated for each queue by filtering on the metadata of the messages.
 The same message can be assigned to multiple queues.
-A consumer claims messages from a queue and acknowledges the successful processing 
+A consumer claims messages from a queue and acknowledges the successful processing
 of the message or reports the unsuccessful processing of the message back to the queue.
-Once a consumer acknowledges the successful processing of a message, that message 
+Once a consumer acknowledges the successful processing of a message, that message
 is added to the list of done messages of the queue.
 If the consumer reports the unsuccessful processing of a message, that message is added to
 the list of failed messages of the queue.
@@ -40,33 +43,34 @@ the list of failed messages of the queue.
 - Specify a storage layout/data model for the queue
 
 ## Non-Goals
-- Specification of a publish API for producers   
+- Specification of a publish API for producers
 - Specification of a consumption API for consumers
-- Specification of a admin API to specify queues
-- Specification of background processes that maintain the queues 
+- Specification of an admin API to specify queues
+- Specification of background processes that maintain the queues
 
 ## Design
-OpenData-Queue stores the payload of the message and its metadata in two logically 
+
+OpenData-Queue stores the payload of the message and its metadata in two logically
 separate stores, the payload store and the metadata log.
-The payload store is optimized for point-lookups and the metadata log is optimized for 
+The payload store is optimized for point-lookups and the metadata log is optimized for
 sequential scans.
-The main benefit of this separation is that queues only need to scan the metadata 
-log to evaluate whether the message belongs to them without the need to also 
+The main benefit of this separation is that queues only need to scan the metadata
+log to evaluate whether the message belongs to them without the need to also
 read the potentially much larger payload.
-Another benefit is that payloads of messages that belong to multiple queues do not 
+Another benefit is that payloads of messages that belong to multiple queues do not
 need to be copied into each queue.
 Payloads are not read until they are claimed by consumers.
 
 ### Payload store
 
-The payload store stores the payload of the messages that are published to the message 
-queue system. 
+The payload store stores the payload of the messages that are published to the message
+queue system.
 The payload store assigns an ID to each published messages.
 The assigned ID is provided by a counter.
 For the counter, the same technique as for the sequence number in [OpenData-Log](log/rfcs/0001-storage.md) shall be used.
 
-The key of a payload in the payload store conforms to 
-[RFC 0001: Record Key Prefix](rfcs/0001-record-key-prefix.md). 
+The key of a payload in the payload store conforms to
+[RFC 0001: Record Key Prefix](rfcs/0001-record-key-prefix.md).
 
 ```
 Payload Entry:
@@ -74,9 +78,9 @@ Payload Entry:
     SlateDB Value: | record value (bytes)
 ```
 
-The initial version is 1. 
-The type discriminator `0x01` is reserved for payload entries. 
-Additional record types (e.g., indexes) may be introduced in future RFCs 
+The initial version is 1.
+The type discriminator `0x01` is reserved for payload entries.
+Additional record types (e.g., indexes) may be introduced in future RFCs
 using different discriminators.
 
 The record value has the following encoding
@@ -86,11 +90,11 @@ Payload Record Value:
 ```
 The type of payload specifies the format of the payload.
 Initially, there will be two payload types:
-- `0x01` `Array<Byte>`  
+- `0x01` `Array<Byte>`
 - `0x02` URI (encoding still to be determined)
 
 An `Array<T>` is encoded as a `count (u16, little endian)` followed by `count` serialized elements of type T,
-encoded back-to-back with no additional padding. 
+encoded back-to-back with no additional padding.
 The type is defined in [OpenData-Timeseries](timeseries/rfcs/0001-tsdb-storage.md).
 
 ### Metadata log
@@ -98,8 +102,8 @@ The type is defined in [OpenData-Timeseries](timeseries/rfcs/0001-tsdb-storage.m
 The metadata log stores the metadata of the published messages.
 The metadata log is an [OpenData-Log](log/rfcs/0001-storage.md).
 The key of the log is `opendata-queue/messages/metadata`.
-If multiple queue systems are maintained by the same slateDB instance, the key for the 
-metadata log needs to be suffixed by an identifier of the actual OpenData-Queue 
+If multiple queue systems are maintained by the same slateDB instance, the key for the
+metadata log needs to be suffixed by an identifier of the actual OpenData-Queue
 instance, e.g., `/newsfeeds`.
 
 The record value contains the following metadata:
@@ -118,13 +122,13 @@ Metadata Record Value:
     | visible at (i64)
     | retention duration in seconds (u32)
     | number of headers N (u8)
-    | key 0 (Utf8) | value 0 (Utf8)   
+    | key 0 (Utf8) | value 0 (Utf8)
     ...
-    | key N-1 (Utf8) | value N-1 (Utf8)   
+    | key N-1 (Utf8) | value N-1 (Utf8)
 ```
 The type `Utf8` is specified in [OpenData-Timeseries](timeseries/rfcs/0001-tsdb-storage.md)
 The retention duration in seconds is computed from the `received at` timestamp.
-If the current timestamp exceeds the `received at` timestamp plus the retention duration, 
+If the current timestamp exceeds the `received at` timestamp plus the retention duration,
 the message -- payload and metadata -- are removed from the OpenData-queue system.
 A retention duration of `0` means infinite retention.
 
@@ -142,24 +146,24 @@ The key of the active messages consists of:
 The key is encoded as follows:
 ```
 Active Message Key:
-    | version (u8) | type (u8) | queue ID (TerminatedBytes)   
+    | version (u8) | type (u8) | queue ID (TerminatedBytes)
 ```
 The initial version is 1.
-The type discriminator is `0x02`. 
+The type discriminator is `0x02`.
 
 The queue ID is of type `TerminatedBytes`.
-A `TerminatedBytes` is a variable-length byte sequence that terminates with a 0x00 delimiter as described in 
+A `TerminatedBytes` is a variable-length byte sequence that terminates with a 0x00 delimiter as described in
 [OpenData-Log](log/rfcs/0001-storage.md).
 
 The value of the active messages consists of:
 - the list of available messages, i.e., the messages that can be claimed by consumers
-- the list of in-flight messages, i.e., the messages that are currently claimed by consumers 
+- the list of in-flight messages, i.e., the messages that are currently claimed by consumers
 
 The encoding of the active messages value is as follows:
 ```
 Queue State Value:
     | available messages (Array<AvailableMessage>)
-    | in-flight messages (Array<InFlightMessage>)   
+    | in-flight messages (Array<InFlightMessage>)
 ```
 
 An `AvailableMessage` consists of:
@@ -172,7 +176,7 @@ An `AvailableMessage` consists of:
 The available message type is encoded as follows:
 ```
 AvailableMessage:
-    | message ID (u64) | priority (u8) | visible at (i64) | retention deadline (i64) | attempts (u16)   
+    | message ID (u64) | priority (u8) | visible at (i64) | retention deadline (i64) | attempts (u16)
 ```
 The priority describes the priority of the message in this queue.
 The priority decreases with increasing number.
@@ -197,15 +201,15 @@ An `InFlightMessage` consists of:
 
 ```
 InFlightMessage:
-    | message ID (u64) | priority (u8) | | claimed at (i64) | lease deadline (i64) | attempts (u16)   
+    | message ID (u64) | priority (u8) | | claimed at (i64) | lease deadline (i64) | attempts (u16)
 ```
 
-There are multiple options to set the lease deadline. 
-Either the consumer that claims the message sets the deadline or the deadline is set 
-by the queue config.  
+There are multiple options to set the lease deadline.
+Either the consumer that claims the message sets the deadline or the deadline is set
+by the queue config.
 
 Besides the available and in-flight messages, the queue store also maintains the list of done messages per queue.
-A message is done if a consumer claimed the message and acknowledged the successful processing. 
+A message is done if a consumer claimed the message and acknowledged the successful processing.
 The done message have a retention period after which the done messages are removed from the queue.
 The payload and the metadata of the messages are not removed from the system since other queues could still use them.
 The key for the done messages is encoded as follows:
@@ -253,7 +257,7 @@ The `FailedMessage` type consists of:
 FailedMessage:
     | message ID (u64) | failed at (i64) | attempts (u16)
 ```
-A message is considered failed if a consumer reports unsuccessful processing and there are no more attempts left for 
+A message is considered failed if a consumer reports unsuccessful processing and there are no more attempts left for
 the message or if the lease deadline expired and there are no more attempts left for the message.
 The maximum attempts are configured per queue.
 
@@ -266,7 +270,7 @@ Attempts Key:
 ```
 The key of the attempts has a version (initially 1), the type discriminator (`0x05`), and the message ID.
 
-The value of the attempts are encoded as follows: 
+The value of the attempts are encoded as follows:
 ```
 Attempts Value:
     | attempts (Array<ConsumerID>)
@@ -276,7 +280,7 @@ The array contains the IDs of the consumers that claimed the message in ascendin
 
 Additionally to the active messages, the done messages, and the failed messages, the queue store also contains the configuration of the queue.
 
-The key of the configuration is similar to the key of the available messages but with a different type discriminator, 
+The key of the configuration is similar to the key of the available messages but with a different type discriminator,
 i.e., `0x06`.
 ```
 Queue Config Key:
@@ -293,17 +297,18 @@ Queue Config Value:
     | filters (FilterExpression)
     | max attempts (u16)
     | retention duration for done messages in seconds (u32)
+    | tags (KeyValue)
 ```
 
 Added messages that satisfy the filter expression for a specific queue belong to the queue and can be claimed by
 consumers that read the queue.
-The filter expression specifies conditions over the message metadata. 
+The filter expression specifies conditions over the message metadata.
 The exact grammar and encoding of the filter expressions are still to be determined.
 
-After the maximum attempts the message is moved to the failed messages.  
+After the maximum attempts the message is moved to the failed messages.
 
 The retention duration for done messages is computed from the timestamp `done at` in the `DoneMessage` record value.
-If the current timestamp exceeds the `done at` timestamp plus the retention duration, the done message is 
+If the current timestamp exceeds the `done at` timestamp plus the retention duration, the done message is
 removed from the array of done messages in the `DoneMessages` value.
 A retention duration of `0` means infinite retention.
 
@@ -336,14 +341,43 @@ The OpenData-Queue has the following rough workflow
    4. the consumer reports the unsuccessful processing of a message
       1. if the message has still attempts, the message is removed from the in-flight messages and added to the available messages
       2. if the message has no attempts left, the message is removed from the in-flight messages and added to the failed messages
-   
+
+### Existing message queue systems
+
+#### Amazon SQS
+In SQS queues are identified by a queue URL (e.g., `https://sqs.us-east-1.amazonaws.com/123456789/my-queue`).
+
+Each message is published to one specific queue.
+A message consists of the queue URL and the message body.
+Optionally also messages attributes (metadata) can be sent along with the message.
+Messages can be published individually or in batches (up to 10).
+
+A consumed message consists of the message body, the message ID, a receipt handle, an attributes (metadata).
+Messages can be consumed in batches (up to 10).
+A consumer can provide a visibility timeout which specifies how long a message is invisible to other consumers after consumption.
+A consumed message must be explicitly deleted after processing otherwise they remain visible for other consumers.
+
+SQS offers two queue types:
+- standard (unlimited throughput, at-least-once delivery)
+- FIFO (exactly-once, strict ordering)
+
+Other features:
+- Dead Letter Queues: Failed messages moved aside for inspection
+- Retention: Up to 14 days
+- Long polling: Wait up to 20 seconds for messages, reducing costs
+- Batching: Send/receive/delete up to 10 messages per API call
+- Server-side encryption: Via AWS KMS
+- Auto-scaling: No capacity planning needed
+
+##### Publish messages
+-
 
 ## Alternatives
 
 ### Use a record for each available and in-flight message
-With such an approach, each available message would have a key like `/avail/{queue ID}/{message ID}` and 
-each in-flight queue a key like `/inflight/{queue ID}/{message ID}`. 
-Each transition from available to in-flight would be a prefix scan of `/avail/{queue ID}` to get all available 
+With such an approach, each available message would have a key like `/avail/{queue ID}/{message ID}` and
+each in-flight queue a key like `/inflight/{queue ID}/{message ID}`.
+Each transition from available to in-flight would be a prefix scan of `/avail/{queue ID}` to get all available
 messages, then a put of `/inflight/{queue ID}/{message ID}` and then a delete of `/avail/{queue ID}/{message ID}`.
 With the proposed approach, the transition from available to in-flight consists of a point lookup `/state/{queue ID}` and
 a put of `/state/{queue ID}` which should be more efficient.
@@ -354,7 +388,7 @@ messages, a point lookup of `/inflight/{queue ID}`, then a put of `/avail/{queue
 The proposed approach saves one point lookup and one put.
 
 ### Store done messages together with available and in-flight messages
-The array of done messages might grow indefinitely if it has infinite retention. 
+The array of done messages might grow indefinitely if it has infinite retention.
 However, available and in-flight messages need to be queried and written continuously to claim messages.
 Each point lookup would load the entire list of done messages.
 Each write would write an updated record containing the entire list of done messages, which would result in
