@@ -15,6 +15,13 @@ own append-only sequence of records tracking message consumption state.
 
 OpenData-Queue is a message queue that allows producers to publish messages and 
 consumers to receive and process them.
+OpenData-Queue is used when messages are transient.
+Once a message is consumed, the message is gone.
+That is useful when one need to spread work across multiple workers.
+Examples for such use cases are job processing and sending e-mails.
+In contrast to OpenData-Log, OpenData-Queue does not support maintaining a complete history of what happened 
+usually used for event sourcing or reprocessing historical data.
+
 OpenData-Queue allows to specify multiple queues.
 When a messages is published, the producer specifies the payload of the message and 
 data about the message, i.e., the metadata of the message.
