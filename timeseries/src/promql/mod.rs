@@ -7,6 +7,7 @@ pub(crate) mod metrics;
 mod middleware;
 pub(crate) mod openmetrics;
 mod parser;
+pub mod query_parser;
 #[cfg(feature = "remote-write")]
 pub(crate) mod remote_write;
 mod request;

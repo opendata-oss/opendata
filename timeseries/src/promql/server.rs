@@ -1,31 +1,33 @@
+use super::{
+    config::PrometheusConfig,
+    metrics::Metrics,
+    middleware::{MetricsLayer, TracingLayer},
+    query_parser::parse_query_with_repeated,
+    request::{
+        LabelValuesParams, LabelsParams, LabelsRequest, QueryParams, QueryRangeParams,
+        QueryRangeRequest, QueryRequest, SeriesParams, SeriesRequest,
+    },
+    response::{
+        LabelValuesResponse, LabelsResponse, QueryRangeResponse, QueryResponse, SeriesResponse,
+    },
+    router::PromqlRouter,
+    scraper::Scraper,
+};
+use crate::{error::Error, tsdb::Tsdb};
+
+#[cfg(feature = "remote-write")]
+use axum::routing::post;
+use axum::{
+    Form, Json, Router,
+    extract::{FromRequest, Path, Query, RawQuery, Request, State},
+    http::{Method, StatusCode},
+    response::{IntoResponse, Response},
+    routing::get,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-
-use axum::extract::{FromRequest, Path, Query, State};
-use axum::http::{Method, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-#[cfg(feature = "remote-write")]
-use axum::routing::post;
-use axum::{Form, extract::Request};
-use axum::{Json, Router};
 use tokio::time::interval;
-
-use super::config::PrometheusConfig;
-use super::metrics::Metrics;
-use super::middleware::{MetricsLayer, TracingLayer};
-use super::request::{
-    LabelValuesParams, LabelsParams, LabelsRequest, QueryParams, QueryRangeParams,
-    QueryRangeRequest, QueryRequest, SeriesParams, SeriesRequest,
-};
-use super::response::{
-    LabelValuesResponse, LabelsResponse, QueryRangeResponse, QueryResponse, SeriesResponse,
-};
-use super::router::PromqlRouter;
-use super::scraper::Scraper;
-use crate::error::Error;
-use crate::tsdb::Tsdb;
 
 /// Shared application state.
 #[derive(Clone)]
@@ -279,16 +281,109 @@ async fn handle_labels(
 }
 
 /// Handle /api/v1/label/{name}/values
+///
+/// Axum’s `Query` extractor does not support repeated `match[]` parameters.
+/// This handler uses a shared query parser to preserve Prometheus-compatible
+/// semantics when handling label value requests.
 async fn handle_label_values(
     State(state): State<AppState>,
     Path(name): Path<String>,
-    Query(params): Query<LabelValuesParams>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<LabelValuesResponse>, ApiError> {
+    let raw_query = raw_query.unwrap_or_default();
+
+    let (matches, mut params): (Vec<String>, LabelValuesParams) =
+        parse_query_with_repeated(&raw_query, "match[]")
+            .map_err(|e| Error::InvalidInput(format!("Failed to parse query: {}", e)))?;
+    // tracing::info!("label_values matches = {:?}", matches);
+    // tracing::info!("label_values start = {:?}", params.start);
+    // tracing::info!("label_values end = {:?}", params.end);
+    // tracing::info!("label_values limit = {:?}", params.limit);
+
+    params.matches = matches;
     let request = params.into_request(name)?;
+
     Ok(Json(state.tsdb.label_values(request).await))
 }
 
 /// Handle /metrics endpoint - returns Prometheus text format
 async fn handle_metrics(State(state): State<AppState>) -> String {
     state.metrics.encode()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LabelValuesParams, parse_query_with_repeated};
+
+    #[test]
+    fn parses_single_match_param() {
+        let raw = "match%5B%5D=%7Binstance%3D%22host-1%22%7D";
+
+        let (matches, params): (Vec<String>, LabelValuesParams) =
+            parse_query_with_repeated::<LabelValuesParams>(raw, "match[]").unwrap();
+
+        assert_eq!(matches, vec![r#"{instance="host-1"}"#.to_string()]);
+        assert!(params.start.is_none());
+        assert!(params.end.is_none());
+        assert!(params.limit.is_none());
+    }
+
+    #[test]
+    fn parses_multiple_match_params() {
+        let raw = concat!(
+            "match%5B%5D=%7Binstance%3D%22host-1%22%7D&",
+            "match%5B%5D=%7Bjob%3D%22node%22%7D"
+        );
+
+        let (matches, params): (Vec<String>, LabelValuesParams) =
+            parse_query_with_repeated::<LabelValuesParams>(raw, "match[]").unwrap();
+
+        assert_eq!(
+            matches,
+            vec![
+                r#"{instance="host-1"}"#.to_string(),
+                r#"{job="node"}"#.to_string(),
+            ]
+        );
+        assert!(params.start.is_none());
+        assert!(params.end.is_none());
+        assert!(params.limit.is_none());
+    }
+
+    #[test]
+    fn parses_optional_params_without_match() {
+        let raw = "start=100&end=200&limit=10";
+
+        let (matches, params): (Vec<String>, LabelValuesParams) =
+            parse_query_with_repeated::<LabelValuesParams>(raw, "match[]").unwrap();
+
+        assert!(matches.is_empty());
+        assert_eq!(params.start.as_deref(), Some("100"));
+        assert_eq!(params.end.as_deref(), Some("200"));
+        assert_eq!(params.limit, Some(10));
+    }
+
+    #[test]
+    fn parses_match_and_optional_params_together() {
+        let raw = concat!("match%5B%5D=%7Bjob%3D%22api%22%7D&", "start=123&limit=5");
+
+        let (matches, params): (Vec<String>, LabelValuesParams) =
+            parse_query_with_repeated::<LabelValuesParams>(raw, "match[]").unwrap();
+
+        assert_eq!(matches, vec![r#"{job="api"}"#.to_string()]);
+        assert_eq!(params.start.as_deref(), Some("123"));
+        assert!(params.end.is_none());
+        assert_eq!(params.limit, Some(5));
+    }
+
+    #[test]
+    fn handles_empty_query() {
+        let (matches, params): (Vec<String>, LabelValuesParams) =
+            parse_query_with_repeated::<LabelValuesParams>("", "match[]").unwrap();
+
+        assert!(matches.is_empty());
+        assert!(params.start.is_none());
+        assert!(params.end.is_none());
+        assert!(params.limit.is_none());
+    }
 }
