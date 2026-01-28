@@ -44,13 +44,15 @@ leveraged by various systems.
 
 ### Components & Terminology
 
-- `Write` is an insertion of data into the system
+- `Write` is an insertion of data into the system; each write is assigned a unique, monotonically
+  increasing epoch
 - `WriteQueue` is a queue that accepts `Write` as input and applies an epoch-based ordering
-- `WriteBatch` is a collection of `Write`s each stamped with an epoch
-- `Snapshot` is a point-in-time reference to the storage state, broadcast to readers after each flush
-- `Image` is the in-memory state needed to initialize a delta (e.g., series dictionary, ID counters);
-  decoupled from `Snapshot` to enable non-blocking flushes
-- `Delta` is the result of applying (multiple) `WriteBatch` to an `Image`
+- `Snapshot` is a point-in-time reference to the storage state, broadcast to readers after each flush;
+  represented in the API as `StorageRead` (a SlateDB snapshot)
+- `Image` is the in-memory state needed to initialize a delta (e.g., series dictionary, ID counters).
+  The initial image is derived from storage (e.g., loading the fingerprint→ID map); subsequent images
+  are extracted from deltas via `fork_image()` to enable non-blocking flushes
+- `Delta` is the result of applying writes to an `Image`; it accumulates changes until flushed
 
 ### Architecture
 
@@ -73,10 +75,10 @@ leveraged by various systems.
 │ │                             │         ┌───────────────┤       │
 │ │                             │ ┌Delta──┴──────┐┌Image──┴──────┐│
 │ │1 ─► handle flush complete   │ │ ┌──────────┐ ││              ││
-│ │2 ─► flush (on command)      │ │ │WriteBatch│ ││ Materialized ││
+│ │2 ─► flush (on command)      │ │ │  Writes  │ ││ Materialized ││
 │ │3 ─► apply queued writes     │ │ └──────────┘ ││    State     ││
 │ │4 ─► flush (on timer)        │ │ ┌──────────┐ ││              ││
-│ │                             │ │ │WriteBatch│ ││              ││
+│ │                             │ │ │  Writes  │ ││              ││
 │ │                             │ │ └──────────┘ ││              ││
 │ └─────────────────────────────┘ └──────────────┘└──────────────┘│
 └─────────────────────────────────────────────────────────────────┘
@@ -87,23 +89,18 @@ leveraged by various systems.
 The main ingestion loop has the following sequence:
 
 1. `Order`: Writes are enqueued on to the `WriteQueue`
-2. `Buffer`: Writes are dequeued and batched into a `WriteBatch`
-3. `Apply`: The `WriteBatch` is applied to the single pending `Delta`
+2. `Buffer`: Writes are dequeued from the queue (possibly batched for efficiency)
+3. `Apply`: Writes are applied to the single pending `Delta`
 4. `Flush`: The pending delta is taken and passed to `Flusher::flush()`
 
 These actions are pluggable, so different systems can compose them however they see fit. Here are
 the APIs provided by this RFC:
 
 ```rust
-pub struct WriteBatch<W> {
-    pub writes: Vec<W>,
-    pub max_epoch: u64,
-}
-
 /// Event broadcast to subscribers after each flush.
 pub struct FlushEvent<D: Delta> {
     /// The new snapshot reflecting the flushed state.
-    pub snapshot: Arc<Snapshot>,
+    pub snapshot: Arc<StorageRead>,
     /// Clone of the delta that was flushed (pre-flush state).
     pub delta: D,
     /// Epoch range covered by this flush: (previous_max, new_max].
@@ -113,13 +110,13 @@ pub struct FlushEvent<D: Delta> {
 }
 
 pub trait Delta: Send + Clone + 'static {
-    type Image: Send + Sync + Clone + 'static;
+    type Image: Send + Sync + 'static;
     type Write: Send + 'static;
 
     /// Initialize the delta with state from the image.
     fn init(&mut self, image: &Self::Image);
-    /// Apply a batch of writes to this delta.
-    fn apply(&mut self, batch: WriteBatch<Self::Write>) -> Result<()>;
+    /// Apply writes to this delta.
+    fn apply(&mut self, writes: Vec<Self::Write>) -> Result<()>;
     /// Estimate the memory size of this delta for backpressure.
     fn estimate_size(&self) -> usize;
     /// Extract state needed for the next delta's initialization.
@@ -131,10 +128,7 @@ pub trait Flusher: Send + Sync + 'static {
     type Delta: Delta;
 
     /// Flush a delta to storage and return the new snapshot.
-    fn flush(
-        &self,
-        delta: Self::Delta,
-    ) -> impl Future<Output = Result<Snapshot>> + Send;
+    async fn flush(&self, delta: Self::Delta) -> Result<StorageRead>;
 }
 ```
 
@@ -243,8 +237,8 @@ impl Delta for TsdbDelta {
         self.next_series_id = image.next_series_id;    // u32
     }
 
-    fn apply(&mut self, batch: WriteBatch<Self::Write>) -> Result<()> {
-        for series in batch.writes {
+    fn apply(&mut self, writes: Vec<Self::Write>) -> Result<()> {
+        for series in writes {
             let fp = series.labels.fingerprint();
             let id = *self.series_dict.entry(fp).or_insert_with(|| {
                 let id = self.next_series_id;
@@ -273,7 +267,7 @@ the flusher just needs to persist everything atomically and return the new snaps
 impl Flusher for TsdbFlusher {
     type Delta = TsdbDelta;
 
-    async fn flush(&self, delta: TsdbDelta) -> Result<Snapshot> {
+    async fn flush(&self, delta: TsdbDelta) -> Result<StorageRead> {
         let forward_index = build_forward_index(&delta);
         let inverted_index = build_inverted_index(&delta);
 
@@ -311,8 +305,8 @@ impl Delta for VectorDelta {
         self.config = image.config.clone();
     }
 
-    fn apply(&mut self, batch: WriteBatch<Self::Write>) -> Result<()> {
-        for vector in batch.writes {
+    fn apply(&mut self, writes: Vec<Self::Write>) -> Result<()> {
+        for vector in writes {
             self.vectors.insert(vector.id.clone(), vector);  // last write wins
         }
         Ok(())
@@ -334,7 +328,7 @@ as deleted if necessary.
 impl Flusher for VectorFlusher {
     type Delta = VectorDelta;
 
-    async fn flush(&self, delta: VectorDelta) -> Result<Snapshot> {
+    async fn flush(&self, delta: VectorDelta) -> Result<StorageRead> {
         let mut batch = WriteBatch::new();
         for (external_id, vector) in delta.vectors {
             let old_id = self.db.get(id_mapping_key(&external_id)).await?;
@@ -415,6 +409,20 @@ This was rejected because:
 - Harder to reason about correctness
 
 ## Future Considerations
+
+### Priority Channel for Maintenance Operations
+
+Some subsystems (e.g., vector index maintenance) may need to sequence internal operations alongside
+user writes. For example, splitting a centroid requires: (1) marking the old centroid as draining,
+(2) waiting until the change is readable, (3) reading vectors to compute reassignments. These
+operations should take priority over user writes to enable backpressure — if writes arrive faster
+than the index can be maintained, we need to pause ingest while still processing splits/merges.
+
+A future enhancement could add a priority channel to the coordinator's `select!` loop (using
+`biased` ordering). Maintenance commands would be processed before queued writes, and could
+optionally bypass WAL logging since they don't need crash recovery (the caller blocks until applied
+and can recompute after restart). Epochs would be assigned by the coordinator task rather than at
+enqueue time, ensuring proper sequencing with snapshot reads.
 
 ### Reading from the Pending Delta
 
