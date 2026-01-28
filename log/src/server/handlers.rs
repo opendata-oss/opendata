@@ -11,11 +11,11 @@ use axum::http::HeaderMap;
 
 use super::error::ApiError;
 use super::metrics::{AppendLabels, Metrics, OperationStatus, ScanLabels};
-use super::request::{AppendRequest, CountParams, ListKeysParams, ListSegmentsParams, ScanParams};
-use super::response::{
-    ApiResponse, AppendResponse, CountResponse, IntoApiResponse, ListKeysResponse,
-    ListSegmentsResponse, ResponseFormat, ScanResponse, ScanValue, SegmentEntry,
+use super::proto::{
+    AppendResponse, CountResponse, KeysResponse, ScanResponse, Segment, SegmentsResponse, Value,
 };
+use super::request::{AppendRequest, CountParams, ListKeysParams, ListSegmentsParams, ScanParams};
+use super::response::{to_api_response, ApiResponse, ResponseFormat};
 use crate::Log;
 use crate::config::WriteOptions;
 use crate::reader::LogRead;
@@ -61,8 +61,9 @@ pub async fn handle_append(
                 })
                 .inc();
 
-            let response = AppendResponse::success(result.records_appended, result.start_sequence);
-            Ok(response.into_api_response(format))
+            let response =
+                AppendResponse::success(result.records_appended as i32, result.start_sequence);
+            Ok(to_api_response(response, format))
         }
         Err(e) => {
             state
@@ -109,10 +110,15 @@ pub async fn handle_scan(
                 })
                 .inc();
 
-            let scan_values: Vec<ScanValue> =
-                entries.iter().map(ScanValue::from_log_entry).collect();
-            let response = ScanResponse::success(key, scan_values);
-            Ok(response.into_api_response(format))
+            let values: Vec<Value> = entries
+                .iter()
+                .map(|e| Value {
+                    sequence: e.sequence,
+                    value: e.value.clone(),
+                })
+                .collect();
+            let response = ScanResponse::success(key, values);
+            Ok(to_api_response(response, format))
         }
         Err(e) => {
             state
@@ -150,8 +156,8 @@ pub async fn handle_list_keys(
         }
     }
 
-    let response = ListKeysResponse::success(keys);
-    Ok(response.into_api_response(format))
+    let response = KeysResponse::success(keys);
+    Ok(to_api_response(response, format))
 }
 
 /// Handle GET /api/v1/log/segments
@@ -166,17 +172,17 @@ pub async fn handle_list_segments(
     let seq_range = params.seq_range();
 
     let segments = state.log.list_segments(seq_range).await?;
-    let segment_entries: Vec<SegmentEntry> = segments
+    let segment_entries: Vec<Segment> = segments
         .into_iter()
-        .map(|s| SegmentEntry {
+        .map(|s| Segment {
             id: s.id,
             start_seq: s.start_seq,
             start_time_ms: s.start_time_ms,
         })
         .collect();
 
-    let response = ListSegmentsResponse::success(segment_entries);
-    Ok(response.into_api_response(format))
+    let response = SegmentsResponse::success(segment_entries);
+    Ok(to_api_response(response, format))
 }
 
 /// Handle GET /api/v1/log/count
@@ -194,7 +200,7 @@ pub async fn handle_count(
     let count = state.log.count(key, range).await?;
 
     let response = CountResponse::success(count);
-    Ok(response.into_api_response(format))
+    Ok(to_api_response(response, format))
 }
 
 /// Handle GET /metrics

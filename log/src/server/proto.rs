@@ -4,11 +4,15 @@
 //! and ProtoJSON encoding (application/protobuf+json) per RFC 0004-http-apis.
 
 use prost::Message;
+use serde::Serialize;
+use serde_with::{base64::Base64, serde_as};
 
 /// Key wraps a bytes value for keys.
-#[derive(Clone, PartialEq, Message)]
+#[serde_as]
+#[derive(Clone, PartialEq, Message, Serialize)]
 pub struct Key {
     #[prost(bytes = "bytes", tag = "1")]
+    #[serde_as(as = "Base64")]
     pub value: bytes::Bytes,
 }
 
@@ -31,7 +35,8 @@ pub struct Record {
 }
 
 /// AppendResponse is the response for POST /api/v1/log/append.
-#[derive(Clone, PartialEq, Message)]
+#[derive(Clone, PartialEq, Message, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppendResponse {
     #[prost(string, tag = "1")]
     pub status: String,
@@ -41,8 +46,20 @@ pub struct AppendResponse {
     pub start_sequence: u64,
 }
 
+impl AppendResponse {
+    /// Create a successful append response.
+    pub fn success(records_appended: i32, start_sequence: u64) -> Self {
+        Self {
+            status: "success".to_string(),
+            records_appended,
+            start_sequence,
+        }
+    }
+}
+
 /// ScanResponse is the response for GET /api/v1/log/scan.
-#[derive(Clone, PartialEq, Message)]
+#[derive(Clone, PartialEq, Message, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScanResponse {
     #[prost(string, tag = "1")]
     pub status: String,
@@ -52,17 +69,32 @@ pub struct ScanResponse {
     pub values: Vec<Value>,
 }
 
+impl ScanResponse {
+    /// Create a successful scan response.
+    pub fn success(key: bytes::Bytes, values: Vec<Value>) -> Self {
+        Self {
+            status: "success".to_string(),
+            key: Some(Key { value: key }),
+            values,
+        }
+    }
+}
+
 /// Value represents a single log entry in scan results.
-#[derive(Clone, PartialEq, Message)]
+#[serde_as]
+#[derive(Clone, PartialEq, Message, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Value {
     #[prost(uint64, tag = "1")]
     pub sequence: u64,
     #[prost(bytes = "bytes", tag = "2")]
+    #[serde_as(as = "Base64")]
     pub value: bytes::Bytes,
 }
 
 /// SegmentsResponse is the response for GET /api/v1/log/segments.
-#[derive(Clone, PartialEq, Message)]
+#[derive(Clone, PartialEq, Message, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SegmentsResponse {
     #[prost(string, tag = "1")]
     pub status: String,
@@ -70,8 +102,19 @@ pub struct SegmentsResponse {
     pub segments: Vec<Segment>,
 }
 
+impl SegmentsResponse {
+    /// Create a successful segments response.
+    pub fn success(segments: Vec<Segment>) -> Self {
+        Self {
+            status: "success".to_string(),
+            segments,
+        }
+    }
+}
+
 /// Segment represents a log segment.
-#[derive(Clone, PartialEq, Message)]
+#[derive(Clone, PartialEq, Message, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Segment {
     #[prost(uint32, tag = "1")]
     pub id: u32,
@@ -82,7 +125,8 @@ pub struct Segment {
 }
 
 /// KeysResponse is the response for GET /api/v1/log/keys.
-#[derive(Clone, PartialEq, Message)]
+#[derive(Clone, PartialEq, Message, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct KeysResponse {
     #[prost(string, tag = "1")]
     pub status: String,
@@ -90,13 +134,34 @@ pub struct KeysResponse {
     pub keys: Vec<Key>,
 }
 
+impl KeysResponse {
+    /// Create a successful keys response.
+    pub fn success(keys: Vec<bytes::Bytes>) -> Self {
+        Self {
+            status: "success".to_string(),
+            keys: keys.into_iter().map(|k| Key { value: k }).collect(),
+        }
+    }
+}
+
 /// CountResponse is the response for GET /api/v1/log/count.
-#[derive(Clone, PartialEq, Message)]
+#[derive(Clone, PartialEq, Message, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CountResponse {
     #[prost(string, tag = "1")]
     pub status: String,
     #[prost(uint64, tag = "2")]
     pub count: u64,
+}
+
+impl CountResponse {
+    /// Create a successful count response.
+    pub fn success(count: u64) -> Self {
+        Self {
+            status: "success".to_string(),
+            count,
+        }
+    }
 }
 
 /// ErrorResponse is returned for all error cases.
