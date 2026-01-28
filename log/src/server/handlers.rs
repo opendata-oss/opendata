@@ -15,7 +15,7 @@ use super::proto::{
     AppendResponse, CountResponse, KeysResponse, ScanResponse, Segment, SegmentsResponse, Value,
 };
 use super::request::{AppendRequest, CountParams, ListKeysParams, ListSegmentsParams, ScanParams};
-use super::response::{to_api_response, ApiResponse, ResponseFormat};
+use super::response::{ApiResponse, ResponseFormat, to_api_response};
 use crate::Log;
 use crate::config::WriteOptions;
 use crate::reader::LogRead;
