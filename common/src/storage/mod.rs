@@ -3,6 +3,7 @@ pub mod factory;
 pub mod in_memory;
 pub mod loader;
 pub mod slate;
+pub mod util;
 
 use std::sync::Arc;
 
@@ -180,4 +181,17 @@ pub trait Storage: StorageRead {
     /// the snapshot was created. Reads from the snapshot will not see any subsequent
     /// writes to the underlying storage.
     async fn snapshot(&self) -> StorageResult<Arc<dyn StorageSnapshot>>;
+
+    /// Flushes all pending writes to durable storage.
+    ///
+    /// This ensures that all writes that have been acknowledged are persisted
+    /// to durable storage. For SlateDB, this flushes the memtable to the WAL
+    /// and object store.
+    async fn flush(&self) -> StorageResult<()>;
+
+    /// Closes the storage, releasing any resources.
+    ///
+    /// This method should be called before dropping the storage to ensure
+    /// proper cleanup. For SlateDB, this releases the database fence.
+    async fn close(&self) -> StorageResult<()>;
 }

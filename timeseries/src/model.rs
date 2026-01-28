@@ -143,7 +143,7 @@ pub enum Temporality {
 /// - **Histogram**: A value that can go up or down (e.g., temperature, memory usage)
 /// - **ExponentialHistogram**: A value that can go up or down (e.g., temperature, memory usage)
 /// - **Summary**: A value that can go up or down (e.g., temperature, memory usage)
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MetricType {
     Gauge,
     Sum {
