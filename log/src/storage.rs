@@ -8,8 +8,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use common::{Storage, StorageIterator, StorageRead};
 use common::SeqBlock;
+use common::{Storage, StorageIterator, StorageRead};
 
 use crate::error::{Error, Result};
 use crate::listing::LogKeyIterator;
