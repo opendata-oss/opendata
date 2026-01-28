@@ -51,73 +51,19 @@ how benchmarks are written.
 
 ## Design
 
-### Crate Structure
+### Structure
 
-A separate `bencher` crate in the workspace provides the core framework.
-System-specific benchmarks live in each system's crate (e.g., `log/bench/`)
-and depend on `bencher` for common infrastructure.
+The `bencher` crate provides the core framework, including:
 
-### Configuration
+- **Configuration** for storage and optional metrics reporting
+- **Bencher** which runs `Benchmark` implementations and manages their lifecycle
+- **Metrics collection** (counters, gauges, histograms) during benchmark runs
+- **Summary output** printed to console after each benchmark completes
 
-```rust
-pub struct Config {
-    /// Storage for benchmark data.
-    pub data: DataConfig,
-    /// Optional reporter for persisting metrics.
-    pub reporter: Option<ReporterConfig>,
-}
-
-pub struct ReporterConfig {
-    /// Object store for metrics storage.
-    pub object_store: ObjectStoreConfig,
-    /// Interval for periodic metrics reporting.
-    pub interval: Duration,  // default: 10s
-}
-```
-
-### Core API
-
-```rust
-pub struct Bencher { /* ... */ }
-
-impl Bencher {
-    /// Start a benchmark run with the given parameters.
-    pub fn bench(&self, params: impl Into<Vec<Label>>) -> Bench;
-
-    /// Access data storage configuration.
-    pub fn data_config(&self) -> &DataConfig;
-}
-
-pub struct Bench { /* ... */ }
-
-impl Bench {
-    /// Ongoing metrics - updated during the benchmark.
-    pub fn counter(&self, name: &'static str) -> Counter;
-    pub fn gauge(&self, name: &'static str) -> Gauge;
-    pub fn histogram(&self, name: &'static str) -> Histogram;
-
-    /// Summary metrics - recorded at the end.
-    pub async fn summarize(&self, summary: Summary) -> Result<()>;
-
-    /// Mark the run as complete.
-    pub async fn close(self) -> Result<()>;
-}
-
-pub struct Summary { /* ... */ }
-
-impl Summary {
-    pub fn new() -> Self;
-    pub fn add(self, name: impl Into<String>, value: f64) -> Self;
-}
-
-/// Entry point for a benchmark. Implemented by benchmark authors.
-#[async_trait]
-pub trait Benchmark: Send + Sync {
-    fn name(&self) -> &str;
-    fn labels(&self) -> Vec<Label> { vec![] }
-    async fn run(&self, bencher: &Bencher) -> Result<()>;
-}
-```
+Each system defines its own benchmarks locally (e.g., `log/bench/`) and builds
+a dedicated binary that registers those benchmarks with Bencher. This keeps
+benchmark implementations close to the code they measure while sharing common
+infrastructure.
 
 ### Output
 
@@ -125,44 +71,7 @@ Summary metrics are always printed to console. If a reporter is configured,
 both ongoing and summary metrics are persisted to the configured object store
 using the TimeSeries format.
 
-### Example
-
-```rust
-use bencher::{Benchmark, Bencher, Label, Summary};
-
-pub struct IngestBenchmark {
-    params: Vec<Params>,
-}
-
-#[async_trait]
-impl Benchmark for IngestBenchmark {
-    fn name(&self) -> &str { "ingest" }
-
-    async fn run(&self, bencher: &Bencher) -> Result<()> {
-        for params in &self.params {
-            let bench = bencher.bench(params);
-
-            // Ongoing metrics
-            let records = bench.counter("records");
-            let latency = bench.histogram("latency_us");
-
-            // ... run workload, updating metrics ...
-
-            // Summary metrics
-            bench.summarize(
-                Summary::new()
-                    .add("throughput_ops", ops_per_sec)
-                    .add("elapsed_ms", elapsed_ms)
-            ).await?;
-
-            bench.close().await?;
-        }
-        Ok(())
-    }
-}
-```
-
-Console output:
+Example console output:
 
 ```
 Running benchmark: ingest
@@ -170,6 +79,14 @@ Running benchmark: ingest
     throughput_ops  526.47K
     elapsed_ms      1
 ```
+
+### Example
+
+See `log/bench/` for a complete example including:
+
+- Benchmark implementation (`src/ingest.rs`)
+- Binary entry point (`src/main.rs`)
+- Usage documentation (`README.md`)
 
 ### Future Work
 
@@ -192,3 +109,4 @@ detection will be addressed in subsequent work.
 |------------|----------------------------|
 | 2026-01-16 | Initial draft              |
 | 2026-01-24 | Updated to reflect implementation |
+| 2026-01-28 | Simplified to high-level structure, removed API details |
