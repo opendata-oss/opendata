@@ -6,25 +6,6 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
 
-/// Labels for append operation metrics.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct AppendLabels {
-    pub status: OperationStatus,
-}
-
-/// Labels for scan operation metrics.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct ScanLabels {
-    pub status: OperationStatus,
-}
-
-/// Operation status for metrics.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
-pub enum OperationStatus {
-    Success,
-    Error,
-}
-
 /// Labels for HTTP request metrics.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct HttpLabelsWithStatus {
@@ -68,12 +49,6 @@ pub struct Metrics {
     /// Counter of records successfully appended.
     pub log_append_records_total: Counter,
 
-    /// Counter of append requests by status.
-    pub log_append_requests_total: Family<AppendLabels, Counter>,
-
-    /// Counter of scan requests by status.
-    pub log_scan_requests_total: Family<ScanLabels, Counter>,
-
     /// Counter of HTTP requests.
     pub http_requests_total: Family<HttpLabelsWithStatus, Counter>,
 }
@@ -97,22 +72,6 @@ impl Metrics {
             log_append_records_total.clone(),
         );
 
-        // Log append requests counter
-        let log_append_requests_total = Family::<AppendLabels, Counter>::default();
-        registry.register(
-            "log_append_requests_total",
-            "Total number of append requests by status",
-            log_append_requests_total.clone(),
-        );
-
-        // Log scan requests counter
-        let log_scan_requests_total = Family::<ScanLabels, Counter>::default();
-        registry.register(
-            "log_scan_requests_total",
-            "Total number of scan requests by status",
-            log_scan_requests_total.clone(),
-        );
-
         // HTTP requests total counter
         let http_requests_total = Family::<HttpLabelsWithStatus, Counter>::default();
         registry.register(
@@ -124,8 +83,6 @@ impl Metrics {
         Self {
             registry,
             log_append_records_total,
-            log_append_requests_total,
-            log_scan_requests_total,
             http_requests_total,
         }
     }
@@ -151,8 +108,6 @@ mod tests {
         // then
         let encoded = metrics.encode();
         assert!(encoded.contains("# HELP log_append_records_total"));
-        assert!(encoded.contains("# HELP log_append_requests_total"));
-        assert!(encoded.contains("# HELP log_scan_requests_total"));
         assert!(encoded.contains("# HELP http_requests_total"));
     }
 

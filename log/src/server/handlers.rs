@@ -10,7 +10,7 @@ use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 
 use super::error::ApiError;
-use super::metrics::{AppendLabels, Metrics, OperationStatus, ScanLabels};
+use super::metrics::Metrics;
 use super::proto::{
     AppendResponse, CountResponse, KeysResponse, ScanResponse, Segment, SegmentsResponse, Value,
 };
@@ -46,37 +46,15 @@ pub async fn handle_append(
         await_durable: request.await_durable,
     };
 
-    match state
+    let result = state
         .log
         .append_with_options(request.records, options)
-        .await
-    {
-        Ok(result) => {
-            state.metrics.log_append_records_total.inc_by(count as u64);
-            state
-                .metrics
-                .log_append_requests_total
-                .get_or_create(&AppendLabels {
-                    status: OperationStatus::Success,
-                })
-                .inc();
+        .await?;
 
-            let response =
-                AppendResponse::success(result.records_appended as i32, result.start_sequence);
-            Ok(to_api_response(response, format))
-        }
-        Err(e) => {
-            state
-                .metrics
-                .log_append_requests_total
-                .get_or_create(&AppendLabels {
-                    status: OperationStatus::Error,
-                })
-                .inc();
+    state.metrics.log_append_records_total.inc_by(count as u64);
 
-            Err(ApiError::from(e))
-        }
-    }
+    let response = AppendResponse::success(result.records_appended as i32, result.start_sequence);
+    Ok(to_api_response(response, format))
 }
 
 /// Handle GET /api/v1/log/scan
@@ -92,46 +70,24 @@ pub async fn handle_scan(
     let range = params.seq_range();
     let limit = params.limit.unwrap_or(32);
 
-    match state.log.scan(key.clone(), range).await {
-        Ok(mut iter) => {
-            let mut entries = Vec::new();
-            while let Some(entry) = iter.next().await.map_err(ApiError::from)? {
-                entries.push(entry);
-                if entries.len() >= limit {
-                    break;
-                }
-            }
-
-            state
-                .metrics
-                .log_scan_requests_total
-                .get_or_create(&ScanLabels {
-                    status: OperationStatus::Success,
-                })
-                .inc();
-
-            let values: Vec<Value> = entries
-                .iter()
-                .map(|e| Value {
-                    sequence: e.sequence,
-                    value: e.value.clone(),
-                })
-                .collect();
-            let response = ScanResponse::success(key, values);
-            Ok(to_api_response(response, format))
-        }
-        Err(e) => {
-            state
-                .metrics
-                .log_scan_requests_total
-                .get_or_create(&ScanLabels {
-                    status: OperationStatus::Error,
-                })
-                .inc();
-
-            Err(ApiError::from(e))
+    let mut iter = state.log.scan(key.clone(), range).await?;
+    let mut entries = Vec::new();
+    while let Some(entry) = iter.next().await.map_err(ApiError::from)? {
+        entries.push(entry);
+        if entries.len() >= limit {
+            break;
         }
     }
+
+    let values: Vec<Value> = entries
+        .iter()
+        .map(|e| Value {
+            sequence: e.sequence,
+            value: e.value.clone(),
+        })
+        .collect();
+    let response = ScanResponse::success(key, values);
+    Ok(to_api_response(response, format))
 }
 
 /// Handle GET /api/v1/log/keys
