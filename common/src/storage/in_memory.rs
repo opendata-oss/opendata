@@ -252,6 +252,11 @@ impl Storage for InMemoryStorage {
             data: snapshot_data,
         }))
     }
+
+    async fn close(&self) -> StorageResult<()> {
+        // No-op for in-memory storage
+        Ok(())
+    }
 }
 
 #[cfg(test)]

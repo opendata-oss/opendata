@@ -247,4 +247,9 @@ impl Storage for SlateDbStorage {
             .map_err(StorageError::from_storage)?;
         Ok(Arc::new(SlateDbStorageSnapshot { snapshot }))
     }
+
+    async fn close(&self) -> StorageResult<()> {
+        self.db.close().await.map_err(StorageError::from_storage)?;
+        Ok(())
+    }
 }

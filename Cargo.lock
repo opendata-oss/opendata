@@ -584,6 +584,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "criterion",
+ "futures",
  "proptest",
  "serde",
  "serde_yaml",

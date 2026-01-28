@@ -80,11 +80,14 @@ impl Benchmark for IngestBenchmark {
         let value = Bytes::from(vec![b'x'; value_size]);
         let record_size = key_length + value_size;
 
+        // Start the timed benchmark
+        let runner = bench.start();
+
         // Run append loop until framework signals to stop
         let mut records_written = 0;
         let mut key_idx = 0;
 
-        while bench.keep_running() {
+        while runner.keep_running() {
             let records: Vec<Record> = (0..batch_size)
                 .map(|_| {
                     let key = keys[key_idx % keys.len()].clone();
@@ -108,7 +111,7 @@ impl Benchmark for IngestBenchmark {
             records_written += batch_size;
         }
 
-        let elapsed_secs = bench.elapsed().as_secs_f64();
+        let elapsed_secs = runner.elapsed().as_secs_f64();
 
         // Summary metrics - computed at the end
         let ops_per_sec = records_written as f64 / elapsed_secs;
@@ -119,9 +122,12 @@ impl Benchmark for IngestBenchmark {
                 Summary::new()
                     .add("throughput_ops", ops_per_sec)
                     .add("throughput_bytes", bytes_per_sec)
-                    .add("elapsed_ms", bench.elapsed().as_millis() as f64),
+                    .add("elapsed_ms", runner.elapsed().as_millis() as f64),
             )
             .await?;
+
+        // Close the log to release SlateDB fence
+        log.close().await?;
 
         bench.close().await?;
         Ok(())

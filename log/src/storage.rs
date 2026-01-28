@@ -184,6 +184,14 @@ impl LogStorage {
         LogStorageRead::new(Arc::clone(&self.storage) as Arc<dyn StorageRead>)
     }
 
+    /// Closes the underlying storage.
+    pub(crate) async fn close(&self) -> Result<()> {
+        self.storage
+            .close()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))
+    }
+
     /// Writes records to storage with options.
     pub(crate) async fn put_with_options(
         &self,

@@ -284,6 +284,15 @@ impl Log {
         Ok(())
     }
 
+    /// Closes the log, releasing any resources.
+    ///
+    /// This method should be called before dropping the log to ensure
+    /// proper cleanup. For SlateDB-backed storage, this releases the database fence.
+    pub async fn close(self) -> Result<()> {
+        self.storage.close().await?;
+        Ok(())
+    }
+
     /// Creates a Log from an existing storage implementation.
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn common::Storage>) -> Result<Self> {

@@ -22,6 +22,10 @@ pub struct Args {
     /// Duration for each benchmark run in seconds.
     #[arg(short, long, default_value = "5")]
     pub duration: u64,
+
+    /// Skip cleanup of benchmark data after completion.
+    #[arg(long)]
+    pub no_cleanup: bool,
 }
 
 impl Args {

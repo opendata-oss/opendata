@@ -63,12 +63,12 @@ mod config;
 mod recorder;
 mod reporter;
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 #[cfg(test)]
 use reporter::MemoryReporter;
 use reporter::{Reporter, TimeSeriesReporter};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
 
 use metrics::Recorder;
 use recorder::BenchRecorder;
@@ -228,7 +228,7 @@ impl Bencher {
             duration,
         );
         let interval = self.config.reporter.as_ref().map(|r| r.interval);
-        Bench::start(spec, self.reporter.clone(), interval)
+        Bench::open(spec, self.reporter.clone(), interval)
     }
 }
 
@@ -276,14 +276,28 @@ impl BenchSpec {
     }
 }
 
+pub struct Runner {
+    start: Instant,
+    deadline: Instant,
+}
+
+impl Runner {
+    pub fn keep_running(&self) -> bool {
+        Instant::now() < self.deadline
+    }
+
+    /// Get the elapsed time since the benchmark started.
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.start.elapsed()
+    }
+}
+
 /// Runtime for recording benchmark metrics.
 ///
 /// Created by the framework for each parameter combination.
 /// Provides access to the spec and metrics recording.
 pub struct Bench {
     spec: BenchSpec,
-    start: std::time::Instant,
-    deadline: std::time::Instant,
     recorder: Arc<BenchRecorder>,
     reporter: Option<Arc<dyn Reporter>>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -291,14 +305,12 @@ pub struct Bench {
 }
 
 impl Bench {
-    fn start(
+    fn open(
         spec: BenchSpec,
         reporter: Option<Arc<dyn Reporter>>,
         interval: Option<std::time::Duration>,
     ) -> Self {
         let recorder = Arc::new(BenchRecorder::new());
-        let start = std::time::Instant::now();
-        let deadline = start + spec.duration;
 
         // Start background reporting if a reporter and interval are configured
         let (shutdown_tx, report_task) = match (&reporter, interval) {
@@ -333,8 +345,6 @@ impl Bench {
 
         Self {
             spec,
-            start,
-            deadline,
             recorder,
             reporter,
             shutdown_tx,
@@ -342,22 +352,15 @@ impl Bench {
         }
     }
 
+    pub fn start(&self) -> Runner {
+        let start = Instant::now();
+        let deadline = start + self.spec.duration;
+        Runner { start, deadline }
+    }
+
     /// Access the benchmark specification.
     pub fn spec(&self) -> &BenchSpec {
         &self.spec
-    }
-
-    /// Get the elapsed time since the benchmark started.
-    pub fn elapsed(&self) -> std::time::Duration {
-        self.start.elapsed()
-    }
-
-    /// Check if the benchmark should continue running.
-    ///
-    /// Returns `true` if the benchmark duration has not elapsed.
-    /// Benchmarks should call this in their main loop.
-    pub fn keep_running(&self) -> bool {
-        std::time::Instant::now() < self.deadline
     }
 
     /// Get a counter handle for recording incremental values.
@@ -575,7 +578,7 @@ impl Bench {
             labels,
             std::time::Duration::from_secs(10),
         );
-        Self::start(spec, Some(reporter), Some(interval))
+        Self::open(spec, Some(reporter), Some(interval))
     }
 }
 
@@ -607,6 +610,9 @@ pub trait Benchmark: Send + Sync {
 
 /// Run a set of benchmarks.
 pub async fn run(benchmarks: Vec<Box<dyn Benchmark>>) -> anyhow::Result<()> {
+    use common::StorageConfig;
+    use common::storage::util::delete;
+
     let args = Args::parse_args();
     let config = args.load_config()?;
 
@@ -617,13 +623,41 @@ pub async fn run(benchmarks: Vec<Box<dyn Benchmark>>) -> anyhow::Result<()> {
 
     let duration = args.duration();
 
+    // Track all storage configs used for deferred cleanup
+    let mut storage_configs: Vec<StorageConfig> = Vec::new();
+    let mut bench_counter = 0;
+
     for benchmark in benchmarks {
         println!("Running benchmark: {}", benchmark.name());
-        let bencher = Bencher::new(config.clone(), benchmark.name(), benchmark.labels()).await?;
+
         // TODO: Allow params to be provided externally (config file, CLI)
         let params = benchmark.default_params();
         for p in params {
+            // Create a unique storage path for this benchmark run
+            let bench_storage = config
+                .data
+                .storage
+                .with_path_suffix(&bench_counter.to_string());
+            storage_configs.push(bench_storage.clone());
+
+            let bench_config = Config {
+                data: DataConfig {
+                    storage: bench_storage,
+                },
+                reporter: config.reporter.clone(),
+            };
+
+            let bencher = Bencher::new(bench_config, benchmark.name(), benchmark.labels()).await?;
             benchmark.run(bencher.bench(p, duration)).await?;
+
+            bench_counter += 1;
+        }
+    }
+
+    // Clean up all benchmark data at the end
+    if !args.no_cleanup {
+        for storage_config in &storage_configs {
+            delete(storage_config).await?;
         }
     }
 
