@@ -68,7 +68,7 @@ leveraged by various systems.
                                  ▼
 ┌Write Coordinator────────────────────────────────────────────────┐
 │ ┌─────────────────────────────┐ ┌──────────────┐┌──────────────┐│             ┌───────────┐
-│ │        select! loop         │ │ EpochTracker ││   Flusher    │├─Snapshot───▶│  Reader   │
+│ │        select! loop         │ │ EpochTracker ││   Flusher    │├FlushEvent──▶│  Reader   │
 │ ├─────────────────────────────┤ └──────────────┘└───────▲──────┘│             └───────────┘
 │ │                             │         ┌───────────────┤       │
 │ │                             │ ┌Delta──┴──────┐┌Image──┴──────┐│
@@ -100,7 +100,19 @@ pub struct WriteBatch<W> {
     pub max_epoch: u64,
 }
 
-pub trait Delta: Send + 'static {
+/// Event broadcast to subscribers after each flush.
+pub struct FlushEvent<D: Delta> {
+    /// The new snapshot reflecting the flushed state.
+    pub snapshot: Arc<Snapshot>,
+    /// Clone of the delta that was flushed (pre-flush state).
+    pub delta: D,
+    /// Epoch range covered by this flush: (previous_max, new_max].
+    /// A subscriber whose cache is at `epoch_range.0` can apply `delta`
+    /// to update their state to `epoch_range.1`.
+    pub epoch_range: (u64, u64),
+}
+
+pub trait Delta: Send + Clone + 'static {
     type Image: Send + Sync + Clone + 'static;
     type Write: Send + 'static;
 
@@ -157,8 +169,16 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     pub async fn write(&self, event: D::Write) -> Result<WriteHandle> { /* ... */ }
     /// Request a flush up to the specified epoch (or all pending if None).
     pub async fn flush(&self, epoch: Option<u64>) -> Result<()> { /* ... */ }
-    /// Subscribe to snapshot updates.
-    pub fn subscribe(&self) -> watch::Receiver<Arc<Snapshot>> { /* ... */ }
+    /// Subscribe to flush events.
+    ///
+    /// Each event contains the new snapshot, a clone of the flushed delta, and the
+    /// epoch range covered. Subscribers can use this for incremental cache updates
+    /// if their local state is at `epoch_range.0`.
+    ///
+    /// **Note**: Uses a `watch` channel — if flushes occur faster than the subscriber
+    /// processes them, intermediate events are dropped. Subscribers that miss events
+    /// must rebuild their cache from the snapshot.
+    pub fn subscribe(&self) -> watch::Receiver<FlushEvent<D>> { /* ... */ }
 }
 ```
 
@@ -179,10 +199,11 @@ The coordinator runs as a single-threaded async loop that processes commands and
    if `write(A)` returns before `write(B)` is called, then `epoch(A) < epoch(B)`.
 2. **Non-Blocking Flush**: when a flush is triggered:
    1. `fork_image()` is called on the current delta to extract state for the next delta
-   2. A new delta is created and initialized from the forked image
-   3. The old delta is passed to the flusher (ownership transferred)
-   4. Writes continue to the new delta while the flush runs in the background
-   5. When flush completes, the new snapshot is broadcast to readers
+   2. The current delta is cloned for subscribers
+   3. A new delta is created and initialized from the forked image
+   4. The old delta is passed to the flusher (ownership transferred)
+   5. Writes continue to the new delta while the flush runs in the background
+   6. When flush completes, a `FlushEvent` is broadcast with the snapshot, cloned delta, and epoch range
 3. **Flush Triggers**: flushes can be triggered manually via `flush()` or based on conditions
    evaluated on a timer. Flush requests are queued if a flush is in progress. A call to
    `flush(epoch)` is a no-op if `epoch` ≤ the already-flushed epoch.
@@ -196,6 +217,11 @@ The coordinator runs as a single-threaded async loop that processes commands and
 6. **Backpressure**: backpressure is applied by both the channel capacity and the size of pending
    deltas. Flushes will be attempted on the ticker interval until backpressure conditions are
    released, during which time writes will fail with `Err(WriteError::Backpressure)`.
+
+Readers that maintain in-memory caches can use `FlushEvent` to update incrementally. On each event,
+the reader compares its local epoch against `epoch_range.0`. If they match, the reader applies the
+delta to advance its state to `epoch_range.1`. If they don't match (the reader missed one or more
+events), the cache is stale and must be rebuilt from the snapshot. 
 
 ### Subsystem Implementations
 
