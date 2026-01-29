@@ -224,29 +224,11 @@ This RFC establishes terminology and sketches the landscape. If there's interest
 3. **Connector framework**: Design how data flows between externally composed systems.
 4. **Internal composition feasibility**: Investigate what changes would be needed to support multiple systems in a single slate.
 
-## Alternatives
-
-### Do Nothing (Rely on External Integration)
-
-We could treat OpenData systems as independent databases and rely on external tools (Kafka Connect, Flink, custom scripts) for integration.
-
-**Consideration**: This is the status quo and always an option. However, it may forfeit OpenData's unique advantage—the shared foundation that could enable tighter integration than external tools can provide. Worth discussing whether the composition opportunity is real enough to pursue.
-
-### Single Composition Mode
-
-We could focus on only internal composition (everything in one slate) or only external composition (always separate slates).
-
-**Consideration**: Different use cases likely have different requirements. Some need atomicity; others need independent scaling. But this is an assumption worth validating—perhaps one mode covers the important cases.
-
 ## Open Questions
 
-1. **Is this worth pursuing?** Does the composition opportunity justify investment, or should we focus on making individual systems excellent first?
+1. **Use cases**: What are the most compelling composition patterns? Log→TSDB? Log→Vector? What real problems would this solve?
 
-2. **Naming**: Are "internal" and "external" the right terms? Alternatives: transactional/eventual, co-located/distributed, unified/federated.
-
-3. **Use cases**: What are the most compelling composition patterns? Log→TSDB? Log→Vector? What real problems would this solve?
-
-4. **Hybrid modes**: Should we support internal and external composition together (e.g., two systems internally composed, externally composed with a third)?
+2. **Hybrid modes**: Should we support internal and external composition together (e.g., two systems internally composed, externally composed with a third)?
 
 ## Updates
 
