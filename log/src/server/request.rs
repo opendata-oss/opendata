@@ -30,6 +30,11 @@ pub struct ScanParams {
     pub end_seq: Option<u64>,
     /// Maximum number of entries to return.
     pub limit: Option<usize>,
+    /// If true, long-poll until data is available or timeout.
+    #[serde(default)]
+    pub follow: bool,
+    /// Timeout in milliseconds for long-polling (default: 30000).
+    pub timeout_ms: Option<u64>,
 }
 
 impl ScanParams {
@@ -207,6 +212,8 @@ mod tests {
             start_seq: None,
             end_seq: None,
             limit: None,
+            follow: false,
+            timeout_ms: None,
         };
 
         // when
@@ -308,6 +315,8 @@ mod tests {
             start_seq: None,
             end_seq: None,
             limit: None,
+            follow: false,
+            timeout_ms: None,
         };
 
         // when
@@ -326,6 +335,8 @@ mod tests {
             start_seq: Some(10),
             end_seq: Some(100),
             limit: None,
+            follow: false,
+            timeout_ms: None,
         };
 
         // when
@@ -334,5 +345,31 @@ mod tests {
         // then
         assert_eq!(range.start, 10);
         assert_eq!(range.end, 100);
+    }
+
+    #[test]
+    fn should_default_follow_to_false() {
+        // given - deserialize params with default follow
+        let json = r#"{"key": "test"}"#;
+
+        // when
+        let params: ScanParams = serde_json::from_str(json).unwrap();
+
+        // then
+        assert!(!params.follow);
+        assert!(params.timeout_ms.is_none());
+    }
+
+    #[test]
+    fn should_parse_follow_and_timeout_params() {
+        // given
+        let json = r#"{"key": "test", "follow": true, "timeout_ms": 5000}"#;
+
+        // when
+        let params: ScanParams = serde_json::from_str(json).unwrap();
+
+        // then
+        assert!(params.follow);
+        assert_eq!(params.timeout_ms, Some(5000));
     }
 }

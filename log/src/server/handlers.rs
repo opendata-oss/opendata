@@ -4,6 +4,7 @@
 //! and ProtoJSON (`application/protobuf+json`) formats.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{Query, State};
@@ -60,6 +61,7 @@ pub async fn handle_append(
 /// Handle GET /api/v1/log/scan
 ///
 /// Returns response in format matching the `Accept` header.
+/// Supports long-polling via `follow=true` and `timeout_ms` parameters.
 pub async fn handle_scan(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -70,7 +72,58 @@ pub async fn handle_scan(
     let range = params.seq_range();
     let limit = params.limit.unwrap_or(32);
 
-    let mut iter = state.log.scan(key.clone(), range).await?;
+    let entries = scan_entries(&state, key.clone(), range.clone(), limit).await?;
+
+    // If we have entries or follow is disabled, return immediately
+    if !entries.is_empty() || !params.follow {
+        let values: Vec<Value> = entries
+            .iter()
+            .map(|e| Value {
+                sequence: e.sequence,
+                value: e.value.clone(),
+            })
+            .collect();
+        let response = ScanResponse::success(key, values);
+        return Ok(to_api_response(response, format));
+    }
+
+    // Long-poll: wait for new entries
+    let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(30000));
+    let deadline = Instant::now() + timeout;
+    let poll_interval = Duration::from_millis(100);
+
+    loop {
+        tokio::time::sleep(poll_interval).await;
+
+        let entries = scan_entries(&state, key.clone(), range.clone(), limit).await?;
+        if !entries.is_empty() {
+            let values: Vec<Value> = entries
+                .iter()
+                .map(|e| Value {
+                    sequence: e.sequence,
+                    value: e.value.clone(),
+                })
+                .collect();
+            let response = ScanResponse::success(key, values);
+            return Ok(to_api_response(response, format));
+        }
+
+        if Instant::now() >= deadline {
+            // Timeout reached, return empty result
+            let response = ScanResponse::success(key, vec![]);
+            return Ok(to_api_response(response, format));
+        }
+    }
+}
+
+/// Helper function to scan entries from the log.
+async fn scan_entries(
+    state: &AppState,
+    key: Bytes,
+    range: std::ops::Range<u64>,
+    limit: usize,
+) -> Result<Vec<crate::LogEntry>, ApiError> {
+    let mut iter = state.log.scan(key, range).await?;
     let mut entries = Vec::new();
     while let Some(entry) = iter.next().await.map_err(ApiError::from)? {
         entries.push(entry);
@@ -78,16 +131,7 @@ pub async fn handle_scan(
             break;
         }
     }
-
-    let values: Vec<Value> = entries
-        .iter()
-        .map(|e| Value {
-            sequence: e.sequence,
-            value: e.value.clone(),
-        })
-        .collect();
-    let response = ScanResponse::success(key, values);
-    Ok(to_api_response(response, format))
+    Ok(entries)
 }
 
 /// Handle GET /api/v1/log/keys
