@@ -17,24 +17,9 @@ The goal is not to define specific APIs, but to map the landscape and stimulate 
 
 Modern applications rarely need just one data system. A usage-based billing platform might combine an event log (capturing usage events) with a timeseries database (aggregating metrics over time). A recommendation system might pair a vector database (similarity search) with a log (tracking user interactions).
 
-Traditionally, composing disparate systems is painful:
+Traditionally, composing disparate systems is painful. Each system has rigid ingest APIs, its own operational profile, and no understanding of the others. Glue code must bridge semantic mismatches and handle failures across system boundaries.
 
-1. **Rigid ingest APIs**: Each system exposes its own RPC-based ingest path. Kafka has its producer API. Prometheus has OTLP. These are the only ways in—there's no flexibility.
-
-2. **Network hops everywhere**: Composition means connector services shuttling data between endpoints. Each hop adds latency, requires authentication, and costs money.
-
-3. **Operational overhead**: Each system has its own endpoints, auth stack, TLS certificates, and monitoring. A simple Kafka→Prometheus pipeline requires operating Kafka brokers, a connector service, and Prometheus—each with distinct operational profiles.
-
-4. **Semantic mismatch**: Systems don't understand each other. Glue code must translate between log offsets and timestamps, handle schema differences, and manage consistency.
-
-OpenData is uniquely positioned to do better. All OpenData databases share:
-
-- **A common storage substrate** (SlateDB)
-- **Common infrastructure** (service runtime, configuration, tooling)
-- **Common data conventions** (record key prefixes, encoding patterns)
-- **Library-first architecture** (systems are embeddable, not just deployable as services)
-
-This shared foundation suggests composition patterns that would be impractical with disparate systems. Instead of stitching together silos through RPC boundaries, could we compose systems directly—embedding readers and writers in the same process, sharing storage for transactional guarantees, or leveraging common semantics for type-safe transformations?
+OpenData is uniquely positioned to do better. All OpenData databases share a common storage substrate (SlateDB), common infrastructure, common data conventions, and a library-first architecture. This shared foundation suggests composition patterns that would be impractical with disparate systems—embedding readers and writers in the same process, sharing storage for transactional guarantees, or leveraging common semantics for type-safe transformations.
 
 This RFC explores what that might look like.
 
@@ -114,15 +99,10 @@ External composition connects data systems that reside in separate slates. Each 
 
 **Inherent limitations:**
 
-- **No transactional boundary**: Writes to different slates are not atomic. Applications must handle partial failures.
+- **No transactional boundary**: Writes to different slates are not atomic.
 - **Eventual consistency**: Data propagation between systems has inherent latency.
 
-**Tradeoffs:**
-
-- **Independent scaling**: Each system scales according to its own needs.
-- **Isolation**: Problems in one system don't directly affect others.
-- **Flexibility**: Systems can be deployed, upgraded, or replaced independently.
-- **Complexity**: Applications must reason about consistency boundaries.
+The tradeoff is independent scaling and failure isolation at the cost of consistency complexity.
 
 **Example use case**: A log captures raw events, and a separate timeseries system maintains aggregated metrics. Imagine a built-in connector that subscribes to the log and updates the timeseries system—the user configures the composition declaratively, no custom code required.
 
@@ -149,24 +129,6 @@ External composition connects data systems that reside in separate slates. Each 
 | Failure isolation | No | Yes |
 | Operational complexity | Lower | Higher |
 | Configuration | Single slate | Multiple slates + connectors |
-
-### When Might Each Mode Apply?
-
-**Internal composition might fit when:**
-
-- Atomicity is required (e.g., exactly-once semantics between systems)
-- Strong consistency across systems is necessary
-- The systems have similar scaling characteristics
-- Operational simplicity is prioritized
-
-**External composition might fit when:**
-
-- Systems have divergent access patterns or scaling needs
-- Failure isolation between systems is important
-- Independent deployment/upgrade cycles are needed
-- Eventual consistency is acceptable
-
-These are hypotheses worth validating against real use cases.
 
 ### SlateDB as a Composition Foundation
 
@@ -200,48 +162,32 @@ SlateDB isn't just a convenient shared storage layer—its specific capabilities
 
 ### Semantic Foundations
 
-What semantic foundations would enable principled composition? This is an open area for exploration. Some concepts that might matter:
+What semantic foundations would enable principled composition? Some concepts that might matter:
 
-**Record identity**: All OpenData records have well-defined keys. Could we leverage this for:
-- Deterministic routing in external composition?
-- Conflict-free key spaces in internal composition?
+- **Record identity**: Well-defined keys could enable deterministic routing and conflict-free key spaces.
+- **Time semantics**: Common notions of event time and ingestion time could enable time-based correlation and consistent windowing.
+- **Schema alignment**: Shared schema conventions could enable type-safe transformations that survive schema evolution.
 
-**Time semantics**: All systems have a notion of time (event time, ingestion time, or both). Could common time semantics enable:
-- Time-based correlation across systems?
-- Consistent windowing for aggregations?
-
-**Schema alignment**: If systems share schema conventions, could we enable:
-- Composition patterns that survive schema changes?
-- Type-safe transformations between systems?
-
-The question is: what would APIs need to expose to make these semantic connections useful? This deserves deeper exploration.
+What would APIs need to expose to make these semantic connections useful?
 
 ### Embedding and Ingest Flexibility
 
-Traditional data systems expose rigid ingest APIs. Kafka provides an RPC-based producer API—that is the one and only way to get data in. Prometheus exposes an OTLP endpoint. Each system's ingest path is fixed by its architecture.
-
-This rigidity has consequences. Consider a telemetry pipeline that routes metrics through Kafka to Prometheus:
+Traditional systems have rigid ingest APIs—Kafka's producer, Prometheus's OTLP endpoint. Composing them means operating multiple services, each with its own endpoints, auth, and monitoring. Each boundary adds latency, operational burden, and cost.
 
 ```
-┌──────────┐    RPC    ┌──────────┐   Connector  ┌────────────┐
-│ Producer │ ───────►  │  Kafka   │  ──────────► │ Prometheus │
-└──────────┘           └──────────┘              └────────────┘
-     │                      │                          │
-     │                      │                          │
-   AuthN/Z               AuthN/Z                    AuthN/Z
-   Endpoint              Endpoint                   Endpoint
-   TLS                   TLS                        TLS
+┌──────────┐       ┌──────────┐       ┌───────────┐       ┌────────────┐
+│ Producer │ ────► │  Kafka   │ ────► │ Connector │ ────► │ Prometheus │
+└──────────┘       └──────────┘       └───────────┘       └────────────┘
+                        │                   │                   │
+                   Endpoints           Endpoints            Endpoints
+                   Auth/TLS            Auth/TLS             Auth/TLS
+                   Monitoring          Monitoring           Monitoring
+                   Scaling             Scaling              Scaling
 ```
 
-The user must operate:
-- Kafka brokers with RPC endpoints, authentication, and authorization
-- A connector service (Kafka Connect or custom) to bridge the systems
-- Prometheus with its ingest endpoint and its own auth stack
-- Network policies, certificates, and monitoring for each hop
+Three independent systems to operate, each with its own failure modes and management plane.
 
-Each RPC boundary adds latency, operational burden, and cost.
-
-**OpenData's library-first architecture suggests a different model.** Because systems are implemented as embeddable libraries (not just deployable services), composition could happen at the library level:
+**OpenData's library-first architecture suggests a different model.** Because systems are embeddable libraries, composition could happen at the library level:
 
 ```
 ┌─────────────────────────────────────────┐
@@ -261,25 +207,13 @@ Each RPC boundary adds latency, operational burden, and cost.
       └──────────┘
 ```
 
-If the user knows that telemetry will only come from a log, they could embed the Log reader directly with the TSDB writer. No intermediate endpoint to maintain—no RPC, no auth, no connector service. The only endpoint needed is downstream for query access (e.g., Grafana).
+If telemetry only comes from a log, the user could embed the Log reader directly with the TSDB writer—no intermediate endpoints, no RPC, no auth, no connector service. The only endpoint needed is downstream for queries (e.g., Grafana).
 
-**Potential benefits:**
+**Potential benefits**: Fewer network hops, simplified operations (one process), reduced cost (no intermediate services), simpler security (no intermediate auth boundaries).
 
-- **Fewer network hops**: Data flows through memory, not RPC.
-- **Simplified operations**: One process, one deployment, one thing to monitor.
-- **Reduced cost**: No intermediate services to run, no inter-service bandwidth.
-- **Security simplification**: No intermediate auth boundaries to configure.
+Embedding is a deployment choice within external composition—it doesn't change the consistency semantics, but could eliminate the operational overhead that typically accompanies integration.
 
-**When might embedding apply?**
-
-Embedding would be a deployment choice within external composition. It could work when:
-- The upstream system's reader and downstream system's writer can run in the same process
-- The data flow is unidirectional (or bidirectional flow can be handled in-process)
-- The combined resource requirements fit a single deployment unit
-
-Embedding wouldn't change the composition semantics—it's still external composition (separate slates, no transactional boundary). But it could eliminate the operational overhead that typically accompanies external integration.
-
-**Open question**: What API design would make embedding natural? How do we ensure readers and writers compose cleanly at the library level?
+**Open question**: What API design would make embedding natural?
 
 ### Next Steps
 
@@ -308,22 +242,11 @@ We could focus on only internal composition (everything in one slate) or only ex
 
 1. **Is this worth pursuing?** Does the composition opportunity justify investment, or should we focus on making individual systems excellent first?
 
-2. **Naming**: Are "internal" and "external" the right terms? Alternatives considered:
-   - Transactional vs. eventual composition
-   - Co-located vs. distributed composition
-   - Unified vs. federated composition
+2. **Naming**: Are "internal" and "external" the right terms? Alternatives: transactional/eventual, co-located/distributed, unified/federated.
 
-3. **What semantic foundations matter?** Which common concepts (time, identity, schema) would actually simplify composition? What would APIs need to expose?
+3. **Use cases**: What are the most compelling composition patterns? Log→TSDB? Log→Vector? What real problems would this solve?
 
-4. **Hybrid modes**: Should we support patterns that combine internal and external composition (e.g., two systems internally composed, externally composed with a third)?
-
-5. **Connector semantics**: For external composition, what delivery guarantees should connectors provide? At-least-once? Exactly-once?
-
-6. **Use cases**: What are the most compelling composition patterns? Log→TSDB for telemetry? Log→Vector for embedding generation? Others?
-
-7. **API design**: What would a composition API look like? Declarative configuration? Programmatic? Both?
-
-8. **Cross-system snapshots**: How important is consistent point-in-time state across composed systems? What are the use cases for time travel, cloning, and coordinated recovery?
+4. **Hybrid modes**: Should we support internal and external composition together (e.g., two systems internally composed, externally composed with a third)?
 
 ## Updates
 
