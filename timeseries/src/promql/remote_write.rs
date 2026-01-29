@@ -63,14 +63,21 @@ pub struct ProtobufSample {
 /// Convert a WriteRequest into a Vec<Series>.
 ///
 /// Each TimeSeries in the WriteRequest produces one Series containing all its samples.
-/// TimeSeries with no samples are filtered out.
+/// TimeSeries with no samples are filtered out - this is intentional because:
+/// - Prometheus remote write 1.0 doesn't carry exemplars or histograms in empty samples
+/// - Label registration happens during ingestion when samples are present
+/// - Empty timeseries would create Series with no data to query
 pub fn convert_write_request(request: WriteRequest) -> Vec<Series> {
-    request
+    let total_timeseries = request.timeseries.len();
+    let mut skipped_empty = 0usize;
+
+    let result: Vec<Series> = request
         .timeseries
         .into_iter()
         .filter_map(|ts| {
             // Skip timeseries with no samples
             if ts.samples.is_empty() {
+                skipped_empty += 1;
                 return None;
             }
 
@@ -94,7 +101,18 @@ pub fn convert_write_request(request: WriteRequest) -> Vec<Series> {
                 samples,
             })
         })
-        .collect()
+        .collect();
+
+    if skipped_empty > 0 {
+        tracing::debug!(
+            total = total_timeseries,
+            skipped = skipped_empty,
+            kept = result.len(),
+            "Filtered out timeseries with no samples"
+        );
+    }
+
+    result
 }
 
 /// Parse a snappy-compressed protobuf WriteRequest.
@@ -412,6 +430,50 @@ mod tests {
 
         // then
         assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn should_filter_empty_timeseries_and_keep_non_empty() {
+        // given - mixed empty and non-empty timeseries
+        let request = WriteRequest {
+            timeseries: vec![
+                TimeSeries {
+                    labels: vec![ProtobufLabel {
+                        name: "__name__".to_string(),
+                        value: "empty_metric".to_string(),
+                    }],
+                    samples: vec![], // Empty - should be filtered
+                },
+                TimeSeries {
+                    labels: vec![ProtobufLabel {
+                        name: "__name__".to_string(),
+                        value: "valid_metric".to_string(),
+                    }],
+                    samples: vec![ProtobufSample {
+                        value: 42.0,
+                        timestamp: 1000,
+                    }],
+                },
+                TimeSeries {
+                    labels: vec![ProtobufLabel {
+                        name: "__name__".to_string(),
+                        value: "another_empty".to_string(),
+                    }],
+                    samples: vec![], // Empty - should be filtered
+                },
+            ],
+        };
+
+        // when
+        let series_list = convert_write_request(request);
+
+        // then - only the non-empty timeseries should be kept
+        assert_eq!(series_list.len(), 1);
+        assert!(series_list[0]
+            .labels
+            .iter()
+            .any(|l| l.name == "__name__" && l.value == "valid_metric"));
+        assert_eq!(series_list[0].samples[0].value, 42.0);
     }
 
     // ==================== SNAPPY COMPRESSION TESTS ====================
