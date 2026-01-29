@@ -1,4 +1,4 @@
-# RFC 0004: Data Composition Patterns
+# RFC 0004: Principled Data Composition
 
 **Status**: Draft
 
