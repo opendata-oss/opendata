@@ -2275,7 +2275,7 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.15.5",
- "indexmap",
+ "indexmap 2.12.1",
  "metrics",
  "ordered-float",
  "quanta",
