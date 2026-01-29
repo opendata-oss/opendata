@@ -17,8 +17,8 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 
 # Build the log binary with http-server feature in release mode
-# Use version specifier to disambiguate from the standard log crate
-RUN cargo build --release -p log@0.1.0 --features http-server
+# Use --manifest-path to disambiguate from the crates.io log crate
+RUN cargo build --release --manifest-path log/Cargo.toml --features http-server
 
 # Runtime stage
 FROM debian:bookworm-slim
