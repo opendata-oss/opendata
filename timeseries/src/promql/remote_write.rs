@@ -63,11 +63,17 @@ pub struct ProtobufSample {
 /// Convert a WriteRequest into a Vec<Series>.
 ///
 /// Each TimeSeries in the WriteRequest produces one Series containing all its samples.
+/// TimeSeries with no samples are filtered out.
 pub fn convert_write_request(request: WriteRequest) -> Vec<Series> {
     request
         .timeseries
         .into_iter()
-        .map(|ts| {
+        .filter_map(|ts| {
+            // Skip timeseries with no samples
+            if ts.samples.is_empty() {
+                return None;
+            }
+
             let labels: Vec<Label> = ts
                 .labels
                 .into_iter()
@@ -80,13 +86,13 @@ pub fn convert_write_request(request: WriteRequest) -> Vec<Series> {
                 .map(|s| Sample::new(s.timestamp, s.value))
                 .collect();
 
-            Series {
+            Some(Series {
                 labels,
                 metric_type: Some(MetricType::Gauge), // Default to Gauge since type info not in 1.0
                 unit: None,
                 description: None,
                 samples,
-            }
+            })
         })
         .collect()
 }
