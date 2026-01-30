@@ -345,7 +345,7 @@ The OpenData-Queue has the following rough workflow
 ### Existing message queue systems
 
 #### Amazon SQS
-Amazon Simple Queue Service (Amazon SQS) offers a secure, durable, and available hosted queue that lets you 
+Amazon Simple Queue Service (Amazon SQS) offers a secure, durable, and available hosted queue that lets you
 integrate and decouple distributed software systems and components.
 
 In SQS queues are identified by a queue URL (e.g., `https://sqs.us-east-1.amazonaws.com/123456789/my-queue`).
@@ -373,37 +373,98 @@ Other features:
 - Auto-scaling: No capacity planning needed
 
 #### RabbitMQ
-RabbitMQ is an open-source message broker that enables applications to communicate asynchronously by sending and 
-receiving messages through queues. 
+RabbitMQ is an open-source message broker that enables applications to communicate asynchronously by sending and
+receiving messages through queues.
 Messages are not published directly to a queue; instead, the producer sends messages to an exchange.
-An exchange is responsible for routing messages to different queues with the help of header attributes, bindings, 
-and routing keys. 
+An exchange is responsible for routing messages to different queues with the help of header attributes, bindings,
+and routing keys.
 Think of it like a post office or mail sorting facility.
 RabbitMQ doesn't allow you to send a message to a queue directly, only through an exchange.
-A binding is a "link" that you set up to bind a queue to an exchange, 
+A binding is a "link" that you set up to bind a queue to an exchange,
 and the routing key is a message attribute the exchange looks at when deciding how to route the message.
 There are four types of exchange:
 - Direct Exchange: A message goes to the queues whose binding key exactly matches the routing key of the message.
-- Fanout Exchange: Routes a copy of every message published to them to every queue, stream or exchange bound to it. 
+- Fanout Exchange: Routes a copy of every message published to them to every queue, stream or exchange bound to it.
   The message's routing key is completely ignored.
 - Topic Exchange: Uses pattern matching of the message's routing key to the routing (binding) key pattern used at binding time.
-- Headers Exchange: Designed for routing on multiple attributes that are more easily expressed as message headers than 
+- Headers Exchange: Designed for routing on multiple attributes that are more easily expressed as message headers than
   a routing key.
 
-To send a message, you establish a connection to the RabbitMQ server, 
+To send a message, you establish a connection to the RabbitMQ server,
 create a channel, and send message with parameters for the exchange, routing key, and message body.
 A message can contain various types of information, from process/task instructions to simple text.
 RabbitMQ accepts, stores, and forwards binary blobs of data as messages.
 Queues are specified by name.
 To receive messages, consumers subscribe to a queue using a callback function that processes each message as it arrives.
-The main features of RabbitMQ include support for multiple protocols (AMQP 1.0, MQTT 5.0), 
-flexible routing through different exchange types (direct, fanout, topic, headers), 
-and reliability through message acknowledgments and cluster replication. 
-An acknowledgment is sent back by the consumer to tell RabbitMQ that a message was received and processed, 
+The main features of RabbitMQ include support for multiple protocols (AMQP 1.0, MQTT 5.0),
+flexible routing through different exchange types (direct, fanout, topic, headers),
+and reliability through message acknowledgments and cluster replication.
+An acknowledgment is sent back by the consumer to tell RabbitMQ that a message was received and processed,
 and if a consumer dies without sending an ack, RabbitMQ will re-queue and redeliver the message to another consumer.
-RabbitMQ is commonly used for decoupling microservices, implementing RPC patterns, streaming data, 
-and IoT applications—it can run on cloud environments, on-premises, or locally, and offers browser-based UI for 
+RabbitMQ is commonly used for decoupling microservices, implementing RPC patterns, streaming data,
+and IoT applications—it can run on cloud environments, on-premises, or locally, and offers browser-based UI for
 monitoring and management.
+
+#### ActiveMQ
+Apache ActiveMQ is an open-source message broker that implements the Java Message Service (JMS)API,
+enabling asynchronous communication between distributed applications.
+To send a message, you create a connection to the broker, establish a session, then use a MessageProducer to send
+messages to a destination.
+Messages can contain various content types including text (TextMessage),
+serialized objects (ObjectMessage), key-value pairs (MapMessage), byte streams (BytesMessage),
+or primitive streams (StreamMessage).
+Receiving works similarly—you create a MessageConsumer on a destination and either call receive() to block until a
+message arrives or register a MessageListener for asynchronous callback-based delivery.
+The received message object contains the payload plus metadata like message ID, timestamp, correlation ID,
+and custom properties.
+Queues (for point-to-point messaging) and topics (for publish-subscribe) are specified by name when creating a
+destination through the session, such as session.createQueue("orders.incoming").
+ActiveMQ's main features include support for multiple protocols (OpenWire, STOMP, AMQP, MQTT, WebSocket),
+message persistence for durability, transactions, clustering and high availability through networks of brokers,
+wildcard destinations for flexible routing, and integration with Spring Framework.
+The newer ActiveMQ Artemis variant offers improved performance with a non-blocking architecture and is recommended
+for new projects.
+
+#### Protocols
+
+**AMQP (Advanced Message Queuing Protocol):**
+An open standard with rich routing capabilities including exchanges, bindings, and queues.
+Supports transactions, acknowledgments, and multiple messaging patterns.
+AMQP has strong adoption in enterprise and backend systems.
+RabbitMQ alone has hundreds of thousands of production deployments.
+It's the go-to for traditional message queuing, task distribution, and microservices communication where you need
+rich routing and reliability features.
+However, the total number of AMQP endpoints is far smaller than MQTT's device count.
+
+**MQTT (Message Queuing Telemetry Transport):**
+Lightweight publish/subscribe protocol designed for constrained devices and low-bandwidth networks.
+Uses topic-based routing with three QoS levels.
+MQTT is popular in IoT and is the most widely deployed messaging protocol.
+It is very popular due to the sheer scale of IoT.
+Billions of devices use it -- everything from smart home sensors to industrial equipment to connected vehicles.
+Major cloud IoT platforms (AWS IoT Core, Azure IoT Hub, Google Cloud IoT) all support MQTT as their primary protocol.
+
+**STOMP (Simple Text Oriented Messaging Protocol):**
+A simple, text-based protocol that's easy to implement.
+Works over WebSockets, making it useful for browser-based messaging.
+STOMP is useful but niche.
+It's typically chosen for browser-based messaging (via WebSockets) or
+when simplicity matters more than performance.
+No major messaging system uses STOMP as its primary protocol --
+it's always an alternative alongside something else.
+You'll find it supported in RabbitMQ and ActiveMQ,
+but most users of those systems choose AMQP or OpenWire instead.
+
+**OpenWire:**
+OpenWire is ActiveMQ Classic's native binary protocol, optimized for performance with Java clients.
+It was significant during ActiveMQ's peak popularity in the late 2000s and early 2010s when ActiveMQ was
+one of the dominant open-source message brokers.
+
+**Java Messaging Service:**
+JMS is a messaging standard that allows Java EE application components to create, send, receive, and read messages,
+enabling distributed communication that is loosely coupled, reliable, and asynchronous.
+It is an API specification, not an implementation — vendors provide JMS providers (like ActiveMQ, IBM MQ, RabbitMQ).
+The used wire protocol depends on the provider.
 
 ## Alternatives
 
