@@ -1,5 +1,6 @@
 # Use cargo-chef for dependency caching
-# Pin to specific digest for reproducible builds
+# Pin to multi-arch manifest list digest for reproducible builds (supports amd64/arm64)
+# To update: docker manifest inspect lukemathwalker/cargo-chef:latest-rust-1.89
 FROM lukemathwalker/cargo-chef:latest-rust-1.89@sha256:abbe80c8000f4e1b6969b4d84d5ec7ad86616be7e6322ba0e3b451c2eee6f280 AS chef
 WORKDIR /app
 
@@ -22,7 +23,8 @@ COPY . .
 RUN cargo build --release --locked --manifest-path timeseries/Cargo.toml --features remote-write
 
 # Runtime stage
-# Pin to specific digest for reproducible builds
+# Pin to multi-arch manifest list digest for reproducible builds (supports amd64/arm64)
+# To update: docker manifest inspect debian:bookworm-slim
 FROM debian:bookworm-slim@sha256:56ff6d36d4eb3db13a741b342ec466f121480b5edded42e4b7ee850ce7a418ee
 
 WORKDIR /app
