@@ -122,8 +122,11 @@ after a split.
 
 On the other hand, implementation or synchronization bugs can cause the index to
 become permanently degraded. Let’s try to define some correctness properties we
-want to aim for to avoid this. Some of these are probably stronger than
-necessary, but they should give us something correct without much overhead:
+want to aim for to avoid this. At a high level, we should never drop a vector
+from the index, and we should make the best effort possible to preserve NPA.
+Let's try do describe what this means in practice. Some of these goals are
+probably stronger than necessary, but they should give us something correct
+without much overhead:
 1. Correct execution of LIRE. Obviously we want to implement LIRE correctly to
    preserve NPA and therefore Recall. So splits/merges should be triggered
    appropriately, a split should assign good new centroids, all vectors from
