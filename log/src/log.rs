@@ -396,6 +396,91 @@ impl LogRead for Log {
     }
 }
 
+/// Builder for creating Log instances with custom options.
+///
+/// This builder provides a fluent API for configuring a Log, including
+/// runtime options that cannot be serialized in configuration files.
+///
+/// # Example
+///
+/// ```ignore
+/// use log::LogBuilder;
+/// use log::Config;
+///
+/// // Create a separate runtime for compaction (important for sync/JNI usage)
+/// let compaction_runtime = tokio::runtime::Builder::new_multi_thread()
+///     .worker_threads(2)
+///     .enable_all()
+///     .build()
+///     .unwrap();
+///
+/// let log = LogBuilder::new(config)
+///     .with_compaction_runtime(compaction_runtime.handle().clone())
+///     .build()
+///     .await?;
+/// ```
+pub struct LogBuilder {
+    config: crate::config::Config,
+    compaction_runtime: Option<tokio::runtime::Handle>,
+}
+
+impl LogBuilder {
+    /// Creates a new log builder with the given configuration.
+    pub fn new(config: crate::config::Config) -> Self {
+        Self {
+            config,
+            compaction_runtime: None,
+        }
+    }
+
+    /// Sets a separate runtime for SlateDB compaction tasks.
+    ///
+    /// When provided, SlateDB's compaction tasks will run on this runtime
+    /// instead of the runtime used for user operations. This is important
+    /// when calling the Log from sync code using `block_on`, as it prevents
+    /// deadlocks between user operations and background compaction.
+    pub fn with_compaction_runtime(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.compaction_runtime = Some(handle);
+        self
+    }
+
+    /// Builds the Log instance.
+    pub async fn build(self) -> Result<Log> {
+        let mut storage_builder =
+            common::storage::factory::StorageBuilder::new(self.config.storage.clone());
+
+        if let Some(handle) = self.compaction_runtime {
+            storage_builder = storage_builder.with_compaction_runtime(handle);
+        }
+
+        let storage = storage_builder
+            .build()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let log_storage = LogStorage::new(storage);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+
+        let log_storage_read = log_storage.as_read();
+        let sequence_allocator = SequenceAllocator::open(&log_storage_read).await?;
+        let segment_cache =
+            SegmentCache::open(&log_storage_read, self.config.segmentation).await?;
+        let listing_cache = ListingCache::new();
+
+        let inner = LogInner {
+            sequence_allocator,
+            segment_cache,
+            listing_cache,
+        };
+
+        Ok(Log {
+            storage: log_storage,
+            clock,
+            inner: RwLock::new(inner),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use common::StorageConfig;
