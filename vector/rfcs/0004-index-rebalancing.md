@@ -699,7 +699,6 @@ We’ll track the following stats to monitor rebalance progress.
 - `reassign_count`: (counter) The number of vectors that have been reassigned.
 - `reassign_candidate_count`: (counter) The number of vectors that have been evaluated
   for reassignment.
-- ``
 
 ## Evaluation
 
