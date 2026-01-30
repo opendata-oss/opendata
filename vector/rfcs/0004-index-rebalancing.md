@@ -124,12 +124,12 @@ On the other hand, implementation or synchronization bugs can cause the index to
 become permanently degraded. Let’s try to define some correctness properties we
 want to aim for to avoid this. Some of these are probably stronger than
 necessary, but they should give us something correct without much overhead:
-1. Correct execution of LIRE. Obviously we want to implement LIRE correctly -
-   so splits/merges should be triggered appropriately, a split should assign
-   good new centroids, all vectors from the source(s) involved should be moved
-   to the target clusters, and the right vectors in the configured
-   neighbourhood should be reassigned. This isn’t really material to the
-   design.
+1. Correct execution of LIRE. Obviously we want to implement LIRE correctly to
+   preserve NPA and therefore Recall. So splits/merges should be triggered
+   appropriately, a split should assign good new centroids, all vectors from
+   the source(s) involved should be moved to the target clusters, and the right
+   vectors in the configured neighbourhood should be reassigned. This isn’t
+   really material to the design.
 2. Serialization of inserts with respect to splits/merges: Insert of a given
    vector should take place either before a split/merge, or after the split
    has created the new centroids and split/merge has removed the old one. This
