@@ -1,5 +1,6 @@
 # Use cargo-chef for dependency caching
-FROM lukemathwalker/cargo-chef:latest-rust-1.89 AS chef
+# Pin to specific digest for reproducible builds
+FROM lukemathwalker/cargo-chef:latest-rust-1.89@sha256:abbe80c8000f4e1b6969b4d84d5ec7ad86616be7e6322ba0e3b451c2eee6f280 AS chef
 WORKDIR /app
 
 FROM chef AS planner
@@ -17,10 +18,12 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 
 # Build the timeseries binary with remote-write feature in release mode
-RUN cargo build --release --manifest-path timeseries/Cargo.toml --features remote-write
+# Use --locked to ensure reproducible builds from Cargo.lock
+RUN cargo build --release --locked --manifest-path timeseries/Cargo.toml --features remote-write
 
 # Runtime stage
-FROM debian:bookworm-slim
+# Pin to specific digest for reproducible builds
+FROM debian:bookworm-slim@sha256:56ff6d36d4eb3db13a741b342ec466f121480b5edded42e4b7ee850ce7a418ee
 
 WORKDIR /app
 
