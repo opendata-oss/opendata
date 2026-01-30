@@ -345,6 +345,9 @@ The OpenData-Queue has the following rough workflow
 ### Existing message queue systems
 
 #### Amazon SQS
+Amazon Simple Queue Service (Amazon SQS) offers a secure, durable, and available hosted queue that lets you 
+integrate and decouple distributed software systems and components.
+
 In SQS queues are identified by a queue URL (e.g., `https://sqs.us-east-1.amazonaws.com/123456789/my-queue`).
 
 Each message is published to one specific queue.
@@ -369,8 +372,38 @@ Other features:
 - Server-side encryption: Via AWS KMS
 - Auto-scaling: No capacity planning needed
 
-##### Publish messages
--
+#### RabbitMQ
+RabbitMQ is an open-source message broker that enables applications to communicate asynchronously by sending and 
+receiving messages through queues. 
+Messages are not published directly to a queue; instead, the producer sends messages to an exchange.
+An exchange is responsible for routing messages to different queues with the help of header attributes, bindings, 
+and routing keys. 
+Think of it like a post office or mail sorting facility.
+RabbitMQ doesn't allow you to send a message to a queue directly, only through an exchange.
+A binding is a "link" that you set up to bind a queue to an exchange, 
+and the routing key is a message attribute the exchange looks at when deciding how to route the message.
+There are four types of exchange:
+- Direct Exchange: A message goes to the queues whose binding key exactly matches the routing key of the message.
+- Fanout Exchange: Routes a copy of every message published to them to every queue, stream or exchange bound to it. 
+  The message's routing key is completely ignored.
+- Topic Exchange: Uses pattern matching of the message's routing key to the routing (binding) key pattern used at binding time.
+- Headers Exchange: Designed for routing on multiple attributes that are more easily expressed as message headers than 
+  a routing key.
+
+To send a message, you establish a connection to the RabbitMQ server, 
+create a channel, and send message with parameters for the exchange, routing key, and message body.
+A message can contain various types of information, from process/task instructions to simple text.
+RabbitMQ accepts, stores, and forwards binary blobs of data as messages.
+Queues are specified by name.
+To receive messages, consumers subscribe to a queue using a callback function that processes each message as it arrives.
+The main features of RabbitMQ include support for multiple protocols (AMQP 1.0, MQTT 5.0), 
+flexible routing through different exchange types (direct, fanout, topic, headers), 
+and reliability through message acknowledgments and cluster replication. 
+An acknowledgment is sent back by the consumer to tell RabbitMQ that a message was received and processed, 
+and if a consumer dies without sending an ack, RabbitMQ will re-queue and redeliver the message to another consumer.
+RabbitMQ is commonly used for decoupling microservices, implementing RPC patterns, streaming data, 
+and IoT applications—it can run on cloud environments, on-premises, or locally, and offers browser-based UI for 
+monitoring and management.
 
 ## Alternatives
 
