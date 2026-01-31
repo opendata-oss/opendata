@@ -44,8 +44,8 @@ leveraged by various systems.
 
 ### Components & Terminology
 
-- `Write` is an insertion of data into the system; each write is assigned a unique `id` at enqueue
-  time (for tracking) and a monotonically increasing `epoch` when dequeued (for ordering)
+- `Write` is an insertion of data into the system; each write is assigned a monotonically increasing
+  `epoch` when dequeued by the coordinator (for ordering and durability tracking)
 - `WriteQueue` is a queue that accepts `Write` as input and applies an epoch-based ordering
 - `Snapshot` is a point-in-time reference to the storage state, broadcast to readers after each flush;
   represented in the API as `StorageRead` (a SlateDB snapshot)
@@ -145,19 +145,32 @@ pub enum Durability {
     Durable,
 }
 
+/// Watchers for durability watermarks. Created per-handle via `sender.subscribe()` to ensure
+/// each handle has independent cursor state.
+struct FlushWatchers {
+    applied: watch::Receiver<u64>,
+    flushed: watch::Receiver<u64>,
+    durable: watch::Receiver<u64>,
+}
+
 /// Handle returned from a write operation for tracking durability.
-pub struct WriteHandle { /* ... */ }
+pub struct WriteHandle {
+    epoch: Shared<oneshot::Receiver<u64>>,
+    watchers: FlushWatchers,
+}
 
 impl WriteHandle {
-    /// Returns the id assigned to this write. The id is assigned at enqueue time
-    /// and is unique but not ordered — it cannot be used to determine write order.
-    pub fn id(&self) -> u64 { /* ... */ }
     /// Returns the epoch assigned to this write. Epochs are assigned when the
     /// coordinator dequeues the write, so this method blocks until sequencing.
     /// Epochs are monotonically increasing and reflect the actual write order.
-    pub async fn epoch(&self) -> u64 { /* ... */ }
+    pub async fn epoch(&self) -> Result<u64> {
+        self.epoch.clone().await.map_err(|_| /* coordinator dropped */)
+    }
     /// Wait until the write reaches the specified durability level.
-    pub async fn wait(&self, durability: Durability) -> Result<()> { /* ... */ }
+    pub async fn wait(&self, durability: Durability) -> Result<()> {
+        let epoch = self.epoch().await?;
+        self.watchers.wait(epoch, durability).await
+    }
 }
 
 /// Handle for interacting with the write coordinator.
@@ -193,10 +206,10 @@ The `WriteHandle` is used to allow readers to wait for the following durability 
 
 The coordinator runs as a single-threaded async loop that processes commands and manages flushes.
 
-1. **Ordering**: all writes are serialized through a single `mpsc` channel (`WriteQueue`). Writes
-   are assigned an unordered `id` at enqueue time for tracking purposes. Epochs are assigned when
-   the coordinator dequeues and processes the write. This means `epoch()` must be awaited, but
-   ordering is still guaranteed within a single async task: if `write(A).await` completes before
+1. **Ordering**: all writes are serialized through a single `mpsc` channel (`WriteQueue`). Each
+   enqueued write includes a `oneshot::Sender` for epoch delivery. Epochs are assigned when the
+   coordinator dequeues and processes the write. This means `epoch()` must be awaited, but ordering
+   is still guaranteed within a single async task: if `write(A).await` completes before
    `write(B).await` is called (sequential awaits), then `epoch(A) < epoch(B)` because both writes
    enter the channel in that order. This matches SlateDB's write semantics.
 2. **Non-Blocking Flush**: when a flush is triggered:
@@ -209,11 +222,13 @@ The coordinator runs as a single-threaded async loop that processes commands and
 3. **Flush Triggers**: flushes can be triggered manually via `flush()` or based on conditions
    evaluated on a timer. Flush requests are queued if a flush is in progress. A call to
    `flush(epoch)` is a no-op if `epoch` ≤ the already-flushed epoch.
-4. **Epoch Tracking**: once a write is dequeued and assigned an epoch, the coordinator stores the
-   mapping from `id` to `epoch` in a shared map protected by a mutex. The `WriteHandle::epoch()`
-   method waits on a condition variable until the mapping exists for its `id`. A separate `BTreeMap`
-   sorted by `epoch` tracks durability notifications so callers can be notified when an epoch is
-   flushed and/or durable. Watchers are removed after notifying of the `durable` watermark.
+4. **Epoch Tracking**: once a write is dequeued and assigned an epoch, the coordinator sends the
+   epoch through the write's oneshot channel, unblocking any pending `epoch()` calls. The handle is
+   automatically cleaned up when dropped (the oneshot is dropped with it). The coordinator holds
+   `watch::Sender<u64>` for each durability level (applied/flushed/durable) and updates them as
+   watermarks advance. Each `WriteHandle` gets its own receivers via `sender.subscribe()`, ensuring
+   independent cursor state. `WriteHandle::wait()` awaits its epoch, then waits for the appropriate
+   watermark to pass that epoch.
 5. **Failure Propagation**: there are two modes of failure:
     1. failures that occur when applying a `Write` to the delta will be propagated to the caller via
        `WriteHandle::wait()`
