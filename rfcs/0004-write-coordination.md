@@ -44,8 +44,8 @@ leveraged by various systems.
 
 ### Components & Terminology
 
-- `Write` is an insertion of data into the system; each write is assigned a unique, monotonically
-  increasing epoch
+- `Write` is an insertion of data into the system; each write is assigned a unique `id` at enqueue
+  time (for tracking) and a monotonically increasing `epoch` when dequeued (for ordering)
 - `WriteQueue` is a queue that accepts `Write` as input and applies an epoch-based ordering
 - `Snapshot` is a point-in-time reference to the storage state, broadcast to readers after each flush;
   represented in the API as `StorageRead` (a SlateDB snapshot)
@@ -149,8 +149,13 @@ pub enum Durability {
 pub struct WriteHandle { /* ... */ }
 
 impl WriteHandle {
-    /// Returns the epoch assigned to this write.
-    pub fn epoch(&self) -> u64 { /* ... */ }
+    /// Returns the id assigned to this write. The id is assigned at enqueue time
+    /// and is unique but not ordered — it cannot be used to determine write order.
+    pub fn id(&self) -> u64 { /* ... */ }
+    /// Returns the epoch assigned to this write. Epochs are assigned when the
+    /// coordinator dequeues the write, so this method blocks until sequencing.
+    /// Epochs are monotonically increasing and reflect the actual write order.
+    pub async fn epoch(&self) -> u64 { /* ... */ }
     /// Wait until the write reaches the specified durability level.
     pub async fn wait(&self, durability: Durability) -> Result<()> { /* ... */ }
 }
@@ -188,9 +193,12 @@ The `WriteHandle` is used to allow readers to wait for the following durability 
 
 The coordinator runs as a single-threaded async loop that processes commands and manages flushes.
 
-1. **Ordering**: all writes are serialized through a single `mpsc` channel (`WriteQueue`). Epochs
-   are assigned atomically when `write()` is called, before any queue blocking, guaranteeing that
-   if `write(A)` returns before `write(B)` is called, then `epoch(A) < epoch(B)`.
+1. **Ordering**: all writes are serialized through a single `mpsc` channel (`WriteQueue`). Writes
+   are assigned an unordered `id` at enqueue time for tracking purposes. Epochs are assigned when
+   the coordinator dequeues and processes the write. This means `epoch()` must be awaited, but
+   ordering is still guaranteed within a single async task: if `write(A).await` completes before
+   `write(B).await` is called (sequential awaits), then `epoch(A) < epoch(B)` because both writes
+   enter the channel in that order. This matches SlateDB's write semantics.
 2. **Non-Blocking Flush**: when a flush is triggered:
    1. `fork_image()` is called on the current delta to extract state for the next delta
    2. The current delta is cloned for subscribers
@@ -201,9 +209,11 @@ The coordinator runs as a single-threaded async loop that processes commands and
 3. **Flush Triggers**: flushes can be triggered manually via `flush()` or based on conditions
    evaluated on a timer. Flush requests are queued if a flush is in progress. A call to
    `flush(epoch)` is a no-op if `epoch` ≤ the already-flushed epoch.
-4. **Epoch Tracking**: write handles are enqueued on a `BTreeMap` sorted by `epoch` so that we can
-   notify readers when an epoch is flushed and/or durable. Watchers are removed after notifying of
-   the `durable` watermark.
+4. **Epoch Tracking**: once a write is dequeued and assigned an epoch, the coordinator stores the
+   mapping from `id` to `epoch` in a shared map protected by a mutex. The `WriteHandle::epoch()`
+   method waits on a condition variable until the mapping exists for its `id`. A separate `BTreeMap`
+   sorted by `epoch` tracks durability notifications so callers can be notified when an epoch is
+   flushed and/or durable. Watchers are removed after notifying of the `durable` watermark.
 5. **Failure Propagation**: there are two modes of failure:
     1. failures that occur when applying a `Write` to the delta will be propagated to the caller via
        `WriteHandle::wait()`
@@ -410,19 +420,31 @@ This was rejected because:
 
 ## Future Considerations
 
-### Priority Channel for Maintenance Operations
+### Sequencing Maintenance Operations
 
 Some subsystems (e.g., vector index maintenance) may need to sequence internal operations alongside
 user writes. For example, splitting a centroid requires: (1) marking the old centroid as draining,
-(2) waiting until the change is readable, (3) reading vectors to compute reassignments. These
-operations should take priority over user writes to enable backpressure — if writes arrive faster
-than the index can be maintained, we need to pause ingest while still processing splits/merges.
+(2) waiting until the change is readable, (3) reading vectors to compute reassignments.
 
-A future enhancement could add a priority channel to the coordinator's `select!` loop (using
-`biased` ordering). Maintenance commands would be processed before queued writes, and could
-optionally bypass WAL logging since they don't need crash recovery (the caller blocks until applied
-and can recompute after restart). Epochs would be assigned by the coordinator task rather than at
-enqueue time, ensuring proper sequencing with snapshot reads.
+The split between `id` (assigned at enqueue) and `epoch` (assigned at dequeue) enables this pattern.
+Maintenance operations can be submitted through the same write channel as user writes:
+
+```rust
+// Submit the split command
+let handle = coordinator.write(SplitCentroid { c, into: [c_0, c_1] }).await?;
+// Wait until the split is readable
+handle.wait(Durability::Flushed).await?;
+// Now safe to read vectors from c for reassignment
+let vectors = read_centroid_vectors(c).await?;
+```
+
+Because epochs are assigned at dequeue time, the split command receives an epoch that correctly
+sequences it relative to concurrent user writes. The `wait(Flushed)` call blocks until the split
+is visible to readers, ensuring the subsequent read sees the draining state.
+
+Backpressure is handled client-side: if writes arrive faster than the index can be maintained, the
+client is responsible for pausing ingest while maintenance catches up. This keeps the coordinator
+simple and gives subsystems full control over their own flow control policies.
 
 ### Reading from the Pending Delta
 
