@@ -4,10 +4,12 @@
 
 pub mod centroid_chunk;
 pub mod collection_meta;
+pub mod deletions;
 pub mod id_dictionary;
 pub mod key;
 pub mod metadata_index;
 pub mod posting_list;
+pub mod vector_bitmap;
 pub mod vector_data;
 pub mod vector_meta;
 
@@ -26,13 +28,14 @@ pub const KEY_VERSION: u8 = 0x01;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordType {
     CollectionMeta = 0x01,
-    CentroidChunk = 0x02,
-    PostingList = 0x03,
-    IdDictionary = 0x04,
-    VectorData = 0x05,
-    VectorMeta = 0x06,
-    MetadataIndex = 0x07,
-    SeqBlock = 0x08,
+    Deletions = 0x02,
+    CentroidChunk = 0x03,
+    PostingList = 0x04,
+    IdDictionary = 0x05,
+    VectorData = 0x06,
+    VectorMeta = 0x07,
+    MetadataIndex = 0x08,
+    SeqBlock = 0x09,
 }
 
 impl RecordType {
@@ -45,13 +48,14 @@ impl RecordType {
     pub fn from_id(id: u8) -> Result<Self, EncodingError> {
         match id {
             0x01 => Ok(RecordType::CollectionMeta),
-            0x02 => Ok(RecordType::CentroidChunk),
-            0x03 => Ok(RecordType::PostingList),
-            0x04 => Ok(RecordType::IdDictionary),
-            0x05 => Ok(RecordType::VectorData),
-            0x06 => Ok(RecordType::VectorMeta),
-            0x07 => Ok(RecordType::MetadataIndex),
-            0x08 => Ok(RecordType::SeqBlock),
+            0x02 => Ok(RecordType::Deletions),
+            0x03 => Ok(RecordType::CentroidChunk),
+            0x04 => Ok(RecordType::PostingList),
+            0x05 => Ok(RecordType::IdDictionary),
+            0x06 => Ok(RecordType::VectorData),
+            0x07 => Ok(RecordType::VectorMeta),
+            0x08 => Ok(RecordType::MetadataIndex),
+            0x09 => Ok(RecordType::SeqBlock),
             _ => Err(EncodingError {
                 message: format!("Invalid record type: 0x{:02x}", id),
             }),
@@ -563,6 +567,7 @@ mod tests {
         // given
         let types = [
             RecordType::CollectionMeta,
+            RecordType::Deletions,
             RecordType::CentroidChunk,
             RecordType::PostingList,
             RecordType::IdDictionary,

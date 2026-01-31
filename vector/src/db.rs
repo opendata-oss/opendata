@@ -29,6 +29,7 @@ use crate::hnsw::CentroidGraph;
 use crate::model::{AttributeValue, Config, Vector};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::key::SeqBlockKey;
+use crate::serde::posting_list::{PostingList, PostingUpdate};
 use crate::storage::{VectorDbStorageExt, VectorDbStorageReadExt};
 
 /// Vector database for storing and querying embedding vectors.
@@ -84,7 +85,8 @@ impl VectorDb {
     /// Other configuration options (like `flush_interval`) can be changed
     /// on subsequent opens.
     pub async fn open(config: Config) -> Result<Self> {
-        let storage = create_storage(&config.storage, Some(Arc::new(VectorDbMergeOperator)))
+        let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
+        let storage = create_storage(&config.storage, Some(Arc::new(merge_op)))
             .await
             .context("Failed to create storage")?;
 
@@ -213,8 +215,7 @@ impl VectorDb {
         let mut ops = Vec::new();
 
         // Batch posting list updates (collect all updates per centroid)
-        use std::collections::HashMap;
-        let mut posting_lists: HashMap<u32, RoaringTreemap> = HashMap::new();
+        let mut posting_updates: HashMap<u32, Vec<PostingUpdate>> = HashMap::new();
         let mut deleted_vectors = RoaringTreemap::new();
 
         for (external_id, pending_vec) in delta.vectors {
@@ -264,10 +265,13 @@ impl VectorDb {
 
             // 6. Assign vector to nearest centroid using HNSW
             let centroid_id = self.assign_to_centroid(pending_vec.values()).await?;
-            posting_lists
+            posting_updates
                 .entry(centroid_id)
                 .or_default()
-                .insert(new_internal_id);
+                .push(PostingUpdate::append(
+                    new_internal_id,
+                    pending_vec.values().to_vec(),
+                ));
         }
 
         // Serialize and merge batched posting lists
@@ -275,8 +279,8 @@ impl VectorDb {
             ops.push(self.storage.merge_deleted_vectors(deleted_vectors)?);
         }
 
-        for (centroid_id, bitmap) in posting_lists {
-            ops.push(self.storage.merge_posting_list(centroid_id, bitmap)?);
+        for (centroid_id, updates) in posting_updates {
+            ops.push(self.storage.merge_posting_list(centroid_id, updates)?);
         }
 
         // ATOMIC: Apply all operations in one batch
@@ -474,7 +478,9 @@ impl VectorDb {
 
         // 4. Load posting lists and deleted vectors
         let snapshot = self.snapshot.read().await;
-        let candidate_ids = self.load_candidates(&centroid_ids, &**snapshot).await?;
+        let candidate_ids = self
+            .load_candidates(&centroid_ids, snapshot.as_ref())
+            .await?;
 
         if candidate_ids.is_empty() {
             return Ok(Vec::new());
@@ -489,7 +495,7 @@ impl VectorDb {
 
         // 6. Score candidates and return top-k
         let results = self
-            .score_and_rank(query, &candidate_ids, k, &**snapshot)
+            .score_and_rank(query, &candidate_ids, k, snapshot.as_ref())
             .await?;
 
         Ok(results)
@@ -512,10 +518,17 @@ impl VectorDb {
         snapshot: &dyn StorageRead,
     ) -> Result<Vec<u64>> {
         let mut all_candidates = Vec::new();
+        let dimensions = self.config.dimensions as usize;
 
         for &centroid_id in centroid_ids {
-            let posting_list = snapshot.get_posting_list(centroid_id).await?;
-            all_candidates.extend(posting_list.vector_ids.iter());
+            let posting_list: PostingList = snapshot
+                .get_posting_list(centroid_id, dimensions)
+                .await?
+                .into();
+            // Extract IDs from posting updates (only include appends, skip deletes)
+            for posting in posting_list.iter() {
+                all_candidates.push(posting.id());
+            }
         }
 
         Ok(all_candidates)
@@ -624,7 +637,7 @@ mod tests {
 
     fn create_test_storage() -> Arc<dyn Storage> {
         Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            VectorDbMergeOperator,
+            VectorDbMergeOperator::new(3),
         )))
     }
 
