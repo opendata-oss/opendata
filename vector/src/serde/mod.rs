@@ -11,7 +11,6 @@ pub mod metadata_index;
 pub mod posting_list;
 pub mod vector_bitmap;
 pub mod vector_data;
-pub mod vector_meta;
 
 use bytes::BytesMut;
 
@@ -33,9 +32,8 @@ pub enum RecordType {
     PostingList = 0x04,
     IdDictionary = 0x05,
     VectorData = 0x06,
-    VectorMeta = 0x07,
-    MetadataIndex = 0x08,
-    SeqBlock = 0x09,
+    MetadataIndex = 0x07,
+    SeqBlock = 0x08,
 }
 
 impl RecordType {
@@ -53,9 +51,8 @@ impl RecordType {
             0x04 => Ok(RecordType::PostingList),
             0x05 => Ok(RecordType::IdDictionary),
             0x06 => Ok(RecordType::VectorData),
-            0x07 => Ok(RecordType::VectorMeta),
-            0x08 => Ok(RecordType::MetadataIndex),
-            0x09 => Ok(RecordType::SeqBlock),
+            0x07 => Ok(RecordType::MetadataIndex),
+            0x08 => Ok(RecordType::SeqBlock),
             _ => Err(EncodingError {
                 message: format!("Invalid record type: 0x{:02x}", id),
             }),
@@ -96,6 +93,9 @@ pub enum FieldType {
     Int64 = 1,
     Float64 = 2,
     Bool = 3,
+    /// Vector type (tag 255) - used internally to store vectors as a special field.
+    /// Not valid in collection metadata schemas.
+    Vector = 255,
 }
 
 impl FieldType {
@@ -105,6 +105,7 @@ impl FieldType {
             1 => Ok(FieldType::Int64),
             2 => Ok(FieldType::Float64),
             3 => Ok(FieldType::Bool),
+            255 => Ok(FieldType::Vector),
             _ => Err(EncodingError {
                 message: format!("Invalid field type: {}", byte),
             }),
@@ -115,13 +116,13 @@ impl FieldType {
 /// A metadata field value (tagged union).
 ///
 /// Used in:
-/// - `VectorMeta`: Stores actual metadata values for each vector
+/// - `VectorData`: Stores actual metadata values for each vector
 /// - `MetadataIndexKey`: Encodes values in index keys for filtering
 ///
 /// ## Encoding
 ///
 /// This type has two encoding modes:
-/// - **Value encoding** (via `Encode`/`Decode` traits): Little-endian, used in `VectorMeta`
+/// - **Value encoding** (via `Encode`/`Decode` traits): Little-endian, used in `VectorData`
 /// - **Sortable encoding** (via `encode_sortable`/`decode_sortable`): Big-endian with
 ///   sign-bit transformations, used in `MetadataIndexKey` for correct lexicographic ordering
 #[derive(Debug, Clone, PartialEq)]
@@ -130,6 +131,8 @@ pub enum FieldValue {
     Int64(i64),
     Float64(f64),
     Bool(bool),
+    /// Vector value - Not valid in metadata index keys.
+    Vector(Vec<f32>),
 }
 
 impl FieldValue {
@@ -140,6 +143,7 @@ impl FieldValue {
             FieldValue::Int64(_) => FieldType::Int64,
             FieldValue::Float64(_) => FieldType::Float64,
             FieldValue::Bool(_) => FieldType::Bool,
+            FieldValue::Vector(_) => FieldType::Vector,
         }
     }
 
@@ -154,6 +158,9 @@ impl FieldValue {
     /// - Integers: -100 < 0 < 100
     /// - Floats: -1.0 < 0.0 < 1.0
     /// - Bools: false < true
+    ///
+    /// # Panics
+    /// Panics if called on a `Vector` variant since vectors should not appear in index keys.
     pub fn encode_sortable(&self, buf: &mut BytesMut) {
         use bytes::BufMut;
         use common::serde::sortable::{encode_f64_sortable, encode_i64_sortable};
@@ -176,10 +183,17 @@ impl FieldValue {
                 buf.put_u8(FieldType::Bool as u8);
                 buf.put_u8(if *v { 1 } else { 0 });
             }
+            FieldValue::Vector(_) => {
+                panic!("Vector values cannot be used in sortable key encoding")
+            }
         }
     }
 
     /// Decode a field value from sortable key encoding.
+    ///
+    /// # Errors
+    /// Returns an error if the buffer is too short or contains invalid data.
+    /// Also returns an error for `Vector` type since vectors should not appear in index keys.
     pub fn decode_sortable(buf: &mut &[u8]) -> Result<Self, EncodingError> {
         use common::serde::sortable::{decode_f64_sortable, decode_i64_sortable};
         use common::serde::terminated_bytes;
@@ -237,6 +251,9 @@ impl FieldValue {
                 *buf = &buf[1..];
                 Ok(FieldValue::Bool(value))
             }
+            FieldType::Vector => Err(EncodingError {
+                message: "Vector values cannot be used in sortable key encoding".to_string(),
+            }),
         }
     }
 }
@@ -462,7 +479,7 @@ impl Decode for f64 {
 
 /// Encode implementation for FieldValue (value encoding, little-endian).
 ///
-/// This is used in `VectorMeta` for storing metadata values.
+/// This is used in `VectorData` for storing metadata and vector values.
 impl Encode for FieldValue {
     fn encode(&self, buf: &mut BytesMut) {
         match self {
@@ -482,11 +499,18 @@ impl Encode for FieldValue {
                 buf.extend_from_slice(&[FieldType::Bool as u8]);
                 buf.extend_from_slice(&[if *v { 1 } else { 0 }]);
             }
+            FieldValue::Vector(v) => {
+                buf.extend_from_slice(&[FieldType::Vector as u8]);
+                encode_fixed_element_array(v, buf);
+            }
         }
     }
 }
 
 /// Decode implementation for FieldValue (value encoding, little-endian).
+///
+/// Note: For `Vector` type, this implementation requires the dimensions to be known.
+/// Use `FieldValue::decode_with_dimensions` when decoding from VectorData records.
 impl Decode for FieldValue {
     fn decode(buf: &mut &[u8]) -> Result<Self, EncodingError> {
         if buf.is_empty() {
@@ -537,6 +561,87 @@ impl Decode for FieldValue {
                 *buf = &buf[1..];
                 Ok(FieldValue::Bool(v))
             }
+            FieldType::Vector => Err(EncodingError {
+                message: "Vector type requires dimensions context; use decode_with_dimensions"
+                    .to_string(),
+            }),
+        }
+    }
+}
+
+impl FieldValue {
+    /// Decode a FieldValue that may be a Vector, using the provided dimensions.
+    ///
+    /// This is used when decoding VectorData records where vectors are stored as fields.
+    pub fn decode_with_dimensions(
+        buf: &mut &[u8],
+        dimensions: usize,
+    ) -> Result<Self, EncodingError> {
+        if buf.is_empty() {
+            return Err(EncodingError {
+                message: "Buffer too short for FieldValue type".to_string(),
+            });
+        }
+
+        let field_type = FieldType::from_byte(buf[0])?;
+        *buf = &buf[1..];
+
+        match field_type {
+            FieldType::String => {
+                let s = decode_utf8(buf)?;
+                Ok(FieldValue::String(s))
+            }
+            FieldType::Int64 => {
+                if buf.len() < 8 {
+                    return Err(EncodingError {
+                        message: "Buffer too short for Int64 value".to_string(),
+                    });
+                }
+                let v = i64::from_le_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ]);
+                *buf = &buf[8..];
+                Ok(FieldValue::Int64(v))
+            }
+            FieldType::Float64 => {
+                if buf.len() < 8 {
+                    return Err(EncodingError {
+                        message: "Buffer too short for Float64 value".to_string(),
+                    });
+                }
+                let v = f64::from_le_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ]);
+                *buf = &buf[8..];
+                Ok(FieldValue::Float64(v))
+            }
+            FieldType::Bool => {
+                if buf.is_empty() {
+                    return Err(EncodingError {
+                        message: "Buffer too short for Bool value".to_string(),
+                    });
+                }
+                let v = buf[0] != 0;
+                *buf = &buf[1..];
+                Ok(FieldValue::Bool(v))
+            }
+            FieldType::Vector => {
+                let expected_bytes = dimensions * 4;
+                if buf.len() < expected_bytes {
+                    return Err(EncodingError {
+                        message: format!(
+                            "Buffer too short for Vector value: expected {} bytes, got {}",
+                            expected_bytes,
+                            buf.len()
+                        ),
+                    });
+                }
+                // Only decode exactly dimensions elements (not the entire buffer)
+                let mut vector_buf = &buf[..expected_bytes];
+                let vector: Vec<f32> = decode_fixed_element_array(&mut vector_buf, 4)?;
+                *buf = &buf[expected_bytes..];
+                Ok(FieldValue::Vector(vector))
+            }
         }
     }
 }
@@ -572,7 +677,7 @@ mod tests {
             RecordType::PostingList,
             RecordType::IdDictionary,
             RecordType::VectorData,
-            RecordType::VectorMeta,
+            // VectorMeta (0x07) was removed - data merged into VectorData
             RecordType::MetadataIndex,
             RecordType::SeqBlock,
         ];

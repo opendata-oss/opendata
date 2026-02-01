@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use crate::model::{AttributeValue, Config, Vector, attributes_to_map};
+use crate::model::{AttributeValue, Config, VECTOR_FIELD_NAME, Vector, attributes_to_map};
 
 /// Builder for accumulating vector writes into a delta.
 ///
@@ -46,20 +46,12 @@ impl<'a> VectorDbDeltaBuilder<'a> {
     /// Writes a vector to the delta after validation.
     ///
     /// This validates:
+    /// - "vector" attribute exists and has type Vector
     /// - Vector dimensions match config
     /// - Attributes match schema (if schema is defined)
     ///
     /// Does NOT allocate internal IDs - that happens during flush.
     pub(crate) async fn write(&mut self, vector: Vector) -> Result<()> {
-        // Validate dimensions
-        if vector.values.len() != self.config.dimensions as usize {
-            return Err(anyhow::anyhow!(
-                "Vector dimension mismatch: expected {}, got {}",
-                self.config.dimensions,
-                vector.values.len()
-            ));
-        }
-
         // Validate external ID length
         if vector.id.len() > 64 {
             return Err(anyhow::anyhow!(
@@ -69,11 +61,37 @@ impl<'a> VectorDbDeltaBuilder<'a> {
         }
 
         // Convert attributes to map for easier validation and storage
-        let metadata = attributes_to_map(&vector.attributes);
+        let attributes = attributes_to_map(&vector.attributes);
+
+        // Extract and validate "vector" attribute
+        let values = match attributes.get(VECTOR_FIELD_NAME) {
+            Some(AttributeValue::Vector(v)) => v.clone(),
+            Some(_) => {
+                return Err(anyhow::anyhow!(
+                    "Field '{}' must have type Vector",
+                    VECTOR_FIELD_NAME
+                ));
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Missing required field '{}'",
+                    VECTOR_FIELD_NAME
+                ));
+            }
+        };
+
+        // Validate dimensions
+        if values.len() != self.config.dimensions as usize {
+            return Err(anyhow::anyhow!(
+                "Vector dimension mismatch: expected {}, got {}",
+                self.config.dimensions,
+                values.len()
+            ));
+        }
 
         // Validate attributes against schema (if schema is defined)
         if !self.config.metadata_fields.is_empty() {
-            self.validate_attributes(&metadata)?;
+            self.validate_attributes(&attributes)?;
         }
 
         // Store in pending vectors (keyed by external_id)
@@ -83,8 +101,8 @@ impl<'a> VectorDbDeltaBuilder<'a> {
             vector.id.clone(),
             PendingVector {
                 external_id: vector.id,
-                values: vector.values,
-                metadata,
+                values,
+                metadata: attributes,
             },
         );
 
@@ -92,6 +110,8 @@ impl<'a> VectorDbDeltaBuilder<'a> {
     }
 
     /// Validates attributes against the configured schema.
+    ///
+    /// The "vector" field is a special field that doesn't need to be in the schema.
     fn validate_attributes(&self, metadata: &HashMap<String, AttributeValue>) -> Result<()> {
         // Build a map of field name -> expected type for quick lookup
         let schema: HashMap<&str, crate::serde::FieldType> = self
@@ -101,8 +121,13 @@ impl<'a> VectorDbDeltaBuilder<'a> {
             .map(|spec| (spec.name.as_str(), spec.field_type))
             .collect();
 
-        // Check each provided attribute
+        // Check each provided attribute (skip VECTOR_FIELD_NAME which is always allowed)
         for (field_name, value) in metadata {
+            // Skip the special "vector" field
+            if field_name == VECTOR_FIELD_NAME {
+                continue;
+            }
+
             match schema.get(field_name.as_str()) {
                 Some(expected_type) => {
                     // Validate type matches
@@ -111,6 +136,7 @@ impl<'a> VectorDbDeltaBuilder<'a> {
                         AttributeValue::Int64(_) => crate::serde::FieldType::Int64,
                         AttributeValue::Float64(_) => crate::serde::FieldType::Float64,
                         AttributeValue::Bool(_) => crate::serde::FieldType::Bool,
+                        AttributeValue::Vector(_) => crate::serde::FieldType::Vector,
                     };
 
                     if actual_type != *expected_type {
@@ -187,7 +213,7 @@ impl PendingVector {
         &self.values
     }
 
-    pub(crate) fn metadata(&self) -> &HashMap<String, AttributeValue> {
+    pub(crate) fn attributes(&self) -> &HashMap<String, AttributeValue> {
         &self.metadata
     }
 }

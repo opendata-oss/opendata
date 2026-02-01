@@ -274,51 +274,6 @@ impl VectorDataKey {
     }
 }
 
-/// VectorMeta key - stores vector metadata including external ID.
-///
-/// Key layout: `[version | tag | vector_id:u64-BE]` (10 bytes)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VectorMetaKey {
-    pub vector_id: u64,
-}
-
-impl RecordKey for VectorMetaKey {
-    const RECORD_TYPE: RecordType = RecordType::VectorMeta;
-}
-
-impl VectorMetaKey {
-    pub fn new(vector_id: u64) -> Self {
-        Self { vector_id }
-    }
-
-    pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(10);
-        Self::RECORD_TYPE.prefix().write_to(&mut buf);
-        buf.put_u64(self.vector_id); // Big-endian
-        buf.freeze()
-    }
-
-    pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 10 {
-            return Err(EncodingError {
-                message: "Buffer too short for VectorMetaKey".to_string(),
-            });
-        }
-        validate_key_prefix::<Self>(buf)?;
-        let vector_id = u64::from_be_bytes([
-            buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
-        ]);
-        Ok(VectorMetaKey { vector_id })
-    }
-
-    /// Returns a range covering all vector metadata keys.
-    pub fn all_metadata_range() -> BytesRange {
-        let mut buf = BytesMut::with_capacity(2);
-        Self::RECORD_TYPE.prefix().write_to(&mut buf);
-        BytesRange::prefix(buf.freeze())
-    }
-}
-
 /// MetadataIndex key - inverted index mapping metadata values to vector IDs.
 ///
 /// Key layout: `[version | tag | field:TerminatedBytes | value:FieldValue]` (variable)
@@ -568,19 +523,6 @@ mod tests {
         // then
         assert!(encoded1 < encoded2);
         assert!(encoded2 < encoded3);
-    }
-
-    #[test]
-    fn should_encode_and_decode_vector_meta_key() {
-        // given
-        let key = VectorMetaKey::new(12345);
-
-        // when
-        let encoded = key.encode();
-        let decoded = VectorMetaKey::decode(&encoded).unwrap();
-
-        // then
-        assert_eq!(decoded, key);
     }
 
     #[test]

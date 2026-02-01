@@ -10,11 +10,10 @@ use crate::serde::Encode;
 use crate::serde::centroid_chunk::CentroidChunkValue;
 use crate::serde::deletions::DeletionsValue;
 use crate::serde::key::{
-    CentroidChunkKey, DeletionsKey, IdDictionaryKey, PostingListKey, VectorDataKey, VectorMetaKey,
+    CentroidChunkKey, DeletionsKey, IdDictionaryKey, PostingListKey, VectorDataKey,
 };
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
-use crate::serde::vector_data::VectorDataValue;
-use crate::serde::vector_meta::{MetadataField, VectorMetaValue};
+use crate::serde::vector_data::{Field, VectorDataValue};
 
 pub(crate) mod merge_operator;
 
@@ -42,27 +41,19 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     }
 
     /// Load a vector's data by internal ID.
+    ///
+    /// Requires dimensions to decode the vector field.
     #[allow(dead_code)]
-    async fn get_vector_data(&self, internal_id: u64) -> Result<Option<VectorDataValue>> {
+    async fn get_vector_data(
+        &self,
+        internal_id: u64,
+        dimensions: usize,
+    ) -> Result<Option<VectorDataValue>> {
         let key = VectorDataKey::new(internal_id).encode();
         let record = self.get(key).await?;
         match record {
             Some(record) => {
-                let value = VectorDataValue::decode_from_bytes(&record.value)?;
-                Ok(Some(value))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Load a vector's metadata by internal ID.
-    #[allow(dead_code)]
-    async fn get_vector_meta(&self, internal_id: u64) -> Result<Option<VectorMetaValue>> {
-        let key = VectorMetaKey::new(internal_id).encode();
-        let record = self.get(key).await?;
-        match record {
-            Some(record) => {
-                let value = VectorMetaValue::decode_from_bytes(&record.value)?;
+                let value = VectorDataValue::decode_from_bytes(&record.value, dimensions)?;
                 Ok(Some(value))
             }
             None => Ok(None),
@@ -171,40 +162,29 @@ pub(crate) trait VectorDbStorageExt: Storage {
         Ok(RecordOp::Delete(key))
     }
 
-    /// Create a RecordOp to write vector data.
-    fn put_vector_data(&self, internal_id: u64, values: Vec<f32>) -> Result<RecordOp> {
-        let key = VectorDataKey::new(internal_id).encode();
-        let value = VectorDataValue::new(values).encode_to_bytes();
-        Ok(RecordOp::Put(Record::new(key, value)))
-    }
-
-    /// Create a RecordOp to write vector metadata.
-    fn put_vector_meta(
+    /// Create a RecordOp to write vector data (including external_id, vector, and metadata).
+    ///
+    /// The `attributes` must include a "vector" field with the embedding values.
+    fn put_vector_data(
         &self,
         internal_id: u64,
         external_id: &str,
-        metadata: &[(String, AttributeValue)],
+        attributes: &[(String, AttributeValue)],
     ) -> Result<RecordOp> {
-        let key = VectorMetaKey::new(internal_id).encode();
-        let fields: Vec<MetadataField> = metadata
+        let key = VectorDataKey::new(internal_id).encode();
+        let fields: Vec<Field> = attributes
             .iter()
             .map(|(name, value)| {
-                MetadataField::new(name, crate::model::attribute_value_to_field_value(value))
+                Field::new(name, crate::model::attribute_value_to_field_value(value))
             })
             .collect();
-        let value = VectorMetaValue::new(external_id, fields).encode_to_bytes();
+        let value = VectorDataValue::new(external_id, fields).encode_to_bytes();
         Ok(RecordOp::Put(Record::new(key, value)))
     }
 
     /// Create a RecordOp to delete vector data.
     fn delete_vector_data(&self, internal_id: u64) -> Result<RecordOp> {
         let key = VectorDataKey::new(internal_id).encode();
-        Ok(RecordOp::Delete(key))
-    }
-
-    /// Create a RecordOp to delete vector metadata.
-    fn delete_vector_meta(&self, internal_id: u64) -> Result<RecordOp> {
-        let key = VectorMetaKey::new(internal_id).encode();
         Ok(RecordOp::Delete(key))
     }
 
@@ -263,22 +243,8 @@ mod tests {
         // given
         let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
         let values = vec![1.0, 2.0, 3.0];
-
-        // when - write
-        let op = storage.put_vector_data(42, values.clone()).unwrap();
-        storage.apply(vec![op]).await.unwrap();
-
-        // then - read
-        let result = storage.get_vector_data(42).await.unwrap();
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().vector, values);
-    }
-
-    #[tokio::test]
-    async fn should_read_and_write_vector_meta() {
-        // given
-        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
-        let metadata = vec![
+        let attributes = vec![
+            ("vector".to_string(), AttributeValue::Vector(values.clone())),
             (
                 "category".to_string(),
                 AttributeValue::String("shoes".to_string()),
@@ -287,15 +253,17 @@ mod tests {
         ];
 
         // when - write
-        let op = storage.put_vector_meta(42, "vec-1", &metadata).unwrap();
+        let op = storage.put_vector_data(42, "vec-1", &attributes).unwrap();
         storage.apply(vec![op]).await.unwrap();
 
         // then - read
-        let result = storage.get_vector_meta(42).await.unwrap();
+        let result = storage.get_vector_data(42, 3).await.unwrap();
         assert!(result.is_some());
-        let meta = result.unwrap();
-        assert_eq!(meta.external_id, "vec-1");
-        assert_eq!(meta.fields.len(), 2);
+        let data = result.unwrap();
+        assert_eq!(data.vector_field(), values.as_slice());
+        assert_eq!(data.external_id(), "vec-1");
+        assert_eq!(data.string_field("category"), Some("shoes"));
+        assert_eq!(data.int64_field("price"), Some(99));
     }
 
     #[tokio::test]
