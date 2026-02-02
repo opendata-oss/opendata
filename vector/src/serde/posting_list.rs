@@ -17,22 +17,22 @@
 //!
 //! ## Value Format
 //!
-//! The value is a FixedElementArray of PostingUpdate entries. Each entry contains:
+//! The value is a FixedElementArray of PostingUpdate entries, **sorted by id**.
+//! Each entry contains:
 //! - `posting_type`: 0x0 for Append, 0x1 for Delete
 //! - `id`: Internal vector ID (u64)
 //! - `vector`: The full vector data (dimensions * f32)
 //!
 //! ## Merge Operators
 //!
-//! Posting lists use SlateDB merge operators:
-//! - New vectors are added as a value with all Append entries
-//! - Vectors removed by LIRE are added as a value with all Delete entries
-//! - Same-type merges are simple buffer concatenation
-//! - Mixed-type merges require filtering
+//! Posting lists use SlateDB merge operators with sort-merge semantics:
+//! - Both existing and new values are sorted by id
+//! - Merge performs a sort-merge, keeping the newer entry when ids match
+//! - Output remains sorted by id
 
 use super::EncodingError;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Posting {
@@ -59,22 +59,18 @@ pub(crate) type PostingList = Vec<Posting>;
 
 impl From<PostingListValue> for PostingList {
     fn from(value: PostingListValue) -> Self {
-        // Process in reverse order so later entries take precedence
-        let mut postings = VecDeque::with_capacity(value.postings.len());
-        let mut seen = HashSet::with_capacity(value.postings.len());
-        for posting in value.postings.into_iter().rev() {
-            let id = match posting {
-                PostingUpdate::Append { id, vector } => {
-                    if !seen.contains(&id) {
-                        postings.push_front(Posting::new(id, vector));
-                    }
-                    id
+        let mut seen = HashSet::new();
+        value
+            .postings
+            .into_iter()
+            .filter_map(|posting| {
+                assert!(seen.insert(posting.id()));
+                match posting {
+                    PostingUpdate::Append { id, vector } => Some(Posting::new(id, vector)),
+                    PostingUpdate::Delete { .. } => None,
                 }
-                PostingUpdate::Delete { id } => id,
-            };
-            seen.insert(id);
-        }
-        postings.into()
+            })
+            .collect()
     }
 }
 
@@ -125,7 +121,6 @@ impl PostingUpdate {
     }
 
     /// Returns the vector ID.
-    #[cfg(test)]
     pub fn id(&self) -> u64 {
         match self {
             Self::Append { id, .. } => *id,
@@ -134,7 +129,6 @@ impl PostingUpdate {
     }
 
     /// Returns the vector data if this is an Append, None if Delete.
-    #[cfg(test)]
     pub fn vector(&self) -> Option<&[f32]> {
         match self {
             Self::Append { vector, .. } => Some(vector.as_slice()),
@@ -249,7 +243,7 @@ impl PostingUpdate {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PostingListValue {
     /// List of posting updates (appends or deletes).
-    pub postings: Vec<PostingUpdate>,
+    postings: Vec<PostingUpdate>,
 }
 
 impl PostingListValue {
@@ -261,10 +255,30 @@ impl PostingListValue {
     }
 
     /// Create a posting list from a vector of updates.
-    pub fn from_posting_updates(posting_updates: Vec<PostingUpdate>) -> Self {
-        Self {
-            postings: posting_updates,
+    ///
+    /// The updates are sorted by id to maintain the invariant that postings
+    /// are always ordered by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there are any entries with repeated ids.
+    pub fn from_posting_updates(
+        mut posting_updates: Vec<PostingUpdate>,
+    ) -> Result<Self, EncodingError> {
+        posting_updates.sort_by_key(|p| p.id());
+
+        // Check for duplicate ids
+        for window in posting_updates.windows(2) {
+            if window[0].id() == window[1].id() {
+                return Err(EncodingError {
+                    message: format!("Duplicate posting id: {}", window[0].id()),
+                });
+            }
         }
+
+        Ok(Self {
+            postings: posting_updates,
+        })
     }
 
     /// Returns the number of posting updates.
@@ -314,7 +328,7 @@ impl PostingListValue {
             postings.push(posting);
         }
 
-        Ok(PostingListValue { postings })
+        PostingListValue::from_posting_updates(postings)
     }
 }
 
@@ -324,58 +338,88 @@ impl Default for PostingListValue {
     }
 }
 
-/// Merge two PostingList values by deduplicating entries by id.
+/// Merge two PostingList values using sort-merge.
 ///
-/// PostingList values contain PostingUpdate entries. The merge strategy keeps
-/// only the last update for each id, where "last" means the entry from the new
-/// value takes precedence over entries in the existing value.
+/// Both input PostingList values are assumed to be sorted by id. The merge
+/// performs a sort-merge operation:
+/// - When ids match, the entry from new_value takes precedence
+/// - Output remains sorted by id
 ///
-/// This implementation avoids full decode/re-encode by working directly with
-/// the raw bytes, only parsing the type byte and id to track locations.
-pub(crate) fn merge_posting_list(existing: Bytes, new_value: Bytes, dimensions: usize) -> Bytes {
-    use std::collections::HashMap;
-
+/// This implementation works directly with raw bytes for efficiency,
+/// only parsing the type byte and id to determine merge decisions.
+pub(crate) fn merge_posting_list(
+    mut existing: Bytes,
+    mut new_value: Bytes,
+    dimensions: usize,
+) -> Bytes {
     let vector_size = dimensions * 4;
     let append_size = 1 + 8 + vector_size; // type + id + vector
     let delete_size = 1 + 8; // type + id
 
-    // Map from id -> (buffer_index, offset, entry_size)
-    // buffer_index: 0 = existing, 1 = new_value
-    let mut locations: HashMap<u64, (usize, usize, usize)> = HashMap::new();
-    let mut ids: Vec<u64> = Vec::new();
-
-    let mut collect_locations = |data: &[u8], buf_idx: usize| {
-        let mut buf = data;
-        let original_len = buf.len();
-        while buf.has_remaining() {
-            let offset = original_len - buf.remaining();
-            let entry_type = buf.get_u8();
-            let id = buf.get_u64_le();
-            let entry_size = if entry_type == POSTING_UPDATE_TYPE_APPEND_BYTE {
-                buf.advance(vector_size);
-                append_size
-            } else {
-                delete_size
-            };
-            if locations
-                .insert(id, (buf_idx, offset, entry_size))
-                .is_none()
-            {
-                ids.push(id);
-            }
+    let peek_entry = |buf: &[u8]| -> Option<(u64, usize)> {
+        if buf.is_empty() {
+            return None;
         }
+        assert!(buf.len() >= delete_size);
+        let entry_type = buf[0];
+        let id = u64::from_le_bytes([
+            buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
+        ]);
+        let entry_size = if entry_type == POSTING_UPDATE_TYPE_APPEND_BYTE {
+            append_size
+        } else {
+            delete_size
+        };
+        Some((id, entry_size))
     };
 
-    collect_locations(&existing, 0);
-    collect_locations(&new_value, 1);
-
-    let buffers = [&existing, &new_value];
-    let total_size: usize = locations.values().map(|(_, _, size)| size).sum();
+    // Estimate capacity
+    let total_size = existing.len() + new_value.len();
     let mut result = BytesMut::with_capacity(total_size);
-    for id in ids {
-        let (buf_idx, offset, size) = locations[&id];
-        result.put_slice(&buffers[buf_idx][offset..offset + size]);
+    let mut last_id = None;
+
+    loop {
+        let existing_entry = peek_entry(&existing);
+        let new_entry = peek_entry(&new_value);
+
+        let id = match (existing_entry, new_entry) {
+            (None, None) => break,
+            (Some((id, size)), None) => {
+                // Only existing has entries left
+                result.put_slice(&existing[..size]);
+                existing.advance(size);
+                id
+            }
+            (None, Some((id, size))) => {
+                // Only new has entries left
+                result.put_slice(&new_value[..size]);
+                new_value.advance(size);
+                id
+            }
+            (Some((existing_id, existing_size)), Some((new_id, new_size))) => {
+                if existing_id < new_id {
+                    // Take from existing
+                    result.put_slice(&existing[..existing_size]);
+                    existing.advance(existing_size);
+                    existing_id
+                } else if new_id < existing_id {
+                    // Take from new
+                    result.put_slice(&new_value[..new_size]);
+                    new_value.advance(new_size);
+                    new_id
+                } else {
+                    // Same id - new wins, skip existing
+                    result.put_slice(&new_value[..new_size]);
+                    new_value.advance(new_size);
+                    existing.advance(existing_size);
+                    new_id
+                }
+            }
+        };
+        assert!(last_id.is_none_or(|last_id| last_id < id));
+        last_id = Some(id);
     }
+
     result.freeze()
 }
 
@@ -403,7 +447,8 @@ mod tests {
             PostingUpdate::append(1, vec![1.0, 2.0, 3.0]),
             PostingUpdate::append(2, vec![4.0, 5.0, 6.0]),
         ];
-        let value = PostingListValue::from_posting_updates(postings);
+        let value = PostingListValue::from_posting_updates(postings)
+            .expect("unexpected error creating posting updates");
 
         // when
         let encoded = value.encode_to_bytes();
@@ -423,7 +468,8 @@ mod tests {
     fn should_encode_and_decode_posting_list_with_deletes() {
         // given
         let postings = vec![PostingUpdate::delete(1), PostingUpdate::delete(2)];
-        let value = PostingListValue::from_posting_updates(postings);
+        let value = PostingListValue::from_posting_updates(postings)
+            .expect("unexpected error creating posting updates");
 
         // when
         let encoded = value.encode_to_bytes();
@@ -524,12 +570,13 @@ mod tests {
             PostingUpdate::append(2, vec![2.0]),
             PostingUpdate::append(3, vec![3.0]),
         ];
-        let value = PostingListValue::from_posting_updates(postings);
+        let value = PostingListValue::from_posting_updates(postings)
+            .expect("unexpected error creating posting updates");
 
-        // when:
+        // when
         let postings: PostingList = value.into();
 
-        // then:
+        // then - sorted by id
         assert_eq!(
             postings,
             vec![
@@ -542,18 +589,19 @@ mod tests {
 
     #[test]
     fn should_drop_deleted_posting_when_convert_value_to_postings() {
-        // given - deletes interspersed with appends
+        // given - deletes interspersed with appends (will be sorted by id)
         let postings = vec![
             PostingUpdate::append(1, vec![1.0]),
             PostingUpdate::delete(99),
             PostingUpdate::append(2, vec![2.0]),
         ];
-        let value = PostingListValue::from_posting_updates(postings);
+        let value = PostingListValue::from_posting_updates(postings)
+            .expect("unexpected error creating posting updates");
 
         // when
         let postings: PostingList = value.into();
 
-        // then - delete entry not in result
+        // then - delete entry not in result, sorted by id
         assert_eq!(
             postings,
             vec![Posting::new(1, vec![1.0]), Posting::new(2, vec![2.0])]
@@ -561,61 +609,30 @@ mod tests {
     }
 
     #[test]
-    fn should_drop_deleted_posting_and_mask_earlier_when_convert_value_to_postings() {
-        // given - append followed by delete of same id
-        let postings = vec![
-            PostingUpdate::append(1, vec![1.0]),
-            PostingUpdate::append(2, vec![2.0]),
-            PostingUpdate::delete(1),
-        ];
-        let value = PostingListValue::from_posting_updates(postings);
-
-        // when
-        let postings: PostingList = value.into();
-
-        // then - id 1 is masked by the delete
-        assert_eq!(postings, vec![Posting::new(2, vec![2.0])]);
-    }
-
-    #[test]
-    fn should_mask_earlier_when_convert_value_to_postings() {
-        // given - two appends with same id, later one wins
-        let postings = vec![
-            PostingUpdate::append(1, vec![1.0]),
-            PostingUpdate::append(2, vec![2.0]),
-            PostingUpdate::append(1, vec![100.0]),
-        ];
-        let value = PostingListValue::from_posting_updates(postings);
-
-        // when
-        let postings: PostingList = value.into();
-
-        // then - id 1 appears only once with the later vector
-        assert_eq!(
-            postings,
-            vec![Posting::new(2, vec![2.0]), Posting::new(1, vec![100.0])]
-        );
-    }
-
-    #[test]
-    fn should_merge_posting_list_with_deduplication() {
-        // given
+    fn should_merge_posting_list_sorted_by_id() {
+        // given - existing and new both sorted
         let existing_postings = vec![
             PostingUpdate::append(1, vec![1.0, 2.0, 3.0]),
-            PostingUpdate::append(2, vec![4.0, 5.0, 6.0]),
+            PostingUpdate::append(3, vec![4.0, 5.0, 6.0]),
         ];
-        let existing_value =
-            PostingListValue::from_posting_updates(existing_postings).encode_to_bytes();
+        let existing_value = PostingListValue::from_posting_updates(existing_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
 
-        let new_postings = vec![PostingUpdate::append(3, vec![7.0, 8.0, 9.0])];
-        let new_value = PostingListValue::from_posting_updates(new_postings).encode_to_bytes();
+        let new_postings = vec![PostingUpdate::append(2, vec![7.0, 8.0, 9.0])];
+        let new_value = PostingListValue::from_posting_updates(new_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
 
         // when
         let merged = merge_posting_list(existing_value, new_value, 3);
         let decoded = PostingListValue::decode_from_bytes(&merged, 3).unwrap();
 
-        // then - all 3 unique ids preserved
+        // then - all 3 unique ids preserved in sorted order
         assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded.postings[0].id(), 1);
+        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[2].id(), 3);
     }
 
     #[test]
@@ -625,17 +642,20 @@ mod tests {
             PostingUpdate::append(1, vec![1.0, 2.0]),
             PostingUpdate::append(2, vec![3.0, 4.0]),
         ];
-        let existing_value =
-            PostingListValue::from_posting_updates(existing_postings).encode_to_bytes();
+        let existing_value = PostingListValue::from_posting_updates(existing_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
 
         let new_postings = vec![PostingUpdate::delete(1)];
-        let new_value = PostingListValue::from_posting_updates(new_postings).encode_to_bytes();
+        let new_value = PostingListValue::from_posting_updates(new_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
 
         // when
         let merged = merge_posting_list(existing_value, new_value, 2);
         let decoded = PostingListValue::decode_from_bytes(&merged, 2).unwrap();
 
-        // then - id 1 is now a delete (keeps original position), id 2 unchanged
+        // then - id 1 is now a delete, id 2 unchanged, sorted order
         assert_eq!(decoded.len(), 2);
         assert!(decoded.postings[0].is_delete());
         assert_eq!(decoded.postings[0].id(), 1);
@@ -650,17 +670,20 @@ mod tests {
             PostingUpdate::append(1, vec![1.0, 2.0]),
             PostingUpdate::append(2, vec![3.0, 4.0]),
         ];
-        let existing_value =
-            PostingListValue::from_posting_updates(existing_postings).encode_to_bytes();
+        let existing_value = PostingListValue::from_posting_updates(existing_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
 
         let new_postings = vec![PostingUpdate::append(1, vec![100.0, 200.0])];
-        let new_value = PostingListValue::from_posting_updates(new_postings).encode_to_bytes();
+        let new_value = PostingListValue::from_posting_updates(new_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
 
         // when
         let merged = merge_posting_list(existing_value, new_value, 2);
         let decoded = PostingListValue::decode_from_bytes(&merged, 2).unwrap();
 
-        // then - id 1 has new vector (keeps original position), id 2 unchanged
+        // then - id 1 has new vector, id 2 unchanged, sorted order
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded.postings[0].id(), 1);
         assert_eq!(decoded.postings[0].vector().unwrap(), &[100.0, 200.0]);
@@ -674,16 +697,18 @@ mod tests {
         let existing_value = PostingListValue::new().encode_to_bytes();
 
         let new_postings = vec![
-            PostingUpdate::append(1, vec![1.0, 2.0]),
             PostingUpdate::append(2, vec![3.0, 4.0]),
+            PostingUpdate::append(1, vec![1.0, 2.0]),
         ];
-        let new_value = PostingListValue::from_posting_updates(new_postings).encode_to_bytes();
+        let new_value = PostingListValue::from_posting_updates(new_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
 
         // when
         let merged = merge_posting_list(existing_value, new_value, 2);
         let decoded = PostingListValue::decode_from_bytes(&merged, 2).unwrap();
 
-        // then - new entries are preserved
+        // then - new entries are preserved in sorted order
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded.postings[0].id(), 1);
         assert_eq!(decoded.postings[1].id(), 2);
@@ -696,8 +721,9 @@ mod tests {
             PostingUpdate::append(1, vec![1.0, 2.0]),
             PostingUpdate::append(2, vec![3.0, 4.0]),
         ];
-        let existing_value =
-            PostingListValue::from_posting_updates(existing_postings).encode_to_bytes();
+        let existing_value = PostingListValue::from_posting_updates(existing_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
 
         let new_value = PostingListValue::new().encode_to_bytes();
 
@@ -705,7 +731,7 @@ mod tests {
         let merged = merge_posting_list(existing_value, new_value, 2);
         let decoded = PostingListValue::decode_from_bytes(&merged, 2).unwrap();
 
-        // then - existing entries are preserved
+        // then - existing entries are preserved in sorted order
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded.postings[0].id(), 1);
         assert_eq!(decoded.postings[1].id(), 2);
@@ -726,34 +752,140 @@ mod tests {
     }
 
     #[test]
-    fn should_merge_preserving_order_of_first_occurrence() {
-        // given - entries appear in specific order
+    fn should_merge_interleaved_ids_in_sorted_order() {
+        // given - existing has odd ids, new has even ids
         let existing_postings = vec![
             PostingUpdate::append(1, vec![1.0]),
-            PostingUpdate::append(2, vec![2.0]),
             PostingUpdate::append(3, vec![3.0]),
-        ];
-        let existing_value =
-            PostingListValue::from_posting_updates(existing_postings).encode_to_bytes();
-
-        let new_postings = vec![
-            PostingUpdate::append(4, vec![4.0]),
-            PostingUpdate::append(2, vec![20.0]), // overwrites id 2
             PostingUpdate::append(5, vec![5.0]),
         ];
-        let new_value = PostingListValue::from_posting_updates(new_postings).encode_to_bytes();
+        let existing_value = PostingListValue::from_posting_updates(existing_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
+
+        let new_postings = vec![
+            PostingUpdate::append(2, vec![2.0]),
+            PostingUpdate::append(4, vec![4.0]),
+        ];
+        let new_value = PostingListValue::from_posting_updates(new_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
 
         // when
         let merged = merge_posting_list(existing_value, new_value, 1);
         let decoded = PostingListValue::decode_from_bytes(&merged, 1).unwrap();
 
-        // then - order preserved: 1, 2 (updated), 3, 4, 5
+        // then - all entries in sorted order: 1, 2, 3, 4, 5
         assert_eq!(decoded.len(), 5);
         assert_eq!(decoded.postings[0].id(), 1);
         assert_eq!(decoded.postings[1].id(), 2);
-        assert_eq!(decoded.postings[1].vector().unwrap(), &[20.0]); // updated value
         assert_eq!(decoded.postings[2].id(), 3);
         assert_eq!(decoded.postings[3].id(), 4);
         assert_eq!(decoded.postings[4].id(), 5);
+    }
+
+    #[test]
+    fn should_sort_postings_by_id_in_from_posting_updates() {
+        // given - postings in unsorted order
+        let postings = vec![
+            PostingUpdate::append(5, vec![5.0]),
+            PostingUpdate::append(1, vec![1.0]),
+            PostingUpdate::append(3, vec![3.0]),
+            PostingUpdate::append(2, vec![2.0]),
+            PostingUpdate::append(4, vec![4.0]),
+        ];
+
+        // when
+        let value = PostingListValue::from_posting_updates(postings)
+            .expect("unexpected error creating posting updates");
+
+        // then - postings are sorted by id
+        assert_eq!(value.len(), 5);
+        assert_eq!(value.postings[0].id(), 1);
+        assert_eq!(value.postings[1].id(), 2);
+        assert_eq!(value.postings[2].id(), 3);
+        assert_eq!(value.postings[3].id(), 4);
+        assert_eq!(value.postings[4].id(), 5);
+    }
+
+    #[test]
+    fn should_serialize_in_id_order() {
+        // given - postings created from unsorted input
+        let postings = vec![
+            PostingUpdate::append(3, vec![3.0, 3.0]),
+            PostingUpdate::append(1, vec![1.0, 1.0]),
+            PostingUpdate::append(2, vec![2.0, 2.0]),
+        ];
+        let value = PostingListValue::from_posting_updates(postings)
+            .expect("unexpected error creating posting updates");
+
+        // when - encode and decode
+        let encoded = value.encode_to_bytes();
+        let decoded = PostingListValue::decode_from_bytes(&encoded, 2).unwrap();
+
+        // then - decoded postings are in id order
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded.postings[0].id(), 1);
+        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[2].id(), 3);
+    }
+
+    #[test]
+    fn should_maintain_id_order_after_merge() {
+        // given - two sorted posting lists
+        let existing_postings = vec![
+            PostingUpdate::append(10, vec![10.0]),
+            PostingUpdate::append(30, vec![30.0]),
+            PostingUpdate::append(50, vec![50.0]),
+        ];
+        let existing_value = PostingListValue::from_posting_updates(existing_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
+
+        let new_postings = vec![
+            PostingUpdate::append(20, vec![20.0]),
+            PostingUpdate::append(30, vec![300.0]), // overwrites
+            PostingUpdate::append(40, vec![40.0]),
+        ];
+        let new_value = PostingListValue::from_posting_updates(new_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
+
+        // when
+        let merged = merge_posting_list(existing_value, new_value, 1);
+        let decoded = PostingListValue::decode_from_bytes(&merged, 1).unwrap();
+
+        // then - result is in sorted order
+        assert_eq!(decoded.len(), 5);
+        assert_eq!(decoded.postings[0].id(), 10);
+        assert_eq!(decoded.postings[1].id(), 20);
+        assert_eq!(decoded.postings[2].id(), 30);
+        assert_eq!(decoded.postings[2].vector().unwrap(), &[300.0]); // new value won
+        assert_eq!(decoded.postings[3].id(), 40);
+        assert_eq!(decoded.postings[4].id(), 50);
+    }
+
+    #[test]
+    fn should_convert_to_posting_list_in_id_order() {
+        // given - postings with mixed types, unsorted input
+        let postings = vec![
+            PostingUpdate::append(5, vec![5.0]),
+            PostingUpdate::delete(3),
+            PostingUpdate::append(1, vec![1.0]),
+            PostingUpdate::append(4, vec![4.0]),
+            PostingUpdate::append(2, vec![2.0]),
+        ];
+        let value = PostingListValue::from_posting_updates(postings)
+            .expect("unexpected error creating posting updates");
+
+        // when
+        let posting_list: PostingList = value.into();
+
+        // then - only appends, in sorted order (delete for id 3 is filtered out)
+        assert_eq!(posting_list.len(), 4);
+        assert_eq!(posting_list[0].id(), 1);
+        assert_eq!(posting_list[1].id(), 2);
+        assert_eq!(posting_list[2].id(), 4);
+        assert_eq!(posting_list[3].id(), 5);
     }
 }

@@ -308,11 +308,14 @@ mod tests {
         let key = create_posting_list_key();
 
         let existing_postings = vec![PostingUpdate::append(1, vec![1.0, 2.0])];
-        let existing_value =
-            PostingListValue::from_posting_updates(existing_postings).encode_to_bytes();
+        let existing_value = PostingListValue::from_posting_updates(existing_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
 
         let new_postings = vec![PostingUpdate::append(2, vec![3.0, 4.0])];
-        let new_value = PostingListValue::from_posting_updates(new_postings).encode_to_bytes();
+        let new_value = PostingListValue::from_posting_updates(new_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
 
         // when
         let merged = operator.merge(&key, Some(existing_value), new_value);

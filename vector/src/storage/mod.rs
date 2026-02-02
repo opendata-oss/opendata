@@ -215,7 +215,7 @@ pub(crate) trait VectorDbStorageExt: Storage {
         postings: Vec<PostingUpdate>,
     ) -> Result<RecordOp> {
         let key = PostingListKey::new(centroid_id).encode();
-        let value = PostingListValue::from_posting_updates(postings).encode_to_bytes();
+        let value = PostingListValue::from_posting_updates(postings)?.encode_to_bytes();
         Ok(RecordOp::Merge(Record::new(key, value)))
     }
 
