@@ -9,7 +9,6 @@ async-trait.workspace = true
 common.workspace = true
 bytes.workspace = true
 fail.workspace = true
-hnsw_rs = "0.3"
 usearch = "2"
 roaring.workspace = true
 rstest.workspace = true

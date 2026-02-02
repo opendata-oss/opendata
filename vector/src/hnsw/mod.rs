@@ -1,9 +1,8 @@
 //! HNSW graph implementations for centroid search.
 //!
 //! This module provides a trait-based abstraction for HNSW indexes with
-//! implementations backed by usearch and hnsw_rs libraries.
+//! an implementation backed by the usearch library.
 
-mod hnsw;
 mod usearch;
 
 use anyhow::Result;
@@ -12,7 +11,6 @@ use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::collection_meta::DistanceMetric;
 
 // Re-export implementations
-pub use hnsw::HnswRsCentroidGraph;
 pub use usearch::UsearchCentroidGraph;
 
 /// Trait for HNSW-based centroid graph implementations.
@@ -52,36 +50,24 @@ pub fn build_centroid_graph(
 mod tests {
     use super::*;
 
-    /// Helper to run tests against both implementations.
-    fn test_with_both_impls<F>(test_fn: F)
-    where
-        F: Fn(Box<dyn CentroidGraph>),
-    {
-        // Test with usearch
+    #[test]
+    fn should_work_through_trait_interface() {
+        // given
         let centroids = vec![
             CentroidEntry::new(1, vec![1.0, 0.0, 0.0]),
             CentroidEntry::new(2, vec![0.0, 1.0, 0.0]),
             CentroidEntry::new(3, vec![0.0, 0.0, 1.0]),
         ];
-        let usearch_graph =
-            UsearchCentroidGraph::build(centroids.clone(), DistanceMetric::L2).unwrap();
-        test_fn(Box::new(usearch_graph));
+        let graph: Box<dyn CentroidGraph> =
+            Box::new(UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap());
 
-        // Test with hnsw_rs
-        let hnsw_graph = HnswRsCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
-        test_fn(Box::new(hnsw_graph));
-    }
+        // when / then
+        assert_eq!(graph.len(), 3);
+        assert!(!graph.is_empty());
 
-    #[test]
-    fn should_work_through_trait_interface() {
-        test_with_both_impls(|graph| {
-            assert_eq!(graph.len(), 3);
-            assert!(!graph.is_empty());
-
-            let results = graph.search(&[0.9, 0.1, 0.1], 1);
-            assert_eq!(results.len(), 1);
-            assert_eq!(results[0], 1);
-        });
+        let results = graph.search(&[0.9, 0.1, 0.1], 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], 1);
     }
 
     #[test]
