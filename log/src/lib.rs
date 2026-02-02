@@ -12,8 +12,8 @@
 //!
 //! # Key Concepts
 //!
-//! - **Log**: The main entry point providing both read and write operations.
-//! - **LogReader**: A read-only view of the log, useful for consumers that should
+//! - **LogDb**: The main entry point providing both read and write operations.
+//! - **LogDbReader**: A read-only view of the log, useful for consumers that should
 //!   not have write access.
 //! - **Sequence Numbers**: Each entry is assigned a global sequence number at
 //!   append time. Sequence numbers are monotonically increasing within a key's
@@ -22,11 +22,11 @@
 //! # Example
 //!
 //! ```ignore
-//! use log::{Log, Config, Record};
+//! use log::{LogDb, Config, Record};
 //! use bytes::Bytes;
 //!
 //! // Open a log
-//! let log = Log::open(Config::default()).await?;
+//! let log = LogDb::open(Config::default()).await?;
 //!
 //! // Append records
 //! let records = vec![
@@ -58,6 +58,6 @@ mod storage;
 pub use config::{Config, CountOptions, ScanOptions, SegmentConfig, WriteOptions};
 pub use error::{Error, Result};
 pub use listing::{LogKey, LogKeyIterator};
-pub use log::Log;
+pub use log::LogDb;
 pub use model::{AppendResult, LogEntry, Record, Segment, SegmentId, Sequence};
-pub use reader::{LogIterator, LogRead, LogReader};
+pub use reader::{LogDbReader, LogIterator, LogRead};

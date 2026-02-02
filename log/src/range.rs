@@ -2,7 +2,7 @@
 //!
 //! # Convention
 //!
-//! Public APIs (`Log`, `LogReader` via `LogRead`) accept `impl RangeBounds<T>`
+//! Public APIs (`LogDb`, `LogDbReader` via `LogRead`) accept `impl RangeBounds<T>`
 //! for ergonomic range syntax (`..`, `5..`, `..10`, `5..10`, etc.).
 //!
 //! Internal code uses concrete `Range<T>` types to avoid generics proliferation

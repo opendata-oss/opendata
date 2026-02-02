@@ -2,7 +2,7 @@
 //!
 //! This module provides:
 //! - [`LogRead`]: The trait defining read operations on the log.
-//! - [`LogReader`]: A read-only view of the log that implements `LogRead`.
+//! - [`LogDbReader`]: A read-only view of the log that implements `LogRead`.
 
 use std::ops::{Range, RangeBounds};
 use std::sync::Arc;
@@ -24,14 +24,14 @@ use crate::storage::{LogStorageRead, SegmentIterator};
 
 /// Trait for read operations on the log.
 ///
-/// This trait defines the common read interface shared by [`Log`](crate::Log)
-/// and [`LogReader`]. It provides methods for scanning entries and counting
+/// This trait defines the common read interface shared by [`LogDb`](crate::LogDb)
+/// and [`LogDbReader`]. It provides methods for scanning entries and counting
 /// records within a key's log.
 ///
 /// # Implementors
 ///
-/// - [`Log`](crate::Log): The main log interface with both read and write access.
-/// - [`LogReader`]: A read-only view of the log.
+/// - [`LogDb`](crate::LogDb): The main log interface with both read and write access.
+/// - [`LogDbReader`]: A read-only view of the log.
 ///
 /// # Example
 ///
@@ -40,7 +40,7 @@ use crate::storage::{LogStorageRead, SegmentIterator};
 /// use bytes::Bytes;
 ///
 /// async fn process_log(reader: &impl LogRead) -> Result<()> {
-///     // Works with both Log and LogReader
+///     // Works with both LogDb and LogDbReader
 ///     let mut iter = reader.scan(Bytes::from("orders"), ..);
 ///     while let Some(entry) = iter.next().await? {
 ///         println!("seq={}: {:?}", entry.sequence, entry.value);
@@ -211,33 +211,33 @@ pub trait LogRead {
 
 /// A read-only view of the log.
 ///
-/// `LogReader` provides access to all read operations via the [`LogRead`]
+/// `LogDbReader` provides access to all read operations via the [`LogRead`]
 /// trait, but not write operations. This is useful for:
 ///
 /// - Consumers that should not have write access
 /// - Sharing read access across multiple components
 /// - Separating read and write concerns in your application
 ///
-/// # Obtaining a LogReader
+/// # Obtaining a LogDbReader
 ///
-/// A `LogReader` is created by calling [`LogReader::open`]:
+/// A `LogDbReader` is created by calling [`LogDbReader::open`]:
 ///
 /// ```ignore
-/// let reader = LogReader::open(config).await?;
+/// let reader = LogDbReader::open(config).await?;
 /// ```
 ///
 /// # Thread Safety
 ///
-/// `LogReader` is designed to be cloned and shared across threads.
+/// `LogDbReader` is designed to be cloned and shared across threads.
 /// All methods take `&self` and are safe to call concurrently.
 ///
 /// # Example
 ///
 /// ```ignore
-/// use log::{LogReader, LogRead};
+/// use log::{LogDbReader, LogRead};
 /// use bytes::Bytes;
 ///
-/// async fn consume_events(reader: LogReader, key: Bytes) -> Result<()> {
+/// async fn consume_events(reader: LogDbReader, key: Bytes) -> Result<()> {
 ///     let mut checkpoint: u64 = 0;
 ///
 ///     loop {
@@ -256,15 +256,15 @@ pub trait LogRead {
 ///     }
 /// }
 /// ```
-pub struct LogReader {
+pub struct LogDbReader {
     storage: LogStorageRead,
     segments: RwLock<SegmentCache>,
 }
 
-impl LogReader {
+impl LogDbReader {
     /// Opens a read-only view of the log with the given configuration.
     ///
-    /// This creates a `LogReader` that can scan and count entries but cannot
+    /// This creates a `LogDbReader` that can scan and count entries but cannot
     /// append new records. Use this when you only need read access to the log.
     ///
     /// # Arguments
@@ -278,10 +278,10 @@ impl LogReader {
     /// # Example
     ///
     /// ```ignore
-    /// use log::{LogReader, LogRead, Config};
+    /// use log::{LogDbReader, LogRead, Config};
     /// use bytes::Bytes;
     ///
-    /// let reader = LogReader::open(config).await?;
+    /// let reader = LogDbReader::open(config).await?;
     /// let mut iter = reader.scan(Bytes::from("orders"), ..).await?;
     /// while let Some(entry) = iter.next().await? {
     ///     println!("seq={}: {:?}", entry.sequence, entry.value);
@@ -299,7 +299,7 @@ impl LogReader {
         })
     }
 
-    /// Creates a LogReader from an existing storage implementation.
+    /// Creates a LogDbReader from an existing storage implementation.
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn StorageRead>) -> Result<Self> {
         let log_storage = LogStorageRead::new(storage);
@@ -312,7 +312,7 @@ impl LogReader {
 }
 
 #[async_trait]
-impl LogRead for LogReader {
+impl LogRead for LogDbReader {
     async fn scan_with_options(
         &self,
         key: Bytes,

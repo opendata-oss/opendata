@@ -16,14 +16,14 @@ use super::proto::{
 };
 use super::request::{AppendRequest, CountParams, ListKeysParams, ListSegmentsParams, ScanParams};
 use super::response::{ApiResponse, ResponseFormat, to_api_response};
-use crate::Log;
+use crate::LogDb;
 use crate::config::WriteOptions;
 use crate::reader::LogRead;
 
 /// Shared application state.
 #[derive(Clone)]
 pub struct AppState {
-    pub log: Arc<Log>,
+    pub log: Arc<LogDb>,
     pub metrics: Arc<Metrics>,
 }
 

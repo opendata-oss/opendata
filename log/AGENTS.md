@@ -35,8 +35,8 @@ This preserves lexicographic ordering and enables prefix-based range queries.
 
 ### Key Modules
 
-- `src/log.rs` - Core `Log` implementation (append, scan)
-- `src/reader.rs` - `LogReader` for read-only access
+- `src/log.rs` - Core `LogDb` implementation (append, scan)
+- `src/reader.rs` - `LogDbReader` for read-only access
 - `src/model.rs` - Public types (Record, LogEntry)
 - `src/serde.rs` - Key/value encoding
 - `src/sequence.rs` - Block-based sequence allocation

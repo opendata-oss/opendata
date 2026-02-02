@@ -6,14 +6,14 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::StorageConfig;
-use log::{Config, Log, LogRead, Record, SegmentConfig};
+use log::{Config, LogDb, LogRead, Record, SegmentConfig};
 
-async fn setup_test_log() -> Arc<Log> {
+async fn setup_test_log() -> Arc<LogDb> {
     let config = Config {
         storage: StorageConfig::InMemory,
         ..Default::default()
     };
-    Arc::new(Log::open(config).await.expect("Failed to open log"))
+    Arc::new(LogDb::open(config).await.expect("Failed to open log"))
 }
 
 #[tokio::test]
@@ -267,14 +267,14 @@ async fn test_list_segments_then_list_keys_workflow() {
     assert_eq!(keys[2], "users");
 }
 
-async fn setup_test_log_with_segment_interval(interval: Duration) -> Arc<Log> {
+async fn setup_test_log_with_segment_interval(interval: Duration) -> Arc<LogDb> {
     let config = Config {
         storage: StorageConfig::InMemory,
         segmentation: SegmentConfig {
             seal_interval: Some(interval),
         },
     };
-    Arc::new(Log::open(config).await.expect("Failed to open log"))
+    Arc::new(LogDb::open(config).await.expect("Failed to open log"))
 }
 
 #[tokio::test]
