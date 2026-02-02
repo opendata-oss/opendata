@@ -569,6 +569,18 @@ impl Decode for FieldValue {
     }
 }
 
+impl From<crate::model::AttributeValue> for FieldValue {
+    fn from(attr: crate::model::AttributeValue) -> Self {
+        match attr {
+            crate::model::AttributeValue::String(s) => FieldValue::String(s),
+            crate::model::AttributeValue::Int64(v) => FieldValue::Int64(v),
+            crate::model::AttributeValue::Float64(v) => FieldValue::Float64(v),
+            crate::model::AttributeValue::Bool(v) => FieldValue::Bool(v),
+            crate::model::AttributeValue::Vector(v) => FieldValue::Vector(v),
+        }
+    }
+}
+
 impl FieldValue {
     /// Decode a FieldValue that may be a Vector, using the provided dimensions.
     ///

@@ -174,9 +174,7 @@ pub(crate) trait VectorDbStorageExt: Storage {
         let key = VectorDataKey::new(internal_id).encode();
         let fields: Vec<Field> = attributes
             .iter()
-            .map(|(name, value)| {
-                Field::new(name, crate::model::attribute_value_to_field_value(value))
-            })
+            .map(|(name, value)| Field::new(name, value.clone().into()))
             .collect();
         let value = VectorDataValue::new(external_id, fields).encode_to_bytes();
         Ok(RecordOp::Put(Record::new(key, value)))

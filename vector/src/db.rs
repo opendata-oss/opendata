@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use crate::delta::{VectorDbDelta, VectorDbDeltaBuilder};
 use crate::distance;
 use crate::hnsw::{CentroidGraph, build_centroid_graph};
-use crate::model::{AttributeValue, Config, Vector};
+use crate::model::{AttributeValue, Config, SearchResult, Vector};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::key::SeqBlockKey;
 use crate::serde::posting_list::{PostingList, PostingUpdate};
@@ -54,23 +54,6 @@ pub struct VectorDb {
     flush_mutex: Arc<Mutex<()>>,
     /// In-memory HNSW graph for centroid search (loaded lazily).
     centroid_graph: RwLock<Option<Box<dyn CentroidGraph>>>,
-}
-
-/// A search result with vector, score, and metadata.
-#[derive(Debug, Clone)]
-pub struct SearchResult {
-    /// Internal vector ID
-    pub internal_id: u64,
-    /// External vector ID (user-provided)
-    pub external_id: String,
-    /// Similarity score (interpretation depends on distance metric)
-    ///
-    /// - L2: Lower scores = more similar
-    /// - Cosine: Higher scores = more similar (range: -1 to 1)
-    /// - DotProduct: Higher scores = more similar
-    pub score: f32,
-    /// attribute key-value pairs
-    pub attributes: HashMap<String, AttributeValue>,
 }
 
 impl VectorDb {
@@ -557,12 +540,7 @@ impl VectorDb {
             // Convert metadata fields to HashMap (includes vector field)
             let metadata: HashMap<String, AttributeValue> = vector_data
                 .fields()
-                .map(|field| {
-                    (
-                        field.field_name.clone(),
-                        crate::model::field_value_to_attribute_value(&field.value),
-                    )
-                })
+                .map(|field| (field.field_name.clone(), field.value.clone().into()))
                 .collect();
 
             scored_results.push(SearchResult {
