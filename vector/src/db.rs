@@ -25,7 +25,7 @@ use std::collections::HashMap;
 
 use crate::delta::{VectorDbDelta, VectorDbDeltaBuilder};
 use crate::distance;
-use crate::hnsw::CentroidGraph;
+use crate::hnsw::{CentroidGraph, build_centroid_graph};
 use crate::model::{AttributeValue, Config, Vector};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::key::SeqBlockKey;
@@ -53,7 +53,7 @@ pub struct VectorDb {
     /// Mutex to ensure only one flush operation can run at a time.
     flush_mutex: Arc<Mutex<()>>,
     /// In-memory HNSW graph for centroid search (loaded lazily).
-    centroid_graph: RwLock<Option<CentroidGraph>>,
+    centroid_graph: RwLock<Option<Box<dyn CentroidGraph>>>,
 }
 
 /// A search result with vector, score, and metadata.
@@ -340,7 +340,7 @@ impl VectorDb {
         self.storage.apply(vec![op]).await?;
 
         // Build HNSW graph
-        let graph = CentroidGraph::build(centroids, self.config.distance_metric)?;
+        let graph = build_centroid_graph(centroids, self.config.distance_metric)?;
         let mut graph_guard = self.centroid_graph.write().await;
         *graph_guard = Some(graph);
 
@@ -367,7 +367,7 @@ impl VectorDb {
             return Err(anyhow::anyhow!("No centroids found in storage"));
         }
 
-        let graph = CentroidGraph::build(centroids, self.config.distance_metric)?;
+        let graph = build_centroid_graph(centroids, self.config.distance_metric)?;
         let mut graph_guard = self.centroid_graph.write().await;
         *graph_guard = Some(graph);
 
