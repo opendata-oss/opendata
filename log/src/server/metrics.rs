@@ -81,7 +81,7 @@ impl Metrics {
             log_append_records_total.clone(),
         );
 
-        // Log append records counter
+        // Log append bytes counter
         let log_append_bytes_written = Counter::default();
         registry.register(
             "log_append_bytes_written",
@@ -89,20 +89,20 @@ impl Metrics {
             log_append_bytes_written.clone(),
         );
 
-        // Log append records counter
+        // Log scan records counter
         let log_records_scanned = Counter::default();
         registry.register(
             "log_records_scanned",
             "Total number of records scanned in the log",
-            log_append_bytes_written.clone(),
+            log_records_scanned.clone(),
         );
 
-        // Log append records counter
+        // Log scan bytes counter
         let log_bytes_scanned = Counter::default();
         registry.register(
             "log_bytes_scanned",
             "Total number of bytes scanned in the log",
-            log_append_bytes_written.clone(),
+            log_bytes_scanned.clone(),
         );
 
         // HTTP requests total counter
