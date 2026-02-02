@@ -5,10 +5,9 @@
 //! like dimension matching and metadata schema validation.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
-use common::Storage;
+use common::StorageConfig;
 
 // Re-export types from serde layer
 pub use crate::serde::FieldType;
@@ -157,10 +156,13 @@ impl From<bool> for AttributeValue {
 }
 
 /// Configuration for a VectorDb instance.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Storage backend configuration.
-    pub storage: Arc<dyn Storage>,
+    ///
+    /// Determines where and how vector data is persisted. See [`StorageConfig`]
+    /// for available options including in-memory and SlateDB backends.
+    pub storage: StorageConfig,
 
     /// Vector dimensionality (immutable after creation).
     ///
@@ -185,7 +187,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            storage: Arc::new(common::storage::in_memory::InMemoryStorage::new()),
+            storage: StorageConfig::InMemory,
             dimensions: 0, // Must be set explicitly
             distance_metric: DistanceMetric::Cosine,
             flush_interval: Duration::from_secs(60),

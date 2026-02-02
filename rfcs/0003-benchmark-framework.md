@@ -1,6 +1,6 @@
 # RFC 0003: Common Benchmark Framework
 
-**Status**: Draft
+**Status**: Implemented
 
 **Authors**:
 - [Jason Gustafson](https://github.com/hachikuji)
@@ -51,131 +51,46 @@ how benchmarks are written.
 
 ## Design
 
-### Crate Structure
+### Structure
 
-A separate `bencher` crate in the `common` workspace provides the core framework.
-System-specific benchmarks live in each system's crate (e.g., `log/benches/`,
-`timeseries/benches/`) and depend on `bencher` for common infrastructure.
+The `bencher` crate provides the core framework, including:
 
-### Core API
+- **Configuration** for storage and optional metrics reporting
+- **Bencher** which runs `Benchmark` implementations and manages their lifecycle
+- **Metrics collection** (counters, gauges, histograms) during benchmark runs
+- **Summary output** printed to console after each benchmark completes
 
-The framework provides two structs—no traits required for benchmark authors:
+Each system defines its own benchmarks locally (e.g., `log/bench/`) and builds
+a dedicated binary that registers those benchmarks with Bencher. This keeps
+benchmark implementations close to the code they measure while sharing common
+infrastructure.
 
-```rust
-/// Configuration for the bencher.
-pub struct BencherConfig {
-    /// Object store for both benchmark storage and metrics export.
-    pub object_store: ObjectStoreConfig,
-    /// Output format for metrics.
-    pub output: OutputFormat,
-}
+### Output
 
-/// Metrics output format.
-pub enum OutputFormat {
-    /// Write CSV files.
-    Csv,
-    /// Write to timeseries format.
-    Timeseries,
-}
+Summary metrics are always printed to console. If a reporter is configured,
+both ongoing and summary metrics are persisted to the configured object store
+using the TimeSeries format.
 
-/// Provided by the framework. Initializes storage and metrics reporting.
-pub struct Bencher {
-    config: BencherConfig,
-}
+Example console output:
 
-impl Bencher {
-    pub fn new(config: BencherConfig) -> Self;
-
-    /// Start a new benchmark run with the given labels.
-    pub fn bench(&self, labels: Vec<Label>) -> Bench;
-}
-
-/// Represents a single benchmark run.
-pub struct Bench {
-    // ...
-}
-
-impl Bench {
-    /// Access the storage backend.
-    pub fn storage(&self) -> &StorageConfig;
-
-    /// Record a metric sample. Labels were set when the bench was created.
-    pub fn record(&self, metric: &str, sample: Sample);
-
-    /// Mark the run as complete and flush metrics.
-    pub fn close(self);
-}
-
-/// Entry point for a benchmark. Implemented by benchmark authors.
-pub trait Benchmark {
-    /// Run the benchmark using the provided bencher.
-    async fn run(&self, bencher: Bencher) -> Result<()>;
-}
+```
+Running benchmark: ingest
+  [batch_size=100, value_size=256, num_keys=10]
+    throughput_ops  526.47K
+    elapsed_ms      1
 ```
 
-A harness (not defined here) is responsible for instantiating the `Bencher`
-from configuration and invoking `Benchmark::run`. The benchmark author controls
-iteration over parameter space, setup, and teardown.
+### Example
 
-### CSV Output Format
+See `log/bench/` for a complete example including:
 
-Results are written as CSV compatible with Apache Otava's expected format:
-
-```csv
-timestamp,benchmark,commit,ops_per_sec,bytes_per_sec,p50_us,p99_us,p999_us
-2026-01-22T10:30:00Z,log_append_throughput,abc123,150000,78643200,45,120,450
-2026-01-22T10:31:00Z,log_scan_throughput,abc123,50000,52428800,200,500,1200
-```
-
-The `commit` column serves as the attribute Otava uses to correlate change
-points with git history.
-
-### Results Storage
-
-Benchmark results can be exported to:
-
-- **CSV on S3**: For consumption by Apache Otava and other analysis tools.
-- **Timeseries database**: For querying with PromQL and visualization in Grafana.
-
-Using the timeseries data model for metrics enables both export paths without
-conversion.
-
-### Example Usage
-
-```rust
-use bencher::{Benchmark, Bencher, Bench};
-use timeseries::{Label, Sample};
-
-pub struct LogAppendBenchmark;
-
-impl Benchmark for LogAppendBenchmark {
-    async fn run(&self, bencher: Bencher) -> Result<()> {
-        for record_size in [64, 256, 1024, 4096] {
-            let labels = vec![
-                Label::new("benchmark", "log_append"),
-                Label::new("record_size", record_size.to_string()),
-            ];
-
-            let bench = bencher.bench(labels);
-            let mut log = Log::open(bench.storage()).await?;
-            let data = vec![0u8; record_size];
-
-            for _ in 0..1000 {
-                let start = Instant::now();
-                log.append(&data).await?;
-                bench.record("latency_us", Sample::now(start.elapsed().as_micros() as f64));
-            }
-
-            bench.close();
-        }
-        Ok(())
-    }
-}
-```
+- Benchmark implementation (`src/ingest.rs`)
+- Binary entry point (`src/main.rs`)
+- Usage documentation (`README.md`)
 
 ### Future Work
 
-The CSV output format enables regression analysis through tools like
+The output format enables regression analysis through tools like
 [Apache Otava](https://otava.apache.org/), which performs statistical
 change-point detection. CI integration and tooling for automated regression
 detection will be addressed in subsequent work.
@@ -193,3 +108,5 @@ detection will be addressed in subsequent work.
 | Date       | Description                |
 |------------|----------------------------|
 | 2026-01-16 | Initial draft              |
+| 2026-01-24 | Updated to reflect implementation |
+| 2026-01-28 | Simplified to high-level structure, removed API details |

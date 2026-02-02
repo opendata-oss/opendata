@@ -56,6 +56,23 @@ impl Default for SlateDbStorageConfig {
     }
 }
 
+impl StorageConfig {
+    /// Returns a new config with the path modified by appending a suffix.
+    ///
+    /// For SlateDB storage, appends the suffix to the path (e.g., "data" -> "data/0").
+    /// For InMemory storage, returns a clone unchanged.
+    pub fn with_path_suffix(&self, suffix: &str) -> Self {
+        match self {
+            StorageConfig::InMemory => StorageConfig::InMemory,
+            StorageConfig::SlateDb(config) => StorageConfig::SlateDb(SlateDbStorageConfig {
+                path: format!("{}/{}", config.path, suffix),
+                object_store: config.object_store.clone(),
+                settings_path: config.settings_path.clone(),
+            }),
+        }
+    }
+}
+
 /// Object store provider configuration for SlateDB.
 #[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]

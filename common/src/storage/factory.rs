@@ -7,12 +7,45 @@ use std::sync::Arc;
 
 use slatedb::DbBuilder;
 use slatedb::config::Settings;
-use slatedb::object_store;
+use slatedb::object_store::{self, ObjectStore};
 
 use super::config::{ObjectStoreConfig, StorageConfig};
 use super::in_memory::InMemoryStorage;
 use super::slate::SlateDbStorage;
 use super::{MergeOperator, Storage, StorageError, StorageResult};
+
+/// Creates an object store from configuration without initializing SlateDB.
+///
+/// This is useful for cleanup operations where you need to access the object store
+/// after the database has been closed.
+pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn ObjectStore>> {
+    match config {
+        ObjectStoreConfig::InMemory => Ok(Arc::new(object_store::memory::InMemory::new())),
+        ObjectStoreConfig::Aws(aws_config) => {
+            let store = object_store::aws::AmazonS3Builder::from_env()
+                .with_region(&aws_config.region)
+                .with_bucket_name(&aws_config.bucket)
+                .build()
+                .map_err(|e| {
+                    StorageError::Storage(format!("Failed to create AWS S3 store: {}", e))
+                })?;
+            Ok(Arc::new(store))
+        }
+        ObjectStoreConfig::Local(local_config) => {
+            std::fs::create_dir_all(&local_config.path).map_err(|e| {
+                StorageError::Storage(format!(
+                    "Failed to create storage directory '{}': {}",
+                    local_config.path, e
+                ))
+            })?;
+            let store = object_store::local::LocalFileSystem::new_with_prefix(&local_config.path)
+                .map_err(|e| {
+                StorageError::Storage(format!("Failed to create local filesystem store: {}", e))
+            })?;
+            Ok(Arc::new(store))
+        }
+    }
+}
 
 /// Creates a storage instance based on the provided configuration.
 ///
@@ -68,34 +101,7 @@ async fn create_slatedb_storage(
     config: &super::config::SlateDbStorageConfig,
     merge_operator: Option<Arc<dyn MergeOperator>>,
 ) -> StorageResult<SlateDbStorage> {
-    // Create object store based on configuration
-    let object_store: Arc<dyn object_store::ObjectStore> = match &config.object_store {
-        ObjectStoreConfig::InMemory => Arc::new(object_store::memory::InMemory::new()),
-        ObjectStoreConfig::Aws(aws_config) => {
-            let store = object_store::aws::AmazonS3Builder::new()
-                .with_region(&aws_config.region)
-                .with_bucket_name(&aws_config.bucket)
-                .build()
-                .map_err(|e| {
-                    StorageError::Storage(format!("Failed to create AWS S3 store: {}", e))
-                })?;
-            Arc::new(store)
-        }
-        ObjectStoreConfig::Local(local_config) => {
-            // Create the directory if it doesn't exist
-            std::fs::create_dir_all(&local_config.path).map_err(|e| {
-                StorageError::Storage(format!(
-                    "Failed to create storage directory '{}': {}",
-                    local_config.path, e
-                ))
-            })?;
-            let store = object_store::local::LocalFileSystem::new_with_prefix(&local_config.path)
-                .map_err(|e| {
-                StorageError::Storage(format!("Failed to create local filesystem store: {}", e))
-            })?;
-            Arc::new(store)
-        }
-    };
+    let object_store = create_object_store(&config.object_store)?;
 
     // Load SlateDB settings
     let settings = match &config.settings_path {

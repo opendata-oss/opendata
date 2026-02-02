@@ -8,9 +8,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use common::{Storage, StorageIterator, StorageRead};
-
 use common::SeqBlock;
+use common::{Storage, StorageIterator, StorageRead};
 
 use crate::error::{Error, Result};
 use crate::listing::LogKeyIterator;
@@ -184,6 +183,14 @@ impl LogStorage {
         LogStorageRead::new(Arc::clone(&self.storage) as Arc<dyn StorageRead>)
     }
 
+    /// Closes the underlying storage.
+    pub(crate) async fn close(&self) -> Result<()> {
+        self.storage
+            .close()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))
+    }
+
     /// Writes records to storage with options.
     pub(crate) async fn put_with_options(
         &self,
@@ -231,6 +238,11 @@ impl LogStorage {
             value: entry.value.clone(),
         };
         self.storage.put(vec![record]).await?;
+        Ok(())
+    }
+
+    pub async fn flush(&self) -> Result<()> {
+        self.storage.flush().await?;
         Ok(())
     }
 }

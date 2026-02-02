@@ -1,9 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
+    "bencher",
     "common",
+    "log",
+    "log/bench",
     "timeseries",
-    "log", "vector",
+    "timeseries/bench",
+    "vector",
+    "vector/bench",
 ]
 
 [workspace.package]
@@ -21,7 +26,9 @@ clap = { version = "4", features = ["derive", "env"] }
 config = "0.14"
 dashmap = "6.1.0"
 fail = "0.5"
+futures = "0.3"
 moka = { version = "0.12", features = ["future"] }
+bencher = { path = "./bencher" }
 common = { path = "./common" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 roaring = "0.10"
@@ -30,9 +37,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_with = { version = "3", features = ["base64"] }
 serde_yaml = "0.9"
-slatedb = "0.9.1"
+slatedb = { git = "https://github.com/slatedb/slatedb.git", branch = "main" }
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["full"] }
+toml = "0.8"
 tower = "0.5"
 tower-http = { version = "0.5", features = ["cors"] }
 tracing = "0.1"

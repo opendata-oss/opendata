@@ -14,9 +14,12 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use common::sequence::{SeqBlockStore, SequenceAllocator};
+use common::storage::factory::create_storage;
 use common::storage::{Storage, StorageRead};
 use roaring::RoaringTreemap;
 use tokio::sync::{Mutex, RwLock};
+
+use crate::storage::merge_operator::VectorDbMergeOperator;
 
 use std::collections::HashMap;
 
@@ -81,8 +84,18 @@ impl VectorDb {
     /// Other configuration options (like `flush_interval`) can be changed
     /// on subsequent opens.
     pub async fn open(config: Config) -> Result<Self> {
-        let storage = Arc::clone(&config.storage);
+        let storage = create_storage(&config.storage, Some(Arc::new(VectorDbMergeOperator)))
+            .await
+            .context("Failed to create storage")?;
 
+        Self::new(storage, config).await
+    }
+
+    /// Create a vector database with the given storage and configuration.
+    ///
+    /// This is a crate-visible constructor for tests that need direct access
+    /// to the underlying storage for verification.
+    pub(crate) async fn new(storage: Arc<dyn Storage>, config: Config) -> Result<Self> {
         // Initialize sequence allocator for internal ID generation
         let seq_key = SeqBlockKey.encode();
         let block_store = SeqBlockStore::new(Arc::clone(&storage), seq_key);
@@ -592,16 +605,13 @@ mod tests {
     use crate::serde::collection_meta::DistanceMetric;
     use crate::serde::key::{IdDictionaryKey, VectorDataKey, VectorMetaKey};
     use crate::serde::vector_data::VectorDataValue;
-    use crate::storage::merge_operator::VectorDbMergeOperator;
+    use common::StorageConfig;
     use common::storage::in_memory::InMemoryStorage;
     use std::time::Duration;
 
     fn create_test_config() -> Config {
-        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            VectorDbMergeOperator,
-        )));
         Config {
-            storage,
+            storage: StorageConfig::InMemory,
             dimensions: 3,
             distance_metric: DistanceMetric::Cosine,
             flush_interval: Duration::from_secs(60),
@@ -610,6 +620,12 @@ mod tests {
                 MetadataFieldSpec::new("price", FieldType::Int64, true),
             ],
         }
+    }
+
+    fn create_test_storage() -> Arc<dyn Storage> {
+        Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            VectorDbMergeOperator,
+        )))
     }
 
     #[tokio::test]
@@ -627,9 +643,9 @@ mod tests {
     #[tokio::test]
     async fn should_write_and_flush_vectors() {
         // given
+        let storage = create_test_storage();
         let config = create_test_config();
-        let storage = Arc::clone(&config.storage);
-        let db = VectorDb::open(config).await.unwrap();
+        let db = VectorDb::new(Arc::clone(&storage), config).await.unwrap();
 
         let vectors = vec![
             Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
@@ -670,9 +686,9 @@ mod tests {
     #[tokio::test]
     async fn should_upsert_existing_vector() {
         // given
+        let storage = create_test_storage();
         let config = create_test_config();
-        let storage = Arc::clone(&config.storage);
-        let db = VectorDb::open(config).await.unwrap();
+        let db = VectorDb::new(Arc::clone(&storage), config).await.unwrap();
 
         // First write
         let vector1 = Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
@@ -740,11 +756,8 @@ mod tests {
     // End-to-end search tests
 
     fn create_test_config_with_dimensions(dimensions: u16) -> Config {
-        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            VectorDbMergeOperator,
-        )));
         Config {
-            storage,
+            storage: StorageConfig::InMemory,
             dimensions,
             distance_metric: DistanceMetric::Cosine,
             flush_interval: Duration::from_secs(60),
@@ -856,11 +869,8 @@ mod tests {
     #[tokio::test]
     async fn should_search_with_l2_distance_metric() {
         // given - create database with L2 metric
-        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            VectorDbMergeOperator,
-        )));
         let config = Config {
-            storage,
+            storage: StorageConfig::InMemory,
             dimensions: 3,
             distance_metric: DistanceMetric::L2,
             flush_interval: Duration::from_secs(60),

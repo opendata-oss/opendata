@@ -1,0 +1,11 @@
+[package]
+name = "vector-bench"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bencher.workspace = true
+vector = { path = ".." }
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
