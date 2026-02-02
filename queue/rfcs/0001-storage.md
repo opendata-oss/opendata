@@ -26,7 +26,7 @@ A queue may re-order messages when messages could not be processed and need to b
 The typical use cases for a queue is spreading work across multiple workers.
 
 OpenData-Queue allows to specify multiple queues.
-When a messages is published, the producer specifies the payload of the message and
+When a message is published, the producer specifies the payload of the message and
 data about the message, i.e., the metadata of the message.
 For example, the metadata contains when the message is visible for consumption.
 A published message is assigned to a queue according to user-defined rules.
@@ -67,7 +67,8 @@ The payload store stores the payload of the messages that are published to the m
 queue system.
 The payload store assigns an ID to each published messages.
 The assigned ID is provided by a counter.
-For the counter, the same technique as for the sequence number in [OpenData-Log](log/rfcs/0001-storage.md) shall be used.
+For the counter, the same technique and common code as for the sequence number in
+[OpenData-Log](log/rfcs/0001-storage.md) shall be used.
 
 The key of a payload in the payload store conforms to
 [RFC 0001: Record Key Prefix](rfcs/0001-record-key-prefix.md).
@@ -90,32 +91,48 @@ Payload Record Value:
 ```
 The type of payload specifies the format of the payload.
 Initially, there will be two payload types:
-- `0x01` `Array<Byte>`
+- `0x01` `bytes`
 - `0x02` URI (encoding still to be determined)
 
-An `Array<T>` is encoded as a `count (u16, little endian)` followed by `count` serialized elements of type T,
-encoded back-to-back with no additional padding.
-The type is defined in [OpenData-Timeseries](timeseries/rfcs/0001-tsdb-storage.md).
+Type `0x01` is a variable-length sequence of bytes.
+The length of the bytes can be computed from the length of the value minus the size of the payload type field.
 
 ### Metadata log
 
 The metadata log stores the metadata of the published messages.
 The metadata log is an [OpenData-Log](log/rfcs/0001-storage.md).
-The key of the log is `opendata-queue/messages/metadata`.
-If multiple queue systems are maintained by the same slateDB instance, the key for the
-metadata log needs to be suffixed by an identifier of the actual OpenData-Queue
-instance, e.g., `/newsfeeds`.
 
-The record value contains the following metadata:
+The key of the log is `opendata-queue/{instance ID}/messages/metadata/{log ID}`.
+The `instance ID` is the identifier of the OpenData-queue system instance.
+That is needed to distinguish between multiple OpenData-queue systems that are maintained in the same SlateDB instance.
+The `log ID` is the identifier of the metadata log.
+An OpenData-queue can maintain multiple metadata logs.
+How the metadata of the published messages is distributed across the metadata logs depends on the implemented
+distribution strategy.
+One strategy could be to provide a metadata log for each created queue.
+Another strategy could be to group messages according to the definitions of the created queues.
+This RFC enables to have multiple metadata logs but treats the distribution of messages over the metadata logs as
+an unknown implementation details.
+
+The record value is an encoded array of message metadata:
+```
+Metadata Record Value:
+    Array<MessageMetadata>
+```
+
+The size of the metadata array depends on the batching strategy.
+Message metadata can be batched by time or by size or both.
+
+The metadata contains the following metadata:
 - the message ID assigned to the payload by the payload store
 - the timestamp the message was created
 - the timestamp the message was received
 - the timestamp after which the message becomes visible the first time to consumers
 - the headers of the message (key-value pairs) that contain data for filtering and routing
 
-The record value is encoded as follows:
+The message metadata is encoded as follows:
 ```
-Metadata Record Value:
+MessageMetadata:
     | message ID (u64)
     | created at (i64)
     | received at (i64)
@@ -126,7 +143,8 @@ Metadata Record Value:
     ...
     | key N-1 (Utf8) | value N-1 (Utf8)
 ```
-The type `Utf8` is specified in [OpenData-Timeseries](timeseries/rfcs/0001-tsdb-storage.md)
+
+The type `Utf8` is specified in [OpenData's Common Encodings](rfcs/0004-common-encodings.md)
 The retention duration in seconds is computed from the `received at` timestamp.
 If the current timestamp exceeds the `received at` timestamp plus the retention duration,
 the message -- payload and metadata -- are removed from the OpenData-queue system.
@@ -146,14 +164,10 @@ The key of the active messages consists of:
 The key is encoded as follows:
 ```
 Active Message Key:
-    | version (u8) | type (u8) | queue ID (TerminatedBytes)
+    | version (u8) | type (u8) | queue ID (bytes)
 ```
 The initial version is 1.
 The type discriminator is `0x02`.
-
-The queue ID is of type `TerminatedBytes`.
-A `TerminatedBytes` is a variable-length byte sequence that terminates with a 0x00 delimiter as described in
-[OpenData-Log](log/rfcs/0001-storage.md).
 
 The value of the active messages consists of:
 - the list of available messages, i.e., the messages that can be claimed by consumers
@@ -215,7 +229,7 @@ The payload and the metadata of the messages are not removed from the system sin
 The key for the done messages is encoded as follows:
 ```
 Done Messages key:
-    | version (u8) | type (u8) | queue ID (TerminatedBytes)
+    | version (u8) | type (u8) | queue ID (bytes)
 ```
 The key is similar to the key for the available messages, but with a different type discriminator, i.e., `0x03`.
 
@@ -239,7 +253,7 @@ the configured number of attempts.
 The key for the failed messages is encoded as follows:
 ```
 Failed Messages Key:
-    | version (u8) | type (u8) | queue ID (TerminatedBytes)
+    | version (u8) | type (u8) | queue ID (bytes)
 ```
 The key is similar to the key for the available messages, but with a different type discriminator, i.e., `0x04`.
 
@@ -284,7 +298,7 @@ The key of the configuration is similar to the key of the available messages but
 i.e., `0x06`.
 ```
 Queue Config Key:
-    | version (u8) | type (u8) | queue ID (TerminatedBytes)
+    | version (u8) | type (u8) | queue ID (bytes)
 ```
 
 The config consists of:
