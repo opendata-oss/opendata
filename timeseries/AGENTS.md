@@ -25,7 +25,7 @@ See `rfcs/0001-tsdb-storage.md` for the complete storage design and `rfcs/0002-w
 ### Key Modules
 
 - `src/tsdb.rs` - Core database implementation
-- `src/timeseries.rs` - Public `TimeSeries` API (write, flush)
+- `src/timeseries.rs` - Public `TimeSeriesDb` API (write, flush)
 - `src/serde/` - Record serialization (mirrors common patterns)
 - `src/promql/` - PromQL query engine and HTTP server
 - `src/index.rs` - Index operations

@@ -1,6 +1,6 @@
-//! Core TimeSeries implementation with write API.
+//! Core TimeSeriesDb implementation with write API.
 //!
-//! This module provides the [`TimeSeries`] struct, the primary entry point for
+//! This module provides the [`TimeSeriesDb`] struct, the primary entry point for
 //! interacting with OpenData TimeSeries. It exposes write operations for
 //! ingesting time series data.
 
@@ -10,18 +10,18 @@ use crate::model::Series;
 
 /// A time series database for storing and querying metrics.
 ///
-/// `TimeSeries` provides a high-level API for ingesting Prometheus-style
+/// `TimeSeriesDb` provides a high-level API for ingesting Prometheus-style
 /// metrics. It handles internal details like time bucketing, series
 /// deduplication, and storage management automatically.
 ///
 /// # Example
 ///
 /// ```ignore
-/// use timeseries::{TimeSeries, Config, Series};
+/// use timeseries::{TimeSeriesDb, Config, Series};
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let ts = TimeSeries::open(Config::default()).await?;
+///     let ts = TimeSeriesDb::open(Config::default()).await?;
 ///
 ///     let series = Series::builder("http_requests_total")
 ///         .label("method", "GET")
@@ -33,15 +33,15 @@ use crate::model::Series;
 ///     Ok(())
 /// }
 /// ```
-pub struct TimeSeries {
+pub struct TimeSeriesDb {
     // Internal Tsdb - not exposed
     _private: (),
 }
 
-impl TimeSeries {
+impl TimeSeriesDb {
     /// Opens or creates a time series database with the given configuration.
     ///
-    /// This is the primary entry point for creating a `TimeSeries` instance.
+    /// This is the primary entry point for creating a `TimeSeriesDb` instance.
     /// The configuration specifies the storage backend and operational parameters.
     ///
     /// # Arguments
@@ -55,9 +55,9 @@ impl TimeSeries {
     /// # Example
     ///
     /// ```ignore
-    /// use timeseries::{TimeSeries, Config};
+    /// use timeseries::{TimeSeriesDb, Config};
     ///
-    /// let ts = TimeSeries::open(Config::default()).await?;
+    /// let ts = TimeSeriesDb::open(Config::default()).await?;
     /// ```
     pub async fn open(_config: Config) -> Result<Self> {
         todo!()
@@ -73,7 +73,7 @@ impl TimeSeries {
     /// # Atomicity
     ///
     /// This operation is atomic: either all series in the batch are accepted,
-    /// or none are. This matches the behavior of `Log::append()`.
+    /// or none are. This matches the behavior of `LogDb::append()`.
     ///
     /// # Series Identification
     ///

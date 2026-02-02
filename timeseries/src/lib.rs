@@ -12,7 +12,7 @@
 //!
 //! # Key Concepts
 //!
-//! - **TimeSeries**: The main entry point providing write operations.
+//! - **TimeSeriesDb**: The main entry point providing write operations.
 //! - **Series**: A time series identified by labels, containing timestamped samples.
 //! - **Label**: A key-value pair that identifies a time series.
 //! - **Sample**: A single data point with a timestamp and value.
@@ -20,11 +20,11 @@
 //! # Example
 //!
 //! ```ignore
-//! use timeseries::{TimeSeries, Config, Series};
+//! use timeseries::{TimeSeriesDb, Config, Series};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let ts = TimeSeries::open(Config::default()).await?;
+//!     let ts = TimeSeriesDb::open(Config::default()).await?;
 //!
 //!     let series = Series::builder("http_requests_total")
 //!         .label("method", "GET")
@@ -61,4 +61,4 @@ mod timeseries;
 pub use config::{Config, WriteOptions};
 pub use error::{Error, Result};
 pub use model::{Label, MetricType, Sample, Series, SeriesBuilder, Temporality};
-pub use timeseries::TimeSeries;
+pub use timeseries::TimeSeriesDb;
