@@ -36,6 +36,44 @@ impl CollectionMetaKey {
     }
 }
 
+/// Deletions key - singleton record storing deleted vector IDs bitmap.
+///
+/// Key layout: `[version | tag]` (2 bytes)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionsKey;
+
+impl RecordKey for DeletionsKey {
+    const RECORD_TYPE: RecordType = RecordType::Deletions;
+}
+
+impl DeletionsKey {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(2);
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
+        buf.freeze()
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < 2 {
+            return Err(EncodingError {
+                message: "Buffer too short for DeletionsKey".to_string(),
+            });
+        }
+        validate_key_prefix::<Self>(buf)?;
+        Ok(DeletionsKey)
+    }
+}
+
+impl Default for DeletionsKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// CentroidChunk key - stores a chunk of cluster centroids.
 ///
 /// Key layout: `[version | tag | chunk_id:u32-BE]` (6 bytes)
@@ -82,10 +120,6 @@ impl CentroidChunkKey {
 /// PostingList key - maps centroid ID to vector IDs.
 ///
 /// Key layout: `[version | tag | centroid_id:u32-BE]` (6 bytes)
-///
-/// Special centroid IDs:
-/// - `0x00000000`: Deleted vectors bitmap
-/// - `0x00000001+`: Cluster centroids
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostingListKey {
     pub centroid_id: u32,
@@ -96,17 +130,8 @@ impl RecordKey for PostingListKey {
 }
 
 impl PostingListKey {
-    /// Centroid ID for the deleted vectors bitmap.
-    pub const DELETED_VECTORS: u32 = 0;
-
     pub fn new(centroid_id: u32) -> Self {
         Self { centroid_id }
-    }
-
-    pub fn deleted_vectors() -> Self {
-        Self {
-            centroid_id: Self::DELETED_VECTORS,
-        }
     }
 
     pub fn encode(&self) -> Bytes {
@@ -472,16 +497,16 @@ mod tests {
     }
 
     #[test]
-    fn should_encode_deleted_vectors_posting_list_key() {
+    fn should_encode_and_decode_deletions_key() {
         // given
-        let key = PostingListKey::deleted_vectors();
+        let key = DeletionsKey::new();
 
         // when
         let encoded = key.encode();
-        let decoded = PostingListKey::decode(&encoded).unwrap();
+        let decoded = DeletionsKey::decode(&encoded).unwrap();
 
         // then
-        assert_eq!(decoded.centroid_id, PostingListKey::DELETED_VECTORS);
+        assert_eq!(decoded, key);
     }
 
     #[test]
