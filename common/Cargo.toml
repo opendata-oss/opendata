@@ -3,6 +3,9 @@ name = "common"
 version.workspace = true
 edition.workspace = true
 
+[features]
+failpoints = ["fail/failpoints"]
+
 [dependencies]
 slatedb.workspace = true
 bytes.workspace = true
@@ -12,6 +15,7 @@ tracing.workspace = true
 uuid.workspace = true
 serde.workspace = true
 futures.workspace = true
+fail.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

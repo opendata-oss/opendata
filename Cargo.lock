@@ -566,6 +566,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "criterion",
+ "fail",
  "futures",
  "proptest",
  "serde",
