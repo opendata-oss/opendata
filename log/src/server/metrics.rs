@@ -50,13 +50,13 @@ pub struct Metrics {
     pub log_append_records_total: Counter,
 
     /// Counter of bytes written
-    pub log_append_bytes_written: Counter,
+    pub log_append_bytes_total: Counter,
 
     /// Counter of records scanned
-    pub log_records_scanned: Counter,
+    pub log_records_scanned_total: Counter,
 
     /// Counter of bytes scanned
-    pub log_bytes_scanned: Counter,
+    pub log_bytes_scanned_total: Counter,
 
     /// Counter of HTTP requests.
     pub http_requests_total: Family<HttpLabelsWithStatus, Counter>,
@@ -82,27 +82,27 @@ impl Metrics {
         );
 
         // Log append bytes counter
-        let log_append_bytes_written = Counter::default();
+        let log_append_bytes_total = Counter::default();
         registry.register(
-            "log_append_bytes_written",
+            "log_append_bytes_total",
             "Total number of bytes written to the log",
-            log_append_bytes_written.clone(),
+            log_append_bytes_total.clone(),
         );
 
         // Log scan records counter
-        let log_records_scanned = Counter::default();
+        let log_records_scanned_total = Counter::default();
         registry.register(
-            "log_records_scanned",
+            "log_records_scanned_total",
             "Total number of records scanned in the log",
-            log_records_scanned.clone(),
+            log_records_scanned_total.clone(),
         );
 
         // Log scan bytes counter
-        let log_bytes_scanned = Counter::default();
+        let log_bytes_scanned_total = Counter::default();
         registry.register(
-            "log_bytes_scanned",
+            "log_bytes_scanned_total",
             "Total number of bytes scanned in the log",
-            log_bytes_scanned.clone(),
+            log_bytes_scanned_total.clone(),
         );
 
         // HTTP requests total counter
@@ -116,9 +116,9 @@ impl Metrics {
         Self {
             registry,
             log_append_records_total,
-            log_append_bytes_written,
-            log_records_scanned,
-            log_bytes_scanned,
+            log_append_bytes_total,
+            log_records_scanned_total,
+            log_bytes_scanned_total,
             http_requests_total,
         }
     }
@@ -144,8 +144,27 @@ mod tests {
         // then
         let encoded = metrics.encode();
         assert!(encoded.contains("# HELP log_append_records_total"));
-        assert!(encoded.contains("# HELP log_append_bytes_written"));
+        assert!(encoded.contains("# HELP log_append_bytes_total"));
+        assert!(encoded.contains("# HELP log_records_scanned_total"));
+        assert!(encoded.contains("# HELP log_bytes_scanned_total"));
         assert!(encoded.contains("# HELP http_requests_total"));
+    }
+
+    #[test]
+    fn should_increment_log_metrics() {
+        // given
+        let metrics = Metrics::new();
+
+        // when
+        metrics.log_append_bytes_total.inc_by(100);
+        metrics.log_records_scanned_total.inc_by(5);
+        metrics.log_bytes_scanned_total.inc_by(500);
+
+        // then
+        let encoded = metrics.encode();
+        assert!(encoded.contains("log_append_bytes_total_total 100"));
+        assert!(encoded.contains("log_records_scanned_total_total 5"));
+        assert!(encoded.contains("log_bytes_scanned_total_total 500"));
     }
 
     #[test]

@@ -46,7 +46,6 @@ pub async fn handle_append(
         .records
         .iter()
         .map(|rec| rec.key.len() + rec.value.len())
-        // should ^ this only consider value bytes ? or both ?
         .sum();
     let options = WriteOptions {
         await_durable: request.await_durable,
@@ -60,7 +59,7 @@ pub async fn handle_append(
     state.metrics.log_append_records_total.inc_by(count as u64);
     state
         .metrics
-        .log_append_bytes_written
+        .log_append_bytes_total
         .inc_by(bytes_count as u64);
 
     let response = AppendResponse::success(result.records_appended as i32, result.start_sequence);
@@ -99,13 +98,15 @@ pub async fn handle_scan(
     let bytes_scanned: usize = entries
         .iter()
         .map(|entry| entry.key.len() + entry.value.len())
-        // should ^ this only consider value bytes ? or both ??
         .sum();
     state
         .metrics
-        .log_records_scanned
+        .log_records_scanned_total
         .inc_by(values.len() as u64);
-    state.metrics.log_bytes_scanned.inc_by(bytes_scanned as u64);
+    state
+        .metrics
+        .log_bytes_scanned_total
+        .inc_by(bytes_scanned as u64);
     let response = ScanResponse::success(key, values);
     Ok(to_api_response(response, format))
 }
