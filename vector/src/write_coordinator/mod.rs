@@ -1,25 +1,15 @@
 mod coordinator;
 
 use anyhow::{Error, Result};
-use std::sync::Arc;
 use async_trait::async_trait;
-use futures::future::Shared;
 use futures::FutureExt;
+use futures::future::Shared;
+use std::sync::Arc;
 use tokio::sync::{oneshot, watch};
-use common::StorageRead;
-use crate::write_coordinator::coordinator::{WriteCoordinatorCtlMsg, WriteCoordinatorWriteMsg};
 
-/// Event broadcast to subscribers after each flush.
-pub struct FlushEvent<D: Delta> {
-    /// The new snapshot reflecting the flushed state.
-    pub snapshot: Arc<dyn StorageRead>,
-    /// Clone of the delta that was flushed (pre-flush state).
-    pub delta: D,
-    /// Epoch range covered by this flush: (previous_max, new_max].
-    /// A subscriber whose cache is at `epoch_range.0` can apply `delta`
-    /// to update their state to `epoch_range.1`.
-    pub epoch_range: (u64, u64),
-}
+use common::StorageRead;
+
+use crate::write_coordinator::coordinator::{WriteCoordinatorCtlMsg, WriteCoordinatorWriteMsg};
 
 pub trait Delta: Send + Clone + 'static {
     type Image: Send + Sync + 'static;
@@ -39,9 +29,8 @@ pub trait Delta: Send + Clone + 'static {
 
 #[async_trait]
 pub trait Flusher<D: Delta>: Send + Sync + 'static {
-
     /// Flush a delta to storage and return the new snapshot.
-    async fn flush(&self, delta: D::ImmutableDelta) -> Result<Arc<dyn StorageRead>>;
+    async fn flush(&self, delta: &D::ImmutableDelta) -> Result<Arc<dyn StorageRead>>;
 }
 
 /// Durability levels for write acknowledgment.
@@ -70,7 +59,10 @@ impl FlushWatchers {
             Durability::Flushed => self.flushed.clone(),
             Durability::Durable => self.durable.clone(),
         };
-        rx.wait_for(|v| *v <= epoch).await.map(|_| ()).map_err(Error::from)
+        rx.wait_for(|v| *v <= epoch)
+            .await
+            .map(|_| ())
+            .map_err(Error::from)
     }
 }
 
@@ -85,7 +77,11 @@ impl WriteHandle {
     /// coordinator dequeues the write, so this method blocks until sequencing.
     /// Epochs are monotonically increasing and reflect the actual write order.
     pub async fn epoch(&self) -> Result<u64> {
-        Ok(self.epoch.clone().await.map_err(|_| Error::msg("coordinator dropped"))?)
+        Ok(self
+            .epoch
+            .clone()
+            .await
+            .map_err(|_| Error::msg("coordinator dropped"))?)
     }
 
     /// Wait until the write reaches the specified durability level.
@@ -99,39 +95,32 @@ impl WriteHandle {
 #[derive(Clone)]
 pub struct WriteCoordinatorHandle<D: Delta> {
     write_tx: tokio::sync::mpsc::Sender<WriteCoordinatorWriteMsg<D>>,
-    ctl_tx: tokio::sync::mpsc::UnboundedSender<WriteCoordinatorCtlMsg<D>>,
+    ctl_tx: tokio::sync::mpsc::UnboundedSender<WriteCoordinatorCtlMsg>,
     flush_watchers: FlushWatchers,
 }
 
 impl<D: Delta> WriteCoordinatorHandle<D> {
     /// Submit a write and receive a handle to track its durability.
-    pub async fn write(&self, event: D::Write) -> Result<WriteHandle> {
-        let (msg, rx) = WriteCoordinatorWriteMsg::new(event);
-        self.write_tx.send(msg).await.map_err(|_| Error::msg("coordinator dropped"))?;
-        Ok(
-            WriteHandle {
-                epoch: rx.shared(),
-                watchers: self.flush_watchers.clone(),
-            }
-        )
+    pub async fn write(&self, write: D::Write) -> Result<WriteHandle> {
+        let (msg, rx) = WriteCoordinatorWriteMsg::new(write);
+        self.write_tx
+            .send(msg)
+            .await
+            .map_err(|_| Error::msg("coordinator dropped"))?;
+        Ok(WriteHandle {
+            epoch: rx.shared(),
+            watchers: self.flush_watchers.clone(),
+        })
     }
 
-    /// Request a flush up to the specified epoch (or all pending if None).
-    pub async fn flush(&self, epoch: Option<u64>) -> Result<()> {
-        todo!()
-    }
-
-    /// Subscribe to flush events.
+    /// Request a flush of all pending writes.
     ///
-    /// Each event contains the new snapshot, a clone of the flushed delta, and the
-    /// epoch range covered. Subscribers can use this for incremental cache updates
-    /// if their local state is at `epoch_range.0`.
-    ///
-    /// **Note**: Uses a `watch` channel — if flushes occur faster than the subscriber
-    /// processes them, intermediate events are dropped. Subscribers that miss events
-    /// must rebuild their cache from the snapshot.
-    pub fn subscribe(&self) -> watch::Receiver<FlushEvent<D>> {
-        todo!()
+    /// Blocks until the flush is complete.
+    pub async fn flush(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.ctl_tx
+            .send(WriteCoordinatorCtlMsg::Flush(tx))
+            .map_err(|_| Error::msg("coordinator dropped"))?;
+        rx.await.map_err(|_| Error::msg("coordinator dropped"))
     }
 }
-
