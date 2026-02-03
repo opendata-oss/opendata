@@ -11,19 +11,13 @@ This RFC defines KeyValue, a thin wrapper over SlateDB that provides general-pur
 
 ## Motivation
 
-There are two primary drivers for KeyValue.
+- **Auxiliary storage**: Core systems (Log, Timeseries, Vector) need simple key-value storage for supporting data like sequence tracking and catalog metadata. KeyValue provides a shared foundation with standardized key encoding.
 
-### Auxiliary Systems
+- **Internal composition**: Issue [#140](https://github.com/opendata-oss/opendata/issues/140) describes building new systems as compositions of existing ones. For example, Log + KeyValue could store materialized views derived from log data.
 
-Core OpenData systems like Log, Timeseries, and Vector each have supporting needs that require simple key-value storage. Examples include sequence tracking for log readers and registry or catalog metadata. We could implement these directly on SlateDB as we do for the primary data stores, but this means reimplementing the standard key encoding for each new system. KeyValue provides a shared foundation with the standardized key structure already in place.
+- **Service layer**: SlateDB is an embedded store. KeyValue provides a natural point to add a service layer exposing key-value storage over the network.
 
-### Internal Composition
-
-Issue [#140](https://github.com/opendata-oss/opendata/issues/140) describes the broader vision for composition across OpenData systems. KeyValue encourages a mindset of building new systems as compositions of existing ones. For example, Log + KeyValue could store arbitrary materialized views derived from log data. Whatever key space partitioning solution emerges from issue #140 will apply to KeyValue as well.
-
-### Naming
-
-Issue [#111](https://github.com/opendata-oss/opendata/issues/111) discusses table-like abstractions ranging from raw key-value primitives to SQL-compatible tables. We use "KeyValue" for this system to reserve "Table" for a future SQL-oriented abstraction. KeyValue corresponds roughly to Option A in that issue—a thin wrapper over SlateDB's primitives.
+We use "KeyValue" rather than "Table" to reserve the latter for a future SQL-oriented abstraction (see issue [#111](https://github.com/opendata-oss/opendata/issues/111)).
 
 ## Goals
 
