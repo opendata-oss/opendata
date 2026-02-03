@@ -481,8 +481,7 @@ centroids) may appear in multiple posting lists to improve recall.
 
 **Structure:**
 
-- The value is a simple array of mutations to the posting. The implementation should enforce that all elements of
-of a value are of the same type to allow for efficient merging of new data.
+- The value is a simple array of mutations to the posting. The mutations are ordered by vector id. 
 - Each entry specifies a mutation type. 0x0 indicates the vector is added, 0x1 indicates its deleted.
 - Posting lists are balanced by the hierarchical clustering algorithm (target size configurable,
   e.g., 10-100 vectors)
