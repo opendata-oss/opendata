@@ -263,7 +263,8 @@ mod tests {
     use std::collections::HashMap;
     use std::ops::Range;
     use std::sync::Mutex;
-
+    use crate::storage::in_memory::InMemoryStorage;
+    use crate::StorageRead;
     // ============================================================================
     // Test Infrastructure
     // ============================================================================
@@ -373,7 +374,7 @@ mod tests {
 
     #[async_trait]
     impl Flusher<TestDelta> for TestFlusher {
-        async fn flush(&self, event: FlushEvent<TestDelta>) -> Result<Arc<TestImage>, String> {
+        async fn flush(&self, event: FlushEvent<TestDelta>) -> Result<Arc<dyn StorageRead>, String> {
             // Signal that flush has started
             let flush_started_tx = {
                 let mut state = self.state.lock().unwrap();
@@ -393,12 +394,13 @@ mod tests {
             }
 
             // Record the flush
-            let (_, image) = event.delta.fork(&event.snapshot);
             {
                 let mut state = self.state.lock().unwrap();
                 state.flushed_events.push((event.delta, event.epoch_range));
             }
-            Ok(Arc::new(image))
+            
+            // not used in the tests
+            Ok(Arc::new(InMemoryStorage::default()))
         }
     }
 

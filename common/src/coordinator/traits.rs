@@ -50,5 +50,5 @@ pub trait Delta: Sized + Send + Sync + 'static {
 pub trait Flusher<D: Delta>: Default + Send + Sync + 'static {
     /// Flush the given event to durable storage and returns a storage
     /// snapshot for readers to use
-    async fn flush(&self, event: FlushEvent<D>) -> Result<Arc<D::Image>, String>;
+    async fn flush(&self, event: FlushEvent<D>) -> Result<Arc<dyn StorageRead>, String>;
 }
