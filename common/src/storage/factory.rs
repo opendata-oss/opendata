@@ -1,6 +1,6 @@
 //! Storage factory for creating storage instances from configuration.
 //!
-//! This module provides factory functions and builders for creating storage backends
+//! This module provides factory functions for creating storage backends
 //! based on configuration, supporting both InMemory and SlateDB backends.
 
 use std::sync::Arc;
@@ -14,6 +14,102 @@ use super::config::{ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
 use super::in_memory::InMemoryStorage;
 use super::slate::SlateDbStorage;
 use super::{MergeOperator, Storage, StorageError, StorageResult};
+
+/// Runtime options for storage that cannot be serialized.
+///
+/// This struct holds non-serializable runtime configuration like tokio
+/// runtime handles. Users can configure these options and pass them to
+/// system builders (e.g., `LogDbBuilder`, `TsdbBuilder`).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use common::StorageRuntime;
+///
+/// // Create a separate runtime for compaction
+/// let compaction_runtime = tokio::runtime::Builder::new_multi_thread()
+///     .worker_threads(2)
+///     .enable_all()
+///     .build()
+///     .unwrap();
+///
+/// let runtime = StorageRuntime::new()
+///     .with_compaction_runtime(compaction_runtime.handle().clone());
+///
+/// // Pass to a system builder
+/// let mut builder = LogDbBuilder::new(config);
+/// *builder.storage_mut() = runtime;
+/// let log = builder.build().await?;
+/// ```
+#[derive(Default)]
+pub struct StorageRuntime {
+    pub(crate) compaction_runtime: Option<Handle>,
+}
+
+impl StorageRuntime {
+    /// Creates a new storage runtime with default options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets a separate runtime for SlateDB compaction tasks.
+    ///
+    /// When provided, SlateDB's compaction tasks will run on this runtime
+    /// instead of the runtime used for user operations. This is important
+    /// when calling the database from sync code using `block_on`, as it
+    /// prevents deadlocks between user operations and background compaction.
+    ///
+    /// This option only affects SlateDB storage; it is ignored for in-memory storage.
+    pub fn with_compaction_runtime(mut self, handle: Handle) -> Self {
+        self.compaction_runtime = Some(handle);
+        self
+    }
+}
+
+/// Storage semantics configured by system crates.
+///
+/// This struct holds semantic concerns like merge operators that are specific
+/// to each system (log, timeseries, vector). End users should not use this
+/// directly - each system configures its own semantics internally.
+///
+/// # Internal Use Only
+///
+/// This type is public so that system crates (timeseries, vector, log) can
+/// access it, but it is not intended for end-user consumption.
+///
+/// # Example (for system crate implementers)
+///
+/// ```rust,ignore
+/// // In timeseries crate:
+/// let semantics = StorageSemantics::new()
+///     .with_merge_operator(Arc::new(TimeSeriesMergeOperator));
+/// let storage = create_storage(&config, runtime, semantics).await?;
+/// ```
+pub struct StorageSemantics {
+    pub(crate) merge_operator: Option<Arc<dyn MergeOperator>>,
+}
+
+impl Default for StorageSemantics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StorageSemantics {
+    /// Creates new storage semantics with default values.
+    pub fn new() -> Self {
+        Self { merge_operator: None }
+    }
+
+    /// Sets the merge operator for merge operations.
+    ///
+    /// The merge operator defines how values are combined during compaction.
+    /// Each system (timeseries, vector) defines its own merge semantics.
+    pub fn with_merge_operator(mut self, op: Arc<dyn MergeOperator>) -> Self {
+        self.merge_operator = Some(op);
+        self
+    }
+}
 
 /// Creates an object store from configuration without initializing SlateDB.
 ///
@@ -48,111 +144,54 @@ pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn 
     }
 }
 
-/// Creates a storage instance based on the provided configuration.
+/// Creates a storage instance based on configuration, runtime options, and semantics.
 ///
-/// This is a convenience function that uses default options. For more control,
-/// use [`StorageBuilder`].
+/// This is the primary factory function for creating storage backends. It combines:
+/// - `config`: Serializable storage configuration (backend type, paths, etc.)
+/// - `runtime`: Non-serializable runtime options (compaction runtime handle)
+/// - `semantics`: System-specific semantics (merge operators)
 ///
 /// # Arguments
 ///
 /// * `config` - The storage configuration specifying the backend type and settings.
-/// * `merge_operator` - Optional merge operator for merge operations. Required if
-///   the storage will use merge operations.
+/// * `runtime` - Runtime options like compaction runtime handles.
+/// * `semantics` - System-specific semantics like merge operators.
 ///
 /// # Returns
 ///
 /// Returns an `Arc<dyn Storage>` on success, or a `StorageError` on failure.
-pub async fn create_storage(
-    config: &StorageConfig,
-    merge_operator: Option<Arc<dyn MergeOperator>>,
-) -> StorageResult<Arc<dyn Storage>> {
-    let mut builder = StorageBuilder::new(config.clone());
-    if let Some(op) = merge_operator {
-        builder = builder.with_merge_operator(op);
-    }
-    builder.build().await
-}
-
-/// Builder for creating storage instances with custom options.
 ///
-/// This builder provides a fluent API for configuring storage, including
-/// runtime options that cannot be serialized in configuration files.
-///
-/// # Example
+/// # Example (for system crate implementers)
 ///
 /// ```rust,ignore
-/// use common::storage::factory::StorageBuilder;
-/// use common::storage::config::StorageConfig;
-///
-/// // Create a separate runtime for compaction
-/// let compaction_runtime = tokio::runtime::Builder::new_multi_thread()
-///     .worker_threads(2)
-///     .enable_all()
-///     .build()
-///     .unwrap();
-///
-/// let storage = StorageBuilder::new(config)
-///     .with_compaction_runtime(compaction_runtime.handle().clone())
-///     .build()
-///     .await?;
+/// // In a system crate's builder:
+/// let storage = create_storage(
+///     &self.config.storage,
+///     self.storage_runtime.unwrap_or_default(),
+///     StorageSemantics::new().with_merge_operator(Arc::new(MyMergeOp)),
+/// ).await?;
 /// ```
-pub struct StorageBuilder {
-    config: StorageConfig,
-    merge_operator: Option<Arc<dyn MergeOperator>>,
-    compaction_runtime: Option<Handle>,
-}
-
-impl StorageBuilder {
-    /// Creates a new storage builder with the given configuration.
-    pub fn new(config: StorageConfig) -> Self {
-        Self {
-            config,
-            merge_operator: None,
-            compaction_runtime: None,
+pub async fn create_storage(
+    config: &StorageConfig,
+    runtime: StorageRuntime,
+    semantics: StorageSemantics,
+) -> StorageResult<Arc<dyn Storage>> {
+    match config {
+        StorageConfig::InMemory => {
+            let storage = match semantics.merge_operator {
+                Some(op) => InMemoryStorage::with_merge_operator(op),
+                None => InMemoryStorage::new(),
+            };
+            Ok(Arc::new(storage))
         }
-    }
-
-    /// Sets the merge operator for merge operations.
-    ///
-    /// This is typically used internally by higher-level abstractions
-    /// and not by end users directly.
-    pub fn with_merge_operator(mut self, op: Arc<dyn MergeOperator>) -> Self {
-        self.merge_operator = Some(op);
-        self
-    }
-
-    /// Sets a separate runtime for SlateDB compaction tasks.
-    ///
-    /// When provided, SlateDB's compaction tasks will run on this runtime
-    /// instead of the runtime used for user operations. This is important
-    /// when calling SlateDB from sync code using `block_on`, as it prevents
-    /// deadlocks between user operations and background compaction.
-    ///
-    /// This option only affects SlateDB storage; it is ignored for in-memory storage.
-    pub fn with_compaction_runtime(mut self, handle: Handle) -> Self {
-        self.compaction_runtime = Some(handle);
-        self
-    }
-
-    /// Builds the storage instance.
-    pub async fn build(self) -> StorageResult<Arc<dyn Storage>> {
-        match &self.config {
-            StorageConfig::InMemory => {
-                let storage = match self.merge_operator {
-                    Some(op) => InMemoryStorage::with_merge_operator(op),
-                    None => InMemoryStorage::new(),
-                };
-                Ok(Arc::new(storage))
-            }
-            StorageConfig::SlateDb(slate_config) => {
-                let storage = create_slatedb_storage(
-                    slate_config,
-                    self.merge_operator,
-                    self.compaction_runtime,
-                )
-                .await?;
-                Ok(Arc::new(storage))
-            }
+        StorageConfig::SlateDb(slate_config) => {
+            let storage = create_slatedb_storage(
+                slate_config,
+                semantics.merge_operator,
+                runtime.compaction_runtime,
+            )
+            .await?;
+            Ok(Arc::new(storage))
         }
     }
 }

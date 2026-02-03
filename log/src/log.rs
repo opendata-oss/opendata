@@ -11,7 +11,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use common::clock::{Clock, SystemClock};
 use common::storage::factory::create_storage;
-use common::{Record as StorageRecord, WriteOptions as StorageWriteOptions};
+use common::{
+    Record as StorageRecord, StorageRuntime, StorageSemantics, WriteOptions as StorageWriteOptions,
+};
 use tokio::sync::RwLock;
 
 use crate::config::{CountOptions, ScanOptions, WriteOptions};
@@ -109,9 +111,13 @@ impl LogDb {
     /// let log = LogDb::open(test_config()).await?;
     /// ```
     pub async fn open(config: crate::config::Config) -> crate::error::Result<Self> {
-        let storage = create_storage(&config.storage, None)
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let storage = create_storage(
+            &config.storage,
+            StorageRuntime::new(),
+            StorageSemantics::new(),
+        )
+        .await
+        .map_err(|e| Error::Storage(e.to_string()))?;
         let log_storage = LogStorage::new(storage);
 
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -414,14 +420,13 @@ impl LogRead for LogDb {
 ///     .build()
 ///     .unwrap();
 ///
-/// let log = LogDbBuilder::new(config)
-///     .with_compaction_runtime(compaction_runtime.handle().clone())
-///     .build()
-///     .await?;
+/// let mut builder = LogDbBuilder::new(config);
+/// builder.storage_mut().with_compaction_runtime(compaction_runtime.handle().clone());
+/// let log = builder.build().await?;
 /// ```
 pub struct LogDbBuilder {
     config: crate::config::Config,
-    compaction_runtime: Option<tokio::runtime::Handle>,
+    storage_runtime: Option<StorageRuntime>,
 }
 
 impl LogDbBuilder {
@@ -429,34 +434,37 @@ impl LogDbBuilder {
     pub fn new(config: crate::config::Config) -> Self {
         Self {
             config,
-            compaction_runtime: None,
+            storage_runtime: None,
         }
     }
 
-    /// Sets a separate runtime for SlateDB compaction tasks.
+    /// Returns a mutable reference to the storage runtime for advanced configuration.
     ///
-    /// When provided, SlateDB's compaction tasks will run on this runtime
-    /// instead of the runtime used for user operations. This is important
-    /// when calling LogDb from sync code using `block_on`, as it prevents
-    /// deadlocks between user operations and background compaction.
-    pub fn with_compaction_runtime(mut self, handle: tokio::runtime::Handle) -> Self {
-        self.compaction_runtime = Some(handle);
-        self
+    /// The storage runtime is lazily initialized with default options. Use this to
+    /// configure runtime options like the compaction runtime handle.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut builder = LogDbBuilder::new(config);
+    /// builder.storage_mut().with_compaction_runtime(runtime.handle().clone());
+    /// let log = builder.build().await?;
+    /// ```
+    pub fn storage_mut(&mut self) -> &mut StorageRuntime {
+        self.storage_runtime.get_or_insert_with(StorageRuntime::new)
     }
 
     /// Builds the LogDb instance.
     pub async fn build(self) -> Result<LogDb> {
-        let mut storage_builder =
-            common::storage::factory::StorageBuilder::new(self.config.storage.clone());
+        let runtime = self.storage_runtime.unwrap_or_default();
 
-        if let Some(handle) = self.compaction_runtime {
-            storage_builder = storage_builder.with_compaction_runtime(handle);
-        }
-
-        let storage = storage_builder
-            .build()
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let storage = create_storage(
+            &self.config.storage,
+            runtime,
+            StorageSemantics::new(),
+        )
+        .await
+        .map_err(|e| Error::Storage(e.to_string()))?;
 
         let log_storage = LogStorage::new(storage);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -897,7 +905,11 @@ mod tests {
     #[tokio::test]
     async fn should_scan_entries_via_log_reader() {
         // given - create shared storage
-        let storage = create_storage(&StorageConfig::InMemory, None)
+        let storage = create_storage(
+            &StorageConfig::InMemory,
+            StorageRuntime::new(),
+            StorageSemantics::new(),
+        )
             .await
             .unwrap();
         let log = LogDb::new(storage.clone()).await.unwrap();
@@ -1131,7 +1143,11 @@ mod tests {
     #[tokio::test]
     async fn should_list_keys_via_log_reader() {
         // given - create shared storage
-        let storage = create_storage(&StorageConfig::InMemory, None)
+        let storage = create_storage(
+            &StorageConfig::InMemory,
+            StorageRuntime::new(),
+            StorageSemantics::new(),
+        )
             .await
             .unwrap();
         let log = LogDb::new(storage.clone()).await.unwrap();
@@ -1539,7 +1555,11 @@ mod tests {
     #[tokio::test]
     async fn should_list_segments_via_log_reader() {
         // given
-        let storage = create_storage(&StorageConfig::InMemory, None)
+        let storage = create_storage(
+            &StorageConfig::InMemory,
+            StorageRuntime::new(),
+            StorageSemantics::new(),
+        )
             .await
             .unwrap();
         let log = LogDb::new(storage.clone()).await.unwrap();
