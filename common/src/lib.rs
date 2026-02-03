@@ -1,5 +1,6 @@
 pub mod bytes;
 pub mod clock;
+pub mod coordinator;
 pub mod display;
 pub mod sequence;
 pub mod serde;
