@@ -458,21 +458,16 @@ impl LogDbBuilder {
     pub async fn build(self) -> Result<LogDb> {
         let runtime = self.storage_runtime.unwrap_or_default();
 
-        let storage = create_storage(
-            &self.config.storage,
-            runtime,
-            StorageSemantics::new(),
-        )
-        .await
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        let storage = create_storage(&self.config.storage, runtime, StorageSemantics::new())
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
 
         let log_storage = LogStorage::new(storage);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
         let log_storage_read = log_storage.as_read();
         let sequence_allocator = SequenceAllocator::open(&log_storage_read).await?;
-        let segment_cache =
-            SegmentCache::open(&log_storage_read, self.config.segmentation).await?;
+        let segment_cache = SegmentCache::open(&log_storage_read, self.config.segmentation).await?;
         let listing_cache = ListingCache::new();
 
         let inner = LogInner {
@@ -910,8 +905,8 @@ mod tests {
             StorageRuntime::new(),
             StorageSemantics::new(),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let log = LogDb::new(storage.clone()).await.unwrap();
         log.append(vec![
             Record {
@@ -1148,8 +1143,8 @@ mod tests {
             StorageRuntime::new(),
             StorageSemantics::new(),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let log = LogDb::new(storage.clone()).await.unwrap();
         log.append(vec![
             Record {
@@ -1560,8 +1555,8 @@ mod tests {
             StorageRuntime::new(),
             StorageSemantics::new(),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let log = LogDb::new(storage.clone()).await.unwrap();
 
         log.append(vec![Record {

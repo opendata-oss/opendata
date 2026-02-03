@@ -98,7 +98,9 @@ impl Default for StorageSemantics {
 impl StorageSemantics {
     /// Creates new storage semantics with default values.
     pub fn new() -> Self {
-        Self { merge_operator: None }
+        Self {
+            merge_operator: None,
+        }
     }
 
     /// Sets the merge operator for merge operations.
@@ -137,8 +139,8 @@ pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn 
             })?;
             let store = object_store::local::LocalFileSystem::new_with_prefix(&local_config.path)
                 .map_err(|e| {
-                    StorageError::Storage(format!("Failed to create local filesystem store: {}", e))
-                })?;
+                StorageError::Storage(format!("Failed to create local filesystem store: {}", e))
+            })?;
             Ok(Arc::new(store))
         }
     }
