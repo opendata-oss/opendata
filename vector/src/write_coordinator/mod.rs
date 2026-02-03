@@ -1,9 +1,13 @@
+mod coordinator;
+
 use anyhow::{Error, Result};
 use std::sync::Arc;
 use async_trait::async_trait;
 use futures::future::Shared;
+use futures::FutureExt;
 use tokio::sync::{oneshot, watch};
 use common::StorageRead;
+use crate::write_coordinator::coordinator::{WriteCoordinatorCtlMsg, WriteCoordinatorWriteMsg};
 
 /// Event broadcast to subscribers after each flush.
 pub struct FlushEvent<D: Delta> {
@@ -20,24 +24,24 @@ pub struct FlushEvent<D: Delta> {
 pub trait Delta: Send + Clone + 'static {
     type Image: Send + Sync + 'static;
     type Write: Send + 'static;
+    type ImmutableDelta: Send + Sync + 'static;
 
     /// Initialize the delta with state from the image.
-    fn init(&mut self, image: &Self::Image);
+    fn init(image: Self::Image) -> Self;
     /// Apply writes to this delta.
     fn apply(&mut self, writes: Vec<Self::Write>) -> Result<()>;
     /// Estimate the memory size of this delta for backpressure.
     fn estimate_size(&self) -> usize;
     /// Extract state needed for the next delta's initialization.
     /// Called before flush to enable non-blocking writes.
-    fn fork_image(&self) -> Self::Image;
+    fn freeze(&self) -> (Self::ImmutableDelta, Self::Image);
 }
 
 #[async_trait]
-pub trait Flusher: Send + Sync + 'static {
-    type Delta: Delta;
+pub trait Flusher<D: Delta>: Send + Sync + 'static {
 
     /// Flush a delta to storage and return the new snapshot.
-    async fn flush(&self, delta: Self::Delta) -> Result<Arc<dyn StorageRead>>;
+    async fn flush(&self, delta: D::ImmutableDelta) -> Result<Arc<dyn StorageRead>>;
 }
 
 /// Durability levels for write acknowledgment.
@@ -52,6 +56,7 @@ pub enum Durability {
 
 /// Watchers for durability watermarks. Created per-handle via `sender.subscribe()` to ensure
 /// each handle has independent cursor state.
+#[derive(Clone)]
 struct FlushWatchers {
     applied: watch::Receiver<u64>,
     flushed: watch::Receiver<u64>,
@@ -82,6 +87,7 @@ impl WriteHandle {
     pub async fn epoch(&self) -> Result<u64> {
         Ok(self.epoch.clone().await.map_err(|_| Error::msg("coordinator dropped"))?)
     }
+
     /// Wait until the write reaches the specified durability level.
     pub async fn wait(&self, durability: Durability) -> Result<()> {
         let epoch = self.epoch().await?;
@@ -90,14 +96,24 @@ impl WriteHandle {
 }
 
 /// Handle for interacting with the write coordinator.
+#[derive(Clone)]
 pub struct WriteCoordinatorHandle<D: Delta> {
-    current_delta: D,
+    write_tx: tokio::sync::mpsc::Sender<WriteCoordinatorWriteMsg<D>>,
+    ctl_tx: tokio::sync::mpsc::UnboundedSender<WriteCoordinatorCtlMsg<D>>,
+    flush_watchers: FlushWatchers,
 }
 
 impl<D: Delta> WriteCoordinatorHandle<D> {
     /// Submit a write and receive a handle to track its durability.
     pub async fn write(&self, event: D::Write) -> Result<WriteHandle> {
-        todo!();
+        let (msg, rx) = WriteCoordinatorWriteMsg::new(event);
+        self.write_tx.send(msg).await.map_err(|_| Error::msg("coordinator dropped"))?;
+        Ok(
+            WriteHandle {
+                epoch: rx.shared(),
+                watchers: self.flush_watchers.clone(),
+            }
+        )
     }
 
     /// Request a flush up to the specified epoch (or all pending if None).
