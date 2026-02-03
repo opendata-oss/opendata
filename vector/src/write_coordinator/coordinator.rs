@@ -1,3 +1,4 @@
+use anyhow::{Error, Result};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,19 +58,22 @@ impl FlushWatermarks {
 
 pub(crate) struct WriteCoordinatorWriteMsg<D: Delta> {
     write: D::Write,
-    epoch: tokio::sync::oneshot::Sender<u64>,
+    result_tx: tokio::sync::oneshot::Sender<Result<u64, Arc<Error>>>,
 }
 
 impl<D: Delta> WriteCoordinatorWriteMsg<D> {
-    pub(crate) fn new(write: D::Write) -> (Self, tokio::sync::oneshot::Receiver<u64>) {
+    pub(crate) fn new(write: D::Write) -> (Self, tokio::sync::oneshot::Receiver<Result<u64, Arc<Error>>>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        (Self { write, epoch: tx }, rx)
+        (Self { write, result_tx: tx }, rx)
     }
 }
 
 pub(crate) enum WriteCoordinatorCtlMsg {
     /// Request a flush. The oneshot is used to signal completion.
-    Flush(tokio::sync::oneshot::Sender<()>),
+    Flush {
+        epoch: Option<u64>,
+        result_tx: tokio::sync::oneshot::Sender<Option<u64>>,
+    },
     // TODO: add a Shutdown msg
 }
 
@@ -103,7 +107,7 @@ impl<D: Delta> WriteCoordinator<D> {
             flush_interval,
             flush_tx,
             current_epoch: 0,
-            delta_start_epoch: 0,
+            delta_start_epoch: 1,
             flush_task_jh,
         };
         let task_jh = tokio::spawn(async move { write_task.run().await });
@@ -152,9 +156,9 @@ impl<D: Delta> WriteCoordinatorTask<D> {
                 // Handle control messages (flush requests)
                 Some(ctl_msg) = self.ctl_rx.recv() => {
                     match ctl_msg {
-                        WriteCoordinatorCtlMsg::Flush(completion) => {
-                            self.flush();
-                            let _ = completion.send(());
+                        WriteCoordinatorCtlMsg::Flush{ epoch, result_tx } => {
+                            let flush_epoch = self.flush(epoch);
+                            let _ = result_tx.send(flush_epoch);
                         }
                     }
                 }
@@ -165,7 +169,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
 
                 // Periodic flush based on flush_interval
                 _ = flush_timer.tick() => {
-                    self.flush();
+                    self.flush(None);
                 }
 
 
@@ -184,13 +188,15 @@ impl<D: Delta> WriteCoordinatorTask<D> {
 
         // Apply the write to the current delta
         // Note: apply takes a Vec, so we wrap the single write
-        if let Err(_e) = self.current_delta.apply(vec![msg.write]) {
+        // TODO: don't burn an epoch if the write fails
+        if let Err(e) = self.current_delta.apply(vec![msg.write]) {
             // The epoch channel will be dropped which signals failure to the caller
+            let _ = msg.result_tx.send(Err(e));
             return;
         }
 
         // Send the epoch back to the caller
-        let _ = msg.epoch.send(epoch);
+        let _ = msg.result_tx.send(Ok(epoch));
 
         // Update the applied watermark
         self.watermarks.update_applied(epoch);
@@ -210,25 +216,28 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         }
     }
 
-    fn flush(&mut self) {
+    fn flush(&mut self, flush_epoch: Option<u64>) -> Option<u64> {
+        let flush_epoch = flush_epoch.unwrap_or(self.current_epoch);
+
         // Nothing to flush if no writes since last flush
-        if self.current_epoch == self.delta_start_epoch {
-            return;
+        if flush_epoch < self.delta_start_epoch {
+            return Some(flush_epoch);
         }
 
         if self.flush_pending() {
-            return;
+            return None;
         }
 
         let epoch_range_start = self.delta_start_epoch;
         let epoch_range_end = self.current_epoch;
+        assert!(epoch_range_start <= epoch_range_end);
 
         // Freeze the current delta to get an immutable snapshot and new image
         let (delta, new_image) = self.current_delta.freeze();
 
         // Replace the current delta with a fresh one initialized from the new image
         self.current_delta = D::init(new_image);
-        self.delta_start_epoch = epoch_range_end;
+        self.delta_start_epoch = self.current_epoch + 1;
 
         self.flush_tx
             .send(FlushTaskMsg::Flush {
@@ -239,6 +248,8 @@ impl<D: Delta> WriteCoordinatorTask<D> {
 
         // Update flushed watermark
         self.watermarks.update_flushed(epoch_range_end);
+
+        Some(epoch_range_end)
     }
 }
 
@@ -353,7 +364,7 @@ mod tests {
             }
         }
 
-        fn apply(&mut self, writes: Vec<Self::Write>) -> Result<()> {
+        fn apply(&mut self, writes: Vec<Self::Write>) -> Result<(), Arc<Error>> {
             self.writes.extend(writes);
             Ok(())
         }
@@ -467,7 +478,7 @@ mod tests {
         // when
         handle.write(10).await.unwrap().epoch().await.unwrap();
         handle.write(20).await.unwrap().epoch().await.unwrap();
-        handle.flush().await.unwrap();
+        handle.flush(None).await.unwrap();
 
         // Wait for flush task to process
         while flush_count.load(Ordering::SeqCst) < 1 {
@@ -528,7 +539,7 @@ mod tests {
         // when - first batch (await epoch to ensure write is processed)
         handle.write(1).await.unwrap().epoch().await.unwrap();
         handle.write(2).await.unwrap().epoch().await.unwrap();
-        handle.flush().await.unwrap();
+        handle.flush(None).await.unwrap();
 
         // Wait for flush to actually complete by polling the flush_count
         while flush_count.load(Ordering::SeqCst) < 1 {
@@ -538,7 +549,7 @@ mod tests {
         // when - second batch (await epoch to ensure write is processed)
         handle.write(3).await.unwrap().epoch().await.unwrap();
         handle.write(4).await.unwrap().epoch().await.unwrap();
-        handle.flush().await.unwrap();
+        handle.flush(None).await.unwrap();
 
         // Wait for second flush to complete
         while flush_count.load(Ordering::SeqCst) < 2 {
@@ -567,7 +578,7 @@ mod tests {
         let handle = coordinator.handle();
 
         // when - request flush without any writes
-        handle.flush().await.unwrap();
+        handle.flush(None).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // then
@@ -595,7 +606,7 @@ mod tests {
         assert_eq!(epoch, 1);
 
         // Flush and verify flushed watermark updates
-        handle.flush().await.unwrap();
+        handle.flush(None).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // The watchers should reflect the flushed epoch

@@ -19,7 +19,7 @@ pub trait Delta: Send + Clone + 'static {
     /// Initialize the delta with state from the image.
     fn init(image: Self::Image) -> Self;
     /// Apply writes to this delta.
-    fn apply(&mut self, writes: Vec<Self::Write>) -> Result<()>;
+    fn apply(&mut self, writes: Vec<Self::Write>) -> Result<(), Arc<Error>>;
     /// Estimate the memory size of this delta for backpressure.
     fn estimate_size(&self) -> usize;
     /// Extract state needed for the next delta's initialization.
@@ -68,7 +68,7 @@ impl FlushWatchers {
 
 /// Handle returned from a write operation for tracking durability.
 pub struct WriteHandle {
-    epoch: Shared<oneshot::Receiver<u64>>,
+    epoch: Shared<oneshot::Receiver<Result<u64, Arc<Error>>>>,
     watchers: FlushWatchers,
 }
 
@@ -76,18 +76,18 @@ impl WriteHandle {
     /// Returns the epoch assigned to this write. Epochs are assigned when the
     /// coordinator dequeues the write, so this method blocks until sequencing.
     /// Epochs are monotonically increasing and reflect the actual write order.
-    pub async fn epoch(&self) -> Result<u64> {
+    pub async fn epoch(&self) -> Result<u64, Arc<Error>> {
         Ok(self
             .epoch
             .clone()
             .await
-            .map_err(|_| Error::msg("coordinator dropped"))?)
+            .map_err(|_| Error::msg("coordinator dropped"))??)
     }
 
     /// Wait until the write reaches the specified durability level.
-    pub async fn wait(&self, durability: Durability) -> Result<()> {
+    pub async fn wait(&self, durability: Durability) -> Result<(), Arc<Error>> {
         let epoch = self.epoch().await?;
-        self.watchers.wait(epoch, durability).await
+        self.watchers.wait(epoch, durability).await.map_err(|e| Arc::new(e))
     }
 }
 
@@ -116,11 +116,15 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     /// Request a flush of all pending writes.
     ///
     /// Blocks until the flush is complete.
-    pub async fn flush(&self) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
+    pub async fn flush(&self, epoch: Option<u64>) -> Result<()> {
+        let (result_tx, result_rx) = oneshot::channel();
         self.ctl_tx
-            .send(WriteCoordinatorCtlMsg::Flush(tx))
+            .send(WriteCoordinatorCtlMsg::Flush{epoch, result_tx})
             .map_err(|_| Error::msg("coordinator dropped"))?;
-        rx.await.map_err(|_| Error::msg("coordinator dropped"))
+        let Some(epoch) = result_rx.await.map_err(|_| Error::msg("coordinator dropped"))? else {
+            return Err(Error::msg("flush already in progress"));
+        };
+        self.flush_watchers.wait(epoch, Durability::Durable).await?;
+        Ok(())
     }
 }
