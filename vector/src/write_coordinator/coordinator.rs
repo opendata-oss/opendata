@@ -1,7 +1,6 @@
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::watch::Ref;
+use std::time::{Duration};
 use tokio::time::{Interval, interval};
 
 use crate::write_coordinator::{Delta, FlushWatchers, Flusher, WriteCoordinatorHandle};
@@ -241,7 +240,6 @@ impl <D: Delta> WriteCoordinatorTask<D> {
     }
 }
 
-#[derive(Clone)]
 enum FlushTaskMsg<D: Delta> {
     None,
     Flush{
@@ -249,6 +247,20 @@ enum FlushTaskMsg<D: Delta> {
         epoch_range: RangeInclusive<u64>,
     },
     // Shutdown,
+}
+
+// Manual Clone impl because derive(Clone) would require D::ImmutableDelta: Clone,
+// but Arc::clone doesn't need the inner type to be Clone.
+impl<D: Delta> Clone for FlushTaskMsg<D> {
+    fn clone(&self) -> Self {
+        match self {
+            FlushTaskMsg::None => FlushTaskMsg::None,
+            FlushTaskMsg::Flush { delta, epoch_range } => FlushTaskMsg::Flush {
+                delta: Arc::clone(delta),
+                epoch_range: epoch_range.clone(),
+            },
+        }
+    }
 }
 
 struct FlushResult<D: Delta> {
@@ -274,19 +286,20 @@ impl <D: Delta> FlushTask<D> {
     async fn run(mut self) {
         let last_flushed = 0u64;
         loop {
-            let msg = self.rx.wait_for(|msg| {
-                match msg {
-                    FlushTaskMsg::None => false,
-                    FlushTaskMsg::Flush { delta, epoch_range } => {
-                        return *epoch_range.end() > last_flushed;
+            let (delta, epoch_range) = {
+                let msg = self.rx.wait_for(|msg| {
+                    match msg {
+                        FlushTaskMsg::None => false,
+                        FlushTaskMsg::Flush { delta, epoch_range } => {
+                            return *epoch_range.end() > last_flushed;
+                        }
                     }
-                }
-            }).await.expect("coordinator hung up");
-            let FlushTaskMsg::Flush { delta, epoch_range } = msg.clone() else {
-                panic!("unreachable");
+                }).await.expect("coordinator hung up");
+                let FlushTaskMsg::Flush { delta, epoch_range } = msg.clone() else {
+                    panic!("unreachable");
+                };
+                (delta.clone(), epoch_range)
             };
-            drop(msg);
-            let delta = delta.clone();
             self.flusher.flush(delta.as_ref()).await.expect("flush failed");
             self.tx.send(FlushResult {
                 delta,
