@@ -31,10 +31,12 @@ impl FlushWatermarks {
         }
     }
 
+    #[allow(dead_code)]
     fn applied(&self) -> u64 {
         *self.applied.borrow()
     }
 
+    #[allow(dead_code)]
     fn flushed(&self) -> u64 {
         *self.flushed.borrow()
     }
@@ -62,9 +64,20 @@ pub(crate) struct WriteCoordinatorWriteMsg<D: Delta> {
 }
 
 impl<D: Delta> WriteCoordinatorWriteMsg<D> {
-    pub(crate) fn new(write: D::Write) -> (Self, tokio::sync::oneshot::Receiver<Result<u64, Arc<Error>>>) {
+    pub(crate) fn new(
+        write: D::Write,
+    ) -> (
+        Self,
+        tokio::sync::oneshot::Receiver<Result<u64, Arc<Error>>>,
+    ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        (Self { write, result_tx: tx }, rx)
+        (
+            Self {
+                write,
+                result_tx: tx,
+            },
+            rx,
+        )
     }
 }
 
@@ -77,13 +90,14 @@ pub(crate) enum WriteCoordinatorCtlMsg {
     // TODO: add a Shutdown msg
 }
 
-struct WriteCoordinator<D: Delta> {
+pub struct WriteCoordinator<D: Delta> {
     handle: WriteCoordinatorHandle<D>,
+    #[allow(dead_code)]
     task_jh: tokio::task::JoinHandle<()>,
 }
 
 impl<D: Delta> WriteCoordinator<D> {
-    pub(crate) fn new(
+    pub fn new(
         image: D::Image,
         max_buffered_writes: usize,
         flush_interval: Duration,
@@ -119,7 +133,7 @@ impl<D: Delta> WriteCoordinator<D> {
         Self { handle, task_jh }
     }
 
-    pub(crate) fn handle(&self) -> WriteCoordinatorHandle<D> {
+    pub fn handle(&self) -> WriteCoordinatorHandle<D> {
         self.handle.clone()
     }
 }
@@ -136,6 +150,7 @@ struct WriteCoordinatorTask<D: Delta> {
     current_epoch: u64,
     /// Epoch at which the current delta started.
     delta_start_epoch: u64,
+    #[allow(dead_code)]
     flush_task_jh: tokio::task::JoinHandle<()>,
 }
 
@@ -277,6 +292,7 @@ impl<D: Delta> Clone for FlushTaskMsg<D> {
 }
 
 struct FlushResult<D: Delta> {
+    #[allow(dead_code)]
     delta: Arc<D::ImmutableDelta>,
     epoch_range: RangeInclusive<u64>,
 }

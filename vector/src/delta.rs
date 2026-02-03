@@ -10,398 +10,218 @@
 //! - ID dictionary lookups happen at flush time, not during write
 //! - No ID allocation during write() - deferred to flush time
 //! - Later writes to the same external_id override earlier ones
+//!
+//! ## WriteCoordinator Integration
+//!
+//! The `VectorDbWriteDelta` implements the `Delta` trait for use with the
+//! WriteCoordinator. Async operations (ID lookup, allocation, centroid
+//! assignment) are performed by VectorDb::write() before sending to the
+//! coordinator. The delta receives `PreparedVectorWrite` instances with
+//! all necessary IDs pre-computed.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Error, Result};
+use async_trait::async_trait;
+use common::storage::{RecordOp, Storage, StorageRead, StorageSnapshot};
+use roaring::RoaringTreemap;
+use tokio::sync::RwLock;
 
-use crate::model::{AttributeValue, Config, VECTOR_FIELD_NAME, Vector, attributes_to_map};
+use crate::model::AttributeValue;
+use crate::serde::posting_list::PostingUpdate;
+use crate::storage::VectorDbStorageExt;
+use crate::write_coordinator::{Delta, Flusher};
 
-/// Builder for accumulating vector writes into a delta.
+// ============================================================================
+// WriteCoordinator Integration Types
+// ============================================================================
+
+/// A fully-prepared vector write ready for the coordinator.
 ///
-/// This builder validates vectors against the schema but does NOT allocate
-/// internal IDs. ID allocation happens atomically during flush.
-pub(crate) struct VectorDbDeltaBuilder<'a> {
-    config: &'a Config,
-    pending_vectors: HashMap<String, PendingVector>,
-}
-
-/// A pending vector write buffered in memory.
+/// All async operations (ID lookup, allocation, centroid assignment)
+/// are done before this struct is created. The delta can then process
+/// these writes synchronously.
 #[derive(Debug, Clone)]
-pub(crate) struct PendingVector {
-    external_id: String,
-    values: Vec<f32>,
-    metadata: HashMap<String, AttributeValue>,
+pub struct PreparedVectorWrite {
+    /// User-provided external ID.
+    pub external_id: String,
+    /// Newly allocated internal ID for this vector.
+    pub new_internal_id: u64,
+    /// Previous internal ID if this is an upsert (looked up from ID dictionary).
+    pub old_internal_id: Option<u64>,
+    /// Centroid this vector is assigned to (via HNSW search).
+    pub centroid_id: u32,
+    /// Vector embedding values.
+    pub values: Vec<f32>,
+    /// All attributes including the vector field.
+    pub attributes: Vec<(String, AttributeValue)>,
 }
 
-impl<'a> VectorDbDeltaBuilder<'a> {
-    /// Creates a new delta builder.
-    pub(crate) fn new(config: &'a Config) -> Self {
-        Self {
-            config,
-            pending_vectors: HashMap::new(),
-        }
-    }
-
-    /// Writes a vector to the delta after validation.
-    ///
-    /// This validates:
-    /// - "vector" attribute exists and has type Vector
-    /// - Vector dimensions match config
-    /// - Attributes match schema (if schema is defined)
-    ///
-    /// Does NOT allocate internal IDs - that happens during flush.
-    pub(crate) async fn write(&mut self, vector: Vector) -> Result<()> {
-        // Validate external ID length
-        if vector.id.len() > 64 {
-            return Err(anyhow::anyhow!(
-                "External ID too long: {} bytes (max 64)",
-                vector.id.len()
-            ));
-        }
-
-        // Convert attributes to map for easier validation and storage
-        let attributes = attributes_to_map(&vector.attributes);
-
-        // Extract and validate "vector" attribute
-        let values = match attributes.get(VECTOR_FIELD_NAME) {
-            Some(AttributeValue::Vector(v)) => v.clone(),
-            Some(_) => {
-                return Err(anyhow::anyhow!(
-                    "Field '{}' must have type Vector",
-                    VECTOR_FIELD_NAME
-                ));
-            }
-            None => {
-                return Err(anyhow::anyhow!(
-                    "Missing required field '{}'",
-                    VECTOR_FIELD_NAME
-                ));
-            }
-        };
-
-        // Validate dimensions
-        if values.len() != self.config.dimensions as usize {
-            return Err(anyhow::anyhow!(
-                "Vector dimension mismatch: expected {}, got {}",
-                self.config.dimensions,
-                values.len()
-            ));
-        }
-
-        // Validate attributes against schema (if schema is defined)
-        if !self.config.metadata_fields.is_empty() {
-            self.validate_attributes(&attributes)?;
-        }
-
-        // Store in pending vectors (keyed by external_id)
-        // If the same external_id is written multiple times in this delta,
-        // the later write overwrites the earlier one
-        self.pending_vectors.insert(
-            vector.id.clone(),
-            PendingVector {
-                external_id: vector.id,
-                values,
-                metadata: attributes,
-            },
-        );
-
-        Ok(())
-    }
-
-    /// Validates attributes against the configured schema.
-    ///
-    /// The "vector" field is a special field that doesn't need to be in the schema.
-    fn validate_attributes(&self, metadata: &HashMap<String, AttributeValue>) -> Result<()> {
-        // Build a map of field name -> expected type for quick lookup
-        let schema: HashMap<&str, crate::serde::FieldType> = self
-            .config
-            .metadata_fields
-            .iter()
-            .map(|spec| (spec.name.as_str(), spec.field_type))
-            .collect();
-
-        // Check each provided attribute (skip VECTOR_FIELD_NAME which is always allowed)
-        for (field_name, value) in metadata {
-            // Skip the special "vector" field
-            if field_name == VECTOR_FIELD_NAME {
-                continue;
-            }
-
-            match schema.get(field_name.as_str()) {
-                Some(expected_type) => {
-                    // Validate type matches
-                    let actual_type = match value {
-                        AttributeValue::String(_) => crate::serde::FieldType::String,
-                        AttributeValue::Int64(_) => crate::serde::FieldType::Int64,
-                        AttributeValue::Float64(_) => crate::serde::FieldType::Float64,
-                        AttributeValue::Bool(_) => crate::serde::FieldType::Bool,
-                        AttributeValue::Vector(_) => crate::serde::FieldType::Vector,
-                    };
-
-                    if actual_type != *expected_type {
-                        return Err(anyhow::anyhow!(
-                            "Type mismatch for field '{}': expected {:?}, got {:?}",
-                            field_name,
-                            expected_type,
-                            actual_type
-                        ));
-                    }
-                }
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "Unknown metadata field: '{}'. Valid fields: {:?}",
-                        field_name,
-                        schema.keys().collect::<Vec<_>>()
-                    ));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Builds the final delta from accumulated writes.
-    pub(crate) fn build(self) -> VectorDbDelta {
-        VectorDbDelta {
-            vectors: self.pending_vectors,
-        }
-    }
-}
-
-/// A delta containing pending vector writes.
+/// Image containing state needed to initialize a new delta.
 ///
-/// Vectors are keyed by external_id. Internal ID allocation happens
-/// during flush, not during delta construction.
-#[derive(Debug)]
-pub(crate) struct VectorDbDelta {
-    /// Pending vectors keyed by external_id.
-    pub(crate) vectors: HashMap<String, PendingVector>,
+/// This is passed to `Delta::init()` when creating a fresh delta.
+#[derive(Clone)]
+pub struct VectorDbImage {
+    /// Storage for building RecordOps (used by VectorDbStorageExt trait methods).
+    pub storage: Arc<dyn Storage>,
+    /// Vector dimensions for encoding.
+    pub dimensions: usize,
 }
 
-impl VectorDbDelta {
-    /// Creates an empty delta.
-    pub(crate) fn empty() -> Self {
+/// Immutable delta containing all RecordOps ready to be flushed.
+///
+/// This is the result of `Delta::freeze()` and contains the finalized
+/// operations to apply atomically to storage.
+pub struct VectorDbImmutableDelta {
+    /// All RecordOps accumulated and finalized from the delta.
+    pub ops: Vec<RecordOp>,
+}
+
+/// Mutable delta that accumulates writes and builds RecordOps.
+///
+/// Implements the `Delta` trait for use with WriteCoordinator.
+#[derive(Clone)]
+pub struct VectorDbWriteDelta {
+    /// Storage reference for building RecordOps.
+    storage: Arc<dyn Storage>,
+    /// Vector dimensions for encoding.
+    dimensions: usize,
+    /// Accumulated RecordOps (ID dictionary, vector data).
+    ops: Vec<RecordOp>,
+    /// Posting list updates grouped by centroid (merged in freeze).
+    posting_updates: HashMap<u32, Vec<PostingUpdate>>,
+    /// Deleted vector IDs (merged in freeze).
+    deleted_vectors: RoaringTreemap,
+}
+
+impl Delta for VectorDbWriteDelta {
+    type Image = VectorDbImage;
+    type Write = PreparedVectorWrite;
+    type ImmutableDelta = VectorDbImmutableDelta;
+
+    fn init(image: Self::Image) -> Self {
         Self {
-            vectors: HashMap::new(),
+            storage: image.storage,
+            dimensions: image.dimensions,
+            ops: Vec::new(),
+            posting_updates: HashMap::new(),
+            deleted_vectors: RoaringTreemap::new(),
         }
     }
 
-    /// Checks if the delta has no pending writes.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.vectors.is_empty()
-    }
+    fn apply(&mut self, writes: Vec<Self::Write>) -> Result<(), Arc<Error>> {
+        for write in writes {
+            // Build ops synchronously from prepared data
 
-    /// Merges another delta into this one.
-    ///
-    /// For vectors with the same external_id, the incoming delta's
-    /// vector overwrites this delta's vector (later writes win).
-    pub(crate) fn merge(&mut self, other: VectorDbDelta) {
-        for (external_id, vector) in other.vectors {
-            self.vectors.insert(external_id, vector);
+            // 1. Update IdDictionary
+            if write.old_internal_id.is_some() {
+                self.ops.push(
+                    self.storage
+                        .delete_id_dictionary(&write.external_id)
+                        .map_err(Arc::new)?,
+                );
+            }
+            self.ops.push(
+                self.storage
+                    .put_id_dictionary(&write.external_id, write.new_internal_id)
+                    .map_err(Arc::new)?,
+            );
+
+            // 2. Handle old vector deletion (if upsert)
+            if let Some(old_id) = write.old_internal_id {
+                self.deleted_vectors.insert(old_id);
+                self.ops.push(
+                    self.storage
+                        .delete_vector_data(old_id)
+                        .map_err(Arc::new)?,
+                );
+            }
+
+            // 3. Write new vector data
+            self.ops.push(
+                self.storage
+                    .put_vector_data(write.new_internal_id, &write.external_id, &write.attributes)
+                    .map_err(Arc::new)?,
+            );
+
+            // 4. Accumulate posting list update
+            self.posting_updates
+                .entry(write.centroid_id)
+                .or_default()
+                .push(PostingUpdate::append(write.new_internal_id, write.values));
         }
+        Ok(())
+    }
+
+    fn estimate_size(&self) -> usize {
+        // Rough estimate: 100 bytes per op, 50 bytes per posting update, 8 bytes per deletion
+        self.ops.len() * 100
+            + self
+                .posting_updates
+                .values()
+                .map(|v| v.len())
+                .sum::<usize>()
+                * 50
+            + self.deleted_vectors.len() as usize * 8
+    }
+
+    fn freeze(&self) -> (Self::ImmutableDelta, Self::Image) {
+        let mut ops = self.ops.clone();
+
+        // Finalize posting list merges
+        for (centroid_id, updates) in &self.posting_updates {
+            if let Ok(op) = self
+                .storage
+                .merge_posting_list(*centroid_id, updates.clone())
+            {
+                ops.push(op);
+            }
+        }
+
+        // Finalize deleted vectors merge
+        if !self.deleted_vectors.is_empty()
+            && let Ok(op) = self
+                .storage
+                .merge_deleted_vectors(self.deleted_vectors.clone())
+        {
+            ops.push(op);
+        }
+
+        (
+            VectorDbImmutableDelta { ops },
+            VectorDbImage {
+                storage: Arc::clone(&self.storage),
+                dimensions: self.dimensions,
+            },
+        )
     }
 }
 
-// Expose PendingVector for use in db.rs during flush
-impl PendingVector {
-    pub(crate) fn external_id(&self) -> &str {
-        &self.external_id
-    }
-
-    pub(crate) fn values(&self) -> &[f32] {
-        &self.values
-    }
-
-    pub(crate) fn attributes(&self) -> &HashMap<String, AttributeValue> {
-        &self.metadata
-    }
+/// Flusher implementation for VectorDb.
+///
+/// Applies the accumulated RecordOps to storage atomically and updates
+/// the shared snapshot for queries.
+pub struct VectorDbFlusher {
+    /// Storage backend.
+    pub storage: Arc<dyn Storage>,
+    /// Shared snapshot for queries (updated after each flush).
+    pub snapshot: Arc<RwLock<Arc<dyn StorageSnapshot>>>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::{MetadataFieldSpec, Vector};
-    use crate::serde::FieldType;
-    use crate::serde::collection_meta::DistanceMetric;
-    use common::StorageConfig;
-    use std::time::Duration;
+#[async_trait]
+impl Flusher<VectorDbWriteDelta> for VectorDbFlusher {
+    async fn flush(&self, delta: &VectorDbImmutableDelta) -> Result<Arc<dyn StorageRead>> {
+        // Apply all ops atomically
+        self.storage.apply(delta.ops.clone()).await?;
 
-    async fn create_test_builder() -> VectorDbDeltaBuilder<'static> {
-        let config = Config {
-            storage: StorageConfig::InMemory,
-            dimensions: 3,
-            distance_metric: DistanceMetric::Cosine,
-            flush_interval: Duration::from_secs(60),
-            metadata_fields: vec![
-                MetadataFieldSpec::new("category", FieldType::String, true),
-                MetadataFieldSpec::new("price", FieldType::Int64, true),
-            ],
-        };
+        // Get new snapshot
+        let snapshot = self.storage.snapshot().await?;
 
-        // Leak to get 'static lifetime for test
-        let config_static = Box::leak(Box::new(config));
+        // Update shared snapshot
+        *self.snapshot.write().await = Arc::clone(&snapshot);
 
-        VectorDbDeltaBuilder::new(config_static)
-    }
-
-    #[tokio::test]
-    async fn should_write_valid_vector_to_delta() {
-        // given
-        let mut builder = create_test_builder().await;
-        let vector = Vector::builder("vec-1", vec![1.0, 2.0, 3.0])
-            .attribute("category", "shoes")
-            .attribute("price", 99i64)
-            .build();
-
-        // when
-        let result = builder.write(vector).await;
-
-        // then
-        assert!(result.is_ok());
-        let delta = builder.build();
-        assert_eq!(delta.vectors.len(), 1);
-        assert!(delta.vectors.contains_key("vec-1"));
-    }
-
-    #[tokio::test]
-    async fn should_reject_vector_with_wrong_dimensions() {
-        // given
-        let mut builder = create_test_builder().await;
-        let vector = Vector::new("vec-1", vec![1.0, 2.0]); // Wrong: 2 instead of 3
-
-        // when
-        let result = builder.write(vector).await;
-
-        // then
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("dimension mismatch")
-        );
-    }
-
-    #[tokio::test]
-    async fn should_reject_vector_with_unknown_field() {
-        // given
-        let mut builder = create_test_builder().await;
-        let vector = Vector::builder("vec-1", vec![1.0, 2.0, 3.0])
-            .attribute("unknown_field", "value")
-            .build();
-
-        // when
-        let result = builder.write(vector).await;
-
-        // then
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unknown metadata"));
-    }
-
-    #[tokio::test]
-    async fn should_reject_vector_with_wrong_type() {
-        // given
-        let mut builder = create_test_builder().await;
-        let vector = Vector::builder("vec-1", vec![1.0, 2.0, 3.0])
-            .attribute("price", "not a number") // Wrong: should be i64
-            .build();
-
-        // when
-        let result = builder.write(vector).await;
-
-        // then
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Type mismatch"));
-    }
-
-    #[tokio::test]
-    async fn should_override_earlier_write_with_same_id() {
-        // given
-        let mut builder = create_test_builder().await;
-        let vector1 = Vector::builder("vec-1", vec![1.0, 2.0, 3.0])
-            .attribute("category", "shoes")
-            .attribute("price", 99i64)
-            .build();
-        let vector2 = Vector::builder("vec-1", vec![4.0, 5.0, 6.0])
-            .attribute("category", "boots")
-            .attribute("price", 199i64)
-            .build();
-
-        // when
-        builder.write(vector1).await.unwrap();
-        builder.write(vector2).await.unwrap();
-        let delta = builder.build();
-
-        // then
-        assert_eq!(delta.vectors.len(), 1);
-        let pending = delta.vectors.get("vec-1").unwrap();
-        assert_eq!(pending.values(), &[4.0, 5.0, 6.0]);
-    }
-
-    #[tokio::test]
-    async fn should_merge_deltas() {
-        // given
-        let mut delta1 = VectorDbDelta::empty();
-        delta1.vectors.insert(
-            "vec-1".to_string(),
-            PendingVector {
-                external_id: "vec-1".to_string(),
-                values: vec![1.0, 2.0, 3.0],
-                metadata: HashMap::new(),
-            },
-        );
-
-        let mut delta2 = VectorDbDelta::empty();
-        delta2.vectors.insert(
-            "vec-2".to_string(),
-            PendingVector {
-                external_id: "vec-2".to_string(),
-                values: vec![4.0, 5.0, 6.0],
-                metadata: HashMap::new(),
-            },
-        );
-
-        // when
-        delta1.merge(delta2);
-
-        // then
-        assert_eq!(delta1.vectors.len(), 2);
-        assert!(delta1.vectors.contains_key("vec-1"));
-        assert!(delta1.vectors.contains_key("vec-2"));
-    }
-
-    #[tokio::test]
-    async fn should_check_if_delta_is_empty() {
-        // given
-        let empty = VectorDbDelta::empty();
-        let mut non_empty = VectorDbDelta::empty();
-        non_empty.vectors.insert(
-            "vec-1".to_string(),
-            PendingVector {
-                external_id: "vec-1".to_string(),
-                values: vec![1.0, 2.0, 3.0],
-                metadata: HashMap::new(),
-            },
-        );
-
-        // then
-        assert!(empty.is_empty());
-        assert!(!non_empty.is_empty());
-    }
-
-    #[tokio::test]
-    async fn should_reject_external_id_too_long() {
-        // given
-        let mut builder = create_test_builder().await;
-        let long_id = "a".repeat(65); // 65 bytes, exceeds max of 64
-        let vector = Vector::new(long_id, vec![1.0, 2.0, 3.0]);
-
-        // when
-        let result = builder.write(vector).await;
-
-        // then
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("too long"));
+        // StorageSnapshot extends StorageRead, so we can return it directly
+        Ok(snapshot)
     }
 }

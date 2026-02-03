@@ -2,35 +2,38 @@
 //!
 //! This module provides the main `VectorDb` struct that handles:
 //! - Vector ingestion with validation
-//! - In-memory delta buffering
+//! - In-memory delta buffering via WriteCoordinator
 //! - Atomic flush with ID allocation
 //! - Snapshot management for consistency
 //!
-//! The implementation follows the MiniTsdb pattern from the timeseries module,
-//! adapted for vector data with external ID tracking and atomic upsert semantics.
+//! The implementation uses the WriteCoordinator pattern for write path:
+//! - Validation and ID allocation happen in write()
+//! - Delta accumulates RecordOps synchronously
+//! - Flusher applies ops atomically to storage
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use anyhow::{Context, Result};
 use common::sequence::{SeqBlockStore, SequenceAllocator};
 use common::storage::factory::create_storage;
-use common::storage::{Storage, StorageRead};
-use roaring::RoaringTreemap;
-use tokio::sync::{Mutex, RwLock};
+use common::storage::{Storage, StorageRead, StorageSnapshot};
+use tokio::sync::RwLock;
 
 use crate::storage::merge_operator::VectorDbMergeOperator;
 
 use std::collections::HashMap;
 
-use crate::delta::{VectorDbDelta, VectorDbDeltaBuilder};
+use crate::delta::{PreparedVectorWrite, VectorDbFlusher, VectorDbImage, VectorDbWriteDelta};
 use crate::distance;
 use crate::hnsw::{CentroidGraph, build_centroid_graph};
-use crate::model::{AttributeValue, Config, SearchResult, Vector};
+use crate::model::{
+    AttributeValue, Config, SearchResult, VECTOR_FIELD_NAME, Vector, attributes_to_map,
+};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::key::SeqBlockKey;
-use crate::serde::posting_list::{PostingList, PostingUpdate};
+use crate::serde::posting_list::PostingList;
 use crate::storage::{VectorDbStorageExt, VectorDbStorageReadExt};
+use crate::write_coordinator::{WriteCoordinator, WriteCoordinatorHandle};
 
 /// Vector database for storing and querying embedding vectors.
 ///
@@ -42,16 +45,16 @@ pub struct VectorDb {
     storage: Arc<dyn Storage>,
     id_allocator: Arc<SequenceAllocator>,
 
-    /// Pending delta accumulating ingested data not yet flushed to storage.
-    pending_delta: Mutex<VectorDbDelta>,
-    /// Receiver for waiting for updates to pending delta
-    pending_delta_watch_rx: tokio::sync::watch::Receiver<Instant>,
-    /// Sender for updating the pending delta when flushing.
-    pending_delta_watch_tx: tokio::sync::watch::Sender<Instant>,
-    /// Storage snapshot used for queries.
-    snapshot: RwLock<Arc<dyn StorageRead>>,
-    /// Mutex to ensure only one flush operation can run at a time.
-    flush_mutex: Arc<Mutex<()>>,
+    /// Handle to the WriteCoordinator for submitting writes.
+    write_coordinator_handle: WriteCoordinatorHandle<VectorDbWriteDelta>,
+
+    /// Storage snapshot used for queries (updated by flusher).
+    snapshot: Arc<RwLock<Arc<dyn StorageSnapshot>>>,
+
+    /// The WriteCoordinator itself (stored to keep it alive).
+    #[allow(dead_code)]
+    write_coordinator: WriteCoordinator<VectorDbWriteDelta>,
+
     /// In-memory HNSW graph for centroid search (loaded lazily).
     centroid_graph: RwLock<Option<Box<dyn CentroidGraph>>>,
 }
@@ -86,20 +89,38 @@ impl VectorDb {
         id_allocator.initialize().await?;
 
         // Get initial snapshot
-        let snapshot = storage.snapshot().await?;
+        let initial_snapshot = storage.snapshot().await?;
+        let snapshot = Arc::new(RwLock::new(initial_snapshot));
 
-        // Create watch channel for pending delta backpressure
-        let (tx, rx) = tokio::sync::watch::channel(Instant::now());
+        // Create flusher for the WriteCoordinator
+        let flusher = VectorDbFlusher {
+            storage: Arc::clone(&storage),
+            snapshot: Arc::clone(&snapshot),
+        };
+
+        // Create initial image for the delta
+        let image = VectorDbImage {
+            storage: Arc::clone(&storage),
+            dimensions: config.dimensions as usize,
+        };
+
+        // Create WriteCoordinator
+        let write_coordinator = WriteCoordinator::<VectorDbWriteDelta>::new(
+            image,
+            1000, // max_buffered_writes
+            config.flush_interval,
+            Box::new(flusher),
+        );
+
+        let write_coordinator_handle = write_coordinator.handle();
 
         Ok(Self {
             config,
             storage,
             id_allocator,
-            pending_delta: Mutex::new(VectorDbDelta::empty()),
-            pending_delta_watch_tx: tx,
-            pending_delta_watch_rx: rx,
-            snapshot: RwLock::new(snapshot),
-            flush_mutex: Arc::new(Mutex::new(())),
+            write_coordinator_handle,
+            snapshot,
+            write_coordinator,
             centroid_graph: RwLock::new(None),
         })
     }
@@ -130,25 +151,135 @@ impl VectorDb {
     /// - Attribute names must be defined in `Config::metadata_fields` (if specified)
     /// - Attribute types must match the schema
     pub async fn write(&self, vectors: Vec<Vector>) -> Result<()> {
-        // Block until the pending delta is young enough (not older than 2 * flush_interval)
-        let max_age = self.config.flush_interval * 2;
-        let mut receiver = self.pending_delta_watch_rx.clone();
-        receiver
-            .wait_for(|t| t.elapsed() <= max_age)
-            .await
-            .context("pending delta watch_rx disconnected")?;
-
-        // Build delta from vectors
-        let mut builder = VectorDbDeltaBuilder::new(&self.config);
+        // Validate and prepare each vector, then send to coordinator
         for vector in vectors {
-            builder.write(vector).await?;
-        }
-        let delta = builder.build();
+            let prepared = self.prepare_vector_write(vector).await?;
 
-        // Merge into pending delta
-        {
-            let mut pending = self.pending_delta.lock().await;
-            pending.merge(delta);
+            // Send to coordinator and wait for epoch (ensures write is processed)
+            let write_handle = self.write_coordinator_handle.write(prepared).await?;
+            write_handle
+                .epoch()
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+        }
+
+        Ok(())
+    }
+
+    /// Validate and prepare a vector write for the coordinator.
+    ///
+    /// This performs all async operations (ID lookup, allocation, centroid
+    /// assignment) so the delta can process the write synchronously.
+    async fn prepare_vector_write(&self, vector: Vector) -> Result<PreparedVectorWrite> {
+        // Validate external ID length
+        if vector.id.len() > 64 {
+            return Err(anyhow::anyhow!(
+                "External ID too long: {} bytes (max 64)",
+                vector.id.len()
+            ));
+        }
+
+        // Convert attributes to map for validation
+        let attributes = attributes_to_map(&vector.attributes);
+
+        // Extract and validate "vector" attribute
+        let values = match attributes.get(VECTOR_FIELD_NAME) {
+            Some(AttributeValue::Vector(v)) => v.clone(),
+            Some(_) => {
+                return Err(anyhow::anyhow!(
+                    "Field '{}' must have type Vector",
+                    VECTOR_FIELD_NAME
+                ));
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Missing required field '{}'",
+                    VECTOR_FIELD_NAME
+                ));
+            }
+        };
+
+        // Validate dimensions
+        if values.len() != self.config.dimensions as usize {
+            return Err(anyhow::anyhow!(
+                "Vector dimension mismatch: expected {}, got {}",
+                self.config.dimensions,
+                values.len()
+            ));
+        }
+
+        // Validate attributes against schema (if schema is defined)
+        if !self.config.metadata_fields.is_empty() {
+            self.validate_attributes(&attributes)?;
+        }
+
+        // Async: Lookup old internal ID
+        let old_internal_id = self.storage.lookup_internal_id(&vector.id).await?;
+
+        // Async: Allocate new internal ID
+        let new_internal_id = self.id_allocator.allocate_one().await?;
+
+        // Sync: Assign to centroid
+        let centroid_id = self.assign_to_centroid(&values).await?;
+
+        // Convert attributes to vec of tuples for PreparedVectorWrite
+        let attributes_vec: Vec<(String, AttributeValue)> = attributes.into_iter().collect();
+
+        Ok(PreparedVectorWrite {
+            external_id: vector.id,
+            new_internal_id,
+            old_internal_id,
+            centroid_id,
+            values,
+            attributes: attributes_vec,
+        })
+    }
+
+    /// Validates attributes against the configured schema.
+    fn validate_attributes(&self, metadata: &HashMap<String, AttributeValue>) -> Result<()> {
+        // Build a map of field name -> expected type for quick lookup
+        let schema: HashMap<&str, crate::serde::FieldType> = self
+            .config
+            .metadata_fields
+            .iter()
+            .map(|spec| (spec.name.as_str(), spec.field_type))
+            .collect();
+
+        // Check each provided attribute (skip VECTOR_FIELD_NAME which is always allowed)
+        for (field_name, value) in metadata {
+            // Skip the special "vector" field
+            if field_name == VECTOR_FIELD_NAME {
+                continue;
+            }
+
+            match schema.get(field_name.as_str()) {
+                Some(expected_type) => {
+                    // Validate type matches
+                    let actual_type = match value {
+                        AttributeValue::String(_) => crate::serde::FieldType::String,
+                        AttributeValue::Int64(_) => crate::serde::FieldType::Int64,
+                        AttributeValue::Float64(_) => crate::serde::FieldType::Float64,
+                        AttributeValue::Bool(_) => crate::serde::FieldType::Bool,
+                        AttributeValue::Vector(_) => crate::serde::FieldType::Vector,
+                    };
+
+                    if actual_type != *expected_type {
+                        return Err(anyhow::anyhow!(
+                            "Type mismatch for field '{}': expected {:?}, got {:?}",
+                            field_name,
+                            expected_type,
+                            actual_type
+                        ));
+                    }
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "Unknown metadata field: '{}'. Valid fields: {:?}",
+                        field_name,
+                        schema.keys().collect::<Vec<_>>()
+                    ));
+                }
+            }
         }
 
         Ok(())
@@ -162,109 +293,14 @@ impl VectorDb {
     /// # Atomic Flush
     ///
     /// The flush operation is atomic:
-    /// 1. Lookup old internal IDs from storage (if they exist)
-    /// 2. Allocate new internal IDs from sequence allocator
-    /// 3. Build all RecordOps (ID dictionary updates, deletes, new records)
-    /// 4. Apply everything in one atomic batch via `storage.apply()`
+    /// 1. All pending writes are frozen into an immutable delta
+    /// 2. RecordOps are applied in one batch via `storage.apply()`
+    /// 3. The snapshot is updated for queries
     ///
     /// This ensures ID dictionary updates, deletes, and new records are all
     /// applied together, maintaining consistency.
     pub async fn flush(&self) -> Result<()> {
-        let _flush_guard = self.flush_mutex.lock().await;
-
-        // Take the pending delta (replace with empty)
-        let (delta, created_at) = {
-            let mut pending = self.pending_delta.lock().await;
-            if pending.is_empty() {
-                return Ok(());
-            }
-            let delta = std::mem::replace(&mut *pending, VectorDbDelta::empty());
-            (delta, Instant::now())
-        };
-
-        // Notify any waiting writers
-        self.pending_delta_watch_tx.send_if_modified(|current| {
-            if created_at > *current {
-                *current = created_at;
-                true
-            } else {
-                false
-            }
-        });
-
-        // Build RecordOps atomically
-        let mut ops = Vec::new();
-
-        // Batch posting list updates (collect all updates per centroid)
-        let mut posting_updates: HashMap<u32, Vec<PostingUpdate>> = HashMap::new();
-        let mut deleted_vectors = RoaringTreemap::new();
-
-        for (external_id, pending_vec) in delta.vectors {
-            // 1. Lookup old internal_id (if exists) from ID dictionary
-            let old_internal_id = self.storage.lookup_internal_id(&external_id).await?;
-
-            // 2. Allocate new internal_id
-            let new_internal_id = self.id_allocator.allocate_one().await?;
-
-            // 3. Update IdDictionary
-            if old_internal_id.is_some() {
-                ops.push(self.storage.delete_id_dictionary(&external_id)?);
-            }
-            ops.push(
-                self.storage
-                    .put_id_dictionary(&external_id, new_internal_id)?,
-            );
-
-            // 4. Handle old vector deletion (if upsert)
-            if let Some(old_id) = old_internal_id {
-                // Add to deleted bitmap for batch merge later
-                deleted_vectors.insert(old_id);
-
-                // Tombstone old vector data record
-                ops.push(self.storage.delete_vector_data(old_id)?);
-            }
-
-            // 5. Write new vector data (includes external_id, vector, and metadata)
-            let attributes: Vec<_> = pending_vec
-                .attributes()
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect();
-            ops.push(self.storage.put_vector_data(
-                new_internal_id,
-                pending_vec.external_id(),
-                &attributes,
-            )?);
-
-            // 6. Assign vector to nearest centroid using HNSW
-            let centroid_id = self.assign_to_centroid(pending_vec.values()).await?;
-            posting_updates
-                .entry(centroid_id)
-                .or_default()
-                .push(PostingUpdate::append(
-                    new_internal_id,
-                    pending_vec.values().to_vec(),
-                ));
-        }
-
-        // Serialize and merge batched posting lists
-        if !deleted_vectors.is_empty() {
-            ops.push(self.storage.merge_deleted_vectors(deleted_vectors)?);
-        }
-
-        for (centroid_id, updates) in posting_updates {
-            ops.push(self.storage.merge_posting_list(centroid_id, updates)?);
-        }
-
-        // ATOMIC: Apply all operations in one batch
-        self.storage.apply(ops).await?;
-
-        // Update snapshot for queries
-        let new_snapshot = self.storage.snapshot().await?;
-        let mut snapshot_guard = self.snapshot.write().await;
-        *snapshot_guard = new_snapshot;
-
-        Ok(())
+        self.write_coordinator_handle.flush(None).await
     }
 
     /// Bootstrap centroids from vectors (for testing).
