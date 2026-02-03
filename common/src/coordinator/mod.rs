@@ -258,13 +258,13 @@ impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StorageRead;
     use crate::coordinator::Durability;
+    use crate::storage::in_memory::InMemoryStorage;
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::ops::Range;
     use std::sync::Mutex;
-    use crate::storage::in_memory::InMemoryStorage;
-    use crate::StorageRead;
     // ============================================================================
     // Test Infrastructure
     // ============================================================================
@@ -374,7 +374,10 @@ mod tests {
 
     #[async_trait]
     impl Flusher<TestDelta> for TestFlusher {
-        async fn flush(&self, event: FlushEvent<TestDelta>) -> Result<Arc<dyn StorageRead>, String> {
+        async fn flush(
+            &self,
+            event: FlushEvent<TestDelta>,
+        ) -> Result<Arc<dyn StorageRead>, String> {
             // Signal that flush has started
             let flush_started_tx = {
                 let mut state = self.state.lock().unwrap();
@@ -398,7 +401,7 @@ mod tests {
                 let mut state = self.state.lock().unwrap();
                 state.flushed_events.push((event.delta, event.epoch_range));
             }
-            
+
             // not used in the tests
             Ok(Arc::new(InMemoryStorage::default()))
         }

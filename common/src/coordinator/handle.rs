@@ -51,7 +51,9 @@ impl WriteHandle {
             Durability::Durable => &mut self.watchers.durable_rx,
         };
 
-        recv.wait_for(|curr| *curr >= epoch).await.map_err(|_| WriteError::Shutdown);
+        recv.wait_for(|curr| *curr >= epoch)
+            .await
+            .map_err(|_| WriteError::Shutdown);
         Ok(())
     }
 }
