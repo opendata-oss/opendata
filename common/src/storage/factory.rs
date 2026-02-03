@@ -85,22 +85,15 @@ impl StorageRuntime {
 ///     .with_merge_operator(Arc::new(TimeSeriesMergeOperator));
 /// let storage = create_storage(&config, runtime, semantics).await?;
 /// ```
+#[derive(Default)]
 pub struct StorageSemantics {
     pub(crate) merge_operator: Option<Arc<dyn MergeOperator>>,
-}
-
-impl Default for StorageSemantics {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl StorageSemantics {
     /// Creates new storage semantics with default values.
     pub fn new() -> Self {
-        Self {
-            merge_operator: None,
-        }
+        Self::default()
     }
 
     /// Sets the merge operator for merge operations.

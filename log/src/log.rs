@@ -111,33 +111,7 @@ impl LogDb {
     /// let log = LogDb::open(test_config()).await?;
     /// ```
     pub async fn open(config: crate::config::Config) -> crate::error::Result<Self> {
-        let storage = create_storage(
-            &config.storage,
-            StorageRuntime::new(),
-            StorageSemantics::new(),
-        )
-        .await
-        .map_err(|e| Error::Storage(e.to_string()))?;
-        let log_storage = LogStorage::new(storage);
-
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-
-        let log_storage_read = log_storage.as_read();
-        let sequence_allocator = SequenceAllocator::open(&log_storage_read).await?;
-        let segment_cache = SegmentCache::open(&log_storage_read, config.segmentation).await?;
-        let listing_cache = ListingCache::new();
-
-        let inner = LogInner {
-            sequence_allocator,
-            segment_cache,
-            listing_cache,
-        };
-
-        Ok(Self {
-            storage: log_storage,
-            clock,
-            inner: RwLock::new(inner),
-        })
+        LogDbBuilder::new(config).build().await
     }
 
     /// Appends records to the log.
