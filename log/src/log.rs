@@ -273,6 +273,21 @@ impl Log {
             .as_millis() as i64
     }
 
+    /// Checks if the underlying storage is accessible.
+    ///
+    /// This performs a lightweight read operation to verify that the storage
+    /// backend is responding. Use this for health/readiness checks.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if storage is accessible, or an error if the check fails.
+    pub async fn check_storage(&self) -> Result<()> {
+        // Read the sequence block - this is a single key lookup that verifies
+        // storage is accessible without scanning or listing data.
+        let _ = self.storage.as_read().get_seq_block().await?;
+        Ok(())
+    }
+
     /// Forces creation of a new segment, sealing the current one.
     ///
     /// This is an internal API for testing multi-segment scenarios. It forces

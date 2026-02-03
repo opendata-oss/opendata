@@ -218,11 +218,12 @@ pub async fn handle_healthy() -> (axum::http::StatusCode, &'static str) {
 /// Handle GET /-/ready
 ///
 /// Returns 200 OK if the service is ready to serve requests.
-/// Performs a lightweight check to verify the log is accessible.
+/// Performs a lightweight storage check to verify the log backend is accessible.
 pub async fn handle_ready(State(state): State<AppState>) -> (axum::http::StatusCode, &'static str) {
-    // Verify we can access the log with a cheap operation.
-    // list_segments with empty range (0..0) just checks the segment cache is accessible.
-    match state.log.list_segments(0..0).await {
+    // Verify storage is accessible with a lightweight read operation.
+    // This reads the sequence block key, which verifies the storage backend
+    // is responding without scanning or listing data.
+    match state.log.check_storage().await {
         Ok(_) => (axum::http::StatusCode::OK, "OK"),
         Err(_) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Not Ready"),
     }
@@ -265,5 +266,108 @@ mod tests {
         // then
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "OK");
+    }
+
+    #[tokio::test]
+    async fn should_return_503_for_ready_when_storage_fails() {
+        use async_trait::async_trait;
+        use bytes::Bytes;
+        use common::storage::{RecordOp, StorageSnapshot};
+        use common::{BytesRange, Record, Storage, StorageIterator, StorageRead};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // A mock storage that can be configured to fail after initialization
+        struct ConfigurableStorage {
+            should_fail: AtomicBool,
+        }
+
+        impl ConfigurableStorage {
+            fn new() -> Self {
+                Self {
+                    should_fail: AtomicBool::new(false),
+                }
+            }
+
+            fn set_failing(&self, fail: bool) {
+                self.should_fail.store(fail, Ordering::SeqCst);
+            }
+
+            fn check_failure(&self) -> common::StorageResult<()> {
+                if self.should_fail.load(Ordering::SeqCst) {
+                    Err(common::StorageError::Storage("storage unavailable".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        struct EmptyIterator;
+
+        #[async_trait]
+        impl StorageIterator for EmptyIterator {
+            async fn next(&mut self) -> common::StorageResult<Option<Record>> {
+                Ok(None)
+            }
+        }
+
+        #[async_trait]
+        impl StorageRead for ConfigurableStorage {
+            async fn get(&self, _key: Bytes) -> common::StorageResult<Option<Record>> {
+                self.check_failure()?;
+                Ok(None)
+            }
+
+            async fn scan_iter(
+                &self,
+                _range: BytesRange,
+            ) -> common::StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+                self.check_failure()?;
+                Ok(Box::new(EmptyIterator))
+            }
+        }
+
+        #[async_trait]
+        impl Storage for ConfigurableStorage {
+            async fn apply(&self, _ops: Vec<RecordOp>) -> common::StorageResult<()> {
+                self.check_failure()
+            }
+
+            async fn put(&self, _records: Vec<Record>) -> common::StorageResult<()> {
+                self.check_failure()
+            }
+
+            async fn put_with_options(
+                &self,
+                _records: Vec<Record>,
+                _options: common::WriteOptions,
+            ) -> common::StorageResult<()> {
+                self.check_failure()
+            }
+
+            async fn merge(&self, _records: Vec<Record>) -> common::StorageResult<()> {
+                self.check_failure()
+            }
+
+            async fn snapshot(&self) -> common::StorageResult<Arc<dyn StorageSnapshot>> {
+                self.check_failure()?;
+                Err(common::StorageError::Storage("not implemented".into()))
+            }
+        }
+
+        // given - a log backed by configurable storage
+        let storage = Arc::new(ConfigurableStorage::new());
+        let log = Arc::new(Log::new(storage.clone()).await.unwrap());
+        let metrics = Arc::new(Metrics::new());
+        let state = AppState { log, metrics };
+
+        // Configure storage to fail after initialization
+        storage.set_failing(true);
+
+        // when
+        let (status, body) = handle_ready(State(state)).await;
+
+        // then
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, "Not Ready");
     }
 }
