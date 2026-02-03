@@ -24,12 +24,12 @@ pub struct FlushEvent<D: Delta> {
 }
 
 /// A delta accumulates writes and can produce a snapshot image.
-pub trait Delta: Default + Clone + Send + Sync + 'static {
+pub trait Delta: Sized + Send + Sync + 'static {
     type Image: Send + Sync + 'static;
     type Write: Send + 'static;
 
-    /// Initialize the delta from a snapshot image.
-    fn init(&mut self, image: &Self::Image);
+    /// Create a new delta initialized from a snapshot image.
+    fn new(image: &Self::Image) -> Self;
 
     /// Apply a write to the delta.
     fn apply(&mut self, write: Self::Write) -> Result<(), String>;
@@ -42,7 +42,7 @@ pub trait Delta: Default + Clone + Send + Sync + 'static {
     /// Implementations should ensure this operation is efficient (e.g., via
     /// copy-on-write or reference counting) since it blocks writes. After this
     /// is complete, the [`Flusher::flush`] happens on a background thread.
-    fn fork_image(&self) -> Self::Image;
+    fn fork(&self, image: &Self::Image) -> (Self, Self::Image);
 }
 
 /// A flusher persists flush events to durable storage.

@@ -101,8 +101,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
             durable_rx,
         };
 
-        let flusher = Arc::new(flusher);
-        let delta = D::default();
+        let delta = D::new(&initial_image);
 
         let flush_task = FlushTask {
             flusher,
@@ -135,8 +134,6 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
 
     /// Run the coordinator event loop.
     pub async fn run(mut self) -> Result<(), String> {
-        self.delta.init(&self.image);
-
         // Start the flush task
         let flush_task = self
             .flush_task
@@ -149,12 +146,6 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
 
         loop {
             tokio::select! {
-                // this might starve flushes under heavy write load, we
-                // should consider alternative strategies if this becomes
-                // a problem (though heavy write loads should also trigger
-                // flushes based on size / backpressure)
-                biased;
-
                 cmd = self.cmd_rx.recv() => {
                     match cmd {
                         Some(WriteCommand::Write {write, epoch: epoch_tx}) => {
@@ -221,11 +212,9 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
 
         // this is the blocking section of the flush, new writes will not be accepted
         // until the event is sent to the FlushTask
-        let delta = self.delta.clone();
-        let image = std::mem::replace(&mut self.image, self.delta.fork_image());
-
-        self.delta = D::default();
-        self.delta.init(&self.image);
+        let (new_delta, new_image) = self.delta.fork(&self.image);
+        let delta = std::mem::replace(&mut self.delta, new_delta);
+        let image = std::mem::replace(&mut self.image, new_image);
 
         // Block until flush task can accept the event
         // (This provides backpressure: if flushing is slow, writes pause)
@@ -241,7 +230,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
 }
 
 struct FlushTask<D: Delta, F: Flusher<D>> {
-    flusher: Arc<F>,
+    flusher: F,
     flush_rx: mpsc::Receiver<FlushEvent<D>>,
     flushed_tx: watch::Sender<u64>,
 }
@@ -294,7 +283,7 @@ mod tests {
     }
 
     /// Delta accumulates writes and can allocate new IDs for unknown keys
-    #[derive(Clone, Debug, Default)]
+    #[derive(Clone, Debug)]
     struct TestDelta {
         key_to_id: HashMap<String, u64>,
         next_id: u64,
@@ -306,11 +295,13 @@ mod tests {
         type Image = TestImage;
         type Write = TestWrite;
 
-        fn init(&mut self, image: &Self::Image) {
-            self.key_to_id = image.key_to_id.clone();
-            self.next_id = image.next_id;
-            self.writes = HashMap::new();
-            self.total_size = 0;
+        fn new(image: &Self::Image) -> Self {
+            Self {
+                key_to_id: image.key_to_id.clone(),
+                next_id: image.next_id,
+                writes: HashMap::new(),
+                total_size: 0,
+            }
         }
 
         fn apply(&mut self, write: Self::Write) -> Result<(), String> {
@@ -329,11 +320,18 @@ mod tests {
             self.total_size
         }
 
-        fn fork_image(&self) -> Self::Image {
-            TestImage {
+        fn fork(&self, image: &Self::Image) -> (Self, Self::Image) {
+            let new_image = TestImage {
                 key_to_id: self.key_to_id.clone(),
                 next_id: self.next_id,
-            }
+            };
+            let new_delta = TestDelta {
+                key_to_id: self.key_to_id.clone(),
+                next_id: self.next_id,
+                writes: HashMap::new(),
+                total_size: 0,
+            };
+            (new_delta, new_image)
         }
     }
 
@@ -395,7 +393,7 @@ mod tests {
             }
 
             // Record the flush
-            let image = event.delta.fork_image();
+            let (_, image) = event.delta.fork(&event.snapshot);
             {
                 let mut state = self.state.lock().unwrap();
                 state.flushed_events.push((event.delta, event.epoch_range));
