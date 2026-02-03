@@ -13,6 +13,9 @@ use common::StorageConfig;
 pub use crate::serde::FieldType;
 pub use crate::serde::collection_meta::DistanceMetric;
 
+/// Reserved field name for the embedding vector stored as an AttributeValue::Vector.
+pub const VECTOR_FIELD_NAME: &str = "vector";
+
 /// A vector with its identifying ID, embedding values, and metadata.
 ///
 /// # Identity
@@ -31,37 +34,42 @@ pub use crate::serde::collection_meta::DistanceMetric;
 ///
 /// # Embedding Values
 ///
-/// The `values` field contains the embedding vector as f32 values. The length
-/// must match the `dimensions` specified in the `Config` when the database
-/// was created.
+/// The embedding vector must be provided as an attribute with name "vector"
+/// and type `AttributeValue::Vector`. The length must match the `dimensions`
+/// specified in the `Config` when the database was created.
 #[derive(Debug, Clone)]
 pub struct Vector {
     /// User-provided unique identifier (max 64 bytes UTF-8).
     pub id: String,
 
-    /// The embedding vector (f32 values).
-    pub values: Vec<f32>,
-
-    /// Metadata attributes for filtering.
+    /// Attributes including the embedding vector (under "vector" field) and metadata.
     pub attributes: Vec<Attribute>,
 }
 
 impl Vector {
-    /// Creates a new vector with no attributes.
+    /// Creates a new vector with just the embedding values (no other attributes).
+    ///
+    /// The vector values are stored as an attribute with name [`VECTOR_FIELD_NAME`].
     pub fn new(id: impl Into<String>, values: Vec<f32>) -> Self {
         Self {
             id: id.into(),
-            values,
-            attributes: Vec::new(),
+            attributes: vec![Attribute::new(
+                VECTOR_FIELD_NAME,
+                AttributeValue::Vector(values),
+            )],
         }
     }
 
     /// Builder-style construction for vectors with attributes.
+    ///
+    /// The vector values are stored as an attribute with name [`VECTOR_FIELD_NAME`].
     pub fn builder(id: impl Into<String>, values: Vec<f32>) -> VectorBuilder {
         VectorBuilder {
             id: id.into(),
-            values,
-            attributes: Vec::new(),
+            attributes: vec![Attribute::new(
+                VECTOR_FIELD_NAME,
+                AttributeValue::Vector(values),
+            )],
         }
     }
 }
@@ -70,7 +78,6 @@ impl Vector {
 #[derive(Debug)]
 pub struct VectorBuilder {
     id: String,
-    values: Vec<f32>,
     attributes: Vec<Attribute>,
 }
 
@@ -86,7 +93,6 @@ impl VectorBuilder {
     pub fn build(self) -> Vector {
         Vector {
             id: self.id,
-            values: self.values,
             attributes: self.attributes,
         }
     }
@@ -122,6 +128,7 @@ pub enum AttributeValue {
     Int64(i64),
     Float64(f64),
     Bool(bool),
+    Vector(Vec<f32>),
 }
 
 // Convenience From implementations for AttributeValue
@@ -229,18 +236,23 @@ pub(crate) fn attribute_value_to_field_value(attr: &AttributeValue) -> crate::se
         AttributeValue::Int64(v) => crate::serde::FieldValue::Int64(*v),
         AttributeValue::Float64(v) => crate::serde::FieldValue::Float64(*v),
         AttributeValue::Bool(v) => crate::serde::FieldValue::Bool(*v),
+        AttributeValue::Vector(v) => crate::serde::FieldValue::Vector(v.clone()),
     }
 }
 
 /// Helper to convert the serde layer's FieldValue to AttributeValue.
 ///
 /// This is used internally when decoding metadata from storage.
+///
+/// # Panics
+/// Panics if called with a Vector variant since vectors are not metadata.
 pub(crate) fn field_value_to_attribute_value(field: &crate::serde::FieldValue) -> AttributeValue {
     match field {
         crate::serde::FieldValue::String(s) => AttributeValue::String(s.clone()),
         crate::serde::FieldValue::Int64(v) => AttributeValue::Int64(*v),
         crate::serde::FieldValue::Float64(v) => AttributeValue::Float64(*v),
         crate::serde::FieldValue::Bool(v) => AttributeValue::Bool(*v),
+        crate::serde::FieldValue::Vector(v) => AttributeValue::Vector(v.clone()),
     }
 }
 
@@ -268,24 +280,36 @@ mod tests {
 
         // then
         assert_eq!(vector.id, "test-id");
-        assert_eq!(vector.values, vec![1.0, 2.0, 3.0]);
-        assert_eq!(vector.attributes.len(), 4);
-        assert_eq!(vector.attributes[0].name, "category");
+        // 5 attributes: vector + category + count + score + enabled
+        assert_eq!(vector.attributes.len(), 5);
+        // First attribute is "vector"
+        assert_eq!(vector.attributes[0].name, "vector");
         assert_eq!(
             vector.attributes[0].value,
+            AttributeValue::Vector(vec![1.0, 2.0, 3.0])
+        );
+        // Second attribute is "category"
+        assert_eq!(vector.attributes[1].name, "category");
+        assert_eq!(
+            vector.attributes[1].value,
             AttributeValue::String("test".to_string())
         );
     }
 
     #[test]
-    fn should_create_vector_without_attributes() {
+    fn should_create_vector_without_extra_attributes() {
         // given/when
         let vector = Vector::new("test-id", vec![1.0, 2.0, 3.0]);
 
         // then
         assert_eq!(vector.id, "test-id");
-        assert_eq!(vector.values, vec![1.0, 2.0, 3.0]);
-        assert!(vector.attributes.is_empty());
+        // Only the "vector" attribute
+        assert_eq!(vector.attributes.len(), 1);
+        assert_eq!(vector.attributes[0].name, "vector");
+        assert_eq!(
+            vector.attributes[0].value,
+            AttributeValue::Vector(vec![1.0, 2.0, 3.0])
+        );
     }
 
     #[test]

@@ -181,10 +181,10 @@ pub struct CollectionMetaValue {
     /// Default is 4096, which yields ~25 MB per chunk at 1536 dimensions.
     pub chunk_target: u16,
 
-    /// Schema for metadata fields attached to vectors.
+    /// Schema for fields attached to vectors.
     ///
     /// Defines field names, types, and whether each field is indexed for filtering.
-    pub metadata_fields: Vec<MetadataFieldSpec>,
+    pub fields: Vec<MetadataFieldSpec>,
 }
 
 impl CollectionMetaValue {
@@ -199,7 +199,7 @@ impl CollectionMetaValue {
             dimensions,
             distance_metric,
             chunk_target,
-            metadata_fields,
+            fields: metadata_fields,
         }
     }
 
@@ -209,7 +209,7 @@ impl CollectionMetaValue {
         buf.extend_from_slice(&self.dimensions.to_le_bytes());
         buf.extend_from_slice(&[self.distance_metric as u8]);
         buf.extend_from_slice(&self.chunk_target.to_le_bytes());
-        encode_array(&self.metadata_fields, &mut buf);
+        encode_array(&self.fields, &mut buf);
         buf.freeze()
     }
 
@@ -236,18 +236,18 @@ impl CollectionMetaValue {
             dimensions,
             distance_metric,
             chunk_target,
-            metadata_fields,
+            fields: metadata_fields,
         })
     }
 
     /// Find a metadata field spec by name.
     pub fn get_field(&self, name: &str) -> Option<&MetadataFieldSpec> {
-        self.metadata_fields.iter().find(|f| f.name == name)
+        self.fields.iter().find(|f| f.name == name)
     }
 
     /// Returns the names of all indexed fields.
     pub fn indexed_fields(&self) -> impl Iterator<Item = &str> {
-        self.metadata_fields
+        self.fields
             .iter()
             .filter(|f| f.indexed)
             .map(|f| f.name.as_str())
@@ -291,7 +291,7 @@ mod tests {
 
         // then
         assert_eq!(decoded, value);
-        assert!(decoded.metadata_fields.is_empty());
+        assert!(decoded.fields.is_empty());
     }
 
     #[test]
@@ -380,7 +380,7 @@ mod tests {
             let decoded = CollectionMetaValue::decode_from_bytes(&encoded).unwrap();
 
             // then
-            assert_eq!(decoded.metadata_fields[0].field_type, field_type);
+            assert_eq!(decoded.fields[0].field_type, field_type);
         }
     }
 }

@@ -1,6 +1,6 @@
 //! Reporter trait and implementations for benchmark metrics.
 
-use timeseries::{Series, TimeSeries};
+use timeseries::{Series, TimeSeriesDb};
 
 /// Reporter for benchmark metrics.
 ///
@@ -30,13 +30,13 @@ pub(crate) trait Reporter: Send + Sync {
     async fn flush(&self) -> anyhow::Result<()>;
 }
 
-/// Reporter that writes metrics to a TimeSeries database.
+/// Reporter that writes metrics to a TimeSeriesDb database.
 pub(crate) struct TimeSeriesReporter {
-    ts: TimeSeries,
+    ts: TimeSeriesDb,
 }
 
 impl TimeSeriesReporter {
-    pub(crate) fn new(ts: TimeSeries) -> Self {
+    pub(crate) fn new(ts: TimeSeriesDb) -> Self {
         Self { ts }
     }
 }

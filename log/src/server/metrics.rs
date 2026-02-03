@@ -49,6 +49,15 @@ pub struct Metrics {
     /// Counter of records successfully appended.
     pub log_append_records_total: Counter,
 
+    /// Counter of bytes written
+    pub log_append_bytes_total: Counter,
+
+    /// Counter of records scanned
+    pub log_records_scanned_total: Counter,
+
+    /// Counter of bytes scanned
+    pub log_bytes_scanned_total: Counter,
+
     /// Counter of HTTP requests.
     pub http_requests_total: Family<HttpLabelsWithStatus, Counter>,
 }
@@ -72,6 +81,30 @@ impl Metrics {
             log_append_records_total.clone(),
         );
 
+        // Log append bytes counter
+        let log_append_bytes_total = Counter::default();
+        registry.register(
+            "log_append_bytes_total",
+            "Total number of bytes written to the log",
+            log_append_bytes_total.clone(),
+        );
+
+        // Log scan records counter
+        let log_records_scanned_total = Counter::default();
+        registry.register(
+            "log_records_scanned_total",
+            "Total number of records scanned in the log",
+            log_records_scanned_total.clone(),
+        );
+
+        // Log scan bytes counter
+        let log_bytes_scanned_total = Counter::default();
+        registry.register(
+            "log_bytes_scanned_total",
+            "Total number of bytes scanned in the log",
+            log_bytes_scanned_total.clone(),
+        );
+
         // HTTP requests total counter
         let http_requests_total = Family::<HttpLabelsWithStatus, Counter>::default();
         registry.register(
@@ -83,6 +116,9 @@ impl Metrics {
         Self {
             registry,
             log_append_records_total,
+            log_append_bytes_total,
+            log_records_scanned_total,
+            log_bytes_scanned_total,
             http_requests_total,
         }
     }
@@ -108,6 +144,9 @@ mod tests {
         // then
         let encoded = metrics.encode();
         assert!(encoded.contains("# HELP log_append_records_total"));
+        assert!(encoded.contains("# HELP log_append_bytes_total"));
+        assert!(encoded.contains("# HELP log_records_scanned_total"));
+        assert!(encoded.contains("# HELP log_bytes_scanned_total"));
         assert!(encoded.contains("# HELP http_requests_total"));
     }
 

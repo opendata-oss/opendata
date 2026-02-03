@@ -25,10 +25,11 @@ use std::collections::HashMap;
 
 use crate::delta::{VectorDbDelta, VectorDbDeltaBuilder};
 use crate::distance;
-use crate::hnsw::CentroidGraph;
+use crate::hnsw::{CentroidGraph, build_centroid_graph};
 use crate::model::{AttributeValue, Config, Vector};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::key::SeqBlockKey;
+use crate::serde::posting_list::{PostingList, PostingUpdate};
 use crate::storage::{VectorDbStorageExt, VectorDbStorageReadExt};
 
 /// Vector database for storing and querying embedding vectors.
@@ -52,7 +53,7 @@ pub struct VectorDb {
     /// Mutex to ensure only one flush operation can run at a time.
     flush_mutex: Arc<Mutex<()>>,
     /// In-memory HNSW graph for centroid search (loaded lazily).
-    centroid_graph: RwLock<Option<CentroidGraph>>,
+    centroid_graph: RwLock<Option<Box<dyn CentroidGraph>>>,
 }
 
 /// A search result with vector, score, and metadata.
@@ -68,10 +69,8 @@ pub struct SearchResult {
     /// - Cosine: Higher scores = more similar (range: -1 to 1)
     /// - DotProduct: Higher scores = more similar
     pub score: f32,
-    /// Vector values
-    pub values: Vec<f32>,
-    /// Metadata key-value pairs
-    pub metadata: HashMap<String, AttributeValue>,
+    /// attribute key-value pairs
+    pub attributes: HashMap<String, AttributeValue>,
 }
 
 impl VectorDb {
@@ -84,7 +83,8 @@ impl VectorDb {
     /// Other configuration options (like `flush_interval`) can be changed
     /// on subsequent opens.
     pub async fn open(config: Config) -> Result<Self> {
-        let storage = create_storage(&config.storage, Some(Arc::new(VectorDbMergeOperator)))
+        let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
+        let storage = create_storage(&config.storage, Some(Arc::new(merge_op)))
             .await
             .context("Failed to create storage")?;
 
@@ -130,7 +130,7 @@ impl VectorDb {
     /// # Atomicity
     ///
     /// This operation is atomic: either all vectors in the batch are accepted,
-    /// or none are. This matches the behavior of `TimeSeries::write()`.
+    /// or none are. This matches the behavior of `TimeSeriesDb::write()`.
     ///
     /// # Upsert Semantics
     ///
@@ -213,8 +213,7 @@ impl VectorDb {
         let mut ops = Vec::new();
 
         // Batch posting list updates (collect all updates per centroid)
-        use std::collections::HashMap;
-        let mut posting_lists: HashMap<u32, RoaringTreemap> = HashMap::new();
+        let mut posting_updates: HashMap<u32, Vec<PostingUpdate>> = HashMap::new();
         let mut deleted_vectors = RoaringTreemap::new();
 
         for (external_id, pending_vec) in delta.vectors {
@@ -238,36 +237,31 @@ impl VectorDb {
                 // Add to deleted bitmap for batch merge later
                 deleted_vectors.insert(old_id);
 
-                // Tombstone old records
+                // Tombstone old vector data record
                 ops.push(self.storage.delete_vector_data(old_id)?);
-                ops.push(self.storage.delete_vector_meta(old_id)?);
             }
 
-            // 5. Write new vector records
-            // VectorData
-            ops.push(
-                self.storage
-                    .put_vector_data(new_internal_id, pending_vec.values().to_vec())?,
-            );
-
-            // VectorMeta
-            let metadata: Vec<_> = pending_vec
-                .metadata()
+            // 5. Write new vector data (includes external_id, vector, and metadata)
+            let attributes: Vec<_> = pending_vec
+                .attributes()
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect();
-            ops.push(self.storage.put_vector_meta(
+            ops.push(self.storage.put_vector_data(
                 new_internal_id,
                 pending_vec.external_id(),
-                &metadata,
+                &attributes,
             )?);
 
             // 6. Assign vector to nearest centroid using HNSW
             let centroid_id = self.assign_to_centroid(pending_vec.values()).await?;
-            posting_lists
+            posting_updates
                 .entry(centroid_id)
                 .or_default()
-                .insert(new_internal_id);
+                .push(PostingUpdate::append(
+                    new_internal_id,
+                    pending_vec.values().to_vec(),
+                ));
         }
 
         // Serialize and merge batched posting lists
@@ -275,8 +269,8 @@ impl VectorDb {
             ops.push(self.storage.merge_deleted_vectors(deleted_vectors)?);
         }
 
-        for (centroid_id, bitmap) in posting_lists {
-            ops.push(self.storage.merge_posting_list(centroid_id, bitmap)?);
+        for (centroid_id, updates) in posting_updates {
+            ops.push(self.storage.merge_posting_list(centroid_id, updates)?);
         }
 
         // ATOMIC: Apply all operations in one batch
@@ -336,7 +330,7 @@ impl VectorDb {
         self.storage.apply(vec![op]).await?;
 
         // Build HNSW graph
-        let graph = CentroidGraph::build(centroids, self.config.distance_metric)?;
+        let graph = build_centroid_graph(centroids, self.config.distance_metric)?;
         let mut graph_guard = self.centroid_graph.write().await;
         *graph_guard = Some(graph);
 
@@ -363,7 +357,7 @@ impl VectorDb {
             return Err(anyhow::anyhow!("No centroids found in storage"));
         }
 
-        let graph = CentroidGraph::build(centroids, self.config.distance_metric)?;
+        let graph = build_centroid_graph(centroids, self.config.distance_metric)?;
         let mut graph_guard = self.centroid_graph.write().await;
         *graph_guard = Some(graph);
 
@@ -474,22 +468,24 @@ impl VectorDb {
 
         // 4. Load posting lists and deleted vectors
         let snapshot = self.snapshot.read().await;
-        let candidate_ids = self.load_candidates(&centroid_ids, &**snapshot).await?;
+        let candidates = self
+            .load_candidates(&centroid_ids, snapshot.as_ref())
+            .await?;
 
-        if candidate_ids.is_empty() {
+        if candidates.is_empty() {
             return Ok(Vec::new());
         }
 
         // 5. Load deleted vectors bitmap and filter
         let deleted = snapshot.get_deleted_vectors().await?;
-        let candidate_ids: Vec<u64> = candidate_ids
+        let candidates: Vec<(u64, Vec<f32>)> = candidates
             .into_iter()
-            .filter(|id| !deleted.contains(*id))
+            .filter(|(id, _)| !deleted.contains(*id))
             .collect();
 
         // 6. Score candidates and return top-k
         let results = self
-            .score_and_rank(query, &candidate_ids, k, &**snapshot)
+            .score_and_rank(query, &candidates, k, snapshot.as_ref())
             .await?;
 
         Ok(results)
@@ -505,17 +501,24 @@ impl VectorDb {
         }
     }
 
-    /// Load candidate vector IDs from posting lists.
+    /// Load candidate vector IDs and their vectors from posting lists.
     async fn load_candidates(
         &self,
         centroid_ids: &[u32],
         snapshot: &dyn StorageRead,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<Vec<(u64, Vec<f32>)>> {
         let mut all_candidates = Vec::new();
+        let dimensions = self.config.dimensions as usize;
 
         for &centroid_id in centroid_ids {
-            let posting_list = snapshot.get_posting_list(centroid_id).await?;
-            all_candidates.extend(posting_list.vector_ids.iter());
+            let posting_list: PostingList = snapshot
+                .get_posting_list(centroid_id, dimensions)
+                .await?
+                .into();
+            // Extract IDs and vectors from postings (only include appends, skip deletes)
+            for posting in posting_list.iter() {
+                all_candidates.push((posting.id(), posting.vector().to_vec()));
+            }
         }
 
         Ok(all_candidates)
@@ -532,50 +535,41 @@ impl VectorDb {
     async fn score_and_rank(
         &self,
         query: &[f32],
-        candidate_ids: &[u64],
+        candidates: &[(u64, Vec<f32>)],
         k: usize,
         snapshot: &dyn StorageRead,
     ) -> Result<Vec<SearchResult>> {
         let mut scored_results = Vec::new();
+        let dimensions = self.config.dimensions as usize;
 
         // Load and score each candidate
-        for &internal_id in candidate_ids {
-            // Load vector data
-            let vector_data = snapshot.get_vector_data(internal_id).await?;
+        for (internal_id, vector) in candidates {
+            // Load vector data (for external_id and metadata)
+            let vector_data = snapshot.get_vector_data(*internal_id, dimensions).await?;
             if vector_data.is_none() {
                 continue; // Skip if vector not found (shouldn't happen)
             }
             let vector_data = vector_data.unwrap();
 
-            // Load vector metadata
-            let vector_meta = snapshot.get_vector_meta(internal_id).await?;
-            if vector_meta.is_none() {
-                continue; // Skip if metadata not found
-            }
-            let vector_meta = vector_meta.unwrap();
+            // Compute distance/similarity score using vector from posting list
+            let score = distance::compute_distance(query, vector, self.config.distance_metric);
 
-            // Compute distance/similarity score
-            let score =
-                distance::compute_distance(query, &vector_data.vector, self.config.distance_metric);
-
-            // Convert metadata fields to HashMap
-            let metadata: HashMap<String, AttributeValue> = vector_meta
-                .fields
-                .into_iter()
+            // Convert metadata fields to HashMap (includes vector field)
+            let metadata: HashMap<String, AttributeValue> = vector_data
+                .fields()
                 .map(|field| {
                     (
-                        field.field_name,
+                        field.field_name.clone(),
                         crate::model::field_value_to_attribute_value(&field.value),
                     )
                 })
                 .collect();
 
             scored_results.push(SearchResult {
-                internal_id,
-                external_id: vector_meta.external_id,
+                internal_id: *internal_id,
+                external_id: vector_data.external_id().to_string(),
                 score,
-                values: vector_data.vector,
-                metadata,
+                attributes: metadata,
             });
         }
 
@@ -603,7 +597,7 @@ mod tests {
     use crate::model::{MetadataFieldSpec, Vector};
     use crate::serde::FieldType;
     use crate::serde::collection_meta::DistanceMetric;
-    use crate::serde::key::{IdDictionaryKey, VectorDataKey, VectorMetaKey};
+    use crate::serde::key::{IdDictionaryKey, VectorDataKey};
     use crate::serde::vector_data::VectorDataValue;
     use common::StorageConfig;
     use common::storage::in_memory::InMemoryStorage;
@@ -624,7 +618,7 @@ mod tests {
 
     fn create_test_storage() -> Arc<dyn Storage> {
         Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            VectorDbMergeOperator,
+            VectorDbMergeOperator::new(3),
         )))
     }
 
@@ -663,7 +657,7 @@ mod tests {
         db.flush().await.unwrap();
 
         // then - verify records exist in storage
-        // Check VectorData records
+        // Check VectorData records (now contain external_id, vector, and metadata)
         let vec1_data_key = VectorDataKey::new(0).encode();
         let vec1_data = storage.get(vec1_data_key).await.unwrap();
         assert!(vec1_data.is_some());
@@ -671,11 +665,6 @@ mod tests {
         let vec2_data_key = VectorDataKey::new(1).encode();
         let vec2_data = storage.get(vec2_data_key).await.unwrap();
         assert!(vec2_data.is_some());
-
-        // Check VectorMeta records
-        let vec1_meta_key = VectorMetaKey::new(0).encode();
-        let vec1_meta = storage.get(vec1_meta_key).await.unwrap();
-        assert!(vec1_meta.is_some());
 
         // Check IdDictionary
         let dict_key1 = IdDictionaryKey::new("vec-1").encode();
@@ -710,8 +699,8 @@ mod tests {
         let vec_data_key = VectorDataKey::new(1).encode(); // New internal ID
         let vec_data = storage.get(vec_data_key).await.unwrap();
         assert!(vec_data.is_some());
-        let decoded = VectorDataValue::decode_from_bytes(&vec_data.unwrap().value).unwrap();
-        assert_eq!(decoded.vector, vec![2.0, 3.0, 4.0]);
+        let decoded = VectorDataValue::decode_from_bytes(&vec_data.unwrap().value, 3).unwrap();
+        assert_eq!(decoded.vector_field(), &[2.0, 3.0, 4.0]);
 
         // Verify only one IdDictionary entry
         let dict_key = IdDictionaryKey::new("vec-1").encode();
@@ -863,7 +852,16 @@ mod tests {
         // then - should only return the new version (not the deleted one)
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].external_id, "vec-1");
-        assert_eq!(results[0].values, vec![0.9, 0.1, 0.0]);
+        let vector = results[0]
+            .attributes
+            .iter()
+            .find(|f| f.0 == "vector")
+            .unwrap()
+            .1;
+        let AttributeValue::Vector(vector) = vector.clone() else {
+            panic!("unexpected attr type");
+        };
+        assert_eq!(vector, vec![0.9, 0.1, 0.0]);
     }
 
     #[tokio::test]

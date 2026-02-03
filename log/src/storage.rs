@@ -229,7 +229,7 @@ impl LogStorage {
     /// Writes a log entry record to storage.
     ///
     /// This is a low-level API primarily for testing. Production code should
-    /// use the higher-level `Log::append` method.
+    /// use the higher-level `LogDb::append` method.
     #[cfg(test)]
     pub(crate) async fn write_entry(&self, segment: &LogSegment, entry: &LogEntry) -> Result<()> {
         let entry_key = LogEntryKey::new(segment.id(), entry.key.clone(), entry.sequence);

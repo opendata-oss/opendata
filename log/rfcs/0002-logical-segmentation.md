@@ -167,7 +167,7 @@ Currently the log provides no simple way to inspect which keys are present—use
 A future enhancement could expose manual segment sealing to applications:
 
 ```rust
-impl Log {
+impl LogDb {
     /// Seals the current segment and starts a new one.
     ///
     /// # Arguments

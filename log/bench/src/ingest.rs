@@ -2,7 +2,7 @@
 
 use bencher::{Bench, Benchmark, Params, Summary};
 use bytes::Bytes;
-use log::{Config, Log, Record};
+use log::{Config, LogDb, Record};
 
 const MICROS_PER_SEC: f64 = 1_000_000.0;
 
@@ -66,7 +66,7 @@ impl Benchmark for IngestBenchmark {
             storage: bench.spec().data().storage.clone(),
             ..Default::default()
         };
-        let log = Log::open(config).await?;
+        let log = LogDb::open(config).await?;
 
         // Generate keys
         let keys: Vec<Bytes> = (0..num_keys)

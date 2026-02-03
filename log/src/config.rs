@@ -22,7 +22,7 @@ use common::StorageConfig;
 ///     storage: StorageConfig::default(),
 ///     segmentation: SegmentConfig::default(),
 /// };
-/// let log = Log::open(config).await?;
+/// let log = LogDb::open(config).await?;
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct Config {
@@ -70,8 +70,8 @@ pub struct SegmentConfig {
 
 /// Options for write operations.
 ///
-/// Controls the durability and behavior of [`Log::append`](crate::Log::append)
-/// and [`Log::append_with_options`](crate::Log::append_with_options).
+/// Controls the durability and behavior of [`LogDb::append`](crate::LogDb::append)
+/// and [`LogDb::append_with_options`](crate::LogDb::append_with_options).
 #[derive(Debug, Clone, Default)]
 pub struct WriteOptions {
     /// Whether to wait for the write to be durable before returning.
