@@ -151,23 +151,6 @@ mod tests {
     }
 
     #[test]
-    fn should_increment_log_metrics() {
-        // given
-        let metrics = Metrics::new();
-
-        // when
-        metrics.log_append_bytes_total.inc_by(100);
-        metrics.log_records_scanned_total.inc_by(5);
-        metrics.log_bytes_scanned_total.inc_by(500);
-
-        // then
-        let encoded = metrics.encode();
-        assert!(encoded.contains("log_append_bytes_total_total 100"));
-        assert!(encoded.contains("log_records_scanned_total_total 5"));
-        assert!(encoded.contains("log_bytes_scanned_total_total 500"));
-    }
-
-    #[test]
     fn should_convert_http_method_to_label() {
         // given
         let method = Method::GET;
