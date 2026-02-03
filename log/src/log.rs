@@ -412,6 +412,7 @@ impl LogRead for LogDb {
 /// ```ignore
 /// use log::LogDbBuilder;
 /// use log::Config;
+/// use common::StorageRuntime;
 ///
 /// // Create a separate runtime for compaction (important for sync/JNI usage)
 /// let compaction_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -420,13 +421,17 @@ impl LogRead for LogDb {
 ///     .build()
 ///     .unwrap();
 ///
-/// let mut builder = LogDbBuilder::new(config);
-/// builder.storage_mut().with_compaction_runtime(compaction_runtime.handle().clone());
-/// let log = builder.build().await?;
+/// let runtime = StorageRuntime::new()
+///     .with_compaction_runtime(compaction_runtime.handle().clone());
+///
+/// let log = LogDbBuilder::new(config)
+///     .with_storage_runtime(runtime)
+///     .build()
+///     .await?;
 /// ```
 pub struct LogDbBuilder {
     config: crate::config::Config,
-    storage_runtime: Option<StorageRuntime>,
+    storage_runtime: StorageRuntime,
 }
 
 impl LogDbBuilder {
@@ -434,33 +439,27 @@ impl LogDbBuilder {
     pub fn new(config: crate::config::Config) -> Self {
         Self {
             config,
-            storage_runtime: None,
+            storage_runtime: StorageRuntime::new(),
         }
     }
 
-    /// Returns a mutable reference to the storage runtime for advanced configuration.
+    /// Sets the storage runtime options.
     ///
-    /// The storage runtime is lazily initialized with default options. Use this to
-    /// configure runtime options like the compaction runtime handle.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let mut builder = LogDbBuilder::new(config);
-    /// builder.storage_mut().with_compaction_runtime(runtime.handle().clone());
-    /// let log = builder.build().await?;
-    /// ```
-    pub fn storage_mut(&mut self) -> &mut StorageRuntime {
-        self.storage_runtime.get_or_insert_with(StorageRuntime::new)
+    /// Use this to configure runtime options like the compaction runtime handle.
+    pub fn with_storage_runtime(mut self, runtime: StorageRuntime) -> Self {
+        self.storage_runtime = runtime;
+        self
     }
 
     /// Builds the LogDb instance.
     pub async fn build(self) -> Result<LogDb> {
-        let runtime = self.storage_runtime.unwrap_or_default();
-
-        let storage = create_storage(&self.config.storage, runtime, StorageSemantics::new())
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let storage = create_storage(
+            &self.config.storage,
+            self.storage_runtime,
+            StorageSemantics::new(),
+        )
+        .await
+        .map_err(|e| Error::Storage(e.to_string()))?;
 
         let log_storage = LogStorage::new(storage);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
