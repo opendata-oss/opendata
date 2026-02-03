@@ -221,9 +221,49 @@ pub async fn handle_healthy() -> (axum::http::StatusCode, &'static str) {
 /// Performs a lightweight check to verify the log is accessible.
 pub async fn handle_ready(State(state): State<AppState>) -> (axum::http::StatusCode, &'static str) {
     // Verify we can access the log with a cheap operation.
-    // Count on a non-existent key with empty range is O(1).
-    match state.log.count(bytes::Bytes::from_static(b"__health__"), 0..0).await {
+    // list_segments with empty range (0..0) just checks the segment cache is accessible.
+    match state.log.list_segments(0..0).await {
         Ok(_) => (axum::http::StatusCode::OK, "OK"),
         Err(_) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Not Ready"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Config;
+    use axum::http::StatusCode;
+    use common::StorageConfig;
+
+    fn test_config() -> Config {
+        Config {
+            storage: StorageConfig::InMemory,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn should_return_ok_for_healthy() {
+        // given/when
+        let (status, body) = handle_healthy().await;
+
+        // then
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "OK");
+    }
+
+    #[tokio::test]
+    async fn should_return_ok_for_ready_when_log_accessible() {
+        // given
+        let log = Arc::new(Log::open(test_config()).await.unwrap());
+        let metrics = Arc::new(Metrics::new());
+        let state = AppState { log, metrics };
+
+        // when
+        let (status, body) = handle_ready(State(state)).await;
+
+        // then
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "OK");
     }
 }
