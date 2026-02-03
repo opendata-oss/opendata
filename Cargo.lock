@@ -4427,6 +4427,7 @@ dependencies = [
  "bytes",
  "common",
  "fail",
+ "futures",
  "rand 0.8.5",
  "roaring 0.10.12",
  "rstest",

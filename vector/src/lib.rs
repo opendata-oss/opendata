@@ -42,6 +42,8 @@ pub(crate) mod storage;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
+mod write_coordinator;
+
 // Public API exports
 pub use db::VectorDb;
 pub use model::{
