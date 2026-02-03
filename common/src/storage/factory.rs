@@ -187,12 +187,7 @@ pub async fn create_storage(
             Ok(Arc::new(storage))
         }
         StorageConfig::SlateDb(slate_config) => {
-            let storage = create_slatedb_storage(
-                slate_config,
-                semantics.merge_operator,
-                runtime.compaction_runtime,
-            )
-            .await?;
+            let storage = create_slatedb_storage(slate_config, runtime, semantics).await?;
             Ok(Arc::new(storage))
         }
     }
@@ -200,8 +195,8 @@ pub async fn create_storage(
 
 async fn create_slatedb_storage(
     config: &SlateDbStorageConfig,
-    merge_operator: Option<Arc<dyn MergeOperator>>,
-    compaction_runtime: Option<Handle>,
+    runtime: StorageRuntime,
+    semantics: StorageSemantics,
 ) -> StorageResult<SlateDbStorage> {
     let object_store = create_object_store(&config.object_store)?;
 
@@ -220,14 +215,14 @@ async fn create_slatedb_storage(
     let mut db_builder = DbBuilder::new(config.path.clone(), object_store).with_settings(settings);
 
     // Add merge operator if provided
-    if let Some(op) = merge_operator {
+    if let Some(op) = semantics.merge_operator {
         let adapter = SlateDbStorage::merge_operator_adapter(op);
         db_builder = db_builder.with_merge_operator(Arc::new(adapter));
     }
 
     // Add compaction runtime if provided
-    if let Some(runtime_handle) = compaction_runtime {
-        db_builder = db_builder.with_compaction_runtime(runtime_handle);
+    if let Some(handle) = runtime.compaction_runtime {
+        db_builder = db_builder.with_compaction_runtime(handle);
     }
 
     let db = db_builder
