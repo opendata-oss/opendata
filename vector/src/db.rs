@@ -130,7 +130,7 @@ impl VectorDb {
     /// # Atomicity
     ///
     /// This operation is atomic: either all vectors in the batch are accepted,
-    /// or none are. This matches the behavior of `TimeSeries::write()`.
+    /// or none are. This matches the behavior of `TimeSeriesDb::write()`.
     ///
     /// # Upsert Semantics
     ///
