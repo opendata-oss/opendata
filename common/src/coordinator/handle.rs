@@ -1,5 +1,5 @@
+use super::WriteCommand;
 use super::{Delta, Durability, FlushEvent, WriteError, WriteResult};
-use crate::coordinator::coordinator::WriteCommand;
 use futures::FutureExt;
 use futures::future::Shared;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -53,7 +53,7 @@ impl WriteHandle {
 
         while *recv.borrow() < epoch {
             match recv.changed().await {
-                Ok(epoch) => {}
+                Ok(_) => {}
                 Err(_) => return Err(WriteError::Shutdown),
             }
         }

@@ -18,6 +18,8 @@ pub enum Durability {
 pub struct FlushEvent<D: Delta> {
     pub snapshot: D::Image,
     pub delta: D,
+    /// The range of epochs contained in this flush (exclusive end).
+    /// Start is the first epoch in the flush, end is one past the last epoch.
     pub epoch_range: Range<u64>,
 }
 
@@ -26,8 +28,8 @@ pub trait Delta: Default + Clone + Send + Sync + 'static {
     type Image: Send + Sync + 'static;
     type Write: Send + 'static;
 
-    /// Initialize a new delta from a snapshot image.
-    fn init(&mut self, image: &Self::Image) -> Self;
+    /// Initialize the delta from a snapshot image.
+    fn init(&mut self, image: &Self::Image);
 
     /// Apply a write to the delta.
     fn apply(&mut self, write: Self::Write) -> Result<(), String>;
