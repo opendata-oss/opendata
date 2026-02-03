@@ -50,5 +50,10 @@ ENV LOG_PORT=8080
 ENV LOG_DATA_DIR=/data
 ENV RUST_LOG=info
 
+# Note: No Docker HEALTHCHECK defined here because:
+# 1. The port is configurable via LOG_PORT, and Docker HEALTHCHECK doesn't support env var interpolation
+# 2. Kubernetes liveness/readiness probes are the primary health check mechanism in production
+# For local Docker testing, use: docker run --health-cmd="curl -f http://localhost:${LOG_PORT}/-/healthy"
+
 # Run the server
 ENTRYPOINT ["/app/opendata-log"]

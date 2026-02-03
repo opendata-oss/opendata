@@ -469,10 +469,12 @@ mod tests {
 
         // then - only the non-empty timeseries should be kept
         assert_eq!(series_list.len(), 1);
-        assert!(series_list[0]
-            .labels
-            .iter()
-            .any(|l| l.name == "__name__" && l.value == "valid_metric"));
+        assert!(
+            series_list[0]
+                .labels
+                .iter()
+                .any(|l| l.name == "__name__" && l.value == "valid_metric")
+        );
         assert_eq!(series_list[0].samples[0].value, 42.0);
     }
 

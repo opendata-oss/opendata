@@ -207,3 +207,23 @@ pub async fn handle_count(
 pub async fn handle_metrics(State(state): State<AppState>) -> String {
     state.metrics.encode()
 }
+
+/// Handle GET /-/healthy
+///
+/// Returns 200 OK if the service is running.
+pub async fn handle_healthy() -> (axum::http::StatusCode, &'static str) {
+    (axum::http::StatusCode::OK, "OK")
+}
+
+/// Handle GET /-/ready
+///
+/// Returns 200 OK if the service is ready to serve requests.
+/// Performs a lightweight check to verify the log is accessible.
+pub async fn handle_ready(State(state): State<AppState>) -> (axum::http::StatusCode, &'static str) {
+    // Verify we can access the log with a cheap operation.
+    // Count on a non-existent key with empty range is O(1).
+    match state.log.count(bytes::Bytes::from_static(b"__health__"), 0..0).await {
+        Ok(_) => (axum::http::StatusCode::OK, "OK"),
+        Err(_) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Not Ready"),
+    }
+}
