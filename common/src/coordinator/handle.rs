@@ -1,8 +1,8 @@
 use super::WriteCommand;
-use super::{Delta, Durability, FlushEvent, WriteError, WriteResult};
+use super::{Delta, Durability, FlushEvent, FlushResult, WriteError, WriteResult};
 use futures::FutureExt;
 use futures::future::Shared;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 /// Receivers for durability watermark updates.
 ///
@@ -65,11 +65,28 @@ impl WriteHandle {
 pub struct WriteCoordinatorHandle<D: Delta> {
     cmd_tx: mpsc::Sender<WriteCommand<D>>,
     watchers: EpochWatcher,
+    flush_result_tx: broadcast::Sender<FlushResult<D>>,
 }
 
 impl<D: Delta> WriteCoordinatorHandle<D> {
-    pub(crate) fn new(cmd_tx: mpsc::Sender<WriteCommand<D>>, watchers: EpochWatcher) -> Self {
-        Self { cmd_tx, watchers }
+    pub(crate) fn new(
+        cmd_tx: mpsc::Sender<WriteCommand<D>>,
+        watchers: EpochWatcher,
+        flush_result_tx: broadcast::Sender<FlushResult<D>>,
+    ) -> Self {
+        Self {
+            cmd_tx,
+            watchers,
+            flush_result_tx,
+        }
+    }
+
+    /// Subscribe to flush result notifications.
+    ///
+    /// Returns a receiver that yields flush results as they occur.
+    /// New subscribers only receive flushes that happen after subscribing.
+    pub fn subscribe(&self) -> broadcast::Receiver<FlushResult<D>> {
+        self.flush_result_tx.subscribe()
     }
 }
 
@@ -115,6 +132,7 @@ impl<D: Delta> Clone for WriteCoordinatorHandle<D> {
         Self {
             cmd_tx: self.cmd_tx.clone(),
             watchers: self.watchers.clone(),
+            flush_result_tx: self.flush_result_tx.clone(),
         }
     }
 }

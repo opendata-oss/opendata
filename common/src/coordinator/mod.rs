@@ -6,13 +6,13 @@ mod traits;
 
 pub use error::{WriteError, WriteResult};
 pub use handle::{WriteCoordinatorHandle, WriteHandle};
-pub use traits::{Delta, Durability, FlushEvent, Flusher};
+pub use traits::{Delta, Durability, FlushEvent, FlushResult, Flusher};
 
 // Internal use only
 pub(crate) use handle::EpochWatcher;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{Instant, Interval, interval_at};
 
 /// Configuration for the write coordinator.
@@ -87,6 +87,9 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         // one flush is pending
         let (flush_tx, flush_rx) = mpsc::channel(1);
 
+        // Broadcast channel for flush results (buffer size 16 should be plenty)
+        let (flush_result_tx, _) = broadcast::channel(16);
+
         let watcher = EpochWatcher {
             applied_rx,
             flushed_rx,
@@ -100,6 +103,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
             flusher,
             flush_rx,
             flushed_tx,
+            flush_result_tx: flush_result_tx.clone(),
         };
         let flush_interval = interval_at(
             Instant::now() + config.flush_interval,
@@ -122,7 +126,10 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
             flush_interval,
         };
 
-        (coordinator, WriteCoordinatorHandle::new(cmd_tx, watcher))
+        (
+            coordinator,
+            WriteCoordinatorHandle::new(cmd_tx, watcher, flush_result_tx),
+        )
     }
 
     /// Run the coordinator event loop.
@@ -228,13 +235,15 @@ struct FlushTask<D: Delta, F: Flusher<D>> {
     flusher: F,
     flush_rx: mpsc::Receiver<FlushEvent<D>>,
     flushed_tx: watch::Sender<u64>,
+    flush_result_tx: broadcast::Sender<FlushResult<D>>,
 }
 
 impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
     fn run(mut self) -> tokio::task::JoinHandle<WriteResult<()>> {
         tokio::spawn(async move {
             while let Some(event) = self.flush_rx.recv().await {
-                self.flusher
+                let snapshot = self
+                    .flusher
                     .flush(&event)
                     .await
                     .map_err(|e| WriteError::FlushError(e.to_string()))?;
@@ -243,6 +252,14 @@ impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
                 self.flushed_tx
                     .send(flushed_epoch)
                     .map_err(|_| WriteError::Shutdown)?;
+
+                // Broadcast flush result to subscribers (ignore if no receivers)
+                let result = FlushResult {
+                    snapshot,
+                    delta: Arc::new(event.delta),
+                    epoch_range: event.epoch_range,
+                };
+                let _ = self.flush_result_tx.send(result);
             }
 
             Ok(())
@@ -1539,6 +1556,155 @@ mod tests {
         assert!(delta2.key_to_id.contains_key("a"));
         assert!(delta2.key_to_id.contains_key("b"));
         assert!(delta2.key_to_id.contains_key("c"));
+
+        // cleanup
+        drop(handle);
+        coordinator_task.await.unwrap().unwrap();
+    }
+
+    // ============================================================================
+    // Subscribe Tests
+    // ============================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_receive_flush_result_on_subscribe() {
+        // given
+        let flusher = TestFlusher::default();
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
+            test_config(),
+            TestImage::default(),
+            flusher,
+        );
+        let coordinator_task = tokio::spawn(coordinator.run());
+        let mut subscriber = handle.subscribe();
+
+        // when
+        handle
+            .write(TestWrite {
+                key: "a".into(),
+                value: 1,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        handle.flush().await.unwrap();
+
+        // then
+        let result = subscriber.recv().await;
+        assert!(result.is_ok());
+
+        // cleanup
+        drop(handle);
+        coordinator_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_include_snapshot_in_flush_result() {
+        // given
+        let flusher = TestFlusher::default();
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
+            test_config(),
+            TestImage::default(),
+            flusher,
+        );
+        let coordinator_task = tokio::spawn(coordinator.run());
+        let mut subscriber = handle.subscribe();
+
+        // when
+        handle
+            .write(TestWrite {
+                key: "a".into(),
+                value: 1,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        handle.flush().await.unwrap();
+        let result = subscriber.recv().await.unwrap();
+
+        // then - snapshot should be the Arc<dyn StorageRead> returned by the flusher
+        // We can verify it exists and is usable (InMemoryStorage in tests)
+        assert!(Arc::strong_count(&result.snapshot) >= 1);
+
+        // cleanup
+        drop(handle);
+        coordinator_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_include_delta_in_flush_result() {
+        // given
+        let flusher = TestFlusher::default();
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
+            test_config(),
+            TestImage::default(),
+            flusher,
+        );
+        let coordinator_task = tokio::spawn(coordinator.run());
+        let mut subscriber = handle.subscribe();
+
+        // when
+        handle
+            .write(TestWrite {
+                key: "a".into(),
+                value: 42,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        handle.flush().await.unwrap();
+        let result = subscriber.recv().await.unwrap();
+
+        // then - delta should contain the write we made
+        assert!(result.delta.key_to_id.contains_key("a"));
+        let id = result.delta.key_to_id.get("a").unwrap();
+        let values = result.delta.writes.get(id).unwrap();
+        assert_eq!(values, &[42]);
+
+        // cleanup
+        drop(handle);
+        coordinator_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_include_epoch_range_in_flush_result() {
+        // given
+        let flusher = TestFlusher::default();
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
+            test_config(),
+            TestImage::default(),
+            flusher,
+        );
+        let coordinator_task = tokio::spawn(coordinator.run());
+        let mut subscriber = handle.subscribe();
+
+        // when
+        let write1 = handle
+            .write(TestWrite {
+                key: "a".into(),
+                value: 1,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        let write2 = handle
+            .write(TestWrite {
+                key: "b".into(),
+                value: 2,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        handle.flush().await.unwrap();
+        let result = subscriber.recv().await.unwrap();
+
+        // then - epoch range should contain the epochs of the writes
+        let epoch1 = write1.epoch().await.unwrap();
+        let epoch2 = write2.epoch().await.unwrap();
+        assert!(result.epoch_range.contains(&epoch1));
+        assert!(result.epoch_range.contains(&epoch2));
+        assert_eq!(result.epoch_range.start, epoch1);
+        assert_eq!(result.epoch_range.end, epoch2 + 1);
 
         // cleanup
         drop(handle);

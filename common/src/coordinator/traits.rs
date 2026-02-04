@@ -3,6 +3,26 @@ use async_trait::async_trait;
 use std::ops::Range;
 use std::sync::Arc;
 
+/// Result of a flush operation, broadcast to subscribers.
+pub struct FlushResult<D: Delta> {
+    /// The new snapshot reflecting the flushed state
+    pub snapshot: Arc<dyn StorageRead>,
+    /// The delta that was flushed (wrapped in Arc for cheap cloning)
+    pub delta: Arc<D::Frozen>,
+    /// Epoch range covered by this flush (exclusive end)
+    pub epoch_range: Range<u64>,
+}
+
+impl<D: Delta> Clone for FlushResult<D> {
+    fn clone(&self) -> Self {
+        Self {
+            snapshot: self.snapshot.clone(),
+            delta: self.delta.clone(),
+            epoch_range: self.epoch_range.clone(),
+        }
+    }
+}
+
 /// The level of durability for a write.
 ///
 /// Durability levels form an ordered progression: `Applied < Flushed < Durable`.
