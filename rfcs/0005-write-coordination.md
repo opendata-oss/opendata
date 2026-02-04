@@ -1,4 +1,4 @@
-# RFC 0004: Write Coordination
+# RFC 0005: Write Coordination
 
 **Status**: Draft
 
