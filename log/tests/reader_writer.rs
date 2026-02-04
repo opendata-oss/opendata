@@ -6,8 +6,8 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
 use common::StorageConfig;
+use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
 use log::{Config, LogDb, LogDbReader, LogRead, ReaderConfig, Record};
 use tempfile::TempDir;
 
@@ -31,7 +31,9 @@ async fn reader_discovers_data_written_by_writer() {
         storage: storage.clone(),
         ..Default::default()
     };
-    let writer = LogDb::open(writer_config).await.expect("Failed to open writer");
+    let writer = LogDb::open(writer_config)
+        .await
+        .expect("Failed to open writer");
 
     let key = Bytes::from("test-key");
     writer
@@ -66,11 +68,19 @@ async fn reader_discovers_data_written_by_writer() {
     // Scan and verify data
     let mut iter = reader.scan(key, ..).await.expect("Failed to scan");
 
-    let entry0 = iter.next().await.expect("Failed to get next").expect("Expected entry");
+    let entry0 = iter
+        .next()
+        .await
+        .expect("Failed to get next")
+        .expect("Expected entry");
     assert_eq!(entry0.value, Bytes::from("value-0"));
     assert_eq!(entry0.sequence, 0);
 
-    let entry1 = iter.next().await.expect("Failed to get next").expect("Expected entry");
+    let entry1 = iter
+        .next()
+        .await
+        .expect("Failed to get next")
+        .expect("Expected entry");
     assert_eq!(entry1.value, Bytes::from("value-1"));
     assert_eq!(entry1.sequence, 1);
 
@@ -91,7 +101,9 @@ async fn reader_discovers_new_data_after_initial_open() {
         storage: storage.clone(),
         ..Default::default()
     };
-    let writer = LogDb::open(writer_config).await.expect("Failed to open writer");
+    let writer = LogDb::open(writer_config)
+        .await
+        .expect("Failed to open writer");
 
     // Create reader before any data exists
     let reader_config = ReaderConfig {
@@ -122,7 +134,11 @@ async fn reader_discovers_new_data_after_initial_open() {
 
     // Reader should now see the data
     let mut iter = reader.scan(key, ..).await.expect("Failed to scan");
-    let entry = iter.next().await.expect("Failed to get next").expect("Expected entry");
+    let entry = iter
+        .next()
+        .await
+        .expect("Failed to get next")
+        .expect("Expected entry");
     assert_eq!(entry.value, Bytes::from("event-1"));
 
     // Clean up
