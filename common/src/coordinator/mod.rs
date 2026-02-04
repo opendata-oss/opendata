@@ -52,7 +52,6 @@ pub(crate) enum WriteCommand<D: Delta> {
 /// and coordinates flushing through a `Flusher`.
 pub struct WriteCoordinator<D: Delta, F: Flusher<D>> {
     config: WriteCoordinatorConfig,
-    image: Arc<D::Image>,
     delta: D,
     flush_task: Option<FlushTask<D, F>>,
     flush_tx: mpsc::Sender<FlushEvent<D>>,
@@ -71,7 +70,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
     /// This is useful for testing with mock flushers.
     pub fn new(
         config: WriteCoordinatorConfig,
-        initial_image: D::Image,
+        initial_context: D::Context,
         flusher: F,
     ) -> (Self, WriteCoordinatorHandle<D>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(config.queue_capacity);
@@ -97,7 +96,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         };
 
         let mut delta = D::default();
-        delta.init(&initial_image);
+        delta.init(initial_context);
 
         let flush_task = FlushTask {
             flusher,
@@ -111,7 +110,6 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         );
         let coordinator = Self {
             config,
-            image: initial_image.into(),
             delta,
             cmd_rx,
             flush_tx,
@@ -215,10 +213,8 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         // this is the blocking section of the flush, new writes will not be accepted
         // until the event is sent to the FlushTask
         let delta = std::mem::take(&mut self.delta);
-        let (frozen, new_image) = delta.freeze(&self.image);
-        self.delta.init(&new_image);
-
-        let image = std::mem::replace(&mut self.image, new_image.into());
+        let (frozen, context) = delta.freeze();
+        self.delta.init(context);
 
         // Block until the flush task can accept the event
         let _ = self
@@ -288,36 +284,35 @@ mod tests {
         size: usize,
     }
 
-    /// Image carries state that must persist across deltas (like series dictionary)
+    /// Context carries state that must persist across deltas (like series dictionary)
     #[derive(Clone, Debug, Default)]
-    struct TestImage {
+    struct TestContext {
         key_to_id: HashMap<String, u64>,
         next_id: u64,
     }
 
-    /// Delta accumulates writes and can allocate new IDs for unknown keys
+    /// Delta accumulates writes and can allocate new IDs for unknown keys.
+    /// Stores the context directly and updates it in place.
     #[derive(Clone, Debug, Default)]
     struct TestDelta {
-        key_to_id: HashMap<String, u64>,
-        next_id: u64,
+        context: TestContext,
         writes: HashMap<u64, Vec<u64>>,
         total_size: usize,
     }
 
     impl Delta for TestDelta {
-        type Image = TestImage;
+        type Context = TestContext;
         type Write = TestWrite;
         type Frozen = TestDelta;
 
-        fn init(&mut self, image: &Self::Image) {
-            self.key_to_id = image.key_to_id.clone();
-            self.next_id = image.next_id;
+        fn init(&mut self, context: Self::Context) {
+            self.context = context;
         }
 
         fn apply(&mut self, write: Self::Write) -> Result<(), String> {
-            let id = *self.key_to_id.entry(write.key).or_insert_with(|| {
-                let id = self.next_id;
-                self.next_id += 1;
+            let id = *self.context.key_to_id.entry(write.key).or_insert_with(|| {
+                let id = self.context.next_id;
+                self.context.next_id += 1;
                 id
             });
 
@@ -330,12 +325,14 @@ mod tests {
             self.total_size
         }
 
-        fn freeze(self, image: &Self::Image) -> (Self::Frozen, Self::Image) {
-            let new_image = TestImage {
-                key_to_id: self.key_to_id.clone(),
-                next_id: self.next_id,
+        fn freeze(self) -> (Self::Frozen, Self::Context) {
+            let context = self.context;
+            let frozen = TestDelta {
+                context: context.clone(),
+                writes: self.writes,
+                total_size: self.total_size,
             };
-            (self, new_image)
+            (frozen, context)
         }
     }
 
@@ -430,7 +427,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher,
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -480,7 +477,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -520,7 +517,8 @@ mod tests {
         assert_eq!(events.len(), 1);
         let (delta, _) = &events[0];
         // All writes to key "a" should be under the same ID in order
-        let id = delta.key_to_id.get("a").unwrap();
+        let ctx = &delta.context;
+        let id = ctx.key_to_id.get("a").unwrap();
         let values = delta.writes.get(id).unwrap();
         assert_eq!(values, &[1, 2, 3]);
 
@@ -535,7 +533,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher,
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -569,7 +567,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -600,7 +598,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -631,7 +629,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -671,7 +669,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -709,7 +707,7 @@ mod tests {
         let events = flusher.flushed_events();
         assert_eq!(events.len(), 1);
         let (delta, _) = &events[0];
-        assert_eq!(delta.key_to_id.len(), 3);
+        assert_eq!(delta.context.key_to_id.len(), 3);
 
         // cleanup
         drop(handle);
@@ -722,7 +720,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -768,7 +766,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher,
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -809,7 +807,7 @@ mod tests {
         };
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             config,
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
 
@@ -860,7 +858,7 @@ mod tests {
         };
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             config,
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -895,7 +893,7 @@ mod tests {
         };
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             config,
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -945,7 +943,7 @@ mod tests {
         let (flusher, flush_started_rx, unblock_tx) = TestFlusher::with_flush_control();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -985,7 +983,7 @@ mod tests {
         let (flusher, flush_started_rx, unblock_tx) = TestFlusher::with_flush_control();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -1044,8 +1042,11 @@ mod tests {
             flush_interval: Duration::from_secs(3600),
             flush_size_threshold: usize::MAX,
         };
-        let (coordinator, handle) =
-            WriteCoordinator::<TestDelta, TestFlusher>::new(config, TestImage::default(), flusher);
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
+            config,
+            TestContext::default(),
+            flusher,
+        );
         // Don't start coordinator - queue will fill
 
         // when - fill the queue
@@ -1089,8 +1090,11 @@ mod tests {
             flush_interval: Duration::from_secs(3600),
             flush_size_threshold: usize::MAX,
         };
-        let (coordinator, handle) =
-            WriteCoordinator::<TestDelta, TestFlusher>::new(config, TestImage::default(), flusher);
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
+            config,
+            TestContext::default(),
+            flusher,
+        );
 
         // Fill queue without processing
         let _ = handle
@@ -1138,7 +1142,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher,
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -1162,7 +1166,7 @@ mod tests {
         };
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             config,
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -1195,7 +1199,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher,
         );
 
@@ -1225,7 +1229,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -1277,7 +1281,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -1337,7 +1341,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -1394,7 +1398,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -1431,8 +1435,8 @@ mod tests {
         let (delta2, _) = &events[1];
 
         // Same key should get the same ID across flushes
-        let id1 = delta1.key_to_id.get("a").unwrap();
-        let id2 = delta2.key_to_id.get("a").unwrap();
+        let id1 = delta1.context.key_to_id.get("a").unwrap();
+        let id2 = delta2.context.key_to_id.get("a").unwrap();
         assert_eq!(id1, id2);
 
         // cleanup
@@ -1446,7 +1450,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -1489,11 +1493,13 @@ mod tests {
         let (delta2, _) = &events[1];
 
         // First batch: a=0, b=1
-        let id_a = delta1.key_to_id.get("a").unwrap();
-        let id_b = delta1.key_to_id.get("b").unwrap();
+        let ctx1 = &delta1.context;
+        let id_a = ctx1.key_to_id.get("a").unwrap();
+        let id_b = ctx1.key_to_id.get("b").unwrap();
 
         // Second batch: c should get ID 2 (continuing sequence)
-        let id_c = delta2.key_to_id.get("c").unwrap();
+        let ctx2 = &delta2.context;
+        let id_c = ctx2.key_to_id.get("c").unwrap();
 
         // IDs should be unique and sequential
         assert_ne!(id_a, id_b);
@@ -1511,7 +1517,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher.clone(),
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -1551,11 +1557,12 @@ mod tests {
         // then - second delta should contain mappings for a, b, c
         let events = flusher.flushed_events();
         let (delta2, _) = &events[1];
+        let ctx2 = &delta2.context;
 
-        // Delta should have inherited a and b from image, plus new c
-        assert!(delta2.key_to_id.contains_key("a"));
-        assert!(delta2.key_to_id.contains_key("b"));
-        assert!(delta2.key_to_id.contains_key("c"));
+        // Delta should have inherited a and b from context, plus new c
+        assert!(ctx2.key_to_id.contains_key("a"));
+        assert!(ctx2.key_to_id.contains_key("b"));
+        assert!(ctx2.key_to_id.contains_key("c"));
 
         // cleanup
         drop(handle);
@@ -1572,7 +1579,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher,
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -1604,7 +1611,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher,
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -1637,7 +1644,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher,
         );
         let coordinator_task = tokio::spawn(coordinator.run());
@@ -1656,8 +1663,9 @@ mod tests {
         let result = subscriber.recv().await.unwrap();
 
         // then - delta should contain the write we made
-        assert!(result.delta.key_to_id.contains_key("a"));
-        let id = result.delta.key_to_id.get("a").unwrap();
+        let ctx = &result.delta.context;
+        assert!(ctx.key_to_id.contains_key("a"));
+        let id = ctx.key_to_id.get("a").unwrap();
         let values = result.delta.writes.get(id).unwrap();
         assert_eq!(values, &[42]);
 
@@ -1672,7 +1680,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
-            TestImage::default(),
+            TestContext::default(),
             flusher,
         );
         let coordinator_task = tokio::spawn(coordinator.run());

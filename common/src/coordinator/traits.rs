@@ -44,12 +44,15 @@ pub struct FlushEvent<D: Delta> {
 
 /// A delta accumulates writes and can produce a snapshot image.
 pub trait Delta: Default + Sized + Send + Sync + 'static {
-    type Image: Send + Sync + 'static;
+    /// The Context is data owned only while the Delta is mutable. After
+    /// freezing the delta the context is returned to the write coordinator
+    type Context: Send + Sync + 'static;
     type Write: Send + 'static;
     type Frozen: Clone + Send + Sync + 'static;
 
-    /// Create a new delta initialized from a snapshot image.
-    fn init(&mut self, image: &Self::Image);
+    /// Create a new delta initialized from a snapshot context.
+    /// The delta takes ownership of the context while it is mutable.
+    fn init(&mut self, context: Self::Context);
 
     /// Apply a write to the delta.
     fn apply(&mut self, write: Self::Write) -> Result<(), String>;
@@ -60,10 +63,11 @@ pub trait Delta: Default + Sized + Send + Sync + 'static {
     /// Freezes the current delta, creating an image with the delta
     /// applied.
     ///
+    /// Returns the frozen delta and the context (which was owned by the delta).
     /// Implementations should ensure this operation is efficient (e.g., via
     /// copy-on-write or reference counting) since it blocks writes. After this
     /// is complete, the [`Flusher::flush`] happens on a background thread.
-    fn freeze(self, image: &Self::Image) -> (Self::Frozen, Self::Image);
+    fn freeze(self) -> (Self::Frozen, Self::Context);
 }
 
 /// A flusher persists flush events to durable storage.
