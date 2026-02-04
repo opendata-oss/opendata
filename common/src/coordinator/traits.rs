@@ -26,7 +26,7 @@ pub struct FlushEvent<D: Delta> {
 pub trait Delta: Default + Sized + Send + Sync + 'static {
     type Image: Send + Sync + 'static;
     type Write: Send + 'static;
-    type Frozen: Send + Sync + 'static;
+    type Frozen: Clone + Send + Sync + 'static;
 
     /// Create a new delta initialized from a snapshot image.
     fn init(&mut self, image: &Self::Image);
@@ -51,5 +51,5 @@ pub trait Delta: Default + Sized + Send + Sync + 'static {
 pub trait Flusher<D: Delta>: Send + Sync + 'static {
     /// Flush the given event to durable storage and returns a storage
     /// snapshot for readers to use
-    async fn flush(&self, event: FlushEvent<D>) -> Result<Arc<dyn StorageRead>, String>;
+    async fn flush(&self, event: &FlushEvent<D>) -> Result<Arc<dyn StorageRead>, String>;
 }

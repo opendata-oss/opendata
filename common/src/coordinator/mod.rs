@@ -234,12 +234,12 @@ impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
     fn run(mut self) -> tokio::task::JoinHandle<WriteResult<()>> {
         tokio::spawn(async move {
             while let Some(event) = self.flush_rx.recv().await {
-                let flushed_epoch = event.epoch_range.end - 1;
-
                 self.flusher
-                    .flush(event)
+                    .flush(&event)
                     .await
                     .map_err(|e| WriteError::FlushError(e.to_string()))?;
+
+                let flushed_epoch = event.epoch_range.end - 1;
                 self.flushed_tx
                     .send(flushed_epoch)
                     .map_err(|_| WriteError::Shutdown)?;
@@ -362,7 +362,7 @@ mod tests {
     impl Flusher<TestDelta> for TestFlusher {
         async fn flush(
             &self,
-            event: FlushEvent<TestDelta>,
+            event: &FlushEvent<TestDelta>,
         ) -> Result<Arc<dyn StorageRead>, String> {
             // Signal that flush has started
             let flush_started_tx = {
@@ -385,7 +385,9 @@ mod tests {
             // Record the flush
             {
                 let mut state = self.state.lock().unwrap();
-                state.flushed_events.push((event.delta, event.epoch_range));
+                state
+                    .flushed_events
+                    .push((event.delta.clone(), event.epoch_range.clone()));
             }
 
             // not used in the tests
