@@ -614,6 +614,7 @@ The deletion of done message due to the retention period can be done in the back
   - Should the queue give an ID to a consumer or should the consumer determine its ID?
 - Should the queue set the lease deadline or should the consumer set it, or both?
 - Should we specify the queue spec (except the filter expression) as a key-value list?
+- How can a strategy for distributing message metadata over metadata logs be persisted? 
 
 ## Updates
 
