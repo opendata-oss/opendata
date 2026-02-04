@@ -9,13 +9,13 @@
 
 This RFC defines the storage format for OpenData-Queue.
 The design separates message storage from queue state, where each queue maintains its
-own append-only sequence of records tracking message consumption state.
+state about the consumption of the messages.
 
 ## Motivation
 
 OpenData-Queue is a message queue that allows producers to publish messages and
 consumers to receive and process them.
-OpenData-Queue is used when messages are transient.
+In contrast to OpenData-Log, messages in OpenData-Queue are transient.
 Once a message is consumed, the message is gone.
 In other words, the retention of the messages is different compared to a log.
 In a log the retention is time-based whereas in a queue the retention is consumption-based.
@@ -28,9 +28,7 @@ The typical use cases for a queue is spreading work across multiple workers.
 OpenData-Queue allows to specify multiple queues.
 When a message is published, the producer specifies the payload of the message and
 data about the message, i.e., the metadata of the message.
-For example, the metadata contains when the message is visible for consumption.
 A published message is assigned to a queue according to user-defined rules.
-User defined rules are formulated for each queue by filtering on the metadata of the messages.
 The same message can be assigned to multiple queues.
 A consumer claims messages from a queue and acknowledges the successful processing
 of the message or reports the unsuccessful processing of the message back to the queue.
@@ -61,302 +59,7 @@ Another benefit is that payloads of messages that belong to multiple queues do n
 need to be copied into each queue.
 Payloads are not read until they are claimed by consumers.
 
-### Payload store
-
-The payload store stores the payload of the messages that are published to the message
-queue system.
-The payload store assigns an ID to each published messages.
-The assigned ID is provided by a counter.
-For the counter, the same technique and common code as for the sequence number in
-[OpenData-Log](log/rfcs/0001-storage.md) shall be used.
-
-The key of a payload in the payload store conforms to
-[RFC 0001: Record Key Prefix](rfcs/0001-record-key-prefix.md).
-
-```
-Payload Entry:
-    SlateDB Key:   | version (u8) | type (u8) | message ID (u64)
-    SlateDB Value: | record value (bytes)
-```
-
-The initial version is 1.
-The type discriminator `0x01` is reserved for payload entries.
-Additional record types (e.g., indexes) may be introduced in future RFCs
-using different discriminators.
-
-The record value has the following encoding
-```
-Payload Record Value:
-    | type of payload (u8) | payload (variable-length bytes)
-```
-The type of payload specifies the format of the payload.
-Initially, there will be two payload types:
-- `0x01` `bytes`
-- `0x02` URI (encoding still to be determined)
-
-Type `0x01` is a variable-length sequence of bytes.
-The length of the bytes can be computed from the length of the value minus the size of the payload type field.
-
-### Metadata log
-
-The metadata log stores the metadata of the published messages.
-The metadata log is an [OpenData-Log](log/rfcs/0001-storage.md).
-
-The key of the log is `opendata-queue/{instance ID}/messages/metadata/{log ID}`.
-The `instance ID` is the identifier of the OpenData-queue system instance.
-That is needed to distinguish between multiple OpenData-queue systems that are maintained in the same SlateDB instance.
-The `log ID` is the identifier of the metadata log.
-An OpenData-queue can maintain multiple metadata logs.
-How the metadata of the published messages is distributed across the metadata logs depends on the implemented
-distribution strategy.
-One strategy could be to provide a metadata log for each created queue.
-Another strategy could be to group messages according to the definitions of the created queues.
-This RFC enables to have multiple metadata logs but treats the distribution of messages over the metadata logs as
-an unknown implementation details.
-
-The record value is an encoded array of message metadata:
-```
-Metadata Record Value:
-    Array<MessageMetadata>
-```
-
-The size of the metadata array depends on the batching strategy.
-Message metadata can be batched by time or by size or both.
-
-The metadata contains the following metadata:
-- the message ID assigned to the payload by the payload store
-- the timestamp the message was created
-- the timestamp the message was received
-- the timestamp after which the message becomes visible the first time to consumers
-- the headers of the message (key-value pairs) that contain data for filtering and routing
-
-The message metadata is encoded as follows:
-```
-MessageMetadata:
-    | message ID (u64)
-    | created at (i64)
-    | received at (i64)
-    | visible at (i64)
-    | retention duration in seconds (u32)
-    | number of headers N (u8)
-    | key 0 (Utf8) | value 0 (Utf8)
-    ...
-    | key N-1 (Utf8) | value N-1 (Utf8)
-```
-
-The type `Utf8` is specified in [OpenData's Common Encodings](rfcs/0004-common-encodings.md)
-The retention duration in seconds is computed from the `received at` timestamp.
-If the current timestamp exceeds the `received at` timestamp plus the retention duration,
-the message -- payload and metadata -- are removed from the OpenData-queue system.
-A retention duration of `0` means infinite retention.
-
-### Queue store
-
-The queue store maintains the state and the config for each queue.
-
-The state consists of active, done, and failed messages.
-
-The key of the active messages consists of:
-- the version of the key
-- the type of key, i.e., key of the active messages
-- The identifier of the queue
-
-The key is encoded as follows:
-```
-Active Message Key:
-    | version (u8) | type (u8) | queue ID (bytes)
-```
-The initial version is 1.
-The type discriminator is `0x02`.
-
-The value of the active messages consists of:
-- the list of available messages, i.e., the messages that can be claimed by consumers
-- the list of in-flight messages, i.e., the messages that are currently claimed by consumers
-
-The encoding of the active messages value is as follows:
-```
-Queue State Value:
-    | available messages (Array<AvailableMessage>)
-    | in-flight messages (Array<InFlightMessage>)
-```
-
-An `AvailableMessage` consists of:
-- the message ID of the available message
-- the priority of the available message
-- the timestamp after which the message becomes visible to consumers
-- the retention deadline of the message.
-- the number attempts to claim the message.
-
-The available message type is encoded as follows:
-```
-AvailableMessage:
-    | message ID (u64) | priority (u8) | visible at (i64) | retention deadline (i64) | attempts (u16)
-```
-The priority describes the priority of the message in this queue.
-The priority decreases with increasing number.
-For example, message with priority 1 has a higher priority than a message with priority 2.
-Available messages with higher priorities need to be claimed before messages with lower priority.
-
-An available message with a `visible at` timestamp after the current timestamp cannot be claimed
-by a consumer.
-The `visible at` timestamp is set by the message metadata.
-However, it could also be used to implement a back-off mechanism when processing attempts fail.
-
-The retention deadline is computed by adding the retention duration in the message metadata
-to the received at timestamp.
-If the retention deadline is expired, the message is removed from the payload store.
-
-An `InFlightMessage` consists of:
-- the message ID of the available message
-- the priority of the available message
-- the timestamp when the message was claimed
-- the timestamp when the lease that was claimed ends at the latest
-- the number of attempts to claim the message
-
-```
-InFlightMessage:
-    | message ID (u64) | priority (u8) | | claimed at (i64) | lease deadline (i64) | attempts (u16)
-```
-
-There are multiple options to set the lease deadline.
-Either the consumer that claims the message sets the deadline or the deadline is set
-by the queue config.
-
-Besides the available and in-flight messages, the queue store also maintains the list of done messages per queue.
-A message is done if a consumer claimed the message and acknowledged the successful processing.
-The done message have a retention period after which the done messages are removed from the queue.
-The payload and the metadata of the messages are not removed from the system since other queues could still use them.
-The key for the done messages is encoded as follows:
-```
-Done Messages key:
-    | version (u8) | type (u8) | queue ID (bytes)
-```
-The key is similar to the key for the available messages, but with a different type discriminator, i.e., `0x03`.
-
-The done messages value is an array of done messages.
-```
-Done Messages value:
-    | done messages (Array<DoneMessage>)
-```
-The `DoneMessage` type consists of:
-- the message ID
-- the timestamp when the consumer acknowledged successful processing
-- the number of attempts to claim the message
-
-```
-DoneMessage:
-    | message ID (u64) | done at (i64) | attempts (u16)
-```
-
-Finally, a list of unsuccessfully processed messages keeps the messages that could not be processed after
-the configured number of attempts.
-The key for the failed messages is encoded as follows:
-```
-Failed Messages Key:
-    | version (u8) | type (u8) | queue ID (bytes)
-```
-The key is similar to the key for the available messages, but with a different type discriminator, i.e., `0x04`.
-
-The failed messages value is an array of failed messages.
-```
-Failed Messages value:
-    | failed messages (Array<FailedMessage>)
-```
-The `FailedMessage` type consists of:
-- the message ID
-- the timestamp when the message was considered failed
-- the attempts to process the message
-
-```
-FailedMessage:
-    | message ID (u64) | failed at (i64) | attempts (u16)
-```
-A message is considered failed if a consumer reports unsuccessful processing and there are no more attempts left for
-the message or if the lease deadline expired and there are no more attempts left for the message.
-The maximum attempts are configured per queue.
-
-The failed attempts are recorded in the attempts record.
-The key of the attempts record is encoded as follows:
-
-```
-Attempts Key:
-    | version (u8) | type (u8) | message ID (u64)
-```
-The key of the attempts has a version (initially 1), the type discriminator (`0x05`), and the message ID.
-
-The value of the attempts are encoded as follows:
-```
-Attempts Value:
-    | attempts (Array<ConsumerID>)
-```
-The value of the attempts are encoded as an array of consumer IDs.
-The array contains the IDs of the consumers that claimed the message in ascending time order of the claims.
-
-Additionally to the active messages, the done messages, and the failed messages, the queue store also contains the configuration of the queue.
-
-The key of the configuration is similar to the key of the available messages but with a different type discriminator,
-i.e., `0x06`.
-```
-Queue Config Key:
-    | version (u8) | type (u8) | queue ID (bytes)
-```
-
-The config consists of:
-- the filters that specify which messages the queue contains.
-- the maximum attempts to process a message
-- the retention duration for done messages
-
-```
-Queue Config Value:
-    | filters (FilterExpression)
-    | max attempts (u16)
-    | retention duration for done messages in seconds (u32)
-    | tags (KeyValue)
-```
-
-Added messages that satisfy the filter expression for a specific queue belong to the queue and can be claimed by
-consumers that read the queue.
-The filter expression specifies conditions over the message metadata.
-The exact grammar and encoding of the filter expressions are still to be determined.
-
-After the maximum attempts the message is moved to the failed messages.
-
-The retention duration for done messages is computed from the timestamp `done at` in the `DoneMessage` record value.
-If the current timestamp exceeds the `done at` timestamp plus the retention duration, the done message is
-removed from the array of done messages in the `DoneMessages` value.
-A retention duration of `0` means infinite retention.
-
-### Record types overview
-
-| type discriminator | Description     |
-|--------------------|-----------------|
-| `0x01`             | message payload |
-| `0x02`             | active messages |
-| `0x03`             | done messages   |
-| `0x04`             | failed messages |
-| `0x05`             | attempts        |
-| `0x06`             | queue config    |
-
-### Workflow overview
-
-The OpenData-Queue has the following rough workflow
-1. an admin specifies queues with filter expressions
-   1. the queue configuration is stored in the queue store
-   2. an empty active messages record, an empty done messages record, and an empty failed messages record for the queue are added
-2. a producer adds messages
-   1. the payload of the message is stored in the payload store
-   2. the metadata of the message is stored in the metadata log
-3. a process tails the metadata log and adds the messages to the available messages
-4. a consumer consumes messages in a queue
-   1. the consumer claims an available message
-   2. the message is removed from the available messages and added to the in-flight messages
-   3. the consumer acknowledges the successful processing of a message
-      1. the message is removed from the in-flight messages and added to the done messages
-   4. the consumer reports the unsuccessful processing of a message
-      1. if the message has still attempts, the message is removed from the in-flight messages and added to the available messages
-      2. if the message has no attempts left, the message is removed from the in-flight messages and added to the failed messages
-
-### Existing message queue systems
+### Related message queue systems
 
 #### Amazon SQS
 Amazon Simple Queue Service (Amazon SQS) offers a secure, durable, and available hosted queue that lets you
@@ -439,7 +142,7 @@ wildcard destinations for flexible routing, and integration with Spring Framewor
 The newer ActiveMQ Artemis variant offers improved performance with a non-blocking architecture and is recommended
 for new projects.
 
-#### Protocols
+### Related message queue protocols
 
 **AMQP (Advanced Message Queuing Protocol):**
 An open standard with rich routing capabilities including exchanges, bindings, and queues.
@@ -480,6 +183,403 @@ enabling distributed communication that is loosely coupled, reliable, and asynch
 It is an API specification, not an implementation — vendors provide JMS providers (like ActiveMQ, IBM MQ, RabbitMQ).
 The used wire protocol depends on the provider.
 
+
+### Specification of records
+
+All records in the OpenData-Queue system conform to the common record key prefix defined in [RFC 0001: Record Key Prefix](rfcs/0001-record-key-prefix.md).
+
+```ascii
+┌─────────┬────────────┬─────────────────────┐
+│ version │    type    │     content         │
+│ 1 byte  │   1 byte   │     (varies)        │
+└─────────┴────────────┴─────────────────────┘
+```
+
+The initial version is 1.
+The type specifies the type of the record.
+
+Overview of record types in OpenData-Queue:
+
+| type discriminator | Description     |
+|--------------------|-----------------|
+| `0x01`             | message payload |
+| `0x02`             | active messages |
+| `0x03`             | done messages   |
+| `0x04`             | failed messages |
+| `0x05`             | attempts        |
+| `0x06`             | queue config    |
+
+For the remaining of this RFC, we use `[version, type=<value>]` in the 
+record encodings to denote the common record key prefix. 
+
+### Payload store
+
+The payload store stores the payload of the messages that are published to the message
+queue system.
+The payload store assigns an ID to each published messages.
+The assigned ID is provided by a counter.
+For the counter, the `SeqBlock` is used as described in [RFC 0002: Block-Based Sequence Allocation](/rfcs/0002-seq-block.md).
+
+#### Payload record 
+
+The payload record has the following encodings
+```
+Payload record:
+Key:
+┌──────────────────────────┬────────────┐
+│ [version, type=0x01]     │ message ID │
+│        (2 bytes)         │   (u64)    │
+└──────────────────────────┴────────────┘
+
+Value:
+┌──────────────────────────────────────┐
+│ record value (variable-length bytes) │
+└──────────────────────────────────────┘
+```
+
+The key contains the assigned message ID.
+The variable-length record value contains the payload as a sequence of bytes.
+How to decode the payload is the responsibility of the consumer.
+The length of the payload can be computed from the length of the value.
+
+### Metadata log
+
+The metadata log stores the metadata of the published messages.
+The metadata log is an instance of [OpenData-Log](log/rfcs/0001-storage.md).
+
+#### Metadata record
+
+The key of the metadata record is `opendata-queue/{instance ID}/messages/metadata/{log ID}`.
+The `instance ID` is the identifier of the OpenData-Queue system instance.
+That is needed to distinguish between multiple OpenData-Queue systems that are maintained in the same SlateDB instance.
+The `log ID` is the identifier of the metadata log.
+An OpenData-Queue can maintain multiple metadata logs.
+How the metadata of the published messages is distributed over the metadata logs depends on the implemented
+distribution strategy.
+One strategy could be to provide a metadata log for each created queue.
+Another strategy could be to group messages according to the queue definitions.
+While this RFC enables multiple metadata logs it does not specify any distribution strategy 
+and leaves the specification for future RFCs.
+
+The value of the metadata record is an encoded array of message metadata:
+```
+Metadata Record Value:
+┌────────────────────────┐
+│ Array<MessageMetadata> │
+└────────────────────────┘
+```
+
+The size of the metadata array depends on the batching strategy.
+Message metadata can be batched by time or by size or both.
+The details of the batching message metadata is left for future RFCs.
+
+The value contains the following metadata:
+- the message ID assigned to the payload by the payload store
+- the metadata encoded as an opaque byte field
+
+The message metadata is encoded as follows:
+```
+MessageMetadata:
+┌────────────┬───────────────────┐
+│ message ID │     metadata      │
+│   (u64)    │    (VarBytes)     │
+└────────────┴───────────────────┘
+```
+
+with `VarBytes` encoded as:
+
+```
+┌────────────┬───────────────────┐
+│   length   │       bytes       │
+│   (u32)    │ (variable-length) │
+└────────────┴───────────────────┘
+```
+
+The metadata is encoded as bytes prefixed with the length of the metadata.
+The length of the metadata is required because `MessageMetadata` is an element of an array,
+i.e., the start and the end of each element must be known for decoding the array. 
+The queue is responsible for decoding the metadata it reads from the metadata log.
+
+### Queue store
+
+The queue store maintains the state and the config for each queue.
+
+The state consists of active, done, and failed messages.
+
+#### Active Messages Record
+
+The record for the active messages contains which messages are available or in-flight. 
+To limit the size of the record, the active messages are split into multiple buckets.
+The size of each record can be specified by size.
+
+The key of the active messages consists of:
+- the common record key prefix with type discriminator `0x02`
+- the identifier of the queue
+- the identifier of the bucket
+
+The key is encoded as follows:
+```
+Active Message Key:
+┌──────────────────────┬───────────────────┬───────────┐
+│ [version, type=0x02] │     queue ID      │ bucket ID │
+│        (2 bytes)     │ (TerminatedBytes) │   (u64)   │
+└──────────────────────┴───────────────────┴───────────┘
+```
+The queue ID is encoded as a `TerminatedBytes` to ensure lexicographical ordering. 
+See [RFC-0004 Common Encodings](/rfcs/0004-common-encodings.md) for details. 
+   
+The bucket ID consists of two parts.
+The highest 4 bits specify the capacity of the bucket in number of messages it can hold.
+The capacity is computed as `10^(highest 4 bits)`.
+If the highest 4 bits are `0000b = 0`, the capacity of the bucket is 1 message.
+If the highest 4 bits are `0001b = 1`, the capacity of the bucket is 10 message, and so forth.
+The maximal capacity of a bucket is `10^16`.
+The remaining 60 bits are the number of the bucket.
+The numbers of buckets start at 0 and increase by the capacity of the bucket.
+Let's assume the capacity is 10. 
+Thus, the first bucket has number 0, the second bucket has number 10, the third bucket number 20, etc. 
+
+The value of the active messages consists of:
+- the list of available messages, i.e., the messages that can be claimed by consumers
+- the list of in-flight messages, i.e., the messages that are currently claimed by consumers
+
+The encoding of the active messages value is as follows:
+```
+Active Message Value:
+┌───────────────────────────┬──────────────────────────┐
+│    available messages     │    in-flight messages    │
+│ (Array<AvailableMessage>) │ (Array<InFlightMessage>) │
+└───────────────────────────┴──────────────────────────┘
+```
+
+An `AvailableMessage` consists of:
+- the message ID of the available message
+- the claim ID of the message, i.e., the ID given to the consumer that claims the message
+- the retention deadline of the message
+- the number of attempts to claim the message
+- the metadata of the message
+
+The available message type is encoded as follows:
+```
+AvailableMessage:
+┌────────────┬──────────┬──────────┬────────────┐
+│ message ID │ claim ID │ attempts │  metadata  │
+│   (u64)    │  (u64)   │  (u16)   │ (VarBytes) │
+└────────────┴──────────┴──────────┴────────────┘
+```
+The claim ID consists of two parts similar to the bucket ID.
+The highest 4 bits specify the capacity of a bucket at the time the claim ID was created.
+The remaining 60 bits represent a number that uniquely identifies the message within a bucket of a given capacity.
+The number of the bucket that contains the message with a given claim ID can be computed by integer dividing the 
+number in the lower 60 bit with the capacity in the higher 4 bits and multiplying the result with the capacity.
+That is `(number / capacity) * capacity`.
+
+The metadata is again an opaque field.
+The queue is responsible to decode the metadata.
+
+An `InFlightMessage` consists of:
+- the message ID of the in-flight message
+- the claim ID of the message, i.e., the ID given to the consumer that claims the message
+- the timestamp when the message was claimed
+- the timestamp when the lease that was claimed ends at the latest
+- the number of attempts to claim the message
+- the metadata of the message
+
+```
+InFlightMessage:
+┌────────────┬──────────┬────────────┬────────────────┬──────────┬────────────┐
+│ message ID │ claim ID │ claimed at │ lease deadline │ attempts │  metadata  │
+│   (u64)    │  (u64)   │   (i64)    │     (i64)      │  (u16)   │ (VarBytes) │
+└────────────┴──────────┴────────────┴────────────────┴──────────┴────────────┘
+```
+
+There are multiple options to set the lease deadline.
+Either the consumer that claims the message sets the deadline or the deadline is set
+by the queue.
+
+#### Done Messages Record
+
+Besides the available and in-flight messages, the queue store also maintains the list of done messages per queue.
+A message is done if a consumer claimed the message and acknowledged the successful processing.
+Also, here, to limit the size of the record, the done messages are split into multiple buckets.
+The done message have a retention period after which the done messages are removed from the queue.
+The payload and the metadata of the messages are not removed from the system since other queues could still use them.
+The key for the done messages is encoded as follows:
+```
+Done Messages key:
+┌──────────────────────┬───────────────────┬───────────┐
+│ [version, type=0x03] │      queue ID     │ bucket ID │
+│        (2 bytes)     │ (TerminatedBytes) │   (u64)   │
+└──────────────────────┴───────────────────┴───────────┘
+```
+The key is similar to the key for the available messages, but with a different type discriminator, i.e., `0x03`.
+
+The done messages value is an array of done messages.
+```
+Done Messages value:
+┌──────────────────────┐
+│     done messages    │
+│ (Array<DoneMessage>) │
+└──────────────────────┘
+```
+The `DoneMessage` type consists of:
+- the message ID
+- the claim ID of the message
+- the timestamp when the consumer acknowledged successful processing
+- the metadata of the message
+
+```
+DoneMessage:
+┌────────────┬──────────┬─────────┬──────────┬────────────┐
+│ message ID │ claim ID │ done at │ attempts │  metadata  │
+│   (u64)    │  (u64)   │  (i64)  │  (u16)   │ (VarBytes) │
+└────────────┴──────────┴─────────┴──────────┴────────────┘
+```
+
+#### Failed Messages Record
+
+Finally, a list of unsuccessfully processed messages keeps the messages that could not be processed after
+the configured number of attempts.
+Similar to active and done messages, also failed messages are split into multiple buckets.
+The key for the failed messages is encoded as follows:
+```
+Failed Messages Key:
+┌──────────────────────┬───────────────────┬───────────┐
+│ [version, type=0x04] │      queue ID     │ bucket ID │
+│      (2 bytes)       │ (TerminatedBytes) │   (u64)   │
+└──────────────────────┴───────────────────┴───────────┘
+```
+The key is similar to the key for the available messages, but with a different type discriminator, i.e., `0x04`.
+
+The failed messages value is an array of failed messages.
+```
+Failed Messages value:
+┌────────────────────────┐
+│    failed messages     │
+│ (Array<FailedMessage>) │
+└────────────────────────┘
+```
+The `FailedMessage` type consists of:
+- the message ID
+- the claim ID
+- the timestamp when the message was considered failed
+- the attempts to process the message
+- the metadata of the message
+
+```
+FailedMessage:
+┌────────────┬──────────┬───────────┬──────────┬────────────┐
+│ message ID │ claim ID │ failed at │ attempts │  metadata  │
+│   (u64)    │  (u64)   │   (i64)   │  (u16)   │ (VarBytes) │
+└────────────┴──────────┴───────────┴──────────┴────────────┘
+```
+A message is considered failed if a consumer reports unsuccessful processing and there are no more attempts left for
+the message or if the lease deadline expired and there are no more attempts left for the message.
+The maximum attempts are configured per queue.
+
+#### Attempts Record
+
+Each attempt to claim the message is recorded in the attempts record.
+The key of the attempts record is encoded as follows:
+
+```
+Attempts Key:
+┌──────────────────────┬───────────────────┬────────────┐
+│ [version, type=0x05] │      queue ID     │ message ID │
+│      (2 bytes)       │ (TerminatedBytes) │    (u64)   │
+└──────────────────────┴───────────────────┴────────────┘
+```
+The key of the attempts has the common key prefix with type discriminator (`0x05`), the queue ID, and the message ID.
+
+The value of the attempts are encoded as follows:
+```
+Attempts Value:
+┌──────────────────┐
+│     attempts     │
+│ (Array<Attempt>) │
+└──────────────────┘
+```
+The value of the attempts are encoded as an array of `Attempt`s.
+
+An `Attempt` is encoded as follows:
+```
+Attempt:
+┌────────────┬──────────────┐
+│ claimed at │  consumer ID │
+│   (i64)    │ (ConsumerID) │
+└────────────┴──────────────┘
+```
+To add new attempts the merge operator can be used since attempts are only added and never removed.
+
+##### Queue Specification record
+
+The queue store also contains the specification of the queue.
+
+The key of the configuration contains the common key prefix with type discriminator `0x06`.
+```
+Queue Spec Key:
+┌──────────────────────┬──────────┐
+│ [version, type=0x06] │ queue ID │
+│      (2 bytes)       │  (bytes) │
+└──────────────────────┴──────────┘
+```
+
+The specification consists of:
+- the filters that specify which messages the queue contains.
+- the maximum attempts to process a message
+- the retention duration for done messages
+- the description of the queue 
+
+```
+Queue Spec Value:
+┌─────────────────────────────────────────────────┐
+│                    filters                      │
+│               (FilterExpression)                │
+├─────────────────────────────────────────────────┤
+│                  max attempts                   │
+│                     (u16)                       │
+├─────────────────────────────────────────────────┤
+│ retention duration for done messages in seconds │
+│                     (u32)                       │
+├─────────────────────────────────────────────────┤
+│                   description                   │
+│                     (Utf8)                      │
+└─────────────────────────────────────────────────┘
+```
+
+Added messages that satisfy the filter expression for a specific queue belong to the queue and can be claimed by
+consumers that read the queue.
+The filter expression specifies conditions over the message metadata.
+The exact grammar and encoding of the filter expressions are still to be determined.
+
+After the maximum attempts the message is moved to the failed messages.
+
+The retention duration for done messages is computed from the timestamp `done at` in the `DoneMessage` record value.
+If the current timestamp exceeds the `done at` timestamp plus the retention duration, the done message is
+removed from the array of done messages in the `DoneMessages` value.
+A retention duration of `0` means infinite retention.
+
+Finally, the queue also contains a description.
+
+### Workflow overview
+
+The OpenData-Queue has the following rough workflow
+1. an admin specifies queues with filter expressions
+   1. the queue configuration is stored in the queue store
+   2. an empty active messages record, an empty done messages record, and an empty failed messages record for the queue are added
+2. a producer adds messages
+   1. the payload of the message is stored in the payload store
+   2. the metadata of the message is stored in the metadata log
+3. a process tails the metadata log and adds the messages to the available messages
+4. a consumer consumes messages in a queue
+   1. the consumer claims an available message
+   2. the message is removed from the available messages and added to the in-flight messages
+   3. the consumer acknowledges the successful processing of a message
+      1. the message is removed from the in-flight messages and added to the done messages
+   4. the consumer reports the unsuccessful processing of a message
+      1. if the message has still attempts, the message is removed from the in-flight messages and added to the available messages
+      2. if the message has no attempts left, the message is removed from the in-flight messages and added to the failed messages
+
 ## Alternatives
 
 ### Use a record for each available and in-flight message
@@ -512,12 +612,12 @@ The deletion of done message due to the retention period can be done in the back
   - How should the expression be encoded in the record?
 - The type of the consumer ID is still to be determined:
   - Should the queue give an ID to a consumer or should the consumer determine its ID?
-- How to encode the URI for the payload?
 - Should the queue set the lease deadline or should the consumer set it, or both?
-- Should we specify the queue config (except the filter expression) as a key-value list?
+- Should we specify the queue spec (except the filter expression) as a key-value list?
 
 ## Updates
 
-| Date       | Description |
-|------------|-------------|
-| 2026-01-26 | Initial draft |
+| Date       | Description                         |
+|------------|-------------------------------------|
+| 2026-01-26 | Initial draft                       |
+| 2026-02-4  | Major iteration, introduced buckets |

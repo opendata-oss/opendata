@@ -234,6 +234,39 @@ Encoded: | 0x01 | 0x00 | 0x00 | 0x00 | 0x02 | 0x00 | 0x00 | 0x00 | 0x03 | 0x00 |
 
 Buffer length = 12 bytes, element size = 4 bytes, so count = 3.
 
+### Pair\<L,R\>
+
+A pair consisting of a left and a right value with potentially different types.
+
+#### Encoding Format
+
+```
+┌────────────┬─────────────┐
+│ left value │ right value │
+└────────────┴─────────────┘
+```
+- No count prefix
+- Left value and right value are serialized back-to-back with no padding
+
+**Total size**: left value size + left value size
+
+#### Properties
+
+1. **Fixed-size elements only** — All elements must have identical, known sizes
+2. **Count derivation** — `count = buffer_length / element_size`
+3. **Schema restriction** — Only use when the schema contains a single array and nothing else (so the buffer length is unambiguous)
+4. **Space efficient** — Saves 2 bytes compared to `Array<T>` by omitting the count
+
+#### Example
+
+Array of three `u32` values `[1, 2, 3]`:
+```
+Encoded: | 0x01 | 0x00 | 0x00 | 0x00 | 0x02 | 0x00 | 0x00 | 0x00 | 0x03 | 0x00 | 0x00 | 0x00 |
+           └────── 1 (LE) ─────────┘  └────── 2 (LE) ─────────┘  └────── 3 (LE) ─────────┘
+```
+
+Buffer length = 12 bytes, element size = 4 bytes, so count = 3.
+
 ## Alternatives
 
 ### Variable-Length Integer for Counts
