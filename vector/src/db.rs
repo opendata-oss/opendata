@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use common::sequence::{SeqBlockStore, SequenceAllocator};
 use common::storage::factory::create_storage;
 use common::storage::{Storage, StorageRead};
+use common::{StorageRuntime, StorageSemantics};
 use roaring::RoaringTreemap;
 use tokio::sync::{Mutex, RwLock};
 
@@ -84,9 +85,13 @@ impl VectorDb {
     /// on subsequent opens.
     pub async fn open(config: Config) -> Result<Self> {
         let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
-        let storage = create_storage(&config.storage, Some(Arc::new(merge_op)))
-            .await
-            .context("Failed to create storage")?;
+        let storage = create_storage(
+            &config.storage,
+            StorageRuntime::new(),
+            StorageSemantics::new().with_merge_operator(Arc::new(merge_op)),
+        )
+        .await
+        .context("Failed to create storage")?;
 
         Self::new(storage, config).await
     }

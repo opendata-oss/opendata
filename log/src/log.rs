@@ -11,7 +11,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use common::clock::{Clock, SystemClock};
 use common::storage::factory::create_storage;
-use common::{Record as StorageRecord, WriteOptions as StorageWriteOptions};
+use common::{
+    Record as StorageRecord, StorageRuntime, StorageSemantics, WriteOptions as StorageWriteOptions,
+};
 use tokio::sync::RwLock;
 
 use crate::config::{CountOptions, ScanOptions, WriteOptions};
@@ -109,29 +111,7 @@ impl LogDb {
     /// let log = LogDb::open(test_config()).await?;
     /// ```
     pub async fn open(config: crate::config::Config) -> crate::error::Result<Self> {
-        let storage = create_storage(&config.storage, None)
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let log_storage = LogStorage::new(storage);
-
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-
-        let log_storage_read = log_storage.as_read();
-        let sequence_allocator = SequenceAllocator::open(&log_storage_read).await?;
-        let segment_cache = SegmentCache::open(&log_storage_read, config.segmentation).await?;
-        let listing_cache = ListingCache::new();
-
-        let inner = LogInner {
-            sequence_allocator,
-            segment_cache,
-            listing_cache,
-        };
-
-        Ok(Self {
-            storage: log_storage,
-            clock,
-            inner: RwLock::new(inner),
-        })
+        LogDbBuilder::new(config).build().await
     }
 
     /// Appends records to the log.
@@ -393,6 +373,87 @@ impl LogRead for LogDb {
         let inner = self.inner.read().await;
         let segments = inner.segment_cache.find_covering(&seq_range);
         Ok(segments.into_iter().map(|s| s.into()).collect())
+    }
+}
+
+/// Builder for creating LogDb instances with custom options.
+///
+/// This builder provides a fluent API for configuring a LogDb, including
+/// runtime options that cannot be serialized in configuration files.
+///
+/// # Example
+///
+/// ```ignore
+/// use log::LogDbBuilder;
+/// use log::Config;
+/// use common::StorageRuntime;
+///
+/// // Create a separate runtime for compaction (important for sync/JNI usage)
+/// let compaction_runtime = tokio::runtime::Builder::new_multi_thread()
+///     .worker_threads(2)
+///     .enable_all()
+///     .build()
+///     .unwrap();
+///
+/// let runtime = StorageRuntime::new()
+///     .with_compaction_runtime(compaction_runtime.handle().clone());
+///
+/// let log = LogDbBuilder::new(config)
+///     .with_storage_runtime(runtime)
+///     .build()
+///     .await?;
+/// ```
+pub struct LogDbBuilder {
+    config: crate::config::Config,
+    storage_runtime: StorageRuntime,
+}
+
+impl LogDbBuilder {
+    /// Creates a new log builder with the given configuration.
+    pub fn new(config: crate::config::Config) -> Self {
+        Self {
+            config,
+            storage_runtime: StorageRuntime::new(),
+        }
+    }
+
+    /// Sets the storage runtime options.
+    ///
+    /// Use this to configure runtime options like the compaction runtime handle.
+    pub fn with_storage_runtime(mut self, runtime: StorageRuntime) -> Self {
+        self.storage_runtime = runtime;
+        self
+    }
+
+    /// Builds the LogDb instance.
+    pub async fn build(self) -> Result<LogDb> {
+        let storage = create_storage(
+            &self.config.storage,
+            self.storage_runtime,
+            StorageSemantics::new(),
+        )
+        .await
+        .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let log_storage = LogStorage::new(storage);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+
+        let log_storage_read = log_storage.as_read();
+        let sequence_allocator = SequenceAllocator::open(&log_storage_read).await?;
+        let segment_cache = SegmentCache::open(&log_storage_read, self.config.segmentation).await?;
+        let listing_cache = ListingCache::new();
+
+        let inner = LogInner {
+            sequence_allocator,
+            segment_cache,
+            listing_cache,
+        };
+
+        Ok(LogDb {
+            storage: log_storage,
+            clock,
+            inner: RwLock::new(inner),
+        })
     }
 }
 
@@ -812,9 +873,13 @@ mod tests {
     #[tokio::test]
     async fn should_scan_entries_via_log_reader() {
         // given - create shared storage
-        let storage = create_storage(&StorageConfig::InMemory, None)
-            .await
-            .unwrap();
+        let storage = create_storage(
+            &StorageConfig::InMemory,
+            StorageRuntime::new(),
+            StorageSemantics::new(),
+        )
+        .await
+        .unwrap();
         let log = LogDb::new(storage.clone()).await.unwrap();
         log.append(vec![
             Record {
@@ -1046,9 +1111,13 @@ mod tests {
     #[tokio::test]
     async fn should_list_keys_via_log_reader() {
         // given - create shared storage
-        let storage = create_storage(&StorageConfig::InMemory, None)
-            .await
-            .unwrap();
+        let storage = create_storage(
+            &StorageConfig::InMemory,
+            StorageRuntime::new(),
+            StorageSemantics::new(),
+        )
+        .await
+        .unwrap();
         let log = LogDb::new(storage.clone()).await.unwrap();
         log.append(vec![
             Record {
@@ -1454,9 +1523,13 @@ mod tests {
     #[tokio::test]
     async fn should_list_segments_via_log_reader() {
         // given
-        let storage = create_storage(&StorageConfig::InMemory, None)
-            .await
-            .unwrap();
+        let storage = create_storage(
+            &StorageConfig::InMemory,
+            StorageRuntime::new(),
+            StorageSemantics::new(),
+        )
+        .await
+        .unwrap();
         let log = LogDb::new(storage.clone()).await.unwrap();
 
         log.append(vec![Record {

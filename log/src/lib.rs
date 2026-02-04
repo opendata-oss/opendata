@@ -58,6 +58,6 @@ mod storage;
 pub use config::{Config, CountOptions, ScanOptions, SegmentConfig, WriteOptions};
 pub use error::{Error, Result};
 pub use listing::{LogKey, LogKeyIterator};
-pub use log::LogDb;
+pub use log::{LogDb, LogDbBuilder};
 pub use model::{AppendResult, LogEntry, Record, Segment, SegmentId, Sequence};
 pub use reader::{LogDbReader, LogIterator, LogRead};
