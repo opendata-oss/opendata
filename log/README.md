@@ -56,9 +56,9 @@ Each record is assigned a sequence number from a global counter. Sequences incre
 ### Reading
 
 ```rust
-use log::{LogRead, LogDbReader};
+use log::{LogRead, LogDbReader, ReaderConfig};
 
-let reader = LogDbReader::open(Config::default()).await?;
+let reader = LogDbReader::open(ReaderConfig::default()).await?;
 
 // Scan all entries for a key
 let mut iter = reader.scan(Bytes::from("orders"), ..).await?;
