@@ -1,6 +1,6 @@
-//! Core Log implementation with read and write APIs.
+//! Core LogDb implementation with read and write APIs.
 //!
-//! This module provides the [`Log`] struct, the primary entry point for
+//! This module provides the [`LogDb`] struct, the primary entry point for
 //! interacting with OpenData Log. It exposes both write operations ([`append`])
 //! and read operations ([`scan`], [`count`]) via the [`LogRead`] trait.
 
@@ -11,7 +11,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use common::clock::{Clock, SystemClock};
 use common::storage::factory::create_storage;
-use common::{Record as StorageRecord, WriteOptions as StorageWriteOptions};
+use common::{
+    Record as StorageRecord, StorageRuntime, StorageSemantics, WriteOptions as StorageWriteOptions,
+};
 use tokio::sync::RwLock;
 
 use crate::config::{CountOptions, ScanOptions, WriteOptions};
@@ -38,19 +40,19 @@ struct LogInner {
 
 /// The main log interface providing read and write operations.
 ///
-/// `Log` is the primary entry point for interacting with OpenData Log.
+/// `LogDb` is the primary entry point for interacting with OpenData Log.
 /// It provides methods to append records, scan entries, and count records
 /// within a key's log.
 ///
 /// # Read Operations
 ///
-/// Read operations are provided via the [`LogRead`] trait, which `Log`
-/// implements. This allows generic code to work with either `Log` or
-/// [`LogReader`](crate::LogReader).
+/// Read operations are provided via the [`LogRead`] trait, which `LogDb`
+/// implements. This allows generic code to work with either `LogDb` or
+/// [`LogDbReader`](crate::LogDbReader).
 ///
 /// # Thread Safety
 ///
-/// `Log` is designed to be shared across threads. All methods take `&self`
+/// `LogDb` is designed to be shared across threads. All methods take `&self`
 /// and internal synchronization is handled automatically.
 ///
 /// # Writer Semantics
@@ -62,11 +64,11 @@ struct LogInner {
 /// # Example
 ///
 /// ```ignore
-/// use log::{Log, LogRead, Record, WriteOptions};
+/// use log::{LogDb, LogRead, Record, WriteOptions};
 /// use bytes::Bytes;
 ///
 /// // Open a log (implementation details TBD)
-/// let log = Log::open(config).await?;
+/// let log = LogDb::open(config).await?;
 ///
 /// // Append records
 /// let records = vec![
@@ -81,16 +83,16 @@ struct LogInner {
 ///     println!("seq={}: {:?}", entry.sequence, entry.value);
 /// }
 /// ```
-pub struct Log {
+pub struct LogDb {
     storage: LogStorage,
     clock: Arc<dyn Clock>,
     inner: RwLock<LogInner>,
 }
 
-impl Log {
+impl LogDb {
     /// Opens or creates a log with the given configuration.
     ///
-    /// This is the primary entry point for creating a `Log` instance. The
+    /// This is the primary entry point for creating a `LogDb` instance. The
     /// configuration specifies the storage backend and other settings.
     ///
     /// # Arguments
@@ -104,34 +106,12 @@ impl Log {
     /// # Example
     ///
     /// ```ignore
-    /// use log::{Log, Config};
+    /// use log::{LogDb, Config};
     ///
-    /// let log = Log::open(test_config()).await?;
+    /// let log = LogDb::open(test_config()).await?;
     /// ```
     pub async fn open(config: crate::config::Config) -> crate::error::Result<Self> {
-        let storage = create_storage(&config.storage, None)
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let log_storage = LogStorage::new(storage);
-
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-
-        let log_storage_read = log_storage.as_read();
-        let sequence_allocator = SequenceAllocator::open(&log_storage_read).await?;
-        let segment_cache = SegmentCache::open(&log_storage_read, config.segmentation).await?;
-        let listing_cache = ListingCache::new();
-
-        let inner = LogInner {
-            sequence_allocator,
-            segment_cache,
-            listing_cache,
-        };
-
-        Ok(Self {
-            storage: log_storage,
-            clock,
-            inner: RwLock::new(inner),
-        })
+        LogDbBuilder::new(config).build().await
     }
 
     /// Appends records to the log.
@@ -167,7 +147,7 @@ impl Log {
     /// println!("Appended {} records at seq {}", result.records_appended, result.start_sequence);
     /// ```
     ///
-    /// [`append_with_options`]: Log::append_with_options
+    /// [`append_with_options`]: LogDb::append_with_options
     pub async fn append(&self, records: Vec<Record>) -> Result<AppendResult> {
         self.append_with_options(records, WriteOptions::default())
             .await
@@ -323,7 +303,7 @@ impl Log {
         Ok(())
     }
 
-    /// Creates a Log from an existing storage implementation.
+    /// Creates a LogDb from an existing storage implementation.
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn common::Storage>) -> Result<Self> {
         use crate::config::SegmentConfig;
@@ -351,7 +331,7 @@ impl Log {
 }
 
 #[async_trait]
-impl LogRead for Log {
+impl LogRead for LogDb {
     async fn scan_with_options(
         &self,
         key: Bytes,
@@ -396,6 +376,87 @@ impl LogRead for Log {
     }
 }
 
+/// Builder for creating LogDb instances with custom options.
+///
+/// This builder provides a fluent API for configuring a LogDb, including
+/// runtime options that cannot be serialized in configuration files.
+///
+/// # Example
+///
+/// ```ignore
+/// use log::LogDbBuilder;
+/// use log::Config;
+/// use common::StorageRuntime;
+///
+/// // Create a separate runtime for compaction (important for sync/JNI usage)
+/// let compaction_runtime = tokio::runtime::Builder::new_multi_thread()
+///     .worker_threads(2)
+///     .enable_all()
+///     .build()
+///     .unwrap();
+///
+/// let runtime = StorageRuntime::new()
+///     .with_compaction_runtime(compaction_runtime.handle().clone());
+///
+/// let log = LogDbBuilder::new(config)
+///     .with_storage_runtime(runtime)
+///     .build()
+///     .await?;
+/// ```
+pub struct LogDbBuilder {
+    config: crate::config::Config,
+    storage_runtime: StorageRuntime,
+}
+
+impl LogDbBuilder {
+    /// Creates a new log builder with the given configuration.
+    pub fn new(config: crate::config::Config) -> Self {
+        Self {
+            config,
+            storage_runtime: StorageRuntime::new(),
+        }
+    }
+
+    /// Sets the storage runtime options.
+    ///
+    /// Use this to configure runtime options like the compaction runtime handle.
+    pub fn with_storage_runtime(mut self, runtime: StorageRuntime) -> Self {
+        self.storage_runtime = runtime;
+        self
+    }
+
+    /// Builds the LogDb instance.
+    pub async fn build(self) -> Result<LogDb> {
+        let storage = create_storage(
+            &self.config.storage,
+            self.storage_runtime,
+            StorageSemantics::new(),
+        )
+        .await
+        .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let log_storage = LogStorage::new(storage);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+
+        let log_storage_read = log_storage.as_read();
+        let sequence_allocator = SequenceAllocator::open(&log_storage_read).await?;
+        let segment_cache = SegmentCache::open(&log_storage_read, self.config.segmentation).await?;
+        let listing_cache = ListingCache::new();
+
+        let inner = LogInner {
+            sequence_allocator,
+            segment_cache,
+            listing_cache,
+        };
+
+        Ok(LogDb {
+            storage: log_storage,
+            clock,
+            inner: RwLock::new(inner),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use common::StorageConfig;
@@ -403,7 +464,7 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
-    use crate::reader::LogReader;
+    use crate::reader::LogDbReader;
 
     fn test_config() -> Config {
         Config {
@@ -418,7 +479,7 @@ mod tests {
         let config = test_config();
 
         // when
-        let result = Log::open(config).await;
+        let result = LogDb::open(config).await;
 
         // then
         assert!(result.is_ok());
@@ -427,7 +488,7 @@ mod tests {
     #[tokio::test]
     async fn should_append_single_record() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
         let records = vec![Record {
             key: Bytes::from("orders"),
             value: Bytes::from("order-1"),
@@ -447,7 +508,7 @@ mod tests {
     #[tokio::test]
     async fn should_append_multiple_records_in_batch() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
         let records = vec![
             Record {
                 key: Bytes::from("orders"),
@@ -487,7 +548,7 @@ mod tests {
     #[tokio::test]
     async fn should_append_empty_records_without_error() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
         let records: Vec<Record> = vec![];
 
         // when
@@ -504,7 +565,7 @@ mod tests {
     #[tokio::test]
     async fn should_assign_sequential_sequences_across_appends() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
 
         // when - first append
         log.append(vec![
@@ -546,7 +607,7 @@ mod tests {
     #[tokio::test]
     async fn should_store_records_with_correct_keys_and_values() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
         let records = vec![
             Record {
                 key: Bytes::from("topic-a"),
@@ -579,7 +640,7 @@ mod tests {
     #[tokio::test]
     async fn should_scan_all_entries_for_key() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
         log.append(vec![
             Record {
                 key: Bytes::from("orders"),
@@ -617,7 +678,7 @@ mod tests {
     #[tokio::test]
     async fn should_scan_with_sequence_range() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
         log.append(vec![
             Record {
                 key: Bytes::from("events"),
@@ -660,7 +721,7 @@ mod tests {
     #[tokio::test]
     async fn should_scan_from_starting_sequence() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
         log.append(vec![
             Record {
                 key: Bytes::from("logs"),
@@ -694,7 +755,7 @@ mod tests {
     #[tokio::test]
     async fn should_scan_up_to_ending_sequence() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
         log.append(vec![
             Record {
                 key: Bytes::from("logs"),
@@ -728,7 +789,7 @@ mod tests {
     #[tokio::test]
     async fn should_scan_only_entries_for_specified_key() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
         log.append(vec![
             Record {
                 key: Bytes::from("key-a"),
@@ -768,7 +829,7 @@ mod tests {
     #[tokio::test]
     async fn should_return_empty_iterator_for_unknown_key() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
         log.append(vec![Record {
             key: Bytes::from("existing"),
             value: Bytes::from("value"),
@@ -787,7 +848,7 @@ mod tests {
     #[tokio::test]
     async fn should_return_empty_iterator_for_empty_range() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
         log.append(vec![
             Record {
                 key: Bytes::from("key"),
@@ -812,10 +873,14 @@ mod tests {
     #[tokio::test]
     async fn should_scan_entries_via_log_reader() {
         // given - create shared storage
-        let storage = create_storage(&StorageConfig::InMemory, None)
-            .await
-            .unwrap();
-        let log = Log::new(storage.clone()).await.unwrap();
+        let storage = create_storage(
+            &StorageConfig::InMemory,
+            StorageRuntime::new(),
+            StorageSemantics::new(),
+        )
+        .await
+        .unwrap();
+        let log = LogDb::new(storage.clone()).await.unwrap();
         log.append(vec![
             Record {
                 key: Bytes::from("orders"),
@@ -833,8 +898,8 @@ mod tests {
         .await
         .unwrap();
 
-        // when - create LogReader sharing the same storage
-        let reader = LogReader::new(storage).await.unwrap();
+        // when - create LogDbReader sharing the same storage
+        let reader = LogDbReader::new(storage).await.unwrap();
         let mut iter = reader.scan(Bytes::from("orders"), ..).await.unwrap();
         let mut entries = vec![];
         while let Some(entry) = iter.next().await.unwrap() {
@@ -854,7 +919,7 @@ mod tests {
     #[tokio::test]
     async fn should_scan_across_multiple_segments() {
         // given - log with entries across multiple segments
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
 
         // write to segment 0
         log.append(vec![
@@ -909,7 +974,7 @@ mod tests {
     #[tokio::test]
     async fn should_scan_range_spanning_segments() {
         // given - log with entries across multiple segments
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
 
         // segment 0: seq 0, 1
         log.append(vec![
@@ -975,7 +1040,7 @@ mod tests {
     #[tokio::test]
     async fn should_scan_single_segment_in_multi_segment_log() {
         // given - log with entries across multiple segments
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
 
         // segment 0: seq 0, 1
         log.append(vec![
@@ -1023,7 +1088,7 @@ mod tests {
     #[tokio::test]
     async fn should_list_keys_returns_iterator() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
         log.append(vec![
             Record {
                 key: Bytes::from("key-a"),
@@ -1046,10 +1111,14 @@ mod tests {
     #[tokio::test]
     async fn should_list_keys_via_log_reader() {
         // given - create shared storage
-        let storage = create_storage(&StorageConfig::InMemory, None)
-            .await
-            .unwrap();
-        let log = Log::new(storage.clone()).await.unwrap();
+        let storage = create_storage(
+            &StorageConfig::InMemory,
+            StorageRuntime::new(),
+            StorageSemantics::new(),
+        )
+        .await
+        .unwrap();
+        let log = LogDb::new(storage.clone()).await.unwrap();
         log.append(vec![
             Record {
                 key: Bytes::from("key-a"),
@@ -1063,8 +1132,8 @@ mod tests {
         .await
         .unwrap();
 
-        // when - create LogReader sharing the same storage
-        let reader = LogReader::new(storage).await.unwrap();
+        // when - create LogDbReader sharing the same storage
+        let reader = LogDbReader::new(storage).await.unwrap();
         let _iter = reader.list_keys(..).await.unwrap();
 
         // then - iterator is returned
@@ -1073,7 +1142,7 @@ mod tests {
     #[tokio::test]
     async fn should_list_keys_in_single_segment() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
         log.append(vec![
             Record {
                 key: Bytes::from("key-a"),
@@ -1108,7 +1177,7 @@ mod tests {
     #[tokio::test]
     async fn should_list_keys_across_segments_after_roll() {
         // given - log with entries across multiple segments
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
 
         // write to segment 0
         log.append(vec![
@@ -1159,7 +1228,7 @@ mod tests {
     #[tokio::test]
     async fn should_deduplicate_keys_across_segments() {
         // given - same key written to multiple segments
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
 
         // write to segment 0
         log.append(vec![Record {
@@ -1206,7 +1275,7 @@ mod tests {
     #[tokio::test]
     async fn should_list_keys_in_lexicographic_order() {
         // given - keys inserted out of order
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
         log.append(vec![
             Record {
                 key: Bytes::from("zebra"),
@@ -1240,7 +1309,7 @@ mod tests {
     #[tokio::test]
     async fn should_list_empty_when_no_entries() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
 
         // when
         let mut iter = log.list_keys(..).await.unwrap();
@@ -1252,7 +1321,7 @@ mod tests {
     #[tokio::test]
     async fn should_list_keys_respects_segment_range() {
         // given - entries in different segments
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
 
         // segment 0
         log.append(vec![
@@ -1316,7 +1385,7 @@ mod tests {
     #[tokio::test]
     async fn should_list_segments_returns_empty_when_no_segments() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
 
         // when
         let segments = log.list_segments(..).await.unwrap();
@@ -1328,7 +1397,7 @@ mod tests {
     #[tokio::test]
     async fn should_list_segments_returns_single_segment() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
         log.append(vec![Record {
             key: Bytes::from("key"),
             value: Bytes::from("value"),
@@ -1348,7 +1417,7 @@ mod tests {
     #[tokio::test]
     async fn should_list_segments_returns_multiple_segments() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
 
         // segment 0
         log.append(vec![Record {
@@ -1394,7 +1463,7 @@ mod tests {
     #[tokio::test]
     async fn should_list_segments_filters_by_sequence_range() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
 
         // segment 0: seq 0, 1
         log.append(vec![
@@ -1454,10 +1523,14 @@ mod tests {
     #[tokio::test]
     async fn should_list_segments_via_log_reader() {
         // given
-        let storage = create_storage(&StorageConfig::InMemory, None)
-            .await
-            .unwrap();
-        let log = Log::new(storage.clone()).await.unwrap();
+        let storage = create_storage(
+            &StorageConfig::InMemory,
+            StorageRuntime::new(),
+            StorageSemantics::new(),
+        )
+        .await
+        .unwrap();
+        let log = LogDb::new(storage.clone()).await.unwrap();
 
         log.append(vec![Record {
             key: Bytes::from("key"),
@@ -1476,7 +1549,7 @@ mod tests {
         .unwrap();
 
         // when
-        let reader = LogReader::new(storage).await.unwrap();
+        let reader = LogDbReader::new(storage).await.unwrap();
         let segments = reader.list_segments(..).await.unwrap();
 
         // then
@@ -1488,7 +1561,7 @@ mod tests {
     #[tokio::test]
     async fn should_list_segments_includes_start_time() {
         // given
-        let log = Log::open(test_config()).await.unwrap();
+        let log = LogDb::open(test_config()).await.unwrap();
         log.append(vec![Record {
             key: Bytes::from("key"),
             value: Bytes::from("value"),

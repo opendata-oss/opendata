@@ -18,16 +18,16 @@ use log::server::handlers::{
 };
 use log::server::metrics::Metrics;
 use log::server::proto;
-use log::{Config, Log, Record};
+use log::{Config, LogDb, Record};
 use prost::Message;
 use tower::ServiceExt;
 
-async fn setup_test_app() -> (Router, Arc<Log>) {
+async fn setup_test_app() -> (Router, Arc<LogDb>) {
     let config = Config {
         storage: StorageConfig::InMemory,
         ..Default::default()
     };
-    let log = Arc::new(Log::open(config).await.expect("Failed to open log"));
+    let log = Arc::new(LogDb::open(config).await.expect("Failed to open log"));
     let metrics = Arc::new(Metrics::new());
 
     let state = AppState {

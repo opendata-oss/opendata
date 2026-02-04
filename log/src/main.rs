@@ -5,7 +5,7 @@ use std::sync::Arc;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use log::Log;
+use log::LogDb;
 use log::server::{CliArgs, LogServer, LogServerConfig};
 
 #[tokio::main]
@@ -27,7 +27,7 @@ async fn main() {
     tracing::info!("Opening log with config: {:?}", log_config);
 
     // Open the log
-    let log = Log::open(log_config).await.expect("Failed to open log");
+    let log = LogDb::open(log_config).await.expect("Failed to open log");
 
     // Create and run the server
     let server = LogServer::new(Arc::new(log), server_config);

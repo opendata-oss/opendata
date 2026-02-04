@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use common::StorageConfig;
 
-/// Configuration for opening a [`TimeSeries`](crate::TimeSeries) database.
+/// Configuration for opening a [`TimeSeriesDb`](crate::TimeSeriesDb) database.
 ///
 /// This struct holds all the settings needed to initialize a time series
 /// instance, including storage backend configuration and operational parameters.
@@ -25,7 +25,7 @@ use common::StorageConfig;
 ///     flush_interval: Duration::from_secs(30),
 ///     retention: Some(Duration::from_secs(86400 * 7)), // 7 days
 /// };
-/// let ts = TimeSeries::open(config).await?;
+/// let ts = TimeSeriesDb::open(config).await?;
 /// ```
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -60,8 +60,8 @@ impl Default for Config {
 
 /// Options for write operations.
 ///
-/// Controls the durability and behavior of [`TimeSeries::write`](crate::TimeSeries::write)
-/// and [`TimeSeries::write_with_options`](crate::TimeSeries::write_with_options).
+/// Controls the durability and behavior of [`TimeSeriesDb::write`](crate::TimeSeriesDb::write)
+/// and [`TimeSeriesDb::write_with_options`](crate::TimeSeriesDb::write_with_options).
 #[derive(Debug, Clone, Default)]
 pub struct WriteOptions {
     /// Whether to wait for data to be flushed to durable storage before returning.

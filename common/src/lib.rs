@@ -13,6 +13,7 @@ pub use sequence::{
 };
 pub use serde::seq_block::SeqBlock;
 pub use storage::config::StorageConfig;
+pub use storage::factory::{StorageRuntime, StorageSemantics, create_storage};
 pub use storage::loader::{LoadMetadata, LoadResult, LoadSpec, Loadable, Loader};
 pub use storage::{
     Record, Storage, StorageError, StorageIterator, StorageRead, StorageResult, WriteOptions,

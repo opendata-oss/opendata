@@ -102,7 +102,7 @@ impl Bencher {
                     storage: reporter_config.to_storage_config(),
                     ..Default::default()
                 };
-                let ts = timeseries::TimeSeries::open(ts_config).await?;
+                let ts = timeseries::TimeSeriesDb::open(ts_config).await?;
                 Some(Arc::new(TimeSeriesReporter::new(ts)))
             }
             None => None,

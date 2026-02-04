@@ -40,10 +40,10 @@ Trade-offs:
 ### Writing
 
 ```rust
-use log::{Log, Config, Record};
+use log::{LogDb, Config, Record};
 use bytes::Bytes;
 
-let log = Log::open(Config::default()).await?;
+let log = LogDb::open(Config::default()).await?;
 
 log.append(vec![
     Record { key: Bytes::from("orders"), value: Bytes::from(b"...") },
@@ -56,9 +56,9 @@ Each record is assigned a sequence number from a global counter. Sequences incre
 ### Reading
 
 ```rust
-use log::{LogRead, LogReader};
+use log::{LogRead, LogDbReader};
 
-let reader = LogReader::open(Config::default()).await?;
+let reader = LogDbReader::open(Config::default()).await?;
 
 // Scan all entries for a key
 let mut iter = reader.scan(Bytes::from("orders"), ..).await?;
