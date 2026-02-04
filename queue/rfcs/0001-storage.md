@@ -322,7 +322,7 @@ The key is encoded as follows:
 Active Message Key:
 ┌──────────────────────┬───────────────────┬───────────┐
 │ [version, type=0x02] │     queue ID      │ bucket ID │
-│        (2 bytes)     │ (TerminatedBytes) │   (u64)   │
+│      (2 bytes)       │ (TerminatedBytes) │   (u64)   │
 └──────────────────────┴───────────────────┴───────────┘
 ```
 The queue ID is encoded as a `TerminatedBytes` to ensure lexicographical ordering. 
@@ -373,6 +373,8 @@ The remaining 60 bits represent a number that uniquely identifies the message wi
 The number of the bucket that contains the message with a given claim ID can be computed by integer dividing the 
 number in the lower 60 bit with the capacity in the higher 4 bits and multiplying the result with the capacity.
 That is `(number / capacity) * capacity`.
+The claim ID is set when the message is read from the metadata log and assigned to the queue according
+to the bucket it lands in.    
 
 The metadata is again an opaque field.
 The queue is responsible to decode the metadata.
@@ -528,6 +530,7 @@ The specification consists of:
 - the filters that specify which messages the queue contains.
 - the maximum attempts to process a message
 - the retention duration for done messages
+- the bucket size for the various message records
 - the description of the queue 
 
 ```
@@ -541,6 +544,9 @@ Queue Spec Value:
 ├─────────────────────────────────────────────────┤
 │ retention duration for done messages in seconds │
 │                     (u32)                       │
+├─────────────────────────────────────────────────┤
+│                  bucket size                    │
+│                     (u8)                        │
 ├─────────────────────────────────────────────────┤
 │                   description                   │
 │                     (Utf8)                      │
