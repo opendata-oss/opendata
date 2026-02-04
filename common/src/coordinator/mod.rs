@@ -50,7 +50,7 @@ pub(crate) enum WriteCommand<D: Delta> {
 /// and coordinates flushing through a `Flusher`.
 pub struct WriteCoordinator<D: Delta, F: Flusher<D>> {
     config: WriteCoordinatorConfig,
-    image: D::Image,
+    image: Arc<D::Image>,
     delta: D,
     flush_task: Option<FlushTask<D, F>>,
     flush_tx: mpsc::Sender<FlushEvent<D>>,
@@ -64,20 +64,10 @@ pub struct WriteCoordinator<D: Delta, F: Flusher<D>> {
 }
 
 impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
-    /// Create a new write coordinator.
-    ///
-    /// Returns the coordinator and a handle for submitting writes.
-    pub fn new(
-        config: WriteCoordinatorConfig,
-        initial_image: D::Image,
-    ) -> (Self, WriteCoordinatorHandle<D>) {
-        Self::with_flusher(config, initial_image, F::default())
-    }
-
     /// Create a new write coordinator with the given flusher.
     ///
     /// This is useful for testing with mock flushers.
-    pub fn with_flusher(
+    pub fn new(
         config: WriteCoordinatorConfig,
         initial_image: D::Image,
         flusher: F,
@@ -101,7 +91,8 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
             durable_rx,
         };
 
-        let delta = D::new(&initial_image);
+        let mut delta = D::default();
+        delta.init(&initial_image);
 
         let flush_task = FlushTask {
             flusher,
@@ -114,7 +105,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         );
         let coordinator = Self {
             config,
-            image: initial_image,
+            image: initial_image.into(),
             delta,
             cmd_rx,
             flush_tx,
@@ -212,20 +203,14 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
 
         // this is the blocking section of the flush, new writes will not be accepted
         // until the event is sent to the FlushTask
-        let (new_delta, new_image) = self.delta.fork(&self.image);
-        let delta = std::mem::replace(&mut self.delta, new_delta);
-        let image = std::mem::replace(&mut self.image, new_image);
+        let delta = std::mem::replace(&mut self.delta, D::default());
+        let (frozen, new_image) = delta.freeze(&self.image);
+        self.delta.init(&new_image);
+        
+        let image = std::mem::replace(&mut self.image, new_image.into());
 
-        // Block until flush task can accept the event
-        // (This provides backpressure: if flushing is slow, writes pause)
-        let _ = self
-            .flush_tx
-            .send(FlushEvent {
-                snapshot: image,
-                delta,
-                epoch_range,
-            })
-            .await;
+        // Block until the flush task can accept the event
+        let _ = self.flush_tx.send(FlushEvent { delta: frozen, epoch_range }).await;
     }
 }
 
@@ -284,7 +269,7 @@ mod tests {
     }
 
     /// Delta accumulates writes and can allocate new IDs for unknown keys
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, Default)]
     struct TestDelta {
         key_to_id: HashMap<String, u64>,
         next_id: u64,
@@ -295,14 +280,11 @@ mod tests {
     impl Delta for TestDelta {
         type Image = TestImage;
         type Write = TestWrite;
+        type Frozen = TestDelta;
 
-        fn new(image: &Self::Image) -> Self {
-            Self {
-                key_to_id: image.key_to_id.clone(),
-                next_id: image.next_id,
-                writes: HashMap::new(),
-                total_size: 0,
-            }
+        fn init(&mut self, image: &Self::Image) {
+            self.key_to_id = image.key_to_id.clone();
+            self.next_id = image.next_id;
         }
 
         fn apply(&mut self, write: Self::Write) -> Result<(), String> {
@@ -321,18 +303,12 @@ mod tests {
             self.total_size
         }
 
-        fn fork(&self, image: &Self::Image) -> (Self, Self::Image) {
+        fn freeze(self, image: &Self::Image) -> (Self::Frozen, Self::Image) {
             let new_image = TestImage {
                 key_to_id: self.key_to_id.clone(),
                 next_id: self.next_id,
             };
-            let new_delta = TestDelta {
-                key_to_id: self.key_to_id.clone(),
-                next_id: self.next_id,
-                writes: HashMap::new(),
-                total_size: 0,
-            };
-            (new_delta, new_image)
+            (self, new_image)
         }
     }
 
@@ -423,7 +399,7 @@ mod tests {
     async fn should_assign_monotonic_epochs() {
         // given
         let flusher = TestFlusher::default();
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
             TestImage::default(),
             flusher,
@@ -473,7 +449,7 @@ mod tests {
     async fn should_apply_writes_in_order() {
         // given
         let flusher = TestFlusher::default();
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
             TestImage::default(),
             flusher.clone(),
@@ -528,7 +504,7 @@ mod tests {
     async fn should_update_applied_watermark_after_each_write() {
         // given
         let flusher = TestFlusher::default();
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
             TestImage::default(),
             flusher,
@@ -562,7 +538,7 @@ mod tests {
     async fn should_flush_on_command() {
         // given
         let flusher = TestFlusher::default();
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
             TestImage::default(),
             flusher.clone(),
@@ -593,7 +569,7 @@ mod tests {
     async fn should_include_all_pending_writes_in_flush() {
         // given
         let flusher = TestFlusher::default();
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
             TestImage::default(),
             flusher.clone(),
@@ -644,7 +620,7 @@ mod tests {
     async fn should_skip_flush_when_no_new_writes() {
         // given
         let flusher = TestFlusher::default();
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
             TestImage::default(),
             flusher.clone(),
@@ -690,7 +666,7 @@ mod tests {
     async fn should_update_flushed_watermark_after_flush() {
         // given
         let flusher = TestFlusher::default();
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
             TestImage::default(),
             flusher,
@@ -731,7 +707,7 @@ mod tests {
             flush_interval: Duration::from_millis(100),
             flush_size_threshold: usize::MAX,
         };
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             config,
             TestImage::default(),
             flusher.clone(),
@@ -782,7 +758,7 @@ mod tests {
             flush_interval: Duration::from_secs(3600),
             flush_size_threshold: 100, // Low threshold for testing
         };
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             config,
             TestImage::default(),
             flusher.clone(),
@@ -817,7 +793,7 @@ mod tests {
             flush_interval: Duration::from_secs(3600),
             flush_size_threshold: 100,
         };
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             config,
             TestImage::default(),
             flusher.clone(),
@@ -867,7 +843,7 @@ mod tests {
     async fn should_accept_writes_during_flush() {
         // given
         let (flusher, flush_started_rx, unblock_tx) = TestFlusher::with_flush_control();
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
             TestImage::default(),
             flusher.clone(),
@@ -907,7 +883,7 @@ mod tests {
     async fn should_assign_new_epochs_during_flush() {
         // given
         let (flusher, flush_started_rx, unblock_tx) = TestFlusher::with_flush_control();
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
             TestImage::default(),
             flusher.clone(),
@@ -968,7 +944,7 @@ mod tests {
             flush_interval: Duration::from_secs(3600),
             flush_size_threshold: usize::MAX,
         };
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             config,
             TestImage::default(),
             flusher,
@@ -1016,7 +992,7 @@ mod tests {
             flush_interval: Duration::from_secs(3600),
             flush_size_threshold: usize::MAX,
         };
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             config,
             TestImage::default(),
             flusher,
@@ -1066,7 +1042,7 @@ mod tests {
     async fn should_shutdown_cleanly_when_handles_dropped() {
         // given
         let flusher = TestFlusher::default();
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
             TestImage::default(),
             flusher,
@@ -1090,7 +1066,7 @@ mod tests {
             flush_interval: Duration::from_secs(3600), // Long interval - won't trigger
             flush_size_threshold: usize::MAX,          // High threshold - won't trigger
         };
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             config,
             TestImage::default(),
             flusher.clone(),
@@ -1123,7 +1099,7 @@ mod tests {
     async fn should_return_shutdown_error_after_coordinator_stops() {
         // given
         let flusher = TestFlusher::default();
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
             TestImage::default(),
             flusher,
@@ -1153,7 +1129,7 @@ mod tests {
     async fn should_track_epoch_range_in_flush_event() {
         // given
         let flusher = TestFlusher::default();
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
             TestImage::default(),
             flusher.clone(),
@@ -1205,7 +1181,7 @@ mod tests {
     async fn should_have_contiguous_epoch_ranges() {
         // given
         let flusher = TestFlusher::default();
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
             TestImage::default(),
             flusher.clone(),
@@ -1265,7 +1241,7 @@ mod tests {
     async fn should_include_exact_epochs_in_range() {
         // given
         let flusher = TestFlusher::default();
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
             TestImage::default(),
             flusher.clone(),
@@ -1322,7 +1298,7 @@ mod tests {
     async fn should_preserve_key_to_id_mapping_across_flushes() {
         // given
         let flusher = TestFlusher::default();
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
             TestImage::default(),
             flusher.clone(),
@@ -1374,7 +1350,7 @@ mod tests {
     async fn should_continue_id_sequence_across_flushes() {
         // given
         let flusher = TestFlusher::default();
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
             TestImage::default(),
             flusher.clone(),
@@ -1439,7 +1415,7 @@ mod tests {
     async fn should_include_complete_mapping_in_flush_event() {
         // given
         let flusher = TestFlusher::default();
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::with_flusher(
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
             test_config(),
             TestImage::default(),
             flusher.clone(),
