@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::RwLock;
 
-use common::storage::factory::create_storage;
-use common::{StorageRead, StorageRuntime, StorageSemantics};
+use common::storage::factory::create_storage_read;
+use common::{StorageRead, StorageSemantics};
 
 use crate::config::{Config, CountOptions, ScanOptions, SegmentConfig};
 use crate::error::{Error, Result};
@@ -288,13 +288,10 @@ impl LogDbReader {
     /// }
     /// ```
     pub async fn open(config: Config) -> Result<Self> {
-        let storage: Arc<dyn StorageRead> = create_storage(
-            &config.storage,
-            StorageRuntime::new(),
-            StorageSemantics::new(),
-        )
-        .await
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        let storage: Arc<dyn StorageRead> =
+            create_storage_read(&config.storage, StorageSemantics::new())
+                .await
+                .map_err(|e| Error::Storage(e.to_string()))?;
         let log_storage = LogStorageRead::new(storage);
         let segments = SegmentCache::open(&log_storage, SegmentConfig::default()).await?;
         Ok(Self {

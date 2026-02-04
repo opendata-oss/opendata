@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use slatedb::config::ScanOptions;
 use slatedb::{
-    Db, DbIterator, DbSnapshot, MergeOperator as SlateDbMergeOperator, MergeOperatorError,
-    WriteBatch, config::WriteOptions as SlateDbWriteOptions,
+    Db, DbIterator, DbReader, DbSnapshot, MergeOperator as SlateDbMergeOperator,
+    MergeOperatorError, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
 };
 
 /// Adapter that wraps our `MergeOperator` trait to implement SlateDB's `MergeOperator` trait.
@@ -33,6 +33,17 @@ impl SlateDbMergeOperator for SlateDbMergeOperatorAdapter {
         value: Bytes,
     ) -> Result<Bytes, MergeOperatorError> {
         Ok(self.operator.merge(key, existing_value, value))
+    }
+}
+
+/// Returns the default scan options used for storage scans.
+fn default_scan_options() -> ScanOptions {
+    ScanOptions {
+        durability_filter: Default::default(),
+        dirty: false,
+        read_ahead_bytes: 1024 * 1024,
+        cache_blocks: true,
+        max_fetch_tasks: 4,
     }
 }
 
@@ -96,23 +107,14 @@ impl StorageRead for SlateDbStorage {
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
         let iter = self
             .db
-            .scan_with_options(
-                range,
-                &ScanOptions {
-                    durability_filter: Default::default(),
-                    dirty: false,
-                    read_ahead_bytes: 1024 * 1024,
-                    cache_blocks: true,
-                    max_fetch_tasks: 4,
-                },
-            )
+            .scan_with_options(range, &default_scan_options())
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
     }
 }
 
-struct SlateDbIterator {
+pub(super) struct SlateDbIterator {
     iter: DbIterator,
 }
 
@@ -157,16 +159,7 @@ impl StorageRead for SlateDbStorageSnapshot {
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
         let iter = self
             .snapshot
-            .scan_with_options(
-                range,
-                &ScanOptions {
-                    durability_filter: Default::default(),
-                    dirty: false,
-                    read_ahead_bytes: 1024 * 1024,
-                    cache_blocks: true,
-                    max_fetch_tasks: 4,
-                },
-            )
+            .scan_with_options(range, &default_scan_options())
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
@@ -256,5 +249,190 @@ impl Storage for SlateDbStorage {
     async fn close(&self) -> StorageResult<()> {
         self.db.close().await.map_err(StorageError::from_storage)?;
         Ok(())
+    }
+}
+
+/// Read-only SlateDB storage using `DbReader`.
+///
+/// This struct provides read-only access to a SlateDB database without fencing,
+/// allowing multiple readers to coexist with a single writer.
+pub struct SlateDbStorageReader {
+    reader: Arc<DbReader>,
+}
+
+impl SlateDbStorageReader {
+    /// Creates a new SlateDbStorageReader wrapping the given DbReader.
+    pub fn new(reader: Arc<DbReader>) -> Self {
+        Self { reader }
+    }
+}
+
+#[async_trait]
+impl StorageRead for SlateDbStorageReader {
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn get(&self, key: Bytes) -> StorageResult<Option<Record>> {
+        let value = self
+            .reader
+            .get(&key)
+            .await
+            .map_err(StorageError::from_storage)?;
+
+        match value {
+            Some(v) => Ok(Some(Record::new(key, v))),
+            None => Ok(None),
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn scan_iter(
+        &self,
+        range: BytesRange,
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        let iter = self
+            .reader
+            .scan_with_options(range, &default_scan_options())
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(Box::new(SlateDbIterator { iter }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BytesRange;
+    use slatedb::DbBuilder;
+    use slatedb::object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn should_read_data_written_by_storage_via_reader() {
+        let object_store = Arc::new(InMemory::new());
+        let path = "/test/db";
+
+        // Create writer and write data
+        let db = DbBuilder::new(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        let storage = SlateDbStorage::new(Arc::new(db));
+
+        storage
+            .put(vec![
+                Record::new(Bytes::from("key1"), Bytes::from("value1")),
+                Record::new(Bytes::from("key2"), Bytes::from("value2")),
+            ])
+            .await
+            .unwrap();
+        storage.flush().await.unwrap();
+
+        // Create reader and verify data
+        let reader = DbReader::open(path, object_store, None, Default::default())
+            .await
+            .unwrap();
+        let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
+
+        let record = storage_reader.get(Bytes::from("key1")).await.unwrap();
+        assert!(record.is_some());
+        assert_eq!(record.unwrap().value, Bytes::from("value1"));
+
+        let record = storage_reader.get(Bytes::from("key2")).await.unwrap();
+        assert!(record.is_some());
+        assert_eq!(record.unwrap().value, Bytes::from("value2"));
+
+        let record = storage_reader.get(Bytes::from("key3")).await.unwrap();
+        assert!(record.is_none());
+
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_scan_data_written_by_storage_via_reader() {
+        let object_store = Arc::new(InMemory::new());
+        let path = "/test/db";
+
+        // Create writer and write data
+        let db = DbBuilder::new(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        let storage = SlateDbStorage::new(Arc::new(db));
+
+        storage
+            .put(vec![
+                Record::new(Bytes::from("a"), Bytes::from("1")),
+                Record::new(Bytes::from("b"), Bytes::from("2")),
+                Record::new(Bytes::from("c"), Bytes::from("3")),
+            ])
+            .await
+            .unwrap();
+        storage.flush().await.unwrap();
+
+        // Create reader and scan data
+        let reader = DbReader::open(path, object_store, None, Default::default())
+            .await
+            .unwrap();
+        let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
+
+        let mut iter = storage_reader
+            .scan_iter(BytesRange::unbounded())
+            .await
+            .unwrap();
+        let mut results = Vec::new();
+        while let Some(record) = iter.next().await.unwrap() {
+            results.push((record.key, record.value));
+        }
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], (Bytes::from("a"), Bytes::from("1")));
+        assert_eq!(results[1], (Bytes::from("b"), Bytes::from("2")));
+        assert_eq!(results[2], (Bytes::from("c"), Bytes::from("3")));
+
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_coexist_writer_and_reader_without_fencing_error() {
+        let object_store = Arc::new(InMemory::new());
+        let path = "/test/db";
+
+        // Create writer
+        let db = DbBuilder::new(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        let storage = SlateDbStorage::new(Arc::new(db));
+
+        // Write initial data
+        storage
+            .put(vec![Record::new(
+                Bytes::from("key1"),
+                Bytes::from("value1"),
+            )])
+            .await
+            .unwrap();
+        storage.flush().await.unwrap();
+
+        // Create reader while writer is still open - this should NOT cause fencing error
+        let reader = DbReader::open(path, object_store, None, Default::default())
+            .await
+            .unwrap();
+        let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
+
+        // Reader can read the data
+        let record = storage_reader.get(Bytes::from("key1")).await.unwrap();
+        assert!(record.is_some());
+        assert_eq!(record.unwrap().value, Bytes::from("value1"));
+
+        // Writer can still write more data
+        storage
+            .put(vec![Record::new(
+                Bytes::from("key2"),
+                Bytes::from("value2"),
+            )])
+            .await
+            .unwrap();
+        storage.flush().await.unwrap();
+
+        storage.close().await.unwrap();
     }
 }

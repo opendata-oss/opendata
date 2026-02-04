@@ -5,15 +5,15 @@
 
 use std::sync::Arc;
 
-use slatedb::DbBuilder;
 use slatedb::config::Settings;
 use slatedb::object_store::{self, ObjectStore};
+use slatedb::{DbBuilder, DbReader};
 use tokio::runtime::Handle;
 
 use super::config::{ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
 use super::in_memory::InMemoryStorage;
-use super::slate::SlateDbStorage;
-use super::{MergeOperator, Storage, StorageError, StorageResult};
+use super::slate::{SlateDbStorage, SlateDbStorageReader};
+use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
 
 /// Runtime options for storage that cannot be serialized.
 ///
@@ -182,6 +182,55 @@ pub async fn create_storage(
         StorageConfig::SlateDb(slate_config) => {
             let storage = create_slatedb_storage(slate_config, runtime, semantics).await?;
             Ok(Arc::new(storage))
+        }
+    }
+}
+
+/// Creates a read-only storage instance based on configuration.
+///
+/// This function creates a storage backend that only supports read operations.
+/// For SlateDB, it uses `DbReader` which does not participate in fencing,
+/// allowing multiple readers to coexist with a single writer.
+///
+/// # Arguments
+///
+/// * `config` - The storage configuration specifying the backend type and settings.
+/// * `semantics` - System-specific semantics like merge operators.
+///
+/// # Returns
+///
+/// Returns an `Arc<dyn StorageRead>` on success, or a `StorageError` on failure.
+pub async fn create_storage_read(
+    config: &StorageConfig,
+    semantics: StorageSemantics,
+) -> StorageResult<Arc<dyn StorageRead>> {
+    match config {
+        StorageConfig::InMemory => {
+            // InMemory has no fencing, reuse existing implementation
+            let storage = match semantics.merge_operator {
+                Some(op) => InMemoryStorage::with_merge_operator(op),
+                None => InMemoryStorage::new(),
+            };
+            Ok(Arc::new(storage))
+        }
+        StorageConfig::SlateDb(slate_config) => {
+            let object_store = create_object_store(&slate_config.object_store)?;
+            let mut options = slatedb::config::DbReaderOptions::default();
+            if let Some(op) = semantics.merge_operator {
+                let adapter = SlateDbStorage::merge_operator_adapter(op);
+                options.merge_operator = Some(Arc::new(adapter));
+            }
+            let reader = DbReader::open(
+                slate_config.path.clone(),
+                object_store,
+                None, // checkpoint_id - use latest state
+                options,
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Storage(format!("Failed to create SlateDB reader: {}", e))
+            })?;
+            Ok(Arc::new(SlateDbStorageReader::new(Arc::new(reader))))
         }
     }
 }
