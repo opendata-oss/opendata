@@ -96,15 +96,17 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     /// Request a flush of the current delta.
     ///
     /// This will trigger a flush even if the flush threshold has not been reached.
-    pub async fn flush(&self) -> WriteResult<()> {
+    /// Returns a handle that can be used to wait for the flush to complete.
+    pub async fn flush(&self) -> WriteResult<WriteHandle> {
+        let (epoch_tx, epoch_rx) = oneshot::channel();
         self.cmd_tx
-            .try_send(WriteCommand::Flush)
+            .try_send(WriteCommand::Flush { epoch: epoch_tx })
             .map_err(|e| match e {
                 mpsc::error::TrySendError::Full(_) => WriteError::Backpressure,
                 mpsc::error::TrySendError::Closed(_) => WriteError::Shutdown,
             })?;
 
-        Ok(())
+        Ok(WriteHandle::new(epoch_rx, self.watchers.clone()))
     }
 }
 

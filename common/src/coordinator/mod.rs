@@ -41,7 +41,9 @@ pub(crate) enum WriteCommand<D: Delta> {
         write: D::Write,
         epoch: oneshot::Sender<u64>,
     },
-    Flush,
+    Flush {
+        epoch: oneshot::Sender<u64>,
+    },
 }
 
 /// The write coordinator manages write ordering, batching, and durability.
@@ -142,7 +144,9 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
                         Some(WriteCommand::Write {write, epoch: epoch_tx}) => {
                             self.handle_write(write, epoch_tx).await?;
                         }
-                        Some(WriteCommand::Flush) => {
+                        Some(WriteCommand::Flush { epoch: epoch_tx }) => {
+                            // Send back the epoch of the last processed write
+                            let _ = epoch_tx.send(self.epoch.saturating_sub(1));
                             self.handle_flush().await;
                         }
                         None => {
@@ -203,14 +207,20 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
 
         // this is the blocking section of the flush, new writes will not be accepted
         // until the event is sent to the FlushTask
-        let delta = std::mem::replace(&mut self.delta, D::default());
+        let delta = std::mem::take(&mut self.delta);
         let (frozen, new_image) = delta.freeze(&self.image);
         self.delta.init(&new_image);
-        
+
         let image = std::mem::replace(&mut self.image, new_image.into());
 
         // Block until the flush task can accept the event
-        let _ = self.flush_tx.send(FlushEvent { delta: frozen, epoch_range }).await;
+        let _ = self
+            .flush_tx
+            .send(FlushEvent {
+                delta: frozen,
+                epoch_range,
+            })
+            .await;
     }
 }
 
@@ -559,6 +569,77 @@ mod tests {
 
         // then
         assert_eq!(flusher.flushed_events().len(), 1);
+
+        // cleanup
+        drop(handle);
+        coordinator_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_wait_on_flush_handle() {
+        // given
+        let flusher = TestFlusher::default();
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
+            test_config(),
+            TestImage::default(),
+            flusher.clone(),
+        );
+        let coordinator_task = tokio::spawn(coordinator.run());
+
+        // when
+        handle
+            .write(TestWrite {
+                key: "a".into(),
+                value: 1,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        let mut flush_handle = handle.flush().await.unwrap();
+
+        // then - can wait directly on the flush handle
+        flush_handle.wait(Durability::Flushed).await.unwrap();
+        assert_eq!(flusher.flushed_events().len(), 1);
+
+        // cleanup
+        drop(handle);
+        coordinator_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_return_correct_epoch_from_flush_handle() {
+        // given
+        let flusher = TestFlusher::default();
+        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
+            test_config(),
+            TestImage::default(),
+            flusher.clone(),
+        );
+        let coordinator_task = tokio::spawn(coordinator.run());
+
+        // when
+        let write1 = handle
+            .write(TestWrite {
+                key: "a".into(),
+                value: 1,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        let write2 = handle
+            .write(TestWrite {
+                key: "b".into(),
+                value: 2,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        let flush_handle = handle.flush().await.unwrap();
+
+        // then - flush handle epoch should be the last write's epoch
+        let flush_epoch = flush_handle.epoch().await.unwrap();
+        let write2_epoch = write2.epoch().await.unwrap();
+        assert_eq!(flush_epoch, write2_epoch);
 
         // cleanup
         drop(handle);
@@ -944,11 +1025,8 @@ mod tests {
             flush_interval: Duration::from_secs(3600),
             flush_size_threshold: usize::MAX,
         };
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
-            config,
-            TestImage::default(),
-            flusher,
-        );
+        let (coordinator, handle) =
+            WriteCoordinator::<TestDelta, TestFlusher>::new(config, TestImage::default(), flusher);
         // Don't start coordinator - queue will fill
 
         // when - fill the queue
@@ -992,11 +1070,8 @@ mod tests {
             flush_interval: Duration::from_secs(3600),
             flush_size_threshold: usize::MAX,
         };
-        let (coordinator, handle) = WriteCoordinator::<TestDelta, TestFlusher>::new(
-            config,
-            TestImage::default(),
-            flusher,
-        );
+        let (coordinator, handle) =
+            WriteCoordinator::<TestDelta, TestFlusher>::new(config, TestImage::default(), flusher);
 
         // Fill queue without processing
         let _ = handle
