@@ -73,7 +73,16 @@ impl VectorDb {
     ///
     /// Other configuration options (like `flush_interval`) can be changed
     /// on subsequent opens.
-    pub async fn open(config: Config, centroids: Vec<CentroidEntry>) -> Result<Self> {
+    pub async fn open(config: Config) -> Result<Self> {
+        let centroid1 = (0..config.dimensions).map(|_| 0.0f32).collect();
+        let centroid1 = CentroidEntry::new(1, centroid1);
+        Self::open_with_centroids(config, vec![centroid1]).await
+    }
+
+    pub async fn open_with_centroids(
+        config: Config,
+        centroids: Vec<CentroidEntry>,
+    ) -> Result<Self> {
         let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
         let storage = create_storage(
             &config.storage,
@@ -83,14 +92,16 @@ impl VectorDb {
         .await
         .context("Failed to create storage")?;
 
-        Self::new(storage, config, centroids).await
+        Self::load_or_init_db(storage, config, centroids).await
     }
 
     /// Create a vector database with the given storage, configuration, and centroids.
+    /// The fn is internal to this module. It is intended to be used by the public api and
+    /// by tests.
     ///
     /// If centroids already exist in storage, the provided centroids are ignored.
     /// Otherwise, the provided centroids are written to storage.
-    pub(crate) async fn new(
+    async fn load_or_init_db(
         storage: Arc<dyn Storage>,
         config: Config,
         centroids: Vec<CentroidEntry>,
@@ -590,24 +601,23 @@ mod tests {
         }
     }
 
+    fn create_test_centroids(dimensions: usize) -> Vec<CentroidEntry> {
+        vec![CentroidEntry::new(1, vec![1.0; dimensions])]
+    }
+
     fn create_test_storage() -> Arc<dyn Storage> {
         Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
             VectorDbMergeOperator::new(3),
         )))
     }
 
-    fn create_test_centroids(dimensions: usize) -> Vec<CentroidEntry> {
-        vec![CentroidEntry::new(1, vec![1.0; dimensions])]
-    }
-
     #[tokio::test]
     async fn should_open_vector_db() {
         // given
         let config = create_test_config();
-        let centroids = create_test_centroids(3);
 
         // when
-        let result = VectorDb::open(config, centroids).await;
+        let result = VectorDb::open(config).await;
 
         // then
         assert!(result.is_ok());
@@ -619,7 +629,7 @@ mod tests {
         let storage = create_test_storage();
         let config = create_test_config();
         let centroids = create_test_centroids(3);
-        let db = VectorDb::new(Arc::clone(&storage), config, centroids)
+        let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
             .await
             .unwrap();
 
@@ -660,7 +670,7 @@ mod tests {
         let storage = create_test_storage();
         let config = create_test_config();
         let centroids = create_test_centroids(3);
-        let db = VectorDb::new(Arc::clone(&storage), config, centroids)
+        let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
             .await
             .unwrap();
 
@@ -697,8 +707,7 @@ mod tests {
     async fn should_reject_vectors_with_wrong_dimensions() {
         // given
         let config = create_test_config();
-        let centroids = create_test_centroids(3);
-        let db = VectorDb::open(config, centroids).await.unwrap();
+        let db = VectorDb::open(config).await.unwrap();
 
         let vector = Vector::new("vec-1", vec![1.0, 2.0]); // Wrong: 2 instead of 3
 
@@ -719,8 +728,7 @@ mod tests {
     async fn should_flush_empty_delta_without_error() {
         // given
         let config = create_test_config();
-        let centroids = create_test_centroids(3);
-        let db = VectorDb::open(config, centroids).await.unwrap();
+        let db = VectorDb::open(config).await.unwrap();
 
         // when
         let result = db.flush().await;
@@ -770,7 +778,9 @@ mod tests {
             .map(|(i, vector)| CentroidEntry::new((i + 1) as u32, vector.clone()))
             .collect();
 
-        let db = VectorDb::open(config, centroids).await.unwrap();
+        let db = VectorDb::open_with_centroids(config, centroids)
+            .await
+            .unwrap();
 
         // Create 4 clusters of 25 vectors each
         let mut all_vectors = Vec::new();
@@ -818,8 +828,7 @@ mod tests {
     async fn should_handle_deleted_vectors_in_search() {
         // given - create database with centroids
         let config = create_test_config_with_dimensions(3);
-        let centroids = vec![CentroidEntry::new(1, vec![1.0, 0.0, 0.0])];
-        let db = VectorDb::open(config, centroids).await.unwrap();
+        let db = VectorDb::open(config).await.unwrap();
 
         // Write initial vector
         let vector1 = Vector::new("vec-1", vec![1.0, 0.0, 0.0]);
@@ -859,8 +868,7 @@ mod tests {
             flush_interval: Duration::from_secs(60),
             metadata_fields: vec![],
         };
-        let centroids = vec![CentroidEntry::new(1, vec![0.0, 0.0, 0.0])];
-        let db = VectorDb::open(config, centroids).await.unwrap();
+        let db = VectorDb::open(config).await.unwrap();
 
         // Write vectors at different distances from origin
         let vectors = vec![
@@ -893,8 +901,7 @@ mod tests {
     async fn should_reject_query_with_wrong_dimensions() {
         // given - database with 3 dimensions
         let config = create_test_config_with_dimensions(3);
-        let centroids = create_test_centroids(3);
-        let db = VectorDb::open(config, centroids).await.unwrap();
+        let db = VectorDb::open(config).await.unwrap();
 
         // when - query with wrong dimensions
         let result = db.search(&[1.0, 2.0], 10).await;
@@ -913,8 +920,7 @@ mod tests {
     async fn should_return_empty_results_when_no_vectors() {
         // given - database with centroids but no vectors
         let config = create_test_config_with_dimensions(3);
-        let centroids = vec![CentroidEntry::new(1, vec![1.0, 0.0, 0.0])];
-        let db = VectorDb::open(config, centroids).await.unwrap();
+        let db = VectorDb::open(config).await.unwrap();
 
         // when - search
         let results = db.search(&[1.0, 0.0, 0.0], 10).await.unwrap();
@@ -927,8 +933,7 @@ mod tests {
     async fn should_limit_results_to_k() {
         // given - database with many vectors
         let config = create_test_config_with_dimensions(2);
-        let centroids = vec![CentroidEntry::new(1, vec![1.0, 0.0])];
-        let db = VectorDb::open(config, centroids).await.unwrap();
+        let db = VectorDb::open(config).await.unwrap();
 
         // Insert 20 vectors
         let vectors: Vec<Vector> = (0..20)
@@ -953,7 +958,9 @@ mod tests {
             CentroidEntry::new(2, vec![0.0, 1.0]),
             CentroidEntry::new(3, vec![-1.0, 0.0]),
         ];
-        let db = VectorDb::open(config, centroids).await.unwrap();
+        let db = VectorDb::open_with_centroids(config, centroids)
+            .await
+            .unwrap();
 
         // Insert vectors in each cluster
         let vectors = vec![
@@ -982,9 +989,10 @@ mod tests {
         let centroids = create_test_centroids(3);
 
         {
-            let db = VectorDb::new(Arc::clone(&storage), config.clone(), centroids.clone())
-                .await
-                .unwrap();
+            let db =
+                VectorDb::load_or_init_db(Arc::clone(&storage), config.clone(), centroids.clone())
+                    .await
+                    .unwrap();
             let vectors = vec![
                 Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
                     .attribute("category", "shoes")
@@ -1000,7 +1008,7 @@ mod tests {
         }
 
         // when - reopen database (centroids should be loaded from storage)
-        let db2 = VectorDb::new(Arc::clone(&storage), config, vec![])
+        let db2 = VectorDb::load_or_init_db(Arc::clone(&storage), config, vec![])
             .await
             .unwrap();
 
@@ -1015,7 +1023,7 @@ mod tests {
         let config = create_test_config();
 
         // when
-        let result = VectorDb::open(config, vec![]).await;
+        let result = VectorDb::open_with_centroids(config, vec![]).await;
 
         // then
         match result {
