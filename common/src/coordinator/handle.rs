@@ -20,12 +20,15 @@ pub(crate) struct EpochWatcher {
 /// Provides the epoch assigned to the write and allows waiting
 /// for the write to reach a desired durability level.
 pub struct WriteHandle {
-    epoch: Shared<oneshot::Receiver<u64>>,
+    epoch: Shared<oneshot::Receiver<Result<u64, String>>>,
     watchers: EpochWatcher,
 }
 
 impl WriteHandle {
-    pub(crate) fn new(epoch: oneshot::Receiver<u64>, watchers: EpochWatcher) -> Self {
+    pub(crate) fn new(
+        epoch: oneshot::Receiver<Result<u64, String>>,
+        watchers: EpochWatcher,
+    ) -> Self {
         Self {
             epoch: epoch.shared(),
             watchers,
@@ -38,7 +41,11 @@ impl WriteHandle {
     /// method blocks until sequencing completes. Epochs are monotonically
     /// increasing and reflect the actual write order.
     pub async fn epoch(&self) -> WriteResult<u64> {
-        self.epoch.clone().await.map_err(|_| WriteError::Shutdown)
+        self.epoch
+            .clone()
+            .await
+            .map_err(|_| WriteError::Shutdown)?
+            .map_err(WriteError::ApplyError)
     }
 
     /// Wait for the write to reach the specified durability level.
@@ -167,7 +174,7 @@ mod tests {
         );
 
         // when
-        epoch_tx.send(42).unwrap();
+        epoch_tx.send(Ok(42)).unwrap();
         let result = handle.epoch().await;
 
         // then
@@ -186,7 +193,7 @@ mod tests {
             epoch_rx,
             create_watchers(applied_rx, flushed_rx, durable_rx),
         );
-        epoch_tx.send(42).unwrap();
+        epoch_tx.send(Ok(42)).unwrap();
 
         // when
         let result1 = handle.epoch().await;
@@ -210,7 +217,7 @@ mod tests {
             epoch_rx,
             create_watchers(applied_rx, flushed_rx, durable_rx),
         );
-        epoch_tx.send(50).unwrap(); // epoch is 50, watermark is 100
+        epoch_tx.send(Ok(50)).unwrap(); // epoch is 50, watermark is 100
 
         // when
         let result = handle.wait(Durability::Applied).await;
@@ -230,7 +237,7 @@ mod tests {
             epoch_rx,
             create_watchers(applied_rx, flushed_rx, durable_rx),
         );
-        epoch_tx.send(10).unwrap();
+        epoch_tx.send(Ok(10)).unwrap();
 
         // when - spawn a task to update the watermark after a delay
         let wait_task = tokio::spawn(async move { handle.wait(Durability::Applied).await });
@@ -257,7 +264,7 @@ mod tests {
             epoch_rx,
             create_watchers(applied_rx, flushed_rx, durable_rx),
         );
-        epoch_tx.send(25).unwrap();
+        epoch_tx.send(Ok(25)).unwrap();
 
         // when - wait for Durable (watermark is 10, epoch is 25)
         let wait_task = tokio::spawn(async move { handle.wait(Durability::Durable).await });
@@ -274,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn should_propagate_epoch_error_in_wait() {
         // given
-        let (epoch_tx, epoch_rx) = oneshot::channel::<u64>();
+        let (epoch_tx, epoch_rx) = oneshot::channel::<Result<u64, String>>();
         let (_applied_tx, applied_rx) = watch::channel(0u64);
         let (_flushed_tx, flushed_rx) = watch::channel(0u64);
         let (_durable_tx, durable_rx) = watch::channel(0u64);
@@ -289,5 +296,25 @@ mod tests {
 
         // then
         assert!(matches!(result, Err(WriteError::Shutdown)));
+    }
+
+    #[tokio::test]
+    async fn should_propagate_apply_error_in_wait() {
+        // given
+        let (epoch_tx, epoch_rx) = oneshot::channel::<Result<u64, String>>();
+        let (_applied_tx, applied_rx) = watch::channel(0u64);
+        let (_flushed_tx, flushed_rx) = watch::channel(0u64);
+        let (_durable_tx, durable_rx) = watch::channel(0u64);
+        let mut handle = WriteHandle::new(
+            epoch_rx,
+            create_watchers(applied_rx, flushed_rx, durable_rx),
+        );
+
+        // when - drop the sender without sending
+        epoch_tx.send(Err("apply error".into())).unwrap();
+        let result = handle.wait(Durability::Applied).await;
+
+        // then
+        assert!(matches!(result, Err(WriteError::ApplyError(msg)) if msg == "apply error"));
     }
 }
