@@ -196,6 +196,9 @@ pub async fn create_storage(
 ///
 /// * `config` - The storage configuration specifying the backend type and settings.
 /// * `semantics` - System-specific semantics like merge operators.
+/// * `reader_options` - SlateDB reader options (e.g., manifest_poll_interval).
+///   These are passed directly to `DbReader::open` for SlateDB storage.
+///   Ignored for InMemory storage.
 ///
 /// # Returns
 ///
@@ -203,6 +206,7 @@ pub async fn create_storage(
 pub async fn create_storage_read(
     config: &StorageConfig,
     semantics: StorageSemantics,
+    reader_options: slatedb::config::DbReaderOptions,
 ) -> StorageResult<Arc<dyn StorageRead>> {
     match config {
         StorageConfig::InMemory => {
@@ -215,7 +219,8 @@ pub async fn create_storage_read(
         }
         StorageConfig::SlateDb(slate_config) => {
             let object_store = create_object_store(&slate_config.object_store)?;
-            let mut options = slatedb::config::DbReaderOptions::default();
+
+            let mut options = reader_options;
             if let Some(op) = semantics.merge_operator {
                 let adapter = SlateDbStorage::merge_operator_adapter(op);
                 options.merge_operator = Some(Arc::new(adapter));

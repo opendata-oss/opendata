@@ -55,7 +55,7 @@ mod serde;
 pub mod server;
 mod storage;
 
-pub use config::{Config, CountOptions, ScanOptions, SegmentConfig, WriteOptions};
+pub use config::{Config, CountOptions, ReaderConfig, ScanOptions, SegmentConfig, WriteOptions};
 pub use error::{Error, Result};
 pub use listing::{LogKey, LogKeyIterator};
 pub use log::{LogDb, LogDbBuilder};

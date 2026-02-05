@@ -6,15 +6,19 @@
 
 use std::ops::{Range, RangeBounds};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::RwLock;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 
 use common::storage::factory::create_storage_read;
 use common::{StorageRead, StorageSemantics};
 
-use crate::config::{Config, CountOptions, ScanOptions, SegmentConfig};
+use crate::config::{CountOptions, ReaderConfig, ScanOptions, SegmentConfig};
 use crate::error::{Error, Result};
 use crate::listing::LogKeyIterator;
 use crate::model::{LogEntry, Segment, SegmentId, Sequence};
@@ -258,7 +262,9 @@ pub trait LogRead {
 /// ```
 pub struct LogDbReader {
     storage: LogStorageRead,
-    segments: RwLock<SegmentCache>,
+    segments: Arc<RwLock<SegmentCache>>,
+    shutdown_tx: watch::Sender<bool>,
+    refresh_task: Option<JoinHandle<()>>,
 }
 
 impl LogDbReader {
@@ -267,9 +273,12 @@ impl LogDbReader {
     /// This creates a `LogDbReader` that can scan and count entries but cannot
     /// append new records. Use this when you only need read access to the log.
     ///
+    /// When `refresh_interval` is set, the reader periodically discovers new
+    /// data written by other processes.
+    ///
     /// # Arguments
     ///
-    /// * `config` - Configuration specifying storage backend and settings.
+    /// * `config` - Reader configuration including storage and refresh settings.
     ///
     /// # Errors
     ///
@@ -278,26 +287,89 @@ impl LogDbReader {
     /// # Example
     ///
     /// ```ignore
-    /// use log::{LogDbReader, LogRead, Config};
+    /// use log::{LogDbReader, LogRead, ReaderConfig};
+    /// use common::StorageConfig;
     /// use bytes::Bytes;
     ///
+    /// let config = ReaderConfig {
+    ///     storage: StorageConfig::default(),
+    ///     ..Default::default()
+    /// };
     /// let reader = LogDbReader::open(config).await?;
+    ///
+    /// // Reader will automatically discover new data
     /// let mut iter = reader.scan(Bytes::from("orders"), ..).await?;
     /// while let Some(entry) = iter.next().await? {
     ///     println!("seq={}: {:?}", entry.sequence, entry.value);
     /// }
+    ///
+    /// // Gracefully shut down when done
+    /// reader.close().await;
     /// ```
-    pub async fn open(config: Config) -> Result<Self> {
+    pub async fn open(config: ReaderConfig) -> Result<Self> {
+        let reader_options = slatedb::config::DbReaderOptions {
+            manifest_poll_interval: config.refresh_interval,
+            ..Default::default()
+        };
         let storage: Arc<dyn StorageRead> =
-            create_storage_read(&config.storage, StorageSemantics::new())
+            create_storage_read(&config.storage, StorageSemantics::new(), reader_options)
                 .await
                 .map_err(|e| Error::Storage(e.to_string()))?;
         let log_storage = LogStorageRead::new(storage);
         let segments = SegmentCache::open(&log_storage, SegmentConfig::default()).await?;
+        let segments = Arc::new(RwLock::new(segments));
+
+        let (shutdown_tx, refresh_task) = Self::spawn_refresh_task(
+            log_storage.clone(),
+            Arc::clone(&segments),
+            config.refresh_interval,
+        );
+
         Ok(Self {
             storage: log_storage,
-            segments: RwLock::new(segments),
+            segments,
+            shutdown_tx,
+            refresh_task: Some(refresh_task),
         })
+    }
+
+    /// Spawns a background task that periodically refreshes the segment cache.
+    fn spawn_refresh_task(
+        storage: LogStorageRead,
+        segments: Arc<RwLock<SegmentCache>>,
+        interval: Duration,
+    ) -> (watch::Sender<bool>, JoinHandle<()>) {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        // Get the latest segment ID for incremental refresh
+                        let after_segment_id = {
+                            let cache = segments.read().await;
+                            cache.latest().map(|s| s.id())
+                        };
+
+                        // Refresh the cache
+                        let mut cache = segments.write().await;
+                        if let Err(e) = cache.refresh(&storage, after_segment_id).await {
+                            tracing::warn!("Failed to refresh segment cache: {}", e);
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        (shutdown_tx, task)
     }
 
     /// Creates a LogDbReader from an existing storage implementation.
@@ -305,10 +377,30 @@ impl LogDbReader {
     pub(crate) async fn new(storage: Arc<dyn StorageRead>) -> Result<Self> {
         let log_storage = LogStorageRead::new(storage);
         let segments = SegmentCache::open(&log_storage, SegmentConfig::default()).await?;
+        let (shutdown_tx, _) = watch::channel(false);
         Ok(Self {
             storage: log_storage,
-            segments: RwLock::new(segments),
+            segments: Arc::new(RwLock::new(segments)),
+            shutdown_tx,
+            refresh_task: None,
         })
+    }
+
+    /// Closes the reader, stopping the background refresh task.
+    ///
+    /// This method consumes `self` and gracefully shuts down the background
+    /// refresh task. It waits up to 5 seconds for the task to complete.
+    pub async fn close(self) {
+        // Signal shutdown
+        let _ = self.shutdown_tx.send(true);
+
+        // Wait for the task to complete with timeout
+        if let Some(task) = self.refresh_task {
+            let timeout = tokio::time::timeout(Duration::from_secs(5), task).await;
+            if timeout.is_err() {
+                tracing::warn!("Refresh task did not stop within timeout");
+            }
+        }
     }
 }
 
@@ -650,5 +742,45 @@ mod tests {
             LogIterator::new(storage.as_read(), vec![segment], Bytes::from("key"), 10..20);
 
         assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn open_spawns_refresh_task() {
+        use common::StorageConfig;
+
+        let config = ReaderConfig {
+            storage: StorageConfig::InMemory,
+            refresh_interval: Duration::from_millis(100),
+        };
+
+        let reader = LogDbReader::open(config).await.unwrap();
+
+        // Verify background task is running
+        assert!(reader.refresh_task.is_some());
+
+        // Clean up
+        reader.close().await;
+    }
+
+    #[tokio::test]
+    async fn close_stops_refresh_task_gracefully() {
+        use common::StorageConfig;
+
+        let config = ReaderConfig {
+            storage: StorageConfig::InMemory,
+            refresh_interval: Duration::from_millis(50),
+        };
+
+        let reader = LogDbReader::open(config).await.unwrap();
+        assert!(reader.refresh_task.is_some());
+
+        // Close should complete without timeout
+        let close_result =
+            tokio::time::timeout(Duration::from_secs(1), async { reader.close().await }).await;
+
+        assert!(
+            close_result.is_ok(),
+            "close() should complete within timeout"
+        );
     }
 }
