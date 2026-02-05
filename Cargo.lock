@@ -568,6 +568,7 @@ dependencies = [
  "serde_yaml",
  "slatedb",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]

@@ -9,6 +9,7 @@ bytes.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 serde.workspace = true

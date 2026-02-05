@@ -6,7 +6,7 @@ pub enum WriteError {
     /// The coordinator has been dropped/shutdown
     Shutdown,
     /// Error applying the write to the delta
-    ApplyError(String),
+    ApplyError(u64, String),
     /// Error flushing the delta to storage
     FlushError(String),
     /// Internal error
@@ -18,7 +18,9 @@ impl std::fmt::Display for WriteError {
         match self {
             WriteError::Backpressure => write!(f, "write queue is full, backpressure applied"),
             WriteError::Shutdown => write!(f, "coordinator has been dropped/shutdown"),
-            WriteError::ApplyError(msg) => write!(f, "error applying write: {}", msg),
+            WriteError::ApplyError(epoch, msg) => {
+                write!(f, "error applying write @{}: {}", epoch, msg)
+            }
             WriteError::FlushError(msg) => write!(f, "error flushing delta: {}", msg),
             WriteError::Internal(msg) => write!(f, "internal error: {}", msg),
         }

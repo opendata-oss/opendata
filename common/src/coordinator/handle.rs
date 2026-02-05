@@ -20,13 +20,13 @@ pub(crate) struct EpochWatcher {
 /// Provides the epoch assigned to the write and allows waiting
 /// for the write to reach a desired durability level.
 pub struct WriteHandle {
-    epoch: Shared<oneshot::Receiver<Result<u64, String>>>,
+    epoch: Shared<oneshot::Receiver<Result<u64, (u64, String)>>>,
     watchers: EpochWatcher,
 }
 
 impl WriteHandle {
     pub(crate) fn new(
-        epoch: oneshot::Receiver<Result<u64, String>>,
+        epoch: oneshot::Receiver<Result<u64, (u64, String)>>,
         watchers: EpochWatcher,
     ) -> Self {
         Self {
@@ -45,7 +45,7 @@ impl WriteHandle {
             .clone()
             .await
             .map_err(|_| WriteError::Shutdown)?
-            .map_err(WriteError::ApplyError)
+            .map_err(|(epoch, msg)| WriteError::ApplyError(epoch, msg))
     }
 
     /// Wait for the write to reach the specified durability level.
@@ -281,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn should_propagate_epoch_error_in_wait() {
         // given
-        let (epoch_tx, epoch_rx) = oneshot::channel::<Result<u64, String>>();
+        let (epoch_tx, epoch_rx) = oneshot::channel();
         let (_applied_tx, applied_rx) = watch::channel(0u64);
         let (_flushed_tx, flushed_rx) = watch::channel(0u64);
         let (_durable_tx, durable_rx) = watch::channel(0u64);
@@ -301,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn should_propagate_apply_error_in_wait() {
         // given
-        let (epoch_tx, epoch_rx) = oneshot::channel::<Result<u64, String>>();
+        let (epoch_tx, epoch_rx) = oneshot::channel();
         let (_applied_tx, applied_rx) = watch::channel(0u64);
         let (_flushed_tx, flushed_rx) = watch::channel(0u64);
         let (_durable_tx, durable_rx) = watch::channel(0u64);
@@ -311,10 +311,12 @@ mod tests {
         );
 
         // when - drop the sender without sending
-        epoch_tx.send(Err("apply error".into())).unwrap();
+        epoch_tx.send(Err((1, "apply error".into()))).unwrap();
         let result = handle.wait(Durability::Applied).await;
 
         // then
-        assert!(matches!(result, Err(WriteError::ApplyError(msg)) if msg == "apply error"));
+        assert!(
+            matches!(result, Err(WriteError::ApplyError(epoch, msg)) if epoch == 1 && msg == "apply error")
+        );
     }
 }

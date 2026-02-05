@@ -40,6 +40,7 @@ serde_yaml = "0.9"
 slatedb = { git = "https://github.com/slatedb/slatedb.git", branch = "main" }
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["full"] }
+tokio-util = "0.7"
 toml = "0.8"
 tower = "0.5"
 tower-http = { version = "0.5", features = ["cors"] }

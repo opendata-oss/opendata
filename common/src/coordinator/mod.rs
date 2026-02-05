@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{Instant, Interval, interval_at};
+use tokio_util::sync::CancellationToken;
 
 /// Configuration for the write coordinator.
 #[derive(Debug, Clone)]
@@ -40,10 +41,10 @@ impl Default for WriteCoordinatorConfig {
 pub(crate) enum WriteCommand<D: Delta> {
     Write {
         write: D::Write,
-        epoch: oneshot::Sender<Result<u64, String>>,
+        epoch: oneshot::Sender<Result<u64, (u64, String)>>,
     },
     Flush {
-        epoch: oneshot::Sender<Result<u64, String>>,
+        epoch: oneshot::Sender<Result<u64, (u64, String)>>,
     },
 }
 
@@ -53,7 +54,7 @@ pub(crate) enum WriteCommand<D: Delta> {
 /// and coordinates flushing through a `Flusher`.
 pub struct WriteCoordinator<D: Delta, F: Flusher<D>> {
     handle: WriteCoordinatorHandle<D>,
-    stop_tx: oneshot::Sender<()>,
+    stop_tok: CancellationToken,
     tasks: Option<(WriteCoordinatorTask<D>, FlushTask<D, F>)>,
     write_task_jh: Option<tokio::task::JoinHandle<Result<(), String>>>,
 }
@@ -93,7 +94,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
             flush_result_tx: flush_result_tx.clone(),
         };
 
-        let (stop_tx, stop_rx) = oneshot::channel();
+        let stop_tok = CancellationToken::new();
 
         let write_task = WriteCoordinatorTask::new(
             config,
@@ -102,7 +103,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
             flush_tx,
             applied_tx,
             durable_tx,
-            stop_rx,
+            stop_tok.clone(),
         );
         let handle = WriteCoordinatorHandle::new(cmd_tx, watcher, flush_result_tx);
 
@@ -110,7 +111,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
             handle,
             tasks: Some((write_task, flush_task)),
             write_task_jh: None,
-            stop_tx,
+            stop_tok,
         }
     }
 
@@ -130,9 +131,9 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
 
     pub async fn stop(mut self) -> Result<(), String> {
         let Some(write_task_jh) = self.write_task_jh.take() else {
-            return Err(String::from("coordinator already stopped"));
+            return Ok(());
         };
-        let _ = self.stop_tx.send(());
+        let _ = self.stop_tok.cancel();
         write_task_jh.await.map_err(|e| e.to_string())?
     }
 }
@@ -148,7 +149,7 @@ struct WriteCoordinatorTask<D: Delta> {
     epoch: u64,
     delta_start_epoch: u64,
     flush_interval: Interval,
-    stop_rx: oneshot::Receiver<()>,
+    stop_tok: CancellationToken,
 }
 
 impl<D: Delta> WriteCoordinatorTask<D> {
@@ -162,7 +163,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         flush_tx: mpsc::Sender<FlushEvent<D>>,
         applied_tx: watch::Sender<u64>,
         durable_tx: watch::Sender<u64>,
-        stop_rx: oneshot::Receiver<()>,
+        stop_tok: CancellationToken,
     ) -> Self {
         let mut delta = D::init(initial_context);
 
@@ -183,7 +184,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
             epoch: 1,
             delta_start_epoch: 1,
             flush_interval,
-            stop_rx,
+            stop_tok,
         }
     }
 
@@ -225,7 +226,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
                     self.handle_flush().await;
                 }
 
-                _ = &mut self.stop_rx => {
+                _ = self.stop_tok.cancelled() => {
                     break;
                 }
             }
@@ -249,14 +250,14 @@ impl<D: Delta> WriteCoordinatorTask<D> {
     async fn handle_write(
         &mut self,
         write: D::Write,
-        epoch_tx: oneshot::Sender<Result<u64, String>>,
+        epoch_tx: oneshot::Sender<Result<u64, (u64, String)>>,
     ) -> Result<(), String> {
         let write_epoch = self.epoch;
         self.epoch += 1;
 
         let result = self.delta.apply(write);
         // Ignore error if receiver was dropped (fire-and-forget write)
-        let _ = epoch_tx.send(result.map(|_| write_epoch));
+        let _ = epoch_tx.send(result.map(|_| write_epoch).map_err(|e| (write_epoch, e)));
 
         // Ignore error if no watchers are listening - this is non-fatal
         let _ = self.applied_tx.send(write_epoch);
@@ -684,7 +685,9 @@ mod tests {
         let result = write.epoch().await;
 
         // then
-        assert!(matches!(result, Err(WriteError::ApplyError(msg)) if msg == "apply error"));
+        assert!(
+            matches!(result, Err(WriteError::ApplyError(epoch, msg)) if epoch == 1 && msg == "apply error")
+        );
 
         // cleanup
         coordinator.stop().await;
