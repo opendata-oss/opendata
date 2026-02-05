@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "bencher",
     "common",
+    "keyvalue",
     "log",
     "log/bench",
     "timeseries",
