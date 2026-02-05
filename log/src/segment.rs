@@ -93,6 +93,7 @@ impl SegmentDelta {
 /// and `apply_delta`.
 ///
 /// Keyed by `start_seq` to optimize `find_covering` queries.
+#[derive(Clone)]
 pub(crate) struct SegmentCache {
     /// Segments keyed by their starting sequence number.
     segments: BTreeMap<u64, LogSegment>,

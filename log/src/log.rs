@@ -87,6 +87,7 @@ pub struct LogDb {
     storage: LogStorage,
     clock: Arc<dyn Clock>,
     inner: RwLock<LogInner>,
+    read_inner: Arc<RwLock<crate::reader::LogReadInner>>,
 }
 
 impl LogDb {
@@ -234,9 +235,19 @@ impl LogDb {
             .await?;
 
         // Apply phase: update in-memory caches.
+        let new_segment = if seg_delta.is_new() {
+            Some(seg_delta.segment().clone())
+        } else {
+            None
+        };
         inner.sequence_allocator.apply_delta(seq_delta);
         inner.segment_cache.apply_delta(seg_delta);
         inner.listing_cache.apply_delta(listing_delta);
+        drop(inner);
+
+        if let Some(segment) = new_segment {
+            self.read_inner.write().await.segments.insert(segment);
+        }
 
         Ok(AppendResult {
             start_sequence,
@@ -278,8 +289,11 @@ impl LogDb {
         let segment = LogSegment::new(segment_id, meta);
         self.storage.write_segment(&segment).await?;
 
-        // Update cache
-        inner.segment_cache.insert(segment);
+        // Update caches
+        inner.segment_cache.insert(segment.clone());
+        drop(inner);
+
+        self.read_inner.write().await.segments.insert(segment);
 
         Ok(())
     }
@@ -307,6 +321,7 @@ impl LogDb {
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn common::Storage>) -> Result<Self> {
         use crate::config::SegmentConfig;
+        use crate::reader::LogReadInner;
 
         let log_storage = LogStorage::new(storage);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -315,6 +330,11 @@ impl LogDb {
         let sequence_allocator = SequenceAllocator::open(&log_storage_read).await?;
         let segment_cache = SegmentCache::open(&log_storage_read, SegmentConfig::default()).await?;
         let listing_cache = ListingCache::new();
+
+        let read_inner = Arc::new(RwLock::new(LogReadInner::new(
+            log_storage_read,
+            segment_cache.clone(),
+        )));
 
         let inner = LogInner {
             sequence_allocator,
@@ -326,6 +346,7 @@ impl LogDb {
             storage: log_storage,
             clock,
             inner: RwLock::new(inner),
+            read_inner,
         })
     }
 }
@@ -336,16 +357,11 @@ impl LogRead for LogDb {
         &self,
         key: Bytes,
         seq_range: impl RangeBounds<Sequence> + Send,
-        _options: ScanOptions,
+        options: ScanOptions,
     ) -> Result<LogIterator> {
         let seq_range = normalize_sequence(&seq_range);
-        let inner = self.inner.read().await;
-        Ok(LogIterator::open(
-            self.storage.as_read(),
-            &inner.segment_cache,
-            key,
-            seq_range,
-        ))
+        let inner = self.read_inner.read().await;
+        Ok(inner.scan_with_options(key, seq_range, &options))
     }
 
     async fn count_with_options(
@@ -362,7 +378,8 @@ impl LogRead for LogDb {
         segment_range: impl RangeBounds<SegmentId> + Send,
     ) -> Result<LogKeyIterator> {
         let segment_range = normalize_segment_id(&segment_range);
-        self.storage.as_read().list_keys(segment_range).await
+        let inner = self.read_inner.read().await;
+        inner.list_keys(segment_range).await
     }
 
     async fn list_segments(
@@ -370,9 +387,8 @@ impl LogRead for LogDb {
         seq_range: impl RangeBounds<Sequence> + Send,
     ) -> Result<Vec<Segment>> {
         let seq_range = normalize_sequence(&seq_range);
-        let inner = self.inner.read().await;
-        let segments = inner.segment_cache.find_covering(&seq_range);
-        Ok(segments.into_iter().map(|s| s.into()).collect())
+        let inner = self.read_inner.read().await;
+        Ok(inner.list_segments(&seq_range))
     }
 }
 
@@ -427,6 +443,8 @@ impl LogDbBuilder {
 
     /// Builds the LogDb instance.
     pub async fn build(self) -> Result<LogDb> {
+        use crate::reader::LogReadInner;
+
         let storage = create_storage(
             &self.config.storage,
             self.storage_runtime,
@@ -443,6 +461,11 @@ impl LogDbBuilder {
         let segment_cache = SegmentCache::open(&log_storage_read, self.config.segmentation).await?;
         let listing_cache = ListingCache::new();
 
+        let read_inner = Arc::new(RwLock::new(LogReadInner::new(
+            log_storage_read,
+            segment_cache.clone(),
+        )));
+
         let inner = LogInner {
             sequence_allocator,
             segment_cache,
@@ -453,6 +476,7 @@ impl LogDbBuilder {
             storage: log_storage,
             clock,
             inner: RwLock::new(inner),
+            read_inner,
         })
     }
 }
