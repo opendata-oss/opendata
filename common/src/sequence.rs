@@ -1,18 +1,22 @@
 //! Sequence number allocation and persistence.
 //!
 //! This module provides components for allocating monotonically increasing
-//! sequence numbers with crash recovery. It consists of two layers:
+//! sequence numbers with crash recovery. It provides:
 //!
-//! 1. **[`SeqBlockStore`]**: Lower-level component for persisting sequence block
-//!    allocations to storage.
-//! 2. **[`SequenceAllocator`]**: Higher-level component for allocating individual
-//!    sequence numbers from blocks.
+//! **[`SequenceAllocator`]**: Allocates individual sequence numbers from sequence
+//!  blocks stored in storage. Tracks the current reserved block, and allocates new
+//!  sequence numbers from it. When the block is out of sequence numbers, the
+//!  allocator allocates a new block, and returns the corresponding Record in the
+//!  return from `SequenceAllocator#allocate`. It is up to the caller to ensure
+//!  that the record is persisted in storage. This allows the allocator to be used
+//!  from implementations of `Delta` by including the sequence block writes in
+//!  persisted deltas.
 //!
 //! # Design
 //!
 //! Block-based allocation reduces write amplification by pre-allocating ranges
-//! of sequence numbers instead of persisting after every allocation. The storage
-//! layer tracks allocations via [`SeqBlock`] records:
+//! of sequence numbers instead of persisting after every allocation. The allocator
+//! tracks allocations via [`SeqBlock`] records:
 //!
 //! - `base_sequence`: Starting sequence number of the allocated block
 //! - `block_size`: Number of sequence numbers in the block
@@ -32,17 +36,15 @@
 //! const MY_SEQ_BLOCK_KEY: &[u8] = &[0x01, 0x02];
 //!
 //! let key = Bytes::from_static(MY_SEQ_BLOCK_KEY);
-//! let block_store = SeqBlockStore::new(storage, key);
-//! let allocator = SequenceAllocator::new(block_store);
-//! allocator.initialize().await?;
+//! let allocator = SequenceAllocator::load(storage.clone(), key);
 //!
-//! let seq = allocator.allocate_one().await?;
+//! let (seq, put) = allocator.allocate_one().await?;
+//! if let Some(put) = put {
+//!     storage.put(vec![put]).await.unwrap();
+//! }
 //! ```
 
-use std::sync::Arc;
-
 use bytes::Bytes;
-use tokio::sync::Mutex;
 
 use crate::serde::DeserializeError;
 use crate::serde::seq_block::SeqBlock;
@@ -86,83 +88,34 @@ impl From<DeserializeError> for SequenceError {
 /// Result type alias for sequence allocation operations.
 pub type SequenceResult<T> = std::result::Result<T, SequenceError>;
 
-/// Persists and retrieves sequence block allocations.
-///
-/// This is a generic store that works with any storage backend and any key format.
-/// The key is provided at construction time and must be a valid serialized key
-/// for the domain using this store.
-///
-/// # Usage
-///
-/// Call [`initialize`](Self::initialize) once at startup to load the last
-/// allocated block from storage. Then call [`allocate`](Self::allocate) to
-/// get new blocks as needed.
-///
-/// # Thread Safety
-///
-/// This struct uses a tokio mutex internally to ensure safe concurrent access.
-/// The mutex is held across storage writes to prevent racing allocations from
-/// producing overlapping sequence blocks.
-pub struct SeqBlockStore {
-    storage: Arc<dyn Storage>,
-    key: Bytes,
-    last_block: Mutex<Option<SeqBlock>>,
+pub struct AllocatedSeqBlock {
+    current_block: Option<SeqBlock>,
+    next_sequence: u64,
 }
 
-impl SeqBlockStore {
-    /// Creates a new sequence block store.
-    ///
-    /// # Arguments
-    /// * `storage` - The storage backend to persist blocks to
-    /// * `key` - The serialized key to use for storing the block record
-    pub fn new(storage: Arc<dyn Storage>, key: Bytes) -> Self {
-        Self {
-            storage,
-            key,
-            last_block: Mutex::new(None),
+impl AllocatedSeqBlock {
+    fn remaining(&self) -> u64 {
+        match &self.current_block {
+            None => 0,
+            Some(block) => block.next_base().saturating_sub(self.next_sequence),
         }
     }
 
-    /// Initializes the store by reading the last allocated block from storage.
-    ///
-    /// This must be called once at startup before calling [`allocate`](Self::allocate).
-    pub async fn initialize(&self) -> SequenceResult<()> {
-        let block = match self.storage.get(self.key.clone()).await? {
+    async fn load(storage: &dyn Storage, key: &Bytes) -> SequenceResult<Self> {
+        let current_block = match storage.get(key.clone()).await? {
             Some(record) => Some(SeqBlock::deserialize(&record.value)?),
             None => None,
         };
-        *self.last_block.lock().await = block;
-        Ok(())
-    }
-
-    /// Returns the last allocated block, if any.
-    pub async fn last_block(&self) -> Option<SeqBlock> {
-        self.last_block.lock().await.clone()
-    }
-
-    /// Allocates a new sequence block.
-    ///
-    /// The new block starts immediately after the previous block (or at 0 for
-    /// the first allocation). The block size is the maximum of `min_count` and
-    /// [`DEFAULT_BLOCK_SIZE`]. The block is persisted to storage before returning.
-    pub async fn allocate(&self, min_count: u64) -> SequenceResult<SeqBlock> {
-        let mut last_block = self.last_block.lock().await;
-
-        let base_sequence = match &*last_block {
-            Some(block) => block.next_base(),
-            None => 0,
-        };
-
-        let block_size = min_count.max(DEFAULT_BLOCK_SIZE);
-        let new_block = SeqBlock::new(base_sequence, block_size);
-
-        let value: Bytes = new_block.serialize();
-        self.storage
-            .put(vec![Record::new(self.key.clone(), value)])
-            .await?;
-
-        *last_block = Some(new_block.clone());
-        Ok(new_block)
+        let next_sequence = current_block
+            .as_ref()
+            // in the event that block exists, set the next sequence to the next base
+            // so that a new block is immediately allocated
+            .map(|b| b.next_base())
+            .unwrap_or(0);
+        Ok(Self {
+            current_block,
+            next_sequence,
+        })
     }
 }
 
@@ -175,109 +128,83 @@ impl SeqBlockStore {
 ///
 /// # Thread Safety
 ///
-/// This struct is thread-safe and can be shared across tasks.
+/// This struct is not inherently thread safe. It should be owned by a single writing task
 pub struct SequenceAllocator {
-    block_store: SeqBlockStore,
-    block: Mutex<AllocatedSeqBlock>,
-}
-
-struct AllocatedSeqBlock {
-    current_block: Option<SeqBlock>,
-    next_sequence: u64,
-}
-
-impl AllocatedSeqBlock {
-    fn remaining(&self) -> u64 {
-        match &self.current_block {
-            None => 0,
-            Some(block) => block.next_base().saturating_sub(self.next_sequence),
-        }
-    }
+    key: Bytes,
+    block: AllocatedSeqBlock,
 }
 
 impl SequenceAllocator {
-    /// Creates a new allocator using the given block store.
-    ///
-    /// # Initialization
-    ///
-    /// The allocator must be initialized before use by calling [`initialize`].
-    /// This reads the current block allocation from storage and prepares
-    /// the allocator for sequence allocation.
-    pub fn new(block_store: SeqBlockStore) -> Self {
-        Self {
-            block_store,
-            block: Mutex::new(AllocatedSeqBlock {
-                current_block: None,
-                next_sequence: 0,
-            }),
-        }
-    }
-
-    /// Initializes the allocator from storage.
-    ///
-    /// This should be called once during startup. It initializes the block
-    /// store, which reads the last allocated block from storage.
-    ///
-    /// After initialization, [`allocate`] can be called.
-    pub async fn initialize(&self) -> SequenceResult<()> {
-        self.block_store.initialize().await
+    /// Creates a new allocator using the given storage and key.
+    pub async fn load(storage: &dyn Storage, key: Bytes) -> SequenceResult<Self> {
+        let block = AllocatedSeqBlock::load(storage, &key).await?;
+        Ok(Self { key, block })
     }
 
     /// Returns the next sequence number that would be allocated.
     ///
     /// This does not consume any sequences; it just peeks at the current state.
-    pub async fn peek_next_sequence(&self) -> u64 {
-        let block = self.block.lock().await;
-        block.next_sequence
+    pub fn peek_next_sequence(&self) -> u64 {
+        self.block.next_sequence
     }
 
     /// Allocates a single sequence number.
     ///
     /// Convenience method equivalent to `allocate(1)`.
-    pub async fn allocate_one(&self) -> SequenceResult<u64> {
-        self.allocate(1).await
+    pub fn allocate_one(&mut self) -> (u64, Option<Record>) {
+        self.allocate(1)
     }
 
     /// Allocates a contiguous range of sequence numbers.
     ///
-    /// Returns the first sequence number in the allocated range. The caller
-    /// can use sequences `base..base+count`.
+    /// Returns a pair where the first element is the first sequence number in
+    /// the allocated range. The caller can use sequences `base..base+count`.
+    /// The second element is an `Option<Record>`. If the current block doesn't
+    /// have enough sequences remaining, the remaining sequences are used and a
+    /// new block is allocated for the rest. The returned record, if present,
+    /// must be put to storage to reserve the full sequence range. Note that since
+    /// blocks are contiguous (each starts where the previous ends), the returned
+    /// sequence range is always contiguous.
     ///
-    /// If the current block doesn't have enough sequences remaining, the
-    /// remaining sequences are used and a new block is allocated for the rest.
-    /// Since blocks are contiguous (each starts where the previous ends), the
-    /// returned sequence range is always contiguous.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if block allocation fails (e.g., storage error).
-    pub async fn allocate(&self, count: u64) -> SequenceResult<u64> {
-        let mut block = self.block.lock().await;
-
-        let remaining = block.remaining();
+    pub fn allocate(&mut self, count: u64) -> (u64, Option<Record>) {
+        let remaining = self.block.remaining();
 
         // If current block can satisfy the request, use it
         if remaining >= count {
-            let base_sequence = block.next_sequence;
-            block.next_sequence += count;
-            return Ok(base_sequence);
+            let base_sequence = self.block.next_sequence;
+            self.block.next_sequence += count;
+            return (base_sequence, None);
         }
 
         // Need a new block. Use remaining sequences from current block first.
         let from_new_block = count - remaining;
-        let new_block = self.block_store.allocate(from_new_block).await?;
+        let (new_block, record) = self.init_next_block(from_new_block);
 
         // Base sequence is either from current block (if any remaining) or new block
         let base_sequence = if remaining > 0 {
-            block.next_sequence
+            self.block.next_sequence
         } else {
             new_block.base_sequence
         };
 
-        block.next_sequence = new_block.base_sequence + from_new_block;
-        block.current_block = Some(new_block);
+        self.block.next_sequence = new_block.base_sequence + from_new_block;
+        self.block.current_block = Some(new_block);
 
-        Ok(base_sequence)
+        (base_sequence, Some(record))
+    }
+
+    fn init_next_block(&self, min_count: u64) -> (SeqBlock, Record) {
+        let base_sequence = match &self.block.current_block {
+            Some(block) => block.next_base(),
+            None => 0,
+        };
+
+        let block_size = min_count.max(DEFAULT_BLOCK_SIZE);
+        let new_block = SeqBlock::new(base_sequence, block_size);
+
+        let value: Bytes = new_block.serialize();
+        let record = Record::new(self.key.clone(), value);
+        (new_block, record)
     }
 }
 
@@ -285,22 +212,43 @@ impl SequenceAllocator {
 mod tests {
     use super::*;
     use crate::storage::in_memory::InMemoryStorage;
+    use std::sync::Arc;
 
     fn test_key() -> Bytes {
         Bytes::from_static(&[0x01, 0x02])
     }
 
     #[tokio::test]
-    async fn should_return_none_when_no_block_allocated() {
+    async fn should_load_none_when_no_block_allocated() {
         // given
         let storage = Arc::new(InMemoryStorage::new());
-        let store = SeqBlockStore::new(storage, test_key());
-        store.initialize().await.unwrap();
 
         // when
-        let block = store.allocate(1).await.unwrap();
+        let block = AllocatedSeqBlock::load(storage.as_ref(), &test_key())
+            .await
+            .unwrap();
 
         // then
+        assert_eq!(block.next_sequence, 0);
+        assert_eq!(block.current_block, None);
+    }
+
+    #[tokio::test]
+    async fn should_load_first_block() {
+        // given:
+        let storage = Arc::new(InMemoryStorage::new());
+        let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
+            .await
+            .unwrap();
+
+        // when:
+        let (seq, record) = allocator.allocate(1);
+
+        // then:
+        assert_eq!(seq, 0);
+        assert!(record.is_some());
+        let record = record.unwrap();
+        let block = SeqBlock::deserialize(&record.value).unwrap();
         assert_eq!(block.base_sequence, 0);
         assert_eq!(block.block_size, DEFAULT_BLOCK_SIZE);
     }
@@ -309,70 +257,120 @@ mod tests {
     async fn should_allocate_larger_block_when_requested() {
         // given
         let storage = Arc::new(InMemoryStorage::new());
-        let store = SeqBlockStore::new(storage, test_key());
-        store.initialize().await.unwrap();
+        let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
+            .await
+            .unwrap();
 
-        // when
+        // when:
         let large_count = DEFAULT_BLOCK_SIZE * 2;
-        let block = store.allocate(large_count).await.unwrap();
+        let (seq, record) = allocator.allocate(large_count);
 
-        // then
-        assert_eq!(block.base_sequence, 0);
-        assert_eq!(block.block_size, large_count);
+        // then:
+        assert_eq!(seq, 0);
+        assert!(record.is_some());
+        let record = record.unwrap();
+        let block = SeqBlock::deserialize(&record.value).unwrap();
+        assert_eq!(block.base_sequence, seq);
+        assert_eq!(block.block_size, DEFAULT_BLOCK_SIZE * 2);
+        let (seq, _) = allocator.allocate(1);
+        assert_eq!(seq, large_count);
     }
 
     #[tokio::test]
     async fn should_allocate_sequential_blocks() {
         // given
         let storage = Arc::new(InMemoryStorage::new());
-        let store = SeqBlockStore::new(storage, test_key());
-        store.initialize().await.unwrap();
+        let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
+            .await
+            .unwrap();
+        let mut puts = vec![];
 
         // when
-        let block1 = store.allocate(1).await.unwrap();
-        let block2 = store.allocate(1).await.unwrap();
-        let block3 = store.allocate(1).await.unwrap();
+        for _ in 0..(DEFAULT_BLOCK_SIZE * 3) {
+            let (_, maybe_put) = allocator.allocate(1);
+            maybe_put.inspect(|r| puts.push(r.clone()));
+        }
 
         // then
-        assert_eq!(block1.base_sequence, 0);
-        assert_eq!(block2.base_sequence, DEFAULT_BLOCK_SIZE);
-        assert_eq!(block3.base_sequence, DEFAULT_BLOCK_SIZE * 2);
+        let blocks: Vec<_> = puts
+            .into_iter()
+            .map(|r| SeqBlock::deserialize(&r.value).unwrap())
+            .collect();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].base_sequence, 0);
+        assert_eq!(blocks[1].base_sequence, DEFAULT_BLOCK_SIZE);
+        assert_eq!(blocks[2].base_sequence, DEFAULT_BLOCK_SIZE * 2);
     }
 
     #[tokio::test]
     async fn should_recover_from_storage_on_initialize() {
         // given
         let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
-
         // First instance allocates some blocks
-        let store1 = SeqBlockStore::new(Arc::clone(&storage), test_key());
-        store1.initialize().await.unwrap();
-        store1.allocate(1).await.unwrap();
-        store1.allocate(1).await.unwrap();
+        let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
+            .await
+            .unwrap();
+        allocator.allocate(DEFAULT_BLOCK_SIZE);
+        let (_, put) = allocator.allocate(DEFAULT_BLOCK_SIZE);
+        storage.put(vec![put.unwrap()]).await.unwrap();
 
-        // Second instance should recover
-        let store2 = SeqBlockStore::new(Arc::clone(&storage), test_key());
-        store2.initialize().await.unwrap();
+        // when: Second instance should recover
+        let mut allocator2 = SequenceAllocator::load(storage.as_ref(), test_key())
+            .await
+            .unwrap();
 
-        // when
-        let block = store2.allocate(1).await.unwrap();
-
-        // then - should start after the previous blocks
+        // then:
+        assert_eq!(
+            allocator2.block.current_block,
+            Some(SeqBlock::new(DEFAULT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE))
+        );
+        assert_eq!(allocator2.block.next_sequence, DEFAULT_BLOCK_SIZE * 2);
+        let (seq, put) = allocator2.allocate(DEFAULT_BLOCK_SIZE);
+        let block = SeqBlock::deserialize(&put.unwrap().value).unwrap();
         assert_eq!(block.base_sequence, DEFAULT_BLOCK_SIZE * 2);
+        assert_eq!(seq, DEFAULT_BLOCK_SIZE * 2);
+    }
+
+    #[tokio::test]
+    async fn should_resume_from_next_block_on_initialize() {
+        // given
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        // First instance allocates some blocks
+        let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
+            .await
+            .unwrap();
+        let (_, put) = allocator.allocate(DEFAULT_BLOCK_SIZE / 2);
+        storage.put(vec![put.unwrap()]).await.unwrap();
+
+        // when: Second instance should recover
+        let mut allocator2 = SequenceAllocator::load(storage.as_ref(), test_key())
+            .await
+            .unwrap();
+
+        // then:
+        assert_eq!(
+            allocator2.block.current_block,
+            Some(SeqBlock::new(0, DEFAULT_BLOCK_SIZE))
+        );
+        assert_eq!(allocator2.block.next_sequence, DEFAULT_BLOCK_SIZE);
+        let (seq, put) = allocator2.allocate(DEFAULT_BLOCK_SIZE);
+        let block = SeqBlock::deserialize(&put.unwrap().value).unwrap();
+        assert_eq!(block.base_sequence, DEFAULT_BLOCK_SIZE);
+        assert_eq!(seq, DEFAULT_BLOCK_SIZE);
     }
 
     #[tokio::test]
     async fn should_allocate_sequential_sequence_numbers() {
         // given
         let storage = Arc::new(InMemoryStorage::new());
-        let block_store = SeqBlockStore::new(storage, test_key());
-        let allocator = SequenceAllocator::new(block_store);
-        allocator.initialize().await.unwrap();
+        let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
+            .await
+            .unwrap();
 
         // when
-        let seq1 = allocator.allocate_one().await.unwrap();
-        let seq2 = allocator.allocate_one().await.unwrap();
-        let seq3 = allocator.allocate_one().await.unwrap();
+        let (seq1, _) = allocator.allocate_one();
+        let (seq2, _) = allocator.allocate_one();
+        let (seq3, _) = allocator.allocate_one();
 
         // then
         assert_eq!(seq1, 0);
@@ -384,13 +382,13 @@ mod tests {
     async fn should_allocate_batch_of_sequences() {
         // given
         let storage = Arc::new(InMemoryStorage::new());
-        let block_store = SeqBlockStore::new(storage, test_key());
-        let allocator = SequenceAllocator::new(block_store);
-        allocator.initialize().await.unwrap();
+        let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
+            .await
+            .unwrap();
 
         // when
-        let seq1 = allocator.allocate(10).await.unwrap();
-        let seq2 = allocator.allocate(5).await.unwrap();
+        let (seq1, _) = allocator.allocate(10);
+        let (seq2, _) = allocator.allocate(5);
 
         // then
         assert_eq!(seq1, 0);
@@ -401,160 +399,102 @@ mod tests {
     async fn should_span_blocks_when_batch_exceeds_remaining() {
         // given
         let storage = Arc::new(InMemoryStorage::new());
-        let block_store = SeqBlockStore::new(storage, test_key());
-        let allocator = SequenceAllocator::new(block_store);
-        allocator.initialize().await.unwrap();
+        let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
+            .await
+            .unwrap();
 
         // Allocate most of the first block
-        allocator.allocate(DEFAULT_BLOCK_SIZE - 10).await.unwrap();
+        allocator.allocate(DEFAULT_BLOCK_SIZE - 10);
 
         // when - allocate more than remaining (10 left, request 25)
-        let seq = allocator.allocate(25).await.unwrap();
+        let (seq, put) = allocator.allocate(25);
 
         // then - should get contiguous sequences starting at remaining position
         assert_eq!(seq, DEFAULT_BLOCK_SIZE - 10);
+        assert!(put.is_some());
+        let block = SeqBlock::deserialize(&put.unwrap().value).unwrap();
+        assert_eq!(block.base_sequence, DEFAULT_BLOCK_SIZE);
     }
 
     #[tokio::test]
     async fn should_allocate_new_block_when_exhausted() {
         // given
         let storage = Arc::new(InMemoryStorage::new());
-        let block_store = SeqBlockStore::new(storage, test_key());
-        let allocator = SequenceAllocator::new(block_store);
-        allocator.initialize().await.unwrap();
+        let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
+            .await
+            .unwrap();
 
         // when - allocate entire first block plus one more
-        allocator.allocate(DEFAULT_BLOCK_SIZE).await.unwrap();
-        let seq = allocator.allocate_one().await.unwrap();
+        allocator.allocate(DEFAULT_BLOCK_SIZE);
+        let (seq, put) = allocator.allocate_one();
 
         // then - should be first sequence of second block
         assert_eq!(seq, DEFAULT_BLOCK_SIZE);
-    }
-
-    #[tokio::test]
-    async fn should_recover_sequence_allocation_across_instances() {
-        // given
-        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
-
-        // First allocator uses some sequences
-        let block_store1 = SeqBlockStore::new(Arc::clone(&storage), test_key());
-        let allocator1 = SequenceAllocator::new(block_store1);
-        allocator1.initialize().await.unwrap();
-        allocator1.allocate(10).await.unwrap();
-
-        // Second allocator should start from next block (sequences 0-9 may be lost, but monotonicity preserved)
-        let block_store2 = SeqBlockStore::new(Arc::clone(&storage), test_key());
-        let allocator2 = SequenceAllocator::new(block_store2);
-        allocator2.initialize().await.unwrap();
-
-        // when
-        let seq = allocator2.allocate_one().await.unwrap();
-
-        // then - should start at next block's base
-        assert_eq!(seq, DEFAULT_BLOCK_SIZE);
-    }
-
-    #[tokio::test]
-    async fn should_allocate_larger_than_default_block_size() {
-        // given
-        let storage = Arc::new(InMemoryStorage::new());
-        let block_store = SeqBlockStore::new(storage, test_key());
-        let allocator = SequenceAllocator::new(block_store);
-        allocator.initialize().await.unwrap();
-
-        // when - request more than DEFAULT_BLOCK_SIZE
-        let large_count = DEFAULT_BLOCK_SIZE * 2;
-        let seq = allocator.allocate(large_count).await.unwrap();
-
-        // then
-        assert_eq!(seq, 0);
-
-        // and subsequent allocation should continue from there
-        let next_seq = allocator.allocate_one().await.unwrap();
-        assert_eq!(next_seq, large_count);
+        assert!(put.is_some());
     }
 
     #[tokio::test]
     async fn should_allocate_exactly_remaining() {
         // given
         let storage = Arc::new(InMemoryStorage::new());
-        let block_store = SeqBlockStore::new(storage, test_key());
-        let allocator = SequenceAllocator::new(block_store);
-        allocator.initialize().await.unwrap();
+        let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
+            .await
+            .unwrap();
 
         // Use some sequences
-        allocator.allocate(100).await.unwrap();
+        allocator.allocate(100);
         let remaining = DEFAULT_BLOCK_SIZE - 100;
 
         // when - allocate exactly the remaining amount
-        let seq = allocator.allocate(remaining).await.unwrap();
+        let (seq, put) = allocator.allocate(remaining);
 
         // then - should use up exactly the current block
         assert_eq!(seq, 100);
+        assert!(put.is_none());
 
         // and next allocation should come from new block
-        let next_seq = allocator.allocate_one().await.unwrap();
+        let (next_seq, put) = allocator.allocate_one();
         assert_eq!(next_seq, DEFAULT_BLOCK_SIZE);
+        assert!(put.is_some());
     }
 
     #[tokio::test]
     async fn should_handle_large_batch_spanning_from_partial_block() {
         // given
         let storage = Arc::new(InMemoryStorage::new());
-        let block_store = SeqBlockStore::new(storage, test_key());
-        let allocator = SequenceAllocator::new(block_store);
-        allocator.initialize().await.unwrap();
+        let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
+            .await
+            .unwrap();
 
         // Use most of first block, leaving 100
-        allocator.allocate(DEFAULT_BLOCK_SIZE - 100).await.unwrap();
+        allocator.allocate(DEFAULT_BLOCK_SIZE - 100);
 
         // when - request much more than remaining (spans into new block)
         let large_request = DEFAULT_BLOCK_SIZE + 500;
-        let seq = allocator.allocate(large_request).await.unwrap();
+        let (seq, _) = allocator.allocate(large_request);
 
         // then - should start at the remaining position
         assert_eq!(seq, DEFAULT_BLOCK_SIZE - 100);
 
         // and next allocation continues after the large batch
-        let next_seq = allocator.allocate_one().await.unwrap();
+        let (next_seq, _) = allocator.allocate_one();
         assert_eq!(next_seq, DEFAULT_BLOCK_SIZE - 100 + large_request);
-    }
-
-    #[tokio::test]
-    async fn should_return_last_block() {
-        // given
-        let storage = Arc::new(InMemoryStorage::new());
-        let store = SeqBlockStore::new(storage, test_key());
-        store.initialize().await.unwrap();
-
-        // when - no allocation yet
-        let before = store.last_block().await;
-
-        // then
-        assert!(before.is_none());
-
-        // when - after allocation
-        let allocated = store.allocate(1).await.unwrap();
-        let after = store.last_block().await;
-
-        // then
-        assert_eq!(after, Some(allocated));
     }
 
     #[tokio::test]
     async fn should_peek_next_sequence_without_consuming() {
         // given
         let storage = Arc::new(InMemoryStorage::new());
-        let block_store = SeqBlockStore::new(storage, test_key());
-        let allocator = SequenceAllocator::new(block_store);
-        allocator.initialize().await.unwrap();
+        let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
+            .await
+            .unwrap();
 
         // Allocate some sequences
-        allocator.allocate(10).await.unwrap();
+        allocator.allocate(10);
 
         // when
-        let peeked = allocator.peek_next_sequence().await;
-        let allocated = allocator.allocate_one().await.unwrap();
+        let peeked = allocator.peek_next_sequence();
+        let (allocated, _) = allocator.allocate_one();
 
         // then - peeked should match what was allocated
         assert_eq!(peeked, allocated);
