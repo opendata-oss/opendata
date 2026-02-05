@@ -1,21 +1,17 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use bytes::BytesMut;
-use common::storage::RecordOp;
-use common::{Record, Storage, StorageRead};
-use roaring::RoaringTreemap;
+use common::StorageRead;
 
-use crate::model::AttributeValue;
-use crate::serde::Encode;
 use crate::serde::centroid_chunk::CentroidChunkValue;
 use crate::serde::deletions::DeletionsValue;
 use crate::serde::key::{
     CentroidChunkKey, DeletionsKey, IdDictionaryKey, PostingListKey, VectorDataKey,
 };
-use crate::serde::posting_list::{PostingListValue, PostingUpdate};
-use crate::serde::vector_data::{Field, VectorDataValue};
+use crate::serde::posting_list::PostingListValue;
+use crate::serde::vector_data::VectorDataValue;
 
 pub(crate) mod merge_operator;
+pub(crate) mod record;
 
 /// Extension trait for StorageRead that provides vector database-specific loading methods.
 ///
@@ -26,6 +22,7 @@ pub(crate) mod merge_operator;
 #[async_trait]
 pub(crate) trait VectorDbStorageReadExt: StorageRead {
     /// Look up internal ID from external ID in the ID dictionary.
+    #[allow(dead_code)]
     async fn lookup_internal_id(&self, external_id: &str) -> Result<Option<u64>> {
         let key = IdDictionaryKey::new(external_id).encode();
         let record = self.get(key).await?;
@@ -144,98 +141,16 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
 // Implement the trait for all types that implement StorageRead
 impl<T: ?Sized + StorageRead> VectorDbStorageReadExt for T {}
 
-/// Extension trait for Storage that provides vector database-specific write helpers.
-///
-/// These methods build RecordOp instances for common write patterns.
-pub(crate) trait VectorDbStorageExt: Storage {
-    /// Create a RecordOp to update the IdDictionary mapping.
-    fn put_id_dictionary(&self, external_id: &str, internal_id: u64) -> Result<RecordOp> {
-        let key = IdDictionaryKey::new(external_id).encode();
-        let mut value_buf = BytesMut::with_capacity(8);
-        internal_id.encode(&mut value_buf);
-        Ok(RecordOp::Put(Record::new(key, value_buf.freeze())))
-    }
-
-    /// Create a RecordOp to delete an IdDictionary mapping.
-    fn delete_id_dictionary(&self, external_id: &str) -> Result<RecordOp> {
-        let key = IdDictionaryKey::new(external_id).encode();
-        Ok(RecordOp::Delete(key))
-    }
-
-    /// Create a RecordOp to write vector data (including external_id, vector, and metadata).
-    ///
-    /// The `attributes` must include a "vector" field with the embedding values.
-    fn put_vector_data(
-        &self,
-        internal_id: u64,
-        external_id: &str,
-        attributes: &[(String, AttributeValue)],
-    ) -> Result<RecordOp> {
-        let key = VectorDataKey::new(internal_id).encode();
-        let fields: Vec<Field> = attributes
-            .iter()
-            .map(|(name, value)| {
-                Field::new(name, crate::model::attribute_value_to_field_value(value))
-            })
-            .collect();
-        let value = VectorDataValue::new(external_id, fields).encode_to_bytes();
-        Ok(RecordOp::Put(Record::new(key, value)))
-    }
-
-    /// Create a RecordOp to delete vector data.
-    fn delete_vector_data(&self, internal_id: u64) -> Result<RecordOp> {
-        let key = VectorDataKey::new(internal_id).encode();
-        Ok(RecordOp::Delete(key))
-    }
-
-    /// Create a RecordOp to merge posting updates into a posting list.
-    fn merge_posting_list(
-        &self,
-        centroid_id: u32,
-        postings: Vec<PostingUpdate>,
-    ) -> Result<RecordOp> {
-        let key = PostingListKey::new(centroid_id).encode();
-        let value = PostingListValue::from_posting_updates(postings)?.encode_to_bytes();
-        Ok(RecordOp::Merge(Record::new(key, value)))
-    }
-
-    /// Create a RecordOp to merge vector IDs into the deleted vectors bitmap.
-    fn merge_deleted_vectors(&self, vector_ids: RoaringTreemap) -> Result<RecordOp> {
-        let key = DeletionsKey::new().encode();
-        let value = DeletionsValue::from_treemap(vector_ids).encode_to_bytes()?;
-        Ok(RecordOp::Merge(Record::new(key, value)))
-    }
-
-    /// Create a RecordOp to write a centroid chunk.
-    fn put_centroid_chunk(
-        &self,
-        chunk_id: u32,
-        entries: Vec<crate::serde::centroid_chunk::CentroidEntry>,
-        dimensions: usize,
-    ) -> Result<RecordOp> {
-        let key = CentroidChunkKey::new(chunk_id).encode();
-        let value = CentroidChunkValue::new(entries).encode_to_bytes(dimensions);
-        Ok(RecordOp::Put(Record::new(key, value)))
-    }
-
-    /// Create a RecordOp to delete a centroid chunk.
-    #[allow(dead_code)]
-    fn delete_centroid_chunk(&self, chunk_id: u32) -> Result<RecordOp> {
-        let key = CentroidChunkKey::new(chunk_id).encode();
-        Ok(RecordOp::Delete(key))
-    }
-}
-
-// Implement the trait for all types that implement Storage
-impl<T: ?Sized + Storage> VectorDbStorageExt for T {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::AttributeValue;
-    use crate::serde::posting_list::PostingList;
+    use crate::serde::posting_list::{PostingList, PostingUpdate};
     use crate::storage::merge_operator::VectorDbMergeOperator;
+    use crate::storage::record;
+    use common::Storage;
     use common::storage::in_memory::InMemoryStorage;
+    use roaring::RoaringTreemap;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -253,7 +168,7 @@ mod tests {
         ];
 
         // when - write
-        let op = storage.put_vector_data(42, "vec-1", &attributes).unwrap();
+        let op = record::put_vector_data(42, "vec-1", &attributes);
         storage.apply(vec![op]).await.unwrap();
 
         // then - read
@@ -296,7 +211,7 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
 
         // when - write
-        let op = storage.put_id_dictionary("vec-1", 42).unwrap();
+        let op = record::put_id_dictionary("vec-1", 42);
         storage.apply(vec![op]).await.unwrap();
 
         // then - read using IdDictionary directly
@@ -316,7 +231,7 @@ mod tests {
         ];
 
         // when - write
-        let op = storage.merge_posting_list(1, postings).unwrap();
+        let op = record::merge_posting_list(1, postings).unwrap();
         storage.apply(vec![op]).await.unwrap();
 
         // then - read
@@ -338,7 +253,7 @@ mod tests {
         deleted.insert(3);
 
         // when - write
-        let op = storage.merge_deleted_vectors(deleted).unwrap();
+        let op = record::merge_deleted_vectors(deleted).unwrap();
         storage.apply(vec![op]).await.unwrap();
 
         // then - read
