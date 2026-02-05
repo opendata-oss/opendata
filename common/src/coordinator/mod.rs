@@ -51,18 +51,19 @@ pub(crate) enum WriteCommand<D: Delta> {
 ///
 /// It accepts writes through `WriteCoordinatorHandle`, applies them to a `Delta`,
 /// and coordinates flushing through a `Flusher`.
-pub struct WriteCoordinator<D: Delta> {
+pub struct WriteCoordinator<D: Delta, F: Flusher<D>> {
     handle: WriteCoordinatorHandle<D>,
     stop_tx: oneshot::Sender<()>,
-    write_task_jh: tokio::task::JoinHandle<Result<(), String>>,
+    tasks: Option<(WriteCoordinatorTask<D>, FlushTask<D, F>)>,
+    write_task_jh: Option<tokio::task::JoinHandle<Result<(), String>>>,
 }
 
-impl <D: Delta> WriteCoordinator<D> {
-    pub fn start<F: Flusher<D>>(
+impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
+    pub fn new(
         config: WriteCoordinatorConfig,
         initial_context: D::Context,
         flusher: F,
-    ) -> WriteCoordinator<D> {
+    ) -> WriteCoordinator<D, F> {
         let (cmd_tx, cmd_rx) = mpsc::channel(config.queue_capacity);
 
         let (applied_tx, applied_rx) = watch::channel(0);
@@ -91,27 +92,24 @@ impl <D: Delta> WriteCoordinator<D> {
             flushed_tx,
             flush_result_tx: flush_result_tx.clone(),
         };
-        let flush_task_jh = flush_task.run();
 
         let (stop_tx, stop_rx) = oneshot::channel();
 
         let write_task = WriteCoordinatorTask::new(
             config,
             initial_context,
-            flush_task_jh,
             cmd_rx,
             flush_tx,
             applied_tx,
             durable_tx,
             stop_rx,
         );
-        let write_task_jh = write_task.run();
-
         let handle = WriteCoordinatorHandle::new(cmd_tx, watcher, flush_result_tx);
 
         Self {
             handle,
-            write_task_jh,
+            tasks: Some((write_task, flush_task)),
+            write_task_jh: None,
             stop_tx,
         }
     }
@@ -120,16 +118,28 @@ impl <D: Delta> WriteCoordinator<D> {
         self.handle.clone()
     }
 
-    pub async fn stop(self) -> Result<(), String> {
+    pub fn start(&mut self) {
+        let Some((write_task, flush_task)) = self.tasks.take() else {
+            // already started
+            return;
+        };
+        let flush_task_jh = flush_task.run();
+        let write_task_jh = write_task.run(flush_task_jh);
+        self.write_task_jh = Some(write_task_jh);
+    }
+
+    pub async fn stop(mut self) -> Result<(), String> {
+        let Some(write_task_jh) = self.write_task_jh.take() else {
+            return Err(String::from("coordinator already stopped"));
+        };
         let _ = self.stop_tx.send(());
-        self.write_task_jh.await.map_err(|e| e.to_string())?
+        write_task_jh.await.map_err(|e| e.to_string())?
     }
 }
 
 struct WriteCoordinatorTask<D: Delta> {
     config: WriteCoordinatorConfig,
     delta: CurrentDelta<D>,
-    flush_task_jh: tokio::task::JoinHandle<WriteResult<()>>,
     flush_tx: mpsc::Sender<FlushEvent<D>>,
     cmd_rx: mpsc::Receiver<WriteCommand<D>>,
     applied_tx: watch::Sender<u64>,
@@ -148,7 +158,6 @@ impl<D: Delta> WriteCoordinatorTask<D> {
     pub fn new(
         config: WriteCoordinatorConfig,
         initial_context: D::Context,
-        flush_task_jh: tokio::task::JoinHandle<WriteResult<()>>,
         cmd_rx: mpsc::Receiver<WriteCommand<D>>,
         flush_tx: mpsc::Sender<FlushEvent<D>>,
         applied_tx: watch::Sender<u64>,
@@ -166,7 +175,6 @@ impl<D: Delta> WriteCoordinatorTask<D> {
             delta: CurrentDelta::new(delta),
             cmd_rx,
             flush_tx,
-            flush_task_jh,
             applied_tx,
             durable_tx,
             // Epochs start at 1 because watch channels initialize to 0 (meaning "nothing
@@ -180,11 +188,17 @@ impl<D: Delta> WriteCoordinatorTask<D> {
     }
 
     /// Run the coordinator event loop.
-    pub fn run(mut self) -> tokio::task::JoinHandle<Result<(), String>> {
-        tokio::task::spawn(async move {self.run_coordinator().await})
+    pub fn run(
+        mut self,
+        flush_task_jh: tokio::task::JoinHandle<WriteResult<()>>,
+    ) -> tokio::task::JoinHandle<Result<(), String>> {
+        tokio::task::spawn(async move { self.run_coordinator(flush_task_jh).await })
     }
 
-    async fn run_coordinator(mut self) -> Result<(), String> {
+    async fn run_coordinator(
+        mut self,
+        flush_task_jh: tokio::task::JoinHandle<WriteResult<()>>,
+    ) -> Result<(), String> {
         // Reset the interval to start fresh from when run() is called
         self.flush_interval.reset();
 
@@ -224,7 +238,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         drop(self.flush_tx);
 
         // Wait for the flush task to complete and propagate any errors
-        self.flush_task_jh
+        flush_task_jh
             .await
             .map_err(|e| format!("flush task panicked: {}", e))?
             .map_err(|e| format!("flush task error: {}", e))?;
@@ -519,12 +533,9 @@ mod tests {
     async fn should_assign_monotonic_epochs() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher,
-        );
+        let mut coordinator = WriteCoordinator::new(test_config(), TestContext::default(), flusher);
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when
         let write1 = handle
@@ -568,12 +579,10 @@ mod tests {
     async fn should_apply_writes_in_order() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when
         handle
@@ -623,12 +632,9 @@ mod tests {
     async fn should_update_applied_watermark_after_each_write() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher,
-        );
+        let mut coordinator = WriteCoordinator::new(test_config(), TestContext::default(), flusher);
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when
         let mut write_handle = handle
@@ -656,12 +662,10 @@ mod tests {
     async fn should_flush_on_command() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when
         let mut write = handle
@@ -686,12 +690,10 @@ mod tests {
     async fn should_wait_on_flush_handle() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when
         handle
@@ -716,12 +718,9 @@ mod tests {
     async fn should_return_correct_epoch_from_flush_handle() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher,
-        );
+        let mut coordinator = WriteCoordinator::new(test_config(), TestContext::default(), flusher);
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when
         let write1 = handle
@@ -755,12 +754,10 @@ mod tests {
     async fn should_include_all_pending_writes_in_flush() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when
         handle
@@ -805,12 +802,10 @@ mod tests {
     async fn should_skip_flush_when_no_new_writes() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when
         let mut write = handle
@@ -850,12 +845,9 @@ mod tests {
     async fn should_update_flushed_watermark_after_flush() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher,
-        );
+        let mut coordinator = WriteCoordinator::new(test_config(), TestContext::default(), flusher);
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when
         let mut write_handle = handle
@@ -890,12 +882,10 @@ mod tests {
             flush_interval: Duration::from_millis(100),
             flush_size_threshold: usize::MAX,
         };
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            config,
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(config, TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when - ensure coordinator task runs and then write something
         tokio::task::yield_now().await;
@@ -936,12 +926,10 @@ mod tests {
             flush_interval: Duration::from_secs(3600),
             flush_size_threshold: 100, // Low threshold for testing
         };
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            config,
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(config, TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when - write that exceeds threshold
         let mut write = handle
@@ -970,12 +958,10 @@ mod tests {
             flush_interval: Duration::from_secs(3600),
             flush_size_threshold: 100,
         };
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            config,
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(config, TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when - small writes that accumulate
         for i in 0..5 {
@@ -1019,12 +1005,10 @@ mod tests {
     async fn should_accept_writes_during_flush() {
         // given
         let (flusher, flush_started_rx, unblock_tx) = TestFlusher::with_flush_control();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when: trigger a flush and wait for it to start (proving it's in progress)
         let write1 = handle
@@ -1058,12 +1042,10 @@ mod tests {
     async fn should_assign_new_epochs_during_flush() {
         // given
         let (flusher, flush_started_rx, unblock_tx) = TestFlusher::with_flush_control();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when: write, flush, then write more during blocked flush
         handle
@@ -1118,11 +1100,8 @@ mod tests {
             flush_interval: Duration::from_secs(3600),
             flush_size_threshold: usize::MAX,
         };
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            config,
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(config, TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
         // Don't start coordinator - queue will fill
 
@@ -1153,9 +1132,6 @@ mod tests {
 
         // then
         assert!(matches!(result, Err(WriteError::Backpressure)));
-
-        drop(handle);
-        drop(coordinator);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1167,11 +1143,8 @@ mod tests {
             flush_interval: Duration::from_secs(3600),
             flush_size_threshold: usize::MAX,
         };
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            config,
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(config, TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
 
         // Fill queue without processing
@@ -1192,6 +1165,7 @@ mod tests {
             .unwrap();
 
         // when - start coordinator to drain queue and wait for it to process writes
+        coordinator.start();
         write_b.wait(Durability::Applied).await.unwrap();
 
         // then - writes should succeed now
@@ -1216,12 +1190,10 @@ mod tests {
     async fn should_shutdown_cleanly_when_stop_called() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when
         let result = coordinator.stop().await;
@@ -1239,12 +1211,10 @@ mod tests {
             flush_interval: Duration::from_secs(3600), // Long interval - won't trigger
             flush_size_threshold: usize::MAX,          // High threshold - won't trigger
         };
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            config,
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(config, TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when - write without explicit flush, then shutdown
         let write = handle
@@ -1271,12 +1241,10 @@ mod tests {
     async fn should_return_shutdown_error_after_coordinator_stops() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // Stop coordinator
         coordinator.stop().await;
@@ -1302,12 +1270,10 @@ mod tests {
     async fn should_track_epoch_range_in_flush_event() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when
         handle
@@ -1353,12 +1319,10 @@ mod tests {
     async fn should_have_contiguous_epoch_ranges() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when - first batch
         handle
@@ -1412,12 +1376,10 @@ mod tests {
     async fn should_include_exact_epochs_in_range() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when - write and capture the assigned epochs
         let write1 = handle
@@ -1468,12 +1430,10 @@ mod tests {
     async fn should_preserve_key_to_id_mapping_across_flushes() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when - write key "a" in first batch
         let mut write1 = handle
@@ -1519,12 +1479,10 @@ mod tests {
     async fn should_continue_id_sequence_across_flushes() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when - write keys in first batch
         handle
@@ -1585,12 +1543,10 @@ mod tests {
     async fn should_include_complete_mapping_in_flush_event() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
+        coordinator.start();
 
         // when - write keys in first batch
         handle
@@ -1646,13 +1602,11 @@ mod tests {
     async fn should_receive_flush_result_on_subscribe() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
         let mut subscriber = handle.subscribe();
+        coordinator.start();
 
         // when
         handle
@@ -1677,13 +1631,11 @@ mod tests {
     async fn should_include_snapshot_in_flush_result() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
         let mut subscriber = handle.subscribe();
+        coordinator.start();
 
         // when
         handle
@@ -1709,13 +1661,11 @@ mod tests {
     async fn should_include_delta_in_flush_result() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
         let mut subscriber = handle.subscribe();
+        coordinator.start();
 
         // when
         handle
@@ -1744,13 +1694,11 @@ mod tests {
     async fn should_include_epoch_range_in_flush_result() {
         // given
         let flusher = TestFlusher::default();
-        let coordinator = WriteCoordinator::<TestDelta>::start(
-            test_config(),
-            TestContext::default(),
-            flusher.clone(),
-        );
+        let mut coordinator =
+            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
         let handle = coordinator.handle();
         let mut subscriber = handle.subscribe();
+        coordinator.start();
 
         // when
         let write1 = handle

@@ -25,9 +25,7 @@ use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
 use anyhow::{Context, Result};
 use common::SequenceAllocator;
-use common::coordinator::{
-    Durability, WriteCoordinator, WriteCoordinatorConfig, WriteCoordinatorHandle,
-};
+use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};
 use common::storage::factory::create_storage;
 use common::storage::{Storage, StorageRead, StorageSnapshot};
 use common::{StorageRuntime, StorageSemantics};
@@ -53,7 +51,7 @@ pub struct VectorDb {
     snapshot: Arc<SnapshotLock>,
 
     /// The WriteCoordinator itself (stored to keep it alive).
-    write_coordinator: WriteCoordinator<VectorDbWriteDelta>,
+    write_coordinator: WriteCoordinator<VectorDbWriteDelta, VectorDbFlusher>,
 
     /// In-memory HNSW graph for centroid search (immutable after initialization).
     centroid_graph: Arc<dyn CentroidGraph>,
@@ -137,13 +135,14 @@ impl VectorDb {
             id_allocator,
         };
 
-        // Create WriteCoordinator
+        // start write coordinator
         let coordinator_config = WriteCoordinatorConfig {
             queue_capacity: 1000,
             flush_interval: Duration::from_secs(5),
             flush_size_threshold: 64 * 1024 * 1024,
         };
-        let write_coordinator = WriteCoordinator::start(coordinator_config, ctx, flusher);
+        let mut write_coordinator = WriteCoordinator::new(coordinator_config, ctx, flusher);
+        write_coordinator.start();
 
         Ok(Self {
             config,
