@@ -133,7 +133,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         let Some(write_task_jh) = self.write_task_jh.take() else {
             return Ok(());
         };
-        let _ = self.stop_tok.cancel();
+        self.stop_tok.cancel();
         write_task_jh.await.map_err(|e| e.to_string())?
     }
 }
