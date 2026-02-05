@@ -162,6 +162,18 @@ impl From<bool> for AttributeValue {
     }
 }
 
+impl From<crate::serde::FieldValue> for AttributeValue {
+    fn from(field: crate::serde::FieldValue) -> Self {
+        match field {
+            crate::serde::FieldValue::String(s) => AttributeValue::String(s),
+            crate::serde::FieldValue::Int64(v) => AttributeValue::Int64(v),
+            crate::serde::FieldValue::Float64(v) => AttributeValue::Float64(v),
+            crate::serde::FieldValue::Bool(v) => AttributeValue::Bool(v),
+            crate::serde::FieldValue::Vector(v) => AttributeValue::Vector(v),
+        }
+    }
+}
+
 /// Configuration for a VectorDb instance.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -227,33 +239,21 @@ impl MetadataFieldSpec {
     }
 }
 
-/// Helper to convert AttributeValue to the serde layer's FieldValue.
-///
-/// This is used internally when encoding metadata for storage.
-pub(crate) fn attribute_value_to_field_value(attr: &AttributeValue) -> crate::serde::FieldValue {
-    match attr {
-        AttributeValue::String(s) => crate::serde::FieldValue::String(s.clone()),
-        AttributeValue::Int64(v) => crate::serde::FieldValue::Int64(*v),
-        AttributeValue::Float64(v) => crate::serde::FieldValue::Float64(*v),
-        AttributeValue::Bool(v) => crate::serde::FieldValue::Bool(*v),
-        AttributeValue::Vector(v) => crate::serde::FieldValue::Vector(v.clone()),
-    }
-}
-
-/// Helper to convert the serde layer's FieldValue to AttributeValue.
-///
-/// This is used internally when decoding metadata from storage.
-///
-/// # Panics
-/// Panics if called with a Vector variant since vectors are not metadata.
-pub(crate) fn field_value_to_attribute_value(field: &crate::serde::FieldValue) -> AttributeValue {
-    match field {
-        crate::serde::FieldValue::String(s) => AttributeValue::String(s.clone()),
-        crate::serde::FieldValue::Int64(v) => AttributeValue::Int64(*v),
-        crate::serde::FieldValue::Float64(v) => AttributeValue::Float64(*v),
-        crate::serde::FieldValue::Bool(v) => AttributeValue::Bool(*v),
-        crate::serde::FieldValue::Vector(v) => AttributeValue::Vector(v.clone()),
-    }
+/// A search result with vector, score, and metadata.
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    /// Internal vector ID
+    pub internal_id: u64,
+    /// External vector ID (user-provided)
+    pub external_id: String,
+    /// Similarity score (interpretation depends on distance metric)
+    ///
+    /// - L2: Lower scores = more similar
+    /// - Cosine: Higher scores = more similar (range: -1 to 1)
+    /// - DotProduct: Higher scores = more similar
+    pub score: f32,
+    /// Attribute key-value pairs
+    pub attributes: HashMap<String, AttributeValue>,
 }
 
 /// Helper to build a metadata map from attributes.

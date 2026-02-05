@@ -35,6 +35,7 @@
 pub mod db;
 pub mod delta;
 pub mod distance;
+pub mod flusher;
 pub mod hnsw;
 pub mod model;
 pub mod serde;
@@ -43,8 +44,8 @@ pub(crate) mod storage;
 pub(crate) mod test_utils;
 
 // Public API exports
-pub use db::{SearchResult, VectorDb};
+pub use db::VectorDb;
 pub use model::{
-    Attribute, AttributeValue, Config, DistanceMetric, FieldType, MetadataFieldSpec, Vector,
-    VectorBuilder,
+    Attribute, AttributeValue, Config, DistanceMetric, FieldType, MetadataFieldSpec, SearchResult,
+    Vector, VectorBuilder,
 };

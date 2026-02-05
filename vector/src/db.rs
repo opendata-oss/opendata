@@ -2,88 +2,82 @@
 //!
 //! This module provides the main `VectorDb` struct that handles:
 //! - Vector ingestion with validation
-//! - In-memory delta buffering
+//! - In-memory delta buffering via WriteCoordinator
 //! - Atomic flush with ID allocation
 //! - Snapshot management for consistency
 //!
-//! The implementation follows the MiniTsdb pattern from the timeseries module,
-//! adapted for vector data with external ID tracking and atomic upsert semantics.
+//! The implementation uses the WriteCoordinator pattern for write path:
+//! - Validation and ID allocation happen in write()
+//! - Delta handles dictionary lookup, centroid assignment, and builds RecordOps
+//! - Flusher applies ops atomically to storage
 
-use std::sync::Arc;
-use std::time::Instant;
-
-use anyhow::{Context, Result};
-use common::sequence::SequenceAllocator;
-use common::storage::factory::create_storage;
-use common::storage::{Storage, StorageRead};
-use common::{StorageRuntime, StorageSemantics};
-use roaring::RoaringTreemap;
-use tokio::sync::{Mutex, RwLock};
-
-use crate::storage::merge_operator::VectorDbMergeOperator;
-
-use std::collections::HashMap;
-
-use crate::delta::{VectorDbDelta, VectorDbDeltaBuilder};
+use crate::delta::{VectorDbDeltaContext, VectorDbWriteDelta, VectorWrite};
 use crate::distance;
+use crate::flusher::VectorDbFlusher;
 use crate::hnsw::{CentroidGraph, build_centroid_graph};
-use crate::model::{AttributeValue, Config, Vector};
+use crate::model::{
+    AttributeValue, Config, SearchResult, VECTOR_FIELD_NAME, Vector, attributes_to_map,
+};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::key::SeqBlockKey;
-use crate::serde::posting_list::{PostingList, PostingUpdate};
-use crate::storage::{VectorDbStorageExt, VectorDbStorageReadExt};
+use crate::serde::posting_list::PostingList;
+use crate::storage::VectorDbStorageReadExt;
+use crate::storage::merge_operator::VectorDbMergeOperator;
+use anyhow::{Context, Result};
+use common::SequenceAllocator;
+use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};
+use common::storage::factory::create_storage;
+use common::storage::{Storage, StorageRead, StorageSnapshot};
+use common::{StorageRuntime, StorageSemantics};
+use dashmap::DashMap;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+type SnapshotLock = std::sync::Mutex<Arc<dyn StorageSnapshot>>;
 
 /// Vector database for storing and querying embedding vectors.
 ///
 /// `VectorDb` provides a high-level API for ingesting vectors with metadata.
-/// It handles internal details like ID allocation, centroid assignment (stubbed),
+/// It handles internal details like ID allocation, centroid assignment,
 /// and metadata index maintenance automatically.
 pub struct VectorDb {
     config: Config,
+    #[allow(dead_code)]
     storage: Arc<dyn Storage>,
-    id_allocator: Arc<tokio::sync::Mutex<SequenceAllocator>>,
 
-    /// Pending delta accumulating ingested data not yet flushed to storage.
-    pending_delta: Mutex<VectorDbDelta>,
-    /// Receiver for waiting for updates to pending delta
-    pending_delta_watch_rx: tokio::sync::watch::Receiver<Instant>,
-    /// Sender for updating the pending delta when flushing.
-    pending_delta_watch_tx: tokio::sync::watch::Sender<Instant>,
-    /// Storage snapshot used for queries.
-    snapshot: RwLock<Arc<dyn StorageRead>>,
-    /// Mutex to ensure only one flush operation can run at a time.
-    flush_mutex: Arc<Mutex<()>>,
-    /// In-memory HNSW graph for centroid search (loaded lazily).
-    centroid_graph: RwLock<Option<Box<dyn CentroidGraph>>>,
-}
+    /// Storage snapshot used for queries (updated by flusher).
+    /// Protected by std::sync::Mutex - callers should clone immediately and release.
+    snapshot: Arc<SnapshotLock>,
 
-/// A search result with vector, score, and metadata.
-#[derive(Debug, Clone)]
-pub struct SearchResult {
-    /// Internal vector ID
-    pub internal_id: u64,
-    /// External vector ID (user-provided)
-    pub external_id: String,
-    /// Similarity score (interpretation depends on distance metric)
-    ///
-    /// - L2: Lower scores = more similar
-    /// - Cosine: Higher scores = more similar (range: -1 to 1)
-    /// - DotProduct: Higher scores = more similar
-    pub score: f32,
-    /// attribute key-value pairs
-    pub attributes: HashMap<String, AttributeValue>,
+    /// The WriteCoordinator itself (stored to keep it alive).
+    write_coordinator: WriteCoordinator<VectorDbWriteDelta, VectorDbFlusher>,
+
+    /// In-memory HNSW graph for centroid search (immutable after initialization).
+    centroid_graph: Arc<dyn CentroidGraph>,
 }
 
 impl VectorDb {
-    /// Open or create a vector database with the given configuration.
+    /// Open or create a vector database with the given configuration and centroids.
     ///
+    /// If the database already exists (centroids are already stored), the provided
+    /// centroids are ignored and the stored centroids are used instead.
+    ///
+    /// If the database is new, the provided centroids are written to storage and
+    /// used to build the HNSW index.
+    ///
+    /// # Arguments
+    /// * `config` - Database configuration
+    /// * `centroids` - Initial centroids to use if database is new
+    ///
+    /// # Configuration Compatibility
     /// If the database already exists, the configuration must be compatible:
     /// - `dimensions` must match exactly
     /// - `distance_metric` must match exactly
     ///
     /// Other configuration options (like `flush_interval`) can be changed
     /// on subsequent opens.
-    pub async fn open(config: Config) -> Result<Self> {
+    pub async fn open(config: Config, centroids: Vec<CentroidEntry>) -> Result<Self> {
         let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
         let storage = create_storage(
             &config.storage,
@@ -93,35 +87,164 @@ impl VectorDb {
         .await
         .context("Failed to create storage")?;
 
-        Self::new(storage, config).await
+        Self::new(storage, config, centroids).await
     }
 
-    /// Create a vector database with the given storage and configuration.
+    /// Create a vector database with the given storage, configuration, and centroids.
     ///
-    /// This is a crate-visible constructor for tests that need direct access
-    /// to the underlying storage for verification.
-    pub(crate) async fn new(storage: Arc<dyn Storage>, config: Config) -> Result<Self> {
+    /// If centroids already exist in storage, the provided centroids are ignored.
+    /// Otherwise, the provided centroids are written to storage.
+    pub(crate) async fn new(
+        storage: Arc<dyn Storage>,
+        config: Config,
+        centroids: Vec<CentroidEntry>,
+    ) -> Result<Self> {
         // Initialize sequence allocator for internal ID generation
         let seq_key = SeqBlockKey.encode();
         let id_allocator = SequenceAllocator::load(storage.as_ref(), seq_key).await?;
 
         // Get initial snapshot
-        let snapshot = storage.snapshot().await?;
+        let initial_snapshot = storage.snapshot().await?;
+        let snapshot = Arc::new(SnapshotLock::new(initial_snapshot));
 
-        // Create watch channel for pending delta backpressure
-        let (tx, rx) = tokio::sync::watch::channel(Instant::now());
+        // For now, load the full ID dictionary from storage into memory at startup
+        // Eventually, we should load this in the background and allow the delta to
+        // read ids that are not yet loaded from storage
+        let dictionary = Arc::new(DashMap::new());
+        {
+            let snapshot_ref = snapshot.lock().unwrap().clone();
+            Self::load_dictionary_from_storage(snapshot_ref.as_ref(), &dictionary).await?;
+        }
+
+        // For now, just force bootstrap centroids. Eventually we'll derive these automatically
+        // from the vectors
+        let centroid_graph =
+            Self::load_or_create_centroids(&storage, &snapshot, &config, centroids).await?;
+
+        // Create flusher for the WriteCoordinator
+        let flusher = VectorDbFlusher {
+            storage: Arc::clone(&storage),
+            snapshot: Arc::clone(&snapshot),
+        };
+
+        // Create initial image for the delta (shares dictionary, centroid_graph, and id_allocator)
+        let ctx = VectorDbDeltaContext {
+            dimensions: config.dimensions as usize,
+            dictionary: Arc::clone(&dictionary),
+            centroid_graph: Arc::clone(&centroid_graph),
+            id_allocator,
+        };
+
+        // start write coordinator
+        let coordinator_config = WriteCoordinatorConfig {
+            queue_capacity: 1000,
+            flush_interval: Duration::from_secs(5),
+            flush_size_threshold: 64 * 1024 * 1024,
+        };
+        let mut write_coordinator = WriteCoordinator::new(coordinator_config, ctx, flusher);
+        write_coordinator.start();
 
         Ok(Self {
             config,
             storage,
-            id_allocator: Arc::new(tokio::sync::Mutex::new(id_allocator)),
-            pending_delta: Mutex::new(VectorDbDelta::empty()),
-            pending_delta_watch_tx: tx,
-            pending_delta_watch_rx: rx,
-            snapshot: RwLock::new(snapshot),
-            flush_mutex: Arc::new(Mutex::new(())),
-            centroid_graph: RwLock::new(None),
+            snapshot,
+            write_coordinator,
+            centroid_graph,
         })
+    }
+
+    /// Load centroids from storage if they exist, otherwise create them from the provided entries.
+    async fn load_or_create_centroids(
+        storage: &Arc<dyn Storage>,
+        snapshot: &Arc<SnapshotLock>,
+        config: &Config,
+        centroids: Vec<CentroidEntry>,
+    ) -> Result<Arc<dyn CentroidGraph>> {
+        // Clone snapshot reference for async operations
+        let snapshot_ref = snapshot.lock().unwrap().clone();
+
+        // Check if centroids already exist in storage
+        let existing_centroids = snapshot_ref
+            .scan_all_centroids(config.dimensions as usize)
+            .await?;
+
+        if !existing_centroids.is_empty() {
+            // Use existing centroids from storage
+            let graph = build_centroid_graph(existing_centroids, config.distance_metric)?;
+            return Ok(Arc::from(graph));
+        }
+
+        // No existing centroids - validate and write the provided ones
+        if centroids.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Centroids must be provided when creating a new database"
+            ));
+        }
+
+        // Validate centroid dimensions
+        for centroid in &centroids {
+            if centroid.dimensions() != config.dimensions as usize {
+                return Err(anyhow::anyhow!(
+                    "Centroid dimension mismatch: expected {}, got {}",
+                    config.dimensions,
+                    centroid.dimensions()
+                ));
+            }
+        }
+
+        // Validate we don't exceed max chunk size (default 4096)
+        const DEFAULT_CHUNK_TARGET: usize = 4096;
+        if centroids.len() > DEFAULT_CHUNK_TARGET {
+            return Err(anyhow::anyhow!(
+                "Too many centroids for single chunk: {} > {}. Multi-chunk support not yet implemented.",
+                centroids.len(),
+                DEFAULT_CHUNK_TARGET
+            ));
+        }
+
+        // Write centroids to storage
+        let op = crate::storage::record::put_centroid_chunk(
+            0,
+            centroids.clone(),
+            config.dimensions as usize,
+        );
+        storage.apply(vec![op]).await?;
+
+        // Build and return the graph
+        let graph = build_centroid_graph(centroids, config.distance_metric)?;
+        Ok(Arc::from(graph))
+    }
+
+    /// Load ID dictionary entries from storage into the in-memory DashMap.
+    async fn load_dictionary_from_storage(
+        snapshot: &dyn StorageRead,
+        dictionary: &DashMap<String, u64>,
+    ) -> Result<()> {
+        // Create prefix for all IdDictionary records
+        let mut prefix_buf = bytes::BytesMut::with_capacity(2);
+        crate::serde::RecordType::IdDictionary
+            .prefix()
+            .write_to(&mut prefix_buf);
+        let prefix = prefix_buf.freeze();
+
+        // Scan all IdDictionary records
+        let range = common::BytesRange::prefix(prefix);
+        let records = snapshot.scan(range).await?;
+
+        for record in records {
+            // Decode the key to get external_id
+            let key = crate::serde::key::IdDictionaryKey::decode(&record.key)?;
+            let external_id = key.external_id.clone();
+
+            // Decode the value to get internal_id
+            let mut slice = record.value.as_ref();
+            let internal_id = common::serde::encoding::decode_u64(&mut slice)
+                .context("failed to decode internal ID from ID dictionary")?;
+
+            dictionary.insert(external_id, internal_id);
+        }
+
+        Ok(())
     }
 
     /// Write vectors to the database.
@@ -150,280 +273,149 @@ impl VectorDb {
     /// - Attribute names must be defined in `Config::metadata_fields` (if specified)
     /// - Attribute types must match the schema
     pub async fn write(&self, vectors: Vec<Vector>) -> Result<()> {
-        // Block until the pending delta is young enough (not older than 2 * flush_interval)
-        let max_age = self.config.flush_interval * 2;
-        let mut receiver = self.pending_delta_watch_rx.clone();
-        receiver
-            .wait_for(|t| t.elapsed() <= max_age)
-            .await
-            .context("pending delta watch_rx disconnected")?;
-
-        // Build delta from vectors
-        let mut builder = VectorDbDeltaBuilder::new(&self.config);
+        // Validate and prepare all vectors
+        let mut writes = Vec::with_capacity(vectors.len());
         for vector in vectors {
-            builder.write(vector).await?;
+            writes.push(self.prepare_vector_write(vector)?);
         }
-        let delta = builder.build();
 
-        // Merge into pending delta
-        {
-            let mut pending = self.pending_delta.lock().await;
-            pending.merge(delta);
+        // Send all writes to coordinator in a single batch and wait for epoch
+        let write_handle = self.write_coordinator.handle().write(writes).await?;
+        write_handle
+            .epoch()
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        Ok(())
+    }
+
+    /// Validate and prepare a vector write for the coordinator.
+    ///
+    /// This validates the vector. The delta handles ID allocation,
+    /// dictionary lookup, and centroid assignment.
+    fn prepare_vector_write(&self, vector: Vector) -> Result<VectorWrite> {
+        // Validate external ID length
+        if vector.id.len() > 64 {
+            return Err(anyhow::anyhow!(
+                "External ID too long: {} bytes (max 64)",
+                vector.id.len()
+            ));
+        }
+
+        // Convert attributes to map for validation
+        let attributes = attributes_to_map(&vector.attributes);
+
+        // Extract and validate "vector" attribute
+        let values = match attributes.get(VECTOR_FIELD_NAME) {
+            Some(AttributeValue::Vector(v)) => v.clone(),
+            Some(_) => {
+                return Err(anyhow::anyhow!(
+                    "Field '{}' must have type Vector",
+                    VECTOR_FIELD_NAME
+                ));
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Missing required field '{}'",
+                    VECTOR_FIELD_NAME
+                ));
+            }
+        };
+
+        // Validate dimensions
+        if values.len() != self.config.dimensions as usize {
+            return Err(anyhow::anyhow!(
+                "Vector dimension mismatch: expected {}, got {}",
+                self.config.dimensions,
+                values.len()
+            ));
+        }
+
+        // Validate attributes against schema (if schema is defined)
+        if !self.config.metadata_fields.is_empty() {
+            self.validate_attributes(&attributes)?;
+        }
+
+        // Convert attributes to vec of tuples for VectorWrite
+        let attributes_vec: Vec<(String, AttributeValue)> = attributes.into_iter().collect();
+
+        Ok(VectorWrite {
+            external_id: vector.id,
+            values,
+            attributes: attributes_vec,
+        })
+    }
+
+    /// Validates attributes against the configured schema.
+    fn validate_attributes(&self, metadata: &HashMap<String, AttributeValue>) -> Result<()> {
+        // Build a map of field name -> expected type for quick lookup
+        let schema: HashMap<&str, crate::serde::FieldType> = self
+            .config
+            .metadata_fields
+            .iter()
+            .map(|spec| (spec.name.as_str(), spec.field_type))
+            .collect();
+
+        // Check each provided attribute (skip VECTOR_FIELD_NAME which is always allowed)
+        for (field_name, value) in metadata {
+            // Skip the special "vector" field
+            if field_name == VECTOR_FIELD_NAME {
+                continue;
+            }
+
+            match schema.get(field_name.as_str()) {
+                Some(expected_type) => {
+                    // Validate type matches
+                    let actual_type = match value {
+                        AttributeValue::String(_) => crate::serde::FieldType::String,
+                        AttributeValue::Int64(_) => crate::serde::FieldType::Int64,
+                        AttributeValue::Float64(_) => crate::serde::FieldType::Float64,
+                        AttributeValue::Bool(_) => crate::serde::FieldType::Bool,
+                        AttributeValue::Vector(_) => crate::serde::FieldType::Vector,
+                    };
+
+                    if actual_type != *expected_type {
+                        return Err(anyhow::anyhow!(
+                            "Type mismatch for field '{}': expected {:?}, got {:?}",
+                            field_name,
+                            expected_type,
+                            actual_type
+                        ));
+                    }
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "Unknown metadata field: '{}'. Valid fields: {:?}",
+                        field_name,
+                        schema.keys().collect::<Vec<_>>()
+                    ));
+                }
+            }
         }
 
         Ok(())
     }
 
-    /// Force flush all pending data to durable storage.
+    /// Force flush all pending data to storage.
     ///
-    /// Normally data is flushed according to `flush_interval`, but this
-    /// method can be used to ensure durability immediately.
+    /// Normally data is flushed according to `flush_interval`, and is then
+    /// readable. This method can be used to make writes readable immediately.
+    /// TODO: extend with an option to make durable, or support reading unflushed
+    ///       and change the meaning here to mean flushed durably
     ///
     /// # Atomic Flush
     ///
     /// The flush operation is atomic:
-    /// 1. Lookup old internal IDs from storage (if they exist)
-    /// 2. Allocate new internal IDs from sequence allocator
-    /// 3. Build all RecordOps (ID dictionary updates, deletes, new records)
-    /// 4. Apply everything in one atomic batch via `storage.apply()`
+    /// 1. All pending writes are frozen into an immutable delta
+    /// 2. RecordOps are applied in one batch via `storage.apply()`
+    /// 3. The snapshot is updated for queries
     ///
     /// This ensures ID dictionary updates, deletes, and new records are all
     /// applied together, maintaining consistency.
     pub async fn flush(&self) -> Result<()> {
-        let _flush_guard = self.flush_mutex.lock().await;
-
-        // Take the pending delta (replace with empty)
-        let (delta, created_at) = {
-            let mut pending = self.pending_delta.lock().await;
-            if pending.is_empty() {
-                return Ok(());
-            }
-            let delta = std::mem::replace(&mut *pending, VectorDbDelta::empty());
-            (delta, Instant::now())
-        };
-
-        // Notify any waiting writers
-        self.pending_delta_watch_tx.send_if_modified(|current| {
-            if created_at > *current {
-                *current = created_at;
-                true
-            } else {
-                false
-            }
-        });
-
-        // Build RecordOps atomically
-        let mut ops = Vec::new();
-
-        // Batch posting list updates (collect all updates per centroid)
-        let mut posting_updates: HashMap<u32, Vec<PostingUpdate>> = HashMap::new();
-        let mut deleted_vectors = RoaringTreemap::new();
-
-        for (external_id, pending_vec) in delta.vectors {
-            // 1. Lookup old internal_id (if exists) from ID dictionary
-            let old_internal_id = self.storage.lookup_internal_id(&external_id).await?;
-
-            // 2. Allocate new internal_id
-            let new_internal_id = {
-                let mut id_allocator = self.id_allocator.lock().await;
-                let (new_internal_id, put) = id_allocator.allocate_one();
-                if let Some(put) = put {
-                    self.storage.put(vec![put]).await?;
-                }
-                new_internal_id
-            };
-
-            // 3. Update IdDictionary
-            if old_internal_id.is_some() {
-                ops.push(self.storage.delete_id_dictionary(&external_id)?);
-            }
-            ops.push(
-                self.storage
-                    .put_id_dictionary(&external_id, new_internal_id)?,
-            );
-
-            // 4. Handle old vector deletion (if upsert)
-            if let Some(old_id) = old_internal_id {
-                // Add to deleted bitmap for batch merge later
-                deleted_vectors.insert(old_id);
-
-                // Tombstone old vector data record
-                ops.push(self.storage.delete_vector_data(old_id)?);
-            }
-
-            // 5. Write new vector data (includes external_id, vector, and metadata)
-            let attributes: Vec<_> = pending_vec
-                .attributes()
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect();
-            ops.push(self.storage.put_vector_data(
-                new_internal_id,
-                pending_vec.external_id(),
-                &attributes,
-            )?);
-
-            // 6. Assign vector to nearest centroid using HNSW
-            let centroid_id = self.assign_to_centroid(pending_vec.values()).await?;
-            posting_updates
-                .entry(centroid_id)
-                .or_default()
-                .push(PostingUpdate::append(
-                    new_internal_id,
-                    pending_vec.values().to_vec(),
-                ));
-        }
-
-        // Serialize and merge batched posting lists
-        if !deleted_vectors.is_empty() {
-            ops.push(self.storage.merge_deleted_vectors(deleted_vectors)?);
-        }
-
-        for (centroid_id, updates) in posting_updates {
-            ops.push(self.storage.merge_posting_list(centroid_id, updates)?);
-        }
-
-        // ATOMIC: Apply all operations in one batch
-        self.storage.apply(ops).await?;
-
-        // Update snapshot for queries
-        let new_snapshot = self.storage.snapshot().await?;
-        let mut snapshot_guard = self.snapshot.write().await;
-        *snapshot_guard = new_snapshot;
-
+        let mut handle = self.write_coordinator.handle().flush().await?;
+        handle.wait(Durability::Flushed).await?;
         Ok(())
-    }
-
-    /// Bootstrap centroids from vectors (for testing).
-    ///
-    /// This method writes centroid chunks to storage and builds the in-memory
-    /// HNSW graph. It's primarily intended for testing to initialize a known
-    /// set of centroids without running clustering algorithms.
-    ///
-    /// # Arguments
-    /// * `centroids` - Vector of centroid entries with their IDs and vectors
-    ///
-    /// # Errors
-    /// Returns an error if:
-    /// - Centroid dimensions don't match the collection's configured dimensions
-    /// - Storage write fails
-    /// - HNSW graph construction fails
-    pub async fn bootstrap_centroids(&self, centroids: Vec<CentroidEntry>) -> Result<()> {
-        // Validate centroid dimensions
-        for centroid in &centroids {
-            if centroid.dimensions() != self.config.dimensions as usize {
-                return Err(anyhow::anyhow!(
-                    "Centroid dimension mismatch: expected {}, got {}",
-                    self.config.dimensions,
-                    centroid.dimensions()
-                ));
-            }
-        }
-
-        // Validate we don't exceed max chunk size (default 4096)
-        // TODO: Support splitting centroids across multiple chunks when count > chunk_target
-        const DEFAULT_CHUNK_TARGET: usize = 4096;
-        if centroids.len() > DEFAULT_CHUNK_TARGET {
-            return Err(anyhow::anyhow!(
-                "Too many centroids for single chunk: {} > {}. Multi-chunk support not yet implemented.",
-                centroids.len(),
-                DEFAULT_CHUNK_TARGET
-            ));
-        }
-
-        // Write centroids to storage (single chunk for simplicity)
-        let op = self.storage.put_centroid_chunk(
-            0,
-            centroids.clone(),
-            self.config.dimensions as usize,
-        )?;
-        self.storage.apply(vec![op]).await?;
-
-        // Build HNSW graph
-        let graph = build_centroid_graph(centroids, self.config.distance_metric)?;
-        let mut graph_guard = self.centroid_graph.write().await;
-        *graph_guard = Some(graph);
-
-        Ok(())
-    }
-
-    /// Load centroids from storage and build HNSW graph.
-    ///
-    /// This method scans all centroid chunks from storage and constructs
-    /// the in-memory HNSW graph for fast centroid search during queries.
-    ///
-    /// # Errors
-    /// Returns an error if:
-    /// - Storage read fails
-    /// - No centroids found in storage
-    /// - HNSW graph construction fails
-    pub async fn load_centroids(&self) -> Result<()> {
-        let snapshot = self.snapshot.read().await;
-        let centroids = snapshot
-            .scan_all_centroids(self.config.dimensions as usize)
-            .await?;
-
-        if centroids.is_empty() {
-            return Err(anyhow::anyhow!("No centroids found in storage"));
-        }
-
-        let graph = build_centroid_graph(centroids, self.config.distance_metric)?;
-        let mut graph_guard = self.centroid_graph.write().await;
-        *graph_guard = Some(graph);
-
-        Ok(())
-    }
-
-    /// Ensure centroids are loaded, loading them if needed.
-    ///
-    /// This is called lazily from search() to load centroids on first query.
-    async fn ensure_centroids_loaded(&self) -> Result<()> {
-        let guard = self.centroid_graph.read().await;
-        if guard.is_some() {
-            return Ok(());
-        }
-        drop(guard);
-
-        // Try to load centroids from storage
-        match self.load_centroids().await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // If no centroids in storage, that's okay - they can be bootstrapped later
-                if e.to_string().contains("No centroids found") {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            }
-        }
-    }
-
-    /// Assign a vector to its nearest centroid using HNSW search.
-    ///
-    /// # Arguments
-    /// * `vector` - Vector to assign
-    ///
-    /// # Returns
-    /// The centroid_id of the nearest centroid, or 1 if no centroids are loaded
-    async fn assign_to_centroid(&self, vector: &[f32]) -> Result<u32> {
-        let graph_guard = self.centroid_graph.read().await;
-
-        match &*graph_guard {
-            Some(graph) => {
-                let results = graph.search(vector, 1);
-                results
-                    .first()
-                    .copied()
-                    .ok_or_else(|| anyhow::anyhow!("No centroids available"))
-            }
-            None => {
-                // Fallback: If no centroids loaded yet, assign to centroid_id=1
-                // This maintains backward compatibility with current stub
-                // TODO: Remove this fallback once LIRE centroid splitting is implemented
-                // and centroids are always initialized on collection creation
-                Ok(1)
-            }
-        }
     }
 
     /// Search for k-nearest neighbors to a query vector.
@@ -444,7 +436,6 @@ impl VectorDb {
     /// # Errors
     /// Returns an error if:
     /// - Query dimensions don't match collection dimensions
-    /// - No centroids are loaded
     /// - Storage read fails
     pub async fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
         // 1. Validate query dimensions
@@ -456,28 +447,20 @@ impl VectorDb {
             ));
         }
 
-        // 2. Ensure centroids are loaded
-        self.ensure_centroids_loaded().await?;
-
-        // Check if centroids are actually loaded
-        let graph_guard = self.centroid_graph.read().await;
-        if graph_guard.is_none() {
-            return Ok(Vec::new());
-        }
-        drop(graph_guard);
-
-        // 3. Search HNSW for nearest centroids (expand by ~10-100x for recall)
+        // 2. Search HNSW for nearest centroids (expand by ~10-100x for recall)
         // clamp(10, 100) ensures we search at least 10 centroids (for small k)
         // and at most 100 centroids (to cap memory/latency for large k)
         let num_centroids = k.clamp(10, 100);
-        let centroid_ids = self.search_centroids(query, num_centroids).await?;
+        let centroid_ids = self.centroid_graph.search(query, num_centroids);
 
         if centroid_ids.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 4. Load posting lists and deleted vectors
-        let snapshot = self.snapshot.read().await;
+        // 3. Clone snapshot reference (lock briefly, then release)
+        let snapshot = self.snapshot.lock().unwrap().clone();
+
+        // 4. Load posting lists
         let candidates = self
             .load_candidates(&centroid_ids, snapshot.as_ref())
             .await?;
@@ -499,16 +482,6 @@ impl VectorDb {
             .await?;
 
         Ok(results)
-    }
-
-    /// Search HNSW graph for nearest centroids.
-    async fn search_centroids(&self, query: &[f32], k: usize) -> Result<Vec<u32>> {
-        let graph_guard = self.centroid_graph.read().await;
-
-        match &*graph_guard {
-            Some(graph) => Ok(graph.search(query, k)),
-            None => Ok(Vec::new()),
-        }
     }
 
     /// Load candidate vector IDs and their vectors from posting lists.
@@ -567,12 +540,7 @@ impl VectorDb {
             // Convert metadata fields to HashMap (includes vector field)
             let metadata: HashMap<String, AttributeValue> = vector_data
                 .fields()
-                .map(|field| {
-                    (
-                        field.field_name.clone(),
-                        crate::model::field_value_to_attribute_value(&field.value),
-                    )
-                })
+                .map(|field| (field.field_name.clone(), field.value.clone().into()))
                 .collect();
 
             scored_results.push(SearchResult {
@@ -632,13 +600,18 @@ mod tests {
         )))
     }
 
+    fn create_test_centroids(dimensions: usize) -> Vec<CentroidEntry> {
+        vec![CentroidEntry::new(1, vec![1.0; dimensions])]
+    }
+
     #[tokio::test]
     async fn should_open_vector_db() {
         // given
         let config = create_test_config();
+        let centroids = create_test_centroids(3);
 
         // when
-        let result = VectorDb::open(config).await;
+        let result = VectorDb::open(config, centroids).await;
 
         // then
         assert!(result.is_ok());
@@ -649,7 +622,10 @@ mod tests {
         // given
         let storage = create_test_storage();
         let config = create_test_config();
-        let db = VectorDb::new(Arc::clone(&storage), config).await.unwrap();
+        let centroids = create_test_centroids(3);
+        let db = VectorDb::new(Arc::clone(&storage), config, centroids)
+            .await
+            .unwrap();
 
         let vectors = vec![
             Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
@@ -687,7 +663,10 @@ mod tests {
         // given
         let storage = create_test_storage();
         let config = create_test_config();
-        let db = VectorDb::new(Arc::clone(&storage), config).await.unwrap();
+        let centroids = create_test_centroids(3);
+        let db = VectorDb::new(Arc::clone(&storage), config, centroids)
+            .await
+            .unwrap();
 
         // First write
         let vector1 = Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
@@ -722,7 +701,8 @@ mod tests {
     async fn should_reject_vectors_with_wrong_dimensions() {
         // given
         let config = create_test_config();
-        let db = VectorDb::open(config).await.unwrap();
+        let centroids = create_test_centroids(3);
+        let db = VectorDb::open(config, centroids).await.unwrap();
 
         let vector = Vector::new("vec-1", vec![1.0, 2.0]); // Wrong: 2 instead of 3
 
@@ -743,7 +723,8 @@ mod tests {
     async fn should_flush_empty_delta_without_error() {
         // given
         let config = create_test_config();
-        let db = VectorDb::open(config).await.unwrap();
+        let centroids = create_test_centroids(3);
+        let db = VectorDb::open(config, centroids).await.unwrap();
 
         // when
         let result = db.flush().await;
@@ -765,14 +746,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_bootstrap_and_query_vectors() {
+    async fn should_query_vectors() {
         // given - create test database with 128 dimensions
         let config = create_test_config_with_dimensions(128);
-        let db = VectorDb::open(config).await.unwrap();
 
-        // given - create 4 clusters of 25 vectors each
-        let mut all_vectors = Vec::new();
-        let cluster_centers = vec![
+        // Create 4 centroids for the clusters
+        let cluster_centers = [
             vec![1.0; 128],  // Cluster 1: all ones
             vec![-1.0; 128], // Cluster 2: all negative ones
             {
@@ -789,6 +768,16 @@ mod tests {
             }, // Cluster 4: alternating
         ];
 
+        let centroids: Vec<CentroidEntry> = cluster_centers
+            .iter()
+            .enumerate()
+            .map(|(i, vector)| CentroidEntry::new((i + 1) as u32, vector.clone()))
+            .collect();
+
+        let db = VectorDb::open(config, centroids).await.unwrap();
+
+        // Create 4 clusters of 25 vectors each
+        let mut all_vectors = Vec::new();
         for (cluster_id, center) in cluster_centers.iter().enumerate() {
             for i in 0..25 {
                 let mut v = center.clone();
@@ -800,19 +789,11 @@ mod tests {
             }
         }
 
-        // when - write vectors and flush
+        // Write vectors and flush
         db.write(all_vectors.clone()).await.unwrap();
         db.flush().await.unwrap();
 
-        // when - bootstrap centroids (use cluster centers)
-        let centroids: Vec<CentroidEntry> = cluster_centers
-            .into_iter()
-            .enumerate()
-            .map(|(i, vector)| CentroidEntry::new((i + 1) as u32, vector))
-            .collect();
-        db.bootstrap_centroids(centroids).await.unwrap();
-
-        // when - search for vector similar to cluster 0
+        // Search for vector similar to cluster 0
         let query = vec![1.0; 128];
         let results = db.search(&query, 10).await.unwrap();
 
@@ -839,14 +820,12 @@ mod tests {
 
     #[tokio::test]
     async fn should_handle_deleted_vectors_in_search() {
-        // given - create database and bootstrap centroids
+        // given - create database with centroids
         let config = create_test_config_with_dimensions(3);
-        let db = VectorDb::open(config).await.unwrap();
-
         let centroids = vec![CentroidEntry::new(1, vec![1.0, 0.0, 0.0])];
-        db.bootstrap_centroids(centroids).await.unwrap();
+        let db = VectorDb::open(config, centroids).await.unwrap();
 
-        // given - write initial vector
+        // Write initial vector
         let vector1 = Vector::new("vec-1", vec![1.0, 0.0, 0.0]);
         db.write(vec![vector1]).await.unwrap();
         db.flush().await.unwrap();
@@ -884,13 +863,10 @@ mod tests {
             flush_interval: Duration::from_secs(60),
             metadata_fields: vec![],
         };
-        let db = VectorDb::open(config).await.unwrap();
-
-        // given - bootstrap centroids
         let centroids = vec![CentroidEntry::new(1, vec![0.0, 0.0, 0.0])];
-        db.bootstrap_centroids(centroids).await.unwrap();
+        let db = VectorDb::open(config, centroids).await.unwrap();
 
-        // given - write vectors at different distances from origin
+        // Write vectors at different distances from origin
         let vectors = vec![
             Vector::new("close", vec![0.1, 0.1, 0.1]), // Close to origin
             Vector::new("medium", vec![1.0, 1.0, 1.0]), // Medium distance
@@ -921,7 +897,8 @@ mod tests {
     async fn should_reject_query_with_wrong_dimensions() {
         // given - database with 3 dimensions
         let config = create_test_config_with_dimensions(3);
-        let db = VectorDb::open(config).await.unwrap();
+        let centroids = create_test_centroids(3);
+        let db = VectorDb::open(config, centroids).await.unwrap();
 
         // when - query with wrong dimensions
         let result = db.search(&[1.0, 2.0], 10).await;
@@ -937,26 +914,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_return_empty_results_when_no_centroids() {
-        // given - database without centroids
-        let config = create_test_config_with_dimensions(3);
-        let db = VectorDb::open(config).await.unwrap();
-
-        // when - search
-        let results = db.search(&[1.0, 0.0, 0.0], 10).await.unwrap();
-
-        // then - should return empty results
-        assert_eq!(results.len(), 0);
-    }
-
-    #[tokio::test]
     async fn should_return_empty_results_when_no_vectors() {
         // given - database with centroids but no vectors
         let config = create_test_config_with_dimensions(3);
-        let db = VectorDb::open(config).await.unwrap();
-
         let centroids = vec![CentroidEntry::new(1, vec![1.0, 0.0, 0.0])];
-        db.bootstrap_centroids(centroids).await.unwrap();
+        let db = VectorDb::open(config, centroids).await.unwrap();
 
         // when - search
         let results = db.search(&[1.0, 0.0, 0.0], 10).await.unwrap();
@@ -969,10 +931,8 @@ mod tests {
     async fn should_limit_results_to_k() {
         // given - database with many vectors
         let config = create_test_config_with_dimensions(2);
-        let db = VectorDb::open(config).await.unwrap();
-
         let centroids = vec![CentroidEntry::new(1, vec![1.0, 0.0])];
-        db.bootstrap_centroids(centroids).await.unwrap();
+        let db = VectorDb::open(config, centroids).await.unwrap();
 
         // Insert 20 vectors
         let vectors: Vec<Vector> = (0..20)
@@ -992,14 +952,12 @@ mod tests {
     async fn should_search_across_multiple_centroids() {
         // given - database with 3 centroids
         let config = create_test_config_with_dimensions(2);
-        let db = VectorDb::open(config).await.unwrap();
-
         let centroids = vec![
             CentroidEntry::new(1, vec![1.0, 0.0]),
             CentroidEntry::new(2, vec![0.0, 1.0]),
             CentroidEntry::new(3, vec![-1.0, 0.0]),
         ];
-        db.bootstrap_centroids(centroids).await.unwrap();
+        let db = VectorDb::open(config, centroids).await.unwrap();
 
         // Insert vectors in each cluster
         let vectors = vec![
@@ -1018,7 +976,59 @@ mod tests {
 
         // then - should find vectors from multiple centroids
         assert!(!results.is_empty());
-        // The algorithm expands to multiple centroids, so we should get results
-        // from both cluster 1 and cluster 2
+    }
+
+    #[tokio::test]
+    async fn should_load_dictionary_on_reopen() {
+        // given - create database and write vectors
+        let storage = create_test_storage();
+        let config = create_test_config();
+        let centroids = create_test_centroids(3);
+
+        {
+            let db = VectorDb::new(Arc::clone(&storage), config.clone(), centroids.clone())
+                .await
+                .unwrap();
+            let vectors = vec![
+                Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
+                    .attribute("category", "shoes")
+                    .attribute("price", 99i64)
+                    .build(),
+                Vector::builder("vec-2", vec![0.0, 1.0, 0.0])
+                    .attribute("category", "boots")
+                    .attribute("price", 149i64)
+                    .build(),
+            ];
+            db.write(vectors).await.unwrap();
+            db.flush().await.unwrap();
+        }
+
+        // when - reopen database (centroids should be loaded from storage)
+        let db2 = VectorDb::new(Arc::clone(&storage), config, vec![])
+            .await
+            .unwrap();
+
+        // then - should be able to search (dictionary and centroids loaded from storage)
+        let results = db2.search(&[1.0, 0.0, 0.0], 10).await.unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_fail_if_no_centroids_provided_for_new_db() {
+        // given - new database without centroids
+        let config = create_test_config();
+
+        // when
+        let result = VectorDb::open(config, vec![]).await;
+
+        // then
+        match result {
+            Err(e) => assert!(
+                e.to_string().contains("Centroids must be provided"),
+                "unexpected error: {}",
+                e
+            ),
+            Ok(_) => panic!("expected error when no centroids provided"),
+        }
     }
 }
