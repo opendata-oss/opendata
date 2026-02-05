@@ -1930,6 +1930,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "common",
+ "slatedb",
  "tokio",
 ]
 

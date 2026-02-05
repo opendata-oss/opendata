@@ -9,7 +9,7 @@ use common::storage::factory::create_storage_read;
 use common::{StorageRead, StorageSemantics};
 
 use crate::config::Config;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::model::KeyValueEntry;
 use crate::storage::{KeyValueScanIterator, KeyValueStorageRead};
 
@@ -40,10 +40,12 @@ pub struct KeyValueDbReader {
 impl KeyValueDbReader {
     /// Opens a read-only view of the key-value store.
     pub async fn open(config: Config) -> Result<Self> {
-        let storage: Arc<dyn StorageRead> =
-            create_storage_read(&config.storage, StorageSemantics::new())
-                .await
-                .map_err(|e| Error::Storage(e.to_string()))?;
+        let storage: Arc<dyn StorageRead> = create_storage_read(
+            &config.storage,
+            StorageSemantics::new(),
+            slatedb::config::DbReaderOptions::default(),
+        )
+        .await?;
         let kv_storage = KeyValueStorageRead::new(storage);
         Ok(Self {
             storage: kv_storage,

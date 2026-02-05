@@ -11,3 +11,4 @@ async-trait.workspace = true
 bytes.workspace = true
 common.workspace = true
 tokio.workspace = true
+slatedb.workspace = true
