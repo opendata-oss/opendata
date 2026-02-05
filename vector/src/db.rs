@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use common::sequence::{SeqBlockStore, SequenceAllocator};
+use common::sequence::SequenceAllocator;
 use common::storage::factory::create_storage;
 use common::storage::{Storage, StorageRead};
 use common::{StorageRuntime, StorageSemantics};
@@ -41,7 +41,7 @@ use crate::storage::{VectorDbStorageExt, VectorDbStorageReadExt};
 pub struct VectorDb {
     config: Config,
     storage: Arc<dyn Storage>,
-    id_allocator: Arc<SequenceAllocator>,
+    id_allocator: Arc<tokio::sync::Mutex<SequenceAllocator>>,
 
     /// Pending delta accumulating ingested data not yet flushed to storage.
     pending_delta: Mutex<VectorDbDelta>,
@@ -103,9 +103,7 @@ impl VectorDb {
     pub(crate) async fn new(storage: Arc<dyn Storage>, config: Config) -> Result<Self> {
         // Initialize sequence allocator for internal ID generation
         let seq_key = SeqBlockKey.encode();
-        let block_store = SeqBlockStore::new(Arc::clone(&storage), seq_key);
-        let id_allocator = Arc::new(SequenceAllocator::new(block_store));
-        id_allocator.initialize().await?;
+        let id_allocator = SequenceAllocator::load(storage.as_ref(), seq_key).await?;
 
         // Get initial snapshot
         let snapshot = storage.snapshot().await?;
@@ -116,7 +114,7 @@ impl VectorDb {
         Ok(Self {
             config,
             storage,
-            id_allocator,
+            id_allocator: Arc::new(tokio::sync::Mutex::new(id_allocator)),
             pending_delta: Mutex::new(VectorDbDelta::empty()),
             pending_delta_watch_tx: tx,
             pending_delta_watch_rx: rx,
@@ -226,7 +224,14 @@ impl VectorDb {
             let old_internal_id = self.storage.lookup_internal_id(&external_id).await?;
 
             // 2. Allocate new internal_id
-            let new_internal_id = self.id_allocator.allocate_one().await?;
+            let new_internal_id = {
+                let mut id_allocator = self.id_allocator.lock().await;
+                let (new_internal_id, put) = id_allocator.allocate_one();
+                if let Some(put) = put {
+                    self.storage.put(vec![put]).await?;
+                }
+                new_internal_id
+            };
 
             // 3. Update IdDictionary
             if old_internal_id.is_some() {
