@@ -48,16 +48,12 @@ pub struct VectorDb {
     #[allow(dead_code)]
     storage: Arc<dyn Storage>,
 
-    /// Handle to the WriteCoordinator for submitting writes.
-    write_coordinator_handle: WriteCoordinatorHandle<VectorDbWriteDelta>,
-
     /// Storage snapshot used for queries (updated by flusher).
     /// Protected by std::sync::Mutex - callers should clone immediately and release.
     snapshot: Arc<SnapshotLock>,
 
     /// The WriteCoordinator itself (stored to keep it alive).
-    //#[allow(dead_code)]
-    //write_coordinator: WriteCoordinator<VectorDbWriteDelta, VectorDbFlusher>,
+    write_coordinator: WriteCoordinator<VectorDbWriteDelta>,
 
     /// In-memory HNSW graph for centroid search (immutable after initialization).
     centroid_graph: Arc<dyn CentroidGraph>,
@@ -147,18 +143,13 @@ impl VectorDb {
             flush_interval: Duration::from_secs(5),
             flush_size_threshold: 64 * 1024 * 1024,
         };
-        let (write_coordinator, write_coordinator_handle) =
-            WriteCoordinator::new(coordinator_config, ctx, flusher);
-
-        tokio::task::spawn(write_coordinator.run());
-        // let write_coordinator_handle = write_coordinator.handle();
+        let write_coordinator = WriteCoordinator::start(coordinator_config, ctx, flusher);
 
         Ok(Self {
             config,
             storage,
-            write_coordinator_handle,
             snapshot,
-            //write_coordinator,
+            write_coordinator,
             centroid_graph,
         })
     }
@@ -290,7 +281,7 @@ impl VectorDb {
         }
 
         // Send all writes to coordinator in a single batch and wait for epoch
-        let write_handle = self.write_coordinator_handle.write(writes).await?;
+        let write_handle = self.write_coordinator.handle().write(writes).await?;
         write_handle
             .epoch()
             .await
@@ -423,7 +414,7 @@ impl VectorDb {
     /// This ensures ID dictionary updates, deletes, and new records are all
     /// applied together, maintaining consistency.
     pub async fn flush(&self) -> Result<()> {
-        let mut handle = self.write_coordinator_handle.flush().await?;
+        let mut handle = self.write_coordinator.handle().flush().await?;
         handle.wait(Durability::Flushed).await?;
         Ok(())
     }
