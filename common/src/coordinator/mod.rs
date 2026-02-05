@@ -40,10 +40,10 @@ impl Default for WriteCoordinatorConfig {
 pub(crate) enum WriteCommand<D: Delta> {
     Write {
         write: D::Write,
-        epoch: oneshot::Sender<u64>,
+        epoch: oneshot::Sender<Result<u64, String>>,
     },
     Flush {
-        epoch: oneshot::Sender<u64>,
+        epoch: oneshot::Sender<Result<u64, String>>,
     },
 }
 
@@ -211,7 +211,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
                         }
                         Some(WriteCommand::Flush { epoch: epoch_tx }) => {
                             // Send back the epoch of the last processed write
-                            let _ = epoch_tx.send(self.epoch.saturating_sub(1));
+                            let _ = epoch_tx.send(Ok(self.epoch.saturating_sub(1)));
                             self.handle_flush().await;
                         }
                         None => {
@@ -249,15 +249,15 @@ impl<D: Delta> WriteCoordinatorTask<D> {
     async fn handle_write(
         &mut self,
         write: D::Write,
-        epoch_tx: oneshot::Sender<u64>,
+        epoch_tx: oneshot::Sender<Result<u64, String>>,
     ) -> Result<(), String> {
         let write_epoch = self.epoch;
         self.epoch += 1;
 
+        let result = self.delta.apply(write);
         // Ignore error if receiver was dropped (fire-and-forget write)
-        let _ = epoch_tx.send(write_epoch);
+        let _ = epoch_tx.send(result.map(|_| write_epoch));
 
-        self.delta.apply(write)?;
         // Ignore error if no watchers are listening - this is non-fatal
         let _ = self.applied_tx.send(write_epoch);
 
@@ -393,6 +393,7 @@ mod tests {
     struct TestContext {
         key_to_id: HashMap<String, u64>,
         next_id: u64,
+        error: Option<String>,
     }
 
     /// Delta accumulates writes and can allocate new IDs for unknown keys.
@@ -418,6 +419,10 @@ mod tests {
         }
 
         fn apply(&mut self, write: Self::Write) -> Result<(), String> {
+            if let Some(error) = &self.context.error {
+                return Err(error.clone());
+            }
+
             let id = *self.context.key_to_id.entry(write.key).or_insert_with(|| {
                 let id = self.context.next_id;
                 self.context.next_id += 1;
@@ -649,6 +654,37 @@ mod tests {
         // then - wait should succeed immediately after write is applied
         let result = write_handle.wait(Durability::Applied).await;
         assert!(result.is_ok());
+
+        // cleanup
+        coordinator.stop().await;
+    }
+
+    #[tokio::test]
+    async fn should_propagate_apply_error_to_handle() {
+        // given
+        let flusher = TestFlusher::default();
+        let context = TestContext {
+            error: Some("apply error".to_string()),
+            ..Default::default()
+        };
+        let mut coordinator = WriteCoordinator::new(test_config(), context, flusher);
+        let handle = coordinator.handle();
+        coordinator.start();
+
+        // when
+        let write = handle
+            .write(TestWrite {
+                key: "a".into(),
+                value: 1,
+                size: 10,
+            })
+            .await
+            .unwrap();
+
+        let result = write.epoch().await;
+
+        // then
+        assert!(matches!(result, Err(WriteError::ApplyError(msg)) if msg == "apply error"));
 
         // cleanup
         coordinator.stop().await;
