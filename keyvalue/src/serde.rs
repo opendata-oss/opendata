@@ -180,7 +180,12 @@ mod tests {
 
         // then
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid key version"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid key version")
+        );
     }
 
     #[test]
@@ -193,7 +198,12 @@ mod tests {
 
         // then
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid record tag"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid record tag")
+        );
     }
 
     #[test]

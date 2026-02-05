@@ -70,7 +70,9 @@ impl KeyValueDb {
         .map_err(|e| Error::Storage(e.to_string()))?;
 
         let kv_storage = KeyValueStorage::new(storage);
-        Ok(Self { storage: kv_storage })
+        Ok(Self {
+            storage: kv_storage,
+        })
     }
 
     /// Puts a key-value pair, overwriting any existing value.
@@ -185,8 +187,8 @@ impl KeyValueRead for KeyValueDb {
 mod tests {
     use std::sync::Arc;
 
-    use common::storage::factory::create_storage;
     use common::StorageConfig;
+    use common::storage::factory::create_storage;
 
     use super::*;
     use crate::reader::KeyValueDbReader;
@@ -230,21 +232,38 @@ mod tests {
         let kv = KeyValueDb::open(test_config()).await.unwrap();
 
         // when
-        kv.put(Bytes::from("key1"), Bytes::from("value1")).await.unwrap();
-        kv.put(Bytes::from("key2"), Bytes::from("value2")).await.unwrap();
-        kv.put(Bytes::from("key3"), Bytes::from("value3")).await.unwrap();
+        kv.put(Bytes::from("key1"), Bytes::from("value1"))
+            .await
+            .unwrap();
+        kv.put(Bytes::from("key2"), Bytes::from("value2"))
+            .await
+            .unwrap();
+        kv.put(Bytes::from("key3"), Bytes::from("value3"))
+            .await
+            .unwrap();
 
         // then
-        assert_eq!(kv.get(Bytes::from("key1")).await.unwrap(), Some(Bytes::from("value1")));
-        assert_eq!(kv.get(Bytes::from("key2")).await.unwrap(), Some(Bytes::from("value2")));
-        assert_eq!(kv.get(Bytes::from("key3")).await.unwrap(), Some(Bytes::from("value3")));
+        assert_eq!(
+            kv.get(Bytes::from("key1")).await.unwrap(),
+            Some(Bytes::from("value1"))
+        );
+        assert_eq!(
+            kv.get(Bytes::from("key2")).await.unwrap(),
+            Some(Bytes::from("value2"))
+        );
+        assert_eq!(
+            kv.get(Bytes::from("key3")).await.unwrap(),
+            Some(Bytes::from("value3"))
+        );
     }
 
     #[tokio::test]
     async fn should_return_none_for_missing_key() {
         // given
         let kv = KeyValueDb::open(test_config()).await.unwrap();
-        kv.put(Bytes::from("existing"), Bytes::from("value")).await.unwrap();
+        kv.put(Bytes::from("existing"), Bytes::from("value"))
+            .await
+            .unwrap();
 
         // when
         let result = kv.get(Bytes::from("missing")).await.unwrap();
@@ -410,8 +429,12 @@ mod tests {
         .await
         .unwrap();
         let kv = KeyValueDb::new(storage.clone());
-        kv.put(Bytes::from("key1"), Bytes::from("value1")).await.unwrap();
-        kv.put(Bytes::from("key2"), Bytes::from("value2")).await.unwrap();
+        kv.put(Bytes::from("key1"), Bytes::from("value1"))
+            .await
+            .unwrap();
+        kv.put(Bytes::from("key2"), Bytes::from("value2"))
+            .await
+            .unwrap();
 
         // when - create KeyValueDbReader sharing the same storage
         let reader = KeyValueDbReader::new(storage as Arc<dyn common::StorageRead>);
@@ -457,7 +480,9 @@ mod tests {
     async fn should_put_with_await_durable_option() {
         // given
         let kv = KeyValueDb::open(test_config()).await.unwrap();
-        let options = WriteOptions { await_durable: true };
+        let options = WriteOptions {
+            await_durable: true,
+        };
 
         // when
         kv.put_with_options(Bytes::from("key"), Bytes::from("value"), options)
@@ -473,11 +498,17 @@ mod tests {
     async fn should_delete_with_await_durable_option() {
         // given
         let kv = KeyValueDb::open(test_config()).await.unwrap();
-        kv.put(Bytes::from("key"), Bytes::from("value")).await.unwrap();
-        let options = WriteOptions { await_durable: true };
+        kv.put(Bytes::from("key"), Bytes::from("value"))
+            .await
+            .unwrap();
+        let options = WriteOptions {
+            await_durable: true,
+        };
 
         // when
-        kv.delete_with_options(Bytes::from("key"), options).await.unwrap();
+        kv.delete_with_options(Bytes::from("key"), options)
+            .await
+            .unwrap();
 
         // then
         let result = kv.get(Bytes::from("key")).await.unwrap();

@@ -45,7 +45,9 @@ impl KeyValueDbReader {
                 .await
                 .map_err(|e| Error::Storage(e.to_string()))?;
         let kv_storage = KeyValueStorageRead::new(storage);
-        Ok(Self { storage: kv_storage })
+        Ok(Self {
+            storage: kv_storage,
+        })
     }
 
     /// Creates a KeyValueDbReader from an existing storage implementation.

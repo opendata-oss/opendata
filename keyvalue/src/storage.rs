@@ -201,7 +201,11 @@ mod tests {
         let storage = KeyValueStorage::in_memory();
 
         // when
-        let result = storage.as_read().get(&Bytes::from("missing")).await.unwrap();
+        let result = storage
+            .as_read()
+            .get(&Bytes::from("missing"))
+            .await
+            .unwrap();
 
         // then
         assert!(result.is_none());
@@ -212,7 +216,10 @@ mod tests {
         // given
         let storage = KeyValueStorage::in_memory();
         let key = Bytes::from("to-delete");
-        storage.put(key.clone(), Bytes::from("value")).await.unwrap();
+        storage
+            .put(key.clone(), Bytes::from("value"))
+            .await
+            .unwrap();
 
         // when
         storage.delete(key.clone()).await.unwrap();
@@ -238,9 +245,18 @@ mod tests {
     async fn should_scan_all_entries() {
         // given
         let storage = KeyValueStorage::in_memory();
-        storage.put(Bytes::from("a"), Bytes::from("1")).await.unwrap();
-        storage.put(Bytes::from("b"), Bytes::from("2")).await.unwrap();
-        storage.put(Bytes::from("c"), Bytes::from("3")).await.unwrap();
+        storage
+            .put(Bytes::from("a"), Bytes::from("1"))
+            .await
+            .unwrap();
+        storage
+            .put(Bytes::from("b"), Bytes::from("2"))
+            .await
+            .unwrap();
+        storage
+            .put(Bytes::from("c"), Bytes::from("3"))
+            .await
+            .unwrap();
 
         // when
         let mut iter = storage.as_read().scan(..).await.unwrap();
@@ -260,10 +276,22 @@ mod tests {
     async fn should_scan_key_range() {
         // given
         let storage = KeyValueStorage::in_memory();
-        storage.put(Bytes::from("a"), Bytes::from("1")).await.unwrap();
-        storage.put(Bytes::from("b"), Bytes::from("2")).await.unwrap();
-        storage.put(Bytes::from("c"), Bytes::from("3")).await.unwrap();
-        storage.put(Bytes::from("d"), Bytes::from("4")).await.unwrap();
+        storage
+            .put(Bytes::from("a"), Bytes::from("1"))
+            .await
+            .unwrap();
+        storage
+            .put(Bytes::from("b"), Bytes::from("2"))
+            .await
+            .unwrap();
+        storage
+            .put(Bytes::from("c"), Bytes::from("3"))
+            .await
+            .unwrap();
+        storage
+            .put(Bytes::from("d"), Bytes::from("4"))
+            .await
+            .unwrap();
 
         // when - scan b..d (exclusive end)
         let mut iter = storage
