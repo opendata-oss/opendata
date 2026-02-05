@@ -49,10 +49,12 @@ leveraged by various systems.
 - `WriteQueue` is a queue that accepts `Write` as input and applies an epoch-based ordering
 - `Snapshot` is a point-in-time reference to the storage state, broadcast to readers after each flush;
   represented in the API as `StorageRead` (a SlateDB snapshot)
-- `Image` is the in-memory state needed to initialize a delta (e.g., series dictionary, ID counters).
-  The initial image is derived from storage (e.g., loading the fingerprint→ID map); subsequent images
-  are extracted from deltas via `fork_image()` to enable non-blocking flushes
-- `Delta` is the result of applying writes to an `Image`; it accumulates changes until flushed
+- `Context` is an in-memory representation of state from the storage system that carries across
+  deltas (e.g., series dictionary, ID counters). It is owned by the delta while the delta is mutable.
+  When the delta is frozen, ownership of the context is returned to the coordinator so it can
+  initialize the next delta. The initial context is derived from storage; subsequent contexts are
+  returned from `freeze()` to enable non-blocking flushes
+- `Delta` is the result of applying writes to a `Context`; it accumulates changes until frozen and flushed
 
 ### Architecture
 
@@ -69,11 +71,11 @@ leveraged by various systems.
                                  │
                                  ▼
 ┌Write Coordinator────────────────────────────────────────────────┐
-│ ┌─────────────────────────────┐ ┌──────────────┐┌──────────────┐│             ┌───────────┐
-│ │        select! loop         │ │ EpochTracker ││   Flusher    │├FlushEvent──▶│  Reader   │
+│ ┌─────────────────────────────┐ ┌──────────────┐┌──────────────┐│              ┌───────────┐
+│ │        select! loop         │ │ EpochTracker ││   Flusher    │├FlushResult──▶│  Reader   │
 │ ├─────────────────────────────┤ └──────────────┘└───────▲──────┘│             └───────────┘
 │ │                             │         ┌───────────────┤       │
-│ │                             │ ┌Delta──┴──────┐┌Image──┴──────┐│
+│ │                             │ ┌Delta──┴──────┐┌Context─┴─────┐│
 │ │1 ─► handle flush complete   │ │ ┌──────────┐ ││              ││
 │ │2 ─► flush (on command)      │ │ │  Writes  │ ││ Materialized ││
 │ │3 ─► apply queued writes     │ │ └──────────┘ ││    State     ││
@@ -97,38 +99,39 @@ These actions are pluggable, so different systems can compose them however they 
 the APIs provided by this RFC:
 
 ```rust
-/// Event broadcast to subscribers after each flush.
-pub struct FlushEvent<D: Delta> {
+/// Result broadcast to subscribers after each flush completes.
+pub struct FlushResult<D: Delta> {
     /// The new snapshot reflecting the flushed state.
-    pub snapshot: Arc<StorageRead>,
-    /// Clone of the delta that was flushed (pre-flush state).
-    pub delta: D,
-    /// Epoch range covered by this flush: (previous_max, new_max].
-    /// A subscriber whose cache is at `epoch_range.0` can apply `delta`
-    /// to update their state to `epoch_range.1`.
-    pub epoch_range: (u64, u64),
+    pub snapshot: Arc<dyn StorageRead>,
+    /// The frozen delta that was flushed.
+    pub delta: Arc<D::Frozen>,
+    /// Epoch range covered by this flush: start..end (exclusive end).
+    /// A subscriber whose cache is at `epoch_range.start` can apply `delta`
+    /// to update their state to `epoch_range.end`.
+    pub epoch_range: Range<u64>,
 }
 
-pub trait Delta: Send + Clone + 'static {
-    type Image: Send + Sync + 'static;
+pub trait Delta: Default + Send + Sync + 'static {
+    type Context: Send + Sync + 'static;
     type Write: Send + 'static;
+    type Frozen: Clone + Send + Sync + 'static;
 
-    /// Initialize the delta with state from the image.
-    fn init(&mut self, image: &Self::Image);
-    /// Apply writes to this delta.
-    fn apply(&mut self, writes: Vec<Self::Write>) -> Result<()>;
+    /// Initialize the delta with state from the context.
+    fn init(&mut self, context: Self::Context);
+    /// Apply a write to this delta.
+    fn apply(&mut self, write: Self::Write) -> Result<()>;
     /// Estimate the memory size of this delta for backpressure.
     fn estimate_size(&self) -> usize;
-    /// Extract state needed for the next delta's initialization.
-    /// Called before flush to enable non-blocking writes.
-    fn fork_image(&self) -> Self::Image;
+    /// Freeze the delta, consuming it and returning an immutable representation
+    /// for the flusher plus the context for the next delta.
+    fn freeze(self) -> (Self::Frozen, Self::Context);
 }
 
 pub trait Flusher: Send + Sync + 'static {
     type Delta: Delta;
 
-    /// Flush a delta to storage and return the new snapshot.
-    async fn flush(&self, delta: Self::Delta) -> Result<StorageRead>;
+    /// Flush a frozen delta to storage and return the new snapshot.
+    async fn flush(&self, delta: <Self::Delta as Delta>::Frozen) -> Result<StorageRead>;
 }
 ```
 
@@ -179,18 +182,21 @@ pub struct WriteCoordinatorHandle<D: Delta> { /* ... */ }
 impl<D: Delta> WriteCoordinatorHandle<D> {
     /// Submit a write and receive a handle to track its durability.
     pub async fn write(&self, event: D::Write) -> Result<WriteHandle> { /* ... */ }
-    /// Request a flush up to the specified epoch (or all pending if None).
-    pub async fn flush(&self, epoch: Option<u64>) -> Result<()> { /* ... */ }
-    /// Subscribe to flush events.
+    /// Request a flush of all pending writes. Returns a WriteHandle so callers
+    /// can wait for the flush to complete.
+    pub async fn flush(&self) -> Result<WriteHandle> { /* ... */ }
+    /// Subscribe to flush results.
     ///
-    /// Each event contains the new snapshot, a clone of the flushed delta, and the
-    /// epoch range covered. Subscribers can use this for incremental cache updates
-    /// if their local state is at `epoch_range.0`.
+    /// Each result contains the new snapshot, the frozen delta, and the epoch range
+    /// covered. Subscribers can use this for incremental cache updates: if the
+    /// subscriber's local state is at `epoch_range.start`, they can apply the delta
+    /// to advance to `epoch_range.end`. If their local state is behind (i.e., not at
+    /// `epoch_range.start`), they missed intermediate state and must rebootstrap
+    /// their cache from the `snapshot`.
     ///
-    /// **Note**: Uses a `watch` channel — if flushes occur faster than the subscriber
-    /// processes them, intermediate events are dropped. Subscribers that miss events
-    /// must rebuild their cache from the snapshot.
-    pub fn subscribe(&self) -> watch::Receiver<FlushEvent<D>> { /* ... */ }
+    /// **Note**: Uses a `broadcast` channel — subscribers receive all flush results
+    /// that occur after subscribing.
+    pub fn subscribe(&self) -> broadcast::Receiver<FlushResult<D>> { /* ... */ }
 }
 ```
 
@@ -199,7 +205,7 @@ The `WriteHandle` is used to allow readers to wait for the following durability 
 | Watermark | Meaning                                                                 |
 |-----------|-------------------------------------------------------------------------|
 | `applied` | Highest epoch that has been applied to the pending delta                |
-| `flushed` | Highest epoch reflected in the current image (delta applied to SlateDB) |
+| `flushed` | Highest epoch reflected in the current snapshot (delta flushed to SlateDB) |
 | `durable` | Highest epoch persisted to object storage (SlateDB WAL flush complete)  |
 
 ### Implementation
@@ -213,15 +219,13 @@ The coordinator runs as a single-threaded async loop that processes commands and
    `write(B).await` is called (sequential awaits), then `epoch(A) < epoch(B)` because both writes
    enter the channel in that order. This matches SlateDB's write semantics.
 2. **Non-Blocking Flush**: when a flush is triggered:
-   1. `fork_image()` is called on the current delta to extract state for the next delta
-   2. The current delta is cloned for subscribers
-   3. A new delta is created and initialized from the forked image
-   4. The old delta is passed to the flusher (ownership transferred)
-   5. Writes continue to the new delta while the flush runs in the background
-   6. When flush completes, a `FlushEvent` is broadcast with the snapshot, cloned delta, and epoch range
+   1. `freeze()` is called on the current delta, consuming it and returning `(Frozen, Context)`
+   2. A new default delta is created and initialized with the returned context
+   3. The frozen delta is sent to a background flush task
+   4. Writes continue to the new delta while the flush runs
+   5. When flush completes, a `FlushResult` is broadcast to subscribers
 3. **Flush Triggers**: flushes can be triggered manually via `flush()` or based on conditions
-   evaluated on a timer. Flush requests are queued if a flush is in progress. A call to
-   `flush(epoch)` is a no-op if `epoch` ≤ the already-flushed epoch.
+   evaluated on a timer. Flush requests are queued if a flush is in progress.
 4. **Epoch Tracking**: once a write is dequeued and assigned an epoch, the coordinator sends the
    epoch through the write's oneshot channel, unblocking any pending `epoch()` calls. The handle is
    automatically cleaned up when dropped (the oneshot is dropped with it). The coordinator holds
@@ -237,49 +241,52 @@ The coordinator runs as a single-threaded async loop that processes commands and
    deltas. Flushes will be attempted on the ticker interval until backpressure conditions are
    released, during which time writes will fail with `Err(WriteError::Backpressure)`.
 
-Readers that maintain in-memory caches can use `FlushEvent` to update incrementally. On each event,
-the reader compares its local epoch against `epoch_range.0`. If they match, the reader applies the
-delta to advance its state to `epoch_range.1`. If they don't match (the reader missed one or more
-events), the cache is stale and must be rebuilt from the snapshot. 
+Readers that maintain in-memory caches can use `FlushResult` to update incrementally. On each result,
+the reader compares its local epoch against `epoch_range.start`. If they match, the reader applies
+the frozen delta to advance its state to `epoch_range.end`. If they don't match (the reader missed
+one or more results), the cache is stale and must be rebuilt from the snapshot. 
 
 ### Subsystem Implementations
 
 #### TimeSeries
 
 TimeSeries identifies each series by a fingerprint (hash of sorted labels). During `init()`, the
-delta clones the series dictionary and ID counter from the image. During `apply()`, it looks up or
-creates a series ID for each fingerprint and appends samples — multiple writes to the same series
-accumulate. Before flush, `fork_image()` extracts the current state so a new delta can continue
-accepting writes.
+delta takes ownership of the series dictionary and ID counter from the context. During `apply()`,
+it looks up or creates a series ID for each fingerprint and appends samples — multiple writes to
+the same series accumulate. When frozen, `freeze()` returns an immutable representation for the
+flusher and the context for the next delta.
 
 ```rust
 impl Delta for TsdbDelta {
-    type Image = TsdbImage;
+    type Context = TsdbContext;
     type Write = Series;
+    type Frozen = FrozenTsdbDelta;
 
-    fn init(&mut self, image: &Self::Image) {
-        self.series_dict = image.series_dict.clone();  // HashMap<Fingerprint, SeriesId>
-        self.next_series_id = image.next_series_id;    // u32
+    fn init(&mut self, context: Self::Context) {
+        self.series_dict = context.series_dict;  // HashMap<Fingerprint, SeriesId>
+        self.next_series_id = context.next_series_id;    // u32
     }
 
-    fn apply(&mut self, writes: Vec<Self::Write>) -> Result<()> {
-        for series in writes {
-            let fp = series.labels.fingerprint();
-            let id = *self.series_dict.entry(fp).or_insert_with(|| {
-                let id = self.next_series_id;
-                self.next_series_id += 1;
-                id
-            });
-            self.samples.entry(id).or_default().extend(series.samples);
-        }
+    fn apply(&mut self, write: Self::Write) -> Result<()> {
+        let fp = write.labels.fingerprint();
+        let id = *self.series_dict.entry(fp).or_insert_with(|| {
+            let id = self.next_series_id;
+            self.next_series_id += 1;
+            id
+        });
+        self.samples.entry(id).or_default().extend(write.samples);
         Ok(())
     }
 
-    fn fork_image(&self) -> Self::Image {
-        TsdbImage {
-            series_dict: self.series_dict.clone(),
+    fn estimate_size(&self) -> usize { /* ... */ }
+
+    fn freeze(self) -> (Self::Frozen, Self::Context) {
+        let frozen = FrozenTsdbDelta { samples: self.samples };
+        let context = TsdbContext {
+            series_dict: self.series_dict,
             next_series_id: self.next_series_id,
-        }
+        };
+        (frozen, context)
     }
 }
 ```
@@ -292,7 +299,7 @@ the flusher just needs to persist everything atomically and return the new snaps
 impl Flusher for TsdbFlusher {
     type Delta = TsdbDelta;
 
-    async fn flush(&self, delta: TsdbDelta) -> Result<StorageRead> {
+    async fn flush(&self, delta: FrozenTsdbDelta) -> Result<StorageRead> {
         let forward_index = build_forward_index(&delta);
         let inverted_index = build_inverted_index(&delta);
 
@@ -316,31 +323,32 @@ impl Flusher for TsdbFlusher {
 #### Vector
 
 Vector identifies records by an external string ID provided by the user. During `init()`, the delta
-gets the collection config for validation. During `apply()`, vectors are keyed by external ID with
-last-write-wins semantics — if the same ID is written twice, the later write replaces the earlier
-one. Internal ID allocation and upsert handling (marking old vectors as deleted) happen at flush
-time in the `Flusher`.
+takes ownership of the collection config for validation. During `apply()`, vectors are keyed by
+external ID with last-write-wins semantics — if the same ID is written twice, the later write
+replaces the earlier one. Internal ID allocation and upsert handling (marking old vectors as
+deleted) happen at flush time in the `Flusher`.
 
 ```rust
 impl Delta for VectorDelta {
-    type Image = VectorImage;
+    type Context = VectorContext;
     type Write = Vector;
+    type Frozen = FrozenVectorDelta;
 
-    fn init(&mut self, image: &Self::Image) {
-        self.config = image.config.clone();
+    fn init(&mut self, context: Self::Context) {
+        self.config = context.config;
     }
 
-    fn apply(&mut self, writes: Vec<Self::Write>) -> Result<()> {
-        for vector in writes {
-            self.vectors.insert(vector.id.clone(), vector);  // last write wins
-        }
+    fn apply(&mut self, write: Self::Write) -> Result<()> {
+        self.vectors.insert(write.id.clone(), write);  // last write wins
         Ok(())
     }
 
-    fn fork_image(&self) -> Self::Image {
-        VectorImage {
-            config: self.config.clone(),
-        }
+    fn estimate_size(&self) -> usize { /* ... */ }
+
+    fn freeze(self) -> (Self::Frozen, Self::Context) {
+        let frozen = FrozenVectorDelta { vectors: self.vectors };
+        let context = VectorContext { config: self.config };
+        (frozen, context)
     }
 }
 ```
@@ -353,7 +361,7 @@ as deleted if necessary.
 impl Flusher for VectorFlusher {
     type Delta = VectorDelta;
 
-    async fn flush(&self, delta: VectorDelta) -> Result<StorageRead> {
+    async fn flush(&self, delta: FrozenVectorDelta) -> Result<StorageRead> {
         let mut batch = WriteBatch::new();
         for (external_id, vector) in delta.vectors {
             let old_id = self.db.get(id_mapping_key(&external_id)).await?;
@@ -484,3 +492,4 @@ concrete use case requiring sub-flush-interval read latency.
 | Date       | Description   |
 |------------|---------------|
 | 2026-01-27 | Initial draft |
+| 2026-02-04 | Updated to match implementation: Image→Context, added Frozen type, freeze() replaces fork_image(), FlushEvent→FlushResult, watch→broadcast channel, flush() returns WriteHandle |
