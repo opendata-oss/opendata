@@ -2004,6 +2004,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "slatedb",
+ "tempfile",
  "tokio",
  "tower",
  "tracing",

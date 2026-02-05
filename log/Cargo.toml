@@ -38,3 +38,4 @@ prometheus-client = { version = "0.22", optional = true }
 base64.workspace = true
 proptest.workspace = true
 reqwest.workspace = true
+tempfile = "3"

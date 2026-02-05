@@ -67,6 +67,7 @@ pub fn convert_write_request(request: WriteRequest) -> Vec<Series> {
     request
         .timeseries
         .into_iter()
+        .filter(|ts| !ts.samples.is_empty())
         .map(|ts| {
             let labels: Vec<Label> = ts
                 .labels

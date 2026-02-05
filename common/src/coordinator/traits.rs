@@ -43,7 +43,7 @@ pub struct FlushEvent<D: Delta> {
 }
 
 /// A delta accumulates writes and can produce a snapshot image.
-pub trait Delta: Default + Sized + Send + Sync + 'static {
+pub trait Delta: Sized + Send + Sync + 'static {
     /// The Context is data owned only while the Delta is mutable. After
     /// freezing the delta the context is returned to the write coordinator
     type Context: Send + Sync + 'static;
@@ -52,7 +52,7 @@ pub trait Delta: Default + Sized + Send + Sync + 'static {
 
     /// Create a new delta initialized from a snapshot context.
     /// The delta takes ownership of the context while it is mutable.
-    fn init(&mut self, context: Self::Context);
+    fn init(context: Self::Context) -> Self;
 
     /// Apply a write to the delta.
     fn apply(&mut self, write: Self::Write) -> Result<(), String>;

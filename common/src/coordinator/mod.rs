@@ -6,6 +6,7 @@ mod traits;
 
 pub use error::{WriteError, WriteResult};
 pub use handle::{WriteCoordinatorHandle, WriteHandle};
+use std::ops::{Deref, DerefMut};
 pub use traits::{Delta, Durability, FlushEvent, FlushResult, Flusher};
 
 // Internal use only
@@ -52,7 +53,7 @@ pub(crate) enum WriteCommand<D: Delta> {
 /// and coordinates flushing through a `Flusher`.
 pub struct WriteCoordinator<D: Delta, F: Flusher<D>> {
     config: WriteCoordinatorConfig,
-    delta: D,
+    delta: CurrentDelta<D>,
     flush_task: Option<FlushTask<D, F>>,
     flush_tx: mpsc::Sender<FlushEvent<D>>,
     cmd_rx: mpsc::Receiver<WriteCommand<D>>,
@@ -95,8 +96,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
             durable_rx,
         };
 
-        let mut delta = D::default();
-        delta.init(initial_context);
+        let mut delta = D::init(initial_context);
 
         let flush_task = FlushTask {
             flusher,
@@ -110,7 +110,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         );
         let coordinator = Self {
             config,
-            delta,
+            delta: CurrentDelta::new(delta),
             cmd_rx,
             flush_tx,
             flush_task: Some(flush_task),
@@ -212,9 +212,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
 
         // this is the blocking section of the flush, new writes will not be accepted
         // until the event is sent to the FlushTask
-        let delta = std::mem::take(&mut self.delta);
-        let (frozen, context) = delta.freeze();
-        self.delta.init(context);
+        let frozen = self.delta.freeze_and_init();
 
         // Block until the flush task can accept the event
         let _ = self
@@ -263,6 +261,45 @@ impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
     }
 }
 
+struct CurrentDelta<D: Delta> {
+    delta: Option<D>,
+}
+
+impl<D: Delta> Deref for CurrentDelta<D> {
+    type Target = D;
+
+    fn deref(&self) -> &Self::Target {
+        match &self.delta {
+            Some(d) => d,
+            None => panic!("current delta not initialized"),
+        }
+    }
+}
+
+impl<D: Delta> DerefMut for CurrentDelta<D> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match &mut self.delta {
+            Some(d) => d,
+            None => panic!("current delta not initialized"),
+        }
+    }
+}
+
+impl<D: Delta> CurrentDelta<D> {
+    fn new(delta: D) -> Self {
+        Self { delta: Some(delta) }
+    }
+
+    fn freeze_and_init(&mut self) -> D::Frozen {
+        let Some(delta) = self.delta.take() else {
+            panic!("delta not initialized");
+        };
+        let (imm_delta, context) = delta.freeze();
+        self.delta = Some(D::init(context));
+        imm_delta
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,8 +342,12 @@ mod tests {
         type Write = TestWrite;
         type Frozen = TestDelta;
 
-        fn init(&mut self, context: Self::Context) {
-            self.context = context;
+        fn init(context: Self::Context) -> Self {
+            Self {
+                context,
+                writes: HashMap::default(),
+                total_size: 0,
+            }
         }
 
         fn apply(&mut self, write: Self::Write) -> Result<(), String> {
