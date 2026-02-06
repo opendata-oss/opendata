@@ -1,5 +1,5 @@
 use super::WriteCommand;
-use super::{Delta, Durability, FlushEvent, FlushResult, WriteError, WriteResult};
+use super::{Delta, Durability, FlushResult, WriteError, WriteResult};
 use futures::FutureExt;
 use futures::future::Shared;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -142,15 +142,15 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     /// Request a flush of the current delta.
     ///
     /// This will trigger a flush even if the flush threshold has not been reached.
-    /// When `await_durable` is true, the flush will also call `storage.flush()`
+    /// When `flush_storage` is true, the flush will also call `storage.flush()`
     /// to guarantee durability, and the durable watermark will be advanced.
     /// Returns a handle that can be used to wait for the flush to complete.
-    pub async fn flush(&self, await_durable: bool) -> WriteResult<WriteHandle> {
+    pub async fn flush(&self, flush_storage: bool) -> WriteResult<WriteHandle> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .try_send(WriteCommand::Flush {
                 epoch_tx: tx,
-                await_durable,
+                flush_storage,
             })
             .map_err(|e| match e {
                 mpsc::error::TrySendError::Full(_) => WriteError::Backpressure,

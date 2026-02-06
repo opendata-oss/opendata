@@ -7,9 +7,9 @@ use std::sync::Arc;
 pub struct FlushResult<D: Delta> {
     /// The new snapshot reflecting the flushed state
     pub snapshot: Arc<dyn StorageRead>,
-    /// The delta that was flushed (wrapped in Arc for cheap cloning).
+    /// The broadcast payload from the flushed delta.
     /// None when the flush was a durable-only flush with no pending writes.
-    pub delta: Option<Arc<D::Frozen>>,
+    pub delta: Option<Arc<D::Broadcast>>,
     /// Epoch range covered by this flush (exclusive end)
     pub epoch_range: Range<u64>,
 }
@@ -35,18 +35,6 @@ pub enum Durability {
     Durable,
 }
 
-/// Event emitted when a flush occurs.
-pub struct FlushEvent<D: Delta> {
-    /// The frozen delta to flush. None when this is a durable-only flush
-    /// with no pending writes.
-    pub delta: Option<D::Frozen>,
-    /// The range of epochs contained in this flush (exclusive end).
-    /// Start is the first epoch in the flush, end is one past the last epoch.
-    pub epoch_range: Range<u64>,
-    /// Whether to wait for durable storage (e.g. call storage.flush()).
-    pub await_durable: bool,
-}
-
 /// A delta accumulates writes and can produce a snapshot image.
 pub trait Delta: Sized + Send + Sync + 'static {
     /// The Context is data owned only while the Delta is mutable. After
@@ -54,6 +42,8 @@ pub trait Delta: Sized + Send + Sync + 'static {
     type Context: Send + Sync + 'static;
     type Write: Send + 'static;
     type Frozen: Clone + Send + Sync + 'static;
+    /// The payload broadcast to subscribers after a flush.
+    type Broadcast: Clone + Send + Sync + 'static;
     /// Metadata returned from [`Delta::apply`], delivered to the caller
     /// through [`WriteHandle::result`](super::WriteHandle::result).
     type ApplyResult: Clone + Send + 'static;
@@ -78,10 +68,27 @@ pub trait Delta: Sized + Send + Sync + 'static {
     fn freeze(self) -> (Self::Frozen, Self::Context);
 }
 
-/// A flusher persists flush events to durable storage.
+/// The result of flushing a frozen delta, broadcast to subscribers.
+pub struct BroadcastDelta<D: Delta> {
+    /// The new snapshot reflecting the flushed state.
+    pub snapshot: Arc<dyn StorageRead>,
+    /// The broadcast payload for subscribers.
+    pub broadcast: D::Broadcast,
+}
+
+/// A flusher persists frozen deltas and ensures storage durability.
 #[async_trait]
 pub trait Flusher<D: Delta>: Send + Sync + 'static {
-    /// Flush the given event to durable storage and returns a storage
-    /// snapshot for readers to use
-    async fn flush(&self, event: &FlushEvent<D>) -> Result<Arc<dyn StorageRead>, String>;
+    /// Flush a frozen delta to storage.
+    ///
+    /// Consumes the frozen delta by value and returns a snapshot for readers
+    /// along with a broadcast payload for subscribers.
+    async fn flush_delta(
+        &self,
+        frozen: D::Frozen,
+        epoch_range: &Range<u64>,
+    ) -> Result<BroadcastDelta<D>, String>;
+
+    /// Ensure storage durability (e.g. call storage.flush()).
+    async fn flush_storage(&self) -> Result<(), String>;
 }

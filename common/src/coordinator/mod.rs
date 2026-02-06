@@ -7,7 +7,20 @@ mod traits;
 pub use error::{WriteError, WriteResult};
 pub use handle::{WriteCoordinatorHandle, WriteHandle};
 use std::ops::{Deref, DerefMut};
-pub use traits::{Delta, Durability, FlushEvent, FlushResult, Flusher};
+pub use traits::{Delta, Durability, BroadcastDelta, FlushResult, Flusher};
+
+use std::ops::Range;
+
+/// Event sent from the write coordinator task to the flush task.
+enum FlushEvent<D: Delta> {
+    /// Flush a frozen delta to storage.
+    FlushDelta {
+        frozen: D::Frozen,
+        epoch_range: Range<u64>,
+    },
+    /// Ensure storage durability (e.g. call storage.flush()).
+    FlushStorage,
+}
 
 // Internal use only
 pub(crate) use handle::EpochWatcher;
@@ -45,7 +58,7 @@ pub(crate) enum WriteCommand<D: Delta> {
     },
     Flush {
         epoch_tx: oneshot::Sender<handle::EpochResult<()>>,
-        await_durable: bool,
+        flush_storage: bool,
     },
 }
 
@@ -77,7 +90,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         // to storage operations is non-blocking. for now, we apply no
         // backpressure on this channel, so writes will block if more than
         // one flush is pending
-        let (flush_tx, flush_rx) = mpsc::channel(1);
+        let (flush_tx, flush_rx) = mpsc::channel(2);
 
         // Broadcast channel for flush results (buffer size 16 should be plenty)
         let (flush_result_tx, _) = broadcast::channel(16);
@@ -94,6 +107,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
             flushed_tx,
             durable_tx: durable_tx.clone(),
             flush_result_tx: flush_result_tx.clone(),
+            last_flushed_epoch: 0,
         };
 
         let stop_tok = CancellationToken::new();
@@ -211,13 +225,13 @@ impl<D: Delta> WriteCoordinatorTask<D> {
                         Some(WriteCommand::Write { write, result_tx }) => {
                             self.handle_write(write, result_tx).await?;
                         }
-                        Some(WriteCommand::Flush { epoch_tx, await_durable }) => {
+                        Some(WriteCommand::Flush { epoch_tx, flush_storage }) => {
                             // Send back the epoch of the last processed write
                             let _ = epoch_tx.send(Ok(handle::WriteApplied {
                                 epoch: self.epoch.saturating_sub(1),
                                 result: (),
                             }));
-                            self.handle_flush(await_durable).await;
+                            self.handle_flush(flush_storage).await;
                         }
                         None => {
                             // should be unreachable since WriteCoordinator holds a handle
@@ -283,33 +297,30 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         Ok(())
     }
 
-    async fn handle_flush(&mut self, await_durable: bool) {
+    async fn handle_flush(&mut self, flush_storage: bool) {
         let has_writes = self.epoch != self.delta_start_epoch;
-        if !has_writes && !await_durable {
+        if !has_writes && !flush_storage {
             return;
         }
 
-        let epoch_range = self.delta_start_epoch..self.epoch;
-        if has_writes {
-            self.delta_start_epoch = self.epoch;
-        }
         self.flush_interval.reset();
 
-        let frozen = if has_writes {
-            Some(self.delta.freeze_and_init())
-        } else {
-            None
-        };
+        if has_writes {
+            let epoch_range = self.delta_start_epoch..self.epoch;
+            self.delta_start_epoch = self.epoch;
+            let frozen = self.delta.freeze_and_init();
+            let _ = self
+                .flush_tx
+                .send(FlushEvent::FlushDelta {
+                    frozen,
+                    epoch_range,
+                })
+                .await;
+        }
 
-        // Block until the flush task can accept the event
-        let _ = self
-            .flush_tx
-            .send(FlushEvent {
-                delta: frozen,
-                epoch_range,
-                await_durable,
-            })
-            .await;
+        if flush_storage {
+            let _ = self.flush_tx.send(FlushEvent::FlushStorage).await;
+        }
     }
 }
 
@@ -319,39 +330,50 @@ struct FlushTask<D: Delta, F: Flusher<D>> {
     flushed_tx: watch::Sender<u64>,
     durable_tx: watch::Sender<u64>,
     flush_result_tx: broadcast::Sender<FlushResult<D>>,
+    last_flushed_epoch: u64,
 }
 
 impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
     fn run(mut self) -> tokio::task::JoinHandle<WriteResult<()>> {
         tokio::spawn(async move {
             while let Some(event) = self.flush_rx.recv().await {
-                let snapshot = self
-                    .flusher
-                    .flush(&event)
-                    .await
-                    .map_err(|e| WriteError::FlushError(e.to_string()))?;
+                match event {
+                    FlushEvent::FlushDelta {
+                        frozen,
+                        epoch_range,
+                    } => {
+                        let flushed = self
+                            .flusher
+                            .flush_delta(frozen, &epoch_range)
+                            .await
+                            .map_err(|e| WriteError::FlushError(e.to_string()))?;
 
-                let flushed_epoch = event.epoch_range.end - 1;
+                        let flushed_epoch = epoch_range.end - 1;
+                        self.last_flushed_epoch = flushed_epoch;
 
-                if event.delta.is_some() {
-                    self.flushed_tx
-                        .send(flushed_epoch)
-                        .map_err(|_| WriteError::Shutdown)?;
+                        self.flushed_tx
+                            .send(flushed_epoch)
+                            .map_err(|_| WriteError::Shutdown)?;
+
+                        // Broadcast flush result to subscribers (ignore if no receivers)
+                        let result = FlushResult {
+                            snapshot: flushed.snapshot,
+                            delta: Some(Arc::new(flushed.broadcast)),
+                            epoch_range,
+                        };
+                        let _ = self.flush_result_tx.send(result);
+                    }
+                    FlushEvent::FlushStorage => {
+                        self.flusher
+                            .flush_storage()
+                            .await
+                            .map_err(|e| WriteError::FlushError(e.to_string()))?;
+
+                        self.durable_tx
+                            .send(self.last_flushed_epoch)
+                            .map_err(|_| WriteError::Shutdown)?;
+                    }
                 }
-
-                if event.await_durable {
-                    self.durable_tx
-                        .send(flushed_epoch)
-                        .map_err(|_| WriteError::Shutdown)?;
-                }
-
-                // Broadcast flush result to subscribers (ignore if no receivers)
-                let result = FlushResult {
-                    snapshot,
-                    delta: event.delta.map(Arc::new),
-                    epoch_range: event.epoch_range,
-                };
-                let _ = self.flush_result_tx.send(result);
             }
 
             Ok(())
@@ -441,6 +463,7 @@ mod tests {
         type Context = TestContext;
         type Write = TestWrite;
         type Frozen = TestDelta;
+        type Broadcast = TestDelta;
         type ApplyResult = ();
 
         fn init(context: Self::Context) -> Self {
@@ -520,10 +543,11 @@ mod tests {
 
     #[async_trait]
     impl Flusher<TestDelta> for TestFlusher {
-        async fn flush(
+        async fn flush_delta(
             &self,
-            event: &FlushEvent<TestDelta>,
-        ) -> Result<Arc<dyn StorageRead>, String> {
+            frozen: TestDelta,
+            epoch_range: &Range<u64>,
+        ) -> Result<BroadcastDelta<TestDelta>, String> {
             // Signal that flush has started
             let flush_started_tx = {
                 let mut state = self.state.lock().unwrap();
@@ -545,15 +569,37 @@ mod tests {
             // Record the flush
             {
                 let mut state = self.state.lock().unwrap();
-                if let Some(delta) = &event.delta {
-                    state
-                        .flushed_events
-                        .push((delta.clone(), event.epoch_range.clone()));
-                }
+                state
+                    .flushed_events
+                    .push((frozen.clone(), epoch_range.clone()));
             }
 
-            // not used in the tests
-            Ok(Arc::new(InMemoryStorage::default()))
+            Ok(BroadcastDelta {
+                snapshot: Arc::new(InMemoryStorage::default()),
+                broadcast: frozen,
+            })
+        }
+
+        async fn flush_storage(&self) -> Result<(), String> {
+            // Signal that flush has started
+            let flush_started_tx = {
+                let mut state = self.state.lock().unwrap();
+                state.flush_started_tx.take()
+            };
+            if let Some(tx) = flush_started_tx {
+                let _ = tx.send(());
+            }
+
+            // Block if test wants to control timing
+            let unblock_rx = {
+                let mut state = self.state.lock().unwrap();
+                state.unblock_rx.take()
+            };
+            if let Some(mut rx) = unblock_rx {
+                rx.recv().await;
+            }
+
+            Ok(())
         }
     }
 
@@ -1811,7 +1857,7 @@ mod tests {
     // ============================================================================
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn should_flush_even_when_no_writes_if_await_durable() {
+    async fn should_flush_even_when_no_writes_if_flush_storage() {
         // given
         let flusher = TestFlusher::default();
         let mut coordinator =
@@ -1819,7 +1865,7 @@ mod tests {
         let handle = coordinator.handle();
         coordinator.start();
 
-        // when - flush with await_durable but no pending writes
+        // when - flush with flush_storage but no pending writes
         let mut flush_handle = handle.flush(true).await.unwrap();
         flush_handle.wait(Durability::Durable).await.unwrap();
 

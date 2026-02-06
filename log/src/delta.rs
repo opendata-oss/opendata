@@ -4,12 +4,12 @@
 //! the write coordinator, providing the log-specific write batching
 //! and flush logic.
 
-use std::sync::Arc;
+use std::ops::Range;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use common::coordinator::{Delta, FlushEvent, Flusher};
-use common::{Record, StorageRead, WriteOptions};
+use common::coordinator::{Delta, BroadcastDelta, Flusher};
+use common::{Record, WriteOptions};
 
 use crate::listing::ListingCache;
 use crate::model::{AppendResult, Record as UserRecord};
@@ -52,6 +52,12 @@ pub(crate) struct FrozenLogDelta {
     pub new_segments: Vec<LogSegment>,
 }
 
+/// Broadcast payload sent to subscribers after a flush.
+#[derive(Clone)]
+pub(crate) struct LogBroadcast {
+    pub new_segments: Vec<LogSegment>,
+}
+
 /// Flushes frozen deltas to storage.
 pub(crate) struct LogFlusher {
     storage: LogStorage,
@@ -67,6 +73,7 @@ impl Delta for LogDelta {
     type Context = LogContext;
     type Write = LogWrite;
     type Frozen = FrozenLogDelta;
+    type Broadcast = LogBroadcast;
     type ApplyResult = AppendResult;
 
     fn init(context: Self::Context) -> Self {
@@ -168,20 +175,30 @@ impl Delta for LogDelta {
 
 #[async_trait]
 impl Flusher<LogDelta> for LogFlusher {
-    async fn flush(&self, event: &FlushEvent<LogDelta>) -> Result<Arc<dyn StorageRead>, String> {
-        if let Some(delta) = &event.delta {
-            let options = WriteOptions {
-                await_durable: false,
-            };
-            self.storage
-                .put_with_options(delta.records.clone(), options)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        if event.await_durable {
-            self.storage.flush().await.map_err(|e| e.to_string())?;
-        }
-        self.storage.snapshot().await.map_err(|e| e.to_string())
+    async fn flush_delta(
+        &self,
+        frozen: FrozenLogDelta,
+        _epoch_range: &Range<u64>,
+    ) -> Result<BroadcastDelta<LogDelta>, String> {
+        let options = WriteOptions {
+            await_durable: false,
+        };
+        self.storage
+            .put_with_options(frozen.records, options)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
+        Ok(BroadcastDelta {
+            snapshot,
+            broadcast: LogBroadcast {
+                new_segments: frozen.new_segments,
+            },
+        })
+    }
+
+    async fn flush_storage(&self) -> Result<(), String> {
+        self.storage.flush().await.map_err(|e| e.to_string())
     }
 }
 
@@ -190,6 +207,7 @@ mod tests {
     use super::*;
     use crate::serde::SEQ_BLOCK_KEY;
     use common::SequenceAllocator;
+    use std::sync::Arc;
 
     /// Creates a LogContext with fresh in-memory state.
     async fn test_context() -> LogContext {
@@ -336,15 +354,10 @@ mod tests {
         let (frozen, _ctx) = delta.freeze();
 
         // when
-        let event = FlushEvent {
-            delta: Some(frozen),
-            epoch_range: 1..2,
-            await_durable: false,
-        };
-        let snapshot = flusher.flush(&event).await.unwrap();
+        let flushed = flusher.flush_delta(frozen, &(1..2)).await.unwrap();
 
         // then - records are readable from snapshot
-        let result = snapshot
+        let result = flushed.snapshot
             .get(Bytes::from_static(&SEQ_BLOCK_KEY))
             .await
             .unwrap();
