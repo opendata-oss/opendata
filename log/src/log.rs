@@ -51,6 +51,29 @@ use crate::storage::LogStorage;
 /// Currently, each log supports a single writer. Multi-writer support may
 /// be added in the future, but would require each key to have a single
 /// writer to maintain monotonic ordering within that key's log.
+///
+/// # Example
+///
+/// ```ignore
+/// use log::{LogDb, LogRead, Record, WriteOptions};
+/// use bytes::Bytes;
+///
+/// // Open a log (implementation details TBD)
+/// let log = LogDb::open(config).await?;
+///
+/// // Append records
+/// let records = vec![
+///     Record { key: Bytes::from("user:123"), value: Bytes::from("event-a") },
+///     Record { key: Bytes::from("user:456"), value: Bytes::from("event-b") },
+/// ];
+/// log.append(records).await?;
+///
+/// // Scan entries for a specific key
+/// let mut iter = log.scan(Bytes::from("user:123"), ..).await?;
+/// while let Some(entry) = iter.next().await? {
+///     println!("seq={}: {:?}", entry.sequence, entry.value);
+/// }
+/// ```
 pub struct LogDb {
     handle: WriteCoordinatorHandle<LogDelta>,
     coordinator: WriteCoordinator<LogDelta, LogFlusher>,
@@ -62,17 +85,98 @@ pub struct LogDb {
 
 impl LogDb {
     /// Opens or creates a log with the given configuration.
+    ///
+    /// This is the primary entry point for creating a `LogDb` instance. The
+    /// configuration specifies the storage backend and other settings.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Configuration specifying storage backend and settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage backend cannot be initialized.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use log::{LogDb, Config};
+    ///
+    /// let log = LogDb::open(test_config()).await?;
+    /// ```
     pub async fn open(config: crate::config::Config) -> Result<Self> {
         LogDbBuilder::new(config).build().await
     }
 
     /// Appends records to the log.
+    ///
+    /// Records are assigned sequence numbers in the order they appear in the
+    /// input vector. All records in a single append call are written atomically.
+    ///
+    /// This method uses default write options. Use [`append_with_options`] for
+    /// custom durability settings.
+    ///
+    /// # Arguments
+    ///
+    /// * `records` - The records to append. Each record specifies its target
+    ///   key and value.
+    ///
+    /// # Returns
+    ///
+    /// On success, returns an [`AppendResult`] containing the starting sequence
+    /// number assigned to the batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails due to storage issues.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let records = vec![
+    ///     Record { key: Bytes::from("events"), value: Bytes::from("event-1") },
+    ///     Record { key: Bytes::from("events"), value: Bytes::from("event-2") },
+    /// ];
+    /// let result = log.append(records).await?;
+    /// println!("Appended at seq {}", result.start_sequence);
+    /// ```
+    ///
+    /// [`append_with_options`]: LogDb::append_with_options
     pub async fn append(&self, records: Vec<Record>) -> Result<AppendResult> {
         self.append_with_options(records, WriteOptions::default())
             .await
     }
 
     /// Appends records to the log with custom options.
+    ///
+    /// Records are assigned sequence numbers in the order they appear in the
+    /// input vector. All records in a single append call are written atomically.
+    ///
+    /// # Arguments
+    ///
+    /// * `records` - The records to append. Each record specifies its target
+    ///   key and value.
+    /// * `options` - Write options controlling durability behavior.
+    ///
+    /// # Returns
+    ///
+    /// On success, returns an [`AppendResult`] containing the starting sequence
+    /// number assigned to the batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails due to storage issues.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let records = vec![
+    ///     Record { key: Bytes::from("events"), value: Bytes::from("critical-event") },
+    /// ];
+    /// let options = WriteOptions { await_durable: true };
+    /// let result = log.append_with_options(records, options).await?;
+    /// println!("Started at sequence {}", result.start_sequence);
+    /// ```
     pub async fn append_with_options(
         &self,
         records: Vec<Record>,
@@ -107,6 +211,10 @@ impl LogDb {
     }
 
     /// Forces creation of a new segment, sealing the current one.
+    ///
+    /// This is an internal API for testing multi-segment scenarios. It forces
+    /// subsequent appends to write to a new segment, regardless of any
+    /// configured seal interval.
     #[cfg(test)]
     pub(crate) async fn seal_segment(&self) -> Result<()> {
         let write = LogWrite {
@@ -120,6 +228,10 @@ impl LogDb {
     }
 
     /// Flushes all pending writes to durable storage.
+    ///
+    /// This ensures that all writes that have been acknowledged are persisted
+    /// to durable storage. For SlateDB-backed storage, this flushes the memtable
+    /// to the WAL and object store.
     pub async fn flush(&self) -> Result<()> {
         let mut flush_handle = self.handle.flush(true).await?;
         flush_handle.wait(Durability::Durable).await?;
@@ -132,6 +244,9 @@ impl LogDb {
     }
 
     /// Closes the log, releasing any resources.
+    ///
+    /// This method should be called before dropping the log to ensure
+    /// proper cleanup. For SlateDB-backed storage, this releases the database fence.
     pub async fn close(self) -> Result<()> {
         self.coordinator.stop().await.map_err(Error::Internal)?;
         self.flush_subscriber_task.abort();
