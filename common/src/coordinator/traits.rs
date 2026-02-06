@@ -31,17 +31,32 @@ pub enum Durability {
     Durable,
 }
 
-/// A delta accumulates writes and can produce a snapshot image.
+/// A delta accumulates writes and can produce a frozen snapshot for flushing.
+///
+/// The write coordinator manages a pipeline of three stages, each represented
+/// by a different type:
+///
+/// - **`Delta`** (this trait) — the mutable, in-progress batch. Writes are
+///   applied here until the delta is frozen.
+/// - **`Frozen`** — an immutable snapshot of the delta, sent to the
+///   [`Flusher`] to be persisted to storage.
+/// - **`Broadcast`** — a lightweight payload extracted during the flush,
+///   sent to readers so they can update their read image.
 pub trait Delta: Sized + Send + Sync + 'static {
-    /// The Context is data owned only while the Delta is mutable. After
-    /// freezing the delta the context is returned to the write coordinator
+    /// Mutable state owned by the delta while it accumulates writes.
+    /// Returned to the write coordinator on [`freeze`](Delta::freeze) so the
+    /// next delta can continue where this one left off.
     type Context: Send + Sync + 'static;
+    /// A single write operation applied via [`apply`](Delta::apply).
     type Write: Send + 'static;
+    /// Immutable snapshot produced by [`freeze`](Delta::freeze), consumed by
+    /// the [`Flusher`] to persist the batch to storage.
     type Frozen: Send + Sync + 'static;
-    /// The payload broadcast to subscribers after a flush.
+    /// Lightweight payload broadcast to subscribers after a flush, carrying
+    /// only the information readers need to update their read image.
     type Broadcast: Clone + Send + Sync + 'static;
-    /// Metadata returned from [`Delta::apply`], delivered to the caller
-    /// through [`WriteHandle::result`](super::WriteHandle::result).
+    /// Metadata returned from [`apply`](Delta::apply), delivered to the caller
+    /// through [`WriteHandle::wait`](super::WriteHandle::wait).
     type ApplyResult: Clone + Send + 'static;
 
     /// Create a new delta initialized from a snapshot context.
