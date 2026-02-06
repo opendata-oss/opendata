@@ -7,7 +7,7 @@ mod traits;
 pub use error::{WriteError, WriteResult};
 pub use handle::{WriteCoordinatorHandle, WriteHandle};
 use std::ops::{Deref, DerefMut};
-pub use traits::{Delta, Durability, BroadcastDelta, FlushResult, Flusher};
+pub use traits::{BroadcastDelta, Delta, Durability, FlushResult, Flusher};
 
 use std::ops::Range;
 

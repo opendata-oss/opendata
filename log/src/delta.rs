@@ -8,7 +8,7 @@ use std::ops::Range;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use common::coordinator::{Delta, BroadcastDelta, Flusher};
+use common::coordinator::{BroadcastDelta, Delta, Flusher};
 use common::{Record, WriteOptions};
 
 use crate::listing::ListingCache;
@@ -357,7 +357,8 @@ mod tests {
         let flushed = flusher.flush_delta(frozen, &(1..2)).await.unwrap();
 
         // then - records are readable from snapshot
-        let result = flushed.snapshot
+        let result = flushed
+            .snapshot
             .get(Bytes::from_static(&SEQ_BLOCK_KEY))
             .await
             .unwrap();
