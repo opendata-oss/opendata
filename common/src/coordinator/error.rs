@@ -30,4 +30,4 @@ impl std::fmt::Display for WriteError {
 impl std::error::Error for WriteError {}
 
 /// Result type for write operations.
-pub type WriteResult<T> = std::result::Result<T, WriteError>;
+pub type WriteResult<T> = Result<T, WriteError>;

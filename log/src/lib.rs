@@ -42,6 +42,7 @@
 //! ```
 
 mod config;
+mod delta;
 mod error;
 mod listing;
 mod log;
@@ -49,7 +50,6 @@ mod model;
 mod range;
 mod reader;
 mod segment;
-mod sequence;
 mod serde;
 #[cfg(feature = "http-server")]
 pub mod server;

@@ -15,24 +15,46 @@ pub(crate) struct EpochWatcher {
     pub durable_rx: watch::Receiver<u64>,
 }
 
-/// Handle returned from a write operation.
+/// Successful write application with its assigned epoch.
+#[derive(Clone, Debug)]
+pub(crate) struct WriteApplied<M> {
+    pub epoch: u64,
+    pub result: M,
+}
+
+/// Failed write application with its assigned epoch.
+#[derive(Clone, Debug)]
+pub(crate) struct WriteFailed {
+    pub epoch: u64,
+    pub error: String,
+}
+
+/// Result payload sent through the oneshot channel for a write or flush.
+pub(crate) type EpochResult<M> = Result<WriteApplied<M>, WriteFailed>;
+
+/// Handle returned from a write or flush operation.
 ///
-/// Provides the epoch assigned to the write and allows waiting
-/// for the write to reach a desired durability level.
-pub struct WriteHandle {
-    epoch: Shared<oneshot::Receiver<Result<u64, (u64, String)>>>,
+/// Provides the epoch assigned to the operation, the apply result (for writes),
+/// and allows waiting for the operation to reach a desired durability level.
+pub struct WriteHandle<M: Clone + Send + 'static = ()> {
+    inner: Shared<oneshot::Receiver<EpochResult<M>>>,
     watchers: EpochWatcher,
 }
 
-impl WriteHandle {
-    pub(crate) fn new(
-        epoch: oneshot::Receiver<Result<u64, (u64, String)>>,
-        watchers: EpochWatcher,
-    ) -> Self {
+impl<M: Clone + Send + 'static> WriteHandle<M> {
+    pub(crate) fn new(rx: oneshot::Receiver<EpochResult<M>>, watchers: EpochWatcher) -> Self {
         Self {
-            epoch: epoch.shared(),
+            inner: rx.shared(),
             watchers,
         }
+    }
+
+    async fn recv(&self) -> WriteResult<WriteApplied<M>> {
+        self.inner
+            .clone()
+            .await
+            .map_err(|_| WriteError::Shutdown)?
+            .map_err(|e| WriteError::ApplyError(e.epoch, e.error))
     }
 
     /// Returns the epoch assigned to this write.
@@ -40,17 +62,17 @@ impl WriteHandle {
     /// Epochs are assigned when the coordinator dequeues the write, so this
     /// method blocks until sequencing completes. Epochs are monotonically
     /// increasing and reflect the actual write order.
+    #[cfg(test)]
     pub async fn epoch(&self) -> WriteResult<u64> {
-        self.epoch
-            .clone()
-            .await
-            .map_err(|_| WriteError::Shutdown)?
-            .map_err(|(epoch, msg)| WriteError::ApplyError(epoch, msg))
+        Ok(self.recv().await?.epoch)
     }
 
     /// Wait for the write to reach the specified durability level.
-    pub async fn wait(&mut self, durability: Durability) -> WriteResult<()> {
-        let epoch = self.epoch().await?;
+    ///
+    /// Returns the apply result produced by [`Delta::apply`] once the
+    /// requested durability level has been reached.
+    pub async fn wait(&mut self, durability: Durability) -> WriteResult<M> {
+        let WriteApplied { epoch, result } = self.recv().await?;
 
         let recv = match durability {
             Durability::Applied => &mut self.watchers.applied_rx,
@@ -60,8 +82,8 @@ impl WriteHandle {
 
         recv.wait_for(|curr| *curr >= epoch)
             .await
-            .map_err(|_| WriteError::Shutdown);
-        Ok(())
+            .map_err(|_| WriteError::Shutdown)?;
+        Ok(result)
     }
 }
 
@@ -100,37 +122,42 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
 impl<D: Delta> WriteCoordinatorHandle<D> {
     /// Submit a write to the coordinator.
     ///
-    /// Returns a handle that can be used to wait for the write to
-    /// reach a desired durability level.
-    pub async fn write(&self, write: D::Write) -> WriteResult<WriteHandle> {
-        let (epoch_tx, epoch_rx) = oneshot::channel();
+    /// Returns a handle that can be used to retrieve the apply result
+    /// and wait for the write to reach a desired durability level.
+    pub async fn write(&self, write: D::Write) -> WriteResult<WriteHandle<D::ApplyResult>> {
+        let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .try_send(WriteCommand::Write {
                 write,
-                epoch: epoch_tx,
+                result_tx: tx,
             })
             .map_err(|e| match e {
                 mpsc::error::TrySendError::Full(_) => WriteError::Backpressure,
                 mpsc::error::TrySendError::Closed(_) => WriteError::Shutdown,
             })?;
 
-        Ok(WriteHandle::new(epoch_rx, self.watchers.clone()))
+        Ok(WriteHandle::new(rx, self.watchers.clone()))
     }
 
     /// Request a flush of the current delta.
     ///
     /// This will trigger a flush even if the flush threshold has not been reached.
+    /// When `await_durable` is true, the flush will also call `storage.flush()`
+    /// to guarantee durability, and the durable watermark will be advanced.
     /// Returns a handle that can be used to wait for the flush to complete.
-    pub async fn flush(&self) -> WriteResult<WriteHandle> {
-        let (epoch_tx, epoch_rx) = oneshot::channel();
+    pub async fn flush(&self, await_durable: bool) -> WriteResult<WriteHandle> {
+        let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .try_send(WriteCommand::Flush { epoch: epoch_tx })
+            .try_send(WriteCommand::Flush {
+                epoch_tx: tx,
+                await_durable,
+            })
             .map_err(|e| match e {
                 mpsc::error::TrySendError::Full(_) => WriteError::Backpressure,
                 mpsc::error::TrySendError::Closed(_) => WriteError::Shutdown,
             })?;
 
-        Ok(WriteHandle::new(epoch_rx, self.watchers.clone()))
+        Ok(WriteHandle::new(rx, self.watchers.clone()))
     }
 }
 
@@ -164,17 +191,19 @@ mod tests {
     #[tokio::test]
     async fn should_return_epoch_when_assigned() {
         // given
-        let (epoch_tx, epoch_rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let (_applied_tx, applied_rx) = watch::channel(0u64);
         let (_flushed_tx, flushed_rx) = watch::channel(0u64);
         let (_durable_tx, durable_rx) = watch::channel(0u64);
-        let handle = WriteHandle::new(
-            epoch_rx,
-            create_watchers(applied_rx, flushed_rx, durable_rx),
-        );
+        let handle: WriteHandle<()> =
+            WriteHandle::new(rx, create_watchers(applied_rx, flushed_rx, durable_rx));
 
         // when
-        epoch_tx.send(Ok(42)).unwrap();
+        tx.send(Ok(WriteApplied {
+            epoch: 42,
+            result: (),
+        }))
+        .unwrap();
         let result = handle.epoch().await;
 
         // then
@@ -185,15 +214,17 @@ mod tests {
     #[tokio::test]
     async fn should_allow_multiple_epoch_calls() {
         // given
-        let (epoch_tx, epoch_rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let (_applied_tx, applied_rx) = watch::channel(0u64);
         let (_flushed_tx, flushed_rx) = watch::channel(0u64);
         let (_durable_tx, durable_rx) = watch::channel(0u64);
-        let handle = WriteHandle::new(
-            epoch_rx,
-            create_watchers(applied_rx, flushed_rx, durable_rx),
-        );
-        epoch_tx.send(Ok(42)).unwrap();
+        let handle: WriteHandle<()> =
+            WriteHandle::new(rx, create_watchers(applied_rx, flushed_rx, durable_rx));
+        tx.send(Ok(WriteApplied {
+            epoch: 42,
+            result: (),
+        }))
+        .unwrap();
 
         // when
         let result1 = handle.epoch().await;
@@ -207,17 +238,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_return_apply_result_from_wait() {
+        // given
+        let (tx, rx) = oneshot::channel();
+        let (_applied_tx, applied_rx) = watch::channel(100u64);
+        let (_flushed_tx, flushed_rx) = watch::channel(0u64);
+        let (_durable_tx, durable_rx) = watch::channel(0u64);
+        let mut handle: WriteHandle<String> =
+            WriteHandle::new(rx, create_watchers(applied_rx, flushed_rx, durable_rx));
+
+        // when
+        tx.send(Ok(WriteApplied {
+            epoch: 1,
+            result: "hello".to_string(),
+        }))
+        .unwrap();
+
+        // then
+        assert_eq!(handle.wait(Durability::Applied).await.unwrap(), "hello");
+    }
+
+    #[tokio::test]
     async fn should_return_immediately_when_watermark_already_reached() {
         // given
-        let (epoch_tx, epoch_rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let (_applied_tx, applied_rx) = watch::channel(100u64); // watermark already at 100
         let (_flushed_tx, flushed_rx) = watch::channel(0u64);
         let (_durable_tx, durable_rx) = watch::channel(0u64);
-        let mut handle = WriteHandle::new(
-            epoch_rx,
-            create_watchers(applied_rx, flushed_rx, durable_rx),
-        );
-        epoch_tx.send(Ok(50)).unwrap(); // epoch is 50, watermark is 100
+        let mut handle: WriteHandle<()> =
+            WriteHandle::new(rx, create_watchers(applied_rx, flushed_rx, durable_rx));
+        tx.send(Ok(WriteApplied {
+            epoch: 50,
+            result: (),
+        }))
+        .unwrap(); // epoch is 50, watermark is 100
 
         // when
         let result = handle.wait(Durability::Applied).await;
@@ -229,15 +283,17 @@ mod tests {
     #[tokio::test]
     async fn should_wait_until_watermark_reaches_epoch() {
         // given
-        let (epoch_tx, epoch_rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let (applied_tx, applied_rx) = watch::channel(0u64);
         let (_flushed_tx, flushed_rx) = watch::channel(0u64);
         let (_durable_tx, durable_rx) = watch::channel(0u64);
-        let mut handle = WriteHandle::new(
-            epoch_rx,
-            create_watchers(applied_rx, flushed_rx, durable_rx),
-        );
-        epoch_tx.send(Ok(10)).unwrap();
+        let mut handle: WriteHandle<()> =
+            WriteHandle::new(rx, create_watchers(applied_rx, flushed_rx, durable_rx));
+        tx.send(Ok(WriteApplied {
+            epoch: 10,
+            result: (),
+        }))
+        .unwrap();
 
         // when - spawn a task to update the watermark after a delay
         let wait_task = tokio::spawn(async move { handle.wait(Durability::Applied).await });
@@ -256,15 +312,17 @@ mod tests {
     #[tokio::test]
     async fn should_wait_for_correct_durability_level() {
         // given - set up watchers with different values
-        let (epoch_tx, epoch_rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let (_applied_tx, applied_rx) = watch::channel(100u64);
         let (_flushed_tx, flushed_rx) = watch::channel(50u64);
         let (durable_tx, durable_rx) = watch::channel(10u64);
-        let mut handle = WriteHandle::new(
-            epoch_rx,
-            create_watchers(applied_rx, flushed_rx, durable_rx),
-        );
-        epoch_tx.send(Ok(25)).unwrap();
+        let mut handle: WriteHandle<()> =
+            WriteHandle::new(rx, create_watchers(applied_rx, flushed_rx, durable_rx));
+        tx.send(Ok(WriteApplied {
+            epoch: 25,
+            result: (),
+        }))
+        .unwrap();
 
         // when - wait for Durable (watermark is 10, epoch is 25)
         let wait_task = tokio::spawn(async move { handle.wait(Durability::Durable).await });
@@ -281,17 +339,14 @@ mod tests {
     #[tokio::test]
     async fn should_propagate_epoch_error_in_wait() {
         // given
-        let (epoch_tx, epoch_rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel::<EpochResult<()>>();
         let (_applied_tx, applied_rx) = watch::channel(0u64);
         let (_flushed_tx, flushed_rx) = watch::channel(0u64);
         let (_durable_tx, durable_rx) = watch::channel(0u64);
-        let mut handle = WriteHandle::new(
-            epoch_rx,
-            create_watchers(applied_rx, flushed_rx, durable_rx),
-        );
+        let mut handle = WriteHandle::new(rx, create_watchers(applied_rx, flushed_rx, durable_rx));
 
         // when - drop the sender without sending
-        drop(epoch_tx);
+        drop(tx);
         let result = handle.wait(Durability::Applied).await;
 
         // then
@@ -301,17 +356,19 @@ mod tests {
     #[tokio::test]
     async fn should_propagate_apply_error_in_wait() {
         // given
-        let (epoch_tx, epoch_rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let (_applied_tx, applied_rx) = watch::channel(0u64);
         let (_flushed_tx, flushed_rx) = watch::channel(0u64);
         let (_durable_tx, durable_rx) = watch::channel(0u64);
-        let mut handle = WriteHandle::new(
-            epoch_rx,
-            create_watchers(applied_rx, flushed_rx, durable_rx),
-        );
+        let mut handle: WriteHandle<()> =
+            WriteHandle::new(rx, create_watchers(applied_rx, flushed_rx, durable_rx));
 
-        // when - drop the sender without sending
-        epoch_tx.send(Err((1, "apply error".into()))).unwrap();
+        // when - send an error
+        tx.send(Err(WriteFailed {
+            epoch: 1,
+            error: "apply error".into(),
+        }))
+        .unwrap();
         let result = handle.wait(Durability::Applied).await;
 
         // then

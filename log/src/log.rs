@@ -10,13 +10,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use common::clock::{Clock, SystemClock};
-use common::storage::factory::create_storage;
-use common::{
-    Record as StorageRecord, StorageRuntime, StorageSemantics, WriteOptions as StorageWriteOptions,
+use common::coordinator::{
+    Durability, WriteCoordinator, WriteCoordinatorConfig, WriteCoordinatorHandle,
 };
+use common::storage::factory::create_storage;
+use common::{StorageRuntime, StorageSemantics};
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 
 use crate::config::{CountOptions, ScanOptions, WriteOptions};
+use crate::delta::{LogContext, LogDelta, LogFlusher, LogWrite};
 use crate::error::{Error, Result};
 use crate::listing::ListingCache;
 use crate::listing::LogKeyIterator;
@@ -24,19 +27,7 @@ use crate::model::{AppendResult, Record, Segment, SegmentId, Sequence};
 use crate::range::{normalize_segment_id, normalize_sequence};
 use crate::reader::{LogIterator, LogRead};
 use crate::segment::SegmentCache;
-use crate::sequence::SequenceAllocator;
-use crate::serde::LogEntryBuilder;
 use crate::storage::LogStorage;
-
-/// Inner state for the write path.
-///
-/// Wrapped in a single `RwLock` for simplicity. A more sophisticated
-/// concurrency strategy may be needed for high-throughput scenarios.
-struct LogInner {
-    sequence_allocator: SequenceAllocator,
-    segment_cache: SegmentCache,
-    listing_cache: ListingCache,
-}
 
 /// The main log interface providing read and write operations.
 ///
@@ -60,199 +51,50 @@ struct LogInner {
 /// Currently, each log supports a single writer. Multi-writer support may
 /// be added in the future, but would require each key to have a single
 /// writer to maintain monotonic ordering within that key's log.
-///
-/// # Example
-///
-/// ```ignore
-/// use log::{LogDb, LogRead, Record, WriteOptions};
-/// use bytes::Bytes;
-///
-/// // Open a log (implementation details TBD)
-/// let log = LogDb::open(config).await?;
-///
-/// // Append records
-/// let records = vec![
-///     Record { key: Bytes::from("user:123"), value: Bytes::from("event-a") },
-///     Record { key: Bytes::from("user:456"), value: Bytes::from("event-b") },
-/// ];
-/// log.append(records).await?;
-///
-/// // Scan entries for a specific key
-/// let mut iter = log.scan(Bytes::from("user:123"), ..).await?;
-/// while let Some(entry) = iter.next().await? {
-///     println!("seq={}: {:?}", entry.sequence, entry.value);
-/// }
-/// ```
 pub struct LogDb {
+    handle: WriteCoordinatorHandle<LogDelta>,
+    coordinator: WriteCoordinator<LogDelta, LogFlusher>,
     storage: LogStorage,
     clock: Arc<dyn Clock>,
-    inner: RwLock<LogInner>,
     read_inner: Arc<RwLock<crate::reader::LogReadInner>>,
+    flush_subscriber_task: JoinHandle<()>,
 }
 
 impl LogDb {
     /// Opens or creates a log with the given configuration.
-    ///
-    /// This is the primary entry point for creating a `LogDb` instance. The
-    /// configuration specifies the storage backend and other settings.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Configuration specifying storage backend and settings.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the storage backend cannot be initialized.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use log::{LogDb, Config};
-    ///
-    /// let log = LogDb::open(test_config()).await?;
-    /// ```
-    pub async fn open(config: crate::config::Config) -> crate::error::Result<Self> {
+    pub async fn open(config: crate::config::Config) -> Result<Self> {
         LogDbBuilder::new(config).build().await
     }
 
     /// Appends records to the log.
-    ///
-    /// Records are assigned sequence numbers in the order they appear in the
-    /// input vector. All records in a single append call are written atomically.
-    ///
-    /// This method uses default write options. Use [`append_with_options`] for
-    /// custom durability settings.
-    ///
-    /// # Arguments
-    ///
-    /// * `records` - The records to append. Each record specifies its target
-    ///   key and value.
-    ///
-    /// # Returns
-    ///
-    /// On success, returns an [`AppendResult`] containing the starting sequence
-    /// number and number of records appended.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the write fails due to storage issues.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let records = vec![
-    ///     Record { key: Bytes::from("events"), value: Bytes::from("event-1") },
-    ///     Record { key: Bytes::from("events"), value: Bytes::from("event-2") },
-    /// ];
-    /// let result = log.append(records).await?;
-    /// println!("Appended {} records at seq {}", result.records_appended, result.start_sequence);
-    /// ```
-    ///
-    /// [`append_with_options`]: LogDb::append_with_options
     pub async fn append(&self, records: Vec<Record>) -> Result<AppendResult> {
         self.append_with_options(records, WriteOptions::default())
             .await
     }
 
     /// Appends records to the log with custom options.
-    ///
-    /// Records are assigned sequence numbers in the order they appear in the
-    /// input vector. All records in a single append call are written atomically.
-    ///
-    /// # Arguments
-    ///
-    /// * `records` - The records to append. Each record specifies its target
-    ///   key and value.
-    /// * `options` - Write options controlling durability behavior.
-    ///
-    /// # Returns
-    ///
-    /// On success, returns an [`AppendResult`] containing the starting sequence
-    /// number and number of records appended.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the write fails due to storage issues.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let records = vec![
-    ///     Record { key: Bytes::from("events"), value: Bytes::from("critical-event") },
-    /// ];
-    /// let options = WriteOptions { await_durable: true };
-    /// let result = log.append_with_options(records, options).await?;
-    /// println!("Started at sequence {}", result.start_sequence);
-    /// ```
     pub async fn append_with_options(
         &self,
         records: Vec<Record>,
         options: WriteOptions,
     ) -> Result<AppendResult> {
-        let records_appended = records.len();
         if records.is_empty() {
-            return Ok(AppendResult {
-                start_sequence: 0,
-                records_appended: 0,
-            });
+            return Ok(AppendResult { start_sequence: 0 });
         }
 
-        let current_time_ms = self.current_time_ms();
-        let mut inner = self.inner.write().await;
-
-        // Three-phase commit: build (fallible) → write (fatal) → apply (infallible).
-        // Deltas capture intent without mutating state, allowing clean abort on build errors.
-
-        // Build phase: accumulate deltas and storage records.
-        let mut storage_records: Vec<StorageRecord> = Vec::new();
-        let seq_delta = inner
-            .sequence_allocator
-            .build_delta(records.len() as u64, &mut storage_records);
-        let start_sequence = seq_delta.base_sequence();
-        let seg_delta = inner.segment_cache.build_delta(
-            current_time_ms,
-            seq_delta.base_sequence(),
-            &mut storage_records,
-        );
-        let keys: Vec<_> = records.iter().map(|r| r.key.clone()).collect();
-        let listing_delta =
-            inner
-                .listing_cache
-                .build_delta(&seg_delta, &keys, &mut storage_records);
-        LogEntryBuilder::build(
-            seg_delta.segment(),
-            seq_delta.base_sequence(),
-            &records,
-            &mut storage_records,
-        );
-
-        // Write phase: atomic write to storage.
-        let storage_options = StorageWriteOptions {
-            await_durable: options.await_durable,
+        let write = LogWrite {
+            records,
+            timestamp_ms: self.current_time_ms(),
+            force_seal: false,
         };
-        self.storage
-            .put_with_options(storage_records, storage_options)
-            .await?;
+        let mut write_handle = self.handle.write(write).await?;
+        let result = write_handle.wait(Durability::Applied).await?;
 
-        // Apply phase: update in-memory caches.
-        let new_segment = if seg_delta.is_new() {
-            Some(seg_delta.segment().clone())
-        } else {
-            None
-        };
-        inner.sequence_allocator.apply_delta(seq_delta);
-        inner.segment_cache.apply_delta(seg_delta);
-        inner.listing_cache.apply_delta(listing_delta);
-        drop(inner);
-
-        if let Some(segment) = new_segment {
-            self.read_inner.write().await.segments.insert(segment);
+        if options.await_durable {
+            self.flush().await?;
         }
 
-        Ok(AppendResult {
-            start_sequence,
-            records_appended,
-        })
+        Ok(result)
     }
 
     /// Returns the current time in milliseconds since Unix epoch.
@@ -265,54 +107,34 @@ impl LogDb {
     }
 
     /// Forces creation of a new segment, sealing the current one.
-    ///
-    /// This is an internal API for testing multi-segment scenarios. It forces
-    /// subsequent appends to write to a new segment, regardless of any
-    /// configured seal interval.
     #[cfg(test)]
     pub(crate) async fn seal_segment(&self) -> Result<()> {
-        use crate::segment::LogSegment;
-        use crate::serde::SegmentMeta;
-
-        let current_time_ms = self.current_time_ms();
-        let mut inner = self.inner.write().await;
-        let next_seq = inner.sequence_allocator.peek_next_sequence();
-
-        // Determine next segment ID
-        let segment_id = match inner.segment_cache.latest() {
-            Some(latest) => latest.id() + 1,
-            None => 0,
+        let write = LogWrite {
+            records: vec![],
+            timestamp_ms: self.current_time_ms(),
+            force_seal: true,
         };
-
-        // Create and write the new segment
-        let meta = SegmentMeta::new(next_seq, current_time_ms);
-        let segment = LogSegment::new(segment_id, meta);
-        self.storage.write_segment(&segment).await?;
-
-        // Update caches
-        inner.segment_cache.insert(segment.clone());
-        drop(inner);
-
-        self.read_inner.write().await.segments.insert(segment);
-
+        self.handle.write(write).await?;
+        self.flush().await?;
         Ok(())
     }
 
     /// Flushes all pending writes to durable storage.
-    ///
-    /// This ensures that all writes that have been acknowledged are persisted
-    /// to durable storage. For SlateDB-backed storage, this flushes the memtable
-    /// to the WAL and object store.
     pub async fn flush(&self) -> Result<()> {
-        self.storage.flush().await?;
+        let mut flush_handle = self.handle.flush(true).await?;
+        flush_handle.wait(Durability::Durable).await?;
+        // Synchronously refresh read_inner segments for immediate visibility
+        let mut inner = self.read_inner.write().await;
+        let after = inner.segments.latest().map(|s| s.id());
+        let storage = inner.storage.clone();
+        inner.segments.refresh(&storage, after).await?;
         Ok(())
     }
 
     /// Closes the log, releasing any resources.
-    ///
-    /// This method should be called before dropping the log to ensure
-    /// proper cleanup. For SlateDB-backed storage, this releases the database fence.
     pub async fn close(self) -> Result<()> {
+        self.coordinator.stop().await.map_err(Error::Internal)?;
+        self.flush_subscriber_task.abort();
         self.storage.close().await?;
         Ok(())
     }
@@ -322,31 +144,45 @@ impl LogDb {
     pub(crate) async fn new(storage: Arc<dyn common::Storage>) -> Result<Self> {
         use crate::config::SegmentConfig;
         use crate::reader::LogReadInner;
+        use crate::serde::SEQ_BLOCK_KEY;
 
-        let log_storage = LogStorage::new(storage);
+        let log_storage = LogStorage::new(storage.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
         let log_storage_read = log_storage.as_read();
-        let sequence_allocator = SequenceAllocator::open(&log_storage_read).await?;
+        let seq_key = Bytes::from_static(&SEQ_BLOCK_KEY);
+        let sequence_allocator = common::SequenceAllocator::load(storage.as_ref(), seq_key)
+            .await
+            .map_err(|e| Error::Internal(e.to_string()))?;
         let segment_cache = SegmentCache::open(&log_storage_read, SegmentConfig::default()).await?;
         let listing_cache = ListingCache::new();
 
-        let read_inner = Arc::new(RwLock::new(LogReadInner::new(
-            log_storage_read,
-            segment_cache.clone(),
-        )));
-
-        let inner = LogInner {
+        let context = LogContext {
             sequence_allocator,
-            segment_cache,
+            segment_cache: segment_cache.clone(),
             listing_cache,
         };
 
+        let flusher = LogFlusher::new(log_storage.clone());
+        let mut coordinator =
+            WriteCoordinator::new(WriteCoordinatorConfig::default(), context, flusher);
+        let handle = coordinator.handle();
+
+        let read_inner = Arc::new(RwLock::new(LogReadInner::new(
+            log_storage_read,
+            segment_cache,
+        )));
+
+        let flush_subscriber_task = spawn_flush_subscriber(&handle, Arc::clone(&read_inner));
+        coordinator.start();
+
         Ok(Self {
+            handle,
+            coordinator,
             storage: log_storage,
             clock,
-            inner: RwLock::new(inner),
             read_inner,
+            flush_subscriber_task,
         })
     }
 }
@@ -444,6 +280,7 @@ impl LogDbBuilder {
     /// Builds the LogDb instance.
     pub async fn build(self) -> Result<LogDb> {
         use crate::reader::LogReadInner;
+        use crate::serde::SEQ_BLOCK_KEY;
 
         let storage = create_storage(
             &self.config.storage,
@@ -453,32 +290,64 @@ impl LogDbBuilder {
         .await
         .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let log_storage = LogStorage::new(storage);
+        let log_storage = LogStorage::new(storage.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
         let log_storage_read = log_storage.as_read();
-        let sequence_allocator = SequenceAllocator::open(&log_storage_read).await?;
+        let seq_key = Bytes::from_static(&SEQ_BLOCK_KEY);
+        let sequence_allocator = common::SequenceAllocator::load(storage.as_ref(), seq_key)
+            .await
+            .map_err(|e| Error::Internal(e.to_string()))?;
         let segment_cache = SegmentCache::open(&log_storage_read, self.config.segmentation).await?;
         let listing_cache = ListingCache::new();
 
-        let read_inner = Arc::new(RwLock::new(LogReadInner::new(
-            log_storage_read,
-            segment_cache.clone(),
-        )));
-
-        let inner = LogInner {
+        let context = LogContext {
             sequence_allocator,
-            segment_cache,
+            segment_cache: segment_cache.clone(),
             listing_cache,
         };
 
+        let flusher = LogFlusher::new(log_storage.clone());
+        let mut coordinator =
+            WriteCoordinator::new(WriteCoordinatorConfig::default(), context, flusher);
+        let handle = coordinator.handle();
+
+        let read_inner = Arc::new(RwLock::new(LogReadInner::new(
+            log_storage_read,
+            segment_cache,
+        )));
+
+        let flush_subscriber_task = spawn_flush_subscriber(&handle, Arc::clone(&read_inner));
+        coordinator.start();
+
         Ok(LogDb {
+            handle,
+            coordinator,
             storage: log_storage,
             clock,
-            inner: RwLock::new(inner),
             read_inner,
+            flush_subscriber_task,
         })
     }
+}
+
+fn spawn_flush_subscriber(
+    handle: &WriteCoordinatorHandle<LogDelta>,
+    read_inner: Arc<RwLock<crate::reader::LogReadInner>>,
+) -> JoinHandle<()> {
+    let mut subscriber = handle.subscribe();
+    tokio::spawn(async move {
+        while let Ok(result) = subscriber.recv().await {
+            if let Some(delta) = &result.delta
+                && !delta.new_segments.is_empty()
+            {
+                let mut inner = read_inner.write().await;
+                for segment in &delta.new_segments {
+                    inner.segments.insert(segment.clone());
+                }
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -520,6 +389,7 @@ mod tests {
 
         // when
         log.append(records).await.unwrap();
+        log.flush().await.unwrap();
 
         // then - verify entry can be read back
         let mut iter = log.scan(Bytes::from("orders"), ..).await.unwrap();
@@ -550,6 +420,7 @@ mod tests {
 
         // when
         log.append(records).await.unwrap();
+        log.flush().await.unwrap();
 
         // then - verify entries with sequential sequence numbers
         let mut iter = log.scan(Bytes::from("orders"), ..).await.unwrap();
@@ -612,6 +483,7 @@ mod tests {
         }])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // then - verify sequences are 0, 1, 2 across appends
         let mut iter = log.scan(Bytes::from("events"), ..).await.unwrap();
@@ -645,6 +517,7 @@ mod tests {
 
         // when
         log.append(records).await.unwrap();
+        log.flush().await.unwrap();
 
         // then - verify entries for topic-a
         let mut iter_a = log.scan(Bytes::from("topic-a"), ..).await.unwrap();
@@ -681,6 +554,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when
         let mut iter = log.scan(Bytes::from("orders"), ..).await.unwrap();
@@ -727,6 +601,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when - scan sequences 1..4 (exclusive end)
         let mut iter = log.scan(Bytes::from("events"), 1..4).await.unwrap();
@@ -762,6 +637,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when - scan from sequence 1 onwards
         let mut iter = log.scan(Bytes::from("logs"), 1..).await.unwrap();
@@ -796,6 +672,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when - scan up to sequence 2 (exclusive)
         let mut iter = log.scan(Bytes::from("logs"), ..2).await.unwrap();
@@ -834,6 +711,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when - scan only key-a
         let mut iter = log.scan(Bytes::from("key-a"), ..).await.unwrap();
@@ -860,6 +738,7 @@ mod tests {
         }])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when - scan for non-existent key
         let mut iter = log.scan(Bytes::from("unknown"), ..).await.unwrap();
@@ -885,6 +764,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when - scan range that doesn't include any existing sequences
         let mut iter = log.scan(Bytes::from("key"), 10..20).await.unwrap();
@@ -921,6 +801,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when - create LogDbReader sharing the same storage
         let reader = LogDbReader::new(storage).await.unwrap();
@@ -975,6 +856,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when - scan all entries
         let mut iter = log.scan(Bytes::from("events"), ..).await.unwrap();
@@ -1045,6 +927,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when - scan range 1..5 (spans segments 0, 1, 2)
         let mut iter = log.scan(Bytes::from("data"), 1..5).await.unwrap();
@@ -1095,6 +978,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when - scan only segment 1's range
         let mut iter = log.scan(Bytes::from("key"), 2..4).await.unwrap();
@@ -1125,6 +1009,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when
         let _iter = log.list_keys(..).await.unwrap();
@@ -1155,6 +1040,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when - create LogDbReader sharing the same storage
         let reader = LogDbReader::new(storage).await.unwrap();
@@ -1183,6 +1069,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when
         let mut iter = log.list_keys(..).await.unwrap();
@@ -1233,6 +1120,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when
         let mut iter = log.list_keys(..).await.unwrap();
@@ -1283,6 +1171,7 @@ mod tests {
         }])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when
         let mut iter = log.list_keys(..).await.unwrap();
@@ -1316,6 +1205,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when
         let mut iter = log.list_keys(..).await.unwrap();
@@ -1392,6 +1282,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when - list only keys from segment 1
         let mut iter = log.list_keys(1..2).await.unwrap();
@@ -1428,6 +1319,7 @@ mod tests {
         }])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when
         let segments = log.list_segments(..).await.unwrap();
@@ -1470,6 +1362,7 @@ mod tests {
         }])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when
         let segments = log.list_segments(..).await.unwrap();
@@ -1534,6 +1427,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when - query range that spans segment 1
         let segments = log.list_segments(2..4).await.unwrap();
@@ -1571,6 +1465,7 @@ mod tests {
         }])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when
         let reader = LogDbReader::new(storage).await.unwrap();
@@ -1592,6 +1487,7 @@ mod tests {
         }])
         .await
         .unwrap();
+        log.flush().await.unwrap();
 
         // when
         let segments = log.list_segments(..).await.unwrap();

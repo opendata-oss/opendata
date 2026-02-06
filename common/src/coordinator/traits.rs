@@ -7,8 +7,9 @@ use std::sync::Arc;
 pub struct FlushResult<D: Delta> {
     /// The new snapshot reflecting the flushed state
     pub snapshot: Arc<dyn StorageRead>,
-    /// The delta that was flushed (wrapped in Arc for cheap cloning)
-    pub delta: Arc<D::Frozen>,
+    /// The delta that was flushed (wrapped in Arc for cheap cloning).
+    /// None when the flush was a durable-only flush with no pending writes.
+    pub delta: Option<Arc<D::Frozen>>,
     /// Epoch range covered by this flush (exclusive end)
     pub epoch_range: Range<u64>,
 }
@@ -36,10 +37,14 @@ pub enum Durability {
 
 /// Event emitted when a flush occurs.
 pub struct FlushEvent<D: Delta> {
-    pub delta: D::Frozen,
+    /// The frozen delta to flush. None when this is a durable-only flush
+    /// with no pending writes.
+    pub delta: Option<D::Frozen>,
     /// The range of epochs contained in this flush (exclusive end).
     /// Start is the first epoch in the flush, end is one past the last epoch.
     pub epoch_range: Range<u64>,
+    /// Whether to wait for durable storage (e.g. call storage.flush()).
+    pub await_durable: bool,
 }
 
 /// A delta accumulates writes and can produce a snapshot image.
@@ -49,13 +54,16 @@ pub trait Delta: Sized + Send + Sync + 'static {
     type Context: Send + Sync + 'static;
     type Write: Send + 'static;
     type Frozen: Clone + Send + Sync + 'static;
+    /// Metadata returned from [`Delta::apply`], delivered to the caller
+    /// through [`WriteHandle::result`](super::WriteHandle::result).
+    type ApplyResult: Clone + Send + 'static;
 
     /// Create a new delta initialized from a snapshot context.
     /// The delta takes ownership of the context while it is mutable.
     fn init(context: Self::Context) -> Self;
 
-    /// Apply a write to the delta.
-    fn apply(&mut self, write: Self::Write) -> Result<(), String>;
+    /// Apply a write to the delta and return a result for the caller.
+    fn apply(&mut self, write: Self::Write) -> Result<Self::ApplyResult, String>;
 
     /// Estimate the size of the delta in bytes.
     fn estimate_size(&self) -> usize;

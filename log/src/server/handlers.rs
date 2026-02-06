@@ -62,7 +62,7 @@ pub async fn handle_append(
         .log_append_bytes_total
         .inc_by(bytes_count as u64);
 
-    let response = AppendResponse::success(result.records_appended as i32, result.start_sequence);
+    let response = AppendResponse::success(count as i32, result.start_sequence);
     Ok(to_api_response(response, format))
 }
 

@@ -8,14 +8,13 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use common::SeqBlock;
 use common::{Storage, StorageIterator, StorageRead};
 
 use crate::error::{Error, Result};
 use crate::listing::LogKeyIterator;
 use crate::model::{LogEntry, SegmentId};
 use crate::segment::LogSegment;
-use crate::serde::{LogEntryKey, SEQ_BLOCK_KEY, SegmentMeta, SegmentMetaKey};
+use crate::serde::{LogEntryKey, SegmentMeta, SegmentMetaKey};
 
 /// Read-only log storage operations.
 ///
@@ -39,21 +38,6 @@ impl LogStorageRead {
             .get(key)
             .await
             .map_err(|e| Error::Storage(e.to_string()))
-    }
-
-    /// Gets the current sequence block from storage.
-    ///
-    /// Returns `None` if no block has been written yet.
-    pub(crate) async fn get_seq_block(&self) -> Result<Option<SeqBlock>> {
-        let record = self
-            .storage
-            .get(Bytes::from_static(&SEQ_BLOCK_KEY))
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        match record {
-            Some(r) => Ok(Some(SeqBlock::deserialize(&r.value)?)),
-            None => Ok(None),
-        }
     }
 
     /// Returns an iterator over keys present in the given segment range.
@@ -239,6 +223,15 @@ impl LogStorage {
         };
         self.storage.put(vec![record]).await?;
         Ok(())
+    }
+
+    pub(crate) async fn snapshot(&self) -> Result<Arc<dyn StorageRead>> {
+        let snapshot = self
+            .storage
+            .snapshot()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(snapshot as Arc<dyn StorageRead>)
     }
 
     pub async fn flush(&self) -> Result<()> {

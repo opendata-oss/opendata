@@ -145,3 +145,80 @@ async fn reader_discovers_new_data_after_initial_open() {
     reader.close().await;
     writer.close().await.expect("Failed to close writer");
 }
+
+#[tokio::test]
+async fn flush_guarantees_durability_across_reopen() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let storage = local_storage_config(&temp_dir);
+
+    let key = Bytes::from("durable-key");
+
+    // Write data and flush, then close
+    {
+        let config = Config {
+            storage: storage.clone(),
+            ..Default::default()
+        };
+        let writer = LogDb::open(config).await.expect("Failed to open writer");
+
+        writer
+            .append(vec![
+                Record {
+                    key: key.clone(),
+                    value: Bytes::from("value-0"),
+                },
+                Record {
+                    key: key.clone(),
+                    value: Bytes::from("value-1"),
+                },
+                Record {
+                    key: key.clone(),
+                    value: Bytes::from("value-2"),
+                },
+            ])
+            .await
+            .expect("Failed to append");
+
+        writer.flush().await.expect("Failed to flush");
+        writer.close().await.expect("Failed to close writer");
+    }
+
+    // Reopen from the same path and verify all data survived
+    {
+        let config = Config {
+            storage: storage.clone(),
+            ..Default::default()
+        };
+        let reader = LogDb::open(config).await.expect("Failed to reopen");
+
+        let mut iter = reader.scan(key, ..).await.expect("Failed to scan");
+
+        let entry0 = iter
+            .next()
+            .await
+            .expect("Failed to get next")
+            .expect("Expected entry 0");
+        assert_eq!(entry0.sequence, 0);
+        assert_eq!(entry0.value, Bytes::from("value-0"));
+
+        let entry1 = iter
+            .next()
+            .await
+            .expect("Failed to get next")
+            .expect("Expected entry 1");
+        assert_eq!(entry1.sequence, 1);
+        assert_eq!(entry1.value, Bytes::from("value-1"));
+
+        let entry2 = iter
+            .next()
+            .await
+            .expect("Failed to get next")
+            .expect("Expected entry 2");
+        assert_eq!(entry2.sequence, 2);
+        assert_eq!(entry2.value, Bytes::from("value-2"));
+
+        assert!(iter.next().await.expect("Failed to get next").is_none());
+
+        reader.close().await.expect("Failed to close reader");
+    }
+}
