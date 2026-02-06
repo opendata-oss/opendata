@@ -40,8 +40,8 @@ pub enum Durability {
 ///   applied here until the delta is frozen.
 /// - **`Frozen`** — an immutable snapshot of the delta, sent to the
 ///   [`Flusher`] to be persisted to storage.
-/// - **`Broadcast`** — a lightweight payload extracted during the flush,
-///   sent to readers so they can update their read image.
+/// - **`Broadcast`** — a minimal representation of the flushed state
+///   that readers need to update their read image.
 pub trait Delta: Sized + Send + Sync + 'static {
     /// Mutable state owned by the delta while it accumulates writes.
     /// Returned to the write coordinator on [`freeze`](Delta::freeze) so the
@@ -52,8 +52,8 @@ pub trait Delta: Sized + Send + Sync + 'static {
     /// Immutable snapshot produced by [`freeze`](Delta::freeze), consumed by
     /// the [`Flusher`] to persist the batch to storage.
     type Frozen: Send + Sync + 'static;
-    /// Lightweight payload broadcast to subscribers after a flush, carrying
-    /// only the information readers need to update their read image.
+    /// Minimal representation of flushed state, broadcast to subscribers
+    /// so they can update their read image.
     type Broadcast: Clone + Send + Sync + 'static;
     /// Metadata returned from [`apply`](Delta::apply), delivered to the caller
     /// through [`WriteHandle::wait`](super::WriteHandle::wait).
