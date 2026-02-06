@@ -37,7 +37,7 @@ pub trait Delta: Sized + Send + Sync + 'static {
     /// freezing the delta the context is returned to the write coordinator
     type Context: Send + Sync + 'static;
     type Write: Send + 'static;
-    type Frozen: Clone + Send + Sync + 'static;
+    type Frozen: Send + Sync + 'static;
     /// The payload broadcast to subscribers after a flush.
     type Broadcast: Clone + Send + Sync + 'static;
     /// Metadata returned from [`Delta::apply`], delivered to the caller

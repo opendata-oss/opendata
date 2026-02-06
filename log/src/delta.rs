@@ -46,7 +46,6 @@ pub(crate) struct LogDelta {
 }
 
 /// Frozen (immutable) snapshot of a delta, ready for flushing.
-#[derive(Clone)]
 pub(crate) struct FrozenLogDelta {
     pub records: Vec<Record>,
     pub new_segments: Vec<LogSegment>,
