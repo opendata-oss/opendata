@@ -1,4 +1,4 @@
-# RFC 0002: TimeSeries Write API
+# RFC 0002: TimeSeriesDb Write API
 
 **Status**: Draft
 
@@ -7,7 +7,7 @@
 
 ## Summary
 
-This RFC proposes a public write API for OpenData-TimeSeries, which is modeled after the `Log` API in the log data system, and `Db` in SlateDb. The `TimeSeries` struct provides a clean, high-level interface with a simple model for time series data.
+This RFC proposes a public write API for OpenData-TimeSeries, which is modeled after the `LogDb` API in the log data system, and `Db` in SlateDb. The `TimeSeriesDb` struct provides a clean, high-level interface with a simple model for time series data.
 
 ## Motivation
 
@@ -18,12 +18,12 @@ It would be useful to expose a low-level API to write time series data and enabl
 - Provide a simple, Prometheus-like data model for time series ingestion
 - Expose a single batched write API with atomic semantics
 - Abstract over internal bucketing and storage details
-- Follow patterns established by the `Log` API and SlateDb's `Db`
+- Follow patterns established by the `LogDb` API and SlateDb's `Db`
 - Support a separate OTEL mapping module (with optional Prometheus-like label validation)
 
 ## Non-Goals
 
-- **Read API** - A `TimeSeriesReader` interface will be defined in a follow-up RFC
+- **Read API** - A `TimeSeriesDbReader` interface will be defined in a follow-up RFC
 - **HTTP endpoints** - Remote Write and OTLP endpoints are out of scope
 - **PromQL** - Query language support is out of scope
 - **Strict Prometheus validation** - We intentionally allow lenient label naming
@@ -179,25 +179,25 @@ Users who need histogram semantics can either:
 - Use the OTEL module, which decomposes histograms into series following Prometheus conventions
 - Implement their own decomposition for custom histogram formats
 
-### TimeSeries API
+### TimeSeriesDb API
 
 #### Construction
 
 ```rust
 /// A time series database for storing and querying metrics.
 ///
-/// `TimeSeries` provides a high-level API for ingesting Prometheus-style
+/// `TimeSeriesDb` provides a high-level API for ingesting Prometheus-style
 /// metrics. It handles internal details like time bucketing, series
 /// deduplication, and storage management automatically.
 ///
 /// # Example
 ///
 /// ```rust
-/// use opendata_timeseries::{TimeSeries, Config, Series};
+/// use opendata_timeseries::{TimeSeriesDb, Config, Series};
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let ts = TimeSeries::open(Config::default()).await?;
+///     let ts = TimeSeriesDb::open(Config::default()).await?;
 ///
 ///     let series = Series::builder("http_requests_total")
 ///         .label("method", "GET")
@@ -209,11 +209,11 @@ Users who need histogram semantics can either:
 ///     Ok(())
 /// }
 /// ```
-pub struct TimeSeries {
+pub struct TimeSeriesDb {
     // Internal Tsdb - not exposed
 }
 
-impl TimeSeries {
+impl TimeSeriesDb {
     /// Open or create a time series database with the given configuration.
     pub async fn open(config: Config) -> Result<Self>;
 }
@@ -222,7 +222,7 @@ impl TimeSeries {
 #### Configuration
 
 ```rust
-/// Configuration for a TimeSeries instance.
+/// Configuration for a TimeSeriesDb instance.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Storage backend configuration
@@ -251,7 +251,7 @@ impl Default for Config {
 The write API consists of a single batched method with atomic semantics:
 
 ```rust
-impl TimeSeries {
+impl TimeSeriesDb {
     /// Write one or more time series.
     ///
     /// This is the primary write method. It accepts a batch of series,
@@ -262,7 +262,7 @@ impl TimeSeries {
     /// # Atomicity
     ///
     /// This operation is atomic: either all series in the batch are accepted,
-    /// or none are. This matches the behavior of `Log::append()`.
+    /// or none are. This matches the behavior of `LogDb::append()`.
     ///
     /// # Series Identification
     ///
@@ -323,25 +323,25 @@ pub struct WriteOptions {
 #### Reader Access (Placeholder)
 
 ```rust
-impl TimeSeries {
+impl TimeSeriesDb {
     /// Get a read-only view of the time series database.
     ///
     /// The reader provides query access without write capabilities.
-    /// See RFC-XXXX for the TimeSeriesReader API.
-    pub fn reader(&self) -> TimeSeriesReader;
+    /// See RFC-XXXX for the TimeSeriesDbReader API.
+    pub fn reader(&self) -> TimeSeriesDbReader;
 }
 
 /// Read-only view of a time series database.
 ///
 /// API to be defined in a future RFC.
-pub struct TimeSeriesReader {
+pub struct TimeSeriesDbReader {
     // ...
 }
 ```
 
 ### OTEL Mapping Module (Future work)
 
-A separate module handles conversion from OpenTelemetry data models to the TimeSeries data model, following the approach used by Prometheus. This module is responsible for:
+A separate module handles conversion from OpenTelemetry data models to the TimeSeriesDb data model, following the approach used by Prometheus. This module is responsible for:
 
 1. **Type decomposition** - Converting complex OTEL types (histograms, summaries) into multiple simple series
 2. **Label sanitization** - Ensuring label names conform to Prometheus conventions
@@ -406,9 +406,9 @@ pub mod otel {
 }
 ```
 
-### Comparison with Log API
+### Comparison with LogDb API
 
-| Aspect | Log | TimeSeries |
+| Aspect | LogDb | TimeSeriesDb |
 |--------|-----|------------|
 | Configuration | `Config` | `Config` |
 | Primary write method | `append(Vec<Record>)` | `write(Vec<Series>)` |
@@ -417,7 +417,7 @@ pub mod otel {
 | Identification | `key: Bytes` | `labels` (including `__name__`) |
 | Sequencing | Global sequence number | Timestamp (ms) |
 | Durability control | `WriteOptions::await_durable` | `WriteOptions::await_durable` |
-| Reader access | `fn reader() -> LogReader` | `fn reader() -> TimeSeriesReader` |
+| Reader access | `fn reader() -> LogDbReader` | `fn reader() -> TimeSeriesDbReader` |
 
 ## Alternatives
 
@@ -440,7 +440,7 @@ pub struct WriteResult {
 }
 ```
 
-**Rationale for rejection**: Atomic semantics are simpler to reason about and match existing APIs (`Log::append()`, SlateDB batch writes). Partial writes complicate error handling.
+**Rationale for rejection**: Atomic semantics are simpler to reason about and match existing APIs (`LogDb::append()`, SlateDB batch writes). Partial writes complicate error handling.
 
 **Future consideration**: A separate `write_partial()` method could be introduced if needed.
 

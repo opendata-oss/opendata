@@ -2,19 +2,23 @@
 //!
 //! This module provides:
 //! - [`LogRead`]: The trait defining read operations on the log.
-//! - [`LogReader`]: A read-only view of the log that implements `LogRead`.
+//! - [`LogDbReader`]: A read-only view of the log that implements `LogRead`.
 
 use std::ops::{Range, RangeBounds};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::RwLock;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 
-use common::StorageRead;
-use common::storage::factory::create_storage;
+use common::storage::factory::create_storage_read;
+use common::{StorageRead, StorageSemantics};
 
-use crate::config::{Config, CountOptions, ScanOptions, SegmentConfig};
+use crate::config::{CountOptions, ReaderConfig, ScanOptions, SegmentConfig};
 use crate::error::{Error, Result};
 use crate::listing::LogKeyIterator;
 use crate::model::{LogEntry, Segment, SegmentId, Sequence};
@@ -24,14 +28,14 @@ use crate::storage::{LogStorageRead, SegmentIterator};
 
 /// Trait for read operations on the log.
 ///
-/// This trait defines the common read interface shared by [`Log`](crate::Log)
-/// and [`LogReader`]. It provides methods for scanning entries and counting
+/// This trait defines the common read interface shared by [`LogDb`](crate::LogDb)
+/// and [`LogDbReader`]. It provides methods for scanning entries and counting
 /// records within a key's log.
 ///
 /// # Implementors
 ///
-/// - [`Log`](crate::Log): The main log interface with both read and write access.
-/// - [`LogReader`]: A read-only view of the log.
+/// - [`LogDb`](crate::LogDb): The main log interface with both read and write access.
+/// - [`LogDbReader`]: A read-only view of the log.
 ///
 /// # Example
 ///
@@ -40,7 +44,7 @@ use crate::storage::{LogStorageRead, SegmentIterator};
 /// use bytes::Bytes;
 ///
 /// async fn process_log(reader: &impl LogRead) -> Result<()> {
-///     // Works with both Log and LogReader
+///     // Works with both LogDb and LogDbReader
 ///     let mut iter = reader.scan(Bytes::from("orders"), ..);
 ///     while let Some(entry) = iter.next().await? {
 ///         println!("seq={}: {:?}", entry.sequence, entry.value);
@@ -209,35 +213,78 @@ pub trait LogRead {
     ) -> Result<Vec<Segment>>;
 }
 
+/// Shared read component used by both `LogDb` and `LogDbReader`.
+///
+/// Contains the storage and segment cache needed for read operations.
+/// Wrapped in `Arc<RwLock<_>>` by both consumers.
+pub(crate) struct LogReadInner {
+    pub(crate) storage: LogStorageRead,
+    pub(crate) segments: SegmentCache,
+}
+
+impl LogReadInner {
+    /// Creates a new `LogReadInner`.
+    pub(crate) fn new(storage: LogStorageRead, segments: SegmentCache) -> Self {
+        Self { storage, segments }
+    }
+
+    /// Scans entries for a key within a sequence number range with custom options.
+    pub(crate) fn scan_with_options(
+        &self,
+        key: Bytes,
+        seq_range: Range<Sequence>,
+        _options: &ScanOptions,
+    ) -> LogIterator {
+        LogIterator::open(self.storage.clone(), &self.segments, key, seq_range)
+    }
+
+    /// Lists distinct keys within a segment range.
+    pub(crate) async fn list_keys(
+        &self,
+        segment_range: Range<SegmentId>,
+    ) -> Result<LogKeyIterator> {
+        self.storage.list_keys(segment_range).await
+    }
+
+    /// Lists segments overlapping a sequence number range.
+    pub(crate) fn list_segments(&self, seq_range: &Range<Sequence>) -> Vec<Segment> {
+        self.segments
+            .find_covering(seq_range)
+            .into_iter()
+            .map(|s| s.into())
+            .collect()
+    }
+}
+
 /// A read-only view of the log.
 ///
-/// `LogReader` provides access to all read operations via the [`LogRead`]
+/// `LogDbReader` provides access to all read operations via the [`LogRead`]
 /// trait, but not write operations. This is useful for:
 ///
 /// - Consumers that should not have write access
 /// - Sharing read access across multiple components
 /// - Separating read and write concerns in your application
 ///
-/// # Obtaining a LogReader
+/// # Obtaining a LogDbReader
 ///
-/// A `LogReader` is created by calling [`LogReader::open`]:
+/// A `LogDbReader` is created by calling [`LogDbReader::open`]:
 ///
 /// ```ignore
-/// let reader = LogReader::open(config).await?;
+/// let reader = LogDbReader::open(config).await?;
 /// ```
 ///
 /// # Thread Safety
 ///
-/// `LogReader` is designed to be cloned and shared across threads.
+/// `LogDbReader` is designed to be cloned and shared across threads.
 /// All methods take `&self` and are safe to call concurrently.
 ///
 /// # Example
 ///
 /// ```ignore
-/// use log::{LogReader, LogRead};
+/// use log::{LogDbReader, LogRead};
 /// use bytes::Bytes;
 ///
-/// async fn consume_events(reader: LogReader, key: Bytes) -> Result<()> {
+/// async fn consume_events(reader: LogDbReader, key: Bytes) -> Result<()> {
 ///     let mut checkpoint: u64 = 0;
 ///
 ///     loop {
@@ -256,20 +303,24 @@ pub trait LogRead {
 ///     }
 /// }
 /// ```
-pub struct LogReader {
-    storage: LogStorageRead,
-    segments: RwLock<SegmentCache>,
+pub struct LogDbReader {
+    inner: Arc<RwLock<LogReadInner>>,
+    shutdown_tx: watch::Sender<bool>,
+    refresh_task: Option<JoinHandle<()>>,
 }
 
-impl LogReader {
+impl LogDbReader {
     /// Opens a read-only view of the log with the given configuration.
     ///
-    /// This creates a `LogReader` that can scan and count entries but cannot
+    /// This creates a `LogDbReader` that can scan and count entries but cannot
     /// append new records. Use this when you only need read access to the log.
+    ///
+    /// When `refresh_interval` is set, the reader periodically discovers new
+    /// data written by other processes.
     ///
     /// # Arguments
     ///
-    /// * `config` - Configuration specifying storage backend and settings.
+    /// * `config` - Reader configuration including storage and refresh settings.
     ///
     /// # Errors
     ///
@@ -278,55 +329,130 @@ impl LogReader {
     /// # Example
     ///
     /// ```ignore
-    /// use log::{LogReader, LogRead, Config};
+    /// use log::{LogDbReader, LogRead, ReaderConfig};
+    /// use common::StorageConfig;
     /// use bytes::Bytes;
     ///
-    /// let reader = LogReader::open(config).await?;
+    /// let config = ReaderConfig {
+    ///     storage: StorageConfig::default(),
+    ///     ..Default::default()
+    /// };
+    /// let reader = LogDbReader::open(config).await?;
+    ///
+    /// // Reader will automatically discover new data
     /// let mut iter = reader.scan(Bytes::from("orders"), ..).await?;
     /// while let Some(entry) = iter.next().await? {
     ///     println!("seq={}: {:?}", entry.sequence, entry.value);
     /// }
+    ///
+    /// // Gracefully shut down when done
+    /// reader.close().await;
     /// ```
-    pub async fn open(config: Config) -> Result<Self> {
-        let storage: Arc<dyn StorageRead> = create_storage(&config.storage, None)
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+    pub async fn open(config: ReaderConfig) -> Result<Self> {
+        let reader_options = slatedb::config::DbReaderOptions {
+            manifest_poll_interval: config.refresh_interval,
+            ..Default::default()
+        };
+        let storage: Arc<dyn StorageRead> =
+            create_storage_read(&config.storage, StorageSemantics::new(), reader_options)
+                .await
+                .map_err(|e| Error::Storage(e.to_string()))?;
         let log_storage = LogStorageRead::new(storage);
         let segments = SegmentCache::open(&log_storage, SegmentConfig::default()).await?;
+        let inner = Arc::new(RwLock::new(LogReadInner::new(log_storage, segments)));
+
+        let (shutdown_tx, refresh_task) =
+            Self::spawn_refresh_task(Arc::clone(&inner), config.refresh_interval);
+
         Ok(Self {
-            storage: log_storage,
-            segments: RwLock::new(segments),
+            inner,
+            shutdown_tx,
+            refresh_task: Some(refresh_task),
         })
     }
 
-    /// Creates a LogReader from an existing storage implementation.
+    /// Spawns a background task that periodically refreshes the segment cache.
+    fn spawn_refresh_task(
+        inner: Arc<RwLock<LogReadInner>>,
+        interval: Duration,
+    ) -> (watch::Sender<bool>, JoinHandle<()>) {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        // Get the latest segment ID for incremental refresh
+                        let after_segment_id = {
+                            let read_inner = inner.read().await;
+                            read_inner.segments.latest().map(|s| s.id())
+                        };
+
+                        // Refresh the cache
+                        let mut read_inner = inner.write().await;
+                        let storage = read_inner.storage.clone();
+                        if let Err(e) = read_inner.segments.refresh(&storage, after_segment_id).await {
+                            tracing::warn!("Failed to refresh segment cache: {}", e);
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        (shutdown_tx, task)
+    }
+
+    /// Creates a LogDbReader from an existing storage implementation.
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn StorageRead>) -> Result<Self> {
         let log_storage = LogStorageRead::new(storage);
         let segments = SegmentCache::open(&log_storage, SegmentConfig::default()).await?;
+        let inner = Arc::new(RwLock::new(LogReadInner::new(log_storage, segments)));
+        let (shutdown_tx, _) = watch::channel(false);
         Ok(Self {
-            storage: log_storage,
-            segments: RwLock::new(segments),
+            inner,
+            shutdown_tx,
+            refresh_task: None,
         })
+    }
+
+    /// Closes the reader, stopping the background refresh task.
+    ///
+    /// This method consumes `self` and gracefully shuts down the background
+    /// refresh task. It waits up to 5 seconds for the task to complete.
+    pub async fn close(self) {
+        // Signal shutdown
+        let _ = self.shutdown_tx.send(true);
+
+        // Wait for the task to complete with timeout
+        if let Some(task) = self.refresh_task {
+            let timeout = tokio::time::timeout(Duration::from_secs(5), task).await;
+            if timeout.is_err() {
+                tracing::warn!("Refresh task did not stop within timeout");
+            }
+        }
     }
 }
 
 #[async_trait]
-impl LogRead for LogReader {
+impl LogRead for LogDbReader {
     async fn scan_with_options(
         &self,
         key: Bytes,
         seq_range: impl RangeBounds<Sequence> + Send,
-        _options: ScanOptions,
+        options: ScanOptions,
     ) -> Result<LogIterator> {
         let seq_range = normalize_sequence(&seq_range);
-        let segments = self.segments.read().await;
-        Ok(LogIterator::open(
-            self.storage.clone(),
-            &segments,
-            key,
-            seq_range,
-        ))
+        let inner = self.inner.read().await;
+        Ok(inner.scan_with_options(key, seq_range, &options))
     }
 
     async fn count_with_options(
@@ -343,7 +469,8 @@ impl LogRead for LogReader {
         segment_range: impl RangeBounds<SegmentId> + Send,
     ) -> Result<LogKeyIterator> {
         let segment_range = normalize_segment_id(&segment_range);
-        self.storage.list_keys(segment_range).await
+        let inner = self.inner.read().await;
+        inner.list_keys(segment_range).await
     }
 
     async fn list_segments(
@@ -351,8 +478,8 @@ impl LogRead for LogReader {
         seq_range: impl RangeBounds<Sequence> + Send,
     ) -> Result<Vec<Segment>> {
         let seq_range = normalize_sequence(&seq_range);
-        let segments = self.segments.read().await.find_covering(&seq_range);
-        Ok(segments.into_iter().map(|s| s.into()).collect())
+        let inner = self.inner.read().await;
+        Ok(inner.list_segments(&seq_range))
     }
 }
 
@@ -649,5 +776,45 @@ mod tests {
             LogIterator::new(storage.as_read(), vec![segment], Bytes::from("key"), 10..20);
 
         assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn open_spawns_refresh_task() {
+        use common::StorageConfig;
+
+        let config = ReaderConfig {
+            storage: StorageConfig::InMemory,
+            refresh_interval: Duration::from_millis(100),
+        };
+
+        let reader = LogDbReader::open(config).await.unwrap();
+
+        // Verify background task is running
+        assert!(reader.refresh_task.is_some());
+
+        // Clean up
+        reader.close().await;
+    }
+
+    #[tokio::test]
+    async fn close_stops_refresh_task_gracefully() {
+        use common::StorageConfig;
+
+        let config = ReaderConfig {
+            storage: StorageConfig::InMemory,
+            refresh_interval: Duration::from_millis(50),
+        };
+
+        let reader = LogDbReader::open(config).await.unwrap();
+        assert!(reader.refresh_task.is_some());
+
+        // Close should complete without timeout
+        let close_result =
+            tokio::time::timeout(Duration::from_secs(1), async { reader.close().await }).await;
+
+        assert!(
+            close_result.is_ok(),
+            "close() should complete within timeout"
+        );
     }
 }

@@ -3,6 +3,7 @@
 //! This module defines [`Error`], the primary error type for all log
 //! operations, along with a convenient [`Result`] type alias.
 
+use common::coordinator::WriteError;
 use common::{SequenceError, StorageError};
 
 /// Error type for OpenData Log operations.
@@ -75,6 +76,18 @@ impl From<SequenceError> for Error {
         match err {
             SequenceError::Storage(storage_err) => Error::from(storage_err),
             SequenceError::Deserialize(de_err) => Error::Encoding(de_err.message),
+        }
+    }
+}
+
+impl From<WriteError> for Error {
+    fn from(err: WriteError) -> Self {
+        match err {
+            WriteError::Backpressure => Error::Internal("write queue full".into()),
+            WriteError::Shutdown => Error::Internal("coordinator shut down".into()),
+            WriteError::ApplyError(_, msg) => Error::Internal(msg),
+            WriteError::FlushError(msg) => Error::Storage(msg),
+            WriteError::Internal(msg) => Error::Internal(msg),
         }
     }
 }

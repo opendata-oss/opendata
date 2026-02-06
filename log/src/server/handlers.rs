@@ -17,14 +17,14 @@ use super::proto::{
 };
 use super::request::{AppendRequest, CountParams, ListKeysParams, ListSegmentsParams, ScanParams};
 use super::response::{ApiResponse, ResponseFormat, to_api_response};
-use crate::Log;
+use crate::LogDb;
 use crate::config::WriteOptions;
 use crate::reader::LogRead;
 
 /// Shared application state.
 #[derive(Clone)]
 pub struct AppState {
-    pub log: Arc<Log>,
+    pub log: Arc<LogDb>,
     pub metrics: Arc<Metrics>,
 }
 
@@ -43,6 +43,11 @@ pub async fn handle_append(
     let request = AppendRequest::from_body(&headers, &body)?;
 
     let count = request.records.len();
+    let bytes_count: usize = request
+        .records
+        .iter()
+        .map(|rec| rec.key.len() + rec.value.len())
+        .sum();
     let options = WriteOptions {
         await_durable: request.await_durable,
     };
@@ -53,8 +58,12 @@ pub async fn handle_append(
         .await?;
 
     state.metrics.log_append_records_total.inc_by(count as u64);
+    state
+        .metrics
+        .log_append_bytes_total
+        .inc_by(bytes_count as u64);
 
-    let response = AppendResponse::success(result.records_appended as i32, result.start_sequence);
+    let response = AppendResponse::success(count as i32, result.start_sequence);
     Ok(to_api_response(response, format))
 }
 
@@ -131,7 +140,28 @@ async fn scan_entries(
             break;
         }
     }
-    Ok(entries)
+
+    let values: Vec<Value> = entries
+        .iter()
+        .map(|e| Value {
+            sequence: e.sequence,
+            value: e.value.clone(),
+        })
+        .collect();
+    let bytes_scanned: usize = entries
+        .iter()
+        .map(|entry| entry.key.len() + entry.value.len())
+        .sum();
+    state
+        .metrics
+        .log_records_scanned_total
+        .inc_by(values.len() as u64);
+    state
+        .metrics
+        .log_bytes_scanned_total
+        .inc_by(bytes_scanned as u64);
+    let response = ScanResponse::success(key, values);
+    Ok(to_api_response(response, format))
 }
 
 /// Handle GET /api/v1/log/keys

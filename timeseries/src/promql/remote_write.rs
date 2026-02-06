@@ -80,7 +80,6 @@ pub fn convert_write_request(request: WriteRequest) -> Vec<Series> {
                 skipped_empty += 1;
                 return None;
             }
-
             let labels: Vec<Label> = ts
                 .labels
                 .into_iter()

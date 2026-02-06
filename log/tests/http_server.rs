@@ -6,14 +6,14 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::StorageConfig;
-use log::{Config, Log, LogRead, Record, SegmentConfig};
+use log::{Config, LogDb, LogRead, Record, SegmentConfig};
 
-async fn setup_test_log() -> Arc<Log> {
+async fn setup_test_log() -> Arc<LogDb> {
     let config = Config {
         storage: StorageConfig::InMemory,
         ..Default::default()
     };
-    Arc::new(Log::open(config).await.expect("Failed to open log"))
+    Arc::new(LogDb::open(config).await.expect("Failed to open log"))
 }
 
 #[tokio::test]
@@ -37,6 +37,7 @@ async fn test_append_and_scan_roundtrip() {
         },
     ];
     log.append(records).await.unwrap();
+    log.flush().await.unwrap();
 
     // Verify we can scan the entries back
     use log::LogRead;
@@ -75,6 +76,7 @@ async fn test_list_keys() {
         },
     ];
     log.append(records).await.unwrap();
+    log.flush().await.unwrap();
 
     // List keys (using segment range)
     use log::LogRead;
@@ -120,6 +122,7 @@ async fn test_scan_with_sequence_range() {
         },
     ];
     log.append(records).await.unwrap();
+    log.flush().await.unwrap();
 
     // Scan with range 1..4 (sequences 1, 2, 3 - exclusive upper bound)
     // This should return 3 entries out of the 5 appended
@@ -149,6 +152,7 @@ async fn test_list_segments_returns_all_segments() {
     }])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     // List all segments
     let segments = log.list_segments(..).await.unwrap();
@@ -179,6 +183,7 @@ async fn test_list_keys_empty_when_no_keys_in_segment_range() {
     }])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     // List keys in segment range 10..20 (no segments exist with these IDs)
     let mut iter = log.list_keys(10..20).await.unwrap();
@@ -207,6 +212,7 @@ async fn test_list_keys_in_specific_segment_range() {
     ])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     // List keys only in segment 0
     let mut iter = log.list_keys(0..1).await.unwrap();
@@ -245,6 +251,7 @@ async fn test_list_segments_then_list_keys_workflow() {
     ])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     // Step 1: Find segments overlapping the sequence range 0..10
     let segments = log.list_segments(0..10).await.unwrap();
@@ -267,14 +274,14 @@ async fn test_list_segments_then_list_keys_workflow() {
     assert_eq!(keys[2], "users");
 }
 
-async fn setup_test_log_with_segment_interval(interval: Duration) -> Arc<Log> {
+async fn setup_test_log_with_segment_interval(interval: Duration) -> Arc<LogDb> {
     let config = Config {
         storage: StorageConfig::InMemory,
         segmentation: SegmentConfig {
             seal_interval: Some(interval),
         },
     };
-    Arc::new(Log::open(config).await.expect("Failed to open log"))
+    Arc::new(LogDb::open(config).await.expect("Failed to open log"))
 }
 
 #[tokio::test]
@@ -289,6 +296,7 @@ async fn test_list_segments_multiple_segments() {
     }])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     // Wait to exceed seal interval
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -300,6 +308,7 @@ async fn test_list_segments_multiple_segments() {
     }])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     // List all segments
     let segments = log.list_segments(..).await.unwrap();
@@ -325,6 +334,7 @@ async fn test_list_keys_across_multiple_segments() {
     }])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     // Wait to exceed seal interval
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -336,6 +346,7 @@ async fn test_list_keys_across_multiple_segments() {
     }])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     // List keys across all segments
     let mut iter = log.list_keys(..).await.unwrap();
@@ -362,6 +373,7 @@ async fn test_list_keys_only_first_segment() {
     }])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     // Wait to exceed seal interval
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -373,6 +385,7 @@ async fn test_list_keys_only_first_segment() {
     }])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     // List keys only from segment 0
     let mut iter = log.list_keys(0..1).await.unwrap();
@@ -398,6 +411,7 @@ async fn test_list_segments_filters_by_sequence_range() {
     }])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     // Wait to exceed seal interval
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -409,6 +423,7 @@ async fn test_list_segments_filters_by_sequence_range() {
     }])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     // Get all segments to know the boundaries
     let all_segments = log.list_segments(..).await.unwrap();

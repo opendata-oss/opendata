@@ -13,17 +13,17 @@ use super::handlers::{
 };
 use super::metrics::Metrics;
 use super::middleware::{MetricsLayer, TracingLayer};
-use crate::Log;
+use crate::LogDb;
 
 /// HTTP server for the log service.
 pub struct LogServer {
-    log: Arc<Log>,
+    log: Arc<LogDb>,
     config: LogServerConfig,
 }
 
 impl LogServer {
     /// Create a new log server.
-    pub fn new(log: Arc<Log>, config: LogServerConfig) -> Self {
+    pub fn new(log: Arc<LogDb>, config: LogServerConfig) -> Self {
         Self { log, config }
     }
 

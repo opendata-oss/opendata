@@ -8,12 +8,12 @@ use roaring::RoaringTreemap;
 use crate::model::AttributeValue;
 use crate::serde::Encode;
 use crate::serde::centroid_chunk::CentroidChunkValue;
+use crate::serde::deletions::DeletionsValue;
 use crate::serde::key::{
-    CentroidChunkKey, IdDictionaryKey, PostingListKey, VectorDataKey, VectorMetaKey,
+    CentroidChunkKey, DeletionsKey, IdDictionaryKey, PostingListKey, VectorDataKey,
 };
-use crate::serde::posting_list::PostingListValue;
-use crate::serde::vector_data::VectorDataValue;
-use crate::serde::vector_meta::{MetadataField, VectorMetaValue};
+use crate::serde::posting_list::{PostingListValue, PostingUpdate};
+use crate::serde::vector_data::{Field, VectorDataValue};
 
 pub(crate) mod merge_operator;
 
@@ -41,27 +41,19 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     }
 
     /// Load a vector's data by internal ID.
+    ///
+    /// Requires dimensions to decode the vector field.
     #[allow(dead_code)]
-    async fn get_vector_data(&self, internal_id: u64) -> Result<Option<VectorDataValue>> {
+    async fn get_vector_data(
+        &self,
+        internal_id: u64,
+        dimensions: usize,
+    ) -> Result<Option<VectorDataValue>> {
         let key = VectorDataKey::new(internal_id).encode();
         let record = self.get(key).await?;
         match record {
             Some(record) => {
-                let value = VectorDataValue::decode_from_bytes(&record.value)?;
-                Ok(Some(value))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Load a vector's metadata by internal ID.
-    #[allow(dead_code)]
-    async fn get_vector_meta(&self, internal_id: u64) -> Result<Option<VectorMetaValue>> {
-        let key = VectorMetaKey::new(internal_id).encode();
-        let record = self.get(key).await?;
-        match record {
-            Some(record) => {
-                let value = VectorMetaValue::decode_from_bytes(&record.value)?;
+                let value = VectorDataValue::decode_from_bytes(&record.value, dimensions)?;
                 Ok(Some(value))
             }
             None => Ok(None),
@@ -69,30 +61,36 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     }
 
     /// Load a posting list for a centroid.
+    ///
+    /// Requires dimensions to decode the embedded vector data.
     #[allow(dead_code)]
-    async fn get_posting_list(&self, centroid_id: u32) -> Result<PostingListValue> {
+    async fn get_posting_list(
+        &self,
+        centroid_id: u32,
+        dimensions: usize,
+    ) -> Result<PostingListValue> {
         let key = PostingListKey::new(centroid_id).encode();
         let record = self.get(key).await?;
         match record {
             Some(record) => {
-                let value = PostingListValue::decode_from_bytes(&record.value)?;
+                let value = PostingListValue::decode_from_bytes(&record.value, dimensions)?;
                 Ok(value)
             }
             None => Ok(PostingListValue::new()),
         }
     }
 
-    /// Load the deleted vectors bitmap (centroid_id = 0).
+    /// Load the deleted vectors bitmap.
     #[allow(dead_code)]
-    async fn get_deleted_vectors(&self) -> Result<RoaringTreemap> {
-        let key = PostingListKey::deleted_vectors().encode();
+    async fn get_deleted_vectors(&self) -> Result<DeletionsValue> {
+        let key = DeletionsKey::new().encode();
         let record = self.get(key).await?;
         match record {
             Some(record) => {
-                let value = PostingListValue::decode_from_bytes(&record.value)?;
-                Ok(value.vector_ids)
+                let value = DeletionsValue::decode_from_bytes(&record.value)?;
+                Ok(value)
             }
-            None => Ok(RoaringTreemap::new()),
+            None => Ok(DeletionsValue::new()),
         }
     }
 
@@ -118,7 +116,6 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     ///
     /// This scans all records with the CentroidChunk prefix and collects
     /// all centroid entries from all chunks.
-    #[allow(dead_code)]
     async fn scan_all_centroids(
         &self,
         dimensions: usize,
@@ -165,28 +162,23 @@ pub(crate) trait VectorDbStorageExt: Storage {
         Ok(RecordOp::Delete(key))
     }
 
-    /// Create a RecordOp to write vector data.
-    fn put_vector_data(&self, internal_id: u64, values: Vec<f32>) -> Result<RecordOp> {
-        let key = VectorDataKey::new(internal_id).encode();
-        let value = VectorDataValue::new(values).encode_to_bytes();
-        Ok(RecordOp::Put(Record::new(key, value)))
-    }
-
-    /// Create a RecordOp to write vector metadata.
-    fn put_vector_meta(
+    /// Create a RecordOp to write vector data (including external_id, vector, and metadata).
+    ///
+    /// The `attributes` must include a "vector" field with the embedding values.
+    fn put_vector_data(
         &self,
         internal_id: u64,
         external_id: &str,
-        metadata: &[(String, AttributeValue)],
+        attributes: &[(String, AttributeValue)],
     ) -> Result<RecordOp> {
-        let key = VectorMetaKey::new(internal_id).encode();
-        let fields: Vec<MetadataField> = metadata
+        let key = VectorDataKey::new(internal_id).encode();
+        let fields: Vec<Field> = attributes
             .iter()
             .map(|(name, value)| {
-                MetadataField::new(name, crate::model::attribute_value_to_field_value(value))
+                Field::new(name, crate::model::attribute_value_to_field_value(value))
             })
             .collect();
-        let value = VectorMetaValue::new(external_id, fields).encode_to_bytes();
+        let value = VectorDataValue::new(external_id, fields).encode_to_bytes();
         Ok(RecordOp::Put(Record::new(key, value)))
     }
 
@@ -196,23 +188,21 @@ pub(crate) trait VectorDbStorageExt: Storage {
         Ok(RecordOp::Delete(key))
     }
 
-    /// Create a RecordOp to delete vector metadata.
-    fn delete_vector_meta(&self, internal_id: u64) -> Result<RecordOp> {
-        let key = VectorMetaKey::new(internal_id).encode();
-        Ok(RecordOp::Delete(key))
-    }
-
-    /// Create a RecordOp to merge vector IDs into a posting list.
-    fn merge_posting_list(&self, centroid_id: u32, vector_ids: RoaringTreemap) -> Result<RecordOp> {
+    /// Create a RecordOp to merge posting updates into a posting list.
+    fn merge_posting_list(
+        &self,
+        centroid_id: u32,
+        postings: Vec<PostingUpdate>,
+    ) -> Result<RecordOp> {
         let key = PostingListKey::new(centroid_id).encode();
-        let value = PostingListValue::from_treemap(vector_ids).encode_to_bytes()?;
+        let value = PostingListValue::from_posting_updates(postings)?.encode_to_bytes();
         Ok(RecordOp::Merge(Record::new(key, value)))
     }
 
     /// Create a RecordOp to merge vector IDs into the deleted vectors bitmap.
     fn merge_deleted_vectors(&self, vector_ids: RoaringTreemap) -> Result<RecordOp> {
-        let key = PostingListKey::deleted_vectors().encode();
-        let value = PostingListValue::from_treemap(vector_ids).encode_to_bytes()?;
+        let key = DeletionsKey::new().encode();
+        let value = DeletionsValue::from_treemap(vector_ids).encode_to_bytes()?;
         Ok(RecordOp::Merge(Record::new(key, value)))
     }
 
@@ -243,6 +233,8 @@ impl<T: ?Sized + Storage> VectorDbStorageExt for T {}
 mod tests {
     use super::*;
     use crate::model::AttributeValue;
+    use crate::serde::posting_list::PostingList;
+    use crate::storage::merge_operator::VectorDbMergeOperator;
     use common::storage::in_memory::InMemoryStorage;
     use std::sync::Arc;
 
@@ -251,22 +243,8 @@ mod tests {
         // given
         let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
         let values = vec![1.0, 2.0, 3.0];
-
-        // when - write
-        let op = storage.put_vector_data(42, values.clone()).unwrap();
-        storage.apply(vec![op]).await.unwrap();
-
-        // then - read
-        let result = storage.get_vector_data(42).await.unwrap();
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().vector, values);
-    }
-
-    #[tokio::test]
-    async fn should_read_and_write_vector_meta() {
-        // given
-        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
-        let metadata = vec![
+        let attributes = vec![
+            ("vector".to_string(), AttributeValue::Vector(values.clone())),
             (
                 "category".to_string(),
                 AttributeValue::String("shoes".to_string()),
@@ -275,15 +253,17 @@ mod tests {
         ];
 
         // when - write
-        let op = storage.put_vector_meta(42, "vec-1", &metadata).unwrap();
+        let op = storage.put_vector_data(42, "vec-1", &attributes).unwrap();
         storage.apply(vec![op]).await.unwrap();
 
         // then - read
-        let result = storage.get_vector_meta(42).await.unwrap();
+        let result = storage.get_vector_data(42, 3).await.unwrap();
         assert!(result.is_some());
-        let meta = result.unwrap();
-        assert_eq!(meta.external_id, "vec-1");
-        assert_eq!(meta.fields.len(), 2);
+        let data = result.unwrap();
+        assert_eq!(data.vector_field(), values.as_slice());
+        assert_eq!(data.external_id(), "vec-1");
+        assert_eq!(data.string_field("category"), Some("shoes"));
+        assert_eq!(data.int64_field("price"), Some(99));
     }
 
     #[tokio::test]
@@ -292,7 +272,7 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
 
         // when
-        let result = storage.get_posting_list(1).await.unwrap();
+        let result = storage.get_posting_list(1, 3).await.unwrap();
 
         // then
         assert!(result.is_empty());
@@ -323,5 +303,49 @@ mod tests {
         let key = IdDictionaryKey::new("vec-1").encode();
         let record = storage.get(key).await.unwrap();
         assert!(record.is_some());
+    }
+
+    #[tokio::test]
+    async fn should_write_and_read_posting_list() {
+        // given
+        let merge_op = Arc::new(VectorDbMergeOperator::new(3));
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::with_merge_operator(merge_op));
+        let postings = vec![
+            PostingUpdate::append(1, vec![1.0, 2.0, 3.0]),
+            PostingUpdate::append(2, vec![4.0, 5.0, 6.0]),
+        ];
+
+        // when - write
+        let op = storage.merge_posting_list(1, postings).unwrap();
+        storage.apply(vec![op]).await.unwrap();
+
+        // then - read
+        let result = storage.get_posting_list(1, 3).await.unwrap();
+        let result: PostingList = result.into();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].id(), 1);
+        assert_eq!(result[1].id(), 2);
+    }
+
+    #[tokio::test]
+    async fn should_write_and_read_deleted_vectors() {
+        // given
+        let merge_op = Arc::new(VectorDbMergeOperator::new(3));
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::with_merge_operator(merge_op));
+        let mut deleted = RoaringTreemap::new();
+        deleted.insert(1);
+        deleted.insert(2);
+        deleted.insert(3);
+
+        // when - write
+        let op = storage.merge_deleted_vectors(deleted).unwrap();
+        storage.apply(vec![op]).await.unwrap();
+
+        // then - read
+        let result = storage.get_deleted_vectors().await.unwrap();
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(1));
+        assert!(result.contains(2));
+        assert!(result.contains(3));
     }
 }

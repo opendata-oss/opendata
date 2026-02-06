@@ -6,6 +6,8 @@
 use std::time::Duration;
 
 use common::StorageConfig;
+use serde::{Deserialize, Serialize};
+use serde_with::{DurationMilliSeconds, serde_as};
 
 /// Configuration for opening a [`Log`](crate::Log).
 ///
@@ -22,9 +24,9 @@ use common::StorageConfig;
 ///     storage: StorageConfig::default(),
 ///     segmentation: SegmentConfig::default(),
 /// };
-/// let log = Log::open(config).await?;
+/// let log = LogDb::open(config).await?;
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     /// Storage backend configuration.
     ///
@@ -36,6 +38,7 @@ pub struct Config {
     ///
     /// Controls how the log is partitioned into segments for efficient
     /// time-based queries and retention management.
+    #[serde(default)]
     pub segmentation: SegmentConfig,
 }
 
@@ -43,7 +46,8 @@ pub struct Config {
 ///
 /// Segments partition the log into time-based chunks, enabling efficient
 /// range queries and retention management. See RFC 0002 for details.
-#[derive(Debug, Clone, Default)]
+#[serde_as]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SegmentConfig {
     /// Interval for automatic segment sealing based on wall-clock time.
     ///
@@ -65,13 +69,15 @@ pub struct SegmentConfig {
     ///     seal_interval: Some(Duration::from_secs(3600)),
     /// };
     /// ```
+    #[serde_as(as = "Option<DurationMilliSeconds<u64>>")]
+    #[serde(default)]
     pub seal_interval: Option<Duration>,
 }
 
 /// Options for write operations.
 ///
-/// Controls the durability and behavior of [`Log::append`](crate::Log::append)
-/// and [`Log::append_with_options`](crate::Log::append_with_options).
+/// Controls the durability and behavior of [`LogDb::append`](crate::LogDb::append)
+/// and [`LogDb::append_with_options`](crate::LogDb::append_with_options).
 #[derive(Debug, Clone, Default)]
 pub struct WriteOptions {
     /// Whether to wait for the write to be durable before returning.
@@ -112,4 +118,56 @@ pub struct CountOptions {
     /// When `false` (the default), an exact count is computed by scanning
     /// the relevant index entries.
     pub approximate: bool,
+}
+
+/// Configuration for opening a [`LogDbReader`](crate::LogDbReader).
+///
+/// This struct holds settings for read-only log access, including storage
+/// backend configuration and automatic refresh settings.
+///
+/// # Example
+///
+/// ```ignore
+/// use log::ReaderConfig;
+/// use common::StorageConfig;
+/// use std::time::Duration;
+///
+/// let config = ReaderConfig {
+///     storage: StorageConfig::default(),
+///     refresh_interval: Duration::from_secs(1),
+/// };
+/// let reader = LogDbReader::open(config).await?;
+/// ```
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReaderConfig {
+    /// Storage backend configuration.
+    ///
+    /// Determines where and how log data is read. See [`StorageConfig`]
+    /// for available options including in-memory and SlateDB backends.
+    pub storage: StorageConfig,
+
+    /// Interval for discovering new log data.
+    ///
+    /// The reader periodically checks for new data written by other processes
+    /// at this interval. This enables readers to see new log entries without
+    /// manual refresh calls.
+    ///
+    /// Defaults to 1 second.
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
+    #[serde(default = "default_refresh_interval")]
+    pub refresh_interval: Duration,
+}
+
+fn default_refresh_interval() -> Duration {
+    Duration::from_secs(1)
+}
+
+impl Default for ReaderConfig {
+    fn default() -> Self {
+        Self {
+            storage: StorageConfig::default(),
+            refresh_interval: default_refresh_interval(),
+        }
+    }
 }

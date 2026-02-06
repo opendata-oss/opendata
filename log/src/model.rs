@@ -101,17 +101,12 @@ pub struct Record {
 ///
 /// ```ignore
 /// let result = log.append(records).await?;
-/// println!(
-///     "Appended {} records starting at sequence {}",
-///     result.records_appended, result.start_sequence
-/// );
+/// println!("Appended starting at sequence {}", result.start_sequence);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendResult {
     /// Sequence number assigned to the first record in the batch.
     pub start_sequence: Sequence,
-    /// Number of records that were appended.
-    pub records_appended: usize,
 }
 
 /// An entry read from the log.

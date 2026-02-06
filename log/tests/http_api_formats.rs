@@ -18,16 +18,16 @@ use log::server::handlers::{
 };
 use log::server::metrics::Metrics;
 use log::server::proto;
-use log::{Config, Log, Record};
+use log::{Config, LogDb, Record};
 use prost::Message;
 use tower::ServiceExt;
 
-async fn setup_test_app() -> (Router, Arc<Log>) {
+async fn setup_test_app() -> (Router, Arc<LogDb>) {
     let config = Config {
         storage: StorageConfig::InMemory,
         ..Default::default()
     };
-    let log = Arc::new(Log::open(config).await.expect("Failed to open log"));
+    let log = Arc::new(LogDb::open(config).await.expect("Failed to open log"));
     let metrics = Arc::new(Metrics::new());
 
     let state = AppState {
@@ -135,6 +135,7 @@ async fn test_scan_json_response() {
     ])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     let request = Request::builder()
         .method("GET")
@@ -192,6 +193,7 @@ async fn test_list_keys_json_response() {
     ])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     let request = Request::builder()
         .method("GET")
@@ -231,6 +233,7 @@ async fn test_list_segments_json_response() {
     }])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     let request = Request::builder()
         .method("GET")
@@ -380,6 +383,7 @@ async fn test_scan_protobuf_response() {
     ])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     let request = Request::builder()
         .method("GET")
@@ -429,6 +433,7 @@ async fn test_list_keys_protobuf_response() {
     ])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     let request = Request::builder()
         .method("GET")
@@ -466,6 +471,7 @@ async fn test_list_segments_protobuf_response() {
     }])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     let request = Request::builder()
         .method("GET")
@@ -536,7 +542,7 @@ async fn test_json_append_then_scan_roundtrip() {
     let value_b64 = STANDARD.encode("roundtrip-value");
 
     let append_body = format!(
-        r#"{{"records": [{{"key": {{"value": "{}"}}, "value": "{}"}}], "awaitDurable": false}}"#,
+        r#"{{"records": [{{"key": {{"value": "{}"}}, "value": "{}"}}], "awaitDurable": true}}"#,
         key_b64, value_b64
     );
 
@@ -587,7 +593,7 @@ async fn test_protobuf_append_then_scan_roundtrip() {
             }),
             value: Bytes::from("proto-roundtrip-value"),
         }],
-        await_durable: false,
+        await_durable: true,
     };
 
     let append_request = Request::builder()
@@ -635,6 +641,7 @@ async fn test_default_response_format_is_json() {
     }])
     .await
     .unwrap();
+    log.flush().await.unwrap();
 
     let request = Request::builder()
         .method("GET")
