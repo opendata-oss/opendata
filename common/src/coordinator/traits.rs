@@ -5,11 +5,8 @@ use std::sync::Arc;
 
 /// Result of a flush operation, broadcast to subscribers.
 pub struct FlushResult<D: Delta> {
-    /// The new snapshot reflecting the flushed state
-    pub snapshot: Arc<dyn StorageRead>,
-    /// The broadcast payload from the flushed delta.
-    /// None when the flush was a durable-only flush with no pending writes.
-    pub delta: Option<Arc<D::Broadcast>>,
+    /// The flushed delta with snapshot and broadcast payload.
+    pub delta: BroadcastDelta<D>,
     /// Epoch range covered by this flush (exclusive end)
     pub epoch_range: Range<u64>,
 }
@@ -17,7 +14,6 @@ pub struct FlushResult<D: Delta> {
 impl<D: Delta> Clone for FlushResult<D> {
     fn clone(&self) -> Self {
         Self {
-            snapshot: self.snapshot.clone(),
             delta: self.delta.clone(),
             epoch_range: self.epoch_range.clone(),
         }
@@ -74,6 +70,15 @@ pub struct BroadcastDelta<D: Delta> {
     pub snapshot: Arc<dyn StorageRead>,
     /// The broadcast payload for subscribers.
     pub broadcast: D::Broadcast,
+}
+
+impl<D: Delta> Clone for BroadcastDelta<D> {
+    fn clone(&self) -> Self {
+        Self {
+            snapshot: self.snapshot.clone(),
+            broadcast: self.broadcast.clone(),
+        }
+    }
 }
 
 /// A flusher persists frozen deltas and ensures storage durability.

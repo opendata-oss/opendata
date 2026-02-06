@@ -357,8 +357,7 @@ impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
 
                         // Broadcast flush result to subscribers (ignore if no receivers)
                         let result = FlushResult {
-                            snapshot: flushed.snapshot,
-                            delta: Some(Arc::new(flushed.broadcast)),
+                            delta: flushed,
                             epoch_range,
                         };
                         let _ = self.flush_result_tx.send(result);
@@ -1770,7 +1769,7 @@ mod tests {
 
         // then - snapshot should be the Arc<dyn StorageRead> returned by the flusher
         // We can verify it exists and is usable (InMemoryStorage in tests)
-        assert!(Arc::strong_count(&result.snapshot) >= 1);
+        assert!(Arc::strong_count(&result.delta.snapshot) >= 1);
 
         // cleanup
         coordinator.stop().await;
@@ -1799,11 +1798,11 @@ mod tests {
         let result = subscriber.recv().await.unwrap();
 
         // then - delta should contain the write we made
-        let delta = result.delta.as_ref().unwrap();
-        let ctx = &delta.context;
+        let broadcast = &result.delta.broadcast;
+        let ctx = &broadcast.context;
         assert!(ctx.key_to_id.contains_key("a"));
         let id = ctx.key_to_id.get("a").unwrap();
-        let values = delta.writes.get(id).unwrap();
+        let values = broadcast.writes.get(id).unwrap();
         assert_eq!(values, &[42]);
 
         // cleanup

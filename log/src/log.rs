@@ -338,11 +338,10 @@ fn spawn_flush_subscriber(
     let mut subscriber = handle.subscribe();
     tokio::spawn(async move {
         while let Ok(result) = subscriber.recv().await {
-            if let Some(delta) = &result.delta
-                && !delta.new_segments.is_empty()
-            {
+            let broadcast = &result.delta.broadcast;
+            if !broadcast.new_segments.is_empty() {
                 let mut inner = read_inner.write().await;
-                for segment in &delta.new_segments {
+                for segment in &broadcast.new_segments {
                     inner.segments.insert(segment.clone());
                 }
             }
