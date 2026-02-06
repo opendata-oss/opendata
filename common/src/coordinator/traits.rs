@@ -3,23 +3,6 @@ use async_trait::async_trait;
 use std::ops::Range;
 use std::sync::Arc;
 
-/// Result of a flush operation, broadcast to subscribers.
-pub struct FlushResult<D: Delta> {
-    /// The flushed delta with snapshot and broadcast payload.
-    pub delta: BroadcastDelta<D>,
-    /// Epoch range covered by this flush (exclusive end)
-    pub epoch_range: Range<u64>,
-}
-
-impl<D: Delta> Clone for FlushResult<D> {
-    fn clone(&self) -> Self {
-        Self {
-            delta: self.delta.clone(),
-            epoch_range: self.epoch_range.clone(),
-        }
-    }
-}
-
 /// The level of durability for a write.
 ///
 /// Durability levels form an ordered progression: `Applied < Flushed < Durable`.
@@ -29,6 +12,14 @@ pub enum Durability {
     Applied,
     Flushed,
     Durable,
+}
+
+/// Event emitted when a flush occurs.
+pub struct FlushEvent<D: Delta> {
+    pub delta: Arc<FrozenDelta<D>>,
+    /// The range of epochs contained in this flush (exclusive end).
+    /// Start is the first epoch in the flush, end is one past the last epoch.
+    pub epoch_range: Range<u64>,
 }
 
 /// A delta accumulates writes and can produce a frozen snapshot for flushing.
@@ -58,6 +49,10 @@ pub trait Delta: Sized + Send + Sync + 'static {
     /// Metadata returned from [`apply`](Delta::apply), delivered to the caller
     /// through [`WriteHandle::wait`](super::WriteHandle::wait).
     type ApplyResult: Clone + Send + 'static;
+    /// Provides an interface for reading the current delta. The specific read API
+    /// is up to the delta implementation. It is up to the implementation to provide
+    /// the APIs required for a given database, including support for snapshot isolation
+    type Reader: Clone + Send + Sync + 'static;
 
     /// Create a new delta initialized from a snapshot context.
     /// The delta takes ownership of the context while it is mutable.
@@ -77,6 +72,13 @@ pub trait Delta: Sized + Send + Sync + 'static {
     /// copy-on-write or reference counting) since it blocks writes. After this
     /// is complete, the [`Flusher::flush`] happens on a background thread.
     fn freeze(self) -> (Self::Frozen, Self::Context);
+
+    fn reader(&self) -> Self::Reader;
+}
+
+pub struct FrozenDelta<D: Delta> {
+    pub delta: D::Frozen,
+    pub epoch_range: Range<u64>,
 }
 
 /// The result of flushing a frozen delta, broadcast to subscribers.

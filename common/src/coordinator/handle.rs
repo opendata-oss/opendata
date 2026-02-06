@@ -1,8 +1,31 @@
 use super::WriteCommand;
-use super::{Delta, Durability, FlushResult, WriteError, WriteResult};
+use super::{Delta, Durability, FlushEvent, FrozenDelta, WriteError, WriteResult};
+use crate::StorageRead;
 use futures::FutureExt;
 use futures::future::Shared;
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
+
+/// The current view of all applied writes. The view is made up a reader for
+/// the current delta, all frozen deltas awaiting flush, and the current
+/// storage snapshot. Readers use the view to query the written data.
+pub struct View<D: Delta> {
+    pub current: D::Reader,
+    pub frozen: Vec<Arc<FrozenDelta<D>>>,
+    pub snapshot: Arc<dyn StorageRead>,
+    pub last_flushed_delta: Option<Arc<FrozenDelta<D>>>,
+}
+
+impl<D: Delta> Clone for View<D> {
+    fn clone(&self) -> Self {
+        Self {
+            current: self.current.clone(),
+            frozen: self.frozen.clone(),
+            snapshot: self.snapshot.clone(),
+            last_flushed_delta: self.last_flushed_delta.clone(),
+        }
+    }
+}
 
 /// Receivers for durability watermark updates.
 ///
@@ -92,30 +115,30 @@ impl<M: Clone + Send + 'static> WriteHandle<M> {
 /// This is the main interface for interacting with the write coordinator.
 /// It can be cloned and shared across tasks.
 pub struct WriteCoordinatorHandle<D: Delta> {
-    cmd_tx: mpsc::Sender<WriteCommand<D>>,
+    write_tx: mpsc::Sender<WriteCommand<D>>,
     watchers: EpochWatcher,
-    flush_result_tx: broadcast::Sender<FlushResult<D>>,
+    view_tx: broadcast::Sender<View<D>>,
 }
 
 impl<D: Delta> WriteCoordinatorHandle<D> {
     pub(crate) fn new(
-        cmd_tx: mpsc::Sender<WriteCommand<D>>,
+        write_tx: mpsc::Sender<WriteCommand<D>>,
         watchers: EpochWatcher,
-        flush_result_tx: broadcast::Sender<FlushResult<D>>,
+        view_tx: broadcast::Sender<View<D>>,
     ) -> Self {
         Self {
-            cmd_tx,
+            write_tx,
             watchers,
-            flush_result_tx,
+            view_tx,
         }
     }
 
-    /// Subscribe to flush result notifications.
+    /// Subscribe to read state notifications.
     ///
-    /// Returns a receiver that yields flush results as they occur.
-    /// New subscribers only receive flushes that happen after subscribing.
-    pub fn subscribe(&self) -> broadcast::Receiver<FlushResult<D>> {
-        self.flush_result_tx.subscribe()
+    /// Returns a receiver that yields the current read state whenever it
+    /// changes (on delta freeze or flush completion).
+    pub fn subscribe(&self) -> broadcast::Receiver<View<D>> {
+        self.view_tx.subscribe()
     }
 }
 
@@ -126,7 +149,7 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     /// and wait for the write to reach a desired durability level.
     pub async fn write(&self, write: D::Write) -> WriteResult<WriteHandle<D::ApplyResult>> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx
+        self.write_tx
             .try_send(WriteCommand::Write {
                 write,
                 result_tx: tx,
@@ -147,7 +170,7 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     /// Returns a handle that can be used to wait for the flush to complete.
     pub async fn flush(&self, flush_storage: bool) -> WriteResult<WriteHandle> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx
+        self.write_tx
             .try_send(WriteCommand::Flush {
                 epoch_tx: tx,
                 flush_storage,
@@ -164,9 +187,9 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
 impl<D: Delta> Clone for WriteCoordinatorHandle<D> {
     fn clone(&self) -> Self {
         Self {
-            cmd_tx: self.cmd_tx.clone(),
+            write_tx: self.write_tx.clone(),
             watchers: self.watchers.clone(),
-            flush_result_tx: self.flush_result_tx.clone(),
+            view_tx: self.view_tx.clone(),
         }
     }
 }
