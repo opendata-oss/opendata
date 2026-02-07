@@ -141,13 +141,6 @@ async fn scan_entries(
         }
     }
 
-    let values: Vec<Value> = entries
-        .iter()
-        .map(|e| Value {
-            sequence: e.sequence,
-            value: e.value.clone(),
-        })
-        .collect();
     let bytes_scanned: usize = entries
         .iter()
         .map(|entry| entry.key.len() + entry.value.len())
@@ -155,13 +148,12 @@ async fn scan_entries(
     state
         .metrics
         .log_records_scanned_total
-        .inc_by(values.len() as u64);
+        .inc_by(entries.len() as u64);
     state
         .metrics
         .log_bytes_scanned_total
         .inc_by(bytes_scanned as u64);
-    let response = ScanResponse::success(key, values);
-    Ok(to_api_response(response, format))
+    Ok(entries)
 }
 
 /// Handle GET /api/v1/log/keys
@@ -286,7 +278,7 @@ mod tests {
     #[tokio::test]
     async fn should_return_ok_for_ready_when_log_accessible() {
         // given
-        let log = Arc::new(Log::open(test_config()).await.unwrap());
+        let log = Arc::new(LogDb::open(test_config()).await.unwrap());
         let metrics = Arc::new(Metrics::new());
         let state = AppState { log, metrics };
 
@@ -382,11 +374,19 @@ mod tests {
                 self.check_failure()?;
                 Err(common::StorageError::Storage("not implemented".into()))
             }
+
+            async fn flush(&self) -> common::StorageResult<()> {
+                self.check_failure()
+            }
+
+            async fn close(&self) -> common::StorageResult<()> {
+                self.check_failure()
+            }
         }
 
         // given - a log backed by configurable storage
         let storage = Arc::new(ConfigurableStorage::new());
-        let log = Arc::new(Log::new(storage.clone()).await.unwrap());
+        let log = Arc::new(LogDb::new(storage.clone()).await.unwrap());
         let metrics = Arc::new(Metrics::new());
         let state = AppState { log, metrics };
 

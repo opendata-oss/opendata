@@ -32,7 +32,6 @@ impl LogStorageRead {
     }
 
     /// Gets a single record by key.
-    #[cfg(test)]
     pub(crate) async fn get(&self, key: Bytes) -> Result<Option<common::Record>> {
         self.storage
             .get(key)

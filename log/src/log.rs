@@ -221,7 +221,8 @@ impl LogDb {
     pub async fn check_storage(&self) -> Result<()> {
         // Read the sequence block - this is a single key lookup that verifies
         // storage is accessible without scanning or listing data.
-        let _ = self.storage.as_read().get_seq_block().await?;
+        let seq_key = Bytes::from_static(&crate::serde::SEQ_BLOCK_KEY);
+        let _ = self.storage.as_read().get(seq_key).await?;
         Ok(())
     }
 
