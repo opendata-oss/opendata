@@ -4,10 +4,12 @@ mod error;
 mod handle;
 mod traits;
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::ops::{Deref, DerefMut};
 
 pub use error::{WriteError, WriteResult};
+use futures::stream::{self, SelectAll, StreamExt};
 pub use handle::{View, WriteCoordinatorHandle, WriteHandle};
 pub use traits::{Delta, Durability, Flusher};
 
@@ -67,7 +69,7 @@ pub(crate) enum WriteCommand<D: Delta> {
 /// It accepts writes through `WriteCoordinatorHandle`, applies them to a `Delta`,
 /// and coordinates flushing through a `Flusher`.
 pub struct WriteCoordinator<D: Delta, F: Flusher<D>> {
-    handle: WriteCoordinatorHandle<D>,
+    handles: HashMap<String, WriteCoordinatorHandle<D>>,
     stop_tok: CancellationToken,
     tasks: Option<(WriteCoordinatorTask<D>, FlushTask<D, F>)>,
     write_task_jh: Option<tokio::task::JoinHandle<Result<(), String>>>,
@@ -77,14 +79,22 @@ pub struct WriteCoordinator<D: Delta, F: Flusher<D>> {
 impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
     pub fn new(
         config: WriteCoordinatorConfig,
+        channels: Vec<String>,
         initial_context: D::Context,
         initial_snapshot: Arc<dyn StorageSnapshot>,
         flusher: F,
     ) -> WriteCoordinator<D, F> {
-        let (write_tx, write_rx) = mpsc::channel(config.queue_capacity);
-
         let (watermarks, watcher) = EpochWatermarks::new();
         let watermarks = Arc::new(watermarks);
+
+        // Create a write channel per named input
+        let mut write_rxs = Vec::with_capacity(channels.len());
+        let mut handles = HashMap::new();
+        for name in channels {
+            let (write_tx, write_rx) = mpsc::channel(config.queue_capacity);
+            write_rxs.push(write_rx);
+            handles.insert(name, WriteCoordinatorHandle::new(write_tx, watcher.clone()));
+        }
 
         // this is the channel that sends FlushEvents to be flushed
         // by a background task so that the process of converting deltas
@@ -99,7 +109,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
             config,
             initial_context,
             initial_snapshot,
-            write_rx,
+            write_rxs,
             flush_tx,
             watermarks.clone(),
             stop_tok.clone(),
@@ -107,8 +117,6 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         );
 
         let view = write_task.view.clone();
-
-        let handle = WriteCoordinatorHandle::new(write_tx, watcher);
 
         let flush_task = FlushTask {
             flusher,
@@ -120,7 +128,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         };
 
         Self {
-            handle,
+            handles,
             tasks: Some((write_task, flush_task)),
             write_task_jh: None,
             stop_tok,
@@ -128,8 +136,11 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         }
     }
 
-    pub fn handle(&self) -> WriteCoordinatorHandle<D> {
-        self.handle.clone()
+    pub fn handle(&self, name: &str) -> WriteCoordinatorHandle<D> {
+        self.handles
+            .get(name)
+            .expect("unknown channel name")
+            .clone()
     }
 
     pub fn start(&mut self) {
@@ -163,7 +174,7 @@ struct WriteCoordinatorTask<D: Delta> {
     config: WriteCoordinatorConfig,
     delta: CurrentDelta<D>,
     flush_tx: mpsc::Sender<FlushEvent<D>>,
-    write_rx: mpsc::Receiver<WriteCommand<D>>,
+    write_rxs: Vec<mpsc::Receiver<WriteCommand<D>>>,
     watermarks: Arc<EpochWatermarks>,
     view: Arc<BroadcastedView<D>>,
     epoch: u64,
@@ -182,7 +193,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         config: WriteCoordinatorConfig,
         initial_context: D::Context,
         initial_snapshot: Arc<dyn StorageSnapshot>,
-        write_rx: mpsc::Receiver<WriteCommand<D>>,
+        write_rxs: Vec<mpsc::Receiver<WriteCommand<D>>>,
         flush_tx: mpsc::Sender<FlushEvent<D>>,
         watermarks: Arc<EpochWatermarks>,
         stop_tok: CancellationToken,
@@ -205,7 +216,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         Self {
             config,
             delta: CurrentDelta::new(delta),
-            write_rx,
+            write_rxs,
             flush_tx,
             watermarks,
             view: initial_view,
@@ -235,9 +246,21 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         // Reset the interval to start fresh from when run() is called
         self.flush_interval.reset();
 
+        // Merge all write receivers into a single stream
+        let mut write_stream: SelectAll<_> = SelectAll::new();
+        for rx in self.write_rxs.drain(..) {
+            write_stream.push(
+                stream::unfold(
+                    rx,
+                    |mut rx| async move { rx.recv().await.map(|cmd| (cmd, rx)) },
+                )
+                .boxed(),
+            );
+        }
+
         loop {
             tokio::select! {
-                cmd = self.write_rx.recv() => {
+                cmd = write_stream.next() => {
                     match cmd {
                         Some(WriteCommand::Write { write, result_tx }) => {
                             self.handle_write(write, result_tx).await?;
@@ -251,7 +274,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
                             self.handle_flush(flush_storage).await;
                         }
                         None => {
-                            // should be unreachable since WriteCoordinator holds a handle
+                            // All write channels closed
                             break;
                         }
                     }
@@ -867,11 +890,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher,
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when
@@ -918,11 +942,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when
@@ -975,11 +1000,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher,
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when
@@ -1010,11 +1036,12 @@ mod tests {
         };
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             context,
             flusher.initial_snapshot().await,
             flusher,
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when
@@ -1048,11 +1075,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when
@@ -1080,11 +1108,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when
@@ -1112,11 +1141,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher,
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when
@@ -1153,11 +1183,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when
@@ -1207,11 +1238,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when
@@ -1254,11 +1286,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher,
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when
@@ -1296,11 +1329,12 @@ mod tests {
         };
         let mut coordinator = WriteCoordinator::new(
             config,
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when - ensure coordinator task runs and then write something
@@ -1346,11 +1380,12 @@ mod tests {
         };
         let mut coordinator = WriteCoordinator::new(
             config,
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when - write that exceeds threshold
@@ -1382,11 +1417,12 @@ mod tests {
         };
         let mut coordinator = WriteCoordinator::new(
             config,
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when - small writes that accumulate
@@ -1433,11 +1469,12 @@ mod tests {
         let (flusher, flush_started_rx, unblock_tx) = TestFlusher::with_flush_control();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when: trigger a flush and wait for it to start (proving it's in progress)
@@ -1474,11 +1511,12 @@ mod tests {
         let (flusher, flush_started_rx, unblock_tx) = TestFlusher::with_flush_control();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when: write, flush, then write more during blocked flush
@@ -1536,11 +1574,12 @@ mod tests {
         };
         let mut coordinator = WriteCoordinator::new(
             config,
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         // Don't start coordinator - queue will fill
 
         // when - fill the queue
@@ -1583,11 +1622,12 @@ mod tests {
         };
         let mut coordinator = WriteCoordinator::new(
             config,
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
 
         // Fill queue without processing
         let _ = handle
@@ -1634,11 +1674,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when
@@ -1659,11 +1700,12 @@ mod tests {
         };
         let mut coordinator = WriteCoordinator::new(
             config,
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when - write without explicit flush, then shutdown
@@ -1693,11 +1735,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // Stop coordinator
@@ -1726,11 +1769,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when
@@ -1779,11 +1823,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when - first batch
@@ -1840,11 +1885,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when - write and capture the assigned epochs
@@ -1898,11 +1944,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when - write key "a" in first batch (seq 0)
@@ -1955,11 +2002,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         let (mut subscriber, _) = coordinator.subscribe();
         coordinator.start();
 
@@ -1988,11 +2036,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         let (mut subscriber, _) = coordinator.subscribe();
         coordinator.start();
 
@@ -2025,11 +2074,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         let (mut subscriber, _) = coordinator.subscribe();
         coordinator.start();
 
@@ -2063,11 +2113,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         let (mut subscriber, _) = coordinator.subscribe();
         coordinator.start();
 
@@ -2114,11 +2165,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         let (mut subscriber, _) = coordinator.subscribe();
         coordinator.start();
 
@@ -2148,11 +2200,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         let (mut subscriber, _) = coordinator.subscribe();
         coordinator.start();
 
@@ -2192,11 +2245,12 @@ mod tests {
         let snapshot = storage.snapshot().await.unwrap();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             snapshot,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when - flush with flush_storage but no pending writes
@@ -2219,11 +2273,12 @@ mod tests {
         let snapshot = storage.snapshot().await.unwrap();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             snapshot,
             flusher.clone(),
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when - write and flush with durable
@@ -2252,11 +2307,12 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
+            vec!["default".to_string()],
             TestContext::default(),
             flusher.initial_snapshot().await,
             flusher,
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle("default");
         coordinator.start();
 
         // when
@@ -2273,6 +2329,68 @@ mod tests {
         // then
         let view = coordinator.view();
         assert_eq!(view.current.get("a"), Some(42));
+
+        // cleanup
+        coordinator.stop().await;
+    }
+
+    // ============================================================================
+    // Multi-Channel Tests
+    // ============================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_flush_writes_from_multiple_channels() {
+        // given
+        let flusher = TestFlusher::default();
+        let mut coordinator = WriteCoordinator::new(
+            test_config(),
+            vec!["ch1".to_string(), "ch2".to_string()],
+            TestContext::default(),
+            flusher.initial_snapshot().await,
+            flusher.clone(),
+        );
+        let ch1 = coordinator.handle("ch1");
+        let ch2 = coordinator.handle("ch2");
+        coordinator.start();
+
+        // when - write to both channels, waiting for each to be applied
+        // to ensure deterministic ordering
+        let mut w1 = ch1
+            .write(TestWrite {
+                key: "a".into(),
+                value: 10,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        w1.wait(Durability::Applied).await.unwrap();
+
+        let mut w2 = ch2
+            .write(TestWrite {
+                key: "b".into(),
+                value: 20,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        w2.wait(Durability::Applied).await.unwrap();
+
+        let mut w3 = ch1
+            .write(TestWrite {
+                key: "c".into(),
+                value: 30,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        w3.wait(Durability::Applied).await.unwrap();
+
+        ch1.flush(false).await.unwrap();
+        w3.wait(Durability::Flushed).await.unwrap();
+
+        // then - snapshot should contain writes from both channels
+        let snapshot = flusher.storage.snapshot().await.unwrap();
+        assert_snapshot_has_rows(&snapshot, &[("a", 0, 10), ("b", 1, 20), ("c", 2, 30)]).await;
 
         // cleanup
         coordinator.stop().await;
