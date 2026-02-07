@@ -1,0 +1,125 @@
+name: Build and Push Docker Images
+
+on:
+  push:
+    branches: [main, opendata-heracles, opendata-heracles-2]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  detect-changes:
+    name: Detect Changed Services
+    runs-on: ubuntu-latest
+    outputs:
+      log: ${{ github.ref_type == 'tag' || steps.changes.outputs.log }}
+      timeseries: ${{ github.ref_type == 'tag' || steps.changes.outputs.timeseries }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for changes
+        if: github.ref_type != 'tag'
+        uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            log:
+              - 'log/**'
+              - 'common/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            timeseries:
+              - 'timeseries/**'
+              - 'common/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+
+  build-and-push:
+    name: Build ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    strategy:
+      matrix:
+        include:
+          - service: opendata-log
+            dockerfile: log/Dockerfile
+            changed: ${{ needs.detect-changes.outputs.log }}
+          - service: opendata-timeseries
+            dockerfile: timeseries/Dockerfile
+            changed: ${{ needs.detect-changes.outputs.timeseries }}
+      fail-fast: false
+    steps:
+      - name: Skip if no changes
+        if: matrix.changed != 'true'
+        run: echo "No changes detected for ${{ matrix.service }}, skipping..."
+
+      - name: Free Disk Space
+        if: matrix.changed == 'true'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout
+        if: matrix.changed == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        if: matrix.changed == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: matrix.changed == 'true' && github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        if: matrix.changed == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}/${{ matrix.service }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short,prefix=main-,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        if: matrix.changed == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:buildcache
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}/{1}:buildcache,mode=max', env.IMAGE_PREFIX, matrix.service) || '' }}
+
+      - name: Output image URI
+        if: matrix.changed == 'true' && github.event_name != 'pull_request'
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          echo "### ${{ matrix.service }}" >> $GITHUB_STEP_SUMMARY
+          echo "Image: \`${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:main-${SHORT_SHA}\`" >> $GITHUB_STEP_SUMMARY
