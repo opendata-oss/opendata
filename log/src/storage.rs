@@ -7,14 +7,14 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use common::{Storage, StorageIterator, StorageRead};
-
 use crate::error::{Error, Result};
 use crate::listing::LogKeyIterator;
 use crate::model::{LogEntry, SegmentId};
 use crate::segment::LogSegment;
 use crate::serde::{LogEntryKey, SegmentMeta, SegmentMetaKey};
+use bytes::Bytes;
+use common::storage::StorageSnapshot;
+use common::{Storage, StorageIterator, StorageRead};
 
 /// Read-only log storage operations.
 ///
@@ -225,13 +225,13 @@ impl LogStorage {
         Ok(())
     }
 
-    pub(crate) async fn snapshot(&self) -> Result<Arc<dyn StorageRead>> {
+    pub(crate) async fn snapshot(&self) -> Result<Arc<dyn StorageSnapshot>> {
         let snapshot = self
             .storage
             .snapshot()
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(snapshot as Arc<dyn StorageRead>)
+        Ok(snapshot)
     }
 
     pub async fn flush(&self) -> Result<()> {

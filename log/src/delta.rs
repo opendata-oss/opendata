@@ -4,18 +4,18 @@
 //! the write coordinator, providing the log-specific write batching
 //! and flush logic.
 
-use std::ops::Range;
-
-use async_trait::async_trait;
-use bytes::Bytes;
-use common::coordinator::{BroadcastDelta, Delta, Flusher};
-use common::{Record, WriteOptions};
-
 use crate::listing::ListingCache;
 use crate::model::{AppendResult, Record as UserRecord};
 use crate::segment::{LogSegment, SegmentCache};
 use crate::serde::{LogEntryBuilder, SegmentMeta, SegmentMetaKey};
 use crate::storage::LogStorage;
+use async_trait::async_trait;
+use bytes::Bytes;
+use common::coordinator::{Delta, Flusher};
+use common::storage::StorageSnapshot;
+use common::{Record, WriteOptions};
+use std::ops::Range;
+use std::sync::Arc;
 
 /// The write type for the log coordinator.
 ///
@@ -48,12 +48,11 @@ pub(crate) struct LogDelta {
 /// Frozen (immutable) snapshot of a delta, ready for flushing.
 pub(crate) struct FrozenLogDelta {
     pub records: Vec<Record>,
-    pub new_segments: Vec<LogSegment>,
 }
 
 /// Broadcast payload sent to subscribers after a flush.
 #[derive(Clone)]
-pub(crate) struct LogBroadcast {
+pub(crate) struct FrozenLogDeltaView {
     pub new_segments: Vec<LogSegment>,
 }
 
@@ -71,8 +70,10 @@ impl LogFlusher {
 impl Delta for LogDelta {
     type Context = LogContext;
     type Write = LogWrite;
+    // Read of latest writes not yet supported
+    type DeltaView = ();
     type Frozen = FrozenLogDelta;
-    type Broadcast = LogBroadcast;
+    type FrozenView = FrozenLogDeltaView;
     type ApplyResult = AppendResult;
 
     fn init(context: Self::Context) -> Self {
@@ -163,13 +164,17 @@ impl Delta for LogDelta {
             .sum()
     }
 
-    fn freeze(self) -> (Self::Frozen, Self::Context) {
-        let frozen = FrozenLogDelta {
-            records: self.records,
+    fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
+        let frozen_read = FrozenLogDeltaView {
             new_segments: self.new_segments,
         };
-        (frozen, self.context)
+        let frozen = FrozenLogDelta {
+            records: self.records,
+        };
+        (frozen, frozen_read, self.context)
     }
+
+    fn reader(&self) -> Self::DeltaView {}
 }
 
 #[async_trait]
@@ -178,7 +183,7 @@ impl Flusher<LogDelta> for LogFlusher {
         &self,
         frozen: FrozenLogDelta,
         _epoch_range: &Range<u64>,
-    ) -> Result<BroadcastDelta<LogDelta>, String> {
+    ) -> Result<Arc<dyn StorageSnapshot>, String> {
         let options = WriteOptions {
             await_durable: false,
         };
@@ -188,12 +193,7 @@ impl Flusher<LogDelta> for LogFlusher {
             .map_err(|e| e.to_string())?;
 
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
-        Ok(BroadcastDelta {
-            snapshot,
-            broadcast: LogBroadcast {
-                new_segments: frozen.new_segments,
-            },
-        })
+        Ok(snapshot)
     }
 
     async fn flush_storage(&self) -> Result<(), String> {
@@ -288,9 +288,9 @@ mod tests {
         delta.apply(make_write(&["key1"], 1000)).unwrap();
 
         // then
-        let (frozen, _ctx) = delta.freeze();
-        assert_eq!(frozen.new_segments.len(), 1);
-        assert_eq!(frozen.new_segments[0].id(), 0);
+        let (_frozen, frozen_read, _ctx) = delta.freeze();
+        assert_eq!(frozen_read.new_segments.len(), 1);
+        assert_eq!(frozen_read.new_segments[0].id(), 0);
     }
 
     #[tokio::test]
@@ -301,7 +301,7 @@ mod tests {
         delta.apply(make_write(&["key1", "key2"], 1000)).unwrap();
 
         // when
-        let (frozen, returned_ctx) = delta.freeze();
+        let (frozen, _, returned_ctx) = delta.freeze();
 
         // then - frozen has records
         assert!(!frozen.records.is_empty());
@@ -350,14 +350,13 @@ mod tests {
         };
         let mut delta = LogDelta::init(ctx);
         delta.apply(make_write(&["mykey"], 1000)).unwrap();
-        let (frozen, _ctx) = delta.freeze();
+        let (frozen, _, _ctx) = delta.freeze();
 
         // when
-        let flushed = flusher.flush_delta(frozen, &(1..2)).await.unwrap();
+        let snapshot = flusher.flush_delta(frozen, &(1..2)).await.unwrap();
 
         // then - records are readable from snapshot
-        let result = flushed
-            .snapshot
+        let result = snapshot
             .get(Bytes::from_static(&SEQ_BLOCK_KEY))
             .await
             .unwrap();
