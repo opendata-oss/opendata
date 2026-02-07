@@ -599,6 +599,18 @@ mod tests {
         error: Option<String>,
     }
 
+    /// A shared reader that sees writes as they are applied to the delta.
+    #[derive(Clone, Debug, Default)]
+    struct TestDeltaReader {
+        data: Arc<Mutex<HashMap<String, Vec<u64>>>>,
+    }
+
+    impl TestDeltaReader {
+        fn get(&self, key: &str) -> Option<Vec<u64>> {
+            self.data.lock().unwrap().get(key).cloned()
+        }
+    }
+
     /// Delta accumulates writes and can allocate new IDs for unknown keys.
     /// Stores the context directly and updates it in place.
     #[derive(Clone, Debug, Default)]
@@ -606,12 +618,13 @@ mod tests {
         context: TestContext,
         writes: HashMap<u64, Vec<u64>>,
         total_size: usize,
+        reader: TestDeltaReader,
     }
 
     impl Delta for TestDelta {
         type Context = TestContext;
         type Write = TestWrite;
-        type DeltaView = ();
+        type DeltaView = TestDeltaReader;
         type Frozen = TestDelta;
         type FrozenView = TestDelta;
         type ApplyResult = ();
@@ -621,6 +634,7 @@ mod tests {
                 context,
                 writes: HashMap::default(),
                 total_size: 0,
+                reader: TestDeltaReader::default(),
             }
         }
 
@@ -629,6 +643,7 @@ mod tests {
                 return Err(error.clone());
             }
 
+            let key = write.key.clone();
             let id = *self.context.key_to_id.entry(write.key).or_insert_with(|| {
                 let id = self.context.next_id;
                 self.context.next_id += 1;
@@ -637,6 +652,13 @@ mod tests {
 
             self.writes.entry(id).or_default().push(write.value);
             self.total_size += write.size;
+            self.reader
+                .data
+                .lock()
+                .unwrap()
+                .entry(key)
+                .or_default()
+                .push(write.value);
             Ok(())
         }
 
@@ -650,11 +672,14 @@ mod tests {
                 context: context.clone(),
                 writes: self.writes,
                 total_size: self.total_size,
+                reader: TestDeltaReader::default(),
             };
             (frozen.clone(), frozen, context)
         }
 
-        fn reader(&self) -> Self::DeltaView {}
+        fn reader(&self) -> Self::DeltaView {
+            self.reader.clone()
+        }
     }
 
     /// Shared state for TestFlusher - allows test to inspect and control behavior
@@ -2272,6 +2297,38 @@ mod tests {
         flush_handle.wait(Durability::Durable).await.unwrap();
         write.wait(Durability::Durable).await.unwrap();
         assert_eq!(flusher.flushed_events().len(), 1);
+
+        // cleanup
+        coordinator.stop().await;
+    }
+
+    #[tokio::test]
+    async fn should_see_applied_write_via_view() {
+        // given
+        let flusher = TestFlusher::default();
+        let mut coordinator = WriteCoordinator::new(
+            test_config(),
+            TestContext::default(),
+            test_snapshot().await,
+            flusher,
+        );
+        let handle = coordinator.handle();
+        coordinator.start();
+
+        // when
+        let mut write = handle
+            .write(TestWrite {
+                key: "a".into(),
+                value: 42,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        write.wait(Durability::Applied).await.unwrap();
+
+        // then
+        let view = coordinator.view();
+        assert_eq!(view.current.get("a"), Some(vec![42]));
 
         // cleanup
         coordinator.stop().await;
