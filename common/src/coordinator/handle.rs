@@ -1,6 +1,8 @@
 use super::WriteCommand;
-use super::{Delta, Durability, FlushEvent, FrozenDelta, WriteError, WriteResult};
+use super::{Delta, Durability, WriteError, WriteResult};
 use crate::StorageRead;
+use crate::coordinator::traits::EpochStamped;
+use crate::storage::StorageSnapshot;
 use futures::FutureExt;
 use futures::future::Shared;
 use std::sync::Arc;
@@ -10,10 +12,10 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 /// the current delta, all frozen deltas awaiting flush, and the current
 /// storage snapshot. Readers use the view to query the written data.
 pub struct View<D: Delta> {
-    pub current: D::Reader,
-    pub frozen: Vec<Arc<FrozenDelta<D>>>,
-    pub snapshot: Arc<dyn StorageRead>,
-    pub last_flushed_delta: Option<Arc<FrozenDelta<D>>>,
+    pub current: D::DeltaView,
+    pub frozen: Vec<EpochStamped<D::FrozenView>>,
+    pub snapshot: Arc<dyn StorageSnapshot>,
+    pub last_flushed_delta: Option<EpochStamped<D::FrozenView>>,
 }
 
 impl<D: Delta> Clone for View<D> {
@@ -117,28 +119,11 @@ impl<M: Clone + Send + 'static> WriteHandle<M> {
 pub struct WriteCoordinatorHandle<D: Delta> {
     write_tx: mpsc::Sender<WriteCommand<D>>,
     watchers: EpochWatcher,
-    view_tx: broadcast::Sender<View<D>>,
 }
 
 impl<D: Delta> WriteCoordinatorHandle<D> {
-    pub(crate) fn new(
-        write_tx: mpsc::Sender<WriteCommand<D>>,
-        watchers: EpochWatcher,
-        view_tx: broadcast::Sender<View<D>>,
-    ) -> Self {
-        Self {
-            write_tx,
-            watchers,
-            view_tx,
-        }
-    }
-
-    /// Subscribe to read state notifications.
-    ///
-    /// Returns a receiver that yields the current read state whenever it
-    /// changes (on delta freeze or flush completion).
-    pub fn subscribe(&self) -> broadcast::Receiver<View<D>> {
-        self.view_tx.subscribe()
+    pub(crate) fn new(write_tx: mpsc::Sender<WriteCommand<D>>, watchers: EpochWatcher) -> Self {
+        Self { write_tx, watchers }
     }
 }
 
@@ -189,7 +174,6 @@ impl<D: Delta> Clone for WriteCoordinatorHandle<D> {
         Self {
             write_tx: self.write_tx.clone(),
             watchers: self.watchers.clone(),
-            view_tx: self.view_tx.clone(),
         }
     }
 }

@@ -4,33 +4,31 @@ mod error;
 mod handle;
 mod traits;
 
-pub use error::{WriteError, WriteResult};
-pub use handle::{View, WriteCoordinatorHandle, WriteHandle};
+use std::ops::Range;
 use std::ops::{Deref, DerefMut};
 
-use std::ops::Range;
+pub use error::{WriteError, WriteResult};
+pub use handle::{View, WriteCoordinatorHandle, WriteHandle};
+pub use traits::{Delta, Durability, Flusher};
 
 /// Event sent from the write coordinator task to the flush task.
 enum FlushEvent<D: Delta> {
     /// Flush a frozen delta to storage.
-    FlushDelta {
-        frozen: D::Frozen,
-        epoch_range: Range<u64>,
-    },
+    FlushDelta { frozen: EpochStamped<D::Frozen> },
     /// Ensure storage durability (e.g. call storage.flush()).
     FlushStorage,
 }
-pub use traits::{BroadcastDelta, Delta, Durability, FlushEvent, Flusher, FrozenDelta};
 
 // Internal use only
+use crate::StorageRead;
+use crate::coordinator::traits::EpochStamped;
+use crate::storage::StorageSnapshot;
 pub(crate) use handle::EpochWatcher;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{Instant, Interval, interval_at};
 use tokio_util::sync::CancellationToken;
-
-use crate::StorageRead;
 
 /// Configuration for the write coordinator.
 #[derive(Debug, Clone)]
@@ -64,12 +62,6 @@ pub(crate) enum WriteCommand<D: Delta> {
     },
 }
 
-/// Internal message from FlushTask back to the coordinator after a flush completes.
-struct FlushComplete<D: Delta> {
-    delta: Arc<FrozenDelta<D>>,
-    snapshot: Arc<dyn StorageRead>,
-}
-
 /// The write coordinator manages write ordering, batching, and durability.
 ///
 /// It accepts writes through `WriteCoordinatorHandle`, applies them to a `Delta`,
@@ -79,19 +71,20 @@ pub struct WriteCoordinator<D: Delta, F: Flusher<D>> {
     stop_tok: CancellationToken,
     tasks: Option<(WriteCoordinatorTask<D>, FlushTask<D, F>)>,
     write_task_jh: Option<tokio::task::JoinHandle<Result<(), String>>>,
-    view: Arc<std::sync::Mutex<View<D>>>,
+    view: Arc<BroadcastedView<D>>,
 }
 
 impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
     pub fn new(
         config: WriteCoordinatorConfig,
         initial_context: D::Context,
-        initial_snapshot: Arc<dyn StorageRead>,
+        initial_snapshot: Arc<dyn StorageSnapshot>,
         flusher: F,
     ) -> WriteCoordinator<D, F> {
         let (write_tx, write_rx) = mpsc::channel(config.queue_capacity);
 
         let (watermarks, watcher) = EpochWatermarks::new();
+        let watermarks = Arc::new(watermarks);
 
         // this is the channel that sends FlushEvents to be flushed
         // by a background task so that the process of converting deltas
@@ -100,21 +93,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         // one flush is pending
         let (flush_tx, flush_rx) = mpsc::channel(2);
 
-        // Channel for flush task to send completion results back to coordinator
-        let (flush_complete_tx, flush_complete_rx) = mpsc::unbounded_channel();
-
-        // Broadcast channel for read state updates (buffer size 16 should be plenty)
-        let (view_tx, _) = broadcast::channel(16);
-
         let flush_stop_tok = CancellationToken::new();
-        let flush_task = FlushTask {
-            flusher,
-            stop_tok: flush_stop_tok.clone(),
-            flush_rx,
-            flush_complete_tx,
-            durable_tx: durable_tx.clone(),
-        };
-
         let stop_tok = CancellationToken::new();
         let write_task = WriteCoordinatorTask::new(
             config,
@@ -122,15 +101,24 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
             initial_snapshot,
             write_rx,
             flush_tx,
-            flush_complete_rx,
-            watermarks,
-            view_tx.clone(),
+            watermarks.clone(),
             stop_tok.clone(),
-            flush_stop_tok,
+            flush_stop_tok.clone(),
         );
-        let handle = WriteCoordinatorHandle::new(write_tx, watcher, view_tx);
 
         let view = write_task.view.clone();
+
+        let handle = WriteCoordinatorHandle::new(write_tx, watcher);
+
+        let flush_task = FlushTask {
+            flusher,
+            stop_tok: flush_stop_tok,
+            flush_rx,
+            watermarks: watermarks.clone(),
+            view: view.clone(),
+            last_flushed_epoch: 0,
+        };
+
         Self {
             handle,
             tasks: Some((write_task, flush_task)),
@@ -162,8 +150,12 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         write_task_jh.await.map_err(|e| e.to_string())?
     }
 
-    pub fn view(&self) -> View<D> {
-        View::clone(&self.view.lock().expect("Lock poisoned"))
+    pub fn view(&self) -> Arc<View<D>> {
+        self.view.current()
+    }
+
+    pub fn subscribe(&self) -> (broadcast::Receiver<Arc<View<D>>>, Arc<View<D>>) {
+        self.view.subscribe()
     }
 }
 
@@ -171,11 +163,9 @@ struct WriteCoordinatorTask<D: Delta> {
     config: WriteCoordinatorConfig,
     delta: CurrentDelta<D>,
     flush_tx: mpsc::Sender<FlushEvent<D>>,
-    flush_complete_rx: mpsc::UnboundedReceiver<FlushComplete<D>>,
     write_rx: mpsc::Receiver<WriteCommand<D>>,
-    watermarks: EpochWatermarks,
-    view_tx: broadcast::Sender<View<D>>,
-    view: Arc<std::sync::Mutex<View<D>>>,
+    watermarks: Arc<EpochWatermarks>,
+    view: Arc<BroadcastedView<D>>,
     epoch: u64,
     delta_start_epoch: u64,
     flush_interval: Interval,
@@ -191,23 +181,22 @@ impl<D: Delta> WriteCoordinatorTask<D> {
     pub fn new(
         config: WriteCoordinatorConfig,
         initial_context: D::Context,
-        initial_snapshot: Arc<dyn StorageRead>,
+        initial_snapshot: Arc<dyn StorageSnapshot>,
         write_rx: mpsc::Receiver<WriteCommand<D>>,
         flush_tx: mpsc::Sender<FlushEvent<D>>,
-        flush_complete_rx: mpsc::UnboundedReceiver<FlushComplete<D>>,
-        watermarks: EpochWatermarks,
-        view_tx: broadcast::Sender<View<D>>,
+        watermarks: Arc<EpochWatermarks>,
         stop_tok: CancellationToken,
         flush_stop_tok: CancellationToken,
     ) -> Self {
         let delta = D::init(initial_context);
 
-        let view = Arc::new(std::sync::Mutex::new(View {
+        let initial_view = View {
             current: delta.reader(),
             frozen: vec![],
             snapshot: initial_snapshot,
             last_flushed_delta: None,
-        }));
+        };
+        let initial_view = Arc::new(BroadcastedView::new(initial_view));
 
         let flush_interval = interval_at(
             Instant::now() + config.flush_interval,
@@ -218,10 +207,8 @@ impl<D: Delta> WriteCoordinatorTask<D> {
             delta: CurrentDelta::new(delta),
             write_rx,
             flush_tx,
-            flush_complete_rx,
             watermarks,
-            view_tx,
-            view,
+            view: initial_view,
             // Epochs start at 1 because watch channels initialize to 0 (meaning "nothing
             // processed yet"). If the first write had epoch 0, wait() would return
             // immediately since the condition `watermark < epoch` would be `0 < 0` = false.
@@ -274,25 +261,10 @@ impl<D: Delta> WriteCoordinatorTask<D> {
                     self.handle_flush(false).await;
                 }
 
-                flush_complete = self.flush_complete_rx.recv() => {
-                    match flush_complete {
-                        Some(flush_complete) => self.handle_flush_complete(flush_complete),
-                        None => break,
-                    }
-                }
-
                 _ = self.stop_tok.cancelled() => {
                     break;
                 }
             }
-        }
-
-        // Drain any pending flush completions before the final flush.
-        // This prevents a deadlock: if a flush completed while we were
-        // breaking from the loop, the flush_complete channel might be full,
-        // blocking the flush task from receiving new events.
-        while let Ok(complete) = self.flush_complete_rx.try_recv() {
-            self.handle_flush_complete(complete);
         }
 
         // Flush any remaining pending writes before shutdown
@@ -301,17 +273,10 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         // Signal the flush task to stop
         self.flush_stop_tok.cancel();
         // Wait for the flush task to complete and propagate any errors
-        let result = flush_task_jh
+        flush_task_jh
             .await
             .map_err(|e| format!("flush task panicked: {}", e))?
-            .map_err(|e| format!("flush task error: {}", e));
-
-        // Drain remaining flush completions until the flush task is done
-        while let Some(complete) = self.flush_complete_rx.recv().await {
-            self.handle_flush_complete(complete);
-        }
-
-        result
+            .map_err(|e| format!("flush task error: {}", e))
     }
 
     async fn handle_write(
@@ -347,73 +312,36 @@ impl<D: Delta> WriteCoordinatorTask<D> {
     }
 
     async fn handle_flush(&mut self, flush_storage: bool) {
-        let has_writes = self.epoch != self.delta_start_epoch;
-        if !has_writes && !flush_storage {
-            return;
-        }
-
-        self.flush_interval.reset();
-
-        if has_writes {
-        let epoch_range = self.delta_start_epoch..self.epoch;
-        self.delta_start_epoch = self.epoch;
-        let frozen = self.delta.freeze_and_init();
-        let frozen_delta = Arc::new(FrozenDelta {
-            delta: frozen,
-            epoch_range: epoch_range.clone(),
-        });
-        let reader = self.delta.reader();
-        let view = {
-            let mut view = self.view.lock().expect("lock poisoned");
-            // Update read state: add frozen delta to front, update current reader
-            let mut new_frozen = vec![frozen_delta.clone()];
-            new_frozen.extend(view.frozen.iter().cloned());
-            *view = View {
-                current: reader,
-                frozen: new_frozen,
-                snapshot: view.snapshot.clone(),
-                last_flushed_delta: view.last_flushed_delta.clone(),
-            };
-            view.clone()
-        };
-        let _ = self.view_tx.send(view);
-
-        // this is the blocking section of the flush, new writes will not be accepted
-        // until the event is sent to the FlushTask
-        let _ = self
-            .flush_tx
-            .send(FlushEvent {
-                delta: frozen_delta,
-                epoch_range,
-            })
-            .await;
-        }
-
+        self.flush_if_delta_has_writes().await;
         if flush_storage {
             let _ = self.flush_tx.send(FlushEvent::FlushStorage).await;
         }
     }
 
-    fn handle_flush_complete(&mut self, complete: FlushComplete<D>) {
-        let flushed_epoch = complete.delta.epoch_range.end - 1;
+    async fn flush_if_delta_has_writes(&mut self) {
+        if self.epoch == self.delta_start_epoch {
+            return;
+        }
+
+        self.flush_interval.reset();
+
+        let epoch_range = self.delta_start_epoch..self.epoch;
+        self.delta_start_epoch = self.epoch;
+        let (frozen, frozen_reader) = self.delta.freeze_and_init();
+        let stamped_frozen = EpochStamped::new(frozen, epoch_range.clone());
+        let stamped_frozen_reader = EpochStamped::new(frozen_reader, epoch_range.clone());
         let reader = self.delta.reader();
-        let view = {
-            let mut view = self.view.lock().expect("lock poisoned");
-            let mut new_frozen = view.frozen.clone();
-            let last = new_frozen
-                .pop()
-                .expect("frozen should not be empty when flush completes");
-            assert_eq!(last.epoch_range, complete.delta.epoch_range);
-            *view = View {
-                current: reader,
-                frozen: new_frozen,
-                snapshot: complete.snapshot,
-                last_flushed_delta: Some(complete.delta),
-            };
-            view.clone()
-        };
-        self.watermarks.update_flushed(flushed_epoch);
-        let _ = self.view_tx.send(view);
+        // update the view before sending the flush msg to ensure the flusher sees
+        // the frozen reader when updating the view post-flush
+        self.view.update_delta_frozen(stamped_frozen_reader, reader);
+        // this is the blocking section of the flush, new writes will not be accepted
+        // until the event is sent to the FlushTask
+        let _ = self
+            .flush_tx
+            .send(FlushEvent::FlushDelta {
+                frozen: stamped_frozen,
+            })
+            .await;
     }
 }
 
@@ -421,7 +349,9 @@ struct FlushTask<D: Delta, F: Flusher<D>> {
     flusher: F,
     stop_tok: CancellationToken,
     flush_rx: mpsc::Receiver<FlushEvent<D>>,
-    flush_complete_tx: mpsc::UnboundedSender<FlushComplete<D>>,
+    watermarks: Arc<EpochWatermarks>,
+    view: Arc<BroadcastedView<D>>,
+    last_flushed_epoch: u64,
 }
 
 impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
@@ -429,25 +359,11 @@ impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    event = self.flush_rx.recv() => { 
-                match event {
-                    FlushEvent::FlushDelta {
-                        frozen,
-                        epoch_range,
-                    } => {
-                        elf.handle_flush(event).await?
-                    }
-                    FlushEvent::FlushStorage => {
-                        self.flusher
-                            .flush_storage()
-                            .await
-                            .map_err(|e| WriteError::FlushError(e.to_string()))?;
-
-                        self.durable_tx
-                            .send(self.last_flushed_epoch)
-                            .map_err(|_| WriteError::Shutdown)?;
-                    }
-                }
+                    event = self.flush_rx.recv() => {
+                        let Some(event) = event else {
+                            break;
+                        };
+                        self.handle_event(event).await?;
                     }
                     _ = self.stop_tok.cancelled() => {
                         break;
@@ -456,23 +372,37 @@ impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
             }
             // drain all remaining flush events
             while let Ok(event) = self.flush_rx.try_recv() {
-                self.handle_flush(event).await;
+                self.handle_event(event).await;
             }
             Ok(())
         })
     }
 
-    async fn handle_flush(&self, event: FlushEvent<D>) -> WriteResult<()> {
+    async fn handle_event(&mut self, event: FlushEvent<D>) -> WriteResult<()> {
+        match event {
+            FlushEvent::FlushDelta { frozen } => self.handle_flush(frozen).await,
+            FlushEvent::FlushStorage => {
+                self.flusher
+                    .flush_storage()
+                    .await
+                    .map_err(|e| WriteError::FlushError(e.to_string()))?;
+                self.watermarks.update_durable(self.last_flushed_epoch);
+                Ok(())
+            }
+        }
+    }
+
+    async fn handle_flush(&mut self, frozen: EpochStamped<D::Frozen>) -> WriteResult<()> {
+        let delta = frozen.val;
+        let epoch_range = frozen.epoch_range;
         let snapshot = self
             .flusher
-            .flush(&event)
+            .flush_delta(delta, &epoch_range)
             .await
             .map_err(|e| WriteError::FlushError(e.to_string()))?;
-        // Send flush completion back to the coordinator
-        let _ = self.flush_complete_tx.send(FlushComplete {
-            delta: event.delta.clone(),
-            snapshot,
-        });
+        self.last_flushed_epoch = epoch_range.end - 1;
+        self.watermarks.update_flushed(self.last_flushed_epoch);
+        self.view.update_flush_finished(snapshot, epoch_range);
         Ok(())
     }
 }
@@ -506,14 +436,14 @@ impl<D: Delta> CurrentDelta<D> {
         Self { delta: Some(delta) }
     }
 
-    fn freeze_and_init(&mut self) -> D::Frozen {
+    fn freeze_and_init(&mut self) -> (D::Frozen, D::FrozenView) {
         let Some(delta) = self.delta.take() else {
             panic!("delta not initialized");
         };
-        let (imm_delta, context) = delta.freeze();
+        let (frozen, frozen_reader, context) = delta.freeze();
         let new_delta = D::init(context);
         self.delta = Some(new_delta);
-        imm_delta
+        (frozen, frozen_reader)
     }
 }
 
@@ -554,17 +484,102 @@ impl EpochWatermarks {
     }
 }
 
+struct BroadcastedView<D: Delta> {
+    inner: Mutex<BroadcastedViewInner<D>>,
+}
+
+impl<D: Delta> BroadcastedView<D> {
+    fn new(initial_view: View<D>) -> Self {
+        let (view_tx, _) = broadcast::channel(16);
+        Self {
+            inner: Mutex::new(BroadcastedViewInner {
+                view: Arc::new(initial_view),
+                view_tx,
+            }),
+        }
+    }
+
+    fn update_flush_finished(&self, snapshot: Arc<dyn StorageSnapshot>, epoch_range: Range<u64>) {
+        self.inner
+            .lock()
+            .expect("lock poisoned")
+            .update_flush_finished(snapshot, epoch_range);
+    }
+
+    fn update_delta_frozen(&self, frozen: EpochStamped<D::FrozenView>, reader: D::DeltaView) {
+        self.inner
+            .lock()
+            .expect("lock poisoned")
+            .update_delta_frozen(frozen, reader);
+    }
+
+    fn current(&self) -> Arc<View<D>> {
+        self.inner.lock().expect("lock poisoned").current()
+    }
+
+    fn subscribe(&self) -> (broadcast::Receiver<Arc<View<D>>>, Arc<View<D>>) {
+        self.inner.lock().expect("lock poisoned").subscribe()
+    }
+}
+
+struct BroadcastedViewInner<D: Delta> {
+    view: Arc<View<D>>,
+    view_tx: tokio::sync::broadcast::Sender<Arc<View<D>>>,
+}
+
+impl<D: Delta> BroadcastedViewInner<D> {
+    fn update_flush_finished(
+        &mut self,
+        snapshot: Arc<dyn StorageSnapshot>,
+        epoch_range: Range<u64>,
+    ) {
+        let mut new_frozen = self.view.frozen.clone();
+        let last = new_frozen
+            .pop()
+            .expect("frozen should not be empty when flush completes");
+        assert_eq!(last.epoch_range, epoch_range);
+        self.view = Arc::new(View {
+            current: self.view.current.clone(),
+            frozen: new_frozen,
+            snapshot,
+            last_flushed_delta: Some(last),
+        });
+        self.view_tx.send(self.view.clone());
+    }
+
+    fn update_delta_frozen(&mut self, frozen: EpochStamped<D::FrozenView>, reader: D::DeltaView) {
+        // Update read state: add frozen delta to front, update current reader
+        let mut new_frozen = vec![frozen];
+        new_frozen.extend(self.view.frozen.iter().cloned());
+        self.view = Arc::new(View {
+            current: reader,
+            frozen: new_frozen,
+            snapshot: self.view.snapshot.clone(),
+            last_flushed_delta: self.view.last_flushed_delta.clone(),
+        });
+        self.view_tx.send(self.view.clone());
+    }
+
+    fn current(&self) -> Arc<View<D>> {
+        self.view.clone()
+    }
+
+    fn subscribe(&self) -> (broadcast::Receiver<Arc<View<D>>>, Arc<View<D>>) {
+        (self.view_tx.subscribe(), self.view.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::StorageRead;
     use crate::coordinator::Durability;
-    use crate::storage::in_memory::InMemoryStorage;
+    use crate::storage::StorageSnapshot;
+    use crate::storage::in_memory::{InMemoryStorage, InMemoryStorageSnapshot};
+    use crate::{Storage, StorageRead};
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::ops::Range;
     use std::sync::Mutex;
-
     // ============================================================================
     // Test Infrastructure
     // ============================================================================
@@ -596,9 +611,9 @@ mod tests {
     impl Delta for TestDelta {
         type Context = TestContext;
         type Write = TestWrite;
-        type Reader = ();
+        type DeltaView = ();
         type Frozen = TestDelta;
-        type Broadcast = TestDelta;
+        type FrozenView = TestDelta;
         type ApplyResult = ();
 
         fn init(context: Self::Context) -> Self {
@@ -629,23 +644,23 @@ mod tests {
             self.total_size
         }
 
-        fn freeze(self) -> (Self::Frozen, Self::Context) {
+        fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
             let context = self.context;
             let frozen = TestDelta {
                 context: context.clone(),
                 writes: self.writes,
                 total_size: self.total_size,
             };
-            (frozen, context)
+            (frozen.clone(), frozen, context)
         }
 
-        fn reader(&self) -> Self::Reader {}
+        fn reader(&self) -> Self::DeltaView {}
     }
 
     /// Shared state for TestFlusher - allows test to inspect and control behavior
     #[derive(Default)]
     struct TestFlusherState {
-        flushed_events: Vec<(Arc<FrozenDelta<TestDelta>>, Range<u64>)>,
+        flushed_events: Vec<(Arc<EpochStamped<TestDelta>>)>,
         /// Signals when a flush starts (before blocking)
         flush_started_tx: Option<oneshot::Sender<()>>,
         /// Blocks flush until signaled
@@ -673,7 +688,7 @@ mod tests {
             (flusher, started_rx, unblock_tx)
         }
 
-        fn flushed_events(&self) -> Vec<(Arc<FrozenDelta<TestDelta>>, Range<u64>)> {
+        fn flushed_events(&self) -> Vec<(Arc<EpochStamped<TestDelta>>)> {
             self.state.lock().unwrap().flushed_events.clone()
         }
     }
@@ -684,7 +699,7 @@ mod tests {
             &self,
             frozen: TestDelta,
             epoch_range: &Range<u64>,
-        ) -> Result<BroadcastDelta<TestDelta>, String> {
+        ) -> Result<Arc<dyn StorageSnapshot>, String> {
             // Signal that flush has started
             let flush_started_tx = {
                 let mut state = self.state.lock().unwrap();
@@ -708,13 +723,10 @@ mod tests {
                 let mut state = self.state.lock().unwrap();
                 state
                     .flushed_events
-                    .push((frozen.clone(), epoch_range.clone()));
+                    .push(Arc::new(EpochStamped::new(frozen, epoch_range.clone())));
             }
 
-            Ok(BroadcastDelta {
-                snapshot: Arc::new(InMemoryStorage::default()),
-                broadcast: frozen,
-            })
+            Ok(InMemoryStorage::default().snapshot().await.unwrap())
         }
 
         async fn flush_storage(&self) -> Result<(), String> {
@@ -748,8 +760,8 @@ mod tests {
         }
     }
 
-    fn test_snapshot() -> Arc<dyn StorageRead> {
-        Arc::new(InMemoryStorage::default())
+    async fn test_snapshot() -> Arc<dyn StorageSnapshot> {
+        InMemoryStorage::default().snapshot().await.unwrap()
     }
 
     // ============================================================================
@@ -763,7 +775,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher,
         );
         let handle = coordinator.handle();
@@ -814,7 +826,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -853,8 +865,8 @@ mod tests {
         // then
         let events = flusher.flushed_events();
         assert_eq!(events.len(), 1);
-        let (frozen_delta, _) = &events[0];
-        let delta = &frozen_delta.delta;
+        let frozen_delta = &events[0];
+        let delta = &frozen_delta.val;
         // All writes to key "a" should be under the same ID in order
         let ctx = &delta.context;
         let id = ctx.key_to_id.get("a").unwrap();
@@ -872,7 +884,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher,
         );
         let handle = coordinator.handle();
@@ -905,7 +917,7 @@ mod tests {
             ..Default::default()
         };
         let mut coordinator =
-            WriteCoordinator::new(test_config(), context, test_snapshot(), flusher);
+            WriteCoordinator::new(test_config(), context, test_snapshot().await, flusher);
         let handle = coordinator.handle();
         coordinator.start();
 
@@ -941,7 +953,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -973,7 +985,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1005,7 +1017,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher,
         );
         let handle = coordinator.handle();
@@ -1046,7 +1058,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1084,8 +1096,8 @@ mod tests {
         // then
         let events = flusher.flushed_events();
         assert_eq!(events.len(), 1);
-        let (frozen_delta, _) = &events[0];
-        assert_eq!(frozen_delta.delta.context.key_to_id.len(), 3);
+        let frozen_delta = &events[0];
+        assert_eq!(frozen_delta.val.context.key_to_id.len(), 3);
 
         // cleanup
         coordinator.stop().await;
@@ -1098,7 +1110,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1145,7 +1157,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher,
         );
         let handle = coordinator.handle();
@@ -1187,7 +1199,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             config,
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1235,7 +1247,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             config,
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1271,7 +1283,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             config,
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1322,7 +1334,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1363,7 +1375,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1425,7 +1437,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             config,
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1472,7 +1484,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             config,
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1523,7 +1535,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1548,7 +1560,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             config,
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1571,7 +1583,7 @@ mod tests {
         // then - pending writes should have been flushed
         let events = flusher.flushed_events();
         assert_eq!(events.len(), 1);
-        let (_, epoch_range) = &events[0];
+        let epoch_range = &events[0].epoch_range;
         assert!(epoch_range.contains(&epoch));
     }
 
@@ -1582,7 +1594,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1615,7 +1627,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1653,7 +1665,7 @@ mod tests {
         // then
         let events = flusher.flushed_events();
         assert_eq!(events.len(), 1);
-        let (_, epoch_range) = &events[0];
+        let epoch_range = &events[0].epoch_range;
         assert_eq!(epoch_range.start, 1);
         assert_eq!(epoch_range.end, 4); // exclusive: one past the last epoch (3)
 
@@ -1668,7 +1680,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1710,8 +1722,8 @@ mod tests {
         let events = flusher.flushed_events();
         assert_eq!(events.len(), 2);
 
-        let (_, range1) = &events[0];
-        let (_, range2) = &events[1];
+        let range1 = &events[0].epoch_range;
+        let range2 = &events[1].epoch_range;
 
         // Ranges should be contiguous (end of first == start of second)
         assert_eq!(range1.end, range2.start);
@@ -1729,7 +1741,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1762,7 +1774,7 @@ mod tests {
         // then - the epoch_range should contain exactly the epochs assigned to writes
         let events = flusher.flushed_events();
         assert_eq!(events.len(), 1);
-        let (_, epoch_range) = &events[0];
+        let epoch_range = &events[0].epoch_range;
 
         // The range should start at the first write's epoch
         assert_eq!(epoch_range.start, epoch1);
@@ -1787,7 +1799,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1821,12 +1833,12 @@ mod tests {
         let events = flusher.flushed_events();
         assert_eq!(events.len(), 2);
 
-        let (frozen_delta1, _) = &events[0];
-        let (frozen_delta2, _) = &events[1];
+        let frozen_delta1 = &events[0].val;
+        let frozen_delta2 = &events[1].val;
 
         // Same key should get the same ID across flushes
-        let id1 = frozen_delta1.delta.context.key_to_id.get("a").unwrap();
-        let id2 = frozen_delta2.delta.context.key_to_id.get("a").unwrap();
+        let id1 = frozen_delta1.context.key_to_id.get("a").unwrap();
+        let id2 = frozen_delta2.context.key_to_id.get("a").unwrap();
         assert_eq!(id1, id2);
 
         // cleanup
@@ -1840,7 +1852,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1880,16 +1892,16 @@ mod tests {
 
         // then
         let events = flusher.flushed_events();
-        let (frozen_delta1, _) = &events[0];
-        let (frozen_delta2, _) = &events[1];
+        let frozen_delta1 = &events[0].val;
+        let frozen_delta2 = &events[1].val;
 
         // First batch: a=0, b=1
-        let ctx1 = &frozen_delta1.delta.context;
+        let ctx1 = &frozen_delta1.context;
         let id_a = ctx1.key_to_id.get("a").unwrap();
         let id_b = ctx1.key_to_id.get("b").unwrap();
 
         // Second batch: c should get ID 2 (continuing sequence)
-        let ctx2 = &frozen_delta2.delta.context;
+        let ctx2 = &frozen_delta2.context;
         let id_c = ctx2.key_to_id.get("c").unwrap();
 
         // IDs should be unique and sequential
@@ -1908,7 +1920,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1948,8 +1960,8 @@ mod tests {
 
         // then - second delta should contain mappings for a, b, c
         let events = flusher.flushed_events();
-        let (frozen_delta2, _) = &events[1];
-        let ctx2 = &frozen_delta2.delta.context;
+        let frozen_delta2 = &events[1].val;
+        let ctx2 = &frozen_delta2.context;
 
         // Delta should have inherited a and b from context, plus new c
         assert!(ctx2.key_to_id.contains_key("a"));
@@ -1971,11 +1983,11 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
-        let mut subscriber = handle.subscribe();
+        let (mut subscriber, _) = coordinator.subscribe();
         coordinator.start();
 
         // when
@@ -2004,11 +2016,11 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
-        let mut subscriber = handle.subscribe();
+        let (mut subscriber, _) = coordinator.subscribe();
         coordinator.start();
 
         // when
@@ -2020,7 +2032,7 @@ mod tests {
             })
             .await
             .unwrap();
-        handle.flush().await.unwrap();
+        handle.flush(false).await.unwrap();
 
         // First broadcast: freeze (frozen delta added)
         let _ = subscriber.recv().await.unwrap();
@@ -2041,11 +2053,11 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
-        let mut subscriber = handle.subscribe();
+        let (mut subscriber, _) = coordinator.subscribe();
         coordinator.start();
 
         // when
@@ -2057,7 +2069,7 @@ mod tests {
             })
             .await
             .unwrap();
-        handle.flush().await.unwrap();
+        handle.flush(false).await.unwrap();
 
         // First broadcast: freeze
         let _ = subscriber.recv().await.unwrap();
@@ -2066,10 +2078,10 @@ mod tests {
 
         // then - last_flushed_delta should contain the write we made
         let flushed = result.last_flushed_delta.as_ref().unwrap();
-        let ctx = &flushed.delta.context;
+        let ctx = &flushed.val.context;
         assert!(ctx.key_to_id.contains_key("a"));
         let id = ctx.key_to_id.get("a").unwrap();
-        let values = flushed.delta.writes.get(id).unwrap();
+        let values = flushed.val.writes.get(id).unwrap();
         assert_eq!(values, &[42]);
 
         // cleanup
@@ -2083,11 +2095,11 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
-        let mut subscriber = handle.subscribe();
+        let (mut subscriber, _) = coordinator.subscribe();
         coordinator.start();
 
         // when
@@ -2107,7 +2119,7 @@ mod tests {
             })
             .await
             .unwrap();
-        handle.flush().await.unwrap();
+        handle.flush(false).await.unwrap();
 
         // First broadcast: freeze
         let _ = subscriber.recv().await.unwrap();
@@ -2134,11 +2146,11 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
-        let mut subscriber = handle.subscribe();
+        let (mut subscriber, _) = coordinator.subscribe();
         coordinator.start();
 
         // when
@@ -2150,12 +2162,12 @@ mod tests {
             })
             .await
             .unwrap();
-        handle.flush().await.unwrap();
+        handle.flush(false).await.unwrap();
 
         // then - first broadcast should have the frozen delta in the frozen vec
         let state = subscriber.recv().await.unwrap();
         assert_eq!(state.frozen.len(), 1);
-        assert!(state.frozen[0].delta.context.key_to_id.contains_key("a"));
+        assert!(state.frozen[0].val.context.key_to_id.contains_key("a"));
 
         // cleanup
         coordinator.stop().await;
@@ -2168,11 +2180,11 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot(),
+            test_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
-        let mut subscriber = handle.subscribe();
+        let (mut subscriber, _) = coordinator.subscribe();
         coordinator.start();
 
         // when
@@ -2184,7 +2196,7 @@ mod tests {
             })
             .await
             .unwrap();
-        handle.flush().await.unwrap();
+        handle.flush(false).await.unwrap();
 
         // First broadcast: freeze (frozen has 1 entry)
         let state1 = subscriber.recv().await.unwrap();
@@ -2207,8 +2219,14 @@ mod tests {
     async fn should_flush_even_when_no_writes_if_flush_storage() {
         // given
         let flusher = TestFlusher::default();
-        let mut coordinator =
-            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
+        let storage = Arc::new(InMemoryStorage::new());
+        let snapshot = storage.snapshot().await.unwrap();
+        let mut coordinator = WriteCoordinator::new(
+            test_config(),
+            TestContext::default(),
+            snapshot,
+            flusher.clone(),
+        );
         let handle = coordinator.handle();
         coordinator.start();
 
@@ -2228,8 +2246,14 @@ mod tests {
     async fn should_advance_durable_watermark() {
         // given
         let flusher = TestFlusher::default();
-        let mut coordinator =
-            WriteCoordinator::new(test_config(), TestContext::default(), flusher.clone());
+        let storage = Arc::new(InMemoryStorage::new());
+        let snapshot = storage.snapshot().await.unwrap();
+        let mut coordinator = WriteCoordinator::new(
+            test_config(),
+            TestContext::default(),
+            snapshot,
+            flusher.clone(),
+        );
         let handle = coordinator.handle();
         coordinator.start();
 

@@ -279,8 +279,12 @@ impl LogDb {
         };
 
         let flusher = LogFlusher::new(log_storage.clone());
-        let mut coordinator =
-            WriteCoordinator::new(WriteCoordinatorConfig::default(), context, flusher);
+        let mut coordinator = WriteCoordinator::new(
+            WriteCoordinatorConfig::default(),
+            context,
+            log_storage.snapshot().await?,
+            flusher,
+        );
         let handle = coordinator.handle();
 
         let read_inner = Arc::new(RwLock::new(LogReadInner::new(
@@ -288,7 +292,7 @@ impl LogDb {
             segment_cache,
         )));
 
-        let flush_subscriber_task = spawn_flush_subscriber(&handle, Arc::clone(&read_inner));
+        let flush_subscriber_task = spawn_flush_subscriber(&coordinator, Arc::clone(&read_inner));
         coordinator.start();
 
         Ok(Self {
@@ -423,8 +427,13 @@ impl LogDbBuilder {
         };
 
         let flusher = LogFlusher::new(log_storage.clone());
-        let mut coordinator =
-            WriteCoordinator::new(WriteCoordinatorConfig::default(), context, flusher);
+        let snapshot = log_storage.snapshot().await?;
+        let mut coordinator = WriteCoordinator::new(
+            WriteCoordinatorConfig::default(),
+            context,
+            snapshot,
+            flusher,
+        );
         let handle = coordinator.handle();
 
         let read_inner = Arc::new(RwLock::new(LogReadInner::new(
@@ -432,7 +441,7 @@ impl LogDbBuilder {
             segment_cache,
         )));
 
-        let flush_subscriber_task = spawn_flush_subscriber(&handle, Arc::clone(&read_inner));
+        let flush_subscriber_task = spawn_flush_subscriber(&coordinator, Arc::clone(&read_inner));
         coordinator.start();
 
         Ok(LogDb {
@@ -447,16 +456,18 @@ impl LogDbBuilder {
 }
 
 fn spawn_flush_subscriber(
-    handle: &WriteCoordinatorHandle<LogDelta>,
+    handle: &WriteCoordinator<LogDelta, LogFlusher>,
     read_inner: Arc<RwLock<crate::reader::LogReadInner>>,
 ) -> JoinHandle<()> {
-    let mut subscriber = handle.subscribe();
+    let (mut subscriber, _) = handle.subscribe();
     tokio::spawn(async move {
         while let Ok(result) = subscriber.recv().await {
-            let broadcast = &result.delta.broadcast;
-            if !broadcast.new_segments.is_empty() {
+            let Some(broadcast) = &result.last_flushed_delta else {
+                continue;
+            };
+            if !broadcast.val.new_segments.is_empty() {
                 let mut inner = read_inner.write().await;
-                for segment in &broadcast.new_segments {
+                for segment in &broadcast.val.new_segments {
                     inner.segments.insert(segment.clone());
                 }
             }
