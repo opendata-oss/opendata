@@ -118,7 +118,9 @@ impl PromqlServer {
             .route("/api/v1/series", get(handle_series).post(handle_series))
             .route("/api/v1/labels", get(handle_labels))
             .route("/api/v1/label/{name}/values", get(handle_label_values))
-            .route("/metrics", get(handle_metrics));
+            .route("/metrics", get(handle_metrics))
+            .route("/-/healthy", get(handle_healthy))
+            .route("/-/ready", get(handle_ready));
 
         #[cfg(feature = "remote-write")]
         let app = app.route(
@@ -291,4 +293,15 @@ async fn handle_label_values(
 /// Handle /metrics endpoint - returns Prometheus text format
 async fn handle_metrics(State(state): State<AppState>) -> String {
     state.metrics.encode()
+}
+
+/// Handle /-/healthy endpoint - returns 200 OK if service is running
+async fn handle_healthy() -> (StatusCode, &'static str) {
+    (StatusCode::OK, "OK")
+}
+
+/// Handle /-/ready endpoint - returns 200 OK if service is ready to serve requests
+async fn handle_ready(State(_state): State<AppState>) -> (StatusCode, &'static str) {
+    // Service is ready if it's running (TSDB is initialized in AppState)
+    (StatusCode::OK, "OK")
 }
