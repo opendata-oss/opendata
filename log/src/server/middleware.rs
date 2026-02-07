@@ -10,7 +10,7 @@ use axum::body::Body;
 use axum::http::{Request, Response};
 use tower::{Layer, Service};
 
-use super::metrics::{HttpLabelsWithStatus, HttpMethod, Metrics};
+use super::metrics::{HttpLabels, HttpLabelsWithStatus, HttpMethod, Metrics};
 
 /// Layer that wraps services with metrics collection.
 #[derive(Clone)]
@@ -61,21 +61,32 @@ where
         let endpoint = normalize_endpoint(request.uri().path());
         let metrics = self.metrics.clone();
 
+        metrics.http_requests_in_flight.inc();
+        let start = Instant::now();
         let future = self.inner.call(request);
 
         Box::pin(async move {
             let response = future.await?;
             let status = response.status().as_u16();
+            let duration = start.elapsed().as_secs_f64();
 
             // Record request count
             metrics
                 .http_requests_total
                 .get_or_create(&HttpLabelsWithStatus {
-                    method,
-                    endpoint,
+                    method: method.clone(),
+                    endpoint: endpoint.clone(),
                     status,
                 })
                 .inc();
+
+            // Record request latency
+            metrics
+                .http_request_duration_seconds
+                .get_or_create(&HttpLabels { method, endpoint })
+                .observe(duration);
+
+            metrics.http_requests_in_flight.dec();
 
             Ok(response)
         })

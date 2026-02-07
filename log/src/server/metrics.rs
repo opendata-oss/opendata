@@ -4,6 +4,8 @@ use axum::http::Method;
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
 use prometheus_client::registry::Registry;
 
 /// Labels for HTTP request metrics.
@@ -42,6 +44,13 @@ impl From<&Method> for HttpMethod {
     }
 }
 
+/// Labels for HTTP request latency histogram (without status, since status is unknown at start).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct HttpLabels {
+    pub method: HttpMethod,
+    pub endpoint: String,
+}
+
 /// Container for all Prometheus metrics.
 pub struct Metrics {
     registry: Registry,
@@ -60,6 +69,12 @@ pub struct Metrics {
 
     /// Counter of HTTP requests.
     pub http_requests_total: Family<HttpLabelsWithStatus, Counter>,
+
+    /// Histogram of HTTP request latency in seconds.
+    pub http_request_duration_seconds: Family<HttpLabels, Histogram>,
+
+    /// Gauge of currently in-flight requests.
+    pub http_requests_in_flight: Gauge,
 }
 
 impl Default for Metrics {
@@ -113,6 +128,24 @@ impl Metrics {
             http_requests_total.clone(),
         );
 
+        // HTTP request duration histogram (buckets from 1ms to ~8s)
+        let http_request_duration_seconds = Family::<HttpLabels, Histogram>::new_with_constructor(
+            || Histogram::new(exponential_buckets(0.001, 2.0, 14)),
+        );
+        registry.register(
+            "http_request_duration_seconds",
+            "HTTP request latency in seconds",
+            http_request_duration_seconds.clone(),
+        );
+
+        // In-flight requests gauge
+        let http_requests_in_flight = Gauge::default();
+        registry.register(
+            "http_requests_in_flight",
+            "Number of HTTP requests currently being processed",
+            http_requests_in_flight.clone(),
+        );
+
         Self {
             registry,
             log_append_records_total,
@@ -120,6 +153,8 @@ impl Metrics {
             log_records_scanned_total,
             log_bytes_scanned_total,
             http_requests_total,
+            http_request_duration_seconds,
+            http_requests_in_flight,
         }
     }
 
@@ -148,6 +183,8 @@ mod tests {
         assert!(encoded.contains("# HELP log_records_scanned_total"));
         assert!(encoded.contains("# HELP log_bytes_scanned_total"));
         assert!(encoded.contains("# HELP http_requests_total"));
+        assert!(encoded.contains("# HELP http_request_duration_seconds"));
+        assert!(encoded.contains("# HELP http_requests_in_flight"));
     }
 
     #[test]

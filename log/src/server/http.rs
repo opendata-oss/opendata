@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::routing::{get, post};
+use tokio::signal;
 
 use super::config::LogServerConfig;
 use super::handlers::{
@@ -56,6 +57,36 @@ impl LogServer {
         tracing::info!("Starting Log HTTP server on {}", addr);
 
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .unwrap();
+
+        tracing::info!("Server shut down gracefully");
+    }
+}
+
+/// Listen for SIGTERM (K8s pod termination) and SIGINT (Ctrl+C).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("Received SIGINT, starting graceful shutdown"),
+        _ = terminate => tracing::info!("Received SIGTERM, starting graceful shutdown"),
     }
 }

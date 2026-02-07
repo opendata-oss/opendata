@@ -10,6 +10,7 @@ use axum::routing::get;
 use axum::routing::post;
 use axum::{Form, extract::Request};
 use axum::{Json, Router};
+use tokio::signal;
 use tokio::time::interval;
 
 use super::config::PrometheusConfig;
@@ -137,7 +138,19 @@ impl PromqlServer {
         tracing::info!("Starting Prometheus-compatible server on {}", addr);
 
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .unwrap();
+
+        // Flush TSDB on shutdown to persist any buffered data
+        let flush_interval_secs = self.config.prometheus_config.flush_interval_secs;
+        tracing::info!("Flushing TSDB before shutdown...");
+        if let Err(e) = self.tsdb.flush(flush_interval_secs).await {
+            tracing::error!("Failed to flush TSDB on shutdown: {}", e);
+        }
+
+        tracing::info!("Server shut down gracefully");
     }
 }
 
@@ -304,4 +317,29 @@ async fn handle_healthy() -> (StatusCode, &'static str) {
 async fn handle_ready(State(_state): State<AppState>) -> (StatusCode, &'static str) {
     // Service is ready if it's running (TSDB is initialized in AppState)
     (StatusCode::OK, "OK")
+}
+
+/// Listen for SIGTERM (K8s pod termination) and SIGINT (Ctrl+C).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("Received SIGINT, starting graceful shutdown"),
+        _ = terminate => tracing::info!("Received SIGTERM, starting graceful shutdown"),
+    }
 }
