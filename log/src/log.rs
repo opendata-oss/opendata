@@ -29,6 +29,8 @@ use crate::reader::{LogIterator, LogRead};
 use crate::segment::SegmentCache;
 use crate::storage::LogStorage;
 
+const WRITE_CHANNEL: &str = "write";
+
 /// The main log interface providing read and write operations.
 ///
 /// `LogDb` is the primary entry point for interacting with OpenData Log.
@@ -281,11 +283,12 @@ impl LogDb {
         let flusher = LogFlusher::new(log_storage.clone());
         let mut coordinator = WriteCoordinator::new(
             WriteCoordinatorConfig::default(),
+            vec![WRITE_CHANNEL.to_string()],
             context,
             log_storage.snapshot().await?,
             flusher,
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle(WRITE_CHANNEL);
 
         let read_inner = Arc::new(RwLock::new(LogReadInner::new(
             log_storage_read,
@@ -430,11 +433,12 @@ impl LogDbBuilder {
         let snapshot = log_storage.snapshot().await?;
         let mut coordinator = WriteCoordinator::new(
             WriteCoordinatorConfig::default(),
+            vec![WRITE_CHANNEL.to_string()],
             context,
             snapshot,
             flusher,
         );
-        let handle = coordinator.handle();
+        let handle = coordinator.handle(WRITE_CHANNEL);
 
         let read_inner = Arc::new(RwLock::new(LogReadInner::new(
             log_storage_read,

@@ -34,6 +34,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub(crate) const WRITE_CHANNEL: &str = "write";
+
 /// Vector database for storing and querying embedding vectors.
 ///
 /// `VectorDb` provides a high-level API for ingesting vectors with metadata.
@@ -132,8 +134,13 @@ impl VectorDb {
             flush_interval: Duration::from_secs(5),
             flush_size_threshold: 64 * 1024 * 1024,
         };
-        let mut write_coordinator =
-            WriteCoordinator::new(coordinator_config, ctx, snapshot.clone(), flusher);
+        let mut write_coordinator = WriteCoordinator::new(
+            coordinator_config,
+            vec![WRITE_CHANNEL.to_string()],
+            ctx,
+            snapshot.clone(),
+            flusher,
+        );
         write_coordinator.start();
 
         Ok(Self {
@@ -268,7 +275,11 @@ impl VectorDb {
         }
 
         // Send all writes to coordinator in a single batch and wait to be applied
-        let mut write_handle = self.write_coordinator.handle().write(writes).await?;
+        let mut write_handle = self
+            .write_coordinator
+            .handle(WRITE_CHANNEL)
+            .write(writes)
+            .await?;
         write_handle
             .wait(Durability::Applied)
             .await
@@ -401,7 +412,11 @@ impl VectorDb {
     /// This ensures ID dictionary updates, deletes, and new records are all
     /// applied together, maintaining consistency.
     pub async fn flush(&self) -> Result<()> {
-        let mut handle = self.write_coordinator.handle().flush(false).await?;
+        let mut handle = self
+            .write_coordinator
+            .handle(WRITE_CHANNEL)
+            .flush(false)
+            .await?;
         handle.wait(Durability::Flushed).await?;
         Ok(())
     }
