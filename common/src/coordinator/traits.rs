@@ -1,24 +1,8 @@
 use crate::StorageRead;
+use crate::storage::StorageSnapshot;
 use async_trait::async_trait;
 use std::ops::Range;
 use std::sync::Arc;
-
-/// Result of a flush operation, broadcast to subscribers.
-pub struct FlushResult<D: Delta> {
-    /// The flushed delta with snapshot and broadcast payload.
-    pub delta: BroadcastDelta<D>,
-    /// Epoch range covered by this flush (exclusive end)
-    pub epoch_range: Range<u64>,
-}
-
-impl<D: Delta> Clone for FlushResult<D> {
-    fn clone(&self) -> Self {
-        Self {
-            delta: self.delta.clone(),
-            epoch_range: self.epoch_range.clone(),
-        }
-    }
-}
 
 /// The level of durability for a write.
 ///
@@ -52,12 +36,21 @@ pub trait Delta: Sized + Send + Sync + 'static {
     /// Immutable snapshot produced by [`freeze`](Delta::freeze), consumed by
     /// the [`Flusher`] to persist the batch to storage.
     type Frozen: Send + Sync + 'static;
-    /// Minimal representation of flushed state, broadcast to subscribers
-    /// so they can update their read image.
-    type Broadcast: Clone + Send + Sync + 'static;
+    /// Provides an interface for reading the frozen delta. Though Frozen is immutable, we
+    /// support specifying a distinct read type to allow implementers to provide a different
+    /// representation or view of flushed state. For example, readers that only allow reading
+    /// the data flushed to storage can materialize a minimal view of metadata to allow the reader
+    /// to cheaply update the read image when a new view is broadcast after a flush, while at the
+    /// same type allowing Frozen to be owned by the coordinator so the contained data doesn't
+    /// need to be copied during flush.
+    type FrozenView: Clone + Send + Sync + 'static;
     /// Metadata returned from [`apply`](Delta::apply), delivered to the caller
     /// through [`WriteHandle::wait`](super::WriteHandle::wait).
     type ApplyResult: Clone + Send + 'static;
+    /// Provides an interface for reading the current delta. The specific read API
+    /// is up to the delta implementation. It is up to the implementation to provide
+    /// the APIs required for a given database, including support for snapshot isolation
+    type DeltaView: Clone + Send + Sync + 'static;
 
     /// Create a new delta initialized from a snapshot context.
     /// The delta takes ownership of the context while it is mutable.
@@ -76,23 +69,23 @@ pub trait Delta: Sized + Send + Sync + 'static {
     /// Implementations should ensure this operation is efficient (e.g., via
     /// copy-on-write or reference counting) since it blocks writes. After this
     /// is complete, the [`Flusher::flush`] happens on a background thread.
-    fn freeze(self) -> (Self::Frozen, Self::Context);
+    fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context);
+
+    fn reader(&self) -> Self::DeltaView;
 }
 
-/// The result of flushing a frozen delta, broadcast to subscribers.
-pub struct BroadcastDelta<D: Delta> {
-    /// The new snapshot reflecting the flushed state.
-    pub snapshot: Arc<dyn StorageRead>,
-    /// The broadcast payload for subscribers.
-    pub broadcast: D::Broadcast,
+/// A value representing data written with some range of epochs
+#[derive(Clone)]
+pub struct EpochStamped<T> {
+    pub val: T,
+    /// The range of epochs contained in this value (exclusive end).
+    /// Start is the first epoch in the flush, end is one past the last epoch.
+    pub epoch_range: Range<u64>,
 }
 
-impl<D: Delta> Clone for BroadcastDelta<D> {
-    fn clone(&self) -> Self {
-        Self {
-            snapshot: self.snapshot.clone(),
-            broadcast: self.broadcast.clone(),
-        }
+impl<T> EpochStamped<T> {
+    pub(crate) fn new(val: T, epoch_range: Range<u64>) -> Self {
+        Self { val, epoch_range }
     }
 }
 
@@ -107,7 +100,7 @@ pub trait Flusher<D: Delta>: Send + Sync + 'static {
         &self,
         frozen: D::Frozen,
         epoch_range: &Range<u64>,
-    ) -> Result<BroadcastDelta<D>, String>;
+    ) -> Result<Arc<dyn StorageSnapshot>, String>;
 
     /// Ensure storage durability (e.g. call storage.flush()).
     async fn flush_storage(&self) -> Result<(), String>;
