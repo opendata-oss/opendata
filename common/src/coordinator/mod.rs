@@ -572,11 +572,13 @@ impl<D: Delta> BroadcastedViewInner<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BytesRange;
     use crate::coordinator::Durability;
-    use crate::storage::StorageSnapshot;
     use crate::storage::in_memory::{InMemoryStorage, InMemoryStorageSnapshot};
+    use crate::storage::{Record, StorageSnapshot};
     use crate::{Storage, StorageRead};
     use async_trait::async_trait;
+    use bytes::Bytes;
     use std::collections::HashMap;
     use std::ops::Range;
     use std::sync::Mutex;
@@ -591,50 +593,54 @@ mod tests {
         size: usize,
     }
 
-    /// Context carries state that must persist across deltas (like series dictionary)
+    /// Context carries state that must persist across deltas (like sequence allocation)
     #[derive(Clone, Debug, Default)]
     struct TestContext {
-        key_to_id: HashMap<String, u64>,
-        next_id: u64,
+        next_seq: u64,
         error: Option<String>,
     }
 
     /// A shared reader that sees writes as they are applied to the delta.
     #[derive(Clone, Debug, Default)]
     struct TestDeltaReader {
-        data: Arc<Mutex<HashMap<String, Vec<u64>>>>,
+        data: Arc<Mutex<HashMap<String, u64>>>,
     }
 
     impl TestDeltaReader {
-        fn get(&self, key: &str) -> Option<Vec<u64>> {
-            self.data.lock().unwrap().get(key).cloned()
+        fn get(&self, key: &str) -> Option<u64> {
+            self.data.lock().unwrap().get(key).copied()
         }
     }
 
-    /// Delta accumulates writes and can allocate new IDs for unknown keys.
+    /// Delta accumulates writes with sequence numbers.
     /// Stores the context directly and updates it in place.
-    #[derive(Clone, Debug, Default)]
+    #[derive(Debug)]
     struct TestDelta {
         context: TestContext,
-        writes: HashMap<u64, Vec<u64>>,
+        writes: HashMap<String, (u64, u64)>,
+        key_values: Arc<Mutex<HashMap<String, u64>>>,
         total_size: usize,
-        reader: TestDeltaReader,
+    }
+
+    #[derive(Clone, Debug)]
+    struct FrozenTestDelta {
+        writes: HashMap<String, (u64, u64)>,
     }
 
     impl Delta for TestDelta {
         type Context = TestContext;
         type Write = TestWrite;
         type DeltaView = TestDeltaReader;
-        type Frozen = TestDelta;
-        type FrozenView = TestDelta;
+        type Frozen = FrozenTestDelta;
+        type FrozenView = Arc<HashMap<String, u64>>;
         type ApplyResult = ();
 
         fn init(context: Self::Context) -> Self {
             Self {
                 context,
                 writes: HashMap::default(),
+                key_values: Arc::new(Mutex::new(HashMap::default())),
                 total_size: 0,
-                reader: TestDeltaReader::default(),
             }
         }
 
@@ -643,22 +649,15 @@ mod tests {
                 return Err(error.clone());
             }
 
-            let key = write.key.clone();
-            let id = *self.context.key_to_id.entry(write.key).or_insert_with(|| {
-                let id = self.context.next_id;
-                self.context.next_id += 1;
-                id
-            });
+            let seq = self.context.next_seq;
+            self.context.next_seq += 1;
 
-            self.writes.entry(id).or_default().push(write.value);
+            self.writes.insert(write.key.clone(), (seq, write.value));
             self.total_size += write.size;
-            self.reader
-                .data
+            self.key_values
                 .lock()
                 .unwrap()
-                .entry(key)
-                .or_default()
-                .push(write.value);
+                .insert(write.key, write.value);
             Ok(())
         }
 
@@ -667,34 +666,43 @@ mod tests {
         }
 
         fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
-            let context = self.context;
-            let frozen = TestDelta {
-                context: context.clone(),
+            let frozen = FrozenTestDelta {
                 writes: self.writes,
-                total_size: self.total_size,
-                reader: TestDeltaReader::default(),
             };
-            (frozen.clone(), frozen, context)
+            let frozen_view = Arc::new(self.key_values.lock().unwrap().clone());
+            (frozen, frozen_view, self.context)
         }
 
         fn reader(&self) -> Self::DeltaView {
-            self.reader.clone()
+            TestDeltaReader {
+                data: self.key_values.clone(),
+            }
         }
     }
 
     /// Shared state for TestFlusher - allows test to inspect and control behavior
     #[derive(Default)]
     struct TestFlusherState {
-        flushed_events: Vec<(Arc<EpochStamped<TestDelta>>)>,
+        flushed_events: Vec<Arc<EpochStamped<FrozenTestDelta>>>,
         /// Signals when a flush starts (before blocking)
         flush_started_tx: Option<oneshot::Sender<()>>,
         /// Blocks flush until signaled
         unblock_rx: Option<mpsc::Receiver<()>>,
     }
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct TestFlusher {
         state: Arc<Mutex<TestFlusherState>>,
+        storage: Arc<InMemoryStorage>,
+    }
+
+    impl Default for TestFlusher {
+        fn default() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(TestFlusherState::default())),
+                storage: Arc::new(InMemoryStorage::new()),
+            }
+        }
     }
 
     impl TestFlusher {
@@ -709,12 +717,17 @@ mod tests {
                     flush_started_tx: Some(started_tx),
                     unblock_rx: Some(unblock_rx),
                 })),
+                storage: Arc::new(InMemoryStorage::new()),
             };
             (flusher, started_rx, unblock_tx)
         }
 
-        fn flushed_events(&self) -> Vec<(Arc<EpochStamped<TestDelta>>)> {
+        fn flushed_events(&self) -> Vec<Arc<EpochStamped<FrozenTestDelta>>> {
             self.state.lock().unwrap().flushed_events.clone()
+        }
+
+        async fn initial_snapshot(&self) -> Arc<dyn StorageSnapshot> {
+            self.storage.snapshot().await.unwrap()
         }
     }
 
@@ -722,7 +735,7 @@ mod tests {
     impl Flusher<TestDelta> for TestFlusher {
         async fn flush_delta(
             &self,
-            frozen: TestDelta,
+            frozen: FrozenTestDelta,
             epoch_range: &Range<u64>,
         ) -> Result<Arc<dyn StorageSnapshot>, String> {
             // Signal that flush has started
@@ -743,6 +756,22 @@ mod tests {
                 rx.recv().await;
             }
 
+            // Write records to storage
+            let records: Vec<Record> = frozen
+                .writes
+                .iter()
+                .map(|(key, (seq, value))| {
+                    let mut buf = Vec::with_capacity(16);
+                    buf.extend_from_slice(&seq.to_le_bytes());
+                    buf.extend_from_slice(&value.to_le_bytes());
+                    Record::new(Bytes::from(key.clone()), Bytes::from(buf))
+                })
+                .collect();
+            self.storage
+                .put(records)
+                .await
+                .map_err(|e| format!("{}", e))?;
+
             // Record the flush
             {
                 let mut state = self.state.lock().unwrap();
@@ -751,7 +780,7 @@ mod tests {
                     .push(Arc::new(EpochStamped::new(frozen, epoch_range.clone())));
             }
 
-            Ok(InMemoryStorage::default().snapshot().await.unwrap())
+            self.storage.snapshot().await.map_err(|e| format!("{}", e))
         }
 
         async fn flush_storage(&self) -> Result<(), String> {
@@ -785,8 +814,47 @@ mod tests {
         }
     }
 
-    async fn test_snapshot() -> Arc<dyn StorageSnapshot> {
-        InMemoryStorage::default().snapshot().await.unwrap()
+    async fn assert_snapshot_has_rows(
+        snapshot: &Arc<dyn StorageSnapshot>,
+        expected: &[(&str, u64, u64)],
+    ) {
+        let records = snapshot.scan(BytesRange::unbounded()).await.unwrap();
+        assert_eq!(
+            records.len(),
+            expected.len(),
+            "expected {} rows but snapshot has {}",
+            expected.len(),
+            records.len()
+        );
+        let mut actual: Vec<(String, u64, u64)> = records
+            .iter()
+            .map(|r| {
+                let key = String::from_utf8(r.key.to_vec()).unwrap();
+                let seq = u64::from_le_bytes(r.value[0..8].try_into().unwrap());
+                let value = u64::from_le_bytes(r.value[8..16].try_into().unwrap());
+                (key, seq, value)
+            })
+            .collect();
+        actual.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut expected: Vec<(&str, u64, u64)> = expected.to_vec();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert_eq!(
+                actual.0, expected.0,
+                "key mismatch: got {:?}, expected {:?}",
+                actual.0, expected.0
+            );
+            assert_eq!(
+                actual.1, expected.1,
+                "seq mismatch for key {:?}: got {}, expected {}",
+                actual.0, actual.1, expected.1
+            );
+            assert_eq!(
+                actual.2, expected.2,
+                "value mismatch for key {:?}: got {}, expected {}",
+                actual.0, actual.2, expected.2
+            );
+        }
     }
 
     // ============================================================================
@@ -800,7 +868,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher,
         );
         let handle = coordinator.handle();
@@ -851,7 +919,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -892,11 +960,10 @@ mod tests {
         assert_eq!(events.len(), 1);
         let frozen_delta = &events[0];
         let delta = &frozen_delta.val;
-        // All writes to key "a" should be under the same ID in order
-        let ctx = &delta.context;
-        let id = ctx.key_to_id.get("a").unwrap();
-        let values = delta.writes.get(id).unwrap();
-        assert_eq!(values, &[1, 2, 3]);
+        // Writing key "a" 3x overwrites; last write wins with seq=2 (0-indexed)
+        let (seq, value) = delta.writes.get("a").unwrap();
+        assert_eq!(*value, 3);
+        assert_eq!(*seq, 2);
 
         // cleanup
         coordinator.stop().await;
@@ -909,7 +976,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher,
         );
         let handle = coordinator.handle();
@@ -941,8 +1008,12 @@ mod tests {
             error: Some("apply error".to_string()),
             ..Default::default()
         };
-        let mut coordinator =
-            WriteCoordinator::new(test_config(), context, test_snapshot().await, flusher);
+        let mut coordinator = WriteCoordinator::new(
+            test_config(),
+            context,
+            flusher.initial_snapshot().await,
+            flusher,
+        );
         let handle = coordinator.handle();
         coordinator.start();
 
@@ -978,7 +1049,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1010,7 +1081,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1042,7 +1113,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher,
         );
         let handle = coordinator.handle();
@@ -1083,7 +1154,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1122,7 +1193,9 @@ mod tests {
         let events = flusher.flushed_events();
         assert_eq!(events.len(), 1);
         let frozen_delta = &events[0];
-        assert_eq!(frozen_delta.val.context.key_to_id.len(), 3);
+        assert_eq!(frozen_delta.val.writes.len(), 3);
+        let snapshot = flusher.storage.snapshot().await.unwrap();
+        assert_snapshot_has_rows(&snapshot, &[("a", 0, 1), ("b", 1, 2), ("c", 2, 3)]).await;
 
         // cleanup
         coordinator.stop().await;
@@ -1135,7 +1208,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1182,7 +1255,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher,
         );
         let handle = coordinator.handle();
@@ -1224,7 +1297,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             config,
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1251,6 +1324,8 @@ mod tests {
 
         // then - flush should have happened
         assert_eq!(flusher.flushed_events().len(), 1);
+        let snapshot = flusher.storage.snapshot().await.unwrap();
+        assert_snapshot_has_rows(&snapshot, &[("a", 0, 1)]).await;
 
         // cleanup
         coordinator.stop().await;
@@ -1272,7 +1347,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             config,
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1308,7 +1383,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             config,
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1359,7 +1434,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1400,7 +1475,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1462,7 +1537,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             config,
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1509,7 +1584,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             config,
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1560,7 +1635,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1585,7 +1660,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             config,
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1619,7 +1694,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1652,7 +1727,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1705,7 +1780,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1766,7 +1841,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -1818,19 +1893,19 @@ mod tests {
     // ============================================================================
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn should_preserve_key_to_id_mapping_across_flushes() {
+    async fn should_preserve_context_across_flushes() {
         // given
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
         coordinator.start();
 
-        // when - write key "a" in first batch
+        // when - write key "a" in first batch (seq 0)
         let mut write1 = handle
             .write(TestWrite {
                 key: "a".into(),
@@ -1842,7 +1917,7 @@ mod tests {
         handle.flush(false).await.unwrap();
         write1.wait(Durability::Flushed).await.unwrap();
 
-        // Write to key "a" again in second batch
+        // Write to key "a" again in second batch (seq 1)
         let mut write2 = handle
             .write(TestWrite {
                 key: "a".into(),
@@ -1858,140 +1933,13 @@ mod tests {
         let events = flusher.flushed_events();
         assert_eq!(events.len(), 2);
 
-        let frozen_delta1 = &events[0].val;
-        let frozen_delta2 = &events[1].val;
+        // Batch 1: "a" with seq 0
+        let (seq1, _) = events[0].val.writes.get("a").unwrap();
+        assert_eq!(*seq1, 0);
 
-        // Same key should get the same ID across flushes
-        let id1 = frozen_delta1.context.key_to_id.get("a").unwrap();
-        let id2 = frozen_delta2.context.key_to_id.get("a").unwrap();
-        assert_eq!(id1, id2);
-
-        // cleanup
-        coordinator.stop().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn should_continue_id_sequence_across_flushes() {
-        // given
-        let flusher = TestFlusher::default();
-        let mut coordinator = WriteCoordinator::new(
-            test_config(),
-            TestContext::default(),
-            test_snapshot().await,
-            flusher.clone(),
-        );
-        let handle = coordinator.handle();
-        coordinator.start();
-
-        // when - write keys in first batch
-        handle
-            .write(TestWrite {
-                key: "a".into(),
-                value: 1,
-                size: 10,
-            })
-            .await
-            .unwrap();
-        let mut write2 = handle
-            .write(TestWrite {
-                key: "b".into(),
-                value: 2,
-                size: 10,
-            })
-            .await
-            .unwrap();
-        handle.flush(false).await.unwrap();
-        write2.wait(Durability::Flushed).await.unwrap();
-
-        // New key in second batch
-        let mut write3 = handle
-            .write(TestWrite {
-                key: "c".into(),
-                value: 3,
-                size: 10,
-            })
-            .await
-            .unwrap();
-        handle.flush(false).await.unwrap();
-        write3.wait(Durability::Flushed).await.unwrap();
-
-        // then
-        let events = flusher.flushed_events();
-        let frozen_delta1 = &events[0].val;
-        let frozen_delta2 = &events[1].val;
-
-        // First batch: a=0, b=1
-        let ctx1 = &frozen_delta1.context;
-        let id_a = ctx1.key_to_id.get("a").unwrap();
-        let id_b = ctx1.key_to_id.get("b").unwrap();
-
-        // Second batch: c should get ID 2 (continuing sequence)
-        let ctx2 = &frozen_delta2.context;
-        let id_c = ctx2.key_to_id.get("c").unwrap();
-
-        // IDs should be unique and sequential
-        assert_ne!(id_a, id_b);
-        assert_ne!(id_b, id_c);
-        assert_ne!(id_a, id_c);
-
-        // cleanup
-        coordinator.stop().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn should_include_complete_mapping_in_flush_event() {
-        // given
-        let flusher = TestFlusher::default();
-        let mut coordinator = WriteCoordinator::new(
-            test_config(),
-            TestContext::default(),
-            test_snapshot().await,
-            flusher.clone(),
-        );
-        let handle = coordinator.handle();
-        coordinator.start();
-
-        // when - write keys in first batch
-        handle
-            .write(TestWrite {
-                key: "a".into(),
-                value: 1,
-                size: 10,
-            })
-            .await
-            .unwrap();
-        let mut write2 = handle
-            .write(TestWrite {
-                key: "b".into(),
-                value: 2,
-                size: 10,
-            })
-            .await
-            .unwrap();
-        handle.flush(false).await.unwrap();
-        write2.wait(Durability::Flushed).await.unwrap();
-
-        // Add new key c in second batch
-        let mut write3 = handle
-            .write(TestWrite {
-                key: "c".into(),
-                value: 3,
-                size: 10,
-            })
-            .await
-            .unwrap();
-        handle.flush(false).await.unwrap();
-        write3.wait(Durability::Flushed).await.unwrap();
-
-        // then - second delta should contain mappings for a, b, c
-        let events = flusher.flushed_events();
-        let frozen_delta2 = &events[1].val;
-        let ctx2 = &frozen_delta2.context;
-
-        // Delta should have inherited a and b from context, plus new c
-        assert!(ctx2.key_to_id.contains_key("a"));
-        assert!(ctx2.key_to_id.contains_key("b"));
-        assert!(ctx2.key_to_id.contains_key("c"));
+        // Batch 2: "a" with seq 1 (sequence continues)
+        let (seq2, _) = events[1].val.writes.get("a").unwrap();
+        assert_eq!(*seq2, 1);
 
         // cleanup
         coordinator.stop().await;
@@ -2008,7 +1956,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -2041,7 +1989,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -2064,8 +2012,8 @@ mod tests {
         // Second broadcast: flush complete (snapshot updated)
         let result = subscriber.recv().await.unwrap();
 
-        // then - snapshot should be the Arc<dyn StorageRead> returned by the flusher
-        assert!(Arc::strong_count(&result.snapshot) >= 1);
+        // then - snapshot should contain the flushed data
+        assert_snapshot_has_rows(&result.snapshot, &[("a", 0, 1)]).await;
 
         // cleanup
         coordinator.stop().await;
@@ -2078,7 +2026,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -2103,11 +2051,7 @@ mod tests {
 
         // then - last_flushed_delta should contain the write we made
         let flushed = result.last_flushed_delta.as_ref().unwrap();
-        let ctx = &flushed.val.context;
-        assert!(ctx.key_to_id.contains_key("a"));
-        let id = ctx.key_to_id.get("a").unwrap();
-        let values = flushed.val.writes.get(id).unwrap();
-        assert_eq!(values, &[42]);
+        assert_eq!(flushed.val.get("a"), Some(&42));
 
         // cleanup
         coordinator.stop().await;
@@ -2120,7 +2064,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -2171,7 +2115,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -2192,7 +2136,7 @@ mod tests {
         // then - first broadcast should have the frozen delta in the frozen vec
         let state = subscriber.recv().await.unwrap();
         assert_eq!(state.frozen.len(), 1);
-        assert!(state.frozen[0].val.context.key_to_id.contains_key("a"));
+        assert!(state.frozen[0].val.contains_key("a"));
 
         // cleanup
         coordinator.stop().await;
@@ -2205,7 +2149,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher.clone(),
         );
         let handle = coordinator.handle();
@@ -2309,7 +2253,7 @@ mod tests {
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             TestContext::default(),
-            test_snapshot().await,
+            flusher.initial_snapshot().await,
             flusher,
         );
         let handle = coordinator.handle();
@@ -2328,7 +2272,7 @@ mod tests {
 
         // then
         let view = coordinator.view();
-        assert_eq!(view.current.get("a"), Some(vec![42]));
+        assert_eq!(view.current.get("a"), Some(42));
 
         // cleanup
         coordinator.stop().await;
