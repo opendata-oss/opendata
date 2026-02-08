@@ -837,7 +837,7 @@ mod tests {
             .collect();
         actual.sort_by(|a, b| a.0.cmp(&b.0));
         let mut expected: Vec<(&str, u64, u64)> = expected.to_vec();
-        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        expected.sort_by(|a, b| a.0.cmp(b.0));
         for (actual, expected) in actual.iter().zip(expected.iter()) {
             assert_eq!(
                 actual.0, expected.0,

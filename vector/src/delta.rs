@@ -104,9 +104,10 @@ impl VectorDbWriteDelta {
 impl Delta for VectorDbWriteDelta {
     type Context = VectorDbDeltaContext;
     type Write = Vec<VectorWrite>;
+    type DeltaView = ();
     type Frozen = VectorDbImmutableDelta;
+    type FrozenView = ();
     type ApplyResult = ();
-    type Broadcast = ();
 
     fn init(context: VectorDbDeltaContext) -> Self {
         Self {
@@ -180,7 +181,7 @@ impl Delta for VectorDbWriteDelta {
             + self.deleted_vectors.len() as usize * 8
     }
 
-    fn freeze(self) -> (Self::Frozen, Self::Context) {
+    fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
         let mut ops = self.ops;
 
         // Finalize posting list merges
@@ -197,8 +198,10 @@ impl Delta for VectorDbWriteDelta {
             ops.push(op);
         }
 
-        (VectorDbImmutableDelta { ops }, self.ctx)
+        (VectorDbImmutableDelta { ops }, (), self.ctx)
     }
+
+    fn reader(&self) -> Self::DeltaView {}
 }
 
 #[cfg(test)]
@@ -292,7 +295,7 @@ mod tests {
 
         // when
         delta.apply(vec![write]).unwrap();
-        let (frozen, _ctx) = delta.freeze();
+        let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have ops for ID dictionary put and vector data put
         let id_dict_key = IdDictionaryKey::new("vec-1").encode();
@@ -324,7 +327,7 @@ mod tests {
 
         // when
         delta.apply(vec![write]).unwrap();
-        let (frozen, _ctx) = delta.freeze();
+        let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have a merge op for the posting list of centroid 42
         let posting_key = PostingListKey::new(centroid_id).encode();
@@ -371,7 +374,7 @@ mod tests {
 
         // when
         delta.apply(vec![write]).unwrap();
-        let (frozen, ctx) = delta.freeze();
+        let (frozen, _view, ctx) = delta.freeze();
 
         // then - should have delete for old ID dictionary entry and put for new
         let id_dict_key = IdDictionaryKey::new("vec-1").encode();
@@ -408,7 +411,7 @@ mod tests {
 
         // when
         delta.apply(vec![write]).unwrap();
-        let (frozen, _ctx) = delta.freeze();
+        let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have posting list merge for the new vector
         let posting_key = PostingListKey::new(centroid_id).encode();
@@ -437,7 +440,7 @@ mod tests {
 
         // when
         delta.apply(vec![write]).unwrap();
-        let (frozen, _ctx) = delta.freeze();
+        let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have delete op for old vector data
         let old_vector_key = VectorDataKey::new(old_internal_id).encode();
@@ -473,7 +476,7 @@ mod tests {
 
         // when
         delta.apply(writes).unwrap();
-        let (frozen, ctx) = delta.freeze();
+        let (frozen, _view, ctx) = delta.freeze();
 
         // then - should have 3 vectors in dictionary
         assert_eq!(ctx.dictionary.len(), 3);
@@ -570,7 +573,7 @@ mod tests {
 
         // when
         delta.apply(writes).unwrap();
-        let (frozen, _ctx) = delta.freeze();
+        let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have posting list merges for centroids 1, 2, and 3
         let posting_merges: Vec<_> = frozen

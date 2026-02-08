@@ -34,8 +34,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-type SnapshotLock = std::sync::Mutex<Arc<dyn StorageSnapshot>>;
-
 /// Vector database for storing and querying embedding vectors.
 ///
 /// `VectorDb` provides a high-level API for ingesting vectors with metadata.
@@ -45,10 +43,6 @@ pub struct VectorDb {
     config: Config,
     #[allow(dead_code)]
     storage: Arc<dyn Storage>,
-
-    /// Storage snapshot used for queries (updated by flusher).
-    /// Protected by std::sync::Mutex - callers should clone immediately and release.
-    snapshot: Arc<SnapshotLock>,
 
     /// The WriteCoordinator itself (stored to keep it alive).
     write_coordinator: WriteCoordinator<VectorDbWriteDelta, VectorDbFlusher>,
@@ -104,27 +98,24 @@ impl VectorDb {
         let id_allocator = SequenceAllocator::load(storage.as_ref(), seq_key).await?;
 
         // Get initial snapshot
-        let initial_snapshot = storage.snapshot().await?;
-        let snapshot = Arc::new(SnapshotLock::new(initial_snapshot));
+        let snapshot = storage.snapshot().await?;
 
         // For now, load the full ID dictionary from storage into memory at startup
         // Eventually, we should load this in the background and allow the delta to
         // read ids that are not yet loaded from storage
         let dictionary = Arc::new(DashMap::new());
         {
-            let snapshot_ref = snapshot.lock().unwrap().clone();
-            Self::load_dictionary_from_storage(snapshot_ref.as_ref(), &dictionary).await?;
+            Self::load_dictionary_from_storage(snapshot.as_ref(), &dictionary).await?;
         }
 
         // For now, just force bootstrap centroids. Eventually we'll derive these automatically
         // from the vectors
         let centroid_graph =
-            Self::load_or_create_centroids(&storage, &snapshot, &config, centroids).await?;
+            Self::load_or_create_centroids(&storage, snapshot.as_ref(), &config, centroids).await?;
 
         // Create flusher for the WriteCoordinator
         let flusher = VectorDbFlusher {
             storage: Arc::clone(&storage),
-            snapshot: Arc::clone(&snapshot),
         };
 
         // Create initial image for the delta (shares dictionary, centroid_graph, and id_allocator)
@@ -141,13 +132,13 @@ impl VectorDb {
             flush_interval: Duration::from_secs(5),
             flush_size_threshold: 64 * 1024 * 1024,
         };
-        let mut write_coordinator = WriteCoordinator::new(coordinator_config, ctx, flusher);
+        let mut write_coordinator =
+            WriteCoordinator::new(coordinator_config, ctx, snapshot.clone(), flusher);
         write_coordinator.start();
 
         Ok(Self {
             config,
             storage,
-            snapshot,
             write_coordinator,
             centroid_graph,
         })
@@ -156,15 +147,12 @@ impl VectorDb {
     /// Load centroids from storage if they exist, otherwise create them from the provided entries.
     async fn load_or_create_centroids(
         storage: &Arc<dyn Storage>,
-        snapshot: &Arc<SnapshotLock>,
+        snapshot: &dyn StorageSnapshot,
         config: &Config,
         centroids: Vec<CentroidEntry>,
     ) -> Result<Arc<dyn CentroidGraph>> {
-        // Clone snapshot reference for async operations
-        let snapshot_ref = snapshot.lock().unwrap().clone();
-
         // Check if centroids already exist in storage
-        let existing_centroids = snapshot_ref
+        let existing_centroids = snapshot
             .scan_all_centroids(config.dimensions as usize)
             .await?;
 
@@ -458,7 +446,7 @@ impl VectorDb {
         }
 
         // 3. Clone snapshot reference (lock briefly, then release)
-        let snapshot = self.snapshot.lock().unwrap().clone();
+        let snapshot = self.write_coordinator.view().snapshot.clone();
 
         // 4. Load posting lists
         let candidates = self
