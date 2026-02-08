@@ -279,10 +279,10 @@ impl VectorDb {
             writes.push(self.prepare_vector_write(vector)?);
         }
 
-        // Send all writes to coordinator in a single batch and wait for epoch
-        let write_handle = self.write_coordinator.handle().write(writes).await?;
+        // Send all writes to coordinator in a single batch and wait to be applied
+        let mut write_handle = self.write_coordinator.handle().write(writes).await?;
         write_handle
-            .epoch()
+            .wait(Durability::Applied)
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
@@ -413,7 +413,7 @@ impl VectorDb {
     /// This ensures ID dictionary updates, deletes, and new records are all
     /// applied together, maintaining consistency.
     pub async fn flush(&self) -> Result<()> {
-        let mut handle = self.write_coordinator.handle().flush().await?;
+        let mut handle = self.write_coordinator.handle().flush(false).await?;
         handle.wait(Durability::Flushed).await?;
         Ok(())
     }

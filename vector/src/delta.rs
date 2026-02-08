@@ -105,6 +105,8 @@ impl Delta for VectorDbWriteDelta {
     type Context = VectorDbDeltaContext;
     type Write = Vec<VectorWrite>;
     type Frozen = VectorDbImmutableDelta;
+    type ApplyResult = ();
+    type Broadcast = ();
 
     fn init(context: VectorDbDeltaContext) -> Self {
         Self {

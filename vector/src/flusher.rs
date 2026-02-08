@@ -3,14 +3,15 @@
 //! This module contains the `VectorDbFlusher` which applies accumulated
 //! RecordOps to storage atomically and updates the shared snapshot for queries.
 
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use common::coordinator::{FlushEvent, Flusher};
-use common::storage::{Storage, StorageRead, StorageSnapshot};
+use common::coordinator::{BroadcastDelta, Flusher};
+use common::storage::{Storage, StorageSnapshot};
 
-use crate::delta::VectorDbWriteDelta;
+use crate::delta::{VectorDbImmutableDelta, VectorDbWriteDelta};
 
 /// Flusher implementation for VectorDb.
 ///
@@ -26,13 +27,14 @@ pub struct VectorDbFlusher {
 
 #[async_trait]
 impl Flusher<VectorDbWriteDelta> for VectorDbFlusher {
-    async fn flush(
+    async fn flush_delta(
         &self,
-        event: &FlushEvent<VectorDbWriteDelta>,
-    ) -> Result<Arc<dyn StorageRead>, String> {
+        frozen: VectorDbImmutableDelta,
+        _epoch_range: &Range<u64>,
+    ) -> Result<BroadcastDelta<VectorDbWriteDelta>, String> {
         // Apply all ops atomically
         self.storage
-            .apply(event.delta.ops.clone())
+            .apply(frozen.ops.clone())
             .await
             .map_err(|e| e.to_string())?;
 
@@ -43,6 +45,13 @@ impl Flusher<VectorDbWriteDelta> for VectorDbFlusher {
         *self.snapshot.lock().unwrap() = Arc::clone(&snapshot);
 
         // StorageSnapshot extends StorageRead, so we can return it directly
-        Ok(snapshot)
+        Ok(BroadcastDelta {
+            snapshot,
+            broadcast: (),
+        })
+    }
+
+    async fn flush_storage(&self) -> std::result::Result<(), String> {
+        self.storage.flush().await.map_err(|e| e.to_string())
     }
 }
