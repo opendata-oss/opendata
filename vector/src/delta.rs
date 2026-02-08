@@ -5,7 +5,7 @@
 //!
 //! ## Key Design
 //!
-//! - The `VectorDbImage` contains shared state: the in-memory ID dictionary
+//! - The `VectorDbDeltaContext` contains shared state: the in-memory ID dictionary
 //!   (DashMap), the centroid graph for assignment, and a sync-safe ID allocator
 //! - The delta handles all write logic in `apply()`: ID allocation, dictionary
 //!   lookup for upsert detection, centroid assignment, and dictionary updates
