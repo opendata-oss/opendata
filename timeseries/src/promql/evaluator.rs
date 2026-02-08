@@ -672,8 +672,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     /// - `@ start()`: Uses query start time
     /// - `@ end()`: Uses query end time
     ///
-    /// When both modifiers are present, `@` is applied first, then `offset` is applied
-    /// relative to the `@` time (order-independent).
+    /// When both modifiers are present, `offset` is applied relative to the `@`
+    /// modifier time. Although PromQL defines the result as order-independent
+    /// (e.g. `@ t offset d` == `offset d @ t`), we normalize the implementation
+    /// by applying `@` first and then applying `offset`. This keeps the logic
+    /// simple and matches Prometheus semantics.
     ///
     /// See: <https://prometheus.io/docs/prometheus/latest/querying/basics/#offset-modifier>
     fn apply_time_modifiers(
@@ -700,13 +703,17 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         if let Some(offset) = &vector_selector.offset {
             adjusted_time = match offset {
                 Offset::Pos(duration) => {
-                    // Positive offset: look back in time
+                    // Positive offset: look back in time (subtract duration).
+                    // This matches Prometheus semantics: `http_requests_total offset 5m`
+                    // queries data from 5 minutes ago.
                     adjusted_time.checked_sub(*duration).ok_or_else(|| {
                         EvaluationError::InternalError("offset underflow".to_string())
                     })?
                 }
                 Offset::Neg(duration) => {
-                    // Negative offset: look forward in time
+                    // Negative offset: look forward in time (add duration).
+                    // This matches Prometheus semantics: `http_requests_total offset -1w`
+                    // queries data from 1 week in the future.
                     adjusted_time.checked_add(*duration).ok_or_else(|| {
                         EvaluationError::InternalError("offset overflow".to_string())
                     })?
@@ -2442,7 +2449,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_evaluate_vector_selector_with_offset_modifier() {
+    async fn should_evaluate_vector_selector_with_positive_offset() {
         // given: samples at different times
         let mut builder = MockMultiBucketQueryReaderBuilder::new();
         let bucket = TimeBucket::hour(100);
@@ -2471,7 +2478,7 @@ mod tests {
         let reader = builder.build();
         let mut evaluator = Evaluator::new(&reader);
 
-        // when: query at t=6_300_000 with offset 5m (300_000ms)
+        // when: query at t=6_300_000 with positive offset 5m (look back 300_000ms)
         let selector = VectorSelector {
             name: Some("http_requests".to_string()),
             matchers: Matchers::new(vec![]),
@@ -2845,6 +2852,134 @@ mod tests {
             assert_eq!(samples.len(), 1);
             assert_eq!(samples[0].value, 30.0);
             assert_eq!(samples[0].timestamp_ms, 6_300_000);
+        } else {
+            panic!("Expected InstantVector result");
+        }
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_vector_selector_with_negative_offset() {
+        // given: samples at different times
+        let mut builder = MockMultiBucketQueryReaderBuilder::new();
+        let bucket = TimeBucket::hour(100);
+
+        for (ts, val) in [(5_700_000, 10.0), (6_000_000, 20.0), (6_300_000, 30.0)] {
+            builder.add_sample(
+                bucket,
+                vec![
+                    Label {
+                        name: METRIC_NAME.to_string(),
+                        value: "http_requests".to_string(),
+                    },
+                    Label {
+                        name: "env".to_string(),
+                        value: "prod".to_string(),
+                    },
+                ],
+                MetricType::Gauge,
+                Sample {
+                    timestamp_ms: ts,
+                    value: val,
+                },
+            );
+        }
+
+        let reader = builder.build();
+        let mut evaluator = Evaluator::new(&reader);
+
+        // when: query at t=5_700_000 with negative offset -5m (look forward 300_000ms)
+        let selector = VectorSelector {
+            name: Some("http_requests".to_string()),
+            matchers: Matchers::new(vec![]),
+            offset: Some(Offset::Neg(Duration::from_millis(300_000))),
+            at: None,
+        };
+
+        let query_time = UNIX_EPOCH + Duration::from_millis(5_700_000);
+        let result = evaluator
+            .evaluate_vector_selector(
+                &selector,
+                query_time,
+                query_time,
+                query_time,
+                Duration::from_secs(300),
+            )
+            .await
+            .unwrap();
+
+        // then: should get the sample from t=6_000_000 (value 20.0)
+        if let ExprResult::InstantVector(samples) = result {
+            assert_eq!(samples.len(), 1);
+            assert_eq!(samples[0].value, 20.0);
+            assert_eq!(samples[0].timestamp_ms, 6_000_000);
+        } else {
+            panic!("Expected InstantVector result");
+        }
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_vector_selector_with_non_aligned_timestamps() {
+        // given: samples at irregular timestamps
+        let mut builder = MockMultiBucketQueryReaderBuilder::new();
+        let bucket = TimeBucket::hour(100);
+
+        for (ts, val) in [
+            (5_723_456, 10.0),
+            (5_987_654, 20.0),
+            (6_234_567, 30.0),
+            (6_456_789, 40.0),
+        ] {
+            builder.add_sample(
+                bucket,
+                vec![
+                    Label {
+                        name: METRIC_NAME.to_string(),
+                        value: "cpu_usage".to_string(),
+                    },
+                    Label {
+                        name: "host".to_string(),
+                        value: "server1".to_string(),
+                    },
+                ],
+                MetricType::Gauge,
+                Sample {
+                    timestamp_ms: ts,
+                    value: val,
+                },
+            );
+        }
+
+        let reader = builder.build();
+        let mut evaluator = Evaluator::new(&reader);
+
+        // when: query at non-aligned timestamp with offset
+        let selector = VectorSelector {
+            name: Some("cpu_usage".to_string()),
+            matchers: Matchers::new(vec![]),
+            offset: Some(Offset::Pos(Duration::from_millis(250_000))),
+            at: None,
+        };
+
+        let query_time = UNIX_EPOCH + Duration::from_millis(6_234_567);
+        let result = evaluator
+            .evaluate_vector_selector(
+                &selector,
+                query_time,
+                query_time,
+                query_time,
+                Duration::from_secs(300),
+            )
+            .await
+            .unwrap();
+
+        // then: should get the sample closest to (6_234_567 - 250_000 = 5_984_567)
+        // Lookback window: (5_684_567, 5_984_567]
+        // Sample 5_723_456 (value 10.0) is within the window
+        // Sample 5_987_654 (value 20.0) is outside the window (too late)
+        if let ExprResult::InstantVector(samples) = result {
+            assert_eq!(samples.len(), 1);
+            assert_eq!(samples[0].value, 10.0);
+            assert_eq!(samples[0].timestamp_ms, 5_723_456);
         } else {
             panic!("Expected InstantVector result");
         }
