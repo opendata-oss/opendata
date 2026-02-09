@@ -37,10 +37,10 @@ pub mod delta;
 pub mod distance;
 pub mod flusher;
 pub mod hnsw;
+pub(crate) mod lire;
 pub mod model;
 pub mod serde;
 pub(crate) mod storage;
-pub(crate) mod view_reader;
 
 #[cfg(test)]
 pub(crate) mod test_utils;

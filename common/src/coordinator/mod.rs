@@ -88,11 +88,11 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
 
         // Create a write channel per named input
         let mut write_rxs = Vec::with_capacity(channels.len());
-        let mut handles = HashMap::new();
-        for name in channels {
+        let mut write_txs = HashMap::new();
+        for name in &channels {
             let (write_tx, write_rx) = mpsc::channel(config.queue_capacity);
             write_rxs.push(write_rx);
-            handles.insert(name, WriteCoordinatorHandle::new(write_tx, watcher.clone()));
+            write_txs.insert(name.clone(), write_tx);
         }
 
         // this is the channel that sends FlushEvents to be flushed
@@ -116,6 +116,15 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         );
 
         let view = write_task.view.clone();
+
+        let mut handles = HashMap::new();
+        for name in channels {
+            let write_tx = write_txs.remove(&name).expect("unreachable");
+            handles.insert(
+                name,
+                WriteCoordinatorHandle::new(write_tx, watcher.clone(), view.clone()),
+            );
+        }
 
         let flush_task = FlushTask {
             flusher,
@@ -506,7 +515,7 @@ impl EpochWatermarks {
     }
 }
 
-struct BroadcastedView<D: Delta> {
+pub(crate) struct BroadcastedView<D: Delta> {
     inner: Mutex<BroadcastedViewInner<D>>,
 }
 

@@ -11,10 +11,11 @@
 //! - Delta handles dictionary lookup, centroid assignment, and builds RecordOps
 //! - Flusher applies ops atomically to storage
 
-use crate::delta::{VectorDbDeltaContext, VectorDbWriteDelta, VectorWrite};
+use crate::delta::{VectorDbDeltaContext, VectorDbWrite, VectorDbWriteDelta, VectorWrite};
 use crate::distance;
 use crate::flusher::VectorDbFlusher;
 use crate::hnsw::{CentroidGraph, build_centroid_graph};
+use crate::lire::rebalancer::IndexRebalancer;
 use crate::model::{
     AttributeValue, Config, SearchResult, VECTOR_FIELD_NAME, Vector, attributes_to_map,
 };
@@ -35,6 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) const WRITE_CHANNEL: &str = "write";
+pub(crate) const REBALANCE_CHANNEL: &str = "rebalance";
 
 /// Vector database for storing and querying embedding vectors.
 ///
@@ -51,6 +53,9 @@ pub struct VectorDb {
 
     /// In-memory HNSW graph for centroid search (immutable after initialization).
     centroid_graph: Arc<dyn CentroidGraph>,
+
+    #[allow(dead_code)]
+    rebalancer: IndexRebalancer,
 }
 
 impl VectorDb {
@@ -131,12 +136,15 @@ impl VectorDb {
             storage: Arc::clone(&storage),
         };
 
+        let (rebalancer_tx, rebalancer_rx) = tokio::sync::mpsc::unbounded_channel();
+
         // Create initial image for the delta (shares dictionary, centroid_graph, and id_allocator)
         let ctx = VectorDbDeltaContext {
             dimensions: config.dimensions as usize,
             dictionary: Arc::clone(&dictionary),
             centroid_graph: Arc::clone(&centroid_graph),
             id_allocator,
+            rebalancer_tx,
         };
 
         // start write coordinator
@@ -147,18 +155,25 @@ impl VectorDb {
         };
         let mut write_coordinator = WriteCoordinator::new(
             coordinator_config,
-            vec![WRITE_CHANNEL.to_string()],
+            vec![WRITE_CHANNEL.to_string(), REBALANCE_CHANNEL.to_string()],
             ctx,
             snapshot.clone(),
             flusher,
         );
         write_coordinator.start();
 
+        let rebalancer = IndexRebalancer::start(
+            centroid_graph.clone(),
+            write_coordinator.handle(REBALANCE_CHANNEL),
+            rebalancer_rx,
+        );
+
         Ok(Self {
             config,
             storage,
             write_coordinator,
             centroid_graph,
+            rebalancer,
         })
     }
 
@@ -289,7 +304,7 @@ impl VectorDb {
         let mut write_handle = self
             .write_coordinator
             .handle(WRITE_CHANNEL)
-            .try_write(writes)
+            .try_write(VectorDbWrite::Write(writes))
             .await?;
         write_handle
             .wait(Durability::Applied)
