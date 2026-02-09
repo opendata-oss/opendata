@@ -221,7 +221,7 @@ impl MiniTsdb {
         self.write_coordinator
             .stop()
             .await
-            .map_err(|e| Error::Internal(e))?;
+            .map_err(Error::Internal)?;
         Ok(())
     }
 }
