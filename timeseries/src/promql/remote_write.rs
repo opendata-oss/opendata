@@ -236,11 +236,7 @@ pub async fn handle_remote_write(
     );
 
     // Ingest samples into the TSDB
-    match state
-        .tsdb
-        .ingest_samples(samples, state.flush_interval_secs)
-        .await
-    {
+    match state.tsdb.ingest_samples(samples).await {
         Ok(()) => {
             // Increment successful ingestion counter
             state

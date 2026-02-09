@@ -1,6 +1,5 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::extract::{FromRequest, Path, Query, State};
 use axum::http::{Method, StatusCode};
@@ -11,7 +10,6 @@ use axum::routing::post;
 use axum::{Form, extract::Request};
 use axum::{Json, Router};
 use tokio::signal;
-use tokio::time::interval;
 
 use super::config::PrometheusConfig;
 use super::metrics::Metrics;
@@ -33,7 +31,6 @@ use crate::tsdb::Tsdb;
 pub(crate) struct AppState {
     pub(crate) tsdb: Arc<Tsdb>,
     pub(crate) metrics: Arc<Metrics>,
-    pub(crate) flush_interval_secs: u64,
 }
 
 /// Server configuration
@@ -71,7 +68,6 @@ impl PromqlServer {
         let state = AppState {
             tsdb: self.tsdb.clone(),
             metrics: metrics.clone(),
-            flush_interval_secs: self.config.prometheus_config.flush_interval_secs,
         };
 
         // Start the scraper if there are scrape configs
@@ -89,25 +85,6 @@ impl PromqlServer {
         } else {
             tracing::info!("No scrape configs found, scraper not started");
         }
-
-        // Start the flush timer
-        let flush_interval_secs = self.config.prometheus_config.flush_interval_secs;
-        let tsdb_for_flush = self.tsdb.clone();
-        tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(flush_interval_secs));
-            tracing::info!(
-                "Starting flush timer with {}s interval",
-                flush_interval_secs
-            );
-            loop {
-                ticker.tick().await;
-                if let Err(e) = tsdb_for_flush.flush(flush_interval_secs).await {
-                    tracing::error!("Failed to flush TSDB: {}", e);
-                } else {
-                    tracing::debug!("Flushed TSDB");
-                }
-            }
-        });
 
         // Build router with metrics middleware
         let app = Router::new()

@@ -1,18 +1,20 @@
-use std::sync::{Arc, atomic::AtomicU32};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig, WriteError};
+use common::storage::StorageSnapshot;
 use common::{Storage, StorageRead};
-use dashmap::DashMap;
-use tokio::sync::{Mutex, RwLock};
 
-use crate::delta::{TsdbDelta, TsdbDeltaBuilder};
+use crate::delta::{TsdbContext, TsdbWriteDelta};
 use crate::error::Error;
+use crate::flusher::TsdbFlusher;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
-use crate::model::{Label, Sample, Series, SeriesFingerprint, SeriesId, TimeBucket};
+use crate::model::{Label, Sample, Series, SeriesId, TimeBucket};
 use crate::query::BucketQueryReader;
 use crate::serde::key::TimeSeriesKey;
 use crate::serde::timeseries::TimeSeriesIterator;
-use crate::storage::{OpenTsdbStorageExt, OpenTsdbStorageReadExt};
+use crate::storage::OpenTsdbStorageReadExt;
 use crate::util::Result;
 
 pub(crate) struct MiniQueryReader {
@@ -98,18 +100,7 @@ impl BucketQueryReader for MiniQueryReader {
 
 pub(crate) struct MiniTsdb {
     bucket: TimeBucket,
-    series_dict: DashMap<SeriesFingerprint, SeriesId>,
-    next_series_id: AtomicU32,
-    /// Pending delta accumulating ingested data not yet flushed to storage.
-    pending_delta: Mutex<TsdbDelta>,
-    /// Receiver for waiting for updates to pending delta
-    pending_delta_watch_rx: tokio::sync::watch::Receiver<std::time::Instant>,
-    /// Sender for updating the pending delta when flushing.
-    pending_delta_watch_tx: tokio::sync::watch::Sender<std::time::Instant>,
-    /// Storage snapshot used for queries.
-    snapshot: RwLock<Arc<dyn StorageRead>>,
-    /// Mutex to ensure only one flush operation can run at a time.
-    flush_mutex: Arc<Mutex<()>>,
+    write_coordinator: WriteCoordinator<TsdbWriteDelta, TsdbFlusher>,
 }
 
 impl MiniTsdb {
@@ -119,49 +110,54 @@ impl MiniTsdb {
     }
 
     /// Create a query reader for read operations.
-    pub(crate) async fn query_reader(&self) -> MiniQueryReader {
-        // TODO: right now the data that is not flushed to storage
-        // (sitting in the pending delta) is not visible to queries,
-        // we should improve this by adding a tiered reader where we
-        // can read from in-memory deltas as well
-
-        // this also holds the lock for the duration of the query reader
-        // meaning we can't finish a flush operation
-        let snapshot = self.snapshot.read().await.clone();
+    pub(crate) fn query_reader(&self) -> MiniQueryReader {
+        let view = self.write_coordinator.view();
         MiniQueryReader {
             bucket: self.bucket,
-            snapshot,
+            snapshot: view.snapshot.clone(),
         }
     }
 
-    pub(crate) async fn load(bucket: TimeBucket, storage: Arc<dyn StorageRead>) -> Result<Self> {
-        let series_dict = DashMap::new();
-        let next_series_id = storage
+    pub(crate) async fn load(bucket: TimeBucket, storage: Arc<dyn Storage>) -> Result<Self> {
+        let snapshot = storage.snapshot().await?;
+
+        let mut series_dict = HashMap::new();
+        let next_series_id = snapshot
             .load_series_dictionary(&bucket, |fingerprint, series_id| {
                 series_dict.insert(fingerprint, series_id);
             })
             .await?;
 
-        // Create tokio::watch channel for pending delta
-        let (tx, rx) = tokio::sync::watch::channel(std::time::Instant::now());
+        let context = TsdbContext {
+            bucket,
+            series_dict: Arc::new(series_dict),
+            next_series_id,
+        };
+
+        let flusher = TsdbFlusher {
+            storage: storage.clone(),
+        };
+
+        let initial_snapshot: Arc<dyn StorageSnapshot> = storage
+            .snapshot()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut write_coordinator = WriteCoordinator::new(
+            WriteCoordinatorConfig::default(),
+            context,
+            initial_snapshot,
+            flusher,
+        );
+        write_coordinator.start();
 
         Ok(Self {
             bucket,
-            series_dict,
-            next_series_id: AtomicU32::new(next_series_id),
-            pending_delta: Mutex::new(TsdbDelta::empty(bucket)),
-            pending_delta_watch_tx: tx,
-            pending_delta_watch_rx: rx,
-            snapshot: RwLock::new(storage),
-            flush_mutex: Arc::new(Mutex::new(())),
+            write_coordinator,
         })
     }
 
     /// Ingest a batch of series with samples in a single operation.
-    /// This is more efficient than calling ingest() multiple times as it creates only one delta builder.
-    /// Note: Ingested data is batched and NOT visible to queries until flush().
-    /// Returns an error if any sample timestamp is outside the bucket's time range.
-    /// Blocks if the pending delta is older than 2 * flush_interval_secs.
     #[tracing::instrument(
         level = "debug",
         skip_all,
@@ -171,11 +167,7 @@ impl MiniTsdb {
             total_samples = series_list.iter().map(|s| s.samples.len()).sum::<usize>()
         )
     )]
-    pub(crate) async fn ingest_batch(
-        &self,
-        series_list: &[Series],
-        flush_interval_secs: u64,
-    ) -> Result<()> {
+    pub(crate) async fn ingest_batch(&self, series_list: &[Series]) -> Result<()> {
         let total_samples = series_list.iter().map(|s| s.samples.len()).sum::<usize>();
 
         tracing::debug!(
@@ -185,29 +177,16 @@ impl MiniTsdb {
             "Starting MiniTsdb batch ingest"
         );
 
-        // Block until the pending delta is young enough (not older than 2 * flush_interval_secs)
-        let max_age = std::time::Duration::from_secs(2 * flush_interval_secs);
-        let mut receiver = self.pending_delta_watch_rx.clone();
-        receiver
-            .wait_for(|t| t.elapsed() <= max_age)
+        let handle = self.write_coordinator.handle();
+        let mut write_handle = handle
+            .write(series_list.to_vec())
             .await
-            .map_err(|_e| "pending delta watch_rx disconnected")?;
+            .map_err(map_write_error)?;
 
-        let mut builder =
-            TsdbDeltaBuilder::new(self.bucket, &self.series_dict, &self.next_series_id);
-
-        // Ingest all series into the same delta builder
-        for series in series_list {
-            builder.ingest(series)?;
-        }
-
-        let delta = builder.build();
-
-        // Accumulate into pending delta
-        {
-            let mut pending = self.pending_delta.lock().await;
-            pending.merge(delta);
-        }
+        write_handle
+            .wait(Durability::Applied)
+            .await
+            .map_err(map_write_error)?;
 
         tracing::debug!(
             bucket = ?self.bucket,
@@ -220,79 +199,39 @@ impl MiniTsdb {
     }
 
     /// Ingest a single series with samples.
-    /// Note: Ingested data is batched and NOT visible to queries until flush().
-    /// Returns an error if any sample timestamp is outside the bucket's time range.
-    ///
-    /// For better performance when ingesting multiple series, use ingest_batch() instead.
-    pub(crate) async fn ingest(&self, series: &Series, flush_interval_secs: u64) -> Result<()> {
-        // Delegate to batch method with a single series
-        self.ingest_batch(std::slice::from_ref(series), flush_interval_secs)
-            .await
+    pub(crate) async fn ingest(&self, series: &Series) -> Result<()> {
+        self.ingest_batch(std::slice::from_ref(series)).await
     }
 
     /// Flush pending data to storage, making it durable and visible to queries.
-    pub(crate) async fn flush(
-        &self,
-        storage: Arc<dyn Storage>,
-        _flush_interval_secs: u64,
-    ) -> Result<()> {
-        let _flush_guard = self.flush_mutex.lock().await;
+    pub(crate) async fn flush(&self) -> Result<()> {
+        let handle = self.write_coordinator.handle();
+        let mut flush_handle = handle.flush(false).await.map_err(map_write_error)?;
 
-        // Take the pending delta (replace with empty) - after this blocking
-        // section we can continue accepting ingestion while we flush to
-        // storage
-        let (delta, created_at) = {
-            let mut pending = self.pending_delta.lock().await;
-            if pending.is_empty() {
-                return Ok(());
-            }
-
-            let delta = std::mem::replace(&mut *pending, TsdbDelta::empty(self.bucket));
-            (delta, std::time::Instant::now())
-        };
-        self.pending_delta_watch_tx.send_if_modified(|current| {
-            if created_at > *current {
-                *current = created_at;
-                true
-            } else {
-                false
-            }
-        });
-
-        let mut ops = Vec::new();
-        ops.push(storage.merge_bucket_list(self.bucket)?);
-
-        for (fingerprint, series_id) in &delta.series_dict {
-            ops.push(storage.insert_series_id(self.bucket, *fingerprint, *series_id)?);
-        }
-
-        for entry in delta.forward_index.series.iter() {
-            ops.push(storage.insert_forward_index(
-                self.bucket,
-                *entry.key(),
-                entry.value().clone(),
-            )?);
-        }
-
-        for entry in delta.inverted_index.postings.iter() {
-            ops.push(storage.merge_inverted_index(
-                self.bucket,
-                entry.key().clone(),
-                entry.value().clone(),
-            )?);
-        }
-
-        for (series_id, samples) in delta.samples {
-            ops.push(storage.merge_samples(self.bucket, series_id, samples)?);
-        }
-
-        storage.apply(ops).await?;
-
-        // Update snapshot
-        let new_snapshot = storage.snapshot().await?;
-        let mut snapshot_guard = self.snapshot.write().await;
-        *snapshot_guard = new_snapshot;
+        flush_handle
+            .wait(Durability::Flushed)
+            .await
+            .map_err(map_write_error)?;
 
         Ok(())
+    }
+
+    /// Gracefully stop the write coordinator, flushing pending data.
+    pub(crate) async fn stop(self) -> Result<()> {
+        self.write_coordinator
+            .stop()
+            .await
+            .map_err(|e| Error::Internal(e))?;
+        Ok(())
+    }
+}
+
+fn map_write_error(e: WriteError) -> Error {
+    match e {
+        WriteError::Backpressure => Error::Backpressure,
+        WriteError::Shutdown => Error::Internal("Write coordinator shut down".to_string()),
+        WriteError::ApplyError(_, msg) => Error::Internal(msg),
+        WriteError::FlushError(msg) => Error::Storage(msg),
+        WriteError::Internal(msg) => Error::Internal(msg),
     }
 }
