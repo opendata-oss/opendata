@@ -12,9 +12,11 @@ use roaring::RoaringTreemap;
 use crate::model::AttributeValue;
 use crate::serde::Encode;
 use crate::serde::centroid_chunk::{CentroidChunkValue, CentroidEntry};
+use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::deletions::DeletionsValue;
 use crate::serde::key::{
-    CentroidChunkKey, DeletionsKey, IdDictionaryKey, PostingListKey, VectorDataKey,
+    CentroidChunkKey, CentroidStatsKey, DeletionsKey, IdDictionaryKey, PostingListKey,
+    VectorDataKey,
 };
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_data::{Field, VectorDataValue};
@@ -86,4 +88,12 @@ pub fn put_centroid_chunk(
 pub fn delete_centroid_chunk(chunk_id: u32) -> RecordOp {
     let key = CentroidChunkKey::new(chunk_id).encode();
     RecordOp::Delete(key)
+}
+
+/// Create a RecordOp to merge a vector count delta into centroid stats.
+#[allow(dead_code)]
+pub fn merge_centroid_stats(centroid_id: u32, delta: i32) -> RecordOp {
+    let key = CentroidStatsKey::new(centroid_id).encode();
+    let value = CentroidStatsValue::new(delta).encode_to_bytes();
+    RecordOp::Merge(Record::new(key, value))
 }
