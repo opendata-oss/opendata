@@ -355,6 +355,165 @@ mod tests {
     }
 
     #[test]
+    fn should_create_different_series_id_for_different_attributes() {
+        // given
+        let ctx = create_test_context();
+        let mut delta = TsdbWriteDelta::init(ctx);
+        let series1 = create_test_series(
+            "http_requests",
+            vec![("service", "api")],
+            create_test_sample(),
+        );
+        let series2 = create_test_series(
+            "http_requests",
+            vec![("service", "web")],
+            create_test_sample(),
+        );
+
+        // when
+        delta.apply(vec![series1]).unwrap();
+        delta.apply(vec![series2]).unwrap();
+
+        // then
+        assert_eq!(delta.next_series_id, 2);
+        assert_eq!(delta.series_dict_delta.len(), 2);
+        assert_eq!(delta.samples.len(), 2);
+        assert!(delta.samples.contains_key(&0));
+        assert!(delta.samples.contains_key(&1));
+    }
+
+    #[test]
+    fn should_sort_attributes_before_fingerprinting() {
+        // given
+        let ctx = create_test_context();
+        let mut delta = TsdbWriteDelta::init(ctx);
+        let series1 = create_test_series(
+            "metric",
+            vec![("z_key", "value"), ("a_key", "value")],
+            create_test_sample(),
+        );
+        let series2 = create_test_series(
+            "metric",
+            vec![("a_key", "value"), ("z_key", "value")],
+            Sample {
+                timestamp_ms: 60_000_002,
+                value: 99.0,
+            },
+        );
+
+        // when
+        delta.apply(vec![series1]).unwrap();
+        delta.apply(vec![series2]).unwrap();
+
+        // then
+        assert_eq!(delta.next_series_id, 1); // Same series_id reused
+        assert_eq!(delta.series_dict_delta.len(), 1);
+        assert_eq!(delta.samples.len(), 1);
+    }
+
+    #[test]
+    fn should_store_metric_unit_and_type_in_forward_index() {
+        // given
+        let ctx = create_test_context();
+        let mut delta = TsdbWriteDelta::init(ctx);
+        let label_vec: Vec<Label> = vec![("env", "prod")]
+            .into_iter()
+            .map(|(k, v)| Label::new(k, v))
+            .collect();
+        let mut series = Series::new("http_requests", label_vec, vec![create_test_sample()]);
+        series.unit = Some("requests_per_second".to_string());
+        series.metric_type = Some(MetricType::Sum {
+            monotonic: true,
+            temporality: crate::model::Temporality::Cumulative,
+        });
+
+        // when
+        delta.apply(vec![series]).unwrap();
+
+        // then
+        let series_spec = delta.forward_index.series.get(&0).unwrap();
+        assert_eq!(series_spec.unit, Some("requests_per_second".to_string()));
+        match series_spec.metric_type {
+            Some(MetricType::Sum {
+                monotonic,
+                temporality,
+            }) => {
+                assert!(monotonic);
+                assert_eq!(temporality, crate::model::Temporality::Cumulative);
+            }
+            _ => panic!("Expected Sum metric type"),
+        }
+    }
+
+    #[test]
+    fn should_index_all_labels_in_inverted_index() {
+        // given
+        let ctx = create_test_context();
+        let mut delta = TsdbWriteDelta::init(ctx);
+        let series = create_test_series(
+            "metric",
+            vec![("service", "api"), ("env", "prod"), ("region", "us-east")],
+            create_test_sample(),
+        );
+
+        // when
+        delta.apply(vec![series]).unwrap();
+
+        // then: __name__ label + 3 explicit labels = 4
+        assert_eq!(delta.inverted_index.postings.len(), 4);
+        for label in &[
+            Label::new("__name__", "metric"),
+            Label::new("service", "api"),
+            Label::new("env", "prod"),
+            Label::new("region", "us-east"),
+        ] {
+            let postings = delta.inverted_index.postings.get(label).unwrap();
+            assert!(postings.value().contains(0));
+            assert_eq!(postings.value().len(), 1);
+        }
+    }
+
+    #[test]
+    fn should_handle_empty_attributes_list() {
+        // given
+        let ctx = create_test_context();
+        let mut delta = TsdbWriteDelta::init(ctx);
+        let series = create_test_series("metric", vec![], create_test_sample());
+
+        // when
+        delta.apply(vec![series]).unwrap();
+
+        // then
+        assert_eq!(delta.next_series_id, 1);
+        assert_eq!(delta.series_dict_delta.len(), 1);
+        assert_eq!(delta.samples.len(), 1);
+        // Only __name__ label in inverted index
+        assert_eq!(delta.inverted_index.postings.len(), 1);
+    }
+
+    #[test]
+    fn should_handle_none_metric_unit() {
+        // given
+        let ctx = create_test_context();
+        let mut delta = TsdbWriteDelta::init(ctx);
+        let label_vec: Vec<Label> = vec![("env", "prod")]
+            .into_iter()
+            .map(|(k, v)| Label::new(k, v))
+            .collect();
+        let mut series = Series::new("http_requests", label_vec, vec![create_test_sample()]);
+        series.unit = None;
+        series.metric_type = Some(MetricType::Gauge);
+
+        // when
+        delta.apply(vec![series]).unwrap();
+
+        // then
+        let series_spec = delta.forward_index.series.get(&0).unwrap();
+        assert_eq!(series_spec.unit, None);
+        assert!(matches!(series_spec.metric_type, Some(MetricType::Gauge)));
+    }
+
+    #[test]
     fn should_reuse_series_from_base_dict() {
         // given: context with pre-existing series
         let mut labels = vec![
