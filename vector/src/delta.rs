@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::hnsw::CentroidGraph;
+use crate::lire::commands::RebalanceCommand;
+use crate::lire::rebalancer::IndexRebalanceOp;
 use crate::model::AttributeValue;
 use crate::serde::posting_list::PostingUpdate;
 use crate::storage::record;
@@ -33,12 +35,18 @@ use roaring::RoaringTreemap;
 // WriteCoordinator Integration Types
 // ============================================================================
 
+#[allow(dead_code)]
+pub(crate) enum VectorDbWrite {
+    Write(Vec<VectorWrite>),
+    Rebalance(RebalanceCommand),
+}
+
 /// A vector write ready for the coordinator.
 ///
 /// The write path validates and enqueues this struct.
 /// The delta handles ID allocation, dictionary lookup, centroid assignment, and updates.
 #[derive(Debug, Clone)]
-pub struct VectorWrite {
+pub(crate) struct VectorWrite {
     /// User-provided external ID.
     pub external_id: String,
     /// Vector embedding values.
@@ -52,6 +60,7 @@ pub struct VectorWrite {
 /// This is passed to `Delta::init()` when creating a fresh delta. The image
 /// contains references to shared in-memory structures that persist across
 /// delta lifecycles.
+#[allow(private_interfaces)]
 pub struct VectorDbDeltaContext {
     /// Vector dimensions for encoding.
     pub dimensions: usize,
@@ -62,6 +71,7 @@ pub struct VectorDbDeltaContext {
     pub centroid_graph: Arc<dyn CentroidGraph>,
     /// Synchronous ID allocator for internal ID generation.
     pub id_allocator: SequenceAllocator,
+    pub rebalancer_tx: tokio::sync::mpsc::UnboundedSender<IndexRebalanceOp>,
 }
 
 /// Immutable delta containing all RecordOps ready to be flushed.
@@ -100,7 +110,7 @@ impl VectorDbWriteDelta {
 
 impl Delta for VectorDbWriteDelta {
     type Context = VectorDbDeltaContext;
-    type Write = Vec<VectorWrite>;
+    type Write = VectorDbWrite;
     type DeltaView = Arc<std::sync::RwLock<VectorDbDeltaView>>;
     type Frozen = VectorDbImmutableDelta;
     type FrozenView = Arc<VectorDbDeltaView>;
@@ -114,7 +124,54 @@ impl Delta for VectorDbWriteDelta {
         }
     }
 
-    fn apply(&mut self, vector_writes: Self::Write) -> Result<(), String> {
+    fn apply(&mut self, write: Self::Write) -> Result<(), String> {
+        match write {
+            VectorDbWrite::Write(writes) => self.apply_write(writes),
+            VectorDbWrite::Rebalance(cmd) => self.apply_rebalance_cmd(cmd),
+        }
+    }
+
+    fn estimate_size(&self) -> usize {
+        let view = self.view.read().expect("lock poisoned");
+        // Rough estimate: 100 bytes per op, 50 bytes per posting update, 8 bytes per deletion
+        self.ops.len() * 100
+            + view
+                .posting_updates
+                .values()
+                .map(|v| v.len())
+                .sum::<usize>()
+                * 50
+            + view.deleted_vectors.len() as usize * 8
+    }
+
+    fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
+        let mut ops = self.ops;
+        let view = self.view.read().expect("lock poisoned").clone();
+
+        // Finalize posting list merges
+        for (centroid_id, updates) in &view.posting_updates {
+            if let Ok(op) = record::merge_posting_list(*centroid_id, updates.clone()) {
+                ops.push(op);
+            }
+        }
+
+        // Finalize deleted vectors merge
+        if !view.deleted_vectors.is_empty()
+            && let Ok(op) = record::merge_deleted_vectors(view.deleted_vectors.clone())
+        {
+            ops.push(op);
+        }
+
+        (VectorDbImmutableDelta { ops }, Arc::new(view), self.ctx)
+    }
+
+    fn reader(&self) -> Self::DeltaView {
+        self.view.clone()
+    }
+}
+
+impl VectorDbWriteDelta {
+    fn apply_write(&mut self, vector_writes: Vec<VectorWrite>) -> Result<(), String> {
         let mut view = self.view.write().expect("lock poisoned");
         for write in vector_writes {
             // 1. Allocate new internal ID
@@ -164,44 +221,6 @@ impl Delta for VectorDbWriteDelta {
                 .push(PostingUpdate::append(new_internal_id, write.values));
         }
         Ok(())
-    }
-
-    fn estimate_size(&self) -> usize {
-        let view = self.view.read().expect("lock poisoned");
-        // Rough estimate: 100 bytes per op, 50 bytes per posting update, 8 bytes per deletion
-        self.ops.len() * 100
-            + view
-                .posting_updates
-                .values()
-                .map(|v| v.len())
-                .sum::<usize>()
-                * 50
-            + view.deleted_vectors.len() as usize * 8
-    }
-
-    fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
-        let mut ops = self.ops;
-        let view = self.view.read().expect("lock poisoned").clone();
-
-        // Finalize posting list merges
-        for (centroid_id, updates) in &view.posting_updates {
-            if let Ok(op) = record::merge_posting_list(*centroid_id, updates.clone()) {
-                ops.push(op);
-            }
-        }
-
-        // Finalize deleted vectors merge
-        if !view.deleted_vectors.is_empty()
-            && let Ok(op) = record::merge_deleted_vectors(view.deleted_vectors.clone())
-        {
-            ops.push(op);
-        }
-
-        (VectorDbImmutableDelta { ops }, Arc::new(view), self.ctx)
-    }
-
-    fn reader(&self) -> Self::DeltaView {
-        self.view.clone()
     }
 }
 
@@ -261,12 +280,14 @@ mod tests {
         let id_allocator = SequenceAllocator::load(storage.as_ref(), key)
             .await
             .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         VectorDbDeltaContext {
             dimensions: 3,
             dictionary: Arc::new(DashMap::new()),
             centroid_graph: Arc::new(MockCentroidGraph::new(centroid_id)),
             id_allocator,
+            rebalancer_tx: tx,
         }
     }
 
@@ -310,7 +331,7 @@ mod tests {
         let write = create_vector_write("vec-1", vec![1.0, 2.0, 3.0]);
 
         // when
-        delta.apply(vec![write]).unwrap();
+        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
         let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have ops for ID dictionary put and vector data put
@@ -342,7 +363,7 @@ mod tests {
         let write = create_vector_write("vec-1", vec![1.0, 2.0, 3.0]);
 
         // when
-        delta.apply(vec![write]).unwrap();
+        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
         let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have a merge op for the posting list of centroid 42
@@ -368,7 +389,7 @@ mod tests {
         let write = create_vector_write("vec-1", vec![1.0, 2.0, 3.0]);
 
         // when
-        delta.apply(vec![write]).unwrap();
+        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
 
         // then - dictionary should be updated in memory
         assert!(dictionary.contains_key("vec-1"));
@@ -389,7 +410,7 @@ mod tests {
         let write = create_vector_write("vec-1", vec![4.0, 5.0, 6.0]);
 
         // when
-        delta.apply(vec![write]).unwrap();
+        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
         let (frozen, _view, ctx) = delta.freeze();
 
         // then - should have delete for old ID dictionary entry and put for new
@@ -426,7 +447,7 @@ mod tests {
         let write = create_vector_write("vec-1", vec![4.0, 5.0, 6.0]);
 
         // when
-        delta.apply(vec![write]).unwrap();
+        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
         let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have posting list merge for the new vector
@@ -455,7 +476,7 @@ mod tests {
         let write = create_vector_write("vec-1", vec![4.0, 5.0, 6.0]);
 
         // when
-        delta.apply(vec![write]).unwrap();
+        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
         let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have delete op for old vector data
@@ -491,7 +512,7 @@ mod tests {
         ];
 
         // when
-        delta.apply(writes).unwrap();
+        delta.apply(VectorDbWrite::Write(writes)).unwrap();
         let (frozen, _view, ctx) = delta.freeze();
 
         // then - should have 3 vectors in dictionary
@@ -531,7 +552,7 @@ mod tests {
         ];
 
         // when
-        delta.apply(writes).unwrap();
+        delta.apply(VectorDbWrite::Write(writes)).unwrap();
 
         // then - internal IDs should be sequential starting from 0
         let id1 = *dictionary.get("vec-1").unwrap();
@@ -570,12 +591,14 @@ mod tests {
         let id_allocator = SequenceAllocator::load(storage.as_ref(), key)
             .await
             .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         let ctx = VectorDbDeltaContext {
             dimensions: 3,
             dictionary: Arc::new(DashMap::new()),
             centroid_graph: Arc::new(MultiCentroidGraph),
             id_allocator,
+            rebalancer_tx: tx,
         };
 
         let mut delta = VectorDbWriteDelta::init(ctx);
@@ -588,7 +611,7 @@ mod tests {
         ];
 
         // when
-        delta.apply(writes).unwrap();
+        delta.apply(VectorDbWrite::Write(writes)).unwrap();
         let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have posting list merges for centroids 1, 2, and 3
@@ -616,7 +639,7 @@ mod tests {
 
         // when - add a vector
         let write = create_vector_write("vec-1", vec![1.0, 2.0, 3.0]);
-        delta.apply(vec![write]).unwrap();
+        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
 
         // then - size should be non-zero
         let size = delta.estimate_size();
@@ -640,7 +663,7 @@ mod tests {
             create_vector_write("vec-2", vec![1.0, 0.0, 0.0]),
             create_vector_write("vec-1", vec![0.0, 1.0, 0.0]),
         ];
-        delta.apply(writes).unwrap();
+        delta.apply(VectorDbWrite::Write(writes)).unwrap();
 
         // then - reader should see posting updates for both vectors
         let view = reader.read().expect("lock poisoned");
