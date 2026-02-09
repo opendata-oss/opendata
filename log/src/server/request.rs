@@ -31,6 +31,8 @@ pub struct ScanParams {
     /// Maximum number of entries to return.
     pub limit: Option<usize>,
     /// If true, long-poll until data is available or timeout.
+    // `bool` doesn't implement `Deserialize` for missing fields like `Option<T>` does,
+    // so `#[serde(default)]` is needed to default to `false` when `?follow=` is omitted.
     #[serde(default)]
     pub follow: bool,
     /// Timeout in milliseconds for long-polling (default: 30000).

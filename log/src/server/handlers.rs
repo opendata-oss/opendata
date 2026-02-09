@@ -102,7 +102,12 @@ pub async fn handle_scan(
     let poll_interval = Duration::from_millis(100);
 
     loop {
-        tokio::time::sleep(poll_interval).await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let response = ScanResponse::success(key, vec![]);
+            return Ok(to_api_response(response, format));
+        }
+        tokio::time::sleep(poll_interval.min(remaining)).await;
 
         let entries = scan_entries(&state, key.clone(), range.clone(), limit).await?;
         if !entries.is_empty() {
@@ -114,12 +119,6 @@ pub async fn handle_scan(
                 })
                 .collect();
             let response = ScanResponse::success(key, values);
-            return Ok(to_api_response(response, format));
-        }
-
-        if Instant::now() >= deadline {
-            // Timeout reached, return empty result
-            let response = ScanResponse::success(key, vec![]);
             return Ok(to_api_response(response, format));
         }
     }
