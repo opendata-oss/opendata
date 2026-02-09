@@ -148,6 +148,7 @@ impl IntoResponse for RemoteWriteError {
             Error::Storage(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
             Error::Encoding(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
             Error::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+            Error::Backpressure => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         };
 
         let body = serde_json::json!({

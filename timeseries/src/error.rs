@@ -46,6 +46,9 @@ pub enum Error {
     /// These errors should not occur during normal operation and
     /// typically indicate a bug in the implementation.
     Internal(String),
+
+    /// The write coordinator queue is full.
+    Backpressure,
 }
 
 impl std::error::Error for Error {}
@@ -57,6 +60,7 @@ impl std::fmt::Display for Error {
             Error::Encoding(msg) => write!(f, "Encoding error: {}", msg),
             Error::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
             Error::Internal(msg) => write!(f, "Internal error: {}", msg),
+            Error::Backpressure => write!(f, "Backpressure: write queue is full"),
         }
     }
 }
