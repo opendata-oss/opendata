@@ -8,6 +8,7 @@ use common::serde::key_prefix::KeyPrefix;
 use roaring::RoaringTreemap;
 use std::io::Cursor;
 
+use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::posting_list::merge_posting_list;
 use crate::serde::{EncodingError, KEY_VERSION, RecordType};
 
@@ -52,6 +53,10 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
                 // PostingList deduplicates by id, keeping only the last update per id
                 merge_posting_list(existing, new_value, self.dimensions)
             }
+            RecordType::CentroidStats => {
+                // CentroidStats sums i32 deltas
+                merge_centroid_stats(existing, new_value)
+            }
             _ => {
                 // For other record types (IdDictionary, VectorData, VectorMeta, etc.),
                 // just use new value. These should use Put, not Merge, but handle gracefully
@@ -92,12 +97,24 @@ fn merge_roaring_treemap(existing: Bytes, new_value: Bytes) -> Result<Bytes, Enc
     Ok(Bytes::from(buf))
 }
 
+/// Merge two CentroidStats values by summing their i32 deltas.
+fn merge_centroid_stats(existing: Bytes, new_value: Bytes) -> Bytes {
+    let existing_stats = CentroidStatsValue::decode_from_bytes(&existing)
+        .expect("Failed to decode existing CentroidStatsValue");
+    let new_stats = CentroidStatsValue::decode_from_bytes(&new_value)
+        .expect("Failed to decode new CentroidStatsValue");
+    let merged = CentroidStatsValue::new(existing_stats.num_vectors + new_stats.num_vectors);
+    merged.encode_to_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::serde::FieldValue;
     use crate::serde::deletions::DeletionsValue;
-    use crate::serde::key::{DeletionsKey, IdDictionaryKey, MetadataIndexKey, PostingListKey};
+    use crate::serde::key::{
+        CentroidStatsKey, DeletionsKey, IdDictionaryKey, MetadataIndexKey, PostingListKey,
+    };
     use crate::serde::metadata_index::MetadataIndexValue;
     use crate::serde::posting_list::{PostingListValue, PostingUpdate};
     use common::storage::MergeOperator;
@@ -337,6 +354,37 @@ mod tests {
 
         // then
         assert_eq!(result, new_value);
+    }
+
+    #[rstest]
+    #[case(10, 5, 15, "positive + positive")]
+    #[case(10, -3, 7, "positive + negative")]
+    #[case(-5, -3, -8, "negative + negative")]
+    #[case(0, 5, 5, "zero + positive")]
+    #[case(5, 0, 5, "positive + zero")]
+    #[case(0, 0, 0, "zero + zero")]
+    fn should_merge_centroid_stats(
+        #[case] existing_count: i32,
+        #[case] new_count: i32,
+        #[case] expected_count: i32,
+        #[case] description: &str,
+    ) {
+        // given
+        let operator = VectorDbMergeOperator::new(3);
+        let key = CentroidStatsKey::new(1).encode();
+        let existing_value = CentroidStatsValue::new(existing_count).encode_to_bytes();
+        let new_value = CentroidStatsValue::new(new_count).encode_to_bytes();
+
+        // when
+        let merged = operator.merge(&key, Some(existing_value), new_value);
+
+        // then
+        let decoded = CentroidStatsValue::decode_from_bytes(&merged).unwrap();
+        assert_eq!(
+            decoded.num_vectors, expected_count,
+            "Failed test case: {}",
+            description
+        );
     }
 
     #[test]
