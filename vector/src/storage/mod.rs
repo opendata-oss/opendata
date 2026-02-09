@@ -3,9 +3,11 @@ use async_trait::async_trait;
 use common::StorageRead;
 
 use crate::serde::centroid_chunk::CentroidChunkValue;
+use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::deletions::DeletionsValue;
 use crate::serde::key::{
-    CentroidChunkKey, DeletionsKey, IdDictionaryKey, PostingListKey, VectorDataKey,
+    CentroidChunkKey, CentroidStatsKey, DeletionsKey, IdDictionaryKey, PostingListKey,
+    VectorDataKey,
 };
 use crate::serde::posting_list::PostingListValue;
 use crate::serde::vector_data::VectorDataValue;
@@ -106,6 +108,23 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
                 Ok(Some(value))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Load centroid stats (vector count) for a centroid.
+    ///
+    /// Returns a zero count if no stats exist yet.
+    #[allow(dead_code)]
+    async fn get_centroid_stats(&self, centroid_id: u32) -> Result<CentroidStatsValue> {
+        let key = CentroidStatsKey::new(centroid_id).encode();
+        let record = self.get(key).await?;
+        match record {
+            Some(record) => {
+                let value = CentroidStatsValue::decode_from_bytes(&record.value)
+                    .context("failed to decode CentroidStatsValue")?;
+                Ok(value)
+            }
+            None => Ok(CentroidStatsValue::new(0)),
         }
     }
 
