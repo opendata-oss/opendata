@@ -37,6 +37,10 @@
 //! }
 //! ```
 
+// Internal modules are shared with the binary target (main.rs) which
+// re-declares them. Suppress dead_code warnings for the lib target.
+#![allow(dead_code)]
+
 // Internal modules
 mod delta;
 mod head;

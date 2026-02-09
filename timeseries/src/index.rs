@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::model::MetricType;
 use crate::model::{Label, SeriesId};
 use dashmap::{DashMap, mapref::one::Ref};
