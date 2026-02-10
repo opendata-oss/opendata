@@ -11,7 +11,7 @@ use std::ops::{Deref, DerefMut};
 pub use error::{WriteError, WriteResult};
 use futures::stream::{self, SelectAll, StreamExt};
 pub use handle::{View, WriteCoordinatorHandle, WriteHandle};
-pub use traits::{Delta, Durability, Flusher};
+pub use traits::{Delta, Durability, EpochStamped, Flusher};
 
 /// Event sent from the write coordinator task to the flush task.
 enum FlushEvent<D: Delta> {
@@ -23,7 +23,6 @@ enum FlushEvent<D: Delta> {
 
 // Internal use only
 use crate::StorageRead;
-use crate::coordinator::traits::EpochStamped;
 use crate::storage::StorageSnapshot;
 pub(crate) use handle::EpochWatcher;
 use std::sync::{Arc, Mutex};

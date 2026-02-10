@@ -4447,6 +4447,7 @@ dependencies = [
  "rstest",
  "tokio",
  "tokio-util",
+ "tracing",
  "usearch",
 ]
 

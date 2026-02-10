@@ -36,7 +36,7 @@
 //!
 //! ## Centroid IDs
 //!
-//! Each centroid carries an explicit `centroid_id` (u32) stored alongside its vector.
+//! Each centroid carries an explicit `centroid_id` (u64) stored alongside its vector.
 //! These IDs:
 //!
 //! - Start at 1 (0 is reserved for the deleted vectors bitmap in PostingList)
@@ -70,7 +70,7 @@ pub struct CentroidEntry {
     /// This ID is used as the key suffix in `PostingListKey` to look up the
     /// vector IDs assigned to this cluster. ID 0 is reserved for the deleted
     /// vectors bitmap.
-    pub centroid_id: u32,
+    pub centroid_id: u64,
     /// Centroid vector with `dimensions` elements (from `CollectionMeta`).
     ///
     /// This is the representative vector for the cluster, typically computed
@@ -80,7 +80,7 @@ pub struct CentroidEntry {
 }
 
 impl CentroidEntry {
-    pub fn new(centroid_id: u32, vector: Vec<f32>) -> Self {
+    pub fn new(centroid_id: u64, vector: Vec<f32>) -> Self {
         Self {
             centroid_id,
             vector,
@@ -109,14 +109,16 @@ pub fn decode_centroid_entry(
     buf: &mut &[u8],
     dimensions: usize,
 ) -> Result<CentroidEntry, EncodingError> {
-    if buf.len() < 4 {
+    if buf.len() < 8 {
         return Err(EncodingError {
             message: "Buffer too short for centroid_id".to_string(),
         });
     }
 
-    let centroid_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    *buf = &buf[4..];
+    let centroid_id = u64::from_le_bytes([
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+    ]);
+    *buf = &buf[8..];
 
     let vector_size = dimensions * 4;
     if buf.len() < vector_size {
@@ -156,7 +158,7 @@ pub fn decode_centroid_entry(
 /// │                                                               │
 /// │  CentroidEntry                                                │
 /// │  ┌──────────────────────────────────────────────────────────┐ │
-/// │  │  centroid_id: u32 (stable identifier)                    │ │
+/// │  │  centroid_id: u64 (stable identifier)                    │ │
 /// │  │  vector:      FixedElementArray<f32>                     │ │
 /// │  │               (dimensions elements from CollectionMeta)  │ │
 /// │  └──────────────────────────────────────────────────────────┘ │
@@ -233,7 +235,7 @@ impl CentroidChunkValue {
     }
 
     /// Find a centroid by ID.
-    pub fn get_centroid(&self, centroid_id: u32) -> Option<&CentroidEntry> {
+    pub fn get_centroid(&self, centroid_id: u64) -> Option<&CentroidEntry> {
         self.entries.iter().find(|e| e.centroid_id == centroid_id)
     }
 }
@@ -311,7 +313,7 @@ mod tests {
         let value = CentroidChunkValue::new(vec![
             CentroidEntry::new(100, vec![1.0, 2.0]),
             CentroidEntry::new(200, vec![3.0, 4.0]),
-            CentroidEntry::new(u32::MAX, vec![5.0, 6.0]),
+            CentroidEntry::new(u64::MAX, vec![5.0, 6.0]),
         ]);
 
         // when
@@ -321,6 +323,6 @@ mod tests {
         // then
         assert_eq!(decoded.entries[0].centroid_id, 100);
         assert_eq!(decoded.entries[1].centroid_id, 200);
-        assert_eq!(decoded.entries[2].centroid_id, u32::MAX);
+        assert_eq!(decoded.entries[2].centroid_id, u64::MAX);
     }
 }

@@ -16,6 +16,7 @@ roaring.workspace = true
 rstest.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 rand = "0.8"

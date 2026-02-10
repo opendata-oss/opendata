@@ -8,6 +8,7 @@ use common::serde::key_prefix::KeyPrefix;
 use roaring::RoaringTreemap;
 use std::io::Cursor;
 
+use crate::serde::centroid_chunk::CentroidChunkValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::posting_list::merge_posting_list;
 use crate::serde::{EncodingError, KEY_VERSION, RecordType};
@@ -57,6 +58,10 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
                 // CentroidStats sums i32 deltas
                 merge_centroid_stats(existing, new_value)
             }
+            RecordType::CentroidChunk => {
+                // CentroidChunk appends new entries to existing chunk
+                merge_centroid_chunk(existing, new_value, self.dimensions)
+            }
             _ => {
                 // For other record types (IdDictionary, VectorData, VectorMeta, etc.),
                 // just use new value. These should use Put, not Merge, but handle gracefully
@@ -95,6 +100,17 @@ fn merge_roaring_treemap(existing: Bytes, new_value: Bytes) -> Result<Bytes, Enc
         message: format!("Failed to serialize merged RoaringTreemap: {}", e),
     })?;
     Ok(Bytes::from(buf))
+}
+
+/// Merge two CentroidChunk values by appending entries from new to existing.
+fn merge_centroid_chunk(existing: Bytes, new_value: Bytes, dimensions: usize) -> Bytes {
+    let existing_chunk = CentroidChunkValue::decode_from_bytes(&existing, dimensions)
+        .expect("Failed to decode existing CentroidChunkValue");
+    let new_chunk = CentroidChunkValue::decode_from_bytes(&new_value, dimensions)
+        .expect("Failed to decode new CentroidChunkValue");
+    let mut combined_entries = existing_chunk.entries;
+    combined_entries.extend(new_chunk.entries);
+    CentroidChunkValue::new(combined_entries).encode_to_bytes(dimensions)
 }
 
 /// Merge two CentroidStats values by summing their i32 deltas.
