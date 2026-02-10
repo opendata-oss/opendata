@@ -1,0 +1,150 @@
+name: Build Binaries
+
+on:
+  push:
+    tags: ['*/v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g., opendata-log/v0.1.1)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-binary:
+    name: Check if crate has binary
+    runs-on: ubuntu-latest
+    outputs:
+      has_binary: ${{ steps.check.outputs.has_binary }}
+      crate_name: ${{ steps.check.outputs.crate_name }}
+      version: ${{ steps.check.outputs.version }}
+      features: ${{ steps.check.outputs.features }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - name: Parse tag and check for binary
+        id: check
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          CRATE_NAME="${TAG%/v*}"
+          VERSION="${TAG#*/v}"
+          echo "crate_name=$CRATE_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          case "$CRATE_NAME" in
+            opendata-log)
+              echo "has_binary=true" >> "$GITHUB_OUTPUT"
+              echo "features=http-server" >> "$GITHUB_OUTPUT"
+              ;;
+            opendata-timeseries)
+              echo "has_binary=true" >> "$GITHUB_OUTPUT"
+              echo "features=remote-write" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "has_binary=false" >> "$GITHUB_OUTPUT"
+              echo "features=" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+  create-release:
+    name: Create GitHub Release
+    needs: [check-binary]
+    if: needs.check-binary.outputs.has_binary == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-binary.outputs.tag }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-binary.outputs.tag }}
+          name: ${{ needs.check-binary.outputs.crate_name }} v${{ needs.check-binary.outputs.version }}
+          generate_release_notes: true
+          draft: false
+
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    needs: [check-binary, create-release]
+    if: needs.check-binary.outputs.has_binary == 'true'
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-binary.outputs.tag }}
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Build
+        run: cargo build --release -p ${{ needs.check-binary.outputs.crate_name }} --features ${{ needs.check-binary.outputs.features }}
+
+      - name: Package binary (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/release
+          tar -czvf ../../${{ needs.check-binary.outputs.crate_name }}-${{ needs.check-binary.outputs.version }}-${{ matrix.target }}.tar.gz ${{ needs.check-binary.outputs.crate_name }}
+
+      - name: Package binary (windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd target/release
+          7z a ../../${{ needs.check-binary.outputs.crate_name }}-${{ needs.check-binary.outputs.version }}-${{ matrix.target }}.zip ${{ needs.check-binary.outputs.crate_name }}.exe
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-binary.outputs.tag }}
+          files: |
+            ${{ needs.check-binary.outputs.crate_name }}-*.tar.gz
+            ${{ needs.check-binary.outputs.crate_name }}-*.zip
