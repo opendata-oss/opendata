@@ -6,6 +6,8 @@ use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig, 
 use common::storage::StorageSnapshot;
 use common::{Storage, StorageRead};
 
+const WRITE_CHANNEL: &str = "write";
+
 use crate::delta::{TsdbContext, TsdbWriteDelta};
 use crate::error::Error;
 use crate::flusher::TsdbFlusher;
@@ -145,6 +147,7 @@ impl MiniTsdb {
 
         let mut write_coordinator = WriteCoordinator::new(
             WriteCoordinatorConfig::default(),
+            vec![WRITE_CHANNEL.to_string()],
             context,
             initial_snapshot,
             flusher,
@@ -177,7 +180,7 @@ impl MiniTsdb {
             "Starting MiniTsdb batch ingest"
         );
 
-        let handle = self.write_coordinator.handle();
+        let handle = self.write_coordinator.handle(WRITE_CHANNEL);
         let mut write_handle = handle
             .write(series_list.to_vec())
             .await
@@ -205,7 +208,7 @@ impl MiniTsdb {
 
     /// Flush pending data to storage, making it durable and visible to queries.
     pub(crate) async fn flush(&self) -> Result<()> {
-        let handle = self.write_coordinator.handle();
+        let handle = self.write_coordinator.handle(WRITE_CHANNEL);
         let mut flush_handle = handle.flush(false).await.map_err(map_write_error)?;
 
         flush_handle
