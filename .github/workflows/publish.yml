@@ -122,12 +122,11 @@ jobs:
           VERSION="${{ steps.common-version.outputs.common_version }}"
           echo "Waiting for opendata-common v$VERSION on crates.io..."
           for i in $(seq 1 30); do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/opendata-common/$VERSION")
-            if [ "$STATUS" = "200" ]; then
+            if cargo info opendata-common@"$VERSION" 2>/dev/null; then
               echo "opendata-common v$VERSION is available"
               exit 0
             fi
-            echo "Attempt $i/30: not yet available (HTTP $STATUS), retrying in 10s..."
+            echo "Attempt $i/30: not yet available, retrying in 10s..."
             sleep 10
           done
           echo "Timed out waiting for opendata-common v$VERSION"
