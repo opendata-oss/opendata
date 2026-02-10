@@ -309,12 +309,12 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
- "common",
  "humantime-serde",
  "metrics",
  "metrics-util",
+ "opendata-common",
+ "opendata-timeseries",
  "serde",
- "timeseries",
  "tokio",
  "toml 0.8.23",
 ]
@@ -554,24 +554,6 @@ name = "colorchoice"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
-
-[[package]]
-name = "common"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "criterion",
- "futures",
- "proptest",
- "serde",
- "serde_yaml",
- "slatedb",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
 
 [[package]]
 name = "concurrent-queue"
@@ -1064,7 +1046,7 @@ version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fe5e43d0f78a42ad591453aedb1d7ae631ce7ee445c7643691055a9ed8d3b01c"
 dependencies = [
- "log 0.4.29",
+ "log",
  "once_cell",
  "rand 0.8.5",
 ]
@@ -1075,7 +1057,7 @@ version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5666e8ca4ec174d896fb742789c29b1bea9319dcfd623c41bececc0a60c4939d"
 dependencies = [
- "log 0.4.29",
+ "log",
  "once_cell",
  "rand 0.8.5",
 ]
@@ -1685,7 +1667,7 @@ dependencies = [
  "core-foundation-sys",
  "iana-time-zone-haiku",
  "js-sys",
- "log 0.4.29",
+ "log",
  "wasm-bindgen",
  "windows-core 0.62.2",
 ]
@@ -1925,17 +1907,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "keyvalue"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "common",
- "slatedb",
- "tokio",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1990,31 +1961,6 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64 0.22.1",
- "bytes",
- "clap",
- "common",
- "prometheus-client",
- "proptest",
- "prost",
- "reqwest",
- "serde",
- "serde_json",
- "serde_with",
- "slatedb",
- "tempfile",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
@@ -2027,7 +1973,7 @@ dependencies = [
  "async-trait",
  "bencher",
  "bytes",
- "log 0.1.0",
+ "opendata-log",
  "tokio",
 ]
 
@@ -2435,6 +2381,116 @@ name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
+
+[[package]]
+name = "opendata-common"
+version = "0.1.3"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "criterion",
+ "futures",
+ "proptest",
+ "serde",
+ "serde_yaml",
+ "slatedb",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "opendata-keyvalue"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "opendata-common",
+ "slatedb",
+ "tokio",
+]
+
+[[package]]
+name = "opendata-log"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "clap",
+ "opendata-common",
+ "prometheus-client",
+ "proptest",
+ "prost",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "slatedb",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "opendata-timeseries"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "blake3",
+ "bytes",
+ "chrono",
+ "clap",
+ "config",
+ "dashmap",
+ "fail",
+ "moka",
+ "opendata-common",
+ "prometheus-client",
+ "promql-parser",
+ "prost",
+ "regex",
+ "regex-syntax",
+ "reqwest",
+ "roaring 0.7.0",
+ "rstest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "slatedb",
+ "snap",
+ "thiserror 2.0.17",
+ "tokio",
+ "tower",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+ "tsz",
+ "uuid",
+]
+
+[[package]]
+name = "opendata-vector"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "dashmap",
+ "fail",
+ "futures",
+ "opendata-common",
+ "rand 0.8.5",
+ "roaring 0.10.12",
+ "rstest",
+ "tokio",
+ "usearch",
+]
 
 [[package]]
 name = "openssl-probe"
@@ -3129,7 +3185,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "js-sys",
- "log 0.4.29",
+ "log",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -3621,8 +3677,9 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 
 [[package]]
 name = "slatedb"
-version = "0.10.0"
-source = "git+https://github.com/slatedb/slatedb.git?branch=main#d0e0f46761c4708fabcdbf937d46085d393344b2"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "588e9ae32019696205a05e54e4456486e8d11b69c72662739be853736833b3dd"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3641,7 +3698,7 @@ dependencies = [
  "flatbuffers",
  "foyer",
  "futures",
- "log 0.4.29",
+ "log",
  "object_store",
  "once_cell",
  "ouroboros",
@@ -3651,8 +3708,6 @@ dependencies = [
  "serde",
  "serde_json",
  "siphasher",
- "slatedb-common",
- "slatedb-txn-obj",
  "sysinfo",
  "thiserror 1.0.69",
  "thread_local",
@@ -3663,30 +3718,6 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
-]
-
-[[package]]
-name = "slatedb-common"
-version = "0.10.0"
-source = "git+https://github.com/slatedb/slatedb.git?branch=main#d0e0f46761c4708fabcdbf937d46085d393344b2"
-dependencies = [
- "chrono",
- "tokio",
-]
-
-[[package]]
-name = "slatedb-txn-obj"
-version = "0.10.0"
-source = "git+https://github.com/slatedb/slatedb.git?branch=main#d0e0f46761c4708fabcdbf937d46085d393344b2"
-dependencies = [
- "async-trait",
- "bytes",
- "chrono",
- "futures",
- "log 0.4.29",
- "object_store",
- "slatedb-common",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3929,51 +3960,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "timeseries"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "blake3",
- "bytes",
- "chrono",
- "clap",
- "common",
- "config",
- "dashmap",
- "fail",
- "moka",
- "prometheus-client",
- "promql-parser",
- "prost",
- "regex",
- "regex-syntax",
- "reqwest",
- "roaring 0.7.0",
- "rstest",
- "serde",
- "serde_json",
- "serde_yaml",
- "slatedb",
- "snap",
- "thiserror 2.0.17",
- "tokio",
- "tower",
- "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
- "tsz",
- "uuid",
-]
-
-[[package]]
 name = "timeseries-bench"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "bencher",
- "timeseries",
+ "opendata-timeseries",
  "tokio",
 ]
 
@@ -4222,7 +4215,7 @@ version = "0.1.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d15d90a0b5c19378952d479dc858407149d7bb45a14de0142f6c534b16fc647"
 dependencies = [
- "log 0.4.29",
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
@@ -4255,7 +4248,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
 dependencies = [
- "log 0.4.29",
+ "log",
  "once_cell",
  "tracing-core",
 ]
@@ -4432,32 +4425,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
-name = "vector"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "common",
- "dashmap",
- "fail",
- "futures",
- "rand 0.8.5",
- "roaring 0.10.12",
- "rstest",
- "tokio",
- "usearch",
-]
-
-[[package]]
 name = "vector-bench"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "bencher",
+ "opendata-vector",
  "tokio",
- "vector",
 ]
 
 [[package]]

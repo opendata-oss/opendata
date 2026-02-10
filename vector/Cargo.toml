@@ -1,7 +1,17 @@
 [package]
-name = "vector"
-version.workspace = true
+name = "opendata-vector"
+version = "0.1.0"
 edition.workspace = true
+description = "Vector similarity search database built on SlateDB"
+license = "MIT"
+repository = "https://github.com/opendata-oss/opendata"
+readme = "README.md"
+keywords = ["database", "vector", "similarity-search", "embeddings"]
+categories = ["database"]
+
+[lib]
+name = "vector"
+path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
