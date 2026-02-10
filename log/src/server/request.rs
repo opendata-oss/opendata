@@ -31,10 +31,7 @@ pub struct ScanParams {
     /// Maximum number of entries to return.
     pub limit: Option<usize>,
     /// If true, long-poll until data is available or timeout.
-    // `bool` doesn't implement `Deserialize` for missing fields like `Option<T>` does,
-    // so `#[serde(default)]` is needed to default to `false` when `?follow=` is omitted.
-    #[serde(default)]
-    pub follow: bool,
+    pub follow: Option<bool>,
     /// Timeout in milliseconds for long-polling (default: 30000).
     pub timeout_ms: Option<u64>,
 }
@@ -214,7 +211,7 @@ mod tests {
             start_seq: None,
             end_seq: None,
             limit: None,
-            follow: false,
+            follow: None,
             timeout_ms: None,
         };
 
@@ -317,7 +314,7 @@ mod tests {
             start_seq: None,
             end_seq: None,
             limit: None,
-            follow: false,
+            follow: None,
             timeout_ms: None,
         };
 
@@ -337,7 +334,7 @@ mod tests {
             start_seq: Some(10),
             end_seq: Some(100),
             limit: None,
-            follow: false,
+            follow: None,
             timeout_ms: None,
         };
 
@@ -358,7 +355,7 @@ mod tests {
         let params: ScanParams = serde_json::from_str(json).unwrap();
 
         // then
-        assert!(!params.follow);
+        assert_eq!(params.follow, None);
         assert!(params.timeout_ms.is_none());
     }
 
@@ -371,7 +368,7 @@ mod tests {
         let params: ScanParams = serde_json::from_str(json).unwrap();
 
         // then
-        assert!(params.follow);
+        assert_eq!(params.follow, Some(true));
         assert_eq!(params.timeout_ms, Some(5000));
     }
 }

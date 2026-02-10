@@ -4,7 +4,9 @@
 //! and ProtoJSON (`application/protobuf+json`) formats.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use axum::body::Bytes;
 use axum::extract::{Query, State};
@@ -84,7 +86,7 @@ pub async fn handle_scan(
     let entries = scan_entries(&state, key.clone(), range.clone(), limit).await?;
 
     // If we have entries or follow is disabled, return immediately
-    if !entries.is_empty() || !params.follow {
+    if !entries.is_empty() || !params.follow.unwrap_or(false) {
         let values: Vec<Value> = entries
             .iter()
             .map(|e| Value {
@@ -347,6 +349,8 @@ mod tests {
             }
         }
 
+        impl StorageSnapshot for ConfigurableStorage {}
+
         #[async_trait]
         impl Storage for ConfigurableStorage {
             async fn apply(&self, _ops: Vec<RecordOp>) -> common::StorageResult<()> {
@@ -371,7 +375,7 @@ mod tests {
 
             async fn snapshot(&self) -> common::StorageResult<Arc<dyn StorageSnapshot>> {
                 self.check_failure()?;
-                Err(common::StorageError::Storage("not implemented".into()))
+                Ok(Arc::new(ConfigurableStorage::new()))
             }
 
             async fn flush(&self) -> common::StorageResult<()> {
