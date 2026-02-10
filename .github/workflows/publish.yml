@@ -44,8 +44,17 @@ jobs:
           docker-images: true
           swap-storage: true
 
+      - name: Generate token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: 2838764
+          private-key: ${{ secrets.GHA_BOT_PRIVATE_KEY }}
+
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Configure git
         run: |
