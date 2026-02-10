@@ -154,16 +154,20 @@ jobs:
           echo "Timed out waiting for opendata-common v$VERSION"
           exit 1
 
+      - name: Push commit and common tag
+        if: steps.common-changes.outputs.changed == 'true'
+        run: |
+          git push origin HEAD
+          git push origin "opendata-common/v${{ steps.common-version.outputs.common_version }}"
+
+      - name: Push commit
+        if: steps.common-changes.outputs.changed != 'true'
+        run: git push origin HEAD
+
       - name: Publish selected crate
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish -p ${{ inputs.crate }}
 
-      - name: Push commit and tags
-        run: |
-          git push origin HEAD
-          git push origin "${{ inputs.crate }}/v${{ steps.version.outputs.new_version }}"
-
-      - name: Push common tag
-        if: steps.common-changes.outputs.changed == 'true'
-        run: git push origin "opendata-common/v${{ steps.common-version.outputs.common_version }}"
+      - name: Push selected crate tag
+        run: git push origin "${{ inputs.crate }}/v${{ steps.version.outputs.new_version }}"
