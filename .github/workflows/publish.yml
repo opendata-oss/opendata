@@ -1,0 +1,142 @@
+name: Publish Crate
+
+on:
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: "Crate to publish"
+        required: true
+        type: choice
+        options:
+          - opendata-common
+          - opendata-log
+          - opendata-timeseries
+          - opendata-vector
+          - opendata-keyvalue
+      bump:
+        description: "Version bump strategy"
+        required: true
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-edit
+        run: cargo install cargo-edit
+
+      - name: Bump version
+        run: cargo set-version -p ${{ inputs.crate }} --bump ${{ inputs.bump }}
+
+      - name: Read new version
+        id: version
+        run: |
+          NEW_VERSION=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name=="${{ inputs.crate }}") | .version')
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Update common dep version in workspace
+        if: inputs.crate == 'opendata-common'
+        run: |
+          sed -i 's|common = { path = "./common", package = "opendata-common", version = "[^"]*" }|common = { path = "./common", package = "opendata-common", version = "${{ steps.version.outputs.new_version }}" }|' Cargo.toml
+
+      - name: Run tests
+        run: cargo test --workspace --all-features
+
+      - name: Commit and tag
+        run: |
+          git add -A
+          git commit -m "release: ${{ inputs.crate }} v${{ steps.version.outputs.new_version }}"
+          git tag "${{ inputs.crate }}/v${{ steps.version.outputs.new_version }}"
+
+      - name: Read common version
+        if: inputs.crate != 'opendata-common'
+        id: common-version
+        run: |
+          COMMON_VERSION=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name=="opendata-common") | .version')
+          echo "common_version=$COMMON_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Publish common first
+        if: inputs.crate != 'opendata-common'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p opendata-common
+
+      - name: Wait for common to be available on crates.io
+        if: inputs.crate != 'opendata-common'
+        run: |
+          VERSION="${{ steps.common-version.outputs.common_version }}"
+          echo "Waiting for opendata-common v$VERSION on crates.io..."
+          for i in $(seq 1 30); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/opendata-common/$VERSION")
+            if [ "$STATUS" = "200" ]; then
+              echo "opendata-common v$VERSION is available"
+              exit 0
+            fi
+            echo "Attempt $i/30: not yet available (HTTP $STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "Timed out waiting for opendata-common v$VERSION"
+          exit 1
+
+      - name: Publish selected crate
+        if: inputs.crate != 'opendata-common'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p ${{ inputs.crate }}
+
+      - name: Publish common
+        if: inputs.crate == 'opendata-common'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p opendata-common
+
+      - name: Push commit and tag
+        run: |
+          git push origin HEAD
+          git push origin "${{ inputs.crate }}/v${{ steps.version.outputs.new_version }}"

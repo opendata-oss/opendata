@@ -1,6 +1,6 @@
 [package]
 name = "opendata-timeseries"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 description = "Prometheus-compatible time series database built on SlateDB"
 license = "MIT"
