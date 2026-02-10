@@ -260,6 +260,10 @@ One strategy could be to provide a metadata log for each created queue.
 Another strategy could be to group messages according to the queue definitions.
 While this RFC enables multiple metadata logs it does not specify any distribution strategy 
 and leaves the specification for future RFCs.
+The generation of both, `instance ID` and `log ID`, is still to be determined since they depend on how 
+OpenData-Queue system instances will be deployed and on the distribution strategy of the metadata over the metadata logs.
+The important aspect is that the key allows multiple OpenData-queues on the same SlateDB instance and that
+an OpenData-queue allows to use multiple metadata logs.
 
 The value of the metadata record is an encoded array of message metadata:
 ```
