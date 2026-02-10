@@ -128,6 +128,31 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         }
     }
 
+    /// Scan all centroid stats records.
+    ///
+    /// Returns a map of centroid_id to accumulated vector count.
+    #[allow(dead_code)]
+    async fn scan_all_centroid_stats(&self) -> Result<Vec<(u32, CentroidStatsValue)>> {
+        let mut prefix_buf = bytes::BytesMut::with_capacity(2);
+        crate::serde::RecordType::CentroidStats
+            .prefix()
+            .write_to(&mut prefix_buf);
+        let prefix = prefix_buf.freeze();
+
+        let range = common::BytesRange::prefix(prefix);
+        let records = self.scan(range).await?;
+
+        let mut stats = Vec::new();
+        for record in records {
+            let key = CentroidStatsKey::decode(&record.key)?;
+            let value = CentroidStatsValue::decode_from_bytes(&record.value)
+                .context("failed to decode CentroidStatsValue")?;
+            stats.push((key.centroid_id, value));
+        }
+
+        Ok(stats)
+    }
+
     /// Scan all centroid chunks to load centroids.
     ///
     /// This scans all records with the CentroidChunk prefix and collects
