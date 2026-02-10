@@ -8,7 +8,6 @@ on:
         required: true
         type: choice
         options:
-          - opendata-common
           - opendata-log
           - opendata-timeseries
           - opendata-vector
@@ -55,6 +54,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
 
       - name: Configure git
         run: |
@@ -78,6 +78,32 @@ jobs:
       - name: Install cargo-edit
         run: cargo install cargo-edit
 
+      - name: Check for common changes
+        id: common-changes
+        run: |
+          LATEST_TAG=$(git describe --tags --match "opendata-common/v*" --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No previous common tag found, treating as changed"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$(git diff "$LATEST_TAG" HEAD -- common/)" ]; then
+            echo "Changes detected in common/ since $LATEST_TAG"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No changes in common/ since $LATEST_TAG"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump common version
+        if: steps.common-changes.outputs.changed == 'true'
+        run: cargo set-version -p opendata-common --bump patch
+
+      - name: Update common dep version in workspace
+        if: steps.common-changes.outputs.changed == 'true'
+        run: |
+          NEW_COMMON_VERSION=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name=="opendata-common") | .version')
+          sed -i "s|common = { path = \"./common\", package = \"opendata-common\", version = \"[^\"]*\" }|common = { path = \"./common\", package = \"opendata-common\", version = \"$NEW_COMMON_VERSION\" }|" Cargo.toml
+
       - name: Bump version
         run: cargo set-version -p ${{ inputs.crate }} --bump ${{ inputs.bump }}
 
@@ -88,11 +114,6 @@ jobs:
             | jq -r '.packages[] | select(.name=="${{ inputs.crate }}") | .version')
           echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Update common dep version in workspace
-        if: inputs.crate == 'opendata-common'
-        run: |
-          sed -i 's|common = { path = "./common", package = "opendata-common", version = "[^"]*" }|common = { path = "./common", package = "opendata-common", version = "${{ steps.version.outputs.new_version }}" }|' Cargo.toml
-
       - name: Run tests
         run: cargo test --workspace --all-features
 
@@ -102,22 +123,23 @@ jobs:
           git commit -m "release: ${{ inputs.crate }} v${{ steps.version.outputs.new_version }}"
           git tag "${{ inputs.crate }}/v${{ steps.version.outputs.new_version }}"
 
-      - name: Read common version
-        if: inputs.crate != 'opendata-common'
+      - name: Tag common release
+        if: steps.common-changes.outputs.changed == 'true'
         id: common-version
         run: |
           COMMON_VERSION=$(cargo metadata --format-version 1 --no-deps \
             | jq -r '.packages[] | select(.name=="opendata-common") | .version')
           echo "common_version=$COMMON_VERSION" >> "$GITHUB_OUTPUT"
+          git tag "opendata-common/v$COMMON_VERSION"
 
-      - name: Publish common first
-        if: inputs.crate != 'opendata-common'
+      - name: Publish common
+        if: steps.common-changes.outputs.changed == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish -p opendata-common
 
       - name: Wait for common to be available on crates.io
-        if: inputs.crate != 'opendata-common'
+        if: steps.common-changes.outputs.changed == 'true'
         run: |
           VERSION="${{ steps.common-version.outputs.common_version }}"
           echo "Waiting for opendata-common v$VERSION on crates.io..."
@@ -133,18 +155,15 @@ jobs:
           exit 1
 
       - name: Publish selected crate
-        if: inputs.crate != 'opendata-common'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish -p ${{ inputs.crate }}
 
-      - name: Publish common
-        if: inputs.crate == 'opendata-common'
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p opendata-common
-
-      - name: Push commit and tag
+      - name: Push commit and tags
         run: |
           git push origin HEAD
           git push origin "${{ inputs.crate }}/v${{ steps.version.outputs.new_version }}"
+
+      - name: Push common tag
+        if: steps.common-changes.outputs.changed == 'true'
+        run: git push origin "opendata-common/v${{ steps.common-version.outputs.common_version }}"
