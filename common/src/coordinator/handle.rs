@@ -131,7 +131,7 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
 impl<D: Delta> WriteCoordinatorHandle<D> {
     /// Submit a write to the coordinator with a timeout.
     ///
-    /// Unlike [`write`](Self::write), which fails immediately when the queue
+    /// Unlike [`write`](Self::try_write), which fails immediately when the queue
     /// is full, this method waits up to `timeout` for space.
     ///
     /// # Errors
@@ -174,7 +174,7 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     /// and wait for the write to reach a desired durability level. On
     /// failure the original write is returned inside the error so it
     /// can be retried without cloning.
-    pub async fn write(
+    pub async fn try_write(
         &self,
         write: D::Write,
     ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Write>> {

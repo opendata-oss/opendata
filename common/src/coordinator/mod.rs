@@ -900,7 +900,7 @@ mod tests {
 
         // when
         let write1 = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -908,7 +908,7 @@ mod tests {
             .await
             .unwrap();
         let write2 = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "b".into(),
                 value: 2,
                 size: 10,
@@ -916,7 +916,7 @@ mod tests {
             .await
             .unwrap();
         let write3 = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "c".into(),
                 value: 3,
                 size: 10,
@@ -952,7 +952,7 @@ mod tests {
 
         // when
         handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -960,7 +960,7 @@ mod tests {
             .await
             .unwrap();
         handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 2,
                 size: 10,
@@ -968,7 +968,7 @@ mod tests {
             .await
             .unwrap();
         let mut last_write = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 3,
                 size: 10,
@@ -1010,7 +1010,7 @@ mod tests {
 
         // when
         let mut write_handle = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -1046,7 +1046,7 @@ mod tests {
 
         // when
         let write = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -1085,7 +1085,7 @@ mod tests {
 
         // when
         let mut write = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -1118,7 +1118,7 @@ mod tests {
 
         // when
         handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -1151,7 +1151,7 @@ mod tests {
 
         // when
         let write1 = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -1159,7 +1159,7 @@ mod tests {
             .await
             .unwrap();
         let write2 = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "b".into(),
                 value: 2,
                 size: 10,
@@ -1193,7 +1193,7 @@ mod tests {
 
         // when
         handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -1201,7 +1201,7 @@ mod tests {
             .await
             .unwrap();
         handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "b".into(),
                 value: 2,
                 size: 10,
@@ -1209,7 +1209,7 @@ mod tests {
             .await
             .unwrap();
         let mut last_write = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "c".into(),
                 value: 3,
                 size: 10,
@@ -1248,7 +1248,7 @@ mod tests {
 
         // when
         let mut write = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -1264,7 +1264,7 @@ mod tests {
         // Synchronization: write and wait for applied to ensure the flush command
         // has been processed (commands are processed in order)
         let sync_write = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "sync".into(),
                 value: 0,
                 size: 1,
@@ -1296,7 +1296,7 @@ mod tests {
 
         // when
         let mut write_handle = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -1340,7 +1340,7 @@ mod tests {
         // when - ensure coordinator task runs and then write something
         tokio::task::yield_now().await;
         let mut write = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -1390,7 +1390,7 @@ mod tests {
 
         // when - write that exceeds threshold
         let mut write = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 150,
@@ -1428,7 +1428,7 @@ mod tests {
         // when - small writes that accumulate
         for i in 0..5 {
             let mut w = handle
-                .write(TestWrite {
+                .try_write(TestWrite {
                     key: format!("key{}", i),
                     value: i,
                     size: 15,
@@ -1443,7 +1443,7 @@ mod tests {
 
         // when - write that pushes over threshold
         let mut final_write = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "final".into(),
                 value: 999,
                 size: 30,
@@ -1479,7 +1479,7 @@ mod tests {
 
         // when: trigger a flush and wait for it to start (proving it's in progress)
         let write1 = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -1491,7 +1491,7 @@ mod tests {
 
         // then: writes during blocked flush still succeed
         let write2 = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "b".into(),
                 value: 2,
                 size: 10,
@@ -1521,7 +1521,7 @@ mod tests {
 
         // when: write, flush, then write more during blocked flush
         handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -1533,7 +1533,7 @@ mod tests {
 
         // Writes during blocked flush get new epochs
         let w1 = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "b".into(),
                 value: 2,
                 size: 10,
@@ -1541,7 +1541,7 @@ mod tests {
             .await
             .unwrap();
         let w2 = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "c".into(),
                 value: 3,
                 size: 10,
@@ -1584,14 +1584,14 @@ mod tests {
 
         // when - fill the queue
         let _ = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
             })
             .await;
         let _ = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "b".into(),
                 value: 2,
                 size: 10,
@@ -1600,7 +1600,7 @@ mod tests {
 
         // Third write should fail with backpressure
         let result = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "c".into(),
                 value: 3,
                 size: 10,
@@ -1631,14 +1631,14 @@ mod tests {
 
         // Fill queue without processing
         let _ = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
             })
             .await;
         let mut write_b = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "b".into(),
                 value: 2,
                 size: 10,
@@ -1652,7 +1652,7 @@ mod tests {
 
         // then - writes should succeed now
         let result = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "c".into(),
                 value: 3,
                 size: 10,
@@ -1710,7 +1710,7 @@ mod tests {
 
         // when - write without explicit flush, then shutdown
         let write = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -1748,7 +1748,7 @@ mod tests {
 
         // when
         let result = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -1779,7 +1779,7 @@ mod tests {
 
         // when
         handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -1787,7 +1787,7 @@ mod tests {
             .await
             .unwrap();
         handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "b".into(),
                 value: 2,
                 size: 10,
@@ -1795,7 +1795,7 @@ mod tests {
             .await
             .unwrap();
         let mut last_write = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "c".into(),
                 value: 3,
                 size: 10,
@@ -1833,7 +1833,7 @@ mod tests {
 
         // when - first batch
         handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -1841,7 +1841,7 @@ mod tests {
             .await
             .unwrap();
         let mut write2 = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "b".into(),
                 value: 2,
                 size: 10,
@@ -1853,7 +1853,7 @@ mod tests {
 
         // when - second batch
         let mut write3 = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "c".into(),
                 value: 3,
                 size: 10,
@@ -1895,7 +1895,7 @@ mod tests {
 
         // when - write and capture the assigned epochs
         let write1 = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -1905,7 +1905,7 @@ mod tests {
         let epoch1 = write1.epoch().await.unwrap();
 
         let mut write2 = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "b".into(),
                 value: 2,
                 size: 10,
@@ -1954,7 +1954,7 @@ mod tests {
 
         // when - write key "a" in first batch (seq 0)
         let mut write1 = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -1966,7 +1966,7 @@ mod tests {
 
         // Write to key "a" again in second batch (seq 1)
         let mut write2 = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 2,
                 size: 10,
@@ -2013,7 +2013,7 @@ mod tests {
 
         // when
         handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -2047,7 +2047,7 @@ mod tests {
 
         // when
         handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -2085,7 +2085,7 @@ mod tests {
 
         // when
         handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 42,
                 size: 10,
@@ -2124,7 +2124,7 @@ mod tests {
 
         // when
         let write1 = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -2132,7 +2132,7 @@ mod tests {
             .await
             .unwrap();
         let write2 = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "b".into(),
                 value: 2,
                 size: 10,
@@ -2176,7 +2176,7 @@ mod tests {
 
         // when
         handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -2211,7 +2211,7 @@ mod tests {
 
         // when
         handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -2283,7 +2283,7 @@ mod tests {
 
         // when - write and flush with durable
         let mut write = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -2317,7 +2317,7 @@ mod tests {
 
         // when
         let mut write = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 42,
                 size: 10,
@@ -2356,7 +2356,7 @@ mod tests {
         // when - write to both channels, waiting for each to be applied
         // to ensure deterministic ordering
         let mut w1 = ch1
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 10,
                 size: 10,
@@ -2366,7 +2366,7 @@ mod tests {
         w1.wait(Durability::Applied).await.unwrap();
 
         let mut w2 = ch2
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "b".into(),
                 value: 20,
                 size: 10,
@@ -2376,7 +2376,7 @@ mod tests {
         w2.wait(Durability::Applied).await.unwrap();
 
         let mut w3 = ch1
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "c".into(),
                 value: 30,
                 size: 10,
@@ -2451,14 +2451,14 @@ mod tests {
 
         // fill the queue
         let _ = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
             })
             .await;
         let _ = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "b".into(),
                 value: 2,
                 size: 10,
@@ -2501,7 +2501,7 @@ mod tests {
 
         // fill the queue
         let _ = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -2549,7 +2549,7 @@ mod tests {
 
         // fill the queue
         let _ = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
@@ -2558,7 +2558,7 @@ mod tests {
 
         // when
         let result = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "retry_me".into(),
                 value: 42,
                 size: 10,
@@ -2594,14 +2594,14 @@ mod tests {
 
         // fill the queue before starting
         let _ = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "a".into(),
                 value: 1,
                 size: 10,
             })
             .await;
         let _ = handle
-            .write(TestWrite {
+            .try_write(TestWrite {
                 key: "b".into(),
                 value: 2,
                 size: 10,
