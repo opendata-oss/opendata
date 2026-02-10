@@ -17,7 +17,7 @@ pub struct Key {
 }
 
 /// AppendRequest is the request body for POST /api/v1/log/append.
-#[derive(Clone, PartialEq, Message, Deserialize)]
+#[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppendRequest {
     #[prost(message, repeated, tag = "1")]
@@ -29,7 +29,7 @@ pub struct AppendRequest {
 
 /// Record represents a single log record with key and value.
 #[serde_as]
-#[derive(Clone, PartialEq, Message, Deserialize)]
+#[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Record {
     #[prost(message, optional, tag = "1")]
@@ -40,7 +40,7 @@ pub struct Record {
 }
 
 /// AppendResponse is the response for POST /api/v1/log/append.
-#[derive(Clone, PartialEq, Message, Serialize)]
+#[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppendResponse {
     #[prost(string, tag = "1")]
@@ -63,7 +63,7 @@ impl AppendResponse {
 }
 
 /// ScanResponse is the response for GET /api/v1/log/scan.
-#[derive(Clone, PartialEq, Message, Serialize)]
+#[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanResponse {
     #[prost(string, tag = "1")]
@@ -87,7 +87,7 @@ impl ScanResponse {
 
 /// Value represents a single log entry in scan results.
 #[serde_as]
-#[derive(Clone, PartialEq, Message, Serialize)]
+#[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Value {
     #[prost(uint64, tag = "1")]

@@ -8,8 +8,8 @@ use axum::routing::{get, post};
 
 use super::config::LogServerConfig;
 use super::handlers::{
-    AppState, handle_append, handle_count, handle_list_keys, handle_list_segments, handle_metrics,
-    handle_scan,
+    AppState, handle_append, handle_count, handle_healthy, handle_list_keys, handle_list_segments,
+    handle_metrics, handle_ready, handle_scan,
 };
 use super::metrics::Metrics;
 use super::middleware::{MetricsLayer, TracingLayer};
@@ -46,6 +46,8 @@ impl LogServer {
             .route("/api/v1/log/segments", get(handle_list_segments))
             .route("/api/v1/log/count", get(handle_count))
             .route("/metrics", get(handle_metrics))
+            .route("/-/healthy", get(handle_healthy))
+            .route("/-/ready", get(handle_ready))
             .layer(TracingLayer::new())
             .layer(MetricsLayer::new(metrics))
             .with_state(state);

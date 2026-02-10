@@ -60,4 +60,11 @@ pub use error::{Error, Result};
 pub use listing::{LogKey, LogKeyIterator};
 pub use log::{LogDb, LogDbBuilder};
 pub use model::{AppendResult, LogEntry, Record, Segment, SegmentId, Sequence};
+
 pub use reader::{LogDbReader, LogIterator, LogRead};
+
+// Re-export proto types for use by clients
+#[cfg(feature = "http-server")]
+pub mod proto {
+    pub use crate::server::proto::*;
+}

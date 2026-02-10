@@ -5,6 +5,7 @@
 //! request/response formats per RFC 0004.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -663,4 +664,89 @@ async fn test_default_response_format_is_json() {
     assert_eq!(json["status"], "success");
     // Verify "values" field exists (not "entries")
     assert!(json["values"].is_array());
+}
+
+// ============================================================================
+// Follow / Long-poll Tests
+// ============================================================================
+
+// Uses start_paused so tokio::time::Instant auto-advances, making the test
+// deterministic regardless of CI runner speed. Virtual elapsed time is
+// asserted to verify the deadline cap actually bounds the sleep.
+#[tokio::test(start_paused = true)]
+async fn test_scan_follow_with_short_timeout_returns_empty() {
+    let (app, _log) = setup_test_app().await;
+
+    // follow=true with timeout_ms=10 < poll_interval (100ms).
+    // The deadline cap ensures we sleep only 10ms, not a full poll interval.
+    let start = tokio::time::Instant::now();
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/log/scan?key=no-data&follow=true&timeout_ms=10")
+        .header(header::ACCEPT, "application/protobuf+json")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["status"], "success");
+    assert_eq!(json["values"].as_array().unwrap().len(), 0);
+    // Virtual time should be ~10ms (the timeout), not 100ms (the poll interval).
+    assert!(
+        elapsed >= Duration::from_millis(10),
+        "expected >= 10ms but got {:?}",
+        elapsed
+    );
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "expected < 100ms but got {:?} — deadline cap may not be working",
+        elapsed
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_scan_follow_at_poll_boundary_returns_empty() {
+    let (app, _log) = setup_test_app().await;
+
+    // timeout_ms=100 matches the poll interval exactly — should still
+    // complete and return empty without hanging.
+    let start = tokio::time::Instant::now();
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/log/scan?key=no-data&follow=true&timeout_ms=100")
+        .header(header::ACCEPT, "application/protobuf+json")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["status"], "success");
+    assert_eq!(json["values"].as_array().unwrap().len(), 0);
+    // Virtual time should be ~100ms (one poll interval = the timeout).
+    assert!(
+        elapsed >= Duration::from_millis(100),
+        "expected >= 100ms but got {:?} — may be returning immediately",
+        elapsed
+    );
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "expected < 200ms but got {:?}",
+        elapsed
+    );
 }

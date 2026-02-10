@@ -39,3 +39,4 @@ base64.workspace = true
 proptest.workspace = true
 reqwest.workspace = true
 tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
