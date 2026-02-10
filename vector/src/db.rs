@@ -126,6 +126,9 @@ impl VectorDb {
             Self::load_dictionary_from_storage(snapshot.as_ref(), &dictionary).await?;
         }
 
+        // Load centroid counts from storage
+        let centroid_counts = Self::load_centroid_counts_from_storage(snapshot.as_ref()).await?;
+
         // For now, just force bootstrap centroids. Eventually we'll derive these automatically
         // from the vectors
         let centroid_graph =
@@ -145,6 +148,7 @@ impl VectorDb {
             centroid_graph: Arc::clone(&centroid_graph),
             id_allocator,
             rebalancer_tx,
+            centroid_counts,
         };
 
         // start write coordinator
@@ -266,6 +270,21 @@ impl VectorDb {
         }
 
         Ok(())
+    }
+
+    /// Load centroid counts from storage into a HashMap.
+    ///
+    /// Scans all CentroidStats records and extracts the accumulated num_vectors
+    /// for each centroid.
+    async fn load_centroid_counts_from_storage(
+        snapshot: &dyn StorageRead,
+    ) -> Result<HashMap<u32, u64>> {
+        let stats = snapshot.scan_all_centroid_stats().await?;
+        let mut counts = HashMap::new();
+        for (centroid_id, value) in stats {
+            counts.insert(centroid_id, value.num_vectors.max(0) as u64);
+        }
+        Ok(counts)
     }
 
     /// Write vectors to the database.
