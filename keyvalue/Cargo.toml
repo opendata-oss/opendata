@@ -1,9 +1,16 @@
 [package]
-name = "keyvalue"
-version.workspace = true
+name = "opendata-keyvalue"
+version = "0.1.0"
 edition.workspace = true
+description = "Key-value database built on SlateDB"
+license = "MIT"
+repository = "https://github.com/opendata-oss/opendata"
+readme = "README.md"
+keywords = ["database", "key-value", "slatedb"]
+categories = ["database"]
 
 [lib]
+name = "keyvalue"
 path = "src/lib.rs"
 
 [dependencies]

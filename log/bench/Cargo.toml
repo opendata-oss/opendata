@@ -2,11 +2,12 @@
 name = "log-bench"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 bencher.workspace = true
 bytes.workspace = true
-log = { path = ".." }
+log = { path = "..", package = "opendata-log" }
 anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true

@@ -2,10 +2,11 @@
 name = "timeseries-bench"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 bencher.workspace = true
-timeseries = { path = ".." }
+timeseries = { path = "..", package = "opendata-timeseries" }
 anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
