@@ -1,13 +1,20 @@
 [package]
-name = "log"
+name = "opendata-log"
 version.workspace = true
 edition.workspace = true
+description = "Key-oriented log database built on SlateDB"
+license = "MIT"
+repository = "https://github.com/opendata-oss/opendata"
+readme = "README.md"
+keywords = ["database", "log", "streaming", "slatedb"]
+categories = ["database"]
 
 [lib]
+name = "log"
 path = "src/lib.rs"
 
 [[bin]]
-name = "log"
+name = "opendata-log"
 path = "src/main.rs"
 required-features = ["http-server"]
 

@@ -30,7 +30,7 @@ fail = "0.5"
 futures = { version = "0.3", features = ["std"] }
 moka = { version = "0.12", features = ["future"] }
 bencher = { path = "./bencher" }
-common = { path = "./common" }
+common = { path = "./common", package = "opendata-common", version = "0.1.0" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 roaring = "0.10"
 rstest = "0.19"
@@ -38,7 +38,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_with = { version = "3", features = ["base64"] }
 serde_yaml = "0.9"
-slatedb = { git = "https://github.com/slatedb/slatedb.git", branch = "main" }
+slatedb = "0.10.1"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["full"] }
 tokio-util = "0.7"

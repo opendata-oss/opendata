@@ -1,7 +1,17 @@
 [package]
-name = "common"
+name = "opendata-common"
 version.workspace = true
 edition.workspace = true
+description = "Shared storage foundation for OpenData databases"
+license = "MIT"
+repository = "https://github.com/opendata-oss/opendata"
+readme = "README.md"
+keywords = ["database", "storage", "slatedb"]
+categories = ["database"]
+
+[lib]
+name = "common"
+path = "src/lib.rs"
 
 [dependencies]
 slatedb.workspace = true

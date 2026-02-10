@@ -10,7 +10,7 @@ use crate::Config;
 
 /// CLI arguments for the log server.
 #[derive(Debug, Parser)]
-#[command(name = "log")]
+#[command(name = "opendata-log")]
 #[command(about = "OpenData Log HTTP Server")]
 pub struct CliArgs {
     /// HTTP server port.

@@ -1,13 +1,20 @@
 [package]
-name = "timeseries"
+name = "opendata-timeseries"
 version.workspace = true
 edition.workspace = true
+description = "Prometheus-compatible time series database built on SlateDB"
+license = "MIT"
+repository = "https://github.com/opendata-oss/opendata"
+readme = "README.md"
+keywords = ["database", "timeseries", "prometheus", "metrics"]
+categories = ["database"]
 
 [lib]
+name = "timeseries"
 path = "src/lib.rs"
 
 [[bin]]
-name = "timeseries"
+name = "opendata-timeseries"
 path = "src/main.rs"
 
 [features]
