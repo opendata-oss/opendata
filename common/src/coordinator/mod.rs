@@ -1608,7 +1608,7 @@ mod tests {
             .await;
 
         // then
-        assert!(matches!(result, Err(WriteError::Backpressure)));
+        assert!(matches!(result, Err(WriteError::Backpressure(_))));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2394,5 +2394,268 @@ mod tests {
 
         // cleanup
         coordinator.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_succeed_with_write_timeout_when_queue_has_space() {
+        // given
+        let flusher = TestFlusher::default();
+        let mut coordinator = WriteCoordinator::new(
+            test_config(),
+            vec!["default".to_string()],
+            TestContext::default(),
+            flusher.initial_snapshot().await,
+            flusher.clone(),
+        );
+        let handle = coordinator.handle("default");
+        coordinator.start();
+
+        // when
+        let mut wh = handle
+            .write_timeout(
+                TestWrite {
+                    key: "a".into(),
+                    value: 1,
+                    size: 10,
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        // then
+        let result = wh.wait(Durability::Applied).await;
+        assert!(result.is_ok());
+
+        // cleanup
+        coordinator.stop().await;
+    }
+
+    #[tokio::test]
+    async fn should_timeout_when_queue_full() {
+        // given - queue_capacity=2, coordinator NOT started so nothing drains
+        let flusher = TestFlusher::default();
+        let config = WriteCoordinatorConfig {
+            queue_capacity: 2,
+            flush_interval: Duration::from_secs(3600),
+            flush_size_threshold: usize::MAX,
+        };
+        let mut coordinator = WriteCoordinator::new(
+            config,
+            vec!["default".to_string()],
+            TestContext::default(),
+            flusher.initial_snapshot().await,
+            flusher.clone(),
+        );
+        let handle = coordinator.handle("default");
+
+        // fill the queue
+        let _ = handle
+            .write(TestWrite {
+                key: "a".into(),
+                value: 1,
+                size: 10,
+            })
+            .await;
+        let _ = handle
+            .write(TestWrite {
+                key: "b".into(),
+                value: 2,
+                size: 10,
+            })
+            .await;
+
+        // when - third write should time out
+        let result = handle
+            .write_timeout(
+                TestWrite {
+                    key: "c".into(),
+                    value: 3,
+                    size: 10,
+                },
+                Duration::from_millis(10),
+            )
+            .await;
+
+        // then
+        assert!(matches!(result, Err(WriteError::TimeoutError(_))));
+    }
+
+    #[tokio::test]
+    async fn should_return_write_in_timeout_error() {
+        // given - queue_capacity=1, coordinator NOT started
+        let flusher = TestFlusher::default();
+        let config = WriteCoordinatorConfig {
+            queue_capacity: 1,
+            flush_interval: Duration::from_secs(3600),
+            flush_size_threshold: usize::MAX,
+        };
+        let mut coordinator = WriteCoordinator::new(
+            config,
+            vec!["default".to_string()],
+            TestContext::default(),
+            flusher.initial_snapshot().await,
+            flusher.clone(),
+        );
+        let handle = coordinator.handle("default");
+
+        // fill the queue
+        let _ = handle
+            .write(TestWrite {
+                key: "a".into(),
+                value: 1,
+                size: 10,
+            })
+            .await;
+
+        // when
+        let result = handle
+            .write_timeout(
+                TestWrite {
+                    key: "retry_me".into(),
+                    value: 42,
+                    size: 10,
+                },
+                Duration::from_millis(10),
+            )
+            .await;
+        let Err(err) = result else {
+            panic!("expected TimeoutError");
+        };
+
+        // then - original write is returned inside the error
+        let write = err.into_inner().expect("should contain the write");
+        assert_eq!(write.key, "retry_me");
+        assert_eq!(write.value, 42);
+    }
+
+    #[tokio::test]
+    async fn should_return_write_in_backpressure_error() {
+        // given - queue_capacity=1, coordinator NOT started
+        let flusher = TestFlusher::default();
+        let config = WriteCoordinatorConfig {
+            queue_capacity: 1,
+            flush_interval: Duration::from_secs(3600),
+            flush_size_threshold: usize::MAX,
+        };
+        let mut coordinator = WriteCoordinator::new(
+            config,
+            vec!["default".to_string()],
+            TestContext::default(),
+            flusher.initial_snapshot().await,
+            flusher.clone(),
+        );
+        let handle = coordinator.handle("default");
+
+        // fill the queue
+        let _ = handle
+            .write(TestWrite {
+                key: "a".into(),
+                value: 1,
+                size: 10,
+            })
+            .await;
+
+        // when
+        let result = handle
+            .write(TestWrite {
+                key: "retry_me".into(),
+                value: 42,
+                size: 10,
+            })
+            .await;
+        let Err(err) = result else {
+            panic!("expected Backpressure");
+        };
+
+        // then - original write is returned inside the error
+        let write = err.into_inner().expect("should contain the write");
+        assert_eq!(write.key, "retry_me");
+        assert_eq!(write.value, 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_succeed_when_queue_drains_within_timeout() {
+        // given - queue_capacity=2, coordinator started so it drains
+        let flusher = TestFlusher::default();
+        let config = WriteCoordinatorConfig {
+            queue_capacity: 2,
+            flush_interval: Duration::from_secs(3600),
+            flush_size_threshold: usize::MAX,
+        };
+        let mut coordinator = WriteCoordinator::new(
+            config,
+            vec!["default".to_string()],
+            TestContext::default(),
+            flusher.initial_snapshot().await,
+            flusher.clone(),
+        );
+        let handle = coordinator.handle("default");
+
+        // fill the queue before starting
+        let _ = handle
+            .write(TestWrite {
+                key: "a".into(),
+                value: 1,
+                size: 10,
+            })
+            .await;
+        let _ = handle
+            .write(TestWrite {
+                key: "b".into(),
+                value: 2,
+                size: 10,
+            })
+            .await;
+
+        // when - start coordinator (begins draining) and write with generous timeout
+        coordinator.start();
+        let result = handle
+            .write_timeout(
+                TestWrite {
+                    key: "c".into(),
+                    value: 3,
+                    size: 10,
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+
+        // then
+        assert!(result.is_ok());
+
+        // cleanup
+        coordinator.stop().await;
+    }
+
+    #[tokio::test]
+    async fn should_return_shutdown_on_write_timeout_after_coordinator_stops() {
+        // given
+        let flusher = TestFlusher::default();
+        let mut coordinator = WriteCoordinator::new(
+            test_config(),
+            vec!["default".to_string()],
+            TestContext::default(),
+            flusher.initial_snapshot().await,
+            flusher.clone(),
+        );
+        let handle = coordinator.handle("default");
+        coordinator.start();
+
+        // when
+        coordinator.stop().await;
+        let result = handle
+            .write_timeout(
+                TestWrite {
+                    key: "a".into(),
+                    value: 1,
+                    size: 10,
+                },
+                Duration::from_secs(1),
+            )
+            .await;
+
+        // then
+        assert!(matches!(result, Err(WriteError::Shutdown)));
     }
 }

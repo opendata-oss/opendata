@@ -6,6 +6,7 @@ use crate::storage::StorageSnapshot;
 use futures::FutureExt;
 use futures::future::Shared;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 /// The current view of all applied writes. The view is made up a reader for
@@ -128,11 +129,55 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
 }
 
 impl<D: Delta> WriteCoordinatorHandle<D> {
+    /// Submit a write to the coordinator with a timeout.
+    ///
+    /// Unlike [`write`](Self::write), which fails immediately when the queue
+    /// is full, this method waits up to `timeout` for space.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriteError::TimeoutError`] — the queue remained full for the
+    ///   entire duration. Contains the original write so it can be retried
+    ///   without cloning.
+    /// - [`WriteError::Shutdown`] — the coordinator has stopped.
+    pub async fn write_timeout(
+        &self,
+        write: D::Write,
+        timeout: Duration,
+    ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Write>> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_timeout(
+                WriteCommand::Write {
+                    write,
+                    result_tx: tx,
+                },
+                timeout,
+            )
+            .await
+            .map_err(|e| match e {
+                mpsc::error::SendTimeoutError::Timeout(WriteCommand::Write { write, .. }) => {
+                    WriteError::TimeoutError(write)
+                }
+                mpsc::error::SendTimeoutError::Closed(WriteCommand::Write { write, .. }) => {
+                    WriteError::Shutdown
+                }
+                _ => unreachable!("sent a Write command"),
+            })?;
+
+        Ok(WriteHandle::new(rx, self.watchers.clone()))
+    }
+
     /// Submit a write to the coordinator.
     ///
     /// Returns a handle that can be used to retrieve the apply result
-    /// and wait for the write to reach a desired durability level.
-    pub async fn write(&self, write: D::Write) -> WriteResult<WriteHandle<D::ApplyResult>> {
+    /// and wait for the write to reach a desired durability level. On
+    /// failure the original write is returned inside the error so it
+    /// can be retried without cloning.
+    pub async fn write(
+        &self,
+        write: D::Write,
+    ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Write>> {
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .try_send(WriteCommand::Write {
@@ -140,8 +185,13 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
                 result_tx: tx,
             })
             .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => WriteError::Backpressure,
-                mpsc::error::TrySendError::Closed(_) => WriteError::Shutdown,
+                mpsc::error::TrySendError::Full(WriteCommand::Write { write, .. }) => {
+                    WriteError::Backpressure(write)
+                }
+                mpsc::error::TrySendError::Closed(WriteCommand::Write { write, .. }) => {
+                    WriteError::Shutdown
+                }
+                _ => unreachable!("sent a Write command"),
             })?;
 
         Ok(WriteHandle::new(rx, self.watchers.clone()))
@@ -161,7 +211,7 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
                 flush_storage,
             })
             .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => WriteError::Backpressure,
+                mpsc::error::TrySendError::Full(_) => WriteError::Backpressure(()),
                 mpsc::error::TrySendError::Closed(_) => WriteError::Shutdown,
             })?;
 
