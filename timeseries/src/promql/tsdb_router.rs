@@ -796,8 +796,8 @@ mod tests {
 
         // Sample at 4000 seconds = 4000000 ms
         let sample = create_sample("http_requests", vec![("env", "prod")], 4_000_000, 42.0);
-        mini.ingest(&sample, 30).await.unwrap();
-        tsdb.flush(30).await.unwrap();
+        mini.ingest(&sample).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // Query time: 4100 seconds (within lookback of sample at 4000s)
         let query_time = UNIX_EPOCH + Duration::from_secs(4100);
@@ -868,8 +868,8 @@ mod tests {
             .sample(4_060_000, 20.0)
             .sample(4_120_000, 30.0)
             .build();
-        mini.ingest(&series, 30).await.unwrap();
-        tsdb.flush(30).await.unwrap();
+        mini.ingest(&series).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // Query range: 4000s to 4120s with 60s step
         let request = QueryRangeRequest {
@@ -916,19 +916,23 @@ mod tests {
         let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
 
         // Ingest two different series
-        mini.ingest(
-            &create_sample("http_requests", vec![("env", "prod")], 4_000_000, 10.0),
-            30,
-        )
+        mini.ingest(&create_sample(
+            "http_requests",
+            vec![("env", "prod")],
+            4_000_000,
+            10.0,
+        ))
         .await
         .unwrap();
-        mini.ingest(
-            &create_sample("http_requests", vec![("env", "staging")], 4_000_000, 20.0),
-            30,
-        )
+        mini.ingest(&create_sample(
+            "http_requests",
+            vec![("env", "staging")],
+            4_000_000,
+            20.0,
+        ))
         .await
         .unwrap();
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         let request = SeriesRequest {
             matches: vec!["http_requests".to_string()],
@@ -963,8 +967,8 @@ mod tests {
             4_000_000,
             10.0,
         );
-        mini.ingest(&sample, 30).await.unwrap();
-        tsdb.flush(30).await.unwrap();
+        mini.ingest(&sample).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         let request = LabelsRequest {
             matches: Some(vec!["http_requests".to_string()]),
@@ -995,19 +999,23 @@ mod tests {
         let bucket = TimeBucket::hour(60);
         let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
 
-        mini.ingest(
-            &create_sample("http_requests", vec![("env", "prod")], 4_000_000, 10.0),
-            30,
-        )
+        mini.ingest(&create_sample(
+            "http_requests",
+            vec![("env", "prod")],
+            4_000_000,
+            10.0,
+        ))
         .await
         .unwrap();
-        mini.ingest(
-            &create_sample("http_requests", vec![("env", "staging")], 4_000_000, 20.0),
-            30,
-        )
+        mini.ingest(&create_sample(
+            "http_requests",
+            vec![("env", "staging")],
+            4_000_000,
+            20.0,
+        ))
         .await
         .unwrap();
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         let request = LabelValuesRequest {
             label_name: "env".to_string(),
@@ -1066,8 +1074,8 @@ mod tests {
             4_000_000,
             10.0,
         );
-        mini.ingest(&sample, 30).await.unwrap();
-        tsdb.flush(30).await.unwrap();
+        mini.ingest(&sample).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         let request = LabelsRequest {
             matches: None,
@@ -1098,19 +1106,23 @@ mod tests {
         let bucket = TimeBucket::hour(60);
         let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
 
-        mini.ingest(
-            &create_sample("http_requests", vec![("env", "prod")], 4_000_000, 10.0),
-            30,
-        )
+        mini.ingest(&create_sample(
+            "http_requests",
+            vec![("env", "prod")],
+            4_000_000,
+            10.0,
+        ))
         .await
         .unwrap();
-        mini.ingest(
-            &create_sample("http_requests", vec![("env", "staging")], 4_000_000, 20.0),
-            30,
-        )
+        mini.ingest(&create_sample(
+            "http_requests",
+            vec![("env", "staging")],
+            4_000_000,
+            20.0,
+        ))
         .await
         .unwrap();
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         let request = LabelValuesRequest {
             label_name: "env".to_string(),
@@ -1143,30 +1155,24 @@ mod tests {
         let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
 
         // http_requests has env and method labels
-        mini.ingest(
-            &create_sample(
-                "http_requests",
-                vec![("env", "prod"), ("method", "GET")],
-                4_000_000,
-                10.0,
-            ),
-            30,
-        )
+        mini.ingest(&create_sample(
+            "http_requests",
+            vec![("env", "prod"), ("method", "GET")],
+            4_000_000,
+            10.0,
+        ))
         .await
         .unwrap();
         // db_queries has env and table labels (different from http_requests)
-        mini.ingest(
-            &create_sample(
-                "db_queries",
-                vec![("env", "prod"), ("table", "users")],
-                4_000_000,
-                20.0,
-            ),
-            30,
-        )
+        mini.ingest(&create_sample(
+            "db_queries",
+            vec![("env", "prod"), ("table", "users")],
+            4_000_000,
+            20.0,
+        ))
         .await
         .unwrap();
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // when: query labels with match[] filter for http_requests only
         let request = LabelsRequest {
@@ -1197,20 +1203,24 @@ mod tests {
         let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
 
         // http_requests with env=prod
-        mini.ingest(
-            &create_sample("http_requests", vec![("env", "prod")], 4_000_000, 10.0),
-            30,
-        )
+        mini.ingest(&create_sample(
+            "http_requests",
+            vec![("env", "prod")],
+            4_000_000,
+            10.0,
+        ))
         .await
         .unwrap();
         // db_queries with env=staging (different metric, different env value)
-        mini.ingest(
-            &create_sample("db_queries", vec![("env", "staging")], 4_000_000, 20.0),
-            30,
-        )
+        mini.ingest(&create_sample(
+            "db_queries",
+            vec![("env", "staging")],
+            4_000_000,
+            20.0,
+        ))
         .await
         .unwrap();
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // when: query label values for "env" with match[] filter for http_requests only
         let request = LabelValuesRequest {
@@ -1250,21 +1260,25 @@ mod tests {
         let bucket2 = TimeBucket::hour(120);
         let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
         mini1
-            .ingest(
-                &create_sample("http_requests", vec![("env", "prod")], 4_000_000, 10.0),
-                30,
-            )
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod")],
+                4_000_000,
+                10.0,
+            ))
             .await
             .unwrap();
         mini2
-            .ingest(
-                &create_sample("http_requests", vec![("env", "staging")], 8_000_000, 30.0),
-                30,
-            )
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging")],
+                8_000_000,
+                30.0,
+            ))
             .await
             .unwrap();
 
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // when: query across both buckets
         let request = SeriesRequest {
@@ -1300,20 +1314,24 @@ mod tests {
         // Same exact series in both buckets
         let series_labels = vec![("env", "prod"), ("service", "api")];
         mini1
-            .ingest(
-                &create_sample("memory_usage", series_labels.clone(), 4_000_000, 100.0),
-                30,
-            )
+            .ingest(&create_sample(
+                "memory_usage",
+                series_labels.clone(),
+                4_000_000,
+                100.0,
+            ))
             .await
             .unwrap();
         mini2
-            .ingest(
-                &create_sample("memory_usage", series_labels, 8_000_000, 150.0),
-                30,
-            )
+            .ingest(&create_sample(
+                "memory_usage",
+                series_labels,
+                8_000_000,
+                150.0,
+            ))
             .await
             .unwrap();
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // when: query across both buckets
         let request = SeriesRequest {
@@ -1346,13 +1364,15 @@ mod tests {
         let bucket1 = TimeBucket::hour(60);
         let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
         mini1
-            .ingest(
-                &create_sample("cpu_usage", vec![("host", "server1")], 4_000_000, 75.0),
-                30,
-            )
+            .ingest(&create_sample(
+                "cpu_usage",
+                vec![("host", "server1")],
+                4_000_000,
+                75.0,
+            ))
             .await
             .unwrap();
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // when: query across a range that includes empty buckets
         let request = SeriesRequest {
@@ -1387,33 +1407,27 @@ mod tests {
         // Create multiple series across buckets
         for i in 1..=5 {
             mini1
-                .ingest(
-                    &create_sample(
-                        "requests",
-                        vec![("service", &format!("svc{}", i))],
-                        4_000_000,
-                        i as f64 * 10.0,
-                    ),
-                    30,
-                )
+                .ingest(&create_sample(
+                    "requests",
+                    vec![("service", &format!("svc{}", i))],
+                    4_000_000,
+                    i as f64 * 10.0,
+                ))
                 .await
                 .unwrap();
         }
         for i in 6..=10 {
             mini2
-                .ingest(
-                    &create_sample(
-                        "requests",
-                        vec![("service", &format!("svc{}", i))],
-                        8_000_000,
-                        i as f64 * 10.0,
-                    ),
-                    30,
-                )
+                .ingest(&create_sample(
+                    "requests",
+                    vec![("service", &format!("svc{}", i))],
+                    8_000_000,
+                    i as f64 * 10.0,
+                ))
                 .await
                 .unwrap();
         }
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // when: query with a limit
         let request = SeriesRequest {
@@ -1444,31 +1458,25 @@ mod tests {
         let bucket2 = TimeBucket::hour(120);
         let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
         mini1
-            .ingest(
-                &create_sample(
-                    "http_requests",
-                    vec![("env", "prod"), ("service", "web")],
-                    4_000_000,
-                    10.0,
-                ),
-                30,
-            )
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod"), ("service", "web")],
+                4_000_000,
+                10.0,
+            ))
             .await
             .unwrap();
         mini2
-            .ingest(
-                &create_sample(
-                    "db_queries",
-                    vec![("env", "staging"), ("database", "postgres")],
-                    8_000_000,
-                    20.0,
-                ),
-                30,
-            )
+            .ingest(&create_sample(
+                "db_queries",
+                vec![("env", "staging"), ("database", "postgres")],
+                8_000_000,
+                20.0,
+            ))
             .await
             .unwrap();
 
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // when: query labels across both buckets (no match filter)
         let request = LabelsRequest {
@@ -1499,20 +1507,24 @@ mod tests {
         let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
         let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
         mini1
-            .ingest(
-                &create_sample("metric_a", vec![("env", "prod")], 4_000_000, 10.0),
-                30,
-            )
+            .ingest(&create_sample(
+                "metric_a",
+                vec![("env", "prod")],
+                4_000_000,
+                10.0,
+            ))
             .await
             .unwrap();
         mini2
-            .ingest(
-                &create_sample("metric_b", vec![("env", "staging")], 8_000_000, 20.0),
-                30,
-            )
+            .ingest(&create_sample(
+                "metric_b",
+                vec![("env", "staging")],
+                8_000_000,
+                20.0,
+            ))
             .await
             .unwrap();
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // when: query labels across both buckets
         let request = LabelsRequest {
@@ -1542,42 +1554,33 @@ mod tests {
         let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
         let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
         mini1
-            .ingest(
-                &create_sample(
-                    "http_requests",
-                    vec![("env", "prod"), ("method", "GET")],
-                    4_000_000,
-                    10.0,
-                ),
-                30,
-            )
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod"), ("method", "GET")],
+                4_000_000,
+                10.0,
+            ))
             .await
             .unwrap();
         mini2
-            .ingest(
-                &create_sample(
-                    "http_requests",
-                    vec![("env", "staging"), ("path", "/api/v1")],
-                    8_000_000,
-                    20.0,
-                ),
-                30,
-            )
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging"), ("path", "/api/v1")],
+                8_000_000,
+                20.0,
+            ))
             .await
             .unwrap();
         mini2
-            .ingest(
-                &create_sample(
-                    "db_queries",
-                    vec![("env", "prod"), ("table", "users")],
-                    8_000_000,
-                    30.0,
-                ),
-                30,
-            )
+            .ingest(&create_sample(
+                "db_queries",
+                vec![("env", "prod"), ("table", "users")],
+                8_000_000,
+                30.0,
+            ))
             .await
             .unwrap();
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // when: query labels with match[] filter for http_requests only
         let request = LabelsRequest {
@@ -1609,38 +1612,32 @@ mod tests {
         let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
         let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
         mini1
-            .ingest(
-                &create_sample(
-                    "metric1",
-                    vec![
-                        ("label_a", "value"),
-                        ("label_b", "value"),
-                        ("label_c", "value"),
-                    ],
-                    4_000_000,
-                    10.0,
-                ),
-                30,
-            )
+            .ingest(&create_sample(
+                "metric1",
+                vec![
+                    ("label_a", "value"),
+                    ("label_b", "value"),
+                    ("label_c", "value"),
+                ],
+                4_000_000,
+                10.0,
+            ))
             .await
             .unwrap();
         mini2
-            .ingest(
-                &create_sample(
-                    "metric2",
-                    vec![
-                        ("label_d", "value"),
-                        ("label_e", "value"),
-                        ("label_f", "value"),
-                    ],
-                    8_000_000,
-                    20.0,
-                ),
-                30,
-            )
+            .ingest(&create_sample(
+                "metric2",
+                vec![
+                    ("label_d", "value"),
+                    ("label_e", "value"),
+                    ("label_f", "value"),
+                ],
+                8_000_000,
+                20.0,
+            ))
             .await
             .unwrap();
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // when: query labels with a limit
         let request = LabelsRequest {
@@ -1667,20 +1664,24 @@ mod tests {
         let bucket2 = TimeBucket::hour(120);
         let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
         mini1
-            .ingest(
-                &create_sample("http_requests", vec![("env", "prod")], 4_000_000, 10.0),
-                30,
-            )
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod")],
+                4_000_000,
+                10.0,
+            ))
             .await
             .unwrap();
         mini2
-            .ingest(
-                &create_sample("http_requests", vec![("env", "staging")], 8_000_000, 20.0),
-                30,
-            )
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging")],
+                8_000_000,
+                20.0,
+            ))
             .await
             .unwrap();
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // when: query env label values across both buckets (no match filter)
         let request = LabelValuesRequest {
@@ -1710,20 +1711,24 @@ mod tests {
         let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
         let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
         mini1
-            .ingest(
-                &create_sample("metric_a", vec![("env", "prod")], 4_000_000, 10.0),
-                30,
-            )
+            .ingest(&create_sample(
+                "metric_a",
+                vec![("env", "prod")],
+                4_000_000,
+                10.0,
+            ))
             .await
             .unwrap();
         mini2
-            .ingest(
-                &create_sample("metric_b", vec![("env", "prod")], 8_000_000, 20.0),
-                30,
-            )
+            .ingest(&create_sample(
+                "metric_b",
+                vec![("env", "prod")],
+                8_000_000,
+                20.0,
+            ))
             .await
             .unwrap();
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // when: query env label values across both buckets
         let request = LabelValuesRequest {
@@ -1752,27 +1757,33 @@ mod tests {
         let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
         let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
         mini1
-            .ingest(
-                &create_sample("http_requests", vec![("env", "prod")], 4_000_000, 10.0),
-                30,
-            )
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod")],
+                4_000_000,
+                10.0,
+            ))
             .await
             .unwrap();
         mini2
-            .ingest(
-                &create_sample("http_requests", vec![("env", "staging")], 8_000_000, 20.0),
-                30,
-            )
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging")],
+                8_000_000,
+                20.0,
+            ))
             .await
             .unwrap();
         mini2
-            .ingest(
-                &create_sample("db_queries", vec![("env", "development")], 8_000_000, 30.0),
-                30,
-            )
+            .ingest(&create_sample(
+                "db_queries",
+                vec![("env", "development")],
+                8_000_000,
+                30.0,
+            ))
             .await
             .unwrap();
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // when: query env label values with match[] filter for http_requests only
         let request = LabelValuesRequest {
@@ -1801,13 +1812,15 @@ mod tests {
         let bucket1 = TimeBucket::hour(60);
         let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
         mini1
-            .ingest(
-                &create_sample("cpu_usage", vec![("host", "server1")], 4_000_000, 75.0),
-                30,
-            )
+            .ingest(&create_sample(
+                "cpu_usage",
+                vec![("host", "server1")],
+                4_000_000,
+                75.0,
+            ))
             .await
             .unwrap();
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // when: query across a range that includes empty buckets
         let request = LabelValuesRequest {
@@ -1837,33 +1850,27 @@ mod tests {
         let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
         for i in 1..=3 {
             mini1
-                .ingest(
-                    &create_sample(
-                        "requests",
-                        vec![("service", &format!("svc{}", i))],
-                        4_000_000,
-                        i as f64 * 10.0,
-                    ),
-                    30,
-                )
+                .ingest(&create_sample(
+                    "requests",
+                    vec![("service", &format!("svc{}", i))],
+                    4_000_000,
+                    i as f64 * 10.0,
+                ))
                 .await
                 .unwrap();
         }
         for i in 4..=6 {
             mini2
-                .ingest(
-                    &create_sample(
-                        "requests",
-                        vec![("service", &format!("svc{}", i))],
-                        8_000_000,
-                        i as f64 * 10.0,
-                    ),
-                    30,
-                )
+                .ingest(&create_sample(
+                    "requests",
+                    vec![("service", &format!("svc{}", i))],
+                    8_000_000,
+                    i as f64 * 10.0,
+                ))
                 .await
                 .unwrap();
         }
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // when: query service label values with a limit
         let request = LabelValuesRequest {
@@ -1891,20 +1898,24 @@ mod tests {
         let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
         let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
         mini1
-            .ingest(
-                &create_sample("metric_a", vec![("env", "prod")], 4_000_000, 10.0),
-                30,
-            )
+            .ingest(&create_sample(
+                "metric_a",
+                vec![("env", "prod")],
+                4_000_000,
+                10.0,
+            ))
             .await
             .unwrap();
         mini2
-            .ingest(
-                &create_sample("metric_b", vec![("service", "api")], 8_000_000, 20.0),
-                30,
-            )
+            .ingest(&create_sample(
+                "metric_b",
+                vec![("service", "api")],
+                8_000_000,
+                20.0,
+            ))
             .await
             .unwrap();
-        tsdb.flush(30).await.unwrap();
+        tsdb.flush().await.unwrap();
 
         // when: query for a label that doesn't exist in any bucket
         let request = LabelValuesRequest {

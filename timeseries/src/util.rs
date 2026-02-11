@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use blake3::Hasher;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

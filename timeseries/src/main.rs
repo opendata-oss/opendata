@@ -2,7 +2,7 @@
 
 mod delta;
 mod error;
-mod head;
+mod flusher;
 mod index;
 mod minitsdb;
 mod model;
