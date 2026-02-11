@@ -182,9 +182,9 @@ impl MiniTsdb {
 
         let handle = self.write_coordinator.handle(WRITE_CHANNEL);
         let mut write_handle = handle
-            .write(series_list.to_vec())
+            .try_write(series_list.to_vec())
             .await
-            .map_err(map_write_error)?;
+            .map_err(|e| map_write_error(e.discard_inner()))?;
 
         write_handle
             .wait(Durability::Applied)
@@ -231,7 +231,8 @@ impl MiniTsdb {
 
 fn map_write_error(e: WriteError) -> Error {
     match e {
-        WriteError::Backpressure => Error::Backpressure,
+        WriteError::Backpressure(_) => Error::Backpressure,
+        WriteError::TimeoutError(_) => Error::Backpressure,
         WriteError::Shutdown => Error::Internal("Write coordinator shut down".to_string()),
         WriteError::ApplyError(_, msg) => Error::Internal(msg),
         WriteError::FlushError(msg) => Error::Storage(msg),

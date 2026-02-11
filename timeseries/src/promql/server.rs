@@ -121,9 +121,8 @@ impl PromqlServer {
             .unwrap();
 
         // Flush TSDB on shutdown to persist any buffered data
-        let flush_interval_secs = self.config.prometheus_config.flush_interval_secs;
         tracing::info!("Flushing TSDB before shutdown...");
-        if let Err(e) = self.tsdb.flush(flush_interval_secs).await {
+        if let Err(e) = self.tsdb.flush().await {
             tracing::error!("Failed to flush TSDB on shutdown: {}", e);
         }
 
