@@ -35,7 +35,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from builder stage
-COPY --from=builder /app/target/release/timeseries /app/timeseries
+COPY --from=builder /app/target/release/opendata-timeseries /app/opendata-timeseries
 
 # Create a non-root user
 RUN useradd -r -u 1000 timeseries
@@ -49,4 +49,4 @@ ENV OPEN_TSDB_PORT=9090
 ENV RUST_LOG=info
 
 # Run the server
-ENTRYPOINT ["/app/timeseries"]
+ENTRYPOINT ["/app/opendata-timeseries"]

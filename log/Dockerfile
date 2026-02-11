@@ -36,7 +36,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from builder stage
-COPY --from=builder /app/target/release/log /app/opendata-log
+COPY --from=builder /app/target/release/opendata-log /app/opendata-log
 
 # Create a non-root user
 RUN useradd -r -u 1000 opendata-log
