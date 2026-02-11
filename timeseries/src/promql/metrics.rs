@@ -5,7 +5,7 @@ use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
-use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
+use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 
 /// Labels for scrape metrics.
@@ -120,9 +120,10 @@ impl Metrics {
         );
 
         // HTTP request duration histogram (buckets from 1ms to ~8s)
-        let http_request_duration_seconds = Family::<HttpLabels, Histogram>::new_with_constructor(
-            || Histogram::new(exponential_buckets(0.001, 2.0, 14)),
-        );
+        let http_request_duration_seconds =
+            Family::<HttpLabels, Histogram>::new_with_constructor(|| {
+                Histogram::new(exponential_buckets(0.001, 2.0, 14))
+            });
         registry.register(
             "http_request_duration_seconds",
             "HTTP request latency in seconds",
