@@ -83,7 +83,8 @@ impl From<SequenceError> for Error {
 impl From<WriteError> for Error {
     fn from(err: WriteError) -> Self {
         match err {
-            WriteError::Backpressure => Error::Internal("write queue full".into()),
+            WriteError::Backpressure(()) => Error::Internal("write queue full".into()),
+            WriteError::TimeoutError(()) => Error::Internal("write queue timeout".into()),
             WriteError::Shutdown => Error::Internal("coordinator shut down".into()),
             WriteError::ApplyError(_, msg) => Error::Internal(msg),
             WriteError::FlushError(msg) => Error::Storage(msg),

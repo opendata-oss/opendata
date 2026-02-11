@@ -193,7 +193,11 @@ impl LogDb {
             timestamp_ms: self.current_time_ms(),
             force_seal: false,
         };
-        let mut write_handle = self.handle.try_write(write).await?;
+        let mut write_handle = self
+            .handle
+            .try_write(write)
+            .await
+            .map_err(|e| e.discard_inner())?;
         let result = write_handle.wait(Durability::Applied).await?;
 
         if options.await_durable {
@@ -240,7 +244,10 @@ impl LogDb {
             timestamp_ms: self.current_time_ms(),
             force_seal: true,
         };
-        self.handle.try_write(write).await?;
+        self.handle
+            .try_write(write)
+            .await
+            .map_err(|e| e.discard_inner())?;
         self.flush().await?;
         Ok(())
     }
