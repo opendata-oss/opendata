@@ -23,6 +23,7 @@ jobs:
       version: ${{ steps.check.outputs.version }}
       features: ${{ steps.check.outputs.features }}
       tag: ${{ steps.check.outputs.tag }}
+      docker_image: ${{ steps.check.outputs.docker_image }}
     steps:
       - name: Parse tag and check for binary
         id: check
@@ -39,14 +40,17 @@ jobs:
             opendata-log)
               echo "has_binary=true" >> "$GITHUB_OUTPUT"
               echo "features=http-server" >> "$GITHUB_OUTPUT"
+              echo "docker_image=log" >> "$GITHUB_OUTPUT"
               ;;
             opendata-timeseries)
               echo "has_binary=true" >> "$GITHUB_OUTPUT"
               echo "features=remote-write" >> "$GITHUB_OUTPUT"
+              echo "docker_image=timeseries" >> "$GITHUB_OUTPUT"
               ;;
             *)
               echo "has_binary=false" >> "$GITHUB_OUTPUT"
               echo "features=" >> "$GITHUB_OUTPUT"
+              echo "docker_image=" >> "$GITHUB_OUTPUT"
               ;;
           esac
 
@@ -148,3 +152,71 @@ jobs:
           files: |
             ${{ needs.check-binary.outputs.crate_name }}-*.tar.gz
             ${{ needs.check-binary.outputs.crate_name }}-*.zip
+
+  build-docker:
+    name: Build Docker image
+    needs: [check-binary, create-release]
+    if: needs.check-binary.outputs.docker_image != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/${{ needs.check-binary.outputs.docker_image }}
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-binary.outputs.tag }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value=v${{ needs.check-binary.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ needs.check-binary.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ needs.check-binary.outputs.docker_image }}/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Output image URI
+        run: |
+          echo "## Docker Image Published" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Image:** \`${{ env.IMAGE_NAME }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Tags:**" >> "$GITHUB_STEP_SUMMARY"
+          echo '${{ steps.meta.outputs.tags }}' | while read -r tag; do
+            echo "- \`${tag}\`" >> "$GITHUB_STEP_SUMMARY"
+          done
