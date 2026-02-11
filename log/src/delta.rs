@@ -7,7 +7,7 @@
 use crate::listing::ListingCache;
 use crate::model::{AppendOutput, Record as UserRecord};
 use crate::segment::{LogSegment, SegmentCache};
-use crate::serde::{LogEntryBuilder, SegmentMeta, SegmentMetaKey};
+use crate::serde::LogEntryBuilder;
 use crate::storage::LogStorage;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -67,14 +67,36 @@ impl LogFlusher {
     }
 }
 
+impl LogDelta {
+    /// Assigns a segment for the given start sequence, tracking new segments
+    /// for the frozen view.
+    fn assign_segment(
+        &mut self,
+        timestamp_ms: i64,
+        start_seq: u64,
+        force_seal: bool,
+    ) -> LogSegment {
+        let assignment = self.context.segment_cache.assign_segment(
+            timestamp_ms,
+            start_seq,
+            &mut self.records,
+            force_seal,
+        );
+        if assignment.is_new {
+            self.new_segments.push(assignment.segment.clone());
+        }
+        assignment.segment
+    }
+}
+
 impl Delta for LogDelta {
     type Context = LogContext;
     type Write = LogWrite;
-    // Read of latest writes not yet supported
-    type DeltaView = ();
     type Frozen = FrozenLogDelta;
     type FrozenView = FrozenLogDeltaView;
-    type ApplyResult = AppendOutput;
+    type ApplyResult = Option<AppendOutput>;
+    // Read of latest writes not yet supported
+    type DeltaView = ();
 
     fn init(context: Self::Context) -> Self {
         Self {
@@ -84,77 +106,41 @@ impl Delta for LogDelta {
         }
     }
 
-    /// Apply a write to the delta. Returns the [`AppendOutput`] with the
-    /// base sequence number assigned to the batch.
-    fn apply(&mut self, write: Self::Write) -> Result<AppendOutput, String> {
+    /// Apply a write to the delta. Returns `Some(`[`AppendOutput`]`)` with the
+    /// base sequence number when records are appended, or `None` for
+    /// seal-only writes.
+    fn apply(&mut self, write: Self::Write) -> Result<Option<AppendOutput>, String> {
         let count = write.records.len() as u64;
 
-        let base_seq = if count > 0 {
-            // 1. Allocate sequences
-            let (base_seq, maybe_record) = self.context.sequence_allocator.allocate(count);
-            if let Some(r) = maybe_record {
-                self.records.push(r);
+        if count == 0 {
+            if write.force_seal {
+                let next_seq = self.context.sequence_allocator.peek_next_sequence();
+                self.assign_segment(write.timestamp_ms, next_seq, true);
             }
-
-            // 2. Build segment delta
-            let seg_delta = self.context.segment_cache.build_delta(
-                write.timestamp_ms,
-                base_seq,
-                &mut self.records,
-            );
-
-            // 3. Build listing delta
-            let keys: Vec<Bytes> = write.records.iter().map(|r| r.key.clone()).collect();
-            let listing_delta =
-                self.context
-                    .listing_cache
-                    .build_delta(&seg_delta, &keys, &mut self.records);
-
-            // 4. Build log entry records
-            LogEntryBuilder::build(
-                seg_delta.segment(),
-                base_seq,
-                &write.records,
-                &mut self.records,
-            );
-
-            // 5. Apply subsystem deltas to context caches
-            let is_new = seg_delta.is_new();
-            let segment = seg_delta.segment().clone();
-            self.context.segment_cache.apply_delta(seg_delta);
-            if is_new {
-                self.new_segments.push(segment);
-            }
-            self.context.listing_cache.apply_delta(listing_delta);
-
-            base_seq
-        } else {
-            self.context.sequence_allocator.peek_next_sequence()
-        };
-
-        // Handle force_seal: create a new segment
-        if write.force_seal {
-            let next_seq = self.context.sequence_allocator.peek_next_sequence();
-            let segment_id = match self.context.segment_cache.latest() {
-                Some(latest) => latest.id() + 1,
-                None => 0,
-            };
-            let meta = SegmentMeta::new(next_seq, write.timestamp_ms);
-            let segment = LogSegment::new(segment_id, meta.clone());
-
-            // Write segment metadata record
-            let key = SegmentMetaKey::new(segment_id).serialize();
-            let value = meta.serialize();
-            self.records.push(Record::new(key, value));
-
-            // Update cache and track
-            self.context.segment_cache.insert(segment.clone());
-            self.new_segments.push(segment);
+            return Ok(None);
         }
 
-        Ok(AppendOutput {
+        // 1. Allocate sequences
+        let (base_seq, maybe_record) = self.context.sequence_allocator.allocate(count);
+        if let Some(r) = maybe_record {
+            self.records.push(r);
+        }
+
+        // 2. Assign segment (creates a new one if seal interval elapsed or force_seal)
+        let segment = self.assign_segment(write.timestamp_ms, base_seq, write.force_seal);
+
+        // 3. Assign listing entries for new keys
+        let keys: Vec<Bytes> = write.records.iter().map(|r| r.key.clone()).collect();
+        self.context
+            .listing_cache
+            .assign_keys(segment.id(), &keys, &mut self.records);
+
+        // 4. Build log entry records
+        LogEntryBuilder::build(&segment, base_seq, &write.records, &mut self.records);
+
+        Ok(Some(AppendOutput {
             start_sequence: base_seq,
-        })
+        }))
     }
 
     fn estimate_size(&self) -> usize {
