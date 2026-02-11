@@ -1,6 +1,6 @@
 //! Benchmark parameter collection.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use timeseries::Label;
 
@@ -11,14 +11,14 @@ use timeseries::Label;
 /// to/from `Vec<Label>` for use with the metrics system.
 #[derive(Debug, Clone, Default)]
 pub struct Params {
-    inner: HashMap<String, String>,
+    inner: BTreeMap<String, String>,
 }
 
 impl Params {
     /// Create an empty Params collection.
     pub fn new() -> Self {
         Self {
-            inner: HashMap::new(),
+            inner: BTreeMap::new(),
         }
     }
 
