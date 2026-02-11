@@ -92,7 +92,7 @@ pub struct Record {
     pub value: Bytes,
 }
 
-/// Result of an append operation.
+/// Output of an append operation.
 ///
 /// Contains metadata about the appended records, including the starting
 /// sequence number assigned to the first record in the batch.
@@ -100,11 +100,11 @@ pub struct Record {
 /// # Example
 ///
 /// ```ignore
-/// let result = log.append(records).await?;
+/// let result = log.try_append(records).await?;
 /// println!("Appended starting at sequence {}", result.start_sequence);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppendResult {
+pub struct AppendOutput {
     /// Sequence number assigned to the first record in the batch.
     pub start_sequence: Sequence,
 }

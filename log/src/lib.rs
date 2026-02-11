@@ -32,7 +32,7 @@
 //! let records = vec![
 //!     Record { key: Bytes::from("orders"), value: Bytes::from("order-123") },
 //! ];
-//! log.append(records).await?;
+//! log.try_append(records).await?;
 //!
 //! // Scan a key's log
 //! let mut iter = log.scan(Bytes::from("orders"), ..);
@@ -55,11 +55,11 @@ mod serde;
 pub mod server;
 mod storage;
 
-pub use config::{Config, CountOptions, ReaderConfig, ScanOptions, SegmentConfig, WriteOptions};
-pub use error::{Error, Result};
+pub use config::{Config, CountOptions, ReaderConfig, ScanOptions, SegmentConfig};
+pub use error::{AppendError, AppendResult, Error, Result};
 pub use listing::{LogKey, LogKeyIterator};
 pub use log::{LogDb, LogDbBuilder};
-pub use model::{AppendResult, LogEntry, Record, Segment, SegmentId, Sequence};
+pub use model::{AppendOutput, LogEntry, Record, Segment, SegmentId, Sequence};
 
 pub use reader::{LogDbReader, LogIterator, LogRead};
 

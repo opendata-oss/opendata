@@ -37,7 +37,7 @@ async fn reader_discovers_data_written_by_writer() {
 
     let key = Bytes::from("test-key");
     writer
-        .append(vec![
+        .try_append(vec![
             Record {
                 key: key.clone(),
                 value: Bytes::from("value-0"),
@@ -121,7 +121,7 @@ async fn reader_discovers_new_data_after_initial_open() {
 
     // Write data after reader is open
     writer
-        .append(vec![Record {
+        .try_append(vec![Record {
             key: key.clone(),
             value: Bytes::from("event-1"),
         }])
@@ -162,7 +162,7 @@ async fn flush_guarantees_durability_across_reopen() {
         let writer = LogDb::open(config).await.expect("Failed to open writer");
 
         writer
-            .append(vec![
+            .try_append(vec![
                 Record {
                     key: key.clone(),
                     value: Bytes::from("value-0"),

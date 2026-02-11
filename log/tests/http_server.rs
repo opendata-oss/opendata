@@ -36,7 +36,7 @@ async fn test_append_and_scan_roundtrip() {
             value: Bytes::from("value-2"),
         },
     ];
-    log.append(records).await.unwrap();
+    log.try_append(records).await.unwrap();
     log.flush().await.unwrap();
 
     // Verify we can scan the entries back
@@ -75,7 +75,7 @@ async fn test_list_keys() {
             value: Bytes::from("value-c"),
         },
     ];
-    log.append(records).await.unwrap();
+    log.try_append(records).await.unwrap();
     log.flush().await.unwrap();
 
     // List keys (using segment range)
@@ -121,7 +121,7 @@ async fn test_scan_with_sequence_range() {
             value: Bytes::from("event-4"),
         },
     ];
-    log.append(records).await.unwrap();
+    log.try_append(records).await.unwrap();
     log.flush().await.unwrap();
 
     // Scan with range 1..4 (sequences 1, 2, 3 - exclusive upper bound)
@@ -146,7 +146,7 @@ async fn test_list_segments_returns_all_segments() {
     let log = setup_test_log().await;
 
     // Append records to create a segment
-    log.append(vec![Record {
+    log.try_append(vec![Record {
         key: Bytes::from("key-a"),
         value: Bytes::from("value-a"),
     }])
@@ -177,7 +177,7 @@ async fn test_list_keys_empty_when_no_keys_in_segment_range() {
     let log = setup_test_log().await;
 
     // Append records to segment 0
-    log.append(vec![Record {
+    log.try_append(vec![Record {
         key: Bytes::from("key-a"),
         value: Bytes::from("value-a"),
     }])
@@ -200,7 +200,7 @@ async fn test_list_keys_in_specific_segment_range() {
     let log = setup_test_log().await;
 
     // Append records to segment 0
-    log.append(vec![
+    log.try_append(vec![
         Record {
             key: Bytes::from("key-a"),
             value: Bytes::from("value-a"),
@@ -235,7 +235,7 @@ async fn test_list_segments_then_list_keys_workflow() {
     let log = setup_test_log().await;
 
     // Append records
-    log.append(vec![
+    log.try_append(vec![
         Record {
             key: Bytes::from("orders"),
             value: Bytes::from("order-1"),
@@ -290,7 +290,7 @@ async fn test_list_segments_multiple_segments() {
     let log = setup_test_log_with_segment_interval(Duration::from_millis(1)).await;
 
     // Append first batch
-    log.append(vec![Record {
+    log.try_append(vec![Record {
         key: Bytes::from("key-a"),
         value: Bytes::from("value-a"),
     }])
@@ -302,7 +302,7 @@ async fn test_list_segments_multiple_segments() {
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     // Append second batch (should create new segment)
-    log.append(vec![Record {
+    log.try_append(vec![Record {
         key: Bytes::from("key-b"),
         value: Bytes::from("value-b"),
     }])
@@ -328,7 +328,7 @@ async fn test_list_keys_across_multiple_segments() {
     let log = setup_test_log_with_segment_interval(Duration::from_millis(1)).await;
 
     // Append key-a to segment 0
-    log.append(vec![Record {
+    log.try_append(vec![Record {
         key: Bytes::from("key-a"),
         value: Bytes::from("value-a"),
     }])
@@ -340,7 +340,7 @@ async fn test_list_keys_across_multiple_segments() {
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     // Append key-b to a new segment
-    log.append(vec![Record {
+    log.try_append(vec![Record {
         key: Bytes::from("key-b"),
         value: Bytes::from("value-b"),
     }])
@@ -367,7 +367,7 @@ async fn test_list_keys_only_first_segment() {
     let log = setup_test_log_with_segment_interval(Duration::from_millis(1)).await;
 
     // Append key-a to segment 0
-    log.append(vec![Record {
+    log.try_append(vec![Record {
         key: Bytes::from("key-a"),
         value: Bytes::from("value-a"),
     }])
@@ -379,7 +379,7 @@ async fn test_list_keys_only_first_segment() {
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     // Append key-b to segment 1
-    log.append(vec![Record {
+    log.try_append(vec![Record {
         key: Bytes::from("key-b"),
         value: Bytes::from("value-b"),
     }])
@@ -405,7 +405,7 @@ async fn test_list_segments_filters_by_sequence_range() {
     let log = setup_test_log_with_segment_interval(Duration::from_millis(1)).await;
 
     // Append to create segment 0 (sequences start at 0)
-    log.append(vec![Record {
+    log.try_append(vec![Record {
         key: Bytes::from("key-a"),
         value: Bytes::from("value-a"),
     }])
@@ -417,7 +417,7 @@ async fn test_list_segments_filters_by_sequence_range() {
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     // Append to create segment 1 (sequences start at 1)
-    log.append(vec![Record {
+    log.try_append(vec![Record {
         key: Bytes::from("key-b"),
         value: Bytes::from("value-b"),
     }])

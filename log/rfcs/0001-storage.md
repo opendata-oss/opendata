@@ -191,7 +191,8 @@ How this optimization can be exposed in SlateDB remains to be explored.
 
 ### Write API
 
-The write API mirrors SlateDB's `write` API. The only supported operation is `append`.
+The write API provides two append methods with different backpressure behavior.
+Durability is handled separately via `flush()`.
 
 ```rust
 struct Record {
@@ -199,16 +200,17 @@ struct Record {
     value: Bytes,
 }
 
-#[derive(Default)]
-struct WriteOptions {
-    await_durable: bool,
-}
-
 impl LogDb {
-    async fn append(&self, records: Vec<Record>) -> Result<(), Error>;
-    async fn append_with_options(&self, records: Vec<Record>, options: WriteOptions) -> Result<(), Error>;
+    async fn try_append(&self, records: Vec<Record>) -> AppendResult<AppendOutput>;
+    async fn append_timeout(&self, records: Vec<Record>, timeout: Duration) -> AppendResult<AppendOutput>;
+    async fn flush(&self) -> Result<(), Error>;
 }
 ```
+
+`try_append` fails immediately if the write queue is full. `append_timeout`
+blocks up to the given duration. Both return the original batch inside
+retryable errors (`QueueFull`, `Timeout`) so callers can retry without
+cloning.
 
 ### Scan API
 
@@ -335,3 +337,4 @@ Messaging systems often expose a way to attach headers to messages in order to e
 | 2026-01-05 | Added block-based sequence allocation |
 | 2026-01-06 | Added TerminatedBytes encoding for variable-length keys |
 | 2026-01-07 | Changed TerminatedBytes delimiter to 0x00 for prefix-friendly ordering |
+| 2026-02-11 | Replaced `append`/`append_with_options` with `try_append`/`append_timeout`; durability is now a separate `flush()` call |

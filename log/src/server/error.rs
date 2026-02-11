@@ -38,6 +38,12 @@ impl From<Error> for ApiError {
     }
 }
 
+impl From<crate::error::AppendError> for ApiError {
+    fn from(err: crate::error::AppendError) -> Self {
+        ApiError(Error::from(err))
+    }
+}
+
 impl From<&str> for ApiError {
     fn from(msg: &str) -> Self {
         ApiError(Error::InvalidInput(msg.to_string()))

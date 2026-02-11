@@ -124,7 +124,7 @@ async fn test_scan_json_response() {
     let (app, log) = setup_test_app().await;
 
     // Append some records directly
-    log.append(vec![
+    log.try_append(vec![
         Record {
             key: Bytes::from("events"),
             value: Bytes::from("event-1"),
@@ -182,7 +182,7 @@ async fn test_scan_json_response() {
 async fn test_list_keys_json_response() {
     let (app, log) = setup_test_app().await;
 
-    log.append(vec![
+    log.try_append(vec![
         Record {
             key: Bytes::from("orders"),
             value: Bytes::from("order-1"),
@@ -228,7 +228,7 @@ async fn test_list_keys_json_response() {
 async fn test_list_segments_json_response() {
     let (app, log) = setup_test_app().await;
 
-    log.append(vec![Record {
+    log.try_append(vec![Record {
         key: Bytes::from("key"),
         value: Bytes::from("value"),
     }])
@@ -372,7 +372,7 @@ async fn test_append_protobuf_request_json_response() {
 async fn test_scan_protobuf_response() {
     let (app, log) = setup_test_app().await;
 
-    log.append(vec![
+    log.try_append(vec![
         Record {
             key: Bytes::from("proto-events"),
             value: Bytes::from("event-a"),
@@ -422,7 +422,7 @@ async fn test_scan_protobuf_response() {
 async fn test_list_keys_protobuf_response() {
     let (app, log) = setup_test_app().await;
 
-    log.append(vec![
+    log.try_append(vec![
         Record {
             key: Bytes::from("alpha"),
             value: Bytes::from("value"),
@@ -466,7 +466,7 @@ async fn test_list_keys_protobuf_response() {
 async fn test_list_segments_protobuf_response() {
     let (app, log) = setup_test_app().await;
 
-    log.append(vec![Record {
+    log.try_append(vec![Record {
         key: Bytes::from("seg-key"),
         value: Bytes::from("seg-value"),
     }])
@@ -636,7 +636,7 @@ async fn test_default_response_format_is_json() {
     // When no Accept header is provided, response should be JSON
     let (app, log) = setup_test_app().await;
 
-    log.append(vec![Record {
+    log.try_append(vec![Record {
         key: Bytes::from("default-test"),
         value: Bytes::from("value"),
     }])

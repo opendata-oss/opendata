@@ -103,3 +103,64 @@ impl From<&str> for Error {
 ///
 /// This is a convenience alias for `std::result::Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
+
+use crate::model::Record;
+
+/// Error type for append operations that preserves the batch for retry.
+///
+/// Unlike [`Error`], this type carries the original `Vec<Record>` inside
+/// retryable variants (`QueueFull`, `Timeout`) so callers can retry without
+/// cloning the batch up front.
+#[derive(Debug)]
+pub enum AppendError {
+    /// The write queue is full (non-blocking send failed). Contains the batch.
+    QueueFull(Vec<Record>),
+    /// Timed out waiting for queue space. Contains the batch.
+    Timeout(Vec<Record>),
+    /// The coordinator has shut down.
+    Shutdown,
+    /// The delta rejected the write (invalid record, invariant violation, etc.).
+    InvalidRecord(String),
+}
+
+impl AppendError {
+    /// Returns the batch of records if this is a retryable error, or `None`
+    /// for terminal errors.
+    pub fn into_inner(self) -> Option<Vec<Record>> {
+        match self {
+            AppendError::QueueFull(records) => Some(records),
+            AppendError::Timeout(records) => Some(records),
+            AppendError::Shutdown => None,
+            AppendError::InvalidRecord(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for AppendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppendError::QueueFull(_) => write!(f, "write queue full"),
+            AppendError::Timeout(_) => write!(f, "write queue timeout"),
+            AppendError::Shutdown => write!(f, "coordinator shut down"),
+            AppendError::InvalidRecord(msg) => write!(f, "invalid record: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for AppendError {}
+
+impl From<AppendError> for Error {
+    fn from(err: AppendError) -> Self {
+        match err {
+            AppendError::QueueFull(_) => Error::Internal("write queue full".into()),
+            AppendError::Timeout(_) => Error::Internal("write queue timeout".into()),
+            AppendError::Shutdown => Error::Internal("coordinator shut down".into()),
+            AppendError::InvalidRecord(msg) => Error::Internal(msg),
+        }
+    }
+}
+
+/// Result type alias for append operations.
+///
+/// This is a convenience alias for `std::result::Result<T, AppendError>`.
+pub type AppendResult<T> = std::result::Result<T, AppendError>;

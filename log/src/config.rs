@@ -74,23 +74,6 @@ pub struct SegmentConfig {
     pub seal_interval: Option<Duration>,
 }
 
-/// Options for write operations.
-///
-/// Controls the durability and behavior of [`LogDb::append`](crate::LogDb::append)
-/// and [`LogDb::append_with_options`](crate::LogDb::append_with_options).
-#[derive(Debug, Clone, Default)]
-pub struct WriteOptions {
-    /// Whether to wait for the write to be durable before returning.
-    ///
-    /// When `true`, the append operation will not return until the data has
-    /// been persisted to durable storage (e.g., flushed to the WAL and
-    /// acknowledged by the object store).
-    ///
-    /// When `false` (the default), the operation returns as soon as the data
-    /// is in memory, providing lower latency but risking data loss on crash.
-    pub await_durable: bool,
-}
-
 /// Options for scan operations.
 ///
 /// Controls the behavior of [`LogRead::scan`](crate::LogRead::scan) and

@@ -1,29 +1,31 @@
 //! Core LogDb implementation with read and write APIs.
 //!
 //! This module provides the [`LogDb`] struct, the primary entry point for
-//! interacting with OpenData Log. It exposes both write operations ([`append`])
+//! interacting with OpenData Log. It exposes both write operations
+//! ([`try_append`](LogDb::try_append), [`append_timeout`](LogDb::append_timeout))
 //! and read operations ([`scan`], [`count`]) via the [`LogRead`] trait.
 
 use std::ops::RangeBounds;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use common::clock::{Clock, SystemClock};
 use common::coordinator::{
-    Durability, WriteCoordinator, WriteCoordinatorConfig, WriteCoordinatorHandle,
+    Durability, WriteCoordinator, WriteCoordinatorConfig, WriteCoordinatorHandle, WriteError,
 };
 use common::storage::factory::create_storage;
 use common::{StorageRuntime, StorageSemantics};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
-use crate::config::{CountOptions, ScanOptions, WriteOptions};
+use crate::config::{CountOptions, ScanOptions};
 use crate::delta::{LogContext, LogDelta, LogFlusher, LogWrite};
-use crate::error::{Error, Result};
+use crate::error::{AppendError, AppendResult, Error, Result};
 use crate::listing::ListingCache;
 use crate::listing::LogKeyIterator;
-use crate::model::{AppendResult, Record, Segment, SegmentId, Sequence};
+use crate::model::{AppendOutput, Record, Segment, SegmentId, Sequence};
 use crate::range::{normalize_segment_id, normalize_sequence};
 use crate::reader::{LogIterator, LogRead};
 use crate::segment::SegmentCache;
@@ -57,7 +59,7 @@ const WRITE_CHANNEL: &str = "write";
 /// # Example
 ///
 /// ```ignore
-/// use log::{LogDb, LogRead, Record, WriteOptions};
+/// use log::{LogDb, LogRead, Record};
 /// use bytes::Bytes;
 ///
 /// // Open a log (implementation details TBD)
@@ -68,7 +70,7 @@ const WRITE_CHANNEL: &str = "write";
 ///     Record { key: Bytes::from("user:123"), value: Bytes::from("event-a") },
 ///     Record { key: Bytes::from("user:456"), value: Bytes::from("event-b") },
 /// ];
-/// log.append(records).await?;
+/// log.try_append(records).await?;
 ///
 /// // Scan entries for a specific key
 /// let mut iter = log.scan(Bytes::from("user:123"), ..).await?;
@@ -110,13 +112,17 @@ impl LogDb {
         LogDbBuilder::new(config).build().await
     }
 
-    /// Appends records to the log.
+    /// Appends records to the log without blocking.
     ///
     /// Records are assigned sequence numbers in the order they appear in the
     /// input vector. All records in a single append call are written atomically.
     ///
-    /// This method uses default write options. Use [`append_with_options`] for
-    /// custom durability settings.
+    /// Fails immediately with [`AppendError::QueueFull`] if the write queue
+    /// is full. The returned error contains the original batch so callers can
+    /// retry without cloning.
+    ///
+    /// Durability is **not** awaited. Call [`flush()`](LogDb::flush) after
+    /// appending to ensure records are persisted.
     ///
     /// # Arguments
     ///
@@ -125,12 +131,8 @@ impl LogDb {
     ///
     /// # Returns
     ///
-    /// On success, returns an [`AppendResult`] containing the starting sequence
+    /// On success, returns an [`AppendOutput`] containing the starting sequence
     /// number assigned to the batch.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the write fails due to storage issues.
     ///
     /// # Example
     ///
@@ -139,53 +141,61 @@ impl LogDb {
     ///     Record { key: Bytes::from("events"), value: Bytes::from("event-1") },
     ///     Record { key: Bytes::from("events"), value: Bytes::from("event-2") },
     /// ];
-    /// let result = log.append(records).await?;
+    /// let result = log.try_append(records).await?;
     /// println!("Appended at seq {}", result.start_sequence);
     /// ```
-    ///
-    /// [`append_with_options`]: LogDb::append_with_options
-    pub async fn append(&self, records: Vec<Record>) -> Result<AppendResult> {
-        self.append_with_options(records, WriteOptions::default())
-            .await
+    pub async fn try_append(&self, records: Vec<Record>) -> AppendResult<AppendOutput> {
+        self.append_inner(records, None).await
     }
 
-    /// Appends records to the log with custom options.
+    /// Appends records to the log, blocking up to `timeout` for queue space.
     ///
     /// Records are assigned sequence numbers in the order they appear in the
     /// input vector. All records in a single append call are written atomically.
     ///
+    /// Returns [`AppendError::Timeout`] if the queue does not drain within the
+    /// deadline. The returned error contains the original batch for retry.
+    ///
+    /// Durability is **not** awaited. Call [`flush()`](LogDb::flush) after
+    /// appending to ensure records are persisted.
+    ///
     /// # Arguments
     ///
-    /// * `records` - The records to append. Each record specifies its target
-    ///   key and value.
-    /// * `options` - Write options controlling durability behavior.
+    /// * `records` - The records to append.
+    /// * `timeout` - Maximum duration to wait for queue space.
     ///
     /// # Returns
     ///
-    /// On success, returns an [`AppendResult`] containing the starting sequence
+    /// On success, returns an [`AppendOutput`] containing the starting sequence
     /// number assigned to the batch.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the write fails due to storage issues.
     ///
     /// # Example
     ///
     /// ```ignore
+    /// use std::time::Duration;
+    ///
     /// let records = vec![
     ///     Record { key: Bytes::from("events"), value: Bytes::from("critical-event") },
     /// ];
-    /// let options = WriteOptions { await_durable: true };
-    /// let result = log.append_with_options(records, options).await?;
+    /// let result = log.append_timeout(records, Duration::from_secs(5)).await?;
     /// println!("Started at sequence {}", result.start_sequence);
     /// ```
-    pub async fn append_with_options(
+    pub async fn append_timeout(
         &self,
         records: Vec<Record>,
-        options: WriteOptions,
-    ) -> Result<AppendResult> {
+        timeout: Duration,
+    ) -> AppendResult<AppendOutput> {
+        self.append_inner(records, Some(timeout)).await
+    }
+
+    /// Shared implementation for `try_append` and `append_timeout`.
+    async fn append_inner(
+        &self,
+        records: Vec<Record>,
+        timeout: Option<Duration>,
+    ) -> AppendResult<AppendOutput> {
         if records.is_empty() {
-            return Ok(AppendResult { start_sequence: 0 });
+            return Ok(AppendOutput { start_sequence: 0 });
         }
 
         let write = LogWrite {
@@ -193,18 +203,27 @@ impl LogDb {
             timestamp_ms: self.current_time_ms(),
             force_seal: false,
         };
-        let mut write_handle = self
-            .handle
-            .try_write(write)
-            .await
-            .map_err(|e| e.discard_inner())?;
-        let result = write_handle.wait(Durability::Applied).await?;
 
-        if options.await_durable {
-            self.flush().await?;
+        let mut write_handle = if let Some(t) = timeout {
+            self.handle.write_timeout(write, t).await
+        } else {
+            self.handle.try_write(write).await
         }
+        .map_err(|e| match e {
+            WriteError::Backpressure(w) => AppendError::QueueFull(w.records),
+            WriteError::TimeoutError(w) => AppendError::Timeout(w.records),
+            WriteError::Shutdown => AppendError::Shutdown,
+            _ => unreachable!(),
+        })?;
 
-        Ok(result)
+        write_handle
+            .wait(Durability::Applied)
+            .await
+            .map_err(|e| match e {
+                WriteError::Shutdown => AppendError::Shutdown,
+                WriteError::ApplyError(_, msg) => AppendError::InvalidRecord(msg),
+                _ => unreachable!(),
+            })
     }
 
     /// Returns the current time in milliseconds since Unix epoch.
@@ -540,7 +559,7 @@ mod tests {
         }];
 
         // when
-        log.append(records).await.unwrap();
+        log.try_append(records).await.unwrap();
         log.flush().await.unwrap();
 
         // then - verify entry can be read back
@@ -571,7 +590,7 @@ mod tests {
         ];
 
         // when
-        log.append(records).await.unwrap();
+        log.try_append(records).await.unwrap();
         log.flush().await.unwrap();
 
         // then - verify entries with sequential sequence numbers
@@ -599,7 +618,7 @@ mod tests {
         let records: Vec<Record> = vec![];
 
         // when
-        let result = log.append(records).await;
+        let result = log.try_append(records).await;
 
         // then
         assert!(result.is_ok());
@@ -615,7 +634,7 @@ mod tests {
         let log = LogDb::open(test_config()).await.unwrap();
 
         // when - first append
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("events"),
                 value: Bytes::from("event-1"),
@@ -629,7 +648,7 @@ mod tests {
         .unwrap();
 
         // when - second append
-        log.append(vec![Record {
+        log.try_append(vec![Record {
             key: Bytes::from("events"),
             value: Bytes::from("event-3"),
         }])
@@ -668,7 +687,7 @@ mod tests {
         ];
 
         // when
-        log.append(records).await.unwrap();
+        log.try_append(records).await.unwrap();
         log.flush().await.unwrap();
 
         // then - verify entries for topic-a
@@ -690,7 +709,7 @@ mod tests {
     async fn should_scan_all_entries_for_key() {
         // given
         let log = LogDb::open(test_config()).await.unwrap();
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("orders"),
                 value: Bytes::from("order-1"),
@@ -729,7 +748,7 @@ mod tests {
     async fn should_scan_with_sequence_range() {
         // given
         let log = LogDb::open(test_config()).await.unwrap();
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("events"),
                 value: Bytes::from("event-0"),
@@ -773,7 +792,7 @@ mod tests {
     async fn should_scan_from_starting_sequence() {
         // given
         let log = LogDb::open(test_config()).await.unwrap();
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("logs"),
                 value: Bytes::from("log-0"),
@@ -808,7 +827,7 @@ mod tests {
     async fn should_scan_up_to_ending_sequence() {
         // given
         let log = LogDb::open(test_config()).await.unwrap();
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("logs"),
                 value: Bytes::from("log-0"),
@@ -843,7 +862,7 @@ mod tests {
     async fn should_scan_only_entries_for_specified_key() {
         // given
         let log = LogDb::open(test_config()).await.unwrap();
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("key-a"),
                 value: Bytes::from("value-a-0"),
@@ -884,7 +903,7 @@ mod tests {
     async fn should_return_empty_iterator_for_unknown_key() {
         // given
         let log = LogDb::open(test_config()).await.unwrap();
-        log.append(vec![Record {
+        log.try_append(vec![Record {
             key: Bytes::from("existing"),
             value: Bytes::from("value"),
         }])
@@ -904,7 +923,7 @@ mod tests {
     async fn should_return_empty_iterator_for_empty_range() {
         // given
         let log = LogDb::open(test_config()).await.unwrap();
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("key"),
                 value: Bytes::from("value-0"),
@@ -937,7 +956,7 @@ mod tests {
         .await
         .unwrap();
         let log = LogDb::new(storage.clone()).await.unwrap();
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("orders"),
                 value: Bytes::from("order-1"),
@@ -979,7 +998,7 @@ mod tests {
         let log = LogDb::open(test_config()).await.unwrap();
 
         // write to segment 0
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("events"),
                 value: Bytes::from("event-0"),
@@ -996,7 +1015,7 @@ mod tests {
         log.seal_segment().await.unwrap();
 
         // write to segment 1
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("events"),
                 value: Bytes::from("event-2"),
@@ -1035,7 +1054,7 @@ mod tests {
         let log = LogDb::open(test_config()).await.unwrap();
 
         // segment 0: seq 0, 1
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("data"),
                 value: Bytes::from("seg0-0"),
@@ -1051,7 +1070,7 @@ mod tests {
         log.seal_segment().await.unwrap();
 
         // segment 1: seq 2, 3
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("data"),
                 value: Bytes::from("seg1-2"),
@@ -1067,7 +1086,7 @@ mod tests {
         log.seal_segment().await.unwrap();
 
         // segment 2: seq 4, 5
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("data"),
                 value: Bytes::from("seg2-4"),
@@ -1102,7 +1121,7 @@ mod tests {
         let log = LogDb::open(test_config()).await.unwrap();
 
         // segment 0: seq 0, 1
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("key"),
                 value: Bytes::from("v0"),
@@ -1118,7 +1137,7 @@ mod tests {
         log.seal_segment().await.unwrap();
 
         // segment 1: seq 2, 3
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("key"),
                 value: Bytes::from("v2"),
@@ -1149,7 +1168,7 @@ mod tests {
     async fn should_list_keys_returns_iterator() {
         // given
         let log = LogDb::open(test_config()).await.unwrap();
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("key-a"),
                 value: Bytes::from("value-a"),
@@ -1180,7 +1199,7 @@ mod tests {
         .await
         .unwrap();
         let log = LogDb::new(storage.clone()).await.unwrap();
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("key-a"),
                 value: Bytes::from("value-a"),
@@ -1205,7 +1224,7 @@ mod tests {
     async fn should_list_keys_in_single_segment() {
         // given
         let log = LogDb::open(test_config()).await.unwrap();
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("key-a"),
                 value: Bytes::from("value-a"),
@@ -1243,7 +1262,7 @@ mod tests {
         let log = LogDb::open(test_config()).await.unwrap();
 
         // write to segment 0
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("key-a"),
                 value: Bytes::from("value-a-0"),
@@ -1260,7 +1279,7 @@ mod tests {
         log.seal_segment().await.unwrap();
 
         // write to segment 1 with different keys
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("key-c"),
                 value: Bytes::from("value-c-1"),
@@ -1295,7 +1314,7 @@ mod tests {
         let log = LogDb::open(test_config()).await.unwrap();
 
         // write to segment 0
-        log.append(vec![Record {
+        log.try_append(vec![Record {
             key: Bytes::from("shared-key"),
             value: Bytes::from("value-0"),
         }])
@@ -1306,7 +1325,7 @@ mod tests {
         log.seal_segment().await.unwrap();
 
         // write same key to segment 1
-        log.append(vec![Record {
+        log.try_append(vec![Record {
             key: Bytes::from("shared-key"),
             value: Bytes::from("value-1"),
         }])
@@ -1317,7 +1336,7 @@ mod tests {
         log.seal_segment().await.unwrap();
 
         // write same key to segment 2
-        log.append(vec![Record {
+        log.try_append(vec![Record {
             key: Bytes::from("shared-key"),
             value: Bytes::from("value-2"),
         }])
@@ -1341,7 +1360,7 @@ mod tests {
     async fn should_list_keys_in_lexicographic_order() {
         // given - keys inserted out of order
         let log = LogDb::open(test_config()).await.unwrap();
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("zebra"),
                 value: Bytes::from("value"),
@@ -1390,7 +1409,7 @@ mod tests {
         let log = LogDb::open(test_config()).await.unwrap();
 
         // segment 0
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("key-seg0"),
                 value: Bytes::from("value"),
@@ -1406,7 +1425,7 @@ mod tests {
         log.seal_segment().await.unwrap();
 
         // segment 1
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("key-seg1"),
                 value: Bytes::from("value"),
@@ -1422,7 +1441,7 @@ mod tests {
         log.seal_segment().await.unwrap();
 
         // segment 2
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("key-seg2"),
                 value: Bytes::from("value"),
@@ -1465,7 +1484,7 @@ mod tests {
     async fn should_list_segments_returns_single_segment() {
         // given
         let log = LogDb::open(test_config()).await.unwrap();
-        log.append(vec![Record {
+        log.try_append(vec![Record {
             key: Bytes::from("key"),
             value: Bytes::from("value"),
         }])
@@ -1488,7 +1507,7 @@ mod tests {
         let log = LogDb::open(test_config()).await.unwrap();
 
         // segment 0
-        log.append(vec![Record {
+        log.try_append(vec![Record {
             key: Bytes::from("key"),
             value: Bytes::from("value-0"),
         }])
@@ -1498,7 +1517,7 @@ mod tests {
         log.seal_segment().await.unwrap();
 
         // segment 1
-        log.append(vec![Record {
+        log.try_append(vec![Record {
             key: Bytes::from("key"),
             value: Bytes::from("value-1"),
         }])
@@ -1508,7 +1527,7 @@ mod tests {
         log.seal_segment().await.unwrap();
 
         // segment 2
-        log.append(vec![Record {
+        log.try_append(vec![Record {
             key: Bytes::from("key"),
             value: Bytes::from("value-2"),
         }])
@@ -1535,7 +1554,7 @@ mod tests {
         let log = LogDb::open(test_config()).await.unwrap();
 
         // segment 0: seq 0, 1
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("key"),
                 value: Bytes::from("v0"),
@@ -1551,7 +1570,7 @@ mod tests {
         log.seal_segment().await.unwrap();
 
         // segment 1: seq 2, 3
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("key"),
                 value: Bytes::from("v2"),
@@ -1567,7 +1586,7 @@ mod tests {
         log.seal_segment().await.unwrap();
 
         // segment 2: seq 4, 5
-        log.append(vec![
+        log.try_append(vec![
             Record {
                 key: Bytes::from("key"),
                 value: Bytes::from("v4"),
@@ -1602,7 +1621,7 @@ mod tests {
         .unwrap();
         let log = LogDb::new(storage.clone()).await.unwrap();
 
-        log.append(vec![Record {
+        log.try_append(vec![Record {
             key: Bytes::from("key"),
             value: Bytes::from("value-0"),
         }])
@@ -1611,7 +1630,7 @@ mod tests {
 
         log.seal_segment().await.unwrap();
 
-        log.append(vec![Record {
+        log.try_append(vec![Record {
             key: Bytes::from("key"),
             value: Bytes::from("value-1"),
         }])
@@ -1633,7 +1652,7 @@ mod tests {
     async fn should_list_segments_includes_start_time() {
         // given
         let log = LogDb::open(test_config()).await.unwrap();
-        log.append(vec![Record {
+        log.try_append(vec![Record {
             key: Bytes::from("key"),
             value: Bytes::from("value"),
         }])
@@ -1647,5 +1666,75 @@ mod tests {
         // then - start_time_ms should be a reasonable timestamp (after year 2020)
         assert_eq!(segments.len(), 1);
         assert!(segments[0].start_time_ms > 1577836800000); // 2020-01-01
+    }
+
+    #[tokio::test]
+    async fn should_try_append_single_record() {
+        // given
+        let log = LogDb::open(test_config()).await.unwrap();
+        let records = vec![Record {
+            key: Bytes::from("orders"),
+            value: Bytes::from("order-1"),
+        }];
+
+        // when
+        let result = log.try_append(records).await.unwrap();
+
+        // then
+        assert_eq!(result.start_sequence, 0);
+        log.flush().await.unwrap();
+        let mut iter = log.scan(Bytes::from("orders"), ..).await.unwrap();
+        let entry = iter.next().await.unwrap().unwrap();
+        assert_eq!(entry.value, Bytes::from("order-1"));
+    }
+
+    #[tokio::test]
+    async fn should_append_timeout_single_record() {
+        // given
+        let log = LogDb::open(test_config()).await.unwrap();
+        let records = vec![Record {
+            key: Bytes::from("orders"),
+            value: Bytes::from("order-1"),
+        }];
+
+        // when
+        let result = log
+            .append_timeout(records, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        // then
+        assert_eq!(result.start_sequence, 0);
+        log.flush().await.unwrap();
+        let mut iter = log.scan(Bytes::from("orders"), ..).await.unwrap();
+        let entry = iter.next().await.unwrap().unwrap();
+        assert_eq!(entry.value, Bytes::from("order-1"));
+    }
+
+    #[tokio::test]
+    async fn should_return_empty_records_on_try_append_empty() {
+        // given
+        let log = LogDb::open(test_config()).await.unwrap();
+
+        // when
+        let result = log.try_append(vec![]).await.unwrap();
+
+        // then
+        assert_eq!(result.start_sequence, 0);
+    }
+
+    #[tokio::test]
+    async fn should_return_empty_records_on_append_timeout_empty() {
+        // given
+        let log = LogDb::open(test_config()).await.unwrap();
+
+        // when
+        let result = log
+            .append_timeout(vec![], Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        // then
+        assert_eq!(result.start_sequence, 0);
     }
 }

@@ -5,7 +5,7 @@
 //! and flush logic.
 
 use crate::listing::ListingCache;
-use crate::model::{AppendResult, Record as UserRecord};
+use crate::model::{AppendOutput, Record as UserRecord};
 use crate::segment::{LogSegment, SegmentCache};
 use crate::serde::{LogEntryBuilder, SegmentMeta, SegmentMetaKey};
 use crate::storage::LogStorage;
@@ -74,7 +74,7 @@ impl Delta for LogDelta {
     type DeltaView = ();
     type Frozen = FrozenLogDelta;
     type FrozenView = FrozenLogDeltaView;
-    type ApplyResult = AppendResult;
+    type ApplyResult = AppendOutput;
 
     fn init(context: Self::Context) -> Self {
         Self {
@@ -84,9 +84,9 @@ impl Delta for LogDelta {
         }
     }
 
-    /// Apply a write to the delta. Returns the [`AppendResult`] with the
+    /// Apply a write to the delta. Returns the [`AppendOutput`] with the
     /// base sequence number assigned to the batch.
-    fn apply(&mut self, write: Self::Write) -> Result<AppendResult, String> {
+    fn apply(&mut self, write: Self::Write) -> Result<AppendOutput, String> {
         let count = write.records.len() as u64;
 
         let base_seq = if count > 0 {
@@ -152,7 +152,7 @@ impl Delta for LogDelta {
             self.new_segments.push(segment);
         }
 
-        Ok(AppendResult {
+        Ok(AppendOutput {
             start_sequence: base_seq,
         })
     }

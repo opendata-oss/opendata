@@ -20,7 +20,6 @@ use super::proto::{
 use super::request::{AppendRequest, CountParams, ListKeysParams, ListSegmentsParams, ScanParams};
 use super::response::{ApiResponse, ResponseFormat, to_api_response};
 use crate::LogDb;
-use crate::config::WriteOptions;
 use crate::reader::LogRead;
 
 /// Shared application state.
@@ -50,14 +49,12 @@ pub async fn handle_append(
         .iter()
         .map(|rec| rec.key.len() + rec.value.len())
         .sum();
-    let options = WriteOptions {
-        await_durable: request.await_durable,
-    };
 
-    let result = state
-        .log
-        .append_with_options(request.records, options)
-        .await?;
+    let result = state.log.try_append(request.records).await?;
+
+    if request.await_durable {
+        state.log.flush().await?;
+    }
 
     state.metrics.log_append_records_total.inc_by(count as u64);
     state
