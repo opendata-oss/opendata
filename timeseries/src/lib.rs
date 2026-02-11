@@ -45,10 +45,10 @@ mod minitsdb;
 mod promql;
 mod query;
 mod serde;
-mod storage;
+pub mod storage;
 #[cfg(test)]
 mod test_utils;
-mod tsdb;
+pub mod tsdb;
 mod util;
 
 // Public API modules

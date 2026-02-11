@@ -20,7 +20,7 @@ use crate::util::Result;
 ///
 /// Tsdb manages multiple MiniTsdb instances (one per time bucket) and provides
 /// a unified QueryReader interface that merges results across buckets.
-pub(crate) struct Tsdb {
+pub struct Tsdb {
     storage: Arc<dyn Storage>,
 
     // TODO(rohan): weird things can happen if these get out of sync
@@ -35,7 +35,7 @@ pub(crate) struct Tsdb {
 }
 
 impl Tsdb {
-    pub(crate) fn new(storage: Arc<dyn Storage>) -> Self {
+    pub fn new(storage: Arc<dyn Storage>) -> Self {
         // TTI cache: 15 minute idle timeout for ingest buckets
         let ingest_cache = Cache::builder()
             .time_to_idle(Duration::from_secs(15 * 60))
@@ -136,7 +136,7 @@ impl Tsdb {
             buckets_touched = tracing::field::Empty
         )
     )]
-    pub(crate) async fn ingest_samples(
+    pub async fn ingest_samples(
         &self,
         series_list: Vec<Series>,
         flush_interval_secs: u64,

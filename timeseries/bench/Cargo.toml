@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 bencher.workspace = true
 timeseries = { path = "..", package = "opendata-timeseries" }
+common.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true

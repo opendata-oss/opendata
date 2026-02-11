@@ -12,7 +12,7 @@ use crate::serde::{EncodingError, RecordType, record_type_from_tag};
 ///
 /// Routes merge operations to the appropriate merge function based on the
 /// record type encoded in the key.
-pub(crate) struct OpenTsdbMergeOperator;
+pub struct OpenTsdbMergeOperator;
 
 impl common::storage::MergeOperator for OpenTsdbMergeOperator {
     fn merge(&self, key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
