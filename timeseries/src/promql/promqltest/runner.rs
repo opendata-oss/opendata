@@ -60,19 +60,9 @@ where
 
         let content = fs::read_to_string(&path).map_err(|e| format!("{}: {}", name, e))?;
 
-        match run_test_with_storage(name, &content, &storage_factory).await {
-            Ok(_) => println!(
-                "  test promql::promqltest::tests::run_all_promql_tests::{} ... ok",
-                name
-            ),
-            Err(e) => {
-                println!(
-                    "  test promql::promqltest::tests::run_all_promql_tests::{} ... FAILED",
-                    name
-                );
-                return Err(format!("{}: {}", name, e));
-            }
-        }
+        run_test_with_storage(name, &content, &storage_factory)
+            .await
+            .map_err(|e| format!("{}: {}", name, e))?;
     }
 
     Ok(())
@@ -95,6 +85,7 @@ where
     let commands = parse_test_file(content)?;
     let mut tsdb = storage_factory();
     let mut eval_count = 0;
+    let mut ignoring = false;
 
     for cmd in commands {
         match cmd {
@@ -103,20 +94,32 @@ where
                 tsdb = storage_factory();
             }
 
+            Command::Ignore(_) => {
+                ignoring = true;
+            }
+
+            Command::Resume(_) => {
+                ignoring = false;
+            }
+
             Command::Load(load_cmd) => {
-                load_series(&tsdb, load_cmd.interval, &load_cmd.series).await?;
+                if !ignoring {
+                    load_series(&tsdb, load_cmd.interval, &load_cmd.series).await?;
+                }
             }
 
             Command::EvalInstant(eval_cmd) => {
-                eval_count += 1;
-                let result = eval_instant(&tsdb, eval_cmd.time, &eval_cmd.query).await?;
-                assert_results(
-                    &result,
-                    &eval_cmd.expected,
-                    name,
-                    eval_count,
-                    &eval_cmd.query,
-                )?;
+                if !ignoring {
+                    eval_count += 1;
+                    let result = eval_instant(&tsdb, eval_cmd.time, &eval_cmd.query).await?;
+                    assert_results(
+                        &result,
+                        &eval_cmd.expected,
+                        name,
+                        eval_count,
+                        &eval_cmd.query,
+                    )?;
+                }
             }
         }
     }
@@ -178,7 +181,7 @@ async fn load_series(
 
         // Ingest each bucket
         for (bucket, bucket_samples) in bucket_samples {
-            let mut labels: Vec<Label> = s
+            let labels: Vec<Label> = s
                 .labels
                 .iter()
                 .map(|(k, v)| Label {
@@ -186,10 +189,6 @@ async fn load_series(
                     value: v.clone(),
                 })
                 .collect();
-            labels.push(Label {
-                name: "__name__".into(),
-                value: s.metric.clone(),
-            });
 
             let series = Series {
                 labels,
@@ -200,10 +199,10 @@ async fn load_series(
             };
 
             let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
-            mini.ingest(&series, 3600).await.unwrap();
+            mini.ingest(&series).await.unwrap();
         }
     }
-    tsdb.flush(3600).await.unwrap();
+    tsdb.flush().await.unwrap();
     Ok(())
 }
 
@@ -357,8 +356,10 @@ mod tests {
         // given
         let tsdb = new_test_storage();
         let series = vec![SeriesLoad {
-            metric: "test_metric".to_string(),
-            labels: HashMap::from([("job".to_string(), "test".to_string())]),
+            labels: HashMap::from([
+                ("__name__".to_string(), "test_metric".to_string()),
+                ("job".to_string(), "test".to_string()),
+            ]),
             values: vec![(0, 1.0), (1, 2.0), (2, 3.0)],
         }];
 
@@ -380,8 +381,7 @@ mod tests {
         // given
         let tsdb = new_test_storage();
         let series = vec![SeriesLoad {
-            metric: "metric".to_string(),
-            labels: HashMap::new(),
+            labels: HashMap::from([("__name__".to_string(), "metric".to_string())]),
             values: vec![(0, 10.0), (1, 20.0), (2, 30.0)],
         }];
         load_series(&tsdb, Duration::from_secs(60), &series)
@@ -488,8 +488,7 @@ eval instant at 10m
         // given
         let tsdb = new_test_storage();
         let series = vec![SeriesLoad {
-            metric: "metric".to_string(),
-            labels: HashMap::new(),
+            labels: HashMap::from([("__name__".to_string(), "metric".to_string())]),
             values: vec![(-1, 10.0)], // Negative step
         }];
 

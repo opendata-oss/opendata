@@ -22,10 +22,18 @@ pub struct EvalInstantCmd {
 pub struct ClearCmd;
 
 #[derive(Debug, Clone)]
+pub struct IgnoreCmd;
+
+#[derive(Debug, Clone)]
+pub struct ResumeCmd;
+
+#[derive(Debug, Clone)]
 pub enum Command {
     Load(LoadCmd),
     EvalInstant(EvalInstantCmd),
     Clear(ClearCmd),
+    Ignore(IgnoreCmd),
+    Resume(ResumeCmd),
 }
 
 // ============================================================================
@@ -34,9 +42,8 @@ pub enum Command {
 
 #[derive(Debug, Clone)]
 pub struct SeriesLoad {
-    pub metric: String,
-    pub labels: HashMap<String, String>,
-    pub values: Vec<(i64, f64)>, // (step_index, value)
+    pub labels: HashMap<String, String>, // includes __name__
+    pub values: Vec<(i64, f64)>,         // (step_index, value)
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +88,10 @@ impl Parser {
             // Try each parser dispatcher in order
             if let Some(cmd) = Self::try_parse_clear(line) {
                 commands.push(cmd);
+            } else if let Some(cmd) = Self::try_parse_ignore(line) {
+                commands.push(cmd);
+            } else if let Some(cmd) = Self::try_parse_resume(line) {
+                commands.push(cmd);
             } else if let Some(cmd) = Self::try_parse_load(line, &lines, &mut i)? {
                 commands.push(cmd);
             } else if let Some(cmd) = Self::try_parse_eval_instant(line, &lines, &mut i)? {
@@ -97,6 +108,24 @@ impl Parser {
     fn try_parse_clear(line: &str) -> Option<Command> {
         if line == "clear" {
             Some(Command::Clear(ClearCmd))
+        } else {
+            None
+        }
+    }
+
+    /// Try to parse "ignore" command
+    fn try_parse_ignore(line: &str) -> Option<Command> {
+        if line == "ignore" {
+            Some(Command::Ignore(IgnoreCmd))
+        } else {
+            None
+        }
+    }
+
+    /// Try to parse "resume" command
+    fn try_parse_resume(line: &str) -> Option<Command> {
+        if line == "resume" {
+            Some(Command::Resume(ResumeCmd))
         } else {
             None
         }
@@ -252,9 +281,13 @@ fn parse_series(line: &str) -> Result<SeriesLoad, String> {
     let (metric, labels) = parse_metric(metric_part.trim())?;
     let values = parse_multiple_value_exprs(&value_parts)?;
 
+    let mut all_labels = labels;
+    if !metric.is_empty() {
+        all_labels.insert("__name__".to_string(), metric);
+    }
+
     Ok(SeriesLoad {
-        metric,
-        labels,
+        labels: all_labels,
         values,
     })
 }
@@ -486,6 +519,32 @@ mod tests {
     }
 
     #[test]
+    fn should_parse_ignore_command() {
+        // given
+        let input = "ignore";
+
+        // when
+        let cmds = Parser::parse_file(input).unwrap();
+
+        // then
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Command::Ignore(_)));
+    }
+
+    #[test]
+    fn should_parse_resume_command() {
+        // given
+        let input = "resume";
+
+        // when
+        let cmds = Parser::parse_file(input).unwrap();
+
+        // then
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Command::Resume(_)));
+    }
+
+    #[test]
     fn should_parse_load_command() {
         // given
         let input = "load 10s\n  metric{job=\"1\"} 1 2 3";
@@ -652,7 +711,10 @@ mod tests {
         // then
         match &cmds[0] {
             Command::Load(cmd) => {
-                assert_eq!(cmd.series[0].metric, "metric");
+                assert_eq!(
+                    cmd.series[0].labels.get("__name__"),
+                    Some(&"metric".to_string())
+                );
                 assert_eq!(cmd.series[0].labels.get("job"), Some(&"test".to_string()));
                 assert_eq!(
                     cmd.series[0].labels.get("instance"),

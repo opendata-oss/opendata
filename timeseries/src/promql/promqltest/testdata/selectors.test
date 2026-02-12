@@ -27,9 +27,29 @@ eval instant at 8000s rate(http_requests_total{group="production"}[1m])
 eval instant at 18000s rate(http_requests_total{group="canary", instance="1"}[1m])
 	{job="api-server", instance="1", group="canary"} 4
 
-# Note: Tests with large offsets and regex matchers removed due to current limitations
-# - Regex patterns (group=~"pro.*") not yet supported
-# - Large offset values may exceed loaded data range
+# Start ignoring
+ignore
+
+eval instant at 8000s rate(http_requests_total{group=~"pro.*"}[1m])
+	{job="api-server", instance="0", group="production"} 1
+	{job="api-server", instance="1", group="production"} 2
+
+eval instant at 18000s rate(http_requests_total{group=~".*ry", instance="1"}[1m])
+	{job="api-server", instance="1", group="canary"} 4
+
+eval instant at 18000s rate(http_requests_total{instance!="3"}[1m] offset 10000s)
+	{job="api-server", instance="0", group="production"} 1
+	{job="api-server", instance="1", group="production"} 2
+	{job="api-server", instance="0", group="canary"} 3
+	{job="api-server", instance="1", group="canary"} 4
+
+eval instant at 4000s rate(http_requests_total{instance!="3"}[1m] offset -4000s)
+	{job="api-server", instance="0", group="production"} 1
+	{job="api-server", instance="1", group="production"} 2
+	{job="api-server", instance="0", group="canary"} 3
+	{job="api-server", instance="1", group="canary"} 4
+
+resume
 
 # Additional tests for label matching and selectors
 

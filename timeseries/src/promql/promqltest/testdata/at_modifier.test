@@ -94,3 +94,12 @@ eval instant at 100s metric offset 50s
 eval instant at 200s metric @ 100s
   metric{job="1"} 10
   metric{job="2"} 20
+
+# Start ignoring
+ignore
+
+eval instant at 10s -metric @ 100
+  {job="1"} -10
+  {job="2"} -20
+
+resume
