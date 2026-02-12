@@ -193,9 +193,9 @@ impl VectorDb {
             .scan_all_centroids(config.dimensions as usize)
             .await?;
 
-        if !existing_centroids.is_empty() {
+        if !existing_centroids.entries.is_empty() {
             // Use existing centroids from storage
-            let graph = build_centroid_graph(existing_centroids, config.distance_metric)?;
+            let graph = build_centroid_graph(existing_centroids.entries, config.distance_metric)?;
             return Ok(Arc::from(graph));
         }
 
