@@ -2,15 +2,17 @@
 
 use crate::delta::VectorDbWriteDelta;
 use crate::hnsw::CentroidGraph;
+use crate::serde::centroid_chunk::CentroidEntry;
 use common::coordinator::WriteCoordinatorHandle;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 /// Specifies individual rebalance operations. Sent by [`VectorDbWriteDelta`] to [`IndexRebalancer`]
+#[derive(Debug)]
 pub(crate) enum IndexRebalanceOp {
     /// Split a centroid into 2 new centroids
-    ExecuteSplit { centroid: u32 },
+    ExecuteSplit { centroid: CentroidEntry },
     /// Merge a centroid into a neighbouring centroid
     ExecuteMerge { centroid: u32 },
 }
@@ -74,7 +76,7 @@ impl IndexRebalancerTask {
         }
     }
 
-    async fn handle_split(&mut self, _centroid: u32) -> Result<(), String> {
+    async fn handle_split(&mut self, _centroid: CentroidEntry) -> Result<(), String> {
         todo!()
     }
 

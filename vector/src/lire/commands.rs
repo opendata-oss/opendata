@@ -3,6 +3,8 @@
 use crate::delta::VectorDbWriteDelta;
 use crate::serde::centroid_chunk::CentroidEntry;
 use common::coordinator::Delta;
+use std::any::Any;
+use std::sync::Arc;
 
 /// Commands sent by [`crate::lire::rebalancer::IndexRebalancer`] to [`VectorDbWriteDelta`]
 /// via [`common::coordinator::WriteCoordinator`] to execute steps of rebalance operations.
@@ -104,7 +106,10 @@ pub(crate) struct MergeReassignCommand {
 }
 
 impl VectorDbWriteDelta {
-    pub(crate) fn apply_rebalance_cmd(&mut self, cmd: RebalanceCommand) -> Result<(), String> {
+    pub(crate) fn apply_rebalance_cmd(
+        &mut self,
+        cmd: RebalanceCommand,
+    ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         match cmd {
             RebalanceCommand::Split(cmd) => self.apply_split_cmd(cmd),
             RebalanceCommand::SplitSweep(cmd) => self.apply_split_sweep_cmd(cmd),
@@ -115,33 +120,45 @@ impl VectorDbWriteDelta {
         }
     }
 
-    pub(crate) fn apply_split_cmd(&mut self, cmd: SplitCommand) -> Result<(), String> {
+    pub(crate) fn apply_split_cmd(
+        &mut self,
+        cmd: SplitCommand,
+    ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         todo!()
     }
 
-    pub(crate) fn apply_split_sweep_cmd(&mut self, cmd: SplitSweepCommand) -> Result<(), String> {
+    pub(crate) fn apply_split_sweep_cmd(
+        &mut self,
+        cmd: SplitSweepCommand,
+    ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         todo!()
     }
 
     pub(crate) fn apply_split_reassign_cmd(
         &mut self,
         cmd: SplitReassignCommand,
-    ) -> Result<(), String> {
+    ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         todo!()
     }
 
-    pub(crate) fn apply_merge_cmd(&mut self, cmd: MergeCommand) -> Result<(), String> {
+    pub(crate) fn apply_merge_cmd(
+        &mut self,
+        cmd: MergeCommand,
+    ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         todo!()
     }
 
-    pub(crate) fn apply_merge_sweep_cmd(&mut self, cmd: MergeSweepCommand) -> Result<(), String> {
+    pub(crate) fn apply_merge_sweep_cmd(
+        &mut self,
+        cmd: MergeSweepCommand,
+    ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         todo!()
     }
 
     pub(crate) fn apply_merge_reassign_cmd(
         &mut self,
         cmd: MergeReassignCommand,
-    ) -> Result<(), String> {
+    ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         todo!()
     }
 }

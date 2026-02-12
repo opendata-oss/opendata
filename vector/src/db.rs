@@ -11,7 +11,9 @@
 //! - Delta handles dictionary lookup, centroid assignment, and builds RecordOps
 //! - Flusher applies ops atomically to storage
 
-use crate::delta::{VectorDbDeltaContext, VectorDbWrite, VectorDbWriteDelta, VectorWrite};
+use crate::delta::{
+    VectorDbDeltaContext, VectorDbDeltaOpts, VectorDbWrite, VectorDbWriteDelta, VectorWrite,
+};
 use crate::distance;
 use crate::flusher::VectorDbFlusher;
 use crate::hnsw::{CentroidGraph, build_centroid_graph};
@@ -143,12 +145,18 @@ impl VectorDb {
 
         // Create initial image for the delta (shares dictionary, centroid_graph, and id_allocator)
         let ctx = VectorDbDeltaContext {
-            dimensions: config.dimensions as usize,
+            opts: VectorDbDeltaOpts {
+                dimensions: config.dimensions as usize,
+                split_threshold_vectors: config.split_threshold_vectors,
+                chunk_target: config.chunk_target as usize,
+            },
             dictionary: Arc::clone(&dictionary),
             centroid_graph: Arc::clone(&centroid_graph),
             id_allocator,
             rebalancer_tx,
             centroid_counts,
+            current_chunk_id: 0,
+            current_chunk_count: 0,
         };
 
         // start write coordinator
@@ -278,11 +286,11 @@ impl VectorDb {
     /// for each centroid.
     async fn load_centroid_counts_from_storage(
         snapshot: &dyn StorageRead,
-    ) -> Result<HashMap<u64, u32>> {
+    ) -> Result<HashMap<u64, u64>> {
         let stats = snapshot.scan_all_centroid_stats().await?;
         let mut counts = HashMap::new();
         for (centroid_id, value) in stats {
-            counts.insert(centroid_id, value.num_vectors.max(0) as u32);
+            counts.insert(centroid_id, value.num_vectors.max(0) as u64);
         }
         Ok(counts)
     }
