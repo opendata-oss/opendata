@@ -65,7 +65,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     #[allow(dead_code)]
     async fn get_posting_list(
         &self,
-        centroid_id: u32,
+        centroid_id: u64,
         dimensions: usize,
     ) -> Result<PostingListValue> {
         let key = PostingListKey::new(centroid_id).encode();
@@ -115,7 +115,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     ///
     /// Returns a zero count if no stats exist yet.
     #[allow(dead_code)]
-    async fn get_centroid_stats(&self, centroid_id: u32) -> Result<CentroidStatsValue> {
+    async fn get_centroid_stats(&self, centroid_id: u64) -> Result<CentroidStatsValue> {
         let key = CentroidStatsKey::new(centroid_id).encode();
         let record = self.get(key).await?;
         match record {
@@ -132,7 +132,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     ///
     /// Returns a map of centroid_id to accumulated vector count.
     #[allow(dead_code)]
-    async fn scan_all_centroid_stats(&self) -> Result<Vec<(u32, CentroidStatsValue)>> {
+    async fn scan_all_centroid_stats(&self) -> Result<Vec<(u64, CentroidStatsValue)>> {
         let mut prefix_buf = bytes::BytesMut::with_capacity(2);
         crate::serde::RecordType::CentroidStats
             .prefix()
