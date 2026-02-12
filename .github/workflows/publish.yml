@@ -1,4 +1,5 @@
 name: Publish Crate
+run-name: "Publish ${{ inputs.crate }} (${{ inputs.bump }})"
 
 on:
   workflow_dispatch:
