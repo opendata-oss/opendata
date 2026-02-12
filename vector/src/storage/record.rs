@@ -30,6 +30,7 @@ pub fn put_id_dictionary(external_id: &str, internal_id: u64) -> RecordOp {
 }
 
 /// Create a RecordOp to delete an IdDictionary mapping.
+#[allow(dead_code)]
 pub fn delete_id_dictionary(external_id: &str) -> RecordOp {
     let key = IdDictionaryKey::new(external_id).encode();
     RecordOp::Delete(key)
@@ -59,7 +60,7 @@ pub fn delete_vector_data(internal_id: u64) -> RecordOp {
 }
 
 /// Create a RecordOp to merge posting updates into a posting list.
-pub fn merge_posting_list(centroid_id: u32, postings: Vec<PostingUpdate>) -> Result<RecordOp> {
+pub fn merge_posting_list(centroid_id: u64, postings: Vec<PostingUpdate>) -> Result<RecordOp> {
     let key = PostingListKey::new(centroid_id).encode();
     let value = PostingListValue::from_posting_updates(postings)?.encode_to_bytes();
     Ok(RecordOp::Merge(Record::new(key, value)))
@@ -92,7 +93,7 @@ pub fn delete_centroid_chunk(chunk_id: u32) -> RecordOp {
 
 /// Create a RecordOp to merge a vector count delta into centroid stats.
 #[allow(dead_code)]
-pub fn merge_centroid_stats(centroid_id: u32, delta: i32) -> RecordOp {
+pub fn merge_centroid_stats(centroid_id: u64, delta: i32) -> RecordOp {
     let key = CentroidStatsKey::new(centroid_id).encode();
     let value = CentroidStatsValue::new(delta).encode_to_bytes();
     RecordOp::Merge(Record::new(key, value))
