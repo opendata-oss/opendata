@@ -1,0 +1,105 @@
+# Adapted from Prometheus promqltest suite.
+# Original source:
+# https://github.com/prometheus/prometheus/tree/main/promql/promqltest
+
+load 10s
+  metric{job="1"} 0+1x1000
+  metric{job="2"} 0+2x1000
+
+load 1ms
+  metric_ms 0+1x10000
+
+# Instant vector selectors.
+eval instant at 10s metric @ 100
+  metric{job="1"} 10
+  metric{job="2"} 20
+
+eval instant at 10s metric @ 100s
+  metric{job="1"} 10
+  metric{job="2"} 20
+
+eval instant at 10s metric @ 1m40s
+  metric{job="1"} 10
+  metric{job="2"} 20
+
+eval instant at 10s metric @ 100 offset 50s
+  metric{job="1"} 5
+  metric{job="2"} 10
+
+eval instant at 10s metric @ 100 offset 50
+  metric{job="1"} 5
+  metric{job="2"} 10
+
+eval instant at 10s metric offset 50s @ 100
+  metric{job="1"} 5
+  metric{job="2"} 10
+
+eval instant at 10s metric offset 50 @ 100
+  metric{job="1"} 5
+  metric{job="2"} 10
+
+eval instant at 10s metric @ 0 offset -50s
+  metric{job="1"} 5
+  metric{job="2"} 10
+
+eval instant at 10s metric @ 0 offset -50
+  metric{job="1"} 5
+  metric{job="2"} 10
+
+eval instant at 10s metric offset -50s @ 0
+  metric{job="1"} 5
+  metric{job="2"} 10
+
+eval instant at 10s metric offset -50 @ 0
+  metric{job="1"} 5
+  metric{job="2"} 10
+
+eval instant at 10s metric @ 0 offset -50s
+  metric{job="1"} 5
+  metric{job="2"} 10
+
+eval instant at 10s metric @ 0 offset -50
+  metric{job="1"} 5
+  metric{job="2"} 10
+
+
+# Test @ modifier at epoch
+eval instant at 100s metric @ 0
+  metric{job="1"} 0
+  metric{job="2"} 0
+
+# Test @ modifier with future timestamp
+eval instant at 10s metric @ 200s
+  metric{job="1"} 20
+  metric{job="2"} 40
+
+# Test @ modifier with millisecond precision
+eval instant at 5000ms metric_ms @ 3000ms
+  metric_ms 3000
+
+# Test range selector with @ modifier
+eval instant at 100s rate(metric{job="1"}[30s] @ 50s)
+  {job="1"} 0.1
+
+# Test @ modifier with specific label selector
+eval instant at 50s metric{job="2"} @ 30s
+  metric{job="2"} 6
+
+# Test offset without @ modifier for comparison
+eval instant at 100s metric offset 50s
+  metric{job="1"} 5
+  metric{job="2"} 10
+
+# Test @ modifier at exact load boundary
+eval instant at 200s metric @ 100s
+  metric{job="1"} 10
+  metric{job="2"} 20
+
+# Start ignoring
+ignore
+
+eval instant at 10s -metric @ 100
+  {job="1"} -10
+  {job="2"} -20
+
+resume
