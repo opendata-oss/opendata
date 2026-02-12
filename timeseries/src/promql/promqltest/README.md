@@ -4,13 +4,19 @@ Implements a Prometheus-inspired promqltest DSL for validating PromQL semantics.
 
 ## Architecture
 
-The test framework follows Prometheus's execution model with automatic test discovery:
+The test framework is organized into focused modules with clear separation of concerns:
 
-1. **Entry Point**: `run_all_promql_tests()` in `mod.rs`
-2. **Test Discovery**: Scans `testdata/` for `*.test` files
-3. **Parser**: `parse_test_file()` in `dsl.rs` parses commands
-4. **Executor**: `run_test_with_storage()` executes commands against TSDB
-5. **Assertion**: Compares query results against expected values
+```
+promqltest/
+├── dsl.rs        # Parse test commands (load, eval, clear, ignore, resume)
+├── loader.rs     # Load series data into TSDB
+├── evaluator.rs  # Execute PromQL queries and return results
+├── assert.rs     # Compare actual vs expected results
+├── runner.rs     # Orchestrate test execution
+└── testdata/     # Test files (*.test)
+```
+
+### Execution Flow
 
 ```
 run_all_promql_tests() (mod.rs)
@@ -21,14 +27,23 @@ discover_test_files() → *.test files in testdata/
     ↓
 parse_test_file() (dsl.rs) → Command objects
     ↓
-run_test_with_storage() → execute each command
-    ↓
-eval_instant() → compare results 
+run_test_with_storage() (runner.rs) → execute each command
+    ├─→ load_series() (loader.rs) → ingest data
+    ├─→ eval_instant() (evaluator.rs) → execute query
+    └─→ assert_results() (assert.rs) → compare results
 ```
 
-### Parser Responsibilities
+### Module Responsibilities
 
-- The test DSL parser parses only test commands (`load`, `eval`, `clear`).
+- **dsl.rs**: Parse test commands (`load`, `eval`, `clear`, `ignore`, `resume`)
+- **loader.rs**: Convert step-based test data to timestamps and ingest into TSDB
+- **evaluator.rs**: Execute PromQL queries via the query router
+- **assert.rs**: Compare results with flexible label matching
+- **runner.rs**: Orchestrate test execution, manage TSDB lifecycle
+
+### Parser Design
+
+- The test DSL parser parses only test commands.
 - PromQL expressions are parsed by the same `promql_parser` crate used by the application.
 - This ensures test evaluation uses identical query parsing logic as production code.
 

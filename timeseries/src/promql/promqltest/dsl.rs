@@ -67,7 +67,7 @@ pub struct EvalResult {
 // Parser
 // ============================================================================
 
-pub struct Parser;
+struct Parser;
 
 impl Parser {
     /// Parse entire test file into commands

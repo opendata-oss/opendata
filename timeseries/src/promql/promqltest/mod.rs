@@ -1,4 +1,7 @@
-pub mod dsl;
+mod assert;
+mod dsl;
+mod evaluator;
+mod loader;
 pub mod runner;
 
 #[cfg(test)]
