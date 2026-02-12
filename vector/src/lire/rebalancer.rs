@@ -10,7 +10,8 @@ use crate::delta::{VectorDbWrite, VectorDbWriteDelta};
 use crate::distance;
 use crate::hnsw::CentroidGraph;
 use crate::lire::commands::{
-    CentroidPostings, RebalanceCommand, SplitCommand, SplitCommandResult, SplitPostings,
+    CentroidPostings, FinishMergeCommand, FinishSplitCommand, MergeCommand, MergeReassignCommand,
+    MergeSweepCommand, RebalanceCommand, SplitCommand, SplitCommandResult, SplitPostings,
     SplitReassignCommand, SplitSweepCommand, VectorReassignment,
 };
 use crate::lire::heuristics;
@@ -29,8 +30,8 @@ use tokio_util::sync::CancellationToken;
 pub(crate) enum IndexRebalanceOp {
     /// Split a centroid into 2 new centroids
     ExecuteSplit { centroid: CentroidEntry },
-    /// Merge a centroid into a neighbouring centroid
-    ExecuteMerge { centroid: u64 },
+    /// Merge centroid `c` (smaller) into centroid `c_other` (larger, survives).
+    ExecuteMerge { c: u64, c_other: u64 },
 }
 
 /// Configuration options for the index rebalancer.
@@ -38,6 +39,7 @@ pub(crate) struct IndexRebalancerOpts {
     pub(crate) dimensions: usize,
     pub(crate) distance_metric: DistanceMetric,
     pub(crate) split_search_neighbourhood: usize,
+    pub(crate) split_threshold_vectors: u64,
 }
 
 /// The index rebalancer executes index rebalance operations to maintain centroids
@@ -89,6 +91,39 @@ impl IndexRebalancerTask {
         id
     }
 
+    async fn send_finish_split(
+        &self,
+        c: u64,
+        c0: Option<u64>,
+        c1: Option<u64>,
+    ) -> Result<(), String> {
+        let cmd = RebalanceCommand::FinishSplit(FinishSplitCommand::new(c, c0, c1));
+        let mut write_handle = self
+            .coordinator_handle
+            .try_write(VectorDbWrite::Rebalance(cmd))
+            .await
+            .map_err(|e| e.to_string())?;
+        write_handle
+            .wait(Durability::Applied)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn send_finish_merge(&self, centroid: u64, c_other: Option<u64>) -> Result<(), String> {
+        let cmd = RebalanceCommand::FinishMerge(FinishMergeCommand::new(centroid, c_other));
+        let mut write_handle = self
+            .coordinator_handle
+            .try_write(VectorDbWrite::Rebalance(cmd))
+            .await
+            .map_err(|e| e.to_string())?;
+        write_handle
+            .wait(Durability::Applied)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     async fn run(mut self) -> Result<(), String> {
         loop {
             tokio::select! {
@@ -106,7 +141,7 @@ impl IndexRebalancerTask {
     async fn handle_rebalance_op(&mut self, op: IndexRebalanceOp) -> Result<(), String> {
         match op {
             IndexRebalanceOp::ExecuteSplit { centroid } => self.handle_split(centroid).await,
-            IndexRebalanceOp::ExecuteMerge { centroid } => self.handle_merge(centroid).await,
+            IndexRebalanceOp::ExecuteMerge { c, c_other } => self.handle_merge(c, c_other).await,
         }
     }
 
@@ -139,6 +174,7 @@ impl IndexRebalancerTask {
                 num_vectors = vectors.len(),
                 "cannot split centroid with fewer than 2 vectors"
             );
+            self.send_finish_split(c_id, None, None).await?;
             return Ok(());
         }
 
@@ -274,7 +310,6 @@ impl IndexRebalancerTask {
             .await?,
         );
 
-        // Send SplitReassignCommand
         let reassign_cmd =
             RebalanceCommand::SplitReassign(SplitReassignCommand::new(task_id, reassignments));
 
@@ -287,6 +322,9 @@ impl IndexRebalancerTask {
             .wait(Durability::Applied)
             .await
             .map_err(|e| e.to_string())?;
+
+        self.send_finish_split(c_id, Some(c0_id), Some(c1_id))
+            .await?;
 
         Ok(())
     }
@@ -401,8 +439,144 @@ impl IndexRebalancerTask {
         Ok(reassignments)
     }
 
-    async fn handle_merge(&mut self, _centroid: u64) -> Result<(), String> {
-        todo!()
+    /// Execute a merge operation. `c` is the smaller centroid (to be removed) and
+    /// `c_other` is the larger centroid (survives). Both were determined by the delta
+    /// before dispatching this operation.
+    async fn handle_merge(&mut self, c: u64, c_other: u64) -> Result<(), String> {
+        let task_id = self.alloc_task_id();
+
+        // =========================================================================
+        // Phase 1: MERGE
+        // =========================================================================
+
+        let reader = ViewReader::new(self.coordinator_handle.view());
+
+        let posting_list = reader
+            .get_posting_list(c, self.opts.dimensions)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Safety check: if c has < 1 vector (e.g. drained by concurrent ops), abort.
+        if posting_list.len() < 1 {
+            warn!(
+                c,
+                num_vectors = posting_list.len(),
+                "cannot merge centroid with fewer than 2 vectors"
+            );
+            self.send_finish_merge(c, Some(c_other)).await?;
+            return Ok(());
+        }
+
+        // Track original vector IDs for sweep phase
+        let original_vector_ids: HashSet<u64> = posting_list.iter().map(|p| p.id()).collect();
+
+        // Send MergeCommand: merge c's postings into c_other
+        let cmd = RebalanceCommand::Merge(MergeCommand::new(
+            task_id,
+            c_other,
+            CentroidPostings::new(c, posting_list),
+        ));
+
+        let mut write_handle = self
+            .coordinator_handle
+            .try_write(VectorDbWrite::Rebalance(cmd))
+            .await
+            .map_err(|e| e.to_string())?;
+        write_handle
+            .wait(Durability::Applied)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // =========================================================================
+        // Phase 2: SWEEP
+        // =========================================================================
+
+        let reader = ViewReader::new(self.coordinator_handle.view());
+
+        // Re-read c's posting list (to catch racing inserts)
+        let c_postings = reader
+            .get_posting_list(c, self.opts.dimensions)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Find vectors not in original set
+        let mut swept_postings = Vec::new();
+        for p in c_postings.iter() {
+            if !original_vector_ids.contains(&p.id()) {
+                swept_postings.push(p.clone());
+            }
+        }
+
+        // Swept postings go to c_other (the surviving centroid)
+        let sweep_cmd = RebalanceCommand::MergeSweep(MergeSweepCommand::new(
+            task_id,
+            CentroidPostings::new(c_other, swept_postings),
+        ));
+
+        let mut write_handle = self
+            .coordinator_handle
+            .try_write(VectorDbWrite::Rebalance(sweep_cmd))
+            .await
+            .map_err(|e| e.to_string())?;
+        write_handle
+            .wait(Durability::Applied)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // =========================================================================
+        // Phase 3: REASSIGN
+        // =========================================================================
+
+        // Re-read c_other's posting list (all vectors from c are now in c_other)
+        let reader = ViewReader::new(self.coordinator_handle.view());
+        let c_other_postings = reader
+            .get_posting_list(c_other, self.opts.dimensions)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Collect all vector IDs that originally belonged to c
+        let all_c_ids: HashSet<u64> = c_postings
+            .iter()
+            .map(|p| p.id())
+            .chain(original_vector_ids.iter().copied())
+            .collect();
+
+        // For each vector that came from c, check if it should be reassigned
+        let mut reassignments = Vec::new();
+        for p in c_other_postings.iter() {
+            if !all_c_ids.contains(&p.id()) {
+                continue;
+            }
+            let nearest = self.centroid_graph.search(p.vector(), 1);
+            let Some(&nearest_id) = nearest.first() else {
+                continue;
+            };
+            if nearest_id != c_other {
+                reassignments.push(VectorReassignment::new(
+                    nearest_id,
+                    c_other,
+                    p.id(),
+                    p.vector().to_vec(),
+                ));
+            }
+        }
+
+        let reassign_cmd =
+            RebalanceCommand::MergeReassign(MergeReassignCommand::new(task_id, reassignments));
+
+        let mut write_handle = self
+            .coordinator_handle
+            .try_write(VectorDbWrite::Rebalance(reassign_cmd))
+            .await
+            .map_err(|e| e.to_string())?;
+        write_handle
+            .wait(Durability::Applied)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        self.send_finish_merge(c, Some(c_other)).await?;
+
+        Ok(())
     }
 }
 
@@ -517,6 +691,7 @@ mod tests {
                 opts: VectorDbDeltaOpts {
                     dimensions,
                     split_threshold_vectors: 10_000,
+                    merge_threshold_vectors: 0,
                     chunk_target,
                 },
                 dictionary: Arc::new(DashMap::new()),
@@ -569,6 +744,7 @@ mod tests {
                     dimensions: self.dimensions,
                     distance_metric: self.distance_metric,
                     split_search_neighbourhood: 4,
+                    split_threshold_vectors: 10_000,
                 },
                 next_task_id: 0,
             }
@@ -772,5 +948,136 @@ mod tests {
         for p in postings {
             assert_eq!(orig_postings[&p.id()], p.vector().to_vec());
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_merge_small_centroid_into_neighbour() {
+        // given
+        // Centroid A at [0,0] with 2 vectors, B at [1,0] with 3 vectors.
+        // Trigger merge on A (smaller). A's postings should move to B. A deleted.
+        let dimensions = 2;
+        let distance_metric = DistanceMetric::L2;
+        let centroid_vecs = vec![
+            vec![0.0, 0.0], // centroid A (id=0)
+            vec![1.0, 0.0], // centroid B (id=1)
+        ];
+        let postings = vec![
+            (0, vec![(100, vec![0.0, 0.1]), (101, vec![0.1, 0.0])]),
+            (
+                1,
+                vec![
+                    (200, vec![1.0, 0.0]),
+                    (201, vec![1.1, 0.0]),
+                    (202, vec![1.0, 0.1]),
+                ],
+            ),
+        ];
+        let env =
+            RebalancerTestEnv::new(dimensions, distance_metric, centroid_vecs, postings.clone())
+                .await;
+        let mut task = env.create_task();
+        let centroid_a_id = env.initial_centroids[0].centroid_id;
+        let centroid_b_id = env.initial_centroids[1].centroid_id;
+
+        // when - merge A (smaller) into B (larger)
+        task.handle_merge(centroid_a_id, centroid_b_id)
+            .await
+            .unwrap();
+
+        // then
+        let snapshot = env.flush_and_snapshot().await;
+
+        // Centroid A should be deleted
+        let deletions = snapshot.get_deleted_vectors().await.unwrap();
+        assert!(
+            deletions.contains(centroid_a_id),
+            "centroid A should be in deletions bitmap"
+        );
+
+        // All of A's vectors should now be in B's posting list
+        // B (id=1) survives because it's larger. A's vectors (100, 101) moved to B.
+        // Since A's vectors are at [0,0.1] and [0.1,0], they are closest to A's centroid,
+        // but A no longer exists. The reassign phase searches the graph and finds B as nearest.
+        // So vectors stay in B (source=B after merge, nearest=B since A is removed).
+        assert_new_posting(
+            &postings,
+            &snapshot,
+            centroid_b_id,
+            &[100, 101, 200, 201, 202],
+            dimensions,
+        );
+
+        // cleanup
+        env.coordinator.stop().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_reassign_merged_vector_to_closer_centroid() {
+        // given
+        // 3 centroids: A at [0,0] (small, to merge), B at [5,0] (merge partner), C at [10,0]
+        // A has a vector at [8,0] that's closer to C than to B.
+        // After merge, vector should be reassigned from B to C.
+        let dimensions = 2;
+        let distance_metric = DistanceMetric::L2;
+        let centroid_vecs = vec![
+            vec![0.0, 0.0],  // centroid A (id=0) - small, merge target
+            vec![5.0, 0.0],  // centroid B (id=1) - merge partner
+            vec![10.0, 0.0], // centroid C (id=2) - for reassignment
+        ];
+        let postings = vec![
+            (
+                0,
+                vec![
+                    (100, vec![0.1, 0.0]),
+                    (101, vec![8.0, 0.0]), // closer to C than to B
+                ],
+            ),
+            (
+                1,
+                vec![
+                    (200, vec![5.0, 0.0]),
+                    (201, vec![5.1, 0.0]),
+                    (202, vec![4.9, 0.0]),
+                ],
+            ),
+            (2, vec![(300, vec![10.0, 0.0])]),
+        ];
+        let env =
+            RebalancerTestEnv::new(dimensions, distance_metric, centroid_vecs, postings.clone())
+                .await;
+        let mut task = env.create_task();
+        let centroid_a_id = env.initial_centroids[0].centroid_id;
+        let centroid_b_id = env.initial_centroids[1].centroid_id;
+
+        // when - merge A (smaller) into B (larger)
+        task.handle_merge(centroid_a_id, centroid_b_id)
+            .await
+            .unwrap();
+
+        // then
+        let snapshot = env.flush_and_snapshot().await;
+
+        // A should be deleted
+        let deletions = snapshot.get_deleted_vectors().await.unwrap();
+        assert!(
+            deletions.contains(centroid_a_id),
+            "centroid A should be in deletions bitmap"
+        );
+
+        let c_id = env.initial_centroids[2].centroid_id;
+
+        // Vector 100 at [0.1, 0] - closest to B (d=4.9) vs C (d=9.9), stays in B
+        // Vector 101 at [8.0, 0] - closest to C (d=2.0) vs B (d=3.0), reassigned to C
+        assert_new_posting(
+            &postings,
+            &snapshot,
+            centroid_b_id,
+            &[100, 200, 201, 202],
+            dimensions,
+        );
+        assert_new_posting(&postings, &snapshot, c_id, &[101, 300], dimensions);
+
+        // cleanup
+        env.coordinator.stop().await.unwrap();
     }
 }

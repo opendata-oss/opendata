@@ -151,6 +151,7 @@ impl VectorDb {
             opts: VectorDbDeltaOpts {
                 dimensions: config.dimensions as usize,
                 split_threshold_vectors: config.split_threshold_vectors,
+                merge_threshold_vectors: config.merge_threshold_vectors,
                 chunk_target: config.chunk_target as usize,
             },
             dictionary: Arc::clone(&dictionary),
@@ -185,6 +186,7 @@ impl VectorDb {
                 dimensions: config.dimensions as usize,
                 distance_metric: config.distance_metric,
                 split_search_neighbourhood: config.split_search_neighbourhood,
+                split_threshold_vectors: config.split_threshold_vectors,
             },
         );
 
@@ -678,6 +680,7 @@ mod tests {
             distance_metric: DistanceMetric::Cosine,
             flush_interval: Duration::from_secs(60),
             split_threshold_vectors: 10_000,
+            merge_threshold_vectors: 200,
             split_search_neighbourhood: 8,
             chunk_target: 4096,
             metadata_fields: vec![
@@ -835,6 +838,7 @@ mod tests {
             distance_metric: DistanceMetric::Cosine,
             flush_interval: Duration::from_secs(60),
             split_threshold_vectors: 10_000,
+            merge_threshold_vectors: 200,
             split_search_neighbourhood: 8,
             chunk_target: 4096,
             metadata_fields: vec![],
@@ -955,6 +959,7 @@ mod tests {
             distance_metric: DistanceMetric::L2,
             flush_interval: Duration::from_secs(60),
             split_threshold_vectors: 10_000,
+            merge_threshold_vectors: 200,
             split_search_neighbourhood: 8,
             chunk_target: 4096,
             metadata_fields: vec![],

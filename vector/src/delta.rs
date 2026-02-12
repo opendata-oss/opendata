@@ -64,6 +64,8 @@ pub(crate) struct VectorDbDeltaOpts {
     pub(crate) dimensions: usize,
     /// Number of vectors in a centroid's posting list that triggers a split.
     pub(crate) split_threshold_vectors: u64,
+    /// Number of vectors below which a centroid's posting list triggers a merge.
+    pub(crate) merge_threshold_vectors: u64,
     /// Target number of centroid entries per chunk.
     pub(crate) chunk_target: usize,
 }
@@ -115,9 +117,10 @@ pub(crate) struct VectorDbWriteDelta {
     pub(crate) ops: Vec<RecordOp>,
     /// Shared view of the delta's current state, readable by concurrent readers.
     pub(crate) view: Arc<std::sync::RwLock<VectorDbDeltaView>>,
-    /// Centroids that already have an in-flight split op sent to the rebalancer.
-    /// Prevents duplicate split requests within a single delta lifecycle.
-    pub(crate) pending_splits: HashSet<u64>,
+    /// Centroids currently participating in a rebalance operation (split or merge).
+    /// Prevents duplicate rebalance requests and protects centroids involved in
+    /// in-flight operations from being scheduled again.
+    pub(crate) rebalance_participants: HashSet<u64>,
 }
 
 impl VectorDbWriteDelta {
@@ -145,7 +148,7 @@ impl Delta for VectorDbWriteDelta {
             ctx: context,
             ops: Vec::new(),
             view: Arc::new(std::sync::RwLock::new(VectorDbDeltaView::new())),
-            pending_splits: HashSet::new(),
+            rebalance_participants: HashSet::new(),
         }
     }
 
@@ -253,30 +256,31 @@ impl VectorDbWriteDelta {
 
         drop(view);
 
-        // Check if any touched centroid exceeded the split threshold
-        self.maybe_schedule_splits(touched_centroids);
+        // Check if any touched centroid needs rebalancing
+        self.maybe_schedule_rebalances(touched_centroids);
 
         Ok(Arc::new(()))
     }
 
-    fn maybe_schedule_splits(&mut self, touched_centroids: HashSet<u64>) {
+    fn maybe_schedule_rebalances(&mut self, touched_centroids: HashSet<u64>) {
         for centroid_id in touched_centroids {
+            if self.rebalance_participants.contains(&centroid_id) {
+                continue;
+            }
             let count = self
                 .ctx
                 .centroid_counts
                 .get(&centroid_id)
                 .copied()
                 .unwrap_or(0);
-            if count >= self.ctx.opts.split_threshold_vectors
-                && !self.pending_splits.contains(&centroid_id)
-            {
+            if count >= self.ctx.opts.split_threshold_vectors {
                 debug!(
                     centroid_id,
                     count,
                     threshold = self.ctx.opts.split_threshold_vectors,
                     "scheduling split for centroid"
                 );
-                self.pending_splits.insert(centroid_id);
+                self.rebalance_participants.insert(centroid_id);
                 let centroid_vec = self
                     .ctx
                     .centroid_graph
@@ -285,6 +289,41 @@ impl VectorDbWriteDelta {
                 let _ = self.ctx.rebalancer_tx.send(IndexRebalanceOp::ExecuteSplit {
                     centroid: CentroidEntry::new(centroid_id, centroid_vec),
                 });
+            } else if count > 0 && count < self.ctx.opts.merge_threshold_vectors {
+                // Find a suitable merge partner from the centroid graph
+                let Some(c_vector) = self.ctx.centroid_graph.get_centroid_vector(centroid_id)
+                else {
+                    continue;
+                };
+                let neighbours = self.ctx.centroid_graph.search(&c_vector, 16);
+                let partner = neighbours.iter().copied().find(|&n_id| {
+                    n_id != centroid_id
+                        && !self.rebalance_participants.contains(&n_id)
+                        && count + self.ctx.centroid_counts.get(&n_id).copied().unwrap_or(0)
+                            < self.ctx.opts.split_threshold_vectors
+                });
+                let Some(partner_id) = partner else {
+                    continue;
+                };
+                let partner_count = self
+                    .ctx
+                    .centroid_counts
+                    .get(&partner_id)
+                    .copied()
+                    .unwrap_or(0);
+                // c = smaller (to be removed), c_other = larger (survives)
+                let (c, c_other) = if count <= partner_count {
+                    (centroid_id, partner_id)
+                } else {
+                    (partner_id, centroid_id)
+                };
+                debug!(c, c_other, "scheduling merge");
+                self.rebalance_participants.insert(c);
+                self.rebalance_participants.insert(c_other);
+                let _ = self
+                    .ctx
+                    .rebalancer_tx
+                    .send(IndexRebalanceOp::ExecuteMerge { c, c_other });
             }
         }
     }
@@ -332,20 +371,21 @@ mod tests {
     use common::storage::RecordOp;
     use common::storage::in_memory::InMemoryStorage;
 
-    /// Mock CentroidGraph that always returns a fixed centroid ID.
+    /// Mock CentroidGraph with configurable centroids. Search returns all
+    /// centroid IDs in insertion order (first = assignment target).
     struct MockCentroidGraph {
-        centroid_id: u64,
+        centroids: Vec<(u64, Vec<f32>)>,
     }
 
     impl MockCentroidGraph {
-        fn new(centroid_id: u64) -> Self {
-            Self { centroid_id }
+        fn new(centroids: Vec<(u64, Vec<f32>)>) -> Self {
+            Self { centroids }
         }
     }
 
     impl CentroidGraph for MockCentroidGraph {
         fn search(&self, _query: &[f32], _k: usize) -> Vec<u64> {
-            vec![self.centroid_id]
+            self.centroids.iter().map(|(id, _)| *id).collect()
         }
 
         fn add_centroid(&self, _entry: &CentroidEntry) -> anyhow::Result<()> {
@@ -357,15 +397,14 @@ mod tests {
         }
 
         fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>> {
-            if centroid_id == self.centroid_id {
-                Some(vec![0.0; 3])
-            } else {
-                None
-            }
+            self.centroids
+                .iter()
+                .find(|(id, _)| *id == centroid_id)
+                .map(|(_, v)| v.clone())
         }
 
         fn len(&self) -> usize {
-            1
+            self.centroids.len()
         }
     }
 
@@ -396,10 +435,11 @@ mod tests {
             opts: VectorDbDeltaOpts {
                 dimensions: 3,
                 split_threshold_vectors: split_threshold,
+                merge_threshold_vectors: 0,
                 chunk_target: 4096,
             },
             dictionary: Arc::new(DashMap::new()),
-            centroid_graph: Arc::new(MockCentroidGraph::new(centroid_id)),
+            centroid_graph: Arc::new(MockCentroidGraph::new(vec![(centroid_id, vec![0.0; 3])])),
             id_allocator,
             rebalancer_tx: tx,
             centroid_counts: HashMap::new(),
@@ -713,6 +753,7 @@ mod tests {
             opts: VectorDbDeltaOpts {
                 dimensions: 3,
                 split_threshold_vectors: 10_000,
+                merge_threshold_vectors: 0,
                 chunk_target: 4096,
             },
             dictionary: Arc::new(DashMap::new()),
@@ -795,6 +836,7 @@ mod tests {
             opts: VectorDbDeltaOpts {
                 dimensions: 3,
                 split_threshold_vectors: 10_000,
+                merge_threshold_vectors: 0,
                 chunk_target: 4096,
             },
             dictionary: Arc::new(DashMap::new()),
@@ -989,6 +1031,112 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "should not send split when below threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_send_merge_when_below_merge_threshold() {
+        // given - 2 centroids: A (id=10) with 3 existing vectors, B (id=20) with 5 existing.
+        // split_threshold = 100, merge_threshold = 10.
+        // Writing 1 vector to A gives it count 4, which is below merge_threshold.
+        // A's neighbour B has count 5, combined = 9 < 100 (split_threshold).
+        // Expect a merge op with c=A (smaller, count 4), c_other=B (larger, count 5).
+        let storage: Arc<dyn common::Storage> = Arc::new(InMemoryStorage::new());
+        let key = Bytes::from_static(&[0x01, 0x02]);
+        let id_allocator = SequenceAllocator::load(storage.as_ref(), key)
+            .await
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut centroid_counts = HashMap::new();
+        centroid_counts.insert(10, 3);
+        centroid_counts.insert(20, 5);
+
+        let ctx = VectorDbDeltaContext {
+            opts: VectorDbDeltaOpts {
+                dimensions: 3,
+                split_threshold_vectors: 100,
+                merge_threshold_vectors: 10,
+                chunk_target: 4096,
+            },
+            dictionary: Arc::new(DashMap::new()),
+            centroid_graph: Arc::new(MockCentroidGraph::new(vec![
+                (10, vec![1.0, 0.0, 0.0]),
+                (20, vec![0.0, 1.0, 0.0]),
+            ])),
+            id_allocator,
+            rebalancer_tx: tx,
+            centroid_counts,
+            current_chunk_id: 0,
+            current_chunk_count: 0,
+        };
+        let mut delta = VectorDbWriteDelta::init(ctx);
+
+        // when - write 1 vector (assigned to centroid 10, giving it count 4)
+        let writes = vec![create_vector_write("v1", vec![1.0, 0.0, 0.0])];
+        delta.apply(VectorDbWrite::Write(writes)).unwrap();
+
+        // then - should have received an ExecuteMerge op
+        let op = rx.try_recv().expect("should have received a merge op");
+        match op {
+            IndexRebalanceOp::ExecuteMerge { c, c_other } => {
+                // c = smaller (A with count 4), c_other = larger (B with count 5)
+                assert_eq!(c, 10, "c should be the smaller centroid");
+                assert_eq!(c_other, 20, "c_other should be the larger centroid");
+            }
+            _ => panic!("expected ExecuteMerge, got {:?}", op),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "should not have sent duplicate merge ops"
+        );
+        // both centroids should be in rebalance_participants
+        assert!(delta.rebalance_participants.contains(&10));
+        assert!(delta.rebalance_participants.contains(&20));
+    }
+
+    #[tokio::test]
+    async fn should_not_merge_when_combined_size_exceeds_split_threshold() {
+        // given - 2 centroids: A (id=10) with 3 existing vectors, B (id=20) with 97 existing.
+        // split_threshold = 100, merge_threshold = 10.
+        // Writing 1 vector to A gives it count 4. Combined = 4 + 97 = 101 >= 100. No merge.
+        let storage: Arc<dyn common::Storage> = Arc::new(InMemoryStorage::new());
+        let key = Bytes::from_static(&[0x01, 0x02]);
+        let id_allocator = SequenceAllocator::load(storage.as_ref(), key)
+            .await
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut centroid_counts = HashMap::new();
+        centroid_counts.insert(10, 3);
+        centroid_counts.insert(20, 97);
+        let ctx = VectorDbDeltaContext {
+            opts: VectorDbDeltaOpts {
+                dimensions: 3,
+                split_threshold_vectors: 100,
+                merge_threshold_vectors: 10,
+                chunk_target: 4096,
+            },
+            dictionary: Arc::new(DashMap::new()),
+            centroid_graph: Arc::new(MockCentroidGraph::new(vec![
+                (10, vec![1.0, 0.0, 0.0]),
+                (20, vec![0.0, 1.0, 0.0]),
+            ])),
+            id_allocator,
+            rebalancer_tx: tx,
+            centroid_counts,
+            current_chunk_id: 0,
+            current_chunk_count: 0,
+        };
+        let mut delta = VectorDbWriteDelta::init(ctx);
+
+        // when - write 1 vector (assigned to centroid 10, giving it count 4)
+        let writes = vec![create_vector_write("v1", vec![1.0, 0.0, 0.0])];
+        delta.apply(VectorDbWrite::Write(writes)).unwrap();
+
+        // then - no merge op because combined size (4 + 97 = 101) >= split_threshold (100)
+        assert!(
+            rx.try_recv().is_err(),
+            "should not merge when combined size exceeds split threshold"
         );
     }
 }

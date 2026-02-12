@@ -21,6 +21,8 @@ pub(crate) enum RebalanceCommand {
     Merge(MergeCommand),
     MergeSweep(MergeSweepCommand),
     MergeReassign(MergeReassignCommand),
+    FinishSplit(FinishSplitCommand),
+    FinishMerge(FinishMergeCommand),
 }
 
 pub(crate) struct SplitPostings {
@@ -170,6 +172,16 @@ pub(crate) struct MergeCommand {
     c_other: CentroidPostings,
 }
 
+impl MergeCommand {
+    pub(crate) fn new(task_id: u64, c: u64, c_other: CentroidPostings) -> Self {
+        Self {
+            task_id,
+            c,
+            c_other,
+        }
+    }
+}
+
 /// Sent by the index rebalancer after the MergeCommand is durably flushed (so that the rebalancer
 /// can read from the latest snapshot). The index rebalancer scans c_other's postings for vectors
 /// written between computing and applying the original merge, and updates c's postings with
@@ -179,6 +191,12 @@ pub(crate) struct MergeSweepCommand {
     task_id: u64,
     /// The postings to be added to centroid c
     c_other: CentroidPostings,
+}
+
+impl MergeSweepCommand {
+    pub(crate) fn new(task_id: u64, c_other: CentroidPostings) -> Self {
+        Self { task_id, c_other }
+    }
 }
 
 /// Sent by the index rebalancer after the MergeSweepCommand is applied (does not need to block on
@@ -191,6 +209,47 @@ pub(crate) struct MergeReassignCommand {
     /// Unique task ID associated with this task
     task_id: u64,
     reassignments: Vec<VectorReassignment>,
+}
+
+impl MergeReassignCommand {
+    pub(crate) fn new(task_id: u64, reassignments: Vec<VectorReassignment>) -> Self {
+        Self {
+            task_id,
+            reassignments,
+        }
+    }
+}
+
+/// Sent by the index rebalancer after a split operation completes (or exits early).
+/// Cleans up rebalance_participants for the centroids involved in the split.
+pub(crate) struct FinishSplitCommand {
+    /// The original centroid that was split.
+    pub(crate) c: u64,
+    /// New centroid c0 (None if split exited before phase 1).
+    pub(crate) c0: Option<u64>,
+    /// New centroid c1 (None if split exited before phase 1).
+    pub(crate) c1: Option<u64>,
+}
+
+impl FinishSplitCommand {
+    pub(crate) fn new(c: u64, c0: Option<u64>, c1: Option<u64>) -> Self {
+        Self { c, c0, c1 }
+    }
+}
+
+/// Sent by the index rebalancer after a merge operation completes (or exits early).
+/// Cleans up rebalance_participants for the centroids involved in the merge.
+pub(crate) struct FinishMergeCommand {
+    /// The centroid that was scheduled for merge.
+    pub(crate) centroid: u64,
+    /// The other centroid participating in the merge (None if merge exited before phase 1).
+    pub(crate) c_other: Option<u64>,
+}
+
+impl FinishMergeCommand {
+    pub(crate) fn new(centroid: u64, c_other: Option<u64>) -> Self {
+        Self { centroid, c_other }
+    }
 }
 
 /// Deduplicate and accumulate postings from a `CentroidPostings` into the view.
@@ -225,6 +284,8 @@ impl VectorDbWriteDelta {
             RebalanceCommand::Merge(cmd) => self.apply_merge_cmd(cmd),
             RebalanceCommand::MergeSweep(cmd) => self.apply_merge_sweep_cmd(cmd),
             RebalanceCommand::MergeReassign(cmd) => self.apply_merge_reassign_cmd(cmd),
+            RebalanceCommand::FinishSplit(cmd) => self.apply_finish_split(cmd),
+            RebalanceCommand::FinishMerge(cmd) => self.apply_finish_merge(cmd),
         }
     }
 
@@ -308,6 +369,11 @@ impl VectorDbWriteDelta {
         *self.ctx.centroid_counts.entry(c0_id).or_default() += c0_count;
         *self.ctx.centroid_counts.entry(c1_id).or_default() += c1_count;
 
+        // 7. Track new centroids in pending_rebalances to prevent scheduling
+        //    while this split is still in progress.
+        self.rebalance_participants.insert(c0_id);
+        self.rebalance_participants.insert(c1_id);
+
         Ok(Arc::new(SplitCommandResult { c0_id, c1_id }))
     }
 
@@ -335,9 +401,30 @@ impl VectorDbWriteDelta {
         &mut self,
         cmd: SplitReassignCommand,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
+        self.apply_reassignments(cmd.reassignments)
+    }
+
+    pub(crate) fn apply_finish_split(
+        &mut self,
+        cmd: FinishSplitCommand,
+    ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
+        self.rebalance_participants.remove(&cmd.c);
+        if let Some(c0) = cmd.c0 {
+            self.rebalance_participants.remove(&c0);
+        }
+        if let Some(c1) = cmd.c1 {
+            self.rebalance_participants.remove(&c1);
+        }
+        Ok(Arc::new(()))
+    }
+
+    fn apply_reassignments(
+        &mut self,
+        reassignments: Vec<VectorReassignment>,
+    ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         let mut view = self.view.write().expect("lock poisoned");
 
-        for reassignment in cmd.reassignments {
+        for reassignment in reassignments {
             // Check if the target centroid still exists. If not, recompute the target
             // by looking in the centroid graph. This handles concurrent splits.
             let target_id = if self
@@ -383,20 +470,67 @@ impl VectorDbWriteDelta {
         &mut self,
         cmd: MergeCommand,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
-        todo!()
+        let c_other_id = cmd.c_other.centroid_id();
+        let c_other_postings = cmd.c_other.postings();
+
+        // 1. Remove c_other from centroid graph
+        self.ctx
+            .centroid_graph
+            .remove_centroid(c_other_id)
+            .map_err(|e| e.to_string())?;
+
+        let mut view = self.view.write().expect("lock poisoned");
+
+        // 2. Mark c_other as deleted
+        view.deleted_centroids.insert(c_other_id);
+
+        // 3. Move all postings from c_other into c
+        let c_other_count = c_other_postings.len() as u64;
+        for p in c_other_postings {
+            let (id, vector) = p.unpack();
+            view.add_to_posting(cmd.c, id, vector);
+        }
+
+        drop(view);
+
+        // 4. Update centroid_counts: add c_other's count to c, remove c_other
+        *self.ctx.centroid_counts.entry(cmd.c).or_default() += c_other_count;
+        self.ctx.centroid_counts.remove(&c_other_id);
+
+        Ok(Arc::new(()))
     }
 
     pub(crate) fn apply_merge_sweep_cmd(
         &mut self,
         cmd: MergeSweepCommand,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
-        todo!()
+        let mut view = self.view.write().expect("lock poisoned");
+
+        let c_id = cmd.c_other.centroid_id();
+        let added = dedup_and_accumulate(&mut view, cmd.c_other);
+
+        drop(view);
+
+        *self.ctx.centroid_counts.entry(c_id).or_default() += added;
+
+        Ok(Arc::new(()))
     }
 
     pub(crate) fn apply_merge_reassign_cmd(
         &mut self,
         cmd: MergeReassignCommand,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
-        todo!()
+        self.apply_reassignments(cmd.reassignments)
+    }
+
+    pub(crate) fn apply_finish_merge(
+        &mut self,
+        cmd: FinishMergeCommand,
+    ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
+        self.rebalance_participants.remove(&cmd.centroid);
+        if let Some(c_other) = cmd.c_other {
+            self.rebalance_participants.remove(&c_other);
+        }
+        Ok(Arc::new(()))
     }
 }

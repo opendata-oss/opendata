@@ -198,6 +198,9 @@ pub struct Config {
     /// Number of vectors in a centroid's posting list that triggers a split.
     pub split_threshold_vectors: u64,
 
+    /// Number of vectors below which a centroid's posting list triggers a merge.
+    pub merge_threshold_vectors: u64,
+
     /// Number of neighboring centroids to scan for reassignment candidates after a split.
     pub split_search_neighbourhood: usize,
 
@@ -220,6 +223,7 @@ impl Default for Config {
             distance_metric: DistanceMetric::Cosine,
             flush_interval: Duration::from_secs(60),
             split_threshold_vectors: 2_000,
+            merge_threshold_vectors: 500,
             split_search_neighbourhood: 8,
             chunk_target: 4096,
             metadata_fields: Vec::new(),
