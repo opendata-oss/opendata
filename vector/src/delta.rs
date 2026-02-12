@@ -253,6 +253,7 @@ mod tests {
     use super::*;
     use crate::hnsw::CentroidGraph;
     use crate::model::AttributeValue;
+    use crate::serde::centroid_chunk::CentroidEntry;
     use crate::serde::key::{
         CentroidStatsKey, DeletionsKey, IdDictionaryKey, PostingListKey, VectorDataKey,
     };
@@ -276,6 +277,22 @@ mod tests {
     impl CentroidGraph for MockCentroidGraph {
         fn search(&self, _query: &[f32], _k: usize) -> Vec<u64> {
             vec![self.centroid_id]
+        }
+
+        fn add_centroid(&self, _entry: &CentroidEntry) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn remove_centroid(&self, _centroid_id: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>> {
+            if centroid_id == self.centroid_id {
+                Some(vec![0.0; 3])
+            } else {
+                None
+            }
         }
 
         fn len(&self) -> usize {
@@ -592,6 +609,18 @@ mod tests {
                 }
             }
 
+            fn add_centroid(&self, _entry: &CentroidEntry) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            fn remove_centroid(&self, _centroid_id: u64) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            fn get_centroid_vector(&self, _centroid_id: u64) -> Option<Vec<f32>> {
+                None
+            }
+
             fn len(&self) -> usize {
                 3
             }
@@ -654,6 +683,18 @@ mod tests {
                 } else {
                     vec![3]
                 }
+            }
+
+            fn add_centroid(&self, _entry: &CentroidEntry) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            fn remove_centroid(&self, _centroid_id: u64) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            fn get_centroid_vector(&self, _centroid_id: u64) -> Option<Vec<f32>> {
+                None
             }
 
             fn len(&self) -> usize {
