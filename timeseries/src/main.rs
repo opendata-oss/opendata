@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use common::storage::factory::create_storage;
-use common::{StorageRuntime, StorageSemantics};
+use common::{StorageBundle, StorageRuntime, StorageSemantics};
 
 use promql::config::{CliArgs, PrometheusConfig, load_config};
 use promql::server::{PromqlServer, ServerConfig};
@@ -63,7 +63,7 @@ async fn main() {
         prometheus_config.storage
     );
     let merge_operator = Arc::new(OpenTsdbMergeOperator);
-    let storage = create_storage(
+    let StorageBundle { storage, stat_registry } = create_storage(
         &prometheus_config.storage,
         StorageRuntime::new(),
         StorageSemantics::new().with_merge_operator(merge_operator),
@@ -85,7 +85,7 @@ async fn main() {
     };
 
     // Create and run server
-    let server = PromqlServer::new(tsdb, config);
+    let server = PromqlServer::new(tsdb, config, stat_registry);
 
     tracing::info!(
         "Starting timeseries Prometheus-compatible server on port {}...",

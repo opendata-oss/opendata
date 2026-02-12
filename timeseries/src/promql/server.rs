@@ -10,6 +10,7 @@ use axum::routing::post;
 use axum::{Form, extract::Request};
 use axum::{Json, Router};
 use rust_embed::Embed;
+use slatedb::stats::StatRegistry;
 use tokio::signal;
 
 use super::config::PrometheusConfig;
@@ -57,17 +58,26 @@ impl Default for ServerConfig {
 pub(crate) struct PromqlServer {
     tsdb: Arc<Tsdb>,
     config: ServerConfig,
+    stat_registry: Option<Arc<StatRegistry>>,
 }
 
 impl PromqlServer {
-    pub(crate) fn new(tsdb: Arc<Tsdb>, config: ServerConfig) -> Self {
-        Self { tsdb, config }
+    pub(crate) fn new(
+        tsdb: Arc<Tsdb>,
+        config: ServerConfig,
+        stat_registry: Option<Arc<StatRegistry>>,
+    ) -> Self {
+        Self {
+            tsdb,
+            config,
+            stat_registry,
+        }
     }
 
     /// Run the HTTP server
     pub(crate) async fn run(self) {
-        // Create metrics registry
-        let metrics = Arc::new(Metrics::new());
+        // Create metrics registry with optional SlateDB stats
+        let metrics = Arc::new(Metrics::new(self.stat_registry));
 
         // Create app state
         let state = AppState {

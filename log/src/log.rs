@@ -16,7 +16,8 @@ use common::coordinator::{
     Durability, WriteCoordinator, WriteCoordinatorConfig, WriteCoordinatorHandle, WriteError,
 };
 use common::storage::factory::create_storage;
-use common::{StorageRuntime, StorageSemantics};
+use common::{StorageBundle, StorageRuntime, StorageSemantics};
+use slatedb::stats::StatRegistry;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
@@ -85,6 +86,7 @@ pub struct LogDb {
     clock: Arc<dyn Clock>,
     read_inner: Arc<RwLock<crate::reader::LogReadInner>>,
     flush_subscriber_task: JoinHandle<()>,
+    stat_registry: Option<Arc<StatRegistry>>,
 }
 
 impl LogDb {
@@ -110,6 +112,11 @@ impl LogDb {
     /// ```
     pub async fn open(config: crate::config::Config) -> Result<Self> {
         LogDbBuilder::new(config).build().await
+    }
+
+    /// Returns the SlateDB stat registry, if the storage backend is SlateDB.
+    pub fn stat_registry(&self) -> Option<Arc<StatRegistry>> {
+        self.stat_registry.clone()
     }
 
     /// Appends records to the log without blocking.
@@ -351,6 +358,7 @@ impl LogDb {
             clock,
             read_inner,
             flush_subscriber_task,
+            stat_registry: None,
         })
     }
 }
@@ -450,7 +458,7 @@ impl LogDbBuilder {
         use crate::reader::LogReadInner;
         use crate::serde::SEQ_BLOCK_KEY;
 
-        let storage = create_storage(
+        let StorageBundle { storage, stat_registry } = create_storage(
             &self.config.storage,
             self.storage_runtime,
             StorageSemantics::new(),
@@ -501,6 +509,7 @@ impl LogDbBuilder {
             clock,
             read_inner,
             flush_subscriber_task,
+            stat_registry,
         })
     }
 }
@@ -952,7 +961,7 @@ mod tests {
     #[tokio::test]
     async fn should_scan_entries_via_log_reader() {
         // given - create shared storage
-        let storage = create_storage(
+        let StorageBundle { storage, .. } = create_storage(
             &StorageConfig::InMemory,
             StorageRuntime::new(),
             StorageSemantics::new(),
@@ -1195,7 +1204,7 @@ mod tests {
     #[tokio::test]
     async fn should_list_keys_via_log_reader() {
         // given - create shared storage
-        let storage = create_storage(
+        let StorageBundle { storage, .. } = create_storage(
             &StorageConfig::InMemory,
             StorageRuntime::new(),
             StorageSemantics::new(),
@@ -1616,7 +1625,7 @@ mod tests {
     #[tokio::test]
     async fn should_list_segments_via_log_reader() {
         // given
-        let storage = create_storage(
+        let StorageBundle { storage, .. } = create_storage(
             &StorageConfig::InMemory,
             StorageRuntime::new(),
             StorageSemantics::new(),

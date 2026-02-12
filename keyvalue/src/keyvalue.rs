@@ -61,7 +61,7 @@ impl KeyValueDb {
     ///
     /// Returns an error if the storage backend cannot be initialized.
     pub async fn open(config: Config) -> Result<Self> {
-        let storage = create_storage(
+        let bundle = create_storage(
             &config.storage,
             StorageRuntime::new(),
             StorageSemantics::new(),
@@ -69,7 +69,7 @@ impl KeyValueDb {
         .await
         .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let kv_storage = KeyValueStorage::new(storage);
+        let kv_storage = KeyValueStorage::new(bundle.storage);
         Ok(Self {
             storage: kv_storage,
         })
@@ -421,14 +421,14 @@ mod tests {
     #[tokio::test]
     async fn should_read_via_keyvalue_reader() {
         // given - create shared storage
-        let storage = create_storage(
+        let bundle = create_storage(
             &StorageConfig::InMemory,
             StorageRuntime::new(),
             StorageSemantics::new(),
         )
         .await
         .unwrap();
-        let kv = KeyValueDb::new(storage.clone());
+        let kv = KeyValueDb::new(bundle.storage.clone());
         kv.put(Bytes::from("key1"), Bytes::from("value1"))
             .await
             .unwrap();
@@ -437,7 +437,7 @@ mod tests {
             .unwrap();
 
         // when - create KeyValueDbReader sharing the same storage
-        let reader = KeyValueDbReader::new(storage as Arc<dyn common::StorageRead>);
+        let reader = KeyValueDbReader::new(bundle.storage as Arc<dyn common::StorageRead>);
         let result1 = reader.get(Bytes::from("key1")).await.unwrap();
         let result2 = reader.get(Bytes::from("key2")).await.unwrap();
 
@@ -449,20 +449,20 @@ mod tests {
     #[tokio::test]
     async fn should_scan_via_keyvalue_reader() {
         // given - create shared storage
-        let storage = create_storage(
+        let bundle = create_storage(
             &StorageConfig::InMemory,
             StorageRuntime::new(),
             StorageSemantics::new(),
         )
         .await
         .unwrap();
-        let kv = KeyValueDb::new(storage.clone());
+        let kv = KeyValueDb::new(bundle.storage.clone());
         kv.put(Bytes::from("a"), Bytes::from("1")).await.unwrap();
         kv.put(Bytes::from("b"), Bytes::from("2")).await.unwrap();
         kv.put(Bytes::from("c"), Bytes::from("3")).await.unwrap();
 
         // when - create KeyValueDbReader sharing the same storage
-        let reader = KeyValueDbReader::new(storage as Arc<dyn common::StorageRead>);
+        let reader = KeyValueDbReader::new(bundle.storage as Arc<dyn common::StorageRead>);
         let mut iter = reader.scan(..).await.unwrap();
         let mut entries = vec![];
         while let Some(entry) = iter.next().await.unwrap() {

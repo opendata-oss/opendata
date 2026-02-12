@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use slatedb::config::Settings;
+use slatedb::stats::StatRegistry;
 use slatedb::object_store::{self, ObjectStore};
 use slatedb::{DbBuilder, DbReader};
 use tokio::runtime::Handle;
@@ -139,6 +140,15 @@ pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn 
     }
 }
 
+/// Result of creating a storage instance, bundling the storage with optional
+/// SlateDB stat registry for metrics exposure.
+pub struct StorageBundle {
+    /// The storage instance.
+    pub storage: Arc<dyn Storage>,
+    /// SlateDB stat registry, if the backend is SlateDB.
+    pub stat_registry: Option<Arc<StatRegistry>>,
+}
+
 /// Creates a storage instance based on configuration, runtime options, and semantics.
 ///
 /// This is the primary factory function for creating storage backends. It combines:
@@ -154,34 +164,42 @@ pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn 
 ///
 /// # Returns
 ///
-/// Returns an `Arc<dyn Storage>` on success, or a `StorageError` on failure.
+/// Returns a `StorageBundle` on success, or a `StorageError` on failure.
 ///
 /// # Example (for system crate implementers)
 ///
 /// ```rust,ignore
 /// // In a system crate's builder:
-/// let storage = create_storage(
+/// let bundle = create_storage(
 ///     &self.config.storage,
 ///     self.storage_runtime.unwrap_or_default(),
 ///     StorageSemantics::new().with_merge_operator(Arc::new(MyMergeOp)),
 /// ).await?;
+/// let storage = bundle.storage;
 /// ```
 pub async fn create_storage(
     config: &StorageConfig,
     runtime: StorageRuntime,
     semantics: StorageSemantics,
-) -> StorageResult<Arc<dyn Storage>> {
+) -> StorageResult<StorageBundle> {
     match config {
         StorageConfig::InMemory => {
             let storage = match semantics.merge_operator {
                 Some(op) => InMemoryStorage::with_merge_operator(op),
                 None => InMemoryStorage::new(),
             };
-            Ok(Arc::new(storage))
+            Ok(StorageBundle {
+                storage: Arc::new(storage),
+                stat_registry: None,
+            })
         }
         StorageConfig::SlateDb(slate_config) => {
-            let storage = create_slatedb_storage(slate_config, runtime, semantics).await?;
-            Ok(Arc::new(storage))
+            let slate = create_slatedb_storage(slate_config, runtime, semantics).await?;
+            let stat_registry = Some(slate.stat_registry());
+            Ok(StorageBundle {
+                storage: Arc::new(slate),
+                stat_registry,
+            })
         }
     }
 }

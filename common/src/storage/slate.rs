@@ -7,6 +7,7 @@ use crate::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use slatedb::config::ScanOptions;
+use slatedb::stats::StatRegistry;
 use slatedb::{
     Db, DbIterator, DbReader, DbSnapshot, MergeOperator as SlateDbMergeOperator,
     MergeOperatorError, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
@@ -59,6 +60,11 @@ impl SlateDbStorage {
     /// Creates a new SlateDbStorage instance wrapping the given SlateDB database.
     pub fn new(db: Arc<Db>) -> Self {
         Self { db }
+    }
+
+    /// Returns the SlateDB stat registry for this database.
+    pub fn stat_registry(&self) -> Arc<StatRegistry> {
+        self.db.metrics()
     }
 
     /// Creates a SlateDB `MergeOperator` from our common `MergeOperator` trait.

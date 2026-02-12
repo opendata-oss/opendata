@@ -251,7 +251,7 @@ mod tests {
         );
         let tsdb = Arc::new(Tsdb::new(storage));
         let config = PrometheusConfig::default();
-        let metrics = Arc::new(Metrics::new());
+        let metrics = Arc::new(Metrics::new(None));
 
         // when
         let scraper = Scraper::new(tsdb, config, metrics);

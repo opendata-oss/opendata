@@ -29,7 +29,7 @@ async fn setup_test_app() -> (Router, Arc<LogDb>) {
         ..Default::default()
     };
     let log = Arc::new(LogDb::open(config).await.expect("Failed to open log"));
-    let metrics = Arc::new(Metrics::new());
+    let metrics = Arc::new(Metrics::new(None));
 
     let state = AppState {
         log: log.clone(),

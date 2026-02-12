@@ -1,5 +1,7 @@
 //! Prometheus metrics for the timeseries server.
 
+use std::sync::Arc;
+
 use axum::http::Method;
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
 use prometheus_client::metrics::counter::Counter;
@@ -7,6 +9,7 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
+use slatedb::stats::StatRegistry;
 
 /// Labels for scrape metrics.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -62,6 +65,9 @@ pub struct HttpLabels {
 pub struct Metrics {
     registry: Registry,
 
+    /// SlateDB metrics bridge (present when storage backend is SlateDB).
+    slatedb_metrics: Option<common::metrics::SlateDbMetrics>,
+
     /// Counter of samples successfully scraped.
     pub scrape_samples_scraped: Family<ScrapeLabels, Counter>,
 
@@ -84,16 +90,17 @@ pub struct Metrics {
     pub remote_write_samples_failed: Counter,
 }
 
-impl Default for Metrics {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Metrics {
     /// Create a new metrics registry with all metrics registered.
-    pub fn new() -> Self {
+    ///
+    /// If `db_stats` is provided, SlateDB internal metrics will be
+    /// registered under the `slatedb_` prefix.
+    pub fn new(stat_registry: Option<Arc<StatRegistry>>) -> Self {
         let mut registry = Registry::default();
+
+        // Register SlateDB metrics if available
+        let slatedb_metrics = stat_registry
+            .map(|sr| common::metrics::SlateDbMetrics::register(sr, &mut registry));
 
         // Scrape samples scraped counter
         let scrape_samples_scraped = Family::<ScrapeLabels, Counter>::default();
@@ -156,6 +163,7 @@ impl Metrics {
 
         Self {
             registry,
+            slatedb_metrics,
             scrape_samples_scraped,
             scrape_samples_failed,
             http_requests_total,
@@ -168,6 +176,9 @@ impl Metrics {
 
     /// Encode all metrics to Prometheus text format.
     pub fn encode(&self) -> String {
+        if let Some(ref slatedb) = self.slatedb_metrics {
+            slatedb.refresh();
+        }
         let mut buffer = String::new();
         prometheus_client::encoding::text::encode(&mut buffer, &self.registry)
             .expect("encoding metrics should not fail");
@@ -182,7 +193,7 @@ mod tests {
     #[test]
     fn should_create_default_metrics() {
         // given/when
-        let metrics = Metrics::new();
+        let metrics = Metrics::new(None);
 
         // then
         let encoded = metrics.encode();
@@ -193,6 +204,10 @@ mod tests {
         assert!(encoded.contains("# HELP remote_write_samples_ingested_total"));
         assert!(encoded.contains("# HELP remote_write_samples_failed_total"));
     }
+
+    // Note: SlateDB's StatRegistry::new() is pub(crate), so we can't construct
+    // one in tests outside slatedb. Integration testing with real SlateDB metrics
+    // happens with a real DB instance.
 
     #[test]
     fn should_convert_http_method_to_label() {

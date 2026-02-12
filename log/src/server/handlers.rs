@@ -277,7 +277,7 @@ mod tests {
     async fn should_return_ok_for_ready_when_log_accessible() {
         // given
         let log = Arc::new(LogDb::open(test_config()).await.unwrap());
-        let metrics = Arc::new(Metrics::new());
+        let metrics = Arc::new(Metrics::new(None));
         let state = AppState { log, metrics };
 
         // when
@@ -387,7 +387,7 @@ mod tests {
         // given - a log backed by configurable storage
         let storage = Arc::new(ConfigurableStorage::new());
         let log = Arc::new(LogDb::new(storage.clone()).await.unwrap());
-        let metrics = Arc::new(Metrics::new());
+        let metrics = Arc::new(Metrics::new(None));
         let state = AppState { log, metrics };
 
         // Configure storage to fail after initialization
