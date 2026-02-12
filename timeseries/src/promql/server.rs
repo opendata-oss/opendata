@@ -354,6 +354,31 @@ async fn handle_ui(Path(path): Path<String>) -> impl IntoResponse {
     }
 }
 
+/// Listen for SIGTERM (K8s pod termination) and SIGINT (Ctrl+C).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("Received SIGINT, starting graceful shutdown"),
+        _ = terminate => tracing::info!("Received SIGTERM, starting graceful shutdown"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,30 +528,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body, "OK");
-    }
-}
-
-/// Listen for SIGTERM (K8s pod termination) and SIGINT (Ctrl+C).
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => tracing::info!("Received SIGINT, starting graceful shutdown"),
-        _ = terminate => tracing::info!("Received SIGTERM, starting graceful shutdown"),
     }
 }
