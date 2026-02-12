@@ -81,7 +81,6 @@ impl Benchmark for IngestBenchmark {
         let mut iteration = 0;
 
         while runner.keep_running() {
-            
             // Generate timeseries data
             let series: Vec<Series> = (0..num_series)
                 .map(|i| {
@@ -89,8 +88,9 @@ impl Benchmark for IngestBenchmark {
                         .map(|j| Label::new(format!("label_{}", i), format!("value_{}", j)))
                         .collect();
 
-                    let base_timestamp = (iteration * num_series as u64 * num_samples as u64 * 1500)
-                        + (i as u64 * num_samples as u64 * 1500);
+                    let base_timestamp =
+                        (iteration * num_series as u64 * num_samples as u64 * 1500)
+                            + (i as u64 * num_samples as u64 * 1500);
                     let samples: Vec<Sample> = (0..num_samples)
                         .map(|j| Sample {
                             timestamp_ms: base_timestamp as i64 + (j as i64 * 1500),
@@ -100,9 +100,7 @@ impl Benchmark for IngestBenchmark {
 
                     Series::new(format!("metric_{}", i), labels, samples)
                 })
-
-            .collect();
-
+                .collect();
 
             let batch_start = std::time::Instant::now();
             //ingest
