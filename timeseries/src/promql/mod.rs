@@ -5,6 +5,8 @@ pub(crate) mod metrics;
 mod middleware;
 pub(crate) mod openmetrics;
 mod parser;
+#[cfg(test)]
+pub(crate) mod promqltest;
 #[cfg(feature = "remote-write")]
 pub(crate) mod remote_write;
 mod request;

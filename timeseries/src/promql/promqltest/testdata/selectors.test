@@ -1,0 +1,85 @@
+# Adapted from Prometheus promqltest suite.
+# Original source:
+# https://github.com/prometheus/prometheus/tree/main/promql/promqltest
+
+load 10s
+	http_requests_total{job="api-server", instance="0", group="production"}	0+10x1000 100+30x1000
+	http_requests_total{job="api-server", instance="1", group="production"}	0+20x1000 200+30x1000
+	http_requests_total{job="api-server", instance="0", group="canary"}	0+30x1000 300+80x1000
+	http_requests_total{job="api-server", instance="1", group="canary"}	0+40x2000
+
+eval instant at 8000s rate(http_requests_total[1m])
+	{job="api-server", instance="0", group="production"} 1
+	{job="api-server", instance="1", group="production"} 2
+	{job="api-server", instance="0", group="canary"} 3
+	{job="api-server", instance="1", group="canary"} 4
+
+eval instant at 18000s rate(http_requests_total[1m])
+	{job="api-server", instance="0", group="production"} 3
+	{job="api-server", instance="1", group="production"} 3
+	{job="api-server", instance="0", group="canary"} 8
+	{job="api-server", instance="1", group="canary"} 4
+
+eval instant at 8000s rate(http_requests_total{group="production"}[1m])
+	{job="api-server", instance="0", group="production"} 1
+	{job="api-server", instance="1", group="production"} 2
+
+eval instant at 18000s rate(http_requests_total{group="canary", instance="1"}[1m])
+	{job="api-server", instance="1", group="canary"} 4
+
+# Start ignoring
+ignore
+
+eval instant at 8000s rate(http_requests_total{group=~"pro.*"}[1m])
+	{job="api-server", instance="0", group="production"} 1
+	{job="api-server", instance="1", group="production"} 2
+
+eval instant at 18000s rate(http_requests_total{group=~".*ry", instance="1"}[1m])
+	{job="api-server", instance="1", group="canary"} 4
+
+eval instant at 18000s rate(http_requests_total{instance!="3"}[1m] offset 10000s)
+	{job="api-server", instance="0", group="production"} 1
+	{job="api-server", instance="1", group="production"} 2
+	{job="api-server", instance="0", group="canary"} 3
+	{job="api-server", instance="1", group="canary"} 4
+
+eval instant at 4000s rate(http_requests_total{instance!="3"}[1m] offset -4000s)
+	{job="api-server", instance="0", group="production"} 1
+	{job="api-server", instance="1", group="production"} 2
+	{job="api-server", instance="0", group="canary"} 3
+	{job="api-server", instance="1", group="canary"} 4
+
+resume
+
+# Additional tests for label matching and selectors
+
+# Test single instance selector
+eval instant at 8000s rate(http_requests_total{instance="0"}[1m])
+	{job="api-server", instance="0", group="production"} 1
+	{job="api-server", instance="0", group="canary"} 3
+
+# Test job selector (all series have same job)
+eval instant at 8000s rate(http_requests_total{job="api-server"}[1m])
+	{job="api-server", instance="0", group="production"} 1
+	{job="api-server", instance="1", group="production"} 2
+	{job="api-server", instance="0", group="canary"} 3
+	{job="api-server", instance="1", group="canary"} 4
+
+# Test multiple label selectors
+eval instant at 8000s rate(http_requests_total{job="api-server", group="production", instance="0"}[1m])
+	{job="api-server", instance="0", group="production"} 1
+
+# Test inequality selector
+eval instant at 8000s rate(http_requests_total{instance!="0"}[1m])
+	{job="api-server", instance="1", group="production"} 2
+	{job="api-server", instance="1", group="canary"} 4
+
+# Test selector at different time point (before rate change at 10000s)
+eval instant at 9000s rate(http_requests_total{group="canary"}[1m])
+	{job="api-server", instance="0", group="canary"} 3
+	{job="api-server", instance="1", group="canary"} 4
+
+# Test with different range window
+eval instant at 8000s rate(http_requests_total{group="production"}[30s])
+	{job="api-server", instance="0", group="production"} 1
+	{job="api-server", instance="1", group="production"} 2
