@@ -5,6 +5,7 @@ use std::path::Path;
 fn main() {
     let testdata_dir = Path::new("src/promql/promqltest/testdata");
     println!("cargo:rerun-if-changed={}", testdata_dir.display());
+    println!("cargo:rerun-if-changed=ui");
 
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest = Path::new(&out_dir).join("promql_tests_generated.rs");

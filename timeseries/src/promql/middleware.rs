@@ -100,6 +100,10 @@ fn normalize_endpoint(path: &str) -> String {
     if path.starts_with("/api/v1/label/") && path.ends_with("/values") {
         return "/api/v1/label/:name/values".to_string();
     }
+    // Group UI asset requests to prevent high-cardinality metrics
+    if !path.starts_with("/api/") && !path.starts_with("/-/") && path != "/metrics" {
+        return "/ui".to_string();
+    }
     path.to_string()
 }
 
@@ -226,6 +230,22 @@ mod tests {
 
         // then
         assert_eq!(normalized, "/metrics");
+    }
+
+    #[test]
+    fn should_normalize_ui_paths_to_ui() {
+        // given / when / then
+        assert_eq!(normalize_endpoint("/"), "/ui");
+        assert_eq!(normalize_endpoint("/style.css"), "/ui");
+        assert_eq!(normalize_endpoint("/app.js"), "/ui");
+        assert_eq!(normalize_endpoint("/index.html"), "/ui");
+    }
+
+    #[test]
+    fn should_preserve_health_endpoints() {
+        // given / when / then
+        assert_eq!(normalize_endpoint("/-/healthy"), "/-/healthy");
+        assert_eq!(normalize_endpoint("/-/ready"), "/-/ready");
     }
 
     #[tokio::test]
