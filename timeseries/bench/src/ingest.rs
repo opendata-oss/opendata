@@ -73,32 +73,37 @@ impl Benchmark for IngestBenchmark {
         let series_counter = bench.counter("series_count");
         let batch_latency = bench.histogram("batch_latency_us");
 
-        // Generate timeseries data
-        let series: Vec<Series> = (0..num_series)
-            .map(|i| {
-                let labels: Vec<Label> = (0..num_labels)
-                    .map(|j| Label::new(format!("label_{}", i), format!("value_{}", j)))
-                    .collect();
-
-                let samples: Vec<Sample> = (0..num_samples)
-                    .map(|i| Sample {
-                        timestamp_ms: (i as i64 * 1500),
-                        value: 1.0,
-                    })
-                    .collect();
-
-                Series::new("metric", labels, samples.clone())
-            })
-            .collect();
-
         // Start the timed benchmark
         let runner = bench.start();
 
         let tsdb = Tsdb::new(create_test_storage().await);
-
         let mut series_written = 0;
+        let mut iteration = 0;
 
         while runner.keep_running() {
+            
+            // Generate timeseries data
+            let series: Vec<Series> = (0..num_series)
+                .map(|i| {
+                    let labels: Vec<Label> = (0..num_labels)
+                        .map(|j| Label::new(format!("label_{}", i), format!("value_{}", j)))
+                        .collect();
+
+                    let base_timestamp = (iteration * num_series as u64 * num_samples as u64 * 1500)
+                        + (i as u64 * num_samples as u64 * 1500);
+                    let samples: Vec<Sample> = (0..num_samples)
+                        .map(|j| Sample {
+                            timestamp_ms: base_timestamp as i64 + (j as i64 * 1500),
+                            value: 1.0,
+                        })
+                        .collect();
+
+                    Series::new(format!("metric_{}", i), labels, samples)
+                })
+
+            .collect();
+
+
             let batch_start = std::time::Instant::now();
             //ingest
             tsdb.ingest_samples(series.clone(), 5).await?;
@@ -110,6 +115,7 @@ impl Benchmark for IngestBenchmark {
             batch_latency.record(series_elapsed.as_secs_f64() * MICROS_PER_SEC);
 
             series_written += num_series;
+            iteration += 1;
         }
 
         let elapsed_secs = runner.elapsed().as_secs_f64();
