@@ -2489,6 +2489,8 @@ dependencies = [
  "roaring 0.10.12",
  "rstest",
  "tokio",
+ "tokio-util",
+ "tracing",
  "usearch",
 ]
 
