@@ -88,7 +88,7 @@ mod tests {
 
         // then
         assert_eq!(response.status, "success");
-        assert_eq!(response.key.as_ref().unwrap().value, Bytes::from("key"));
+        assert_eq!(*response.key.as_ref().unwrap(), Bytes::from("key"));
         assert_eq!(response.values.len(), 1);
     }
 
@@ -109,7 +109,7 @@ mod tests {
         // then
         // "test-key" -> "dGVzdC1rZXk=", "test-value" -> "dGVzdC12YWx1ZQ=="
         assert!(json.contains(r#""status":"success""#));
-        assert!(json.contains(r#""key":{"value":"dGVzdC1rZXk="}"#));
+        assert!(json.contains(r#""key":"dGVzdC1rZXk=""#));
         assert!(json.contains(r#""sequence":42"#));
         assert!(json.contains(r#""value":"dGVzdC12YWx1ZQ==""#));
         assert!(json.contains(r#""values":"#));
@@ -150,7 +150,7 @@ mod tests {
 
         // then
         // "events" -> "ZXZlbnRz", "orders" -> "b3JkZXJz"
-        assert!(json.contains(r#""keys":[{"value":"ZXZlbnRz"},{"value":"b3JkZXJz"}]"#));
+        assert!(json.contains(r#""keys":[{"key":"ZXZlbnRz"},{"key":"b3JkZXJz"}]"#));
     }
 
     #[test]

@@ -143,19 +143,7 @@ impl AppendRequest {
         let proto_request = proto::AppendRequest::decode(body)
             .map_err(|e| Error::InvalidInput(format!("Invalid protobuf: {}", e)))?;
 
-        let records = proto_request
-            .records
-            .into_iter()
-            .map(|r| crate::Record {
-                key: r.key.map(|k| k.value).unwrap_or_default(),
-                value: r.value,
-            })
-            .collect();
-
-        Ok(Self {
-            records,
-            await_durable: proto_request.await_durable,
-        })
+        Self::from_proto_request(proto_request)
     }
 
     /// Parse from JSON (ProtoJSON format).
@@ -163,14 +151,21 @@ impl AppendRequest {
         let proto_request: proto::AppendRequest = serde_json::from_slice(body)
             .map_err(|e| Error::InvalidInput(format!("Invalid JSON: {}", e)))?;
 
-        let records = proto_request
-            .records
-            .into_iter()
-            .map(|r| crate::Record {
-                key: r.key.map(|k| k.value).unwrap_or_default(),
-                value: r.value,
-            })
-            .collect();
+        Self::from_proto_request(proto_request)
+    }
+
+    /// Convert a proto AppendRequest into the internal representation.
+    fn from_proto_request(proto_request: proto::AppendRequest) -> Result<Self, Error> {
+        let mut records = Vec::with_capacity(proto_request.records.len());
+        for (i, r) in proto_request.records.into_iter().enumerate() {
+            let key = r
+                .key
+                .ok_or_else(|| Error::InvalidInput(format!("record[{}]: key is required", i)))?;
+            let value = r
+                .value
+                .ok_or_else(|| Error::InvalidInput(format!("record[{}]: value is required", i)))?;
+            records.push(crate::Record { key, value });
+        }
 
         Ok(Self {
             records,
@@ -224,10 +219,10 @@ mod tests {
 
     #[test]
     fn should_parse_append_request_from_json() {
-        // given - camelCase JSON with base64 encoded bytes wrapped in Key message
+        // given - camelCase JSON with base64 encoded bytes
         // "test-key" -> "dGVzdC1rZXk=", "test-value" -> "dGVzdC12YWx1ZQ=="
         let json = br#"{
-            "records": [{"key": {"value": "dGVzdC1rZXk="}, "value": "dGVzdC12YWx1ZQ=="}],
+            "records": [{"key": "dGVzdC1rZXk=", "value": "dGVzdC12YWx1ZQ=="}],
             "awaitDurable": true
         }"#;
 
@@ -246,7 +241,7 @@ mod tests {
         // given - awaitDurable defaults to false when not specified
         // "key" -> "a2V5", "value" -> "dmFsdWU="
         let json = br#"{
-            "records": [{"key": {"value": "a2V5"}, "value": "dmFsdWU="}]
+            "records": [{"key": "a2V5", "value": "dmFsdWU="}]
         }"#;
 
         // when
@@ -261,10 +256,8 @@ mod tests {
         // given
         let proto_request = proto::AppendRequest {
             records: vec![proto::Record {
-                key: Some(proto::Key {
-                    value: Bytes::from("proto-key"),
-                }),
-                value: Bytes::from("proto-value"),
+                key: Some(Bytes::from("proto-key")),
+                value: Some(Bytes::from("proto-value")),
             }],
             await_durable: true,
         };
@@ -278,6 +271,41 @@ mod tests {
         assert_eq!(request.records[0].key, Bytes::from("proto-key"));
         assert_eq!(request.records[0].value, Bytes::from("proto-value"));
         assert!(request.await_durable);
+    }
+
+    #[test]
+    fn should_return_error_for_missing_key() {
+        // given - record without key
+        let json = br#"{
+            "records": [{"value": "dmFsdWU="}]
+        }"#;
+
+        // when
+        let result = AppendRequest::from_body(&protojson_headers(), json);
+
+        // then
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("key is required"));
+    }
+
+    #[test]
+    fn should_return_error_for_missing_value() {
+        // given - record without value
+        let json = br#"{
+            "records": [{"key": "a2V5"}]
+        }"#;
+
+        // when
+        let result = AppendRequest::from_body(&protojson_headers(), json);
+
+        // then
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("value is required")
+        );
     }
 
     #[test]
