@@ -2,13 +2,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{FromRequest, Path, Query, State};
-use axum::http::{Method, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::{Method, StatusCode, Uri, header};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 #[cfg(feature = "remote-write")]
 use axum::routing::post;
 use axum::{Form, extract::Request};
 use axum::{Json, Router};
+use rust_embed::Embed;
 use tokio::signal;
 
 use super::config::PrometheusConfig;
@@ -25,6 +26,10 @@ use super::router::PromqlRouter;
 use super::scraper::Scraper;
 use crate::error::Error;
 use crate::tsdb::Tsdb;
+
+#[derive(Embed)]
+#[folder = "ui/"]
+struct UiAssets;
 
 /// Shared application state.
 #[derive(Clone)]
@@ -105,6 +110,11 @@ impl PromqlServer {
             "/api/v1/write",
             post(super::remote_write::handle_remote_write),
         );
+
+        let app = app
+            .route("/", get(handle_ui_redirect))
+            .route("/query", get(handle_ui_index))
+            .route("/{*path}", get(handle_ui));
 
         let app = app
             .layer(TracingLayer::new())
@@ -294,6 +304,206 @@ async fn handle_healthy() -> (StatusCode, &'static str) {
 async fn handle_ready(State(_state): State<AppState>) -> (StatusCode, &'static str) {
     // Service is ready if it's running (TSDB is initialized in AppState)
     (StatusCode::OK, "OK")
+}
+
+/// Redirect `/` to `/query`.
+async fn handle_ui_redirect(uri: Uri) -> Redirect {
+    // Preserve any query string from the original request
+    match uri.query() {
+        Some(q) => Redirect::permanent(&format!("/query?{}", q)),
+        None => Redirect::permanent("/query"),
+    }
+}
+
+/// Serve the UI index page at `/query`.
+async fn handle_ui_index() -> impl IntoResponse {
+    match UiAssets::get("index.html") {
+        Some(file) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            file.data.to_vec(),
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "UI not found").into_response(),
+    }
+}
+
+/// Serve UI static assets at `/{*path}`.
+async fn handle_ui(Path(path): Path<String>) -> impl IntoResponse {
+    match UiAssets::get(&path) {
+        Some(file) => {
+            let mime = mime_guess::from_path(&path)
+                .first_or_octet_stream()
+                .to_string();
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, mime)],
+                file.data.to_vec(),
+            )
+                .into_response()
+        }
+        None => match UiAssets::get("404.html") {
+            Some(page) => (
+                StatusCode::NOT_FOUND,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8".to_string())],
+                page.data.to_vec(),
+            )
+                .into_response(),
+            None => (StatusCode::NOT_FOUND, "Not found").into_response(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// Build a minimal router with just the UI and health routes (no AppState needed).
+    fn ui_router() -> Router {
+        Router::new()
+            .route("/-/healthy", get(handle_healthy))
+            .route("/api/v1/labels", get(|| async { "labels-api" }))
+            .route("/", get(handle_ui_redirect))
+            .route("/query", get(handle_ui_index))
+            .route("/{*path}", get(handle_ui))
+    }
+
+    #[tokio::test]
+    async fn should_redirect_root_to_query() {
+        // given
+        let app = ui_router();
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+
+        // when
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then
+        assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(resp.headers().get("location").unwrap(), "/query");
+    }
+
+    #[tokio::test]
+    async fn should_redirect_root_preserving_query_string() {
+        // given
+        let app = ui_router();
+        let req = Request::builder()
+            .uri("/?expr=up&tab=graph")
+            .body(Body::empty())
+            .unwrap();
+
+        // when
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then
+        assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            resp.headers().get("location").unwrap(),
+            "/query?expr=up&tab=graph"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_serve_index_html_at_query() {
+        // given
+        let app = ui_router();
+        let req = Request::builder()
+            .uri("/query")
+            .body(Body::empty())
+            .unwrap();
+
+        // when
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/html; charset=utf-8"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_serve_static_assets_with_correct_mime() {
+        // given
+        let app = ui_router();
+        let req = Request::builder()
+            .uri("/style.css")
+            .body(Body::empty())
+            .unwrap();
+
+        // when
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("css")
+        );
+    }
+
+    #[tokio::test]
+    async fn should_return_404_for_missing_assets() {
+        // given
+        let app = ui_router();
+        let req = Request::builder()
+            .uri("/does-not-exist.js")
+            .body(Body::empty())
+            .unwrap();
+
+        // when
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn should_not_intercept_api_routes() {
+        // given
+        let app = ui_router();
+        let req = Request::builder()
+            .uri("/api/v1/labels")
+            .body(Body::empty())
+            .unwrap();
+
+        // when
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then — should hit the stub API handler, not the UI wildcard
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, "labels-api");
+    }
+
+    #[tokio::test]
+    async fn should_not_intercept_health_routes() {
+        // given
+        let app = ui_router();
+        let req = Request::builder()
+            .uri("/-/healthy")
+            .body(Body::empty())
+            .unwrap();
+
+        // when
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, "OK");
+    }
 }
 
 /// Listen for SIGTERM (K8s pod termination) and SIGINT (Ctrl+C).
