@@ -112,7 +112,7 @@ pub fn create_centroid_entries(vectors: Vec<Vec<f32>>) -> Vec<CentroidEntry> {
     vectors
         .into_iter()
         .enumerate()
-        .map(|(i, vec)| CentroidEntry::new((i + 1) as u32, vec))
+        .map(|(i, vec)| CentroidEntry::new((i + 1) as u64, vec))
         .collect()
 }
 

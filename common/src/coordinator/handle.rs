@@ -1,4 +1,4 @@
-use super::WriteCommand;
+use super::{BroadcastedView, WriteCommand};
 use super::{Delta, Durability, WriteError, WriteResult};
 use crate::StorageRead;
 use crate::coordinator::traits::EpochStamped;
@@ -120,11 +120,20 @@ impl<M: Clone + Send + 'static> WriteHandle<M> {
 pub struct WriteCoordinatorHandle<D: Delta> {
     write_tx: mpsc::Sender<WriteCommand<D>>,
     watchers: EpochWatcher,
+    view: Arc<BroadcastedView<D>>,
 }
 
 impl<D: Delta> WriteCoordinatorHandle<D> {
-    pub(crate) fn new(write_tx: mpsc::Sender<WriteCommand<D>>, watchers: EpochWatcher) -> Self {
-        Self { write_tx, watchers }
+    pub(crate) fn new(
+        write_tx: mpsc::Sender<WriteCommand<D>>,
+        watchers: EpochWatcher,
+        view: Arc<BroadcastedView<D>>,
+    ) -> Self {
+        Self {
+            write_tx,
+            watchers,
+            view,
+        }
     }
 }
 
@@ -217,6 +226,14 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
 
         Ok(WriteHandle::new(rx, self.watchers.clone()))
     }
+
+    pub fn view(&self) -> Arc<View<D>> {
+        self.view.current()
+    }
+
+    pub fn subscribe(&self) -> (broadcast::Receiver<Arc<View<D>>>, Arc<View<D>>) {
+        self.view.subscribe()
+    }
 }
 
 impl<D: Delta> Clone for WriteCoordinatorHandle<D> {
@@ -224,6 +241,7 @@ impl<D: Delta> Clone for WriteCoordinatorHandle<D> {
         Self {
             write_tx: self.write_tx.clone(),
             watchers: self.watchers.clone(),
+            view: self.view.clone(),
         }
     }
 }

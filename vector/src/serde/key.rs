@@ -119,10 +119,10 @@ impl CentroidChunkKey {
 
 /// PostingList key - maps centroid ID to vector IDs.
 ///
-/// Key layout: `[version | tag | centroid_id:u32-BE]` (6 bytes)
+/// Key layout: `[version | tag | centroid_id:u64-BE]` (10 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostingListKey {
-    pub centroid_id: u32,
+    pub centroid_id: u64,
 }
 
 impl RecordKey for PostingListKey {
@@ -130,25 +130,27 @@ impl RecordKey for PostingListKey {
 }
 
 impl PostingListKey {
-    pub fn new(centroid_id: u32) -> Self {
+    pub fn new(centroid_id: u64) -> Self {
         Self { centroid_id }
     }
 
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(6);
+        let mut buf = BytesMut::with_capacity(10);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
-        buf.put_u32(self.centroid_id); // Big-endian
+        buf.put_u64(self.centroid_id); // Big-endian
         buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 6 {
+        if buf.len() < 10 {
             return Err(EncodingError {
                 message: "Buffer too short for PostingListKey".to_string(),
             });
         }
         validate_key_prefix::<Self>(buf)?;
-        let centroid_id = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
+        let centroid_id = u64::from_be_bytes([
+            buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+        ]);
         Ok(PostingListKey { centroid_id })
     }
 
@@ -368,6 +370,44 @@ impl SeqBlockKey {
         }
         validate_key_prefix::<Self>(buf)?;
         Ok(SeqBlockKey)
+    }
+}
+
+/// CentroidStats key - per-centroid vector count for rebalance triggers.
+///
+/// Key layout: `[version | tag | centroid_id:u64-BE]` (10 bytes)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CentroidStatsKey {
+    pub centroid_id: u64,
+}
+
+impl RecordKey for CentroidStatsKey {
+    const RECORD_TYPE: RecordType = RecordType::CentroidStats;
+}
+
+impl CentroidStatsKey {
+    pub fn new(centroid_id: u64) -> Self {
+        Self { centroid_id }
+    }
+
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(10);
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
+        buf.put_u64(self.centroid_id); // Big-endian
+        buf.freeze()
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < 10 {
+            return Err(EncodingError {
+                message: "Buffer too short for CentroidStatsKey".to_string(),
+            });
+        }
+        validate_key_prefix::<Self>(buf)?;
+        let centroid_id = u64::from_be_bytes([
+            buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+        ]);
+        Ok(CentroidStatsKey { centroid_id })
     }
 }
 
@@ -637,6 +677,37 @@ mod tests {
         // then
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("Invalid record type"));
+    }
+
+    #[test]
+    fn should_encode_and_decode_centroid_stats_key() {
+        // given
+        let key = CentroidStatsKey::new(42);
+
+        // when
+        let encoded = key.encode();
+        let decoded = CentroidStatsKey::decode(&encoded).unwrap();
+
+        // then
+        assert_eq!(decoded, key);
+        assert_eq!(encoded.len(), 10);
+    }
+
+    #[test]
+    fn should_preserve_centroid_stats_key_ordering() {
+        // given
+        let key1 = CentroidStatsKey::new(1);
+        let key2 = CentroidStatsKey::new(2);
+        let key3 = CentroidStatsKey::new(u64::MAX);
+
+        // when
+        let encoded1 = key1.encode();
+        let encoded2 = key2.encode();
+        let encoded3 = key3.encode();
+
+        // then
+        assert!(encoded1 < encoded2);
+        assert!(encoded2 < encoded3);
     }
 
     #[test]
