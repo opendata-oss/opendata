@@ -458,7 +458,10 @@ impl LogDbBuilder {
         use crate::reader::LogReadInner;
         use crate::serde::SEQ_BLOCK_KEY;
 
-        let StorageBundle { storage, stat_registry } = create_storage(
+        let StorageBundle {
+            storage,
+            stat_registry,
+        } = create_storage(
             &self.config.storage,
             self.storage_runtime,
             StorageSemantics::new(),

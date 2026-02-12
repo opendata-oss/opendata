@@ -92,8 +92,8 @@ impl Metrics {
         let mut registry = Registry::default();
 
         // Register SlateDB metrics if available
-        let slatedb_metrics = stat_registry
-            .map(|sr| common::metrics::SlateDbMetrics::register(sr, &mut registry));
+        let slatedb_metrics =
+            stat_registry.map(|sr| common::metrics::SlateDbMetrics::register(sr, &mut registry));
 
         // Log append records counter
         let log_append_records_total = Counter::default();
@@ -179,14 +179,20 @@ impl Metrics {
     }
 }
 
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn should_create_default_metrics() {
-        // given/when
-        let metrics = Metrics::new(None);
+        // given/when — exercises the Default impl (delegates to new(None))
+        let metrics = Metrics::default();
 
         // then
         let encoded = metrics.encode();
@@ -200,8 +206,8 @@ mod tests {
     }
 
     // Note: SlateDB's StatRegistry::new() is pub(crate), so we can't construct
-    // one in tests outside slatedb. Integration testing with real SlateDB metrics
-    // is done via the http_api_formats integration tests with a real DB instance.
+    // one in unit tests outside slatedb. The http_api_formats integration tests
+    // cover SlateDB metrics by creating a real SlateDB-backed LogDb.
 
     #[test]
     fn should_convert_http_method_to_label() {

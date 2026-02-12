@@ -812,9 +812,36 @@ async fn test_slatedb_metrics_appear_on_metrics_endpoint() {
     );
 }
 
+/// Parse the value of a Prometheus metric line like "slatedb_db_write_ops 42".
+fn parse_metric_value(metrics_text: &str, metric_name: &str) -> i64 {
+    let line = metrics_text
+        .lines()
+        .find(|line| line.starts_with(&format!("{metric_name} ")))
+        .unwrap_or_else(|| panic!("{metric_name} metric line not found"));
+    line.split_whitespace()
+        .last()
+        .unwrap()
+        .parse()
+        .unwrap_or_else(|_| panic!("Failed to parse {metric_name} value"))
+}
+
 #[tokio::test]
 async fn test_slatedb_metrics_reflect_writes() {
     let app = setup_slatedb_test_app().await;
+
+    // Capture baseline write_ops before append (startup may already increment it)
+    let baseline_request = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let baseline_response = app.clone().oneshot(baseline_request).await.unwrap();
+    assert_eq!(baseline_response.status(), StatusCode::OK);
+    let baseline_body = axum::body::to_bytes(baseline_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let baseline_text = String::from_utf8(baseline_body.to_vec()).unwrap();
+    let baseline_write_ops = parse_metric_value(&baseline_text, "slatedb_db_write_ops");
 
     // Append some data via the HTTP API
     let key_b64 = STANDARD.encode("metrics-test-key");
@@ -833,7 +860,7 @@ async fn test_slatedb_metrics_reflect_writes() {
     let append_response = app.clone().oneshot(append_request).await.unwrap();
     assert_eq!(append_response.status(), StatusCode::OK);
 
-    // Now check /metrics — write_ops should be > 0
+    // Check /metrics — write_ops should have increased from the append
     let metrics_request = Request::builder()
         .method("GET")
         .uri("/metrics")
@@ -846,29 +873,12 @@ async fn test_slatedb_metrics_reflect_writes() {
         .await
         .unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
+    let write_ops_after = parse_metric_value(&text, "slatedb_db_write_ops");
 
-    // Verify the write_ops counter was incremented (SlateDB tracks this)
-    // The metric name is "db/write_ops" which becomes "slatedb_db_write_ops"
     assert!(
-        text.contains("slatedb_db_write_ops"),
-        "Expected slatedb_db_write_ops metric, got:\n{}",
-        &text[..text.len().min(1000)]
-    );
-
-    // Parse the write_ops value — it should be > 0 after our append
-    let write_ops_line = text
-        .lines()
-        .find(|line| line.starts_with("slatedb_db_write_ops "))
-        .expect("slatedb_db_write_ops metric line not found");
-    let write_ops_value: i64 = write_ops_line
-        .split_whitespace()
-        .last()
-        .unwrap()
-        .parse()
-        .expect("Failed to parse write_ops value");
-    assert!(
-        write_ops_value > 0,
-        "Expected write_ops > 0 after append, got {}",
-        write_ops_value
+        write_ops_after > baseline_write_ops,
+        "Expected write_ops to increase after append: baseline={}, after={}",
+        baseline_write_ops,
+        write_ops_after
     );
 }

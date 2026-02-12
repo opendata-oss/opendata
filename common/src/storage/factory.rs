@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use slatedb::config::Settings;
-use slatedb::stats::StatRegistry;
 use slatedb::object_store::{self, ObjectStore};
+use slatedb::stats::StatRegistry;
 use slatedb::{DbBuilder, DbReader};
 use tokio::runtime::Handle;
 

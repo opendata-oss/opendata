@@ -63,7 +63,10 @@ async fn main() {
         prometheus_config.storage
     );
     let merge_operator = Arc::new(OpenTsdbMergeOperator);
-    let StorageBundle { storage, stat_registry } = create_storage(
+    let StorageBundle {
+        storage,
+        stat_registry,
+    } = create_storage(
         &prometheus_config.storage,
         StorageRuntime::new(),
         StorageSemantics::new().with_merge_operator(merge_operator),
