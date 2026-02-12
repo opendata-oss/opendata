@@ -635,6 +635,9 @@ mod tests {
             dimensions: 3,
             distance_metric: DistanceMetric::Cosine,
             flush_interval: Duration::from_secs(60),
+            split_threshold_vectors: 10_000,
+            split_search_neighbourhood: 8,
+            chunk_target: 4096,
             metadata_fields: vec![
                 MetadataFieldSpec::new("category", FieldType::String, true),
                 MetadataFieldSpec::new("price", FieldType::Int64, true),
@@ -786,6 +789,9 @@ mod tests {
             dimensions,
             distance_metric: DistanceMetric::Cosine,
             flush_interval: Duration::from_secs(60),
+            split_threshold_vectors: 10_000,
+            split_search_neighbourhood: 8,
+            chunk_target: 4096,
             metadata_fields: vec![],
         }
     }
@@ -907,6 +913,9 @@ mod tests {
             dimensions: 3,
             distance_metric: DistanceMetric::L2,
             flush_interval: Duration::from_secs(60),
+            split_threshold_vectors: 10_000,
+            split_search_neighbourhood: 8,
+            chunk_target: 4096,
             metadata_fields: vec![],
         };
         let db = VectorDb::open(config).await.unwrap();
