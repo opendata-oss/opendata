@@ -9,6 +9,8 @@ use axum::Router;
 use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig};
 use common::{StorageConfig, StorageRuntime, StorageSemantics, create_storage};
 
+use common::Storage;
+
 use crate::model::Series;
 use crate::promql::metrics::Metrics;
 use crate::promql::server::build_router;
@@ -27,6 +29,7 @@ pub use crate::promql::response::{
 /// without the crate needing to expose `Tsdb` as a public type.
 pub struct TestTsdb {
     inner: Arc<Tsdb>,
+    storage: Arc<dyn Storage>,
 }
 
 impl TestTsdb {
@@ -58,7 +61,8 @@ pub async fn create_test_tsdb() -> TestTsdb {
     .await
     .unwrap();
     TestTsdb {
-        inner: Arc::new(Tsdb::new(storage)),
+        inner: Arc::new(Tsdb::new(storage.clone())),
+        storage,
     }
 }
 
@@ -66,5 +70,7 @@ pub async fn create_test_tsdb() -> TestTsdb {
 /// as [`crate::promql::server::PromqlServer::run()`] but without binding
 /// to a TCP port.
 pub fn build_app(tsdb: &TestTsdb) -> Router {
-    build_router(tsdb.inner.clone(), Arc::new(Metrics::new()))
+    let mut metrics = Metrics::new();
+    tsdb.storage.register_metrics(metrics.registry_mut());
+    build_router(tsdb.inner.clone(), Arc::new(metrics))
 }

@@ -370,3 +370,65 @@ async fn test_roundtrip() {
     // Value should be "42" (string representation)
     assert_eq!(results[0].value.1, "42");
 }
+
+// ---------------------------------------------------------------------------
+// SlateDB metrics
+// ---------------------------------------------------------------------------
+
+/// Parse the value of a Prometheus metric line like "slatedb_db_write_ops 42".
+fn parse_metric_value(metrics_text: &str, metric_name: &str) -> i64 {
+    let line = metrics_text
+        .lines()
+        .find(|line| line.starts_with(&format!("{metric_name} ")))
+        .unwrap_or_else(|| panic!("{metric_name} metric line not found"));
+    line.split_whitespace()
+        .last()
+        .unwrap()
+        .parse()
+        .unwrap_or_else(|_| panic!("Failed to parse {metric_name} value"))
+}
+
+#[tokio::test]
+async fn test_slatedb_metrics_appear_on_metrics_endpoint() {
+    let (app, _) = setup().await;
+    let req = Request::get("/metrics").body(Body::empty()).unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = body_string(resp).await;
+    assert!(
+        text.contains("slatedb_"),
+        "Expected slatedb_ prefixed metrics in output, got:\n{}",
+        &text[..text.len().min(500)]
+    );
+}
+
+#[tokio::test]
+async fn test_slatedb_metrics_reflect_writes() {
+    let (app, tsdb) = setup().await;
+
+    // Capture baseline write_ops before ingestion
+    let req = Request::get("/metrics").body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let baseline_text = body_string(resp).await;
+    let baseline_write_ops = parse_metric_value(&baseline_text, "slatedb_db_write_ops");
+
+    // Ingest data and flush to trigger SlateDB writes
+    ingest_test_data(&tsdb).await;
+
+    // Check that write_ops increased
+    let req = Request::get("/metrics").body(Body::empty()).unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = body_string(resp).await;
+    let write_ops_after = parse_metric_value(&text, "slatedb_db_write_ops");
+
+    assert!(
+        write_ops_after > baseline_write_ops,
+        "Expected write_ops to increase after ingestion: baseline={}, after={}",
+        baseline_write_ops,
+        write_ops_after
+    );
+}
