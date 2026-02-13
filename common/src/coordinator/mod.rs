@@ -2774,10 +2774,7 @@ mod tests {
         // then
         // make sure the data only contains keys from b (so a was never processed)
         let data = coordinator.view().current.data.lock().unwrap().clone();
-        let mut expected = (0..1000)
-            .into_iter()
-            .map(|i| format!("b{}", i))
-            .collect::<HashSet<_>>();
+        let mut expected = (0..1000).map(|i| format!("b{}", i)).collect::<HashSet<_>>();
         assert_eq!(data.keys().cloned().collect::<HashSet<_>>(), expected);
         pause_handle.unpause();
         // after resuming, wait for the data to include keys from a
