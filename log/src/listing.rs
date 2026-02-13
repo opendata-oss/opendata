@@ -7,8 +7,7 @@
 //! # Components
 //!
 //! - [`ListingReader`]: Read-only access to listing entries
-//! - [`ListingCache`]: In-memory cache for write-path delta building
-//! - [`ListingDelta`]: Delta representing listing state changes
+//! - [`ListingCache`]: In-memory cache for deduplicating listing entries on the write path
 //! - [`LogKeyIterator`]: Iterator over keys from listing entries
 
 use std::collections::BTreeSet;
@@ -20,7 +19,6 @@ use common::{Record, StorageRead};
 
 use crate::error::{Error, Result};
 use crate::model::SegmentId;
-use crate::segment::SegmentDelta;
 use crate::serde::{ListingEntryKey, ListingEntryValue};
 
 /// A key returned from the listing iterator.
@@ -91,35 +89,10 @@ impl LogKeyIterator {
     }
 }
 
-/// Delta representing listing state changes.
-///
-/// Produced by [`ListingCache::build_delta`] and consumed by [`ListingCache::apply_delta`].
-#[derive(Debug, Clone)]
-pub(crate) struct ListingDelta {
-    /// The segment ID these entries belong to.
-    segment_id: SegmentId,
-    /// Keys that are new to this segment.
-    new_keys: BTreeSet<Bytes>,
-}
-
 /// In-memory cache of keys seen in the current segment.
 ///
-/// Used to build deltas for listing entries during ingestion, avoiding
+/// Used to generate listing entry records during ingestion, avoiding
 /// duplicate writes for the same key within a segment.
-///
-/// # Usage
-///
-/// ```ignore
-/// let mut records = Vec::new();
-///
-/// // Build delta and add listing records
-/// let listing_delta = listing_cache.build_delta(&seg_delta, &keys, &mut records);
-///
-/// // ... write records to storage ...
-///
-/// // Apply delta to cache
-/// listing_cache.apply_delta(listing_delta);
-/// ```
 pub(crate) struct ListingCache {
     /// The segment ID this cache is tracking.
     current_segment_id: Option<SegmentId>,
@@ -136,60 +109,39 @@ impl ListingCache {
         }
     }
 
-    /// Builds a delta for the given keys.
+    /// Assigns listing entries for the given keys.
     ///
-    /// For each key that is new to the segment (not in cache and not seen
-    /// earlier in this batch), adds:
-    /// - The key to the returned delta
-    /// - A listing entry record to the records vec
+    /// For each key that is new to the segment (not already cached and not
+    /// a duplicate within this batch), appends a listing entry record to
+    /// `records` and updates the cache.
     ///
-    /// Does NOT update the cache - call `apply_delta()` after the storage
-    /// write succeeds.
-    pub(crate) fn build_delta(
-        &self,
-        seg_delta: &SegmentDelta,
+    /// If `segment_id` differs from the cached segment, the cache is reset.
+    pub(crate) fn assign_keys(
+        &mut self,
+        segment_id: SegmentId,
         keys: &[Bytes],
         records: &mut Vec<Record>,
-    ) -> ListingDelta {
-        let segment_id = seg_delta.segment().id();
-        let mut new_keys = BTreeSet::new();
+    ) {
+        if self.current_segment_id != Some(segment_id) {
+            self.keys.clear();
+            self.current_segment_id = Some(segment_id);
+        }
+
         let value = ListingEntryValue::new().serialize();
 
         for key in keys {
-            // Skip if already seen in this batch or cached
-            if new_keys.contains(key) || !self.is_new(segment_id, key) {
+            if self.keys.contains(key) {
                 continue;
             }
 
-            // Add listing entry record
             let storage_key = ListingEntryKey::new(segment_id, key.clone()).serialize();
             records.push(Record::new(storage_key, value.clone()));
-            new_keys.insert(key.clone());
-        }
-
-        ListingDelta {
-            segment_id,
-            new_keys,
-        }
-    }
-
-    /// Applies a delta to the cache, recording all new keys as seen.
-    ///
-    /// Call this after the storage write succeeds to update the cache
-    /// with the newly written keys.
-    ///
-    /// If the delta's segment differs from the cached segment, the cache
-    /// is reset before applying.
-    pub(crate) fn apply_delta(&mut self, delta: ListingDelta) {
-        if self.current_segment_id != Some(delta.segment_id) {
-            self.keys = delta.new_keys;
-            self.current_segment_id = Some(delta.segment_id);
-        } else {
-            self.keys.extend(delta.new_keys);
+            self.keys.insert(key.clone());
         }
     }
 
     /// Checks if a key is new for the given segment.
+    #[cfg(test)]
     fn is_new(&self, segment_id: SegmentId, key: &Bytes) -> bool {
         if self.current_segment_id != Some(segment_id) {
             return true;
@@ -201,17 +153,7 @@ impl ListingCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segment::LogSegment;
-    use crate::serde::SegmentMeta;
     use crate::storage::LogStorage;
-
-    fn test_segment(id: u32) -> LogSegment {
-        LogSegment::new(id, SegmentMeta::new(0, 0))
-    }
-
-    fn test_seg_delta(segment_id: u32) -> SegmentDelta {
-        SegmentDelta::new(test_segment(segment_id), false)
-    }
 
     mod log_key_iterator {
         use super::*;
@@ -362,49 +304,46 @@ mod tests {
         use super::*;
 
         #[test]
-        fn should_build_delta_with_new_keys() {
+        fn should_add_records_for_new_keys() {
             // given
-            let cache = ListingCache::new();
-            let seg_delta = test_seg_delta(0);
+            let mut cache = ListingCache::new();
             let keys = vec![Bytes::from("key1"), Bytes::from("key2")];
             let mut records = Vec::new();
 
             // when
-            let delta = cache.build_delta(&seg_delta, &keys, &mut records);
+            cache.assign_keys(0, &keys, &mut records);
 
             // then
-            assert_eq!(delta.new_keys.len(), 2);
             assert_eq!(records.len(), 2);
         }
 
         #[test]
-        fn should_exclude_cached_keys_from_delta() {
+        fn should_exclude_cached_keys() {
             // given
             let mut cache = ListingCache::new();
-            let seg_delta = test_seg_delta(0);
-            let keys1 = vec![Bytes::from("key1"), Bytes::from("key2")];
             let mut records1 = Vec::new();
-
-            // First batch
-            let delta1 = cache.build_delta(&seg_delta, &keys1, &mut records1);
-            cache.apply_delta(delta1);
+            cache.assign_keys(
+                0,
+                &[Bytes::from("key1"), Bytes::from("key2")],
+                &mut records1,
+            );
 
             // when - second batch with overlap
-            let keys2 = vec![Bytes::from("key2"), Bytes::from("key3")];
             let mut records2 = Vec::new();
-            let delta2 = cache.build_delta(&seg_delta, &keys2, &mut records2);
+            cache.assign_keys(
+                0,
+                &[Bytes::from("key2"), Bytes::from("key3")],
+                &mut records2,
+            );
 
             // then - only key3 is new
-            assert_eq!(delta2.new_keys.len(), 1);
-            assert!(delta2.new_keys.contains(&Bytes::from("key3")));
             assert_eq!(records2.len(), 1);
         }
 
         #[test]
         fn should_dedupe_keys_within_batch() {
             // given
-            let cache = ListingCache::new();
-            let seg_delta = test_seg_delta(0);
+            let mut cache = ListingCache::new();
             let keys = vec![
                 Bytes::from("key1"),
                 Bytes::from("key2"),
@@ -413,10 +352,9 @@ mod tests {
             let mut records = Vec::new();
 
             // when
-            let delta = cache.build_delta(&seg_delta, &keys, &mut records);
+            cache.assign_keys(0, &keys, &mut records);
 
             // then
-            assert_eq!(delta.new_keys.len(), 2);
             assert_eq!(records.len(), 2);
         }
 
@@ -425,37 +363,27 @@ mod tests {
             // given
             let mut cache = ListingCache::new();
             let keys = vec![Bytes::from("key1"), Bytes::from("key2")];
-
-            // First segment
-            let seg_delta0 = test_seg_delta(0);
             let mut records0 = Vec::new();
-            let delta0 = cache.build_delta(&seg_delta0, &keys, &mut records0);
-            cache.apply_delta(delta0);
+            cache.assign_keys(0, &keys, &mut records0);
 
             // when - new segment with same keys
-            let seg_delta1 = test_seg_delta(1);
             let mut records1 = Vec::new();
-            let delta1 = cache.build_delta(&seg_delta1, &keys, &mut records1);
+            cache.assign_keys(1, &keys, &mut records1);
 
             // then - all keys are new in new segment
-            assert_eq!(delta1.new_keys.len(), 2);
             assert_eq!(records1.len(), 2);
         }
 
         #[test]
-        fn should_clear_cache_when_applying_delta_for_new_segment() {
+        fn should_clear_cache_when_segment_changes() {
             // given
             let mut cache = ListingCache::new();
-            let seg_delta0 = test_seg_delta(0);
             let mut records0 = Vec::new();
-            let delta0 = cache.build_delta(&seg_delta0, &[Bytes::from("key1")], &mut records0);
-            cache.apply_delta(delta0);
+            cache.assign_keys(0, &[Bytes::from("key1")], &mut records0);
 
-            // when - apply delta for different segment
-            let seg_delta1 = test_seg_delta(1);
+            // when - different segment
             let mut records1 = Vec::new();
-            let delta1 = cache.build_delta(&seg_delta1, &[Bytes::from("key2")], &mut records1);
-            cache.apply_delta(delta1);
+            cache.assign_keys(1, &[Bytes::from("key2")], &mut records1);
 
             // then - key1 should be new again (cache cleared)
             assert!(cache.is_new(1, &Bytes::from("key1")));
@@ -466,13 +394,12 @@ mod tests {
         #[test]
         fn should_create_correct_listing_entry_records() {
             // given
-            let cache = ListingCache::new();
-            let seg_delta = test_seg_delta(42);
+            let mut cache = ListingCache::new();
             let keys = vec![Bytes::from("mykey")];
             let mut records = Vec::new();
 
             // when
-            cache.build_delta(&seg_delta, &keys, &mut records);
+            cache.assign_keys(42, &keys, &mut records);
 
             // then
             assert_eq!(records.len(), 1);

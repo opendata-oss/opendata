@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <title>OpenData Timeseries</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="uPlot.min.css">
+</head>
+<body>
+  <nav class="navbar">
+    <div class="navbar-left">
+      <img src="logo.svg" alt="OpenData" class="navbar-logo">
+    </div>
+    <a href="/query" class="navbar-link active">query</a>
+  </nav>
+
+  <div class="container">
+    <div class="query-bar">
+      <div class="query-input-wrap">
+        <span class="query-prompt">&gt;_</span>
+        <input type="text" id="expr" placeholder="Expression (e.g. up, rate(http_requests_total[5m]))" autocomplete="off">
+      </div>
+      <button id="execute-btn" class="btn-execute" title="Execute query (Ctrl+Enter)">Execute</button>
+    </div>
+
+    <div id="error-display" class="error-display" style="display:none"></div>
+    <div id="loading" class="loading" style="display:none">Loading...</div>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="table">Table</button>
+      <button class="tab" data-tab="graph">Graph</button>
+    </div>
+
+    <div id="panel-table" class="panel">
+      <div class="graph-controls">
+        <label>Evaluation time:
+          <input type="datetime-local" id="eval-time" step="1">
+        </label>
+      </div>
+      <div id="table-output"></div>
+    </div>
+
+    <div id="panel-graph" class="panel" style="display:none">
+      <div class="graph-controls">
+        <label>End:
+          <input type="datetime-local" id="end-time" step="1">
+        </label>
+        <label>Duration:
+          <select id="range-duration">
+            <option value="300">5m</option>
+            <option value="900">15m</option>
+            <option value="1800">30m</option>
+            <option value="3600" selected>1h</option>
+            <option value="7200">2h</option>
+            <option value="21600">6h</option>
+            <option value="43200">12h</option>
+            <option value="86400">1d</option>
+            <option value="172800">2d</option>
+            <option value="604800">7d</option>
+          </select>
+        </label>
+        <label>Step:
+          <input type="text" id="step-input" value="15s" size="6">
+        </label>
+      </div>
+      <div id="graph-output"></div>
+      <div id="graph-hover-table"></div>
+    </div>
+  </div>
+
+  <script src="uPlot.iife.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

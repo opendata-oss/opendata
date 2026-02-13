@@ -58,39 +58,18 @@ impl From<LogSegment> for Segment {
     }
 }
 
-/// Delta representing segment state changes.
-///
-/// Produced by [`SegmentCache::build_delta`] and consumed by [`SegmentCache::apply_delta`].
+/// Result of assigning a segment for a write batch.
 #[derive(Debug, Clone)]
-pub(crate) struct SegmentDelta {
+pub(crate) struct SegmentAssignment {
     /// The segment for this write.
-    segment: LogSegment,
+    pub(crate) segment: LogSegment,
     /// Whether this is a newly created segment.
-    is_new: bool,
-}
-
-impl SegmentDelta {
-    /// Creates a new segment delta.
-    pub(crate) fn new(segment: LogSegment, is_new: bool) -> Self {
-        Self { segment, is_new }
-    }
-
-    /// Returns the segment.
-    pub(crate) fn segment(&self) -> &LogSegment {
-        &self.segment
-    }
-
-    /// Returns whether this is a newly created segment.
-    pub(crate) fn is_new(&self) -> bool {
-        self.is_new
-    }
+    pub(crate) is_new: bool,
 }
 
 /// In-memory cache of segments loaded from storage.
 ///
 /// Provides fast access to segment metadata without repeated storage reads.
-/// Also implements the delta pattern for batched writes via `build_delta`
-/// and `apply_delta`.
 ///
 /// Keyed by `start_seq` to optimize `find_covering` queries.
 #[derive(Clone)]
@@ -196,30 +175,21 @@ impl SegmentCache {
         Ok(())
     }
 
-    /// Builds a delta for segment state, adding a segment record if needed.
+    /// Assigns a segment for a write batch.
     ///
     /// Determines whether to use an existing segment or create a new one based on
-    /// the seal interval configuration. If a new segment is needed, adds the segment
-    /// metadata record to `records`.
-    ///
-    /// Does NOT update the cache - call `apply_delta()` after the storage write succeeds.
-    ///
-    /// # Parameters
-    /// - `current_time_ms`: Current wall-clock time in milliseconds since Unix epoch
-    /// - `start_seq`: The starting sequence number for a new segment if one is created
-    /// - `records`: Mutable vec to append the segment meta record to (if new segment)
-    ///
-    /// # Returns
-    /// A `SegmentDelta` containing the segment to use and whether it's new.
-    pub(crate) fn build_delta(
-        &self,
+    /// the seal interval and `force_seal`. If a new segment is created, its metadata
+    /// record is appended to `records` and the cache is updated.
+    pub(crate) fn assign_segment(
+        &mut self,
         current_time_ms: i64,
         start_seq: u64,
         records: &mut Vec<Record>,
-    ) -> SegmentDelta {
+        force_seal: bool,
+    ) -> SegmentAssignment {
         let latest = self.latest();
-        let needs_new_segment =
-            Self::should_roll(self.config.seal_interval, current_time_ms, latest.as_ref());
+        let needs_new_segment = force_seal
+            || Self::should_roll(self.config.seal_interval, current_time_ms, latest.as_ref());
 
         if needs_new_segment {
             let segment_id = latest.map(|s| s.id + 1).unwrap_or(0);
@@ -229,21 +199,17 @@ impl SegmentCache {
             records.push(Record::new(key, value));
 
             let segment = LogSegment::new(segment_id, meta);
-            SegmentDelta::new(segment, true)
+            self.insert(segment.clone());
+            SegmentAssignment {
+                segment,
+                is_new: true,
+            }
         } else {
             // Safe to unwrap: should_roll returns true if latest is None
-            let segment = latest.unwrap();
-            SegmentDelta::new(segment, false)
-        }
-    }
-
-    /// Applies a delta to update the segment cache.
-    ///
-    /// Call this after the storage write succeeds. Only updates the cache
-    /// if the delta indicates a new segment was created.
-    pub(crate) fn apply_delta(&mut self, delta: SegmentDelta) {
-        if delta.is_new {
-            self.insert(delta.segment);
+            SegmentAssignment {
+                segment: latest.unwrap(),
+                is_new: false,
+            }
         }
     }
 
@@ -645,27 +611,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_delta_creates_first_segment_when_none_exist() {
+    async fn assign_segment_creates_first_segment_when_none_exist() {
         // given
         let storage = LogStorage::in_memory();
-        let cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
         let mut records = Vec::new();
 
         // when
-        let delta = cache.build_delta(1000, 0, &mut records);
+        let assignment = cache.assign_segment(1000, 0, &mut records, false);
 
         // then
-        assert!(delta.is_new());
-        assert_eq!(delta.segment().id(), 0);
-        assert_eq!(delta.segment().meta().start_seq, 0);
-        assert_eq!(delta.segment().meta().start_time_ms, 1000);
+        assert!(assignment.is_new);
+        assert_eq!(assignment.segment.id(), 0);
+        assert_eq!(assignment.segment.meta().start_seq, 0);
+        assert_eq!(assignment.segment.meta().start_time_ms, 1000);
         assert_eq!(records.len(), 1); // segment meta record added
+        // cache is updated
+        assert_eq!(cache.latest().unwrap().id(), 0);
     }
 
     #[tokio::test]
-    async fn build_delta_returns_existing_segment_when_within_interval() {
+    async fn assign_segment_returns_existing_segment_when_within_interval() {
         // given: segment exists, within seal interval
         let storage = LogStorage::in_memory();
         let config = SegmentConfig {
@@ -679,16 +647,18 @@ mod tests {
 
         // when: request 30 minutes later
         let current_time_ms = 1000 + 30 * 60 * 1000;
-        let delta = cache.build_delta(current_time_ms, 100, &mut records);
+        let assignment = cache.assign_segment(current_time_ms, 100, &mut records, false);
 
         // then: returns existing segment, no new record
-        assert!(!delta.is_new());
-        assert_eq!(delta.segment().id(), 0);
+        assert!(!assignment.is_new);
+        assert_eq!(assignment.segment.id(), 0);
         assert_eq!(records.len(), 0);
+        // still only one segment in cache
+        assert_eq!(cache.all().len(), 1);
     }
 
     #[tokio::test]
-    async fn build_delta_creates_new_segment_when_interval_exceeded() {
+    async fn assign_segment_creates_new_segment_when_interval_exceeded() {
         // given: segment at time 1000, seal interval 1 hour
         let storage = LogStorage::in_memory();
         let config = SegmentConfig {
@@ -702,90 +672,56 @@ mod tests {
 
         // when: request 2 hours later
         let current_time_ms = 1000 + 2 * 60 * 60 * 1000;
-        let delta = cache.build_delta(current_time_ms, 100, &mut records);
+        let assignment = cache.assign_segment(current_time_ms, 100, &mut records, false);
 
-        // then: creates new segment
-        assert!(delta.is_new());
-        assert_eq!(delta.segment().id(), 1);
-        assert_eq!(delta.segment().meta().start_seq, 100);
+        // then: creates new segment and updates cache
+        assert!(assignment.is_new);
+        assert_eq!(assignment.segment.id(), 1);
+        assert_eq!(assignment.segment.meta().start_seq, 100);
         assert_eq!(records.len(), 1);
+        assert_eq!(cache.all().len(), 2);
     }
 
     #[tokio::test]
-    async fn build_delta_does_not_update_cache() {
-        // given
+    async fn assign_segment_force_seal_creates_new_segment() {
+        // given: segment exists, within seal interval
         let storage = LogStorage::in_memory();
-        let cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
-            .await
-            .unwrap();
-        let mut records = Vec::new();
-
-        // when
-        let _delta = cache.build_delta(1000, 0, &mut records);
-
-        // then: cache is not updated
-        assert!(cache.latest().is_none());
-    }
-
-    #[tokio::test]
-    async fn apply_delta_updates_cache_for_new_segment() {
-        // given
-        let storage = LogStorage::in_memory();
-        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
-            .await
-            .unwrap();
-        let mut records = Vec::new();
-        let delta = cache.build_delta(1000, 0, &mut records);
-
-        // when
-        cache.apply_delta(delta);
-
-        // then: cache is updated
-        let latest = cache.latest().unwrap();
-        assert_eq!(latest.id(), 0);
-        assert_eq!(latest.meta().start_seq, 0);
-    }
-
-    #[tokio::test]
-    async fn apply_delta_is_noop_for_existing_segment() {
-        // given: segment exists
-        let storage = LogStorage::in_memory();
-        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let config = SegmentConfig {
+            seal_interval: Some(Duration::from_secs(3600)),
+        };
+        let mut cache = SegmentCache::open(&storage.as_read(), config)
             .await
             .unwrap();
         write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
         let mut records = Vec::new();
 
-        // when: build delta returns existing segment
-        let delta = cache.build_delta(2000, 100, &mut records);
-        assert!(!delta.is_new());
+        // when: force_seal overrides interval check
+        let current_time_ms = 1000 + 30 * 60 * 1000;
+        let assignment = cache.assign_segment(current_time_ms, 100, &mut records, true);
 
-        // apply should be a no-op
-        cache.apply_delta(delta);
-
-        // then: still only one segment
-        let all = cache.all();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].id(), 0);
+        // then: new segment created despite being within interval
+        assert!(assignment.is_new);
+        assert_eq!(assignment.segment.id(), 1);
+        assert_eq!(cache.all().len(), 2);
     }
 
     #[tokio::test]
-    async fn build_delta_creates_correct_segment_meta_record() {
+    async fn assign_segment_creates_correct_segment_meta_record() {
         // given
         let storage = LogStorage::in_memory();
-        let cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
         let mut records = Vec::new();
 
         // when
-        let delta = cache.build_delta(5000, 42, &mut records);
+        let assignment = cache.assign_segment(5000, 42, &mut records, false);
 
         // then: verify the record can be deserialized
         assert_eq!(records.len(), 1);
         let key = SegmentMetaKey::deserialize(&records[0].key).unwrap();
         let meta = SegmentMeta::deserialize(&records[0].value).unwrap();
-        assert_eq!(key.segment_id, delta.segment().id());
+        assert_eq!(key.segment_id, assignment.segment.id());
         assert_eq!(meta.start_seq, 42);
         assert_eq!(meta.start_time_ms, 5000);
     }

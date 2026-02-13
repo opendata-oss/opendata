@@ -216,14 +216,18 @@ impl LogDb {
             _ => unreachable!(),
         })?;
 
-        write_handle
+        let output = write_handle
             .wait(Durability::Applied)
             .await
             .map_err(|e| match e {
                 WriteError::Shutdown => AppendError::Shutdown,
                 WriteError::ApplyError(_, msg) => AppendError::InvalidRecord(msg),
                 _ => unreachable!(),
-            })
+            })?;
+
+        // Safe to unwrap: append_inner is only called with non-empty records,
+        // and Delta::apply returns Some for non-empty writes.
+        Ok(output.expect("non-empty append must produce output"))
     }
 
     /// Returns the current time in milliseconds since Unix epoch.

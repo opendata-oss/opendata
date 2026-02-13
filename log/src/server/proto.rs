@@ -13,7 +13,7 @@ use serde_with::{base64::Base64, serde_as};
 pub struct Key {
     #[prost(bytes = "bytes", tag = "1")]
     #[serde_as(as = "Base64")]
-    pub value: bytes::Bytes,
+    pub key: bytes::Bytes,
 }
 
 /// AppendRequest is the request body for POST /api/v1/log/append.
@@ -32,11 +32,12 @@ pub struct AppendRequest {
 #[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Record {
-    #[prost(message, optional, tag = "1")]
-    pub key: Option<Key>,
-    #[prost(bytes = "bytes", tag = "2")]
-    #[serde_as(as = "Base64")]
-    pub value: bytes::Bytes,
+    #[prost(bytes = "bytes", optional, tag = "1")]
+    #[serde_as(as = "Option<Base64>")]
+    pub key: Option<bytes::Bytes>,
+    #[prost(bytes = "bytes", optional, tag = "2")]
+    #[serde_as(as = "Option<Base64>")]
+    pub value: Option<bytes::Bytes>,
 }
 
 /// AppendResponse is the response for POST /api/v1/log/append.
@@ -63,13 +64,15 @@ impl AppendResponse {
 }
 
 /// ScanResponse is the response for GET /api/v1/log/scan.
+#[serde_as]
 #[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanResponse {
     #[prost(string, tag = "1")]
     pub status: String,
-    #[prost(message, optional, tag = "2")]
-    pub key: Option<Key>,
+    #[prost(bytes = "bytes", optional, tag = "2")]
+    #[serde_as(as = "Option<Base64>")]
+    pub key: Option<bytes::Bytes>,
     #[prost(message, repeated, tag = "3")]
     pub values: Vec<Value>,
 }
@@ -79,7 +82,7 @@ impl ScanResponse {
     pub fn success(key: bytes::Bytes, values: Vec<Value>) -> Self {
         Self {
             status: "success".to_string(),
-            key: Some(Key { value: key }),
+            key: Some(key),
             values,
         }
     }
@@ -144,7 +147,7 @@ impl KeysResponse {
     pub fn success(keys: Vec<bytes::Bytes>) -> Self {
         Self {
             status: "success".to_string(),
-            keys: keys.into_iter().map(|k| Key { value: k }).collect(),
+            keys: keys.into_iter().map(|k| Key { key: k }).collect(),
         }
     }
 }
@@ -188,10 +191,8 @@ mod tests {
         // given
         let request = AppendRequest {
             records: vec![Record {
-                key: Some(Key {
-                    value: bytes::Bytes::from("test-key"),
-                }),
-                value: bytes::Bytes::from("test-value"),
+                key: Some(bytes::Bytes::from("test-key")),
+                value: Some(bytes::Bytes::from("test-value")),
             }],
             await_durable: true,
         };
@@ -203,10 +204,13 @@ mod tests {
         // then
         assert_eq!(decoded.records.len(), 1);
         assert_eq!(
-            decoded.records[0].key.as_ref().unwrap().value,
+            *decoded.records[0].key.as_ref().unwrap(),
             bytes::Bytes::from("test-key")
         );
-        assert_eq!(decoded.records[0].value, bytes::Bytes::from("test-value"));
+        assert_eq!(
+            *decoded.records[0].value.as_ref().unwrap(),
+            bytes::Bytes::from("test-value")
+        );
         assert!(decoded.await_durable);
     }
 
@@ -234,9 +238,7 @@ mod tests {
         // given
         let response = ScanResponse {
             status: "success".to_string(),
-            key: Some(Key {
-                value: bytes::Bytes::from("my-key"),
-            }),
+            key: Some(bytes::Bytes::from("my-key")),
             values: vec![Value {
                 sequence: 10,
                 value: bytes::Bytes::from("my-value"),
@@ -249,10 +251,7 @@ mod tests {
 
         // then
         assert_eq!(decoded.status, "success");
-        assert_eq!(
-            decoded.key.as_ref().unwrap().value,
-            bytes::Bytes::from("my-key")
-        );
+        assert_eq!(*decoded.key.as_ref().unwrap(), bytes::Bytes::from("my-key"));
         assert_eq!(decoded.values.len(), 1);
         assert_eq!(decoded.values[0].sequence, 10);
         assert_eq!(decoded.values[0].value, bytes::Bytes::from("my-value"));
@@ -265,10 +264,10 @@ mod tests {
             status: "success".to_string(),
             keys: vec![
                 Key {
-                    value: bytes::Bytes::from("key-a"),
+                    key: bytes::Bytes::from("key-a"),
                 },
                 Key {
-                    value: bytes::Bytes::from("key-b"),
+                    key: bytes::Bytes::from("key-b"),
                 },
             ],
         };
@@ -280,8 +279,8 @@ mod tests {
         // then
         assert_eq!(decoded.status, "success");
         assert_eq!(decoded.keys.len(), 2);
-        assert_eq!(decoded.keys[0].value, bytes::Bytes::from("key-a"));
-        assert_eq!(decoded.keys[1].value, bytes::Bytes::from("key-b"));
+        assert_eq!(decoded.keys[0].key, bytes::Bytes::from("key-a"));
+        assert_eq!(decoded.keys[1].key, bytes::Bytes::from("key-b"));
     }
 
     #[test]
