@@ -30,7 +30,7 @@ clap.workspace = true
 config.workspace = true
 dashmap.workspace = true
 moka.workspace = true
-common.workspace = true
+common = { workspace = true, features = ["metrics"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -112,6 +112,12 @@ impl LogDb {
         LogDbBuilder::new(config).build().await
     }
 
+    /// Registers storage engine metrics into the given Prometheus registry.
+    #[cfg(feature = "http-server")]
+    pub fn register_metrics(&self, registry: &mut prometheus_client::registry::Registry) {
+        self.storage.register_metrics(registry);
+    }
+
     /// Appends records to the log without blocking.
     ///
     /// Records are assigned sequence numbers in the order they appear in the
