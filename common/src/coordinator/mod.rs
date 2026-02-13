@@ -2,6 +2,7 @@
 
 mod error;
 mod handle;
+pub mod subscriber;
 mod traits;
 
 use std::collections::HashMap;
@@ -11,6 +12,7 @@ use std::ops::{Deref, DerefMut};
 pub use error::{WriteError, WriteResult};
 use futures::stream::{self, SelectAll, StreamExt};
 pub use handle::{View, WriteCoordinatorHandle, WriteHandle};
+pub use subscriber::{SubscribeError, ViewMonitor, ViewSubscriber};
 pub use traits::{Delta, Durability, Flusher};
 
 /// Event sent from the write coordinator task to the flush task.
@@ -165,8 +167,9 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         self.view.current()
     }
 
-    pub fn subscribe(&self) -> (broadcast::Receiver<Arc<View<D>>>, Arc<View<D>>) {
-        self.view.subscribe()
+    pub fn subscribe(&self) -> (ViewSubscriber<D>, ViewMonitor) {
+        let (view_rx, initial_view) = self.view.subscribe();
+        ViewSubscriber::new(view_rx, initial_view)
     }
 }
 
@@ -470,14 +473,14 @@ impl<D: Delta> CurrentDelta<D> {
     }
 }
 
-struct EpochWatermarks {
+pub(crate) struct EpochWatermarks {
     applied_tx: tokio::sync::watch::Sender<u64>,
     flushed_tx: tokio::sync::watch::Sender<u64>,
     durable_tx: tokio::sync::watch::Sender<u64>,
 }
 
 impl EpochWatermarks {
-    fn new() -> (Self, EpochWatcher) {
+    pub(crate) fn new() -> (Self, EpochWatcher) {
         let (applied_tx, applied_rx) = tokio::sync::watch::channel(0);
         let (flushed_tx, flushed_rx) = tokio::sync::watch::channel(0);
         let (durable_tx, durable_rx) = tokio::sync::watch::channel(0);
@@ -494,15 +497,15 @@ impl EpochWatermarks {
         (watermarks, watcher)
     }
 
-    fn update_applied(&self, epoch: u64) {
+    pub(crate) fn update_applied(&self, epoch: u64) {
         let _ = self.applied_tx.send(epoch);
     }
 
-    fn update_flushed(&self, epoch: u64) {
+    pub(crate) fn update_flushed(&self, epoch: u64) {
         let _ = self.flushed_tx.send(epoch);
     }
 
-    fn update_durable(&self, epoch: u64) {
+    pub(crate) fn update_durable(&self, epoch: u64) {
         let _ = self.durable_tx.send(epoch);
     }
 }
@@ -2009,6 +2012,7 @@ mod tests {
         );
         let handle = coordinator.handle("default");
         let (mut subscriber, _) = coordinator.subscribe();
+        subscriber.initialize();
         coordinator.start();
 
         // when
@@ -2043,6 +2047,7 @@ mod tests {
         );
         let handle = coordinator.handle("default");
         let (mut subscriber, _) = coordinator.subscribe();
+        subscriber.initialize();
         coordinator.start();
 
         // when
@@ -2081,6 +2086,7 @@ mod tests {
         );
         let handle = coordinator.handle("default");
         let (mut subscriber, _) = coordinator.subscribe();
+        subscriber.initialize();
         coordinator.start();
 
         // when
@@ -2120,6 +2126,7 @@ mod tests {
         );
         let handle = coordinator.handle("default");
         let (mut subscriber, _) = coordinator.subscribe();
+        subscriber.initialize();
         coordinator.start();
 
         // when
@@ -2172,6 +2179,7 @@ mod tests {
         );
         let handle = coordinator.handle("default");
         let (mut subscriber, _) = coordinator.subscribe();
+        subscriber.initialize();
         coordinator.start();
 
         // when
@@ -2207,6 +2215,7 @@ mod tests {
         );
         let handle = coordinator.handle("default");
         let (mut subscriber, _) = coordinator.subscribe();
+        subscriber.initialize();
         coordinator.start();
 
         // when

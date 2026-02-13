@@ -32,6 +32,7 @@ impl LogStorageRead {
     }
 
     /// Gets a single record by key.
+    #[cfg(any(test, feature = "http-server"))]
     pub(crate) async fn get(&self, key: Bytes) -> Result<Option<common::Record>> {
         self.storage
             .get(key)
@@ -162,6 +163,7 @@ impl LogStorage {
     }
 
     /// Returns a read-only view of this storage.
+    #[cfg(any(test, feature = "http-server"))]
     pub(crate) fn as_read(&self) -> LogStorageRead {
         LogStorageRead::new(Arc::clone(&self.storage) as Arc<dyn StorageRead>)
     }
