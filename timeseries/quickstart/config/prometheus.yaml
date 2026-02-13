@@ -40,7 +40,7 @@ storage:
   path: data
   object_store:
     type: Local
-    path: /app/data
+    path: ./data
 
 # Flush interval for persisting data
 flush_interval_secs: 30

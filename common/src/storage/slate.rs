@@ -12,6 +12,31 @@ use slatedb::{
     MergeOperatorError, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
 };
 
+/// Wraps a SlateDB `ReadableStat` as a Prometheus gauge.
+/// Reads the current value directly from the stat on each encode (scrape).
+///
+/// All stats are registered as gauges for now. Once
+/// https://github.com/slatedb/slatedb/pull/1283 lands, we can read the
+/// metric type from SlateDB and use the correct Prometheus type (counter
+/// vs gauge) for each stat.
+#[cfg(feature = "metrics")]
+#[derive(Debug)]
+struct ReadableStatGauge(Arc<dyn slatedb::stats::ReadableStat>);
+
+#[cfg(feature = "metrics")]
+impl prometheus_client::encoding::EncodeMetric for ReadableStatGauge {
+    fn encode(
+        &self,
+        mut encoder: prometheus_client::encoding::MetricEncoder,
+    ) -> Result<(), std::fmt::Error> {
+        encoder.encode_gauge(&self.0.get())
+    }
+
+    fn metric_type(&self) -> prometheus_client::metrics::MetricType {
+        prometheus_client::metrics::MetricType::Gauge
+    }
+}
+
 /// Adapter that wraps our `MergeOperator` trait to implement SlateDB's `MergeOperator` trait.
 ///
 /// This allows using our common merge operator interface with SlateDB's merge functionality.
@@ -249,6 +274,21 @@ impl Storage for SlateDbStorage {
     async fn close(&self) -> StorageResult<()> {
         self.db.close().await.map_err(StorageError::from_storage)?;
         Ok(())
+    }
+
+    #[cfg(feature = "metrics")]
+    fn register_metrics(&self, registry: &mut prometheus_client::registry::Registry) {
+        let stat_registry = self.db.metrics();
+        for name in stat_registry.names() {
+            if let Some(stat) = stat_registry.lookup(name) {
+                let prom_name = format!("slatedb_{}", name.replace('/', "_"));
+                registry.register(
+                    &prom_name,
+                    format!("SlateDB {name}"),
+                    ReadableStatGauge(stat),
+                );
+            }
+        }
     }
 }
 

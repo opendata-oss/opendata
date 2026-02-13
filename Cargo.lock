@@ -2400,6 +2400,7 @@ dependencies = [
  "bytes",
  "criterion",
  "futures",
+ "prometheus-client",
  "proptest",
  "serde",
  "serde_yaml",

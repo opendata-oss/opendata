@@ -237,6 +237,12 @@ impl LogStorage {
         self.storage.flush().await?;
         Ok(())
     }
+
+    /// Registers storage engine metrics into the given Prometheus registry.
+    #[cfg(feature = "http-server")]
+    pub(crate) fn register_metrics(&self, registry: &mut prometheus_client::registry::Registry) {
+        self.storage.register_metrics(registry);
+    }
 }
 
 #[cfg(test)]

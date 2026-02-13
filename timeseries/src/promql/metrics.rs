@@ -166,6 +166,11 @@ impl Metrics {
         }
     }
 
+    /// Returns a mutable reference to the underlying Prometheus registry.
+    pub fn registry_mut(&mut self) -> &mut Registry {
+        &mut self.registry
+    }
+
     /// Encode all metrics to Prometheus text format.
     pub fn encode(&self) -> String {
         let mut buffer = String::new();
