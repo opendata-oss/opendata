@@ -55,6 +55,9 @@ mod test_utils;
 mod tsdb;
 mod util;
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
 // Public API modules
 mod config;
 pub(crate) mod error;

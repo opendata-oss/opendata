@@ -19,6 +19,7 @@ path = "src/main.rs"
 
 [features]
 default = []
+testing = []
 remote-write = ["dep:prost", "dep:snap"]
 
 [dependencies]
