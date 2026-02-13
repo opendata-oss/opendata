@@ -30,8 +30,10 @@ impl LogServer {
 
     /// Run the HTTP server.
     pub async fn run(self) {
-        // Create metrics registry
-        let metrics = Arc::new(Metrics::new());
+        // Create metrics registry and register storage engine metrics
+        let mut metrics = Metrics::new();
+        self.log.register_metrics(metrics.registry_mut());
+        let metrics = Arc::new(metrics);
 
         // Create app state
         let state = AppState {

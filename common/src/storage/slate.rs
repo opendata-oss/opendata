@@ -12,6 +12,28 @@ use slatedb::{
     MergeOperatorError, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
 };
 
+/// Thin wrapper that exposes a SlateDB [`ReadableStat`] as a Prometheus gauge.
+///
+/// Instead of snapshotting stats into an intermediate representation and
+/// refreshing gauges, this reads the live atomic value on each encode/scrape.
+#[cfg(feature = "metrics")]
+#[derive(Debug)]
+struct ReadableStatGauge(std::sync::Arc<dyn slatedb::stats::ReadableStat>);
+
+#[cfg(feature = "metrics")]
+impl prometheus_client::encoding::EncodeMetric for ReadableStatGauge {
+    fn encode(
+        &self,
+        mut encoder: prometheus_client::encoding::MetricEncoder,
+    ) -> Result<(), std::fmt::Error> {
+        encoder.encode_gauge(&self.0.get())
+    }
+
+    fn metric_type(&self) -> prometheus_client::metrics::MetricType {
+        prometheus_client::metrics::MetricType::Gauge
+    }
+}
+
 /// Adapter that wraps our `MergeOperator` trait to implement SlateDB's `MergeOperator` trait.
 ///
 /// This allows using our common merge operator interface with SlateDB's merge functionality.
@@ -249,6 +271,38 @@ impl Storage for SlateDbStorage {
     async fn close(&self) -> StorageResult<()> {
         self.db.close().await.map_err(StorageError::from_storage)?;
         Ok(())
+    }
+
+    #[cfg(feature = "metrics")]
+    fn register_metrics(&self, registry: &mut prometheus_client::registry::Registry) {
+        let stat_registry = self.db.metrics();
+        let mut seen = std::collections::HashSet::new();
+        for name in stat_registry.names() {
+            if let Some(stat) = stat_registry.lookup(name) {
+                let sanitized: String = name
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '_' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                let prom_name = format!("slatedb_{sanitized}");
+                if !seen.insert(prom_name.clone()) {
+                    tracing::warn!(
+                        "Duplicate metric name after sanitization: {prom_name:?} (from {name:?}, skipped)"
+                    );
+                    continue;
+                }
+                registry.register(
+                    &prom_name,
+                    format!("SlateDB {name}"),
+                    ReadableStatGauge(stat),
+                );
+            }
+        }
     }
 }
 

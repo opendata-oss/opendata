@@ -9,9 +9,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-/// The current view of all applied writes. The view is made up a reader for
-/// the current delta, all frozen deltas awaiting flush, and the current
-/// storage snapshot. Readers use the view to query the written data.
+/// A point-in-time view of all applied writes, broadcast by the coordinator
+/// on freeze and flush events.
+///
+/// Each field corresponds to a stage in the write pipeline, ordered by
+/// increasing durability:
+///
+/// - `current` — the active delta, still accepting writes (Applied).
+/// - `frozen` — deltas that have been sealed but not yet flushed to storage
+///   (Applied, ordered newest-first).
+/// - `snapshot` — the storage snapshot, updated after each flush. Contains
+///   all data up through the most recently flushed delta.
+/// - `last_flushed_delta` — the most recently flushed delta (Flushed). Data
+///   has been written to storage but not necessarily synced to disk. A
+///   separate `FlushStorage` step advances the durable watermark.
 pub struct View<D: Delta> {
     pub current: D::DeltaView,
     pub frozen: Vec<EpochStamped<D::FrozenView>>,
@@ -88,7 +99,6 @@ impl<M: Clone + Send + 'static> WriteHandle<M> {
     /// Epochs are assigned when the coordinator dequeues the write, so this
     /// method blocks until sequencing completes. Epochs are monotonically
     /// increasing and reflect the actual write order.
-    #[cfg(test)]
     pub async fn epoch(&self) -> WriteResult<u64> {
         Ok(self.recv().await?.epoch)
     }
@@ -134,6 +144,14 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
             watchers,
             view,
         }
+    }
+
+    /// Returns the highest epoch that has been flushed to storage.
+    ///
+    /// This is a non-blocking snapshot of the current flushed watermark.
+    /// Returns 0 if no data has been flushed yet.
+    pub fn flushed_epoch(&self) -> u64 {
+        *self.watchers.flushed_rx.borrow()
     }
 }
 

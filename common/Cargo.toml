@@ -1,6 +1,6 @@
 [package]
 name = "opendata-common"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 description = "Shared storage foundation for OpenData databases"
 license = "MIT"
@@ -13,6 +13,10 @@ categories = ["database"]
 name = "common"
 path = "src/lib.rs"
 
+[features]
+default = []
+metrics = ["dep:prometheus-client"]
+
 [dependencies]
 slatedb.workspace = true
 bytes.workspace = true
@@ -23,6 +27,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 serde.workspace = true
+prometheus-client = { version = "0.22", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

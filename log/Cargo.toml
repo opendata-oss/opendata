@@ -1,6 +1,6 @@
 [package]
 name = "opendata-log"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 description = "Key-oriented log database built on SlateDB"
 license = "MIT"
@@ -20,7 +20,7 @@ required-features = ["http-server"]
 
 [features]
 default = []
-http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prometheus-client"]
+http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prometheus-client", "common/metrics"]
 
 [dependencies]
 async-trait.workspace = true

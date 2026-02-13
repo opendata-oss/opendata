@@ -15,9 +15,6 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use common::storage::factory::create_storage_read;
-use common::{StorageRead, StorageSemantics};
-
 use crate::config::{CountOptions, ReaderConfig, ScanOptions, SegmentConfig};
 use crate::error::{Error, Result};
 use crate::listing::LogKeyIterator;
@@ -25,6 +22,9 @@ use crate::model::{LogEntry, Segment, SegmentId, Sequence};
 use crate::range::{normalize_segment_id, normalize_sequence};
 use crate::segment::{LogSegment, SegmentCache};
 use crate::storage::{LogStorageRead, SegmentIterator};
+use common::storage::StorageSnapshot;
+use common::storage::factory::create_storage_read;
+use common::{StorageRead, StorageSemantics};
 
 /// Trait for read operations on the log.
 ///
@@ -217,15 +217,27 @@ pub trait LogRead {
 ///
 /// Contains the storage and segment cache needed for read operations.
 /// Wrapped in `Arc<RwLock<_>>` by both consumers.
-pub(crate) struct LogReadInner {
+pub(crate) struct LogReadView {
     pub(crate) storage: LogStorageRead,
     pub(crate) segments: SegmentCache,
 }
 
-impl LogReadInner {
-    /// Creates a new `LogReadInner`.
+impl LogReadView {
+    /// Creates a new `LogReadView`.
     pub(crate) fn new(storage: LogStorageRead, segments: SegmentCache) -> Self {
         Self { storage, segments }
+    }
+
+    /// Replaces the underlying storage snapshot with a new one.
+    pub(crate) fn update_snapshot(&mut self, snapshot: Arc<dyn StorageSnapshot>) {
+        self.storage = LogStorageRead::new(snapshot as Arc<dyn StorageRead>);
+    }
+
+    /// Inserts new segments into the segment cache.
+    pub(crate) fn apply_new_segments(&mut self, segments: &[LogSegment]) {
+        for segment in segments {
+            self.segments.insert(segment.clone());
+        }
     }
 
     /// Scans entries for a key within a sequence number range with custom options.
@@ -304,7 +316,7 @@ impl LogReadInner {
 /// }
 /// ```
 pub struct LogDbReader {
-    inner: Arc<RwLock<LogReadInner>>,
+    read_view: Arc<RwLock<LogReadView>>,
     shutdown_tx: watch::Sender<bool>,
     refresh_task: Option<JoinHandle<()>>,
 }
@@ -359,13 +371,13 @@ impl LogDbReader {
                 .map_err(|e| Error::Storage(e.to_string()))?;
         let log_storage = LogStorageRead::new(storage);
         let segments = SegmentCache::open(&log_storage, SegmentConfig::default()).await?;
-        let inner = Arc::new(RwLock::new(LogReadInner::new(log_storage, segments)));
+        let read_view = Arc::new(RwLock::new(LogReadView::new(log_storage, segments)));
 
         let (shutdown_tx, refresh_task) =
-            Self::spawn_refresh_task(Arc::clone(&inner), config.refresh_interval);
+            Self::spawn_refresh_task(Arc::clone(&read_view), config.refresh_interval);
 
         Ok(Self {
-            inner,
+            read_view,
             shutdown_tx,
             refresh_task: Some(refresh_task),
         })
@@ -373,7 +385,7 @@ impl LogDbReader {
 
     /// Spawns a background task that periodically refreshes the segment cache.
     fn spawn_refresh_task(
-        inner: Arc<RwLock<LogReadInner>>,
+        read_view: Arc<RwLock<LogReadView>>,
         interval: Duration,
     ) -> (watch::Sender<bool>, JoinHandle<()>) {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -387,14 +399,14 @@ impl LogDbReader {
                     _ = ticker.tick() => {
                         // Get the latest segment ID for incremental refresh
                         let after_segment_id = {
-                            let read_inner = inner.read().await;
-                            read_inner.segments.latest().map(|s| s.id())
+                            let view = read_view.read().await;
+                            view.segments.latest().map(|s| s.id())
                         };
 
                         // Refresh the cache
-                        let mut read_inner = inner.write().await;
-                        let storage = read_inner.storage.clone();
-                        if let Err(e) = read_inner.segments.refresh(&storage, after_segment_id).await {
+                        let mut view = read_view.write().await;
+                        let storage = view.storage.clone();
+                        if let Err(e) = view.segments.refresh(&storage, after_segment_id).await {
                             tracing::warn!("Failed to refresh segment cache: {}", e);
                         }
                     }
@@ -415,10 +427,10 @@ impl LogDbReader {
     pub(crate) async fn new(storage: Arc<dyn StorageRead>) -> Result<Self> {
         let log_storage = LogStorageRead::new(storage);
         let segments = SegmentCache::open(&log_storage, SegmentConfig::default()).await?;
-        let inner = Arc::new(RwLock::new(LogReadInner::new(log_storage, segments)));
+        let read_view = Arc::new(RwLock::new(LogReadView::new(log_storage, segments)));
         let (shutdown_tx, _) = watch::channel(false);
         Ok(Self {
-            inner,
+            read_view,
             shutdown_tx,
             refresh_task: None,
         })
@@ -451,8 +463,8 @@ impl LogRead for LogDbReader {
         options: ScanOptions,
     ) -> Result<LogIterator> {
         let seq_range = normalize_sequence(&seq_range);
-        let inner = self.inner.read().await;
-        Ok(inner.scan_with_options(key, seq_range, &options))
+        let view = self.read_view.read().await;
+        Ok(view.scan_with_options(key, seq_range, &options))
     }
 
     async fn count_with_options(
@@ -469,8 +481,8 @@ impl LogRead for LogDbReader {
         segment_range: impl RangeBounds<SegmentId> + Send,
     ) -> Result<LogKeyIterator> {
         let segment_range = normalize_segment_id(&segment_range);
-        let inner = self.inner.read().await;
-        inner.list_keys(segment_range).await
+        let view = self.read_view.read().await;
+        view.list_keys(segment_range).await
     }
 
     async fn list_segments(
@@ -478,8 +490,8 @@ impl LogRead for LogDbReader {
         seq_range: impl RangeBounds<Sequence> + Send,
     ) -> Result<Vec<Segment>> {
         let seq_range = normalize_sequence(&seq_range);
-        let inner = self.inner.read().await;
-        Ok(inner.list_segments(&seq_range))
+        let view = self.read_view.read().await;
+        Ok(view.list_segments(&seq_range))
     }
 }
 
