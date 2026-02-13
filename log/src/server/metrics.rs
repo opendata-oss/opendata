@@ -205,9 +205,24 @@ mod tests {
         assert!(encoded.contains("# HELP http_requests_in_flight"));
     }
 
-    // Note: SlateDB's StatRegistry::new() is pub(crate), so we can't construct
-    // one in unit tests outside slatedb. The http_api_formats integration tests
-    // cover SlateDB metrics by creating a real SlateDB-backed LogDb.
+    #[test]
+    fn should_create_metrics_with_storage_stats() {
+        // given — a mock StorageStats
+        struct FakeStats;
+        impl StorageStats for FakeStats {
+            fn snapshot(&self) -> Vec<(String, i64)> {
+                vec![("db_write_ops".to_string(), 5)]
+            }
+        }
+
+        // when
+        let stats: Arc<dyn StorageStats> = Arc::new(FakeStats);
+        let metrics = Metrics::new(Some(stats));
+
+        // then — storage metrics should appear in encoded output
+        let encoded = metrics.encode();
+        assert!(encoded.contains("slatedb_db_write_ops"));
+    }
 
     #[test]
     fn should_convert_http_method_to_label() {
