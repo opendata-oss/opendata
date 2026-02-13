@@ -63,7 +63,7 @@ This RFC uses the `AttributeValue` enum defined in RFC 0002, which includes a `V
 
 ```rust
 pub enum AttributeValue {
-    Vector(Vec<f32>),  // API-level only; stored in VectorData
+    Vector(Vec<f32>),
     String(String),
     Int64(i64),
     Float64(f64),
@@ -73,9 +73,7 @@ pub enum AttributeValue {
 
 The vector embedding is stored under the reserved field name `"vector"` in the fields HashMap,
 enabling a unified data model where all attributes (including the vector) can be queried and
-retrieved consistently. The Vector variant is first as it is the primary data in a vector
-database. At the storage layer, vectors are stored in VectorData records while other attributes
-are stored in VectorMeta records.
+retrieved consistently.
 
 ### VectorDbRead Trait
 
@@ -597,7 +595,7 @@ use std::collections::HashMap;
 ///
 /// Returned by `get()` operations.
 #[derive(Debug, Clone)]
-pub struct VectorRecord {
+pub struct Vector {
     /// External vector ID (user-provided)
     pub external_id: String,
 
@@ -618,9 +616,6 @@ pub struct VectorRecord {
 /// Returned by `search()` operations.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
-    /// Internal vector ID (system-assigned)
-    pub internal_id: u64,
-
     /// External vector ID (user-provided)
     pub external_id: String,
 
@@ -688,7 +683,7 @@ The `search()` operation implements the SPANN algorithm with metadata filtering:
    - Intersect filtered IDs with posting list candidates
 6. **Filter deleted vectors** using the deleted bitmap (centroid_id=0)
 7. **Load fields** for remaining candidates based on `include_fields`:
-   - `FieldSelection::All`: Load all fields from VectorData and VectorMeta
+   - `FieldSelection::All`: Load all fields from VectorData
    - `FieldSelection::None`: Skip loading fields entirely
    - `FieldSelection::Fields(names)`: Load only specified fields
 8. **Score candidates** using configured distance metric (L2, Cosine, or DotProduct)
@@ -726,7 +721,6 @@ The `get()` operation retrieves a single vector record by external ID:
 1. **Lookup internal ID** from `IdDictionary[external_id]`
 2. **Check deleted bitmap**: Return `None` if internal ID is in deleted set (centroid_id=0)
 3. **Load vector data** from `VectorData[internal_id]`
-4. **Load metadata** from `VectorMeta[internal_id]`
 5. **Construct VectorRecord** with external_id and fields (including "vector" field)
 
 ## Thread Safety
@@ -765,8 +759,6 @@ The `include_fields` parameter reduces data transfer and deserialization overhea
 - `FieldSelection::Fields(names)`: Selectively loads specified fields
 
 Performance benefits:
-- Skip loading VectorData entirely if "vector" is not requested (saves 4 bytes × dimensions)
-- Skip loading VectorMeta entirely if no metadata fields are requested
 - Reduce deserialization overhead for large records
 
 This is useful for:
