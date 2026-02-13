@@ -119,10 +119,7 @@ mod tests {
         // Two stats with the same normalized name — register should keep the
         // first and skip the second, refresh should use first-wins too.
         let stats = Arc::new(FakeStats {
-            data: vec![
-                ("dup_name".to_string(), 100),
-                ("dup_name".to_string(), 999),
-            ],
+            data: vec![("dup_name".to_string(), 100), ("dup_name".to_string(), 999)],
         });
 
         let mut registry = Registry::default();
