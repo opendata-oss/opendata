@@ -93,8 +93,8 @@ pub struct Metrics {
 impl Metrics {
     /// Create a new metrics registry with all metrics registered.
     ///
-    /// If `storage_stats` is provided, storage engine metrics will be
-    /// registered under the `slatedb_` prefix.
+    /// If `storage_stats` is provided, storage engine metrics will also
+    /// be registered (names are determined by the `StorageStats` impl).
     pub fn new(storage_stats: Option<Arc<dyn StorageStats>>) -> Self {
         let mut registry = Registry::default();
 
