@@ -3,13 +3,13 @@
 use std::sync::Arc;
 
 use axum::http::Method;
+use common::storage::stats::StorageStats;
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
-use slatedb::stats::StatRegistry;
 
 /// Labels for HTTP request metrics.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -58,8 +58,8 @@ pub struct HttpLabels {
 pub struct Metrics {
     registry: Registry,
 
-    /// SlateDB metrics bridge (present when storage backend is SlateDB).
-    slatedb_metrics: Option<common::metrics::SlateDbMetrics>,
+    /// Storage metrics bridge (present when the storage backend exposes stats).
+    storage_metrics: Option<common::metrics::StorageMetrics>,
 
     /// Counter of records successfully appended.
     pub log_append_records_total: Counter,
@@ -86,14 +86,14 @@ pub struct Metrics {
 impl Metrics {
     /// Create a new metrics registry with all metrics registered.
     ///
-    /// If `db_stats` is provided, SlateDB internal metrics will be
+    /// If `storage_stats` is provided, storage engine metrics will be
     /// registered under the `slatedb_` prefix.
-    pub fn new(stat_registry: Option<Arc<StatRegistry>>) -> Self {
+    pub fn new(storage_stats: Option<Arc<dyn StorageStats>>) -> Self {
         let mut registry = Registry::default();
 
-        // Register SlateDB metrics if available
-        let slatedb_metrics =
-            stat_registry.map(|sr| common::metrics::SlateDbMetrics::register(sr, &mut registry));
+        // Register storage metrics if available
+        let storage_metrics = storage_stats
+            .map(|stats| common::metrics::StorageMetrics::register(stats, &mut registry));
 
         // Log append records counter
         let log_append_records_total = Counter::default();
@@ -156,7 +156,7 @@ impl Metrics {
 
         Self {
             registry,
-            slatedb_metrics,
+            storage_metrics,
             log_append_records_total,
             log_append_bytes_total,
             log_records_scanned_total,
@@ -169,8 +169,8 @@ impl Metrics {
 
     /// Encode all metrics to Prometheus text format.
     pub fn encode(&self) -> String {
-        if let Some(ref slatedb) = self.slatedb_metrics {
-            slatedb.refresh();
+        if let Some(ref storage) = self.storage_metrics {
+            storage.refresh();
         }
         let mut buffer = String::new();
         prometheus_client::encoding::text::encode(&mut buffer, &self.registry)

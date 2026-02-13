@@ -14,6 +14,7 @@ use crate::segment::LogSegment;
 use crate::serde::{LogEntryKey, SegmentMeta, SegmentMetaKey};
 use bytes::Bytes;
 use common::storage::StorageSnapshot;
+use common::storage::stats::StorageStats;
 use common::{Storage, StorageIterator, StorageRead};
 
 /// Read-only log storage operations.
@@ -236,6 +237,11 @@ impl LogStorage {
     pub async fn flush(&self) -> Result<()> {
         self.storage.flush().await?;
         Ok(())
+    }
+
+    /// Returns storage engine statistics, if the backend supports them.
+    pub(crate) fn storage_stats(&self) -> Option<Arc<dyn StorageStats>> {
+        self.storage.storage_stats()
     }
 }
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult,
-    storage::{MergeOperator, RecordOp, Storage, StorageSnapshot, WriteOptions},
+    storage::{MergeOperator, RecordOp, Storage, StorageSnapshot, StorageStats, WriteOptions},
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -48,23 +48,38 @@ fn default_scan_options() -> ScanOptions {
     }
 }
 
+/// Adapter that exposes SlateDB's `StatRegistry` via the backend-agnostic
+/// [`StorageStats`] trait.
+struct SlateDbStats(Arc<StatRegistry>);
+
+impl StorageStats for SlateDbStats {
+    fn snapshot(&self) -> Vec<(String, i64)> {
+        self.0
+            .names()
+            .iter()
+            .filter_map(|name| {
+                self.0
+                    .lookup(name)
+                    .map(|s| (name.replace('/', "_"), s.get()))
+            })
+            .collect()
+    }
+}
+
 /// SlateDB-backed implementation of the Storage trait.
 ///
 /// SlateDB is an embedded key-value store built on object storage, providing
 /// LSM-tree semantics with cloud-native durability.
 pub struct SlateDbStorage {
     pub(super) db: Arc<Db>,
+    stats: Arc<dyn StorageStats>,
 }
 
 impl SlateDbStorage {
     /// Creates a new SlateDbStorage instance wrapping the given SlateDB database.
     pub fn new(db: Arc<Db>) -> Self {
-        Self { db }
-    }
-
-    /// Returns the SlateDB stat registry for this database.
-    pub fn stat_registry(&self) -> Arc<StatRegistry> {
-        self.db.metrics()
+        let stats = Arc::new(SlateDbStats(db.metrics()));
+        Self { db, stats }
     }
 
     /// Creates a SlateDB `MergeOperator` from our common `MergeOperator` trait.
@@ -255,6 +270,10 @@ impl Storage for SlateDbStorage {
     async fn close(&self) -> StorageResult<()> {
         self.db.close().await.map_err(StorageError::from_storage)?;
         Ok(())
+    }
+
+    fn storage_stats(&self) -> Option<Arc<dyn StorageStats>> {
+        Some(Arc::clone(&self.stats))
     }
 }
 

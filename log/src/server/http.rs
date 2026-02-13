@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::routing::{get, post};
-use slatedb::stats::StatRegistry;
 use tokio::signal;
 
 use super::config::LogServerConfig;
@@ -21,24 +20,18 @@ use crate::LogDb;
 pub struct LogServer {
     log: Arc<LogDb>,
     config: LogServerConfig,
-    stat_registry: Option<Arc<StatRegistry>>,
 }
 
 impl LogServer {
     /// Create a new log server.
     pub fn new(log: Arc<LogDb>, config: LogServerConfig) -> Self {
-        let stat_registry = log.stat_registry();
-        Self {
-            log,
-            config,
-            stat_registry,
-        }
+        Self { log, config }
     }
 
     /// Run the HTTP server.
     pub async fn run(self) {
-        // Create metrics registry with optional SlateDB stats
-        let metrics = Arc::new(Metrics::new(self.stat_registry));
+        // Create metrics registry with optional storage stats
+        let metrics = Arc::new(Metrics::new(self.log.storage_stats()));
 
         // Create app state
         let state = AppState {

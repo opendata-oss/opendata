@@ -770,8 +770,8 @@ async fn setup_slatedb_test_app() -> Router {
     };
 
     let log = Arc::new(LogDb::open(config).await.expect("Failed to open log"));
-    let stat_registry = log.stat_registry();
-    let metrics = Arc::new(Metrics::new(stat_registry));
+    let storage_stats = log.storage_stats();
+    let metrics = Arc::new(Metrics::new(storage_stats));
 
     let state = AppState {
         log: log.clone(),

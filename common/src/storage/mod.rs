@@ -3,6 +3,7 @@ pub mod factory;
 pub mod in_memory;
 pub mod loader;
 pub mod slate;
+pub mod stats;
 pub mod util;
 
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::BytesRange;
+pub use stats::StorageStats;
 
 #[derive(Clone, Debug)]
 pub struct Record {
@@ -194,4 +196,13 @@ pub trait Storage: StorageRead {
     /// This method should be called before dropping the storage to ensure
     /// proper cleanup. For SlateDB, this releases the database fence.
     async fn close(&self) -> StorageResult<()>;
+
+    /// Returns storage engine statistics, if available.
+    ///
+    /// The default implementation returns `None`. Storage backends that
+    /// expose internal metrics (e.g., SlateDB) override this to return
+    /// an implementation of [`StorageStats`].
+    fn storage_stats(&self) -> Option<Arc<dyn StorageStats>> {
+        None
+    }
 }

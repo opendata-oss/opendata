@@ -29,6 +29,7 @@ use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};
 use common::storage::factory::create_storage;
 use common::storage::{Storage, StorageRead, StorageSnapshot};
 use common::{StorageRuntime, StorageSemantics};
+
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -75,7 +76,7 @@ impl VectorDb {
     /// on subsequent opens.
     pub async fn open(config: Config, centroids: Vec<CentroidEntry>) -> Result<Self> {
         let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
-        let bundle = create_storage(
+        let storage = create_storage(
             &config.storage,
             StorageRuntime::new(),
             StorageSemantics::new().with_merge_operator(Arc::new(merge_op)),
@@ -83,7 +84,7 @@ impl VectorDb {
         .await
         .context("Failed to create storage")?;
 
-        Self::new(bundle.storage, config, centroids).await
+        Self::new(storage, config, centroids).await
     }
 
     /// Create a vector database with the given storage, configuration, and centroids.
