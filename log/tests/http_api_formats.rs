@@ -841,7 +841,7 @@ async fn test_slatedb_metrics_reflect_writes() {
     let key_b64 = STANDARD.encode("metrics-test-key");
     let value_b64 = STANDARD.encode("metrics-test-value");
     let append_body = format!(
-        r#"{{"records": [{{"key": {{"value": "{}"}}, "value": "{}"}}], "awaitDurable": true}}"#,
+        r#"{{"records": [{{"key": "{}", "value": "{}"}}], "awaitDurable": true}}"#,
         key_b64, value_b64
     );
 
