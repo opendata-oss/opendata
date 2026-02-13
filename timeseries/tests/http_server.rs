@@ -4,9 +4,9 @@
 //! Exercises HTTP endpoints using Axum's `oneshot()` test infrastructure
 //! with a real SlateDB-backed TSDB (in-memory object store).
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
 use timeseries::testing::{
     self, LabelValuesResponse, LabelsResponse, QueryRangeResponse, QueryResponse, SeriesResponse,
     TestTsdb, VectorSeries,

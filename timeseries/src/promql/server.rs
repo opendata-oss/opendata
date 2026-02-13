@@ -1,13 +1,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::Request;
 use axum::extract::{FromRequest, Path, State};
 use axum::http::{Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 #[cfg(feature = "remote-write")]
 use axum::routing::post;
-use axum::extract::Request;
 use axum::{Json, Router};
 use axum_extra::extract::{Form, Query};
 use rust_embed::Embed;
