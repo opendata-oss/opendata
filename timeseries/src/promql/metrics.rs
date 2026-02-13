@@ -225,9 +225,13 @@ mod tests {
         let stats: Arc<dyn StorageStats> = Arc::new(FakeStats);
         let metrics = Metrics::new(Some(stats));
 
-        // then — storage metrics should appear in encoded output
+        // then — storage metrics should appear with the correct value
         let encoded = metrics.encode();
-        assert!(encoded.contains("slatedb_db_write_ops"));
+        assert!(
+            encoded.contains("slatedb_db_write_ops 5"),
+            "Expected slatedb_db_write_ops 5 in encoded output:\n{}",
+            encoded
+        );
     }
 
     #[test]
