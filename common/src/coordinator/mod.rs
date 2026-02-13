@@ -2754,10 +2754,19 @@ mod tests {
         let handle_a = coordinator.handle("a");
         let handle_b = coordinator.handle("b");
         let pause_handle = coordinator.pause_handle("a");
+
+        // pause before starting the coordinator. otherwise
+        // there's a race condition where the PausableReceiver
+        // makes it past pause_rx.wait_for(|v| !*v).await; and
+        // waits for recv before we pause the handle - we could
+        // change the behavior of the PausableReceiver to first
+        // wait on recv and then check pause before returning
+        // but that feels weird and is not necessary for the use
+        // cases we have in mind
+        pause_handle.pause();
         coordinator.start();
 
         // when
-        pause_handle.pause();
         let mut result_a = handle_a
             .try_write(TestWrite {
                 key: "a".into(),
