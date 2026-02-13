@@ -24,6 +24,7 @@ enum FlushEvent<D: Delta> {
 // Internal use only
 use crate::StorageRead;
 use crate::storage::StorageSnapshot;
+use async_trait::async_trait;
 pub(crate) use handle::EpochWatcher;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -69,6 +70,7 @@ pub(crate) enum WriteCommand<D: Delta> {
 /// and coordinates flushing through a `Flusher`.
 pub struct WriteCoordinator<D: Delta, F: Flusher<D>> {
     handles: HashMap<String, WriteCoordinatorHandle<D>>,
+    pause_handles: HashMap<String, PauseHandle>,
     stop_tok: CancellationToken,
     tasks: Option<(WriteCoordinatorTask<D>, FlushTask<D, F>)>,
     write_task_jh: Option<tokio::task::JoinHandle<Result<(), String>>>,
@@ -89,10 +91,12 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         // Create a write channel per named input
         let mut write_rxs = Vec::with_capacity(channels.len());
         let mut write_txs = HashMap::new();
-        for name in &channels {
-            let (write_tx, write_rx) = mpsc::channel(config.queue_capacity);
+        let mut pause_handles = HashMap::new();
+        for name in channels {
+            let (write_tx, write_rx, pause_hdl) = pausable_channel(config.queue_capacity);
             write_rxs.push(write_rx);
             write_txs.insert(name.clone(), write_tx);
+            pause_handles.insert(name.clone(), pause_hdl);
         }
 
         // this is the channel that sends FlushEvents to be flushed
@@ -118,8 +122,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         let view = write_task.view.clone();
 
         let mut handles = HashMap::new();
-        for name in channels {
-            let write_tx = write_txs.remove(&name).expect("unreachable");
+        for (name, write_tx) in write_txs {
             handles.insert(
                 name,
                 WriteCoordinatorHandle::new(write_tx, watcher.clone(), view.clone()),
@@ -137,6 +140,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
 
         Self {
             handles,
+            pause_handles,
             tasks: Some((write_task, flush_task)),
             write_task_jh: None,
             stop_tok,
@@ -146,6 +150,13 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
 
     pub fn handle(&self, name: &str) -> WriteCoordinatorHandle<D> {
         self.handles
+            .get(name)
+            .expect("unknown channel name")
+            .clone()
+    }
+
+    pub fn pause_handle(&self, name: &str) -> PauseHandle {
+        self.pause_handles
             .get(name)
             .expect("unknown channel name")
             .clone()
@@ -182,7 +193,7 @@ struct WriteCoordinatorTask<D: Delta> {
     config: WriteCoordinatorConfig,
     delta: CurrentDelta<D>,
     flush_tx: mpsc::Sender<FlushEvent<D>>,
-    write_rxs: Vec<mpsc::Receiver<WriteCommand<D>>>,
+    write_rxs: Vec<PausableReceiver<D>>,
     watermarks: Arc<EpochWatermarks>,
     view: Arc<BroadcastedView<D>>,
     epoch: u64,
@@ -201,7 +212,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         config: WriteCoordinatorConfig,
         initial_context: D::Context,
         initial_snapshot: Arc<dyn StorageSnapshot>,
-        write_rxs: Vec<mpsc::Receiver<WriteCommand<D>>>,
+        write_rxs: Vec<PausableReceiver<D>>,
         flush_tx: mpsc::Sender<FlushEvent<D>>,
         watermarks: Arc<EpochWatermarks>,
         stop_tok: CancellationToken,
@@ -598,6 +609,55 @@ impl<D: Delta> BroadcastedViewInner<D> {
     fn subscribe(&self) -> (broadcast::Receiver<Arc<View<D>>>, Arc<View<D>>) {
         (self.view_tx.subscribe(), self.view.clone())
     }
+}
+
+struct PausableReceiver<D: Delta> {
+    pause_rx: Option<watch::Receiver<bool>>,
+    rx: mpsc::Receiver<WriteCommand<D>>,
+}
+
+impl<D: Delta> PausableReceiver<D> {
+    async fn recv(&mut self) -> Option<WriteCommand<D>> {
+        if let Some(pause_rx) = self.pause_rx.as_mut() {
+            pause_rx.wait_for(|v| !*v).await;
+        }
+        self.rx.recv().await
+    }
+}
+
+/// A handle that can be used to pause/unpause the coordinator's consumption from a write queue
+#[derive(Clone)]
+pub struct PauseHandle {
+    pause_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl PauseHandle {
+    fn pause(&self) {
+        self.pause_tx.send_replace(true);
+    }
+
+    fn unpause(&self) {
+        self.pause_tx.send_replace(false);
+    }
+}
+
+fn pausable_channel<D: Delta>(
+    capacity: usize,
+) -> (
+    mpsc::Sender<WriteCommand<D>>,
+    PausableReceiver<D>,
+    PauseHandle,
+) {
+    let (pause_tx, pause_rx) = watch::channel(false);
+    let (tx, rx) = mpsc::channel(capacity);
+    (
+        tx,
+        PausableReceiver {
+            pause_rx: Some(pause_rx),
+            rx,
+        },
+        PauseHandle { pause_tx },
+    )
 }
 
 #[cfg(test)]
