@@ -25,6 +25,7 @@ remote-write = ["dep:prost", "dep:snap"]
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
+axum-extra.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 clap.workspace = true

@@ -247,8 +247,6 @@ async fn test_query_range_missing_params() {
 #[tokio::test]
 async fn test_series() {
     let (app, _) = setup_with_data().await;
-    // Use POST form body with match[] — the custom deserialize_one_or_many
-    // handles single-value match[] from serde_urlencoded.
     let form_body = format!(
         "match[]=http_requests_total&start={}&end={}",
         SAMPLE_TS_SECS - 300,
@@ -267,6 +265,28 @@ async fn test_series() {
     assert_eq!(parsed.status, "success");
     let data = parsed.data.unwrap();
     assert_eq!(data.len(), 2, "expected 2 series for http_requests_total");
+}
+
+#[tokio::test]
+async fn test_series_multiple_match() {
+    let (app, _) = setup_with_data().await;
+    // Multiple match[] params on a single GET request — requires serde_html_form
+    // (via axum-extra) since serde_urlencoded cannot aggregate repeated keys.
+    let uri = format!(
+        "/api/v1/series?match[]=http_requests_total&match[]=nonexistent&start={}&end={}",
+        SAMPLE_TS_SECS - 300,
+        SAMPLE_TS_SECS + 300,
+    );
+    let req = Request::get(&uri).body(Body::empty()).unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let parsed: SeriesResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(parsed.status, "success");
+    let data = parsed.data.unwrap();
+    // Only http_requests_total matches, "nonexistent" yields nothing
+    assert_eq!(data.len(), 2);
 }
 
 // ---------------------------------------------------------------------------
