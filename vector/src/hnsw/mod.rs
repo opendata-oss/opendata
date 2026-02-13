@@ -26,7 +26,7 @@ pub trait CentroidGraph: Send + Sync {
     ///
     /// # Returns
     /// Vector of centroid_ids sorted by similarity (closest first)
-    fn search(&self, query: &[f32], k: usize) -> Vec<u32>;
+    fn search(&self, query: &[f32], k: usize) -> Vec<u64>;
 
     /// Returns the number of centroids in the graph.
     fn len(&self) -> usize;

@@ -15,7 +15,7 @@ pub struct UsearchCentroidGraph {
     /// The usearch index
     index: Index,
     /// Map from usearch key (0, 1, 2...) to centroid_id
-    key_to_centroid: Vec<u32>,
+    key_to_centroid: Vec<u64>,
 }
 
 impl fmt::Debug for UsearchCentroidGraph {
@@ -53,7 +53,7 @@ impl UsearchCentroidGraph {
         }
 
         // Build mapping from key to centroid_id
-        let key_to_centroid: Vec<u32> = centroids.iter().map(|c| c.centroid_id).collect();
+        let key_to_centroid: Vec<u64> = centroids.iter().map(|c| c.centroid_id).collect();
 
         // Convert distance metric to usearch MetricKind
         let metric = match distance_metric {
@@ -92,7 +92,7 @@ impl UsearchCentroidGraph {
 }
 
 impl CentroidGraph for UsearchCentroidGraph {
-    fn search(&self, query: &[f32], k: usize) -> Vec<u32> {
+    fn search(&self, query: &[f32], k: usize) -> Vec<u64> {
         let k = k.min(self.key_to_centroid.len());
         if k == 0 {
             return Vec::new();

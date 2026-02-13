@@ -75,7 +75,7 @@ pub struct VectorDbDeltaContext {
     /// In-memory centroid vector counts, loaded from storage at startup and
     /// updated on each write. Used by the current delta to observe counts
     /// and schedule splits/merges.
-    pub centroid_counts: HashMap<u32, u64>,
+    pub centroid_counts: HashMap<u64, u32>,
 }
 
 /// Immutable delta containing all RecordOps ready to be flushed.
@@ -102,7 +102,7 @@ pub(crate) struct VectorDbWriteDelta {
 
 impl VectorDbWriteDelta {
     /// Assign a vector to its nearest centroid using the HNSW graph.
-    fn assign_to_centroid(&self, vector: &[f32]) -> u32 {
+    fn assign_to_centroid(&self, vector: &[f32]) -> u64 {
         self.ctx
             .centroid_graph
             .search(vector, 1)
@@ -235,7 +235,7 @@ impl VectorDbWriteDelta {
 
 #[derive(Clone)]
 pub struct VectorDbDeltaView {
-    posting_updates: HashMap<u32, Vec<PostingUpdate>>,
+    posting_updates: HashMap<u64, Vec<PostingUpdate>>,
     deleted_vectors: RoaringTreemap,
 }
 
@@ -264,17 +264,17 @@ mod tests {
 
     /// Mock CentroidGraph that always returns a fixed centroid ID.
     struct MockCentroidGraph {
-        centroid_id: u32,
+        centroid_id: u64,
     }
 
     impl MockCentroidGraph {
-        fn new(centroid_id: u32) -> Self {
+        fn new(centroid_id: u64) -> Self {
             Self { centroid_id }
         }
     }
 
     impl CentroidGraph for MockCentroidGraph {
-        fn search(&self, _query: &[f32], _k: usize) -> Vec<u32> {
+        fn search(&self, _query: &[f32], _k: usize) -> Vec<u64> {
             vec![self.centroid_id]
         }
 
@@ -284,7 +284,7 @@ mod tests {
     }
 
     /// Create a test context with the given centroid ID for assignment.
-    async fn create_test_context(centroid_id: u32) -> VectorDbDeltaContext {
+    async fn create_test_context(centroid_id: u64) -> VectorDbDeltaContext {
         let storage: Arc<dyn common::Storage> = Arc::new(InMemoryStorage::new());
         let key = Bytes::from_static(&[0x01, 0x02]);
         let id_allocator = SequenceAllocator::load(storage.as_ref(), key)
@@ -367,7 +367,7 @@ mod tests {
     #[tokio::test]
     async fn should_assign_vectors_to_postings() {
         // given
-        let centroid_id = 42u32;
+        let centroid_id = 42u64;
         let ctx = create_test_context(centroid_id).await;
         let mut delta = VectorDbWriteDelta::init(ctx);
 
@@ -447,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn should_assign_vectors_to_postings_on_update() {
         // given
-        let centroid_id = 5u32;
+        let centroid_id = 5u64;
         let ctx = create_test_context(centroid_id).await;
 
         // Pre-populate dictionary to simulate existing vector
@@ -581,7 +581,7 @@ mod tests {
         struct MultiCentroidGraph;
 
         impl CentroidGraph for MultiCentroidGraph {
-            fn search(&self, query: &[f32], _k: usize) -> Vec<u32> {
+            fn search(&self, query: &[f32], _k: usize) -> Vec<u64> {
                 // Return centroid based on which dimension has highest value
                 if query[0] > query[1] && query[0] > query[2] {
                     vec![1]
@@ -646,7 +646,7 @@ mod tests {
         struct MultiCentroidGraph;
 
         impl CentroidGraph for MultiCentroidGraph {
-            fn search(&self, query: &[f32], _k: usize) -> Vec<u32> {
+            fn search(&self, query: &[f32], _k: usize) -> Vec<u64> {
                 if query[0] > query[1] && query[0] > query[2] {
                     vec![1]
                 } else if query[1] > query[2] {
@@ -700,7 +700,7 @@ mod tests {
     #[tokio::test]
     async fn should_emit_centroid_stats_on_freeze() {
         // given
-        let centroid_id = 42u32;
+        let centroid_id = 42u64;
         let ctx = create_test_context(centroid_id).await;
         let mut delta = VectorDbWriteDelta::init(ctx);
 
@@ -755,7 +755,7 @@ mod tests {
     #[tokio::test]
     async fn should_expose_posting_updates_and_deletes_via_reader() {
         // given
-        let centroid_id = 7u32;
+        let centroid_id = 7u64;
         let ctx = create_test_context(centroid_id).await;
 
         // Pre-populate dictionary so the second write to "vec-1" triggers an upsert/delete

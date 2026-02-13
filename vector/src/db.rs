@@ -278,11 +278,11 @@ impl VectorDb {
     /// for each centroid.
     async fn load_centroid_counts_from_storage(
         snapshot: &dyn StorageRead,
-    ) -> Result<HashMap<u32, u64>> {
+    ) -> Result<HashMap<u64, u32>> {
         let stats = snapshot.scan_all_centroid_stats().await?;
         let mut counts = HashMap::new();
         for (centroid_id, value) in stats {
-            counts.insert(centroid_id, value.num_vectors.max(0) as u64);
+            counts.insert(centroid_id, value.num_vectors.max(0) as u32);
         }
         Ok(counts)
     }
@@ -535,7 +535,7 @@ impl VectorDb {
     /// Load candidate vector IDs and their vectors from posting lists.
     async fn load_candidates(
         &self,
-        centroid_ids: &[u32],
+        centroid_ids: &[u64],
         snapshot: &dyn StorageRead,
     ) -> Result<Vec<(u64, Vec<f32>)>> {
         let mut all_candidates = Vec::new();
@@ -594,7 +594,7 @@ impl VectorDb {
             scored_results.push(SearchResult {
                 internal_id: *internal_id,
                 external_id: vector_data.external_id().to_string(),
-                score,
+                score: score.score(),
                 attributes: metadata,
             });
         }
@@ -816,7 +816,7 @@ mod tests {
         let centroids: Vec<CentroidEntry> = cluster_centers
             .iter()
             .enumerate()
-            .map(|(i, vector)| CentroidEntry::new((i + 1) as u32, vector.clone()))
+            .map(|(i, vector)| CentroidEntry::new((i + 1) as u64, vector.clone()))
             .collect();
 
         let db = VectorDb::open_with_centroids(config, centroids)
