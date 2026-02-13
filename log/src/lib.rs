@@ -54,6 +54,7 @@ mod serde;
 #[cfg(feature = "http-server")]
 pub mod server;
 mod storage;
+mod view;
 
 pub use config::{Config, CountOptions, ReaderConfig, ScanOptions, SegmentConfig};
 pub use error::{AppendError, AppendResult, Error, Result};

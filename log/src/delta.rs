@@ -5,15 +5,16 @@
 //! and flush logic.
 
 use crate::listing::ListingCache;
-use crate::model::{AppendOutput, Record as UserRecord};
+use crate::model::{AppendOutput, LogEntry, Record as UserRecord};
 use crate::segment::{LogSegment, SegmentCache};
-use crate::serde::LogEntryBuilder;
 use crate::storage::LogStorage;
+use crate::view::FrozenLogDeltaView;
 use async_trait::async_trait;
 use bytes::Bytes;
 use common::coordinator::{Delta, Flusher};
 use common::storage::StorageSnapshot;
 use common::{Record, WriteOptions};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -43,17 +44,12 @@ pub(crate) struct LogDelta {
     context: LogContext,
     records: Vec<Record>,
     new_segments: Vec<LogSegment>,
+    entries: HashMap<Bytes, Vec<LogEntry>>,
 }
 
 /// Frozen (immutable) snapshot of a delta, ready for flushing.
 pub(crate) struct FrozenLogDelta {
     pub records: Vec<Record>,
-}
-
-/// Broadcast payload sent to subscribers after a flush.
-#[derive(Clone)]
-pub(crate) struct FrozenLogDeltaView {
-    pub new_segments: Vec<LogSegment>,
 }
 
 /// Flushes frozen deltas to storage.
@@ -87,13 +83,45 @@ impl LogDelta {
         }
         assignment.segment
     }
+
+    /// Adds storage records and indexes log entries for a batch of user records.
+    fn add_entries(&mut self, segment: &LogSegment, base_seq: u64, user_records: &[UserRecord]) {
+        let segment_start_seq = segment.meta().start_seq;
+
+        for (i, user_record) in user_records.iter().enumerate() {
+            let sequence = base_seq + i as u64;
+
+            // Build the storage record
+            let entry_key =
+                crate::serde::LogEntryKey::new(segment.id(), user_record.key.clone(), sequence);
+            let storage_record = Record::new(
+                entry_key.serialize(segment_start_seq),
+                user_record.value.clone(),
+            );
+            self.records.push(storage_record);
+
+            // Index the entry for reads
+            let log_entry = LogEntry {
+                key: user_record.key.clone(),
+                sequence,
+                value: user_record.value.clone(),
+            };
+            self.entries
+                .entry(user_record.key.clone())
+                .or_default()
+                .push(log_entry);
+        }
+    }
 }
 
 impl Delta for LogDelta {
     type Context = LogContext;
     type Write = LogWrite;
     type Frozen = FrozenLogDelta;
-    type FrozenView = FrozenLogDeltaView;
+    // TODO: Arc is needed because the coordinator clones frozen views when
+    // building new View instances. Consider having the coordinator wrap
+    // FrozenView in Arc internally so implementations don't need to.
+    type FrozenView = Arc<FrozenLogDeltaView>;
     type ApplyResult = Option<AppendOutput>;
     // Read of latest writes not yet supported
     type DeltaView = ();
@@ -103,6 +131,7 @@ impl Delta for LogDelta {
             context,
             records: Vec::new(),
             new_segments: Vec::new(),
+            entries: HashMap::new(),
         }
     }
 
@@ -135,8 +164,8 @@ impl Delta for LogDelta {
             .listing_cache
             .assign_keys(segment.id(), &keys, &mut self.records);
 
-        // 4. Build log entry records
-        LogEntryBuilder::build(&segment, base_seq, &write.records, &mut self.records);
+        // 4. Build log entry records and index for reads
+        self.add_entries(&segment, base_seq, &write.records);
 
         Ok(Some(AppendOutput {
             start_sequence: base_seq,
@@ -151,13 +180,11 @@ impl Delta for LogDelta {
     }
 
     fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
-        let frozen_read = FrozenLogDeltaView {
-            new_segments: self.new_segments,
-        };
+        let frozen_view = Arc::new(FrozenLogDeltaView::new(self.new_segments, self.entries));
         let frozen = FrozenLogDelta {
             records: self.records,
         };
-        (frozen, frozen_read, self.context)
+        (frozen, frozen_view, self.context)
     }
 
     fn reader(&self) -> Self::DeltaView {}
@@ -347,5 +374,65 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn should_freeze_entries_for_single_key() {
+        // given
+        let ctx = test_context().await;
+        let mut delta = LogDelta::init(ctx);
+        delta.apply(make_write(&["key1"], 1000)).unwrap();
+
+        // when
+        let (_frozen, view, _ctx) = delta.freeze();
+
+        // then
+        assert_eq!(view.entries.len(), 1);
+        let entries = &view.entries[&Bytes::from("key1")];
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sequence, 0);
+        assert_eq!(entries[0].value, Bytes::from("value-key1"));
+    }
+
+    #[tokio::test]
+    async fn should_freeze_entries_for_multiple_keys() {
+        // given
+        let ctx = test_context().await;
+        let mut delta = LogDelta::init(ctx);
+        delta.apply(make_write(&["key1", "key2"], 1000)).unwrap();
+
+        // when
+        let (_frozen, view, _ctx) = delta.freeze();
+
+        // then
+        assert_eq!(view.entries.len(), 2);
+        let entries1 = &view.entries[&Bytes::from("key1")];
+        assert_eq!(entries1.len(), 1);
+        assert_eq!(entries1[0].sequence, 0);
+        let entries2 = &view.entries[&Bytes::from("key2")];
+        assert_eq!(entries2.len(), 1);
+        assert_eq!(entries2[0].sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn should_freeze_entries_across_multiple_applies() {
+        // given
+        let ctx = test_context().await;
+        let mut delta = LogDelta::init(ctx);
+        delta.apply(make_write(&["key1"], 1000)).unwrap();
+        delta.apply(make_write(&["key1", "key2"], 1000)).unwrap();
+
+        // when
+        let (_frozen, view, _ctx) = delta.freeze();
+
+        // then
+        assert_eq!(view.entries.len(), 2);
+        let entries1 = &view.entries[&Bytes::from("key1")];
+        assert_eq!(entries1.len(), 2);
+        assert_eq!(entries1[0].sequence, 0);
+        assert_eq!(entries1[1].sequence, 1);
+        let entries2 = &view.entries[&Bytes::from("key2")];
+        assert_eq!(entries2.len(), 1);
+        assert_eq!(entries2[0].sequence, 2);
     }
 }

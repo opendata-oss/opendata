@@ -16,15 +16,19 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::config::{CountOptions, ReaderConfig, ScanOptions, SegmentConfig};
+use crate::delta::LogDelta;
 use crate::error::{Error, Result};
 use crate::listing::LogKeyIterator;
 use crate::model::{LogEntry, Segment, SegmentId, Sequence};
 use crate::range::{normalize_segment_id, normalize_sequence};
 use crate::segment::{LogSegment, SegmentCache};
-use crate::storage::{LogStorageRead, SegmentIterator};
+use crate::storage::{LogStorage, LogStorageRead, SegmentIterator};
+use crate::view::FrozenViewIterator;
 use common::storage::StorageSnapshot;
 use common::storage::factory::create_storage_read;
 use common::{StorageRead, StorageSemantics};
+
+type View = common::coordinator::View<LogDelta>;
 
 /// Trait for read operations on the log.
 ///
@@ -247,7 +251,7 @@ impl LogReadView {
         seq_range: Range<Sequence>,
         _options: &ScanOptions,
     ) -> LogIterator {
-        LogIterator::open(self.storage.clone(), &self.segments, key, seq_range)
+        LogIterator::from_storage(self.storage.clone(), &self.segments, key, seq_range)
     }
 
     /// Lists distinct keys within a segment range.
@@ -495,12 +499,12 @@ impl LogRead for LogDbReader {
     }
 }
 
-/// Iterator over log entries across multiple segments.
+/// Iterator over log entries across multiple storage segments.
 ///
 /// Iterates through segments in order, fetching entries for the given key
 /// within the sequence range. Instantiates a `SegmentIterator` for each
 /// segment as needed.
-pub struct LogIterator {
+struct LogStorageIterator {
     storage: LogStorageRead,
     segments: Vec<LogSegment>,
     key: Bytes,
@@ -509,9 +513,9 @@ pub struct LogIterator {
     current_iter: Option<SegmentIterator>,
 }
 
-impl LogIterator {
+impl LogStorageIterator {
     /// Opens a new iterator by looking up segments covering the sequence range.
-    pub(crate) fn open(
+    fn open(
         storage: LogStorageRead,
         segment_cache: &SegmentCache,
         key: Bytes,
@@ -530,7 +534,7 @@ impl LogIterator {
 
     /// Creates a new iterator over the given segments.
     #[cfg(test)]
-    pub(crate) fn new(
+    fn new(
         storage: LogStorageRead,
         segments: Vec<LogSegment>,
         key: Bytes,
@@ -547,7 +551,7 @@ impl LogIterator {
     }
 
     /// Returns the next log entry, or None if iteration is complete.
-    pub async fn next(&mut self) -> Result<Option<LogEntry>> {
+    async fn next(&mut self) -> Result<Option<LogEntry>> {
         loop {
             // If we have a current iterator, try to get the next entry
             if let Some(iter) = &mut self.current_iter {
@@ -581,6 +585,80 @@ impl LogIterator {
             .await?;
         self.current_iter = Some(iter);
         Ok(true)
+    }
+}
+
+/// Iterator over log entries combining storage and frozen delta sources.
+///
+/// Drains the storage iterator first, then yields entries from frozen
+/// (unflushed) deltas. This ensures entries are returned in sequence order
+/// since storage contains older entries and frozen deltas contain newer ones.
+pub struct LogIterator {
+    storage_iter: LogStorageIterator,
+    frozen_iter: Option<FrozenViewIterator>,
+}
+
+impl LogIterator {
+    /// Creates an iterator from a coordinator view (storage snapshot + frozen deltas).
+    pub(crate) fn from_view(
+        segment_cache: &SegmentCache,
+        view: Arc<View>,
+        key: Bytes,
+        seq_range: Range<Sequence>,
+    ) -> Self {
+        let storage = LogStorageRead::new(view.snapshot.clone() as Arc<dyn StorageRead>);
+        let storage_iter =
+            LogStorageIterator::open(storage, segment_cache, key.clone(), seq_range.clone());
+        let frozen_iter = FrozenViewIterator::new(view, key, seq_range);
+        Self {
+            storage_iter,
+            frozen_iter: Some(frozen_iter),
+        }
+    }
+
+    /// Creates a storage-only iterator (no frozen deltas).
+    pub(crate) fn from_storage(
+        storage: LogStorageRead,
+        segment_cache: &SegmentCache,
+        key: Bytes,
+        seq_range: Range<Sequence>,
+    ) -> Self {
+        let storage_iter = LogStorageIterator::open(storage, segment_cache, key, seq_range);
+        Self {
+            storage_iter,
+            frozen_iter: None,
+        }
+    }
+
+    /// Creates a new iterator over the given segments (test helper).
+    #[cfg(test)]
+    pub(crate) fn new(
+        storage: LogStorageRead,
+        segments: Vec<LogSegment>,
+        key: Bytes,
+        seq_range: Range<Sequence>,
+    ) -> Self {
+        Self {
+            storage_iter: LogStorageIterator::new(storage, segments, key, seq_range),
+            frozen_iter: None,
+        }
+    }
+
+    /// Returns the next log entry, or None if iteration is complete.
+    pub async fn next(&mut self) -> Result<Option<LogEntry>> {
+        // First drain storage
+        if let Some(entry) = self.storage_iter.next().await? {
+            return Ok(Some(entry));
+        }
+
+        // Then drain frozen deltas
+        if let Some(frozen) = &mut self.frozen_iter {
+            if let Some(entry) = frozen.next() {
+                return Ok(Some(entry));
+            }
+        }
+
+        Ok(None)
     }
 }
 

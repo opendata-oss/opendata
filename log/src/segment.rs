@@ -82,6 +82,8 @@ pub(crate) struct SegmentCache {
 
 impl SegmentCache {
     /// Creates a new cache by loading all segments from storage.
+    // TODO: SegmentConfig is only needed for segment assignment (writer concern).
+    // Split SegmentCache so readers don't need to pass a config.
     pub(crate) async fn open(
         storage: &crate::storage::LogStorageRead,
         config: SegmentConfig,
