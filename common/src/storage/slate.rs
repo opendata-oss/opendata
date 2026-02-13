@@ -72,14 +72,12 @@ impl StorageStats for SlateDbStats {
 /// LSM-tree semantics with cloud-native durability.
 pub struct SlateDbStorage {
     pub(super) db: Arc<Db>,
-    stats: Arc<dyn StorageStats>,
 }
 
 impl SlateDbStorage {
     /// Creates a new SlateDbStorage instance wrapping the given SlateDB database.
     pub fn new(db: Arc<Db>) -> Self {
-        let stats = Arc::new(SlateDbStats(db.metrics()));
-        Self { db, stats }
+        Self { db }
     }
 
     /// Creates a SlateDB `MergeOperator` from our common `MergeOperator` trait.
@@ -273,7 +271,7 @@ impl Storage for SlateDbStorage {
     }
 
     fn storage_stats(&self) -> Option<Arc<dyn StorageStats>> {
-        Some(Arc::clone(&self.stats))
+        Some(Arc::new(SlateDbStats(self.db.metrics())))
     }
 }
 

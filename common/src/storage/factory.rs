@@ -180,8 +180,8 @@ pub async fn create_storage(
             Ok(Arc::new(storage))
         }
         StorageConfig::SlateDb(slate_config) => {
-            let slate = create_slatedb_storage(slate_config, runtime, semantics).await?;
-            Ok(Arc::new(slate))
+            let storage = create_slatedb_storage(slate_config, runtime, semantics).await?;
+            Ok(Arc::new(storage))
         }
     }
 }
