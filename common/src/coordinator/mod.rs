@@ -80,7 +80,7 @@ pub struct WriteCoordinator<D: Delta, F: Flusher<D>> {
 impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
     pub fn new(
         config: WriteCoordinatorConfig,
-        channels: Vec<String>,
+        channels: Vec<impl ToString>,
         initial_context: D::Context,
         initial_snapshot: Arc<dyn StorageSnapshot>,
         flusher: F,
@@ -95,8 +95,8 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         for name in &channels {
             let (write_tx, write_rx, pause_hdl) = pausable_channel(config.queue_capacity);
             write_rxs.push(write_rx);
-            write_txs.insert(name.clone(), write_tx);
-            pause_handles.insert(name.clone(), pause_hdl);
+            write_txs.insert(name.to_string(), write_tx);
+            pause_handles.insert(name.to_string(), pause_hdl);
         }
 
         // this is the channel that sends FlushEvents to be flushed
@@ -123,9 +123,9 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
 
         let mut handles = HashMap::new();
         for name in channels {
-            let write_tx = write_txs.remove(&name).expect("unreachable");
+            let write_tx = write_txs.remove(&name.to_string()).expect("unreachable");
             handles.insert(
-                name,
+                name.to_string(),
                 WriteCoordinatorHandle::new(write_tx, watcher.clone(), view.clone()),
             );
         }
@@ -671,7 +671,7 @@ mod tests {
     use crate::{Storage, StorageRead};
     use async_trait::async_trait;
     use bytes::Bytes;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::ops::Range;
     use std::sync::Mutex;
     // ============================================================================
@@ -2726,5 +2726,64 @@ mod tests {
 
         // then
         assert!(matches!(result, Err(WriteError::Shutdown)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_pause_and_resume_write_channel() {
+        // given
+        let flusher = TestFlusher::default();
+        let mut config = test_config();
+        config.flush_size_threshold = usize::MAX;
+        config.flush_interval = Duration::from_hours(24);
+        let mut coordinator = WriteCoordinator::new(
+            config,
+            vec!["a", "b"],
+            TestContext::default(),
+            flusher.initial_snapshot().await,
+            flusher.clone(),
+        );
+        let handle_a = coordinator.handle("a");
+        let handle_b = coordinator.handle("b");
+        let pause_handle = coordinator.pause_handle("a");
+        coordinator.start();
+
+        // when
+        pause_handle.pause();
+        let mut result_a = handle_a
+            .try_write(TestWrite {
+                key: "a".into(),
+                value: 1,
+                size: 1,
+            })
+            .await
+            .unwrap();
+        for i in 0..1000 {
+            handle_b
+                .try_write(TestWrite {
+                    key: format!("b{}", i),
+                    value: i,
+                    size: 1,
+                })
+                .await
+                .unwrap()
+                .wait(Durability::Applied)
+                .await
+                .unwrap();
+        }
+
+        // then
+        // make sure the data only contains keys from b (so a was never processed)
+        let data = coordinator.view().current.data.lock().unwrap().clone();
+        let mut expected = (0..1000)
+            .into_iter()
+            .map(|i| format!("b{}", i))
+            .collect::<HashSet<_>>();
+        assert_eq!(data.keys().cloned().collect::<HashSet<_>>(), expected);
+        pause_handle.unpause();
+        // after resuming, wait for the data to include keys from a
+        result_a.wait(Durability::Applied).await.unwrap();
+        let data = coordinator.view().current.data.lock().unwrap().clone();
+        expected.insert("a".into());
+        assert_eq!(data.keys().cloned().collect::<HashSet<_>>(), expected);
     }
 }
