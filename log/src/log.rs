@@ -392,8 +392,7 @@ impl LogDb {
             segment_cache,
         )));
 
-        let flush_subscriber_task =
-            spawn_flush_subscriber(view_subscriber, Arc::clone(&read_view));
+        let flush_subscriber_task = spawn_flush_subscriber(view_subscriber, Arc::clone(&read_view));
         coordinator.start();
 
         Ok(Self {
@@ -553,8 +552,7 @@ impl LogDbBuilder {
             segment_cache,
         )));
 
-        let flush_subscriber_task =
-            spawn_flush_subscriber(view_subscriber, Arc::clone(&read_view));
+        let flush_subscriber_task = spawn_flush_subscriber(view_subscriber, Arc::clone(&read_view));
         coordinator.start();
 
         Ok(LogDb {
