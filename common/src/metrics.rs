@@ -36,9 +36,9 @@ pub struct StorageMetrics {
 
 impl StorageMetrics {
     /// Register all metrics discovered via `StorageStats::snapshot()` into
-    /// the given prometheus registry under a `slatedb` sub-registry prefix.
+    /// the given prometheus registry. Metric names are used as-is — the
+    /// `StorageStats` implementation is responsible for any prefix/filtering.
     pub fn register(stats: Arc<dyn StorageStats>, registry: &mut Registry) -> Self {
-        let sub = registry.sub_registry_with_prefix("slatedb");
         let mut gauges = Vec::new();
         let mut seen = HashSet::new();
 
@@ -51,7 +51,7 @@ impl StorageMetrics {
                 continue;
             }
             let gauge = Gauge::<i64, _>::default();
-            sub.register(&name, format!("Storage {name}"), gauge.clone());
+            registry.register(&name, format!("Storage {name}"), gauge.clone());
             gauges.push(StatGauge {
                 gauge,
                 name: name.clone(),
@@ -110,8 +110,8 @@ mod tests {
 
         let mut buf = String::new();
         prometheus_client::encoding::text::encode(&mut buf, &registry).unwrap();
-        assert!(buf.contains("slatedb_db_write_ops 42"));
-        assert!(buf.contains("slatedb_db_read_ops 10"));
+        assert!(buf.contains("db_write_ops 42"));
+        assert!(buf.contains("db_read_ops 10"));
     }
 
     #[test]
@@ -134,7 +134,7 @@ mod tests {
         prometheus_client::encoding::text::encode(&mut buf, &registry).unwrap();
         // Should show 100 (first-wins), not 999
         assert!(
-            buf.contains("slatedb_dup_name 100"),
+            buf.contains("dup_name 100"),
             "Expected first-wins value 100, got:\n{}",
             buf
         );

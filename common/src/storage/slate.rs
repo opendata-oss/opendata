@@ -60,7 +60,7 @@ impl StorageStats for SlateDbStats {
             .filter_map(|name| {
                 self.0
                     .lookup(name)
-                    .map(|s| (name.replace('/', "_"), s.get()))
+                    .map(|s| (format!("slatedb_{}", name.replace('/', "_")), s.get()))
             })
             .collect()
     }

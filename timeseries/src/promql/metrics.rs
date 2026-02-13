@@ -217,7 +217,7 @@ mod tests {
         struct FakeStats;
         impl StorageStats for FakeStats {
             fn snapshot(&self) -> Vec<(String, i64)> {
-                vec![("db_write_ops".to_string(), 5)]
+                vec![("slatedb_db_write_ops".to_string(), 5)]
             }
         }
 
