@@ -57,17 +57,28 @@ impl Default for ServerConfig {
 pub(crate) struct PromqlServer {
     tsdb: Arc<Tsdb>,
     config: ServerConfig,
+    storage: Arc<dyn common::Storage>,
 }
 
 impl PromqlServer {
-    pub(crate) fn new(tsdb: Arc<Tsdb>, config: ServerConfig) -> Self {
-        Self { tsdb, config }
+    pub(crate) fn new(
+        tsdb: Arc<Tsdb>,
+        config: ServerConfig,
+        storage: Arc<dyn common::Storage>,
+    ) -> Self {
+        Self {
+            tsdb,
+            config,
+            storage,
+        }
     }
 
     /// Run the HTTP server
     pub(crate) async fn run(self) {
-        // Create metrics registry
-        let metrics = Arc::new(Metrics::new());
+        // Create metrics registry and register storage engine metrics
+        let mut metrics = Metrics::new();
+        self.storage.register_metrics(metrics.registry_mut());
+        let metrics = Arc::new(metrics);
 
         // Create app state
         let state = AppState {

@@ -2400,6 +2400,7 @@ dependencies = [
  "bytes",
  "criterion",
  "futures",
+ "prometheus-client",
  "proptest",
  "serde",
  "serde_yaml",
@@ -2501,6 +2502,8 @@ dependencies = [
  "roaring 0.10.12",
  "rstest",
  "tokio",
+ "tokio-util",
+ "tracing",
  "usearch",
 ]
 

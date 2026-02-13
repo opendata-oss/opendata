@@ -20,7 +20,7 @@ required-features = ["http-server"]
 
 [features]
 default = []
-http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prometheus-client"]
+http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prometheus-client", "common/metrics"]
 
 [dependencies]
 async-trait.workspace = true

@@ -194,4 +194,12 @@ pub trait Storage: StorageRead {
     /// This method should be called before dropping the storage to ensure
     /// proper cleanup. For SlateDB, this releases the database fence.
     async fn close(&self) -> StorageResult<()>;
+
+    /// Registers storage engine metrics into the given Prometheus registry.
+    ///
+    /// The default implementation is a no-op. Storage backends that expose
+    /// internal metrics (e.g., SlateDB) override this to register gauges
+    /// that read live values on each scrape.
+    #[cfg(feature = "metrics")]
+    fn register_metrics(&self, _registry: &mut prometheus_client::registry::Registry) {}
 }
