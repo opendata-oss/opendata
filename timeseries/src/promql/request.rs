@@ -5,6 +5,41 @@ use serde::Deserialize;
 use crate::error::Error;
 use crate::util::{parse_duration, parse_timestamp, parse_timestamp_to_seconds};
 
+/// Deserialize a `match[]` parameter that may arrive as a single string
+/// (from `serde_urlencoded`, which cannot aggregate repeated keys into a
+/// sequence) or as a proper sequence.
+fn deserialize_one_or_many<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct OneOrMany;
+
+    impl<'de> Visitor<'de> for OneOrMany {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a string or sequence of strings")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(vec![v.to_owned()])
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut vec = Vec::new();
+            while let Some(v) = seq.next_element()? {
+                vec.push(v);
+            }
+            Ok(vec)
+        }
+    }
+
+    deserializer.deserialize_any(OneOrMany)
+}
+
 // =============================================================================
 // Domain Request Types (parsed, validated)
 // =============================================================================
@@ -119,7 +154,7 @@ impl TryFrom<QueryRangeParams> for QueryRangeRequest {
 /// Query parameters for /api/v1/series
 #[derive(Debug, Deserialize)]
 pub struct SeriesParams {
-    #[serde(rename = "match[]", default)]
+    #[serde(rename = "match[]", default, deserialize_with = "deserialize_one_or_many")]
     pub matches: Vec<String>,
     pub start: Option<String>,
     pub end: Option<String>,
@@ -148,7 +183,7 @@ impl TryFrom<SeriesParams> for SeriesRequest {
 /// Query parameters for /api/v1/labels
 #[derive(Debug, Deserialize)]
 pub struct LabelsParams {
-    #[serde(rename = "match[]", default)]
+    #[serde(rename = "match[]", default, deserialize_with = "deserialize_one_or_many")]
     pub matches: Vec<String>,
     pub start: Option<String>,
     pub end: Option<String>,
@@ -181,7 +216,7 @@ impl TryFrom<LabelsParams> for LabelsRequest {
 /// Query parameters for /api/v1/label/{name}/values
 #[derive(Debug, Deserialize)]
 pub struct LabelValuesParams {
-    #[serde(rename = "match[]", default)]
+    #[serde(rename = "match[]", default, deserialize_with = "deserialize_one_or_many")]
     pub matches: Vec<String>,
     pub start: Option<String>,
     pub end: Option<String>,
@@ -230,7 +265,7 @@ impl From<MetadataParams> for MetadataRequest {
 /// Query parameters for /federate
 #[derive(Debug, Deserialize)]
 pub struct FederateParams {
-    #[serde(rename = "match[]", default)]
+    #[serde(rename = "match[]", default, deserialize_with = "deserialize_one_or_many")]
     pub matches: Vec<String>,
 }
 

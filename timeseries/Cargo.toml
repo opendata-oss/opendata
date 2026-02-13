@@ -62,3 +62,7 @@ snap = { workspace = true, optional = true }
 [dev-dependencies]
 fail.workspace = true
 rstest.workspace = true
+
+[[test]]
+name = "http_server"
+required-features = ["testing"]

@@ -4,14 +4,12 @@
 //! Exercises HTTP endpoints using Axum's `oneshot()` test infrastructure
 //! with a real SlateDB-backed TSDB (in-memory object store).
 
-use std::sync::Arc;
-
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use timeseries::testing::{
     self, LabelValuesResponse, LabelsResponse, QueryRangeResponse, QueryResponse, SeriesResponse,
-    Tsdb, VectorSeries,
+    TestTsdb, VectorSeries,
 };
 use timeseries::{Label, MetricType, Sample, Series};
 use tower::ServiceExt;
@@ -27,19 +25,19 @@ const SAMPLE_TS_MS: i64 = 3_900_000;
 /// Same instant expressed in seconds (for query params).
 const SAMPLE_TS_SECS: i64 = 3900;
 
-async fn setup() -> (Router, Arc<Tsdb>) {
+async fn setup() -> (Router, TestTsdb) {
     let tsdb = testing::create_test_tsdb().await;
-    let app = testing::build_app(tsdb.clone());
+    let app = testing::build_app(&tsdb);
     (app, tsdb)
 }
 
-async fn setup_with_data() -> (Router, Arc<Tsdb>) {
+async fn setup_with_data() -> (Router, TestTsdb) {
     let (app, tsdb) = setup().await;
     ingest_test_data(&tsdb).await;
     (app, tsdb)
 }
 
-async fn ingest_test_data(tsdb: &Tsdb) {
+async fn ingest_test_data(tsdb: &TestTsdb) {
     let series = vec![
         Series {
             labels: vec![
@@ -65,8 +63,8 @@ async fn ingest_test_data(tsdb: &Tsdb) {
         },
     ];
 
-    tsdb.ingest_samples(series).await.unwrap();
-    tsdb.flush().await.unwrap();
+    tsdb.ingest_samples(series).await;
+    tsdb.flush().await;
 }
 
 async fn body_string(resp: axum::response::Response) -> String {
@@ -155,10 +153,7 @@ async fn test_query_get() {
 #[tokio::test]
 async fn test_query_post() {
     let (app, _) = setup_with_data().await;
-    let form_body = format!(
-        "query=http_requests_total&time={}",
-        SAMPLE_TS_SECS
-    );
+    let form_body = format!("query=http_requests_total&time={}", SAMPLE_TS_SECS);
     let req = Request::post("/api/v1/query")
         .header("content-type", "application/x-www-form-urlencoded")
         .body(Body::from(form_body))
@@ -252,24 +247,26 @@ async fn test_query_range_missing_params() {
 #[tokio::test]
 async fn test_series() {
     let (app, _) = setup_with_data().await;
-    // NOTE: serde_urlencoded does not support Vec<String> from repeated
-    // query params, so match[] cannot be passed via GET or POST form.
-    // Test that the endpoint responds and the response deserializes into
-    // the production SeriesResponse type. Without match[] the handler
-    // returns an error response — we verify that format here.
-    let uri = format!(
-        "/api/v1/series?start={}&end={}",
+    // Use POST form body with match[] — the custom deserialize_one_or_many
+    // handles single-value match[] from serde_urlencoded.
+    let form_body = format!(
+        "match[]=http_requests_total&start={}&end={}",
         SAMPLE_TS_SECS - 300,
         SAMPLE_TS_SECS + 300,
     );
-    let req = Request::get(&uri).body(Body::empty()).unwrap();
+    let req = Request::post("/api/v1/series")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(form_body))
+        .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
-    let parsed: SeriesResponse = serde_json::from_str(&body_string(resp).await).unwrap();
-    // Empty match[] defaults to error in the handler.
-    assert_eq!(parsed.status, "error");
+    let body = body_string(resp).await;
+    let parsed: SeriesResponse = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed.status, "success");
+    let data = parsed.data.unwrap();
+    assert_eq!(data.len(), 2, "expected 2 series for http_requests_total");
 }
 
 // ---------------------------------------------------------------------------
