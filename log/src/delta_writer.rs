@@ -4,17 +4,17 @@
 //! the write coordinator, providing the log-specific write batching
 //! and flush logic.
 
+use crate::delta_reader::FrozenLogDeltaView;
 use crate::listing::ListingCache;
-use crate::model::{AppendOutput, LogEntry, Record as UserRecord};
+use crate::model::{AppendOutput, LogEntry, Record as UserRecord, SegmentId};
 use crate::segment::{LogSegment, SegmentCache};
 use crate::storage::LogStorage;
-use crate::view::FrozenLogDeltaView;
 use async_trait::async_trait;
 use bytes::Bytes;
 use common::coordinator::{Delta, Flusher};
 use common::storage::StorageSnapshot;
 use common::{Record, WriteOptions};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -45,6 +45,8 @@ pub(crate) struct LogDelta {
     records: Vec<Record>,
     new_segments: Vec<LogSegment>,
     entries: HashMap<Bytes, Vec<LogEntry>>,
+    /// Maps segment ID → keys that are new to that segment in this delta.
+    segment_keys: HashMap<SegmentId, BTreeSet<Bytes>>,
 }
 
 /// Frozen (immutable) snapshot of a delta, ready for flushing.
@@ -132,6 +134,7 @@ impl Delta for LogDelta {
             records: Vec::new(),
             new_segments: Vec::new(),
             entries: HashMap::new(),
+            segment_keys: HashMap::new(),
         }
     }
 
@@ -160,9 +163,16 @@ impl Delta for LogDelta {
 
         // 3. Assign listing entries for new keys
         let keys: Vec<Bytes> = write.records.iter().map(|r| r.key.clone()).collect();
-        self.context
-            .listing_cache
-            .assign_keys(segment.id(), &keys, &mut self.records);
+        let new_keys =
+            self.context
+                .listing_cache
+                .assign_new_keys(segment.id(), &keys, &mut self.records);
+        if !new_keys.is_empty() {
+            self.segment_keys
+                .entry(segment.id())
+                .or_default()
+                .extend(new_keys);
+        }
 
         // 4. Build log entry records and index for reads
         self.add_entries(&segment, base_seq, &write.records);
@@ -180,7 +190,11 @@ impl Delta for LogDelta {
     }
 
     fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
-        let frozen_view = Arc::new(FrozenLogDeltaView::new(self.new_segments, self.entries));
+        let frozen_view = Arc::new(FrozenLogDeltaView::new(
+            self.new_segments,
+            self.entries,
+            self.segment_keys,
+        ));
         let frozen = FrozenLogDelta {
             records: self.records,
         };
@@ -233,7 +247,7 @@ mod tests {
             .unwrap();
 
         let log_storage = LogStorage::new(storage);
-        let segment_cache = SegmentCache::open(&log_storage.as_read(), SegmentConfig::default())
+        let segment_cache = SegmentCache::open(&*log_storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
         let listing_cache = ListingCache::new();
@@ -351,7 +365,7 @@ mod tests {
             .unwrap();
 
         use crate::config::SegmentConfig;
-        let segment_cache = SegmentCache::open(&log_storage.as_read(), SegmentConfig::default())
+        let segment_cache = SegmentCache::open(&*log_storage.as_read(), SegmentConfig::default())
             .await
             .unwrap();
         let listing_cache = ListingCache::new();

@@ -1,62 +1,63 @@
-//! Log-specific storage wrappers.
+//! Log-specific storage extensions.
 //!
-//! This module provides [`LogStorage`] and [`LogStorageRead`] which wrap
-//! the underlying storage traits with log-specific operations like key listing
-//! and segment metadata access.
+//! This module provides [`LogStorage`] for write operations and [`LogStorageRead`],
+//! an extension trait that adds log-specific read operations (segment scanning,
+//! entry scanning, key listing) to any [`StorageRead`] implementation.
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use crate::error::{Error, Result};
-use crate::listing::LogKeyIterator;
 use crate::model::{LogEntry, SegmentId};
 use crate::segment::LogSegment;
-use crate::serde::{LogEntryKey, SegmentMeta, SegmentMetaKey};
+use crate::serde::{ListingEntryKey, LogEntryKey, SegmentMeta, SegmentMetaKey};
 use bytes::Bytes;
 use common::storage::StorageSnapshot;
 use common::{Storage, StorageIterator, StorageRead};
 
-/// Read-only log storage operations.
+/// Extension trait adding log-specific read operations to any [`StorageRead`].
 ///
-/// Wraps `Arc<dyn StorageRead>` with log-specific read operations
-/// for segments and key listings.
-#[derive(Clone)]
-pub(crate) struct LogStorageRead {
-    storage: Arc<dyn StorageRead>,
-}
-
-impl LogStorageRead {
-    /// Creates a new read-only log storage wrapper.
-    pub(crate) fn new(storage: Arc<dyn StorageRead>) -> Self {
-        Self { storage }
-    }
-
-    /// Gets a single record by key.
-    #[cfg(any(test, feature = "http-server"))]
-    pub(crate) async fn get(&self, key: Bytes) -> Result<Option<common::Record>> {
-        self.storage
-            .get(key)
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))
-    }
-
-    /// Returns an iterator over keys present in the given segment range.
+/// Provides default implementations for scanning segments, entries, and listing keys.
+/// Automatically available on all `StorageRead` types via a blanket impl.
+#[async_trait]
+pub(crate) trait LogStorageRead: StorageRead {
+    /// Returns keys present in the given segment range.
     ///
-    /// Keys are deduplicated and returned in lexicographic order.
+    /// Keys are deduplicated and returned in a sorted `BTreeSet`.
     /// The segment range is half-open: [start, end).
-    pub(crate) async fn list_keys(
-        &self,
-        segment_range: Range<SegmentId>,
-    ) -> Result<LogKeyIterator> {
-        LogKeyIterator::open(Arc::clone(&self.storage), segment_range).await
+    async fn list_keys(&self, segment_range: Range<SegmentId>) -> Result<BTreeSet<Bytes>> {
+        if segment_range.start >= segment_range.end {
+            return Ok(BTreeSet::new());
+        }
+
+        let scan_range = ListingEntryKey::scan_range(segment_range);
+        let mut iter = self
+            .scan_iter(scan_range)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut keys = BTreeSet::new();
+        while let Some(record) = iter
+            .next()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?
+        {
+            let entry_key = ListingEntryKey::deserialize(&record.key)?;
+            keys.insert(entry_key.key);
+        }
+
+        Ok(keys)
     }
 
     /// Scans segment metadata records within the given segment ID range.
     ///
     /// Returns segments ordered by segment ID.
-    pub(crate) async fn scan_segments(&self, range: Range<SegmentId>) -> Result<Vec<LogSegment>> {
+    async fn scan_segments(&self, range: Range<SegmentId>) -> Result<Vec<LogSegment>> {
         let scan_range = SegmentMetaKey::scan_range(range);
-        let mut iter = self.storage.scan_iter(scan_range).await?;
+        let mut iter = self.scan_iter(scan_range).await?;
 
         let mut segments = Vec::new();
         while let Some(record) = iter.next().await? {
@@ -71,14 +72,14 @@ impl LogStorageRead {
     /// Scans log entries for a key within a segment and sequence range.
     ///
     /// Returns an iterator that yields `LogEntry` values in sequence order.
-    pub(crate) async fn scan_entries(
+    async fn scan_entries(
         &self,
         segment: &LogSegment,
         key: &Bytes,
         seq_range: Range<u64>,
     ) -> Result<SegmentIterator> {
         let scan_range = LogEntryKey::scan_range(segment, key, seq_range.clone());
-        let inner = self.storage.scan_iter(scan_range).await?;
+        let inner = self.scan_iter(scan_range).await?;
         Ok(SegmentIterator::new(
             inner,
             seq_range,
@@ -86,6 +87,8 @@ impl LogStorageRead {
         ))
     }
 }
+
+impl<T: StorageRead + ?Sized> LogStorageRead for T {}
 
 /// Iterator over log entries within a single segment.
 ///
@@ -170,8 +173,8 @@ impl LogStorage {
 
     /// Returns a read-only view of this storage.
     #[cfg(any(test, feature = "http-server"))]
-    pub(crate) fn as_read(&self) -> LogStorageRead {
-        LogStorageRead::new(Arc::clone(&self.storage) as Arc<dyn StorageRead>)
+    pub(crate) fn as_read(&self) -> Arc<dyn StorageRead> {
+        Arc::clone(&self.storage) as Arc<dyn StorageRead>
     }
 
     /// Closes the underlying storage.
@@ -449,29 +452,5 @@ mod tests {
         let r2 = storage.as_read().get(Bytes::from("k2")).await.unwrap();
         assert_eq!(r1.unwrap().value, Bytes::from("v1"));
         assert_eq!(r2.unwrap().value, Bytes::from("v2"));
-    }
-
-    #[tokio::test]
-    async fn should_clone_log_storage_read() {
-        // given
-        let storage = LogStorage::in_memory();
-        storage
-            .storage
-            .put(vec![common::Record::new(
-                Bytes::from("key"),
-                Bytes::from("value"),
-            )])
-            .await
-            .unwrap();
-
-        let read = storage.as_read();
-
-        // when
-        let cloned = read.clone();
-
-        // then - both should see the same data
-        let r1 = read.get(Bytes::from("key")).await.unwrap();
-        let r2 = cloned.get(Bytes::from("key")).await.unwrap();
-        assert_eq!(r1.unwrap().value, r2.unwrap().value);
     }
 }
