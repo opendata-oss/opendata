@@ -582,10 +582,10 @@ impl LogIterator {
         }
 
         // Then drain frozen deltas
-        if let Some(frozen) = &mut self.frozen_iter {
-            if let Some(entry) = frozen.next() {
-                return Ok(Some(entry));
-            }
+        if let Some(frozen) = &mut self.frozen_iter
+            && let Some(entry) = frozen.next()
+        {
+            return Ok(Some(entry));
         }
 
         Ok(None)
@@ -611,8 +611,12 @@ mod tests {
         let storage = in_memory_storage();
         let segments = vec![];
 
-        let mut iter =
-            LogIterator::new(storage.clone() as Arc<dyn StorageRead>, segments, Bytes::from("key"), 0..u64::MAX);
+        let mut iter = LogIterator::new(
+            storage.clone() as Arc<dyn StorageRead>,
+            segments,
+            Bytes::from("key"),
+            0..u64::MAX,
+        );
 
         assert!(iter.next().await.unwrap().is_none());
     }
@@ -729,7 +733,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mut iter = LogIterator::new(storage.clone() as Arc<dyn StorageRead>, vec![segment], Bytes::from("key"), 1..3);
+        let mut iter = LogIterator::new(
+            storage.clone() as Arc<dyn StorageRead>,
+            vec![segment],
+            Bytes::from("key"),
+            1..3,
+        );
 
         let entry = iter.next().await.unwrap().unwrap();
         assert_eq!(entry.sequence, 1);
@@ -792,8 +801,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mut iter =
-            LogIterator::new(storage.clone() as Arc<dyn StorageRead>, vec![segment], Bytes::from("key"), 10..20);
+        let mut iter = LogIterator::new(
+            storage.clone() as Arc<dyn StorageRead>,
+            vec![segment],
+            Bytes::from("key"),
+            10..20,
+        );
 
         assert!(iter.next().await.unwrap().is_none());
     }

@@ -8,9 +8,9 @@ use crate::delta_reader::FrozenLogDeltaView;
 use crate::listing::ListingCache;
 use crate::model::{AppendOutput, LogEntry, Record as UserRecord, SegmentId};
 use crate::segment::{LogSegment, SegmentCache};
-use common::Storage;
 use async_trait::async_trait;
 use bytes::Bytes;
+use common::Storage;
 use common::coordinator::{Delta, Flusher};
 use common::storage::StorageSnapshot;
 use common::{Record, WriteOptions};
@@ -219,19 +219,12 @@ impl Flusher<LogDelta> for LogFlusher {
             .await
             .map_err(|e| e.to_string())?;
 
-        let snapshot = self
-            .storage
-            .snapshot()
-            .await
-            .map_err(|e| e.to_string())?;
+        let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
         Ok(snapshot)
     }
 
     async fn flush_storage(&self) -> Result<(), String> {
-        self.storage
-            .flush()
-            .await
-            .map_err(|e| e.to_string())
+        self.storage.flush().await.map_err(|e| e.to_string())
     }
 }
 

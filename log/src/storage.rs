@@ -325,10 +325,7 @@ mod tests {
         }
 
         // when - scan only sequences 3..7
-        let mut iter = storage
-            .scan_entries(&segment, &key, 3..7)
-            .await
-            .unwrap();
+        let mut iter = storage.scan_entries(&segment, &key, 3..7).await.unwrap();
 
         // then
         let mut entries = Vec::new();

@@ -178,12 +178,7 @@ mod tests {
             write_listing_entry(&*storage, 0, b"key-c").await;
 
             // when
-            let keys: Vec<Bytes> = storage
-                .list_keys(0..1)
-                .await
-                .unwrap()
-                .into_iter()
-                .collect();
+            let keys: Vec<Bytes> = storage.list_keys(0..1).await.unwrap().into_iter().collect();
 
             // then - keys returned in lexicographic order
             assert_eq!(keys.len(), 3);
@@ -233,12 +228,7 @@ mod tests {
             write_listing_entry(&*storage, 3, b"key-3").await;
 
             // when - only query segments 1..3
-            let keys: Vec<Bytes> = storage
-                .list_keys(1..3)
-                .await
-                .unwrap()
-                .into_iter()
-                .collect();
+            let keys: Vec<Bytes> = storage.list_keys(1..3).await.unwrap().into_iter().collect();
 
             // then - only keys from segments 1 and 2
             assert_eq!(keys.len(), 2);
@@ -255,12 +245,7 @@ mod tests {
             write_listing_entry(&*storage, 0, b"mango").await;
 
             // when
-            let keys: Vec<Bytes> = storage
-                .list_keys(0..1)
-                .await
-                .unwrap()
-                .into_iter()
-                .collect();
+            let keys: Vec<Bytes> = storage.list_keys(0..1).await.unwrap().into_iter().collect();
 
             // then - keys returned in lexicographic order
             assert_eq!(keys[0], Bytes::from("apple"));

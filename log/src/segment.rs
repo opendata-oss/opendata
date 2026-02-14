@@ -446,9 +446,12 @@ mod tests {
         #[tokio::test]
         async fn should_return_none_when_no_segments_exist() {
             let storage = in_memory_storage();
-            let cache = SegmentCache::open(&*(storage.clone() as Arc<dyn StorageRead>), SegmentConfig::default())
-                .await
-                .unwrap();
+            let cache = SegmentCache::open(
+                &*(storage.clone() as Arc<dyn StorageRead>),
+                SegmentConfig::default(),
+            )
+            .await
+            .unwrap();
 
             assert!(cache.latest().is_none());
         }
@@ -456,9 +459,12 @@ mod tests {
         #[tokio::test]
         async fn should_write_first_segment_with_id_zero() {
             let storage = in_memory_storage();
-            let mut cache = SegmentCache::open(&*(storage.clone() as Arc<dyn StorageRead>), SegmentConfig::default())
-                .await
-                .unwrap();
+            let mut cache = SegmentCache::open(
+                &*(storage.clone() as Arc<dyn StorageRead>),
+                SegmentConfig::default(),
+            )
+            .await
+            .unwrap();
             let meta = SegmentMeta::new(0, 1000);
 
             let segment = write_segment(&*storage, &mut cache, meta.clone()).await;
@@ -470,9 +476,12 @@ mod tests {
         #[tokio::test]
         async fn should_increment_segment_id_on_subsequent_writes() {
             let storage = in_memory_storage();
-            let mut cache = SegmentCache::open(&*(storage.clone() as Arc<dyn StorageRead>), SegmentConfig::default())
-                .await
-                .unwrap();
+            let mut cache = SegmentCache::open(
+                &*(storage.clone() as Arc<dyn StorageRead>),
+                SegmentConfig::default(),
+            )
+            .await
+            .unwrap();
 
             let seg0 = write_segment(&*storage, &mut cache, SegmentMeta::new(0, 1000)).await;
             let seg1 = write_segment(&*storage, &mut cache, SegmentMeta::new(100, 2000)).await;
@@ -486,9 +495,12 @@ mod tests {
         #[tokio::test]
         async fn should_return_latest_segment() {
             let storage = in_memory_storage();
-            let mut cache = SegmentCache::open(&*(storage.clone() as Arc<dyn StorageRead>), SegmentConfig::default())
-                .await
-                .unwrap();
+            let mut cache = SegmentCache::open(
+                &*(storage.clone() as Arc<dyn StorageRead>),
+                SegmentConfig::default(),
+            )
+            .await
+            .unwrap();
             write_segment(&*storage, &mut cache, SegmentMeta::new(0, 1000)).await;
             write_segment(&*storage, &mut cache, SegmentMeta::new(100, 2000)).await;
 
@@ -575,9 +587,12 @@ mod tests {
     async fn assign_segment_creates_first_segment_when_none_exist() {
         // given
         let storage = in_memory_storage();
-        let mut cache = SegmentCache::open(&*(storage.clone() as Arc<dyn StorageRead>), SegmentConfig::default())
-            .await
-            .unwrap();
+        let mut cache = SegmentCache::open(
+            &*(storage.clone() as Arc<dyn StorageRead>),
+            SegmentConfig::default(),
+        )
+        .await
+        .unwrap();
         let mut records = Vec::new();
 
         // when
@@ -670,9 +685,12 @@ mod tests {
     async fn assign_segment_creates_correct_segment_meta_record() {
         // given
         let storage = in_memory_storage();
-        let mut cache = SegmentCache::open(&*(storage.clone() as Arc<dyn StorageRead>), SegmentConfig::default())
-            .await
-            .unwrap();
+        let mut cache = SegmentCache::open(
+            &*(storage.clone() as Arc<dyn StorageRead>),
+            SegmentConfig::default(),
+        )
+        .await
+        .unwrap();
         let mut records = Vec::new();
 
         // when
