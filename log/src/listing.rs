@@ -127,13 +127,12 @@ impl ListingCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::LogStorage;
+    use crate::storage::{LogStorageRead, in_memory_storage};
 
     mod log_key_iterator {
         use super::*;
-        use crate::storage::LogStorageRead;
 
-        async fn write_listing_entry(storage: &LogStorage, segment_id: u32, key: &[u8]) {
+        async fn write_listing_entry(storage: &dyn common::Storage, segment_id: u32, key: &[u8]) {
             let storage_key =
                 ListingEntryKey::new(segment_id, Bytes::copy_from_slice(key)).serialize();
             let value = ListingEntryValue::new().serialize();
@@ -149,10 +148,10 @@ mod tests {
         #[tokio::test]
         async fn should_return_empty_for_empty_range() {
             // given
-            let storage = LogStorage::in_memory();
+            let storage = in_memory_storage();
 
             // when
-            let keys = storage.as_read().list_keys(0..0).await.unwrap();
+            let keys = storage.list_keys(0..0).await.unwrap();
 
             // then
             assert!(keys.is_empty());
@@ -161,10 +160,10 @@ mod tests {
         #[tokio::test]
         async fn should_return_empty_when_no_listing_entries() {
             // given
-            let storage = LogStorage::in_memory();
+            let storage = in_memory_storage();
 
             // when
-            let keys = storage.as_read().list_keys(0..10).await.unwrap();
+            let keys = storage.list_keys(0..10).await.unwrap();
 
             // then
             assert!(keys.is_empty());
@@ -173,14 +172,13 @@ mod tests {
         #[tokio::test]
         async fn should_iterate_keys_in_single_segment() {
             // given
-            let storage = LogStorage::in_memory();
-            write_listing_entry(&storage, 0, b"key-a").await;
-            write_listing_entry(&storage, 0, b"key-b").await;
-            write_listing_entry(&storage, 0, b"key-c").await;
+            let storage = in_memory_storage();
+            write_listing_entry(&*storage, 0, b"key-a").await;
+            write_listing_entry(&*storage, 0, b"key-b").await;
+            write_listing_entry(&*storage, 0, b"key-c").await;
 
             // when
             let keys: Vec<Bytes> = storage
-                .as_read()
                 .list_keys(0..1)
                 .await
                 .unwrap()
@@ -197,13 +195,13 @@ mod tests {
         #[tokio::test]
         async fn should_iterate_keys_across_multiple_segments() {
             // given
-            let storage = LogStorage::in_memory();
-            write_listing_entry(&storage, 0, b"key-a").await;
-            write_listing_entry(&storage, 1, b"key-b").await;
-            write_listing_entry(&storage, 2, b"key-c").await;
+            let storage = in_memory_storage();
+            write_listing_entry(&*storage, 0, b"key-a").await;
+            write_listing_entry(&*storage, 1, b"key-b").await;
+            write_listing_entry(&*storage, 2, b"key-c").await;
 
             // when
-            let keys = storage.as_read().list_keys(0..3).await.unwrap();
+            let keys = storage.list_keys(0..3).await.unwrap();
 
             // then
             assert_eq!(keys.len(), 3);
@@ -212,13 +210,13 @@ mod tests {
         #[tokio::test]
         async fn should_deduplicate_keys_across_segments() {
             // given - same key in multiple segments
-            let storage = LogStorage::in_memory();
-            write_listing_entry(&storage, 0, b"shared-key").await;
-            write_listing_entry(&storage, 1, b"shared-key").await;
-            write_listing_entry(&storage, 2, b"shared-key").await;
+            let storage = in_memory_storage();
+            write_listing_entry(&*storage, 0, b"shared-key").await;
+            write_listing_entry(&*storage, 1, b"shared-key").await;
+            write_listing_entry(&*storage, 2, b"shared-key").await;
 
             // when
-            let keys = storage.as_read().list_keys(0..3).await.unwrap();
+            let keys = storage.list_keys(0..3).await.unwrap();
 
             // then - only one instance of the key
             assert_eq!(keys.len(), 1);
@@ -228,15 +226,14 @@ mod tests {
         #[tokio::test]
         async fn should_respect_segment_range() {
             // given
-            let storage = LogStorage::in_memory();
-            write_listing_entry(&storage, 0, b"key-0").await;
-            write_listing_entry(&storage, 1, b"key-1").await;
-            write_listing_entry(&storage, 2, b"key-2").await;
-            write_listing_entry(&storage, 3, b"key-3").await;
+            let storage = in_memory_storage();
+            write_listing_entry(&*storage, 0, b"key-0").await;
+            write_listing_entry(&*storage, 1, b"key-1").await;
+            write_listing_entry(&*storage, 2, b"key-2").await;
+            write_listing_entry(&*storage, 3, b"key-3").await;
 
             // when - only query segments 1..3
             let keys: Vec<Bytes> = storage
-                .as_read()
                 .list_keys(1..3)
                 .await
                 .unwrap()
@@ -252,14 +249,13 @@ mod tests {
         #[tokio::test]
         async fn should_return_keys_in_lexicographic_order() {
             // given - keys inserted out of order
-            let storage = LogStorage::in_memory();
-            write_listing_entry(&storage, 0, b"zebra").await;
-            write_listing_entry(&storage, 0, b"apple").await;
-            write_listing_entry(&storage, 0, b"mango").await;
+            let storage = in_memory_storage();
+            write_listing_entry(&*storage, 0, b"zebra").await;
+            write_listing_entry(&*storage, 0, b"apple").await;
+            write_listing_entry(&*storage, 0, b"mango").await;
 
             // when
             let keys: Vec<Bytes> = storage
-                .as_read()
                 .list_keys(0..1)
                 .await
                 .unwrap()
