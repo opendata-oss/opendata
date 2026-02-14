@@ -1,6 +1,107 @@
 use std::collections::HashMap;
 
 use super::evaluator::{EvalResult, EvalSample, EvalSamples};
+use crate::model::Sample;
+
+/// Kahan summation increment with Neumaier improvement
+/// Performs addition of a value to a running sum with compensation
+/// Returns (new_sum, new_compensation)
+#[inline(never)]
+// Important: do NOT inline.
+// Prometheus observed precision regressions when the compiler reordered
+// floating-point operations during inlining. We lock behavior to match
+// Prometheus' IEEE-754 semantics exactly.
+// See: https://github.com/prometheus/prometheus/issues/16714
+fn kahan_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
+    let t = sum + inc;
+
+    let new_c = if t.is_infinite() {
+        0.0
+    } else if sum.abs() >= inc.abs() {
+        // Neumaier improvement: swap if next term larger than sum
+        c + ((sum - t) + inc)
+    } else {
+        c + ((inc - t) + sum)
+    };
+
+    (t, new_c)
+}
+
+/// Generic aggregator for range vector functions.
+///
+/// Invariant:
+/// - Each input series is reduced to a single output sample at eval_timestamp_ms.
+/// - Empty series are skipped (matching Prometheus behavior).
+/// - Aggregation function `f` must implement PromQL float semantics exactly.
+fn aggr_over_time<F>(samples: Vec<EvalSamples>, eval_timestamp_ms: i64, f: F) -> Vec<EvalSample>
+where
+    F: Fn(&[Sample]) -> f64,
+{
+    let mut result = Vec::with_capacity(samples.len());
+
+    for series in samples {
+        if series.values.is_empty() {
+            continue;
+        }
+
+        let value = f(&series.values);
+
+        result.push(EvalSample {
+            timestamp_ms: eval_timestamp_ms,
+            value,
+            labels: series.labels,
+        });
+    }
+
+    result
+}
+
+/// Average calculation matching Prometheus semantics.
+///
+/// Strategy:
+/// 1. Use Kahan summation for numerical stability.
+/// 2. If intermediate sum overflows to ±Inf, switch to incremental mean
+///    to avoid poisoning the entire result.
+///
+/// This mirrors Prometheus' hybrid strategy and prevents overflow-induced
+/// divergence while maintaining IEEE-754 parity.
+fn avg_kahan(values: &[Sample]) -> f64 {
+    if values.len() == 1 {
+        return values[0].value;
+    }
+
+    let mut sum = values[0].value;
+    let mut c = 0.0;
+    let mut mean = 0.0;
+    let mut incremental = false;
+
+    for (i, sample) in values.iter().enumerate().skip(1) {
+        let count = (i + 1) as f64;
+
+        if !incremental {
+            let (new_sum, new_c) = kahan_inc(sample.value, sum, c);
+            if !new_sum.is_infinite() {
+                sum = new_sum;
+                c = new_c;
+                continue;
+            }
+
+            incremental = true;
+            mean = sum / (count - 1.0);
+            c /= count - 1.0;
+        }
+
+        let q = (count - 1.0) / count;
+        (mean, c) = kahan_inc(sample.value / count, q * mean, q * c);
+    }
+
+    if incremental {
+        mean + c
+    } else {
+        let count = values.len() as f64;
+        sum / count + c / count
+    }
+}
 
 /// Trait for PromQL functions that operate on instant vectors
 pub(crate) trait PromQLFunction {
@@ -139,6 +240,14 @@ impl FunctionRegistry {
 
         // Range vector functions
         range_functions.insert("rate".to_string(), Box::new(RateFunction));
+        range_functions.insert("sum_over_time".to_string(), Box::new(SumOverTimeFunction));
+        range_functions.insert("avg_over_time".to_string(), Box::new(AvgOverTimeFunction));
+        range_functions.insert("min_over_time".to_string(), Box::new(MinOverTimeFunction));
+        range_functions.insert("max_over_time".to_string(), Box::new(MaxOverTimeFunction));
+        range_functions.insert(
+            "count_over_time".to_string(),
+            Box::new(CountOverTimeFunction),
+        );
 
         Self {
             functions,
@@ -238,6 +347,135 @@ impl RangeFunction for RateFunction {
         }
 
         Ok(result)
+    }
+}
+
+/// Sum over time function: sums all sample values in the range
+/// Uses Kahan summation for numerical stability
+/// TODO: Add histogram support when histogram types are implemented
+struct SumOverTimeFunction;
+
+impl RangeFunction for SumOverTimeFunction {
+    fn apply(
+        &self,
+        samples: Vec<EvalSamples>,
+        eval_timestamp_ms: i64,
+    ) -> EvalResult<Vec<EvalSample>> {
+        Ok(aggr_over_time(samples, eval_timestamp_ms, |values| {
+            let mut sum = 0.0;
+            let mut c = 0.0;
+            for sample in values {
+                (sum, c) = kahan_inc(sample.value, sum, c);
+            }
+            // If sum is infinite, return it directly without compensation
+            if sum.is_infinite() { sum } else { sum + c }
+        }))
+    }
+}
+
+/// Average over time function: averages all sample values in the range
+/// Uses hybrid approach: direct mean with Kahan summation, switching to incremental mean on overflow
+/// TODO: Add histogram support when histogram types are implemented
+struct AvgOverTimeFunction;
+
+impl RangeFunction for AvgOverTimeFunction {
+    fn apply(
+        &self,
+        samples: Vec<EvalSamples>,
+        eval_timestamp_ms: i64,
+    ) -> EvalResult<Vec<EvalSample>> {
+        Ok(aggr_over_time(samples, eval_timestamp_ms, avg_kahan))
+    }
+}
+
+// NOTE ON NaN HANDLING:
+//
+// Prometheus does NOT use simple f64::min/max semantics.
+// It uses explicit comparisons to ensure:
+//   - Real numbers replace NaN
+//   - All-NaN input returns NaN
+//
+// We mirror that behavior exactly for semantic parity.
+
+/// Min over time.
+///
+/// IMPORTANT:
+/// We intentionally do NOT use `f64::min` or a fold with +inf.
+///
+/// Prometheus semantics:
+/// - If the first value is NaN and later values are real numbers,
+///   NaN is replaced by the first real number.
+/// - If all values are NaN, result must remain NaN.
+///
+/// A naive fold starting from +inf would incorrectly return +inf
+/// for all-NaN input. This manual loop preserves exact PromQL behavior.
+struct MinOverTimeFunction;
+
+impl RangeFunction for MinOverTimeFunction {
+    fn apply(
+        &self,
+        samples: Vec<EvalSamples>,
+        eval_timestamp_ms: i64,
+    ) -> EvalResult<Vec<EvalSample>> {
+        Ok(aggr_over_time(samples, eval_timestamp_ms, |values| {
+            let mut min_val = values[0].value;
+            for sample in values.iter().skip(1) {
+                let cur = sample.value;
+                if cur < min_val || min_val.is_nan() {
+                    min_val = cur;
+                }
+            }
+            min_val
+        }))
+    }
+}
+
+/// Max over time.
+///
+/// IMPORTANT:
+/// We intentionally do NOT use `f64::max` or a fold with -inf.
+///
+/// Prometheus semantics:
+/// - NaN is replaced by any subsequent real value.
+/// - If all values are NaN, result must remain NaN.
+///
+/// A naive fold starting from -inf would incorrectly return -inf
+/// for all-NaN input. This manual loop guarantees semantic parity
+/// with Prometheus.
+struct MaxOverTimeFunction;
+
+impl RangeFunction for MaxOverTimeFunction {
+    fn apply(
+        &self,
+        samples: Vec<EvalSamples>,
+        eval_timestamp_ms: i64,
+    ) -> EvalResult<Vec<EvalSample>> {
+        Ok(aggr_over_time(samples, eval_timestamp_ms, |values| {
+            let mut max_val = values[0].value;
+            for sample in values.iter().skip(1) {
+                let cur = sample.value;
+                if cur > max_val || max_val.is_nan() {
+                    max_val = cur;
+                }
+            }
+            max_val
+        }))
+    }
+}
+
+/// Count over time function: counts number of samples in the range
+/// TODO: Add histogram support - Prometheus counts both floats and histograms
+struct CountOverTimeFunction;
+
+impl RangeFunction for CountOverTimeFunction {
+    fn apply(
+        &self,
+        samples: Vec<EvalSamples>,
+        eval_timestamp_ms: i64,
+    ) -> EvalResult<Vec<EvalSample>> {
+        Ok(aggr_over_time(samples, eval_timestamp_ms, |values| {
+            values.len() as f64
+        }))
     }
 }
 
@@ -347,6 +585,101 @@ mod tests {
     }
 
     #[test]
+    fn should_apply_sum_over_time_function() {
+        // given
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("sum_over_time").unwrap();
+
+        let samples = vec![create_eval_samples(
+            vec![(1000, 1.0), (2000, 2.0), (3000, 3.0)],
+            HashMap::new(),
+        )];
+
+        // when
+        let result = func.apply(samples, 3000).unwrap();
+
+        // then
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 6.0); // 1 + 2 + 3
+    }
+
+    #[test]
+    fn should_apply_avg_over_time_function() {
+        // given
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("avg_over_time").unwrap();
+
+        let samples = vec![create_eval_samples(
+            vec![(1000, 10.0), (2000, 20.0), (3000, 30.0)],
+            HashMap::new(),
+        )];
+
+        // when
+        let result = func.apply(samples, 3000).unwrap();
+
+        // then
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 20.0); // (10 + 20 + 30) / 3
+    }
+
+    #[test]
+    fn should_apply_min_over_time_function() {
+        // given
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("min_over_time").unwrap();
+
+        let samples = vec![create_eval_samples(
+            vec![(1000, 10.0), (2000, 5.0), (3000, 30.0)],
+            HashMap::new(),
+        )];
+
+        // when
+        let result = func.apply(samples, 3000).unwrap();
+
+        // then
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 5.0);
+    }
+
+    #[test]
+    fn should_apply_max_over_time_function() {
+        // given
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("max_over_time").unwrap();
+
+        let samples = vec![create_eval_samples(
+            vec![(1000, 10.0), (2000, 50.0), (3000, 30.0)],
+            HashMap::new(),
+        )];
+
+        // when
+        let result = func.apply(samples, 3000).unwrap();
+
+        // then
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 50.0);
+    }
+
+    #[test]
+    fn should_apply_count_over_time_function() {
+        // given
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("count_over_time").unwrap();
+
+        let samples = vec![create_eval_samples(
+            vec![(1000, 10.0), (2000, 20.0), (3000, 30.0), (4000, 40.0)],
+            HashMap::new(),
+        )];
+
+        // when
+        let result = func.apply(samples, 4000).unwrap();
+
+        // then
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 4.0);
+    }
+
+    #[test]
     fn should_handle_counter_reset_in_rate() {
         let registry = FunctionRegistry::new();
         let func = registry.get_range_function("rate").unwrap();
@@ -381,5 +714,184 @@ mod tests {
 
         // Should return empty result for insufficient samples
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn should_handle_catastrophic_cancellation_in_sum() {
+        // Test Kahan summation handles catastrophic cancellation
+        let values = vec![
+            Sample {
+                timestamp_ms: 0,
+                value: 1e16,
+            },
+            Sample {
+                timestamp_ms: 1,
+                value: 1.0,
+            },
+            Sample {
+                timestamp_ms: 2,
+                value: -1e16,
+            },
+        ];
+
+        let naive: f64 = values.iter().map(|s| s.value).sum();
+
+        let mut sum = 0.0;
+        let mut c = 0.0;
+        for sample in &values {
+            (sum, c) = kahan_inc(sample.value, sum, c);
+        }
+        let kahan = sum + c;
+
+        // Naive sum loses precision due to catastrophic cancellation
+        // Kahan summation preserves the 1.0
+        assert!((kahan - 1.0).abs() < 1e-9, "kahan={}, expected=1.0", kahan);
+        assert!(
+            (naive - 1.0).abs() > 1e-9,
+            "naive={}, should lose precision",
+            naive
+        );
+    }
+
+    #[test]
+    fn should_match_prometheus_kahan_bits() {
+        // Bitwise exact match with Prometheus Go implementation.
+        //
+        // Generated using the following Go harness:
+        //
+        // package main
+        //
+        // import (
+        //     "fmt"
+        //     "math"
+        //     "github.com/prometheus/prometheus/util/kahansum"
+        // )
+        //
+        // func main() {
+        //     values := []float64{1e16, 1.0, -1e16}
+        //
+        //     sum, c := 0.0, 0.0
+        //     for _, v := range values {
+        //         sum, c = kahansum.Inc(v, sum, c)
+        //     }
+        //
+        //     result := sum + c
+        //     fmt.Println(math.Float64bits(result))
+        // }
+        //
+        // Output:
+        // 4607182418800017408
+        //
+        // This locks Rust behavior to Prometheus' exact IEEE-754 bit pattern.
+        // Any future compiler or refactor drift will be caught immediately.
+        let values = vec![
+            Sample {
+                timestamp_ms: 0,
+                value: 1e16,
+            },
+            Sample {
+                timestamp_ms: 1,
+                value: 1.0,
+            },
+            Sample {
+                timestamp_ms: 2,
+                value: -1e16,
+            },
+        ];
+
+        let mut sum = 0.0;
+        let mut c = 0.0;
+        for sample in &values {
+            (sum, c) = kahan_inc(sample.value, sum, c);
+        }
+        let result = sum + c;
+
+        // Expected bits generated from Go harness
+        let expected_bits: u64 = 4607182418800017408;
+
+        assert_eq!(
+            result.to_bits(),
+            expected_bits,
+            "result={}, bits={}, expected_bits={}",
+            result,
+            result.to_bits(),
+            expected_bits
+        );
+    }
+
+    #[test]
+    fn should_handle_nan_in_max_over_time() {
+        // Test that NaN is replaced by subsequent values (Prometheus behavior)
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("max_over_time").unwrap();
+
+        let samples = vec![create_eval_samples(
+            vec![(1000, f64::NAN), (2000, 5.0)],
+            HashMap::new(),
+        )];
+
+        let result = func.apply(samples, 2000).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 5.0, "NaN should be replaced by 5.0");
+    }
+
+    #[test]
+    fn should_handle_nan_in_min_over_time() {
+        // Test that NaN is replaced by subsequent values (Prometheus behavior)
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("min_over_time").unwrap();
+
+        let samples = vec![create_eval_samples(
+            vec![(1000, f64::NAN), (2000, 5.0)],
+            HashMap::new(),
+        )];
+
+        let result = func.apply(samples, 2000).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 5.0, "NaN should be replaced by 5.0");
+    }
+
+    #[test]
+    fn should_match_prometheus_all_nan_max() {
+        // Test that all-NaN returns NaN (not -inf from fold)
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("max_over_time").unwrap();
+
+        let samples = vec![create_eval_samples(
+            vec![(1000, f64::NAN), (2000, f64::NAN)],
+            HashMap::new(),
+        )];
+
+        let result = func.apply(samples, 2000).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].value.is_nan(),
+            "All-NaN should return NaN, got {}",
+            result[0].value
+        );
+    }
+
+    #[test]
+    fn should_match_prometheus_all_nan_min() {
+        // Test that all-NaN returns NaN (not +inf from fold)
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("min_over_time").unwrap();
+
+        let samples = vec![create_eval_samples(
+            vec![(1000, f64::NAN), (2000, f64::NAN)],
+            HashMap::new(),
+        )];
+
+        let result = func.apply(samples, 2000).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].value.is_nan(),
+            "All-NaN should return NaN, got {}",
+            result[0].value
+        );
     }
 }
