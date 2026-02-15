@@ -21,8 +21,8 @@ use common::{StorageRuntime, StorageSemantics};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
-use crate::config::{CountOptions, ScanOptions};
-use crate::delta::{LogContext, LogDelta, LogFlusher, LogWrite};
+use crate::config::CountOptions;
+use crate::delta_writer::{LogContext, LogDelta, LogFlusher, LogWrite};
 use crate::error::{AppendError, AppendResult, Error, Result};
 use crate::listing::ListingCache;
 use crate::listing::LogKeyIterator;
@@ -30,7 +30,6 @@ use crate::model::{AppendOutput, Record, Segment, SegmentId, Sequence};
 use crate::range::{normalize_segment_id, normalize_sequence};
 use crate::reader::{LogIterator, LogRead};
 use crate::segment::SegmentCache;
-use crate::storage::LogStorage;
 
 const WRITE_CHANNEL: &str = "write";
 
@@ -102,9 +101,9 @@ const WRITE_CHANNEL: &str = "write";
 pub struct LogDb {
     handle: WriteCoordinatorHandle<LogDelta>,
     coordinator: WriteCoordinator<LogDelta, LogFlusher>,
-    storage: LogStorage,
+    storage: Arc<dyn common::Storage>,
     clock: Arc<dyn Clock>,
-    read_view: Arc<RwLock<crate::reader::LogReadView>>,
+    view: Arc<RwLock<crate::delta_reader::DeltaReaderView>>,
     view_monitor: ViewMonitor,
     flush_subscriber_task: JoinHandle<()>,
 }
@@ -280,7 +279,7 @@ impl LogDb {
         // Read the sequence block - this is a single key lookup that verifies
         // storage is accessible without scanning or listing data.
         let seq_key = Bytes::from_static(&crate::serde::SEQ_BLOCK_KEY);
-        let _ = self.storage.as_read().get(seq_key).await?;
+        let _ = self.storage.get(seq_key).await?;
         Ok(())
     }
 
@@ -356,31 +355,30 @@ impl LogDb {
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn common::Storage>) -> Result<Self> {
         use crate::config::SegmentConfig;
-        use crate::reader::LogReadView;
+        use crate::delta_reader::DeltaReaderView;
         use crate::serde::SEQ_BLOCK_KEY;
-        use crate::storage::LogStorageRead;
 
-        let log_storage = LogStorage::new(storage.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
         let seq_key = Bytes::from_static(&SEQ_BLOCK_KEY);
         let sequence_allocator = common::SequenceAllocator::load(storage.as_ref(), seq_key)
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
-        let snapshot = log_storage.snapshot().await?;
+        let snapshot = storage.snapshot().await?;
+        let segment_config = SegmentConfig::default();
         let segment_cache = {
-            let bootstrap = LogStorageRead::new(snapshot.clone() as Arc<dyn common::StorageRead>);
-            SegmentCache::open(&bootstrap, SegmentConfig::default()).await?
+            let bootstrap: Arc<dyn common::StorageRead> = snapshot.clone();
+            SegmentCache::open(&*bootstrap, segment_config.clone()).await?
         };
         let listing_cache = ListingCache::new();
 
         let context = LogContext {
             sequence_allocator,
-            segment_cache: segment_cache.clone(),
+            segment_cache,
             listing_cache,
         };
 
-        let flusher = LogFlusher::new(log_storage.clone());
+        let flusher = LogFlusher::new(storage.clone());
         let mut coordinator = WriteCoordinator::new(
             WriteCoordinatorConfig::default(),
             vec![WRITE_CHANNEL.to_string()],
@@ -393,20 +391,17 @@ impl LogDb {
         let (mut view_subscriber, monitor) = coordinator.subscribe();
         let initial_view = view_subscriber.initialize();
 
-        let read_view = Arc::new(RwLock::new(LogReadView::new(
-            LogStorageRead::new(initial_view.snapshot.clone() as Arc<dyn common::StorageRead>),
-            segment_cache,
-        )));
+        let view = Arc::new(RwLock::new(DeltaReaderView::open(initial_view).await?));
 
-        let flush_subscriber_task = spawn_flush_subscriber(view_subscriber, Arc::clone(&read_view));
+        let flush_subscriber_task = spawn_flush_subscriber(view_subscriber, Arc::clone(&view));
         coordinator.start();
 
         Ok(Self {
             handle,
             coordinator,
-            storage: log_storage,
+            storage,
             clock,
-            read_view,
+            view,
             view_monitor: monitor,
             flush_subscriber_task,
         })
@@ -415,16 +410,15 @@ impl LogDb {
 
 #[async_trait]
 impl LogRead for LogDb {
-    async fn scan_with_options(
+    async fn scan(
         &self,
         key: Bytes,
         seq_range: impl RangeBounds<Sequence> + Send,
-        options: ScanOptions,
     ) -> Result<LogIterator> {
         self.sync_reader_to_flushed().await?;
         let seq_range = normalize_sequence(&seq_range);
-        let view = self.read_view.read().await;
-        Ok(view.scan_with_options(key, seq_range, &options))
+        let view = self.view.read().await;
+        Ok(view.scan_entries(key, seq_range))
     }
 
     async fn count_with_options(
@@ -442,7 +436,7 @@ impl LogRead for LogDb {
     ) -> Result<LogKeyIterator> {
         self.sync_reader_to_flushed().await?;
         let segment_range = normalize_segment_id(&segment_range);
-        let view = self.read_view.read().await;
+        let view = self.view.read().await;
         view.list_keys(segment_range).await
     }
 
@@ -452,8 +446,8 @@ impl LogRead for LogDb {
     ) -> Result<Vec<Segment>> {
         self.sync_reader_to_flushed().await?;
         let seq_range = normalize_sequence(&seq_range);
-        let view = self.read_view.read().await;
-        Ok(view.list_segments(&seq_range))
+        let view = self.view.read().await;
+        Ok(view.list_segments(seq_range))
     }
 }
 
@@ -508,9 +502,8 @@ impl LogDbBuilder {
 
     /// Builds the LogDb instance.
     pub async fn build(self) -> Result<LogDb> {
-        use crate::reader::LogReadView;
+        use crate::delta_reader::DeltaReaderView;
         use crate::serde::SEQ_BLOCK_KEY;
-        use crate::storage::LogStorageRead;
 
         let storage = create_storage(
             &self.config.storage,
@@ -520,27 +513,26 @@ impl LogDbBuilder {
         .await
         .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let log_storage = LogStorage::new(storage.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
         let seq_key = Bytes::from_static(&SEQ_BLOCK_KEY);
         let sequence_allocator = common::SequenceAllocator::load(storage.as_ref(), seq_key)
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
-        let snapshot = log_storage.snapshot().await?;
+        let snapshot = storage.snapshot().await?;
         let segment_cache = {
-            let bootstrap = LogStorageRead::new(snapshot.clone() as Arc<dyn common::StorageRead>);
-            SegmentCache::open(&bootstrap, self.config.segmentation).await?
+            let bootstrap: Arc<dyn common::StorageRead> = snapshot.clone();
+            SegmentCache::open(&*bootstrap, self.config.segmentation.clone()).await?
         };
         let listing_cache = ListingCache::new();
 
         let context = LogContext {
             sequence_allocator,
-            segment_cache: segment_cache.clone(),
+            segment_cache,
             listing_cache,
         };
 
-        let flusher = LogFlusher::new(log_storage.clone());
+        let flusher = LogFlusher::new(storage.clone());
         let mut coordinator = WriteCoordinator::new(
             WriteCoordinatorConfig::default(),
             vec![WRITE_CHANNEL.to_string()],
@@ -553,20 +545,17 @@ impl LogDbBuilder {
         let (mut view_subscriber, monitor) = coordinator.subscribe();
         let initial_view = view_subscriber.initialize();
 
-        let read_view = Arc::new(RwLock::new(LogReadView::new(
-            LogStorageRead::new(initial_view.snapshot.clone() as Arc<dyn common::StorageRead>),
-            segment_cache,
-        )));
+        let view = Arc::new(RwLock::new(DeltaReaderView::open(initial_view).await?));
 
-        let flush_subscriber_task = spawn_flush_subscriber(view_subscriber, Arc::clone(&read_view));
+        let flush_subscriber_task = spawn_flush_subscriber(view_subscriber, Arc::clone(&view));
         coordinator.start();
 
         Ok(LogDb {
             handle,
             coordinator,
-            storage: log_storage,
+            storage,
             clock,
-            read_view,
+            view,
             view_monitor: monitor,
             flush_subscriber_task,
         })
@@ -575,19 +564,21 @@ impl LogDbBuilder {
 
 fn spawn_flush_subscriber(
     mut subscriber: ViewSubscriber<LogDelta>,
-    read_view: Arc<RwLock<crate::reader::LogReadView>>,
+    read_view: Arc<RwLock<crate::delta_reader::DeltaReaderView>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Ok(view) = subscriber.recv().await {
-            let Some(flushed) = &view.last_flushed_delta else {
+            if view.last_flushed_delta.is_none() {
                 continue;
-            };
-            let mut rv = read_view.write().await;
-            rv.update_snapshot(view.snapshot.clone());
-            if !flushed.val.new_segments.is_empty() {
-                rv.apply_new_segments(&flushed.val.new_segments);
             }
-            subscriber.update_flushed(flushed.epoch_range.end - 1);
+            let epoch_end = view
+                .last_flushed_delta
+                .as_ref()
+                .map(|f| f.epoch_range.end - 1)
+                .unwrap();
+            let mut rv = read_view.write().await;
+            rv.update_view(view);
+            subscriber.update_flushed(epoch_end);
         }
     })
 }

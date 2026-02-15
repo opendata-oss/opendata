@@ -4,16 +4,17 @@
 //! the write coordinator, providing the log-specific write batching
 //! and flush logic.
 
+use crate::delta_reader::FrozenLogDeltaView;
 use crate::listing::ListingCache;
-use crate::model::{AppendOutput, Record as UserRecord};
+use crate::model::{AppendOutput, LogEntry, Record as UserRecord, SegmentId};
 use crate::segment::{LogSegment, SegmentCache};
-use crate::serde::LogEntryBuilder;
-use crate::storage::LogStorage;
 use async_trait::async_trait;
 use bytes::Bytes;
+use common::Storage;
 use common::coordinator::{Delta, Flusher};
 use common::storage::StorageSnapshot;
 use common::{Record, WriteOptions};
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -43,6 +44,9 @@ pub(crate) struct LogDelta {
     context: LogContext,
     records: Vec<Record>,
     new_segments: Vec<LogSegment>,
+    entries: HashMap<Bytes, Vec<LogEntry>>,
+    /// Maps segment ID → keys that are new to that segment in this delta.
+    segment_keys: HashMap<SegmentId, BTreeSet<Bytes>>,
 }
 
 /// Frozen (immutable) snapshot of a delta, ready for flushing.
@@ -50,19 +54,13 @@ pub(crate) struct FrozenLogDelta {
     pub records: Vec<Record>,
 }
 
-/// Broadcast payload sent to subscribers after a flush.
-#[derive(Clone)]
-pub(crate) struct FrozenLogDeltaView {
-    pub new_segments: Vec<LogSegment>,
-}
-
 /// Flushes frozen deltas to storage.
 pub(crate) struct LogFlusher {
-    storage: LogStorage,
+    storage: Arc<dyn Storage>,
 }
 
 impl LogFlusher {
-    pub(crate) fn new(storage: LogStorage) -> Self {
+    pub(crate) fn new(storage: Arc<dyn Storage>) -> Self {
         Self { storage }
     }
 }
@@ -87,13 +85,45 @@ impl LogDelta {
         }
         assignment.segment
     }
+
+    /// Adds storage records and indexes log entries for a batch of user records.
+    fn add_entries(&mut self, segment: &LogSegment, base_seq: u64, user_records: &[UserRecord]) {
+        let segment_start_seq = segment.meta().start_seq;
+
+        for (i, user_record) in user_records.iter().enumerate() {
+            let sequence = base_seq + i as u64;
+
+            // Build the storage record
+            let entry_key =
+                crate::serde::LogEntryKey::new(segment.id(), user_record.key.clone(), sequence);
+            let storage_record = Record::new(
+                entry_key.serialize(segment_start_seq),
+                user_record.value.clone(),
+            );
+            self.records.push(storage_record);
+
+            // Index the entry for reads
+            let log_entry = LogEntry {
+                key: user_record.key.clone(),
+                sequence,
+                value: user_record.value.clone(),
+            };
+            self.entries
+                .entry(user_record.key.clone())
+                .or_default()
+                .push(log_entry);
+        }
+    }
 }
 
 impl Delta for LogDelta {
     type Context = LogContext;
     type Write = LogWrite;
     type Frozen = FrozenLogDelta;
-    type FrozenView = FrozenLogDeltaView;
+    // TODO: Arc is needed because the coordinator clones frozen views when
+    // building new View instances. Consider having the coordinator wrap
+    // FrozenView in Arc internally so implementations don't need to.
+    type FrozenView = Arc<FrozenLogDeltaView>;
     type ApplyResult = Option<AppendOutput>;
     // Read of latest writes not yet supported
     type DeltaView = ();
@@ -103,6 +133,8 @@ impl Delta for LogDelta {
             context,
             records: Vec::new(),
             new_segments: Vec::new(),
+            entries: HashMap::new(),
+            segment_keys: HashMap::new(),
         }
     }
 
@@ -131,12 +163,19 @@ impl Delta for LogDelta {
 
         // 3. Assign listing entries for new keys
         let keys: Vec<Bytes> = write.records.iter().map(|r| r.key.clone()).collect();
-        self.context
-            .listing_cache
-            .assign_keys(segment.id(), &keys, &mut self.records);
+        let new_keys =
+            self.context
+                .listing_cache
+                .assign_new_keys(segment.id(), &keys, &mut self.records);
+        if !new_keys.is_empty() {
+            self.segment_keys
+                .entry(segment.id())
+                .or_default()
+                .extend(new_keys);
+        }
 
-        // 4. Build log entry records
-        LogEntryBuilder::build(&segment, base_seq, &write.records, &mut self.records);
+        // 4. Build log entry records and index for reads
+        self.add_entries(&segment, base_seq, &write.records);
 
         Ok(Some(AppendOutput {
             start_sequence: base_seq,
@@ -151,13 +190,15 @@ impl Delta for LogDelta {
     }
 
     fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
-        let frozen_read = FrozenLogDeltaView {
-            new_segments: self.new_segments,
-        };
+        let frozen_view = Arc::new(FrozenLogDeltaView::new(
+            self.new_segments,
+            self.entries,
+            self.segment_keys,
+        ));
         let frozen = FrozenLogDelta {
             records: self.records,
         };
-        (frozen, frozen_read, self.context)
+        (frozen, frozen_view, self.context)
     }
 
     fn reader(&self) -> Self::DeltaView {}
@@ -197,16 +238,15 @@ mod tests {
     /// Creates a LogContext with fresh in-memory state.
     async fn test_context() -> LogContext {
         use crate::config::SegmentConfig;
-        use common::storage::in_memory::InMemoryStorage;
+        use crate::storage::in_memory_storage;
 
-        let storage: Arc<dyn common::Storage> = Arc::new(InMemoryStorage::new());
+        let storage = in_memory_storage();
         let seq_key = Bytes::from_static(&SEQ_BLOCK_KEY);
         let sequence_allocator = SequenceAllocator::load(storage.as_ref(), seq_key)
             .await
             .unwrap();
 
-        let log_storage = LogStorage::new(storage);
-        let segment_cache = SegmentCache::open(&log_storage.as_read(), SegmentConfig::default())
+        let segment_cache = SegmentCache::open(&*storage, SegmentConfig::default())
             .await
             .unwrap();
         let listing_cache = ListingCache::new();
@@ -312,19 +352,18 @@ mod tests {
     #[tokio::test]
     async fn should_flush_writes_to_storage() {
         // given
-        use common::storage::in_memory::InMemoryStorage;
+        use crate::config::SegmentConfig;
+        use crate::storage::in_memory_storage;
 
-        let storage: Arc<dyn common::Storage> = Arc::new(InMemoryStorage::new());
-        let log_storage = LogStorage::new(Arc::clone(&storage));
-        let flusher = LogFlusher::new(log_storage.clone());
+        let storage = in_memory_storage();
+        let flusher = LogFlusher::new(Arc::clone(&storage));
 
         let seq_key = Bytes::from_static(&SEQ_BLOCK_KEY);
         let sequence_allocator = SequenceAllocator::load(storage.as_ref(), seq_key)
             .await
             .unwrap();
 
-        use crate::config::SegmentConfig;
-        let segment_cache = SegmentCache::open(&log_storage.as_read(), SegmentConfig::default())
+        let segment_cache = SegmentCache::open(&*storage, SegmentConfig::default())
             .await
             .unwrap();
         let listing_cache = ListingCache::new();
@@ -347,5 +386,65 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn should_freeze_entries_for_single_key() {
+        // given
+        let ctx = test_context().await;
+        let mut delta = LogDelta::init(ctx);
+        delta.apply(make_write(&["key1"], 1000)).unwrap();
+
+        // when
+        let (_frozen, view, _ctx) = delta.freeze();
+
+        // then
+        assert_eq!(view.entries.len(), 1);
+        let entries = &view.entries[&Bytes::from("key1")];
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sequence, 0);
+        assert_eq!(entries[0].value, Bytes::from("value-key1"));
+    }
+
+    #[tokio::test]
+    async fn should_freeze_entries_for_multiple_keys() {
+        // given
+        let ctx = test_context().await;
+        let mut delta = LogDelta::init(ctx);
+        delta.apply(make_write(&["key1", "key2"], 1000)).unwrap();
+
+        // when
+        let (_frozen, view, _ctx) = delta.freeze();
+
+        // then
+        assert_eq!(view.entries.len(), 2);
+        let entries1 = &view.entries[&Bytes::from("key1")];
+        assert_eq!(entries1.len(), 1);
+        assert_eq!(entries1[0].sequence, 0);
+        let entries2 = &view.entries[&Bytes::from("key2")];
+        assert_eq!(entries2.len(), 1);
+        assert_eq!(entries2[0].sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn should_freeze_entries_across_multiple_applies() {
+        // given
+        let ctx = test_context().await;
+        let mut delta = LogDelta::init(ctx);
+        delta.apply(make_write(&["key1"], 1000)).unwrap();
+        delta.apply(make_write(&["key1", "key2"], 1000)).unwrap();
+
+        // when
+        let (_frozen, view, _ctx) = delta.freeze();
+
+        // then
+        assert_eq!(view.entries.len(), 2);
+        let entries1 = &view.entries[&Bytes::from("key1")];
+        assert_eq!(entries1.len(), 2);
+        assert_eq!(entries1[0].sequence, 0);
+        assert_eq!(entries1[1].sequence, 1);
+        let entries2 = &view.entries[&Bytes::from("key2")];
+        assert_eq!(entries2.len(), 1);
+        assert_eq!(entries2[0].sequence, 2);
     }
 }

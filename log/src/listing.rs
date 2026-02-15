@@ -11,13 +11,11 @@
 //! - [`LogKeyIterator`]: Iterator over keys from listing entries
 
 use std::collections::BTreeSet;
-use std::ops::Range;
-use std::sync::Arc;
 
 use bytes::Bytes;
-use common::{Record, StorageRead};
+use common::Record;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::model::SegmentId;
 use crate::serde::{ListingEntryKey, ListingEntryValue};
 
@@ -45,42 +43,11 @@ pub struct LogKeyIterator {
 }
 
 impl LogKeyIterator {
-    /// Creates a new key iterator by scanning listing entries.
-    ///
-    /// This loads all keys from the segment range into memory for deduplication.
-    /// The async API is preserved for future streaming implementations.
-    pub(crate) async fn open(
-        storage: Arc<dyn StorageRead>,
-        segment_range: Range<SegmentId>,
-    ) -> Result<Self> {
-        // Empty range means no keys
-        if segment_range.start >= segment_range.end {
-            return Ok(Self {
-                keys: BTreeSet::new().into_iter(),
-            });
-        }
-
-        // Scan all listing entries in the segment range
-        let scan_range = ListingEntryKey::scan_range(segment_range);
-        let mut iter = storage
-            .scan_iter(scan_range)
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        // Collect keys into BTreeSet (deduplicates and sorts)
-        let mut keys = BTreeSet::new();
-        while let Some(record) = iter
-            .next()
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?
-        {
-            let entry_key = ListingEntryKey::deserialize(&record.key)?;
-            keys.insert(entry_key.key);
-        }
-
-        Ok(Self {
+    /// Creates a key iterator from a pre-built set of keys.
+    pub(crate) fn from_keys(keys: BTreeSet<Bytes>) -> Self {
+        Self {
             keys: keys.into_iter(),
-        })
+        }
     }
 
     /// Returns the next key, or `None` if exhausted.
@@ -109,25 +76,29 @@ impl ListingCache {
         }
     }
 
-    /// Assigns listing entries for the given keys.
+    /// Assigns listing entries for the given keys, returning the new ones.
     ///
     /// For each key that is new to the segment (not already cached and not
     /// a duplicate within this batch), appends a listing entry record to
     /// `records` and updates the cache.
     ///
     /// If `segment_id` differs from the cached segment, the cache is reset.
-    pub(crate) fn assign_keys(
+    ///
+    /// Returns the keys that were new to this segment (i.e., produced listing
+    /// records). Callers can use this to track segment→key associations.
+    pub(crate) fn assign_new_keys(
         &mut self,
         segment_id: SegmentId,
         keys: &[Bytes],
         records: &mut Vec<Record>,
-    ) {
+    ) -> Vec<Bytes> {
         if self.current_segment_id != Some(segment_id) {
             self.keys.clear();
             self.current_segment_id = Some(segment_id);
         }
 
         let value = ListingEntryValue::new().serialize();
+        let mut new_keys = Vec::new();
 
         for key in keys {
             if self.keys.contains(key) {
@@ -137,7 +108,10 @@ impl ListingCache {
             let storage_key = ListingEntryKey::new(segment_id, key.clone()).serialize();
             records.push(Record::new(storage_key, value.clone()));
             self.keys.insert(key.clone());
+            new_keys.push(key.clone());
         }
+
+        new_keys
     }
 
     /// Checks if a key is new for the given segment.
@@ -153,12 +127,12 @@ impl ListingCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::LogStorage;
+    use crate::storage::{LogStorageRead, in_memory_storage};
 
     mod log_key_iterator {
         use super::*;
 
-        async fn write_listing_entry(storage: &LogStorage, segment_id: u32, key: &[u8]) {
+        async fn write_listing_entry(storage: &dyn common::Storage, segment_id: u32, key: &[u8]) {
             let storage_key =
                 ListingEntryKey::new(segment_id, Bytes::copy_from_slice(key)).serialize();
             let value = ListingEntryValue::new().serialize();
@@ -174,43 +148,39 @@ mod tests {
         #[tokio::test]
         async fn should_return_empty_for_empty_range() {
             // given
-            let storage = LogStorage::in_memory();
+            let storage = in_memory_storage();
 
             // when
-            let mut iter = storage.as_read().list_keys(0..0).await.unwrap();
+            let keys = storage.list_keys(0..0).await.unwrap();
 
             // then
-            assert!(iter.next().await.unwrap().is_none());
+            assert!(keys.is_empty());
         }
 
         #[tokio::test]
         async fn should_return_empty_when_no_listing_entries() {
             // given
-            let storage = LogStorage::in_memory();
+            let storage = in_memory_storage();
 
             // when
-            let mut iter = storage.as_read().list_keys(0..10).await.unwrap();
+            let keys = storage.list_keys(0..10).await.unwrap();
 
             // then
-            assert!(iter.next().await.unwrap().is_none());
+            assert!(keys.is_empty());
         }
 
         #[tokio::test]
         async fn should_iterate_keys_in_single_segment() {
             // given
-            let storage = LogStorage::in_memory();
-            write_listing_entry(&storage, 0, b"key-a").await;
-            write_listing_entry(&storage, 0, b"key-b").await;
-            write_listing_entry(&storage, 0, b"key-c").await;
+            let storage = in_memory_storage();
+            write_listing_entry(&*storage, 0, b"key-a").await;
+            write_listing_entry(&*storage, 0, b"key-b").await;
+            write_listing_entry(&*storage, 0, b"key-c").await;
 
             // when
-            let mut iter = storage.as_read().list_keys(0..1).await.unwrap();
+            let keys: Vec<Bytes> = storage.list_keys(0..1).await.unwrap().into_iter().collect();
 
             // then - keys returned in lexicographic order
-            let mut keys = Vec::new();
-            while let Some(key) = iter.next().await.unwrap() {
-                keys.push(key.key);
-            }
             assert_eq!(keys.len(), 3);
             assert_eq!(keys[0], Bytes::from("key-a"));
             assert_eq!(keys[1], Bytes::from("key-b"));
@@ -220,59 +190,47 @@ mod tests {
         #[tokio::test]
         async fn should_iterate_keys_across_multiple_segments() {
             // given
-            let storage = LogStorage::in_memory();
-            write_listing_entry(&storage, 0, b"key-a").await;
-            write_listing_entry(&storage, 1, b"key-b").await;
-            write_listing_entry(&storage, 2, b"key-c").await;
+            let storage = in_memory_storage();
+            write_listing_entry(&*storage, 0, b"key-a").await;
+            write_listing_entry(&*storage, 1, b"key-b").await;
+            write_listing_entry(&*storage, 2, b"key-c").await;
 
             // when
-            let mut iter = storage.as_read().list_keys(0..3).await.unwrap();
+            let keys = storage.list_keys(0..3).await.unwrap();
 
             // then
-            let mut keys = Vec::new();
-            while let Some(key) = iter.next().await.unwrap() {
-                keys.push(key.key);
-            }
             assert_eq!(keys.len(), 3);
         }
 
         #[tokio::test]
         async fn should_deduplicate_keys_across_segments() {
             // given - same key in multiple segments
-            let storage = LogStorage::in_memory();
-            write_listing_entry(&storage, 0, b"shared-key").await;
-            write_listing_entry(&storage, 1, b"shared-key").await;
-            write_listing_entry(&storage, 2, b"shared-key").await;
+            let storage = in_memory_storage();
+            write_listing_entry(&*storage, 0, b"shared-key").await;
+            write_listing_entry(&*storage, 1, b"shared-key").await;
+            write_listing_entry(&*storage, 2, b"shared-key").await;
 
             // when
-            let mut iter = storage.as_read().list_keys(0..3).await.unwrap();
+            let keys = storage.list_keys(0..3).await.unwrap();
 
             // then - only one instance of the key
-            let mut keys = Vec::new();
-            while let Some(key) = iter.next().await.unwrap() {
-                keys.push(key.key);
-            }
             assert_eq!(keys.len(), 1);
-            assert_eq!(keys[0], Bytes::from("shared-key"));
+            assert!(keys.contains(&Bytes::from("shared-key")));
         }
 
         #[tokio::test]
         async fn should_respect_segment_range() {
             // given
-            let storage = LogStorage::in_memory();
-            write_listing_entry(&storage, 0, b"key-0").await;
-            write_listing_entry(&storage, 1, b"key-1").await;
-            write_listing_entry(&storage, 2, b"key-2").await;
-            write_listing_entry(&storage, 3, b"key-3").await;
+            let storage = in_memory_storage();
+            write_listing_entry(&*storage, 0, b"key-0").await;
+            write_listing_entry(&*storage, 1, b"key-1").await;
+            write_listing_entry(&*storage, 2, b"key-2").await;
+            write_listing_entry(&*storage, 3, b"key-3").await;
 
             // when - only query segments 1..3
-            let mut iter = storage.as_read().list_keys(1..3).await.unwrap();
+            let keys: Vec<Bytes> = storage.list_keys(1..3).await.unwrap().into_iter().collect();
 
             // then - only keys from segments 1 and 2
-            let mut keys = Vec::new();
-            while let Some(key) = iter.next().await.unwrap() {
-                keys.push(key.key);
-            }
             assert_eq!(keys.len(), 2);
             assert_eq!(keys[0], Bytes::from("key-1"));
             assert_eq!(keys[1], Bytes::from("key-2"));
@@ -281,19 +239,15 @@ mod tests {
         #[tokio::test]
         async fn should_return_keys_in_lexicographic_order() {
             // given - keys inserted out of order
-            let storage = LogStorage::in_memory();
-            write_listing_entry(&storage, 0, b"zebra").await;
-            write_listing_entry(&storage, 0, b"apple").await;
-            write_listing_entry(&storage, 0, b"mango").await;
+            let storage = in_memory_storage();
+            write_listing_entry(&*storage, 0, b"zebra").await;
+            write_listing_entry(&*storage, 0, b"apple").await;
+            write_listing_entry(&*storage, 0, b"mango").await;
 
             // when
-            let mut iter = storage.as_read().list_keys(0..1).await.unwrap();
+            let keys: Vec<Bytes> = storage.list_keys(0..1).await.unwrap().into_iter().collect();
 
             // then - keys returned in lexicographic order
-            let mut keys = Vec::new();
-            while let Some(key) = iter.next().await.unwrap() {
-                keys.push(key.key);
-            }
             assert_eq!(keys[0], Bytes::from("apple"));
             assert_eq!(keys[1], Bytes::from("mango"));
             assert_eq!(keys[2], Bytes::from("zebra"));
@@ -311,7 +265,7 @@ mod tests {
             let mut records = Vec::new();
 
             // when
-            cache.assign_keys(0, &keys, &mut records);
+            cache.assign_new_keys(0, &keys, &mut records);
 
             // then
             assert_eq!(records.len(), 2);
@@ -322,7 +276,7 @@ mod tests {
             // given
             let mut cache = ListingCache::new();
             let mut records1 = Vec::new();
-            cache.assign_keys(
+            cache.assign_new_keys(
                 0,
                 &[Bytes::from("key1"), Bytes::from("key2")],
                 &mut records1,
@@ -330,7 +284,7 @@ mod tests {
 
             // when - second batch with overlap
             let mut records2 = Vec::new();
-            cache.assign_keys(
+            cache.assign_new_keys(
                 0,
                 &[Bytes::from("key2"), Bytes::from("key3")],
                 &mut records2,
@@ -352,7 +306,7 @@ mod tests {
             let mut records = Vec::new();
 
             // when
-            cache.assign_keys(0, &keys, &mut records);
+            cache.assign_new_keys(0, &keys, &mut records);
 
             // then
             assert_eq!(records.len(), 2);
@@ -364,11 +318,11 @@ mod tests {
             let mut cache = ListingCache::new();
             let keys = vec![Bytes::from("key1"), Bytes::from("key2")];
             let mut records0 = Vec::new();
-            cache.assign_keys(0, &keys, &mut records0);
+            cache.assign_new_keys(0, &keys, &mut records0);
 
             // when - new segment with same keys
             let mut records1 = Vec::new();
-            cache.assign_keys(1, &keys, &mut records1);
+            cache.assign_new_keys(1, &keys, &mut records1);
 
             // then - all keys are new in new segment
             assert_eq!(records1.len(), 2);
@@ -379,11 +333,11 @@ mod tests {
             // given
             let mut cache = ListingCache::new();
             let mut records0 = Vec::new();
-            cache.assign_keys(0, &[Bytes::from("key1")], &mut records0);
+            cache.assign_new_keys(0, &[Bytes::from("key1")], &mut records0);
 
             // when - different segment
             let mut records1 = Vec::new();
-            cache.assign_keys(1, &[Bytes::from("key2")], &mut records1);
+            cache.assign_new_keys(1, &[Bytes::from("key2")], &mut records1);
 
             // then - key1 should be new again (cache cleared)
             assert!(cache.is_new(1, &Bytes::from("key1")));
@@ -399,7 +353,7 @@ mod tests {
             let mut records = Vec::new();
 
             // when
-            cache.assign_keys(42, &keys, &mut records);
+            cache.assign_new_keys(42, &keys, &mut records);
 
             // then
             assert_eq!(records.len(), 1);

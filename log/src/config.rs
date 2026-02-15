@@ -74,18 +74,6 @@ pub struct SegmentConfig {
     pub seal_interval: Option<Duration>,
 }
 
-/// Options for scan operations.
-///
-/// Controls the behavior of [`LogRead::scan`](crate::LogRead::scan) and
-/// [`LogRead::scan_with_options`](crate::LogRead::scan_with_options).
-/// Additional options may be added in future versions.
-#[derive(Debug, Clone, Default)]
-pub struct ScanOptions {
-    // Reserved for future options such as:
-    // - read_level: control consistency vs performance tradeoff
-    // - cache_policy: control block cache behavior
-}
-
 /// Options for count operations.
 ///
 /// Controls the behavior of [`LogRead::count`](crate::LogRead::count) and
