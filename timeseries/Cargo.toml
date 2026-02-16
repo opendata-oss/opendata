@@ -64,7 +64,7 @@ snap = { workspace = true, optional = true }
 fail.workspace = true
 proptest.workspace = true
 rstest.workspace = true
-rug.workspace = true
+dashu-float.workspace = true
 
 [[test]]
 name = "http_server"
