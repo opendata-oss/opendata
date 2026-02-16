@@ -73,6 +73,22 @@ impl Benchmark for IngestBenchmark {
         let series_counter = bench.counter("series_count");
         let batch_latency = bench.histogram("batch_latency_us");
 
+        // Pre-generate labels for each series (avoid allocations in the hot loop)
+        let series_labels: Vec<Vec<Label>> = (0..num_series)
+            .map(|i| {
+                (0..num_labels)
+                    .map(|j| Label::new(format!("label_{j}"), format!("value_{i}")))
+                    .collect()
+            })
+            .collect();
+        let series_names: Vec<String> = (0..num_series).map(|i| format!("metric_{i}")).collect();
+
+        // Bucket at minute 60 covers ms [3_600_000, 7_200_000), a 3_600_000 ms range.
+        // We keep all sample timestamps inside this single bucket so the benchmark
+        // measures steady-state ingest rather than bucket-creation overhead.
+        let bucket_start_ms: i64 = 3_600_000;
+        let bucket_range_ms: i64 = 3_600_000;
+
         // Start the timed benchmark
         let runner = bench.start();
 
@@ -81,28 +97,24 @@ impl Benchmark for IngestBenchmark {
         let mut iteration = 0;
 
         while runner.keep_running() {
-            // Generate timeseries data
+            // Build series from pre-generated labels, only varying timestamps.
+            // Wrap timestamps within the bucket so we never spill into a new one.
+            let iter_offset = (iteration as i64 * num_samples as i64 * 100) % bucket_range_ms;
             let series: Vec<Series> = (0..num_series)
                 .map(|i| {
-                    let labels: Vec<Label> = (0..num_labels)
-                        .map(|j| Label::new(format!("label_{}", j), format!("value_{}", i)))
-                        .collect();
-
-                    let base_timestamp = iteration as u64 * 3_600_000;
-
                     let samples: Vec<Sample> = (0..num_samples)
                         .map(|j| Sample {
-                            timestamp_ms: base_timestamp as i64 + (j as i64 * 100),
+                            timestamp_ms: bucket_start_ms
+                                + (iter_offset + j as i64 * 100) % bucket_range_ms,
                             value: 1.0,
                         })
                         .collect();
 
-                    Series::new(format!("metric_{}", i), labels, samples)
+                    Series::new(series_names[i].clone(), series_labels[i].clone(), samples)
                 })
                 .collect();
 
             let batch_start = std::time::Instant::now();
-            //ingest
             tsdb.ingest_samples(series, 5).await?;
             let ingest_elapsed = batch_start.elapsed();
 
