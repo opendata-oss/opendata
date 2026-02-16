@@ -1,7 +1,9 @@
 //! Ingest throughput benchmark for the tsdb database.
 
 use bencher::{Bench, Benchmark, Params, Summary};
-use timeseries::testing::{TestTsdb, create_test_tsdb_with_config, ObjectStoreConfig, LocalObjectStoreConfig};
+use timeseries::testing::{
+    LocalObjectStoreConfig, ObjectStoreConfig, TestTsdb, create_test_tsdb_with_config,
+};
 use timeseries::{Label, Sample, Series};
 
 const MICROS_PER_SEC: f64 = 1_000_000.0;
