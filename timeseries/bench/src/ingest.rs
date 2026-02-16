@@ -1,12 +1,7 @@
 //! Ingest throughput benchmark for the tsdb database.
 
-use std::sync::Arc;
-
 use bencher::{Bench, Benchmark, Params, Summary};
-use common::Storage;
-use common::storage::in_memory::InMemoryStorage;
-use timeseries::storage::merge_operator::OpenTsdbMergeOperator;
-use timeseries::tsdb::Tsdb;
+use timeseries::testing::{TestTsdb, create_test_tsdb};
 use timeseries::{Label, Sample, Series};
 
 const MICROS_PER_SEC: f64 = 1_000_000.0;
@@ -35,11 +30,6 @@ impl Default for IngestBenchmark {
     }
 }
 
-async fn create_test_storage() -> Arc<dyn Storage> {
-    Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-        OpenTsdbMergeOperator,
-    )))
-}
 
 #[async_trait::async_trait]
 impl Benchmark for IngestBenchmark {
@@ -92,7 +82,7 @@ impl Benchmark for IngestBenchmark {
         // Start the timed benchmark
         let runner = bench.start();
 
-        let tsdb = Tsdb::new(create_test_storage().await);
+        let tsdb: TestTsdb = create_test_tsdb().await;
         let mut series_written = 0;
         let mut iteration = 0;
 
@@ -115,7 +105,7 @@ impl Benchmark for IngestBenchmark {
                 .collect();
 
             let batch_start = std::time::Instant::now();
-            tsdb.ingest_samples(series, 5).await?;
+            tsdb.ingest_samples(series).await;
             let ingest_elapsed = batch_start.elapsed();
 
             // Update live metrics
@@ -141,7 +131,7 @@ impl Benchmark for IngestBenchmark {
                     .add("elapsed_ms", runner.elapsed().as_millis() as f64),
             )
             .await?;
-
+        tsdb.flush().await;
         bench.close().await?;
         Ok(())
     }

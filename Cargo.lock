@@ -4091,7 +4091,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bencher",
- "opendata-common",
  "opendata-timeseries",
  "tokio",
 ]

@@ -49,10 +49,10 @@ mod minitsdb;
 mod promql;
 mod query;
 mod serde;
-pub mod storage;
+mod storage;
 #[cfg(test)]
 mod test_utils;
-pub mod tsdb;
+mod tsdb;
 mod util;
 
 #[cfg(any(test, feature = "testing"))]
