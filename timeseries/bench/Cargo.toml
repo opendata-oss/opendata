@@ -10,3 +10,4 @@ timeseries = { path = "..", package = "opendata-timeseries", features = ["testin
 anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+tempfile = "3"

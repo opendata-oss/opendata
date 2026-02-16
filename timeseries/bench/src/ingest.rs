@@ -1,7 +1,7 @@
 //! Ingest throughput benchmark for the tsdb database.
 
 use bencher::{Bench, Benchmark, Params, Summary};
-use timeseries::testing::{TestTsdb, create_test_tsdb};
+use timeseries::testing::{TestTsdb, create_test_tsdb_with_config, ObjectStoreConfig, LocalObjectStoreConfig};
 use timeseries::{Label, Sample, Series};
 
 const MICROS_PER_SEC: f64 = 1_000_000.0;
@@ -77,11 +77,15 @@ impl Benchmark for IngestBenchmark {
         // measures steady-state ingest rather than bucket-creation overhead.
         let bucket_start_ms: i64 = 3_600_000;
         let bucket_range_ms: i64 = 3_600_000;
+        let tmp = tempfile::tempdir()?;
+        let object_store = ObjectStoreConfig::Local(LocalObjectStoreConfig {
+            path: tmp.path().to_str().unwrap().to_string(),
+        });
+        let tsdb: TestTsdb = create_test_tsdb_with_config(object_store).await;
 
         // Start the timed benchmark
         let runner = bench.start();
 
-        let tsdb: TestTsdb = create_test_tsdb().await;
         let mut series_written = 0;
         let mut iteration = 0;
 
