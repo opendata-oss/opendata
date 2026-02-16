@@ -30,7 +30,6 @@ impl Default for IngestBenchmark {
     }
 }
 
-
 #[async_trait::async_trait]
 impl Benchmark for IngestBenchmark {
     fn name(&self) -> &str {

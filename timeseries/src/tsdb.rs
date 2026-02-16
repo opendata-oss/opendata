@@ -131,10 +131,7 @@ impl Tsdb {
             buckets_touched = tracing::field::Empty
         )
     )]
-    pub(crate) async fn ingest_samples(
-        &self,
-        series_list: Vec<Series>
-    ) -> Result<()> {
+    pub(crate) async fn ingest_samples(&self, series_list: Vec<Series>) -> Result<()> {
         let mut bucket_series_map: HashMap<TimeBucket, Vec<Series>> = HashMap::new();
         let mut total_samples = 0;
 
