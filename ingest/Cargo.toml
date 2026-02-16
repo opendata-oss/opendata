@@ -10,7 +10,6 @@ path = "src/lib.rs"
 [dependencies]
 common.workspace = true
 bytes.workspace = true
-reqwest = { workspace = true, features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_with.workspace = true
@@ -19,5 +18,4 @@ tokio.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
-axum.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

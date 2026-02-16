@@ -1,7 +1,6 @@
 #[derive(Debug)]
 pub enum Error {
     Storage(String),
-    Http(String),
     Serialization(String),
 }
 
@@ -11,7 +10,6 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Storage(msg) => write!(f, "Storage error: {}", msg),
-            Error::Http(msg) => write!(f, "HTTP error: {}", msg),
             Error::Serialization(msg) => write!(f, "Serialization error: {}", msg),
         }
     }
