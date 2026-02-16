@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::Sample;
@@ -505,7 +505,24 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let adjusted_eval_ts =
             self.apply_time_modifiers(vector_selector, query_start, query_end, evaluation_ts)?;
 
-        let start = adjusted_eval_ts - range;
+        // Example where this matters:
+        //   sum_over_time(metric[100s] @ 100 offset 50s)
+        //   → adjusted_eval_ts = 50s
+        //   → start = 50s - 100s = -50s (before UNIX_EPOCH!)
+        //
+        // NOTE: Prometheus represents timestamps internally as int64 milliseconds
+        // and allows negative timestamps (times before UNIX_EPOCH).
+        // See: https://github.com/prometheus/prometheus/blob/main/model/timestamp/timestamp.go
+        //
+        // Rust's SystemTime cannot represent times before UNIX_EPOCH. Subtracting
+        // a range may therefore underflow. To avoid panic, we clamp to UNIX_EPOCH.
+        //
+        // This is a semantic deviation from Prometheus. In practice it is harmless
+        // unless data exists before UNIX_EPOCH.
+        //
+        // TODO: Replace SystemTime with i64 millisecond timestamps across the
+        // evaluator to achieve full PromQL time semantics and remove this clamp.
+        let start = adjusted_eval_ts.checked_sub(range).unwrap_or(UNIX_EPOCH);
 
         let end_ms = adjusted_eval_ts
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -513,7 +530,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             .as_millis() as i64;
         let start_ms = start
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as i64;
 
         // order buckets in chronological order

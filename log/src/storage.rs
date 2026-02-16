@@ -32,6 +32,7 @@ impl LogStorageRead {
     }
 
     /// Gets a single record by key.
+    #[cfg(any(test, feature = "http-server"))]
     pub(crate) async fn get(&self, key: Bytes) -> Result<Option<common::Record>> {
         self.storage
             .get(key)
@@ -161,7 +162,14 @@ impl LogStorage {
         Self::new(Arc::new(InMemoryStorage::new()))
     }
 
+    /// Registers storage engine metrics into the given Prometheus registry.
+    #[cfg(feature = "http-server")]
+    pub(crate) fn register_metrics(&self, registry: &mut prometheus_client::registry::Registry) {
+        self.storage.register_metrics(registry);
+    }
+
     /// Returns a read-only view of this storage.
+    #[cfg(any(test, feature = "http-server"))]
     pub(crate) fn as_read(&self) -> LogStorageRead {
         LogStorageRead::new(Arc::clone(&self.storage) as Arc<dyn StorageRead>)
     }

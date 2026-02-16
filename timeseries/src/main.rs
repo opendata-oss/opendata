@@ -76,7 +76,7 @@ async fn main() {
     tracing::info!("Storage created successfully");
 
     // Create Tsdb
-    let tsdb = Arc::new(Tsdb::new(storage));
+    let tsdb = Arc::new(Tsdb::new(storage.clone()));
 
     // Create server configuration
     let config = ServerConfig {
@@ -85,7 +85,7 @@ async fn main() {
     };
 
     // Create and run server
-    let server = PromqlServer::new(tsdb, config);
+    let server = PromqlServer::new(tsdb, config, storage);
 
     tracing::info!(
         "Starting timeseries Prometheus-compatible server on port {}...",

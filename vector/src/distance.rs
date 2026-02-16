@@ -4,6 +4,7 @@
 //! candidates during similarity search.
 
 use crate::serde::collection_meta::DistanceMetric;
+use std::cmp::Ordering;
 
 /// Compute distance/similarity between two vectors.
 ///
@@ -18,18 +19,19 @@ use crate::serde::collection_meta::DistanceMetric;
 ///
 /// # Panics
 /// Panics if the vectors have different lengths.
-pub fn compute_distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
+pub(crate) fn compute_distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> VectorDistance {
     assert_eq!(
         a.len(),
         b.len(),
         "Cannot compute distance between vectors of different lengths"
     );
 
-    match metric {
+    let v = match metric {
         DistanceMetric::L2 => l2_distance(a, b),
         DistanceMetric::Cosine => cosine_similarity(a, b),
         DistanceMetric::DotProduct => dot_product(a, b),
-    }
+    };
+    VectorDistance { score: v, metric }
 }
 
 /// Compute L2 (Euclidean) distance between two vectors.
@@ -70,6 +72,52 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Higher scores indicate more similar vectors (for normalized vectors).
 fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// A distance/similarity score between two vectors, with metric-aware ordering.
+///
+/// Ordering is defined so that `a < b` means `a` is **more similar** than `b`.
+/// This abstracts over the direction of each metric:
+/// - L2: lower raw value = more similar (natural order)
+/// - Cosine/DotProduct: higher raw value = more similar (reversed order)
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct VectorDistance {
+    score: f32,
+    metric: DistanceMetric,
+}
+
+impl VectorDistance {
+    /// Returns the raw distance/similarity value.
+    pub(crate) fn score(&self) -> f32 {
+        self.score
+    }
+}
+
+impl PartialEq for VectorDistance {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for VectorDistance {}
+
+impl PartialOrd for VectorDistance {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for VectorDistance {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.metric {
+            // L2: lower value = more similar, so natural order
+            DistanceMetric::L2 => self.score.total_cmp(&other.score),
+            // Cosine/DotProduct: higher value = more similar, so reverse order
+            DistanceMetric::Cosine | DistanceMetric::DotProduct => {
+                other.score.total_cmp(&self.score)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -146,7 +194,7 @@ mod tests {
             DistanceMetric::Cosine => cosine_similarity(&a, &b),
             DistanceMetric::DotProduct => dot_product(&a, &b),
         };
-        assert_eq!(result, expected);
+        assert_eq!(result.score(), expected);
     }
 
     #[test]
@@ -160,5 +208,83 @@ mod tests {
         compute_distance(&a, &b, DistanceMetric::L2);
 
         // then - should panic
+    }
+
+    // ---- VectorDistance ordering ----
+
+    #[test]
+    fn should_order_l2_by_lower_is_more_similar() {
+        // given
+        let closer = compute_distance(&[0.0, 0.0], &[1.0, 0.0], DistanceMetric::L2);
+        let farther = compute_distance(&[0.0, 0.0], &[3.0, 0.0], DistanceMetric::L2);
+
+        // then - closer (lower L2) should be "less than" farther
+        assert!(closer < farther);
+        assert!(farther > closer);
+        assert_ne!(closer, farther);
+    }
+
+    #[test]
+    fn should_order_cosine_by_higher_is_more_similar() {
+        // given
+        let more_similar = compute_distance(&[1.0, 0.0], &[1.0, 0.1], DistanceMetric::Cosine);
+        let less_similar = compute_distance(&[1.0, 0.0], &[0.0, 1.0], DistanceMetric::Cosine);
+
+        // then - higher cosine sim should be "less than" (more similar)
+        assert!(more_similar < less_similar);
+    }
+
+    #[test]
+    fn should_order_dot_product_by_higher_is_more_similar() {
+        // given
+        let more_similar = compute_distance(&[3.0, 0.0], &[2.0, 0.0], DistanceMetric::DotProduct);
+        let less_similar = compute_distance(&[3.0, 0.0], &[0.0, 2.0], DistanceMetric::DotProduct);
+
+        // then - higher dot product should be "less than" (more similar)
+        assert!(more_similar < less_similar);
+    }
+
+    #[test]
+    fn should_consider_equal_distances_equal() {
+        // given
+        let d1 = compute_distance(&[1.0, 0.0], &[0.0, 1.0], DistanceMetric::L2);
+        let d2 = compute_distance(&[0.0, 1.0], &[1.0, 0.0], DistanceMetric::L2);
+
+        // then
+        assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn should_sort_vector_distances_most_similar_first() {
+        // given - three L2 distances
+        let d_far = compute_distance(&[0.0], &[10.0], DistanceMetric::L2);
+        let d_mid = compute_distance(&[0.0], &[5.0], DistanceMetric::L2);
+        let d_near = compute_distance(&[0.0], &[1.0], DistanceMetric::L2);
+        let mut distances = [d_far, d_mid, d_near];
+
+        // when
+        distances.sort();
+
+        // then - most similar (nearest) first
+        assert_eq!(distances[0].score(), d_near.score());
+        assert_eq!(distances[1].score(), d_mid.score());
+        assert_eq!(distances[2].score(), d_far.score());
+    }
+
+    #[test]
+    fn should_sort_cosine_distances_most_similar_first() {
+        // given - three cosine distances
+        let d_high = compute_distance(&[1.0, 0.0], &[1.0, 0.0], DistanceMetric::Cosine); // sim=1.0
+        let d_mid = compute_distance(&[1.0, 0.0], &[1.0, 1.0], DistanceMetric::Cosine); // sim≈0.707
+        let d_low = compute_distance(&[1.0, 0.0], &[0.0, 1.0], DistanceMetric::Cosine); // sim=0.0
+        let mut distances = [d_low, d_high, d_mid];
+
+        // when
+        distances.sort();
+
+        // then - most similar (highest cosine) first
+        assert_eq!(distances[0].score(), d_high.score());
+        assert_eq!(distances[1].score(), d_mid.score());
+        assert_eq!(distances[2].score(), d_low.score());
     }
 }

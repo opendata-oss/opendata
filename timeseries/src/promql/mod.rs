@@ -10,7 +10,7 @@ pub(crate) mod promqltest;
 #[cfg(feature = "remote-write")]
 pub(crate) mod remote_write;
 mod request;
-mod response;
+pub(crate) mod response;
 mod router;
 pub(crate) mod scraper;
 pub(crate) mod selector;

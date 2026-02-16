@@ -1,6 +1,6 @@
 [package]
 name = "opendata-timeseries"
-version = "0.1.3"
+version = "0.1.4"
 edition.workspace = true
 description = "Prometheus-compatible time series database built on SlateDB"
 license = "MIT"
@@ -19,18 +19,20 @@ path = "src/main.rs"
 
 [features]
 default = []
+testing = []
 remote-write = ["dep:prost", "dep:snap"]
 
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
+axum-extra.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 clap.workspace = true
 config.workspace = true
 dashmap.workspace = true
 moka.workspace = true
-common.workspace = true
+common = { workspace = true, features = ["metrics"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -60,4 +62,10 @@ snap = { workspace = true, optional = true }
 
 [dev-dependencies]
 fail.workspace = true
+proptest.workspace = true
 rstest.workspace = true
+rug.workspace = true
+
+[[test]]
+name = "http_server"
+required-features = ["testing"]

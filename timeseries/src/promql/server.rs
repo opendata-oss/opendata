@@ -1,14 +1,15 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{FromRequest, Path, Query, State};
+use axum::extract::Request;
+use axum::extract::{FromRequest, Path, State};
 use axum::http::{Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 #[cfg(feature = "remote-write")]
 use axum::routing::post;
-use axum::{Form, extract::Request};
 use axum::{Json, Router};
+use axum_extra::extract::{Form, Query};
 use rust_embed::Embed;
 use tokio::signal;
 
@@ -53,27 +54,68 @@ impl Default for ServerConfig {
     }
 }
 
+/// Build the production Axum router with all routes, middleware, and state.
+///
+/// Used by `PromqlServer::run()` and the `testing` module for integration tests.
+pub(crate) fn build_router(tsdb: Arc<Tsdb>, metrics: Arc<Metrics>) -> Router {
+    let state = AppState {
+        tsdb,
+        metrics: metrics.clone(),
+    };
+
+    let app = Router::new()
+        .route("/api/v1/query", get(handle_query).post(handle_query))
+        .route(
+            "/api/v1/query_range",
+            get(handle_query_range).post(handle_query_range),
+        )
+        .route("/api/v1/series", get(handle_series).post(handle_series))
+        .route("/api/v1/labels", get(handle_labels))
+        .route("/api/v1/label/{name}/values", get(handle_label_values))
+        .route("/metrics", get(handle_metrics))
+        .route("/-/healthy", get(handle_healthy))
+        .route("/-/ready", get(handle_ready));
+
+    #[cfg(feature = "remote-write")]
+    let app = app.route(
+        "/api/v1/write",
+        post(super::remote_write::handle_remote_write),
+    );
+
+    app.route("/", get(handle_ui_redirect))
+        .route("/query", get(handle_ui_index))
+        .route("/{*path}", get(handle_ui))
+        .layer(TracingLayer::new())
+        .layer(MetricsLayer::new(metrics))
+        .with_state(state)
+}
+
 /// Prometheus-compatible HTTP server
 pub(crate) struct PromqlServer {
     tsdb: Arc<Tsdb>,
     config: ServerConfig,
+    storage: Arc<dyn common::Storage>,
 }
 
 impl PromqlServer {
-    pub(crate) fn new(tsdb: Arc<Tsdb>, config: ServerConfig) -> Self {
-        Self { tsdb, config }
+    pub(crate) fn new(
+        tsdb: Arc<Tsdb>,
+        config: ServerConfig,
+        storage: Arc<dyn common::Storage>,
+    ) -> Self {
+        Self {
+            tsdb,
+            config,
+            storage,
+        }
     }
 
     /// Run the HTTP server
     pub(crate) async fn run(self) {
-        // Create metrics registry
-        let metrics = Arc::new(Metrics::new());
-
-        // Create app state
-        let state = AppState {
-            tsdb: self.tsdb.clone(),
-            metrics: metrics.clone(),
-        };
+        // Create metrics registry and register storage engine metrics
+        let mut metrics = Metrics::new();
+        self.storage.register_metrics(metrics.registry_mut());
+        let metrics = Arc::new(metrics);
 
         // Start the scraper if there are scrape configs
         if !self.config.prometheus_config.scrape_configs.is_empty() {
@@ -92,34 +134,7 @@ impl PromqlServer {
         }
 
         // Build router with metrics middleware
-        let app = Router::new()
-            .route("/api/v1/query", get(handle_query).post(handle_query))
-            .route(
-                "/api/v1/query_range",
-                get(handle_query_range).post(handle_query_range),
-            )
-            .route("/api/v1/series", get(handle_series).post(handle_series))
-            .route("/api/v1/labels", get(handle_labels))
-            .route("/api/v1/label/{name}/values", get(handle_label_values))
-            .route("/metrics", get(handle_metrics))
-            .route("/-/healthy", get(handle_healthy))
-            .route("/-/ready", get(handle_ready));
-
-        #[cfg(feature = "remote-write")]
-        let app = app.route(
-            "/api/v1/write",
-            post(super::remote_write::handle_remote_write),
-        );
-
-        let app = app
-            .route("/", get(handle_ui_redirect))
-            .route("/query", get(handle_ui_index))
-            .route("/{*path}", get(handle_ui));
-
-        let app = app
-            .layer(TracingLayer::new())
-            .layer(MetricsLayer::new(metrics))
-            .with_state(state);
+        let app = build_router(self.tsdb.clone(), metrics);
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.port));
         tracing::info!("Starting Prometheus-compatible server on {}", addr);

@@ -15,7 +15,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use common::StorageConfig;
 use log::server::handlers::{
-    AppState, handle_append, handle_list_keys, handle_list_segments, handle_scan,
+    AppState, handle_append, handle_list_keys, handle_list_segments, handle_metrics, handle_scan,
 };
 use log::server::metrics::Metrics;
 use log::server::proto;
@@ -742,5 +742,138 @@ async fn test_scan_follow_at_poll_boundary_returns_empty() {
         elapsed < Duration::from_millis(200),
         "expected < 200ms but got {:?}",
         elapsed
+    );
+}
+
+// ============================================================================
+// SlateDB Metrics Tests
+// ============================================================================
+
+/// Setup a test app backed by SlateDB (in-memory object store) so that
+/// the StatRegistry is populated with real metrics.
+async fn setup_slatedb_test_app() -> Router {
+    use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig};
+
+    let config = Config {
+        storage: StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "test-metrics".to_string(),
+            object_store: ObjectStoreConfig::InMemory,
+            settings_path: None,
+        }),
+        ..Default::default()
+    };
+
+    let log = Arc::new(LogDb::open(config).await.expect("Failed to open log"));
+    let mut metrics = Metrics::new();
+    log.register_metrics(metrics.registry_mut());
+    let metrics = Arc::new(metrics);
+
+    let state = AppState {
+        log: log.clone(),
+        metrics,
+    };
+
+    Router::new()
+        .route("/api/v1/log/append", post(handle_append))
+        .route("/api/v1/log/scan", get(handle_scan))
+        .route("/metrics", get(handle_metrics))
+        .with_state(state)
+}
+
+#[tokio::test]
+async fn test_slatedb_metrics_appear_on_metrics_endpoint() {
+    let app = setup_slatedb_test_app().await;
+
+    // Hit /metrics before any writes — SlateDB stats should be registered
+    let request = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+
+    // Verify SlateDB metrics are present (these are registered by the Db on startup)
+    assert!(
+        text.contains("slatedb_"),
+        "Expected slatedb_ prefixed metrics in output, got:\n{}",
+        &text[..text.len().min(500)]
+    );
+}
+
+/// Parse the value of a Prometheus metric line like "slatedb_db_write_ops 42".
+fn parse_metric_value(metrics_text: &str, metric_name: &str) -> i64 {
+    let line = metrics_text
+        .lines()
+        .find(|line| line.starts_with(&format!("{metric_name} ")))
+        .unwrap_or_else(|| panic!("{metric_name} metric line not found"));
+    line.split_whitespace()
+        .last()
+        .unwrap()
+        .parse()
+        .unwrap_or_else(|_| panic!("Failed to parse {metric_name} value"))
+}
+
+#[tokio::test]
+async fn test_slatedb_metrics_reflect_writes() {
+    let app = setup_slatedb_test_app().await;
+
+    // Capture baseline write_ops before append (startup may already increment it)
+    let baseline_request = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let baseline_response = app.clone().oneshot(baseline_request).await.unwrap();
+    assert_eq!(baseline_response.status(), StatusCode::OK);
+    let baseline_body = axum::body::to_bytes(baseline_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let baseline_text = String::from_utf8(baseline_body.to_vec()).unwrap();
+    let baseline_write_ops = parse_metric_value(&baseline_text, "slatedb_db_write_ops");
+
+    // Append some data via the HTTP API
+    let key_b64 = STANDARD.encode("metrics-test-key");
+    let value_b64 = STANDARD.encode("metrics-test-value");
+    let append_body = format!(
+        r#"{{"records": [{{"key": "{}", "value": "{}"}}], "awaitDurable": true}}"#,
+        key_b64, value_b64
+    );
+
+    let append_request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/log/append")
+        .header(header::CONTENT_TYPE, "application/protobuf+json")
+        .body(Body::from(append_body))
+        .unwrap();
+    let append_response = app.clone().oneshot(append_request).await.unwrap();
+    assert_eq!(append_response.status(), StatusCode::OK);
+
+    // Check /metrics — write_ops should have increased from the append
+    let metrics_request = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let metrics_response = app.oneshot(metrics_request).await.unwrap();
+    assert_eq!(metrics_response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(metrics_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    let write_ops_after = parse_metric_value(&text, "slatedb_db_write_ops");
+
+    assert!(
+        write_ops_after > baseline_write_ops,
+        "Expected write_ops to increase after append: baseline={}, after={}",
+        baseline_write_ops,
+        write_ops_after
     );
 }
