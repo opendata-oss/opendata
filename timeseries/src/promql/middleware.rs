@@ -12,6 +12,18 @@ use tower::{Layer, Service};
 
 use super::metrics::{HttpLabels, HttpLabelsWithStatus, HttpMethod, Metrics};
 
+/// RAII guard that decrements the in-flight gauge on drop, ensuring the gauge
+/// is always decremented even if the request future is cancelled or errors.
+struct InFlightGuard {
+    metrics: Arc<Metrics>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.metrics.http_requests_in_flight.dec();
+    }
+}
+
 /// Layer that wraps services with metrics collection.
 #[derive(Clone)]
 pub struct MetricsLayer {
@@ -62,10 +74,14 @@ where
         let metrics = self.metrics.clone();
 
         metrics.http_requests_in_flight.inc();
+        let _guard = InFlightGuard {
+            metrics: metrics.clone(),
+        };
         let start = Instant::now();
         let future = self.inner.call(request);
 
         Box::pin(async move {
+            let _guard = _guard; // move guard into the future so it drops when the future completes
             let response = future.await?;
             let status = response.status().as_u16();
             let duration = start.elapsed().as_secs_f64();
@@ -85,8 +101,6 @@ where
                 .http_request_duration_seconds
                 .get_or_create(&HttpLabels { method, endpoint })
                 .observe(duration);
-
-            metrics.http_requests_in_flight.dec();
 
             Ok(response)
         })
@@ -195,6 +209,85 @@ where
 mod tests {
     use super::*;
     use axum::http::Method;
+    use tower::service_fn;
+
+    fn test_request(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn should_decrement_in_flight_gauge_after_successful_request() {
+        // given
+        let metrics = Arc::new(Metrics::new());
+        let mut service = MetricsService {
+            inner: service_fn(|_req: Request<Body>| async {
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder().status(200).body(Body::empty()).unwrap(),
+                )
+            }),
+            metrics: metrics.clone(),
+        };
+
+        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+
+        // when
+        let response = service.call(test_request("/test")).await.unwrap();
+
+        // then
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_decrement_in_flight_gauge_when_inner_service_errors() {
+        // given
+        let metrics = Arc::new(Metrics::new());
+        let mut service = MetricsService {
+            inner: service_fn(|_req: Request<Body>| async {
+                Err::<Response<Body>, _>(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "connection reset",
+                ))
+            }),
+            metrics: metrics.clone(),
+        };
+
+        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+
+        // when
+        let result = service.call(test_request("/test")).await;
+
+        // then
+        assert!(result.is_err());
+        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_decrement_in_flight_gauge_when_future_is_cancelled() {
+        // given — a service that never completes (simulates a long-poll)
+        let metrics = Arc::new(Metrics::new());
+        let mut service = MetricsService {
+            inner: service_fn(|_req: Request<Body>| {
+                std::future::pending::<Result<Response<Body>, std::convert::Infallible>>()
+            }),
+            metrics: metrics.clone(),
+        };
+
+        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+
+        // when — call returns a future (gauge incremented), then drop it
+        let future = service.call(test_request("/api/v1/query"));
+        assert_eq!(metrics.http_requests_in_flight.get(), 1);
+
+        drop(future);
+
+        // then — gauge must return to zero despite the future never completing
+        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+    }
 
     #[test]
     fn should_normalize_label_values_endpoint() {
