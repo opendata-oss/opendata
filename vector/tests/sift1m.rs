@@ -87,7 +87,7 @@ async fn sift1m_recall() {
     let base_vectors = read_fvecs(&data_dir.join("sift_base.fvecs"));
     println!("Loaded {} base vectors", base_vectors.len());
 
-    let num_batches = (base_vectors.len() + 99) / 10;
+    let num_batches = (base_vectors.len() + 9) / 10;
     for (batch_idx, chunk) in base_vectors.chunks(10).enumerate() {
         let batch: Vec<Vector> = chunk
             .iter()
@@ -98,13 +98,12 @@ async fn sift1m_recall() {
             })
             .collect();
         db.write(batch).await.expect("failed to write batch");
-        if (batch_idx + 1) % 1000 == 0 {
+        if (batch_idx + 1) % 10000 == 0 {
             println!("Written batch {}/{}", batch_idx + 1, num_batches);
         }
     }
     db.flush().await.expect("failed to flush");
     println!("Ingested all base vectors");
-    // tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
 
     // Query and measure recall
     let queries = read_fvecs(&data_dir.join("sift_query.fvecs"));

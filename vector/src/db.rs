@@ -378,7 +378,55 @@ impl VectorDb {
         let mut write_handle = self
             .write_coordinator
             .handle(WRITE_CHANNEL)
-            .try_write(VectorDbWrite::Write(writes))
+            .write(VectorDbWrite::Write(writes))
+            .await?;
+        write_handle
+            .wait(Durability::Applied)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        Ok(())
+    }
+
+    /// Write vectors to the database with a timeout.
+    ///
+    /// This is the primary write method. It accepts a batch of vectors and
+    /// returns when the data has been accepted for ingestion (but not
+    /// necessarily flushed to durable storage).
+    ///
+    /// The write may time out if the db is busy compacting or indexing.
+    ///
+    /// # Atomicity
+    ///
+    /// This operation is atomic: either all vectors in the batch are accepted,
+    /// or none are. This matches the behavior of `TimeSeriesDb::write()`.
+    ///
+    /// # Upsert Semantics
+    ///
+    /// Writing a vector with an ID that already exists performs an upsert:
+    /// the old vector is deleted and replaced with the new one. The system
+    /// allocates a new internal ID for the updated vector and marks the old
+    /// internal ID as deleted. This ensures index structures are updated
+    /// correctly without expensive read-modify-write cycles.
+    ///
+    /// # Validation
+    ///
+    /// The following validations are performed:
+    /// - Vector dimensions must match `Config::dimensions`
+    /// - Attribute names must be defined in `Config::metadata_fields` (if specified)
+    /// - Attribute types must match the schema
+    pub async fn write_timeout(&self, vectors: Vec<Vector>, timeout: Duration) -> Result<()> {
+        // Validate and prepare all vectors
+        let mut writes = Vec::with_capacity(vectors.len());
+        for vector in vectors {
+            writes.push(self.prepare_vector_write(vector)?);
+        }
+
+        // Send all writes to coordinator in a single batch and wait to be applied
+        let mut write_handle = self
+            .write_coordinator
+            .handle(WRITE_CHANNEL)
+            .write_timeout(VectorDbWrite::Write(writes), timeout)
             .await?;
         write_handle
             .wait(Durability::Applied)
