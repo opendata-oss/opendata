@@ -195,6 +195,34 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
         Ok(WriteHandle::new(rx, self.watchers.clone()))
     }
 
+    /// Submit a write to the coordinator, blocking indefinitely until there is
+    /// room in the channel.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriteError::TimeoutError`] — the queue remained full for the
+    ///   entire duration. Contains the original write so it can be retried
+    ///   without cloning.
+    /// - [`WriteError::Shutdown`] — the coordinator has stopped.
+    pub async fn write(
+        &self,
+        write: D::Write,
+    ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Write>> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::Write {
+                write,
+                result_tx: tx,
+            })
+            .await
+            .map_err(|e| match e {
+                mpsc::error::SendError(WriteCommand::Write { write, .. }) => WriteError::Shutdown,
+                _ => unreachable!("sent a Write command"),
+            })?;
+
+        Ok(WriteHandle::new(rx, self.watchers.clone()))
+    }
+
     /// Submit a write to the coordinator.
     ///
     /// Returns a handle that can be used to retrieve the apply result

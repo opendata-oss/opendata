@@ -11,7 +11,6 @@ use crate::serde::collection_meta::DistanceMetric;
 /// centroid could be closer than either new centroid. If either new centroid
 /// is closer than the old one, the vector is already better off and cannot
 /// need reassignment (by the NPA triangle inequality argument).
-#[allow(dead_code)]
 pub(crate) fn split_heuristic(
     vector: &[f32],
     c_vector: &[f32],
@@ -38,7 +37,6 @@ pub(crate) fn split_heuristic(
 /// than the old one, the split only made things worse for `v` and its
 /// existing assignment to `B` (which was already closer than `A_o`) remains
 /// optimal.
-#[allow(dead_code)]
 pub(crate) fn neighbour_split_heuristic(
     vector: &[f32],
     c_vector: &[f32],

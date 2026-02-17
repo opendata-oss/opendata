@@ -85,9 +85,9 @@ impl UsearchCentroidGraph {
             dimensions,
             metric,
             quantization: ScalarKind::F32,
-            connectivity: 16,     // M parameter
-            expansion_add: 200,   // ef_construction
-            expansion_search: 30, // ef_search default
+            connectivity: 16,      // M parameter
+            expansion_add: 200,    // ef_construction
+            expansion_search: 100, // ef_search default
             multi: false,
         };
 
