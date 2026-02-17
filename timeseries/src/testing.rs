@@ -52,22 +52,7 @@ impl TestTsdb {
 ///
 /// This exercises the full storage path including SlateDB merge operations.
 pub async fn create_test_tsdb() -> TestTsdb {
-    let config = StorageConfig::SlateDb(SlateDbStorageConfig {
-        path: "test-data".to_string(),
-        object_store: ObjectStoreConfig::InMemory,
-        settings_path: None,
-    });
-    let storage = create_storage(
-        &config,
-        StorageRuntime::new(),
-        StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
-    )
-    .await
-    .unwrap();
-    TestTsdb {
-        inner: Arc::new(Tsdb::new(storage.clone())),
-        storage,
-    }
+    create_test_tsdb_with_config(ObjectStoreConfig::InMemory).await
 }
 
 /// Create a [`TestTsdb`] with a caller-provided object store config.
