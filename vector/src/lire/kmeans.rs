@@ -6,25 +6,21 @@ use crate::distance;
 use crate::serde::collection_meta::DistanceMetric;
 
 /// Trait for splitting a set of vectors into two clusters.
-#[allow(dead_code)]
 pub(crate) trait Clustering {
     fn two_means(&self, vectors: &[(u64, &[f32])], dimensions: usize) -> (Vec<f32>, Vec<f32>);
 }
 
 /// K-means with L2-based initialization and arithmetic mean centroids.
 /// Suitable for L2 and DotProduct metrics.
-#[allow(dead_code)]
 pub(crate) struct KMeansPP {
     metric: DistanceMetric,
 }
 
 /// Spherical k-means: cosine-aware initialization and L2-normalized centroids.
 /// Suitable for Cosine metric.
-#[allow(dead_code)]
 pub(crate) struct SphericalKMeans;
 
 /// Create a clustering strategy appropriate for the given distance metric.
-#[allow(dead_code)]
 pub(crate) fn for_metric(metric: DistanceMetric) -> Box<dyn Clustering + Send> {
     match metric {
         DistanceMetric::Cosine => Box::new(SphericalKMeans),
@@ -228,7 +224,6 @@ fn normalize_centroid(v: &mut [f32]) {
 }
 
 impl Clustering for KMeansPP {
-    #[allow(dead_code)]
     fn two_means(&self, vectors: &[(u64, &[f32])], dimensions: usize) -> (Vec<f32>, Vec<f32>) {
         assert!(vectors.len() >= 2, "two_means requires at least 2 vectors");
 
@@ -248,7 +243,6 @@ impl Clustering for KMeansPP {
 }
 
 impl Clustering for SphericalKMeans {
-    #[allow(dead_code)]
     fn two_means(&self, vectors: &[(u64, &[f32])], dimensions: usize) -> (Vec<f32>, Vec<f32>) {
         assert!(vectors.len() >= 2, "two_means requires at least 2 vectors");
 

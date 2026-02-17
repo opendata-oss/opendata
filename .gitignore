@@ -27,3 +27,6 @@ target
 
 # Default storage directory
 .data/
+
+# Vector test datasets
+vector/tests/data/sift100k/*vecs
