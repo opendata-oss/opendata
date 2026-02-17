@@ -32,7 +32,8 @@
 
 use super::EncodingError;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::collections::HashSet;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashSet};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Posting {
@@ -41,7 +42,7 @@ pub(crate) struct Posting {
 }
 
 impl Posting {
-    fn new(id: u64, vector: Vec<f32>) -> Self {
+    pub(crate) fn new(id: u64, vector: Vec<f32>) -> Self {
         Self { id, vector }
     }
 
@@ -49,9 +50,13 @@ impl Posting {
         self.id
     }
 
-    #[allow(dead_code)]
     pub(crate) fn vector(&self) -> &[f32] {
         self.vector.as_slice()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn unpack(self) -> (u64, Vec<f32>) {
+        (self.id, self.vector)
     }
 }
 
@@ -257,28 +262,27 @@ impl PostingListValue {
     /// Create a posting list from a vector of updates.
     ///
     /// The updates are sorted by id to maintain the invariant that postings
-    /// are always ordered by id.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if there are any entries with repeated ids.
+    /// are always ordered by id. When multiple updates share the same id,
+    /// the last occurrence wins (last-write-wins). This supports the case
+    /// where a vector is appended to a posting list and then deleted within
+    /// the same delta (e.g. during split reassignment).
     pub fn from_posting_updates(
-        mut posting_updates: Vec<PostingUpdate>,
+        posting_updates: Vec<PostingUpdate>,
     ) -> Result<Self, EncodingError> {
-        posting_updates.sort_by_key(|p| p.id());
-
-        // Check for duplicate ids
-        for window in posting_updates.windows(2) {
-            if window[0].id() == window[1].id() {
-                return Err(EncodingError {
-                    message: format!("Duplicate posting id: {}", window[0].id()),
-                });
-            }
+        // Deduplicate by id, keeping the last occurrence (most recent operation).
+        // We iterate in reverse so that when we encounter a duplicate, the first
+        // insertion (= last in original order) wins via the Entry API.
+        let mut last_by_id = std::collections::HashMap::new();
+        for (idx, update) in posting_updates.iter().enumerate() {
+            last_by_id.insert(update.id(), idx);
         }
+        let mut deduped: Vec<PostingUpdate> = last_by_id
+            .into_values()
+            .map(|idx| posting_updates[idx].clone())
+            .collect();
+        deduped.sort_by_key(|p| p.id());
 
-        Ok(Self {
-            postings: posting_updates,
-        })
+        Ok(Self { postings: deduped })
     }
 
     /// Returns the number of posting updates.
@@ -336,6 +340,62 @@ impl Default for PostingListValue {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[allow(dead_code)]
+pub(crate) fn merge_decoded_posting_lists(postings: Vec<PostingListValue>) -> PostingListValue {
+    struct E(PostingUpdate, usize, std::vec::IntoIter<PostingUpdate>);
+
+    impl PartialEq<Self> for E {
+        fn eq(&self, other: &Self) -> bool {
+            self.0 == other.0 && self.1 == other.1
+        }
+    }
+    impl Eq for E {}
+
+    impl PartialOrd for E {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for E {
+        fn cmp(&self, other: &Self) -> Ordering {
+            match self.0.id().cmp(&other.0.id()) {
+                Ordering::Less => Ordering::Less,
+                Ordering::Equal => self.1.cmp(&other.1),
+                Ordering::Greater => Ordering::Greater,
+            }
+        }
+    }
+
+    let mut heap = BinaryHeap::new();
+    for (i, p) in postings.into_iter().enumerate() {
+        let mut p_iter = p.postings.into_iter();
+        let Some(next) = p_iter.next() else {
+            continue;
+        };
+        heap.push(Reverse(E(next, i, p_iter)));
+    }
+    let mut merged = Vec::new();
+    while let Some(Reverse(E(u, i, mut p_iter))) = heap.pop() {
+        let id = u.id();
+        merged.push(u);
+        if let Some(next) = p_iter.next() {
+            heap.push(Reverse(E(next, i, p_iter)));
+        };
+        loop {
+            if heap.peek().map(|e| e.0.0.id() == id).unwrap_or(false) {
+                let Reverse(E(_, i, mut p_iter)) = heap.pop().unwrap();
+                if let Some(next) = p_iter.next() {
+                    heap.push(Reverse(E(next, i, p_iter)));
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    PostingListValue::from_posting_updates(merged).expect("unexpected error")
 }
 
 /// Merge two PostingList values using sort-merge.
@@ -863,6 +923,121 @@ mod tests {
         assert_eq!(decoded.postings[2].vector().unwrap(), &[300.0]); // new value won
         assert_eq!(decoded.postings[3].id(), 40);
         assert_eq!(decoded.postings[4].id(), 50);
+    }
+
+    #[test]
+    fn should_merge_decoded_posting_lists_from_all_operands() {
+        // given - three posting lists with disjoint IDs
+        let p0 = PostingListValue::from_posting_updates(vec![
+            PostingUpdate::append(1, vec![1.0]),
+            PostingUpdate::append(2, vec![2.0]),
+        ])
+        .unwrap();
+        let p1 = PostingListValue::from_posting_updates(vec![
+            PostingUpdate::append(3, vec![3.0]),
+            PostingUpdate::append(4, vec![4.0]),
+        ])
+        .unwrap();
+        let p2 = PostingListValue::from_posting_updates(vec![PostingUpdate::append(5, vec![5.0])])
+            .unwrap();
+
+        // when
+        let merged = merge_decoded_posting_lists(vec![p0, p1, p2]);
+
+        // then - all 5 postings present in sorted order
+        assert_eq!(merged.len(), 5);
+        assert_eq!(merged.postings[0].id(), 1);
+        assert_eq!(merged.postings[1].id(), 2);
+        assert_eq!(merged.postings[2].id(), 3);
+        assert_eq!(merged.postings[3].id(), 4);
+        assert_eq!(merged.postings[4].id(), 5);
+    }
+
+    #[test]
+    fn should_merge_decoded_posting_lists_newer_wins_on_duplicate_key() {
+        // given - two posting lists with overlapping ID 2; p0 is newer (lower index)
+        let p0 =
+            PostingListValue::from_posting_updates(vec![PostingUpdate::append(2, vec![200.0])])
+                .unwrap();
+        let p1 = PostingListValue::from_posting_updates(vec![
+            PostingUpdate::append(1, vec![1.0]),
+            PostingUpdate::append(2, vec![2.0]),
+            PostingUpdate::append(3, vec![3.0]),
+        ])
+        .unwrap();
+
+        // when
+        let merged = merge_decoded_posting_lists(vec![p0, p1]);
+
+        // then - ID 2 has the value from p0 (the newer operand)
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged.postings[0].id(), 1);
+        assert_eq!(merged.postings[1].id(), 2);
+        assert_eq!(merged.postings[1].vector().unwrap(), &[200.0]);
+        assert_eq!(merged.postings[2].id(), 3);
+    }
+
+    #[test]
+    fn should_merge_decoded_posting_lists_newer_delete_wins_over_older_append() {
+        // given - newer list (p0) deletes ID 2, older list (p1) has append for ID 2
+        let p0 = PostingListValue::from_posting_updates(vec![PostingUpdate::delete(2)]).unwrap();
+        let p1 = PostingListValue::from_posting_updates(vec![
+            PostingUpdate::append(1, vec![1.0]),
+            PostingUpdate::append(2, vec![2.0]),
+            PostingUpdate::append(3, vec![3.0]),
+        ])
+        .unwrap();
+
+        // when
+        let merged = merge_decoded_posting_lists(vec![p0, p1]);
+
+        // then - ID 2 is a delete (from the newer operand)
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged.postings[0].id(), 1);
+        assert!(merged.postings[0].is_append());
+        assert_eq!(merged.postings[1].id(), 2);
+        assert!(merged.postings[1].is_delete());
+        assert_eq!(merged.postings[2].id(), 3);
+        assert!(merged.postings[2].is_append());
+    }
+
+    #[test]
+    fn should_merge_decoded_posting_lists_three_way_duplicate() {
+        // given - three lists all containing ID 5; p0 is newest
+        let p0 =
+            PostingListValue::from_posting_updates(vec![PostingUpdate::append(5, vec![500.0])])
+                .unwrap();
+        let p1 = PostingListValue::from_posting_updates(vec![PostingUpdate::append(5, vec![50.0])])
+            .unwrap();
+        let p2 = PostingListValue::from_posting_updates(vec![PostingUpdate::append(5, vec![5.0])])
+            .unwrap();
+
+        // when
+        let merged = merge_decoded_posting_lists(vec![p0, p1, p2]);
+
+        // then - newest (p0) wins
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged.postings[0].id(), 5);
+        assert_eq!(merged.postings[0].vector().unwrap(), &[500.0]);
+    }
+
+    #[test]
+    fn should_merge_decoded_posting_lists_with_empty_operand() {
+        // given - one empty, one non-empty
+        let p0 = PostingListValue::new();
+        let p1 = PostingListValue::from_posting_updates(vec![
+            PostingUpdate::append(1, vec![1.0]),
+            PostingUpdate::append(2, vec![2.0]),
+        ])
+        .unwrap();
+
+        // when
+        let merged = merge_decoded_posting_lists(vec![p0, p1]);
+
+        // then - non-empty entries preserved
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged.postings[0].id(), 1);
+        assert_eq!(merged.postings[1].id(), 2);
     }
 
     #[test]

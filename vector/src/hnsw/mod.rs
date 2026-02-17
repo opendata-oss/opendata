@@ -28,6 +28,21 @@ pub trait CentroidGraph: Send + Sync {
     /// Vector of centroid_ids sorted by similarity (closest first)
     fn search(&self, query: &[f32], k: usize) -> Vec<u64>;
 
+    /// Add a centroid to the graph.
+    ///
+    /// Uses interior mutability since the graph is behind `Arc<dyn CentroidGraph>`.
+    fn add_centroid(&self, entry: &CentroidEntry) -> Result<()>;
+
+    /// Remove a centroid from the graph by its ID.
+    ///
+    /// Uses interior mutability since the graph is behind `Arc<dyn CentroidGraph>`.
+    fn remove_centroid(&self, centroid_id: u64) -> Result<()>;
+
+    /// Get the vector for a centroid by its ID.
+    ///
+    /// Returns `None` if the centroid is not in the graph.
+    fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>>;
+
     /// Returns the number of centroids in the graph.
     fn len(&self) -> usize;
 

@@ -51,6 +51,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = "1.14.0"
 prost = "0.13"
 proptest = "1"
-rug = "1.28"
+dashu-float = "0.4"
 snap = "1"
 criterion = "0.5"

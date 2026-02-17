@@ -942,8 +942,8 @@ mod tests {
     // Property-based tests using proptest
     mod proptests {
         use super::*;
+        use dashu_float::{FBig, round::mode::HalfEven};
         use proptest::prelude::*;
-        use rug::Float;
 
         /// Generate finite f64 values (no NaN, no infinity)
         fn finite_f64() -> impl Strategy<Value = f64> {
@@ -952,21 +952,20 @@ mod tests {
 
         /// Compute high-precision sum using arbitrary precision arithmetic (oracle)
         fn oracle_sum_high_precision(values: &[f64]) -> f64 {
-            // Use 256-bit precision (much higher than f64's 53 bits)
-            let mut sum = Float::with_val(256, 0.0);
+            let mut sum = FBig::<HalfEven>::ZERO.with_precision(256).value();
             for &val in values {
-                sum += Float::with_val(256, val);
+                sum += FBig::try_from(val).unwrap();
             }
-            sum.to_f64()
+            sum.to_f64().value()
         }
 
         /// Compute sum of absolute values for error bound
         fn sum_abs(values: &[f64]) -> f64 {
-            let mut sum = Float::with_val(256, 0.0);
+            let mut sum = FBig::<HalfEven>::ZERO.with_precision(256).value();
             for &val in values {
-                sum += Float::with_val(256, val.abs());
+                sum += FBig::try_from(val.abs()).unwrap();
             }
-            sum.to_f64()
+            sum.to_f64().value()
         }
 
         proptest! {
