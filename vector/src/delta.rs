@@ -19,7 +19,7 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::hnsw::CentroidGraph;
 use crate::lire::commands::RebalanceCommand;
@@ -28,9 +28,10 @@ use crate::model::AttributeValue;
 use crate::serde::posting_list::PostingUpdate;
 use crate::storage::record;
 use common::SequenceAllocator;
-use common::coordinator::Delta;
+use common::coordinator::{Delta, PauseHandle};
 use common::storage::RecordOp;
 use dashmap::DashMap;
+use log::info;
 use roaring::RoaringTreemap;
 // ============================================================================
 // WriteCoordinator Integration Types
@@ -61,6 +62,9 @@ pub(crate) struct VectorDbDeltaOpts {
     pub(crate) dimensions: usize,
     /// Target number of centroid entries per chunk.
     pub(crate) chunk_target: usize,
+    pub(crate) max_pending_and_running_rebalance_tasks: usize,
+    pub(crate) split_threshold_vectors: usize,
+    pub(crate) rebalance_backpressure_resume_threshold: usize,
 }
 
 /// Image containing shared state for the delta.
@@ -83,6 +87,7 @@ pub(crate) struct VectorDbDeltaContext {
     /// Number of centroid entries in the current chunk.
     pub(crate) current_chunk_count: usize,
     pub(crate) rebalancer: IndexRebalancer,
+    pub(crate) pause_handle: Arc<OnceLock<PauseHandle>>,
 }
 
 /// Immutable delta containing all RecordOps ready to be flushed.
@@ -139,10 +144,12 @@ impl Delta for VectorDbWriteDelta {
         &mut self,
         write: Self::Write,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
-        match write {
+        let result = match write {
             VectorDbWrite::Write(writes) => self.apply_write(writes),
             VectorDbWrite::Rebalance(cmd) => self.apply_rebalance_cmd(cmd),
-        }
+        };
+        self.toggle_rebalance_backpressure();
+        result
     }
 
     fn estimate_size(&self) -> usize {
@@ -188,6 +195,26 @@ impl Delta for VectorDbWriteDelta {
 }
 
 impl VectorDbWriteDelta {
+    fn pause_handle(&self) -> PauseHandle {
+        self.ctx.pause_handle.get().unwrap().clone()
+    }
+
+    fn toggle_rebalance_backpressure(&self) {
+        let total_tasks = self.ctx.rebalancer.total_ops_pending_and_running();
+        let max_centroid_limit = self.ctx.opts.split_threshold_vectors.saturating_mul(2) as u64;
+        if total_tasks >= self.ctx.opts.max_pending_and_running_rebalance_tasks
+            || self.ctx.rebalancer.max_centroid_size() >= max_centroid_limit
+        {
+            info!(
+                "applying rebalance backpressure: {} {}",
+                total_tasks, self.ctx.opts.max_pending_and_running_rebalance_tasks
+            );
+            self.pause_handle().pause();
+        } else if total_tasks < self.ctx.opts.rebalance_backpressure_resume_threshold {
+            self.pause_handle().unpause();
+        }
+    }
+
     fn apply_write(
         &mut self,
         vector_writes: Vec<VectorWrite>,
@@ -349,6 +376,9 @@ mod tests {
             opts: VectorDbDeltaOpts {
                 dimensions: 3,
                 chunk_target: 4096,
+                max_pending_and_running_rebalance_tasks: usize::MAX,
+                split_threshold_vectors: usize::MAX,
+                rebalance_backpressure_resume_threshold: 0,
             },
             dictionary: Arc::new(DashMap::new()),
             centroid_graph,
@@ -356,6 +386,7 @@ mod tests {
             current_chunk_id: 0,
             current_chunk_count: 0,
             rebalancer,
+            pause_handle: Arc::new(OnceLock::new()),
         }
     }
 
@@ -677,6 +708,9 @@ mod tests {
             opts: VectorDbDeltaOpts {
                 dimensions: 3,
                 chunk_target: 4096,
+                max_pending_and_running_rebalance_tasks: usize::MAX,
+                split_threshold_vectors: usize::MAX,
+                rebalance_backpressure_resume_threshold: 0,
             },
             dictionary: Arc::new(DashMap::new()),
             centroid_graph,
@@ -684,6 +718,7 @@ mod tests {
             current_chunk_id: 0,
             current_chunk_count: 0,
             rebalancer,
+            pause_handle: Arc::new(OnceLock::new()),
         };
 
         let mut delta = VectorDbWriteDelta::init(ctx);
@@ -855,6 +890,9 @@ mod tests {
             opts: VectorDbDeltaOpts {
                 dimensions: 3,
                 chunk_target: 4096,
+                max_pending_and_running_rebalance_tasks: usize::MAX,
+                split_threshold_vectors: usize::MAX,
+                rebalance_backpressure_resume_threshold: 0,
             },
             dictionary: Arc::new(DashMap::new()),
             centroid_graph,
@@ -862,6 +900,7 @@ mod tests {
             current_chunk_id: 0,
             current_chunk_count: 0,
             rebalancer,
+            pause_handle: Arc::new(OnceLock::new()),
         };
 
         let mut delta = VectorDbWriteDelta::init(ctx);

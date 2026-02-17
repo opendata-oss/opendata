@@ -946,6 +946,9 @@ mod tests {
                 opts: VectorDbDeltaOpts {
                     dimensions,
                     chunk_target,
+                    max_pending_and_running_rebalance_tasks: usize::MAX,
+                    split_threshold_vectors: usize::MAX / 2,
+                    rebalance_backpressure_resume_threshold: 0,
                 },
                 dictionary: Arc::new(DashMap::new()),
                 centroid_graph: centroid_graph.clone(),
@@ -953,6 +956,7 @@ mod tests {
                 current_chunk_id,
                 current_chunk_count,
                 rebalancer,
+                pause_handle: Arc::new(OnceLock::new()),
             };
 
             // 9. Create flusher and coordinator

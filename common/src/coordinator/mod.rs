@@ -636,11 +636,11 @@ pub struct PauseHandle {
 }
 
 impl PauseHandle {
-    fn pause(&self) {
+    pub fn pause(&self) {
         self.pause_tx.send_replace(true);
     }
 
-    fn unpause(&self) {
+    pub fn unpause(&self) {
         self.pause_tx.send_replace(false);
     }
 }
