@@ -17,7 +17,7 @@ use crate::delta::{
 use crate::distance;
 use crate::flusher::VectorDbFlusher;
 use crate::hnsw::{CentroidGraph, build_centroid_graph};
-use crate::lire::rebalancer::IndexRebalancer;
+use crate::lire::rebalancer::{IndexRebalancer, IndexRebalancerOpts};
 use crate::model::{
     AttributeValue, Config, SearchResult, VECTOR_FIELD_NAME, Vector, attributes_to_map,
 };
@@ -34,8 +34,9 @@ use common::storage::{Storage, StorageRead, StorageSnapshot};
 use common::{StorageRuntime, StorageSemantics};
 use dashmap::DashMap;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tracing::debug;
 
 pub(crate) const WRITE_CHANNEL: &str = "write";
 pub(crate) const REBALANCE_CHANNEL: &str = "rebalance";
@@ -55,9 +56,6 @@ pub struct VectorDb {
 
     /// In-memory HNSW graph for centroid search (immutable after initialization).
     centroid_graph: Arc<dyn CentroidGraph>,
-
-    #[allow(dead_code)]
-    rebalancer: IndexRebalancer,
 }
 
 impl VectorDb {
@@ -81,15 +79,11 @@ impl VectorDb {
     /// Other configuration options (like `flush_interval`) can be changed
     /// on subsequent opens.
     pub async fn open(config: Config) -> Result<Self> {
-        let centroid1 = (0..config.dimensions).map(|_| 0.0f32).collect();
-        let centroid1 = CentroidEntry::new(1, centroid1);
+        let centroid1: Vec<f32> = vec![0.0f32; config.dimensions as usize];
         Self::open_with_centroids(config, vec![centroid1]).await
     }
 
-    pub async fn open_with_centroids(
-        config: Config,
-        centroids: Vec<CentroidEntry>,
-    ) -> Result<Self> {
+    pub async fn open_with_centroids(config: Config, centroids: Vec<Vec<f32>>) -> Result<Self> {
         let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
         let storage = create_storage(
             &config.storage,
@@ -111,11 +105,11 @@ impl VectorDb {
     async fn load_or_init_db(
         storage: Arc<dyn Storage>,
         config: Config,
-        centroids: Vec<CentroidEntry>,
+        centroids: Vec<Vec<f32>>,
     ) -> Result<Self> {
         // Initialize sequence allocator for internal ID generation
         let seq_key = SeqBlockKey.encode();
-        let id_allocator = SequenceAllocator::load(storage.as_ref(), seq_key).await?;
+        let mut id_allocator = SequenceAllocator::load(storage.as_ref(), seq_key).await?;
 
         // Get initial snapshot
         let snapshot = storage.snapshot().await?;
@@ -133,30 +127,52 @@ impl VectorDb {
 
         // For now, just force bootstrap centroids. Eventually we'll derive these automatically
         // from the vectors
-        let centroid_graph =
-            Self::load_or_create_centroids(&storage, snapshot.as_ref(), &config, centroids).await?;
+        let (centroid_graph, current_chunk_id, current_chunk_count) =
+            Self::load_or_create_centroids(
+                &storage,
+                snapshot.as_ref(),
+                &config,
+                centroids,
+                &mut id_allocator,
+            )
+            .await?;
 
         // Create flusher for the WriteCoordinator
         let flusher = VectorDbFlusher {
             storage: Arc::clone(&storage),
         };
 
-        let (rebalancer_tx, rebalancer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle_tx = Arc::new(OnceLock::new());
+        let rebalancer = IndexRebalancer::new(
+            IndexRebalancerOpts {
+                dimensions: config.dimensions as usize,
+                distance_metric: config.distance_metric,
+                split_search_neighbourhood: config.split_search_neighbourhood,
+                split_threshold_vectors: config.split_threshold_vectors,
+                merge_threshold_vectors: config.merge_threshold_vectors,
+                max_rebalance_tasks: 8,
+            },
+            centroid_graph.clone(),
+            centroid_counts,
+            handle_tx.clone(),
+        );
 
-        // Create initial image for the delta (shares dictionary, centroid_graph, and id_allocator)
+        let pause_handle = Arc::new(OnceLock::new());
         let ctx = VectorDbDeltaContext {
             opts: VectorDbDeltaOpts {
                 dimensions: config.dimensions as usize,
-                split_threshold_vectors: config.split_threshold_vectors,
                 chunk_target: config.chunk_target as usize,
+                max_in_flight_rebalance_tasks: 16,
+                rebalance_backpressure_resume_threshold: 8,
+                split_threshold_vectors: config.split_threshold_vectors,
             },
             dictionary: Arc::clone(&dictionary),
             centroid_graph: Arc::clone(&centroid_graph),
             id_allocator,
-            rebalancer_tx,
-            centroid_counts,
-            current_chunk_id: 0,
-            current_chunk_count: 0,
+            current_chunk_id,
+            current_chunk_count,
+            rebalancer,
+            pause_handle: pause_handle.clone(),
         };
 
         // start write coordinator
@@ -172,39 +188,51 @@ impl VectorDb {
             snapshot.clone(),
             flusher,
         );
+        handle_tx
+            .set(write_coordinator.handle(REBALANCE_CHANNEL))
+            .map_err(|e| "unreachable")
+            .unwrap();
+        pause_handle
+            .set(write_coordinator.pause_handle(WRITE_CHANNEL))
+            .map_err(|e| "unreachable")
+            .unwrap();
         write_coordinator.start();
-
-        let rebalancer = IndexRebalancer::start(
-            centroid_graph.clone(),
-            write_coordinator.handle(REBALANCE_CHANNEL),
-            rebalancer_rx,
-        );
 
         Ok(Self {
             config,
             storage,
             write_coordinator,
             centroid_graph,
-            rebalancer,
         })
     }
 
     /// Load centroids from storage if they exist, otherwise create them from the provided entries.
+    /// Returns the centroid graph and the last chunk's ID and entry count, used for initializing
+    /// chunk tracking state.
     async fn load_or_create_centroids(
         storage: &Arc<dyn Storage>,
         snapshot: &dyn StorageSnapshot,
         config: &Config,
-        centroids: Vec<CentroidEntry>,
-    ) -> Result<Arc<dyn CentroidGraph>> {
+        centroids: Vec<Vec<f32>>,
+        id_allocator: &mut SequenceAllocator,
+    ) -> Result<(Arc<dyn CentroidGraph>, u32, usize)> {
         // Check if centroids already exist in storage
-        let existing_centroids = snapshot
+        let scan_result = snapshot
             .scan_all_centroids(config.dimensions as usize)
             .await?;
 
-        if !existing_centroids.entries.is_empty() {
-            // Use existing centroids from storage
-            let graph = build_centroid_graph(existing_centroids.entries, config.distance_metric)?;
-            return Ok(Arc::from(graph));
+        if !scan_result.entries.is_empty() {
+            let last_chunk_id = scan_result.last_chunk_id;
+            let last_chunk_count = scan_result.last_chunk_count;
+            // Filter out centroids that have been deleted (tracked in deletions bitmap)
+            let deletions = snapshot.get_deleted_vectors().await?;
+            let live_centroids: Vec<CentroidEntry> = scan_result
+                .entries
+                .into_iter()
+                .filter(|c| !deletions.contains(c.centroid_id))
+                .collect();
+            let graph = build_centroid_graph(live_centroids, config.distance_metric)?;
+            return Ok((Arc::from(graph), last_chunk_id, last_chunk_count));
         }
 
         // No existing centroids - validate and write the provided ones
@@ -216,36 +244,53 @@ impl VectorDb {
 
         // Validate centroid dimensions
         for centroid in &centroids {
-            if centroid.dimensions() != config.dimensions as usize {
+            if centroid.len() != config.dimensions as usize {
                 return Err(anyhow::anyhow!(
                     "Centroid dimension mismatch: expected {}, got {}",
                     config.dimensions,
-                    centroid.dimensions()
+                    centroid.len()
                 ));
             }
         }
 
-        // Validate we don't exceed max chunk size (default 4096)
-        const DEFAULT_CHUNK_TARGET: usize = 4096;
-        if centroids.len() > DEFAULT_CHUNK_TARGET {
-            return Err(anyhow::anyhow!(
-                "Too many centroids for single chunk: {} > {}. Multi-chunk support not yet implemented.",
-                centroids.len(),
-                DEFAULT_CHUNK_TARGET
-            ));
+        // Allocate IDs and build CentroidEntries
+        let mut ops = Vec::new();
+        let mut entries = Vec::with_capacity(centroids.len());
+        for vector in centroids {
+            let (centroid_id, seq_alloc_put) = id_allocator.allocate_one();
+            if let Some(seq_alloc_put) = seq_alloc_put {
+                ops.push(common::storage::RecordOp::Put(seq_alloc_put));
+            }
+            entries.push(CentroidEntry::new(centroid_id, vector));
         }
 
-        // Write centroids to storage
-        let op = crate::storage::record::put_centroid_chunk(
-            0,
-            centroids.clone(),
-            config.dimensions as usize,
-        );
-        storage.apply(vec![op]).await?;
+        // Write centroids to storage in chunks
+        let chunk_target = config.chunk_target as usize;
+        let num_chunks = entries.chunks(chunk_target).len();
+        for (chunk_idx, chunk_entries) in entries.chunks(chunk_target).enumerate() {
+            ops.push(crate::storage::record::put_centroid_chunk(
+                chunk_idx as u32,
+                chunk_entries.to_vec(),
+                config.dimensions as usize,
+            ));
+        }
+        storage.apply(ops).await?;
+
+        // Compute last chunk state from what we just wrote
+        let last_chunk_id = if num_chunks == 0 {
+            0
+        } else {
+            (num_chunks - 1) as u32
+        };
+        let last_chunk_count = if entries.is_empty() {
+            0
+        } else {
+            entries.len() - (last_chunk_id as usize * chunk_target)
+        };
 
         // Build and return the graph
-        let graph = build_centroid_graph(centroids, config.distance_metric)?;
-        Ok(Arc::from(graph))
+        let graph = build_centroid_graph(entries, config.distance_metric)?;
+        Ok((Arc::from(graph), last_chunk_id, last_chunk_count))
     }
 
     /// Load ID dictionary entries from storage into the in-memory DashMap.
@@ -474,6 +519,10 @@ impl VectorDb {
         Ok(())
     }
 
+    pub fn num_centroids(&self) -> usize {
+        self.centroid_graph.len()
+    }
+
     /// Search for k-nearest neighbors to a query vector.
     ///
     /// This implements the SPANN-style query algorithm:
@@ -494,6 +543,64 @@ impl VectorDb {
     /// - Query dimensions don't match collection dimensions
     /// - Storage read fails
     pub async fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        // clamp(10, 100) ensures we search at least 10 centroids (for small k)
+        // and at most 100 centroids (to cap memory/latency for large k)
+        let nprobe = k.clamp(10, 100);
+        self.search_with_nprobe(query, k, nprobe).await
+    }
+
+    /// Search using brute-force centroid lookup (for diagnostics).
+    /// Compares all centroids to the query to find the true nearest ones,
+    /// bypassing HNSW entirely.
+    pub async fn search_exact_nprobe(
+        &self,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+    ) -> Result<Vec<SearchResult>> {
+        if query.len() != self.config.dimensions as usize {
+            return Err(anyhow::anyhow!(
+                "Query dimension mismatch: expected {}, got {}",
+                self.config.dimensions,
+                query.len()
+            ));
+        }
+
+        // Brute-force: compute distance from query to every centroid
+        let num_centroids = self.centroid_graph.len();
+        let all_centroid_ids = self.centroid_graph.search(query, num_centroids);
+        let mut scored: Vec<(u64, distance::VectorDistance)> = all_centroid_ids
+            .iter()
+            .filter_map(|&cid| {
+                let cv = self.centroid_graph.get_centroid_vector(cid)?;
+                let d = distance::compute_distance(query, &cv, self.config.distance_metric);
+                Some((cid, d))
+            })
+            .collect();
+        scored.sort_by(|a, b| a.1.cmp(&b.1));
+        let centroid_ids: Vec<u64> = scored.iter().take(nprobe).map(|(id, _)| *id).collect();
+
+        if centroid_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let snapshot = self.write_coordinator.view().snapshot.clone();
+        let candidates = self
+            .load_candidates(&centroid_ids, snapshot.as_ref())
+            .await?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.score_and_rank(query, &candidates, k, snapshot.as_ref())
+            .await
+    }
+
+    pub async fn search_with_nprobe(
+        &self,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+    ) -> Result<Vec<SearchResult>> {
         // 1. Validate query dimensions
         if query.len() != self.config.dimensions as usize {
             return Err(anyhow::anyhow!(
@@ -503,20 +610,21 @@ impl VectorDb {
             ));
         }
 
-        // 2. Search HNSW for nearest centroids (expand by ~10-100x for recall)
-        // clamp(10, 100) ensures we search at least 10 centroids (for small k)
-        // and at most 100 centroids (to cap memory/latency for large k)
-        let num_centroids = k.clamp(10, 100);
+        // 2. Search HNSW for nearest centroids
+        let num_centroids = nprobe;
         let centroid_ids = self.centroid_graph.search(query, num_centroids);
+        debug!(
+            "searched for {} centroids, found: {}",
+            num_centroids,
+            centroid_ids.len()
+        );
 
         if centroid_ids.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 3. Clone snapshot reference (lock briefly, then release)
+        // 3. Load posting lists from flushed snapshot
         let snapshot = self.write_coordinator.view().snapshot.clone();
-
-        // 4. Load posting lists
         let candidates = self
             .load_candidates(&centroid_ids, snapshot.as_ref())
             .await?;
@@ -525,14 +633,7 @@ impl VectorDb {
             return Ok(Vec::new());
         }
 
-        // 5. Load deleted vectors bitmap and filter
-        let deleted = snapshot.get_deleted_vectors().await?;
-        let candidates: Vec<(u64, Vec<f32>)> = candidates
-            .into_iter()
-            .filter(|(id, _)| !deleted.contains(*id))
-            .collect();
-
-        // 6. Score candidates and return top-k
+        // 4. Score candidates and return top-k
         let results = self
             .score_and_rank(query, &candidates, k, snapshot.as_ref())
             .await?;
@@ -554,7 +655,6 @@ impl VectorDb {
                 .get_posting_list(centroid_id, dimensions)
                 .await?
                 .into();
-            // Extract IDs and vectors from postings (only include appends, skip deletes)
             for posting in posting_list.iter() {
                 all_candidates.push((posting.id(), posting.vector().to_vec()));
             }
@@ -578,20 +678,35 @@ impl VectorDb {
         k: usize,
         snapshot: &dyn StorageRead,
     ) -> Result<Vec<SearchResult>> {
+        struct ScoredResult {
+            internal_id: u64,
+            distance: distance::VectorDistance,
+        }
+
         let mut scored_results = Vec::new();
         let dimensions = self.config.dimensions as usize;
 
         // Load and score each candidate
         for (internal_id, vector) in candidates {
+            // Compute distance/similarity score using vector from posting list
+            let distance = distance::compute_distance(query, vector, self.config.distance_metric);
+            scored_results.push(ScoredResult {
+                internal_id: *internal_id,
+                distance,
+            });
+        }
+
+        // Sort by distance (most similar first)
+        scored_results.sort_by(|a, b| a.distance.cmp(&b.distance));
+
+        let mut results = Vec::with_capacity(k);
+        for sr in scored_results {
             // Load vector data (for external_id and metadata)
-            let vector_data = snapshot.get_vector_data(*internal_id, dimensions).await?;
+            let vector_data = snapshot.get_vector_data(sr.internal_id, dimensions).await?;
             if vector_data.is_none() {
-                continue; // Skip if vector not found (shouldn't happen)
+                continue;
             }
             let vector_data = vector_data.unwrap();
-
-            // Compute distance/similarity score using vector from posting list
-            let score = distance::compute_distance(query, vector, self.config.distance_metric);
 
             // Convert metadata fields to HashMap (includes vector field)
             let metadata: HashMap<String, AttributeValue> = vector_data
@@ -599,29 +714,19 @@ impl VectorDb {
                 .map(|field| (field.field_name.clone(), field.value.clone().into()))
                 .collect();
 
-            scored_results.push(SearchResult {
-                internal_id: *internal_id,
+            results.push(SearchResult {
+                internal_id: sr.internal_id,
                 external_id: vector_data.external_id().to_string(),
-                score: score.score(),
+                score: sr.distance.score(),
                 attributes: metadata,
             });
-        }
 
-        // Sort by score
-        // For L2, lower is better; for Cosine/DotProduct, higher is better
-        match self.config.distance_metric {
-            crate::serde::collection_meta::DistanceMetric::L2 => {
-                scored_results.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
-            }
-            crate::serde::collection_meta::DistanceMetric::Cosine
-            | crate::serde::collection_meta::DistanceMetric::DotProduct => {
-                scored_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+            if results.len() == k {
+                break;
             }
         }
 
-        // Return top-k
-        scored_results.truncate(k);
-        Ok(scored_results)
+        Ok(results)
     }
 }
 
@@ -644,6 +749,7 @@ mod tests {
             distance_metric: DistanceMetric::Cosine,
             flush_interval: Duration::from_secs(60),
             split_threshold_vectors: 10_000,
+            merge_threshold_vectors: 200,
             split_search_neighbourhood: 8,
             chunk_target: 4096,
             metadata_fields: vec![
@@ -653,8 +759,8 @@ mod tests {
         }
     }
 
-    fn create_test_centroids(dimensions: usize) -> Vec<CentroidEntry> {
-        vec![CentroidEntry::new(1, vec![1.0; dimensions])]
+    fn create_test_centroids(dimensions: usize) -> Vec<Vec<f32>> {
+        vec![vec![1.0; dimensions]]
     }
 
     fn create_test_storage() -> Arc<dyn Storage> {
@@ -702,11 +808,13 @@ mod tests {
 
         // then - verify records exist in storage
         // Check VectorData records (now contain external_id, vector, and metadata)
-        let vec1_data_key = VectorDataKey::new(0).encode();
+        // Note: centroid IDs are allocated from the same sequence as vector IDs.
+        // With 1 centroid (ID 0), vectors start at ID 1.
+        let vec1_data_key = VectorDataKey::new(1).encode();
         let vec1_data = storage.get(vec1_data_key).await.unwrap();
         assert!(vec1_data.is_some());
 
-        let vec2_data_key = VectorDataKey::new(1).encode();
+        let vec2_data_key = VectorDataKey::new(2).encode();
         let vec2_data = storage.get(vec2_data_key).await.unwrap();
         assert!(vec2_data.is_some());
 
@@ -743,7 +851,8 @@ mod tests {
         db.flush().await.unwrap();
 
         // then - verify new vector data
-        let vec_data_key = VectorDataKey::new(1).encode(); // New internal ID
+        // Centroid takes ID 0, first write gets ID 1, upsert gets ID 2
+        let vec_data_key = VectorDataKey::new(2).encode(); // New internal ID
         let vec_data = storage.get(vec_data_key).await.unwrap();
         assert!(vec_data.is_some());
         let decoded = VectorDataValue::decode_from_bytes(&vec_data.unwrap().value, 3).unwrap();
@@ -798,6 +907,7 @@ mod tests {
             distance_metric: DistanceMetric::Cosine,
             flush_interval: Duration::from_secs(60),
             split_threshold_vectors: 10_000,
+            merge_threshold_vectors: 200,
             split_search_neighbourhood: 8,
             chunk_target: 4096,
             metadata_fields: vec![],
@@ -827,11 +937,7 @@ mod tests {
             }, // Cluster 4: alternating
         ];
 
-        let centroids: Vec<CentroidEntry> = cluster_centers
-            .iter()
-            .enumerate()
-            .map(|(i, vector)| CentroidEntry::new((i + 1) as u64, vector.clone()))
-            .collect();
+        let centroids: Vec<Vec<f32>> = cluster_centers.to_vec();
 
         let db = VectorDb::open_with_centroids(config, centroids)
             .await
@@ -922,6 +1028,7 @@ mod tests {
             distance_metric: DistanceMetric::L2,
             flush_interval: Duration::from_secs(60),
             split_threshold_vectors: 10_000,
+            merge_threshold_vectors: 200,
             split_search_neighbourhood: 8,
             chunk_target: 4096,
             metadata_fields: vec![],
@@ -1011,11 +1118,7 @@ mod tests {
     async fn should_search_across_multiple_centroids() {
         // given - database with 3 centroids
         let config = create_test_config_with_dimensions(2);
-        let centroids = vec![
-            CentroidEntry::new(1, vec![1.0, 0.0]),
-            CentroidEntry::new(2, vec![0.0, 1.0]),
-            CentroidEntry::new(3, vec![-1.0, 0.0]),
-        ];
+        let centroids = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![-1.0, 0.0]];
         let db = VectorDb::open_with_centroids(config, centroids)
             .await
             .unwrap();

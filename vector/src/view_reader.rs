@@ -5,18 +5,15 @@ use anyhow::Result;
 use common::coordinator::View;
 use std::sync::Arc;
 
-#[allow(dead_code)]
 pub(crate) struct ViewReader {
     view: Arc<View<VectorDbWriteDelta>>,
 }
 
 impl ViewReader {
-    #[allow(dead_code)]
     pub(crate) fn new(view: Arc<View<VectorDbWriteDelta>>) -> Self {
         Self { view }
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn get_posting_list(
         &self,
         centroid_id: u64,

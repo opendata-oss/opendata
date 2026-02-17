@@ -2573,6 +2573,7 @@ dependencies = [
  "dashmap",
  "fail",
  "futures",
+ "log",
  "opendata-common",
  "rand 0.8.5",
  "roaring 0.10.12",
@@ -2580,6 +2581,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "usearch",
 ]
 

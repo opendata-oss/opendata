@@ -20,10 +20,8 @@ pub(crate) struct CentroidScanResult {
     /// All centroid entries across all chunks.
     pub(crate) entries: Vec<crate::serde::centroid_chunk::CentroidEntry>,
     /// The chunk ID of the last (highest-numbered) chunk seen.
-    #[allow(dead_code)]
     pub(crate) last_chunk_id: u32,
     /// The number of entries in the last chunk.
-    #[allow(dead_code)]
     pub(crate) last_chunk_count: usize,
 }
 

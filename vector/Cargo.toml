@@ -27,6 +27,12 @@ rstest.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+log = "0.4.29"
+rand = "0.8"
+
+[[bin]]
+name = "gen_sift100k_groundtruth"
+path = "src/bin/gen_sift100k_groundtruth.rs"
 
 [dev-dependencies]
-rand = "0.8"
+tracing-subscriber.workspace = true

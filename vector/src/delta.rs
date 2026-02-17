@@ -19,21 +19,22 @@
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tracing::debug;
 
 use crate::hnsw::CentroidGraph;
 use crate::lire::commands::RebalanceCommand;
-use crate::lire::rebalancer::IndexRebalanceOp;
+use crate::lire::rebalancer::{IndexRebalanceOp, IndexRebalancer};
 use crate::model::AttributeValue;
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::posting_list::PostingUpdate;
 use crate::storage::record;
 use common::SequenceAllocator;
-use common::coordinator::Delta;
+use common::coordinator::{Delta, PauseHandle};
 use common::storage::RecordOp;
 use dashmap::DashMap;
+use log::info;
 use roaring::RoaringTreemap;
 // ============================================================================
 // WriteCoordinator Integration Types
@@ -41,7 +42,6 @@ use roaring::RoaringTreemap;
 
 pub(crate) enum VectorDbWrite {
     Write(Vec<VectorWrite>),
-    #[allow(dead_code)]
     Rebalance(RebalanceCommand),
 }
 
@@ -62,13 +62,12 @@ pub(crate) struct VectorWrite {
 /// Configuration options for the delta.
 pub(crate) struct VectorDbDeltaOpts {
     /// Vector dimensions for encoding.
-    #[allow(dead_code)]
     pub(crate) dimensions: usize,
-    /// Number of vectors in a centroid's posting list that triggers a split.
-    pub(crate) split_threshold_vectors: u64,
     /// Target number of centroid entries per chunk.
-    #[allow(dead_code)]
     pub(crate) chunk_target: usize,
+    pub(crate) max_in_flight_rebalance_tasks: usize,
+    pub(crate) split_threshold_vectors: usize,
+    pub(crate) rebalance_backpressure_resume_threshold: usize,
 }
 
 /// Image containing shared state for the delta.
@@ -86,18 +85,12 @@ pub(crate) struct VectorDbDeltaContext {
     pub(crate) centroid_graph: Arc<dyn CentroidGraph>,
     /// Synchronous ID allocator for internal ID generation.
     pub(crate) id_allocator: SequenceAllocator,
-    /// Channel for sending rebalance ops to index rebalancer
-    pub(crate) rebalancer_tx: tokio::sync::mpsc::UnboundedSender<IndexRebalanceOp>,
-    /// In-memory centroid vector counts, loaded from storage at startup and
-    /// updated on each write. Used by the current delta to observe counts
-    /// and schedule splits/merges.
-    pub(crate) centroid_counts: HashMap<u64, u64>,
     /// The current centroid chunk being appended to.
-    #[allow(dead_code)]
     pub(crate) current_chunk_id: u32,
     /// Number of centroid entries in the current chunk.
-    #[allow(dead_code)]
     pub(crate) current_chunk_count: usize,
+    pub(crate) rebalancer: IndexRebalancer,
+    pub(crate) pause_handle: Arc<OnceLock<PauseHandle>>,
 }
 
 /// Immutable delta containing all RecordOps ready to be flushed.
@@ -120,9 +113,6 @@ pub(crate) struct VectorDbWriteDelta {
     pub(crate) ops: Vec<RecordOp>,
     /// Shared view of the delta's current state, readable by concurrent readers.
     pub(crate) view: Arc<std::sync::RwLock<VectorDbDeltaView>>,
-    /// Centroids that already have an in-flight split op sent to the rebalancer.
-    /// Prevents duplicate split requests within a single delta lifecycle.
-    pub(crate) pending_splits: HashSet<u64>,
 }
 
 impl VectorDbWriteDelta {
@@ -150,7 +140,6 @@ impl Delta for VectorDbWriteDelta {
             ctx: context,
             ops: Vec::new(),
             view: Arc::new(std::sync::RwLock::new(VectorDbDeltaView::new())),
-            pending_splits: HashSet::new(),
         }
     }
 
@@ -158,10 +147,12 @@ impl Delta for VectorDbWriteDelta {
         &mut self,
         write: Self::Write,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
-        match write {
+        let result = match write {
             VectorDbWrite::Write(writes) => self.apply_write(writes),
             VectorDbWrite::Rebalance(cmd) => self.apply_rebalance_cmd(cmd),
-        }
+        };
+        self.toggle_rebalance_backpressure();
+        result
     }
 
     fn estimate_size(&self) -> usize {
@@ -178,6 +169,7 @@ impl Delta for VectorDbWriteDelta {
     }
 
     fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
+        self.ctx.rebalancer.log_summary();
         let mut ops = self.ops;
         let view = self.view.read().expect("lock poisoned").clone();
 
@@ -206,12 +198,31 @@ impl Delta for VectorDbWriteDelta {
 }
 
 impl VectorDbWriteDelta {
+    fn pause_handle(&self) -> PauseHandle {
+        self.ctx.pause_handle.get().unwrap().clone()
+    }
+
+    fn toggle_rebalance_backpressure(&self) {
+        let in_flight = self.ctx.rebalancer.total_ops_pending_and_running();
+        let max_centroid_limit = (self.ctx.opts.split_threshold_vectors * 2) as u64;
+        if in_flight >= self.ctx.opts.max_in_flight_rebalance_tasks
+            || self.ctx.rebalancer.max_centroid_size() >= max_centroid_limit
+        {
+            info!(
+                "applying rebalance backpressure: {} {}",
+                in_flight, self.ctx.opts.max_in_flight_rebalance_tasks
+            );
+            self.pause_handle().pause();
+        } else if in_flight < self.ctx.opts.rebalance_backpressure_resume_threshold {
+            self.pause_handle().unpause();
+        }
+    }
+
     fn apply_write(
         &mut self,
         vector_writes: Vec<VectorWrite>,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         let mut view = self.view.write().expect("lock poisoned");
-        let mut touched_centroids = HashSet::new();
 
         for write in vector_writes {
             // Allocate new internal ID
@@ -251,47 +262,12 @@ impl VectorDbWriteDelta {
 
             // Accumulate posting list update
             view.add_to_posting(centroid_id, new_internal_id, write.values);
-            *self.ctx.centroid_counts.entry(centroid_id).or_default() += 1;
-
-            touched_centroids.insert(centroid_id);
+            self.ctx.rebalancer.update_counts(&[(centroid_id, 1)])
         }
 
         drop(view);
 
-        // Check if any touched centroid exceeded the split threshold
-        self.maybe_schedule_splits(touched_centroids);
-
         Ok(Arc::new(()))
-    }
-
-    fn maybe_schedule_splits(&mut self, touched_centroids: HashSet<u64>) {
-        for centroid_id in touched_centroids {
-            let count = self
-                .ctx
-                .centroid_counts
-                .get(&centroid_id)
-                .copied()
-                .unwrap_or(0);
-            if count >= self.ctx.opts.split_threshold_vectors
-                && !self.pending_splits.contains(&centroid_id)
-            {
-                debug!(
-                    centroid_id,
-                    count,
-                    threshold = self.ctx.opts.split_threshold_vectors,
-                    "scheduling split for centroid"
-                );
-                self.pending_splits.insert(centroid_id);
-                let centroid_vec = self
-                    .ctx
-                    .centroid_graph
-                    .get_centroid_vector(centroid_id)
-                    .expect("unexpected missing centroid");
-                let _ = self.ctx.rebalancer_tx.send(IndexRebalanceOp::ExecuteSplit {
-                    centroid: CentroidEntry::new(centroid_id, centroid_vec),
-                });
-            }
-        }
     }
 }
 
@@ -316,7 +292,6 @@ impl VectorDbDeltaView {
             .push(PostingUpdate::append(vector_id, vector));
     }
 
-    #[allow(dead_code)]
     pub(crate) fn delete_from_posting(&mut self, centroid_id: u64, vector_id: u64) {
         self.posting_updates
             .entry(centroid_id)
@@ -329,8 +304,10 @@ impl VectorDbDeltaView {
 mod tests {
     use super::*;
     use crate::hnsw::CentroidGraph;
+    use crate::lire::rebalancer::{IndexRebalancer, IndexRebalancerOpts};
     use crate::model::AttributeValue;
     use crate::serde::centroid_chunk::CentroidEntry;
+    use crate::serde::collection_meta::DistanceMetric;
     use crate::serde::key::{CentroidStatsKey, IdDictionaryKey, PostingListKey, VectorDataKey};
     use bytes::{Buf, Bytes};
     use common::SequenceAllocator;
@@ -338,20 +315,21 @@ mod tests {
     use common::storage::RecordOp;
     use common::storage::in_memory::InMemoryStorage;
 
-    /// Mock CentroidGraph that always returns a fixed centroid ID.
+    /// Mock CentroidGraph with configurable centroids. Search returns all
+    /// centroid IDs in insertion order (first = assignment target).
     struct MockCentroidGraph {
-        centroid_id: u64,
+        centroids: Vec<(u64, Vec<f32>)>,
     }
 
     impl MockCentroidGraph {
-        fn new(centroid_id: u64) -> Self {
-            Self { centroid_id }
+        fn new(centroids: Vec<(u64, Vec<f32>)>) -> Self {
+            Self { centroids }
         }
     }
 
     impl CentroidGraph for MockCentroidGraph {
         fn search(&self, _query: &[f32], _k: usize) -> Vec<u64> {
-            vec![self.centroid_id]
+            self.centroids.iter().map(|(id, _)| *id).collect()
         }
 
         fn add_centroid(&self, _entry: &CentroidEntry) -> anyhow::Result<()> {
@@ -363,56 +341,56 @@ mod tests {
         }
 
         fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>> {
-            if centroid_id == self.centroid_id {
-                Some(vec![0.0; 3])
-            } else {
-                None
-            }
+            self.centroids
+                .iter()
+                .find(|(id, _)| *id == centroid_id)
+                .map(|(_, v)| v.clone())
         }
 
         fn len(&self) -> usize {
-            1
+            self.centroids.len()
         }
     }
 
     /// Create a test context with the given centroid ID for assignment.
     async fn create_test_context(centroid_id: u64) -> VectorDbDeltaContext {
-        create_test_context_with_threshold(centroid_id, 10_000)
-            .await
-            .0
-    }
-
-    /// Create a test context with the given centroid ID and split threshold.
-    /// Returns the context and the rebalancer receiver for inspecting sent ops.
-    async fn create_test_context_with_threshold(
-        centroid_id: u64,
-        split_threshold: u64,
-    ) -> (
-        VectorDbDeltaContext,
-        tokio::sync::mpsc::UnboundedReceiver<IndexRebalanceOp>,
-    ) {
         let storage: Arc<dyn common::Storage> = Arc::new(InMemoryStorage::new());
         let key = Bytes::from_static(&[0x01, 0x02]);
         let id_allocator = SequenceAllocator::load(storage.as_ref(), key)
             .await
             .unwrap();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let centroid_graph: Arc<dyn CentroidGraph> =
+            Arc::new(MockCentroidGraph::new(vec![(centroid_id, vec![0.0; 3])]));
+        let rebalancer = IndexRebalancer::new(
+            IndexRebalancerOpts {
+                dimensions: 3,
+                distance_metric: DistanceMetric::L2,
+                split_search_neighbourhood: 4,
+                split_threshold_vectors: 10_000,
+                merge_threshold_vectors: 0,
+                max_rebalance_tasks: 0,
+            },
+            centroid_graph.clone(),
+            HashMap::new(),
+            Arc::new(std::sync::OnceLock::new()),
+        );
 
-        let ctx = VectorDbDeltaContext {
+        VectorDbDeltaContext {
             opts: VectorDbDeltaOpts {
                 dimensions: 3,
-                split_threshold_vectors: split_threshold,
                 chunk_target: 4096,
+                max_in_flight_rebalance_tasks: usize::MAX,
+                split_threshold_vectors: usize::MAX,
+                rebalance_backpressure_resume_threshold: 0,
             },
             dictionary: Arc::new(DashMap::new()),
-            centroid_graph: Arc::new(MockCentroidGraph::new(centroid_id)),
+            centroid_graph,
             id_allocator,
-            rebalancer_tx: tx,
-            centroid_counts: HashMap::new(),
             current_chunk_id: 0,
             current_chunk_count: 0,
-        };
-        (ctx, rx)
+            rebalancer,
+            pause_handle: Arc::new(OnceLock::new()),
+        }
     }
 
     /// Create a simple vector write for testing.
@@ -713,21 +691,37 @@ mod tests {
         let id_allocator = SequenceAllocator::load(storage.as_ref(), key)
             .await
             .unwrap();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let centroid_graph: Arc<dyn CentroidGraph> = Arc::new(MultiCentroidGraph);
+        let rebalancer = IndexRebalancer::new(
+            IndexRebalancerOpts {
+                dimensions: 3,
+                distance_metric: DistanceMetric::L2,
+                split_search_neighbourhood: 4,
+                split_threshold_vectors: 10_000,
+                merge_threshold_vectors: 0,
+                max_rebalance_tasks: 0,
+            },
+            centroid_graph.clone(),
+            HashMap::new(),
+            Arc::new(std::sync::OnceLock::new()),
+        );
 
         let ctx = VectorDbDeltaContext {
             opts: VectorDbDeltaOpts {
                 dimensions: 3,
-                split_threshold_vectors: 10_000,
                 chunk_target: 4096,
+                max_in_flight_rebalance_tasks: usize::MAX,
+                split_threshold_vectors: usize::MAX,
+                rebalance_backpressure_resume_threshold: 0,
             },
             dictionary: Arc::new(DashMap::new()),
-            centroid_graph: Arc::new(MultiCentroidGraph),
+            centroid_graph,
             id_allocator,
-            rebalancer_tx: tx,
-            centroid_counts: HashMap::new(),
             current_chunk_id: 0,
             current_chunk_count: 0,
+            rebalancer,
+            pause_handle: Arc::new(OnceLock::new()),
         };
 
         let mut delta = VectorDbWriteDelta::init(ctx);
@@ -755,81 +749,6 @@ mod tests {
             3,
             "should have 3 posting list merge ops"
         );
-    }
-
-    #[tokio::test]
-    async fn should_update_centroid_counts_per_centroid() {
-        // given - create a mock that routes vectors to different centroids
-        struct MultiCentroidGraph;
-
-        impl CentroidGraph for MultiCentroidGraph {
-            fn search(&self, query: &[f32], _k: usize) -> Vec<u64> {
-                if query[0] > query[1] && query[0] > query[2] {
-                    vec![1]
-                } else if query[1] > query[2] {
-                    vec![2]
-                } else {
-                    vec![3]
-                }
-            }
-
-            fn add_centroid(&self, _entry: &CentroidEntry) -> anyhow::Result<()> {
-                Ok(())
-            }
-
-            fn remove_centroid(&self, _centroid_id: u64) -> anyhow::Result<()> {
-                Ok(())
-            }
-
-            fn get_centroid_vector(&self, _centroid_id: u64) -> Option<Vec<f32>> {
-                None
-            }
-
-            fn len(&self) -> usize {
-                3
-            }
-        }
-
-        let storage: Arc<dyn common::Storage> = Arc::new(InMemoryStorage::new());
-        let key = Bytes::from_static(&[0x01, 0x02]);
-        let id_allocator = SequenceAllocator::load(storage.as_ref(), key)
-            .await
-            .unwrap();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let ctx = VectorDbDeltaContext {
-            opts: VectorDbDeltaOpts {
-                dimensions: 3,
-                split_threshold_vectors: 10_000,
-                chunk_target: 4096,
-            },
-            dictionary: Arc::new(DashMap::new()),
-            centroid_graph: Arc::new(MultiCentroidGraph),
-            id_allocator,
-            rebalancer_tx: tx,
-            centroid_counts: HashMap::new(),
-            current_chunk_id: 0,
-            current_chunk_count: 0,
-        };
-
-        let mut delta = VectorDbWriteDelta::init(ctx);
-
-        let writes = vec![
-            create_vector_write("vec-1", vec![1.0, 0.0, 0.0]), // -> centroid 1
-            create_vector_write("vec-2", vec![0.0, 1.0, 0.0]), // -> centroid 2
-            create_vector_write("vec-3", vec![0.0, 0.0, 1.0]), // -> centroid 3
-            create_vector_write("vec-4", vec![0.9, 0.1, 0.0]), // -> centroid 1
-        ];
-
-        // when
-        delta.apply(VectorDbWrite::Write(writes)).unwrap();
-        let (_frozen, _view, ctx) = delta.freeze();
-
-        // then - only centroids that received postings should have counts
-        assert_eq!(ctx.centroid_counts.get(&1), Some(&2)); // vec-1, vec-4
-        assert_eq!(ctx.centroid_counts.get(&2), Some(&1)); // vec-2
-        assert_eq!(ctx.centroid_counts.get(&3), Some(&1)); // vec-3
-        assert_eq!(ctx.centroid_counts.len(), 3);
     }
 
     #[tokio::test]
@@ -916,85 +835,117 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_send_split_when_threshold_exceeded() {
-        // given - threshold of 3, centroid 5
-        let centroid_id = 5u64;
-        let (ctx, mut rx) = create_test_context_with_threshold(centroid_id, 3).await;
-        let mut delta = VectorDbWriteDelta::init(ctx);
+    async fn should_update_centroid_counts_per_centroid() {
+        // given - create a mock that routes vectors to different centroids
+        struct MultiCentroidGraph;
 
-        // when - write 4 vectors (exceeds threshold of 3)
-        let writes = vec![
-            create_vector_write("v1", vec![1.0, 0.0, 0.0]),
-            create_vector_write("v2", vec![0.0, 1.0, 0.0]),
-            create_vector_write("v3", vec![0.0, 0.0, 1.0]),
-            create_vector_write("v4", vec![1.0, 1.0, 0.0]),
-        ];
-        delta.apply(VectorDbWrite::Write(writes)).unwrap();
-
-        // then - should have received exactly one ExecuteSplit for centroid 5
-        let op = rx.try_recv().expect("should have received a split op");
-        match op {
-            IndexRebalanceOp::ExecuteSplit { centroid } => {
-                assert_eq!(centroid.centroid_id, centroid_id);
+        impl CentroidGraph for MultiCentroidGraph {
+            fn search(&self, query: &[f32], _k: usize) -> Vec<u64> {
+                if query[0] > query[1] && query[0] > query[2] {
+                    vec![1]
+                } else if query[1] > query[2] {
+                    vec![2]
+                } else {
+                    vec![3]
+                }
             }
-            _ => panic!("expected ExecuteSplit, got {:?}", op),
+
+            fn add_centroid(&self, _entry: &CentroidEntry) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            fn remove_centroid(&self, _centroid_id: u64) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            fn get_centroid_vector(&self, _centroid_id: u64) -> Option<Vec<f32>> {
+                None
+            }
+
+            fn len(&self) -> usize {
+                3
+            }
         }
-        assert!(
-            rx.try_recv().is_err(),
-            "should not have sent duplicate split ops"
-        );
-    }
 
-    #[tokio::test]
-    async fn should_not_send_duplicate_split_for_same_centroid() {
-        // given - threshold of 2, centroid 1
-        let centroid_id = 1u64;
-        let (ctx, mut rx) = create_test_context_with_threshold(centroid_id, 2).await;
+        let storage: Arc<dyn common::Storage> = Arc::new(InMemoryStorage::new());
+        let key = Bytes::from_static(&[0x01, 0x02]);
+        let id_allocator = SequenceAllocator::load(storage.as_ref(), key)
+            .await
+            .unwrap();
+
+        let centroid_graph: Arc<dyn CentroidGraph> = Arc::new(MultiCentroidGraph);
+        let rebalancer = IndexRebalancer::new(
+            IndexRebalancerOpts {
+                dimensions: 3,
+                distance_metric: DistanceMetric::L2,
+                split_search_neighbourhood: 4,
+                split_threshold_vectors: 10_000,
+                merge_threshold_vectors: 0,
+                max_rebalance_tasks: 0,
+            },
+            centroid_graph.clone(),
+            HashMap::new(),
+            Arc::new(std::sync::OnceLock::new()),
+        );
+
+        let ctx = VectorDbDeltaContext {
+            opts: VectorDbDeltaOpts {
+                dimensions: 3,
+                chunk_target: 4096,
+                max_in_flight_rebalance_tasks: usize::MAX,
+                split_threshold_vectors: usize::MAX,
+                rebalance_backpressure_resume_threshold: 0,
+            },
+            dictionary: Arc::new(DashMap::new()),
+            centroid_graph,
+            id_allocator,
+            current_chunk_id: 0,
+            current_chunk_count: 0,
+            rebalancer,
+            pause_handle: Arc::new(OnceLock::new()),
+        };
+
         let mut delta = VectorDbWriteDelta::init(ctx);
 
-        // when - first batch exceeds threshold
-        let writes1 = vec![
-            create_vector_write("v1", vec![1.0, 0.0, 0.0]),
-            create_vector_write("v2", vec![0.0, 1.0, 0.0]),
-        ];
-        delta.apply(VectorDbWrite::Write(writes1)).unwrap();
-
-        // drain the first split op
-        let _ = rx.try_recv().expect("should have first split op");
-
-        // when - second batch also goes to the same centroid
-        let writes2 = vec![
-            create_vector_write("v3", vec![0.0, 0.0, 1.0]),
-            create_vector_write("v4", vec![1.0, 1.0, 0.0]),
-        ];
-        delta.apply(VectorDbWrite::Write(writes2)).unwrap();
-
-        // then - should not have sent a second split op (already pending)
-        assert!(
-            rx.try_recv().is_err(),
-            "should not send duplicate split for same centroid"
-        );
-    }
-
-    #[tokio::test]
-    async fn should_not_send_split_when_below_threshold() {
-        // given - threshold of 5, centroid 1
-        let centroid_id = 1u64;
-        let (ctx, mut rx) = create_test_context_with_threshold(centroid_id, 5).await;
-        let mut delta = VectorDbWriteDelta::init(ctx);
-
-        // when - write 3 vectors (below threshold of 5)
         let writes = vec![
-            create_vector_write("v1", vec![1.0, 0.0, 0.0]),
-            create_vector_write("v2", vec![0.0, 1.0, 0.0]),
-            create_vector_write("v3", vec![0.0, 0.0, 1.0]),
+            create_vector_write("vec-1", vec![1.0, 0.0, 0.0]), // -> centroid 1
+            create_vector_write("vec-2", vec![0.0, 1.0, 0.0]), // -> centroid 2
+            create_vector_write("vec-3", vec![0.0, 0.0, 1.0]), // -> centroid 3
+            create_vector_write("vec-4", vec![0.9, 0.1, 0.0]), // -> centroid 1
         ];
-        delta.apply(VectorDbWrite::Write(writes)).unwrap();
 
-        // then - no split ops should have been sent
-        assert!(
-            rx.try_recv().is_err(),
-            "should not send split when below threshold"
-        );
+        // when
+        delta.apply(VectorDbWrite::Write(writes)).unwrap();
+        let (frozen, _view, ctx) = delta.freeze();
+
+        // then - rebalancer should have correct counts per centroid
+        assert_eq!(ctx.rebalancer.centroid_count(1), Some(2));
+        assert_eq!(ctx.rebalancer.centroid_count(2), Some(1));
+        assert_eq!(ctx.rebalancer.centroid_count(3), Some(1));
+
+        // and - frozen delta should have centroid stats merge ops with correct deltas
+        for (centroid_id, expected_count) in [(1u64, 2i32), (2, 1), (3, 1)] {
+            let stats_key = CentroidStatsKey::new(centroid_id).encode();
+            let stats_merge = frozen.ops.iter().find(|op| match op {
+                RecordOp::Merge(record) => record.key == stats_key,
+                _ => false,
+            });
+            assert!(
+                stats_merge.is_some(),
+                "should have centroid stats merge op for centroid {}",
+                centroid_id
+            );
+            if let Some(RecordOp::Merge(record)) = stats_merge {
+                let value = crate::serde::centroid_stats::CentroidStatsValue::decode_from_bytes(
+                    &record.value,
+                )
+                .unwrap();
+                assert_eq!(
+                    value.num_vectors, expected_count,
+                    "centroid {} should have count delta {}",
+                    centroid_id, expected_count
+                );
+            }
+        }
     }
 }

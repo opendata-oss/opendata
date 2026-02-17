@@ -54,7 +54,6 @@ impl Posting {
         self.vector.as_slice()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn unpack(self) -> (u64, Vec<f32>) {
         (self.id, self.vector)
     }
@@ -342,7 +341,6 @@ impl Default for PostingListValue {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn merge_decoded_posting_lists(postings: Vec<PostingListValue>) -> PostingListValue {
     struct E(PostingUpdate, usize, std::vec::IntoIter<PostingUpdate>);
 
