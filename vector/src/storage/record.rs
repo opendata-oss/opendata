@@ -100,7 +100,6 @@ pub fn merge_centroid_stats(centroid_id: u64, delta: i32) -> RecordOp {
 }
 
 /// Create a RecordOp to merge new centroid entries into an existing centroid chunk.
-#[allow(dead_code)]
 pub fn merge_centroid_chunk(
     chunk_id: u32,
     entries: Vec<CentroidEntry>,

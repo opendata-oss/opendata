@@ -27,4 +27,8 @@ rstest.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+log = "0.4.29"
 rand = "0.8"
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
