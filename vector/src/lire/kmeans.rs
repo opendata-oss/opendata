@@ -1,9 +1,38 @@
 //! Simple 2-means clustering for centroid splitting.
 
+use rand::Rng;
+
 use crate::distance;
 use crate::serde::collection_meta::DistanceMetric;
 
-/// Compute the mean vector of a set of vectors.
+/// Trait for splitting a set of vectors into two clusters.
+#[allow(dead_code)]
+pub(crate) trait Clustering {
+    fn two_means(&self, vectors: &[(u64, &[f32])], dimensions: usize) -> (Vec<f32>, Vec<f32>);
+}
+
+/// K-means with L2-based initialization and arithmetic mean centroids.
+/// Suitable for L2 and DotProduct metrics.
+#[allow(dead_code)]
+pub(crate) struct KMeansPP {
+    metric: DistanceMetric,
+}
+
+/// Spherical k-means: cosine-aware initialization and L2-normalized centroids.
+/// Suitable for Cosine metric.
+#[allow(dead_code)]
+pub(crate) struct SphericalKMeans;
+
+/// Create a clustering strategy appropriate for the given distance metric.
+#[allow(dead_code)]
+pub(crate) fn for_metric(metric: DistanceMetric) -> Box<dyn Clustering + Send> {
+    match metric {
+        DistanceMetric::Cosine => Box::new(SphericalKMeans),
+        _ => Box::new(KMeansPP { metric }),
+    }
+}
+
+/// Compute the arithmetic mean vector of a set of vectors.
 fn mean_vector(vectors: &[&[f32]], dimensions: usize) -> Vec<f32> {
     let mut mean = vec![0.0f32; dimensions];
     if vectors.is_empty() {
@@ -21,88 +50,144 @@ fn mean_vector(vectors: &[&[f32]], dimensions: usize) -> Vec<f32> {
     mean
 }
 
-/// Split a set of vectors into two clusters using k-means with k=2.
-///
-/// Returns the two centroid vectors `(c0, c1)`.
-///
-/// # Arguments
-/// * `vectors` - Slice of `(vector_id, vector_data)` tuples
-/// * `dimensions` - Number of dimensions per vector
-/// * `distance_metric` - Distance metric for assignment
-///
-/// # Panics
-/// Panics if fewer than 2 vectors are provided.
-#[allow(dead_code)]
-pub(crate) fn two_means(
-    vectors: &[(u64, &[f32])],
-    dimensions: usize,
-    distance_metric: DistanceMetric,
-) -> (Vec<f32>, Vec<f32>) {
-    assert!(vectors.len() >= 2, "two_means requires at least 2 vectors");
+/// L2-normalize a vector in place.
+fn normalize(v: &mut [f32]) {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        v.iter_mut().for_each(|x| *x /= norm);
+    }
+}
 
-    // Initialize: pick the two farthest vectors as initial centroids (using L2)
+/// Farthest-pair initialization using a given distance metric.
+/// Finds the two most distant vectors by exhaustive pairwise comparison.
+fn farthest_pair_init(vectors: &[(u64, &[f32])], metric: DistanceMetric) -> (usize, usize) {
     let mut best_dist: Option<distance::VectorDistance> = None;
     let mut idx_a = 0;
     let mut idx_b = 1;
-
-    // For small sets, do full pairwise; for large sets, sample against first vector
-    if vectors.len() <= 100 {
-        for i in 0..vectors.len() {
-            for j in (i + 1)..vectors.len() {
-                let d = distance::compute_distance(vectors[i].1, vectors[j].1, DistanceMetric::L2);
-                if best_dist.is_none_or(|best| d > best) {
-                    best_dist = Some(d);
-                    idx_a = i;
-                    idx_b = j;
-                }
+    for i in 0..vectors.len() {
+        for j in (i + 1)..vectors.len() {
+            let d = distance::compute_distance(vectors[i].1, vectors[j].1, metric);
+            if best_dist.is_none_or(|best| d > best) {
+                best_dist = Some(d);
+                idx_a = i;
+                idx_b = j;
             }
         }
-    } else {
-        // Heuristic: find farthest from first, then farthest from that
-        let first = vectors[0].1;
-        let mut farthest_idx = 1;
-        let mut farthest_dist: Option<distance::VectorDistance> = None;
-        for (i, (_, v)) in vectors.iter().enumerate().skip(1) {
-            let d = distance::compute_distance(first, v, DistanceMetric::L2);
-            if farthest_dist.is_none_or(|best| d > best) {
-                farthest_dist = Some(d);
-                farthest_idx = i;
-            }
-        }
-        idx_a = farthest_idx;
-        let pivot = vectors[idx_a].1;
-        farthest_dist = None;
-        for (i, (_, v)) in vectors.iter().enumerate() {
-            if i == idx_a {
-                continue;
-            }
-            let d = distance::compute_distance(pivot, v, DistanceMetric::L2);
-            if farthest_dist.is_none_or(|best| d > best) {
-                farthest_dist = Some(d);
-                farthest_idx = i;
-            }
-        }
-        idx_b = farthest_idx;
     }
+    (idx_a, idx_b)
+}
 
-    let mut c0 = vectors[idx_a].1.to_vec();
-    let mut c1 = vectors[idx_b].1.to_vec();
+/// K-means++ initialization using squared L2 distance.
+/// Picks first centroid randomly, then picks second with probability proportional
+/// to squared L2 distance from the first.
+fn kmeans_pp_init_l2(vectors: &[(u64, &[f32])]) -> (usize, usize) {
+    let mut rng = rand::thread_rng();
+    let idx_a = rng.gen_range(0..vectors.len());
 
+    let distances: Vec<f32> = vectors
+        .iter()
+        .map(|(_, v)| {
+            v.iter()
+                .zip(vectors[idx_a].1.iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum()
+        })
+        .collect();
+    let total: f32 = distances.iter().sum();
+
+    let idx_b = if total > 0.0 {
+        let threshold = rng.gen_range(0.0..total);
+        let mut cumsum = 0.0;
+        let mut chosen = 0;
+        for (i, &d) in distances.iter().enumerate() {
+            cumsum += d;
+            if cumsum >= threshold {
+                chosen = i;
+                break;
+            }
+        }
+        chosen
+    } else if idx_a == 0 {
+        1
+    } else {
+        0
+    };
+
+    (idx_a, idx_b)
+}
+
+/// K-means++ initialization using cosine dissimilarity (1 - cosine_similarity).
+/// Picks first centroid randomly, then picks second with probability proportional
+/// to `1.0 - cosine_similarity` from the first.
+fn kmeans_pp_init_cosine(vectors: &[(u64, &[f32])]) -> (usize, usize) {
+    let mut rng = rand::thread_rng();
+    let idx_a = rng.gen_range(0..vectors.len());
+
+    let distances: Vec<f32> = vectors
+        .iter()
+        .map(|(_, v)| {
+            let dot: f32 = v
+                .iter()
+                .zip(vectors[idx_a].1.iter())
+                .map(|(a, b)| a * b)
+                .sum();
+            let norm_v: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let norm_a: f32 = vectors[idx_a].1.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let sim = if norm_v > 0.0 && norm_a > 0.0 {
+                dot / (norm_v * norm_a)
+            } else {
+                0.0
+            };
+            (1.0 - sim).max(0.0)
+        })
+        .collect();
+    let total: f32 = distances.iter().sum();
+
+    let idx_b = if total > 0.0 {
+        let threshold = rng.gen_range(0.0..total);
+        let mut cumsum = 0.0;
+        let mut chosen = 0;
+        for (i, &d) in distances.iter().enumerate() {
+            cumsum += d;
+            if cumsum >= threshold {
+                chosen = i;
+                break;
+            }
+        }
+        chosen
+    } else if idx_a == 0 {
+        1
+    } else {
+        0
+    };
+
+    (idx_a, idx_b)
+}
+
+/// Run the k-means loop: assign vectors to centroids, recompute centroids.
+/// `update_centroid` is called on each centroid after computing the arithmetic mean.
+fn kmeans_loop(
+    vectors: &[(u64, &[f32])],
+    dimensions: usize,
+    metric: DistanceMetric,
+    c0: &mut Vec<f32>,
+    c1: &mut Vec<f32>,
+    update_centroid: fn(&mut [f32]),
+) {
     let max_iterations = 20;
-    let mut prev_assignments: Vec<bool> = Vec::new(); // false = c0, true = c1
+    let mut prev_assignments: Vec<bool> = Vec::new();
 
     for _ in 0..max_iterations {
         // Assign each vector to the closer centroid
         let assignments: Vec<bool> = vectors
             .iter()
             .map(|(_, v)| {
-                let d0 = distance::compute_distance(v, &c0, distance_metric);
-                let d1 = distance::compute_distance(v, &c1, distance_metric);
-                d1 < d0 // true if d1 is more similar (closer to c1)
+                let d0 = distance::compute_distance(v, c0, metric);
+                let d1 = distance::compute_distance(v, c1, metric);
+                d1 < d0
             })
             .collect();
 
-        // Check convergence
         if assignments == prev_assignments {
             break;
         }
@@ -123,16 +208,70 @@ pub(crate) fn two_means(
             .map(|((_, v), _)| *v)
             .collect();
 
-        // Only update if cluster is non-empty
         if !c0_vecs.is_empty() {
-            c0 = mean_vector(&c0_vecs, dimensions);
+            *c0 = mean_vector(&c0_vecs, dimensions);
+            update_centroid(c0);
         }
         if !c1_vecs.is_empty() {
-            c1 = mean_vector(&c1_vecs, dimensions);
+            *c1 = mean_vector(&c1_vecs, dimensions);
+            update_centroid(c1);
         }
     }
+}
 
-    (c0, c1)
+/// Identity update — no post-processing after computing the mean.
+fn identity(_v: &mut [f32]) {}
+
+/// Normalize the centroid vector to unit length.
+fn normalize_centroid(v: &mut [f32]) {
+    normalize(v);
+}
+
+impl Clustering for KMeansPP {
+    #[allow(dead_code)]
+    fn two_means(&self, vectors: &[(u64, &[f32])], dimensions: usize) -> (Vec<f32>, Vec<f32>) {
+        assert!(vectors.len() >= 2, "two_means requires at least 2 vectors");
+
+        let (idx_a, idx_b) = if vectors.len() <= 100 {
+            farthest_pair_init(vectors, DistanceMetric::L2)
+        } else {
+            kmeans_pp_init_l2(vectors)
+        };
+
+        let mut c0 = vectors[idx_a].1.to_vec();
+        let mut c1 = vectors[idx_b].1.to_vec();
+
+        kmeans_loop(vectors, dimensions, self.metric, &mut c0, &mut c1, identity);
+
+        (c0, c1)
+    }
+}
+
+impl Clustering for SphericalKMeans {
+    #[allow(dead_code)]
+    fn two_means(&self, vectors: &[(u64, &[f32])], dimensions: usize) -> (Vec<f32>, Vec<f32>) {
+        assert!(vectors.len() >= 2, "two_means requires at least 2 vectors");
+
+        let (idx_a, idx_b) = if vectors.len() <= 100 {
+            farthest_pair_init(vectors, DistanceMetric::Cosine)
+        } else {
+            kmeans_pp_init_cosine(vectors)
+        };
+
+        let mut c0 = vectors[idx_a].1.to_vec();
+        let mut c1 = vectors[idx_b].1.to_vec();
+
+        kmeans_loop(
+            vectors,
+            dimensions,
+            DistanceMetric::Cosine,
+            &mut c0,
+            &mut c1,
+            normalize_centroid,
+        );
+
+        (c0, c1)
+    }
 }
 
 #[cfg(test)]
@@ -153,7 +292,8 @@ mod tests {
         let refs: Vec<(u64, &[f32])> = vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
 
         // when
-        let (c0, c1) = two_means(&refs, 2, DistanceMetric::L2);
+        let clustering = for_metric(DistanceMetric::L2);
+        let (c0, c1) = clustering.two_means(&refs, 2);
 
         // then - centroids should be near [1, 0] and [-1, 0]
         let near_positive = (c0[0] > 0.5 && c1[0] < -0.5) || (c1[0] > 0.5 && c0[0] < -0.5);
@@ -171,7 +311,10 @@ mod tests {
         let refs: Vec<(u64, &[f32])> = vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
 
         // when
-        let (c0, c1) = two_means(&refs, 2, DistanceMetric::L2);
+        let (c0, c1) = KMeansPP {
+            metric: DistanceMetric::L2,
+        }
+        .two_means(&refs, 2);
 
         // then - each centroid should be at one of the input vectors
         assert!(
@@ -195,10 +338,40 @@ mod tests {
         let refs: Vec<(u64, &[f32])> = vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
 
         // when
-        let (c0, c1) = two_means(&refs, 3, DistanceMetric::Cosine);
+        let clustering = for_metric(DistanceMetric::Cosine);
+        let (c0, c1) = clustering.two_means(&refs, 3);
 
         // then - centroids should separate into two groups
         assert_ne!(c0, c1, "centroids should be different");
+    }
+
+    #[test]
+    fn should_produce_normalized_centroids_for_spherical_kmeans() {
+        // given - vectors in different directions (not unit length)
+        let vectors: Vec<(u64, Vec<f32>)> = vec![
+            (1, vec![3.0, 0.0, 0.0]),
+            (2, vec![2.7, 0.3, 0.0]),
+            (3, vec![0.0, 0.0, 5.0]),
+            (4, vec![0.0, 0.5, 4.5]),
+        ];
+        let refs: Vec<(u64, &[f32])> = vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+
+        // when
+        let (c0, c1) = SphericalKMeans.two_means(&refs, 3);
+
+        // then - both centroids should be approximately unit length
+        let norm_c0: f32 = c0.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let norm_c1: f32 = c1.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm_c0 - 1.0).abs() < 1e-5,
+            "c0 should be unit length, got norm {}",
+            norm_c0
+        );
+        assert!(
+            (norm_c1 - 1.0).abs() < 1e-5,
+            "c1 should be unit length, got norm {}",
+            norm_c1
+        );
     }
 
     #[test]
@@ -206,6 +379,6 @@ mod tests {
     fn should_panic_on_single_vector() {
         let vectors: Vec<(u64, Vec<f32>)> = vec![(1, vec![1.0])];
         let refs: Vec<(u64, &[f32])> = vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
-        two_means(&refs, 1, DistanceMetric::L2);
+        for_metric(DistanceMetric::L2).two_means(&refs, 1);
     }
 }
