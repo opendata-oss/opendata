@@ -521,6 +521,10 @@ impl VectorDb {
         Ok(())
     }
 
+    pub fn num_centroids(&self) -> usize {
+        self.centroid_graph.len()
+    }
+
     /// Search for k-nearest neighbors to a query vector.
     ///
     /// This implements the SPANN-style query algorithm:
@@ -541,6 +545,64 @@ impl VectorDb {
     /// - Query dimensions don't match collection dimensions
     /// - Storage read fails
     pub async fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        // clamp(10, 100) ensures we search at least 10 centroids (for small k)
+        // and at most 100 centroids (to cap memory/latency for large k)
+        let nprobe = k.clamp(10, 100);
+        self.search_with_nprobe(query, k, nprobe).await
+    }
+
+    /// Search using brute-force centroid lookup (for diagnostics).
+    /// Compares all centroids to the query to find the true nearest ones,
+    /// bypassing HNSW entirely.
+    pub async fn search_exact_nprobe(
+        &self,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+    ) -> Result<Vec<SearchResult>> {
+        if query.len() != self.config.dimensions as usize {
+            return Err(anyhow::anyhow!(
+                "Query dimension mismatch: expected {}, got {}",
+                self.config.dimensions,
+                query.len()
+            ));
+        }
+
+        // Brute-force: compute distance from query to every centroid
+        let num_centroids = self.centroid_graph.len();
+        let all_centroid_ids = self.centroid_graph.search(query, num_centroids);
+        let mut scored: Vec<(u64, distance::VectorDistance)> = all_centroid_ids
+            .iter()
+            .filter_map(|&cid| {
+                let cv = self.centroid_graph.get_centroid_vector(cid)?;
+                let d = distance::compute_distance(query, &cv, self.config.distance_metric);
+                Some((cid, d))
+            })
+            .collect();
+        scored.sort_by(|a, b| a.1.cmp(&b.1));
+        let centroid_ids: Vec<u64> = scored.iter().take(nprobe).map(|(id, _)| *id).collect();
+
+        if centroid_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let snapshot = self.write_coordinator.view().snapshot.clone();
+        let candidates = self
+            .load_candidates(&centroid_ids, snapshot.as_ref())
+            .await?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.score_and_rank(query, &candidates, k, snapshot.as_ref())
+            .await
+    }
+
+    pub async fn search_with_nprobe(
+        &self,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+    ) -> Result<Vec<SearchResult>> {
         // 1. Validate query dimensions
         if query.len() != self.config.dimensions as usize {
             return Err(anyhow::anyhow!(
@@ -551,13 +613,11 @@ impl VectorDb {
         }
 
         // 2. Search HNSW for nearest centroids
-        // clamp(10, 100) ensures we search at least 10 centroids (for small k)
-        // and at most 100 centroids (to cap memory/latency for large k)
-        let nprobe = k.clamp(10, 100);
-        let centroid_ids = self.centroid_graph.search(query, nprobe);
+        let num_centroids = nprobe;
+        let centroid_ids = self.centroid_graph.search(query, num_centroids);
         debug!(
             "searched for {} centroids, found: {}",
-            nprobe,
+            num_centroids,
             centroid_ids.len()
         );
 
