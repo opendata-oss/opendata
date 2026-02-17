@@ -1,5 +1,8 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use common::clock::Clock;
 use slatedb::object_store::path::Path;
 use slatedb::object_store::{
     Error as ObjectStoreError, ObjectStore, PutMode, PutPayload, UpdateVersion,
@@ -8,10 +11,16 @@ use slatedb::object_store::{
 use crate::error::{Error, Result};
 use crate::queue_config::QueueConfig;
 
+fn millis(time: SystemTime) -> i64 {
+    time.duration_since(UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_millis() as i64
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct Manifest {
     pending: Vec<String>,
-    claimed: Vec<String>,
+    claimed: HashMap<String, i64>,
 }
 
 enum ManifestWriteError {
@@ -112,35 +121,54 @@ impl QueueProducer {
 
 pub struct QueueConsumer {
     manifest_store: ManifestStore,
+    heartbeat_timeout_ms: i64,
+    clock: Arc<dyn Clock>,
 }
 
 impl QueueConsumer {
-    pub fn new(config: QueueConfig) -> Result<Self> {
+    pub fn new(config: QueueConfig, clock: Arc<dyn Clock>) -> Result<Self> {
         let object_store = common::storage::factory::create_object_store(&config.object_store)
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Self::with_object_store(config, object_store)
+        Self::with_object_store(config, object_store, clock)
     }
 
     pub fn with_object_store(
         config: QueueConfig,
         object_store: Arc<dyn ObjectStore>,
+        clock: Arc<dyn Clock>,
     ) -> Result<Self> {
         Ok(Self {
             manifest_store: ManifestStore {
                 object_store,
                 manifest_path: config.manifest_path,
             },
+            heartbeat_timeout_ms: config.heartbeat_timeout_ms,
+            clock,
         })
     }
 
     pub async fn claim(&self) -> Result<Option<String>> {
         loop {
             let (mut manifest, version) = self.manifest_store.read().await?;
-            if manifest.pending.is_empty() {
+            let now = millis(self.clock.now());
+
+            let cutoff = now - self.heartbeat_timeout_ms;
+            let stale = manifest
+                .claimed
+                .iter()
+                .filter(|(_, ts)| **ts < cutoff)
+                .min_by_key(|(_, ts)| **ts)
+                .map(|(loc, _)| loc.clone());
+
+            let location = if let Some(loc) = stale {
+                loc
+            } else if !manifest.pending.is_empty() {
+                manifest.pending.remove(0)
+            } else {
                 return Ok(None);
-            }
-            let location = manifest.pending.remove(0);
-            manifest.claimed.push(location.clone());
+            };
+
+            manifest.claimed.insert(location.clone(), now);
             match self.manifest_store.write(&manifest, version).await {
                 Ok(()) => return Ok(Some(location)),
                 Err(ManifestWriteError::Conflict) => continue,
@@ -152,12 +180,28 @@ impl QueueConsumer {
     pub async fn dequeue(&self, location: &str) -> Result<bool> {
         loop {
             let (mut manifest, version) = self.manifest_store.read().await?;
-            let Some(pos) = manifest.claimed.iter().position(|l| l == location) else {
+            if manifest.claimed.remove(location).is_none() {
                 return Ok(false);
-            };
-            manifest.claimed.swap_remove(pos);
+            }
             match self.manifest_store.write(&manifest, version).await {
                 Ok(()) => return Ok(true),
+                Err(ManifestWriteError::Conflict) => continue,
+                Err(ManifestWriteError::Fatal(e)) => return Err(e),
+            }
+        }
+    }
+
+    pub async fn heartbeat(&self, locations: &[String]) -> Result<()> {
+        loop {
+            let (mut manifest, version) = self.manifest_store.read().await?;
+            let now = millis(self.clock.now());
+            for location in locations {
+                if manifest.claimed.contains_key(location) {
+                    manifest.claimed.insert(location.clone(), now);
+                }
+            }
+            match self.manifest_store.write(&manifest, version).await {
+                Ok(()) => return Ok(()),
                 Err(ManifestWriteError::Conflict) => continue,
                 Err(ManifestWriteError::Fatal(e)) => return Err(e),
             }
@@ -168,6 +212,7 @@ impl QueueConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::clock::SystemClock;
     use common::storage::config::ObjectStoreConfig;
     use slatedb::object_store::memory::InMemory;
 
@@ -175,6 +220,7 @@ mod tests {
         QueueConfig {
             object_store: ObjectStoreConfig::InMemory,
             manifest_path: "test/manifest.json".to_string(),
+            heartbeat_timeout_ms: 30_000,
         }
     }
 
@@ -206,7 +252,7 @@ mod tests {
         // Pre-populate manifest
         let existing = Manifest {
             pending: vec!["existing/file.json".to_string()],
-            claimed: vec![],
+            claimed: HashMap::new(),
         };
         let json = serde_json::to_vec(&existing).unwrap();
         let path = Path::from("test/manifest.json");
@@ -230,7 +276,7 @@ mod tests {
         let producer =
             QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
         let consumer =
-            QueueConsumer::with_object_store(config, store.clone()).unwrap();
+            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
 
         producer.enqueue("first.json".to_string()).await.unwrap();
         producer.enqueue("second.json".to_string()).await.unwrap();
@@ -240,14 +286,14 @@ mod tests {
 
         let manifest = read_manifest(&store, "test/manifest.json").await;
         assert_eq!(manifest.pending, vec!["second.json"]);
-        assert_eq!(manifest.claimed, vec!["first.json"]);
+        assert!(manifest.claimed.contains_key("first.json"));
     }
 
     #[tokio::test]
     async fn should_return_none_when_nothing_to_claim() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let consumer =
-            QueueConsumer::with_object_store(test_config(), store.clone()).unwrap();
+            QueueConsumer::with_object_store(test_config(), store.clone(), Arc::new(SystemClock)).unwrap();
 
         let claimed = consumer.claim().await.unwrap();
         assert_eq!(claimed, None);
@@ -260,7 +306,7 @@ mod tests {
         let producer =
             QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
         let consumer =
-            QueueConsumer::with_object_store(config, store.clone()).unwrap();
+            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
 
         producer.enqueue("to_process.json".to_string()).await.unwrap();
         let claimed = consumer.claim().await.unwrap();
@@ -278,7 +324,7 @@ mod tests {
     async fn should_return_false_when_dequeuing_unknown_location() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let consumer =
-            QueueConsumer::with_object_store(test_config(), store.clone()).unwrap();
+            QueueConsumer::with_object_store(test_config(), store.clone(), Arc::new(SystemClock)).unwrap();
 
         let removed = consumer.dequeue("unknown.json").await.unwrap();
         assert!(!removed);
@@ -302,7 +348,7 @@ mod tests {
         let mut join_handles = Vec::new();
         for _ in 0..n {
             let consumer =
-                QueueConsumer::with_object_store(config.clone(), store.clone()).unwrap();
+                QueueConsumer::with_object_store(config.clone(), store.clone(), Arc::new(SystemClock)).unwrap();
             join_handles.push(tokio::spawn(async move {
                 consumer.claim().await.unwrap().unwrap()
             }));
@@ -320,5 +366,198 @@ mod tests {
         let manifest = read_manifest(&store, "test/manifest.json").await;
         assert!(manifest.pending.is_empty());
         assert_eq!(manifest.claimed.len(), n);
+    }
+
+    #[tokio::test]
+    async fn should_heartbeat_claimed_locations() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let config = test_config();
+        let producer =
+            QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let consumer =
+            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+
+        producer.enqueue("a.json".to_string()).await.unwrap();
+        producer.enqueue("b.json".to_string()).await.unwrap();
+        consumer.claim().await.unwrap();
+        consumer.claim().await.unwrap();
+
+        let before = millis(SystemTime::now());
+        consumer
+            .heartbeat(&["a.json".to_string(), "b.json".to_string()])
+            .await
+            .unwrap();
+
+        let manifest = read_manifest(&store, "test/manifest.json").await;
+        assert!(*manifest.claimed.get("a.json").unwrap() >= before);
+        assert!(*manifest.claimed.get("b.json").unwrap() >= before);
+    }
+
+    #[tokio::test]
+    async fn should_overwrite_heartbeat_timestamps() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let config = test_config();
+        let producer =
+            QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let consumer =
+            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+
+        producer.enqueue("a.json".to_string()).await.unwrap();
+        consumer.claim().await.unwrap();
+
+        consumer
+            .heartbeat(&["a.json".to_string()])
+            .await
+            .unwrap();
+        let manifest = read_manifest(&store, "test/manifest.json").await;
+        let ts1 = *manifest.claimed.get("a.json").unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        consumer
+            .heartbeat(&["a.json".to_string()])
+            .await
+            .unwrap();
+        let manifest = read_manifest(&store, "test/manifest.json").await;
+        let ts2 = *manifest.claimed.get("a.json").unwrap();
+
+        assert!(ts2 > ts1);
+    }
+
+    #[tokio::test]
+    async fn should_skip_unknown_locations_in_heartbeat() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let config = test_config();
+        let producer =
+            QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let consumer =
+            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+
+        producer.enqueue("a.json".to_string()).await.unwrap();
+        consumer.claim().await.unwrap();
+
+        consumer
+            .heartbeat(&["unknown.json".to_string()])
+            .await
+            .unwrap();
+
+        let manifest = read_manifest(&store, "test/manifest.json").await;
+        assert!(!manifest.claimed.contains_key("unknown.json"));
+        assert_eq!(manifest.claimed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn should_reclaim_stale_location_when_pending_is_empty() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut config = test_config();
+        config.heartbeat_timeout_ms = 50;
+
+        let producer =
+            QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let consumer1 =
+            QueueConsumer::with_object_store(config.clone(), store.clone(), Arc::new(SystemClock)).unwrap();
+        let consumer2 =
+            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+
+        producer.enqueue("a.json".to_string()).await.unwrap();
+        let claimed = consumer1.claim().await.unwrap();
+        assert_eq!(claimed, Some("a.json".to_string()));
+
+        let claimed = consumer2.claim().await.unwrap();
+        assert_eq!(claimed, None);
+
+        // ToDo: use mock clock
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        let claimed = consumer2.claim().await.unwrap();
+        assert_eq!(claimed, Some("a.json".to_string()));
+
+        let manifest = read_manifest(&store, "test/manifest.json").await;
+        assert!(manifest.pending.is_empty());
+        assert_eq!(manifest.claimed.len(), 1);
+        assert!(manifest.claimed.contains_key("a.json"));
+    }
+
+    #[tokio::test]
+    async fn should_not_reclaim_location_with_fresh_heartbeat() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut config = test_config();
+        config.heartbeat_timeout_ms = 200;
+
+        let producer =
+            QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let consumer1 =
+            QueueConsumer::with_object_store(config.clone(), store.clone(), Arc::new(SystemClock)).unwrap();
+        let consumer2 =
+            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+
+        producer.enqueue("a.json".to_string()).await.unwrap();
+        consumer1.claim().await.unwrap();
+
+        // Heartbeat keeps it fresh
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        consumer1
+            .heartbeat(&["a.json".to_string()])
+            .await
+            .unwrap();
+
+        // consumer2 cannot reclaim — heartbeat is fresh
+        let claimed = consumer2.claim().await.unwrap();
+        assert_eq!(claimed, None);
+    }
+
+    #[tokio::test]
+    async fn should_reclaim_oldest_stale_location() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut config = test_config();
+        config.heartbeat_timeout_ms = 50;
+
+        let producer =
+            QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let consumer =
+            QueueConsumer::with_object_store(config.clone(), store.clone(), Arc::new(SystemClock)).unwrap();
+
+        producer.enqueue("old.json".to_string()).await.unwrap();
+        consumer.claim().await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        producer.enqueue("newer.json".to_string()).await.unwrap();
+        consumer.claim().await.unwrap();
+
+        // Wait for both to become stale
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        let reclaimer =
+            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+        let claimed = reclaimer.claim().await.unwrap();
+        assert_eq!(claimed, Some("old.json".to_string()));
+    }
+
+    #[tokio::test]
+    async fn should_prefer_stale_claimed_over_pending() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut config = test_config();
+        config.heartbeat_timeout_ms = 50;
+
+        let producer =
+            QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let consumer1 =
+            QueueConsumer::with_object_store(config.clone(), store.clone(), Arc::new(SystemClock)).unwrap();
+        let consumer2 =
+            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+
+        producer.enqueue("claimed.json".to_string()).await.unwrap();
+        consumer1.claim().await.unwrap();
+
+        // Wait for heartbeat to expire
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        // Enqueue a new pending item
+        producer.enqueue("pending.json".to_string()).await.unwrap();
+
+        // consumer2 should prefer the stale claimed item
+        let claimed = consumer2.claim().await.unwrap();
+        assert_eq!(claimed, Some("claimed.json".to_string()));
     }
 }

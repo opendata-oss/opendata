@@ -1,109 +1,156 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use common::clock::Clock;
 use slatedb::object_store::path::Path;
 use slatedb::object_store::{ObjectStore, PutPayload};
-use tokio::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::KeyValueEntry;
 use crate::queue::QueueProducer;
 
-struct BatchState {
-    entries: Vec<KeyValueEntry>,
-    size_bytes: usize,
-    started_at: Option<tokio::time::Instant>,
+type Notifier = tokio::sync::watch::Sender<Option<Result<()>>>;
+
+#[derive(Clone)]
+pub struct WriteWatcher {
+    rx: tokio::sync::watch::Receiver<Option<Result<()>>>,
 }
 
-pub struct Ingestor {
+impl WriteWatcher {
+    pub fn result(&self) -> Option<Result<()>> {
+        self.rx.borrow().clone()
+    }
+
+    pub async fn await_durable(&mut self) -> Result<()> {
+        self.rx
+            .wait_for(|v| v.is_some())
+            .await
+            .map_err(|_| Error::Storage("ingestor shut down".to_string()))?
+            .clone()
+            .expect("value must be present after wait_for")
+    }
+}
+
+enum IngestMessage {
+    Write {
+        entries: Vec<KeyValueEntry>,
+        notifier: Notifier,
+    },
+    Flush {
+        done: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+}
+
+struct Batch {
+    entries: Vec<KeyValueEntry>,
+    notifiers: Vec<Notifier>,
+    size_bytes: usize,
+    started_at: Option<SystemTime>,
+}
+
+impl Batch {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            notifiers: Vec::new(),
+            size_bytes: 0,
+            started_at: None,
+        }
+    }
+
+    fn add(&mut self, entries: Vec<KeyValueEntry>, notifier: Notifier, now: SystemTime) {
+        let incoming_size: usize = entries.iter().map(|e| e.key.len() + e.value.len()).sum();
+        self.entries.extend(entries);
+        self.size_bytes += incoming_size;
+        self.notifiers.push(notifier);
+        if self.started_at.is_none() {
+            self.started_at = Some(now);
+        }
+    }
+
+    fn take(&mut self) -> (Vec<KeyValueEntry>, Vec<Notifier>) {
+        self.size_bytes = 0;
+        self.started_at = None;
+        (
+            std::mem::take(&mut self.entries),
+            std::mem::take(&mut self.notifiers),
+        )
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+struct BatchWriter {
     object_store: Arc<dyn ObjectStore>,
     producer: QueueProducer,
     path_prefix: String,
-    batch: Mutex<BatchState>,
     batch_interval: Duration,
     batch_max_bytes: usize,
+    batch: Batch,
+    clock: Arc<dyn Clock>,
 }
 
-impl Ingestor {
-    pub fn new(config: Config, producer: QueueProducer) -> Result<Self> {
-        let object_store = common::storage::factory::create_object_store(&config.object_store)
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        Self::with_object_store(config, object_store, producer)
+impl BatchWriter {
+    async fn run(
+        &mut self,
+        mut rx: mpsc::UnboundedReceiver<IngestMessage>,
+        shutdown: CancellationToken,
+    ) {
+        loop {
+            let sleep_duration = match self.batch.started_at {
+                Some(started) => (started + self.batch_interval)
+                    .duration_since(self.clock.now())
+                    .unwrap_or(Duration::ZERO),
+                None => self.batch_interval,
+            };
+
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    self.close(&mut rx).await;
+                    return;
+                },
+                msg = rx.recv() => {
+                    match msg {
+                        Some(IngestMessage::Write { entries, notifier }) => {
+                            self.batch.add(entries, notifier, self.clock.now());
+                            if self.batch.size_bytes >= self.batch_max_bytes {
+                                let _ = self.write_batch().await;
+                            }
+                        }
+                        Some(IngestMessage::Flush { done }) => {
+                            let _ = done.send(self.write_batch().await);
+                        }
+                        None => break,
+                    }
+                },
+                _ = tokio::time::sleep(sleep_duration) => {
+                    let _ = self.write_batch().await;
+                },
+            }
+        }
     }
 
-    pub fn with_object_store(
-        config: Config,
-        object_store: Arc<dyn ObjectStore>,
-        producer: QueueProducer,
-    ) -> Result<Self> {
-        Ok(Self {
-            object_store,
-            producer,
-            path_prefix: config.path_prefix,
-            batch: Mutex::new(BatchState {
-                entries: Vec::new(),
-                size_bytes: 0,
-                started_at: None,
-            }),
-            batch_interval: Duration::from_millis(config.batch_interval_ms),
-            batch_max_bytes: config.batch_max_bytes,
-        })
-    }
+    async fn write_batch(&mut self) -> Result<()> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        let (entries, notifiers) = self.batch.take();
+        let result = self.write_and_enqueue(entries).await;
 
-    pub async fn ingest(&self, entries: Vec<KeyValueEntry>) -> Result<()> {
-        let incoming_size: usize = entries
-            .iter()
-            .map(|e| e.key.len() + e.value.len())
-            .sum();
-
-        let flush_entries = {
-            let mut batch = self.batch.lock().await;
-            batch.entries.extend(entries);
-            batch.size_bytes += incoming_size;
-            if batch.started_at.is_none() {
-                batch.started_at = Some(tokio::time::Instant::now());
-            }
-
-            let should_flush = batch.size_bytes >= self.batch_max_bytes
-                || batch
-                    .started_at
-                    .map(|s| s.elapsed() >= self.batch_interval)
-                    .unwrap_or(false);
-
-            if should_flush {
-                let entries = std::mem::take(&mut batch.entries);
-                batch.size_bytes = 0;
-                batch.started_at = None;
-                Some(entries)
-            } else {
-                None
-            }
-        };
-
-        if let Some(entries) = flush_entries {
-            self.write_batch(entries).await?;
+        for tx in notifiers {
+            let _ = tx.send(Some(result.clone()));
         }
 
-        Ok(())
+        result
     }
 
-    pub async fn flush(&self) -> Result<()> {
-        let entries = {
-            let mut batch = self.batch.lock().await;
-            if batch.entries.is_empty() {
-                return Ok(());
-            }
-            let entries = std::mem::take(&mut batch.entries);
-            batch.size_bytes = 0;
-            batch.started_at = None;
-            entries
-        };
-
-        self.write_batch(entries).await
-    }
-
-    async fn write_batch(&self, entries: Vec<KeyValueEntry>) -> Result<()> {
+    async fn write_and_enqueue(&self, entries: Vec<KeyValueEntry>) -> Result<()> {
         let json =
             serde_json::to_vec(&entries).map_err(|e| Error::Serialization(e.to_string()))?;
 
@@ -119,6 +166,92 @@ impl Ingestor {
 
         Ok(())
     }
+
+    async fn close(&mut self, rx: &mut mpsc::UnboundedReceiver<IngestMessage>) {
+        let mut flush_responders = Vec::new();
+
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                IngestMessage::Write { entries, notifier } => {
+                    self.batch.add(entries, notifier, self.clock.now());
+                }
+                IngestMessage::Flush { done } => {
+                    flush_responders.push(done);
+                }
+            }
+        }
+
+        let result = self.write_batch().await;
+
+        for done in flush_responders {
+            let _ = done.send(result.clone());
+        }
+    }
+}
+
+pub struct Ingestor {
+    tx: mpsc::UnboundedSender<IngestMessage>,
+    cancellation_token: CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Ingestor {
+    pub fn new(config: Config, producer: QueueProducer, clock: Arc<dyn Clock>) -> Result<Self> {
+        let object_store = common::storage::factory::create_object_store(&config.object_store)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Self::with_object_store(config, object_store, producer, clock)
+    }
+
+    pub fn with_object_store(
+        config: Config,
+        object_store: Arc<dyn ObjectStore>,
+        producer: QueueProducer,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+
+        let mut writer = BatchWriter {
+            object_store,
+            producer,
+            path_prefix: config.path_prefix,
+            batch_interval: Duration::from_millis(config.batch_interval_ms),
+            batch_max_bytes: config.batch_max_bytes,
+            batch: Batch::new(),
+            clock,
+        };
+        let cancellation_token = shutdown.clone();
+        let handle = tokio::spawn(async move { writer.run(rx, shutdown).await });
+
+        Ok(Self { tx, cancellation_token, handle })
+    }
+
+    pub fn ingest(&self, entries: Vec<KeyValueEntry>) -> Result<WriteWatcher> {
+        let (notifier_tx, notifier_rx) = tokio::sync::watch::channel(None);
+        self.tx
+            .send(IngestMessage::Write {
+                entries,
+                notifier: notifier_tx,
+            })
+            .map_err(|_| Error::Storage("ingestor shut down".to_string()))?;
+        Ok(WriteWatcher { rx: notifier_rx })
+    }
+
+    pub async fn flush(&self) -> Result<()> {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(IngestMessage::Flush { done: done_tx })
+            .map_err(|_| Error::Storage("ingestor shut down".to_string()))?;
+        done_rx
+            .await
+            .map_err(|_| Error::Storage("ingestor shut down".to_string()))?
+    }
+
+    pub async fn close(self) -> Result<()> {
+        self.cancellation_token.cancel();
+        let _ = self.handle.await;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -127,6 +260,7 @@ mod tests {
     use crate::config::Config;
     use crate::queue_config::QueueConfig;
     use bytes::Bytes;
+    use common::clock::SystemClock;
     use common::storage::config::ObjectStoreConfig;
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::ObjectStore;
@@ -154,7 +288,7 @@ mod tests {
         let producer =
             QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
         let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), producer).unwrap();
+            Ingestor::with_object_store(test_config(), store.clone(), producer, Arc::new(SystemClock)).unwrap();
 
         let entries = vec![
             KeyValueEntry {
@@ -167,7 +301,7 @@ mod tests {
             },
         ];
 
-        ingestor.ingest(entries).await.unwrap();
+        ingestor.ingest(entries).unwrap();
         ingestor.flush().await.unwrap();
 
         // Verify manifest has the enqueued location
@@ -186,14 +320,14 @@ mod tests {
         let producer =
             QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
         let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), producer).unwrap();
+            Ingestor::with_object_store(test_config(), store.clone(), producer, Arc::new(SystemClock)).unwrap();
 
         let entries = vec![KeyValueEntry {
             key: "mykey".to_string(),
             value: Bytes::from("myvalue"),
         }];
 
-        ingestor.ingest(entries).await.unwrap();
+        ingestor.ingest(entries).unwrap();
         ingestor.flush().await.unwrap();
 
         // Read back the location from the manifest
@@ -227,15 +361,17 @@ mod tests {
         config.batch_max_bytes = 10; // very small threshold
 
         let ingestor =
-            Ingestor::with_object_store(config, store.clone(), producer).unwrap();
+            Ingestor::with_object_store(config, store.clone(), producer, Arc::new(SystemClock)).unwrap();
 
         let entries = vec![KeyValueEntry {
             key: "a-long-key".to_string(),
             value: Bytes::from("a-long-value"),
         }];
 
-        // This single ingest exceeds the 10-byte threshold, so it should auto-flush
-        ingestor.ingest(entries).await.unwrap();
+        // This single ingest exceeds the 10-byte threshold, so the background
+        // task should auto-flush without an explicit flush() call.
+        let mut watcher = ingestor.ingest(entries).unwrap();
+        watcher.await_durable().await.unwrap();
 
         let manifest_path = slatedb::object_store::path::Path::from("test/manifest.json");
         let data = store
@@ -261,32 +397,22 @@ mod tests {
         config.batch_max_bytes = 64 * 1024 * 1024;
 
         let ingestor =
-            Ingestor::with_object_store(config, store.clone(), producer).unwrap();
+            Ingestor::with_object_store(config, store.clone(), producer, Arc::new(SystemClock)).unwrap();
 
-        // First ingest — starts the timer, but doesn't flush
-        ingestor
+        let mut watcher = ingestor
             .ingest(vec![KeyValueEntry {
                 key: "k1".to_string(),
                 value: Bytes::from("v1"),
             }])
-            .await
             .unwrap();
 
         // Nothing written yet
+        assert!(watcher.result().is_none());
         let manifest_path = slatedb::object_store::path::Path::from("test/manifest.json");
         assert!(store.get(&manifest_path).await.is_err());
 
-        // Sleep past the interval
-        tokio::time::sleep(Duration::from_millis(60)).await;
-
-        // Second ingest triggers the time check
-        ingestor
-            .ingest(vec![KeyValueEntry {
-                key: "k2".to_string(),
-                value: Bytes::from("v2"),
-            }])
-            .await
-            .unwrap();
+        // Background task should flush when the interval elapses — no second ingest needed
+        watcher.await_durable().await.unwrap();
 
         let data = store
             .get(&manifest_path)
@@ -306,22 +432,26 @@ mod tests {
         let producer =
             QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
         let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), producer).unwrap();
+            Ingestor::with_object_store(test_config(), store.clone(), producer, Arc::new(SystemClock)).unwrap();
 
-        ingestor
+        let watcher = ingestor
             .ingest(vec![KeyValueEntry {
                 key: "k".to_string(),
                 value: Bytes::from("v"),
             }])
-            .await
             .unwrap();
+
+        // Watcher not yet resolved
+        assert!(watcher.result().is_none());
 
         // Nothing written to object store yet (below thresholds)
         let manifest_path = slatedb::object_store::path::Path::from("test/manifest.json");
         assert!(store.get(&manifest_path).await.is_err());
 
-        // Explicit flush writes it
+        // Explicit flush writes it and notifies the watcher
         ingestor.flush().await.unwrap();
+
+        assert!(watcher.result().unwrap().is_ok());
 
         let data = store
             .get(&manifest_path)
@@ -341,25 +471,27 @@ mod tests {
         let producer =
             QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
         let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), producer).unwrap();
+            Ingestor::with_object_store(test_config(), store.clone(), producer, Arc::new(SystemClock)).unwrap();
 
-        ingestor
+        let watcher1 = ingestor
             .ingest(vec![KeyValueEntry {
                 key: "k1".to_string(),
                 value: Bytes::from("v1"),
             }])
-            .await
             .unwrap();
 
-        ingestor
+        let watcher2 = ingestor
             .ingest(vec![KeyValueEntry {
                 key: "k2".to_string(),
                 value: Bytes::from("v2"),
             }])
-            .await
             .unwrap();
 
         ingestor.flush().await.unwrap();
+
+        // Both watchers resolved
+        assert!(watcher1.result().unwrap().is_ok());
+        assert!(watcher2.result().unwrap().is_ok());
 
         // Only one file enqueued
         let manifest_path = slatedb::object_store::path::Path::from("test/manifest.json");
