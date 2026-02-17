@@ -150,17 +150,23 @@ impl VectorDb {
                 split_search_neighbourhood: config.split_search_neighbourhood,
                 split_threshold_vectors: config.split_threshold_vectors,
                 merge_threshold_vectors: config.merge_threshold_vectors,
-                max_rebalance_tasks: 8,
+                max_rebalance_tasks: config.max_rebalance_tasks,
             },
             centroid_graph.clone(),
             centroid_counts,
             handle_tx.clone(),
         );
 
+        let pause_handle = Arc::new(OnceLock::new());
         let ctx = VectorDbDeltaContext {
             opts: VectorDbDeltaOpts {
                 dimensions: config.dimensions as usize,
                 chunk_target: config.chunk_target as usize,
+                max_pending_and_running_rebalance_tasks: config
+                    .max_pending_and_running_rebalance_tasks,
+                rebalance_backpressure_resume_threshold: config
+                    .rebalance_backpressure_resume_threshold,
+                split_threshold_vectors: config.split_threshold_vectors,
             },
             dictionary: Arc::clone(&dictionary),
             centroid_graph: Arc::clone(&centroid_graph),
@@ -168,6 +174,7 @@ impl VectorDb {
             current_chunk_id,
             current_chunk_count,
             rebalancer,
+            pause_handle: pause_handle.clone(),
         };
 
         // start write coordinator
@@ -185,6 +192,10 @@ impl VectorDb {
         );
         handle_tx
             .set(write_coordinator.handle(REBALANCE_CHANNEL))
+            .map_err(|_e| "unreachable")
+            .unwrap();
+        pause_handle
+            .set(write_coordinator.pause_handle(WRITE_CHANNEL))
             .map_err(|_e| "unreachable")
             .unwrap();
         write_coordinator.start();
@@ -687,6 +698,7 @@ mod tests {
                 MetadataFieldSpec::new("category", FieldType::String, true),
                 MetadataFieldSpec::new("price", FieldType::Int64, true),
             ],
+            ..Default::default()
         }
     }
 
@@ -842,6 +854,7 @@ mod tests {
             split_search_neighbourhood: 8,
             chunk_target: 4096,
             metadata_fields: vec![],
+            ..Default::default()
         }
     }
 
@@ -963,6 +976,7 @@ mod tests {
             split_search_neighbourhood: 8,
             chunk_target: 4096,
             metadata_fields: vec![],
+            ..Default::default()
         };
         let db = VectorDb::open(config).await.unwrap();
 
