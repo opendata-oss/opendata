@@ -693,18 +693,23 @@ impl IndexRebalancerTask {
         // 2. Get fresh view for reading posting lists
         let reader = ViewReader::new(self.coordinator_handle.view());
 
-        // 3. For each neighbor (excluding c0, c1), check if any of their vectors should move
-        for &neighbour_id in &neighbours {
-            if neighbour_id == c0_id || neighbour_id == c1_id {
-                continue;
-            }
+        // 3. Read all neighbour posting lists in parallel
+        let neighbour_ids: Vec<u64> = neighbours
+            .iter()
+            .copied()
+            .filter(|&id| id != c0_id && id != c1_id)
+            .collect();
 
-            let neighbour_postings_value = reader
-                .get_posting_list(neighbour_id, self.opts.dimensions)
-                .await
-                .map_err(|e| e.to_string())?;
+        let posting_futures: Vec<_> = neighbour_ids
+            .iter()
+            .map(|&id| reader.get_posting_list(id, self.opts.dimensions))
+            .collect();
+        let posting_results = futures::future::join_all(posting_futures).await;
 
-            let neighbour_postings: PostingList = neighbour_postings_value;
+        // 4. Process each neighbour's postings to find reassignments
+        for (neighbour_id, posting_result) in neighbour_ids.iter().zip(posting_results) {
+            let neighbour_postings: PostingList =
+                posting_result.map_err(|e| e.to_string())?;
 
             for p in neighbour_postings.iter() {
                 // use the heuristic for neighbour vectors from the spfresh paper to cheaply
@@ -724,12 +729,12 @@ impl IndexRebalancerTask {
 
                 // Find the closest centroid for this vector using the graph
                 let nearest = self.centroid_graph.search(&vector, 1);
-                let nearest_id = nearest.first().copied().unwrap_or(neighbour_id);
+                let nearest_id = nearest.first().copied().unwrap_or(*neighbour_id);
 
-                if nearest_id != neighbour_id {
+                if nearest_id != *neighbour_id {
                     reassignments.push(VectorReassignment::new(
                         nearest_id,
-                        neighbour_id,
+                        *neighbour_id,
                         p.id(),
                         vector,
                     ));
