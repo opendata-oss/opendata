@@ -4106,6 +4106,7 @@ dependencies = [
  "async-trait",
  "bencher",
  "opendata-timeseries",
+ "tempfile",
  "tokio",
 ]
 

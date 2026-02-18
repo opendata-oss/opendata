@@ -4,9 +4,15 @@
 //! interacting with OpenData TimeSeries. It exposes write operations for
 //! ingesting time series data.
 
+use std::sync::Arc;
+
+use common::{StorageRuntime, StorageSemantics, create_storage};
+
 use crate::config::{Config, WriteOptions};
 use crate::error::Result;
 use crate::model::Series;
+use crate::storage::merge_operator::OpenTsdbMergeOperator;
+use crate::tsdb::Tsdb;
 
 /// A time series database for storing and querying metrics.
 ///
@@ -35,7 +41,7 @@ use crate::model::Series;
 /// ```
 pub struct TimeSeriesDb {
     // Internal Tsdb - not exposed
-    _private: (),
+    tsdb: Tsdb,
 }
 
 impl TimeSeriesDb {
@@ -59,8 +65,19 @@ impl TimeSeriesDb {
     ///
     /// let ts = TimeSeriesDb::open(Config::default()).await?;
     /// ```
-    pub async fn open(_config: Config) -> Result<Self> {
-        todo!()
+    pub async fn open(config: Config) -> Result<Self> {
+        let storage = create_storage(
+            &config.storage,
+            StorageRuntime::new(),
+            StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
+        )
+        .await?;
+        let tsdb = Tsdb::new(storage);
+        Ok(Self { tsdb })
+    }
+
+    pub async fn ingest_samples(&self, series: Vec<Series>) -> Result<()> {
+        self.tsdb.ingest_samples(series).await
     }
 
     /// Writes one or more time series.
@@ -138,6 +155,6 @@ impl TimeSeriesDb {
     ///
     /// Returns an error if the flush fails due to storage issues.
     pub async fn flush(&self) -> Result<()> {
-        todo!()
+        self.tsdb.flush().await
     }
 }

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use axum::Router;
-use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig};
+use common::storage::config::SlateDbStorageConfig;
 use common::{StorageConfig, StorageRuntime, StorageSemantics, create_storage};
 
 use common::Storage;
@@ -16,6 +16,10 @@ use crate::promql::metrics::Metrics;
 use crate::promql::server::build_router;
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::Tsdb;
+
+// Re-export storage config types so benchmarks and integration tests
+// can construct object store configs without depending on `common` directly.
+pub use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig};
 
 // Re-export production types so integration tests use the real types.
 pub use crate::promql::response::{
@@ -48,9 +52,17 @@ impl TestTsdb {
 ///
 /// This exercises the full storage path including SlateDB merge operations.
 pub async fn create_test_tsdb() -> TestTsdb {
+    create_test_tsdb_with_config(ObjectStoreConfig::InMemory).await
+}
+
+/// Create a [`TestTsdb`] with a caller-provided object store config.
+///
+/// This allows benchmarks to use production-like storage backends
+/// such as local filesystem or S3 instead of in-memory.
+pub async fn create_test_tsdb_with_config(object_store: ObjectStoreConfig) -> TestTsdb {
     let config = StorageConfig::SlateDb(SlateDbStorageConfig {
-        path: "test-data".to_string(),
-        object_store: ObjectStoreConfig::InMemory,
+        path: "bench-data".to_string(),
+        object_store,
         settings_path: None,
     });
     let storage = create_storage(
