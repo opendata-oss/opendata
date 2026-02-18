@@ -98,3 +98,15 @@ pub fn merge_centroid_stats(centroid_id: u64, delta: i32) -> RecordOp {
     let value = CentroidStatsValue::new(delta).encode_to_bytes();
     RecordOp::Merge(Record::new(key, value))
 }
+
+/// Create a RecordOp to merge new centroid entries into an existing centroid chunk.
+#[allow(dead_code)]
+pub fn merge_centroid_chunk(
+    chunk_id: u32,
+    entries: Vec<CentroidEntry>,
+    dimensions: usize,
+) -> RecordOp {
+    let key = CentroidChunkKey::new(chunk_id).encode();
+    let value = CentroidChunkValue::new(entries).encode_to_bytes(dimensions);
+    RecordOp::Merge(Record::new(key, value))
+}

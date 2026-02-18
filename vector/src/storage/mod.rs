@@ -15,6 +15,18 @@ use crate::serde::vector_data::VectorDataValue;
 pub(crate) mod merge_operator;
 pub(crate) mod record;
 
+/// Result of scanning all centroid chunks from storage.
+pub(crate) struct CentroidScanResult {
+    /// All centroid entries across all chunks.
+    pub(crate) entries: Vec<crate::serde::centroid_chunk::CentroidEntry>,
+    /// The chunk ID of the last (highest-numbered) chunk seen.
+    #[allow(dead_code)]
+    pub(crate) last_chunk_id: u32,
+    /// The number of entries in the last chunk.
+    #[allow(dead_code)]
+    pub(crate) last_chunk_count: usize,
+}
+
 /// Extension trait for StorageRead that provides vector database-specific loading methods.
 ///
 /// These methods are marked as `#[allow(dead_code)]` because they are used by the query path
@@ -156,11 +168,9 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     /// Scan all centroid chunks to load centroids.
     ///
     /// This scans all records with the CentroidChunk prefix and collects
-    /// all centroid entries from all chunks.
-    async fn scan_all_centroids(
-        &self,
-        dimensions: usize,
-    ) -> Result<Vec<crate::serde::centroid_chunk::CentroidEntry>> {
+    /// all centroid entries from all chunks. Also returns the last chunk's
+    /// ID and entry count for initializing chunk tracking state.
+    async fn scan_all_centroids(&self, dimensions: usize) -> Result<CentroidScanResult> {
         // Create prefix for all CentroidChunk records
         let mut prefix_buf = bytes::BytesMut::with_capacity(2);
         crate::serde::RecordType::CentroidChunk
@@ -173,12 +183,22 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         let records = self.scan(range).await?;
 
         let mut all_centroids = Vec::new();
+        let mut last_chunk_id: u32 = 0;
+        let mut last_chunk_count: usize = 0;
         for record in records {
+            let key = CentroidChunkKey::decode(&record.key)?;
             let chunk = CentroidChunkValue::decode_from_bytes(&record.value, dimensions)?;
+            let count = chunk.entries.len();
             all_centroids.extend(chunk.entries);
+            last_chunk_id = key.chunk_id;
+            last_chunk_count = count;
         }
 
-        Ok(all_centroids)
+        Ok(CentroidScanResult {
+            entries: all_centroids,
+            last_chunk_id,
+            last_chunk_count,
+        })
     }
 }
 
