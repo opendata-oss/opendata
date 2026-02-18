@@ -697,14 +697,17 @@ impl VectorDb {
         centroid_ids: &[u64],
         snapshot: &dyn StorageRead,
     ) -> Result<Vec<(u64, Vec<f32>)>> {
-        let mut all_candidates = Vec::new();
         let dimensions = self.config.dimensions as usize;
 
-        for &centroid_id in centroid_ids {
-            let posting_list: PostingList = snapshot
-                .get_posting_list(centroid_id, dimensions)
-                .await?
-                .into();
+        let futures: Vec<_> = centroid_ids
+            .iter()
+            .map(|&cid| snapshot.get_posting_list(cid, dimensions))
+            .collect();
+        let results = futures::future::join_all(futures).await;
+
+        let mut all_candidates = Vec::new();
+        for result in results {
+            let posting_list: PostingList = result?.into();
             for posting in posting_list.iter() {
                 all_candidates.push((posting.id(), posting.vector().to_vec()));
             }
