@@ -753,29 +753,33 @@ impl VectorDb {
         scored_results.sort_by(|a, b| a.distance.cmp(&b.distance));
 
         let mut results = Vec::with_capacity(k);
-        for sr in scored_results {
-            // Load vector data (for external_id and metadata)
-            let vector_data = snapshot.get_vector_data(sr.internal_id, dimensions).await?;
-            if vector_data.is_none() {
-                continue;
-            }
-            let vector_data = vector_data.unwrap();
-
-            // Convert metadata fields to HashMap (includes vector field)
-            let metadata: HashMap<String, AttributeValue> = vector_data
-                .fields()
-                .map(|field| (field.field_name.clone(), field.value.clone().into()))
+        for chunk in scored_results.chunks(k) {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|sr| snapshot.get_vector_data(sr.internal_id, dimensions))
                 .collect();
+            let loaded = futures::future::join_all(futures).await;
 
-            results.push(SearchResult {
-                internal_id: sr.internal_id,
-                external_id: vector_data.external_id().to_string(),
-                score: sr.distance.score(),
-                attributes: metadata,
-            });
+            for (sr, vector_data) in chunk.iter().zip(loaded) {
+                let Some(vector_data) = vector_data? else {
+                    continue;
+                };
 
-            if results.len() == k {
-                break;
+                let metadata: HashMap<String, AttributeValue> = vector_data
+                    .fields()
+                    .map(|field| (field.field_name.clone(), field.value.clone().into()))
+                    .collect();
+
+                results.push(SearchResult {
+                    internal_id: sr.internal_id,
+                    external_id: vector_data.external_id().to_string(),
+                    score: sr.distance.score(),
+                    attributes: metadata,
+                });
+
+                if results.len() == k {
+                    return Ok(results);
+                }
             }
         }
 
