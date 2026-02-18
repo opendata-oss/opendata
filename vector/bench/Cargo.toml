@@ -11,3 +11,4 @@ serde_yaml.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+log = "0.4.29"

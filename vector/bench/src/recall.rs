@@ -19,6 +19,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use bencher::{Bench, Benchmark, Params, Summary};
+use log::info;
 use vector::{Config, DistanceMetric, SearchResult, Vector, VectorDb};
 
 const DEFAULT_NUM_QUERIES: usize = 100;
@@ -36,6 +37,7 @@ fn load_config_file() -> Option<Config> {
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {}: {}", path, e));
     let config: Config = serde_yaml::from_str(&contents)
         .unwrap_or_else(|e| panic!("failed to parse {}: {}", path, e));
+    info!("config: {:?}", config);
     Some(config)
 }
 

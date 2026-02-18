@@ -4580,6 +4580,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bencher",
+ "log",
  "opendata-vector",
  "serde_yaml",
  "tokio",
