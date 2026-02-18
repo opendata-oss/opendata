@@ -232,7 +232,9 @@ mod tests {
         assert_eq!(metrics.http_requests_in_flight.get(), 0);
 
         // when
-        let response = service.call(test_request("/test")).await.unwrap();
+        let future = service.call(test_request("/test"));
+        assert_eq!(metrics.http_requests_in_flight.get(), 1);
+        let response = future.await.unwrap();
 
         // then
         assert_eq!(response.status().as_u16(), 200);
@@ -256,7 +258,9 @@ mod tests {
         assert_eq!(metrics.http_requests_in_flight.get(), 0);
 
         // when
-        let result = service.call(test_request("/test")).await;
+        let future = service.call(test_request("/test"));
+        assert_eq!(metrics.http_requests_in_flight.get(), 1);
+        let result = future.await;
 
         // then
         assert!(result.is_err());
