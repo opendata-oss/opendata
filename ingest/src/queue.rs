@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -83,8 +84,40 @@ impl ManifestStore {
     }
 }
 
+struct ConflictCounter {
+    write_count: AtomicU64,
+    conflict_count: AtomicU64,
+}
+
+impl ConflictCounter {
+    fn new() -> Self {
+        Self {
+            write_count: AtomicU64::new(0),
+            conflict_count: AtomicU64::new(0),
+        }
+    }
+
+    fn record_write(&self) {
+        self.write_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_conflict(&self) {
+        self.conflict_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn conflict_rate(&self) -> f64 {
+        let writes = self.write_count.load(Ordering::Relaxed);
+        if writes == 0 {
+            return 0.0;
+        }
+        let conflicts = self.conflict_count.load(Ordering::Relaxed);
+        (conflicts as f64 / writes as f64) * 100.0
+    }
+}
+
 pub struct QueueProducer {
     manifest_store: ManifestStore,
+    counter: ConflictCounter,
 }
 
 impl QueueProducer {
@@ -103,6 +136,7 @@ impl QueueProducer {
                 object_store,
                 manifest_path: config.manifest_path,
             },
+            counter: ConflictCounter::new(),
         })
     }
 
@@ -110,12 +144,20 @@ impl QueueProducer {
         loop {
             let (mut manifest, version) = self.manifest_store.read().await?;
             manifest.pending.push(location.clone());
+            self.counter.record_write();
             match self.manifest_store.write(&manifest, version).await {
                 Ok(()) => return Ok(()),
-                Err(ManifestWriteError::Conflict) => continue,
+                Err(ManifestWriteError::Conflict) => {
+                    self.counter.record_conflict();
+                    continue;
+                }
                 Err(ManifestWriteError::Fatal(e)) => return Err(e),
             }
         }
+    }
+
+    pub fn conflict_rate(&self) -> f64 {
+        self.counter.conflict_rate()
     }
 }
 
@@ -123,6 +165,7 @@ pub struct QueueConsumer {
     manifest_store: ManifestStore,
     heartbeat_timeout_ms: i64,
     clock: Arc<dyn Clock>,
+    counter: ConflictCounter,
 }
 
 impl QueueConsumer {
@@ -144,6 +187,7 @@ impl QueueConsumer {
             },
             heartbeat_timeout_ms: config.heartbeat_timeout_ms,
             clock,
+            counter: ConflictCounter::new(),
         })
     }
 
@@ -169,9 +213,13 @@ impl QueueConsumer {
             };
 
             manifest.claimed.insert(location.clone(), now);
+            self.counter.record_write();
             match self.manifest_store.write(&manifest, version).await {
                 Ok(()) => return Ok(Some(location)),
-                Err(ManifestWriteError::Conflict) => continue,
+                Err(ManifestWriteError::Conflict) => {
+                    self.counter.record_conflict();
+                    continue;
+                }
                 Err(ManifestWriteError::Fatal(e)) => return Err(e),
             }
         }
@@ -200,12 +248,25 @@ impl QueueConsumer {
                     manifest.claimed.insert(location.clone(), now);
                 }
             }
+            self.counter.record_write();
             match self.manifest_store.write(&manifest, version).await {
                 Ok(()) => return Ok(()),
-                Err(ManifestWriteError::Conflict) => continue,
+                Err(ManifestWriteError::Conflict) => {
+                    self.counter.record_conflict();
+                    continue;
+                }
                 Err(ManifestWriteError::Fatal(e)) => return Err(e),
             }
         }
+    }
+
+    pub async fn len(&self) -> Result<usize> {
+        let (manifest, _) = self.manifest_store.read().await?;
+        Ok(manifest.pending.len() + manifest.claimed.len())
+    }
+
+    pub fn conflict_rate(&self) -> f64 {
+        self.counter.conflict_rate()
     }
 }
 
