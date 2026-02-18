@@ -1,10 +1,8 @@
 //! Ingest throughput benchmark for the tsdb database.
 
 use bencher::{Bench, Benchmark, Params, Summary};
-use timeseries::testing::{
-    LocalObjectStoreConfig, ObjectStoreConfig, TestTsdb, create_test_tsdb_with_config,
-};
-use timeseries::{Label, Sample, Series};
+
+use timeseries::{Config, Label, Sample, Series, TimeSeriesDb};
 
 const MICROS_PER_SEC: f64 = 1_000_000.0;
 
@@ -79,11 +77,12 @@ impl Benchmark for IngestBenchmark {
         // measures steady-state ingest rather than bucket-creation overhead.
         let bucket_start_ms: i64 = 3_600_000;
         let bucket_range_ms: i64 = 3_600_000;
-        let tmp = tempfile::tempdir()?;
-        let object_store = ObjectStoreConfig::Local(LocalObjectStoreConfig {
-            path: tmp.path().to_str().unwrap().to_string(),
-        });
-        let tsdb: TestTsdb = create_test_tsdb_with_config(object_store).await;
+
+        let config = Config {
+            storage: bench.spec().data().storage.clone(),
+            ..Default::default()
+        };
+        let timeseries = TimeSeriesDb::open(config).await?;
 
         // Start the timed benchmark
         let runner = bench.start();
@@ -110,7 +109,7 @@ impl Benchmark for IngestBenchmark {
                 .collect();
 
             let batch_start = std::time::Instant::now();
-            tsdb.ingest_samples(series).await;
+            timeseries.ingest_samples(series).await?;
             let ingest_elapsed = batch_start.elapsed();
 
             // Update live metrics
@@ -136,7 +135,7 @@ impl Benchmark for IngestBenchmark {
                     .add("elapsed_ms", runner.elapsed().as_millis() as f64),
             )
             .await?;
-        tsdb.flush().await;
+        timeseries.flush().await?;
         bench.close().await?;
         Ok(())
     }
