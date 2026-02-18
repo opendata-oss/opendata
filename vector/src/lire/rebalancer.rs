@@ -690,8 +690,7 @@ impl IndexRebalancerTask {
 
         // 4. Process each neighbour's postings to find reassignments
         for (neighbour_id, posting_result) in neighbour_ids.iter().zip(posting_results) {
-            let neighbour_postings: PostingList =
-                posting_result.map_err(|e| e.to_string())?;
+            let neighbour_postings: PostingList = posting_result.map_err(|e| e.to_string())?;
 
             for p in neighbour_postings.iter() {
                 // use the heuristic for neighbour vectors from the spfresh paper to cheaply

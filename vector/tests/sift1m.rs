@@ -117,7 +117,7 @@ async fn sift1m_recall() {
     println!("Num centroids: {}", db.num_centroids());
 
     let k = 10;
-    let nprobe = 12;
+    let nprobe = 10;
     let mut hnsw_recall = 0.0;
     let mut exact_recall = 0.0;
     for (i, query) in queries.iter().enumerate() {
