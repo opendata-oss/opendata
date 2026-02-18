@@ -2578,6 +2578,8 @@ dependencies = [
  "rand 0.8.5",
  "roaring 0.10.12",
  "rstest",
+ "serde",
+ "serde_yaml",
  "tokio",
  "tokio-util",
  "tracing",
@@ -4579,8 +4581,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bencher",
+ "opendata-common",
  "opendata-vector",
+ "serde_yaml",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

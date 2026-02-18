@@ -1,10 +1,13 @@
 //! Configuration types for the bencher.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use common::StorageConfig;
 use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig};
 use serde::{Deserialize, Serialize};
+
+use crate::params::Params;
 
 /// Configuration for the bencher.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +21,12 @@ pub struct Config {
     /// Summary metrics are always printed to console regardless of this setting.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reporter: Option<ReporterConfig>,
+    /// Per-benchmark parameter overrides.
+    ///
+    /// Maps benchmark name to a list of parameter sets. When present, these
+    /// are used instead of `Benchmark::default_params()`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub params: HashMap<String, Vec<Params>>,
 }
 
 /// Configuration for benchmark data storage.
