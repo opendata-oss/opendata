@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tracing::{debug, info, trace, warn};
@@ -100,6 +101,47 @@ impl RebalanceTasks {
     }
 }
 
+/// Tracks cumulative statistics for index rebalancer operations.
+pub(crate) struct IndexRebalancerStats {
+    total_splits: AtomicU64,
+    total_merges: AtomicU64,
+    total_reassignments: AtomicU64,
+}
+
+impl IndexRebalancerStats {
+    fn new() -> Self {
+        Self {
+            total_splits: AtomicU64::new(0),
+            total_merges: AtomicU64::new(0),
+            total_reassignments: AtomicU64::new(0),
+        }
+    }
+
+    fn record_split(&self) {
+        self.total_splits.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_merge(&self) {
+        self.total_merges.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_reassignments(&self, count: u64) {
+        self.total_reassignments.fetch_add(count, Ordering::SeqCst);
+    }
+
+    pub(crate) fn get_splits(&self) -> u64 {
+        self.total_splits.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn get_merges(&self) -> u64 {
+        self.total_merges.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn get_reassignments(&self) -> u64 {
+        self.total_reassignments.load(Ordering::SeqCst)
+    }
+}
+
 /// The index rebalancer executes index rebalance operations to maintain centroids
 /// with limited and balanced sizes of postings.
 pub(crate) struct IndexRebalancer {
@@ -108,8 +150,7 @@ pub(crate) struct IndexRebalancer {
     centroid_counts: HashMap<u64, u64>,
     pending_rebalance: HashSet<u64>,
     tasks: Arc<RebalanceTasks>,
-    total_merges: u64,
-    total_splits: u64,
+    stats: Arc<IndexRebalancerStats>,
     next_task_id: u64,
     // this is an annoying workaround for the circular dependency between wc and rebalancer
     coordinator_handle_rx: Arc<std::sync::OnceLock<WriteCoordinatorHandle<VectorDbWriteDelta>>>,
@@ -129,12 +170,15 @@ impl IndexRebalancer {
             centroid_counts,
             pending_rebalance: HashSet::new(),
             tasks: Arc::new(RebalanceTasks::new()),
+            stats: Arc::new(IndexRebalancerStats::new()),
             next_task_id: 0,
-            total_merges: 0,
-            total_splits: 0,
             coordinator_handle_rx,
             coordinator_handle: None,
         }
+    }
+
+    pub(crate) fn stats(&self) -> &Arc<IndexRebalancerStats> {
+        &self.stats
     }
 
     fn coordinator_handle(&mut self) -> WriteCoordinatorHandle<VectorDbWriteDelta> {
@@ -221,13 +265,14 @@ impl IndexRebalancer {
         self.next_task_id += 1;
         let task_id = self.next_task_id;
         self.tasks.register(task_id, &[candidate_centroid_id]);
-        self.total_splits += 1;
+        self.stats.record_split();
         let mut task = IndexRebalancerTask {
             centroid_graph: self.centroid_graph.clone(),
             coordinator_handle: self.coordinator_handle(),
             opts: self.opts.clone(),
             task_id,
             tasks: self.tasks.clone(),
+            stats: self.stats.clone(),
         };
         tokio::spawn(async move {
             task.handle_split(c).await.expect("splitting failed");
@@ -278,7 +323,7 @@ impl IndexRebalancer {
         } else {
             (partner_id, candidate_centroid_id)
         };
-        self.total_merges += 1;
+        self.stats.record_merge();
         self.tasks.register(task_id, &[c_from, c_to]);
         let mut task = IndexRebalancerTask {
             centroid_graph: self.centroid_graph.clone(),
@@ -286,6 +331,7 @@ impl IndexRebalancer {
             opts: self.opts.clone(),
             task_id,
             tasks: self.tasks.clone(),
+            stats: self.stats.clone(),
         };
         debug!("start merge for centroids {}->{}", c_from, c_to);
         tokio::spawn(async move {
@@ -310,8 +356,9 @@ impl IndexRebalancer {
             min,
             max,
             total_ops_pending_and_running = self.total_ops_pending_and_running(),
-            merges = self.total_merges,
-            splits = self.total_splits,
+            merges = self.stats.get_merges(),
+            splits = self.stats.get_splits(),
+            reassignments = self.stats.get_reassignments(),
             "index summary"
         );
     }
@@ -339,6 +386,7 @@ struct IndexRebalancerTask {
     opts: IndexRebalancerOpts,
     task_id: u64,
     tasks: Arc<RebalanceTasks>,
+    stats: Arc<IndexRebalancerStats>,
 }
 
 impl Drop for IndexRebalancerTask {
@@ -542,6 +590,7 @@ impl IndexRebalancerTask {
             .await?,
         );
 
+        let num_reassignments = reassignments.len() as u64;
         let reassign_cmd =
             RebalanceCommand::SplitReassign(SplitReassignCommand::new(self.task_id, reassignments));
 
@@ -554,6 +603,8 @@ impl IndexRebalancerTask {
             .wait(Durability::Applied)
             .await
             .map_err(|e| e.to_string())?;
+
+        self.stats.record_reassignments(num_reassignments);
 
         self.send_finish_split(c_id, Some(c0_id), Some(c1_id))
             .await?;
@@ -791,6 +842,7 @@ impl IndexRebalancerTask {
             }
         }
 
+        let num_reassignments = reassignments.len() as u64;
         let reassign_cmd =
             RebalanceCommand::MergeReassign(MergeReassignCommand::new(self.task_id, reassignments));
 
@@ -803,6 +855,8 @@ impl IndexRebalancerTask {
             .wait(Durability::Applied)
             .await
             .map_err(|e| e.to_string())?;
+
+        self.stats.record_reassignments(num_reassignments);
 
         self.send_finish_merge(c_to).await?;
 
@@ -993,6 +1047,7 @@ mod tests {
                 },
                 task_id,
                 tasks: self.tasks.clone(),
+                stats: Arc::new(IndexRebalancerStats::new()),
             }
         }
 
