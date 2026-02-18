@@ -76,7 +76,6 @@ impl Benchmark for IngestBenchmark {
         // We keep all sample timestamps inside this single bucket so the benchmark
         // measures steady-state ingest rather than bucket-creation overhead.
         let bucket_start_ms: i64 = 3_600_000;
-        let bucket_range_ms: i64 = 3_600_000;
 
         let config = Config {
             storage: bench.spec().data().storage.clone(),
@@ -92,14 +91,12 @@ impl Benchmark for IngestBenchmark {
 
         while runner.keep_running() {
             // Build series from pre-generated labels, only varying timestamps.
-            // Wrap timestamps within the bucket so we never spill into a new one.
-            let iter_offset = (iteration as i64 * num_samples as i64 * 100) % bucket_range_ms;
+            let iter_offset = iteration as i64 * num_samples as i64 * 100;
             let series: Vec<Series> = (0..num_series)
                 .map(|i| {
                     let samples: Vec<Sample> = (0..num_samples)
                         .map(|j| Sample {
-                            timestamp_ms: bucket_start_ms
-                                + (iter_offset + j as i64 * 100) % bucket_range_ms,
+                            timestamp_ms: bucket_start_ms + (iter_offset + j as i64 * 100),
                             value: 1.0,
                         })
                         .collect();
