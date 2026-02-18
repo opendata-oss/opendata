@@ -254,7 +254,7 @@ mod tests {
     use super::*;
     use crate::Config;
     use axum::http::StatusCode;
-    use common::StorageConfig;
+    use common::{MergeRecordOp, PutRecordOp, StorageConfig};
 
     fn test_config() -> Config {
         Config {
@@ -354,19 +354,19 @@ mod tests {
                 self.check_failure()
             }
 
-            async fn put(&self, _records: Vec<Record>) -> common::StorageResult<()> {
+            async fn put(&self, _records: Vec<PutRecordOp>) -> common::StorageResult<()> {
                 self.check_failure()
             }
 
             async fn put_with_options(
                 &self,
-                _records: Vec<Record>,
+                _records: Vec<PutRecordOp>,
                 _options: common::WriteOptions,
             ) -> common::StorageResult<()> {
                 self.check_failure()
             }
 
-            async fn merge(&self, _records: Vec<Record>) -> common::StorageResult<()> {
+            async fn merge(&self, _records: Vec<MergeRecordOp>) -> common::StorageResult<()> {
                 self.check_failure()
             }
 
