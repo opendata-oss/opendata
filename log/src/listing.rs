@@ -301,9 +301,9 @@ mod tests {
     }
 
     mod listing_cache {
-        use common::storage::PutOptions;
-        use common::Ttl;
         use super::*;
+        use common::Ttl;
+        use common::storage::PutOptions;
 
         #[test]
         fn should_add_records_for_new_keys() {
@@ -409,7 +409,7 @@ mod tests {
             let expected_value = ListingEntryValue::new().serialize();
             assert_eq!(records[0].record.key, expected_key);
             assert_eq!(records[0].record.value, expected_value);
-            assert_eq!(records[0].options, PutOptions{ ttl: Ttl::Default })
+            assert_eq!(records[0].options, PutOptions { ttl: Ttl::Default })
         }
     }
 }

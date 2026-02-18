@@ -11,12 +11,12 @@ use crate::serde::LogEntryBuilder;
 use crate::storage::LogStorage;
 use async_trait::async_trait;
 use bytes::Bytes;
+use common::Ttl::NoExpiry;
 use common::coordinator::{Delta, Flusher};
 use common::storage::{PutOptions, StorageSnapshot};
 use common::{PutRecordOp, WriteOptions};
 use std::ops::Range;
 use std::sync::Arc;
-use common::Ttl::NoExpiry;
 
 /// The write type for the log coordinator.
 ///
@@ -124,7 +124,10 @@ impl Delta for LogDelta {
         // 1. Allocate sequences
         let (base_seq, maybe_record) = self.context.sequence_allocator.allocate(count);
         if let Some(r) = maybe_record {
-            self.records.push(PutRecordOp::new_with_options(r, PutOptions{ ttl: NoExpiry }));
+            self.records.push(PutRecordOp::new_with_options(
+                r,
+                PutOptions { ttl: NoExpiry },
+            ));
         }
 
         // 2. Assign segment (creates a new one if seal interval elapsed or force_seal)
@@ -175,10 +178,7 @@ impl Flusher<LogDelta> for LogFlusher {
             await_durable: false,
         };
         self.storage
-            .put_with_options(
-                frozen.records,
-                options,
-            )
+            .put_with_options(frozen.records, options)
             .await
             .map_err(|e| e.to_string())?;
 

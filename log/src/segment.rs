@@ -10,13 +10,13 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::time::Duration;
 
-use common::{PutRecordOp, Record, Ttl};
-use common::storage::PutOptions;
 use crate::config::SegmentConfig;
 use crate::error::Result;
 use crate::model::Segment;
 use crate::model::SegmentId;
 use crate::serde::{SegmentMeta, SegmentMetaKey};
+use common::storage::PutOptions;
+use common::{PutRecordOp, Record, Ttl};
 
 /// A logical segment of the log.
 ///
@@ -196,7 +196,10 @@ impl SegmentCache {
             let meta = SegmentMeta::new(start_seq, current_time_ms);
             let key = SegmentMetaKey::new(segment_id).serialize();
             let value = meta.serialize();
-            records.push(PutRecordOp::new_with_options(Record::new(key, value), PutOptions{ ttl: Ttl::NoExpiry }));
+            records.push(PutRecordOp::new_with_options(
+                Record::new(key, value),
+                PutOptions { ttl: Ttl::NoExpiry },
+            ));
 
             let segment = LogSegment::new(segment_id, meta);
             self.insert(segment.clone());
@@ -724,6 +727,6 @@ mod tests {
         assert_eq!(key.segment_id, assignment.segment.id());
         assert_eq!(meta.start_seq, 42);
         assert_eq!(meta.start_time_ms, 5000);
-        assert_eq!(records[0].options, PutOptions{ ttl: Ttl::NoExpiry })
+        assert_eq!(records[0].options, PutOptions { ttl: Ttl::NoExpiry })
     }
 }

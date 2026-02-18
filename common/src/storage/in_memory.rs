@@ -480,9 +480,11 @@ mod tests {
     async fn should_scan_all_records_when_unbounded() {
         // given
         let storage = InMemoryStorage::new();
-        let records = [Record::new(Bytes::from("a"), Bytes::from("value_a")),
+        let records = [
+            Record::new(Bytes::from("a"), Bytes::from("value_a")),
             Record::new(Bytes::from("b"), Bytes::from("value_b")),
-            Record::new(Bytes::from("c"), Bytes::from("value_c"))];
+            Record::new(Bytes::from("c"), Bytes::from("value_c")),
+        ];
         storage
             .put(records.iter().cloned().map(PutRecordOp::new).collect())
             .await
