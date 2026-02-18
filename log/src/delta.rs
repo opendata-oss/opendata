@@ -12,10 +12,11 @@ use crate::storage::LogStorage;
 use async_trait::async_trait;
 use bytes::Bytes;
 use common::coordinator::{Delta, Flusher};
-use common::storage::StorageSnapshot;
-use common::{Record, WriteOptions};
+use common::storage::{PutOptions, StorageSnapshot};
+use common::{PutRecordOp, WriteOptions};
 use std::ops::Range;
 use std::sync::Arc;
+use common::Ttl::NoExpiry;
 
 /// The write type for the log coordinator.
 ///
@@ -41,13 +42,13 @@ pub(crate) struct LogContext {
 /// Accumulates writes for a batch before flushing to storage.
 pub(crate) struct LogDelta {
     context: LogContext,
-    records: Vec<Record>,
+    records: Vec<PutRecordOp>,
     new_segments: Vec<LogSegment>,
 }
 
 /// Frozen (immutable) snapshot of a delta, ready for flushing.
 pub(crate) struct FrozenLogDelta {
-    pub records: Vec<Record>,
+    pub records: Vec<PutRecordOp>,
 }
 
 /// Broadcast payload sent to subscribers after a flush.
@@ -123,7 +124,7 @@ impl Delta for LogDelta {
         // 1. Allocate sequences
         let (base_seq, maybe_record) = self.context.sequence_allocator.allocate(count);
         if let Some(r) = maybe_record {
-            self.records.push(r);
+            self.records.push(PutRecordOp::new_with_options(r, PutOptions{ ttl: NoExpiry }));
         }
 
         // 2. Assign segment (creates a new one if seal interval elapsed or force_seal)
@@ -146,7 +147,7 @@ impl Delta for LogDelta {
     fn estimate_size(&self) -> usize {
         self.records
             .iter()
-            .map(|r| r.key.len() + r.value.len())
+            .map(|r| r.record.key.len() + r.record.value.len())
             .sum()
     }
 
@@ -174,7 +175,10 @@ impl Flusher<LogDelta> for LogFlusher {
             await_durable: false,
         };
         self.storage
-            .put_with_options(frozen.records, options)
+            .put_with_options(
+                frozen.records,
+                options,
+            )
             .await
             .map_err(|e| e.to_string())?;
 

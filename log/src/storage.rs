@@ -185,7 +185,7 @@ impl LogStorage {
     /// Writes records to storage with options.
     pub(crate) async fn put_with_options(
         &self,
-        records: Vec<common::Record>,
+        records: Vec<common::PutRecordOp>,
         options: common::WriteOptions,
     ) -> Result<()> {
         self.storage
@@ -201,7 +201,7 @@ impl LogStorage {
         let key = Bytes::from(vec![KEY_VERSION, RecordType::SeqBlock.id()]);
         let value = block.serialize();
         self.storage
-            .put(vec![common::Record::new(key, value)])
+            .put(vec![common::Record::new(key, value).into()])
             .await?;
         Ok(())
     }
@@ -212,7 +212,7 @@ impl LogStorage {
         let key = SegmentMetaKey::new(segment.id()).serialize();
         let value = segment.meta().serialize();
         self.storage
-            .put(vec![common::Record::new(key, value)])
+            .put(vec![common::Record::new(key, value).into()])
             .await?;
         Ok(())
     }
@@ -228,7 +228,7 @@ impl LogStorage {
             key: entry_key.serialize(segment.meta().start_seq),
             value: entry.value.clone(),
         };
-        self.storage.put(vec![record]).await?;
+        self.storage.put(vec![record.into()]).await?;
         Ok(())
     }
 
@@ -260,7 +260,7 @@ mod tests {
         let value = Bytes::from("test-value");
         storage
             .storage
-            .put(vec![common::Record::new(key.clone(), value.clone())])
+            .put(vec![common::Record::new(key.clone(), value.clone()).into()])
             .await
             .unwrap();
 
@@ -434,8 +434,8 @@ mod tests {
         // given
         let storage = LogStorage::in_memory();
         let records = vec![
-            common::Record::new(Bytes::from("k1"), Bytes::from("v1")),
-            common::Record::new(Bytes::from("k2"), Bytes::from("v2")),
+            common::Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+            common::Record::new(Bytes::from("k2"), Bytes::from("v2")).into(),
         ];
 
         // when
@@ -457,10 +457,9 @@ mod tests {
         let storage = LogStorage::in_memory();
         storage
             .storage
-            .put(vec![common::Record::new(
-                Bytes::from("key"),
-                Bytes::from("value"),
-            )])
+            .put(vec![
+                common::Record::new(Bytes::from("key"), Bytes::from("value")).into(),
+            ])
             .await
             .unwrap();
 

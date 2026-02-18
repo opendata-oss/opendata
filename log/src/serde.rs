@@ -461,7 +461,7 @@ impl LogEntryBuilder {
         segment: &crate::segment::LogSegment,
         base_sequence: u64,
         user_records: &[crate::model::Record],
-        records: &mut Vec<common::Record>,
+        records: &mut Vec<common::PutRecordOp>,
     ) {
         let segment_start_seq = segment.meta().start_seq;
 
@@ -472,7 +472,7 @@ impl LogEntryBuilder {
                 entry_key.serialize(segment_start_seq),
                 user_record.value.clone(),
             );
-            records.push(storage_record);
+            records.push(storage_record.into());
         }
     }
 }

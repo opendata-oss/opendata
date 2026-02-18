@@ -14,5 +14,6 @@ pub use storage::config::StorageConfig;
 pub use storage::factory::{StorageRuntime, StorageSemantics, create_storage, create_storage_read};
 pub use storage::loader::{LoadMetadata, LoadResult, LoadSpec, Loadable, Loader};
 pub use storage::{
-    Record, Storage, StorageError, StorageIterator, StorageRead, StorageResult, WriteOptions,
+    MergeRecordOp, PutRecordOp, Record, Storage, StorageError, StorageIterator, StorageRead,
+    StorageResult, Ttl, WriteOptions,
 };

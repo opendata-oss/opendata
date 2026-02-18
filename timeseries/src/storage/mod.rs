@@ -227,7 +227,7 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
         }
         .encode();
 
-        Ok(RecordOp::Merge(Record { key, value }))
+        Ok(RecordOp::Merge(Record { key, value }.into()))
     }
 
     fn insert_series_id(
@@ -243,7 +243,7 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
         }
         .encode();
         let value = SeriesDictionaryValue { series_id: id }.encode();
-        Ok(RecordOp::Put(Record { key, value }))
+        Ok(RecordOp::Put(Record { key, value }.into()))
     }
 
     fn insert_forward_index(
@@ -265,7 +265,7 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
             labels: series_spec.labels,
         }
         .encode();
-        Ok(RecordOp::Put(Record { key, value }))
+        Ok(RecordOp::Put(Record { key, value }.into()))
     }
 
     fn merge_inverted_index(
@@ -282,7 +282,7 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
         }
         .encode();
         let value = InvertedIndexValue { postings }.encode()?;
-        Ok(RecordOp::Merge(Record { key, value }))
+        Ok(RecordOp::Merge(Record { key, value }.into()))
     }
 
     fn merge_samples(
@@ -298,7 +298,7 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
         }
         .encode();
         let value = TimeSeriesValue { points: samples }.encode()?;
-        Ok(RecordOp::Merge(Record { key, value }))
+        Ok(RecordOp::Merge(Record { key, value }.into()))
     }
 }
 

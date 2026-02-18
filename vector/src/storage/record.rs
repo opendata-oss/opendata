@@ -26,7 +26,7 @@ pub fn put_id_dictionary(external_id: &str, internal_id: u64) -> RecordOp {
     let key = IdDictionaryKey::new(external_id).encode();
     let mut value_buf = BytesMut::with_capacity(8);
     internal_id.encode(&mut value_buf);
-    RecordOp::Put(Record::new(key, value_buf.freeze()))
+    RecordOp::Put(Record::new(key, value_buf.freeze()).into())
 }
 
 /// Create a RecordOp to delete an IdDictionary mapping.
@@ -50,7 +50,7 @@ pub fn put_vector_data(
         .map(|(name, value)| Field::new(name, value.clone().into()))
         .collect();
     let value = VectorDataValue::new(external_id, fields).encode_to_bytes();
-    RecordOp::Put(Record::new(key, value))
+    RecordOp::Put(Record::new(key, value).into())
 }
 
 /// Create a RecordOp to delete vector data.
@@ -63,14 +63,14 @@ pub fn delete_vector_data(internal_id: u64) -> RecordOp {
 pub fn merge_posting_list(centroid_id: u64, postings: Vec<PostingUpdate>) -> Result<RecordOp> {
     let key = PostingListKey::new(centroid_id).encode();
     let value = PostingListValue::from_posting_updates(postings)?.encode_to_bytes();
-    Ok(RecordOp::Merge(Record::new(key, value)))
+    Ok(RecordOp::Merge(Record::new(key, value).into()))
 }
 
 /// Create a RecordOp to merge vector IDs into the deleted vectors bitmap.
 pub fn merge_deleted_vectors(vector_ids: RoaringTreemap) -> Result<RecordOp> {
     let key = DeletionsKey::new().encode();
     let value = DeletionsValue::from_treemap(vector_ids).encode_to_bytes()?;
-    Ok(RecordOp::Merge(Record::new(key, value)))
+    Ok(RecordOp::Merge(Record::new(key, value).into()))
 }
 
 /// Create a RecordOp to write a centroid chunk.
@@ -81,7 +81,7 @@ pub fn put_centroid_chunk(
 ) -> RecordOp {
     let key = CentroidChunkKey::new(chunk_id).encode();
     let value = CentroidChunkValue::new(entries).encode_to_bytes(dimensions);
-    RecordOp::Put(Record::new(key, value))
+    RecordOp::Put(Record::new(key, value).into())
 }
 
 /// Create a RecordOp to delete a centroid chunk.
@@ -96,7 +96,7 @@ pub fn delete_centroid_chunk(chunk_id: u32) -> RecordOp {
 pub fn merge_centroid_stats(centroid_id: u64, delta: i32) -> RecordOp {
     let key = CentroidStatsKey::new(centroid_id).encode();
     let value = CentroidStatsValue::new(delta).encode_to_bytes();
-    RecordOp::Merge(Record::new(key, value))
+    RecordOp::Merge(Record::new(key, value).into())
 }
 
 /// Create a RecordOp to merge new centroid entries into an existing centroid chunk.
@@ -108,5 +108,5 @@ pub fn merge_centroid_chunk(
 ) -> RecordOp {
     let key = CentroidChunkKey::new(chunk_id).encode();
     let value = CentroidChunkValue::new(entries).encode_to_bytes(dimensions);
-    RecordOp::Merge(Record::new(key, value))
+    RecordOp::Merge(Record::new(key, value).into())
 }

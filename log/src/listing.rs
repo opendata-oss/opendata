@@ -15,7 +15,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use common::{Record, StorageRead};
+use common::{PutRecordOp, Record, StorageRead};
 
 use crate::error::{Error, Result};
 use crate::model::SegmentId;
@@ -120,7 +120,7 @@ impl ListingCache {
         &mut self,
         segment_id: SegmentId,
         keys: &[Bytes],
-        records: &mut Vec<Record>,
+        records: &mut Vec<PutRecordOp>,
     ) {
         if self.current_segment_id != Some(segment_id) {
             self.keys.clear();
@@ -135,7 +135,7 @@ impl ListingCache {
             }
 
             let storage_key = ListingEntryKey::new(segment_id, key.clone()).serialize();
-            records.push(Record::new(storage_key, value.clone()));
+            records.push(Record::new(storage_key, value.clone()).into());
             self.keys.insert(key.clone());
         }
     }
@@ -164,7 +164,7 @@ mod tests {
             let value = ListingEntryValue::new().serialize();
             storage
                 .put_with_options(
-                    vec![common::Record::new(storage_key, value)],
+                    vec![common::Record::new(storage_key, value).into()],
                     common::WriteOptions::default(),
                 )
                 .await
@@ -301,6 +301,8 @@ mod tests {
     }
 
     mod listing_cache {
+        use common::storage::PutOptions;
+        use common::Ttl;
         use super::*;
 
         #[test]
@@ -405,8 +407,9 @@ mod tests {
             assert_eq!(records.len(), 1);
             let expected_key = ListingEntryKey::new(42, Bytes::from("mykey")).serialize();
             let expected_value = ListingEntryValue::new().serialize();
-            assert_eq!(records[0].key, expected_key);
-            assert_eq!(records[0].value, expected_value);
+            assert_eq!(records[0].record.key, expected_key);
+            assert_eq!(records[0].record.value, expected_value);
+            assert_eq!(records[0].options, PutOptions{ ttl: Ttl::Default })
         }
     }
 }

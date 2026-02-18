@@ -77,7 +77,10 @@ mod tests {
         let value = PostingListValue::from_posting_updates(updates)
             .unwrap()
             .encode_to_bytes();
-        storage.put(vec![Record::new(key, value)]).await.unwrap();
+        storage
+            .put(vec![Record::new(key, value).into()])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

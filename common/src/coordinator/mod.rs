@@ -670,7 +670,7 @@ mod tests {
     use crate::BytesRange;
     use crate::coordinator::Durability;
     use crate::storage::in_memory::{InMemoryStorage, InMemoryStorageSnapshot};
-    use crate::storage::{Record, StorageSnapshot};
+    use crate::storage::{PutRecordOp, Record, StorageSnapshot};
     use crate::{Storage, StorageRead};
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -852,14 +852,14 @@ mod tests {
             }
 
             // Write records to storage
-            let records: Vec<Record> = frozen
+            let records: Vec<PutRecordOp> = frozen
                 .writes
                 .iter()
                 .map(|(key, (seq, value))| {
                     let mut buf = Vec::with_capacity(16);
                     buf.extend_from_slice(&seq.to_le_bytes());
                     buf.extend_from_slice(&value.to_le_bytes());
-                    Record::new(Bytes::from(key.clone()), Bytes::from(buf))
+                    Record::new(Bytes::from(key.clone()), Bytes::from(buf)).into()
                 })
                 .collect();
             self.storage

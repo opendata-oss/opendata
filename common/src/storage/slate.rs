@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
+use crate::storage::{MergeOptions, PutOptions};
 use crate::{
-    BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult,
-    storage::{MergeOperator, RecordOp, Storage, StorageSnapshot, WriteOptions},
+    BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult, Ttl,
+    storage::{
+        MergeOperator, MergeRecordOp, PutRecordOp, RecordOp, Storage, StorageSnapshot, WriteOptions,
+    },
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -197,8 +200,12 @@ impl Storage for SlateDbStorage {
         let mut batch = WriteBatch::new();
         for op in records {
             match op {
-                RecordOp::Put(record) => batch.put(record.key, record.value),
-                RecordOp::Merge(record) => batch.merge(record.key, record.value),
+                RecordOp::Put(op) => {
+                    batch.put_with_options(op.record.key, op.record.value, &op.options.into())
+                }
+                RecordOp::Merge(op) => {
+                    batch.merge_with_options(op.record.key, op.record.value, &op.options.into())
+                }
                 RecordOp::Delete(key) => batch.delete(key),
             }
         }
@@ -208,19 +215,20 @@ impl Storage for SlateDbStorage {
             .map_err(StorageError::from_storage)?;
         Ok(())
     }
-    async fn put(&self, records: Vec<Record>) -> StorageResult<()> {
+
+    async fn put(&self, records: Vec<PutRecordOp>) -> StorageResult<()> {
         self.put_with_options(records, WriteOptions::default())
             .await
     }
 
     async fn put_with_options(
         &self,
-        records: Vec<Record>,
+        records: Vec<PutRecordOp>,
         options: WriteOptions,
     ) -> StorageResult<()> {
         let mut batch = WriteBatch::new();
-        for record in records {
-            batch.put(record.key, record.value);
+        for op in records {
+            batch.put_with_options(op.record.key, op.record.value, &op.options.into());
         }
         let slate_options = SlateDbWriteOptions {
             await_durable: options.await_durable,
@@ -237,10 +245,10 @@ impl Storage for SlateDbStorage {
     /// This method requires the database to be configured with a merge operator
     /// during construction. If no merge operator is configured, this will return
     /// a `StorageError::Storage` error.
-    async fn merge(&self, records: Vec<Record>) -> StorageResult<()> {
+    async fn merge(&self, records: Vec<MergeRecordOp>) -> StorageResult<()> {
         let mut batch = WriteBatch::new();
-        for record in records {
-            batch.merge(record.key, record.value);
+        for op in records {
+            batch.merge_with_options(op.record.key, op.record.value, &op.options.into());
         }
         self.db.write(batch).await.map_err(|e| {
             let error_msg = e.to_string();
@@ -306,6 +314,32 @@ impl Storage for SlateDbStorage {
     }
 }
 
+impl From<Ttl> for slatedb::config::Ttl {
+    fn from(value: Ttl) -> Self {
+        match value {
+            Ttl::Default => slatedb::config::Ttl::Default,
+            Ttl::NoExpiry => slatedb::config::Ttl::NoExpiry,
+            Ttl::ExpireAfter(ts) => slatedb::config::Ttl::ExpireAfter(ts),
+        }
+    }
+}
+
+impl From<PutOptions> for slatedb::config::PutOptions {
+    fn from(value: PutOptions) -> Self {
+        Self {
+            ttl: value.ttl.into(),
+        }
+    }
+}
+
+impl From<MergeOptions> for slatedb::config::MergeOptions {
+    fn from(value: MergeOptions) -> Self {
+        Self {
+            ttl: value.ttl.into(),
+        }
+    }
+}
+
 /// Read-only SlateDB storage using `DbReader`.
 ///
 /// This struct provides read-only access to a SlateDB database without fencing,
@@ -356,7 +390,24 @@ mod tests {
     use super::*;
     use crate::BytesRange;
     use slatedb::DbBuilder;
+    use slatedb::clock::{LogicalClock, MockSystemClock, SystemClock};
+    use slatedb::config::Settings;
     use slatedb::object_store::memory::InMemory;
+
+    /// Adapter that bridges [`MockSystemClock`] to [`LogicalClock`].
+    ///
+    /// SlateDB uses `LogicalClock` (not `SystemClock`) for TTL expiration.
+    /// This wrapper lets us control TTL time via `MockSystemClock::set()`.
+    #[derive(Debug)]
+    struct MockLogicalClockAdapter {
+        system_clock: Arc<MockSystemClock>,
+    }
+
+    impl LogicalClock for MockLogicalClockAdapter {
+        fn now(&self) -> i64 {
+            self.system_clock.now().timestamp_millis()
+        }
+    }
 
     #[tokio::test]
     async fn should_read_data_written_by_storage_via_reader() {
@@ -372,8 +423,8 @@ mod tests {
 
         storage
             .put(vec![
-                Record::new(Bytes::from("key1"), Bytes::from("value1")),
-                Record::new(Bytes::from("key2"), Bytes::from("value2")),
+                Record::new(Bytes::from("key1"), Bytes::from("value1")).into(),
+                Record::new(Bytes::from("key2"), Bytes::from("value2")).into(),
             ])
             .await
             .unwrap();
@@ -413,9 +464,9 @@ mod tests {
 
         storage
             .put(vec![
-                Record::new(Bytes::from("a"), Bytes::from("1")),
-                Record::new(Bytes::from("b"), Bytes::from("2")),
-                Record::new(Bytes::from("c"), Bytes::from("3")),
+                Record::new(Bytes::from("a"), Bytes::from("1")).into(),
+                Record::new(Bytes::from("b"), Bytes::from("2")).into(),
+                Record::new(Bytes::from("c"), Bytes::from("3")).into(),
             ])
             .await
             .unwrap();
@@ -458,10 +509,9 @@ mod tests {
 
         // Write initial data
         storage
-            .put(vec![Record::new(
-                Bytes::from("key1"),
-                Bytes::from("value1"),
-            )])
+            .put(vec![
+                Record::new(Bytes::from("key1"), Bytes::from("value1")).into(),
+            ])
             .await
             .unwrap();
         storage.flush().await.unwrap();
@@ -479,13 +529,198 @@ mod tests {
 
         // Writer can still write more data
         storage
-            .put(vec![Record::new(
-                Bytes::from("key2"),
-                Bytes::from("value2"),
-            )])
+            .put(vec![
+                Record::new(Bytes::from("key2"), Bytes::from("value2")).into(),
+            ])
             .await
             .unwrap();
         storage.flush().await.unwrap();
+
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_expire_records_based_on_ttl() {
+        // given - storage configured with a 30 second default TTL
+        let object_store = Arc::new(InMemory::new());
+        let path = "/test/ttl_db";
+        let clock = Arc::new(MockSystemClock::new());
+        let logical_clock = Arc::new(MockLogicalClockAdapter {
+            system_clock: clock.clone(),
+        });
+
+        let db = DbBuilder::new(path, object_store)
+            .with_settings(Settings {
+                default_ttl: Some(30_000),
+                ..Default::default()
+            })
+            .with_logical_clock(logical_clock)
+            .build()
+            .await
+            .unwrap();
+        let storage = SlateDbStorage::new(Arc::new(db));
+
+        // Write three keys at time=0:
+        //   key1: expires after 20 seconds
+        //   key2: uses default TTL (30 seconds)
+        //   key3: never expires
+        storage
+            .put(vec![
+                PutRecordOp::new_with_options(
+                    Record::new(Bytes::from("key1"), Bytes::from("value1")),
+                    PutOptions {
+                        ttl: Ttl::ExpireAfter(20_000),
+                    },
+                ),
+                PutRecordOp::new_with_options(
+                    Record::new(Bytes::from("key2"), Bytes::from("value2")),
+                    PutOptions { ttl: Ttl::Default },
+                ),
+                PutRecordOp::new_with_options(
+                    Record::new(Bytes::from("key3"), Bytes::from("value3")),
+                    PutOptions { ttl: Ttl::NoExpiry },
+                ),
+            ])
+            .await
+            .unwrap();
+
+        // then - all three keys are present at time=0
+        assert!(storage.get(Bytes::from("key1")).await.unwrap().is_some());
+        assert!(storage.get(Bytes::from("key2")).await.unwrap().is_some());
+        assert!(storage.get(Bytes::from("key3")).await.unwrap().is_some());
+
+        // when - advance to 25 seconds
+        clock.set(25_000);
+
+        // then - key1 (20s TTL) expired; key2 (30s default) and key3 (no expiry) still present
+        assert!(storage.get(Bytes::from("key1")).await.unwrap().is_none());
+        assert!(storage.get(Bytes::from("key2")).await.unwrap().is_some());
+        assert!(storage.get(Bytes::from("key3")).await.unwrap().is_some());
+
+        // when - advance to 35 seconds
+        clock.set(35_000);
+
+        // then - key1 and key2 expired; key3 (no expiry) still present with correct value
+        assert!(storage.get(Bytes::from("key1")).await.unwrap().is_none());
+        assert!(storage.get(Bytes::from("key2")).await.unwrap().is_none());
+        let record = storage.get(Bytes::from("key3")).await.unwrap();
+        assert!(record.is_some());
+        assert_eq!(record.unwrap().value, Bytes::from("value3"));
+
+        storage.close().await.unwrap();
+    }
+
+    /// Simple merge operator that concatenates existing and new values.
+    struct ConcatMergeOperator;
+
+    impl MergeOperator for ConcatMergeOperator {
+        fn merge(&self, _key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
+            match existing_value {
+                Some(existing) => {
+                    let mut result = Vec::with_capacity(existing.len() + new_value.len());
+                    result.extend_from_slice(&existing);
+                    result.extend_from_slice(&new_value);
+                    Bytes::from(result)
+                }
+                None => new_value,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn should_expire_merge_records_based_on_ttl() {
+        // given - storage configured with a 30 second default TTL and a merge operator
+        let object_store = Arc::new(InMemory::new());
+        let path = "/test/merge_ttl_db";
+        let clock = Arc::new(MockSystemClock::new());
+        let logical_clock = Arc::new(MockLogicalClockAdapter {
+            system_clock: clock.clone(),
+        });
+
+        let merge_op: Arc<dyn MergeOperator> = Arc::new(ConcatMergeOperator);
+        let slate_merge_op = SlateDbStorage::merge_operator_adapter(merge_op);
+        let db = DbBuilder::new(path, object_store)
+            .with_settings(Settings {
+                default_ttl: Some(30_000),
+                ..Default::default()
+            })
+            .with_logical_clock(logical_clock)
+            .with_merge_operator(Arc::new(slate_merge_op))
+            .build()
+            .await
+            .unwrap();
+        let storage = SlateDbStorage::new(Arc::new(db));
+
+        // Merge three keys at time=0:
+        //   key1: expires after 20 seconds
+        //   key2: uses default TTL (30 seconds)
+        //   key3: never expires
+        storage
+            .merge(vec![
+                MergeRecordOp::new_with_ttl(
+                    Record::new(Bytes::from("key1"), Bytes::from("v1")),
+                    MergeOptions {
+                        ttl: Ttl::ExpireAfter(20_000),
+                    },
+                ),
+                MergeRecordOp::new_with_ttl(
+                    Record::new(Bytes::from("key2"), Bytes::from("v2")),
+                    MergeOptions { ttl: Ttl::Default },
+                ),
+                MergeRecordOp::new_with_ttl(
+                    Record::new(Bytes::from("key3"), Bytes::from("v3")),
+                    MergeOptions { ttl: Ttl::NoExpiry },
+                ),
+            ])
+            .await
+            .unwrap();
+
+        // then - all three keys are present at time=0
+        assert_eq!(
+            storage
+                .get(Bytes::from("key1"))
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            Bytes::from("v1")
+        );
+        assert_eq!(
+            storage
+                .get(Bytes::from("key2"))
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            Bytes::from("v2")
+        );
+        assert_eq!(
+            storage
+                .get(Bytes::from("key3"))
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            Bytes::from("v3")
+        );
+
+        // when - advance to 25 seconds
+        clock.set(25_000);
+
+        // then - key1 (20s TTL) expired; key2 (30s default) and key3 (no expiry) still present
+        assert!(storage.get(Bytes::from("key1")).await.unwrap().is_none());
+        assert!(storage.get(Bytes::from("key2")).await.unwrap().is_some());
+        assert!(storage.get(Bytes::from("key3")).await.unwrap().is_some());
+
+        // when - advance to 35 seconds
+        clock.set(35_000);
+
+        // then - key1 and key2 expired; key3 (no expiry) still present with correct value
+        assert!(storage.get(Bytes::from("key1")).await.unwrap().is_none());
+        assert!(storage.get(Bytes::from("key2")).await.unwrap().is_none());
+        let record = storage.get(Bytes::from("key3")).await.unwrap();
+        assert!(record.is_some());
+        assert_eq!(record.unwrap().value, Bytes::from("v3"));
 
         storage.close().await.unwrap();
     }

@@ -31,6 +31,7 @@ prometheus-client = { version = "0.22", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+slatedb = { workspace = true, features = ["test-util"] }
 serde_yaml.workspace = true
 proptest.workspace = true
 criterion.workspace = true

@@ -5,17 +5,62 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use super::{MergeOperator, Storage, StorageSnapshot, WriteOptions};
+use super::{MergeOperator, MergeRecordOp, PutRecordOp, Storage, StorageSnapshot, WriteOptions};
 use crate::storage::RecordOp;
-use crate::{BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult};
+use crate::{BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult, Ttl};
+
+/// Trait for providing the current time.
+pub trait Clock: Send + Sync {
+    /// Returns the current time as milliseconds since the Unix epoch.
+    fn now(&self) -> i64;
+}
+
+/// Clock implementation that returns the real system time.
+pub struct WallClock;
+
+impl Clock for WallClock {
+    fn now(&self) -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before Unix epoch")
+            .as_millis() as i64
+    }
+}
+
+/// Internal wrapper that stores a value alongside its expiration timestamp.
+#[derive(Clone, Debug)]
+struct StoredValue {
+    value: Bytes,
+    /// `None` means the value never expires.
+    expire_ts: Option<i64>,
+}
+
+impl StoredValue {
+    fn is_expired(&self, now: i64) -> bool {
+        self.expire_ts.is_some_and(|ts| now >= ts)
+    }
+}
+
+/// Computes the absolute expiration timestamp from TTL options.
+fn compute_expire_ts(now: i64, ttl: Ttl, default_ttl: Option<u64>) -> Option<i64> {
+    let duration = match ttl {
+        Ttl::Default => default_ttl,
+        Ttl::NoExpiry => None,
+        Ttl::ExpireAfter(ms) => Some(ms),
+    };
+    duration.map(|ms| now + ms as i64)
+}
 
 /// In-memory implementation of the Storage trait using a BTreeMap.
 ///
 /// This implementation stores all data in memory and is useful for testing
-/// or scenarios where durability is not required.
+/// or scenarios where durability is not required. Supports TTL-based
+/// expiration via a configurable [`Clock`].
 pub struct InMemoryStorage {
-    data: Arc<RwLock<BTreeMap<Bytes, Bytes>>>,
+    data: Arc<RwLock<BTreeMap<Bytes, StoredValue>>>,
     merge_operator: Option<Arc<dyn MergeOperator + Send + Sync>>,
+    clock: Arc<dyn Clock>,
+    default_ttl: Option<u64>,
 }
 
 impl InMemoryStorage {
@@ -24,6 +69,8 @@ impl InMemoryStorage {
         Self {
             data: Arc::new(RwLock::new(BTreeMap::new())),
             merge_operator: None,
+            clock: Arc::new(WallClock),
+            default_ttl: None,
         }
     }
 
@@ -36,7 +83,21 @@ impl InMemoryStorage {
         Self {
             data: Arc::new(RwLock::new(BTreeMap::new())),
             merge_operator: Some(merge_operator),
+            clock: Arc::new(WallClock),
+            default_ttl: None,
         }
+    }
+
+    /// Sets a custom clock for TTL expiration checks.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Sets the default TTL (in milliseconds) for records written with [`Ttl::Default`].
+    pub fn with_default_ttl(mut self, ttl: u64) -> Self {
+        self.default_ttl = Some(ttl);
+        self
     }
 }
 
@@ -50,7 +111,7 @@ impl Default for InMemoryStorage {
 impl StorageRead for InMemoryStorage {
     /// Retrieves a single record by key from the in-memory store.
     ///
-    /// Returns `None` if the key does not exist.
+    /// Returns `None` if the key does not exist or has expired.
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get(&self, key: Bytes) -> StorageResult<Option<Record>> {
         let data = self
@@ -59,8 +120,10 @@ impl StorageRead for InMemoryStorage {
             .map_err(|e| StorageError::Internal(format!("Failed to acquire read lock: {}", e)))?;
 
         match data.get(&key) {
-            Some(value) => Ok(Some(Record::new(key, value.clone()))),
-            None => Ok(None),
+            Some(stored) if !stored.is_expired(self.clock.now()) => {
+                Ok(Some(Record::new(key, stored.value.clone())))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -74,10 +137,11 @@ impl StorageRead for InMemoryStorage {
             .read()
             .map_err(|e| StorageError::Internal(format!("Failed to acquire read lock: {}", e)))?;
 
-        // Collect all matching records into a Vec for the iterator
+        let now = self.clock.now();
         let records: Vec<Record> = data
             .range((range.start_bound().cloned(), range.end_bound().cloned()))
-            .map(|(k, v)| Record::new(k.clone(), v.clone()))
+            .filter(|(_, stored)| !stored.is_expired(now))
+            .map(|(k, stored)| Record::new(k.clone(), stored.value.clone()))
             .collect();
 
         Ok(Box::new(InMemoryIterator { records, index: 0 }))
@@ -106,8 +170,10 @@ impl StorageIterator for InMemoryIterator {
 /// In-memory snapshot that holds a copy of the data at the time of snapshot creation.
 ///
 /// Provides a consistent read-only view of the database at the time the snapshot was created.
+/// Expired entries are filtered out at read time using the shared clock.
 pub struct InMemoryStorageSnapshot {
-    data: Arc<BTreeMap<Bytes, Bytes>>,
+    data: Arc<BTreeMap<Bytes, StoredValue>>,
+    clock: Arc<dyn Clock>,
 }
 
 #[async_trait]
@@ -115,8 +181,10 @@ impl StorageRead for InMemoryStorageSnapshot {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get(&self, key: Bytes) -> StorageResult<Option<Record>> {
         match self.data.get(&key) {
-            Some(value) => Ok(Some(Record::new(key, value.clone()))),
-            None => Ok(None),
+            Some(stored) if !stored.is_expired(self.clock.now()) => {
+                Ok(Some(Record::new(key, stored.value.clone())))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -125,11 +193,12 @@ impl StorageRead for InMemoryStorageSnapshot {
         &self,
         range: BytesRange,
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
-        // Collect all matching records into a Vec for the iterator
+        let now = self.clock.now();
         let records: Vec<Record> = self
             .data
             .range((range.start_bound().cloned(), range.end_bound().cloned()))
-            .map(|(k, v)| Record::new(k.clone(), v.clone()))
+            .filter(|(_, stored)| !stored.is_expired(now))
+            .map(|(k, stored)| Record::new(k.clone(), stored.value.clone()))
             .collect();
 
         Ok(Box::new(InMemoryIterator { records, index: 0 }))
@@ -147,19 +216,37 @@ impl Storage for InMemoryStorage {
             .write()
             .map_err(|e| StorageError::Internal(format!("Failed to acquire write lock: {}", e)))?;
 
+        let now = self.clock.now();
         for record in records {
             match record {
-                RecordOp::Put(record) => {
-                    data.insert(record.key, record.value);
-                }
-                RecordOp::Merge(record) => {
-                    let existing_value = data.get(&record.key).cloned();
-                    let merged_value = self.merge_operator.as_ref().unwrap().merge(
-                        &record.key,
-                        existing_value,
-                        record.value.clone(),
+                RecordOp::Put(op) => {
+                    let expire_ts = compute_expire_ts(now, op.options.ttl, self.default_ttl);
+                    data.insert(
+                        op.record.key,
+                        StoredValue {
+                            value: op.record.value,
+                            expire_ts,
+                        },
                     );
-                    data.insert(record.key, merged_value);
+                }
+                RecordOp::Merge(op) => {
+                    let existing_value = data
+                        .get(&op.record.key)
+                        .filter(|s| !s.is_expired(now))
+                        .map(|s| s.value.clone());
+                    let merged_value = self.merge_operator.as_ref().unwrap().merge(
+                        &op.record.key,
+                        existing_value,
+                        op.record.value.clone(),
+                    );
+                    let expire_ts = compute_expire_ts(now, op.options.ttl, self.default_ttl);
+                    data.insert(
+                        op.record.key,
+                        StoredValue {
+                            value: merged_value,
+                            expire_ts,
+                        },
+                    );
                 }
                 RecordOp::Delete(key) => {
                     data.remove(&key);
@@ -173,7 +260,7 @@ impl Storage for InMemoryStorage {
     /// Writes a batch of records to the in-memory store with default options.
     ///
     /// Delegates to [`put_with_options`](Self::put_with_options) with default options.
-    async fn put(&self, records: Vec<Record>) -> StorageResult<()> {
+    async fn put(&self, records: Vec<PutRecordOp>) -> StorageResult<()> {
         self.put_with_options(records, WriteOptions::default())
             .await
     }
@@ -185,7 +272,7 @@ impl Storage for InMemoryStorage {
     /// durable storage to await.
     async fn put_with_options(
         &self,
-        records: Vec<Record>,
+        records: Vec<PutRecordOp>,
         _options: WriteOptions,
     ) -> StorageResult<()> {
         let mut data = self
@@ -193,8 +280,16 @@ impl Storage for InMemoryStorage {
             .write()
             .map_err(|e| StorageError::Internal(format!("Failed to acquire write lock: {}", e)))?;
 
-        for record in records {
-            data.insert(record.key, record.value);
+        let now = self.clock.now();
+        for op in records {
+            let expire_ts = compute_expire_ts(now, op.options.ttl, self.default_ttl);
+            data.insert(
+                op.record.key,
+                StoredValue {
+                    value: op.record.value,
+                    expire_ts,
+                },
+            );
         }
 
         Ok(())
@@ -204,13 +299,13 @@ impl Storage for InMemoryStorage {
     ///
     /// This method requires a merge operator to be configured during construction.
     /// For each record, it will:
-    /// 1. Get the existing value (if any)
+    /// 1. Get the existing value (if any), excluding expired entries
     /// 2. Call the merge operator to combine existing and new values
-    /// 3. Put the merged result back
+    /// 3. Put the merged result back with the new TTL
     ///
     /// If no merge operator is configured, this method will return a
     /// `StorageError::Storage` error.
-    async fn merge(&self, records: Vec<Record>) -> StorageResult<()> {
+    async fn merge(&self, records: Vec<MergeRecordOp>) -> StorageResult<()> {
         let merge_op = self
             .merge_operator
             .as_ref()
@@ -225,10 +320,22 @@ impl Storage for InMemoryStorage {
             .write()
             .map_err(|e| StorageError::Internal(format!("Failed to acquire write lock: {}", e)))?;
 
-        for record in records {
-            let existing_value = data.get(&record.key).cloned();
-            let merged_value = merge_op.merge(&record.key, existing_value, record.value.clone());
-            data.insert(record.key, merged_value);
+        let now = self.clock.now();
+        for op in records {
+            let existing_value = data
+                .get(&op.record.key)
+                .filter(|s| !s.is_expired(now))
+                .map(|s| s.value.clone());
+            let merged_value =
+                merge_op.merge(&op.record.key, existing_value, op.record.value.clone());
+            let expire_ts = compute_expire_ts(now, op.options.ttl, self.default_ttl);
+            data.insert(
+                op.record.key,
+                StoredValue {
+                    value: merged_value,
+                    expire_ts,
+                },
+            );
         }
 
         Ok(())
@@ -238,18 +345,18 @@ impl Storage for InMemoryStorage {
     ///
     /// The snapshot provides a consistent read-only view of the database at the time
     /// the snapshot was created. Reads from the snapshot will not see any subsequent
-    /// writes to the underlying storage.
+    /// writes to the underlying storage. Expired entries are filtered at read time.
     async fn snapshot(&self) -> StorageResult<Arc<dyn StorageSnapshot>> {
         let data = self
             .data
             .read()
             .map_err(|e| StorageError::Internal(format!("Failed to acquire read lock: {}", e)))?;
 
-        // Clone the entire BTreeMap for the snapshot
         let snapshot_data = Arc::new(data.clone());
 
         Ok(Arc::new(InMemoryStorageSnapshot {
             data: snapshot_data,
+            clock: self.clock.clone(),
         }))
     }
 
@@ -309,7 +416,7 @@ mod tests {
 
         // when
         storage
-            .put(vec![Record::new(key.clone(), value.clone())])
+            .put(vec![Record::new(key.clone(), value.clone()).into()])
             .await
             .unwrap();
         let result = storage.get(key).await.unwrap();
@@ -331,11 +438,11 @@ mod tests {
 
         // when
         storage
-            .put(vec![Record::new(key.clone(), initial_value)])
+            .put(vec![Record::new(key.clone(), initial_value).into()])
             .await
             .unwrap();
         storage
-            .put(vec![Record::new(key.clone(), updated_value.clone())])
+            .put(vec![Record::new(key.clone(), updated_value.clone()).into()])
             .await
             .unwrap();
         let result = storage.get(key).await.unwrap();
@@ -356,7 +463,10 @@ mod tests {
         ];
 
         // when
-        storage.put(records.clone()).await.unwrap();
+        storage
+            .put(records.iter().cloned().map(PutRecordOp::new).collect())
+            .await
+            .unwrap();
 
         // then
         for record in records {
@@ -375,7 +485,10 @@ mod tests {
             Record::new(Bytes::from("b"), Bytes::from("value_b")),
             Record::new(Bytes::from("c"), Bytes::from("value_c")),
         ];
-        storage.put(records.clone()).await.unwrap();
+        storage
+            .put(records.iter().cloned().map(PutRecordOp::new).collect())
+            .await
+            .unwrap();
 
         // when
         let scanned = storage.scan(BytesRange::unbounded()).await.unwrap();
@@ -396,7 +509,10 @@ mod tests {
             Record::new(Bytes::from("prefix_b"), Bytes::from("value2")),
             Record::new(Bytes::from("other_c"), Bytes::from("value3")),
         ];
-        storage.put(records).await.unwrap();
+        storage
+            .put(records.into_iter().map(PutRecordOp::new).collect())
+            .await
+            .unwrap();
 
         // when
         let scanned = storage
@@ -420,7 +536,10 @@ mod tests {
             Record::new(Bytes::from("c"), Bytes::from("value_c")),
             Record::new(Bytes::from("d"), Bytes::from("value_d")),
         ];
-        storage.put(records).await.unwrap();
+        storage
+            .put(records.into_iter().map(PutRecordOp::new).collect())
+            .await
+            .unwrap();
 
         // when
         let range = BytesRange::new(
@@ -452,8 +571,8 @@ mod tests {
         // given
         let storage = InMemoryStorage::new();
         let records = vec![
-            Record::new(Bytes::from("key1"), Bytes::from("value1")),
-            Record::new(Bytes::from("key2"), Bytes::from("value2")),
+            Record::new(Bytes::from("key1"), Bytes::from("value1")).into(),
+            Record::new(Bytes::from("key2"), Bytes::from("value2")).into(),
         ];
         storage.put(records).await.unwrap();
 
@@ -476,10 +595,9 @@ mod tests {
         // given
         let storage = InMemoryStorage::new();
         storage
-            .put(vec![Record::new(
-                Bytes::from("key1"),
-                Bytes::from("value1"),
-            )])
+            .put(vec![
+                Record::new(Bytes::from("key1"), Bytes::from("value1")).into(),
+            ])
             .await
             .unwrap();
 
@@ -497,20 +615,18 @@ mod tests {
         // given
         let storage = InMemoryStorage::new();
         storage
-            .put(vec![Record::new(
-                Bytes::from("key1"),
-                Bytes::from("value1"),
-            )])
+            .put(vec![
+                Record::new(Bytes::from("key1"), Bytes::from("value1")).into(),
+            ])
             .await
             .unwrap();
 
         // when
         let snapshot = storage.snapshot().await.unwrap();
         storage
-            .put(vec![Record::new(
-                Bytes::from("key2"),
-                Bytes::from("value2"),
-            )])
+            .put(vec![
+                Record::new(Bytes::from("key2"), Bytes::from("value2")).into(),
+            ])
             .await
             .unwrap();
 
@@ -527,14 +643,18 @@ mod tests {
         // given
         let storage = InMemoryStorage::new();
         storage
-            .put(vec![Record::new(Bytes::from("a"), Bytes::from("value_a"))])
+            .put(vec![
+                Record::new(Bytes::from("a"), Bytes::from("value_a")).into(),
+            ])
             .await
             .unwrap();
 
         // when
         let snapshot = storage.snapshot().await.unwrap();
         storage
-            .put(vec![Record::new(Bytes::from("b"), Bytes::from("value_b"))])
+            .put(vec![
+                Record::new(Bytes::from("b"), Bytes::from("value_b")).into(),
+            ])
             .await
             .unwrap();
 
@@ -554,7 +674,10 @@ mod tests {
         let key = Bytes::from("empty_key");
 
         // when
-        storage.put(vec![Record::empty(key.clone())]).await.unwrap();
+        storage
+            .put(vec![Record::empty(key.clone()).into()])
+            .await
+            .unwrap();
         let result = storage.get(key).await.unwrap();
 
         // then
@@ -569,7 +692,7 @@ mod tests {
         let record = Record::new(Bytes::from("key1"), Bytes::from("value1"));
 
         // when
-        let result = storage.merge(vec![record]).await;
+        let result = storage.merge(vec![record.into()]).await;
 
         // then
         assert!(result.is_err());
@@ -591,7 +714,7 @@ mod tests {
 
         // when
         storage
-            .merge(vec![Record::new(key.clone(), value.clone())])
+            .merge(vec![Record::new(key.clone(), value.clone()).into()])
             .await
             .unwrap();
         let result = storage.get(key).await.unwrap();
@@ -611,13 +734,13 @@ mod tests {
         let new_value = Bytes::from("value2");
 
         storage
-            .put(vec![Record::new(key.clone(), initial_value)])
+            .put(vec![Record::new(key.clone(), initial_value).into()])
             .await
             .unwrap();
 
         // when
         storage
-            .merge(vec![Record::new(key.clone(), new_value)])
+            .merge(vec![Record::new(key.clone(), new_value).into()])
             .await
             .unwrap();
         let result = storage.get(key).await.unwrap();
@@ -633,16 +756,16 @@ mod tests {
         let merge_op = Arc::new(AppendMergeOperator);
         let storage = InMemoryStorage::with_merge_operator(merge_op);
         let records = vec![
-            Record::new(Bytes::from("key1"), Bytes::from("value1")),
-            Record::new(Bytes::from("key2"), Bytes::from("value2")),
+            Record::new(Bytes::from("key1"), Bytes::from("value1")).into(),
+            Record::new(Bytes::from("key2"), Bytes::from("value2")).into(),
         ];
         storage.put(records).await.unwrap();
 
         // when
         storage
             .merge(vec![
-                Record::new(Bytes::from("key1"), Bytes::from("value1a")),
-                Record::new(Bytes::from("key2"), Bytes::from("value2a")),
+                Record::new(Bytes::from("key1"), Bytes::from("value1a")).into(),
+                Record::new(Bytes::from("key2"), Bytes::from("value2a")).into(),
             ])
             .await
             .unwrap();
@@ -664,7 +787,7 @@ mod tests {
 
         // when
         storage
-            .merge(vec![Record::empty(key.clone())])
+            .merge(vec![Record::empty(key.clone()).into()])
             .await
             .unwrap();
         let result = storage.get(key).await.unwrap();

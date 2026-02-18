@@ -312,7 +312,7 @@ mod tests {
             .unwrap();
         allocator.allocate(DEFAULT_BLOCK_SIZE);
         let (_, put) = allocator.allocate(DEFAULT_BLOCK_SIZE);
-        storage.put(vec![put.unwrap()]).await.unwrap();
+        storage.put(vec![put.unwrap().into()]).await.unwrap();
 
         // when: Second instance should recover
         let mut allocator2 = SequenceAllocator::load(storage.as_ref(), test_key())
@@ -340,7 +340,7 @@ mod tests {
             .await
             .unwrap();
         let (_, put) = allocator.allocate(DEFAULT_BLOCK_SIZE / 2);
-        storage.put(vec![put.unwrap()]).await.unwrap();
+        storage.put(vec![put.unwrap().into()]).await.unwrap();
 
         // when: Second instance should recover
         let mut allocator2 = SequenceAllocator::load(storage.as_ref(), test_key())

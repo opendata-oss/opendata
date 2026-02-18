@@ -12,6 +12,85 @@ use bytes::Bytes;
 
 use crate::BytesRange;
 
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub enum Ttl {
+    #[default]
+    Default,
+    NoExpiry,
+    ExpireAfter(u64),
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct PutOptions {
+    pub ttl: Ttl,
+}
+
+/// Encapsulates a record being put along with options specific to the put.
+#[derive(Clone, Debug)]
+pub struct PutRecordOp {
+    pub record: Record,
+    pub options: PutOptions,
+}
+
+impl PutRecordOp {
+    pub fn new(record: Record) -> Self {
+        Self {
+            record,
+            options: PutOptions::default(),
+        }
+    }
+
+    pub fn new_with_options(record: Record, options: PutOptions) -> Self {
+        Self { record, options }
+    }
+
+    pub fn with_options(self, options: PutOptions) -> Self {
+        Self {
+            record: self.record,
+            options,
+        }
+    }
+}
+
+/// Converts a Record to a PutRecordOp with default options
+impl From<Record> for PutRecordOp {
+    fn from(record: Record) -> Self {
+        Self::new(record)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MergeOptions {
+    pub ttl: Ttl,
+}
+
+/// Encapsulates a record written as part of a merge op along with options specific to the merge.
+#[derive(Clone, Debug)]
+pub struct MergeRecordOp {
+    pub record: Record,
+    pub options: MergeOptions,
+}
+
+impl MergeRecordOp {
+    pub fn new(record: Record) -> Self {
+        Self {
+            record,
+            options: MergeOptions::default(),
+        }
+    }
+
+    pub fn new_with_ttl(record: Record, options: MergeOptions) -> Self {
+        Self { record, options }
+    }
+}
+
+/// Converts a Record to a PutRecordOp with default options
+impl From<Record> for MergeRecordOp {
+    fn from(record: Record) -> Self {
+        Self::new(record)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Record {
     pub key: Bytes,
@@ -30,8 +109,8 @@ impl Record {
 
 #[derive(Clone, Debug)]
 pub enum RecordOp {
-    Put(Record),
-    Merge(Record),
+    Put(PutRecordOp),
+    Merge(MergeRecordOp),
     Delete(Bytes),
 }
 
@@ -148,7 +227,7 @@ pub trait StorageSnapshot: StorageRead {}
 pub trait Storage: StorageRead {
     async fn apply(&self, ops: Vec<RecordOp>) -> StorageResult<()>;
 
-    async fn put(&self, records: Vec<Record>) -> StorageResult<()>;
+    async fn put(&self, records: Vec<PutRecordOp>) -> StorageResult<()>;
 
     /// Writes records to storage with custom options.
     ///
@@ -161,7 +240,7 @@ pub trait Storage: StorageRead {
     /// * `options` - Write options controlling durability behavior
     async fn put_with_options(
         &self,
-        records: Vec<Record>,
+        records: Vec<PutRecordOp>,
         options: WriteOptions,
     ) -> StorageResult<()>;
 
@@ -173,7 +252,7 @@ pub trait Storage: StorageRead {
     ///
     /// The merge operation is atomic - all merges in the batch are applied
     /// together or not at all.
-    async fn merge(&self, records: Vec<Record>) -> StorageResult<()>;
+    async fn merge(&self, records: Vec<MergeRecordOp>) -> StorageResult<()>;
 
     /// Creates a point-in-time snapshot of the storage.
     ///

@@ -127,7 +127,7 @@ impl KeyValueStorage {
             await_durable: options.await_durable,
         };
         self.storage
-            .put_with_options(vec![record], storage_options)
+            .put_with_options(vec![record.into()], storage_options)
             .await
             .map_err(|e| Error::Storage(e.to_string()))
     }

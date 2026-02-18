@@ -217,7 +217,7 @@ impl VectorDbWriteDelta {
             // Allocate new internal ID
             let (new_internal_id, seq_alloc_put) = self.ctx.id_allocator.allocate_one();
             if let Some(seq_alloc_put) = seq_alloc_put {
-                self.ops.push(RecordOp::Put(seq_alloc_put));
+                self.ops.push(RecordOp::Put(seq_alloc_put.into()));
             }
 
             // Check dictionary for existing mapping (upsert detection)
@@ -433,7 +433,7 @@ mod tests {
     /// Helper to check if an op is a Put for a specific key prefix.
     fn is_put_with_key_prefix(op: &RecordOp, prefix: &[u8]) -> bool {
         match op {
-            RecordOp::Put(record) => record.key.starts_with(prefix),
+            RecordOp::Put(record) => record.record.key.starts_with(prefix),
             _ => false,
         }
     }
@@ -441,7 +441,7 @@ mod tests {
     /// Helper to check if an op is a Merge for a specific key prefix.
     fn is_merge_with_key_prefix(op: &RecordOp, prefix: &[u8]) -> bool {
         match op {
-            RecordOp::Merge(record) => record.key.starts_with(prefix),
+            RecordOp::Merge(record) => record.record.key.starts_with(prefix),
             _ => false,
         }
     }
@@ -464,7 +464,7 @@ mod tests {
 
         // Find ID dictionary put
         let has_id_dict_put = frozen.ops.iter().any(|op| match op {
-            RecordOp::Put(record) => record.key == id_dict_key,
+            RecordOp::Put(record) => record.record.key == id_dict_key,
             _ => false,
         });
         assert!(has_id_dict_put, "should have ID dictionary put op");
@@ -493,7 +493,7 @@ mod tests {
         // then - should have a merge op for the posting list of centroid 42
         let posting_key = PostingListKey::new(centroid_id).encode();
         let has_posting_merge = frozen.ops.iter().any(|op| match op {
-            RecordOp::Merge(record) => record.key == posting_key,
+            RecordOp::Merge(record) => record.record.key == posting_key,
             _ => false,
         });
         assert!(
@@ -542,7 +542,7 @@ mod tests {
             .clone()
             .into_iter()
             .filter(|op| match op {
-                RecordOp::Put(record) => record.key == id_dict_key,
+                RecordOp::Put(record) => record.record.key == id_dict_key,
                 _ => false,
             })
             .collect();
@@ -550,7 +550,7 @@ mod tests {
         let RecordOp::Put(record) = id_dict_puts.last().unwrap() else {
             panic!("should have ID dictionary put op");
         };
-        let new_id = record.value.clone().get_u64_le();
+        let new_id = record.record.value.clone().get_u64_le();
         assert!(new_id > first_id);
         // Dictionary should have new internal ID
         let new_id_dict = *ctx.dictionary.get("vec-1").unwrap();
@@ -577,7 +577,7 @@ mod tests {
         // then - should have posting list merge for the new vector
         let posting_key = PostingListKey::new(centroid_id).encode();
         let has_posting_merge = frozen.ops.iter().any(|op| match op {
-            RecordOp::Merge(record) => record.key == posting_key,
+            RecordOp::Merge(record) => record.record.key == posting_key,
             _ => false,
         });
         assert!(
@@ -851,7 +851,7 @@ mod tests {
         // then - should have a centroid stats merge op with delta = 2
         let stats_key = CentroidStatsKey::new(centroid_id).encode();
         let stats_merge = frozen.ops.iter().find(|op| match op {
-            RecordOp::Merge(record) => record.key == stats_key,
+            RecordOp::Merge(record) => record.record.key == stats_key,
             _ => false,
         });
         assert!(
@@ -862,9 +862,10 @@ mod tests {
 
         // Verify the delta value is 2
         if let Some(RecordOp::Merge(record)) = stats_merge {
-            let value =
-                crate::serde::centroid_stats::CentroidStatsValue::decode_from_bytes(&record.value)
-                    .unwrap();
+            let value = crate::serde::centroid_stats::CentroidStatsValue::decode_from_bytes(
+                &record.record.value,
+            )
+            .unwrap();
             assert_eq!(value.num_vectors, 2, "should have delta of 2 for 2 vectors");
         }
     }
