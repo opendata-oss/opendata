@@ -67,5 +67,7 @@ mod timeseries;
 // Public re-exports
 pub use config::{Config, WriteOptions};
 pub use error::{Error, Result};
-pub use model::{Label, MetricType, Sample, Series, SeriesBuilder, Temporality};
+pub use model::{
+    Label, MetricType, STALE_NAN, Sample, Series, SeriesBuilder, Temporality, is_stale_nan,
+};
 pub use timeseries::TimeSeriesDb;

@@ -251,6 +251,14 @@ impl FunctionRegistry {
             "count_over_time".to_string(),
             Box::new(CountOverTimeFunction),
         );
+        range_functions.insert(
+            "stddev_over_time".to_string(),
+            Box::new(StddevOverTimeFunction),
+        );
+        range_functions.insert(
+            "stdvar_over_time".to_string(),
+            Box::new(StdvarOverTimeFunction),
+        );
 
         Self {
             functions,
@@ -482,12 +490,149 @@ impl RangeFunction for CountOverTimeFunction {
     }
 }
 
+/// Variance calculation using Welford's online algorithm (1962)
+/// with compensated summation for improved numerical stability.
+///
+/// Algorithm:
+///   For each value x:
+///     count += 1
+///     delta  = x - mean
+///     mean  += delta / count
+///     delta2 = x - mean
+///     M2    += delta * delta2
+///   variance = M2 / count   (population variance)
+///
+/// Enhancement:
+///   Kahan compensated summation is applied to the incremental
+///   updates of both the running mean and M2 accumulators,
+///   reducing floating-point rounding error in long sequences.
+///
+/// Semantics:
+///   - Computes population variance (divides by n)
+///   - Matches Prometheus population variance semantics
+///
+/// NaN handling:
+///   - Empty input returns NaN
+///   - Single value returns 0.0
+///   - NaN values propagate through the calculation
+///
+/// References:
+///   - https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm
+///   - Prometheus: `promql/functions.go::varianceOverTime`
+fn variance_kahan(values: &[Sample]) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+
+    let mut count = 0.0;
+    let mut mean = 0.0;
+    let mut c_mean = 0.0;
+    let mut m2 = 0.0;
+    let mut c_m2 = 0.0;
+
+    for sample in values {
+        count += 1.0;
+        let delta = sample.value - (mean + c_mean);
+        (mean, c_mean) = kahan_inc(delta / count, mean, c_mean);
+        let new_delta = sample.value - (mean + c_mean);
+        (m2, c_m2) = kahan_inc(delta * new_delta, m2, c_m2);
+    }
+
+    (m2 + c_m2) / count
+}
+
+/// Standard deviation over time function: population stddev of all sample values
+/// Only operates on float samples; histogram samples are ignored
+struct StddevOverTimeFunction;
+
+impl RangeFunction for StddevOverTimeFunction {
+    fn apply(
+        &self,
+        samples: Vec<EvalSamples>,
+        eval_timestamp_ms: i64,
+    ) -> EvalResult<Vec<EvalSample>> {
+        Ok(aggr_over_time(samples, eval_timestamp_ms, |values| {
+            variance_kahan(values).sqrt()
+        }))
+    }
+}
+
+/// Standard variance over time function: population variance of all sample values
+/// Only operates on float samples; histogram samples are ignored
+struct StdvarOverTimeFunction;
+
+impl RangeFunction for StdvarOverTimeFunction {
+    fn apply(
+        &self,
+        samples: Vec<EvalSamples>,
+        eval_timestamp_ms: i64,
+    ) -> EvalResult<Vec<EvalSample>> {
+        Ok(aggr_over_time(samples, eval_timestamp_ms, variance_kahan))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::Sample;
     use rstest::rstest;
     use std::collections::HashMap;
+
+    // ========================================================================
+    // Test helpers
+    // ========================================================================
+
+    /// Converts f64 values to Sample structs with sequential timestamps
+    fn test_samples(values: &[f64]) -> Vec<Sample> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| Sample {
+                timestamp_ms: i as i64,
+                value: v,
+            })
+            .collect()
+    }
+
+    // Copyright The Prometheus Authors
+    // Licensed under the Apache License, Version 2.0
+    // See: https://github.com/prometheus/prometheus/blob/main/util/almost/almost.go
+
+    /// Relative error allowed for sample values (matches Prometheus defaultEpsilon)
+    const DEFAULT_EPSILON: f64 = 0.000001;
+
+    /// Compare two floats with tolerance.
+    ///
+    /// Handles StaleNaN, NaN, exact equality, near-zero, and relative tolerance.
+    fn almost_equal(a: f64, b: f64, epsilon: f64) -> bool {
+        use crate::model::is_stale_nan;
+        const MIN_NORMAL: f64 = f64::MIN_POSITIVE;
+
+        if is_stale_nan(a) || is_stale_nan(b) {
+            return is_stale_nan(a) && is_stale_nan(b);
+        }
+
+        if a.is_nan() && b.is_nan() {
+            return true;
+        }
+
+        if a == b {
+            return true;
+        }
+
+        let abs_sum = a.abs() + b.abs();
+        let diff = (a - b).abs();
+
+        if a == 0.0 || b == 0.0 || abs_sum < MIN_NORMAL {
+            return diff < epsilon * MIN_NORMAL;
+        }
+
+        diff / abs_sum.min(f64::MAX) < epsilon
+    }
+
+    // ========================================================================
+    // Tests for variance_kahan
+    // ========================================================================
 
     fn create_sample(value: f64) -> EvalSample {
         EvalSample {
@@ -681,6 +826,271 @@ mod tests {
         // then
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].value, 4.0);
+    }
+
+    #[test]
+    fn should_apply_stddev_over_time_function() {
+        // given
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("stddev_over_time").unwrap();
+
+        // Values: [10, 20, 30, 40]
+        // Mean: 25
+        // Variance: ((10-25)^2 + (20-25)^2 + (30-25)^2 + (40-25)^2) / 4 = (225 + 25 + 25 + 225) / 4 = 125
+        // Stddev: sqrt(125) ≈ 11.180339887498949
+        let samples = vec![create_eval_samples(
+            vec![(1000, 10.0), (2000, 20.0), (3000, 30.0), (4000, 40.0)],
+            HashMap::new(),
+        )];
+
+        // when
+        let result = func.apply(samples, 4000).unwrap();
+
+        // then
+        assert_eq!(result.len(), 1);
+        assert!((result[0].value - 11.180339887498949).abs() < 1e-10);
+    }
+
+    #[test]
+    fn should_apply_stdvar_over_time_function() {
+        // given
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("stdvar_over_time").unwrap();
+
+        // Values: [10, 20, 30, 40]
+        // Mean: 25
+        // Variance: 125
+        let samples = vec![create_eval_samples(
+            vec![(1000, 10.0), (2000, 20.0), (3000, 30.0), (4000, 40.0)],
+            HashMap::new(),
+        )];
+
+        // when
+        let result = func.apply(samples, 4000).unwrap();
+
+        // then
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 125.0);
+    }
+
+    #[test]
+    fn should_return_zero_for_stddev_with_single_value() {
+        // given
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("stddev_over_time").unwrap();
+
+        let samples = vec![create_eval_samples(vec![(1000, 42.0)], HashMap::new())];
+
+        // when
+        let result = func.apply(samples, 1000).unwrap();
+
+        // then
+        assert_eq!(result.len(), 1);
+        // Single value has variance 0, stddev 0
+        assert_eq!(result[0].value, 0.0);
+    }
+
+    #[test]
+    fn should_skip_empty_series_for_stddev() {
+        // given
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("stddev_over_time").unwrap();
+
+        let samples = vec![create_eval_samples(vec![], HashMap::new())];
+
+        // when
+        let result = func.apply(samples, 1000).unwrap();
+
+        // then
+        // Empty series are skipped (Prometheus behavior)
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn should_skip_empty_series_for_stdvar() {
+        // given
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("stdvar_over_time").unwrap();
+
+        let samples = vec![create_eval_samples(vec![], HashMap::new())];
+
+        // when
+        let result = func.apply(samples, 1000).unwrap();
+
+        // then
+        // Empty series are skipped (Prometheus behavior)
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn variance_kahan_empty_returns_nan() {
+        assert!(variance_kahan(&[]).is_nan());
+    }
+
+    #[test]
+    fn variance_kahan_single_value_returns_zero() {
+        let result = variance_kahan(&test_samples(&[42.0]));
+        assert!(almost_equal(result, 0.0, 1e-6));
+    }
+
+    #[rstest]
+    #[case(&[10.0, 20.0, 30.0, 40.0], 125.0)]
+    #[case(&[5.0, 5.0, 5.0, 5.0], 0.0)]
+    #[case(&[1.0, 2.0], 0.25)]
+    #[case(&[1.0, 2.0, 3.0, 4.0, 5.0], 2.0)]
+    fn variance_kahan_fixed_vectors(#[case] values: &[f64], #[case] expected: f64) {
+        let result = variance_kahan(&test_samples(values));
+        assert!(
+            almost_equal(result, expected, 1e-6),
+            "Expected {}, got {}",
+            expected,
+            result
+        );
+    }
+
+    #[test]
+    fn variance_kahan_numerical_stability_stress() {
+        // Large base + small deltas: base=1e10, values [base+0, base+1, base+2, base+3]
+        // Expected from delta-space variance ([0,1,2,3]) = 1.25
+        let base = 1e10;
+        let samples = test_samples(&[base, base + 1.0, base + 2.0, base + 3.0]);
+        let result = variance_kahan(&samples);
+        assert!(
+            almost_equal(result, 1.25, 1e-6),
+            "Expected 1.25, got {}",
+            result
+        );
+    }
+
+    #[test]
+    fn variance_kahan_vs_two_pass_oracle() {
+        // Test against independent two-pass algorithm (inlined to prevent misuse)
+        let samples = test_samples(&[10.0, 20.0, 30.0, 40.0]);
+
+        let welford_result = variance_kahan(&samples);
+
+        // Two-pass oracle (inlined)
+        let mean = samples.iter().map(|s| s.value).sum::<f64>() / samples.len() as f64;
+        let two_pass_result = samples
+            .iter()
+            .map(|s| (s.value - mean).powi(2))
+            .sum::<f64>()
+            / samples.len() as f64;
+
+        assert!(
+            almost_equal(welford_result, two_pass_result, 1e-6),
+            "Welford: {}, Two-pass: {}",
+            welford_result,
+            two_pass_result
+        );
+    }
+
+    #[test]
+    fn variance_kahan_nan_propagation() {
+        assert!(variance_kahan(&test_samples(&[1.0, f64::NAN, 3.0])).is_nan());
+    }
+
+    #[test]
+    fn should_handle_constant_values_in_stddev() {
+        // given
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("stddev_over_time").unwrap();
+
+        let samples = vec![create_eval_samples(
+            vec![(1000, 5.0), (2000, 5.0), (3000, 5.0), (4000, 5.0)],
+            HashMap::new(),
+        )];
+
+        // when
+        let result = func.apply(samples, 4000).unwrap();
+
+        // then
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 0.0); // All values same = zero variance
+    }
+
+    #[test]
+    fn should_handle_large_magnitude_small_variance_in_stddev() {
+        // given
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("stddev_over_time").unwrap();
+
+        // Large magnitude values (1e10) with small variance
+        // At 1e16, floating point precision limits prevent accurate small variance calculation
+        // Values: [1e10, 1e10 + 1, 1e10 + 2, 1e10 + 3]
+        // Mean: 1e10 + 1.5
+        // Variance: ((0-1.5)^2 + (1-1.5)^2 + (2-1.5)^2 + (3-1.5)^2) / 4 = 1.25
+        // Stddev: sqrt(1.25) ≈ 1.118033988749895
+        let base = 1e10;
+        let samples = vec![create_eval_samples(
+            vec![
+                (1000, base),
+                (2000, base + 1.0),
+                (3000, base + 2.0),
+                (4000, base + 3.0),
+            ],
+            HashMap::new(),
+        )];
+
+        // when
+        let result = func.apply(samples, 4000).unwrap();
+
+        // then
+        assert_eq!(result.len(), 1);
+        // Kahan summation should maintain reasonable precision
+        let expected_stddev = 1.118033988749895;
+        let rel_error = ((result[0].value - expected_stddev) / expected_stddev).abs();
+        assert!(
+            rel_error < 1e-6,
+            "stddev should be reasonably accurate for large magnitude with small variance: computed={}, expected={}, rel_error={}",
+            result[0].value,
+            expected_stddev,
+            rel_error
+        );
+    }
+
+    #[test]
+    fn should_propagate_nan_in_stddev() {
+        // given
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("stddev_over_time").unwrap();
+
+        let samples = vec![create_eval_samples(
+            vec![(1000, 10.0), (2000, f64::NAN), (3000, 30.0)],
+            HashMap::new(),
+        )];
+
+        // when
+        let result = func.apply(samples, 3000).unwrap();
+
+        // then
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].value.is_nan(),
+            "NaN should propagate through stddev calculation"
+        );
+    }
+
+    #[test]
+    fn should_propagate_nan_in_stdvar() {
+        // given
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("stdvar_over_time").unwrap();
+
+        let samples = vec![create_eval_samples(
+            vec![(1000, 10.0), (2000, f64::NAN), (3000, 30.0)],
+            HashMap::new(),
+        )];
+
+        // when
+        let result = func.apply(samples, 3000).unwrap();
+
+        // then
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].value.is_nan(),
+            "NaN should propagate through stdvar calculation"
+        );
     }
 
     #[test]
@@ -1107,6 +1517,126 @@ mod tests {
                 let expected_count = values.len() as f64;
 
                 assert_eq!(computed_count, expected_count, "count_over_time should return exact count");
+            }
+
+            /// Test that stddev_over_time computes correct standard deviation
+            #[test]
+            fn stddev_over_time_computes_correctly(
+                values in prop::collection::vec(finite_f64(), 2..100)
+            ) {
+                let registry = FunctionRegistry::new();
+                let func = registry.get_range_function("stddev_over_time").unwrap();
+
+                let eval_samples = vec![create_eval_samples(
+                    values.iter().enumerate().map(|(i, &v)| ((i as i64) * 1000, v)).collect(),
+                    HashMap::new(),
+                )];
+
+                let result = func.apply(eval_samples, 0).unwrap();
+                let computed_stddev = result[0].value;
+
+                // Independent two-pass algorithm (stable baseline)
+                let mean = values.iter().sum::<f64>() / values.len() as f64;
+                let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+                let expected_stddev = variance.sqrt();
+
+                // Skip if overflow occurred
+                if computed_stddev.is_infinite() || expected_stddev.is_infinite() {
+                    return Ok(());
+                }
+
+                // Allow small relative error due to numerical differences
+                let rel_error = ((computed_stddev - expected_stddev) / expected_stddev.max(1e-10)).abs();
+                prop_assert!(
+                    rel_error < 1e-10 || (computed_stddev - expected_stddev).abs() < 1e-10,
+                    "stddev_over_time error too large: computed={}, expected={}, rel_error={}",
+                    computed_stddev, expected_stddev, rel_error
+                );
+            }
+
+            /// Test that stdvar_over_time computes correct variance
+            #[test]
+            fn stdvar_over_time_computes_correctly(
+                values in prop::collection::vec(finite_f64(), 2..100)
+            ) {
+                let registry = FunctionRegistry::new();
+                let func = registry.get_range_function("stdvar_over_time").unwrap();
+
+                let eval_samples = vec![create_eval_samples(
+                    values.iter().enumerate().map(|(i, &v)| ((i as i64) * 1000, v)).collect(),
+                    HashMap::new(),
+                )];
+
+                let result = func.apply(eval_samples, 0).unwrap();
+                let computed_variance = result[0].value;
+
+                // Independent two-pass algorithm (stable baseline)
+                let mean = values.iter().sum::<f64>() / values.len() as f64;
+                let expected_variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+
+                // Skip if overflow occurred
+                if computed_variance.is_infinite() || expected_variance.is_infinite() {
+                    return Ok(());
+                }
+
+                // Allow small relative error due to numerical differences
+                let rel_error = ((computed_variance - expected_variance) / expected_variance.max(1e-10)).abs();
+                prop_assert!(
+                    rel_error < 1e-10 || (computed_variance - expected_variance).abs() < 1e-10,
+                    "stdvar_over_time error too large: computed={}, expected={}, rel_error={}",
+                    computed_variance, expected_variance, rel_error
+                );
+            }
+
+            /// Test stddev with extremely close values (catastrophic cancellation scenario)
+            /// Values are base ± small_delta where base >> small_delta
+            #[test]
+            fn stddev_handles_extremely_close_values(
+                base in 1e10_f64..1e14_f64,  // Limit base to avoid extreme precision loss
+                small_deltas in prop::collection::vec(-10.0_f64..10.0_f64, 3..20)  // At least 3 values
+            ) {
+                let registry = FunctionRegistry::new();
+                let func = registry.get_range_function("stddev_over_time").unwrap();
+
+                // Create values: base + delta for each delta
+                let values: Vec<f64> = small_deltas.iter().map(|&d| base + d).collect();
+
+                let samples = vec![create_eval_samples(
+                    values.iter().enumerate().map(|(i, &v)| ((i as i64) * 1000, v)).collect(),
+                    HashMap::new(),
+                )];
+
+                let result = func.apply(samples, 0).unwrap();
+                let computed_stddev = result[0].value;
+
+                // Compute expected stddev from the deltas (more numerically stable)
+                let delta_mean = small_deltas.iter().sum::<f64>() / small_deltas.len() as f64;
+                let delta_variance = small_deltas.iter().map(|d| (d - delta_mean).powi(2)).sum::<f64>() / small_deltas.len() as f64;
+                let expected_stddev = delta_variance.sqrt();
+
+                // Skip if overflow occurred or variance is too small
+                if computed_stddev.is_infinite() || expected_stddev.is_infinite() || expected_stddev < 1e-10 {
+                    return Ok(());
+                }
+
+                // For catastrophic cancellation scenarios, Welford's algorithm should maintain
+                // reasonable accuracy. We expect relative error < 1% for well-conditioned cases.
+                // The condition number is roughly base/stddev, so we scale tolerance accordingly.
+                let condition_number = base / expected_stddev.max(1.0);
+                let tolerance = if condition_number > 1e12 {
+                    0.1  // Very ill-conditioned: 10% tolerance
+                } else if condition_number > 1e10 {
+                    0.01  // Ill-conditioned: 1% tolerance
+                } else {
+                    0.001  // Well-conditioned: 0.1% tolerance
+                };
+
+                let rel_error = ((computed_stddev - expected_stddev) / expected_stddev).abs();
+                prop_assert!(
+                    rel_error < tolerance,
+                    "stddev_over_time failed for extremely close values: base={}, computed={}, expected={}, rel_error={}, tolerance={}, condition_number={}",
+                    base, computed_stddev, expected_stddev, rel_error, tolerance, condition_number
+                );
             }
         }
     }

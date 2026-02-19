@@ -297,3 +297,23 @@ eval instant at 1111111s mad_over_time({__name__="up"}[1h:1m] @ 1111111)
 resume
 
 clear
+
+# ============================================================================
+# Custom tests for stddev_over_time and stdvar_over_time
+# Added to verify Welford's algorithm implementation with Kahan summation
+# ============================================================================
+load 5m
+  test_metric{job="a"} 10 20 30 40 50
+  test_metric{job="b"} 100 100 100 100 100
+
+eval instant at 20m stddev_over_time(test_metric{job="a"}[20m])
+  {job="a"} 11.180339887498949
+
+eval instant at 20m stdvar_over_time(test_metric{job="a"}[20m])
+  {job="a"} 125
+
+eval instant at 20m stddev_over_time(test_metric{job="b"}[20m])
+  {job="b"} 0
+
+eval instant at 20m stdvar_over_time(test_metric{job="b"}[20m])
+  {job="b"} 0

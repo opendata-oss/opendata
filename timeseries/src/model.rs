@@ -19,6 +19,37 @@ pub(crate) type BucketSize = u8;
 // Re-export common RecordTag for internal use
 pub(crate) use common::serde::key_prefix::RecordTag;
 
+// Copyright The Prometheus Authors
+// Licensed under the Apache License, Version 2.0
+// See: https://github.com/prometheus/prometheus/blob/main/model/value/value.go
+
+/// NormalNaN is a quiet NaN (same as f64::NAN)
+pub const NORMAL_NAN: u64 = 0x7ff8000000000001;
+
+/// StaleNaN is a signaling NaN used as a staleness marker in Prometheus.
+///
+/// This value indicates that a time series is no longer being scraped or updated.
+/// It's a signaling NaN (MSB of mantissa is 0) chosen with leading zeros to allow
+/// for future extensions. The value 2 (rather than 1) makes it easier to distinguish
+/// from NormalNaN during debugging.
+pub const STALE_NAN: u64 = 0x7ff0000000000002;
+
+/// Check if a float value is the special StaleNaN marker.
+///
+/// # Example
+///
+/// ```
+/// use timeseries::{is_stale_nan, STALE_NAN};
+///
+/// let stale = f64::from_bits(STALE_NAN);
+/// assert!(is_stale_nan(stale));
+/// assert!(!is_stale_nan(f64::NAN));
+/// assert!(!is_stale_nan(42.0));
+/// ```
+pub fn is_stale_nan(v: f64) -> bool {
+    v.to_bits() == STALE_NAN
+}
+
 /// A label is a key-value pair that identifies a time series.
 ///
 /// # Naming
@@ -91,6 +122,14 @@ impl PartialOrd for Label {
 /// Samples represent individual measurements at specific points in time.
 /// The timestamp is in milliseconds since the Unix epoch, and the value
 /// is a 64-bit floating point number.
+///
+/// ## Special Values
+///
+/// Prometheus uses special NaN values for signaling:
+/// - [`STALE_NAN`]: Marks a series as stale (no longer being scraped)
+/// - Regular NaN: Represents missing or invalid data
+///
+/// Use [`is_stale_nan`] to check if a value is the staleness marker.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sample {
     /// Timestamp in milliseconds since Unix epoch.
