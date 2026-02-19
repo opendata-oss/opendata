@@ -19,6 +19,7 @@ use crate::index::InvertedIndexLookup;
 use crate::model::Label;
 use crate::model::SeriesId;
 use crate::model::TimeBucket;
+use crate::promql::response::MetricMetadata;
 use crate::query::QueryReader;
 use crate::tsdb::Tsdb;
 use async_trait::async_trait;
@@ -713,8 +714,35 @@ impl PromqlRouter for Tsdb {
         }
     }
 
-    async fn metadata(&self, _request: MetadataRequest) -> MetadataResponse {
-        todo!()
+    async fn metadata(&self, request: MetadataRequest) -> MetadataResponse {
+        let catalog = self.metadata_catalog.read().await;
+        let mut data: HashMap<String, Vec<MetricMetadata>> =
+            if let Some(ref metric) = request.metric {
+                // Filter for specific metric
+                catalog
+                    .get(metric)
+                    .map(|entries| [(metric.clone(), entries.clone())].into_iter().collect())
+                    .unwrap_or_default()
+            } else {
+                catalog.clone()
+            };
+
+        if let Some(limit) = request.limit {
+            data = data.into_iter().take(limit).collect();
+        }
+
+        if let Some(limit_per_metric) = request.limit_per_metric {
+            for entries in data.values_mut() {
+                entries.truncate(limit_per_metric);
+            }
+        }
+
+        MetadataResponse {
+            status: ("success".to_string()),
+            data: Some(data),
+            error: None,
+            error_type: None,
+        }
     }
 
     async fn federate(&self, _request: FederateRequest) -> FederateResponse {

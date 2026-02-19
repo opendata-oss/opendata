@@ -60,6 +60,7 @@ pub struct LabelValuesRequest {
 pub struct MetadataRequest {
     pub metric: Option<String>,
     pub limit: Option<usize>,
+    pub limit_per_metric: Option<usize>,
 }
 
 /// Request for federation (/federate)
@@ -216,6 +217,7 @@ impl LabelValuesParams {
 pub struct MetadataParams {
     pub metric: Option<String>,
     pub limit: Option<usize>,
+    pub limit_per_metric: Option<usize>,
 }
 
 impl From<MetadataParams> for MetadataRequest {
@@ -223,6 +225,7 @@ impl From<MetadataParams> for MetadataRequest {
         MetadataRequest {
             metric: params.metric,
             limit: params.limit,
+            limit_per_metric: params.limit_per_metric,
         }
     }
 }

@@ -5,11 +5,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use common::Storage;
 use moka::future::Cache;
+use tokio::sync::RwLock;
 use tracing::error;
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::minitsdb::{MiniQueryReader, MiniTsdb};
 use crate::model::{Label, Sample, Series, SeriesId, TimeBucket};
+use crate::promql::response::MetricMetadata;
 use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::util::Result;
@@ -30,6 +32,9 @@ pub(crate) struct Tsdb {
     /// LRU cache (50 max) for read-only query buckets.
     /// Only populated for buckets NOT in ingest_cache.
     query_cache: Cache<TimeBucket, Arc<MiniTsdb>>,
+
+    // Metadata catalog
+    pub(crate) metadata_catalog: RwLock<HashMap<String, Vec<MetricMetadata>>>,
 }
 
 impl Tsdb {
@@ -46,6 +51,7 @@ impl Tsdb {
             storage,
             ingest_cache,
             query_cache,
+            metadata_catalog: RwLock::new(HashMap::new()),
         }
     }
 
@@ -139,6 +145,27 @@ impl Tsdb {
         for series in series_list {
             let series_sample_count = series.samples.len();
             total_samples += series_sample_count;
+
+            if let Some(metric_name) = series
+                .labels
+                .iter()
+                .find(|l| l.name == "__name__")
+                .map(|l| l.value.clone())
+            {
+                let entry = MetricMetadata {
+                    metric_type: series
+                        .metric_type
+                        .map(|t| t.as_str().to_string())
+                        .unwrap_or_default(),
+                    help: String::new(),
+                    unit: series.unit.clone().unwrap_or_default(),
+                };
+                let mut catalog = self.metadata_catalog.write().await;
+                let entries = catalog.entry(metric_name).or_default();
+                if !entries.contains(&entry) {
+                    entries.push(entry);
+                }
+            }
 
             // Group samples by bucket for this series
             let mut bucket_samples: HashMap<TimeBucket, Vec<Sample>> = HashMap::new();

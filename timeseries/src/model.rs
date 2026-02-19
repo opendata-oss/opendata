@@ -159,6 +159,23 @@ pub enum MetricType {
     Summary,
 }
 
+impl MetricType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            MetricType::Gauge => "gauge",
+            MetricType::Sum {
+                monotonic: true, ..
+            } => "counter",
+            MetricType::Sum {
+                monotonic: false, ..
+            } => "gauge",
+            MetricType::Histogram { .. } => "histogram",
+            MetricType::ExponentialHistogram { .. } => "histogram",
+            MetricType::Summary => "summary",
+        }
+    }
+}
+
 /// A time series with its identifying labels and data points.
 ///
 /// A series represents a single stream of timestamped values.

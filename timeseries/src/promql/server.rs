@@ -26,6 +26,8 @@ use super::response::{
 use super::router::PromqlRouter;
 use super::scraper::Scraper;
 use crate::error::Error;
+use crate::promql::request::{MetadataParams, MetadataRequest};
+use crate::promql::response::MetadataResponse;
 use crate::tsdb::Tsdb;
 
 #[derive(Embed)]
@@ -72,6 +74,7 @@ pub(crate) fn build_router(tsdb: Arc<Tsdb>, metrics: Arc<Metrics>) -> Router {
         .route("/api/v1/series", get(handle_series).post(handle_series))
         .route("/api/v1/labels", get(handle_labels))
         .route("/api/v1/label/{name}/values", get(handle_label_values))
+        .route("/api/v1/metadata", get(handle_metadata))
         .route("/metrics", get(handle_metrics))
         .route("/-/healthy", get(handle_healthy))
         .route("/-/ready", get(handle_ready));
@@ -303,6 +306,15 @@ async fn handle_label_values(
 ) -> Result<Json<LabelValuesResponse>, ApiError> {
     let request = params.into_request(name)?;
     Ok(Json(state.tsdb.label_values(request).await))
+}
+
+/// Handle /api/v1/metadata
+async fn handle_metadata(
+    State(state): State<AppState>,
+    Query(params): Query<MetadataParams>,
+) -> Result<Json<MetadataResponse>, ApiError> {
+    let request: MetadataRequest = params.into();
+    Ok(Json(state.tsdb.metadata(request).await))
 }
 
 /// Handle /metrics endpoint - returns Prometheus text format
