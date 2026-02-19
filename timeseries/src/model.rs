@@ -19,10 +19,6 @@ pub(crate) type BucketSize = u8;
 // Re-export common RecordTag for internal use
 pub(crate) use common::serde::key_prefix::RecordTag;
 
-// Copyright The Prometheus Authors
-// Licensed under the Apache License, Version 2.0
-// See: https://github.com/prometheus/prometheus/blob/main/model/value/value.go
-
 /// NormalNaN is a quiet NaN (same as f64::NAN)
 pub const NORMAL_NAN: u64 = 0x7ff8000000000001;
 

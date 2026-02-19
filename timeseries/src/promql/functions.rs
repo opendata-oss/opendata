@@ -594,10 +594,6 @@ mod tests {
             .collect()
     }
 
-    // Copyright The Prometheus Authors
-    // Licensed under the Apache License, Version 2.0
-    // See: https://github.com/prometheus/prometheus/blob/main/util/almost/almost.go
-
     /// Relative error allowed for sample values (matches Prometheus defaultEpsilon)
     const DEFAULT_EPSILON: f64 = 0.000001;
 
