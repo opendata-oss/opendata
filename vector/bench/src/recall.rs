@@ -113,6 +113,14 @@ fn recall_at_k(results: &[SearchResult], ground_truth: &[i32], k: usize) -> f64 
     found as f64 / k as f64
 }
 
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = (p / 100.0 * (sorted.len() - 1) as f64).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
 /// Dataset descriptor.
 struct Dataset {
     name: &'static str,
@@ -294,22 +302,33 @@ impl Benchmark for RecallBenchmark {
 
         let query_start = std::time::Instant::now();
         let mut total_recall = 0.0;
+        let mut latencies_us = Vec::with_capacity(queries.len());
         for (i, query) in queries.iter().enumerate() {
             let t = std::time::Instant::now();
             let results = db.search_with_nprobe(query, k, nprobe).await?;
-            query_latency.record(t.elapsed().as_secs_f64() * 1_000_000.0);
+            let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
+            query_latency.record(elapsed_us);
+            latencies_us.push(elapsed_us);
             total_recall += recall_at_k(&results, &ground_truth[i], k);
         }
         let query_secs = query_start.elapsed().as_secs_f64();
         let avg_recall = total_recall / queries.len() as f64;
         let qps = queries.len() as f64 / query_secs;
 
+        latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p50 = percentile(&latencies_us, 50.0);
+        let p90 = percentile(&latencies_us, 90.0);
+        let p99 = percentile(&latencies_us, 99.0);
+
         println!(
-            "  recall@{} = {:.4}, QPS = {:.1}, avg latency = {:.2} ms",
+            "  recall@{} = {:.4}, QPS = {:.1}, avg = {:.2} ms, p50 = {:.2} ms, p90 = {:.2} ms, p99 = {:.2} ms",
             k,
             avg_recall,
             qps,
             (query_secs / queries.len() as f64) * 1000.0,
+            p50 / 1000.0,
+            p90 / 1000.0,
+            p99 / 1000.0,
         );
 
         let mut summary = Summary::new()
@@ -317,7 +336,10 @@ impl Benchmark for RecallBenchmark {
             .add("k", k as f64)
             .add("qps", qps)
             .add("num_queries", queries.len() as f64)
-            .add("num_centroids", db.num_centroids() as f64);
+            .add("num_centroids", db.num_centroids() as f64)
+            .add("p50_latency_us", p50)
+            .add("p90_latency_us", p90)
+            .add("p99_latency_us", p99);
         if let Some(secs) = ingest_secs {
             summary = summary
                 .add("num_vectors", num_vectors as f64)
