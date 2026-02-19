@@ -87,7 +87,7 @@ impl Batch {
 
 struct BatchWriter {
     object_store: Arc<dyn ObjectStore>,
-    producer: QueueProducer,
+    producer: Arc<QueueProducer>,
     path_prefix: String,
     batch_interval: Duration,
     batch_max_bytes: usize,
@@ -193,6 +193,7 @@ pub struct Ingestor {
     tx: mpsc::UnboundedSender<IngestMessage>,
     cancellation_token: CancellationToken,
     handle: tokio::task::JoinHandle<()>,
+    producer: Arc<QueueProducer>,
 }
 
 impl Ingestor {
@@ -210,10 +211,11 @@ impl Ingestor {
     ) -> Result<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         let shutdown = CancellationToken::new();
+        let producer = Arc::new(producer);
 
         let mut writer = BatchWriter {
             object_store,
-            producer,
+            producer: Arc::clone(&producer),
             path_prefix: config.path_prefix,
             batch_interval: Duration::from_millis(config.batch_interval_ms),
             batch_max_bytes: config.batch_max_bytes,
@@ -223,7 +225,7 @@ impl Ingestor {
         let cancellation_token = shutdown.clone();
         let handle = tokio::spawn(async move { writer.run(rx, shutdown).await });
 
-        Ok(Self { tx, cancellation_token, handle })
+        Ok(Self { tx, cancellation_token, handle, producer })
     }
 
     pub fn ingest(&self, entries: Vec<KeyValueEntry>) -> Result<WriteWatcher> {
@@ -245,6 +247,10 @@ impl Ingestor {
         done_rx
             .await
             .map_err(|_| Error::Storage("ingestor shut down".to_string()))?
+    }
+
+    pub fn conflict_rate(&self) -> f64 {
+        self.producer.conflict_rate()
     }
 
     pub async fn close(self) -> Result<()> {
