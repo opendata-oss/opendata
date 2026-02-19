@@ -38,6 +38,11 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::debug;
 
+struct ScoredCandidate {
+    internal_id: u64,
+    distance: distance::VectorDistance,
+}
+
 pub(crate) const WRITE_CHANNEL: &str = "write";
 pub(crate) const REBALANCE_CHANNEL: &str = "rebalance";
 
@@ -635,14 +640,13 @@ impl VectorDb {
         }
 
         let snapshot = self.write_coordinator.view().snapshot.clone();
-        let candidates = self
-            .load_candidates(&centroid_ids, snapshot.as_ref())
+        let scored = self
+            .load_and_score(&centroid_ids, query, snapshot.clone())
             .await?;
-        if candidates.is_empty() {
+        if scored.is_empty() {
             return Ok(Vec::new());
         }
-        self.score_and_rank(query, &candidates, k, snapshot.as_ref())
-            .await
+        self.resolve_top_k(&scored, k, snapshot.as_ref()).await
     }
 
     pub async fn search_with_nprobe(
@@ -673,87 +677,75 @@ impl VectorDb {
             return Ok(Vec::new());
         }
 
-        // 3. Load posting lists from flushed snapshot
+        // 3. Load posting lists and score candidates
         let snapshot = self.write_coordinator.view().snapshot.clone();
-        let candidates = self
-            .load_candidates(&centroid_ids, snapshot.as_ref())
+        let scored = self
+            .load_and_score(&centroid_ids, query, snapshot.clone())
             .await?;
 
-        if candidates.is_empty() {
+        if scored.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 4. Score candidates and return top-k
-        let results = self
-            .score_and_rank(query, &candidates, k, snapshot.as_ref())
-            .await?;
-
-        Ok(results)
+        // 4. Resolve top-k forward index lookups
+        self.resolve_top_k(&scored, k, snapshot.as_ref()).await
     }
 
-    /// Load candidate vector IDs and their vectors from posting lists.
-    async fn load_candidates(
+    /// Spawn a task per centroid to load its posting list and score all candidates
+    /// against the query vector. Returns scored candidates sorted by distance.
+    async fn load_and_score(
         &self,
         centroid_ids: &[u64],
-        snapshot: &dyn StorageRead,
-    ) -> Result<Vec<(u64, Vec<f32>)>> {
+        query: &[f32],
+        snapshot: Arc<dyn StorageSnapshot>,
+    ) -> Result<Vec<ScoredCandidate>> {
         let dimensions = self.config.dimensions as usize;
+        let metric = self.config.distance_metric;
+        let query_vec: Vec<f32> = query.to_vec();
 
-        let futures: Vec<_> = centroid_ids
-            .iter()
-            .map(|&cid| snapshot.get_posting_list(cid, dimensions))
-            .collect();
-        let results = futures::future::join_all(futures).await;
-
-        let mut all_candidates = Vec::new();
-        for result in results {
-            let posting_list: PostingList = result?.into();
-            for posting in posting_list.iter() {
-                all_candidates.push((posting.id(), posting.vector().to_vec()));
-            }
+        let mut handles = Vec::with_capacity(centroid_ids.len());
+        for &cid in centroid_ids {
+            let snap = snapshot.clone();
+            let q = query_vec.clone();
+            handles.push(tokio::spawn(async move {
+                let posting_list: PostingList =
+                    snap.get_posting_list(cid, dimensions).await?.into();
+                let scored: Vec<ScoredCandidate> = posting_list
+                    .iter()
+                    .map(|posting| {
+                        let d = distance::compute_distance(&q, posting.vector(), metric);
+                        ScoredCandidate {
+                            internal_id: posting.id(),
+                            distance: d,
+                        }
+                    })
+                    .collect();
+                Ok::<_, anyhow::Error>(scored)
+            }));
         }
 
-        Ok(all_candidates)
+        let results = futures::future::join_all(handles).await;
+        let mut all_scored = Vec::new();
+        for result in results {
+            let scored = result??;
+            all_scored.extend(scored);
+        }
+        all_scored.sort_by(|a, b| a.distance.cmp(&b.distance));
+        Ok(all_scored)
     }
 
-    /// Score candidates and return top-k results.
-    ///
-    /// TODO: Use a min/max heap to maintain only top-k results in memory instead of
-    /// materializing all candidates. This would reduce memory usage for large candidate sets.
-    ///
-    /// TODO: Consider pipelining this operation so we load and score candidates in batches,
-    /// keeping only the current top-k in memory. This would enable processing arbitrarily
-    /// large candidate sets without loading them all at once.
-    async fn score_and_rank(
+    /// Resolve top-k scored candidates by loading forward index data.
+    /// Loads up to k forward index entries concurrently per batch.
+    async fn resolve_top_k(
         &self,
-        query: &[f32],
-        candidates: &[(u64, Vec<f32>)],
+        scored: &[ScoredCandidate],
         k: usize,
         snapshot: &dyn StorageRead,
     ) -> Result<Vec<SearchResult>> {
-        struct ScoredResult {
-            internal_id: u64,
-            distance: distance::VectorDistance,
-        }
-
-        let mut scored_results = Vec::new();
         let dimensions = self.config.dimensions as usize;
-
-        // Load and score each candidate
-        for (internal_id, vector) in candidates {
-            // Compute distance/similarity score using vector from posting list
-            let distance = distance::compute_distance(query, vector, self.config.distance_metric);
-            scored_results.push(ScoredResult {
-                internal_id: *internal_id,
-                distance,
-            });
-        }
-
-        // Sort by distance (most similar first)
-        scored_results.sort_by(|a, b| a.distance.cmp(&b.distance));
-
         let mut results = Vec::with_capacity(k);
-        for chunk in scored_results.chunks(k) {
+
+        for chunk in scored.chunks(k) {
             let futures: Vec<_> = chunk
                 .iter()
                 .map(|sr| snapshot.get_vector_data(sr.internal_id, dimensions))
