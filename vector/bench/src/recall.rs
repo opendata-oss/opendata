@@ -298,6 +298,13 @@ impl Benchmark for RecallBenchmark {
         println!("  Num centroids: {}", db.num_centroids());
 
         // -- Query & measure recall -------------------------------------------
+        println!("start warmup");
+        for (_, query) in queries.iter().enumerate() {
+            let t = std::time::Instant::now();
+            let _ = db.search_with_nprobe(query, k, nprobe).await?;
+        }
+        println!("end warmup");
+
         let query_latency = bench.histogram("query_latency_us");
 
         let query_start = std::time::Instant::now();
