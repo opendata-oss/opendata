@@ -33,7 +33,8 @@ use common::storage::factory::create_storage;
 use common::storage::{Storage, StorageRead, StorageSnapshot};
 use common::{StorageRuntime, StorageSemantics};
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::debug;
@@ -41,6 +42,29 @@ use tracing::debug;
 struct ScoredCandidate {
     internal_id: u64,
     distance: distance::VectorDistance,
+}
+
+/// Entry for k-way merge of sorted scored candidate lists.
+struct MergeEntry(ScoredCandidate, std::vec::IntoIter<ScoredCandidate>);
+
+impl PartialEq for MergeEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.distance == other.0.distance
+    }
+}
+
+impl Eq for MergeEntry {}
+
+impl PartialOrd for MergeEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MergeEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.distance.cmp(&other.0.distance)
+    }
 }
 
 pub(crate) const WRITE_CHANNEL: &str = "write";
@@ -713,7 +737,7 @@ impl VectorDb {
             handles.push(tokio::spawn(async move {
                 let posting_list: PostingList =
                     snap.get_posting_list(cid, dimensions).await?.into();
-                let scored: Vec<ScoredCandidate> = posting_list
+                let mut scored: Vec<ScoredCandidate> = posting_list
                     .iter()
                     .map(|posting| {
                         let d = distance::compute_distance(&q, posting.vector(), metric);
@@ -723,17 +747,39 @@ impl VectorDb {
                         }
                     })
                     .collect();
+                scored.sort_unstable_by(|a, b| a.distance.cmp(&b.distance));
                 Ok::<_, anyhow::Error>(scored)
             }));
         }
 
         let results = futures::future::join_all(handles).await;
-        let mut all_scored = Vec::new();
+        let mut sorted_lists: Vec<Vec<ScoredCandidate>> = Vec::with_capacity(results.len());
         for result in results {
             let scored = result??;
-            all_scored.extend(scored);
+            if !scored.is_empty() {
+                sorted_lists.push(scored);
+            }
         }
-        all_scored.sort_by(|a, b| a.distance.cmp(&b.distance));
+
+        let mut heap = BinaryHeap::new();
+        for list in sorted_lists {
+            let mut iter = list.into_iter();
+            if let Some(first) = iter.next() {
+                heap.push(Reverse(MergeEntry(first, iter)));
+            }
+        }
+
+        let mut all_scored = Vec::new();
+        let mut seen = HashSet::new();
+        while let Some(Reverse(MergeEntry(candidate, mut iter))) = heap.pop() {
+            if let Some(next) = iter.next() {
+                heap.push(Reverse(MergeEntry(next, iter)));
+            }
+            if seen.insert(candidate.internal_id) {
+                all_scored.push(candidate);
+            }
+        }
+
         Ok(all_scored)
     }
 
