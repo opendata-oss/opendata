@@ -232,6 +232,17 @@ pub struct Config {
     /// amplification.
     pub max_cluster_replication: usize,
 
+    /// Query-aware dynamic pruning epsilon (ε₂ from SPANN paper).
+    ///
+    /// When set, a posting list is searched only if its centroid's distance
+    /// to the query satisfies `dist(q, c) <= (1 + epsilon) * dist(q, closest)`.
+    /// This reduces query latency by skipping distant posting lists while
+    /// preserving recall.
+    ///
+    /// Typical values: 0.1 to 0.5. `None` disables pruning (all nprobe
+    /// posting lists are searched).
+    pub query_pruning_epsilon: Option<f32>,
+
     /// Metadata field schema.
     ///
     /// Defines the expected attribute names and types. Writes with unknown
@@ -255,6 +266,7 @@ impl Default for Config {
             max_rebalance_tasks: 8,
             chunk_target: 4096,
             max_cluster_replication: 1,
+            query_pruning_epsilon: None,
             metadata_fields: Vec::new(),
         }
     }
