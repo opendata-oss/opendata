@@ -643,6 +643,9 @@ impl VectorDb {
             return Ok(Vec::new());
         }
 
+        // Dynamic pruning: skip posting lists whose centroids are far from query
+        let centroid_ids = self.prune_centroids(&centroid_ids, query);
+
         let snapshot = self.write_coordinator.view().snapshot.clone();
         let sorted_lists = self
             .load_and_score(&centroid_ids, query, snapshot.clone())
@@ -681,7 +684,11 @@ impl VectorDb {
             return Ok(Vec::new());
         }
 
-        // 3. Load posting lists and score candidates
+        // 3. Dynamic pruning: skip posting lists whose centroids are far from query
+        let centroid_ids = self.prune_centroids(&centroid_ids, query);
+        debug!("after dynamic pruning: {} centroids", centroid_ids.len());
+
+        // 4. Load posting lists and score candidates
         let snapshot = self.write_coordinator.view().snapshot.clone();
         let sorted_lists = self
             .load_and_score(&centroid_ids, query, snapshot.clone())
@@ -693,6 +700,53 @@ impl VectorDb {
 
         // 5. K-way merge and resolve top-k forward index lookups
         self.resolve_top_k(sorted_lists, k, snapshot.as_ref()).await
+    }
+
+    /// Apply query-aware dynamic pruning
+    /// (SPANN §3.2: https://arxiv.org/pdf/2111.08566).
+    ///
+    /// Given candidate centroid IDs (already sorted closest-first), computes
+    /// the raw distance from the query to each centroid and keeps only those
+    /// satisfying `dist(q, c) <= (1 + epsilon) * dist(q, closest)`.
+    ///
+    /// Returns the pruned centroid IDs. If pruning is disabled (`None`), returns
+    /// the input unchanged.
+    fn prune_centroids(&self, centroid_ids: &[u64], query: &[f32]) -> Vec<u64> {
+        let epsilon = match self.config.query_pruning_factor {
+            Some(e) => e,
+            None => return centroid_ids.to_vec(),
+        };
+
+        let metric = self.config.distance_metric;
+
+        // Compute raw distance (lower = closer) from query to each centroid.
+        let mut scored: Vec<(u64, f32)> = centroid_ids
+            .iter()
+            .filter_map(|&cid| {
+                let cv = self.centroid_graph.get_centroid_vector(cid)?;
+                let d = distance::raw_distance(query, &cv, metric);
+                Some((cid, d))
+            })
+            .collect();
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        if scored.is_empty() {
+            return Vec::new();
+        }
+
+        let closest_dist = scored[0].1;
+        // Skip pruning when closest distance is non-positive (can happen with
+        // DotProduct metric) since the multiplicative threshold is meaningless.
+        if closest_dist < 0.0 {
+            return scored.into_iter().map(|(id, _)| id).collect();
+        }
+
+        let threshold = (1.0 + epsilon) * closest_dist;
+        scored
+            .into_iter()
+            .take_while(|&(_, d)| d <= threshold)
+            .map(|(id, _)| id)
+            .collect()
     }
 
     /// Spawn a task per centroid to load its posting list and score all candidates
@@ -1296,6 +1350,99 @@ mod tests {
         // then - should be able to search (dictionary and centroids loaded from storage)
         let results = db2.search(&[1.0, 0.0, 0.0], 10).await.unwrap();
         assert!(!results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_prune_centroids_beyond_epsilon_threshold() {
+        // given - 4 centroids at known L2 distances from query [0,0,0]:
+        //   c0 = [1,0,0]  -> dist = 1.0
+        //   c1 = [1.4,0,0] -> dist = 1.4
+        //   c2 = [2,0,0]  -> dist = 2.0
+        //   c3 = [5,0,0]  -> dist = 5.0
+        // epsilon = 0.5 => threshold = 1.5 * 1.0 = 1.5
+        // Expected: c0 (1.0) and c1 (1.4) survive; c2 (2.0) and c3 (5.0) pruned.
+        let config = Config {
+            storage: StorageConfig::InMemory,
+            dimensions: 3,
+            distance_metric: DistanceMetric::L2,
+            query_pruning_factor: Some(0.5),
+            ..Default::default()
+        };
+        let centroids = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![1.4, 0.0, 0.0],
+            vec![2.0, 0.0, 0.0],
+            vec![5.0, 0.0, 0.0],
+        ];
+        let db = VectorDb::open_with_centroids(config, centroids, StorageRuntime::new())
+            .await
+            .unwrap();
+
+        let query = [0.0, 0.0, 0.0];
+        let all_ids: Vec<u64> = (0..4).collect();
+
+        // when
+        let pruned = db.prune_centroids(&all_ids, &query);
+
+        // then
+        assert_eq!(pruned.len(), 2);
+        assert_eq!(pruned[0], 0); // closest
+        assert_eq!(pruned[1], 1); // within threshold
+    }
+
+    #[tokio::test]
+    async fn should_skip_pruning_when_epsilon_is_none() {
+        // given - no pruning configured
+        let config = Config {
+            storage: StorageConfig::InMemory,
+            dimensions: 3,
+            distance_metric: DistanceMetric::L2,
+            query_pruning_factor: None,
+            ..Default::default()
+        };
+        let centroids = vec![vec![1.0, 0.0, 0.0], vec![100.0, 0.0, 0.0]];
+        let db = VectorDb::open_with_centroids(config, centroids, StorageRuntime::new())
+            .await
+            .unwrap();
+
+        let query = [0.0, 0.0, 0.0];
+        let all_ids: Vec<u64> = (0..2).collect();
+
+        // when
+        let result = db.prune_centroids(&all_ids, &query);
+
+        // then - all centroids returned regardless of distance
+        assert_eq!(result.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn should_prune_centroids_returns_sorted_by_distance() {
+        // given - pass centroid IDs in non-distance order
+        let config = Config {
+            storage: StorageConfig::InMemory,
+            dimensions: 3,
+            distance_metric: DistanceMetric::L2,
+            query_pruning_factor: Some(10.0), // large epsilon, keeps all
+            ..Default::default()
+        };
+        let centroids = vec![
+            vec![5.0, 0.0, 0.0], // c0: far
+            vec![1.0, 0.0, 0.0], // c1: close
+            vec![3.0, 0.0, 0.0], // c2: medium
+        ];
+        let db = VectorDb::open_with_centroids(config, centroids, StorageRuntime::new())
+            .await
+            .unwrap();
+
+        let query = [0.0, 0.0, 0.0];
+        // pass IDs in reverse distance order
+        let ids: Vec<u64> = vec![0, 2, 1];
+
+        // when
+        let result = db.prune_centroids(&ids, &query);
+
+        // then - sorted by ascending distance: c1 (1.0), c2 (3.0), c0 (5.0)
+        assert_eq!(result, vec![1, 2, 0]);
     }
 
     #[tokio::test]
