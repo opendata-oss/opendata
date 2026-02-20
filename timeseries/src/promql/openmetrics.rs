@@ -63,6 +63,7 @@ impl OpenMetricsType {
 struct MetricFamily {
     metric_type: OpenMetricsType,
     unit: Option<String>,
+    help: Option<String>,
 }
 
 /// Parser state
@@ -135,8 +136,14 @@ impl Parser {
                 let unit = parts[1];
                 self.families.entry(name.to_string()).or_default().unit = Some(unit.to_string());
             }
+        } else if let Some(rest) = line.strip_prefix("HELP ") {
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                let name = parts[0];
+                let help = parts[1];
+                self.families.entry(name.to_string()).or_default().help = Some(help.to_string())
+            }
         }
-        // Ignore HELP and other comments
 
         Ok(())
     }
@@ -196,7 +203,7 @@ impl Parser {
                 labels: series_labels,
                 unit: family.unit.clone(),
                 metric_type: Some(metric_type),
-                description: None,
+                description: family.help.clone(),
                 samples: vec![sample],
             });
 

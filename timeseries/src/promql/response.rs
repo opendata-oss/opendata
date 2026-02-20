@@ -128,7 +128,7 @@ pub struct MetadataResponse {
     pub error_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MetricMetadata {
     #[serde(rename = "type")]
     pub metric_type: String, // "gauge", "counter", "histogram", "summary"
