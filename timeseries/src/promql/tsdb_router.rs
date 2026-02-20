@@ -1997,7 +1997,7 @@ mod tests {
         .await
         .unwrap();
 
-        // when: query for a label that doesn't exist in any bucket
+        // when: query for all metric metadata
         let request = MetadataRequest {
             metric: None,
             limit: None,
@@ -2005,7 +2005,7 @@ mod tests {
         };
         let response = tsdb.metadata(request).await;
 
-        // then: should return empty result
+        // then: should return all metric metadata
         assert_eq!(response.status, "success");
         let data = response.data.unwrap();
         assert_eq!(data.len(), 2);
@@ -2030,7 +2030,7 @@ mod tests {
         .await
         .unwrap();
 
-        // when: query for a label that doesn't exist in any bucket
+        // when: query metadata filtered for cpu_usage
         let request = MetadataRequest {
             metric: Some("cpu_usage".to_string()),
             limit: None,
@@ -2064,7 +2064,7 @@ mod tests {
         .await
         .unwrap();
 
-        // when: query for a label that doesn't exist in any bucket
+        // when: query for metadata with limit=2
         let request = MetadataRequest {
             metric: None,
             limit: Some(2),
@@ -2117,7 +2117,7 @@ mod tests {
             .await
             .unwrap();
 
-        // when: query for a label that doesn't exist in any bucket
+        // when: query metadata using limit_per_metric=4
         let request = MetadataRequest {
             metric: None,
             limit: None,
