@@ -64,7 +64,7 @@ pub trait Delta: Sized + Send + Sync + 'static {
     fn estimate_size(&self) -> usize;
 
     fn poke(&self) {}
-    
+
     /// Freezes the current delta, creating an image with the delta
     /// applied.
     ///

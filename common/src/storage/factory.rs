@@ -5,15 +5,15 @@
 
 use std::sync::Arc;
 
+use super::config::{ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
+use super::in_memory::InMemoryStorage;
+use super::slate::{SlateDbStorage, SlateDbStorageReader};
+use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
 use slatedb::config::Settings;
 use slatedb::object_store::{self, ObjectStore};
 use slatedb::{DbBuilder, DbReader};
 use tokio::runtime::Handle;
 use tracing::info;
-use super::config::{ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
-use super::in_memory::InMemoryStorage;
-use super::slate::{SlateDbStorage, SlateDbStorageReader};
-use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
 
 /// Runtime options for storage that cannot be serialized.
 ///
@@ -258,7 +258,10 @@ async fn create_slatedb_storage(
         None => Settings::load().unwrap_or_default(),
     };
 
-    info!("create slatedb storage with config: {:?}, settings: {:?}", config, settings);
+    info!(
+        "create slatedb storage with config: {:?}, settings: {:?}",
+        config, settings
+    );
 
     // Build the database
     let mut db_builder = DbBuilder::new(config.path.clone(), object_store).with_settings(settings);

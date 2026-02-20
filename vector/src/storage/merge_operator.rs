@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use crate::serde::centroid_chunk::CentroidChunkValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
-use crate::serde::posting_list::merge_posting_list;
+use crate::serde::posting_list::{merge_batch_posting_list, merge_posting_list};
 use crate::serde::vector_indexed_metadata::{
     VectorIndexedMetadataMergeValue, VectorIndexedMetadataValue,
 };
@@ -73,6 +73,27 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
                 // For other record types (IdDictionary, VectorData, VectorMeta, etc.),
                 // just use new value. These should use Put, not Merge, but handle gracefully
                 new_value
+            }
+        }
+    }
+
+    fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
+        let prefix =
+            KeyPrefix::from_bytes_versioned(key, KEY_VERSION).expect("Failed to decode key prefix");
+        let record_type = RecordType::from_id(prefix.tag().record_type())
+            .expect("Failed to get record type from record tag");
+
+        match record_type {
+            RecordType::PostingList => {
+                merge_batch_posting_list(existing_value, operands, self.dimensions)
+            }
+            _ => {
+                // Default pairwise for all other record types
+                let mut result = existing_value;
+                for operand in operands {
+                    result = Some(self.merge(key, result, operand.clone()));
+                }
+                result.expect("merge_batch called with no existing value and no operands")
             }
         }
     }
@@ -551,6 +572,38 @@ mod tests {
         // then — empty Put replaces existing
         let decoded = VectorIndexedMetadataValue::decode_from_bytes(&merged).unwrap();
         assert_eq!(decoded.centroid_ids, Vec::<u64>::new());
+    }
+
+    #[test]
+    fn should_route_posting_list_to_batch_merge() {
+        // given - 2 operands with overlapping IDs
+        let operator = VectorDbMergeOperator::new(2);
+        let key = create_posting_list_key();
+
+        let op0 = PostingListValue::from_posting_updates(vec![
+            PostingUpdate::append(1, vec![1.0, 2.0]),
+            PostingUpdate::append(2, vec![3.0, 4.0]),
+        ])
+        .unwrap()
+        .encode_to_bytes();
+        let op1 = PostingListValue::from_posting_updates(vec![
+            PostingUpdate::append(2, vec![30.0, 40.0]),
+            PostingUpdate::append(3, vec![5.0, 6.0]),
+        ])
+        .unwrap()
+        .encode_to_bytes();
+
+        // when
+        let merged = operator.merge_batch(&key, None, &[op0, op1]);
+
+        // then
+        let decoded = PostingListValue::decode_from_bytes(&merged, 2).unwrap();
+        let entries: Vec<_> = decoded.iter().collect();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].id(), 1);
+        assert_eq!(entries[1].id(), 2);
+        assert_eq!(entries[1].vector().unwrap(), &[30.0, 40.0]); // newer wins
+        assert_eq!(entries[2].id(), 3);
     }
 
     #[test]
