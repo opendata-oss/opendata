@@ -56,6 +56,18 @@ impl SlateDbMergeOperator for SlateDbMergeOperatorAdapter {
     ) -> Result<Bytes, MergeOperatorError> {
         Ok(self.operator.merge(key, existing_value, value))
     }
+
+    fn merge_batch(
+        &self,
+        key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<Bytes, MergeOperatorError> {
+        if operands.is_empty() && existing_value.is_none() {
+            return Err(MergeOperatorError::EmptyBatch);
+        }
+        Ok(self.operator.merge_batch(key, existing_value, operands))
+    }
 }
 
 /// Returns the default scan options used for storage scans.

@@ -727,8 +727,7 @@ impl VectorDb {
         }
 
         // 5. K-way merge and resolve top-k forward index lookups
-        self.resolve_top_k(sorted_lists, k, snapshot.as_ref())
-            .await
+        self.resolve_top_k(sorted_lists, k, snapshot.as_ref()).await
     }
 
     /// Apply query-aware dynamic pruning (SPANN §3.2).

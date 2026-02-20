@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use crate::serde::centroid_chunk::CentroidChunkValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
-use crate::serde::posting_list::merge_posting_list;
+use crate::serde::posting_list::{merge_batch_posting_list, merge_posting_list};
 use crate::serde::{EncodingError, KEY_VERSION, RecordType};
 
 /// Merge operator for vector database that handles merging of different record types.
@@ -66,6 +66,27 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
                 // For other record types (IdDictionary, VectorData, VectorMeta, etc.),
                 // just use new value. These should use Put, not Merge, but handle gracefully
                 new_value
+            }
+        }
+    }
+
+    fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
+        let prefix =
+            KeyPrefix::from_bytes_versioned(key, KEY_VERSION).expect("Failed to decode key prefix");
+        let record_type = RecordType::from_id(prefix.tag().record_type())
+            .expect("Failed to get record type from record tag");
+
+        match record_type {
+            RecordType::PostingList => {
+                merge_batch_posting_list(existing_value, operands, self.dimensions)
+            }
+            _ => {
+                // Default pairwise for all other record types
+                let mut result = existing_value;
+                for operand in operands {
+                    result = Some(self.merge(key, result, operand.clone()));
+                }
+                result.expect("merge_batch called with no existing value and no operands")
             }
         }
     }
