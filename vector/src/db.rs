@@ -667,13 +667,13 @@ impl VectorDb {
         let centroid_ids = self.prune_centroids(&centroid_ids, query);
 
         let snapshot = self.write_coordinator.view().snapshot.clone();
-        let scored = self
+        let sorted_lists = self
             .load_and_score(&centroid_ids, query, snapshot.clone())
             .await?;
-        if scored.is_empty() {
+        if sorted_lists.is_empty() {
             return Ok(Vec::new());
         }
-        self.resolve_top_k(&scored, k, snapshot.as_ref()).await
+        self.resolve_top_k(sorted_lists, k, snapshot.as_ref()).await
     }
 
     pub async fn search_with_nprobe(
@@ -710,16 +710,17 @@ impl VectorDb {
 
         // 4. Load posting lists and score candidates
         let snapshot = self.write_coordinator.view().snapshot.clone();
-        let scored = self
+        let sorted_lists = self
             .load_and_score(&centroid_ids, query, snapshot.clone())
             .await?;
 
-        if scored.is_empty() {
+        if sorted_lists.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 4. Resolve top-k forward index lookups
-        self.resolve_top_k(&scored, k, snapshot.as_ref()).await
+        // 5. K-way merge and resolve top-k forward index lookups
+        self.resolve_top_k(sorted_lists, k, snapshot.as_ref())
+            .await
     }
 
     /// Apply query-aware dynamic pruning (SPANN §3.2).
@@ -769,13 +770,13 @@ impl VectorDb {
     }
 
     /// Spawn a task per centroid to load its posting list and score all candidates
-    /// against the query vector. Returns scored candidates sorted by distance.
+    /// against the query vector. Returns per-centroid sorted candidate lists.
     async fn load_and_score(
         &self,
         centroid_ids: &[u64],
         query: &[f32],
         snapshot: Arc<dyn StorageSnapshot>,
-    ) -> Result<Vec<ScoredCandidate>> {
+    ) -> Result<Vec<Vec<ScoredCandidate>>> {
         let dimensions = self.config.dimensions as usize;
         let metric = self.config.distance_metric;
         let query_vec: Vec<f32> = query.to_vec();
@@ -811,6 +812,21 @@ impl VectorDb {
             }
         }
 
+        Ok(sorted_lists)
+    }
+
+    /// K-way merge the per-centroid sorted lists and resolve top-k forward
+    /// index lookups. Only merges as far into the lists as needed to produce
+    /// k results, deduplicating by `internal_id` along the way.
+    async fn resolve_top_k(
+        &self,
+        sorted_lists: Vec<Vec<ScoredCandidate>>,
+        k: usize,
+        snapshot: &dyn StorageRead,
+    ) -> Result<Vec<SearchResult>> {
+        let dimensions = self.config.dimensions as usize;
+
+        // Seed the min-heap with the first element of each sorted list.
         let mut heap = BinaryHeap::new();
         for list in sorted_lists {
             let mut iter = list.into_iter();
@@ -819,39 +835,38 @@ impl VectorDb {
             }
         }
 
-        let mut all_scored = Vec::new();
-        let mut seen = HashSet::new();
-        while let Some(Reverse(MergeEntry(candidate, mut iter))) = heap.pop() {
-            if let Some(next) = iter.next() {
-                heap.push(Reverse(MergeEntry(next, iter)));
-            }
-            if seen.insert(candidate.internal_id) {
-                all_scored.push(candidate);
-            }
-        }
-
-        Ok(all_scored)
-    }
-
-    /// Resolve top-k scored candidates by loading forward index data.
-    /// Loads up to k forward index entries concurrently per batch.
-    async fn resolve_top_k(
-        &self,
-        scored: &[ScoredCandidate],
-        k: usize,
-        snapshot: &dyn StorageRead,
-    ) -> Result<Vec<SearchResult>> {
-        let dimensions = self.config.dimensions as usize;
         let mut results = Vec::with_capacity(k);
+        let mut seen = HashSet::new();
 
-        for chunk in scored.chunks(k) {
-            let futures: Vec<_> = chunk
+        // Pop candidates from the heap in score order, batch-resolve k at a
+        // time, and stop as soon as we have k results.
+        loop {
+            // Drain up to k unique candidates from the merge heap.
+            let mut batch = Vec::with_capacity(k - results.len());
+            while batch.len() < k - results.len() {
+                let Some(Reverse(MergeEntry(candidate, mut iter))) = heap.pop() else {
+                    break;
+                };
+                if let Some(next) = iter.next() {
+                    heap.push(Reverse(MergeEntry(next, iter)));
+                }
+                if seen.insert(candidate.internal_id) {
+                    batch.push(candidate);
+                }
+            }
+
+            if batch.is_empty() {
+                break;
+            }
+
+            // Resolve forward index lookups for the batch concurrently.
+            let futures: Vec<_> = batch
                 .iter()
                 .map(|sr| snapshot.get_vector_data(sr.internal_id, dimensions))
                 .collect();
             let loaded = futures::future::join_all(futures).await;
 
-            for (sr, vector_data) in chunk.iter().zip(loaded) {
+            for (sr, vector_data) in batch.iter().zip(loaded) {
                 let Some(vector_data) = vector_data? else {
                     continue;
                 };
