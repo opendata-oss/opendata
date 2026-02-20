@@ -79,15 +79,23 @@ impl VectorDb {
     /// Other configuration options (like `flush_interval`) can be changed
     /// on subsequent opens.
     pub async fn open(config: Config) -> Result<Self> {
-        let centroid1: Vec<f32> = vec![0.0f32; config.dimensions as usize];
-        Self::open_with_centroids(config, vec![centroid1]).await
+        Self::open_with_runtime(config, StorageRuntime::new()).await
     }
 
-    pub async fn open_with_centroids(config: Config, centroids: Vec<Vec<f32>>) -> Result<Self> {
+    pub async fn open_with_runtime(config: Config, runtime: StorageRuntime) -> Result<Self> {
+        let centroid1: Vec<f32> = vec![0.0f32; config.dimensions as usize];
+        Self::open_with_centroids(config, vec![centroid1], runtime).await
+    }
+
+    pub async fn open_with_centroids(
+        config: Config,
+        centroids: Vec<Vec<f32>>,
+        runtime: StorageRuntime,
+    ) -> Result<Self> {
         let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
         let storage = create_storage(
             &config.storage,
-            StorageRuntime::new(),
+            runtime,
             StorageSemantics::new().with_merge_operator(Arc::new(merge_op)),
         )
         .await
@@ -991,7 +999,7 @@ mod tests {
 
         let centroids: Vec<Vec<f32>> = cluster_centers.to_vec();
 
-        let db = VectorDb::open_with_centroids(config, centroids)
+        let db = VectorDb::open_with_centroids(config, centroids, StorageRuntime::new())
             .await
             .unwrap();
 
@@ -1172,7 +1180,7 @@ mod tests {
         // given - database with 3 centroids
         let config = create_test_config_with_dimensions(2);
         let centroids = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![-1.0, 0.0]];
-        let db = VectorDb::open_with_centroids(config, centroids)
+        let db = VectorDb::open_with_centroids(config, centroids, StorageRuntime::new())
             .await
             .unwrap();
 
@@ -1237,7 +1245,7 @@ mod tests {
         let config = create_test_config();
 
         // when
-        let result = VectorDb::open_with_centroids(config, vec![]).await;
+        let result = VectorDb::open_with_centroids(config, vec![], StorageRuntime::new()).await;
 
         // then
         match result {
