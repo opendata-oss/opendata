@@ -663,6 +663,9 @@ impl VectorDb {
             return Ok(Vec::new());
         }
 
+        // Dynamic pruning: skip posting lists whose centroids are far from query
+        let centroid_ids = self.prune_centroids(&centroid_ids, query);
+
         let snapshot = self.write_coordinator.view().snapshot.clone();
         let scored = self
             .load_and_score(&centroid_ids, query, snapshot.clone())
@@ -701,7 +704,11 @@ impl VectorDb {
             return Ok(Vec::new());
         }
 
-        // 3. Load posting lists and score candidates
+        // 3. Dynamic pruning: skip posting lists whose centroids are far from query
+        let centroid_ids = self.prune_centroids(&centroid_ids, query);
+        debug!("after dynamic pruning: {} centroids", centroid_ids.len());
+
+        // 4. Load posting lists and score candidates
         let snapshot = self.write_coordinator.view().snapshot.clone();
         let scored = self
             .load_and_score(&centroid_ids, query, snapshot.clone())
@@ -713,6 +720,52 @@ impl VectorDb {
 
         // 4. Resolve top-k forward index lookups
         self.resolve_top_k(&scored, k, snapshot.as_ref()).await
+    }
+
+    /// Apply query-aware dynamic pruning (SPANN §3.2).
+    ///
+    /// Given candidate centroid IDs (already sorted closest-first), computes
+    /// the raw distance from the query to each centroid and keeps only those
+    /// satisfying `dist(q, c) <= (1 + epsilon) * dist(q, closest)`.
+    ///
+    /// Returns the pruned centroid IDs. If pruning is disabled (`None`), returns
+    /// the input unchanged.
+    fn prune_centroids(&self, centroid_ids: &[u64], query: &[f32]) -> Vec<u64> {
+        let epsilon = match self.config.query_pruning_epsilon {
+            Some(e) => e,
+            None => return centroid_ids.to_vec(),
+        };
+
+        let metric = self.config.distance_metric;
+
+        // Compute raw distance (lower = closer) from query to each centroid.
+        let mut scored: Vec<(u64, f32)> = centroid_ids
+            .iter()
+            .filter_map(|&cid| {
+                let cv = self.centroid_graph.get_centroid_vector(cid)?;
+                let d = distance::raw_distance(query, &cv, metric);
+                Some((cid, d))
+            })
+            .collect();
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        if scored.is_empty() {
+            return Vec::new();
+        }
+
+        let closest_dist = scored[0].1;
+        // Skip pruning when closest distance is non-positive (can happen with
+        // DotProduct metric) since the multiplicative threshold is meaningless.
+        if closest_dist <= 0.0 {
+            return scored.into_iter().map(|(id, _)| id).collect();
+        }
+
+        let threshold = (1.0 + epsilon) * closest_dist;
+        scored
+            .into_iter()
+            .take_while(|&(_, d)| d <= threshold)
+            .map(|(id, _)| id)
+            .collect()
     }
 
     /// Spawn a task per centroid to load its posting list and score all candidates
