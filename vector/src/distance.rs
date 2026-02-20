@@ -5,8 +5,8 @@
 
 use crate::hnsw::CentroidGraph;
 use crate::serde::collection_meta::DistanceMetric;
+use log::debug;
 use std::cmp::Ordering;
-use log::{debug, info};
 
 /// Compute distance/similarity between two vectors.
 ///

@@ -120,20 +120,42 @@ fn merge_centroid_chunk(existing: Bytes, new_value: Bytes, dimensions: usize) ->
     CentroidChunkValue::new(combined_entries).encode_to_bytes(dimensions)
 }
 
-/// Merge a VectorIndexedMetadata value with a merge delta.
+/// Merge a VectorIndexedMetadata value with either a merge delta or a full replacement.
 ///
-/// The existing value (if any) is a full centroid list. The new_value is a merge delta
-/// describing removals and additions. Returns the updated centroid list.
+/// The `new_value` can be one of two formats:
+/// - **Merge delta** (VectorIndexedMetadataMergeValue): `num_removals:u32 + removals + num_additions:u32 + additions`
+/// - **Full value** (VectorIndexedMetadataValue): `count:u32 + centroid_ids`
+///
+/// This dual-format handling is needed because SlateDB's batch processing may pass
+/// Put values as merge operands when both Put and Merge operations for the same key
+/// appear in the same batch. The two formats are unambiguously distinguishable by size:
+/// Put = `4 + C*8` bytes, Merge = `4 + R*8 + 4 + A*8` bytes. These can never be equal
+/// for the same first u32 value (since that would require `4 + A*8 = 0`).
 fn merge_vector_indexed_metadata(existing: Option<Bytes>, new_value: Bytes) -> Bytes {
-    let mut current = match existing {
-        Some(bytes) => VectorIndexedMetadataValue::decode_from_bytes(&bytes)
-            .expect("Failed to decode existing VectorIndexedMetadataValue"),
-        None => VectorIndexedMetadataValue::new(vec![]),
+    // Detect whether new_value is a full value (Put format) or a merge delta.
+    let is_put_format = if new_value.len() >= 4 {
+        let first_u32 =
+            u32::from_le_bytes([new_value[0], new_value[1], new_value[2], new_value[3]]) as usize;
+        new_value.len() == 4 + first_u32 * 8
+    } else {
+        false
     };
-    let delta = VectorIndexedMetadataMergeValue::decode_from_bytes(&new_value)
-        .expect("Failed to decode VectorIndexedMetadataMergeValue");
-    current.apply_merge(&delta);
-    current.encode_to_bytes()
+
+    if is_put_format {
+        // Full value replacement — the Put supersedes any existing value.
+        new_value
+    } else {
+        // Merge delta — apply removals/additions to existing value.
+        let mut current = match existing {
+            Some(bytes) => VectorIndexedMetadataValue::decode_from_bytes(&bytes)
+                .expect("Failed to decode existing VectorIndexedMetadataValue"),
+            None => VectorIndexedMetadataValue::new(vec![]),
+        };
+        let delta = VectorIndexedMetadataMergeValue::decode_from_bytes(&new_value)
+            .expect("Failed to decode VectorIndexedMetadataMergeValue");
+        current.apply_merge(&delta);
+        current.encode_to_bytes()
+    }
 }
 
 /// Merge two CentroidStats values by summing their i32 deltas.
@@ -439,5 +461,111 @@ mod tests {
 
         // then - should return new_value without merging
         assert_eq!(result, new_value);
+    }
+
+    // ---- VectorIndexedMetadata merge tests ----
+
+    use crate::serde::key::VectorIndexedMetadataKey;
+
+    /// Helper to create a test key for VectorIndexedMetadata
+    fn create_vector_indexed_metadata_key() -> Bytes {
+        VectorIndexedMetadataKey::new(1).encode()
+    }
+
+    #[test]
+    fn should_merge_vector_indexed_metadata_delta_with_existing() {
+        // given — existing value with centroids [1, 2, 3], merge removes 2 and adds 4
+        let operator = VectorDbMergeOperator::new(3);
+        let key = create_vector_indexed_metadata_key();
+        let existing = VectorIndexedMetadataValue::new(vec![1, 2, 3]).encode_to_bytes();
+        let delta = VectorIndexedMetadataMergeValue::new(vec![2], vec![4]).encode_to_bytes();
+
+        // when
+        let merged = operator.merge(&key, Some(existing), delta);
+
+        // then
+        let decoded = VectorIndexedMetadataValue::decode_from_bytes(&merged).unwrap();
+        assert_eq!(decoded.centroid_ids, vec![1, 3, 4]);
+    }
+
+    #[test]
+    fn should_merge_vector_indexed_metadata_delta_without_existing() {
+        // given — no existing value, merge adds centroids [5, 6]
+        let operator = VectorDbMergeOperator::new(3);
+        let key = create_vector_indexed_metadata_key();
+        let delta = VectorIndexedMetadataMergeValue::new(vec![], vec![5, 6]).encode_to_bytes();
+
+        // when
+        let merged = operator.merge(&key, None, delta);
+
+        // then
+        let decoded = VectorIndexedMetadataValue::decode_from_bytes(&merged).unwrap();
+        assert_eq!(decoded.centroid_ids, vec![5, 6]);
+    }
+
+    #[test]
+    fn should_treat_put_value_as_full_replacement_in_merge() {
+        // given — existing value with centroids [1, 2, 3], but new_value is a Put (full value)
+        // This happens when SlateDB's batch processing passes a Put as a merge operand.
+        let operator = VectorDbMergeOperator::new(3);
+        let key = create_vector_indexed_metadata_key();
+        let existing = VectorIndexedMetadataValue::new(vec![1, 2, 3]).encode_to_bytes();
+        let put_value = VectorIndexedMetadataValue::new(vec![10, 20]).encode_to_bytes();
+
+        // when
+        let merged = operator.merge(&key, Some(existing), put_value.clone());
+
+        // then — the Put value should completely replace the existing value
+        let decoded = VectorIndexedMetadataValue::decode_from_bytes(&merged).unwrap();
+        assert_eq!(decoded.centroid_ids, vec![10, 20]);
+        assert_eq!(merged, put_value);
+    }
+
+    #[test]
+    fn should_treat_put_value_as_full_replacement_without_existing() {
+        // given — no existing value, new_value is a Put
+        let operator = VectorDbMergeOperator::new(3);
+        let key = create_vector_indexed_metadata_key();
+        let put_value = VectorIndexedMetadataValue::new(vec![7, 8, 9]).encode_to_bytes();
+
+        // when
+        let merged = operator.merge(&key, None, put_value.clone());
+
+        // then
+        let decoded = VectorIndexedMetadataValue::decode_from_bytes(&merged).unwrap();
+        assert_eq!(decoded.centroid_ids, vec![7, 8, 9]);
+        assert_eq!(merged, put_value);
+    }
+
+    #[test]
+    fn should_handle_empty_put_value_in_merge() {
+        // given — empty Put value (0 centroids) passed as merge operand
+        let operator = VectorDbMergeOperator::new(3);
+        let key = create_vector_indexed_metadata_key();
+        let existing = VectorIndexedMetadataValue::new(vec![1, 2]).encode_to_bytes();
+        let empty_put = VectorIndexedMetadataValue::new(vec![]).encode_to_bytes();
+
+        // when
+        let merged = operator.merge(&key, Some(existing), empty_put);
+
+        // then — empty Put replaces existing
+        let decoded = VectorIndexedMetadataValue::decode_from_bytes(&merged).unwrap();
+        assert_eq!(decoded.centroid_ids, Vec::<u64>::new());
+    }
+
+    #[test]
+    fn should_handle_single_centroid_put_value_in_merge() {
+        // given — single-centroid Put value (4 + 1*8 = 12 bytes)
+        let operator = VectorDbMergeOperator::new(3);
+        let key = create_vector_indexed_metadata_key();
+        let existing = VectorIndexedMetadataValue::new(vec![1, 2, 3]).encode_to_bytes();
+        let put_value = VectorIndexedMetadataValue::new(vec![42]).encode_to_bytes();
+
+        // when
+        let merged = operator.merge(&key, Some(existing), put_value);
+
+        // then
+        let decoded = VectorIndexedMetadataValue::decode_from_bytes(&merged).unwrap();
+        assert_eq!(decoded.centroid_ids, vec![42]);
     }
 }

@@ -1,20 +1,20 @@
 #![allow(unused)]
 
+use log::info;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Write};
 use std::sync::Arc;
-use log::info;
 use tracing::{debug, warn};
 
 use crate::delta::{VectorDbDeltaView, VectorDbWriteDelta};
+use crate::lire::commands::RebalanceCommand::SplitSweep;
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::posting_list::{PostingList, PostingUpdate};
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::record;
 use common::coordinator::Delta;
 use common::storage::RecordOp;
-use crate::lire::commands::RebalanceCommand::SplitSweep;
 
 /// Commands sent by [`crate::lire::rebalancer::IndexRebalancer`] to [`VectorDbWriteDelta`]
 /// via [`common::coordinator::WriteCoordinator`] to execute steps of rebalance operations.

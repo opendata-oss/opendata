@@ -31,7 +31,6 @@ use common::SequenceAllocator;
 use common::coordinator::{Delta, PauseHandle};
 use common::storage::RecordOp;
 use dashmap::DashMap;
-use log::info;
 use roaring::RoaringTreemap;
 use tracing::debug;
 // ============================================================================
