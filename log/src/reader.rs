@@ -24,7 +24,7 @@ use crate::segment::{LogSegment, SegmentCache};
 use crate::storage::{LogStorageRead, SegmentIterator};
 use common::storage::StorageSnapshot;
 use common::storage::factory::create_storage_read;
-use common::{StorageRead, StorageSemantics};
+use common::{StorageRead, StorageReaderRuntime, StorageSemantics};
 
 /// Trait for read operations on the log.
 ///
@@ -365,10 +365,14 @@ impl LogDbReader {
             manifest_poll_interval: config.refresh_interval,
             ..Default::default()
         };
-        let storage: Arc<dyn StorageRead> =
-            create_storage_read(&config.storage, StorageSemantics::new(), reader_options)
-                .await
-                .map_err(|e| Error::Storage(e.to_string()))?;
+        let storage: Arc<dyn StorageRead> = create_storage_read(
+            &config.storage,
+            StorageReaderRuntime::new(),
+            StorageSemantics::new(),
+            reader_options,
+        )
+        .await
+        .map_err(|e| Error::Storage(e.to_string()))?;
         let log_storage = LogStorageRead::new(storage);
         let segments = SegmentCache::open(&log_storage, SegmentConfig::default()).await?;
         let read_view = Arc::new(RwLock::new(LogReadView::new(log_storage, segments)));
