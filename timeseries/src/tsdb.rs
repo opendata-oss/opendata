@@ -157,7 +157,7 @@ impl Tsdb {
                         .metric_type
                         .map(|t| t.as_str().to_string())
                         .unwrap_or_default(),
-                    help: String::new(),
+                    help: series.description.clone().unwrap_or_default(),
                     unit: series.unit.clone().unwrap_or_default(),
                 };
                 let mut catalog = self.metadata_catalog.write().await;

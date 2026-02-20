@@ -1960,4 +1960,178 @@ mod tests {
         let data = response.data.unwrap();
         assert!(data.is_empty());
     }
+
+    #[tokio::test]
+    async fn should_return_empty_metadata_when_catalog_empty() {
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        // when: query for a label that doesn't exist in any bucket
+        let request = MetadataRequest {
+            metric: None,
+            limit: None,
+            limit_per_metric: Some(1),
+        };
+        let response = tsdb.metadata(request).await;
+
+        // then: should return empty result
+        assert_eq!(response.status, "success");
+        let data = response.data.unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_return_all_metadata() {
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        tsdb.ingest_samples(vec![
+            create_sample(
+                "http_requests_total",
+                vec![("env", "prod")],
+                4_000_000,
+                10.0,
+            ),
+            create_sample("cpu_usage", vec![("host1", "server1")], 4_000_000, 0.5),
+        ])
+        .await
+        .unwrap();
+
+        // when: query for a label that doesn't exist in any bucket
+        let request = MetadataRequest {
+            metric: None,
+            limit: None,
+            limit_per_metric: None,
+        };
+        let response = tsdb.metadata(request).await;
+
+        // then: should return empty result
+        assert_eq!(response.status, "success");
+        let data = response.data.unwrap();
+        assert_eq!(data.len(), 2);
+        assert!(data.contains_key("http_requests_total"));
+        assert!(data.contains_key("cpu_usage"));
+    }
+
+    #[tokio::test]
+    async fn should_filter_metadata_by_metric_name() {
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        tsdb.ingest_samples(vec![
+            create_sample(
+                "http_requests_total",
+                vec![("env", "prod")],
+                4_000_000,
+                10.0,
+            ),
+            create_sample("cpu_usage", vec![("host1", "server1")], 4_000_000, 0.5),
+        ])
+        .await
+        .unwrap();
+
+        // when: query for a label that doesn't exist in any bucket
+        let request = MetadataRequest {
+            metric: Some("cpu_usage".to_string()),
+            limit: None,
+            limit_per_metric: None,
+        };
+        let response = tsdb.metadata(request).await;
+
+        // then: should return empty result
+        assert_eq!(response.status, "success");
+        let data = response.data.unwrap();
+        assert_eq!(data.len(), 1);
+        assert!(data.contains_key("cpu_usage"));
+        assert!(!data.contains_key("http_requests_total"));
+    }
+
+    #[tokio::test]
+    async fn should_apply_limit_to_metadata() {
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        tsdb.ingest_samples(vec![
+            create_sample(
+                "http_requests_total",
+                vec![("env", "prod")],
+                4_000_000,
+                10.0,
+            ),
+            create_sample("cpu_usage", vec![("host1", "server1")], 4_000_000, 0.5),
+            create_sample("idle_time", vec![("host1", "server1")], 4_000_000, 1.0),
+        ])
+        .await
+        .unwrap();
+
+        // when: query for a label that doesn't exist in any bucket
+        let request = MetadataRequest {
+            metric: None,
+            limit: Some(2),
+            limit_per_metric: None,
+        };
+        let response = tsdb.metadata(request).await;
+
+        // then: should return empty result
+        assert_eq!(response.status, "success");
+        let data = response.data.unwrap();
+        assert_eq!(data.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn should_apply_limit_per_metric() {
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+        let mut sample1 = create_sample(
+            "http_requests_total",
+            vec![("env", "prod")],
+            4_000_000,
+            10.0,
+        );
+        sample1.description = Some("Number of http requests".to_string());
+        let mut sample2 = create_sample("cpu_usage", vec![("host1", "server1")], 4_000_000, 0.5);
+        sample2.description = Some("cpu usage".to_string());
+        let mut sample3 = create_sample(
+            "http_requests_total",
+            vec![("env", "prod")],
+            4_000_010,
+            10.0,
+        );
+        sample3.description = Some("Number of HTTP requests".to_string());
+        let mut sample4 = create_sample(
+            "http_requests_total",
+            vec![("env", "prod")],
+            4_000_100,
+            10.0,
+        );
+        sample4.description = Some("total http requests".to_string());
+        let mut sample5 = create_sample(
+            "http_requests_total",
+            vec![("env", "prod")],
+            4_000_020,
+            10.0,
+        );
+        sample5.description = Some("HTTP request total".to_string());
+
+        tsdb.ingest_samples(vec![sample1, sample2, sample3, sample4, sample5])
+            .await
+            .unwrap();
+
+        // when: query for a label that doesn't exist in any bucket
+        let request = MetadataRequest {
+            metric: None,
+            limit: None,
+            limit_per_metric: Some(4),
+        };
+        let response = tsdb.metadata(request).await;
+
+        // then: should return empty result
+        assert_eq!(response.status, "success");
+        let data = response.data.unwrap();
+        println!("data: {:?}", data);
+        assert_eq!(data.len(), 2);
+        assert!(data.contains_key("cpu_usage"));
+        assert!(data.contains_key("http_requests_total"));
+        assert!(data.get("http_requests_total").unwrap().len() == 4)
+    }
 }
