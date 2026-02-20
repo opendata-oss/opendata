@@ -285,6 +285,7 @@ mod tests {
             object_store: ObjectStoreConfig::InMemory,
             manifest_path: "test/manifest.json".to_string(),
             heartbeat_timeout_ms: 30_000,
+            done_cleanup_threshold: 100,
         }
     }
 

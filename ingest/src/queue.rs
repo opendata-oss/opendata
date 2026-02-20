@@ -19,9 +19,14 @@ fn millis(time: SystemTime) -> i64 {
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-struct Manifest {
+struct ProducerManifest {
     pending: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct ConsumerManifest {
     claimed: HashMap<String, i64>,
+    done: Vec<String>,
 }
 
 enum ManifestWriteError {
@@ -36,7 +41,10 @@ struct ManifestStore {
 }
 
 impl ManifestStore {
-    async fn read(&self) -> Result<(Manifest, Option<UpdateVersion>)> {
+    async fn read<T>(&self) -> Result<(T, Option<UpdateVersion>)>
+    where
+        T: serde::de::DeserializeOwned + Default,
+    {
         let path = Path::from(self.manifest_path.as_str());
         match self.object_store.get(&path).await {
             Ok(result) => {
@@ -48,20 +56,23 @@ impl ManifestStore {
                     .bytes()
                     .await
                     .map_err(|e| Error::Storage(e.to_string()))?;
-                let manifest: Manifest = serde_json::from_slice(&bytes)
+                let manifest: T = serde_json::from_slice(&bytes)
                     .map_err(|e| Error::Serialization(e.to_string()))?;
                 Ok((manifest, Some(version)))
             }
-            Err(ObjectStoreError::NotFound { .. }) => Ok((Manifest::default(), None)),
+            Err(ObjectStoreError::NotFound { .. }) => Ok((T::default(), None)),
             Err(e) => Err(Error::Storage(e.to_string())),
         }
     }
 
-    async fn write(
+    async fn write<T>(
         &self,
-        manifest: &Manifest,
+        manifest: &T,
         version: Option<UpdateVersion>,
-    ) -> std::result::Result<(), ManifestWriteError> {
+    ) -> std::result::Result<(), ManifestWriteError>
+    where
+        T: serde::Serialize,
+    {
         let path = Path::from(self.manifest_path.as_str());
         let json = serde_json::to_vec(manifest)
             .map_err(|e| ManifestWriteError::Fatal(Error::Serialization(e.to_string())))?;
@@ -142,7 +153,8 @@ impl QueueProducer {
 
     pub async fn enqueue(&self, location: String) -> Result<()> {
         loop {
-            let (mut manifest, version) = self.manifest_store.read().await?;
+            let (mut manifest, version): (ProducerManifest, _) =
+                self.manifest_store.read().await?;
             manifest.pending.push(location.clone());
             self.counter.record_write();
             match self.manifest_store.write(&manifest, version).await {
@@ -162,10 +174,19 @@ impl QueueProducer {
 }
 
 pub struct QueueConsumer {
-    manifest_store: ManifestStore,
+    producer_store: ManifestStore,
+    consumer_store: ManifestStore,
     heartbeat_timeout_ms: i64,
+    done_cleanup_threshold: usize,
     clock: Arc<dyn Clock>,
     counter: ConflictCounter,
+}
+
+fn consumer_manifest_path(producer_path: &str) -> String {
+    match producer_path.rsplit_once('.') {
+        Some((base, ext)) => format!("{}.consumer.{}", base, ext),
+        None => format!("{}.consumer", producer_path),
+    }
 }
 
 impl QueueConsumer {
@@ -180,12 +201,18 @@ impl QueueConsumer {
         object_store: Arc<dyn ObjectStore>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
+        let consumer_path = consumer_manifest_path(&config.manifest_path);
         Ok(Self {
-            manifest_store: ManifestStore {
-                object_store,
+            producer_store: ManifestStore {
+                object_store: object_store.clone(),
                 manifest_path: config.manifest_path,
             },
+            consumer_store: ManifestStore {
+                object_store,
+                manifest_path: consumer_path,
+            },
             heartbeat_timeout_ms: config.heartbeat_timeout_ms,
+            done_cleanup_threshold: config.done_cleanup_threshold,
             clock,
             counter: ConflictCounter::new(),
         })
@@ -193,11 +220,14 @@ impl QueueConsumer {
 
     pub async fn claim(&self) -> Result<Option<String>> {
         loop {
-            let (mut manifest, version) = self.manifest_store.read().await?;
+            let (producer, _): (ProducerManifest, _) = self.producer_store.read().await?;
+            let (mut consumer, version): (ConsumerManifest, _) =
+                self.consumer_store.read().await?;
             let now = millis(self.clock.now());
 
+            // Try to re-claim a stale location first
             let cutoff = now - self.heartbeat_timeout_ms;
-            let stale = manifest
+            let stale = consumer
                 .claimed
                 .iter()
                 .filter(|(_, ts)| **ts < cutoff)
@@ -206,20 +236,21 @@ impl QueueConsumer {
 
             let location = if let Some(loc) = stale {
                 loc
-            } else if !manifest.pending.is_empty() {
-                manifest.pending.remove(0)
             } else {
-                return Ok(None);
+                // Find first pending location not already claimed or done
+                match producer.pending.iter().find(|loc| {
+                    !consumer.claimed.contains_key(loc.as_str())
+                        && !consumer.done.contains(loc)
+                }) {
+                    Some(loc) => loc.clone(),
+                    None => return Ok(None),
+                }
             };
 
-            manifest.claimed.insert(location.clone(), now);
-            self.counter.record_write();
-            match self.manifest_store.write(&manifest, version).await {
+            consumer.claimed.insert(location.clone(), now);
+            match self.consumer_store.write(&consumer, version).await {
                 Ok(()) => return Ok(Some(location)),
-                Err(ManifestWriteError::Conflict) => {
-                    self.counter.record_conflict();
-                    continue;
-                }
+                Err(ManifestWriteError::Conflict) => continue,
                 Err(ManifestWriteError::Fatal(e)) => return Err(e),
             }
         }
@@ -227,30 +258,42 @@ impl QueueConsumer {
 
     pub async fn dequeue(&self, location: &str) -> Result<bool> {
         loop {
-            let (mut manifest, version) = self.manifest_store.read().await?;
-            if manifest.claimed.remove(location).is_none() {
+            let (mut consumer, version): (ConsumerManifest, _) =
+                self.consumer_store.read().await?;
+            if consumer.claimed.remove(location).is_none() {
                 return Ok(false);
             }
-            match self.manifest_store.write(&manifest, version).await {
-                Ok(()) => return Ok(true),
+            consumer.done.push(location.to_string());
+            match self.consumer_store.write(&consumer, version).await {
+                Ok(()) => break,
                 Err(ManifestWriteError::Conflict) => continue,
                 Err(ManifestWriteError::Fatal(e)) => return Err(e),
             }
         }
+
+        // Check if we should cleanup done items
+        let (consumer, _): (ConsumerManifest, _) = self.consumer_store.read().await?;
+        if consumer.done.len() >= self.done_cleanup_threshold {
+            self.cleanup_done().await?;
+        }
+
+        Ok(true)
     }
 
-    pub async fn heartbeat(&self, locations: &[String]) -> Result<()> {
+    async fn cleanup_done(&self) -> Result<()> {
+        // Read the current done list
+        let (consumer, _): (ConsumerManifest, _) = self.consumer_store.read().await?;
+        let done_set: std::collections::HashSet<&str> =
+            consumer.done.iter().map(|s| s.as_str()).collect();
+
+        // CAS-loop: remove done locations from producer pending
         loop {
-            let (mut manifest, version) = self.manifest_store.read().await?;
-            let now = millis(self.clock.now());
-            for location in locations {
-                if manifest.claimed.contains_key(location) {
-                    manifest.claimed.insert(location.clone(), now);
-                }
-            }
+            let (mut producer, version): (ProducerManifest, _) =
+                self.producer_store.read().await?;
+            producer.pending.retain(|loc| !done_set.contains(loc.as_str()));
             self.counter.record_write();
-            match self.manifest_store.write(&manifest, version).await {
-                Ok(()) => return Ok(()),
+            match self.producer_store.write(&producer, version).await {
+                Ok(()) => break,
                 Err(ManifestWriteError::Conflict) => {
                     self.counter.record_conflict();
                     continue;
@@ -258,11 +301,43 @@ impl QueueConsumer {
                 Err(ManifestWriteError::Fatal(e)) => return Err(e),
             }
         }
+
+        // CAS-loop: clear the flushed locations from consumer done
+        loop {
+            let (mut consumer, version): (ConsumerManifest, _) =
+                self.consumer_store.read().await?;
+            consumer.done.retain(|loc| !done_set.contains(loc.as_str()));
+            match self.consumer_store.write(&consumer, version).await {
+                Ok(()) => break,
+                Err(ManifestWriteError::Conflict) => continue,
+                Err(ManifestWriteError::Fatal(e)) => return Err(e),
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn heartbeat(&self, locations: &[String]) -> Result<()> {
+        loop {
+            let (mut consumer, version): (ConsumerManifest, _) =
+                self.consumer_store.read().await?;
+            let now = millis(self.clock.now());
+            for location in locations {
+                if consumer.claimed.contains_key(location) {
+                    consumer.claimed.insert(location.clone(), now);
+                }
+            }
+            match self.consumer_store.write(&consumer, version).await {
+                Ok(()) => return Ok(()),
+                Err(ManifestWriteError::Conflict) => continue,
+                Err(ManifestWriteError::Fatal(e)) => return Err(e),
+            }
+        }
     }
 
     pub async fn len(&self) -> Result<usize> {
-        let (manifest, _) = self.manifest_store.read().await?;
-        Ok(manifest.pending.len() + manifest.claimed.len())
+        let (producer, _): (ProducerManifest, _) = self.producer_store.read().await?;
+        Ok(producer.pending.len())
     }
 
     pub fn conflict_rate(&self) -> f64 {
@@ -282,14 +357,27 @@ mod tests {
             object_store: ObjectStoreConfig::InMemory,
             manifest_path: "test/manifest.json".to_string(),
             heartbeat_timeout_ms: 30_000,
+            done_cleanup_threshold: 100,
         }
     }
 
-    async fn read_manifest(store: &Arc<dyn ObjectStore>, path: &str) -> Manifest {
+    async fn read_producer_manifest(store: &Arc<dyn ObjectStore>, path: &str) -> ProducerManifest {
         let path = Path::from(path);
         let result = store.get(&path).await.unwrap();
         let bytes = result.bytes().await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn read_consumer_manifest(store: &Arc<dyn ObjectStore>, path: &str) -> ConsumerManifest {
+        let path = Path::from(path);
+        match store.get(&path).await {
+            Ok(result) => {
+                let bytes = result.bytes().await.unwrap();
+                serde_json::from_slice(&bytes).unwrap()
+            }
+            Err(ObjectStoreError::NotFound { .. }) => ConsumerManifest::default(),
+            Err(e) => panic!("unexpected error: {}", e),
+        }
     }
 
     #[tokio::test]
@@ -301,9 +389,8 @@ mod tests {
         producer.enqueue("path/to/file1.json".to_string()).await.unwrap();
         producer.enqueue("path/to/file2.json".to_string()).await.unwrap();
 
-        let manifest = read_manifest(&store, "test/manifest.json").await;
+        let manifest = read_producer_manifest(&store, "test/manifest.json").await;
         assert_eq!(manifest.pending, vec!["path/to/file1.json", "path/to/file2.json"]);
-        assert!(manifest.claimed.is_empty());
     }
 
     #[tokio::test]
@@ -311,9 +398,8 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
         // Pre-populate manifest
-        let existing = Manifest {
+        let existing = ProducerManifest {
             pending: vec!["existing/file.json".to_string()],
-            claimed: HashMap::new(),
         };
         let json = serde_json::to_vec(&existing).unwrap();
         let path = Path::from("test/manifest.json");
@@ -323,7 +409,7 @@ mod tests {
             QueueProducer::with_object_store(test_config(), store.clone()).unwrap();
         producer.enqueue("new/file.json".to_string()).await.unwrap();
 
-        let manifest = read_manifest(&store, "test/manifest.json").await;
+        let manifest = read_producer_manifest(&store, "test/manifest.json").await;
         assert_eq!(
             manifest.pending,
             vec!["existing/file.json", "new/file.json"]
@@ -345,9 +431,13 @@ mod tests {
         let claimed = consumer.claim().await.unwrap();
         assert_eq!(claimed, Some("first.json".to_string()));
 
-        let manifest = read_manifest(&store, "test/manifest.json").await;
-        assert_eq!(manifest.pending, vec!["second.json"]);
-        assert!(manifest.claimed.contains_key("first.json"));
+        // Producer manifest still has both pending items (read-only from consumer)
+        let producer_manifest = read_producer_manifest(&store, "test/manifest.json").await;
+        assert_eq!(producer_manifest.pending, vec!["first.json", "second.json"]);
+
+        // Consumer manifest tracks the claim
+        let consumer_manifest = read_consumer_manifest(&store, "test/manifest.consumer.json").await;
+        assert!(consumer_manifest.claimed.contains_key("first.json"));
     }
 
     #[tokio::test]
@@ -376,9 +466,14 @@ mod tests {
         let removed = consumer.dequeue("to_process.json").await.unwrap();
         assert!(removed);
 
-        let manifest = read_manifest(&store, "test/manifest.json").await;
-        assert!(manifest.pending.is_empty());
-        assert!(manifest.claimed.is_empty());
+        // Producer manifest still has the pending item
+        let producer_manifest = read_producer_manifest(&store, "test/manifest.json").await;
+        assert_eq!(producer_manifest.pending, vec!["to_process.json"]);
+
+        // Consumer manifest: claimed is empty, done has the location
+        let consumer_manifest = read_consumer_manifest(&store, "test/manifest.consumer.json").await;
+        assert!(consumer_manifest.claimed.is_empty());
+        assert_eq!(consumer_manifest.done, vec!["to_process.json"]);
     }
 
     #[tokio::test]
@@ -424,9 +519,13 @@ mod tests {
         claimed_locations.dedup();
         assert_eq!(claimed_locations.len(), n);
 
-        let manifest = read_manifest(&store, "test/manifest.json").await;
-        assert!(manifest.pending.is_empty());
-        assert_eq!(manifest.claimed.len(), n);
+        // Producer manifest still has all pending items
+        let producer_manifest = read_producer_manifest(&store, "test/manifest.json").await;
+        assert_eq!(producer_manifest.pending.len(), n);
+
+        // Consumer manifest has all claimed
+        let consumer_manifest = read_consumer_manifest(&store, "test/manifest.consumer.json").await;
+        assert_eq!(consumer_manifest.claimed.len(), n);
     }
 
     #[tokio::test]
@@ -449,9 +548,9 @@ mod tests {
             .await
             .unwrap();
 
-        let manifest = read_manifest(&store, "test/manifest.json").await;
-        assert!(*manifest.claimed.get("a.json").unwrap() >= before);
-        assert!(*manifest.claimed.get("b.json").unwrap() >= before);
+        let consumer_manifest = read_consumer_manifest(&store, "test/manifest.consumer.json").await;
+        assert!(*consumer_manifest.claimed.get("a.json").unwrap() >= before);
+        assert!(*consumer_manifest.claimed.get("b.json").unwrap() >= before);
     }
 
     #[tokio::test]
@@ -470,8 +569,8 @@ mod tests {
             .heartbeat(&["a.json".to_string()])
             .await
             .unwrap();
-        let manifest = read_manifest(&store, "test/manifest.json").await;
-        let ts1 = *manifest.claimed.get("a.json").unwrap();
+        let consumer_manifest = read_consumer_manifest(&store, "test/manifest.consumer.json").await;
+        let ts1 = *consumer_manifest.claimed.get("a.json").unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
@@ -479,8 +578,8 @@ mod tests {
             .heartbeat(&["a.json".to_string()])
             .await
             .unwrap();
-        let manifest = read_manifest(&store, "test/manifest.json").await;
-        let ts2 = *manifest.claimed.get("a.json").unwrap();
+        let consumer_manifest = read_consumer_manifest(&store, "test/manifest.consumer.json").await;
+        let ts2 = *consumer_manifest.claimed.get("a.json").unwrap();
 
         assert!(ts2 > ts1);
     }
@@ -502,9 +601,9 @@ mod tests {
             .await
             .unwrap();
 
-        let manifest = read_manifest(&store, "test/manifest.json").await;
-        assert!(!manifest.claimed.contains_key("unknown.json"));
-        assert_eq!(manifest.claimed.len(), 1);
+        let consumer_manifest = read_consumer_manifest(&store, "test/manifest.consumer.json").await;
+        assert!(!consumer_manifest.claimed.contains_key("unknown.json"));
+        assert_eq!(consumer_manifest.claimed.len(), 1);
     }
 
     #[tokio::test]
@@ -524,6 +623,7 @@ mod tests {
         let claimed = consumer1.claim().await.unwrap();
         assert_eq!(claimed, Some("a.json".to_string()));
 
+        // consumer2 shares the same consumer manifest, so it sees the claim
         let claimed = consumer2.claim().await.unwrap();
         assert_eq!(claimed, None);
 
@@ -533,10 +633,9 @@ mod tests {
         let claimed = consumer2.claim().await.unwrap();
         assert_eq!(claimed, Some("a.json".to_string()));
 
-        let manifest = read_manifest(&store, "test/manifest.json").await;
-        assert!(manifest.pending.is_empty());
-        assert_eq!(manifest.claimed.len(), 1);
-        assert!(manifest.claimed.contains_key("a.json"));
+        let consumer_manifest = read_consumer_manifest(&store, "test/manifest.consumer.json").await;
+        assert_eq!(consumer_manifest.claimed.len(), 1);
+        assert!(consumer_manifest.claimed.contains_key("a.json"));
     }
 
     #[tokio::test]
@@ -620,5 +719,108 @@ mod tests {
         // consumer2 should prefer the stale claimed item
         let claimed = consumer2.claim().await.unwrap();
         assert_eq!(claimed, Some("claimed.json".to_string()));
+    }
+
+    #[tokio::test]
+    async fn should_accumulate_done_in_consumer_manifest_after_dequeue() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let config = test_config();
+        let producer =
+            QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let consumer =
+            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+
+        producer.enqueue("a.json".to_string()).await.unwrap();
+        producer.enqueue("b.json".to_string()).await.unwrap();
+        consumer.claim().await.unwrap();
+        consumer.claim().await.unwrap();
+
+        consumer.dequeue("a.json").await.unwrap();
+        consumer.dequeue("b.json").await.unwrap();
+
+        let consumer_manifest = read_consumer_manifest(&store, "test/manifest.consumer.json").await;
+        assert!(consumer_manifest.claimed.is_empty());
+        assert_eq!(consumer_manifest.done.len(), 2);
+        assert!(consumer_manifest.done.contains(&"a.json".to_string()));
+        assert!(consumer_manifest.done.contains(&"b.json".to_string()));
+
+        // Producer manifest still has both in pending (no flush yet)
+        let producer_manifest = read_producer_manifest(&store, "test/manifest.json").await;
+        assert_eq!(producer_manifest.pending.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn should_cleanup_done_removes_from_producer_when_threshold_reached() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut config = test_config();
+        config.done_cleanup_threshold = 2;
+
+        let producer =
+            QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let consumer =
+            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+
+        producer.enqueue("a.json".to_string()).await.unwrap();
+        producer.enqueue("b.json".to_string()).await.unwrap();
+        producer.enqueue("c.json".to_string()).await.unwrap();
+
+        consumer.claim().await.unwrap();
+        consumer.claim().await.unwrap();
+
+        // First dequeue — done has 1 item, below threshold
+        consumer.dequeue("a.json").await.unwrap();
+        let producer_manifest = read_producer_manifest(&store, "test/manifest.json").await;
+        assert_eq!(producer_manifest.pending.len(), 3); // still all three
+
+        // Second dequeue — done reaches threshold (2), triggers cleanup
+        consumer.dequeue("b.json").await.unwrap();
+        let producer_manifest = read_producer_manifest(&store, "test/manifest.json").await;
+        assert_eq!(producer_manifest.pending, vec!["c.json"]);
+    }
+
+    #[tokio::test]
+    async fn should_cleanup_done_clears_done_list_in_consumer_manifest() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut config = test_config();
+        config.done_cleanup_threshold = 2;
+
+        let producer =
+            QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let consumer =
+            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+
+        producer.enqueue("a.json".to_string()).await.unwrap();
+        producer.enqueue("b.json".to_string()).await.unwrap();
+
+        consumer.claim().await.unwrap();
+        consumer.claim().await.unwrap();
+        consumer.dequeue("a.json").await.unwrap();
+        consumer.dequeue("b.json").await.unwrap();
+
+        // After cleanup, consumer done list should be empty
+        let consumer_manifest = read_consumer_manifest(&store, "test/manifest.consumer.json").await;
+        assert!(consumer_manifest.done.is_empty());
+
+        // Producer pending should also be empty
+        let producer_manifest = read_producer_manifest(&store, "test/manifest.json").await;
+        assert!(producer_manifest.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_not_reclaim_done_locations() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let config = test_config();
+        let producer =
+            QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let consumer =
+            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+
+        producer.enqueue("a.json".to_string()).await.unwrap();
+        consumer.claim().await.unwrap();
+        consumer.dequeue("a.json").await.unwrap();
+
+        // "a.json" is still in producer pending but in consumer done — should not be claimed again
+        let claimed = consumer.claim().await.unwrap();
+        assert_eq!(claimed, None);
     }
 }
