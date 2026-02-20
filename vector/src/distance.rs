@@ -58,7 +58,7 @@ pub(crate) fn assign_to_centroids(
     max_cluster_replication: usize,
     distance_metric: DistanceMetric,
 ) -> Vec<u64> {
-    let candidates = centroid_graph.search(vector, max_cluster_replication);
+    let candidates = centroid_graph.search(vector, max_cluster_replication * 4);
 
     if candidates.is_empty() {
         return vec![1];
@@ -67,27 +67,35 @@ pub(crate) fn assign_to_centroids(
         return vec![candidates[0]];
     }
 
-    let ci1 = candidates[0];
-    let ci1_vec = centroid_graph.get_centroid_vector(ci1);
-    let Some(ci1_vec) = ci1_vec else {
-        return vec![ci1];
-    };
-    let dist_ci1 = raw_distance(vector, &ci1_vec, distance_metric);
+    // Resolve candidates to (id, vector, distance) and sort by distance,
+    // since the centroid graph search may not return them in sorted order.
+    let mut scored: Vec<(u64, Vec<f32>, f32)> = candidates
+        .iter()
+        .filter_map(|&cid| {
+            let cv = centroid_graph.get_centroid_vector(cid)?;
+            let dist = raw_distance(vector, &cv, distance_metric);
+            Some((cid, cv, dist))
+        })
+        .collect();
+    scored.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut boundaries = vec![(ci1, ci1_vec.clone())];
-    for &cij_d in &candidates[1..] {
-        let cij_vec = centroid_graph.get_centroid_vector(cij_d);
-        let Some(cij_vec) = cij_vec else { continue };
-        let dist_cij = raw_distance(vector, &cij_vec, distance_metric);
-        if dist_cij <= 11.0 * dist_ci1 {
-            boundaries.push((cij_d, cij_vec));
+    if scored.is_empty() {
+        return vec![candidates[0]];
+    }
+
+    let (ci1, ci1_vec, dist_ci1) = &scored[0];
+
+    let mut boundaries: Vec<(u64, Vec<f32>)> = vec![(*ci1, ci1_vec.clone())];
+    for &(cid, ref cv, dist) in &scored[1..] {
+        if dist <= 2.0 * dist_ci1 {
+            boundaries.push((cid, cv.clone()));
         } else {
-            break; // candidates are sorted by distance
+            break; // sorted by distance
         }
     }
     // apply rng rule
     let mut result = Vec::with_capacity(boundaries.len());
-    result.push(ci1);
+    result.push(*ci1);
     for w in boundaries.windows(2) {
         let (_, cijminus1_vec) = &w[0];
         let (cij, cij_vec) = &w[1];
@@ -99,6 +107,7 @@ pub(crate) fn assign_to_centroids(
         result.push(*cij);
     }
     debug!("assign done");
+    result.truncate(max_cluster_replication);
     result
 }
 
