@@ -33,10 +33,12 @@ use common::storage::RecordOp;
 use dashmap::DashMap;
 use log::info;
 use roaring::RoaringTreemap;
+use tracing::debug;
 // ============================================================================
 // WriteCoordinator Integration Types
 // ============================================================================
 
+#[derive(Debug)]
 pub(crate) enum VectorDbWrite {
     Write(Vec<VectorWrite>),
     Rebalance(RebalanceCommand),
@@ -65,6 +67,10 @@ pub(crate) struct VectorDbDeltaOpts {
     pub(crate) max_pending_and_running_rebalance_tasks: usize,
     pub(crate) split_threshold_vectors: usize,
     pub(crate) rebalance_backpressure_resume_threshold: usize,
+    /// Distance metric used for boundary replication distance computations.
+    pub(crate) distance_metric: crate::serde::collection_meta::DistanceMetric,
+    /// Maximum number of centroids a vector can be replicated to.
+    pub(crate) max_cluster_replication: usize,
 }
 
 /// Image containing shared state for the delta.
@@ -113,14 +119,14 @@ pub(crate) struct VectorDbWriteDelta {
 }
 
 impl VectorDbWriteDelta {
-    /// Assign a vector to its nearest centroid using the HNSW graph.
-    fn assign_to_centroid(&self, vector: &[f32]) -> u64 {
-        self.ctx
-            .centroid_graph
-            .search(vector, 1)
-            .first()
-            .copied()
-            .unwrap_or(1)
+    /// Assign a vector to one or more centroids using the HNSW graph.
+    fn assign_to_centroids(&self, vector: &[f32]) -> Vec<u64> {
+        crate::distance::assign_to_centroids(
+            vector,
+            self.ctx.centroid_graph.as_ref(),
+            self.ctx.opts.max_cluster_replication,
+            self.ctx.opts.distance_metric,
+        )
     }
 }
 
@@ -148,6 +154,7 @@ impl Delta for VectorDbWriteDelta {
             VectorDbWrite::Write(writes) => self.apply_write(writes),
             VectorDbWrite::Rebalance(cmd) => self.apply_rebalance_cmd(cmd),
         };
+        debug!("done apply");
         self.toggle_rebalance_backpressure();
         result
     }
@@ -165,8 +172,12 @@ impl Delta for VectorDbWriteDelta {
             + view.deleted_centroids.len() as usize * 8
     }
 
-    fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
+    fn poke(&self) {
         self.ctx.rebalancer.log_summary();
+    }
+
+    fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
+        //self.ctx.rebalancer.log_summary();
         let mut ops = self.ops;
         let view = self.view.read().expect("lock poisoned").clone();
 
@@ -205,7 +216,7 @@ impl VectorDbWriteDelta {
         if total_tasks >= self.ctx.opts.max_pending_and_running_rebalance_tasks
             || self.ctx.rebalancer.max_centroid_size() >= max_centroid_limit
         {
-            info!(
+            debug!(
                 "applying rebalance backpressure: {} {}",
                 total_tasks, self.ctx.opts.max_pending_and_running_rebalance_tasks
             );
@@ -219,6 +230,7 @@ impl VectorDbWriteDelta {
         &mut self,
         vector_writes: Vec<VectorWrite>,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
+        debug!("apply write");
         let mut view = self.view.write().expect("lock poisoned");
 
         for write in vector_writes {
@@ -231,8 +243,9 @@ impl VectorDbWriteDelta {
             // Check dictionary for existing mapping (upsert detection)
             let old_internal_id = self.ctx.dictionary.get(&write.external_id).map(|r| *r);
 
-            // Assign to centroid using the graph
-            let centroid_id = self.assign_to_centroid(&write.values);
+            debug!("assign to centroids");
+            // Assign to centroid(s) using the graph
+            let centroid_ids = self.assign_to_centroids(&write.values);
 
             // Update ID dictionary (in-memory)
             self.ctx
@@ -257,9 +270,25 @@ impl VectorDbWriteDelta {
                 &write.attributes,
             ));
 
-            // Accumulate posting list update
-            view.add_to_posting(centroid_id, new_internal_id, write.values);
-            self.ctx.rebalancer.update_counts(&[(centroid_id, 1)])
+            debug!("put metadata");
+            // Write VectorIndexedMetadata when boundary replication is enabled.
+            // Always written (even for single-centroid assignment) so that split/merge
+            // operations can update it via merge deltas.
+            if self.ctx.opts.max_cluster_replication > 1 {
+                self.ops.push(record::put_vector_indexed_metadata(
+                    new_internal_id,
+                    &centroid_ids,
+                ));
+            }
+
+            // Accumulate posting list updates for all assigned centroids
+            for &centroid_id in &centroid_ids {
+                view.add_to_posting(centroid_id, new_internal_id, write.values.clone());
+            }
+            debug!("update counts");
+            let count_deltas: Vec<(u64, i32)> = centroid_ids.iter().map(|&c| (c, 1)).collect();
+            self.ctx.rebalancer.update_counts(&count_deltas);
+            debug!("done one vector")
         }
 
         drop(view);
@@ -366,6 +395,7 @@ mod tests {
                 split_threshold_vectors: 10_000,
                 merge_threshold_vectors: 0,
                 max_rebalance_tasks: 0,
+                max_cluster_replication: 1,
             },
             centroid_graph.clone(),
             HashMap::new(),
@@ -379,6 +409,8 @@ mod tests {
                 max_pending_and_running_rebalance_tasks: usize::MAX,
                 split_threshold_vectors: usize::MAX,
                 rebalance_backpressure_resume_threshold: 0,
+                distance_metric: DistanceMetric::L2,
+                max_cluster_replication: 1,
             },
             dictionary: Arc::new(DashMap::new()),
             centroid_graph,
@@ -698,6 +730,7 @@ mod tests {
                 split_threshold_vectors: 10_000,
                 merge_threshold_vectors: 0,
                 max_rebalance_tasks: 0,
+                max_cluster_replication: 1,
             },
             centroid_graph.clone(),
             HashMap::new(),
@@ -711,6 +744,8 @@ mod tests {
                 max_pending_and_running_rebalance_tasks: usize::MAX,
                 split_threshold_vectors: usize::MAX,
                 rebalance_backpressure_resume_threshold: 0,
+                distance_metric: DistanceMetric::L2,
+                max_cluster_replication: 1,
             },
             dictionary: Arc::new(DashMap::new()),
             centroid_graph,
@@ -879,6 +914,7 @@ mod tests {
                 split_threshold_vectors: 10_000,
                 merge_threshold_vectors: 0,
                 max_rebalance_tasks: 0,
+                max_cluster_replication: 1,
             },
             centroid_graph.clone(),
             HashMap::new(),
@@ -892,6 +928,8 @@ mod tests {
                 max_pending_and_running_rebalance_tasks: usize::MAX,
                 split_threshold_vectors: usize::MAX,
                 rebalance_backpressure_resume_threshold: 0,
+                distance_metric: DistanceMetric::L2,
+                max_cluster_replication: 1,
             },
             dictionary: Arc::new(DashMap::new()),
             centroid_graph,

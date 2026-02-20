@@ -11,6 +11,9 @@ use std::io::Cursor;
 use crate::serde::centroid_chunk::CentroidChunkValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::posting_list::merge_posting_list;
+use crate::serde::vector_indexed_metadata::{
+    VectorIndexedMetadataMergeValue, VectorIndexedMetadataValue,
+};
 use crate::serde::{EncodingError, KEY_VERSION, RecordType};
 
 /// Merge operator for vector database that handles merging of different record types.
@@ -31,19 +34,23 @@ impl VectorDbMergeOperator {
 
 impl common::storage::MergeOperator for VectorDbMergeOperator {
     fn merge(&self, key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
-        // If no existing value, just return the new value
-        let Some(existing) = existing_value else {
-            return new_value;
-        };
-
         let prefix =
             KeyPrefix::from_bytes_versioned(key, KEY_VERSION).expect("Failed to decode key prefix");
-
         let record_tag = prefix.tag();
-
         let record_type_id = record_tag.record_type();
         let record_type =
             RecordType::from_id(record_type_id).expect("Failed to get record type from record tag");
+
+        // VectorIndexedMetadata uses different formats for put (value) vs merge (delta),
+        // so we must handle the None case explicitly rather than returning new_value as-is.
+        if matches!(record_type, RecordType::VectorIndexedMetadata) {
+            return merge_vector_indexed_metadata(existing_value, new_value);
+        }
+
+        // For all other record types, the merge format matches the value format
+        let Some(existing) = existing_value else {
+            return new_value;
+        };
 
         match record_type {
             RecordType::Deletions | RecordType::MetadataIndex => {
@@ -111,6 +118,22 @@ fn merge_centroid_chunk(existing: Bytes, new_value: Bytes, dimensions: usize) ->
     let mut combined_entries = existing_chunk.entries;
     combined_entries.extend(new_chunk.entries);
     CentroidChunkValue::new(combined_entries).encode_to_bytes(dimensions)
+}
+
+/// Merge a VectorIndexedMetadata value with a merge delta.
+///
+/// The existing value (if any) is a full centroid list. The new_value is a merge delta
+/// describing removals and additions. Returns the updated centroid list.
+fn merge_vector_indexed_metadata(existing: Option<Bytes>, new_value: Bytes) -> Bytes {
+    let mut current = match existing {
+        Some(bytes) => VectorIndexedMetadataValue::decode_from_bytes(&bytes)
+            .expect("Failed to decode existing VectorIndexedMetadataValue"),
+        None => VectorIndexedMetadataValue::new(vec![]),
+    };
+    let delta = VectorIndexedMetadataMergeValue::decode_from_bytes(&new_value)
+        .expect("Failed to decode VectorIndexedMetadataMergeValue");
+    current.apply_merge(&delta);
+    current.encode_to_bytes()
 }
 
 /// Merge two CentroidStats values by summing their i32 deltas.

@@ -411,6 +411,44 @@ impl CentroidStatsKey {
     }
 }
 
+/// VectorIndexedMetadata key - tracks which centroids a vector is assigned to.
+///
+/// Key layout: `[version | tag | vector_id:u64-BE]` (10 bytes)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorIndexedMetadataKey {
+    pub vector_id: u64,
+}
+
+impl RecordKey for VectorIndexedMetadataKey {
+    const RECORD_TYPE: RecordType = RecordType::VectorIndexedMetadata;
+}
+
+impl VectorIndexedMetadataKey {
+    pub fn new(vector_id: u64) -> Self {
+        Self { vector_id }
+    }
+
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(10);
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
+        buf.put_u64(self.vector_id); // Big-endian
+        buf.freeze()
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < 10 {
+            return Err(EncodingError {
+                message: "Buffer too short for VectorIndexedMetadataKey".to_string(),
+            });
+        }
+        validate_key_prefix::<Self>(buf)?;
+        let vector_id = u64::from_be_bytes([
+            buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+        ]);
+        Ok(VectorIndexedMetadataKey { vector_id })
+    }
+}
+
 /// Validates the key prefix (version and record tag).
 fn validate_key_prefix<T: RecordKey>(buf: &[u8]) -> Result<(), EncodingError> {
     let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;

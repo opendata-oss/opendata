@@ -77,6 +77,9 @@ async fn sift1m_recall() {
         dimensions: 128,
         distance_metric: DistanceMetric::L2,
         split_search_neighbourhood: 16,
+        max_cluster_replication: 4,
+        split_threshold_vectors: 200,
+        merge_threshold_vectors: 10,
         ..Default::default()
     };
     let db = VectorDb::open(config)
@@ -117,7 +120,7 @@ async fn sift1m_recall() {
     println!("Num centroids: {}", db.num_centroids());
 
     let k = 10;
-    let nprobe = 10;
+    let nprobe = 32;
     let mut hnsw_recall = 0.0;
     let mut exact_recall = 0.0;
     for (i, query) in queries.iter().enumerate() {

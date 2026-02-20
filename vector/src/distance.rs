@@ -3,8 +3,10 @@
 //! This module provides distance and similarity functions used for scoring
 //! candidates during similarity search.
 
+use crate::hnsw::CentroidGraph;
 use crate::serde::collection_meta::DistanceMetric;
 use std::cmp::Ordering;
+use log::{debug, info};
 
 /// Compute distance/similarity between two vectors.
 ///
@@ -32,6 +34,72 @@ pub(crate) fn compute_distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> 
         DistanceMetric::DotProduct => dot_product(a, b),
     };
     VectorDistance { score: v, metric }
+}
+
+/// Compute a uniform distance where lower = closer, suitable for comparing
+/// across distance metrics in the boundary replication formula.
+pub(crate) fn raw_distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
+    match metric {
+        DistanceMetric::L2 => compute_distance(a, b, metric).score(),
+        DistanceMetric::Cosine => 1.0 - compute_distance(a, b, metric).score(),
+        DistanceMetric::DotProduct => -compute_distance(a, b, metric).score(),
+    }
+}
+
+/// Assign a vector to one or more centroids using the SPANN boundary replication formula.
+///
+/// When `max_cluster_replication == 1`, returns a single centroid (the nearest).
+/// When `> 1`, applies the boundary replication formula with RNG pruning:
+///   - Include centroid j if `dist(x, cj) <= 11 * dist(x, c1)`
+///   - Apply relative neighborhood graph rule to prune redundant assignments
+pub(crate) fn assign_to_centroids(
+    vector: &[f32],
+    centroid_graph: &dyn CentroidGraph,
+    max_cluster_replication: usize,
+    distance_metric: DistanceMetric,
+) -> Vec<u64> {
+    let candidates = centroid_graph.search(vector, max_cluster_replication);
+
+    if candidates.is_empty() {
+        return vec![1];
+    }
+    if max_cluster_replication == 1 {
+        return vec![candidates[0]];
+    }
+
+    let ci1 = candidates[0];
+    let ci1_vec = centroid_graph.get_centroid_vector(ci1);
+    let Some(ci1_vec) = ci1_vec else {
+        return vec![ci1];
+    };
+    let dist_ci1 = raw_distance(vector, &ci1_vec, distance_metric);
+
+    let mut boundaries = vec![(ci1, ci1_vec.clone())];
+    for &cij_d in &candidates[1..] {
+        let cij_vec = centroid_graph.get_centroid_vector(cij_d);
+        let Some(cij_vec) = cij_vec else { continue };
+        let dist_cij = raw_distance(vector, &cij_vec, distance_metric);
+        if dist_cij <= 11.0 * dist_ci1 {
+            boundaries.push((cij_d, cij_vec));
+        } else {
+            break; // candidates are sorted by distance
+        }
+    }
+    // apply rng rule
+    let mut result = Vec::with_capacity(boundaries.len());
+    result.push(ci1);
+    for w in boundaries.windows(2) {
+        let (_, cijminus1_vec) = &w[0];
+        let (cij, cij_vec) = &w[1];
+        if raw_distance(cij_vec, vector, distance_metric)
+            > raw_distance(cijminus1_vec, cij_vec, distance_metric)
+        {
+            continue;
+        }
+        result.push(*cij);
+    }
+    debug!("assign done");
+    result
 }
 
 /// Compute L2 (Euclidean) distance between two vectors.

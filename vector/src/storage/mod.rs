@@ -7,10 +7,11 @@ use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::deletions::DeletionsValue;
 use crate::serde::key::{
     CentroidChunkKey, CentroidStatsKey, DeletionsKey, IdDictionaryKey, PostingListKey,
-    VectorDataKey,
+    VectorDataKey, VectorIndexedMetadataKey,
 };
 use crate::serde::posting_list::PostingListValue;
 use crate::serde::vector_data::VectorDataValue;
+use crate::serde::vector_indexed_metadata::VectorIndexedMetadataValue;
 
 pub(crate) mod merge_operator;
 pub(crate) mod record;
@@ -115,6 +116,23 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         match record {
             Some(record) => {
                 let value = CentroidChunkValue::decode_from_bytes(&record.value, dimensions)?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Load vector indexed metadata (centroid assignments) for a vector.
+    #[allow(dead_code)]
+    async fn get_vector_indexed_metadata(
+        &self,
+        vector_id: u64,
+    ) -> Result<Option<VectorIndexedMetadataValue>> {
+        let key = VectorIndexedMetadataKey::new(vector_id).encode();
+        let record = self.get(key).await?;
+        match record {
+            Some(record) => {
+                let value = VectorIndexedMetadataValue::decode_from_bytes(&record.value)?;
                 Ok(Some(value))
             }
             None => Ok(None),

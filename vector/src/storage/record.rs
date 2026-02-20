@@ -16,10 +16,13 @@ use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::deletions::DeletionsValue;
 use crate::serde::key::{
     CentroidChunkKey, CentroidStatsKey, DeletionsKey, IdDictionaryKey, PostingListKey,
-    VectorDataKey,
+    VectorDataKey, VectorIndexedMetadataKey,
 };
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_data::{Field, VectorDataValue};
+use crate::serde::vector_indexed_metadata::{
+    VectorIndexedMetadataMergeValue, VectorIndexedMetadataValue,
+};
 
 /// Create a RecordOp to update the IdDictionary mapping.
 pub fn put_id_dictionary(external_id: &str, internal_id: u64) -> RecordOp {
@@ -96,6 +99,29 @@ pub fn delete_centroid_chunk(chunk_id: u32) -> RecordOp {
 pub fn merge_centroid_stats(centroid_id: u64, delta: i32) -> RecordOp {
     let key = CentroidStatsKey::new(centroid_id).encode();
     let value = CentroidStatsValue::new(delta).encode_to_bytes();
+    RecordOp::Merge(Record::new(key, value))
+}
+
+/// Create a RecordOp to write vector indexed metadata (centroid assignments).
+pub fn put_vector_indexed_metadata(vector_id: u64, centroid_ids: &[u64]) -> RecordOp {
+    let key = VectorIndexedMetadataKey::new(vector_id).encode();
+    let value = VectorIndexedMetadataValue::new(centroid_ids.to_vec()).encode_to_bytes();
+    RecordOp::Put(Record::new(key, value))
+}
+
+/// Create a RecordOp to merge a centroid assignment delta into vector indexed metadata.
+///
+/// Used during split/merge operations to update a vector's centroid assignments
+/// without reading the existing value. The merge operator applies removals first,
+/// then additions.
+pub fn merge_vector_indexed_metadata(
+    vector_id: u64,
+    removals: &[u64],
+    additions: &[u64],
+) -> RecordOp {
+    let key = VectorIndexedMetadataKey::new(vector_id).encode();
+    let value = VectorIndexedMetadataMergeValue::new(removals.to_vec(), additions.to_vec())
+        .encode_to_bytes();
     RecordOp::Merge(Record::new(key, value))
 }
 

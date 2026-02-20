@@ -2,15 +2,19 @@
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::fmt::{Debug, Write};
 use std::sync::Arc;
-use tracing::warn;
+use log::info;
+use tracing::{debug, warn};
 
 use crate::delta::{VectorDbDeltaView, VectorDbWriteDelta};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::posting_list::{PostingList, PostingUpdate};
+use crate::storage::VectorDbStorageReadExt;
 use crate::storage::record;
 use common::coordinator::Delta;
 use common::storage::RecordOp;
+use crate::lire::commands::RebalanceCommand::SplitSweep;
 
 /// Commands sent by [`crate::lire::rebalancer::IndexRebalancer`] to [`VectorDbWriteDelta`]
 /// via [`common::coordinator::WriteCoordinator`] to execute steps of rebalance operations.
@@ -25,6 +29,23 @@ pub(crate) enum RebalanceCommand {
     FinishMerge(FinishMergeCommand),
 }
 
+impl Debug for RebalanceCommand {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            RebalanceCommand::Split(_) => write!(f, "RebalanceCommand::Split"),
+            SplitSweep(_) => write!(f, "RebalanceCommand::SplitSweep"),
+            RebalanceCommand::SplitReassign(_) => write!(f, "RebalanceCommand::SplitReassign"),
+            RebalanceCommand::Merge(_) => write!(f, "RebalanceCommand::Merge"),
+            RebalanceCommand::MergeSweep(_) => write!(f, "RebalanceCommand::MergeSweep"),
+            RebalanceCommand::MergeReassign(_) => write!(f, "RebalanceCommand::MergeReassign"),
+            RebalanceCommand::FinishSplit(_) => write!(f, "RebalanceCommand::FinishSplit"),
+            RebalanceCommand::FinishMerge(_) => write!(f, "RebalanceCommand::FinishMerge"),
+        };
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct SplitPostings {
     centroid_vec: Vec<f32>,
     postings: PostingList,
@@ -47,6 +68,7 @@ impl SplitPostings {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct CentroidPostings {
     centroid_id: u64,
     postings: PostingList,
@@ -67,11 +89,16 @@ impl CentroidPostings {
     pub(crate) fn postings(self) -> PostingList {
         self.postings
     }
+
+    pub(crate) fn postings_ref(&self) -> &PostingList {
+        &self.postings
+    }
 }
 
 /// Instructs the write coordinator to split a given centroid c into 2 new centroids c0 and c1.
 /// After this command is executed, c is removed from the centroid graph and c0/c1 are added.
 /// The task state transitions to SWEEP.
+#[derive(Debug)]
 pub(crate) struct SplitCommand {
     /// Unique task ID associated with this task
     task_id: u64,
@@ -100,9 +127,12 @@ pub(crate) struct SplitCommandResult {
 /// scans c's postings for vectors written between computing and applying the original split, and
 /// updates c0 and c1 postings with these updates. After this command is applied, the task
 /// transitions to REASSIGN
+#[derive(Debug)]
 pub(crate) struct SplitSweepCommand {
     /// Unique task ID associated with this task
     task_id: u64,
+    /// The original centroid that was split (needed for metadata merge deltas).
+    c: u64,
     /// New postings to be added to c0
     c0: CentroidPostings,
     /// New postings to be added to c1
@@ -110,27 +140,28 @@ pub(crate) struct SplitSweepCommand {
 }
 
 impl SplitSweepCommand {
-    pub(crate) fn new(task_id: u64, c0: CentroidPostings, c1: CentroidPostings) -> Self {
-        Self { task_id, c0, c1 }
+    pub(crate) fn new(task_id: u64, c: u64, c0: CentroidPostings, c1: CentroidPostings) -> Self {
+        Self { task_id, c, c0, c1 }
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct VectorReassignment {
-    target_centroid_id: u64,
-    source_centroid_id: u64,
-    vector_id: u64,
-    vector: Vec<f32>,
+    pub(crate) target_centroid_ids: Vec<u64>,
+    pub(crate) source_centroid_id: u64,
+    pub(crate) vector_id: u64,
+    pub(crate) vector: Vec<f32>,
 }
 
 impl VectorReassignment {
     pub(crate) fn new(
-        target_centroid_id: u64,
+        target_centroid_ids: Vec<u64>,
         source_centroid_id: u64,
         vector_id: u64,
         vector: Vec<f32>,
     ) -> Self {
         Self {
-            target_centroid_id,
+            target_centroid_ids,
             source_centroid_id,
             vector_id,
             vector,
@@ -144,6 +175,7 @@ impl VectorReassignment {
 /// reassignments by adding a `PostingUpdate` with type `Append` to the target posting list, and
 /// a `PostingUpdate` with type `Delete` in the source posting list. After this command is applied,
 /// the task is complete and its state is deleted. Centroid c is deleted from the set of centroids.
+#[derive(Debug)]
 pub(crate) struct SplitReassignCommand {
     /// Unique task ID associated with this task
     task_id: u64,
@@ -163,6 +195,7 @@ impl SplitReassignCommand {
 /// Instructs the write coordinator to initiate a merge of centroid c_from into centroid c_to. After
 /// this command is applied, the write coordinator transitions c_from to DRAINING and the task
 /// is created and its state set to SWEEP.
+#[derive(Debug)]
 pub(crate) struct MergeCommand {
     /// Unique task ID associated with this task
     task_id: u64,
@@ -186,17 +219,21 @@ impl MergeCommand {
 /// can read from the latest snapshot). The index rebalancer scans c_from's postings for vectors
 /// written between computing and applying the original merge, and updates c_to's postings with
 /// these updates. After this command is applied, the task transitions to REASSIGN
+#[derive(Debug)]
 pub(crate) struct MergeSweepCommand {
     /// Unique task ID associated with this task
     task_id: u64,
+    /// The original centroid that was merged away (needed for metadata merge deltas).
+    c_from: u64,
     /// The postings to be added to centroid c_to
     c_to_postings: CentroidPostings,
 }
 
 impl MergeSweepCommand {
-    pub(crate) fn new(task_id: u64, c_to_postings: CentroidPostings) -> Self {
+    pub(crate) fn new(task_id: u64, c_from: u64, c_to_postings: CentroidPostings) -> Self {
         Self {
             task_id,
+            c_from,
             c_to_postings,
         }
     }
@@ -208,6 +245,7 @@ impl MergeSweepCommand {
 /// execute. The write coordinator executes the reassignments by adding a `PostingUpdate` with type
 /// `Append` to the target posting list, and a `PostingUpdate` with type `Delete` in the source
 /// posting list.After this command is applied, the task and c are deleted.
+#[derive(Debug)]
 pub(crate) struct MergeReassignCommand {
     /// Unique task ID associated with this task
     task_id: u64,
@@ -225,6 +263,7 @@ impl MergeReassignCommand {
 
 /// Sent by the index rebalancer after a split operation completes (or exits early).
 /// Cleans up rebalance_participants for the centroids involved in the split.
+#[derive(Debug)]
 pub(crate) struct FinishSplitCommand {
     pub(crate) task_id: u64,
     pub(crate) c0: Option<u64>,
@@ -239,6 +278,7 @@ impl FinishSplitCommand {
 
 /// Sent by the index rebalancer after a merge operation completes (or exits early).
 /// Cleans up rebalance_participants for the centroids involved in the merge.
+#[derive(Debug)]
 pub(crate) struct FinishMergeCommand {
     pub(crate) task_id: u64,
     c_to: u64,
@@ -275,6 +315,7 @@ impl VectorDbWriteDelta {
         &mut self,
         cmd: RebalanceCommand,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
+        debug!("Applying rebalance command: {:?}", cmd);
         match cmd {
             RebalanceCommand::Split(cmd) => self.apply_split_cmd(cmd),
             RebalanceCommand::SplitSweep(cmd) => self.apply_split_sweep_cmd(cmd),
@@ -341,6 +382,10 @@ impl VectorDbWriteDelta {
             .add_centroid(&c1)
             .map_err(|e| e.to_string())?;
 
+        // Collect vector IDs before consuming postings (needed for metadata merges)
+        let c0_vector_ids: Vec<u64> = c0_postings.iter().map(|p| p.id()).collect();
+        let c1_vector_ids: Vec<u64> = c1_postings.iter().map(|p| p.id()).collect();
+
         let mut view = self.view.write().expect("lock poisoned");
 
         // Mark the old centroid as deleted in the deletions bitmap
@@ -362,6 +407,24 @@ impl VectorDbWriteDelta {
 
         drop(view);
 
+        // Update VectorIndexedMetadata: replace old centroid with new child
+        if self.ctx.opts.max_cluster_replication > 1 {
+            for &vid in &c0_vector_ids {
+                self.ops.push(record::merge_vector_indexed_metadata(
+                    vid,
+                    &[cmd.c],
+                    &[c0_id],
+                ));
+            }
+            for &vid in &c1_vector_ids {
+                self.ops.push(record::merge_vector_indexed_metadata(
+                    vid,
+                    &[cmd.c],
+                    &[c1_id],
+                ));
+            }
+        }
+
         // 6. Update centroid_counts: remove c, add c0 count, add c1 count
         self.ctx.rebalancer.drop_centroid(cmd.c);
         self.ctx
@@ -378,10 +441,14 @@ impl VectorDbWriteDelta {
         &mut self,
         cmd: SplitSweepCommand,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
-        let mut view = self.view.write().expect("lock poisoned");
-
         let c0_centroid_id = cmd.c0.centroid_id();
         let c1_centroid_id = cmd.c1.centroid_id();
+
+        // Collect vector IDs before consuming postings (needed for metadata merges)
+        let c0_vector_ids: Vec<u64> = cmd.c0.postings_ref().iter().map(|p| p.id()).collect();
+        let c1_vector_ids: Vec<u64> = cmd.c1.postings_ref().iter().map(|p| p.id()).collect();
+
+        let mut view = self.view.write().expect("lock poisoned");
 
         let c0_added = dedup_and_accumulate(&mut view, cmd.c0);
         let c1_added = dedup_and_accumulate(&mut view, cmd.c1);
@@ -392,6 +459,24 @@ impl VectorDbWriteDelta {
             (c0_centroid_id, c0_added as i32),
             (c1_centroid_id, c1_added as i32),
         ]);
+
+        // Update VectorIndexedMetadata for swept vectors
+        if self.ctx.opts.max_cluster_replication > 1 {
+            for &vid in &c0_vector_ids {
+                self.ops.push(record::merge_vector_indexed_metadata(
+                    vid,
+                    &[cmd.c],
+                    &[c0_centroid_id],
+                ));
+            }
+            for &vid in &c1_vector_ids {
+                self.ops.push(record::merge_vector_indexed_metadata(
+                    vid,
+                    &[cmd.c],
+                    &[c1_centroid_id],
+                ));
+            }
+        }
 
         Ok(Arc::new(()))
     }
@@ -417,50 +502,126 @@ impl VectorDbWriteDelta {
         &mut self,
         reassignments: Vec<VectorReassignment>,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
+        // Read VectorIndexedMetadata for all reassigned vectors so we can clean up
+        // all replicated postings (not just the source centroid).
+        let metadata_map: HashMap<u64, Vec<u64>> = if self.ctx.opts.max_cluster_replication > 1 {
+            let view = self.ctx.rebalancer.view();
+            let vector_ids: Vec<u64> = reassignments.iter().map(|r| r.vector_id).collect();
+
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let futs: Vec<_> = vector_ids
+                        .iter()
+                        .map(|&vid| {
+                            let snap = view.snapshot.clone();
+                            async move {
+                                let meta = snap.get_vector_indexed_metadata(vid).await;
+                                (vid, meta)
+                            }
+                        })
+                        .collect();
+                    let results = futures::future::join_all(futs).await;
+                    results
+                        .into_iter()
+                        .filter_map(|(vid, r)| r.ok().flatten().map(|m| (vid, m.centroid_ids)))
+                        .collect()
+                })
+            })
+        } else {
+            HashMap::new()
+        };
+
         let mut view = self.view.write().expect("lock poisoned");
 
         for reassignment in reassignments {
-            let source_id = self
+            let source_exists = self
                 .ctx
                 .centroid_graph
-                .get_centroid_vector(reassignment.source_centroid_id);
-            if source_id.is_none() {
+                .get_centroid_vector(reassignment.source_centroid_id)
+                .is_some();
+            if !source_exists {
                 // vector was from a centroid involved in a racing split/merge. skip
-                // TODO: in general we could have racing reassignments that cause vectors
-                //       to be double-assigned. We should try to avoid that
                 continue;
             }
-            // Check if the target centroid still exists. If not, recompute the target
-            // by looking in the centroid graph. This handles concurrent splits.
-            let target_id = if self
-                .ctx
-                .centroid_graph
-                .get_centroid_vector(reassignment.target_centroid_id)
-                .is_some()
+
+            // Validate target centroid(s). If any target no longer exists, recompute
+            // the full assignment using the centroid graph.
+            let target_ids = if reassignment
+                .target_centroid_ids
+                .iter()
+                .all(|&tid| self.ctx.centroid_graph.get_centroid_vector(tid).is_some())
             {
-                reassignment.target_centroid_id
+                reassignment.target_centroid_ids.clone()
             } else {
-                let nearest = self.ctx.centroid_graph.search(&reassignment.vector, 1);
-                match nearest.first() {
-                    Some(&id) => id,
-                    None => {
-                        warn!(
-                            target_centroid_id = reassignment.target_centroid_id,
-                            vector_id = reassignment.vector_id,
-                            "target centroid no longer exists and no alternative found, skipping"
-                        );
-                        continue;
-                    }
-                }
+                // One or more targets are stale (concurrent split/merge). Recompute.
+                crate::distance::assign_to_centroids(
+                    &reassignment.vector,
+                    self.ctx.centroid_graph.as_ref(),
+                    self.ctx.opts.max_cluster_replication,
+                    self.ctx.opts.distance_metric,
+                )
             };
 
-            // Append to target centroid's posting list
-            view.add_to_posting(target_id, reassignment.vector_id, reassignment.vector);
-            // Delete from source centroid's posting list
-            view.delete_from_posting(reassignment.source_centroid_id, reassignment.vector_id);
-            self.ctx
-                .rebalancer
-                .update_counts(&[(target_id, 1), (reassignment.source_centroid_id, -1)]);
+            if target_ids.is_empty() {
+                continue;
+            }
+
+            let target_set: HashSet<u64> = target_ids.iter().copied().collect();
+
+            // Delete from all old centroids that are NOT in the new target set.
+            if let Some(old_centroids) = metadata_map.get(&reassignment.vector_id) {
+                for &old_cid in old_centroids {
+                    if !target_set.contains(&old_cid)
+                        && self
+                            .ctx
+                            .centroid_graph
+                            .get_centroid_vector(old_cid)
+                            .is_some()
+                    {
+                        view.delete_from_posting(old_cid, reassignment.vector_id);
+                        self.ctx.rebalancer.update_counts(&[(old_cid, -1)]);
+                    }
+                }
+                // Also delete from source if not already in metadata (handles in-delta
+                // staleness where source was created by a split in the same delta)
+                if !old_centroids.contains(&reassignment.source_centroid_id)
+                    && !target_set.contains(&reassignment.source_centroid_id)
+                {
+                    view.delete_from_posting(
+                        reassignment.source_centroid_id,
+                        reassignment.vector_id,
+                    );
+                    self.ctx
+                        .rebalancer
+                        .update_counts(&[(reassignment.source_centroid_id, -1)]);
+                }
+            } else if !target_set.contains(&reassignment.source_centroid_id) {
+                view.delete_from_posting(reassignment.source_centroid_id, reassignment.vector_id);
+                self.ctx
+                    .rebalancer
+                    .update_counts(&[(reassignment.source_centroid_id, -1)]);
+            }
+
+            // Append to each target centroid's posting list (skip if already present
+            // from old centroids to avoid duplicates).
+            let old_centroids = metadata_map.get(&reassignment.vector_id);
+            for &tid in &target_ids {
+                let already_assigned = old_centroids
+                    .map(|oc| oc.contains(&tid))
+                    .unwrap_or(tid == reassignment.source_centroid_id);
+                if !already_assigned {
+                    view.add_to_posting(tid, reassignment.vector_id, reassignment.vector.clone());
+                    self.ctx.rebalancer.update_counts(&[(tid, 1)]);
+                }
+            }
+
+            // Update VectorIndexedMetadata to contain the new targets
+            if self.ctx.opts.max_cluster_replication > 1 {
+                self.ops.push(record::put_vector_indexed_metadata(
+                    reassignment.vector_id,
+                    &target_ids,
+                ));
+            }
         }
 
         Ok(Arc::new(()))
@@ -471,6 +632,11 @@ impl VectorDbWriteDelta {
         cmd: MergeCommand,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         let c_from_id = cmd.c_from.centroid_id();
+
+        // Collect vector IDs before consuming postings (needed for metadata merges)
+        let c_from_vector_ids: Vec<u64> =
+            cmd.c_from.postings_ref().iter().map(|p| p.id()).collect();
+
         let c_from_postings = cmd.c_from.postings();
 
         // 1. Remove c_other from centroid graph
@@ -499,6 +665,17 @@ impl VectorDbWriteDelta {
             .update_counts(&[(cmd.c_to, c_other_count as i32)]);
         self.ctx.rebalancer.drop_centroid(c_from_id);
 
+        // Update VectorIndexedMetadata: replace c_from with c_to
+        if self.ctx.opts.max_cluster_replication > 1 {
+            for &vid in &c_from_vector_ids {
+                self.ops.push(record::merge_vector_indexed_metadata(
+                    vid,
+                    &[c_from_id],
+                    &[cmd.c_to],
+                ));
+            }
+        }
+
         Ok(Arc::new(()))
     }
 
@@ -506,9 +683,18 @@ impl VectorDbWriteDelta {
         &mut self,
         cmd: MergeSweepCommand,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
+        let c_to_id = cmd.c_to_postings.centroid_id();
+
+        // Collect vector IDs before consuming postings (needed for metadata merges)
+        let swept_vector_ids: Vec<u64> = cmd
+            .c_to_postings
+            .postings_ref()
+            .iter()
+            .map(|p| p.id())
+            .collect();
+
         let mut view = self.view.write().expect("lock poisoned");
 
-        let c_to_id = cmd.c_to_postings.centroid_id();
         let added = dedup_and_accumulate(&mut view, cmd.c_to_postings);
 
         drop(view);
@@ -516,6 +702,17 @@ impl VectorDbWriteDelta {
         self.ctx
             .rebalancer
             .update_counts(&[(c_to_id, added as i32)]);
+
+        // Update VectorIndexedMetadata for swept vectors
+        if self.ctx.opts.max_cluster_replication > 1 {
+            for &vid in &swept_vector_ids {
+                self.ops.push(record::merge_vector_indexed_metadata(
+                    vid,
+                    &[cmd.c_from],
+                    &[c_to_id],
+                ));
+            }
+        }
 
         Ok(Arc::new(()))
     }

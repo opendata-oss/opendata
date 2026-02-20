@@ -63,6 +63,8 @@ pub trait Delta: Sized + Send + Sync + 'static {
     /// Estimate the size of the delta in bytes.
     fn estimate_size(&self) -> usize;
 
+    fn poke(&self) {}
+    
     /// Freezes the current delta, creating an image with the delta
     /// applied.
     ///

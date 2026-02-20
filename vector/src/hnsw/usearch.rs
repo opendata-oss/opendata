@@ -14,7 +14,7 @@ use super::CentroidGraph;
 
 /// Initial capacity reserved for the usearch index.
 /// Kept artificially high to avoid usearch deadlock issues near capacity limits.
-const INITIAL_CAPACITY: usize = 200_000;
+const INITIAL_CAPACITY: usize = 2_000_000;
 
 /// Inner state for UsearchCentroidGraph, protected by a single RwLock.
 struct UsearchCentroidGraphInner {
@@ -126,7 +126,7 @@ impl UsearchCentroidGraph {
 
 impl CentroidGraph for UsearchCentroidGraph {
     fn search(&self, query: &[f32], k: usize) -> Vec<u64> {
-        self.inner.read().expect("lock poisoned").search(query, k)
+        self.inner.write().expect("lock poisoned").search(query, k)
     }
 
     fn add_centroid(&self, entry: &CentroidEntry) -> Result<()> {

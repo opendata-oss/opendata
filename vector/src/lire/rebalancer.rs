@@ -35,6 +35,7 @@ pub(crate) struct IndexRebalancerOpts {
     pub(crate) split_threshold_vectors: usize,
     pub(crate) merge_threshold_vectors: usize,
     pub(crate) max_rebalance_tasks: usize,
+    pub(crate) max_cluster_replication: usize,
 }
 
 struct RebalanceTask {
@@ -189,6 +190,10 @@ impl IndexRebalancer {
         self.coordinator_handle()
     }
 
+    pub(crate) fn view(&mut self) -> Arc<common::coordinator::View<VectorDbWriteDelta>> {
+        self.coordinator_handle().view()
+    }
+
     pub(crate) fn update_counts(&mut self, posting_deltas: &[(u64, i32)]) {
         for (centroid, delta) in posting_deltas {
             let count = self.centroid_counts.entry(*centroid).or_insert(0);
@@ -292,10 +297,13 @@ impl IndexRebalancer {
         // Find a suitable merge partner from the centroid graph. A partner is suitable
         // if (1) it is not already participating in a merge, and (2) the total count is
         // not over the split threshold
-        let v = self
+        let Some(v) = self
             .centroid_graph
             .get_centroid_vector(candidate_centroid_id)
-            .unwrap_or_else(|| panic!("unexpected missing centroid {}", candidate_centroid_id));
+        else {
+            warn!("centroid not found in graph for merge. was likely removed already");
+            return;
+        };
         let neighbours = self.centroid_graph.search(&v, 16);
         let partner = neighbours.iter().copied().find_map(|n_id| {
             let n_count = self.centroid_counts.get(&n_id).copied().unwrap_or(u64::MAX);
@@ -356,6 +364,7 @@ impl IndexRebalancer {
             min,
             max,
             total_ops_pending_and_running = self.total_ops_pending_and_running(),
+            running = self.tasks.num_tasks(),
             merges = self.stats.get_merges(),
             splits = self.stats.get_splits(),
             reassignments = self.stats.get_reassignments(),
@@ -546,6 +555,7 @@ impl IndexRebalancerTask {
         // Send SplitSweepCommand
         let sweep_cmd = RebalanceCommand::SplitSweep(SplitSweepCommand::new(
             self.task_id,
+            c_id,
             CentroidPostings::new(c0_id, sweep_c0_postings),
             CentroidPostings::new(c1_id, sweep_c1_postings),
         ));
@@ -638,19 +648,23 @@ impl IndexRebalancerTask {
             ) {
                 continue;
             }
-            let nearest = self.centroid_graph.search(p.vector(), 1);
-            let Some(nearest_id) = nearest.first() else {
-                continue;
-            };
+            let target_ids = crate::distance::assign_to_centroids(
+                p.vector(),
+                self.centroid_graph.as_ref(),
+                self.opts.max_cluster_replication,
+                self.opts.distance_metric,
+            );
 
-            if *nearest_id != c0_id && *nearest_id != c1_id {
-                reassignments.push(VectorReassignment::new(
-                    *nearest_id,
-                    centroid_id,
-                    p.id(),
-                    p.vector().to_vec(),
-                ));
+            // Only reassign if the targets differ from being solely in centroid_id
+            if target_ids.len() == 1 && target_ids[0] == centroid_id {
+                continue;
             }
+            reassignments.push(VectorReassignment::new(
+                target_ids,
+                centroid_id,
+                p.id(),
+                p.vector().to_vec(),
+            ));
         }
         reassignments
     }
@@ -708,18 +722,23 @@ impl IndexRebalancerTask {
                 }
                 let vector = p.vector().to_vec();
 
-                // Find the closest centroid for this vector using the graph
-                let nearest = self.centroid_graph.search(&vector, 1);
-                let nearest_id = nearest.first().copied().unwrap_or(*neighbour_id);
+                let target_ids = crate::distance::assign_to_centroids(
+                    &vector,
+                    self.centroid_graph.as_ref(),
+                    self.opts.max_cluster_replication,
+                    self.opts.distance_metric,
+                );
 
-                if nearest_id != *neighbour_id {
-                    reassignments.push(VectorReassignment::new(
-                        nearest_id,
-                        *neighbour_id,
-                        p.id(),
-                        vector,
-                    ));
+                // Reassign if the targets differ from being solely in this neighbour
+                if target_ids.len() == 1 && target_ids[0] == *neighbour_id {
+                    continue;
                 }
+                reassignments.push(VectorReassignment::new(
+                    target_ids,
+                    *neighbour_id,
+                    p.id(),
+                    vector,
+                ));
             }
         }
 
@@ -795,6 +814,7 @@ impl IndexRebalancerTask {
         // Swept postings go to c_to (the surviving centroid)
         let sweep_cmd = RebalanceCommand::MergeSweep(MergeSweepCommand::new(
             self.task_id,
+            c_from,
             CentroidPostings::new(c_to, swept_postings),
         ));
 
@@ -832,18 +852,22 @@ impl IndexRebalancerTask {
             if !all_c_from_ids.contains(&p.id()) {
                 continue;
             }
-            let nearest = self.centroid_graph.search(p.vector(), 1);
-            let Some(&nearest_id) = nearest.first() else {
+            let target_ids = crate::distance::assign_to_centroids(
+                p.vector(),
+                self.centroid_graph.as_ref(),
+                self.opts.max_cluster_replication,
+                self.opts.distance_metric,
+            );
+            // Only reassign if the targets differ from being solely in c_to
+            if target_ids.len() == 1 && target_ids[0] == c_to {
                 continue;
-            };
-            if nearest_id != c_to {
-                reassignments.push(VectorReassignment::new(
-                    nearest_id,
-                    c_to,
-                    p.id(),
-                    p.vector().to_vec(),
-                ));
             }
+            reassignments.push(VectorReassignment::new(
+                target_ids,
+                c_to,
+                p.id(),
+                p.vector().to_vec(),
+            ));
         }
 
         let num_reassignments = reassignments.len() as u64;
@@ -981,6 +1005,7 @@ mod tests {
                     split_threshold_vectors: 10_000,
                     merge_threshold_vectors: 0,
                     max_rebalance_tasks: 0,
+                    max_cluster_replication: 1,
                 },
                 centroid_graph.clone(),
                 centroid_counts,
@@ -994,6 +1019,8 @@ mod tests {
                     max_pending_and_running_rebalance_tasks: usize::MAX,
                     split_threshold_vectors: usize::MAX / 2,
                     rebalance_backpressure_resume_threshold: 0,
+                    distance_metric,
+                    max_cluster_replication: 1,
                 },
                 dictionary: Arc::new(DashMap::new()),
                 centroid_graph: centroid_graph.clone(),
@@ -1048,6 +1075,7 @@ mod tests {
                     split_threshold_vectors: 10_000,
                     merge_threshold_vectors: 0,
                     max_rebalance_tasks: 10,
+                    max_cluster_replication: 1,
                 },
                 task_id,
                 tasks: self.tasks.clone(),
@@ -1436,6 +1464,7 @@ mod tests {
                 split_threshold_vectors: split_threshold,
                 merge_threshold_vectors: 2,
                 max_rebalance_tasks: 0,
+                max_cluster_replication: 1,
             },
             centroid_graph,
             centroid_counts,
@@ -1543,6 +1572,7 @@ mod tests {
                 split_threshold_vectors: 5,
                 merge_threshold_vectors: 2,
                 max_rebalance_tasks: 1,
+                max_cluster_replication: 1,
             },
             centroid_graph,
             HashMap::new(),
@@ -1587,6 +1617,7 @@ mod tests {
                 split_threshold_vectors: 5,
                 merge_threshold_vectors: 2,
                 max_rebalance_tasks: 2,
+                max_cluster_replication: 1,
             },
             centroid_graph,
             HashMap::new(),
@@ -1626,6 +1657,7 @@ mod tests {
                 split_threshold_vectors: 100,
                 merge_threshold_vectors: 5,
                 max_rebalance_tasks: 2,
+                max_cluster_replication: 1,
             },
             centroid_graph,
             HashMap::new(),

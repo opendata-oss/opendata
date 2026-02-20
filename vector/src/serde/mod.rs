@@ -12,6 +12,7 @@ pub mod metadata_index;
 pub mod posting_list;
 pub mod vector_bitmap;
 pub mod vector_data;
+pub(crate) mod vector_indexed_metadata;
 
 use bytes::BytesMut;
 
@@ -36,6 +37,7 @@ pub enum RecordType {
     MetadataIndex = 0x07,
     SeqBlock = 0x08,
     CentroidStats = 0x09,
+    VectorIndexedMetadata = 0x0A,
 }
 
 impl RecordType {
@@ -56,6 +58,7 @@ impl RecordType {
             0x07 => Ok(RecordType::MetadataIndex),
             0x08 => Ok(RecordType::SeqBlock),
             0x09 => Ok(RecordType::CentroidStats),
+            0x0A => Ok(RecordType::VectorIndexedMetadata),
             _ => Err(EncodingError {
                 message: format!("Invalid record type: 0x{:02x}", id),
             }),
@@ -696,6 +699,7 @@ mod tests {
             RecordType::MetadataIndex,
             RecordType::SeqBlock,
             RecordType::CentroidStats,
+            RecordType::VectorIndexedMetadata,
         ];
 
         for record_type in types {

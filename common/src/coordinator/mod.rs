@@ -33,6 +33,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{Instant, Interval, interval_at};
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, info};
 
 /// Configuration for the write coordinator.
 #[derive(Debug, Clone)]
@@ -286,9 +287,11 @@ impl<D: Delta> WriteCoordinatorTask<D> {
                 cmd = write_stream.next() => {
                     match cmd {
                         Some(WriteCommand::Write { write, result_tx }) => {
+                            debug!("got write");
                             self.handle_write(write, result_tx).await?;
                         }
                         Some(WriteCommand::Flush { epoch_tx, flush_storage }) => {
+                            debug!("got flush");
                             // Send back the epoch of the last processed write
                             let _ = epoch_tx.send(Ok(handle::WriteApplied {
                                 epoch: self.epoch.saturating_sub(1),
@@ -297,6 +300,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
                             self.handle_flush(flush_storage).await;
                         }
                         None => {
+                            debug!("all closed");
                             // All write channels closed
                             break;
                         }
@@ -304,13 +308,16 @@ impl<D: Delta> WriteCoordinatorTask<D> {
                 }
 
                 _ = self.flush_interval.tick() => {
+                    debug!("flush ticker");
                     self.handle_flush(false).await;
                 }
 
                 _ = self.stop_tok.cancelled() => {
+                    debug!("stop");
                     break;
                 }
             }
+            debug!("finished cmd");
         }
 
         // Flush any remaining pending writes before shutdown
@@ -365,6 +372,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
     }
 
     async fn flush_if_delta_has_writes(&mut self) {
+        self.delta.poke();
         if self.epoch == self.delta_start_epoch {
             return;
         }

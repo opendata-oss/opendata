@@ -220,6 +220,18 @@ pub struct Config {
     /// Target number of centroids per chunk.
     pub chunk_target: u16,
 
+    /// Maximum number of centroids a vector can be assigned to during ingest.
+    ///
+    /// When `1` (the default), each vector is assigned to exactly one centroid,
+    /// matching the original single-assignment behavior. When `> 1`, boundary
+    /// vectors (those near cluster edges) are replicated to up to this many
+    /// centroids using the SPANN replication formula:
+    ///   `dist(x, cj) <= 2 * dist(x, c1)` (i.e., ε₁ = 1)
+    ///
+    /// Higher values improve recall at the cost of increased storage and write
+    /// amplification.
+    pub max_cluster_replication: usize,
+
     /// Metadata field schema.
     ///
     /// Defines the expected attribute names and types. Writes with unknown
@@ -242,6 +254,7 @@ impl Default for Config {
             rebalance_backpressure_resume_threshold: 8,
             max_rebalance_tasks: 8,
             chunk_target: 4096,
+            max_cluster_replication: 1,
             metadata_fields: Vec::new(),
         }
     }

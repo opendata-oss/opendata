@@ -156,6 +156,7 @@ impl VectorDb {
                 split_threshold_vectors: config.split_threshold_vectors,
                 merge_threshold_vectors: config.merge_threshold_vectors,
                 max_rebalance_tasks: config.max_rebalance_tasks,
+                max_cluster_replication: config.max_cluster_replication,
             },
             centroid_graph.clone(),
             centroid_counts,
@@ -172,6 +173,8 @@ impl VectorDb {
                 rebalance_backpressure_resume_threshold: config
                     .rebalance_backpressure_resume_threshold,
                 split_threshold_vectors: config.split_threshold_vectors,
+                distance_metric: config.distance_metric,
+                max_cluster_replication: config.max_cluster_replication,
             },
             dictionary: Arc::clone(&dictionary),
             centroid_graph: Arc::clone(&centroid_graph),
