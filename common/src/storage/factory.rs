@@ -278,7 +278,7 @@ async fn create_slatedb_storage(
         db_builder = db_builder.with_compaction_runtime(handle);
     }
 
-    db_builder.with_memory_cache(Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+    db_builder = db_builder.with_memory_cache(Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
         max_capacity: 32 * 1024 * 1024 * 1024,
         ..FoyerCacheOptions::default()
     })));
