@@ -12,6 +12,7 @@ use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
 use slatedb::config::Settings;
 use slatedb::object_store::{self, ObjectStore};
 use slatedb::{DbBuilder, DbReader};
+use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 use tokio::runtime::Handle;
 use tracing::info;
 
@@ -276,6 +277,11 @@ async fn create_slatedb_storage(
     if let Some(handle) = runtime.compaction_runtime {
         db_builder = db_builder.with_compaction_runtime(handle);
     }
+
+    db_builder.with_memory_cache(Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+        max_capacity: 32 * 1024 * 1024 * 1024,
+        ..FoyerCacheOptions::default()
+    })));
 
     let db = db_builder
         .build()
