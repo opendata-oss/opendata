@@ -50,10 +50,11 @@ fn skip_ingest() -> bool {
 fn data_dir() -> PathBuf {
     // When running from workspace root via `cargo run -p vector-bench`,
     // CARGO_MANIFEST_DIR points to vector/bench. Data is at vector/tests/data.
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    /*Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("bench dir has parent")
-        .join("tests/data")
+        .join("tests/data")*/
+    PathBuf::from("/mnt/cache")
 }
 
 fn read_fvecs(path: &Path) -> Vec<Vec<f32>> {
@@ -155,7 +156,7 @@ const COHERE1M: Dataset = Dataset {
     ground_truth_file: "cohere/cohere_groundtruth.ivecs",
     split_threshold: 1_024,
     merge_threshold: 256,
-    nprobe: 30,
+    nprobe: 100,
 };
 
 const ALL_DATASETS: &[&Dataset] = &[&SIFT1M, &COHERE1M];
@@ -299,10 +300,18 @@ impl Benchmark for RecallBenchmark {
 
         // -- Query & measure recall -------------------------------------------
         println!("start warmup");
+        let query_latency = bench.histogram("cold_query_latency_us");
+        let mut cold_latencies_us = Vec::with_capacity(queries.len());
         for (_, query) in queries.iter().enumerate() {
             let t = std::time::Instant::now();
             let _ = db.search_with_nprobe(query, k, nprobe).await?;
+            let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
+            query_latency.record(elapsed_us);
+            cold_latencies_us.push(elapsed_us);
+            //println!("done: {:?}", t.elapsed());
         }
+        let p90 = percentile(&cold_latencies_us, 90.0);
+        println!("p90 = {:.2}", p90 / 1000.0);
         println!("end warmup");
 
         let query_latency = bench.histogram("query_latency_us");

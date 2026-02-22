@@ -31,7 +31,7 @@ use common::SequenceAllocator;
 use common::coordinator::{Delta, PauseHandle};
 use common::storage::RecordOp;
 use dashmap::DashMap;
-use log::info;
+use log::{debug, info};
 use roaring::RoaringTreemap;
 // ============================================================================
 // WriteCoordinator Integration Types
@@ -205,7 +205,7 @@ impl VectorDbWriteDelta {
         if total_tasks >= self.ctx.opts.max_pending_and_running_rebalance_tasks
             || self.ctx.rebalancer.max_centroid_size() >= max_centroid_limit
         {
-            info!(
+            debug!(
                 "applying rebalance backpressure: {} {}",
                 total_tasks, self.ctx.opts.max_pending_and_running_rebalance_tasks
             );
