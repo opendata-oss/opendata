@@ -18,11 +18,11 @@ pub(crate) enum RebalanceCommand {
     Split(SplitCommand),
     SplitSweep(SplitSweepCommand),
     SplitReassign(SplitReassignCommand),
+    SplitFinish(SplitFinishCommand),
     Merge(MergeCommand),
     MergeSweep(MergeSweepCommand),
     MergeReassign(MergeReassignCommand),
-    FinishSplit(FinishSplitCommand),
-    FinishMerge(FinishMergeCommand),
+    MergeFinish(MergeFinishCommand),
 }
 
 pub(crate) struct SplitPostings {
@@ -225,13 +225,13 @@ impl MergeReassignCommand {
 
 /// Sent by the index rebalancer after a split operation completes (or exits early).
 /// Cleans up rebalance_participants for the centroids involved in the split.
-pub(crate) struct FinishSplitCommand {
+pub(crate) struct SplitFinishCommand {
     pub(crate) task_id: u64,
     pub(crate) c0: Option<u64>,
     pub(crate) c1: Option<u64>,
 }
 
-impl FinishSplitCommand {
+impl SplitFinishCommand {
     pub(crate) fn new(task_id: u64, c0: Option<u64>, c1: Option<u64>) -> Self {
         Self { task_id, c0, c1 }
     }
@@ -239,12 +239,12 @@ impl FinishSplitCommand {
 
 /// Sent by the index rebalancer after a merge operation completes (or exits early).
 /// Cleans up rebalance_participants for the centroids involved in the merge.
-pub(crate) struct FinishMergeCommand {
+pub(crate) struct MergeFinishCommand {
     pub(crate) task_id: u64,
     c_to: u64,
 }
 
-impl FinishMergeCommand {
+impl MergeFinishCommand {
     pub(crate) fn new(task_id: u64, c_to: u64) -> Self {
         Self { task_id, c_to }
     }
@@ -282,8 +282,8 @@ impl VectorDbWriteDelta {
             RebalanceCommand::Merge(cmd) => self.apply_merge_cmd(cmd),
             RebalanceCommand::MergeSweep(cmd) => self.apply_merge_sweep_cmd(cmd),
             RebalanceCommand::MergeReassign(cmd) => self.apply_merge_reassign_cmd(cmd),
-            RebalanceCommand::FinishSplit(cmd) => self.apply_finish_split(cmd),
-            RebalanceCommand::FinishMerge(cmd) => self.apply_finish_merge(cmd),
+            RebalanceCommand::SplitFinish(cmd) => self.apply_finish_split(cmd),
+            RebalanceCommand::MergeFinish(cmd) => self.apply_finish_merge(cmd),
         }
     }
 
@@ -405,7 +405,7 @@ impl VectorDbWriteDelta {
 
     pub(crate) fn apply_finish_split(
         &mut self,
-        cmd: FinishSplitCommand,
+        cmd: SplitFinishCommand,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         self.ctx
             .rebalancer
@@ -529,7 +529,7 @@ impl VectorDbWriteDelta {
 
     pub(crate) fn apply_finish_merge(
         &mut self,
-        cmd: FinishMergeCommand,
+        cmd: MergeFinishCommand,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         self.ctx.rebalancer.finish_merge(cmd.task_id, cmd.c_to);
         Ok(Arc::new(()))

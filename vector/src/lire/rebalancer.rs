@@ -10,8 +10,8 @@ use crate::delta::{VectorDbWrite, VectorDbWriteDelta};
 use crate::distance;
 use crate::hnsw::CentroidGraph;
 use crate::lire::commands::{
-    CentroidPostings, FinishMergeCommand, FinishSplitCommand, MergeCommand, MergeReassignCommand,
-    MergeSweepCommand, RebalanceCommand, SplitCommand, SplitCommandResult, SplitPostings,
+    CentroidPostings, MergeCommand, MergeFinishCommand, MergeReassignCommand, MergeSweepCommand,
+    RebalanceCommand, SplitCommand, SplitCommandResult, SplitFinishCommand, SplitPostings,
     SplitReassignCommand, SplitSweepCommand, VectorReassignment,
 };
 use crate::lire::heuristics;
@@ -58,7 +58,10 @@ impl RebalanceTasks {
             drop(tasks);
             panic!("Rebalance task already registered");
         }
-        debug!("registering rebalance task {}", id);
+        debug!(
+            "registering rebalance task {} with participants {:?}",
+            id, participants
+        );
         tasks.insert(
             id,
             RebalanceTask {
@@ -200,18 +203,27 @@ impl IndexRebalancer {
 
     pub(crate) fn maybe_schedule_split(&mut self, candidate_centroid_id: u64) {
         if self.tasks.participants().contains(&candidate_centroid_id) {
-            trace!("centroid is already actively participating in rebalance. skip");
+            trace!(
+                "centroid {} is already actively participating in rebalance. skip",
+                candidate_centroid_id
+            );
             return;
         }
         let Some(v) = self
             .centroid_graph
             .get_centroid_vector(candidate_centroid_id)
         else {
-            warn!("centroid not found in graph. was likely merged already");
+            warn!(
+                "centroid {} not found in graph. was likely merged already",
+                candidate_centroid_id
+            );
             return;
         };
         if self.tasks.num_tasks() >= self.opts.max_rebalance_tasks {
-            debug!("too many tasks running. mark centroid pending");
+            debug!(
+                "too many tasks running. mark centroid {} pending",
+                candidate_centroid_id
+            );
             self.pending_rebalance.insert(candidate_centroid_id);
             return;
         }
@@ -236,11 +248,17 @@ impl IndexRebalancer {
 
     pub(crate) fn maybe_schedule_merge(&mut self, candidate_centroid_id: u64, count: u64) {
         if self.tasks.participants().contains(&candidate_centroid_id) {
-            trace!("centroid is already actively participating in rebalance. skip");
+            trace!(
+                "centroid {} is already actively participating in rebalance. skip",
+                candidate_centroid_id
+            );
             return;
         }
         if self.tasks.num_tasks() >= self.opts.max_rebalance_tasks {
-            debug!("too many tasks running. mark centroid pending");
+            debug!(
+                "too many tasks running. mark centroid {} pending",
+                candidate_centroid_id
+            );
             self.pending_rebalance.insert(candidate_centroid_id);
             return;
         }
@@ -354,7 +372,7 @@ impl IndexRebalancerTask {
         c0: Option<u64>,
         c1: Option<u64>,
     ) -> Result<(), String> {
-        let cmd = RebalanceCommand::FinishSplit(FinishSplitCommand::new(self.task_id, c0, c1));
+        let cmd = RebalanceCommand::SplitFinish(SplitFinishCommand::new(self.task_id, c0, c1));
         let mut write_handle = self
             .coordinator_handle
             .write(VectorDbWrite::Rebalance(cmd))
@@ -368,7 +386,7 @@ impl IndexRebalancerTask {
     }
 
     async fn send_finish_merge(&self, c_to: u64) -> Result<(), String> {
-        let cmd = RebalanceCommand::FinishMerge(FinishMergeCommand::new(self.task_id, c_to));
+        let cmd = RebalanceCommand::MergeFinish(MergeFinishCommand::new(self.task_id, c_to));
         let mut write_handle = self
             .coordinator_handle
             .write(VectorDbWrite::Rebalance(cmd))
@@ -691,14 +709,19 @@ impl IndexRebalancerTask {
             warn!(
                 c_from,
                 num_vectors = posting_list.len(),
-                "cannot merge centroid with fewer than 2 vectors"
+                "cannot merge empty centroid",
             );
             self.send_finish_merge(c_to).await?;
             return Ok(());
         }
 
-        // Track original vector IDs for sweep phase
+        // Track original vector IDs for sweep phase, and save (id, vector)
+        // pairs for reassignment in Phase 3.
         let original_vector_ids: HashSet<u64> = posting_list.iter().map(|p| p.id()).collect();
+        let mut moved_vectors: Vec<(u64, Vec<f32>)> = posting_list
+            .iter()
+            .map(|p| (p.id(), p.vector().to_vec()))
+            .collect();
 
         // Send MergeCommand: merge c_from's postings into c_to
         let cmd = RebalanceCommand::Merge(MergeCommand::new(
@@ -737,6 +760,11 @@ impl IndexRebalancerTask {
             }
         }
 
+        // Save swept vectors for Phase 3 reassignment before moving
+        for p in &swept_postings {
+            moved_vectors.push((p.id(), p.vector().to_vec()));
+        }
+
         // Swept postings go to c_to (the surviving centroid)
         let sweep_cmd = RebalanceCommand::MergeSweep(MergeSweepCommand::new(
             self.task_id,
@@ -757,27 +785,12 @@ impl IndexRebalancerTask {
         // Phase 3: REASSIGN
         // =========================================================================
 
-        // Re-read c_to's posting list (all vectors from c_from are now in c_to)
-        let reader = ViewReader::new(self.coordinator_handle.view());
-        let c_to_postings = reader
-            .get_posting_list(c_to, self.opts.dimensions)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        // Collect all vector IDs that originally belonged to c_from
-        let all_c_from_ids: HashSet<u64> = c_from_postings
-            .iter()
-            .map(|p| p.id())
-            .chain(original_vector_ids.iter().copied())
-            .collect();
-
-        // For each vector that came from c, check if it should be reassigned
+        // We already have all vectors that came from c_from (collected in
+        // moved_vectors during Phases 1 and 2). Check whether any of them
+        // are closer to a different centroid than c_to.
         let mut reassignments = Vec::new();
-        for p in c_to_postings.iter() {
-            if !all_c_from_ids.contains(&p.id()) {
-                continue;
-            }
-            let nearest = self.centroid_graph.search(p.vector(), 1);
+        for (id, vector) in &moved_vectors {
+            let nearest = self.centroid_graph.search(vector, 1);
             let Some(&nearest_id) = nearest.first() else {
                 continue;
             };
@@ -785,8 +798,8 @@ impl IndexRebalancerTask {
                 reassignments.push(VectorReassignment::new(
                     nearest_id,
                     c_to,
-                    p.id(),
-                    p.vector().to_vec(),
+                    *id,
+                    vector.clone(),
                 ));
             }
         }
