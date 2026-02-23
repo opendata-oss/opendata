@@ -836,52 +836,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     )))
                 }
             }
-            ExprResult::Scalar(_) => Err(EvaluationError::InternalError(
-                "Scalar function arguments not yet supported".to_string(),
-            )),
-        }
-    }
-
-    async fn eval_single_argument(
-        &mut self,
-        call: &Call,
-        query_start: SystemTime,
-        query_end: SystemTime,
-        evaluation_ts: SystemTime,
-        interval: Duration,
-        lookback_delta: Duration,
-    ) -> EvalResult<Vec<EvalSample>> {
-        if call.args.args.len() != 1 {
-            return Err(EvaluationError::InternalError(format!(
-                "{} function requires exactly one argument",
-                call.func.name
-            )));
-        }
-
-        // Evaluate the argument (can be any expression that returns an instant vector)
-        match self
-            .evaluate_expr(
-                call.args.args[0].as_ref(),
-                query_start,
-                query_end,
-                evaluation_ts,
-                interval,
-                lookback_delta,
-            )
-            .await?
-        {
-            ExprResult::Scalar(s) => Ok(vec![EvalSample {
-                timestamp_ms: evaluation_ts
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64,
-                value: s,
-                labels: HashMap::new(),
-            }]),
-            ExprResult::InstantVector(v) => Ok(v),
-            ExprResult::RangeVector(_) => Err(EvaluationError::InternalError(
-                "range vector handling not yet implemented in eval_single_argument".to_string(),
-            )),
+            ExprResult::Scalar(s) => Ok(ExprResult::Scalar(s)),
         }
     }
 
@@ -2388,7 +2343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_eval_single_argument_scalar() {
+    async fn test_evaluate_call_scalar_argument() {
         let (reader, end_time) = setup_mock_reader(vec![]);
         let mut evaluator = Evaluator::new(&reader);
 
@@ -2397,7 +2352,7 @@ mod tests {
                 "test_func",
                 vec![ValueType::Scalar],
                 false,
-                ValueType::Vector,
+                ValueType::Scalar,
             ),
             args: FunctionArgs::new_args(Expr::NumberLiteral(NumberLiteral { val: 42.0 })),
         };
@@ -2406,7 +2361,7 @@ mod tests {
         let lookback_delta = Duration::from_secs(300);
 
         let result = evaluator
-            .eval_single_argument(
+            .evaluate_call(
                 &call,
                 end_time,
                 end_time,
@@ -2417,13 +2372,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].value, 42.0);
-        assert!(result[0].labels.is_empty());
-        assert_eq!(
-            result[0].timestamp_ms,
-            end_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
-        );
+        match result {
+            ExprResult::Scalar(v) => assert_eq!(v, 42.0),
+            other => panic!("Expected Scalar, got {:?}", other),
+        }
     }
 
     #[tokio::test]
