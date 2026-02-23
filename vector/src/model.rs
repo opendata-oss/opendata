@@ -204,6 +204,17 @@ pub struct Config {
     /// Number of neighboring centroids to scan for reassignment candidates after a split.
     pub split_search_neighbourhood: usize,
 
+    /// The maximum number of centroids that require rebalancing before which backpressure
+    /// is applied by pausing ingestion of new vector writes.
+    pub max_pending_and_running_rebalance_tasks: usize,
+
+    /// After backpressure is applied, ingestion resumes after the total number of centroids
+    /// requiring rebalance drops below this value.
+    pub rebalance_backpressure_resume_threshold: usize,
+
+    /// The maximum number of rebalance tasks that the rebalancer will run concurrently.
+    pub max_rebalance_tasks: usize,
+
     /// Target number of centroids per chunk.
     pub chunk_target: u16,
 
@@ -225,6 +236,9 @@ impl Default for Config {
             split_threshold_vectors: 2_000,
             merge_threshold_vectors: 500,
             split_search_neighbourhood: 16,
+            max_pending_and_running_rebalance_tasks: 16,
+            rebalance_backpressure_resume_threshold: 8,
+            max_rebalance_tasks: 8,
             chunk_target: 4096,
             metadata_fields: Vec::new(),
         }
