@@ -886,7 +886,7 @@ mod tests {
         for (centroid_id, expected_count) in [(1u64, 2i32), (2, 1), (3, 1)] {
             let stats_key = CentroidStatsKey::new(centroid_id).encode();
             let stats_merge = frozen.ops.iter().find(|op| match op {
-                RecordOp::Merge(record) => record.key == stats_key,
+                RecordOp::Merge(record) => record.record.key == stats_key,
                 _ => false,
             });
             assert!(
@@ -896,7 +896,7 @@ mod tests {
             );
             if let Some(RecordOp::Merge(record)) = stats_merge {
                 let value = crate::serde::centroid_stats::CentroidStatsValue::decode_from_bytes(
-                    &record.value,
+                    &record.record.value,
                 )
                 .unwrap();
                 assert_eq!(

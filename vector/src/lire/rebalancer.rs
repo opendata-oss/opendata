@@ -883,7 +883,7 @@ mod tests {
             for centroid_vec in &centroid_vecs {
                 let (centroid_id, seq_put) = allocator.allocate_one();
                 if let Some(put) = seq_put {
-                    initial_ops.push(RecordOp::Put(put));
+                    initial_ops.push(RecordOp::Put(put.into()));
                 }
                 entries.push(CentroidEntry::new(centroid_id, centroid_vec.clone()));
             }

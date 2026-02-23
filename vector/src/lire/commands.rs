@@ -293,11 +293,11 @@ impl VectorDbWriteDelta {
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         let (c0_id, seq_alloc_put) = self.ctx.id_allocator.allocate_one();
         if let Some(seq_alloc_put) = seq_alloc_put {
-            self.ops.push(RecordOp::Put(seq_alloc_put));
+            self.ops.push(RecordOp::Put(seq_alloc_put.into()));
         }
         let (c1_id, seq_alloc_put) = self.ctx.id_allocator.allocate_one();
         if let Some(seq_alloc_put) = seq_alloc_put {
-            self.ops.push(RecordOp::Put(seq_alloc_put));
+            self.ops.push(RecordOp::Put(seq_alloc_put.into()));
         }
         let c0 = CentroidEntry::new(c0_id, cmd.c0.centroid_vec);
         let c0_postings = cmd.c0.postings;

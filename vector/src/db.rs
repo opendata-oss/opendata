@@ -250,7 +250,7 @@ impl VectorDb {
         for vector in centroids {
             let (centroid_id, seq_alloc_put) = id_allocator.allocate_one();
             if let Some(seq_alloc_put) = seq_alloc_put {
-                ops.push(common::storage::RecordOp::Put(seq_alloc_put));
+                ops.push(common::storage::RecordOp::Put(seq_alloc_put.into()));
             }
             entries.push(CentroidEntry::new(centroid_id, vector));
         }
