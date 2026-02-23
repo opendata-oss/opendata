@@ -15,15 +15,19 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::config::{CountOptions, ReaderConfig, ScanOptions, SegmentConfig};
+use crate::config::{CountOptions, ReaderConfig};
+use crate::delta_reader::FrozenViewLogIterator;
+use crate::delta_writer::LogDelta;
 use crate::error::{Error, Result};
 use crate::listing::LogKeyIterator;
 use crate::model::{LogEntry, Segment, SegmentId, Sequence};
 use crate::range::{normalize_segment_id, normalize_sequence};
-use crate::segment::{LogSegment, SegmentCache};
+use crate::segment::{LogSegment, SegmentSnapshot};
 use crate::storage::{LogStorageRead as _, SegmentIterator};
 use common::storage::factory::create_storage_read;
 use common::{StorageRead, StorageSemantics};
+
+type View = common::coordinator::View<LogDelta>;
 
 /// Trait for read operations on the log.
 ///
@@ -58,9 +62,6 @@ pub trait LogRead {
     /// Returns an iterator that yields entries in sequence number order.
     /// The range is specified using Rust's standard range syntax.
     ///
-    /// This method uses default scan options. Use [`scan_with_options`] for
-    /// custom read behavior.
-    ///
     /// # Read Visibility
     ///
     /// An active scan may or may not see records appended after the initial
@@ -76,36 +77,10 @@ pub trait LogRead {
     /// # Errors
     ///
     /// Returns an error if the scan fails due to storage issues.
-    ///
-    /// [`scan_with_options`]: LogRead::scan_with_options
     async fn scan(
         &self,
         key: Bytes,
         seq_range: impl RangeBounds<Sequence> + Send,
-    ) -> Result<LogIterator> {
-        self.scan_with_options(key, seq_range, ScanOptions::default())
-            .await
-    }
-
-    /// Scans entries for a key within a sequence number range with custom options.
-    ///
-    /// Returns an iterator that yields entries in sequence number order.
-    /// See [`scan`](LogRead::scan) for read visibility semantics.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The key identifying the log stream to scan.
-    /// * `seq_range` - The sequence number range to scan.
-    /// * `options` - Scan options controlling read behavior.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the scan fails due to storage issues.
-    async fn scan_with_options(
-        &self,
-        key: Bytes,
-        seq_range: impl RangeBounds<Sequence> + Send,
-        options: ScanOptions,
     ) -> Result<LogIterator>;
 
     /// Counts entries for a key within a sequence number range.
@@ -212,44 +187,26 @@ pub trait LogRead {
     ) -> Result<Vec<Segment>>;
 }
 
-/// Shared read component used by both `LogDb` and `LogDbReader`.
+/// A read view backed by a storage snapshot.
 ///
-/// Contains the storage and segment cache needed for read operations.
-/// Wrapped in `Arc<RwLock<_>>` by both consumers.
-pub(crate) struct LogReadView {
-    pub(crate) storage: Arc<dyn StorageRead>,
-    pub(crate) segments: SegmentCache,
+/// Used by [`LogDbReader`] for storage-only reads without frozen delta
+/// merging. Supports periodic segment refresh from storage.
+pub(crate) struct ReaderView {
+    storage: Arc<dyn StorageRead>,
+    segments: SegmentSnapshot,
 }
 
-impl LogReadView {
-    /// Creates a new `LogReadView`.
-    pub(crate) fn new(storage: Arc<dyn StorageRead>, segments: SegmentCache) -> Self {
-        Self { storage, segments }
+impl ReaderView {
+    pub(crate) async fn open(storage: Arc<dyn StorageRead>) -> Result<Self> {
+        let segments = SegmentSnapshot::open(&*storage).await?;
+        Ok(Self { storage, segments })
     }
 
-    /// Replaces the underlying storage snapshot with a new one.
-    pub(crate) fn update_snapshot(&mut self, snapshot: Arc<dyn StorageRead>) {
-        self.storage = snapshot;
+    pub(crate) fn scan_entries(&self, key: Bytes, seq_range: Range<Sequence>) -> LogIterator {
+        let segments = self.segments.find_covering(&seq_range);
+        LogIterator::from_storage(self.storage.clone(), segments, key, seq_range)
     }
 
-    /// Inserts new segments into the segment cache.
-    pub(crate) fn apply_new_segments(&mut self, segments: &[LogSegment]) {
-        for segment in segments {
-            self.segments.insert(segment.clone());
-        }
-    }
-
-    /// Scans entries for a key within a sequence number range with custom options.
-    pub(crate) fn scan_with_options(
-        &self,
-        key: Bytes,
-        seq_range: Range<Sequence>,
-        _options: &ScanOptions,
-    ) -> LogIterator {
-        LogIterator::open(Arc::clone(&self.storage), &self.segments, key, seq_range)
-    }
-
-    /// Lists distinct keys within a segment range.
     pub(crate) async fn list_keys(
         &self,
         segment_range: Range<SegmentId>,
@@ -258,13 +215,22 @@ impl LogReadView {
         Ok(LogKeyIterator::from_keys(keys))
     }
 
-    /// Lists segments overlapping a sequence number range.
-    pub(crate) fn list_segments(&self, seq_range: &Range<Sequence>) -> Vec<Segment> {
+    pub(crate) fn list_segments(&self, seq_range: Range<Sequence>) -> Vec<Segment> {
         self.segments
-            .find_covering(seq_range)
+            .find_covering(&seq_range)
             .into_iter()
             .map(|s| s.into())
             .collect()
+    }
+
+    pub(crate) async fn refresh_segments(&mut self) -> Result<()> {
+        let after_id = self.segments.latest().map(|s| s.id());
+        let scan_start = after_id.map(|id| id.saturating_add(1)).unwrap_or(0);
+        let loaded = self.storage.scan_segments(scan_start..u32::MAX).await?;
+        for segment in loaded {
+            self.segments.insert(segment);
+        }
+        Ok(())
     }
 }
 
@@ -316,7 +282,7 @@ impl LogReadView {
 /// }
 /// ```
 pub struct LogDbReader {
-    read_view: Arc<RwLock<LogReadView>>,
+    read_view: Arc<RwLock<ReaderView>>,
     shutdown_tx: watch::Sender<bool>,
     refresh_task: Option<JoinHandle<()>>,
 }
@@ -369,8 +335,7 @@ impl LogDbReader {
             create_storage_read(&config.storage, StorageSemantics::new(), reader_options)
                 .await
                 .map_err(|e| Error::Storage(e.to_string()))?;
-        let segments = SegmentCache::open(storage.as_ref(), SegmentConfig::default()).await?;
-        let read_view = Arc::new(RwLock::new(LogReadView::new(storage, segments)));
+        let read_view = Arc::new(RwLock::new(ReaderView::open(storage).await?));
 
         let (shutdown_tx, refresh_task) =
             Self::spawn_refresh_task(Arc::clone(&read_view), config.refresh_interval);
@@ -384,7 +349,7 @@ impl LogDbReader {
 
     /// Spawns a background task that periodically refreshes the segment cache.
     fn spawn_refresh_task(
-        read_view: Arc<RwLock<LogReadView>>,
+        read_view: Arc<RwLock<ReaderView>>,
         interval: Duration,
     ) -> (watch::Sender<bool>, JoinHandle<()>) {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -396,16 +361,8 @@ impl LogDbReader {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        // Get the latest segment ID for incremental refresh
-                        let after_segment_id = {
-                            let view = read_view.read().await;
-                            view.segments.latest().map(|s| s.id())
-                        };
-
-                        // Refresh the cache
                         let mut view = read_view.write().await;
-                        let storage = Arc::clone(&view.storage);
-                        if let Err(e) = view.segments.refresh(storage.as_ref(), after_segment_id).await {
+                        if let Err(e) = view.refresh_segments().await {
                             tracing::warn!("Failed to refresh segment cache: {}", e);
                         }
                     }
@@ -424,8 +381,7 @@ impl LogDbReader {
     /// Creates a LogDbReader from an existing storage implementation.
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn StorageRead>) -> Result<Self> {
-        let segments = SegmentCache::open(storage.as_ref(), SegmentConfig::default()).await?;
-        let read_view = Arc::new(RwLock::new(LogReadView::new(storage, segments)));
+        let read_view = Arc::new(RwLock::new(ReaderView::open(storage).await?));
         let (shutdown_tx, _) = watch::channel(false);
         Ok(Self {
             read_view,
@@ -454,15 +410,14 @@ impl LogDbReader {
 
 #[async_trait]
 impl LogRead for LogDbReader {
-    async fn scan_with_options(
+    async fn scan(
         &self,
         key: Bytes,
         seq_range: impl RangeBounds<Sequence> + Send,
-        options: ScanOptions,
     ) -> Result<LogIterator> {
         let seq_range = normalize_sequence(&seq_range);
         let view = self.read_view.read().await;
-        Ok(view.scan_with_options(key, seq_range, &options))
+        Ok(view.scan_entries(key, seq_range))
     }
 
     async fn count_with_options(
@@ -489,16 +444,16 @@ impl LogRead for LogDbReader {
     ) -> Result<Vec<Segment>> {
         let seq_range = normalize_sequence(&seq_range);
         let view = self.read_view.read().await;
-        Ok(view.list_segments(&seq_range))
+        Ok(view.list_segments(seq_range))
     }
 }
 
-/// Iterator over log entries across multiple segments.
+/// Iterator over log entries across multiple storage segments.
 ///
 /// Iterates through segments in order, fetching entries for the given key
 /// within the sequence range. Instantiates a `SegmentIterator` for each
 /// segment as needed.
-pub struct LogIterator {
+struct LogStorageIterator {
     storage: Arc<dyn StorageRead>,
     segments: Vec<LogSegment>,
     key: Bytes,
@@ -507,28 +462,9 @@ pub struct LogIterator {
     current_iter: Option<SegmentIterator>,
 }
 
-impl LogIterator {
-    /// Opens a new iterator by looking up segments covering the sequence range.
-    pub(crate) fn open(
-        storage: Arc<dyn StorageRead>,
-        segment_cache: &SegmentCache,
-        key: Bytes,
-        seq_range: Range<Sequence>,
-    ) -> Self {
-        let segments = segment_cache.find_covering(&seq_range);
-        Self {
-            storage,
-            segments,
-            key,
-            seq_range,
-            current_segment_idx: 0,
-            current_iter: None,
-        }
-    }
-
+impl LogStorageIterator {
     /// Creates a new iterator over the given segments.
-    #[cfg(test)]
-    pub(crate) fn new(
+    fn new(
         storage: Arc<dyn StorageRead>,
         segments: Vec<LogSegment>,
         key: Bytes,
@@ -545,7 +481,7 @@ impl LogIterator {
     }
 
     /// Returns the next log entry, or None if iteration is complete.
-    pub async fn next(&mut self) -> Result<Option<LogEntry>> {
+    async fn next(&mut self) -> Result<Option<LogEntry>> {
         loop {
             // If we have a current iterator, try to get the next entry
             if let Some(iter) = &mut self.current_iter {
@@ -579,6 +515,80 @@ impl LogIterator {
             .await?;
         self.current_iter = Some(iter);
         Ok(true)
+    }
+}
+
+/// Iterator over log entries combining storage and frozen delta sources.
+///
+/// Drains the storage iterator first, then yields entries from frozen
+/// (unflushed) deltas. This ensures entries are returned in sequence order
+/// since storage contains older entries and frozen deltas contain newer ones.
+pub struct LogIterator {
+    storage_iter: LogStorageIterator,
+    frozen_iter: Option<FrozenViewLogIterator>,
+}
+
+impl LogIterator {
+    /// Creates an iterator from a coordinator view (storage snapshot + frozen deltas).
+    pub(crate) fn from_view(
+        segments: Vec<LogSegment>,
+        view: Arc<View>,
+        key: Bytes,
+        seq_range: Range<Sequence>,
+    ) -> Self {
+        let storage: Arc<dyn StorageRead> = view.snapshot.clone() as Arc<dyn StorageRead>;
+        let storage_iter =
+            LogStorageIterator::new(storage, segments, key.clone(), seq_range.clone());
+        let frozen_iter = FrozenViewLogIterator::new(view, key, seq_range);
+        Self {
+            storage_iter,
+            frozen_iter: Some(frozen_iter),
+        }
+    }
+
+    /// Creates a storage-only iterator (no frozen deltas).
+    pub(crate) fn from_storage(
+        storage: Arc<dyn StorageRead>,
+        segments: Vec<LogSegment>,
+        key: Bytes,
+        seq_range: Range<Sequence>,
+    ) -> Self {
+        let storage_iter = LogStorageIterator::new(storage, segments, key, seq_range);
+        Self {
+            storage_iter,
+            frozen_iter: None,
+        }
+    }
+
+    /// Creates a new iterator over the given segments (test helper).
+    #[cfg(test)]
+    pub(crate) fn new(
+        storage: Arc<dyn StorageRead>,
+        segments: Vec<LogSegment>,
+        key: Bytes,
+        seq_range: Range<Sequence>,
+    ) -> Self {
+        Self {
+            storage_iter: LogStorageIterator::new(storage, segments, key, seq_range),
+            frozen_iter: None,
+        }
+    }
+
+    /// Returns the next log entry, or None if iteration is complete.
+    pub async fn next(&mut self) -> Result<Option<LogEntry>> {
+        // First drain storage
+        if let Some(entry) = self.storage_iter.next().await? {
+            return Ok(Some(entry));
+        }
+
+        // Then drain frozen deltas
+        if let Some(frozen) = &mut self.frozen_iter
+            && let Some(entry) = frozen.next()
+        {
+            return Ok(Some(entry));
+        }
+
+        Ok(None)
     }
 }
 
@@ -817,6 +827,18 @@ mod tests {
 
         // Clean up
         reader.close().await;
+    }
+
+    #[tokio::test]
+    async fn reader_view_list_keys_delegates_to_storage() {
+        use common::Storage;
+        use common::storage::in_memory::InMemoryStorage;
+
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let view = ReaderView::open(storage).await.unwrap();
+
+        let mut iter = view.list_keys(0..10).await.unwrap();
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]

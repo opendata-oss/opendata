@@ -21,8 +21,8 @@ use common::{StorageRuntime, StorageSemantics};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
-use crate::config::{CountOptions, ScanOptions};
-use crate::delta::{LogContext, LogDelta, LogFlusher, LogWrite};
+use crate::config::CountOptions;
+use crate::delta_writer::{LogContext, LogDelta, LogFlusher, LogWrite};
 use crate::error::{AppendError, AppendResult, Error, Result};
 use crate::listing::ListingCache;
 use crate::listing::LogKeyIterator;
@@ -103,7 +103,7 @@ pub struct LogDb {
     coordinator: WriteCoordinator<LogDelta, LogFlusher>,
     storage: Arc<dyn common::Storage>,
     clock: Arc<dyn Clock>,
-    read_view: Arc<RwLock<crate::reader::LogReadView>>,
+    view: Arc<RwLock<crate::delta_reader::DeltaReaderView>>,
     view_monitor: ViewMonitor,
     flush_subscriber_task: JoinHandle<()>,
 }
@@ -358,7 +358,7 @@ impl LogDb {
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn common::Storage>) -> Result<Self> {
         use crate::config::SegmentConfig;
-        use crate::reader::LogReadView;
+        use crate::delta_reader::DeltaReaderView;
         use crate::serde::SEQ_BLOCK_KEY;
 
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -376,7 +376,7 @@ impl LogDb {
 
         let context = LogContext {
             sequence_allocator,
-            segment_cache: segment_cache.clone(),
+            segment_cache,
             listing_cache,
         };
 
@@ -393,12 +393,9 @@ impl LogDb {
         let (mut view_subscriber, monitor) = coordinator.subscribe();
         let initial_view = view_subscriber.initialize();
 
-        let read_view = Arc::new(RwLock::new(LogReadView::new(
-            initial_view.snapshot.clone() as Arc<dyn common::StorageRead>,
-            segment_cache,
-        )));
+        let view = Arc::new(RwLock::new(DeltaReaderView::open(initial_view).await?));
 
-        let flush_subscriber_task = spawn_flush_subscriber(view_subscriber, Arc::clone(&read_view));
+        let flush_subscriber_task = spawn_flush_subscriber(view_subscriber, Arc::clone(&view));
         coordinator.start();
 
         Ok(Self {
@@ -406,7 +403,7 @@ impl LogDb {
             coordinator,
             storage,
             clock,
-            read_view,
+            view,
             view_monitor: monitor,
             flush_subscriber_task,
         })
@@ -415,16 +412,15 @@ impl LogDb {
 
 #[async_trait]
 impl LogRead for LogDb {
-    async fn scan_with_options(
+    async fn scan(
         &self,
         key: Bytes,
         seq_range: impl RangeBounds<Sequence> + Send,
-        options: ScanOptions,
     ) -> Result<LogIterator> {
         self.sync_reader_to_flushed().await?;
         let seq_range = normalize_sequence(&seq_range);
-        let view = self.read_view.read().await;
-        Ok(view.scan_with_options(key, seq_range, &options))
+        let view = self.view.read().await;
+        Ok(view.scan_entries(key, seq_range))
     }
 
     async fn count_with_options(
@@ -442,7 +438,7 @@ impl LogRead for LogDb {
     ) -> Result<LogKeyIterator> {
         self.sync_reader_to_flushed().await?;
         let segment_range = normalize_segment_id(&segment_range);
-        let view = self.read_view.read().await;
+        let view = self.view.read().await;
         view.list_keys(segment_range).await
     }
 
@@ -452,8 +448,8 @@ impl LogRead for LogDb {
     ) -> Result<Vec<Segment>> {
         self.sync_reader_to_flushed().await?;
         let seq_range = normalize_sequence(&seq_range);
-        let view = self.read_view.read().await;
-        Ok(view.list_segments(&seq_range))
+        let view = self.view.read().await;
+        Ok(view.list_segments(seq_range))
     }
 }
 
@@ -508,7 +504,7 @@ impl LogDbBuilder {
 
     /// Builds the LogDb instance.
     pub async fn build(self) -> Result<LogDb> {
-        use crate::reader::LogReadView;
+        use crate::delta_reader::DeltaReaderView;
         use crate::serde::SEQ_BLOCK_KEY;
 
         let storage = create_storage(
@@ -534,7 +530,7 @@ impl LogDbBuilder {
 
         let context = LogContext {
             sequence_allocator,
-            segment_cache: segment_cache.clone(),
+            segment_cache,
             listing_cache,
         };
 
@@ -551,12 +547,9 @@ impl LogDbBuilder {
         let (mut view_subscriber, monitor) = coordinator.subscribe();
         let initial_view = view_subscriber.initialize();
 
-        let read_view = Arc::new(RwLock::new(LogReadView::new(
-            initial_view.snapshot.clone() as Arc<dyn common::StorageRead>,
-            segment_cache,
-        )));
+        let view = Arc::new(RwLock::new(DeltaReaderView::open(initial_view).await?));
 
-        let flush_subscriber_task = spawn_flush_subscriber(view_subscriber, Arc::clone(&read_view));
+        let flush_subscriber_task = spawn_flush_subscriber(view_subscriber, Arc::clone(&view));
         coordinator.start();
 
         Ok(LogDb {
@@ -564,7 +557,7 @@ impl LogDbBuilder {
             coordinator,
             storage,
             clock,
-            read_view,
+            view,
             view_monitor: monitor,
             flush_subscriber_task,
         })
@@ -573,19 +566,21 @@ impl LogDbBuilder {
 
 fn spawn_flush_subscriber(
     mut subscriber: ViewSubscriber<LogDelta>,
-    read_view: Arc<RwLock<crate::reader::LogReadView>>,
+    read_view: Arc<RwLock<crate::delta_reader::DeltaReaderView>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Ok(view) = subscriber.recv().await {
-            let Some(flushed) = &view.last_flushed_delta else {
+            if view.last_flushed_delta.is_none() {
                 continue;
-            };
-            let mut rv = read_view.write().await;
-            rv.update_snapshot(view.snapshot.clone() as Arc<dyn common::StorageRead>);
-            if !flushed.val.new_segments.is_empty() {
-                rv.apply_new_segments(&flushed.val.new_segments);
             }
-            subscriber.update_flushed(flushed.epoch_range.end - 1);
+            let epoch_end = view
+                .last_flushed_delta
+                .as_ref()
+                .map(|f| f.epoch_range.end - 1)
+                .unwrap();
+            let mut rv = read_view.write().await;
+            rv.update_view(view);
+            subscriber.update_flushed(epoch_end);
         }
     })
 }

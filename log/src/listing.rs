@@ -86,7 +86,7 @@ impl ListingCache {
     /// If `segment_id` differs from the cached segment, the cache is reset.
     ///
     /// Returns the keys that were new to this segment (i.e., produced listing
-    /// records). Callers can use this to track segment->key associations.
+    /// records). Callers can use this to track segment→key associations.
     pub(crate) fn assign_new_keys(
         &mut self,
         segment_id: SegmentId,
