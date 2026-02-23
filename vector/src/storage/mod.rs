@@ -1,6 +1,7 @@
+use std::ops::Bound::Included;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use common::StorageRead;
+use common::{BytesRange, StorageRead};
 
 use crate::serde::centroid_chunk::CentroidChunkValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
@@ -79,9 +80,13 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         dimensions: usize,
     ) -> Result<PostingListValue> {
         let key = PostingListKey::new(centroid_id).encode();
-        let record = self.get(key).await?;
-        match record {
+        let key_next = PostingListKey::new(centroid_id + 1).encode();
+        let record = self.scan(BytesRange::new(Included(key.clone()), Included(key_next))).await?;
+        match record.first() {
             Some(record) => {
+                if record.key != key {
+                    return Ok(PostingListValue::new())
+                }
                 let value = PostingListValue::decode_from_bytes(&record.value, dimensions)?;
                 Ok(value)
             }

@@ -31,7 +31,7 @@ use common::SequenceAllocator;
 use common::coordinator::{Delta, PauseHandle};
 use common::storage::RecordOp;
 use dashmap::DashMap;
-use log::info;
+use log::{debug, info};
 use roaring::RoaringTreemap;
 // ============================================================================
 // WriteCoordinator Integration Types

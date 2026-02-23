@@ -793,6 +793,7 @@ impl VectorDb {
             let snap = snapshot.clone();
             let q = query_vec.clone();
             handles.push(tokio::spawn(async move {
+                let t = std::time::Instant::now();
                 let posting_list: PostingList =
                     snap.get_posting_list(cid, dimensions).await?.into();
                 let mut scored: Vec<ScoredCandidate> = posting_list
