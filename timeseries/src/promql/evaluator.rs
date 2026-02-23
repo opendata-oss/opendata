@@ -870,10 +870,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             )
             .await?
         {
-            // TODO: support functions with scalar args
-            ExprResult::Scalar(_) => Err(EvaluationError::InternalError(
-                "unsupported scalar result".to_string(),
-            )),
+            ExprResult::Scalar(s) => Ok(vec![EvalSample {
+                timestamp_ms: evaluation_ts
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64,
+                value: s,
+                labels: HashMap::new(),
+            }]),
             ExprResult::InstantVector(v) => Ok(v),
             ExprResult::RangeVector(_) => Err(EvaluationError::InternalError(
                 "range vector handling not yet implemented in eval_single_argument".to_string(),
@@ -1184,7 +1188,9 @@ mod tests {
     use crate::test_utils::assertions::approx_eq;
     use promql_parser::label::{METRIC_NAME, Matchers};
     use promql_parser::parser::value::ValueType;
-    use promql_parser::parser::{AtModifier, EvalStmt, Offset, VectorSelector};
+    use promql_parser::parser::{
+        AtModifier, EvalStmt, Function, FunctionArgs, NumberLiteral, Offset, VectorSelector,
+    };
     use rstest::rstest;
 
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -2379,6 +2385,45 @@ mod tests {
                 test_name, result
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_eval_single_argument_scalar() {
+        let (reader, end_time) = setup_mock_reader(vec![]);
+        let mut evaluator = Evaluator::new(&reader);
+
+        let call = Call {
+            func: Function::new(
+                "test_func",
+                vec![ValueType::Scalar],
+                false,
+                ValueType::Vector,
+            ),
+            args: FunctionArgs::new_args(Expr::NumberLiteral(NumberLiteral { val: 42.0 })),
+        };
+
+        let interval = Duration::from_secs(60);
+        let lookback_delta = Duration::from_secs(300);
+
+        let result = evaluator
+            .eval_single_argument(
+                &call,
+                end_time,
+                end_time,
+                end_time,
+                interval,
+                lookback_delta,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 42.0);
+        assert!(result[0].labels.is_empty());
+        assert_eq!(
+            result[0].timestamp_ms,
+            end_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+        );
     }
 
     #[tokio::test]
