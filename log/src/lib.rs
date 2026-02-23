@@ -42,7 +42,8 @@
 //! ```
 
 mod config;
-mod delta;
+mod delta_reader;
+mod delta_writer;
 mod error;
 mod listing;
 mod log;
@@ -55,7 +56,7 @@ mod serde;
 pub mod server;
 mod storage;
 
-pub use config::{Config, CountOptions, ReaderConfig, ScanOptions, SegmentConfig};
+pub use config::{Config, CountOptions, ReaderConfig, SegmentConfig};
 pub use error::{AppendError, AppendResult, Error, Result};
 pub use listing::{LogKey, LogKeyIterator};
 pub use log::{LogDb, LogDbBuilder};
