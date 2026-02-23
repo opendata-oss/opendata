@@ -4,14 +4,16 @@
 //! recall@k against ground truth.
 //!
 //! Environment variables:
-//! - `VECTOR_BENCH_DATASET`: Target dataset (`sift1m` or `cohere1m`). If unset,
-//!   runs all datasets whose data files are present.
+//! - `VECTOR_BENCH_DATASET`: Target dataset (`sift1m`, `cohere1m`, `sift10m`,
+//!   `sift50m`, `sift100m`, `sift1b`). If unset, runs all datasets whose data
+//!   files are present.
 //! - `VECTOR_BENCH_NUM_QUERIES`: Number of queries to run (default: 100).
 //! - `VECTOR_BENCH_CONFIG`: Path to a YAML file with vector `Config` overrides
 //!   (storage, thresholds, etc.). When set, the config from this file is used
 //!   instead of the defaults. This allows persistent storage for reuse across runs.
 //! - `VECTOR_BENCH_SKIP_INGEST`: Set to `1` to skip the ingest phase and query
 //!   an existing database (requires persistent storage via `VECTOR_BENCH_CONFIG`).
+//! - `SLATEDB_BLOCK_CACHE`: Block cache size in bytes (e.g. `536870912` for 512MB).
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -19,7 +21,8 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use bencher::{Bench, Benchmark, Params, Summary};
-use common::{FoyerCache, FoyerCacheOptions, StorageRuntime};
+use common::StorageRuntime;
+use common::storage::factory::{FoyerCache, FoyerCacheOptions};
 use vector::{Config, DistanceMetric, SearchResult, Vector, VectorDb};
 
 const DEFAULT_NUM_QUERIES: usize = 100;
@@ -51,13 +54,15 @@ fn skip_ingest() -> bool {
 fn data_dir() -> PathBuf {
     // When running from workspace root via `cargo run -p vector-bench`,
     // CARGO_MANIFEST_DIR points to vector/bench. Data is at vector/tests/data.
-    TODO: fix me and make me configurable
+    // TODO: fix me and make me configurable
     /*Path::new(env!("CARGO_MANIFEST_DIR"))
     .parent()
     .expect("bench dir has parent")
     .join("tests/data")*/
     PathBuf::from("/mnt/cache")
 }
+
+// -- Vector file readers ------------------------------------------------------
 
 fn read_fvecs(path: &Path) -> Vec<Vec<f32>> {
     let file =
@@ -101,6 +106,36 @@ fn read_ivecs(path: &Path) -> Vec<Vec<i32>> {
     vectors
 }
 
+/// Read bvecs format (BigANN). Each record: 4-byte dimension (i32 LE) followed
+/// by `dim` unsigned bytes. Values are converted to f32.
+/// If `limit` is `Some(n)`, stops after reading `n` vectors.
+fn read_bvecs(path: &Path, limit: Option<usize>) -> Vec<Vec<f32>> {
+    let file =
+        File::open(path).unwrap_or_else(|e| panic!("failed to open {}: {}", path.display(), e));
+    let mut reader = BufReader::new(file);
+    let mut vectors = Vec::new();
+    let mut dim_buf = [0u8; 4];
+
+    while reader.read_exact(&mut dim_buf).is_ok() {
+        if let Some(n) = limit {
+            if vectors.len() >= n {
+                break;
+            }
+        }
+        let dim = u32::from_le_bytes(dim_buf) as usize;
+        let mut bytes = vec![0u8; dim];
+        reader
+            .read_exact(&mut bytes)
+            .expect("failed to read bvecs values");
+        let values: Vec<f32> = bytes.iter().map(|&b| b as f32).collect();
+        vectors.push(values);
+    }
+
+    vectors
+}
+
+// -- Recall / percentile helpers ----------------------------------------------
+
 fn recall_at_k(results: &[SearchResult], ground_truth: &[i32], k: usize) -> f64 {
     let gt_set: HashSet<i32> = ground_truth.iter().take(k).copied().collect();
     let found = results
@@ -124,6 +159,14 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
+// -- Dataset descriptors ------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum VecFormat {
+    Fvecs,
+    Bvecs,
+}
+
 /// Dataset descriptor.
 struct Dataset {
     name: &'static str,
@@ -135,6 +178,36 @@ struct Dataset {
     split_threshold: usize,
     merge_threshold: usize,
     nprobe: usize,
+    /// File format for base and query vectors.
+    format: VecFormat,
+    /// Maximum number of base vectors to ingest. `None` = all.
+    max_vectors: Option<usize>,
+}
+
+impl Dataset {
+    /// Load base vectors, respecting `format` and `max_vectors`.
+    fn load_base_vectors(&self, data_dir: &Path) -> Vec<Vec<f32>> {
+        let path = data_dir.join(self.base_file);
+        match self.format {
+            VecFormat::Fvecs => {
+                let vecs = read_fvecs(&path);
+                match self.max_vectors {
+                    Some(n) => vecs.into_iter().take(n).collect(),
+                    None => vecs,
+                }
+            }
+            VecFormat::Bvecs => read_bvecs(&path, self.max_vectors),
+        }
+    }
+
+    /// Load query vectors, respecting `format`.
+    fn load_query_vectors(&self, data_dir: &Path, nqueries: usize) -> Vec<Vec<f32>> {
+        let path = data_dir.join(self.query_file);
+        match self.format {
+            VecFormat::Fvecs => read_fvecs(&path).into_iter().take(nqueries).collect(),
+            VecFormat::Bvecs => read_bvecs(&path, Some(nqueries)),
+        }
+    }
 }
 
 const SIFT1M: Dataset = Dataset {
@@ -144,9 +217,11 @@ const SIFT1M: Dataset = Dataset {
     base_file: "sift/sift_base.fvecs",
     query_file: "sift/sift_query.fvecs",
     ground_truth_file: "sift/sift_groundtruth.ivecs",
-    split_threshold: 2_000,
+    split_threshold: 1500,
     merge_threshold: 500,
-    nprobe: 12,
+    nprobe: 100,
+    format: VecFormat::Fvecs,
+    max_vectors: None,
 };
 
 const COHERE1M: Dataset = Dataset {
@@ -156,12 +231,73 @@ const COHERE1M: Dataset = Dataset {
     base_file: "cohere/cohere_base.fvecs",
     query_file: "cohere/cohere_query.fvecs",
     ground_truth_file: "cohere/cohere_groundtruth.ivecs",
-    split_threshold: 1_024,
-    merge_threshold: 256,
+    split_threshold: 200,
+    merge_threshold: 50,
     nprobe: 100,
+    format: VecFormat::Fvecs,
+    max_vectors: None,
 };
 
-const ALL_DATASETS: &[&Dataset] = &[&SIFT1M, &COHERE1M];
+// BigANN / SIFT1B variants — all share the same base and query files but
+// differ in the number of vectors ingested and their ground truth files.
+
+const SIFT10M: Dataset = Dataset {
+    name: "sift10m",
+    dimensions: 128,
+    distance_metric: DistanceMetric::L2,
+    base_file: "bigann/bigann_base.bvecs",
+    query_file: "bigann/bigann_query.bvecs",
+    ground_truth_file: "bigann/bigann_groundtruth_10M.ivecs",
+    split_threshold: 1500,
+    merge_threshold: 500,
+    nprobe: 100,
+    format: VecFormat::Bvecs,
+    max_vectors: Some(10_000_000),
+};
+
+const SIFT50M: Dataset = Dataset {
+    name: "sift50m",
+    dimensions: 128,
+    distance_metric: DistanceMetric::L2,
+    base_file: "bigann/bigann_base.bvecs",
+    query_file: "bigann/bigann_query.bvecs",
+    ground_truth_file: "bigann/bigann_groundtruth_50M.ivecs",
+    split_threshold: 1500,
+    merge_threshold: 500,
+    nprobe: 100,
+    format: VecFormat::Bvecs,
+    max_vectors: Some(50_000_000),
+};
+
+const SIFT100M: Dataset = Dataset {
+    name: "sift100m",
+    dimensions: 128,
+    distance_metric: DistanceMetric::L2,
+    base_file: "bigann/bigann_base.bvecs",
+    query_file: "bigann/bigann_query.bvecs",
+    ground_truth_file: "bigann/bigann_groundtruth_100M.ivecs",
+    split_threshold: 1500,
+    merge_threshold: 500,
+    nprobe: 100,
+    format: VecFormat::Bvecs,
+    max_vectors: Some(100_000_000),
+};
+
+const SIFT1B: Dataset = Dataset {
+    name: "sift1b",
+    dimensions: 128,
+    distance_metric: DistanceMetric::L2,
+    base_file: "bigann/bigann_base.bvecs",
+    query_file: "bigann/bigann_query.bvecs",
+    ground_truth_file: "bigann/bigann_groundtruth_1B.ivecs",
+    split_threshold: 1500,
+    merge_threshold: 500,
+    nprobe: 100,
+    format: VecFormat::Bvecs,
+    max_vectors: None,
+};
+
+const ALL_DATASETS: &[&Dataset] = &[&SIFT1M, &COHERE1M, &SIFT10M, &SIFT50M, &SIFT100M, &SIFT1B];
 
 fn target_dataset() -> Option<String> {
     std::env::var("VECTOR_BENCH_DATASET").ok()
@@ -178,6 +314,8 @@ fn make_params(dataset: &Dataset) -> Params {
     params.insert("num_queries", num_queries().to_string());
     params
 }
+
+// -- Benchmark ----------------------------------------------------------------
 
 pub struct RecallBenchmark;
 
@@ -221,21 +359,15 @@ impl Benchmark for RecallBenchmark {
         let nprobe: usize = bench.spec().params().get_parse("nprobe")?;
         let nqueries: usize = bench.spec().params().get_parse("num_queries")?;
 
-        let dataset = match dataset_name.as_str() {
-            "sift1m" => &SIFT1M,
-            "cohere1m" => &COHERE1M,
-            other => anyhow::bail!("unknown dataset: {}", other),
-        };
+        let dataset = lookup_dataset(&dataset_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown dataset: {}", dataset_name))?;
 
         let data = data_dir();
         let k = 10;
         let skip = skip_ingest();
 
         // -- Load query data --------------------------------------------------
-        let queries: Vec<Vec<f32>> = read_fvecs(&data.join(dataset.query_file))
-            .into_iter()
-            .take(nqueries)
-            .collect();
+        let queries = dataset.load_query_vectors(&data, nqueries);
         let ground_truth = read_ivecs(&data.join(dataset.ground_truth_file));
         println!(
             "  Loaded {} queries, {} ground truth entries",
@@ -276,7 +408,7 @@ impl Benchmark for RecallBenchmark {
             println!("  Skipping ingest (VECTOR_BENCH_SKIP_INGEST=1)");
         } else {
             println!("  Loading {} base vectors...", dataset.name);
-            let base_vectors = read_fvecs(&data.join(dataset.base_file));
+            let base_vectors = dataset.load_base_vectors(&data);
             println!(
                 "  Loaded {} base vectors (dim={})",
                 base_vectors.len(),
@@ -322,7 +454,6 @@ impl Benchmark for RecallBenchmark {
             let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
             query_latency.record(elapsed_us);
             cold_latencies_us.push(elapsed_us);
-            //println!("done: {:?}", t.elapsed());
         }
         let p90 = percentile(&cold_latencies_us, 90.0);
         println!("p90 = {:.2}", p90 / 1000.0);
