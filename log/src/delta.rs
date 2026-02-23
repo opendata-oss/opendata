@@ -7,8 +7,7 @@
 use crate::listing::ListingCache;
 use crate::model::{AppendOutput, Record as UserRecord};
 use crate::segment::{LogSegment, SegmentCache};
-use crate::serde::LogEntryBuilder;
-use crate::storage::LogStorage;
+use crate::serde::LogEntryKey;
 use async_trait::async_trait;
 use bytes::Bytes;
 use common::Ttl::NoExpiry;
@@ -59,11 +58,11 @@ pub(crate) struct FrozenLogDeltaView {
 
 /// Flushes frozen deltas to storage.
 pub(crate) struct LogFlusher {
-    storage: LogStorage,
+    storage: Arc<dyn common::Storage>,
 }
 
 impl LogFlusher {
-    pub(crate) fn new(storage: LogStorage) -> Self {
+    pub(crate) fn new(storage: Arc<dyn common::Storage>) -> Self {
         Self { storage }
     }
 }
@@ -87,6 +86,28 @@ impl LogDelta {
             self.new_segments.push(assignment.segment.clone());
         }
         assignment.segment
+    }
+
+    /// Builds log entry storage records from user records and appends them.
+    fn add_entries(
+        &mut self,
+        segment: &LogSegment,
+        base_sequence: u64,
+        user_records: &[UserRecord],
+    ) {
+        let segment_start_seq = segment.meta().start_seq;
+        for (i, user_record) in user_records.iter().enumerate() {
+            let sequence = base_sequence + i as u64;
+            let entry_key = LogEntryKey::new(segment.id(), user_record.key.clone(), sequence);
+            let storage_record = common::Record::new(
+                entry_key.serialize(segment_start_seq),
+                user_record.value.clone(),
+            );
+            self.records.push(PutRecordOp::new_with_options(
+                storage_record,
+                PutOptions { ttl: NoExpiry },
+            ));
+        }
     }
 }
 
@@ -137,10 +158,10 @@ impl Delta for LogDelta {
         let keys: Vec<Bytes> = write.records.iter().map(|r| r.key.clone()).collect();
         self.context
             .listing_cache
-            .assign_keys(segment.id(), &keys, &mut self.records);
+            .assign_new_keys(segment.id(), &keys, &mut self.records);
 
         // 4. Build log entry records
-        LogEntryBuilder::build(&segment, base_seq, &write.records, &mut self.records);
+        self.add_entries(&segment, base_seq, &write.records);
 
         Ok(Some(AppendOutput {
             start_sequence: base_seq,
@@ -183,7 +204,7 @@ impl Flusher<LogDelta> for LogFlusher {
             .map_err(|e| e.to_string())?;
 
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
-        Ok(snapshot)
+        Ok(snapshot as Arc<dyn StorageSnapshot>)
     }
 
     async fn flush_storage(&self) -> Result<(), String> {
@@ -201,16 +222,15 @@ mod tests {
     /// Creates a LogContext with fresh in-memory state.
     async fn test_context() -> LogContext {
         use crate::config::SegmentConfig;
-        use common::storage::in_memory::InMemoryStorage;
+        use crate::storage::in_memory_storage;
 
-        let storage: Arc<dyn common::Storage> = Arc::new(InMemoryStorage::new());
+        let storage = in_memory_storage();
         let seq_key = Bytes::from_static(&SEQ_BLOCK_KEY);
         let sequence_allocator = SequenceAllocator::load(storage.as_ref(), seq_key)
             .await
             .unwrap();
 
-        let log_storage = LogStorage::new(storage);
-        let segment_cache = SegmentCache::open(&log_storage.as_read(), SegmentConfig::default())
+        let segment_cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
         let listing_cache = ListingCache::new();
@@ -316,19 +336,18 @@ mod tests {
     #[tokio::test]
     async fn should_flush_writes_to_storage() {
         // given
-        use common::storage::in_memory::InMemoryStorage;
+        use crate::config::SegmentConfig;
+        use crate::storage::in_memory_storage;
 
-        let storage: Arc<dyn common::Storage> = Arc::new(InMemoryStorage::new());
-        let log_storage = LogStorage::new(Arc::clone(&storage));
-        let flusher = LogFlusher::new(log_storage.clone());
+        let storage = in_memory_storage();
+        let flusher = LogFlusher::new(Arc::clone(&storage));
 
         let seq_key = Bytes::from_static(&SEQ_BLOCK_KEY);
         let sequence_allocator = SequenceAllocator::load(storage.as_ref(), seq_key)
             .await
             .unwrap();
 
-        use crate::config::SegmentConfig;
-        let segment_cache = SegmentCache::open(&log_storage.as_read(), SegmentConfig::default())
+        let segment_cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
         let listing_cache = ListingCache::new();

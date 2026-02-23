@@ -15,8 +15,9 @@ use crate::error::Result;
 use crate::model::Segment;
 use crate::model::SegmentId;
 use crate::serde::{SegmentMeta, SegmentMetaKey};
+use crate::storage::LogStorageRead as _;
 use common::storage::PutOptions;
-use common::{PutRecordOp, Record, Ttl};
+use common::{PutRecordOp, Record, StorageRead, Ttl};
 
 /// A logical segment of the log.
 ///
@@ -82,10 +83,7 @@ pub(crate) struct SegmentCache {
 
 impl SegmentCache {
     /// Creates a new cache by loading all segments from storage.
-    pub(crate) async fn open(
-        storage: &crate::storage::LogStorageRead,
-        config: SegmentConfig,
-    ) -> Result<Self> {
+    pub(crate) async fn open(storage: &dyn StorageRead, config: SegmentConfig) -> Result<Self> {
         let loaded = storage.scan_segments(0..u32::MAX).await?;
 
         let mut segments = BTreeMap::new();
@@ -152,7 +150,7 @@ impl SegmentCache {
     /// If `after_segment_id` is `None`, reloads all segments.
     pub(crate) async fn refresh(
         &mut self,
-        storage: &crate::storage::LogStorageRead,
+        storage: &dyn StorageRead,
         after_segment_id: Option<SegmentId>,
     ) -> Result<()> {
         let loaded = match after_segment_id {
@@ -241,11 +239,11 @@ impl SegmentCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::LogStorage;
+    use crate::storage::{LogStorageWrite, in_memory_storage};
 
     // Helper to create a segment and write it to storage + cache
     async fn write_segment(
-        storage: &LogStorage,
+        storage: &dyn common::Storage,
         cache: &mut SegmentCache,
         meta: SegmentMeta,
     ) -> LogSegment {
@@ -262,8 +260,8 @@ mod tests {
     #[tokio::test]
     async fn should_return_none_when_no_segments_exist() {
         // given
-        let storage = LogStorage::in_memory();
-        let cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let storage = in_memory_storage();
+        let cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
 
@@ -277,14 +275,14 @@ mod tests {
     #[tokio::test]
     async fn should_write_first_segment_with_id_zero() {
         // given
-        let storage = LogStorage::in_memory();
-        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let storage = in_memory_storage();
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
         let meta = SegmentMeta::new(0, 1000);
 
         // when
-        let segment = write_segment(&storage, &mut cache, meta.clone()).await;
+        let segment = write_segment(storage.as_ref(), &mut cache, meta.clone()).await;
 
         // then
         assert_eq!(segment.id(), 0);
@@ -294,15 +292,15 @@ mod tests {
     #[tokio::test]
     async fn should_increment_segment_id_on_subsequent_writes() {
         // given
-        let storage = LogStorage::in_memory();
-        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let storage = in_memory_storage();
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
 
         // when
-        let seg0 = write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
-        let seg1 = write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
-        let seg2 = write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
+        let seg0 = write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        let seg1 = write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+        let seg2 = write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // then
         assert_eq!(seg0.id(), 0);
@@ -313,12 +311,12 @@ mod tests {
     #[tokio::test]
     async fn should_return_latest_segment() {
         // given
-        let storage = LogStorage::in_memory();
-        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let storage = in_memory_storage();
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
-        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
 
         // when
         let latest = cache.latest();
@@ -330,13 +328,13 @@ mod tests {
     #[tokio::test]
     async fn should_scan_all_segments() {
         // given
-        let storage = LogStorage::in_memory();
-        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let storage = in_memory_storage();
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
-        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // when
         let segments = cache.all();
@@ -351,15 +349,15 @@ mod tests {
     #[tokio::test]
     async fn should_persist_segments_to_storage() {
         // given
-        let storage = LogStorage::in_memory();
-        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let storage = in_memory_storage();
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
-        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
 
         // when - reopen cache from same storage
-        let cache2 = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let cache2 = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
         let segments = cache2.all();
@@ -375,13 +373,13 @@ mod tests {
     #[tokio::test]
     async fn should_find_segments_by_seq_range_all() {
         // given: segments at seq 0, 100, 200
-        let storage = LogStorage::in_memory();
-        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let storage = in_memory_storage();
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
-        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // when: query all sequences
         let segments = cache.find_covering(&(0..u64::MAX));
@@ -393,13 +391,13 @@ mod tests {
     #[tokio::test]
     async fn should_find_segments_by_seq_range_single() {
         // given: segments at seq 0, 100, 200
-        let storage = LogStorage::in_memory();
-        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let storage = in_memory_storage();
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
-        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // when: query seq 50..60 (within first segment)
         let segments = cache.find_covering(&(50..60));
@@ -412,13 +410,13 @@ mod tests {
     #[tokio::test]
     async fn should_find_segments_by_seq_range_spanning() {
         // given: segments at seq 0, 100, 200
-        let storage = LogStorage::in_memory();
-        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let storage = in_memory_storage();
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
-        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // when: query seq 50..150 (spans first and second segment)
         let segments = cache.find_covering(&(50..150));
@@ -432,13 +430,13 @@ mod tests {
     #[tokio::test]
     async fn should_find_segments_by_seq_range_unbounded_end() {
         // given: segments at seq 0, 100, 200
-        let storage = LogStorage::in_memory();
-        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let storage = in_memory_storage();
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
-        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // when: query seq 150.. (from middle of second segment to end)
         let segments = cache.find_covering(&(150..u64::MAX));
@@ -452,11 +450,11 @@ mod tests {
     #[tokio::test]
     async fn should_find_no_segments_when_range_before_all() {
         // given: segments starting at seq 100
-        let storage = LogStorage::in_memory();
-        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let storage = in_memory_storage();
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
-        write_segment(&storage, &mut cache, SegmentMeta::new(100, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 1000)).await;
 
         // when: query seq 0..50 (before any segment data)
         let segments = cache.find_covering(&(0..50));
@@ -468,8 +466,8 @@ mod tests {
     #[tokio::test]
     async fn should_find_no_segments_when_storage_empty() {
         // given: no segments
-        let storage = LogStorage::in_memory();
-        let cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let storage = in_memory_storage();
+        let cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
 
@@ -483,13 +481,13 @@ mod tests {
     #[tokio::test]
     async fn should_find_last_segment_when_range_after_all() {
         // given: segments at seq 0, 100, 200
-        let storage = LogStorage::in_memory();
-        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let storage = in_memory_storage();
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
-        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // when: query seq 500..600 (after all segment starts)
         let segments = cache.find_covering(&(500..600));
@@ -502,13 +500,13 @@ mod tests {
     #[tokio::test]
     async fn should_find_segment_when_query_starts_at_boundary() {
         // given: segments at seq 0, 100, 200
-        let storage = LogStorage::in_memory();
-        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let storage = in_memory_storage();
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
-        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // when: query starting exactly at segment boundary
         let segments = cache.find_covering(&(100..150));
@@ -521,13 +519,13 @@ mod tests {
     #[tokio::test]
     async fn should_find_segments_with_unbounded_start() {
         // given: segments at seq 0, 100, 200
-        let storage = LogStorage::in_memory();
-        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let storage = in_memory_storage();
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
-        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(100, 2000)).await;
-        write_segment(&storage, &mut cache, SegmentMeta::new(200, 3000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // when: query with unbounded start ..150
         let segments = cache.find_covering(&(0..150));
@@ -616,8 +614,8 @@ mod tests {
     #[tokio::test]
     async fn assign_segment_creates_first_segment_when_none_exist() {
         // given
-        let storage = LogStorage::in_memory();
-        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let storage = in_memory_storage();
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
         let mut records = Vec::new();
@@ -638,14 +636,12 @@ mod tests {
     #[tokio::test]
     async fn assign_segment_returns_existing_segment_when_within_interval() {
         // given: segment exists, within seal interval
-        let storage = LogStorage::in_memory();
+        let storage = in_memory_storage();
         let config = SegmentConfig {
             seal_interval: Some(Duration::from_secs(3600)),
         };
-        let mut cache = SegmentCache::open(&storage.as_read(), config)
-            .await
-            .unwrap();
-        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
+        let mut cache = SegmentCache::open(storage.as_ref(), config).await.unwrap();
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
         let mut records = Vec::new();
 
         // when: request 30 minutes later
@@ -663,14 +659,12 @@ mod tests {
     #[tokio::test]
     async fn assign_segment_creates_new_segment_when_interval_exceeded() {
         // given: segment at time 1000, seal interval 1 hour
-        let storage = LogStorage::in_memory();
+        let storage = in_memory_storage();
         let config = SegmentConfig {
             seal_interval: Some(Duration::from_secs(3600)),
         };
-        let mut cache = SegmentCache::open(&storage.as_read(), config)
-            .await
-            .unwrap();
-        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
+        let mut cache = SegmentCache::open(storage.as_ref(), config).await.unwrap();
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
         let mut records = Vec::new();
 
         // when: request 2 hours later
@@ -688,14 +682,12 @@ mod tests {
     #[tokio::test]
     async fn assign_segment_force_seal_creates_new_segment() {
         // given: segment exists, within seal interval
-        let storage = LogStorage::in_memory();
+        let storage = in_memory_storage();
         let config = SegmentConfig {
             seal_interval: Some(Duration::from_secs(3600)),
         };
-        let mut cache = SegmentCache::open(&storage.as_read(), config)
-            .await
-            .unwrap();
-        write_segment(&storage, &mut cache, SegmentMeta::new(0, 1000)).await;
+        let mut cache = SegmentCache::open(storage.as_ref(), config).await.unwrap();
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
         let mut records = Vec::new();
 
         // when: force_seal overrides interval check
@@ -711,8 +703,8 @@ mod tests {
     #[tokio::test]
     async fn assign_segment_creates_correct_segment_meta_record() {
         // given
-        let storage = LogStorage::in_memory();
-        let mut cache = SegmentCache::open(&storage.as_read(), SegmentConfig::default())
+        let storage = in_memory_storage();
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
         let mut records = Vec::new();
