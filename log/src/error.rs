@@ -3,7 +3,6 @@
 //! This module defines [`Error`], the primary error type for all log
 //! operations, along with a convenient [`Result`] type alias.
 
-use common::coordinator::WriteError;
 use common::{SequenceError, StorageError};
 
 /// Error type for OpenData Log operations.
@@ -80,19 +79,6 @@ impl From<SequenceError> for Error {
     }
 }
 
-impl From<WriteError> for Error {
-    fn from(err: WriteError) -> Self {
-        match err {
-            WriteError::Backpressure(()) => Error::Internal("write queue full".into()),
-            WriteError::TimeoutError(()) => Error::Internal("write queue timeout".into()),
-            WriteError::Shutdown => Error::Internal("coordinator shut down".into()),
-            WriteError::ApplyError(_, msg) => Error::Internal(msg),
-            WriteError::FlushError(msg) => Error::Storage(msg),
-            WriteError::Internal(msg) => Error::Internal(msg),
-        }
-    }
-}
-
 impl From<&str> for Error {
     fn from(msg: &str) -> Self {
         Error::InvalidInput(msg.to_string())
@@ -117,9 +103,9 @@ pub enum AppendError {
     QueueFull(Vec<Record>),
     /// Timed out waiting for queue space. Contains the batch.
     Timeout(Vec<Record>),
-    /// The coordinator has shut down.
+    /// The writer has shut down.
     Shutdown,
-    /// The delta rejected the write (invalid record, invariant violation, etc.).
+    /// The writer rejected the write (invalid record, invariant violation, etc.).
     InvalidRecord(String),
 }
 
@@ -141,7 +127,7 @@ impl std::fmt::Display for AppendError {
         match self {
             AppendError::QueueFull(_) => write!(f, "write queue full"),
             AppendError::Timeout(_) => write!(f, "write queue timeout"),
-            AppendError::Shutdown => write!(f, "coordinator shut down"),
+            AppendError::Shutdown => write!(f, "writer shut down"),
             AppendError::InvalidRecord(msg) => write!(f, "invalid record: {}", msg),
         }
     }
@@ -154,7 +140,7 @@ impl From<AppendError> for Error {
         match err {
             AppendError::QueueFull(_) => Error::Internal("write queue full".into()),
             AppendError::Timeout(_) => Error::Internal("write queue timeout".into()),
-            AppendError::Shutdown => Error::Internal("coordinator shut down".into()),
+            AppendError::Shutdown => Error::Internal("writer shut down".into()),
             AppendError::InvalidRecord(msg) => Error::Internal(msg),
         }
     }

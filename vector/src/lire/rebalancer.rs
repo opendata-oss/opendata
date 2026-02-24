@@ -1066,7 +1066,7 @@ mod tests {
 
         async fn flush_and_snapshot(&self) -> Arc<dyn StorageSnapshot> {
             let mut flush_handle = self.handle.flush(false).await.unwrap();
-            flush_handle.wait(Durability::Flushed).await.unwrap();
+            flush_handle.wait(Durability::Written).await.unwrap();
             self.storage.snapshot().await.unwrap()
         }
     }

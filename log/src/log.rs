@@ -12,26 +12,23 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use common::clock::{Clock, SystemClock};
-use common::coordinator::{
-    Durability, ViewMonitor, ViewSubscriber, WriteCoordinator, WriteCoordinatorConfig,
-    WriteCoordinatorHandle, WriteError,
-};
+use common::coordinator::{Durability, EpochWatcher, EpochWatermarks};
 use common::storage::factory::create_storage;
 use common::{StorageRuntime, StorageSemantics};
 use tokio::sync::RwLock;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::config::{CountOptions, ScanOptions};
-use crate::delta::{LogContext, LogDelta, LogFlusher, LogWrite};
-use crate::error::{AppendError, AppendResult, Error, Result};
+use crate::config::{CountOptions, ScanOptions, SegmentConfig};
+use crate::error::{AppendResult, Error, Result};
 use crate::listing::ListingCache;
 use crate::listing::LogKeyIterator;
 use crate::model::{AppendOutput, Record, Segment, SegmentId, Sequence};
 use crate::range::{normalize_segment_id, normalize_sequence};
-use crate::reader::{LogIterator, LogRead};
-use crate::segment::SegmentCache;
-
-const WRITE_CHANNEL: &str = "write";
+use crate::reader::{LogIterator, LogRead, LogReadView};
+use crate::segment::{LogSegment, SegmentCache};
+use crate::serde::SEQ_BLOCK_KEY;
+use crate::writer::{LogWrite, LogWriteHandle, LogWriter, LogWriterConfig, WrittenView};
 
 /// The main log interface providing read and write operations.
 ///
@@ -99,13 +96,13 @@ const WRITE_CHANNEL: &str = "write";
 /// }
 /// ```
 pub struct LogDb {
-    handle: WriteCoordinatorHandle<LogDelta>,
-    coordinator: WriteCoordinator<LogDelta, LogFlusher>,
+    handle: LogWriteHandle,
+    writer_task: JoinHandle<()>,
     storage: Arc<dyn common::Storage>,
     clock: Arc<dyn Clock>,
-    read_view: Arc<RwLock<crate::reader::LogReadView>>,
-    view_monitor: ViewMonitor,
-    flush_subscriber_task: JoinHandle<()>,
+    read_view: Arc<RwLock<LogReadView>>,
+    epoch_watcher: EpochWatcher,
+    flushed_subscriber_task: JoinHandle<()>,
 }
 
 impl LogDb {
@@ -228,33 +225,17 @@ impl LogDb {
         let write = LogWrite {
             records,
             timestamp_ms: self.current_time_ms(),
-            force_seal: false,
         };
 
-        let mut write_handle = if let Some(t) = timeout {
-            self.handle.write_timeout(write, t).await
+        let result = if let Some(t) = timeout {
+            self.handle.append_timeout(write, t).await
         } else {
-            self.handle.try_write(write).await
-        }
-        .map_err(|e| match e {
-            WriteError::Backpressure(w) => AppendError::QueueFull(w.records),
-            WriteError::TimeoutError(w) => AppendError::Timeout(w.records),
-            WriteError::Shutdown => AppendError::Shutdown,
-            _ => unreachable!(),
-        })?;
-
-        let output = write_handle
-            .wait(Durability::Applied)
-            .await
-            .map_err(|e| match e {
-                WriteError::Shutdown => AppendError::Shutdown,
-                WriteError::ApplyError(_, msg) => AppendError::InvalidRecord(msg),
-                _ => unreachable!(),
-            })?;
+            self.handle.try_append(write).await
+        }?;
 
         // Safe to unwrap: append_inner is only called with non-empty records,
-        // and Delta::apply returns Some for non-empty writes.
-        Ok(output.expect("non-empty append must produce output"))
+        // and the writer returns Some for non-empty writes.
+        Ok(result.expect("non-empty append must produce output"))
     }
 
     /// Returns the current time in milliseconds since Unix epoch.
@@ -290,15 +271,7 @@ impl LogDb {
     /// configured seal interval.
     #[cfg(test)]
     pub(crate) async fn seal_segment(&self) -> Result<()> {
-        let write = LogWrite {
-            records: vec![],
-            timestamp_ms: self.current_time_ms(),
-            force_seal: true,
-        };
-        self.handle
-            .try_write(write)
-            .await
-            .map_err(|e| e.discard_inner())?;
+        self.handle.force_seal(self.current_time_ms()).await?;
         self.flush().await?;
         Ok(())
     }
@@ -308,35 +281,17 @@ impl LogDb {
     /// This method ensures that all acknowledged writes are durably persisted
     /// to storage.
     pub async fn flush(&self) -> Result<()> {
-        let mut flush_handle = self.handle.flush(true).await?;
-        flush_handle.wait(Durability::Durable).await?;
-        Ok(())
+        self.handle.flush().await
     }
 
-    /// Flushes pending writes to storage without waiting for durability.
-    ///
-    /// Unlike [`flush()`](Self::flush), this only waits for
-    /// `Durability::Flushed` — data is written to storage but not
-    /// necessarily synced to disk.
-    #[cfg(test)]
-    pub(crate) async fn flush_soft(&self) -> Result<()> {
-        let mut flush_handle = self.handle.flush(false).await?;
-        flush_handle.wait(Durability::Flushed).await?;
-        Ok(())
-    }
-
-    /// Waits for the reader view to catch up to the coordinator's flushed
-    /// watermark.
-    ///
-    /// Reads are guaranteed to see all data at `Durability::Flushed` or
-    /// higher at the time this method is called.
-    async fn sync_reader_to_flushed(&self) -> Result<()> {
-        let epoch = self.handle.flushed_epoch();
-        self.view_monitor
+    /// Waits for the flushed subscriber to apply all writes up to the current epoch.
+    async fn sync_to_flushed(&self) -> Result<()> {
+        let target = self.handle.flushed_epoch();
+        self.epoch_watcher
             .clone()
-            .wait(epoch, Durability::Flushed)
+            .wait(target, Durability::Written)
             .await
-            .map_err(|e| Error::Internal(e.to_string()))?;
+            .map_err(|_| Error::Internal("writer shut down".into()))?;
         Ok(())
     }
 
@@ -345,8 +300,10 @@ impl LogDb {
     /// This method should be called before dropping the log to ensure
     /// proper cleanup. For SlateDB-backed storage, this releases the database fence.
     pub async fn close(self) -> Result<()> {
-        self.coordinator.stop().await.map_err(Error::Internal)?;
-        self.flush_subscriber_task.abort();
+        // Drop the handle to signal the writer to stop
+        drop(self.handle);
+        let _ = self.writer_task.await;
+        self.flushed_subscriber_task.abort();
         self.storage
             .close()
             .await
@@ -357,10 +314,14 @@ impl LogDb {
     /// Creates a LogDb from an existing storage implementation.
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn common::Storage>) -> Result<Self> {
-        use crate::config::SegmentConfig;
-        use crate::reader::LogReadView;
-        use crate::serde::SEQ_BLOCK_KEY;
+        Self::from_storage(storage, SegmentConfig::default()).await
+    }
 
+    /// Shared construction logic used by both `LogDb::new` and `LogDbBuilder::build`.
+    async fn from_storage(
+        storage: Arc<dyn common::Storage>,
+        segment_config: SegmentConfig,
+    ) -> Result<Self> {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
         let seq_key = Bytes::from_static(&SEQ_BLOCK_KEY);
@@ -371,44 +332,38 @@ impl LogDb {
             .snapshot()
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let segment_cache = SegmentCache::open(snapshot.as_ref(), SegmentConfig::default()).await?;
+        let segment_cache = SegmentCache::open(snapshot.as_ref(), segment_config).await?;
         let listing_cache = ListingCache::new();
 
-        let context = LogContext {
+        let (writer, mut handle) = LogWriter::new(
+            storage.clone(),
             sequence_allocator,
-            segment_cache: segment_cache.clone(),
+            segment_cache.clone(),
             listing_cache,
-        };
+            LogWriterConfig::default(),
+        )
+        .await
+        .map_err(Error::Storage)?;
 
-        let flusher = LogFlusher::new(storage.clone());
-        let mut coordinator = WriteCoordinator::new(
-            WriteCoordinatorConfig::default(),
-            vec![WRITE_CHANNEL.to_string()],
-            context,
-            snapshot,
-            flusher,
-        );
-        let handle = coordinator.handle(WRITE_CHANNEL);
-
-        let (mut view_subscriber, monitor) = coordinator.subscribe();
-        let initial_view = view_subscriber.initialize();
+        let written_rx = handle.written_rx();
+        let writer_task = handle.spawn(writer);
 
         let read_view = Arc::new(RwLock::new(LogReadView::new(
-            initial_view.snapshot.clone() as Arc<dyn common::StorageRead>,
+            snapshot as Arc<dyn common::StorageRead>,
             segment_cache,
         )));
 
-        let flush_subscriber_task = spawn_flush_subscriber(view_subscriber, Arc::clone(&read_view));
-        coordinator.start();
+        let (epoch_watcher, flushed_subscriber_task) =
+            spawn_flushed_subscriber(written_rx, Arc::clone(&read_view));
 
         Ok(Self {
             handle,
-            coordinator,
+            writer_task,
             storage,
             clock,
             read_view,
-            view_monitor: monitor,
-            flush_subscriber_task,
+            epoch_watcher,
+            flushed_subscriber_task,
         })
     }
 }
@@ -421,7 +376,7 @@ impl LogRead for LogDb {
         seq_range: impl RangeBounds<Sequence> + Send,
         options: ScanOptions,
     ) -> Result<LogIterator> {
-        self.sync_reader_to_flushed().await?;
+        self.sync_to_flushed().await?;
         let seq_range = normalize_sequence(&seq_range);
         let view = self.read_view.read().await;
         Ok(view.scan_with_options(key, seq_range, &options))
@@ -440,7 +395,7 @@ impl LogRead for LogDb {
         &self,
         segment_range: impl RangeBounds<SegmentId> + Send,
     ) -> Result<LogKeyIterator> {
-        self.sync_reader_to_flushed().await?;
+        self.sync_to_flushed().await?;
         let segment_range = normalize_segment_id(&segment_range);
         let view = self.read_view.read().await;
         view.list_keys(segment_range).await
@@ -450,7 +405,7 @@ impl LogRead for LogDb {
         &self,
         seq_range: impl RangeBounds<Sequence> + Send,
     ) -> Result<Vec<Segment>> {
-        self.sync_reader_to_flushed().await?;
+        self.sync_to_flushed().await?;
         let seq_range = normalize_sequence(&seq_range);
         let view = self.read_view.read().await;
         Ok(view.list_segments(&seq_range))
@@ -508,9 +463,6 @@ impl LogDbBuilder {
 
     /// Builds the LogDb instance.
     pub async fn build(self) -> Result<LogDb> {
-        use crate::reader::LogReadView;
-        use crate::serde::SEQ_BLOCK_KEY;
-
         let storage = create_storage(
             &self.config.storage,
             self.storage_runtime,
@@ -519,75 +471,36 @@ impl LogDbBuilder {
         .await
         .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-
-        let seq_key = Bytes::from_static(&SEQ_BLOCK_KEY);
-        let sequence_allocator = common::SequenceAllocator::load(storage.as_ref(), seq_key)
-            .await
-            .map_err(|e| Error::Internal(e.to_string()))?;
-        let snapshot = storage
-            .snapshot()
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let segment_cache = SegmentCache::open(snapshot.as_ref(), self.config.segmentation).await?;
-        let listing_cache = ListingCache::new();
-
-        let context = LogContext {
-            sequence_allocator,
-            segment_cache: segment_cache.clone(),
-            listing_cache,
-        };
-
-        let flusher = LogFlusher::new(storage.clone());
-        let mut coordinator = WriteCoordinator::new(
-            WriteCoordinatorConfig::default(),
-            vec![WRITE_CHANNEL.to_string()],
-            context,
-            snapshot,
-            flusher,
-        );
-        let handle = coordinator.handle(WRITE_CHANNEL);
-
-        let (mut view_subscriber, monitor) = coordinator.subscribe();
-        let initial_view = view_subscriber.initialize();
-
-        let read_view = Arc::new(RwLock::new(LogReadView::new(
-            initial_view.snapshot.clone() as Arc<dyn common::StorageRead>,
-            segment_cache,
-        )));
-
-        let flush_subscriber_task = spawn_flush_subscriber(view_subscriber, Arc::clone(&read_view));
-        coordinator.start();
-
-        Ok(LogDb {
-            handle,
-            coordinator,
-            storage,
-            clock,
-            read_view,
-            view_monitor: monitor,
-            flush_subscriber_task,
-        })
+        LogDb::from_storage(storage, self.config.segmentation).await
     }
 }
 
-fn spawn_flush_subscriber(
-    mut subscriber: ViewSubscriber<LogDelta>,
-    read_view: Arc<RwLock<crate::reader::LogReadView>>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Ok(view) = subscriber.recv().await {
-            let Some(flushed) = &view.last_flushed_delta else {
-                continue;
-            };
+fn spawn_flushed_subscriber(
+    mut written_rx: watch::Receiver<WrittenView>,
+    read_view: Arc<RwLock<LogReadView>>,
+) -> (EpochWatcher, JoinHandle<()>) {
+    let (watermarks, watcher) = EpochWatermarks::new();
+    let task = tokio::spawn(async move {
+        let mut last_segments: Option<Arc<[LogSegment]>> = None;
+        while written_rx.changed().await.is_ok() {
+            let view = written_rx.borrow_and_update().clone();
+
             let mut rv = read_view.write().await;
-            rv.update_snapshot(view.snapshot.clone() as Arc<dyn common::StorageRead>);
-            if !flushed.val.new_segments.is_empty() {
-                rv.apply_new_segments(&flushed.val.new_segments);
+            rv.update_snapshot(view.snapshot as Arc<dyn common::StorageRead>);
+
+            // Only rebuild segment cache when segments actually changed
+            if !last_segments
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &view.segments))
+            {
+                rv.replace_segments(&view.segments);
+                last_segments = Some(Arc::clone(&view.segments));
             }
-            subscriber.update_flushed(flushed.epoch_range.end - 1);
+
+            watermarks.update_written(view.epoch);
         }
-    })
+    });
+    (watcher, task)
 }
 
 #[cfg(test)]
@@ -629,7 +542,6 @@ mod tests {
 
         // when
         log.try_append(records).await.unwrap();
-        log.flush().await.unwrap();
 
         // then - verify entry can be read back
         let mut iter = log.scan(Bytes::from("orders"), ..).await.unwrap();
@@ -660,7 +572,6 @@ mod tests {
 
         // when
         log.try_append(records).await.unwrap();
-        log.flush().await.unwrap();
 
         // then - verify entries with sequential sequence numbers
         let mut iter = log.scan(Bytes::from("orders"), ..).await.unwrap();
@@ -723,7 +634,6 @@ mod tests {
         }])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // then - verify sequences are 0, 1, 2 across appends
         let mut iter = log.scan(Bytes::from("events"), ..).await.unwrap();
@@ -757,7 +667,6 @@ mod tests {
 
         // when
         log.try_append(records).await.unwrap();
-        log.flush().await.unwrap();
 
         // then - verify entries for topic-a
         let mut iter_a = log.scan(Bytes::from("topic-a"), ..).await.unwrap();
@@ -794,7 +703,6 @@ mod tests {
         ])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when
         let mut iter = log.scan(Bytes::from("orders"), ..).await.unwrap();
@@ -841,7 +749,6 @@ mod tests {
         ])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when - scan sequences 1..4 (exclusive end)
         let mut iter = log.scan(Bytes::from("events"), 1..4).await.unwrap();
@@ -877,7 +784,6 @@ mod tests {
         ])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when - scan from sequence 1 onwards
         let mut iter = log.scan(Bytes::from("logs"), 1..).await.unwrap();
@@ -912,7 +818,6 @@ mod tests {
         ])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when - scan up to sequence 2 (exclusive)
         let mut iter = log.scan(Bytes::from("logs"), ..2).await.unwrap();
@@ -951,7 +856,6 @@ mod tests {
         ])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when - scan only key-a
         let mut iter = log.scan(Bytes::from("key-a"), ..).await.unwrap();
@@ -978,7 +882,6 @@ mod tests {
         }])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when - scan for non-existent key
         let mut iter = log.scan(Bytes::from("unknown"), ..).await.unwrap();
@@ -1004,7 +907,6 @@ mod tests {
         ])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when - scan range that doesn't include any existing sequences
         let mut iter = log.scan(Bytes::from("key"), 10..20).await.unwrap();
@@ -1096,7 +998,6 @@ mod tests {
         ])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when - scan all entries
         let mut iter = log.scan(Bytes::from("events"), ..).await.unwrap();
@@ -1167,7 +1068,6 @@ mod tests {
         ])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when - scan range 1..5 (spans segments 0, 1, 2)
         let mut iter = log.scan(Bytes::from("data"), 1..5).await.unwrap();
@@ -1218,7 +1118,6 @@ mod tests {
         ])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when - scan only segment 1's range
         let mut iter = log.scan(Bytes::from("key"), 2..4).await.unwrap();
@@ -1249,7 +1148,6 @@ mod tests {
         ])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when
         let _iter = log.list_keys(..).await.unwrap();
@@ -1309,7 +1207,6 @@ mod tests {
         ])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when
         let mut iter = log.list_keys(..).await.unwrap();
@@ -1360,7 +1257,6 @@ mod tests {
         ])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when
         let mut iter = log.list_keys(..).await.unwrap();
@@ -1411,7 +1307,6 @@ mod tests {
         }])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when
         let mut iter = log.list_keys(..).await.unwrap();
@@ -1445,7 +1340,6 @@ mod tests {
         ])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when
         let mut iter = log.list_keys(..).await.unwrap();
@@ -1522,7 +1416,6 @@ mod tests {
         ])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when - list only keys from segment 1
         let mut iter = log.list_keys(1..2).await.unwrap();
@@ -1559,7 +1452,6 @@ mod tests {
         }])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when
         let segments = log.list_segments(..).await.unwrap();
@@ -1602,7 +1494,6 @@ mod tests {
         }])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when
         let segments = log.list_segments(..).await.unwrap();
@@ -1667,7 +1558,6 @@ mod tests {
         ])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when - query range that spans segment 1
         let segments = log.list_segments(2..4).await.unwrap();
@@ -1727,7 +1617,6 @@ mod tests {
         }])
         .await
         .unwrap();
-        log.flush().await.unwrap();
 
         // when
         let segments = log.list_segments(..).await.unwrap();
@@ -1751,7 +1640,6 @@ mod tests {
 
         // then
         assert_eq!(result.start_sequence, 0);
-        log.flush().await.unwrap();
         let mut iter = log.scan(Bytes::from("orders"), ..).await.unwrap();
         let entry = iter.next().await.unwrap().unwrap();
         assert_eq!(entry.value, Bytes::from("order-1"));
@@ -1774,7 +1662,6 @@ mod tests {
 
         // then
         assert_eq!(result.start_sequence, 0);
-        log.flush().await.unwrap();
         let mut iter = log.scan(Bytes::from("orders"), ..).await.unwrap();
         let entry = iter.next().await.unwrap().unwrap();
         assert_eq!(entry.value, Bytes::from("order-1"));
@@ -1808,7 +1695,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_scan_after_flush_soft() {
+    async fn should_scan_without_flush() {
         // given
         let log = LogDb::open(test_config()).await.unwrap();
         log.try_append(vec![
@@ -1824,10 +1711,7 @@ mod tests {
         .await
         .unwrap();
 
-        // when - flush without durability
-        log.flush_soft().await.unwrap();
-
-        // then - reads should still see the data
+        // when/then - reads see unflushed data via sync_to_flushed
         let mut iter = log.scan(Bytes::from("key"), ..).await.unwrap();
         let e0 = iter.next().await.unwrap().unwrap();
         assert_eq!(e0.sequence, 0);
@@ -1839,7 +1723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_list_keys_after_flush_soft() {
+    async fn should_list_keys_without_flush() {
         // given
         let log = LogDb::open(test_config()).await.unwrap();
         log.try_append(vec![
@@ -1855,10 +1739,7 @@ mod tests {
         .await
         .unwrap();
 
-        // when
-        log.flush_soft().await.unwrap();
-
-        // then
+        // when/then - reads see unflushed data via sync_to_flushed
         let mut iter = log.list_keys(..).await.unwrap();
         let mut keys = vec![];
         while let Some(key) = iter.next().await.unwrap() {
@@ -1868,7 +1749,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_list_segments_after_flush_soft() {
+    async fn should_list_segments_without_flush() {
         // given
         let log = LogDb::open(test_config()).await.unwrap();
         log.try_append(vec![Record {
@@ -1878,10 +1759,7 @@ mod tests {
         .await
         .unwrap();
 
-        // when
-        log.flush_soft().await.unwrap();
-
-        // then
+        // when/then - reads see unflushed data via sync_to_flushed
         let segments = log.list_segments(..).await.unwrap();
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].id, 0);

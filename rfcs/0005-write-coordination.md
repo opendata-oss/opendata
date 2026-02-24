@@ -142,8 +142,8 @@ The `WriteCoordinator` itself has the following APIs:
 pub enum Durability {
     /// Write has been applied to an in-memory delta.
     Applied,
-    /// Write has been flushed to SlateDB memtable.
-    Flushed,
+    /// Write has been written to SlateDB memtable.
+    Written,
     /// Write has been persisted to object storage.
     Durable,
 }
@@ -456,13 +456,13 @@ Maintenance operations can be submitted through the same write channel as user w
 // Submit the split command
 let handle = coordinator.write(SplitCentroid { c, into: [c_0, c_1] }).await?;
 // Wait until the split is readable
-handle.wait(Durability::Flushed).await?;
+handle.wait(Durability::Written).await?;
 // Now safe to read vectors from c for reassignment
 let vectors = read_centroid_vectors(c).await?;
 ```
 
 Because epochs are assigned at dequeue time, the split command receives an epoch that correctly
-sequences it relative to concurrent user writes. The `wait(Flushed)` call blocks until the split
+sequences it relative to concurrent user writes. The `wait(Written)` call blocks until the split
 is visible to readers, ensuring the subsequent read sees the draining state.
 
 Backpressure is handled client-side: if writes arrive faster than the index can be maintained, the

@@ -19,15 +19,15 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 /// - `frozen` — deltas that have been sealed but not yet flushed to storage
 ///   (Applied, ordered newest-first).
 /// - `snapshot` — the storage snapshot, updated after each flush. Contains
-///   all data up through the most recently flushed delta.
-/// - `last_flushed_delta` — the most recently flushed delta (Flushed). Data
+///   all data up through the most recently written delta.
+/// - `last_written_delta` — the most recently written delta (Written). Data
 ///   has been written to storage but not necessarily synced to disk. A
 ///   separate `FlushStorage` step advances the durable watermark.
 pub struct View<D: Delta> {
     pub current: D::DeltaView,
     pub frozen: Vec<EpochStamped<D::FrozenView>>,
     pub snapshot: Arc<dyn StorageSnapshot>,
-    pub last_flushed_delta: Option<EpochStamped<D::FrozenView>>,
+    pub last_written_delta: Option<EpochStamped<D::FrozenView>>,
 }
 
 impl<D: Delta> Clone for View<D> {
@@ -36,7 +36,7 @@ impl<D: Delta> Clone for View<D> {
             current: self.current.clone(),
             frozen: self.frozen.clone(),
             snapshot: self.snapshot.clone(),
-            last_flushed_delta: self.last_flushed_delta.clone(),
+            last_written_delta: self.last_written_delta.clone(),
         }
     }
 }
@@ -46,10 +46,29 @@ impl<D: Delta> Clone for View<D> {
 /// Each receiver tracks the highest epoch that has reached the corresponding
 /// [`Durability`] level. See [`Durability`] for details on each level.
 #[derive(Clone)]
-pub(crate) struct EpochWatcher {
+pub struct EpochWatcher {
     pub applied_rx: watch::Receiver<u64>,
-    pub flushed_rx: watch::Receiver<u64>,
+    pub written_rx: watch::Receiver<u64>,
     pub durable_rx: watch::Receiver<u64>,
+}
+
+impl EpochWatcher {
+    /// Waits until the given epoch has reached the specified durability level.
+    ///
+    /// Returns `Err` if the corresponding [`EpochWatermarks`](super::EpochWatermarks)
+    /// was dropped (i.e. the writer shut down).
+    pub async fn wait(
+        &mut self,
+        epoch: u64,
+        durability: Durability,
+    ) -> Result<(), watch::error::RecvError> {
+        let rx = match durability {
+            Durability::Applied => &mut self.applied_rx,
+            Durability::Written => &mut self.written_rx,
+            Durability::Durable => &mut self.durable_rx,
+        };
+        rx.wait_for(|curr| *curr >= epoch).await.map(|_| ())
+    }
 }
 
 /// Successful write application with its assigned epoch.
@@ -110,13 +129,8 @@ impl<M: Clone + Send + 'static> WriteHandle<M> {
     pub async fn wait(&mut self, durability: Durability) -> WriteResult<M> {
         let WriteApplied { epoch, result } = self.recv().await?;
 
-        let recv = match durability {
-            Durability::Applied => &mut self.watchers.applied_rx,
-            Durability::Flushed => &mut self.watchers.flushed_rx,
-            Durability::Durable => &mut self.watchers.durable_rx,
-        };
-
-        recv.wait_for(|curr| *curr >= epoch)
+        self.watchers
+            .wait(epoch, durability)
             .await
             .map_err(|_| WriteError::Shutdown)?;
         Ok(result)
@@ -151,7 +165,7 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     /// This is a non-blocking snapshot of the current flushed watermark.
     /// Returns 0 if no data has been flushed yet.
     pub fn flushed_epoch(&self) -> u64 {
-        *self.watchers.flushed_rx.borrow()
+        *self.watchers.written_rx.borrow()
     }
 }
 
@@ -304,7 +318,7 @@ mod tests {
     ) -> EpochWatcher {
         EpochWatcher {
             applied_rx: applied,
-            flushed_rx: flushed,
+            written_rx: flushed,
             durable_rx: durable,
         }
     }
@@ -496,5 +510,67 @@ mod tests {
         assert!(
             matches!(result, Err(WriteError::ApplyError(epoch, msg)) if epoch == 1 && msg == "apply error")
         );
+    }
+
+    #[tokio::test]
+    async fn epoch_watcher_should_resolve_when_watermark_reached() {
+        // given
+        let (applied_tx, applied_rx) = watch::channel(0u64);
+        let (_flushed_tx, flushed_rx) = watch::channel(0u64);
+        let (_durable_tx, durable_rx) = watch::channel(0u64);
+        let mut watcher = create_watchers(applied_rx, flushed_rx, durable_rx);
+
+        // when
+        let wait_task = tokio::spawn(async move { watcher.wait(5, Durability::Applied).await });
+        tokio::task::yield_now().await;
+        applied_tx.send(5).unwrap();
+
+        // then
+        assert!(wait_task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn epoch_watcher_should_resolve_immediately_when_already_reached() {
+        // given
+        let (_applied_tx, applied_rx) = watch::channel(10u64);
+        let (_flushed_tx, flushed_rx) = watch::channel(0u64);
+        let (_durable_tx, durable_rx) = watch::channel(0u64);
+        let mut watcher = create_watchers(applied_rx, flushed_rx, durable_rx);
+
+        // when/then
+        assert!(watcher.wait(5, Durability::Applied).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn epoch_watcher_should_select_correct_durability_receiver() {
+        // given
+        let (_applied_tx, applied_rx) = watch::channel(0u64);
+        let (_flushed_tx, flushed_rx) = watch::channel(0u64);
+        let (durable_tx, durable_rx) = watch::channel(0u64);
+        let mut watcher = create_watchers(applied_rx, flushed_rx, durable_rx);
+
+        // when
+        let wait_task = tokio::spawn(async move { watcher.wait(3, Durability::Durable).await });
+        tokio::task::yield_now().await;
+        durable_tx.send(3).unwrap();
+
+        // then
+        assert!(wait_task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn epoch_watcher_should_return_error_on_sender_drop() {
+        // given
+        let (applied_tx, applied_rx) = watch::channel(0u64);
+        let (_flushed_tx, flushed_rx) = watch::channel(0u64);
+        let (_durable_tx, durable_rx) = watch::channel(0u64);
+        let mut watcher = create_watchers(applied_rx, flushed_rx, durable_rx);
+
+        // when
+        drop(applied_tx);
+        let result = watcher.wait(1, Durability::Applied).await;
+
+        // then
+        assert!(result.is_err());
     }
 }

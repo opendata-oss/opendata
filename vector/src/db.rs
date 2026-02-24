@@ -573,7 +573,7 @@ impl VectorDb {
             .handle(WRITE_CHANNEL)
             .flush(false)
             .await?;
-        handle.wait(Durability::Flushed).await?;
+        handle.wait(Durability::Written).await?;
         Ok(())
     }
 

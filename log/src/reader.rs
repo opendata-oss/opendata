@@ -232,11 +232,9 @@ impl LogReadView {
         self.storage = snapshot;
     }
 
-    /// Inserts new segments into the segment cache.
-    pub(crate) fn apply_new_segments(&mut self, segments: &[LogSegment]) {
-        for segment in segments {
-            self.segments.insert(segment.clone());
-        }
+    /// Replaces the segment cache contents with the given segments.
+    pub(crate) fn replace_segments(&mut self, segments: &[LogSegment]) {
+        self.segments.replace_all(segments);
     }
 
     /// Scans entries for a key within a sequence number range with custom options.
