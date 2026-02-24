@@ -128,6 +128,13 @@ pub(crate) trait RangeFunction {
     ) -> EvalResult<Vec<EvalSample>>;
 }
 
+/// Trait for PromQL functions that operate on scalars
+pub(crate) trait PromQLScalarFunction {
+    /// Apply the function to the input samples.
+    /// `eval_timestamp_ms` is the evaluation timestamp in milliseconds since UNIX epoch.
+    fn apply(&self, scalar: f64, eval_timestamp_ms: i64) -> EvalResult<Vec<EvalSample>>;
+}
+
 /// Function that applies a unary operation to each sample
 struct UnaryFunction {
     op: fn(f64) -> f64,
@@ -150,12 +157,14 @@ impl PromQLFunction for UnaryFunction {
 pub(crate) struct FunctionRegistry {
     functions: HashMap<String, Box<dyn PromQLFunction>>,
     range_functions: HashMap<String, Box<dyn RangeFunction>>,
+    scalar_functions: HashMap<String, Box<dyn PromQLScalarFunction>>,
 }
 
 impl FunctionRegistry {
     pub(crate) fn new() -> Self {
         let mut functions: HashMap<String, Box<dyn PromQLFunction>> = HashMap::new();
         let mut range_functions: HashMap<String, Box<dyn RangeFunction>> = HashMap::new();
+        let mut scalar_functions: HashMap<String, Box<dyn PromQLScalarFunction>> = HashMap::new();
 
         // Mathematical functions
         functions.insert("abs".to_string(), Box::new(UnaryFunction { op: f64::abs }));
@@ -259,10 +268,12 @@ impl FunctionRegistry {
             "stdvar_over_time".to_string(),
             Box::new(StdvarOverTimeFunction),
         );
+        scalar_functions.insert("vector".to_string(), Box::new(VectorFunction));
 
         Self {
             functions,
             range_functions,
+            scalar_functions,
         }
     }
 
@@ -272,6 +283,10 @@ impl FunctionRegistry {
 
     pub(crate) fn get_range_function(&self, name: &str) -> Option<&dyn RangeFunction> {
         self.range_functions.get(name).map(|f| f.as_ref())
+    }
+
+    pub(crate) fn get_scalar_function(&self, name: &str) -> Option<&dyn PromQLScalarFunction> {
+        self.scalar_functions.get(name).map(|f| f.as_ref())
     }
 }
 
@@ -568,6 +583,18 @@ impl RangeFunction for StdvarOverTimeFunction {
         eval_timestamp_ms: i64,
     ) -> EvalResult<Vec<EvalSample>> {
         Ok(aggr_over_time(samples, eval_timestamp_ms, variance_kahan))
+    }
+}
+
+struct VectorFunction;
+
+impl PromQLScalarFunction for VectorFunction {
+    fn apply(&self, scalar: f64, eval_timestamp_ms: i64) -> EvalResult<Vec<EvalSample>> {
+        Ok(vec![EvalSample {
+            timestamp_ms: eval_timestamp_ms,
+            value: scalar,
+            labels: HashMap::new(),
+        }])
     }
 }
 

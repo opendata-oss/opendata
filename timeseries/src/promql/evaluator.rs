@@ -836,7 +836,17 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     )))
                 }
             }
-            ExprResult::Scalar(s) => Ok(ExprResult::Scalar(s)),
+            ExprResult::Scalar(scalar) => {
+                if let Some(func) = registry.get_scalar_function(call.func.name) {
+                    let result = func.apply(scalar, eval_timestamp_ms)?;
+                    Ok(ExprResult::InstantVector(result))
+                } else {
+                    Err(EvaluationError::InternalError(format!(
+                        "Unknown scalar function: {}",
+                        call.func.name
+                    )))
+                }
+            }
         }
     }
 
@@ -2348,12 +2358,7 @@ mod tests {
         let mut evaluator = Evaluator::new(&reader);
 
         let call = Call {
-            func: Function::new(
-                "test_func",
-                vec![ValueType::Scalar],
-                false,
-                ValueType::Scalar,
-            ),
+            func: Function::new("vector", vec![ValueType::Scalar], false, ValueType::Scalar),
             args: FunctionArgs::new_args(Expr::NumberLiteral(NumberLiteral { val: 42.0 })),
         };
 
@@ -2373,8 +2378,17 @@ mod tests {
             .unwrap();
 
         match result {
-            ExprResult::Scalar(v) => assert_eq!(v, 42.0),
-            other => panic!("Expected Scalar, got {:?}", other),
+            ExprResult::InstantVector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].value, 42.0);
+                assert!(samples[0].labels.is_empty());
+                let expected_ts = end_time
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64;
+                assert_eq!(samples[0].timestamp_ms, expected_ts);
+            }
+            other => panic!("Expected Instant Vector, got {:?}", other),
         }
     }
 
