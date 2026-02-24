@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use common::clock::Clock;
@@ -93,6 +94,7 @@ struct BatchWriter {
     batch_max_bytes: usize,
     batch: Batch,
     clock: Arc<dyn Clock>,
+    pending_bytes: Arc<AtomicUsize>,
 }
 
 impl BatchWriter {
@@ -142,6 +144,7 @@ impl BatchWriter {
         }
         let (entries, notifiers) = self.batch.take();
         let result = self.write_and_enqueue(entries).await;
+        self.pending_bytes.store(0, Ordering::Release);
 
         for tx in notifiers {
             let _ = tx.send(Some(result.clone()));
@@ -151,8 +154,7 @@ impl BatchWriter {
     }
 
     async fn write_and_enqueue(&self, entries: Vec<KeyValueEntry>) -> Result<()> {
-        let json =
-            serde_json::to_vec(&entries).map_err(|e| Error::Serialization(e.to_string()))?;
+        let json = serde_json::to_vec(&entries).map_err(|e| Error::Serialization(e.to_string()))?;
 
         let id = uuid::Uuid::new_v4();
         let path = Path::from(format!("{}/{}.json", self.path_prefix, id));
@@ -194,6 +196,8 @@ pub struct Ingestor {
     cancellation_token: CancellationToken,
     handle: tokio::task::JoinHandle<()>,
     producer: Arc<QueueProducer>,
+    pending_bytes: Arc<AtomicUsize>,
+    backpressure_at_bytes: Option<usize>,
 }
 
 impl Ingestor {
@@ -212,6 +216,7 @@ impl Ingestor {
         let (tx, rx) = mpsc::unbounded_channel();
         let shutdown = CancellationToken::new();
         let producer = Arc::new(producer);
+        let pending_bytes = Arc::new(AtomicUsize::new(0));
 
         let mut writer = BatchWriter {
             object_store,
@@ -221,14 +226,24 @@ impl Ingestor {
             batch_max_bytes: config.batch_max_bytes,
             batch: Batch::new(),
             clock,
+            pending_bytes: Arc::clone(&pending_bytes),
         };
         let cancellation_token = shutdown.clone();
         let handle = tokio::spawn(async move { writer.run(rx, shutdown).await });
 
-        Ok(Self { tx, cancellation_token, handle, producer })
+        Ok(Self {
+            tx,
+            cancellation_token,
+            handle,
+            producer,
+            pending_bytes,
+            backpressure_at_bytes: config.backpressure_at_bytes,
+        })
     }
 
-    pub fn ingest(&self, entries: Vec<KeyValueEntry>) -> Result<WriteWatcher> {
+    pub async fn ingest(&self, entries: Vec<KeyValueEntry>) -> Result<WriteWatcher> {
+        let incoming_size: usize = entries.iter().map(|e| e.key.len() + e.value.len()).sum();
+        self.maybe_apply_backpressure(incoming_size).await?;
         let (notifier_tx, notifier_rx) = tokio::sync::watch::channel(None);
         self.tx
             .send(IngestMessage::Write {
@@ -236,7 +251,24 @@ impl Ingestor {
                 notifier: notifier_tx,
             })
             .map_err(|_| Error::Storage("ingestor shut down".to_string()))?;
+        self.pending_bytes
+            .fetch_add(incoming_size, Ordering::Release);
         Ok(WriteWatcher { rx: notifier_rx })
+    }
+
+    async fn maybe_apply_backpressure(&self, incoming_size: usize) -> Result<()> {
+        if let Some(threshold) = self.backpressure_at_bytes {
+            if incoming_size > threshold {
+                return Err(Error::BackpressureLimitExceeded {
+                    incoming_size,
+                    limit: threshold,
+                });
+            }
+            if self.pending_bytes.load(Ordering::Acquire) + incoming_size >= threshold {
+                self.flush().await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn flush(&self) -> Result<()> {
@@ -268,8 +300,8 @@ mod tests {
     use bytes::Bytes;
     use common::clock::SystemClock;
     use common::storage::config::ObjectStoreConfig;
-    use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::ObjectStore;
+    use slatedb::object_store::memory::InMemory;
 
     fn test_config() -> Config {
         Config {
@@ -277,6 +309,7 @@ mod tests {
             path_prefix: "test-ingest".to_string(),
             batch_interval_ms: 60_000,
             batch_max_bytes: 64 * 1024 * 1024,
+            backpressure_at_bytes: None,
         }
     }
 
@@ -294,8 +327,13 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let producer =
             QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
-        let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), producer, Arc::new(SystemClock)).unwrap();
+        let ingestor = Ingestor::with_object_store(
+            test_config(),
+            store.clone(),
+            producer,
+            Arc::new(SystemClock),
+        )
+        .unwrap();
 
         let entries = vec![
             KeyValueEntry {
@@ -308,7 +346,7 @@ mod tests {
             },
         ];
 
-        ingestor.ingest(entries).unwrap();
+        ingestor.ingest(entries).await.unwrap();
         ingestor.flush().await.unwrap();
 
         // Verify manifest has the enqueued location
@@ -326,15 +364,20 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let producer =
             QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
-        let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), producer, Arc::new(SystemClock)).unwrap();
+        let ingestor = Ingestor::with_object_store(
+            test_config(),
+            store.clone(),
+            producer,
+            Arc::new(SystemClock),
+        )
+        .unwrap();
 
         let entries = vec![KeyValueEntry {
             key: "mykey".to_string(),
             value: Bytes::from("myvalue"),
         }];
 
-        ingestor.ingest(entries).unwrap();
+        ingestor.ingest(entries).await.unwrap();
         ingestor.flush().await.unwrap();
 
         // Read back the location from the manifest
@@ -368,7 +411,8 @@ mod tests {
         config.batch_max_bytes = 10; // very small threshold
 
         let ingestor =
-            Ingestor::with_object_store(config, store.clone(), producer, Arc::new(SystemClock)).unwrap();
+            Ingestor::with_object_store(config, store.clone(), producer, Arc::new(SystemClock))
+                .unwrap();
 
         let entries = vec![KeyValueEntry {
             key: "a-long-key".to_string(),
@@ -377,7 +421,7 @@ mod tests {
 
         // This single ingest exceeds the 10-byte threshold, so the background
         // task should auto-flush without an explicit flush() call.
-        let mut watcher = ingestor.ingest(entries).unwrap();
+        let mut watcher = ingestor.ingest(entries).await.unwrap();
         watcher.await_durable().await.unwrap();
 
         let manifest_path = slatedb::object_store::path::Path::from("test/manifest.json");
@@ -404,13 +448,15 @@ mod tests {
         config.batch_max_bytes = 64 * 1024 * 1024;
 
         let ingestor =
-            Ingestor::with_object_store(config, store.clone(), producer, Arc::new(SystemClock)).unwrap();
+            Ingestor::with_object_store(config, store.clone(), producer, Arc::new(SystemClock))
+                .unwrap();
 
         let mut watcher = ingestor
             .ingest(vec![KeyValueEntry {
                 key: "k1".to_string(),
                 value: Bytes::from("v1"),
             }])
+            .await
             .unwrap();
 
         // Nothing written yet
@@ -438,14 +484,20 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let producer =
             QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
-        let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), producer, Arc::new(SystemClock)).unwrap();
+        let ingestor = Ingestor::with_object_store(
+            test_config(),
+            store.clone(),
+            producer,
+            Arc::new(SystemClock),
+        )
+        .unwrap();
 
         let watcher = ingestor
             .ingest(vec![KeyValueEntry {
                 key: "k".to_string(),
                 value: Bytes::from("v"),
             }])
+            .await
             .unwrap();
 
         // Watcher not yet resolved
@@ -477,14 +529,20 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let producer =
             QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
-        let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), producer, Arc::new(SystemClock)).unwrap();
+        let ingestor = Ingestor::with_object_store(
+            test_config(),
+            store.clone(),
+            producer,
+            Arc::new(SystemClock),
+        )
+        .unwrap();
 
         let watcher1 = ingestor
             .ingest(vec![KeyValueEntry {
                 key: "k1".to_string(),
                 value: Bytes::from("v1"),
             }])
+            .await
             .unwrap();
 
         let watcher2 = ingestor
@@ -492,6 +550,7 @@ mod tests {
                 key: "k2".to_string(),
                 value: Bytes::from("v2"),
             }])
+            .await
             .unwrap();
 
         ingestor.flush().await.unwrap();
@@ -521,5 +580,85 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].key, "k1");
         assert_eq!(parsed[1].key, "k2");
+    }
+
+    #[tokio::test]
+    async fn should_apply_backpressure_when_threshold_exceeded() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let producer =
+            QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
+
+        let mut config = test_config();
+        config.batch_max_bytes = 64 * 1024 * 1024; // large, won't auto-flush
+        config.batch_interval_ms = 60_000; // large, won't auto-flush
+        config.backpressure_at_bytes = Some(30); // threshold larger than one entry but smaller than two
+
+        let ingestor =
+            Ingestor::with_object_store(config, store.clone(), producer, Arc::new(SystemClock))
+                .unwrap();
+
+        // First ingest (22 bytes: "a-long-key" + "a-long-value") — below 30-byte threshold
+        ingestor
+            .ingest(vec![KeyValueEntry {
+                key: "a-long-key".to_string(),
+                value: Bytes::from("a-long-value"),
+            }])
+            .await
+            .unwrap();
+
+        // Nothing flushed yet
+        let manifest_path = slatedb::object_store::path::Path::from("test/manifest.json");
+        assert!(store.get(&manifest_path).await.is_err());
+
+        // Second ingest (22 bytes) — pending(22) + incoming(22) = 44 >= 30, triggers backpressure flush
+        ingestor
+            .ingest(vec![KeyValueEntry {
+                key: "a-long-key".to_string(),
+                value: Bytes::from("a-long-value"),
+            }])
+            .await
+            .unwrap();
+
+        // First batch was flushed by backpressure without an explicit flush() call
+        let data = store
+            .get(&manifest_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        let pending = manifest["pending"].as_array().unwrap();
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn should_reject_ingest_exceeding_backpressure_limit() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let producer =
+            QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
+
+        let mut config = test_config();
+        config.backpressure_at_bytes = Some(10);
+
+        let ingestor =
+            Ingestor::with_object_store(config, store.clone(), producer, Arc::new(SystemClock))
+                .unwrap();
+
+        // 22 bytes > 10-byte limit
+        let result = ingestor
+            .ingest(vec![KeyValueEntry {
+                key: "a-long-key".to_string(),
+                value: Bytes::from("a-long-value"),
+            }])
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::BackpressureLimitExceeded {
+                incoming_size: 22,
+                limit: 10
+            })
+        ));
     }
 }

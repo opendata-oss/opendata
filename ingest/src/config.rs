@@ -10,6 +10,8 @@ pub struct Config {
     pub batch_interval_ms: u64,
     #[serde(default = "default_batch_max_bytes")]
     pub batch_max_bytes: usize,
+    #[serde(default)]
+    pub backpressure_at_bytes: Option<usize>,
 }
 
 fn default_path_prefix() -> String {
