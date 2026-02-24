@@ -142,9 +142,10 @@ impl BatchWriter {
         if self.batch.is_empty() {
             return Ok(());
         }
+        let flushed_bytes = self.batch.size_bytes;
         let (entries, notifiers) = self.batch.take();
         let result = self.write_and_enqueue(entries).await;
-        self.pending_bytes.store(0, Ordering::Release);
+        self.pending_bytes.fetch_sub(flushed_bytes, Ordering::Release);
 
         for tx in notifiers {
             let _ = tx.send(Some(result.clone()));
