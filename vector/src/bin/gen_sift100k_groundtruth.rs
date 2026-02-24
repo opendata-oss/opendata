@@ -3,10 +3,12 @@
 //! Usage:
 //!   cargo run -p opendata-vector --release --bin gen_sift100k_groundtruth
 //!
-//! Reads from tests/data/sift/{sift_base.fvecs, sift_query.fvecs}
+//! Requires the SIFT1M dataset in tests/data/sift/{sift_base.fvecs, sift_query.fvecs}.
+//!
 //! Writes:
-//!   tests/data/sift/sift100k_indices.ivecs  — single row of 100K randomly selected base indices
-//!   tests/data/sift/sift100k_groundtruth.ivecs — top-100 neighbors (by index into sift100k_indices)
+//!   tests/data/sift100k/base.fvecs        — 100K randomly sampled base vectors
+//!   tests/data/sift100k/query.fvecs       — first 1000 query vectors (copied from SIFT1M)
+//!   tests/data/sift100k/groundtruth.ivecs — top-100 neighbors per query (positional IDs)
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -101,7 +103,9 @@ fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn main() {
-    let data_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sift");
+    let sift_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sift");
+    let out_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sift100k");
+    std::fs::create_dir_all(&out_dir).expect("failed to create output directory");
 
     // Randomly sample 100K indices from 1M with a fixed seed
     let mut rng = StdRng::seed_from_u64(SEED);
@@ -109,20 +113,9 @@ fn main() {
     all_indices.shuffle(&mut rng);
     let selected_indices: Vec<usize> = all_indices.into_iter().take(NUM_BASE).collect();
 
-    // Save selected indices (as a single ivecs row)
-    let indices_path = data_dir.join("sift100k_indices.ivecs");
-    println!("Saving {} selected indices to {:?}", NUM_BASE, indices_path);
-    let indices_row = vec![
-        selected_indices
-            .iter()
-            .map(|&i| i as i32)
-            .collect::<Vec<i32>>(),
-    ];
-    write_ivecs(&indices_path, &indices_row);
-
     // Load all 1M base vectors and select the subset
     println!("Loading all base vectors...");
-    let all_base = read_all_fvecs(&data_dir.join("sift_base.fvecs"));
+    let all_base = read_all_fvecs(&sift_dir.join("sift_base.fvecs"));
     println!(
         "Loaded {} base vectors (dim={})",
         all_base.len(),
@@ -132,16 +125,22 @@ fn main() {
     let base: Vec<&Vec<f32>> = selected_indices.iter().map(|&i| &all_base[i]).collect();
     println!("Selected {} random base vectors", base.len());
 
-    // Write the selected base vectors so the test can load them directly
-    let base_path = data_dir.join("sift100k_base.fvecs");
+    // Write the selected base vectors
+    let base_path = out_dir.join("base.fvecs");
     println!("Writing {} base vectors to {:?}", base.len(), base_path);
     write_fvecs(&base_path, &base);
 
+    // Copy query vectors
     println!("Loading queries (first {})...", NUM_QUERIES);
-    let queries = read_fvecs(&data_dir.join("sift_query.fvecs"), NUM_QUERIES);
+    let queries = read_fvecs(&sift_dir.join("sift_query.fvecs"), NUM_QUERIES);
     println!("Loaded {} queries", queries.len());
 
-    // Compute ground truth — IDs are the original sift_base indices (selected_indices[i])
+    let query_refs: Vec<&Vec<f32>> = queries.iter().collect();
+    let query_path = out_dir.join("query.fvecs");
+    println!("Writing {} queries to {:?}", queries.len(), query_path);
+    write_fvecs(&query_path, &query_refs);
+
+    // Compute ground truth using positional IDs (0, 1, 2, ...)
     println!("Computing ground truth (top-{} for each query)...", K);
     let mut ground_truth = Vec::with_capacity(queries.len());
 
@@ -157,7 +156,6 @@ fn main() {
         dists.truncate(K);
         dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
-        // Store the positional index into sift100k_base.fvecs (matches external_id in the test)
         let ids: Vec<i32> = dists.iter().map(|(i, _)| *i as i32).collect();
         ground_truth.push(ids);
 
@@ -166,8 +164,11 @@ fn main() {
         }
     }
 
-    let out_path = data_dir.join("sift100k_groundtruth.ivecs");
-    println!("Writing ground truth to {:?}", out_path);
-    write_ivecs(&out_path, &ground_truth);
-    println!("Done.");
+    let gt_path = out_dir.join("groundtruth.ivecs");
+    println!("Writing ground truth to {:?}", gt_path);
+    write_ivecs(&gt_path, &ground_truth);
+    println!(
+        "Done. To update the tarball:\n  cd {} && tar czf sift100k.tgz base.fvecs query.fvecs groundtruth.ivecs",
+        out_dir.display()
+    );
 }
