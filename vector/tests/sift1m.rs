@@ -102,7 +102,7 @@ async fn sift1m_recall() {
     let base_vectors = read_fvecs(&data_dir.join("sift_base.fvecs"));
     println!("Loaded {} base vectors", base_vectors.len());
 
-    let num_batches = (base_vectors.len() + 9) / 10;
+    let num_batches = base_vectors.len().div_ceil(10);
     for (batch_idx, chunk) in base_vectors.chunks(10).enumerate() {
         let batch: Vec<Vector> = chunk
             .iter()
@@ -167,7 +167,8 @@ async fn sift1m_recall() {
         k,
         exact_recall / n
     );
-    assert!(true);
+    let recall = hnsw_recall / n;
+    assert!(recall > 0.9);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -194,7 +195,7 @@ async fn sift100k_recall() {
     println!("Loaded {} base vectors", base_vectors.len());
 
     // Ingest in batches of 10, using positional index as external_id
-    let num_batches = (base_vectors.len() + 9) / 10;
+    let num_batches = base_vectors.len().div_ceil(10);
     for (batch_idx, chunk) in base_vectors.chunks(10).enumerate() {
         let batch: Vec<Vector> = chunk
             .iter()
