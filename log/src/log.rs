@@ -343,7 +343,7 @@ impl LogDb {
             LogWriterConfig::default(),
         )
         .await
-        .map_err(|e| Error::Storage(e))?;
+        .map_err(Error::Storage)?;
 
         let written_rx = handle.written_rx();
         let writer_task = handle.spawn(writer);
