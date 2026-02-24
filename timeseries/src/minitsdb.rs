@@ -212,7 +212,7 @@ impl MiniTsdb {
         let mut flush_handle = handle.flush(false).await.map_err(map_write_error)?;
 
         flush_handle
-            .wait(Durability::Flushed)
+            .wait(Durability::Written)
             .await
             .map_err(map_write_error)?;
 

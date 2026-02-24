@@ -19,15 +19,15 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 /// - `frozen` — deltas that have been sealed but not yet flushed to storage
 ///   (Applied, ordered newest-first).
 /// - `snapshot` — the storage snapshot, updated after each flush. Contains
-///   all data up through the most recently flushed delta.
-/// - `last_flushed_delta` — the most recently flushed delta (Flushed). Data
+///   all data up through the most recently written delta.
+/// - `last_written_delta` — the most recently written delta (Written). Data
 ///   has been written to storage but not necessarily synced to disk. A
 ///   separate `FlushStorage` step advances the durable watermark.
 pub struct View<D: Delta> {
     pub current: D::DeltaView,
     pub frozen: Vec<EpochStamped<D::FrozenView>>,
     pub snapshot: Arc<dyn StorageSnapshot>,
-    pub last_flushed_delta: Option<EpochStamped<D::FrozenView>>,
+    pub last_written_delta: Option<EpochStamped<D::FrozenView>>,
 }
 
 impl<D: Delta> Clone for View<D> {
@@ -36,7 +36,7 @@ impl<D: Delta> Clone for View<D> {
             current: self.current.clone(),
             frozen: self.frozen.clone(),
             snapshot: self.snapshot.clone(),
-            last_flushed_delta: self.last_flushed_delta.clone(),
+            last_written_delta: self.last_written_delta.clone(),
         }
     }
 }
@@ -48,7 +48,7 @@ impl<D: Delta> Clone for View<D> {
 #[derive(Clone)]
 pub struct EpochWatcher {
     pub applied_rx: watch::Receiver<u64>,
-    pub flushed_rx: watch::Receiver<u64>,
+    pub written_rx: watch::Receiver<u64>,
     pub durable_rx: watch::Receiver<u64>,
 }
 
@@ -64,7 +64,7 @@ impl EpochWatcher {
     ) -> Result<(), watch::error::RecvError> {
         let rx = match durability {
             Durability::Applied => &mut self.applied_rx,
-            Durability::Flushed => &mut self.flushed_rx,
+            Durability::Written => &mut self.written_rx,
             Durability::Durable => &mut self.durable_rx,
         };
         rx.wait_for(|curr| *curr >= epoch).await.map(|_| ())
@@ -165,7 +165,7 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     /// This is a non-blocking snapshot of the current flushed watermark.
     /// Returns 0 if no data has been flushed yet.
     pub fn flushed_epoch(&self) -> u64 {
-        *self.watchers.flushed_rx.borrow()
+        *self.watchers.written_rx.borrow()
     }
 }
 
@@ -318,7 +318,7 @@ mod tests {
     ) -> EpochWatcher {
         EpochWatcher {
             applied_rx: applied,
-            flushed_rx: flushed,
+            written_rx: flushed,
             durable_rx: durable,
         }
     }

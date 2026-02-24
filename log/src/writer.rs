@@ -10,7 +10,7 @@
 //! The log writer skips [`Durability::Applied`] because there is no in-memory
 //! delta stage — writes go straight to SlateDB. The watermarks advance as:
 //!
-//! - **Flushed** — after each append or seal, once the data is in SlateDB's
+//! - **Written** — after each append or seal, once the data is in SlateDB's
 //!   memtable (visible to snapshot reads, but not yet on disk).
 //! - **Durable** — after `storage.flush()`, once SlateDB has synced to disk.
 
@@ -236,7 +236,7 @@ impl LogWriter {
             snapshot,
             segments: Arc::clone(&self.segments_snapshot),
         });
-        self.watermarks.update_flushed(self.epoch);
+        self.watermarks.update_written(self.epoch);
         Ok(())
     }
 
@@ -369,7 +369,7 @@ impl LogWriteHandle {
 
     /// The highest epoch flushed to storage (but not necessarily durable).
     pub(crate) fn flushed_epoch(&self) -> u64 {
-        *self.watcher.flushed_rx.borrow()
+        *self.watcher.written_rx.borrow()
     }
 
     /// Returns a clone of the written view receiver.
@@ -573,7 +573,7 @@ mod tests {
 
         handle.try_append(make_write(&["k1"], 1000)).await.unwrap();
 
-        // Flushed watermark should advance, durable should not
+        // Written watermark should advance, durable should not
         assert_eq!(handle.flushed_epoch(), 1);
         assert_eq!(handle.durable_epoch(), 0);
     }

@@ -141,8 +141,8 @@ impl<D: Delta> ViewSubscriber<D> {
 
     /// Advances the flushed watermark, signaling that the reader has processed
     /// up through the given epoch.
-    pub fn update_flushed(&self, epoch: u64) {
-        self.watermarks.update_flushed(epoch);
+    pub fn update_written(&self, epoch: u64) {
+        self.watermarks.update_written(epoch);
     }
 
     /// Advances the durable watermark, signaling that the reader has processed
@@ -210,10 +210,10 @@ mod tests {
         let (watermarks, mut monitor) = create_pair();
 
         // when
-        watermarks.update_flushed(3);
+        watermarks.update_written(3);
 
         // then
-        monitor.wait(3, Durability::Flushed).await.unwrap();
+        monitor.wait(3, Durability::Written).await.unwrap();
     }
 
     #[tokio::test]
@@ -247,12 +247,12 @@ mod tests {
 
         // when - advance each level to a different epoch
         watermarks.update_applied(3);
-        watermarks.update_flushed(2);
+        watermarks.update_written(2);
         watermarks.update_durable(1);
 
         // then - each level tracks independently
         monitor.wait(3, Durability::Applied).await.unwrap();
-        monitor.wait(2, Durability::Flushed).await.unwrap();
+        monitor.wait(2, Durability::Written).await.unwrap();
         monitor.wait(1, Durability::Durable).await.unwrap();
     }
 }

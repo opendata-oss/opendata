@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 /// The level of durability for a write.
 ///
-/// Durability levels form an ordered progression: `Applied < Flushed < Durable`.
+/// Durability levels form an ordered progression: `Applied < Written < Durable`.
 /// Each level provides stronger guarantees about write persistence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Durability {
     Applied,
-    Flushed,
+    Written,
     Durable,
 }
 

@@ -289,7 +289,7 @@ impl LogDb {
         let target = self.handle.flushed_epoch();
         self.epoch_watcher
             .clone()
-            .wait(target, Durability::Flushed)
+            .wait(target, Durability::Written)
             .await
             .map_err(|_| Error::Internal("writer shut down".into()))?;
         Ok(())
@@ -497,7 +497,7 @@ fn spawn_flushed_subscriber(
                 last_segments = Some(Arc::clone(&view.segments));
             }
 
-            watermarks.update_flushed(view.epoch);
+            watermarks.update_written(view.epoch);
         }
     });
     (watcher, task)
