@@ -130,7 +130,7 @@ pub(crate) trait RangeFunction {
 
 /// Trait for PromQL functions that operate on scalars
 pub(crate) trait PromQLScalarFunction {
-    /// Apply the function to the input samples.
+    /// Apply the function to the input scalar.
     /// `eval_timestamp_ms` is the evaluation timestamp in milliseconds since UNIX epoch.
     fn apply(&self, scalar: f64, eval_timestamp_ms: i64) -> EvalResult<Vec<EvalSample>>;
 }
