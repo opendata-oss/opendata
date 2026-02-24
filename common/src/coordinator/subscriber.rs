@@ -167,12 +167,8 @@ impl ViewMonitor {
     /// Waits until the subscriber has processed at least `epoch` at the
     /// given [`Durability`] level.
     pub async fn wait(&mut self, epoch: u64, durability: Durability) -> Result<(), SubscribeError> {
-        let rx = match durability {
-            Durability::Applied => &mut self.watcher.applied_rx,
-            Durability::Flushed => &mut self.watcher.flushed_rx,
-            Durability::Durable => &mut self.watcher.durable_rx,
-        };
-        rx.wait_for(|curr| *curr >= epoch)
+        self.watcher
+            .wait(epoch, durability)
             .await
             .map_err(|_| SubscribeError::Shutdown)?;
         Ok(())

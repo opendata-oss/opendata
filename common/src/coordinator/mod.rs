@@ -27,7 +27,7 @@ enum FlushEvent<D: Delta> {
 use crate::StorageRead;
 use crate::storage::StorageSnapshot;
 use async_trait::async_trait;
-pub(crate) use handle::EpochWatcher;
+pub use handle::EpochWatcher;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -493,14 +493,14 @@ impl<D: Delta> CurrentDelta<D> {
     }
 }
 
-pub(crate) struct EpochWatermarks {
+pub struct EpochWatermarks {
     applied_tx: tokio::sync::watch::Sender<u64>,
     flushed_tx: tokio::sync::watch::Sender<u64>,
     durable_tx: tokio::sync::watch::Sender<u64>,
 }
 
 impl EpochWatermarks {
-    pub(crate) fn new() -> (Self, EpochWatcher) {
+    pub fn new() -> (Self, EpochWatcher) {
         let (applied_tx, applied_rx) = tokio::sync::watch::channel(0);
         let (flushed_tx, flushed_rx) = tokio::sync::watch::channel(0);
         let (durable_tx, durable_rx) = tokio::sync::watch::channel(0);
@@ -517,15 +517,15 @@ impl EpochWatermarks {
         (watermarks, watcher)
     }
 
-    pub(crate) fn update_applied(&self, epoch: u64) {
+    pub fn update_applied(&self, epoch: u64) {
         let _ = self.applied_tx.send(epoch);
     }
 
-    pub(crate) fn update_flushed(&self, epoch: u64) {
+    pub fn update_flushed(&self, epoch: u64) {
         let _ = self.flushed_tx.send(epoch);
     }
 
-    pub(crate) fn update_durable(&self, epoch: u64) {
+    pub fn update_durable(&self, epoch: u64) {
         let _ = self.durable_tx.send(epoch);
     }
 }
