@@ -67,9 +67,7 @@ impl EpochWatcher {
             Durability::Flushed => &mut self.flushed_rx,
             Durability::Durable => &mut self.durable_rx,
         };
-        rx.wait_for(|curr| *curr >= epoch)
-            .await
-            .map(|_| ())
+        rx.wait_for(|curr| *curr >= epoch).await.map(|_| ())
     }
 }
 
