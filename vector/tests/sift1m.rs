@@ -58,11 +58,7 @@ fn ensure_extracted(data_dir: &Path, tarball: &str, marker: &str) {
         return;
     }
     let tgz = data_dir.join(tarball);
-    assert!(
-        tgz.exists(),
-        "tarball not found: {}",
-        tgz.display()
-    );
+    assert!(tgz.exists(), "tarball not found: {}", tgz.display());
     let status = Command::new("tar")
         .args(["xzf", tarball])
         .current_dir(data_dir)
