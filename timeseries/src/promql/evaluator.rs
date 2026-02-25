@@ -671,9 +671,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         // Evaluate the inner expression at each step within the subquery range
         let mut series_map: HashMap<Vec<Label>, Vec<Sample>> = HashMap::new();
-        let mut current_time_ms = aligned_start_ms;
 
-        while current_time_ms <= subquery_end_ms {
+        for current_time_ms in (aligned_start_ms..=subquery_end_ms).step_by(step_ms as usize) {
             let current_time = Timestamp::from_millis(current_time_ms);
 
             let result = self
@@ -712,8 +711,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     value: sample.value,
                 });
             }
-
-            current_time_ms += step_ms;
         }
 
         let mut range_vector = Vec::new();
