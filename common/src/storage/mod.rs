@@ -225,6 +225,11 @@ pub trait StorageSnapshot: StorageRead {}
 /// The storage type encapsulates access to the underlying storage (e.g. SlateDB).
 #[async_trait]
 pub trait Storage: StorageRead {
+    /// Applies a batch of mixed operations (puts, merges, and deletes) atomically.
+    ///
+    /// All operations in the batch are written together in a single `WriteBatch`,
+    /// so either all succeed or none are visible. This is the primary write method
+    /// used by flushers that produce a mix of operation types from a frozen delta.
     async fn apply(&self, ops: Vec<RecordOp>) -> StorageResult<()>;
 
     async fn put(&self, records: Vec<PutRecordOp>) -> StorageResult<()>;
