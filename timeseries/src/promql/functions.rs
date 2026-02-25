@@ -53,6 +53,7 @@ where
             timestamp_ms: eval_timestamp_ms,
             value,
             labels: series.labels,
+            drop_name: false,
         });
     }
 
@@ -290,6 +291,7 @@ impl PromQLFunction for AbsentFunction {
                 timestamp_ms: eval_timestamp_ms,
                 value: 1.0,
                 labels: HashMap::new(),
+                drop_name: false,
             }])
         } else {
             // Return empty vector when input has samples
@@ -354,6 +356,7 @@ impl RangeFunction for RateFunction {
                 timestamp_ms: eval_timestamp_ms,
                 value: rate,
                 labels: sample_series.labels,
+                drop_name: false,
             });
         }
 
@@ -635,6 +638,7 @@ mod tests {
             timestamp_ms: 1000,
             value,
             labels: HashMap::new(),
+            drop_name: false,
         }
     }
 

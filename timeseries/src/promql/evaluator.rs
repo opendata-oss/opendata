@@ -13,6 +13,7 @@ use crate::promql::functions::FunctionRegistry;
 use crate::promql::selector::evaluate_selector_with_reader;
 use crate::query::QueryReader;
 use crate::util::Result;
+use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::*;
 use promql_parser::parser::{
     AggregateExpr, BinaryExpr, Call, EvalStmt, Expr, LabelModifier, MatrixSelector,
@@ -195,6 +196,7 @@ pub struct EvalSample {
     pub(crate) timestamp_ms: i64,
     pub(crate) value: f64,
     pub(crate) labels: HashMap<String, String>,
+    pub(crate) drop_name: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -380,15 +382,25 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 stmt.start, stmt.end
             )));
         }
-        self.evaluate_expr(
-            &stmt.expr,
-            stmt.start,
-            stmt.end,
-            stmt.end, // evaluation_ts: using end follows the "as-of" convention (evaluate at the effective end of the interval)
-            stmt.interval,
-            stmt.lookback_delta,
-        )
-        .await
+        let mut result = self
+            .evaluate_expr(
+                &stmt.expr,
+                stmt.start,
+                stmt.end,
+                stmt.end, // evaluation_ts: using end follows the "as-of" convention (evaluate at the effective end of the interval)
+                stmt.interval,
+                stmt.lookback_delta,
+            )
+            .await?;
+        // Deferred __name__ cleanup (mirrors Prometheus cleanupMetricLabels)
+        if let ExprResult::InstantVector(ref mut samples) = result {
+            for sample in samples.iter_mut() {
+                if sample.drop_name {
+                    sample.labels.remove(METRIC_NAME);
+                }
+            }
+        }
+        Ok(result)
     }
 
     // this call recurses to evaluate sub-expressions, so it needs to return a boxed future
@@ -670,6 +682,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                         timestamp_ms: best_sample.timestamp_ms,
                         value: best_sample.value,
                         labels,
+                        drop_name: false,
                     });
 
                     // Mark this series fingerprint as found so we don't add it again from older buckets
@@ -917,6 +930,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         // Check if this is a comparison operation (filters results in PromQL)
         let is_comparison = matches!(op.id(), T_NEQ | T_LSS | T_GTR | T_LTE | T_GTE | T_EQLC);
+        // With `bool` modifier, comparison ops return 0/1 for all pairs instead of filtering
+        let return_bool = expr.return_bool();
 
         match (left_result, right_result) {
             // Vector-Scalar operations: apply scalar to each vector element
@@ -926,11 +941,13 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     .filter_map(|mut sample| {
                         match self.apply_binary_op(op, sample.value, scalar) {
                             Ok(value) => {
-                                // For comparison operations, filter out false results (0.0)
-                                if is_comparison && value == 0.0 {
+                                // For comparison ops without bool, filter out false results
+                                if is_comparison && !return_bool && value == 0.0 {
                                     None
                                 } else {
                                     sample.value = value;
+                                    sample.drop_name |=
+                                        Self::changes_metric_schema(op) || return_bool;
                                     Some(sample)
                                 }
                             }
@@ -947,11 +964,13 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     .filter_map(|mut sample| {
                         match self.apply_binary_op(op, scalar, sample.value) {
                             Ok(value) => {
-                                // For comparison operations, filter out false results (0.0)
-                                if is_comparison && value == 0.0 {
+                                // For comparison ops without bool, filter out false results
+                                if is_comparison && !return_bool && value == 0.0 {
                                     None
                                 } else {
                                     sample.value = value;
+                                    sample.drop_name |=
+                                        Self::changes_metric_schema(op) || return_bool;
                                     Some(sample)
                                 }
                             }
@@ -962,52 +981,78 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 Ok(ExprResult::InstantVector(result))
             }
             // Vector-Vector operations: one-to-one matching only
-            (ExprResult::InstantVector(left_vector), ExprResult::InstantVector(right_vector)) => {
-                if let Some(modifier) = &expr.modifier {
-                    if !matches!(modifier.card, VectorMatchCardinality::OneToOne) {
-                        return Err(EvaluationError::InternalError(
-                            "only one-to-one cardinality supported".to_string(),
-                        ));
-                        // TODO: support many-to-one/one-to-many cardinality
+            (
+                ExprResult::InstantVector(mut left_vector),
+                ExprResult::InstantVector(mut right_vector),
+            ) => {
+                if let Some(modifier) = &expr.modifier
+                    && !matches!(modifier.card, VectorMatchCardinality::OneToOne)
+                {
+                    return Err(EvaluationError::InternalError(
+                        "only one-to-one cardinality supported".to_string(),
+                    ));
+                    // TODO: support many-to-one/one-to-many cardinality (group_left/group_right)
+                }
+
+                let matching = expr.modifier.as_ref().and_then(|m| m.matching.as_ref());
+
+                // Materialize pending __name__ drops before matching so that
+                // stale names don't participate in match keys or result labels
+                for sample in left_vector.iter_mut() {
+                    if sample.drop_name {
+                        sample.labels.remove(METRIC_NAME);
                     }
-                    if modifier.matching.is_some() {
-                        return Err(EvaluationError::InternalError(
-                            "label matching not yet supported".to_string(),
-                        ));
-                        // TODO: support label matching between vectors
+                }
+                for sample in right_vector.iter_mut() {
+                    if sample.drop_name {
+                        sample.labels.remove(METRIC_NAME);
                     }
                 }
 
-                // For one-to-one matching, we need vectors of the same size with matching labels
-                if left_vector.len() != right_vector.len() {
-                    return Err(EvaluationError::InternalError(
-                        "Vector-vector operations require one-to-one matching cardinality"
-                            .to_string(),
-                    ));
+                // Build right-side index keyed by match signature
+                let mut right_map: HashMap<Vec<(String, String)>, EvalSample> = HashMap::new();
+                for sample in right_vector {
+                    let key = Self::compute_binary_match_key(&sample.labels, matching);
+                    if right_map.insert(key.clone(), sample).is_some() {
+                        return Err(EvaluationError::InternalError(
+                            "many-to-many matching not allowed: found duplicate series on the right side of the operation".to_string(),
+                        ));
+                    }
                 }
 
                 let mut result = Vec::new();
+                let mut left_seen: HashSet<Vec<(String, String)>> = HashSet::new();
 
-                // Simple implementation: match by position (assumes same ordering)
-                // TODO: Implement proper label matching
-                for (left_sample, right_sample) in
-                    left_vector.into_iter().zip(right_vector.into_iter())
-                {
-                    if left_sample.labels != right_sample.labels {
+                for left_sample in left_vector {
+                    let key = Self::compute_binary_match_key(&left_sample.labels, matching);
+
+                    // Look up matching right sample
+                    let right_sample = match right_map.get(&key) {
+                        Some(rs) => rs,
+                        None => continue, // Unmatched left samples silently dropped
+                    };
+
+                    // One-to-one check: only error on duplicate left keys that have a right match
+                    if !left_seen.insert(key) {
                         return Err(EvaluationError::InternalError(
-                            "Vector-vector operations require matching labels".to_string(),
+                            "many-to-many matching not allowed: found duplicate series on the left side of the operation".to_string(),
                         ));
                     }
 
-                    let mut sample = left_sample;
-                    match self.apply_binary_op(op, sample.value, right_sample.value) {
+                    match self.apply_binary_op(op, left_sample.value, right_sample.value) {
                         Ok(value) => {
-                            // For comparison operations, filter out false results (0.0)
-                            if is_comparison && value == 0.0 {
+                            // For comparison ops without bool, filter out false results
+                            if is_comparison && !return_bool && value == 0.0 {
                                 continue;
                             }
-                            sample.value = value;
-                            result.push(sample);
+                            let result_labels =
+                                Self::result_metric(left_sample.labels, op, matching);
+                            result.push(EvalSample {
+                                timestamp_ms: left_sample.timestamp_ms,
+                                value,
+                                labels: result_labels,
+                                drop_name: left_sample.drop_name || return_bool,
+                            });
                         }
                         Err(e) => return Err(e),
                     }
@@ -1027,6 +1072,37 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 ))
             }
         }
+    }
+
+    /// Returns true if the binary operation changes the metric schema, meaning
+    /// `__name__` should be dropped from the result. Mirrors Prometheus's `resultMetric`
+    /// logic in engine.go.
+    fn changes_metric_schema(op: TokenType) -> bool {
+        matches!(op.id(), T_ADD | T_SUB | T_MUL | T_DIV)
+    }
+
+    /// Compute the result labels for a vector-vector binary operation.
+    /// Mirrors Prometheus's `resultMetric` (engine.go L3062-3104):
+    /// 1. Arithmetic ops always drop `__name__`
+    /// 2. `on()` keeps only listed labels; `ignoring()` removes listed labels
+    fn result_metric(
+        mut labels: HashMap<String, String>,
+        op: TokenType,
+        matching: Option<&LabelModifier>,
+    ) -> HashMap<String, String> {
+        if Self::changes_metric_schema(op) {
+            labels.remove(METRIC_NAME);
+        }
+        match matching {
+            Some(LabelModifier::Include(label_list)) => {
+                labels.retain(|k, _| label_list.labels.contains(k));
+            }
+            Some(LabelModifier::Exclude(label_list)) => {
+                labels.retain(|k, _| !label_list.labels.contains(k));
+            }
+            None => {}
+        }
+        labels
     }
 
     fn apply_binary_op(&self, op: TokenType, left: f64, right: f64) -> EvalResult<f64> {
@@ -1080,6 +1156,39 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         key_vec
     }
 
+    /// Compute a match signature for a sample's labels per Prometheus binary op semantics.
+    /// - No modifier: match on ALL labels except `__name__`
+    /// - `on(l1, l2)` (Include): match only on listed labels
+    /// - `ignoring(l1, l2)` (Exclude): match on all labels except listed ones and `__name__`
+    ///
+    /// This is intentionally separate from `compute_grouping_labels` because their `None`
+    /// cases have opposite semantics (aggregation groups everything together; binary ops
+    /// match on all labels).
+    fn compute_binary_match_key(
+        labels: &HashMap<String, String>,
+        matching: Option<&LabelModifier>,
+    ) -> Vec<(String, String)> {
+        let mut key: Vec<(String, String)> = match matching {
+            None => labels
+                .iter()
+                .filter(|(k, _)| k.as_str() != METRIC_NAME)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            Some(LabelModifier::Include(label_list)) => labels
+                .iter()
+                .filter(|(k, _)| label_list.labels.contains(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            Some(LabelModifier::Exclude(label_list)) => labels
+                .iter()
+                .filter(|(k, _)| k.as_str() != METRIC_NAME && !label_list.labels.contains(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        };
+        key.sort();
+        key
+    }
+
     async fn evaluate_aggregate(
         &mut self,
         aggregate: &AggregateExpr,
@@ -1124,7 +1233,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         // Group samples by their grouping key (which consumes the filtered labels)
         let mut groups: HashMap<Vec<(String, String)>, Vec<f64>> = HashMap::new();
-        for sample in samples {
+        for mut sample in samples {
+            // Materialize pending __name__ drops before grouping
+            if sample.drop_name {
+                sample.labels.remove(METRIC_NAME);
+            }
             // Compute the grouping labels by taking ownership and filtering
             let group_labels =
                 Self::compute_grouping_labels(sample.labels, aggregate.modifier.as_ref());
@@ -1168,6 +1281,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 timestamp_ms,
                 value: aggregated_value,
                 labels: result_labels,
+                drop_name: false,
             });
         }
 
@@ -1587,10 +1701,10 @@ mod tests {
             ("http_requests_total", vec![("env", "staging"), ("method", "POST")], 3, 40.0),
         ],
         vec![
-            (15.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "GET")]),
-            (25.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "POST")]),
-            (35.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "GET")]),
-            (45.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "POST")]),
+            (15.0, vec![("env", "prod"), ("method", "GET")]),
+            (25.0, vec![("env", "prod"), ("method", "POST")]),
+            (35.0, vec![("env", "staging"), ("method", "GET")]),
+            (45.0, vec![("env", "staging"), ("method", "POST")]),
         ]
     )]
     #[case(
@@ -1603,10 +1717,10 @@ mod tests {
             ("http_requests_total", vec![("env", "staging"), ("method", "POST")], 3, 40.0),
         ],
         vec![
-            (20.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "GET")]),
-            (40.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "POST")]),
-            (60.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "GET")]),
-            (80.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "POST")]),
+            (20.0, vec![("env", "prod"), ("method", "GET")]),
+            (40.0, vec![("env", "prod"), ("method", "POST")]),
+            (60.0, vec![("env", "staging"), ("method", "GET")]),
+            (80.0, vec![("env", "staging"), ("method", "POST")]),
         ]
     )]
     #[case(
@@ -1616,7 +1730,7 @@ mod tests {
             ("memory_bytes", vec![("env", "prod")], 0, 100.0),
         ],
         vec![
-            (10.0, vec![("__name__", "memory_bytes"), ("env", "prod")]), // 100 / 10 = 10
+            (10.0, vec![("env", "prod")]), // 100 / 10 = 10
         ]
     )]
     // Binary Operations - Comparison
@@ -1658,6 +1772,265 @@ mod tests {
         ],
         vec![
             (1.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "POST")]), // 20 == 20
+        ]
+    )]
+    // Binary Operations - Comparison with bool (vector-scalar and scalar-vector)
+    #[case(
+        "binary_vector_scalar_comparison_bool_keeps_false",
+        "http_requests_total > bool 15",
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+        ],
+        vec![
+            // bool: false results retained as 0, true as 1; __name__ dropped
+            (0.0, vec![("env", "prod"), ("method", "GET")]),  // 10 > 15 = false → 0
+            (1.0, vec![("env", "prod"), ("method", "POST")]), // 20 > 15 = true → 1
+        ]
+    )]
+    #[case(
+        "binary_scalar_vector_comparison_bool_keeps_false",
+        "15 < bool http_requests_total",
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+        ],
+        vec![
+            // bool: 15 < 10 = false → 0, 15 < 20 = true → 1; __name__ dropped
+            (0.0, vec![("env", "prod"), ("method", "GET")]),
+            (1.0, vec![("env", "prod"), ("method", "POST")]),
+        ]
+    )]
+    // Vector-Vector Binary Operations
+    #[case(
+        "binary_vector_vector_sub_same_metric",
+        "http_requests_total - http_requests_total",
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+            ("http_requests_total", vec![("env", "staging"), ("method", "GET")], 2, 30.0),
+        ],
+        vec![
+            (0.0, vec![("env", "prod"), ("method", "GET")]),
+            (0.0, vec![("env", "prod"), ("method", "POST")]),
+            (0.0, vec![("env", "staging"), ("method", "GET")]),
+        ]
+    )]
+    #[case(
+        "binary_vector_vector_add_same_metric",
+        "http_requests_total + http_requests_total",
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+        ],
+        vec![
+            (20.0, vec![("env", "prod"), ("method", "GET")]),
+            (40.0, vec![("env", "prod"), ("method", "POST")]),
+        ]
+    )]
+    #[case(
+        "binary_vector_vector_unmatched_dropped",
+        "cpu_usage + memory_bytes",
+        vec![
+            ("cpu_usage", vec![("env", "prod"), ("instance", "i1")], 0, 50.0),
+            ("cpu_usage", vec![("env", "prod"), ("instance", "i2")], 1, 60.0),
+            ("memory_bytes", vec![("env", "prod")], 2, 100.0),
+        ],
+        vec![] // No matching label sets (different labels), all dropped
+    )]
+    #[case(
+        "binary_vector_vector_comparison",
+        "cpu_usage > memory_bytes",
+        vec![
+            ("cpu_usage", vec![("env", "prod")], 0, 150.0),
+            ("cpu_usage", vec![("env", "staging")], 1, 50.0),
+            ("memory_bytes", vec![("env", "prod")], 2, 100.0),
+            ("memory_bytes", vec![("env", "staging")], 3, 100.0),
+        ],
+        vec![
+            // 150 > 100 = true; __name__ preserved for comparison ops
+            (1.0, vec![("__name__", "cpu_usage"), ("env", "prod")]),
+            // 50 > 100 = false, filtered out
+        ]
+    )]
+    #[case(
+        "binary_vector_vector_after_aggregation",
+        "sum by (env)(http_requests_total) - sum by (env)(http_requests_total)",
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+            ("http_requests_total", vec![("env", "staging"), ("method", "GET")], 2, 30.0),
+        ],
+        vec![
+            (0.0, vec![("env", "prod")]),   // (10+20) - (10+20) = 0
+            (0.0, vec![("env", "staging")]), // 30 - 30 = 0
+        ]
+    )]
+    #[case(
+        "binary_vector_vector_on_modifier",
+        "cpu_usage + on(env) memory_bytes",
+        vec![
+            ("cpu_usage", vec![("env", "prod"), ("instance", "i1")], 0, 50.0),
+            ("memory_bytes", vec![("env", "prod")], 1, 100.0),
+        ],
+        vec![
+            (150.0, vec![("env", "prod")]),
+        ]
+    )]
+    #[case(
+        "binary_vector_vector_comparison_on_drops_name",
+        "cpu_usage > on(env) memory_bytes",
+        vec![
+            ("cpu_usage", vec![("env", "prod"), ("instance", "i1")], 0, 150.0),
+            ("cpu_usage", vec![("env", "staging"), ("instance", "i2")], 1, 50.0),
+            ("memory_bytes", vec![("env", "prod")], 2, 100.0),
+            ("memory_bytes", vec![("env", "staging")], 3, 100.0),
+        ],
+        vec![
+            // 150 > 100 = true; on(env) keeps only env label
+            (1.0, vec![("env", "prod")]),
+            // 50 > 100 = false, filtered out
+        ]
+    )]
+    #[case(
+        "binary_vector_vector_comparison_ignoring_preserves_name",
+        "cpu_usage > ignoring(instance) memory_bytes",
+        vec![
+            ("cpu_usage", vec![("env", "prod"), ("instance", "i1")], 0, 150.0),
+            ("memory_bytes", vec![("env", "prod")], 1, 100.0),
+        ],
+        vec![
+            // ignoring(instance) comparison preserves __name__ but removes instance
+            (1.0, vec![("__name__", "cpu_usage"), ("env", "prod")]),
+        ]
+    )]
+    #[case(
+        "binary_vector_vector_comparison_on_name_preserves_name",
+        "cpu_usage == on(__name__) cpu_usage",
+        vec![
+            ("cpu_usage", vec![("env", "prod")], 0, 150.0),
+        ],
+        vec![
+            // on(__name__) comparison without bool: Prometheus preserves __name__
+            // (shouldDropMetricName only returns true for comparisons when ReturnBool is set)
+            (1.0, vec![("__name__", "cpu_usage")]),
+        ]
+    )]
+    #[case(
+        "binary_nested_arithmetic_then_on_name_no_match_left",
+        "(cpu_usage + 1) == on(__name__) cpu_usage",
+        vec![
+            ("cpu_usage", vec![("env", "prod")], 0, 150.0),
+        ],
+        vec![
+            // Inner + drops __name__ (materialized before matching), so on(__name__)
+            // finds no __name__ on left → match keys differ → no match → empty result
+        ]
+    )]
+    #[case(
+        "binary_nested_arithmetic_then_on_name_no_match_right",
+        "cpu_usage == on(__name__) (cpu_usage + 1)",
+        vec![
+            ("cpu_usage", vec![("env", "prod")], 0, 150.0),
+        ],
+        vec![
+            // Inner + drops __name__ on right side → on(__name__) match keys differ → empty
+        ]
+    )]
+    #[case(
+        "binary_vector_vector_comparison_bool_keeps_false",
+        "cpu_usage > bool memory_bytes",
+        vec![
+            ("cpu_usage", vec![("env", "prod")], 0, 150.0),
+            ("cpu_usage", vec![("env", "staging")], 1, 50.0),
+            ("memory_bytes", vec![("env", "prod")], 2, 100.0),
+            ("memory_bytes", vec![("env", "staging")], 3, 100.0),
+        ],
+        vec![
+            // bool modifier: keep all results as 0/1 and drop __name__
+            (0.0, vec![("env", "staging")]), // 50 > 100 = false → 0
+            (1.0, vec![("env", "prod")]),    // 150 > 100 = true → 1
+        ]
+    )]
+    #[case(
+        "binary_vector_vector_ignoring_modifier",
+        "cpu_usage - ignoring(instance) memory_bytes",
+        vec![
+            ("cpu_usage", vec![("env", "prod"), ("instance", "i1")], 0, 50.0),
+            ("memory_bytes", vec![("env", "prod")], 1, 100.0),
+        ],
+        vec![
+            // ignoring(instance) removes instance; arithmetic drops __name__
+            (-50.0, vec![("env", "prod")]),
+        ]
+    )]
+    #[case(
+        "binary_vector_vector_order_insensitive",
+        "http_requests_total - http_requests_total",
+        vec![
+            // Reverse order: staging first, prod second
+            ("http_requests_total", vec![("env", "staging"), ("method", "GET")], 0, 30.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 1, 10.0),
+        ],
+        vec![
+            (0.0, vec![("env", "prod"), ("method", "GET")]),
+            (0.0, vec![("env", "staging"), ("method", "GET")]),
+        ]
+    )]
+    // Vector-Vector: matched arithmetic with different metric names (only __name__ differs)
+    #[case(
+        "binary_vector_vector_arithmetic_different_metrics",
+        "cpu_usage + memory_bytes",
+        vec![
+            ("cpu_usage", vec![("env", "prod")], 0, 50.0),
+            ("memory_bytes", vec![("env", "prod")], 1, 100.0),
+        ],
+        vec![
+            // Matched on {env=prod} (__name__ excluded from match key), __name__ dropped (arithmetic)
+            (150.0, vec![("env", "prod")]),
+        ]
+    )]
+    // Aggregation over arithmetic: drop_name materialized before grouping
+    #[case(
+        "binary_aggregation_over_arithmetic_drops_name",
+        r#"sum by (__name__) (http_requests_total + 1)"#,
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+        ],
+        vec![
+            // Inner + sets drop_name=true, aggregation materializes the drop before grouping,
+            // so by(__name__) finds no __name__ → single group {} with sum 11+21=32
+            (32.0, vec![]),
+        ]
+    )]
+    // Nested expression: drop_name propagation through nested binary ops
+    #[case(
+        "binary_nested_arithmetic_then_comparison",
+        "(http_requests_total + 1) > 15",
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+        ],
+        vec![
+            // Inner + sets drop_name=true, outer > filters to values > 15.
+            // 10+1=11 not > 15 (filtered). 20+1=21 > 15 → returns 1.0. __name__ stripped at top level.
+            (1.0, vec![("env", "prod"), ("method", "POST")]),
+        ]
+    )]
+    // Function-wrapped arithmetic: drop_name propagation through instant-vector functions
+    #[case(
+        "binary_function_wrapped_arithmetic_drops_name",
+        "abs(http_requests_total + 1)",
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, -20.0),
+        ],
+        vec![
+            // Inner + sets drop_name=true, abs() preserves drop_name (mutates value in-place),
+            // __name__ stripped at top-level deferred cleanup
+            (11.0, vec![("env", "prod"), ("method", "GET")]),
+            (19.0, vec![("env", "prod"), ("method", "POST")]),
         ]
     )]
     // Aggregations
@@ -3000,5 +3373,133 @@ mod tests {
         } else {
             panic!("Expected InstantVector result");
         }
+    }
+
+    #[tokio::test]
+    async fn binary_vector_vector_duplicate_right_key_error() {
+        // Two right-side series that have different full label sets but the same match key
+        // when using on(env). memory_bytes{env="prod",instance="i1"} and
+        // memory_bytes{env="prod",instance="i2"} both map to match key {env="prod"}.
+        let test_data: TestSampleData = vec![
+            ("cpu_usage", vec![("env", "prod")], 0, 50.0),
+            (
+                "memory_bytes",
+                vec![("env", "prod"), ("instance", "i1")],
+                1,
+                100.0,
+            ),
+            (
+                "memory_bytes",
+                vec![("env", "prod"), ("instance", "i2")],
+                2,
+                200.0,
+            ),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "cpu_usage + on(env) memory_bytes",
+            end_time,
+            lookback_delta,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "Expected error for duplicate right-side match key"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate series on the right side"),
+            "Error should mention right side: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_vector_vector_duplicate_left_key_matched_error() {
+        // Two left-side series that collapse to the same match key with on(env),
+        // and there IS a matching right-side series.
+        let test_data: TestSampleData = vec![
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i1")],
+                0,
+                50.0,
+            ),
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i2")],
+                1,
+                60.0,
+            ),
+            ("memory_bytes", vec![("env", "prod")], 2, 100.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "cpu_usage + on(env) memory_bytes",
+            end_time,
+            lookback_delta,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "Expected error for duplicate left-side match key"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate series on the left side"),
+            "Error should mention left side: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_vector_vector_duplicate_left_key_unmatched_ok() {
+        // Two left-side series that collapse to the same match key with on(env),
+        // but no right-side match — should NOT error, silently dropped.
+        let test_data: TestSampleData = vec![
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i1")],
+                0,
+                50.0,
+            ),
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i2")],
+                1,
+                60.0,
+            ),
+            ("memory_bytes", vec![("env", "staging")], 2, 100.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "cpu_usage - on(env) memory_bytes",
+            end_time,
+            lookback_delta,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Should not error for unmatched duplicate left keys"
+        );
+        let samples = result.unwrap();
+        assert!(
+            samples.is_empty(),
+            "No matches expected, got {} samples",
+            samples.len()
+        );
     }
 }
