@@ -33,7 +33,8 @@ use common::storage::factory::create_storage;
 use common::storage::{Storage, StorageRead, StorageSnapshot};
 use common::{StorageRuntime, StorageSemantics};
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::debug;
@@ -643,14 +644,13 @@ impl VectorDb {
         }
 
         let snapshot = self.write_coordinator.view().snapshot.clone();
-        let candidates = self
-            .load_candidates(&centroid_ids, snapshot.as_ref())
+        let sorted_lists = self
+            .load_and_score(&centroid_ids, query, snapshot.clone())
             .await?;
-        if candidates.is_empty() {
+        if sorted_lists.is_empty() {
             return Ok(Vec::new());
         }
-        self.score_and_rank(query, &candidates, k, snapshot.as_ref())
-            .await
+        self.resolve_top_k(sorted_lists, k, snapshot.as_ref()).await
     }
 
     pub async fn search_with_nprobe(
@@ -681,110 +681,169 @@ impl VectorDb {
             return Ok(Vec::new());
         }
 
-        // 3. Load posting lists from flushed snapshot
+        // 3. Load posting lists and score candidates
         let snapshot = self.write_coordinator.view().snapshot.clone();
-        let candidates = self
-            .load_candidates(&centroid_ids, snapshot.as_ref())
+        let sorted_lists = self
+            .load_and_score(&centroid_ids, query, snapshot.clone())
             .await?;
 
-        if candidates.is_empty() {
+        if sorted_lists.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 4. Score candidates and return top-k
-        let results = self
-            .score_and_rank(query, &candidates, k, snapshot.as_ref())
-            .await?;
-
-        Ok(results)
+        // 5. K-way merge and resolve top-k forward index lookups
+        self.resolve_top_k(sorted_lists, k, snapshot.as_ref()).await
     }
 
-    /// Load candidate vector IDs and their vectors from posting lists.
-    async fn load_candidates(
+    /// Spawn a task per centroid to load its posting list and score all candidates
+    /// against the query vector. Returns per-centroid sorted candidate lists.
+    async fn load_and_score(
         &self,
         centroid_ids: &[u64],
-        snapshot: &dyn StorageRead,
-    ) -> Result<Vec<(u64, Vec<f32>)>> {
-        let mut all_candidates = Vec::new();
+        query: &[f32],
+        snapshot: Arc<dyn StorageSnapshot>,
+    ) -> Result<Vec<Vec<ScoredCandidate>>> {
         let dimensions = self.config.dimensions as usize;
+        let metric = self.config.distance_metric;
+        let query_vec: Vec<f32> = query.to_vec();
 
-        for &centroid_id in centroid_ids {
-            let posting_list: PostingList = snapshot
-                .get_posting_list(centroid_id, dimensions)
-                .await?
-                .into();
-            for posting in posting_list.iter() {
-                all_candidates.push((posting.id(), posting.vector().to_vec()));
+        let mut handles = Vec::with_capacity(centroid_ids.len());
+        for &cid in centroid_ids {
+            let snap = snapshot.clone();
+            let q = query_vec.clone();
+            handles.push(tokio::spawn(async move {
+                let posting_list: PostingList =
+                    snap.get_posting_list(cid, dimensions).await?.into();
+                let mut scored: Vec<ScoredCandidate> = posting_list
+                    .iter()
+                    .map(|posting| {
+                        let d = distance::compute_distance(&q, posting.vector(), metric);
+                        ScoredCandidate {
+                            internal_id: posting.id(),
+                            distance: d,
+                        }
+                    })
+                    .collect();
+                scored.sort_unstable_by(|a, b| a.distance.cmp(&b.distance));
+                Ok::<_, anyhow::Error>(scored)
+            }));
+        }
+
+        let results = futures::future::join_all(handles).await;
+        let mut sorted_lists: Vec<Vec<ScoredCandidate>> = Vec::with_capacity(results.len());
+        for result in results {
+            let scored = result??;
+            if !scored.is_empty() {
+                sorted_lists.push(scored);
             }
         }
 
-        Ok(all_candidates)
+        Ok(sorted_lists)
     }
 
-    /// Score candidates and return top-k results.
-    ///
-    /// TODO: Use a min/max heap to maintain only top-k results in memory instead of
-    /// materializing all candidates. This would reduce memory usage for large candidate sets.
-    ///
-    /// TODO: Consider pipelining this operation so we load and score candidates in batches,
-    /// keeping only the current top-k in memory. This would enable processing arbitrarily
-    /// large candidate sets without loading them all at once.
-    async fn score_and_rank(
+    /// K-way merge the per-centroid sorted lists and resolve top-k forward
+    /// index lookups. Only merges as far into the lists as needed to produce
+    /// k results, deduplicating by `internal_id` along the way.
+    async fn resolve_top_k(
         &self,
-        query: &[f32],
-        candidates: &[(u64, Vec<f32>)],
+        sorted_lists: Vec<Vec<ScoredCandidate>>,
         k: usize,
         snapshot: &dyn StorageRead,
     ) -> Result<Vec<SearchResult>> {
-        struct ScoredResult {
-            internal_id: u64,
-            distance: distance::VectorDistance,
-        }
-
-        let mut scored_results = Vec::new();
         let dimensions = self.config.dimensions as usize;
 
-        // Load and score each candidate
-        for (internal_id, vector) in candidates {
-            // Compute distance/similarity score using vector from posting list
-            let distance = distance::compute_distance(query, vector, self.config.distance_metric);
-            scored_results.push(ScoredResult {
-                internal_id: *internal_id,
-                distance,
-            });
+        // Seed the min-heap with the first element of each sorted list.
+        let mut heap = BinaryHeap::new();
+        for list in sorted_lists {
+            let mut iter = list.into_iter();
+            if let Some(first) = iter.next() {
+                heap.push(Reverse(MergeEntry(first, iter)));
+            }
         }
 
-        // Sort by distance (most similar first)
-        scored_results.sort_by(|a, b| a.distance.cmp(&b.distance));
-
         let mut results = Vec::with_capacity(k);
-        for sr in scored_results {
-            // Load vector data (for external_id and metadata)
-            let vector_data = snapshot.get_vector_data(sr.internal_id, dimensions).await?;
-            if vector_data.is_none() {
-                continue;
+        let mut seen = HashSet::new();
+
+        // Pop candidates from the heap in score order, batch-resolve k at a
+        // time, and stop as soon as we have k results.
+        loop {
+            // Drain up to k unique candidates from the merge heap.
+            let mut batch = Vec::with_capacity(k - results.len());
+            while batch.len() < k - results.len() {
+                let Some(Reverse(MergeEntry(candidate, mut iter))) = heap.pop() else {
+                    break;
+                };
+                if let Some(next) = iter.next() {
+                    heap.push(Reverse(MergeEntry(next, iter)));
+                }
+                if seen.insert(candidate.internal_id) {
+                    batch.push(candidate);
+                }
             }
-            let vector_data = vector_data.unwrap();
 
-            // Convert metadata fields to HashMap (includes vector field)
-            let metadata: HashMap<String, AttributeValue> = vector_data
-                .fields()
-                .map(|field| (field.field_name.clone(), field.value.clone().into()))
-                .collect();
-
-            results.push(SearchResult {
-                internal_id: sr.internal_id,
-                external_id: vector_data.external_id().to_string(),
-                score: sr.distance.score(),
-                attributes: metadata,
-            });
-
-            if results.len() == k {
+            if batch.is_empty() {
                 break;
+            }
+
+            // Resolve forward index lookups for the batch concurrently.
+            let futures: Vec<_> = batch
+                .iter()
+                .map(|sr| snapshot.get_vector_data(sr.internal_id, dimensions))
+                .collect();
+            let loaded = futures::future::join_all(futures).await;
+
+            for (sr, vector_data) in batch.iter().zip(loaded) {
+                let Some(vector_data) = vector_data? else {
+                    continue;
+                };
+
+                let metadata: HashMap<String, AttributeValue> = vector_data
+                    .fields()
+                    .map(|field| (field.field_name.clone(), field.value.clone().into()))
+                    .collect();
+
+                results.push(SearchResult {
+                    internal_id: sr.internal_id,
+                    external_id: vector_data.external_id().to_string(),
+                    score: sr.distance.score(),
+                    attributes: metadata,
+                });
+
+                if results.len() == k {
+                    return Ok(results);
+                }
             }
         }
 
         Ok(results)
+    }
+}
+
+struct ScoredCandidate {
+    internal_id: u64,
+    distance: distance::VectorDistance,
+}
+
+/// Entry for k-way merge of sorted scored candidate lists.
+struct MergeEntry(ScoredCandidate, std::vec::IntoIter<ScoredCandidate>);
+
+impl PartialEq for MergeEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.distance == other.0.distance
+    }
+}
+
+impl Eq for MergeEntry {}
+
+impl PartialOrd for MergeEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MergeEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.distance.cmp(&other.0.distance)
     }
 }
 
