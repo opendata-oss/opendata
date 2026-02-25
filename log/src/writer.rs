@@ -391,7 +391,6 @@ mod tests {
     use crate::serde::SEQ_BLOCK_KEY;
     use crate::storage::in_memory_storage;
     use common::storage::in_memory::FailingStorage;
-    use std::sync::atomic::Ordering;
 
     async fn create_writer() -> (LogWriter, LogWriteHandle, Arc<dyn common::Storage>) {
         create_writer_with_config(LogWriterConfig::default()).await
@@ -609,7 +608,6 @@ mod tests {
         assert_eq!(handle.durable_epoch(), 1);
     }
 
-    // ---- Critical gap: storage error propagation ----
 
     #[tokio::test]
     async fn should_propagate_put_error_on_append() {
@@ -620,12 +618,12 @@ mod tests {
         let _task = handle.spawn(writer);
 
         // Enable put failure after writer is running
-        failing.fail_put.store(true, Ordering::SeqCst);
+        failing.fail_put(common::StorageError::Storage("test put error".into()));
 
         let result = handle.try_append(make_write(&["key1"], 1000)).await;
         assert!(
-            matches!(&result, Err(AppendError::InvalidRecord(msg)) if msg.contains("injected put failure")),
-            "expected InvalidRecord with injected message, got: {:?}",
+            matches!(&result, Err(AppendError::InvalidRecord(msg)) if msg.contains("test put error")),
+            "expected InvalidRecord with test put error, got: {:?}",
             result,
         );
 
@@ -643,12 +641,12 @@ mod tests {
 
         // Snapshot is taken inside write_and_broadcast after a successful put.
         // Fail only snapshot, not put.
-        failing.fail_snapshot.store(true, Ordering::SeqCst);
+        failing.fail_snapshot(common::StorageError::Storage("test snapshot error".into()));
 
         let result = handle.try_append(make_write(&["key1"], 1000)).await;
         assert!(
-            matches!(&result, Err(AppendError::InvalidRecord(msg)) if msg.contains("injected snapshot failure")),
-            "expected InvalidRecord with injected message, got: {:?}",
+            matches!(&result, Err(AppendError::InvalidRecord(msg)) if msg.contains("test snapshot error")),
+            "expected InvalidRecord with test snapshot error, got: {:?}",
             result,
         );
     }
@@ -668,14 +666,14 @@ mod tests {
             .unwrap();
 
         // Enable flush failure
-        failing.fail_flush.store(true, Ordering::SeqCst);
+        failing.fail_flush(common::StorageError::Storage("test flush error".into()));
 
         let result = handle.flush().await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            err.to_string().contains("injected flush failure"),
-            "expected injected flush failure, got: {}",
+            err.to_string().contains("test flush error"),
+            "expected test flush error, got: {}",
             err,
         );
     }
@@ -689,12 +687,12 @@ mod tests {
         let _task = handle.spawn(writer);
 
         // First append fails
-        failing.fail_put.store(true, Ordering::SeqCst);
+        failing.fail_put(common::StorageError::Storage("test put error".into()));
         let result = handle.try_append(make_write(&["key1"], 1000)).await;
         assert!(result.is_err());
 
         // Recover — writer task should still be alive
-        failing.fail_put.store(false, Ordering::SeqCst);
+        failing.clear_fail_put();
         let result = handle
             .try_append(make_write(&["key2"], 2000))
             .await
@@ -702,7 +700,6 @@ mod tests {
         assert!(result.is_some());
     }
 
-    // ---- Critical gap: writer shutdown / channel-closed ----
 
     #[tokio::test]
     async fn should_return_shutdown_on_try_append_when_writer_dropped() {

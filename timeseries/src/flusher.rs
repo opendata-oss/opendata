@@ -189,9 +189,7 @@ mod tests {
         let flusher = TsdbFlusher {
             storage: storage.clone(),
         };
-        storage
-            .fail_apply
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        storage.fail_apply(common::StorageError::Storage("test apply error".into()));
 
         // when
         let result = flusher
@@ -201,8 +199,8 @@ mod tests {
         // then
         let err = result.err().expect("expected apply error");
         assert!(
-            err.contains("injected apply failure"),
-            "expected injected apply failure message, got: {err}"
+            err.contains("test apply error"),
+            "expected test apply error message, got: {err}"
         );
     }
 
@@ -214,9 +212,7 @@ mod tests {
             storage: storage.clone(),
         };
         // Apply succeeds, but snapshot after apply fails
-        storage
-            .fail_snapshot
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        storage.fail_snapshot(common::StorageError::Storage("test snapshot error".into()));
 
         // when
         let result = flusher
@@ -226,8 +222,8 @@ mod tests {
         // then
         let err = result.err().expect("expected snapshot error");
         assert!(
-            err.contains("injected snapshot failure"),
-            "expected injected snapshot failure message, got: {err}"
+            err.contains("test snapshot error"),
+            "expected test snapshot error message, got: {err}"
         );
     }
 
@@ -238,9 +234,7 @@ mod tests {
         let flusher = TsdbFlusher {
             storage: storage.clone(),
         };
-        storage
-            .fail_flush
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        storage.fail_flush(common::StorageError::Storage("test flush error".into()));
 
         // when
         let result = flusher.flush_storage().await;
@@ -248,8 +242,8 @@ mod tests {
         // then
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().contains("injected flush failure"),
-            "expected injected flush failure message"
+            result.unwrap_err().contains("test flush error"),
+            "expected test flush error message"
         );
     }
 

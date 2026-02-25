@@ -372,11 +372,11 @@ impl Storage for InMemoryStorage {
 }
 
 /// A storage wrapper that delegates to an inner [`Storage`] but can inject
-/// failures into `put_with_options`, `flush`, and `snapshot` on demand.
+/// failures into `apply`, `put_with_options`, `flush`, and `snapshot` on demand.
 ///
-/// Each failure mode is controlled by an [`AtomicBool`] flag. When a flag is
-/// set to `true`, the corresponding operation returns a [`StorageError::Storage`]
-/// instead of delegating to the inner storage.
+/// Each failure mode is controlled by a `Mutex<Option<StorageError>>`. When the
+/// option is `Some(err)`, the corresponding operation returns a clone of that
+/// error instead of delegating to the inner storage.
 ///
 /// Gated behind the `test-utils` feature.
 ///
@@ -385,29 +385,54 @@ impl Storage for InMemoryStorage {
 /// ```ignore
 /// let inner = Arc::new(InMemoryStorage::new());
 /// let storage = FailingStorage::wrap(inner);
-/// storage.fail_put.store(true, Ordering::SeqCst);
-/// // storage.put_with_options(...) now returns Err(...)
+/// storage.fail_put(StorageError::Storage("disk full".into()));
+/// // storage.put_with_options(...) now returns Err(StorageError::Storage("disk full"))
 /// ```
 #[cfg(feature = "test-utils")]
 pub struct FailingStorage {
     inner: Arc<dyn super::Storage>,
-    pub fail_apply: std::sync::atomic::AtomicBool,
-    pub fail_put: std::sync::atomic::AtomicBool,
-    pub fail_flush: std::sync::atomic::AtomicBool,
-    pub fail_snapshot: std::sync::atomic::AtomicBool,
+    fail_apply: std::sync::Mutex<Option<super::StorageError>>,
+    fail_put: std::sync::Mutex<Option<super::StorageError>>,
+    fail_flush: std::sync::Mutex<Option<super::StorageError>>,
+    fail_snapshot: std::sync::Mutex<Option<super::StorageError>>,
 }
 
 #[cfg(feature = "test-utils")]
 impl FailingStorage {
-    /// Wraps an existing storage, with all failure flags initially `false`.
+    /// Wraps an existing storage, with all failure injections initially `None`.
     pub fn wrap(inner: Arc<dyn super::Storage>) -> Arc<Self> {
         Arc::new(Self {
             inner,
-            fail_apply: std::sync::atomic::AtomicBool::new(false),
-            fail_put: std::sync::atomic::AtomicBool::new(false),
-            fail_flush: std::sync::atomic::AtomicBool::new(false),
-            fail_snapshot: std::sync::atomic::AtomicBool::new(false),
+            fail_apply: std::sync::Mutex::new(None),
+            fail_put: std::sync::Mutex::new(None),
+            fail_flush: std::sync::Mutex::new(None),
+            fail_snapshot: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Makes `apply` return the given error on every subsequent call.
+    pub fn fail_apply(&self, err: super::StorageError) {
+        self.fail_apply.lock().unwrap().replace(err);
+    }
+
+    /// Makes `put_with_options` return the given error on every subsequent call.
+    pub fn fail_put(&self, err: super::StorageError) {
+        self.fail_put.lock().unwrap().replace(err);
+    }
+
+    /// Clears the `put` failure so calls delegate to the inner storage.
+    pub fn clear_fail_put(&self) {
+        *self.fail_put.lock().unwrap() = None;
+    }
+
+    /// Makes `flush` return the given error on every subsequent call.
+    pub fn fail_flush(&self, err: super::StorageError) {
+        self.fail_flush.lock().unwrap().replace(err);
+    }
+
+    /// Makes `snapshot` return the given error on every subsequent call.
+    pub fn fail_snapshot(&self, err: super::StorageError) {
+        self.fail_snapshot.lock().unwrap().replace(err);
     }
 }
 
@@ -430,10 +455,8 @@ impl super::StorageRead for FailingStorage {
 #[async_trait]
 impl super::Storage for FailingStorage {
     async fn apply(&self, ops: Vec<super::RecordOp>) -> super::StorageResult<()> {
-        if self.fail_apply.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(super::StorageError::Storage(
-                "injected apply failure".into(),
-            ));
+        if let Some(err) = self.fail_apply.lock().unwrap().clone() {
+            return Err(err);
         }
         self.inner.apply(ops).await
     }
@@ -447,8 +470,8 @@ impl super::Storage for FailingStorage {
         records: Vec<super::PutRecordOp>,
         options: super::WriteOptions,
     ) -> super::StorageResult<()> {
-        if self.fail_put.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(super::StorageError::Storage("injected put failure".into()));
+        if let Some(err) = self.fail_put.lock().unwrap().clone() {
+            return Err(err);
         }
         self.inner.put_with_options(records, options).await
     }
@@ -458,19 +481,15 @@ impl super::Storage for FailingStorage {
     }
 
     async fn snapshot(&self) -> super::StorageResult<Arc<dyn super::StorageSnapshot>> {
-        if self.fail_snapshot.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(super::StorageError::Storage(
-                "injected snapshot failure".into(),
-            ));
+        if let Some(err) = self.fail_snapshot.lock().unwrap().clone() {
+            return Err(err);
         }
         self.inner.snapshot().await
     }
 
     async fn flush(&self) -> super::StorageResult<()> {
-        if self.fail_flush.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(super::StorageError::Storage(
-                "injected flush failure".into(),
-            ));
+        if let Some(err) = self.fail_flush.lock().unwrap().clone() {
+            return Err(err);
         }
         self.inner.flush().await
     }
