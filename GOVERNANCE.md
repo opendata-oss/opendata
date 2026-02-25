@@ -22,6 +22,7 @@ background and evaluate your fit for the project.
 - [@cadonna](https://github.com/cadonna)
 - [@hachikuji](https://github.com/hachikuji)
 - [@rodesai](https://github.com/rodesai)
+- [@samsond](https://github.com/samsond)
 
 ## Decision Making
 
