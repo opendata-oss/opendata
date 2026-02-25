@@ -608,7 +608,6 @@ mod tests {
         assert_eq!(handle.durable_epoch(), 1);
     }
 
-
     #[tokio::test]
     async fn should_propagate_put_error_on_append() {
         let inner = in_memory_storage();
@@ -686,20 +685,18 @@ mod tests {
             create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
         let _task = handle.spawn(writer);
 
-        // First append fails
-        failing.fail_put(common::StorageError::Storage("test put error".into()));
+        // First append fails, then auto-clears
+        failing.fail_put_once(common::StorageError::Storage("test put error".into()));
         let result = handle.try_append(make_write(&["key1"], 1000)).await;
         assert!(result.is_err());
 
         // Recover — writer task should still be alive
-        failing.clear_fail_put();
         let result = handle
             .try_append(make_write(&["key2"], 2000))
             .await
             .unwrap();
         assert!(result.is_some());
     }
-
 
     #[tokio::test]
     async fn should_return_shutdown_on_try_append_when_writer_dropped() {
