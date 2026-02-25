@@ -685,8 +685,14 @@ impl VectorDb {
         }
 
         // 3. Dynamic pruning: skip posting lists whose centroids are far from query
+        let original_ncentroids = centroid_ids.len();
         let centroid_ids = self.prune_centroids(&centroid_ids, query);
-        debug!("after dynamic pruning: {} centroids", centroid_ids.len());
+        debug!(
+            "query: {:?}, before pruning: {} centroids, after dynamic pruning: {} centroids",
+            query,
+            original_ncentroids,
+            centroid_ids.len()
+        );
 
         // 4. Load posting lists and score candidates
         let snapshot = self.write_coordinator.view().snapshot.clone();
