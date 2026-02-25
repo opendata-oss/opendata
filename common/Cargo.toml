@@ -16,6 +16,7 @@ path = "src/lib.rs"
 [features]
 default = []
 metrics = ["dep:prometheus-client"]
+test-utils = []
 
 [dependencies]
 slatedb.workspace = true
