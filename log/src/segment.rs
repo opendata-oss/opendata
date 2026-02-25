@@ -144,6 +144,15 @@ impl SegmentCache {
         self.segments.insert(segment.meta.start_seq, segment);
     }
 
+    /// Replaces all segments in the cache with the given segments.
+    pub(crate) fn replace_all(&mut self, segments: &[LogSegment]) {
+        self.segments.clear();
+        for segment in segments {
+            self.segments
+                .insert(segment.meta.start_seq, segment.clone());
+        }
+    }
+
     /// Refreshes the cache by loading segments from storage.
     ///
     /// If `after_segment_id` is `Some(id)`, only loads segments with id > `id` and appends them.

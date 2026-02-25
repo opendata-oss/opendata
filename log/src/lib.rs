@@ -42,7 +42,6 @@
 //! ```
 
 mod config;
-mod delta;
 mod error;
 mod listing;
 mod log;
@@ -54,6 +53,7 @@ mod serde;
 #[cfg(feature = "http-server")]
 pub mod server;
 mod storage;
+mod writer;
 
 pub use config::{Config, CountOptions, ReaderConfig, ScanOptions, SegmentConfig};
 pub use error::{AppendError, AppendResult, Error, Result};

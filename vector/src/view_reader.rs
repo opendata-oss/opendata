@@ -99,7 +99,7 @@ mod tests {
             current: Arc::new(std::sync::RwLock::new(current_view)),
             frozen: vec![],
             snapshot,
-            last_flushed_delta: None,
+            last_written_delta: None,
         });
         let reader = ViewReader::new(view);
 
@@ -137,7 +137,7 @@ mod tests {
                 epoch_range: 0..1,
             }],
             snapshot,
-            last_flushed_delta: None,
+            last_written_delta: None,
         });
         let reader = ViewReader::new(view);
 
@@ -173,7 +173,7 @@ mod tests {
             })),
             frozen: vec![],
             snapshot,
-            last_flushed_delta: None,
+            last_written_delta: None,
         });
         let reader = ViewReader::new(view);
 
@@ -212,7 +212,7 @@ mod tests {
                 epoch_range: 0..1,
             }],
             snapshot,
-            last_flushed_delta: None,
+            last_written_delta: None,
         });
         let reader = ViewReader::new(view);
 
@@ -248,7 +248,7 @@ mod tests {
                 epoch_range: 0..1,
             }],
             snapshot,
-            last_flushed_delta: None,
+            last_written_delta: None,
         });
         let reader = ViewReader::new(view);
 
@@ -290,7 +290,7 @@ mod tests {
                 epoch_range: 0..1,
             }],
             snapshot,
-            last_flushed_delta: None,
+            last_written_delta: None,
         });
         let reader = ViewReader::new(view);
 
@@ -324,7 +324,7 @@ mod tests {
             current: Arc::new(std::sync::RwLock::new(current_view)),
             frozen: vec![],
             snapshot,
-            last_flushed_delta: None,
+            last_written_delta: None,
         });
         let reader = ViewReader::new(view);
 
@@ -364,7 +364,7 @@ mod tests {
                 epoch_range: 0..1,
             }],
             snapshot,
-            last_flushed_delta: None,
+            last_written_delta: None,
         });
         let reader = ViewReader::new(view);
 
@@ -410,7 +410,7 @@ mod tests {
                 },
             ],
             snapshot,
-            last_flushed_delta: None,
+            last_written_delta: None,
         });
         let reader = ViewReader::new(view);
 

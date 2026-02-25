@@ -23,7 +23,7 @@ use crate::range::{normalize_segment_id, normalize_sequence};
 use crate::segment::{LogSegment, SegmentCache};
 use crate::storage::{LogStorageRead as _, SegmentIterator};
 use common::storage::factory::create_storage_read;
-use common::{StorageRead, StorageSemantics};
+use common::{StorageRead, StorageReaderRuntime, StorageSemantics};
 
 /// Trait for read operations on the log.
 ///
@@ -232,11 +232,9 @@ impl LogReadView {
         self.storage = snapshot;
     }
 
-    /// Inserts new segments into the segment cache.
-    pub(crate) fn apply_new_segments(&mut self, segments: &[LogSegment]) {
-        for segment in segments {
-            self.segments.insert(segment.clone());
-        }
+    /// Replaces the segment cache contents with the given segments.
+    pub(crate) fn replace_segments(&mut self, segments: &[LogSegment]) {
+        self.segments.replace_all(segments);
     }
 
     /// Scans entries for a key within a sequence number range with custom options.
@@ -365,10 +363,14 @@ impl LogDbReader {
             manifest_poll_interval: config.refresh_interval,
             ..Default::default()
         };
-        let storage: Arc<dyn StorageRead> =
-            create_storage_read(&config.storage, StorageSemantics::new(), reader_options)
-                .await
-                .map_err(|e| Error::Storage(e.to_string()))?;
+        let storage: Arc<dyn StorageRead> = create_storage_read(
+            &config.storage,
+            StorageReaderRuntime::new(),
+            StorageSemantics::new(),
+            reader_options,
+        )
+        .await
+        .map_err(|e| Error::Storage(e.to_string()))?;
         let segments = SegmentCache::open(storage.as_ref(), SegmentConfig::default()).await?;
         let read_view = Arc::new(RwLock::new(LogReadView::new(storage, segments)));
 

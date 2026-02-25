@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use common::storage::factory::create_storage_read;
-use common::{StorageRead, StorageSemantics};
+use common::{StorageRead, StorageReaderRuntime, StorageSemantics};
 
 use crate::config::Config;
 use crate::error::Result;
@@ -42,6 +42,7 @@ impl KeyValueDbReader {
     pub async fn open(config: Config) -> Result<Self> {
         let storage: Arc<dyn StorageRead> = create_storage_read(
             &config.storage,
+            StorageReaderRuntime::new(),
             StorageSemantics::new(),
             slatedb::config::DbReaderOptions::default(),
         )

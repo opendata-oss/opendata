@@ -141,8 +141,8 @@ impl<D: Delta> ViewSubscriber<D> {
 
     /// Advances the flushed watermark, signaling that the reader has processed
     /// up through the given epoch.
-    pub fn update_flushed(&self, epoch: u64) {
-        self.watermarks.update_flushed(epoch);
+    pub fn update_written(&self, epoch: u64) {
+        self.watermarks.update_written(epoch);
     }
 
     /// Advances the durable watermark, signaling that the reader has processed
@@ -167,12 +167,8 @@ impl ViewMonitor {
     /// Waits until the subscriber has processed at least `epoch` at the
     /// given [`Durability`] level.
     pub async fn wait(&mut self, epoch: u64, durability: Durability) -> Result<(), SubscribeError> {
-        let rx = match durability {
-            Durability::Applied => &mut self.watcher.applied_rx,
-            Durability::Flushed => &mut self.watcher.flushed_rx,
-            Durability::Durable => &mut self.watcher.durable_rx,
-        };
-        rx.wait_for(|curr| *curr >= epoch)
+        self.watcher
+            .wait(epoch, durability)
             .await
             .map_err(|_| SubscribeError::Shutdown)?;
         Ok(())
@@ -214,10 +210,10 @@ mod tests {
         let (watermarks, mut monitor) = create_pair();
 
         // when
-        watermarks.update_flushed(3);
+        watermarks.update_written(3);
 
         // then
-        monitor.wait(3, Durability::Flushed).await.unwrap();
+        monitor.wait(3, Durability::Written).await.unwrap();
     }
 
     #[tokio::test]
@@ -251,12 +247,12 @@ mod tests {
 
         // when - advance each level to a different epoch
         watermarks.update_applied(3);
-        watermarks.update_flushed(2);
+        watermarks.update_written(2);
         watermarks.update_durable(1);
 
         // then - each level tracks independently
         monitor.wait(3, Durability::Applied).await.unwrap();
-        monitor.wait(2, Durability::Flushed).await.unwrap();
+        monitor.wait(2, Durability::Written).await.unwrap();
         monitor.wait(1, Durability::Durable).await.unwrap();
     }
 }
