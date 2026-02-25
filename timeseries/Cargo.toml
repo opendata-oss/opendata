@@ -61,6 +61,7 @@ prost = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
 
 [dev-dependencies]
+common = { workspace = true, features = ["test-utils"] }
 fail.workspace = true
 proptest.workspace = true
 rstest.workspace = true

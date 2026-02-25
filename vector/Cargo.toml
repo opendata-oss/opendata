@@ -35,4 +35,5 @@ name = "gen_sift100k_groundtruth"
 path = "src/bin/gen_sift100k_groundtruth.rs"
 
 [dev-dependencies]
+common = { workspace = true, features = ["test-utils"] }
 tracing-subscriber.workspace = true
