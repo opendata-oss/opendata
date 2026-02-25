@@ -196,6 +196,7 @@ pub struct EvalSample {
     pub(crate) timestamp_ms: i64,
     pub(crate) value: f64,
     pub(crate) labels: HashMap<String, String>,
+    pub(crate) drop_name: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -381,15 +382,25 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 stmt.start, stmt.end
             )));
         }
-        self.evaluate_expr(
-            &stmt.expr,
-            stmt.start,
-            stmt.end,
-            stmt.end, // evaluation_ts: using end follows the "as-of" convention (evaluate at the effective end of the interval)
-            stmt.interval,
-            stmt.lookback_delta,
-        )
-        .await
+        let mut result = self
+            .evaluate_expr(
+                &stmt.expr,
+                stmt.start,
+                stmt.end,
+                stmt.end, // evaluation_ts: using end follows the "as-of" convention (evaluate at the effective end of the interval)
+                stmt.interval,
+                stmt.lookback_delta,
+            )
+            .await?;
+        // Deferred __name__ cleanup (mirrors Prometheus cleanupMetricLabels)
+        if let ExprResult::InstantVector(ref mut samples) = result {
+            for sample in samples.iter_mut() {
+                if sample.drop_name {
+                    sample.labels.remove(METRIC_NAME);
+                }
+            }
+        }
+        Ok(result)
     }
 
     // this call recurses to evaluate sub-expressions, so it needs to return a boxed future
@@ -671,6 +682,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                         timestamp_ms: best_sample.timestamp_ms,
                         value: best_sample.value,
                         labels,
+                        drop_name: false,
                     });
 
                     // Mark this series fingerprint as found so we don't add it again from older buckets
@@ -934,9 +946,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                                     None
                                 } else {
                                     sample.value = value;
-                                    if is_comparison && return_bool {
-                                        sample.labels.remove(METRIC_NAME);
-                                    }
+                                    sample.drop_name |=
+                                        Self::changes_metric_schema(op) || return_bool;
                                     Some(sample)
                                 }
                             }
@@ -958,9 +969,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                                     None
                                 } else {
                                     sample.value = value;
-                                    if is_comparison && return_bool {
-                                        sample.labels.remove(METRIC_NAME);
-                                    }
+                                    sample.drop_name |=
+                                        Self::changes_metric_schema(op) || return_bool;
                                     Some(sample)
                                 }
                             }
@@ -971,7 +981,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 Ok(ExprResult::InstantVector(result))
             }
             // Vector-Vector operations: one-to-one matching only
-            (ExprResult::InstantVector(left_vector), ExprResult::InstantVector(right_vector)) => {
+            (
+                ExprResult::InstantVector(mut left_vector),
+                ExprResult::InstantVector(mut right_vector),
+            ) => {
                 if let Some(modifier) = &expr.modifier
                     && !matches!(modifier.card, VectorMatchCardinality::OneToOne)
                 {
@@ -982,6 +995,19 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 }
 
                 let matching = expr.modifier.as_ref().and_then(|m| m.matching.as_ref());
+
+                // Materialize pending __name__ drops before matching so that
+                // stale names don't participate in match keys or result labels
+                for sample in left_vector.iter_mut() {
+                    if sample.drop_name {
+                        sample.labels.remove(METRIC_NAME);
+                    }
+                }
+                for sample in right_vector.iter_mut() {
+                    if sample.drop_name {
+                        sample.labels.remove(METRIC_NAME);
+                    }
+                }
 
                 // Build right-side index keyed by match signature
                 let mut right_map: HashMap<Vec<(String, String)>, EvalSample> = HashMap::new();
@@ -1019,23 +1045,13 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                             if is_comparison && !return_bool && value == 0.0 {
                                 continue;
                             }
-                            let mut result_labels = left_sample.labels;
-                            // Drop __name__ per Prometheus semantics:
-                            // - Arithmetic ops: always drop
-                            // - Comparison ops: drop if on() (Include) or bool modifier;
-                            //   ignoring() alone does NOT cause __name__ drop
-                            let drop_name = if is_comparison {
-                                matches!(matching, Some(LabelModifier::Include(_))) || return_bool
-                            } else {
-                                true
-                            };
-                            if drop_name {
-                                result_labels.remove(METRIC_NAME);
-                            }
+                            let result_labels =
+                                Self::result_metric(left_sample.labels, op, matching);
                             result.push(EvalSample {
                                 timestamp_ms: left_sample.timestamp_ms,
                                 value,
                                 labels: result_labels,
+                                drop_name: left_sample.drop_name || return_bool,
                             });
                         }
                         Err(e) => return Err(e),
@@ -1056,6 +1072,37 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 ))
             }
         }
+    }
+
+    /// Returns true if the binary operation changes the metric schema, meaning
+    /// `__name__` should be dropped from the result. Mirrors Prometheus's `resultMetric`
+    /// logic in engine.go.
+    fn changes_metric_schema(op: TokenType) -> bool {
+        matches!(op.id(), T_ADD | T_SUB | T_MUL | T_DIV)
+    }
+
+    /// Compute the result labels for a vector-vector binary operation.
+    /// Mirrors Prometheus's `resultMetric` (engine.go L3062-3104):
+    /// 1. Arithmetic ops always drop `__name__`
+    /// 2. `on()` keeps only listed labels; `ignoring()` removes listed labels
+    fn result_metric(
+        mut labels: HashMap<String, String>,
+        op: TokenType,
+        matching: Option<&LabelModifier>,
+    ) -> HashMap<String, String> {
+        if Self::changes_metric_schema(op) {
+            labels.remove(METRIC_NAME);
+        }
+        match matching {
+            Some(LabelModifier::Include(label_list)) => {
+                labels.retain(|k, _| label_list.labels.contains(k));
+            }
+            Some(LabelModifier::Exclude(label_list)) => {
+                labels.retain(|k, _| !label_list.labels.contains(k));
+            }
+            None => {}
+        }
+        labels
     }
 
     fn apply_binary_op(&self, op: TokenType, left: f64, right: f64) -> EvalResult<f64> {
@@ -1186,7 +1233,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         // Group samples by their grouping key (which consumes the filtered labels)
         let mut groups: HashMap<Vec<(String, String)>, Vec<f64>> = HashMap::new();
-        for sample in samples {
+        for mut sample in samples {
+            // Materialize pending __name__ drops before grouping
+            if sample.drop_name {
+                sample.labels.remove(METRIC_NAME);
+            }
             // Compute the grouping labels by taking ownership and filtering
             let group_labels =
                 Self::compute_grouping_labels(sample.labels, aggregate.modifier.as_ref());
@@ -1230,6 +1281,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 timestamp_ms,
                 value: aggregated_value,
                 labels: result_labels,
+                drop_name: false,
             });
         }
 
@@ -1649,10 +1701,10 @@ mod tests {
             ("http_requests_total", vec![("env", "staging"), ("method", "POST")], 3, 40.0),
         ],
         vec![
-            (15.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "GET")]),
-            (25.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "POST")]),
-            (35.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "GET")]),
-            (45.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "POST")]),
+            (15.0, vec![("env", "prod"), ("method", "GET")]),
+            (25.0, vec![("env", "prod"), ("method", "POST")]),
+            (35.0, vec![("env", "staging"), ("method", "GET")]),
+            (45.0, vec![("env", "staging"), ("method", "POST")]),
         ]
     )]
     #[case(
@@ -1665,10 +1717,10 @@ mod tests {
             ("http_requests_total", vec![("env", "staging"), ("method", "POST")], 3, 40.0),
         ],
         vec![
-            (20.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "GET")]),
-            (40.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "POST")]),
-            (60.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "GET")]),
-            (80.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "POST")]),
+            (20.0, vec![("env", "prod"), ("method", "GET")]),
+            (40.0, vec![("env", "prod"), ("method", "POST")]),
+            (60.0, vec![("env", "staging"), ("method", "GET")]),
+            (80.0, vec![("env", "staging"), ("method", "POST")]),
         ]
     )]
     #[case(
@@ -1678,7 +1730,7 @@ mod tests {
             ("memory_bytes", vec![("env", "prod")], 0, 100.0),
         ],
         vec![
-            (10.0, vec![("__name__", "memory_bytes"), ("env", "prod")]), // 100 / 10 = 10
+            (10.0, vec![("env", "prod")]), // 100 / 10 = 10
         ]
     )]
     // Binary Operations - Comparison
@@ -1822,7 +1874,7 @@ mod tests {
             ("memory_bytes", vec![("env", "prod")], 1, 100.0),
         ],
         vec![
-            (150.0, vec![("env", "prod"), ("instance", "i1")]),
+            (150.0, vec![("env", "prod")]),
         ]
     )]
     #[case(
@@ -1835,8 +1887,8 @@ mod tests {
             ("memory_bytes", vec![("env", "staging")], 3, 100.0),
         ],
         vec![
-            // 150 > 100 = true; on() causes __name__ to be dropped
-            (1.0, vec![("env", "prod"), ("instance", "i1")]),
+            // 150 > 100 = true; on(env) keeps only env label
+            (1.0, vec![("env", "prod")]),
             // 50 > 100 = false, filtered out
         ]
     )]
@@ -1848,8 +1900,41 @@ mod tests {
             ("memory_bytes", vec![("env", "prod")], 1, 100.0),
         ],
         vec![
-            // ignoring() comparison preserves __name__
-            (1.0, vec![("__name__", "cpu_usage"), ("env", "prod"), ("instance", "i1")]),
+            // ignoring(instance) comparison preserves __name__ but removes instance
+            (1.0, vec![("__name__", "cpu_usage"), ("env", "prod")]),
+        ]
+    )]
+    #[case(
+        "binary_vector_vector_comparison_on_name_preserves_name",
+        "cpu_usage == on(__name__) cpu_usage",
+        vec![
+            ("cpu_usage", vec![("env", "prod")], 0, 150.0),
+        ],
+        vec![
+            // on(__name__) comparison without bool: Prometheus preserves __name__
+            // (shouldDropMetricName only returns true for comparisons when ReturnBool is set)
+            (1.0, vec![("__name__", "cpu_usage")]),
+        ]
+    )]
+    #[case(
+        "binary_nested_arithmetic_then_on_name_no_match_left",
+        "(cpu_usage + 1) == on(__name__) cpu_usage",
+        vec![
+            ("cpu_usage", vec![("env", "prod")], 0, 150.0),
+        ],
+        vec![
+            // Inner + drops __name__ (materialized before matching), so on(__name__)
+            // finds no __name__ on left → match keys differ → no match → empty result
+        ]
+    )]
+    #[case(
+        "binary_nested_arithmetic_then_on_name_no_match_right",
+        "cpu_usage == on(__name__) (cpu_usage + 1)",
+        vec![
+            ("cpu_usage", vec![("env", "prod")], 0, 150.0),
+        ],
+        vec![
+            // Inner + drops __name__ on right side → on(__name__) match keys differ → empty
         ]
     )]
     #[case(
@@ -1875,7 +1960,8 @@ mod tests {
             ("memory_bytes", vec![("env", "prod")], 1, 100.0),
         ],
         vec![
-            (-50.0, vec![("env", "prod"), ("instance", "i1")]),
+            // ignoring(instance) removes instance; arithmetic drops __name__
+            (-50.0, vec![("env", "prod")]),
         ]
     )]
     #[case(
@@ -1889,6 +1975,62 @@ mod tests {
         vec![
             (0.0, vec![("env", "prod"), ("method", "GET")]),
             (0.0, vec![("env", "staging"), ("method", "GET")]),
+        ]
+    )]
+    // Vector-Vector: matched arithmetic with different metric names (only __name__ differs)
+    #[case(
+        "binary_vector_vector_arithmetic_different_metrics",
+        "cpu_usage + memory_bytes",
+        vec![
+            ("cpu_usage", vec![("env", "prod")], 0, 50.0),
+            ("memory_bytes", vec![("env", "prod")], 1, 100.0),
+        ],
+        vec![
+            // Matched on {env=prod} (__name__ excluded from match key), __name__ dropped (arithmetic)
+            (150.0, vec![("env", "prod")]),
+        ]
+    )]
+    // Aggregation over arithmetic: drop_name materialized before grouping
+    #[case(
+        "binary_aggregation_over_arithmetic_drops_name",
+        r#"sum by (__name__) (http_requests_total + 1)"#,
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+        ],
+        vec![
+            // Inner + sets drop_name=true, aggregation materializes the drop before grouping,
+            // so by(__name__) finds no __name__ → single group {} with sum 11+21=32
+            (32.0, vec![]),
+        ]
+    )]
+    // Nested expression: drop_name propagation through nested binary ops
+    #[case(
+        "binary_nested_arithmetic_then_comparison",
+        "(http_requests_total + 1) > 15",
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+        ],
+        vec![
+            // Inner + sets drop_name=true, outer > filters to values > 15.
+            // 10+1=11 not > 15 (filtered). 20+1=21 > 15 → returns 1.0. __name__ stripped at top level.
+            (1.0, vec![("env", "prod"), ("method", "POST")]),
+        ]
+    )]
+    // Function-wrapped arithmetic: drop_name propagation through instant-vector functions
+    #[case(
+        "binary_function_wrapped_arithmetic_drops_name",
+        "abs(http_requests_total + 1)",
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, -20.0),
+        ],
+        vec![
+            // Inner + sets drop_name=true, abs() preserves drop_name (mutates value in-place),
+            // __name__ stripped at top-level deferred cleanup
+            (11.0, vec![("env", "prod"), ("method", "GET")]),
+            (19.0, vec![("env", "prod"), ("method", "POST")]),
         ]
     )]
     // Aggregations
