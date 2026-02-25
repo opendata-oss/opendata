@@ -586,6 +586,7 @@ impl RangeFunction for StdvarOverTimeFunction {
     }
 }
 
+/// Vector function: converts a scalar value to a single-element instant vector with no labels.
 struct VectorFunction;
 
 impl PromQLScalarFunction for VectorFunction {
