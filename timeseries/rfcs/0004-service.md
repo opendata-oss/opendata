@@ -13,19 +13,10 @@ This RFC defines the TimeSeries Service — an HTTP server that exposes `TimeSer
 
 RFCs 0002 and 0003 define `TimeSeriesDb` as a self-contained embedded database with write and PromQL query APIs. To be useful in a deployed system, these need to be accessible over the network. The service layer adds HTTP transport without introducing new data model or query concepts — it maps protocol-specific formats to and from the core API.
 
-The service supports three protocols:
-
-- **PromQL HTTP API** — Prometheus-compatible query endpoints, enabling Grafana and other standard tools
-- **Remote Write** — Prometheus remote-write protocol for receiving metrics from Prometheus servers and compatible agents
-- **OTLP/HTTP** — OpenTelemetry metrics ingestion, converting rich OTEL types to the Prometheus-style series model via `OtelSeriesBuilder`
-
-Each is feature-gated so deployments only pull in the dependencies they need.
-
 ## Goals
 
 - Expose `TimeSeriesDb` query and write APIs over HTTP
-- Provide Prometheus-compatible query endpoints
-- Support Prometheus remote-write ingestion
+- Provide Prometheus-compatible query and remote-write endpoints
 - Support OTLP/HTTP metrics ingestion with `OtelSeriesBuilder` for type decomposition
 - Feature-gate each protocol independently
 
@@ -40,27 +31,26 @@ Each is feature-gated so deployments only pull in the dependencies they need.
 ### Architecture Overview
 
 ```
-  Grafana / PromQL clients          Prometheus / agents           OTEL SDK / Collector
-          │                                │                              │
-   GET /api/v1/query               POST /api/v1/write              POST /v1/metrics
-   GET /api/v1/query_range         (snappy + protobuf)            (protobuf)
-   GET /api/v1/series                      │                              │
-   GET /api/v1/labels                      │                              │
-          │                                │                              │
-          └────────────────┬───────────────┴──────────────┬───────────────┘
-                           │                              │
-                           ▼                              ▼
-                  ┌─────────────────┐           ┌──────────────────┐
-                  │  Axum HTTP      │           │ OtelSeriesBuilder │
-                  │  Server         │           │ (feature: otel)   │
-                  │                 │           └────────┬─────────┘
-                  └────────┬────────┘                    │
-                           │                    Vec<Series>
-                           ▼                              │
-                  ┌─────────────────────────────┐         │
-                  │       TimeSeriesDb          │◄────────┘
-                  │  write() / query() / ...    │
-                  └─────────────────────────────┘
+  Grafana / PromQL         Prometheus / agents        OTEL SDK / Collector
+          │                       │                           │
+   GET /api/v1/query       POST /api/v1/write          POST /v1/metrics
+   GET /api/v1/query_range  (snappy + protobuf)         (protobuf)
+   GET /api/v1/series             │                           │
+   ...                            │                     ┌─────┴──────┐
+          │                       │                     │OtelSeries- │
+          │                       │                     │Builder     │
+          │                       │                     └─────┬──────┘
+          │                       │                     Vec<Series>
+          └───────────┬───────────┴───────────┬───────────────┘
+                      │                       │
+                      ▼                       ▼
+             tsdb.query()              tsdb.write()
+                      │                       │
+                      └───────────┬───────────┘
+                                  ▼
+                          ┌──────────────┐
+                          │ TimeSeriesDb │
+                          └──────────────┘
 ```
 
 ### Feature Flags
@@ -72,124 +62,64 @@ remote-write = ["http-server", "dep:prost", "dep:snap"]
 otel = ["dep:opentelemetry-proto", "dep:prost"]
 ```
 
-| Feature | What it enables | Dependencies |
+| Feature | What it enables | Key dependencies |
 |---|---|---|
-| `http-server` | PromQL query endpoints, server lifecycle, metrics endpoint | axum, tokio, tower |
-| `remote-write` | `POST /api/v1/write` endpoint | prost, snap (implies `http-server`) |
-| `otel` | `OtelSeriesBuilder` + `POST /v1/metrics` endpoint (when `http-server` also enabled) | opentelemetry-proto, prost |
+| `http-server` | PromQL endpoints, server lifecycle | axum, tokio, tower |
+| `remote-write` | `POST /api/v1/write` (implies `http-server`) | prost, snap |
+| `otel` | `OtelSeriesBuilder`; `POST /v1/metrics` when `http-server` also enabled | opentelemetry-proto, prost |
 
-The `otel` feature is usable without `http-server` — the `OtelSeriesBuilder` can be used standalone for programmatic conversion (e.g., replaying OTEL data from `LogDb`). The HTTP endpoint is only registered when both `otel` and `http-server` are active.
+The `otel` feature is usable without `http-server` — the builder can be used standalone for programmatic conversion (e.g., replaying OTEL data from `LogDb`).
 
 ### HTTP Server
 
-The server uses Axum and follows the existing implementation pattern.
+The service uses Axum, listens on a single port (default 9090), and handles graceful shutdown (SIGINT/SIGTERM) with a TSDB flush.
 
-#### Server Lifecycle
+#### Endpoints
 
-```rust
-#[cfg(feature = "http-server")]
-pub struct TimeSeriesServer {
-    tsdb: TimeSeriesDb,
-    config: ServerConfig,
-}
-
-pub struct ServerConfig {
-    /// HTTP listen port. Default: 9090.
-    pub port: u16,
-}
-
-impl TimeSeriesServer {
-    pub fn new(tsdb: TimeSeriesDb, config: ServerConfig) -> Self;
-
-    /// Run the server until SIGINT or SIGTERM.
-    ///
-    /// Flushes TimeSeriesDb on shutdown.
-    pub async fn run(self) -> Result<()>;
-}
-```
-
-#### Route Registration
-
-```rust
-fn build_router(tsdb: Arc<Tsdb>, metrics: Arc<Metrics>) -> Router {
-    let app = Router::new()
-        // PromQL query endpoints
-        .route("/api/v1/query", get(handle_query).post(handle_query))
-        .route("/api/v1/query_range", get(handle_query_range).post(handle_query_range))
-        .route("/api/v1/series", get(handle_series).post(handle_series))
-        .route("/api/v1/labels", get(handle_labels))
-        .route("/api/v1/label/{name}/values", get(handle_label_values))
-        .route("/api/v1/metadata", get(handle_metadata))
-        // Health and metrics
-        .route("/-/healthy", get(handle_healthy))
-        .route("/-/ready", get(handle_ready))
-        .route("/metrics", get(handle_metrics));
-
-    // Remote-write endpoint
-    #[cfg(feature = "remote-write")]
-    let app = app.route("/api/v1/write", post(handle_remote_write));
-
-    // OTEL endpoint
-    #[cfg(feature = "otel")]
-    let app = app.route("/v1/metrics", post(handle_otel_metrics));
-
-    app
-}
-```
-
-### PromQL HTTP Endpoints
-
-These endpoints are thin wrappers that deserialize HTTP parameters into the request types from RFC 0003 and serialize the responses as JSON.
+**PromQL query endpoints** (always available with `http-server`):
 
 | Endpoint | Method | Maps to |
 |---|---|---|
-| `/api/v1/query` | GET, POST | `tsdb.query(QueryRequest)` |
-| `/api/v1/query_range` | GET, POST | `tsdb.query_range(QueryRangeRequest)` |
-| `/api/v1/series` | GET, POST | `tsdb.series(SeriesRequest)` |
-| `/api/v1/labels` | GET | `tsdb.labels(LabelsRequest)` |
-| `/api/v1/label/{name}/values` | GET | `tsdb.label_values(LabelValuesRequest)` |
-| `/api/v1/metadata` | GET | `tsdb.metadata(MetadataRequest)` |
+| `/api/v1/query` | GET, POST | `tsdb.query(expr, time)` |
+| `/api/v1/query_range` | GET, POST | `tsdb.query_range(expr, start, end, step)` |
+| `/api/v1/series` | GET, POST | `tsdb.series(matchers, start, end)` |
+| `/api/v1/labels` | GET | `tsdb.labels(matchers, start, end)` |
+| `/api/v1/label/{name}/values` | GET | `tsdb.label_values(name, matchers, start, end)` |
+| `/api/v1/metadata` | GET | `tsdb.metadata(metric)` |
 
-All responses follow the Prometheus HTTP API format:
+Each handler deserializes HTTP parameters, calls the corresponding `TimeSeriesDb` method (RFC 0003), and wraps the result in the Prometheus JSON format (`{"status": "success", "data": ...}`). `QueryError` variants map to HTTP status codes:
 
-```json
-{
-  "status": "success",
-  "data": { ... }
-}
-```
+| `QueryError` | HTTP Status | Prometheus `error_type` |
+|---|---|---|
+| `InvalidQuery` | 400 | `bad_data` |
+| `Timeout` | 422 | `timeout` |
+| `Execution` | 422 | `execution` |
 
-### Remote Write Endpoint
-
-The remote-write handler accepts Prometheus remote-write protocol requests. Gated behind the `remote-write` feature flag.
+**Remote-write endpoint** (feature: `remote-write`):
 
 | Aspect | Value |
 |---|---|
-| Path | `/api/v1/write` |
-| Method | POST |
-| Content-Type | `application/x-protobuf` |
-| Content-Encoding | `snappy` |
-| Request body | Snappy-compressed protobuf `WriteRequest` |
-| Success status | `204 No Content` |
+| Path | `POST /api/v1/write` |
+| Encoding | Snappy-compressed protobuf `WriteRequest` |
+| Success | `204 No Content` |
 
-The handler decompresses, decodes the protobuf `WriteRequest`, extracts `Vec<Series>` from the flat label/sample pairs, and calls `tsdb.write()`.
+The handler decompresses, decodes the `WriteRequest` (a flat list of label/sample pairs), converts to `Vec<Series>`, and calls `tsdb.write()`.
 
-### OTEL Metrics Ingest
+**OTLP endpoint** (feature: `otel` + `http-server`):
 
-OTEL support has two parts: `OtelSeriesBuilder` (the conversion layer) and the HTTP endpoint.
+| Aspect | Value |
+|---|---|
+| Path | `POST /v1/metrics` |
+| Encoding | Protobuf `ExportMetricsServiceRequest` |
+| Success | `200 OK` with protobuf `ExportMetricsServiceResponse` |
 
-#### OtelSeriesBuilder
+The handler decodes the request, calls `OtelSeriesBuilder::build()` to decompose OTEL metrics into `Vec<Series>`, and calls `tsdb.write()`.
+
+### OtelSeriesBuilder
+
+The builder decomposes OpenTelemetry metrics into `Vec<Series>` suitable for `TimeSeriesDb::write()`. It is gated behind the `otel` feature and has no dependency on the HTTP server.
 
 ```rust
-/// Decomposes OpenTelemetry metrics into Prometheus-style Series.
-///
-/// # Example
-///
-/// ```rust
-/// let builder = OtelSeriesBuilder::new(OtelConfig::default());
-/// let series = builder.build(&otel_request)?;
-/// tsdb.write(series).await?;
-/// ```
 #[cfg(feature = "otel")]
 pub struct OtelSeriesBuilder {
     config: OtelConfig,
@@ -203,19 +133,12 @@ impl OtelSeriesBuilder {
         &self,
         request: &ExportMetricsServiceRequest,
     ) -> Result<Vec<Series>>;
-
-    /// Decompose a batch of ResourceMetrics directly.
-    pub fn build_from_resource_metrics(
-        &self,
-        resource_metrics: &[ResourceMetrics],
-    ) -> Result<Vec<Series>>;
 }
 
 #[derive(Debug, Clone)]
 pub struct OtelConfig {
     /// Include resource attributes as labels. Default: true.
     pub include_resource_attrs: bool,
-
     /// Include scope attributes as labels. Default: true.
     pub include_scope_attrs: bool,
 }
@@ -223,60 +146,17 @@ pub struct OtelConfig {
 
 #### Type Decomposition
 
-All OTEL metric types are decomposed into flat `Series` with `MetricType::Gauge` or `MetricType::Counter` as defined in RFC 0002. This follows the same approach used by Prometheus.
+The builder walks the OTLP hierarchy (`ResourceMetrics` → `ScopeMetrics` → `Metric` → data points) and collects attributes as labels at each level. OTEL metric types map to Prometheus-style series as follows:
 
-The conversion walks the OTLP hierarchy: `ResourceMetrics` → `ScopeMetrics` → `Metric` → data points
-
-At each level, attributes are collected as labels:
-
-| OTEL level | Label treatment |
-|---|---|
-| Resource attributes | Included as labels (e.g., `service_name`, `host_name`) |
-| Scope attributes | Included as labels (e.g., `otel_scope_name`) |
-| Metric attributes | Included as labels directly |
-| Metric name | Stored as `__name__` label |
-
-**Gauge** → Single series, `MetricType::Gauge`
-
-**Sum (monotonic, cumulative)** → Single series with `_total` suffix, `MetricType::Counter`
-
-**Sum (non-monotonic)** → Single series, `MetricType::Gauge`
-
-**Sum (delta)** → Dropped with warning
-
-**Histogram** → Multiple series: `_bucket` (per `le`), `_sum`, `_count` — all `MetricType::Counter`
-
-**Exponential Histogram** → Converted to explicit boundaries, then same as Histogram
-
-**Summary** → Per-quantile series (`MetricType::Gauge`) + `_sum`, `_count` (`MetricType::Counter`)
-
-#### OTLP HTTP Endpoint
-
-The endpoint follows the [OTLP/HTTP specification](https://opentelemetry.io/docs/specs/otlp/#otlphttp). Registered when both `otel` and `http-server` features are enabled.
-
-```rust
-#[cfg(feature = "otel")]
-pub(crate) async fn handle_otel_metrics(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response<Body>, StatusCode> {
-    // 1. Validate Content-Type
-    // 2. Decode protobuf ExportMetricsServiceRequest
-    // 3. builder.build(&request) → Vec<Series>
-    // 4. tsdb.write(series)
-    // 5. Return ExportMetricsServiceResponse
-}
-```
-
-| Aspect | Value |
-|---|---|
-| Path | `/v1/metrics` |
-| Method | POST |
-| Content-Type | `application/x-protobuf` |
-| Request body | Protobuf-encoded `ExportMetricsServiceRequest` |
-| Response body | Protobuf-encoded `ExportMetricsServiceResponse` |
-| Success status | `200 OK` |
+| OTEL type | Decomposition | MetricType |
+|---|---|---|
+| Gauge | Single series | Gauge |
+| Sum (monotonic, cumulative) | Single series with `_total` suffix | Counter |
+| Sum (non-monotonic) | Single series | Gauge |
+| Sum (delta) | Dropped with warning | — |
+| Histogram | `_bucket` (per `le`), `_sum`, `_count` | Counter |
+| Exponential Histogram | Converted to explicit boundaries, then same as Histogram | Counter |
+| Summary | Per-quantile series + `_sum`, `_count` | Gauge / Counter |
 
 #### Dependencies
 
@@ -286,33 +166,21 @@ opentelemetry-proto = { version = "0.28", optional = true, features = ["metrics"
 prost = { version = "0.13", optional = true }
 ```
 
-The `opentelemetry-proto` crate provides pre-generated prost types for all OTLP protobuf messages. We use `gen-prost` (not `gen-tonic`) since we only need the message types, not gRPC service definitions.
-
-### Comparison of Ingest Protocols
-
-| Aspect | Remote Write | OTLP/HTTP |
-|---|---|---|
-| Feature flag | `remote-write` | `otel` |
-| Endpoint | `POST /api/v1/write` | `POST /v1/metrics` |
-| Encoding | Snappy + protobuf | Protobuf |
-| Source data | Flat labels + samples | Rich hierarchy (Resource → Scope → Metric → DataPoints) |
-| Type info | None (default to Gauge) | Full (Gauge, Sum, Histogram, etc.) |
-| Decomposition | 1:1 mapping | Complex (histograms → N series) |
-| Write path | Parse → `tsdb.write()` | Parse → `builder.build()` → `tsdb.write()` |
+We use `gen-prost` (not `gen-tonic`) — only message types are needed, not gRPC service definitions.
 
 ## Alternatives Considered
 
 ### OTLP gRPC instead of HTTP
 
-An earlier draft used gRPC via tonic as the primary OTLP transport. This requires a separate port (4317), a tonic dependency, and HTTP/2 support. OTLP/HTTP is simpler — it runs on the existing Axum server, shares the same port, and requires no new networking dependencies. Most OTEL SDKs and collectors support both transports. gRPC can be added later as a separate feature flag if needed.
+An earlier draft used gRPC via tonic as the primary OTLP transport. This requires a separate port (4317), a tonic dependency, and HTTP/2 support. OTLP/HTTP is simpler — it runs on the existing Axum server, shares the same port, and requires no new networking dependencies. gRPC can be added later as a separate feature flag.
 
 ### OtelTimeSeriesDb wrapper instead of OtelSeriesBuilder
 
-An earlier draft wrapped `TimeSeriesDb` in an `OtelTimeSeriesDb` that accepted OTEL requests and wrote decomposed series internally. This couples the conversion and storage steps. The builder approach keeps them explicit — `build()` produces series, then the caller writes them — and composes more naturally with the existing `TimeSeriesDb::write()` API.
+An earlier draft wrapped `TimeSeriesDb` in an `OtelTimeSeriesDb` that accepted OTEL requests and wrote decomposed series internally. This couples the conversion and storage steps. The builder approach keeps them explicit — `build()` produces series, then the caller writes them — and composes naturally with `TimeSeriesDb::write()`.
 
 ### Separate server per protocol
 
-Instead of adding routes to a single Axum server, each protocol could run its own server on a different port. This adds operational complexity (multiple ports to configure, monitor, and load-balance) with no clear benefit. A single server with feature-gated routes is simpler.
+Each protocol could run its own server on a different port. This adds operational complexity with no clear benefit. A single server with feature-gated routes is simpler.
 
 ## Open Questions
 
