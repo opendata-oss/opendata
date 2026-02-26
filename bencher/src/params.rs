@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use timeseries::Label;
 
 /// A collection of benchmark parameters with efficient key lookup.
@@ -9,8 +10,9 @@ use timeseries::Label;
 /// Provides convenient methods for extracting and parsing parameter values.
 /// Parameters are stored as string key-value pairs and can be converted
 /// to/from `Vec<Label>` for use with the metrics system.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Params {
+    #[serde(flatten)]
     inner: BTreeMap<String, String>,
 }
 
