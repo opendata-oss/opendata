@@ -23,7 +23,6 @@ pub(crate) fn encode_batch(entries: &[Bytes]) -> Bytes {
     buf.freeze()
 }
 
-#[allow(dead_code)]
 pub(crate) fn decode_batch(mut data: Bytes) -> Result<Vec<Bytes>> {
     if data.len() < FOOTER_SIZE {
         return Err(Error::Serialization(
