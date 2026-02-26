@@ -10,7 +10,7 @@ use slatedb::object_store::{
 };
 
 use crate::error::{Error, Result};
-use crate::queue_config::QueueConfig;
+use crate::queue_config::{ConsumerConfig, ProducerConfig};
 
 fn millis(time: SystemTime) -> i64 {
     time.duration_since(UNIX_EPOCH)
@@ -132,14 +132,14 @@ pub struct QueueProducer {
 }
 
 impl QueueProducer {
-    pub fn new(config: QueueConfig) -> Result<Self> {
+    pub fn new(config: ProducerConfig) -> Result<Self> {
         let object_store = common::storage::factory::create_object_store(&config.object_store)
             .map_err(|e| Error::Storage(e.to_string()))?;
         Self::with_object_store(config, object_store)
     }
 
     pub fn with_object_store(
-        config: QueueConfig,
+        config: ProducerConfig,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
         Ok(Self {
@@ -189,14 +189,14 @@ fn consumer_manifest_path(producer_path: &str) -> String {
 }
 
 impl QueueConsumer {
-    pub fn new(config: QueueConfig, clock: Arc<dyn Clock>) -> Result<Self> {
+    pub fn new(config: ConsumerConfig, clock: Arc<dyn Clock>) -> Result<Self> {
         let object_store = common::storage::factory::create_object_store(&config.object_store)
             .map_err(|e| Error::Storage(e.to_string()))?;
         Self::with_object_store(config, object_store, clock)
     }
 
     pub fn with_object_store(
-        config: QueueConfig,
+        config: ConsumerConfig,
         object_store: Arc<dyn ObjectStore>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
@@ -347,8 +347,15 @@ mod tests {
     use common::storage::config::ObjectStoreConfig;
     use slatedb::object_store::memory::InMemory;
 
-    fn test_config() -> QueueConfig {
-        QueueConfig {
+    fn test_producer_config() -> ProducerConfig {
+        ProducerConfig {
+            object_store: ObjectStoreConfig::InMemory,
+            manifest_path: "test/manifest.json".to_string(),
+        }
+    }
+
+    fn test_consumer_config() -> ConsumerConfig {
+        ConsumerConfig {
             object_store: ObjectStoreConfig::InMemory,
             manifest_path: "test/manifest.json".to_string(),
             heartbeat_timeout_ms: 30_000,
@@ -378,7 +385,7 @@ mod tests {
     #[tokio::test]
     async fn should_enqueue_locations_to_manifest() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(test_config(), store.clone()).unwrap();
+        let producer = QueueProducer::with_object_store(test_producer_config(), store.clone()).unwrap();
 
         producer
             .enqueue("path/to/file1.json".to_string())
@@ -408,7 +415,7 @@ mod tests {
         let path = Path::from("test/manifest.json");
         store.put(&path, PutPayload::from(json)).await.unwrap();
 
-        let producer = QueueProducer::with_object_store(test_config(), store.clone()).unwrap();
+        let producer = QueueProducer::with_object_store(test_producer_config(), store.clone()).unwrap();
         producer.enqueue("new/file.json".to_string()).await.unwrap();
 
         let manifest = read_producer_manifest(&store, "test/manifest.json").await;
@@ -421,10 +428,9 @@ mod tests {
     #[tokio::test]
     async fn should_claim_earliest_pending_location() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let config = test_config();
-        let producer = QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let producer = QueueProducer::with_object_store(test_producer_config(), store.clone()).unwrap();
         let consumer =
-            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+            QueueConsumer::with_object_store(test_consumer_config(), store.clone(), Arc::new(SystemClock)).unwrap();
 
         producer.enqueue("first.json".to_string()).await.unwrap();
         producer.enqueue("second.json".to_string()).await.unwrap();
@@ -445,7 +451,7 @@ mod tests {
     async fn should_return_none_when_nothing_to_claim() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let consumer =
-            QueueConsumer::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+            QueueConsumer::with_object_store(test_consumer_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
         let claimed = consumer.claim().await.unwrap();
@@ -455,10 +461,9 @@ mod tests {
     #[tokio::test]
     async fn should_dequeue_claimed_location() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let config = test_config();
-        let producer = QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let producer = QueueProducer::with_object_store(test_producer_config(), store.clone()).unwrap();
         let consumer =
-            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+            QueueConsumer::with_object_store(test_consumer_config(), store.clone(), Arc::new(SystemClock)).unwrap();
 
         producer
             .enqueue("to_process.json".to_string())
@@ -484,7 +489,7 @@ mod tests {
     async fn should_return_false_when_dequeuing_unknown_location() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let consumer =
-            QueueConsumer::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+            QueueConsumer::with_object_store(test_consumer_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
         let removed = consumer.dequeue("unknown.json").await.unwrap();
@@ -494,8 +499,7 @@ mod tests {
     #[tokio::test]
     async fn should_handle_concurrent_claims() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let config = test_config();
-        let producer = QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let producer = QueueProducer::with_object_store(test_producer_config(), store.clone()).unwrap();
 
         let n = 5;
         for i in 0..n {
@@ -505,7 +509,7 @@ mod tests {
         let mut join_handles = Vec::new();
         for _ in 0..n {
             let consumer = QueueConsumer::with_object_store(
-                config.clone(),
+                test_consumer_config(),
                 store.clone(),
                 Arc::new(SystemClock),
             )
@@ -536,10 +540,9 @@ mod tests {
     #[tokio::test]
     async fn should_heartbeat_claimed_locations() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let config = test_config();
-        let producer = QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let producer = QueueProducer::with_object_store(test_producer_config(), store.clone()).unwrap();
         let consumer =
-            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+            QueueConsumer::with_object_store(test_consumer_config(), store.clone(), Arc::new(SystemClock)).unwrap();
 
         producer.enqueue("a.json".to_string()).await.unwrap();
         producer.enqueue("b.json".to_string()).await.unwrap();
@@ -560,10 +563,9 @@ mod tests {
     #[tokio::test]
     async fn should_overwrite_heartbeat_timestamps() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let config = test_config();
-        let producer = QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let producer = QueueProducer::with_object_store(test_producer_config(), store.clone()).unwrap();
         let consumer =
-            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+            QueueConsumer::with_object_store(test_consumer_config(), store.clone(), Arc::new(SystemClock)).unwrap();
 
         producer.enqueue("a.json".to_string()).await.unwrap();
         consumer.claim().await.unwrap();
@@ -584,10 +586,9 @@ mod tests {
     #[tokio::test]
     async fn should_skip_unknown_locations_in_heartbeat() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let config = test_config();
-        let producer = QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let producer = QueueProducer::with_object_store(test_producer_config(), store.clone()).unwrap();
         let consumer =
-            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+            QueueConsumer::with_object_store(test_consumer_config(), store.clone(), Arc::new(SystemClock)).unwrap();
 
         producer.enqueue("a.json".to_string()).await.unwrap();
         consumer.claim().await.unwrap();
@@ -605,15 +606,15 @@ mod tests {
     #[tokio::test]
     async fn should_reclaim_stale_location_when_pending_is_empty() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let mut config = test_config();
-        config.heartbeat_timeout_ms = 50;
+        let mut consumer_config = test_consumer_config();
+        consumer_config.heartbeat_timeout_ms = 50;
 
-        let producer = QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let producer = QueueProducer::with_object_store(test_producer_config(), store.clone()).unwrap();
         let consumer1 =
-            QueueConsumer::with_object_store(config.clone(), store.clone(), Arc::new(SystemClock))
+            QueueConsumer::with_object_store(consumer_config.clone(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
         let consumer2 =
-            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+            QueueConsumer::with_object_store(consumer_config, store.clone(), Arc::new(SystemClock)).unwrap();
 
         producer.enqueue("a.json".to_string()).await.unwrap();
         let claimed = consumer1.claim().await.unwrap();
@@ -637,15 +638,15 @@ mod tests {
     #[tokio::test]
     async fn should_not_reclaim_location_with_fresh_heartbeat() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let mut config = test_config();
-        config.heartbeat_timeout_ms = 200;
+        let mut consumer_config = test_consumer_config();
+        consumer_config.heartbeat_timeout_ms = 200;
 
-        let producer = QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let producer = QueueProducer::with_object_store(test_producer_config(), store.clone()).unwrap();
         let consumer1 =
-            QueueConsumer::with_object_store(config.clone(), store.clone(), Arc::new(SystemClock))
+            QueueConsumer::with_object_store(consumer_config.clone(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
         let consumer2 =
-            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+            QueueConsumer::with_object_store(consumer_config, store.clone(), Arc::new(SystemClock)).unwrap();
 
         producer.enqueue("a.json".to_string()).await.unwrap();
         consumer1.claim().await.unwrap();
@@ -662,12 +663,12 @@ mod tests {
     #[tokio::test]
     async fn should_reclaim_oldest_stale_location() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let mut config = test_config();
-        config.heartbeat_timeout_ms = 50;
+        let mut consumer_config = test_consumer_config();
+        consumer_config.heartbeat_timeout_ms = 50;
 
-        let producer = QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let producer = QueueProducer::with_object_store(test_producer_config(), store.clone()).unwrap();
         let consumer =
-            QueueConsumer::with_object_store(config.clone(), store.clone(), Arc::new(SystemClock))
+            QueueConsumer::with_object_store(consumer_config.clone(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
         producer.enqueue("old.json".to_string()).await.unwrap();
@@ -682,7 +683,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
 
         let reclaimer =
-            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+            QueueConsumer::with_object_store(consumer_config, store.clone(), Arc::new(SystemClock)).unwrap();
         let claimed = reclaimer.claim().await.unwrap();
         assert_eq!(claimed, Some("old.json".to_string()));
     }
@@ -690,15 +691,15 @@ mod tests {
     #[tokio::test]
     async fn should_prefer_stale_claimed_over_pending() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let mut config = test_config();
-        config.heartbeat_timeout_ms = 50;
+        let mut consumer_config = test_consumer_config();
+        consumer_config.heartbeat_timeout_ms = 50;
 
-        let producer = QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let producer = QueueProducer::with_object_store(test_producer_config(), store.clone()).unwrap();
         let consumer1 =
-            QueueConsumer::with_object_store(config.clone(), store.clone(), Arc::new(SystemClock))
+            QueueConsumer::with_object_store(consumer_config.clone(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
         let consumer2 =
-            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+            QueueConsumer::with_object_store(consumer_config, store.clone(), Arc::new(SystemClock)).unwrap();
 
         producer.enqueue("claimed.json".to_string()).await.unwrap();
         consumer1.claim().await.unwrap();
@@ -717,10 +718,9 @@ mod tests {
     #[tokio::test]
     async fn should_accumulate_done_in_consumer_manifest_after_dequeue() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let config = test_config();
-        let producer = QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let producer = QueueProducer::with_object_store(test_producer_config(), store.clone()).unwrap();
         let consumer =
-            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+            QueueConsumer::with_object_store(test_consumer_config(), store.clone(), Arc::new(SystemClock)).unwrap();
 
         producer.enqueue("a.json".to_string()).await.unwrap();
         producer.enqueue("b.json".to_string()).await.unwrap();
@@ -744,12 +744,12 @@ mod tests {
     #[tokio::test]
     async fn should_cleanup_done_removes_from_producer_when_threshold_reached() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let mut config = test_config();
-        config.done_cleanup_threshold = 2;
+        let mut consumer_config = test_consumer_config();
+        consumer_config.done_cleanup_threshold = 2;
 
-        let producer = QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let producer = QueueProducer::with_object_store(test_producer_config(), store.clone()).unwrap();
         let consumer =
-            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+            QueueConsumer::with_object_store(consumer_config, store.clone(), Arc::new(SystemClock)).unwrap();
 
         producer.enqueue("a.json".to_string()).await.unwrap();
         producer.enqueue("b.json".to_string()).await.unwrap();
@@ -772,12 +772,12 @@ mod tests {
     #[tokio::test]
     async fn should_cleanup_done_clears_done_list_in_consumer_manifest() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let mut config = test_config();
-        config.done_cleanup_threshold = 2;
+        let mut consumer_config = test_consumer_config();
+        consumer_config.done_cleanup_threshold = 2;
 
-        let producer = QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let producer = QueueProducer::with_object_store(test_producer_config(), store.clone()).unwrap();
         let consumer =
-            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+            QueueConsumer::with_object_store(consumer_config, store.clone(), Arc::new(SystemClock)).unwrap();
 
         producer.enqueue("a.json".to_string()).await.unwrap();
         producer.enqueue("b.json".to_string()).await.unwrap();
@@ -799,10 +799,9 @@ mod tests {
     #[tokio::test]
     async fn should_not_reclaim_done_locations() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let config = test_config();
-        let producer = QueueProducer::with_object_store(config.clone(), store.clone()).unwrap();
+        let producer = QueueProducer::with_object_store(test_producer_config(), store.clone()).unwrap();
         let consumer =
-            QueueConsumer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+            QueueConsumer::with_object_store(test_consumer_config(), store.clone(), Arc::new(SystemClock)).unwrap();
 
         producer.enqueue("a.json".to_string()).await.unwrap();
         consumer.claim().await.unwrap();

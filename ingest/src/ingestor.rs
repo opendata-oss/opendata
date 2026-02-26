@@ -297,7 +297,7 @@ impl Ingestor {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::queue_config::QueueConfig;
+    use crate::queue_config::ProducerConfig;
     use bytes::Bytes;
     use common::clock::SystemClock;
     use common::storage::config::ObjectStoreConfig;
@@ -314,12 +314,10 @@ mod tests {
         }
     }
 
-    fn test_queue_config() -> QueueConfig {
-        QueueConfig {
+    fn test_queue_config() -> ProducerConfig {
+        ProducerConfig {
             object_store: ObjectStoreConfig::InMemory,
             manifest_path: "test/manifest.json".to_string(),
-            heartbeat_timeout_ms: 30_000,
-            done_cleanup_threshold: 100,
         }
     }
 
@@ -338,11 +336,11 @@ mod tests {
 
         let entries = vec![
             KeyValueEntry {
-                key: "key1".to_string(),
+                key: Bytes::from("key1"),
                 value: Bytes::from("value1"),
             },
             KeyValueEntry {
-                key: "key2".to_string(),
+                key: Bytes::from("key2"),
                 value: Bytes::from("value2"),
             },
         ];
@@ -374,7 +372,7 @@ mod tests {
         .unwrap();
 
         let entries = vec![KeyValueEntry {
-            key: "mykey".to_string(),
+            key: Bytes::from("mykey"),
             value: Bytes::from("myvalue"),
         }];
 
@@ -398,7 +396,7 @@ mod tests {
         let parsed: Vec<KeyValueEntry> = serde_json::from_slice(&data).unwrap();
 
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].key, "mykey");
+        assert_eq!(parsed[0].key, Bytes::from("mykey"));
         assert_eq!(parsed[0].value, Bytes::from("myvalue"));
     }
 
@@ -416,7 +414,7 @@ mod tests {
                 .unwrap();
 
         let entries = vec![KeyValueEntry {
-            key: "a-long-key".to_string(),
+            key: Bytes::from("a-long-key"),
             value: Bytes::from("a-long-value"),
         }];
 
@@ -454,7 +452,7 @@ mod tests {
 
         let mut watcher = ingestor
             .ingest(vec![KeyValueEntry {
-                key: "k1".to_string(),
+                key: Bytes::from("k1"),
                 value: Bytes::from("v1"),
             }])
             .await
@@ -495,7 +493,7 @@ mod tests {
 
         let watcher = ingestor
             .ingest(vec![KeyValueEntry {
-                key: "k".to_string(),
+                key: Bytes::from("k"),
                 value: Bytes::from("v"),
             }])
             .await
@@ -540,7 +538,7 @@ mod tests {
 
         let watcher1 = ingestor
             .ingest(vec![KeyValueEntry {
-                key: "k1".to_string(),
+                key: Bytes::from("k1"),
                 value: Bytes::from("v1"),
             }])
             .await
@@ -548,7 +546,7 @@ mod tests {
 
         let watcher2 = ingestor
             .ingest(vec![KeyValueEntry {
-                key: "k2".to_string(),
+                key: Bytes::from("k2"),
                 value: Bytes::from("v2"),
             }])
             .await
@@ -579,8 +577,8 @@ mod tests {
         let data = store.get(&path).await.unwrap().bytes().await.unwrap();
         let parsed: Vec<KeyValueEntry> = serde_json::from_slice(&data).unwrap();
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].key, "k1");
-        assert_eq!(parsed[1].key, "k2");
+        assert_eq!(parsed[0].key, Bytes::from("k1"));
+        assert_eq!(parsed[1].key, Bytes::from("k2"));
     }
 
     #[tokio::test]
@@ -601,7 +599,7 @@ mod tests {
         // First ingest (22 bytes: "a-long-key" + "a-long-value") — below 30-byte threshold
         ingestor
             .ingest(vec![KeyValueEntry {
-                key: "a-long-key".to_string(),
+                key: Bytes::from("a-long-key"),
                 value: Bytes::from("a-long-value"),
             }])
             .await
@@ -614,7 +612,7 @@ mod tests {
         // Second ingest (22 bytes) — pending(22) + incoming(22) = 44 >= 30, triggers backpressure flush
         ingestor
             .ingest(vec![KeyValueEntry {
-                key: "a-long-key".to_string(),
+                key: Bytes::from("a-long-key"),
                 value: Bytes::from("a-long-value"),
             }])
             .await
@@ -649,7 +647,7 @@ mod tests {
         // 22 bytes > 10-byte limit
         let result = ingestor
             .ingest(vec![KeyValueEntry {
-                key: "a-long-key".to_string(),
+                key: Bytes::from("a-long-key"),
                 value: Bytes::from("a-long-value"),
             }])
             .await;
