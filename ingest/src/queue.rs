@@ -31,15 +31,15 @@ const VERSION_SIZE: usize = 2;
 const FOOTER_SIZE: usize = ENTRIES_COUNT_SIZE + SEQUENCE_SIZE + EPOCH_SIZE + VERSION_SIZE;
 
 #[derive(Debug, Clone)]
-struct QueueEntry {
-    sequence: u64,
-    location: String,
-    ingestion_time_ms: i64,
-    metadata: Bytes,
+pub(crate) struct QueueEntry {
+    pub(crate) sequence: u64,
+    pub(crate) location: String,
+    pub(crate) ingestion_time_ms: i64,
+    pub(crate) metadata: Bytes,
 }
 
 #[derive(Debug, Clone)]
-struct Manifest {
+pub(crate) struct Manifest {
     data: Bytes,
     appended: BytesMut,
     appended_count: usize,
@@ -65,7 +65,7 @@ impl Manifest {
     }
 
     /// Wrap raw binary data as a queue manifest, validating the footer.
-    fn from_bytes(data: Bytes) -> Result<Self> {
+    pub(crate) fn from_bytes(data: Bytes) -> Result<Self> {
         if data.is_empty() {
             return Err(Error::Serialization(
                 "queue manifest data must not be empty".to_string(),
@@ -138,7 +138,7 @@ impl Manifest {
     }
 
     /// Return a borrowing iterator that lazily deserializes entries.
-    fn iter(&self) -> ManifestIter<'_> {
+    pub(crate) fn iter(&self) -> ManifestIter<'_> {
         let base_count = self.existing_entries_count();
         let entries_end = if self.data.is_empty() {
             0
@@ -377,7 +377,7 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntr
 }
 
 /// Borrowing iterator over manifest entries. Lazily deserializes each entry.
-struct ManifestIter<'a> {
+pub(crate) struct ManifestIter<'a> {
     data: &'a [u8],
     offset: usize,
     remaining: usize,
