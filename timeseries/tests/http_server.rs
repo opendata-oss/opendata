@@ -179,9 +179,17 @@ async fn test_query_bad_syntax() {
     let resp = app.oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
-    let parsed: QueryResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+    let body = body_string(resp).await;
+    let parsed: QueryResponse = serde_json::from_str(&body).unwrap();
     assert_eq!(parsed.status, "error");
     assert!(parsed.error_type.is_some());
+    assert!(parsed.data.is_none());
+    // Verify the JSON does not contain a "data" key at all (not even null).
+    let raw: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        raw.get("data").is_none(),
+        "error response should omit 'data' field, got: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +295,28 @@ async fn test_series_multiple_match() {
     let data = parsed.data.unwrap();
     // Only http_requests_total matches, "nonexistent" yields nothing
     assert_eq!(data.len(), 2);
+}
+
+#[tokio::test]
+async fn test_series_error_omits_data() {
+    let (app, _) = setup().await;
+    // POST with empty match[] triggers a bad_data error.
+    let req = Request::post("/api/v1/series")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from("start=0&end=100"))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    let parsed: SeriesResponse = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed.status, "error");
+    let raw: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        raw.get("data").is_none(),
+        "series error response should omit 'data' field, got: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------

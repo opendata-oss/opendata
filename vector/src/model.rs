@@ -218,6 +218,17 @@ pub struct Config {
     /// Target number of centroids per chunk.
     pub chunk_target: u16,
 
+    /// Query-aware dynamic pruning epsilon (ε₂ from SPANN paper).
+    ///
+    /// When set, a posting list is searched only if its centroid's distance
+    /// to the query satisfies `dist(q, c) <= (1 + epsilon) * dist(q, closest)`.
+    /// This reduces query latency by skipping distant posting lists while
+    /// preserving recall.
+    ///
+    /// Typical values: 0.1 to 0.5. `None` disables pruning (all nprobe
+    /// posting lists are searched).
+    pub query_pruning_factor: Option<f32>,
+
     /// Metadata field schema.
     ///
     /// Defines the expected attribute names and types. Writes with unknown
@@ -240,6 +251,7 @@ impl Default for Config {
             rebalance_backpressure_resume_threshold: 8,
             max_rebalance_tasks: 8,
             chunk_target: 4096,
+            query_pruning_factor: None,
             metadata_fields: Vec::new(),
         }
     }
