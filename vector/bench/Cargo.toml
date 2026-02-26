@@ -6,7 +6,10 @@ publish = false
 
 [dependencies]
 bencher.workspace = true
+common.workspace = true
 vector = { path = "..", package = "opendata-vector" }
+serde_yaml.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+tracing-subscriber.workspace = true

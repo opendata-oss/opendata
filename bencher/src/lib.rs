@@ -212,8 +212,11 @@ pub async fn run(benchmarks: Vec<Box<dyn Benchmark>>) -> anyhow::Result<()> {
     for benchmark in benchmarks {
         println!("Running benchmark: {}", benchmark.name());
 
-        // TODO: Allow params to be provided externally (config file, CLI)
-        let params = benchmark.default_params();
+        let params = config
+            .params
+            .get(benchmark.name())
+            .cloned()
+            .unwrap_or_else(|| benchmark.default_params());
         for p in params {
             // Create a unique storage path for this benchmark run
             let bench_storage = config
@@ -227,6 +230,7 @@ pub async fn run(benchmarks: Vec<Box<dyn Benchmark>>) -> anyhow::Result<()> {
                     storage: bench_storage,
                 },
                 reporter: config.reporter.clone(),
+                params: config.params.clone(),
             };
 
             let bencher = Bencher::new(bench_config, benchmark.name(), benchmark.labels()).await?;

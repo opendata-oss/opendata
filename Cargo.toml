@@ -54,3 +54,7 @@ proptest = "1"
 dashu-float = "0.4"
 snap = "1"
 criterion = "0.5"
+
+[profile.release]
+debug = true
+strip = "none"

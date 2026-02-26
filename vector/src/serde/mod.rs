@@ -89,7 +89,7 @@ pub trait RecordKey {
 /// - `CollectionMeta`: Defines the schema type for each metadata field
 /// - `FieldValue`: Tags the variant in serialized form
 /// - `MetadataIndexKey`: Identifies the value type in index keys
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum FieldType {
     String = 0,
