@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "bencher",
     "common",
+    "ingest",
     "keyvalue",
     "log",
     "log/bench",
