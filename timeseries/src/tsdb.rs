@@ -117,6 +117,25 @@ impl Tsdb {
         Ok(TsdbQueryReader::new(self.storage.clone(), readers))
     }
 
+    /// Create a QueryReader for a set of disjoint time ranges.
+    /// Discovers all buckets overlapping any range and returns a TsdbQueryReader.
+    pub(crate) async fn query_reader_for_ranges(
+        &self,
+        ranges: &[(i64, i64)],
+    ) -> Result<TsdbQueryReader> {
+        let snapshot = self.storage.snapshot().await?;
+        let buckets = snapshot.get_buckets_for_ranges(ranges).await?;
+
+        let mut readers = Vec::new();
+        for bucket in buckets {
+            let mini = self.get_bucket(bucket).await?;
+            let reader = mini.query_reader();
+            readers.push((bucket, reader));
+        }
+
+        Ok(TsdbQueryReader::new(self.storage.clone(), readers))
+    }
+
     /// Flush all dirty buckets in the ingest cache to storage.
     pub(crate) async fn flush(&self) -> Result<()> {
         // Note: moka's iter() returns a clone of the current entries

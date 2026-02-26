@@ -83,6 +83,46 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         Ok(filtered_buckets)
     }
 
+    /// Given a set of sorted, non-overlapping time ranges, return all buckets
+    /// that overlap any range. Reads the bucket list once.
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn get_buckets_for_ranges(&self, ranges: &[(i64, i64)]) -> Result<Vec<TimeBucket>> {
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let key = BucketListKey.encode();
+        let record = self.get(key).await?;
+        let bucket_list = match record {
+            Some(record) => BucketListValue::decode(record.value.as_ref())?,
+            None => {
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut filtered_buckets: Vec<TimeBucket> = bucket_list
+            .buckets
+            .into_iter()
+            .map(|(size, start)| TimeBucket { size, start })
+            .filter(|bucket| {
+                let bucket_start_min = bucket.start as i64;
+                let bucket_end_min = bucket_start_min + bucket.size_in_mins() as i64;
+                // Convert bucket bounds to seconds for comparison
+                let bucket_start_secs = bucket_start_min * 60;
+                let bucket_end_secs = bucket_end_min * 60;
+                // Bucket is half-open [start, end), range is closed [r_start, r_end].
+                // Overlap iff bucket_end > r_start (strict: end is exclusive) and
+                // bucket_start <= r_end (inclusive: start is inclusive).
+                ranges.iter().any(|&(r_start, r_end)| {
+                    bucket_end_secs > r_start && bucket_start_secs <= r_end
+                })
+            })
+            .collect();
+
+        filtered_buckets.sort_by_key(|bucket| bucket.start);
+        Ok(filtered_buckets)
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get_forward_index(&self, bucket: TimeBucket) -> Result<ForwardIndex> {
         let range = ForwardIndexKey::bucket_range(&bucket);
@@ -304,3 +344,88 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
 
 // Implement the trait for all types that implement Storage
 impl<T: ?Sized + Storage> OpenTsdbStorageExt for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::merge_operator::OpenTsdbMergeOperator;
+    use common::storage::PutRecordOp;
+    use common::storage::in_memory::InMemoryStorage;
+    use std::sync::Arc;
+
+    /// Create an InMemoryStorage with the given hour-buckets pre-populated.
+    /// Each entry in `bucket_starts` is the bucket start in minutes.
+    async fn storage_with_buckets(bucket_starts: &[u32]) -> Arc<InMemoryStorage> {
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let buckets: Vec<(u8, u32)> = bucket_starts.iter().map(|&s| (1u8, s)).collect();
+        let key = BucketListKey.encode();
+        let value = BucketListValue { buckets }.encode();
+        storage
+            .put(vec![PutRecordOp::new(Record { key, value })])
+            .await
+            .unwrap();
+        storage
+    }
+
+    fn starts(buckets: &[TimeBucket]) -> Vec<u32> {
+        buckets.iter().map(|b| b.start).collect()
+    }
+
+    // ── get_buckets_for_ranges boundary tests ──────────────────────────
+
+    #[tokio::test]
+    async fn ranges_point_at_bucket_start() {
+        // Buckets: [0, 3600s), [3600s, 7200s)  (hour buckets at min 0 and 60)
+        let s = storage_with_buckets(&[0, 60]).await;
+        // Point query exactly at second bucket start
+        let buckets = s.get_buckets_for_ranges(&[(3600, 3600)]).await.unwrap();
+        // Should match only the bucket starting at 3600s (min 60), not the one ending there
+        assert_eq!(starts(&buckets), vec![60]);
+    }
+
+    #[tokio::test]
+    async fn ranges_point_at_epoch() {
+        let s = storage_with_buckets(&[0, 60]).await;
+        // Point query at t=0
+        let buckets = s.get_buckets_for_ranges(&[(0, 0)]).await.unwrap();
+        assert_eq!(starts(&buckets), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn ranges_spanning_two_buckets() {
+        let s = storage_with_buckets(&[0, 60, 120]).await;
+        // Range [1800, 5400] spans bucket [0,3600) and [3600,7200)
+        let buckets = s.get_buckets_for_ranges(&[(1800, 5400)]).await.unwrap();
+        assert_eq!(starts(&buckets), vec![0, 60]);
+    }
+
+    #[tokio::test]
+    async fn ranges_disjoint_skips_middle() {
+        // 3 hour-buckets: [0,3600), [3600,7200), [7200,10800)
+        let s = storage_with_buckets(&[0, 60, 120]).await;
+        // Two disjoint ranges that skip the middle bucket
+        let buckets = s
+            .get_buckets_for_ranges(&[(100, 200), (8000, 9000)])
+            .await
+            .unwrap();
+        assert_eq!(starts(&buckets), vec![0, 120]);
+    }
+
+    #[tokio::test]
+    async fn ranges_empty_returns_nothing() {
+        let s = storage_with_buckets(&[0, 60]).await;
+        let buckets = s.get_buckets_for_ranges(&[]).await.unwrap();
+        assert!(buckets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ranges_exact_bucket_boundary_excludes_previous() {
+        // Range starts exactly at boundary between two buckets.
+        // Bucket [0, 3600s) should NOT match range [3600, 7200].
+        let s = storage_with_buckets(&[0, 60]).await;
+        let buckets = s.get_buckets_for_ranges(&[(3600, 7200)]).await.unwrap();
+        assert_eq!(starts(&buckets), vec![60]);
+    }
+}

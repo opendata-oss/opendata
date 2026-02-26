@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use super::evaluator::{CachedQueryReader, Evaluator, ExprResult, compute_preload_bounds};
+use super::evaluator::{CachedQueryReader, Evaluator, ExprResult, compute_preload_ranges};
 use super::parser::Parseable;
 use super::request::{
     FederateRequest, LabelValuesRequest, LabelsRequest, MetadataRequest, QueryRangeRequest,
@@ -26,19 +26,17 @@ use async_trait::async_trait;
 use common::clock::SystemClock;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 
-/// Compute the preload time window for bucket discovery.
+/// Compute the disjoint preload ranges for bucket discovery.
 ///
-/// Uses `compute_preload_bounds` to account for `offset`/`@` modifiers,
-/// falling back to `(default_start, default_end)` for selector-free
-/// expressions. Clamps start to >= 0 and ensures end >= start.
-fn preload_window(stmt: &EvalStmt, default_start: i64, default_end: i64) -> (i64, i64) {
-    match compute_preload_bounds(&stmt.expr, stmt.start, stmt.end, stmt.lookback_delta) {
-        Some((start, end)) => {
-            let s = start.max(0);
-            let e = end.max(s);
-            (s, e)
-        }
-        None => (default_start, default_end),
+/// Uses `compute_preload_ranges` to account for `offset`/`@` modifiers.
+/// Falls back to a single `[(default_start, default_end)]` for
+/// selector-free expressions. Ranges are already clamped and normalized.
+fn preload_ranges(stmt: &EvalStmt, default_start: i64, default_end: i64) -> Vec<(i64, i64)> {
+    let ranges = compute_preload_ranges(&stmt.expr, stmt.start, stmt.end, stmt.lookback_delta);
+    if ranges.is_empty() {
+        vec![(default_start.max(0), default_end.max(default_start.max(0)))]
+    } else {
+        ranges
     }
 }
 
@@ -118,7 +116,7 @@ impl PromqlRouter for Tsdb {
         };
 
         // Calculate time range for bucket discovery
-        // Use compute_preload_bounds to account for offset/@ modifiers
+        // Use compute_preload_ranges to account for offset/@ modifiers
         // that may shift evaluation into buckets outside the default window.
         let query_time = stmt.start;
         let query_time_secs = query_time
@@ -132,14 +130,10 @@ impl PromqlRouter for Tsdb {
             .unwrap_or(Duration::from_secs(0))
             .as_secs() as i64;
 
-        let (preload_start_secs, preload_end_secs) =
-            preload_window(&stmt, lookback_start_secs, query_time_secs);
+        let ranges = preload_ranges(&stmt, lookback_start_secs, query_time_secs);
 
-        // Get query reader for the time range
-        let reader = match self
-            .query_reader(preload_start_secs, preload_end_secs)
-            .await
-        {
+        // Get query reader for the time ranges
+        let reader = match self.query_reader_for_ranges(&ranges).await {
             Ok(reader) => reader,
             Err(e) => {
                 let err = ErrorResponse::internal(e.to_string());
@@ -238,7 +232,7 @@ impl PromqlRouter for Tsdb {
         };
 
         // Calculate time range for bucket discovery
-        // Use compute_preload_bounds to account for offset/@ modifiers
+        // Use compute_preload_ranges to account for offset/@ modifiers
         // that may shift evaluation into buckets outside [start - lookback, end].
         let default_start_secs = stmt
             .start
@@ -249,14 +243,10 @@ impl PromqlRouter for Tsdb {
             .as_secs() as i64;
         let default_end_secs = stmt.end.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
 
-        let (preload_start_secs, preload_end_secs) =
-            preload_window(&stmt, default_start_secs, default_end_secs);
+        let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
 
-        // Get query reader for the full time range
-        let reader = match self
-            .query_reader(preload_start_secs, preload_end_secs)
-            .await
-        {
+        // Get query reader for the time ranges
+        let reader = match self.query_reader_for_ranges(&ranges).await {
             Ok(reader) => reader,
             Err(e) => {
                 let err = ErrorResponse::internal(e.to_string());

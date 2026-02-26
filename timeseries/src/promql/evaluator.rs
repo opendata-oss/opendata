@@ -365,42 +365,74 @@ impl ExprResult {
     }
 }
 
-/// Walk the AST and compute the time window needed for bucket preloading.
+/// Walk the AST and compute the disjoint time ranges needed for bucket preloading.
 ///
 /// For each selector, compute the effective evaluation time by applying
 /// @ and offset modifiers, then expand by lookback_delta (vector) or
-/// range (matrix). Returns (earliest_secs, latest_secs) covering all
-/// selectors in the expression.
+/// range (matrix). Returns a sorted, non-overlapping list of
+/// `(earliest_secs, latest_secs)` ranges covering all selectors.
 ///
-/// Returns `None` when the expression contains no selectors (e.g. `1 + 2`),
-/// allowing the caller to fall back to the default window.
-pub(crate) fn compute_preload_bounds(
+/// Returns an empty Vec when the expression contains no selectors
+/// (e.g. `1 + 2`), allowing the caller to fall back to the default window.
+pub(crate) fn compute_preload_ranges(
     expr: &Expr,
     query_start: std::time::SystemTime,
     query_end: std::time::SystemTime,
     lookback_delta: std::time::Duration,
-) -> Option<(i64, i64)> {
+) -> Vec<(i64, i64)> {
     let start_ms = Timestamp::from(query_start).as_millis();
     let end_ms = Timestamp::from(query_end).as_millis();
     let lookback_ms = lookback_delta.as_millis() as i64;
     // At the top level, eval range == query range
-    let bounds = preload_bounds_inner(expr, start_ms, end_ms, start_ms, end_ms, lookback_ms);
-    // Convert ms to seconds (floor for start, ceil for end)
-    bounds.map(|(lo, hi)| {
-        let start_secs = lo.div_euclid(1000);
-        let end_secs = hi.div_euclid(1000) + i64::from(hi.rem_euclid(1000) != 0);
-        (start_secs, end_secs)
-    })
+    let mut ranges = Vec::new();
+    preload_ranges_inner(
+        expr,
+        start_ms,
+        end_ms,
+        start_ms,
+        end_ms,
+        lookback_ms,
+        &mut ranges,
+    );
+    // Convert ms to seconds (floor for start, ceil for end), then normalize
+    let ranges_secs: Vec<(i64, i64)> = ranges
+        .into_iter()
+        .map(|(lo, hi)| {
+            let start_secs = lo.div_euclid(1000);
+            let end_secs = hi.div_euclid(1000) + i64::from(hi.rem_euclid(1000) != 0);
+            (start_secs, end_secs)
+        })
+        .collect();
+    normalize_ranges(ranges_secs)
 }
 
-/// Merge two optional bounds, taking the min start and max end.
-fn merge_bounds(a: Option<(i64, i64)>, b: Option<(i64, i64)>) -> Option<(i64, i64)> {
-    match (a, b) {
-        (Some((a_lo, a_hi)), Some((b_lo, b_hi))) => Some((a_lo.min(b_lo), a_hi.max(b_hi))),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
+/// Sort ranges by start, merge overlapping ones, and clamp start to >= 0.
+/// Adjacent-but-not-overlapping ranges are kept separate since they may map
+/// to different buckets.
+pub(crate) fn normalize_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    if ranges.is_empty() {
+        return ranges;
     }
+    // Clamp and fix ordering
+    for r in ranges.iter_mut() {
+        r.0 = r.0.max(0);
+        r.1 = r.1.max(r.0);
+    }
+    ranges.sort_by_key(|&(start, _)| start);
+    let mut merged = Vec::with_capacity(ranges.len());
+    let (mut cur_start, mut cur_end) = ranges[0];
+    for &(start, end) in &ranges[1..] {
+        if start <= cur_end {
+            // Overlapping — extend
+            cur_end = cur_end.max(end);
+        } else {
+            merged.push((cur_start, cur_end));
+            cur_start = start;
+            cur_end = end;
+        }
+    }
+    merged.push((cur_start, cur_end));
+    merged
 }
 
 /// Compute the effective evaluation-time range for a selector after applying
@@ -475,21 +507,23 @@ fn selector_bounds(
 }
 
 /// Recursive inner function operating in milliseconds.
+/// Appends per-selector `(earliest_ms, latest_ms)` ranges to `out`.
 ///
 /// `at_start_ms`/`at_end_ms` are what `@ start()` / `@ end()` resolve to.
 /// `eval_start_ms`/`eval_end_ms` are the effective evaluation-time range
 /// for selectors without `@`.
-fn preload_bounds_inner(
+fn preload_ranges_inner(
     expr: &Expr,
     at_start_ms: i64,
     at_end_ms: i64,
     eval_start_ms: i64,
     eval_end_ms: i64,
     lookback_ms: i64,
-) -> Option<(i64, i64)> {
+    out: &mut Vec<(i64, i64)>,
+) {
     match expr {
         Expr::VectorSelector(vs) => {
-            let bounds = selector_bounds(
+            out.push(selector_bounds(
                 vs.at.as_ref(),
                 vs.offset.as_ref(),
                 at_start_ms,
@@ -497,12 +531,11 @@ fn preload_bounds_inner(
                 eval_start_ms,
                 eval_end_ms,
                 lookback_ms,
-            );
-            Some(bounds)
+            ));
         }
         Expr::MatrixSelector(ms) => {
             let range_ms = ms.range.as_millis() as i64;
-            let bounds = selector_bounds(
+            out.push(selector_bounds(
                 ms.vs.at.as_ref(),
                 ms.vs.offset.as_ref(),
                 at_start_ms,
@@ -510,13 +543,10 @@ fn preload_bounds_inner(
                 eval_start_ms,
                 eval_end_ms,
                 range_ms,
-            );
-            Some(bounds)
+            ));
         }
         Expr::Subquery(sq) => {
             // Compute the subquery's own adjusted eval-time window.
-            // This produces the (start, end) of the subquery's step range
-            // *without* a backward window (the inner expr handles its own lookback).
             let (sq_start, sq_end) = selector_bounds(
                 sq.at.as_ref(),
                 sq.offset.as_ref(),
@@ -526,99 +556,96 @@ fn preload_bounds_inner(
                 eval_end_ms,
                 0,
             );
-            // The subquery evaluates inner expr at steps in [sq_start - range, sq_end].
             let range_ms = sq.range.as_millis() as i64;
             let inner_eval_start = sq_start.saturating_sub(range_ms);
             // Recurse: evaluate_subquery passes the original query_start/query_end
             // through, so @ start()/@ end() inside the subquery resolve to the
-            // outer query bounds (at_start_ms/at_end_ms). The eval-time range
-            // narrows to the subquery step window.
-            preload_bounds_inner(
+            // outer query bounds. The eval-time range narrows to the subquery
+            // step window.
+            preload_ranges_inner(
                 &sq.expr,
                 at_start_ms,
                 at_end_ms,
                 inner_eval_start,
                 sq_end,
                 lookback_ms,
-            )
+                out,
+            );
         }
         Expr::Aggregate(agg) => {
-            let mut bounds = preload_bounds_inner(
+            preload_ranges_inner(
                 &agg.expr,
                 at_start_ms,
                 at_end_ms,
                 eval_start_ms,
                 eval_end_ms,
                 lookback_ms,
+                out,
             );
             if let Some(ref param) = agg.param {
-                bounds = merge_bounds(
-                    bounds,
-                    preload_bounds_inner(
-                        param,
-                        at_start_ms,
-                        at_end_ms,
-                        eval_start_ms,
-                        eval_end_ms,
-                        lookback_ms,
-                    ),
+                preload_ranges_inner(
+                    param,
+                    at_start_ms,
+                    at_end_ms,
+                    eval_start_ms,
+                    eval_end_ms,
+                    lookback_ms,
+                    out,
                 );
             }
-            bounds
         }
         Expr::Binary(b) => {
-            let lhs = preload_bounds_inner(
+            preload_ranges_inner(
                 &b.lhs,
                 at_start_ms,
                 at_end_ms,
                 eval_start_ms,
                 eval_end_ms,
                 lookback_ms,
+                out,
             );
-            let rhs = preload_bounds_inner(
+            preload_ranges_inner(
                 &b.rhs,
                 at_start_ms,
                 at_end_ms,
                 eval_start_ms,
                 eval_end_ms,
                 lookback_ms,
+                out,
             );
-            merge_bounds(lhs, rhs)
         }
-        Expr::Paren(p) => preload_bounds_inner(
+        Expr::Paren(p) => preload_ranges_inner(
             &p.expr,
             at_start_ms,
             at_end_ms,
             eval_start_ms,
             eval_end_ms,
             lookback_ms,
+            out,
         ),
         Expr::Call(call) => {
-            let mut bounds = None;
             for arg in &call.args.args {
-                bounds = merge_bounds(
-                    bounds,
-                    preload_bounds_inner(
-                        arg,
-                        at_start_ms,
-                        at_end_ms,
-                        eval_start_ms,
-                        eval_end_ms,
-                        lookback_ms,
-                    ),
+                preload_ranges_inner(
+                    arg,
+                    at_start_ms,
+                    at_end_ms,
+                    eval_start_ms,
+                    eval_end_ms,
+                    lookback_ms,
+                    out,
                 );
             }
-            bounds
         }
-        Expr::Unary(u) => preload_bounds_inner(
+        Expr::Unary(u) => preload_ranges_inner(
             &u.expr,
             at_start_ms,
             at_end_ms,
             eval_start_ms,
             eval_end_ms,
             lookback_ms,
+            out,
         ),
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => None,
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => {}
     }
 }
 
@@ -3967,21 +3994,21 @@ mod tests {
         );
     }
 
-    // ── compute_preload_bounds tests ──────────────────────────────────
+    // ── compute_preload_ranges tests ──────────────────────────────────
 
-    mod preload_bounds_tests {
+    mod preload_ranges_tests {
         use super::*;
-        use crate::promql::evaluator::compute_preload_bounds;
+        use crate::promql::evaluator::compute_preload_ranges;
 
         fn t(secs: u64) -> SystemTime {
             UNIX_EPOCH + Duration::from_secs(secs)
         }
 
         #[test]
-        fn scalar_only_returns_none() {
+        fn scalar_only_returns_empty() {
             let expr = promql_parser::parser::parse("1 + 2").unwrap();
-            let result = compute_preload_bounds(&expr, t(1000), t(1000), Duration::from_secs(300));
-            assert_eq!(result, None);
+            let result = compute_preload_ranges(&expr, t(1000), t(1000), Duration::from_secs(300));
+            assert_eq!(result, vec![]);
         }
 
         #[test]
@@ -3989,8 +4016,8 @@ mod tests {
             // query_time=1000s, lookback=300s
             // eval_time=1000s, data window: [1000-300, 1000] = [700, 1000]
             let expr = promql_parser::parser::parse("metric_name").unwrap();
-            let result = compute_preload_bounds(&expr, t(1000), t(1000), Duration::from_secs(300));
-            assert_eq!(result, Some((700, 1000)));
+            let result = compute_preload_ranges(&expr, t(1000), t(1000), Duration::from_secs(300));
+            assert_eq!(result, vec![(700, 1000)]);
         }
 
         #[test]
@@ -3999,8 +4026,8 @@ mod tests {
             // eval_time = 7200 - 3600 = 3600
             // data window: [3600 - 300, 3600] = [3300, 3600]
             let expr = promql_parser::parser::parse("metric_name offset 1h").unwrap();
-            let result = compute_preload_bounds(&expr, t(7200), t(7200), Duration::from_secs(300));
-            assert_eq!(result, Some((3300, 3600)));
+            let result = compute_preload_ranges(&expr, t(7200), t(7200), Duration::from_secs(300));
+            assert_eq!(result, vec![(3300, 3600)]);
         }
 
         #[test]
@@ -4008,18 +4035,18 @@ mod tests {
             // query_time=2000s, lookback=300s, @500
             // eval_time = 500, data window: [500 - 300, 500] = [200, 500]
             let expr = promql_parser::parser::parse("metric_name @ 500").unwrap();
-            let result = compute_preload_bounds(&expr, t(2000), t(2000), Duration::from_secs(300));
-            assert_eq!(result, Some((200, 500)));
+            let result = compute_preload_ranges(&expr, t(2000), t(2000), Duration::from_secs(300));
+            assert_eq!(result, vec![(200, 500)]);
         }
 
         #[test]
         fn at_with_offset() {
             // query_time=2000s, lookback=300s, @500 offset 5m
             // eval_time = 500 - 300 = 200, data window: [200 - 300, 200] = [-100, 200]
-            // floor(-100000ms / 1000) = -100
+            // floor(-100000ms / 1000) = -100 → clamped to 0
             let expr = promql_parser::parser::parse("metric_name @ 500 offset 5m").unwrap();
-            let result = compute_preload_bounds(&expr, t(2000), t(2000), Duration::from_secs(300));
-            assert_eq!(result, Some((-100, 200)));
+            let result = compute_preload_ranges(&expr, t(2000), t(2000), Duration::from_secs(300));
+            assert_eq!(result, vec![(0, 200)]);
         }
 
         #[test]
@@ -4027,8 +4054,8 @@ mod tests {
             // query_time=1000s, lookback=300s, offset=-5m=-300s
             // eval_time = 1000 + 300 = 1300, data window: [1300 - 300, 1300] = [1000, 1300]
             let expr = promql_parser::parser::parse("metric_name offset -5m").unwrap();
-            let result = compute_preload_bounds(&expr, t(1000), t(1000), Duration::from_secs(300));
-            assert_eq!(result, Some((1000, 1300)));
+            let result = compute_preload_ranges(&expr, t(1000), t(1000), Duration::from_secs(300));
+            assert_eq!(result, vec![(1000, 1300)]);
         }
 
         #[test]
@@ -4037,22 +4064,22 @@ mod tests {
             // eval_time = 7200 - 3600 = 3600
             // data window: [3600 - 300, 3600] = [3300, 3600]
             let expr = promql_parser::parser::parse("metric_name[5m] offset 1h").unwrap();
-            let result = compute_preload_bounds(&expr, t(7200), t(7200), Duration::from_secs(300));
-            assert_eq!(result, Some((3300, 3600)));
+            let result = compute_preload_ranges(&expr, t(7200), t(7200), Duration::from_secs(300));
+            assert_eq!(result, vec![(3300, 3600)]);
         }
 
         #[test]
-        fn nested_binary_uses_widest_window() {
+        fn nested_binary_produces_disjoint_ranges() {
             // max(metric offset 1h) - max(metric offset 2h) at query_time=7200, lookback=300
-            // Left:  eval=3600, window=[3300, 3600]
-            // Right: eval=0,    window=[-300, 0]
-            // Merged: [-300, 3600] → (-300, 3600) in seconds
+            // Left:  eval=3600, window=[3300, 3600] → [3300, 3600]
+            // Right: eval=0,    window=[-300, 0] → clamped to [0, 0]
+            // Two disjoint ranges (not merged into one)
             let expr = promql_parser::parser::parse(
                 "max(metric_name offset 1h) - max(metric_name offset 2h)",
             )
             .unwrap();
-            let result = compute_preload_bounds(&expr, t(7200), t(7200), Duration::from_secs(300));
-            assert_eq!(result, Some((-300, 3600)));
+            let result = compute_preload_ranges(&expr, t(7200), t(7200), Duration::from_secs(300));
+            assert_eq!(result, vec![(0, 0), (3300, 3600)]);
         }
 
         #[test]
@@ -4062,8 +4089,8 @@ mod tests {
             // subquery range = 1h = 3600s, inner eval over [5400-3600, 5400] = [1800, 5400]
             // inner selector lookback: [1800 - 300, 5400] = [1500, 5400]
             let expr = promql_parser::parser::parse("metric_name[1h:5m] offset 30m").unwrap();
-            let result = compute_preload_bounds(&expr, t(7200), t(7200), Duration::from_secs(300));
-            assert_eq!(result, Some((1500, 5400)));
+            let result = compute_preload_ranges(&expr, t(7200), t(7200), Duration::from_secs(300));
+            assert_eq!(result, vec![(1500, 5400)]);
         }
 
         #[test]
@@ -4079,8 +4106,8 @@ mod tests {
             // Without the fix, @ end() would resolve to sq_end = 5400, giving [5100, 5400].
             let expr =
                 promql_parser::parser::parse("metric_name @ end()[1h:5m] offset 30m").unwrap();
-            let result = compute_preload_bounds(&expr, t(7200), t(7200), Duration::from_secs(300));
-            assert_eq!(result, Some((6900, 7200)));
+            let result = compute_preload_ranges(&expr, t(7200), t(7200), Duration::from_secs(300));
+            assert_eq!(result, vec![(6900, 7200)]);
         }
 
         #[test]
@@ -4096,8 +4123,8 @@ mod tests {
             //   data window: [3600 - 300, 7200] = [3300, 7200]
             let expr =
                 promql_parser::parser::parse("metric_name @ start()[1h:5m] offset 30m").unwrap();
-            let result = compute_preload_bounds(&expr, t(3600), t(7200), Duration::from_secs(300));
-            assert_eq!(result, Some((3300, 7200)));
+            let result = compute_preload_ranges(&expr, t(3600), t(7200), Duration::from_secs(300));
+            assert_eq!(result, vec![(3300, 7200)]);
         }
 
         #[test]
@@ -4105,18 +4132,18 @@ mod tests {
             // range [1000, 2000] with lookback=300
             // data window: [1000 - 300, 2000] = [700, 2000]
             let expr = promql_parser::parser::parse("metric_name").unwrap();
-            let result = compute_preload_bounds(&expr, t(1000), t(2000), Duration::from_secs(300));
-            assert_eq!(result, Some((700, 2000)));
+            let result = compute_preload_ranges(&expr, t(1000), t(2000), Duration::from_secs(300));
+            assert_eq!(result, vec![(700, 2000)]);
         }
 
         #[test]
         fn range_query_with_offset() {
             // range [3600, 7200] with lookback=300, offset=1h
             // eval range: [3600-3600, 7200-3600] = [0, 3600]
-            // data window: [0 - 300, 3600] = [-300, 3600]
+            // data window: [0 - 300, 3600] = [-300, 3600] → clamped to [0, 3600]
             let expr = promql_parser::parser::parse("metric_name offset 1h").unwrap();
-            let result = compute_preload_bounds(&expr, t(3600), t(7200), Duration::from_secs(300));
-            assert_eq!(result, Some((-300, 3600)));
+            let result = compute_preload_ranges(&expr, t(3600), t(7200), Duration::from_secs(300));
+            assert_eq!(result, vec![(0, 3600)]);
         }
 
         #[test]
@@ -4128,8 +4155,8 @@ mod tests {
             // Without the fix, @ end() would collapse to (5000, 5000)
             // giving only [4700, 5000] and missing earlier steps.
             let expr = promql_parser::parser::parse("metric_name @ end()").unwrap();
-            let result = compute_preload_bounds(&expr, t(1000), t(5000), Duration::from_secs(300));
-            assert_eq!(result, Some((700, 5000)));
+            let result = compute_preload_ranges(&expr, t(1000), t(5000), Duration::from_secs(300));
+            assert_eq!(result, vec![(700, 5000)]);
         }
 
         #[test]
@@ -4138,8 +4165,8 @@ mod tests {
             // Same as @ end(): sweeps [1000, 5000] across steps.
             // Preload must cover: [1000 - 300, 5000] = [700, 5000]
             let expr = promql_parser::parser::parse("metric_name @ start()").unwrap();
-            let result = compute_preload_bounds(&expr, t(1000), t(5000), Duration::from_secs(300));
-            assert_eq!(result, Some((700, 5000)));
+            let result = compute_preload_ranges(&expr, t(1000), t(5000), Duration::from_secs(300));
+            assert_eq!(result, vec![(700, 5000)]);
         }
 
         #[test]
@@ -4148,8 +4175,8 @@ mod tests {
             // start=end=2000s, so @ end() → (2000, 2000)
             // data window: [2000 - 300, 2000] = [1700, 2000]
             let expr = promql_parser::parser::parse("metric_name @ end()").unwrap();
-            let result = compute_preload_bounds(&expr, t(2000), t(2000), Duration::from_secs(300));
-            assert_eq!(result, Some((1700, 2000)));
+            let result = compute_preload_ranges(&expr, t(2000), t(2000), Duration::from_secs(300));
+            assert_eq!(result, vec![(1700, 2000)]);
         }
 
         #[test]
@@ -4158,16 +4185,16 @@ mod tests {
             // matrix: eval_time = 7200 - 3600 = 3600, range = 5m = 300s
             // data window: [3600 - 300, 3600] = [3300, 3600]
             let expr = promql_parser::parser::parse("rate(metric_name[5m] offset 1h)").unwrap();
-            let result = compute_preload_bounds(&expr, t(7200), t(7200), Duration::from_secs(300));
-            assert_eq!(result, Some((3300, 3600)));
+            let result = compute_preload_ranges(&expr, t(7200), t(7200), Duration::from_secs(300));
+            assert_eq!(result, vec![(3300, 3600)]);
         }
 
         #[test]
         fn ceil_conversion_exact_second_boundary() {
             // hi_ms = 2000000 (exact), end should be 2000 not 2001
             let expr = promql_parser::parser::parse("metric_name").unwrap();
-            let result = compute_preload_bounds(&expr, t(2000), t(2000), Duration::from_secs(0));
-            assert_eq!(result, Some((2000, 2000)));
+            let result = compute_preload_ranges(&expr, t(2000), t(2000), Duration::from_secs(0));
+            assert_eq!(result, vec![(2000, 2000)]);
         }
 
         #[test]
@@ -4175,8 +4202,54 @@ mod tests {
             // offset -500ms shifts eval_end to 2000500ms → ceil = 2001
             // eval_start = 2000500ms → floor = 2000
             let expr = promql_parser::parser::parse("metric_name offset -500ms").unwrap();
-            let result = compute_preload_bounds(&expr, t(2000), t(2000), Duration::from_secs(0));
-            assert_eq!(result, Some((2000, 2001)));
+            let result = compute_preload_ranges(&expr, t(2000), t(2000), Duration::from_secs(0));
+            assert_eq!(result, vec![(2000, 2001)]);
+        }
+
+        #[test]
+        fn disjoint_ranges_not_merged() {
+            // metric - metric offset 5d at query_time=1000000s, lookback=300
+            // Left: eval=1000000, window=[999700, 1000000]
+            // Right: eval=1000000-432000=568000, window=[567700, 568000]
+            // These are far apart and should produce 2 disjoint ranges
+            let expr = promql_parser::parser::parse("metric_name - metric_name offset 5d").unwrap();
+            let result =
+                compute_preload_ranges(&expr, t(1_000_000), t(1_000_000), Duration::from_secs(300));
+            assert_eq!(result, vec![(567700, 568000), (999700, 1000000)]);
+        }
+
+        #[test]
+        fn overlapping_ranges_are_merged() {
+            // metric offset 1m - metric offset 2m at query_time=7200, lookback=300
+            // Left:  eval=7140, window=[6840, 7140]
+            // Right: eval=7080, window=[6780, 7080]
+            // These overlap → merged into [6780, 7140]
+            let expr =
+                promql_parser::parser::parse("metric_name offset 1m - metric_name offset 2m")
+                    .unwrap();
+            let result = compute_preload_ranges(&expr, t(7200), t(7200), Duration::from_secs(300));
+            assert_eq!(result, vec![(6780, 7140)]);
+        }
+
+        #[test]
+        fn normalize_ranges_basic() {
+            use crate::promql::evaluator::normalize_ranges;
+            // Already sorted, overlapping
+            assert_eq!(normalize_ranges(vec![(0, 5), (3, 10)]), vec![(0, 10)]);
+            // Disjoint
+            assert_eq!(
+                normalize_ranges(vec![(0, 5), (10, 15)]),
+                vec![(0, 5), (10, 15)]
+            );
+            // Unsorted
+            assert_eq!(
+                normalize_ranges(vec![(10, 15), (0, 5)]),
+                vec![(0, 5), (10, 15)]
+            );
+            // Negative start gets clamped
+            assert_eq!(normalize_ranges(vec![(-5, 10)]), vec![(0, 10)]);
+            // Empty
+            assert_eq!(normalize_ranges(vec![]), vec![]);
         }
     }
 }
