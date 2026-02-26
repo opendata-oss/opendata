@@ -3,10 +3,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::clock::Clock;
-use slatedb::object_store::path::Path;
 use slatedb::object_store::ObjectStore;
+use slatedb::object_store::path::Path;
 use tokio_util::sync::CancellationToken;
 
+use crate::config::CollectorConfig;
 use crate::error::{Error, Result};
 use crate::model::KeyValueEntry;
 use crate::queue::QueueConsumer;
@@ -38,20 +39,26 @@ impl Drop for Collector {
 }
 
 impl Collector {
-    pub fn new(config: ConsumerConfig, clock: Arc<dyn Clock>) -> Result<Self> {
+    pub fn new(config: CollectorConfig, clock: Arc<dyn Clock>) -> Result<Self> {
         let object_store = common::storage::factory::create_object_store(&config.object_store)
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let heartbeat_interval = Duration::from_millis(config.heartbeat_timeout_ms as u64 / 3);
-        let consumer = QueueConsumer::new(config, clock)?;
-        Ok(Self::build(consumer, object_store, heartbeat_interval))
+        Self::with_object_store(config, object_store, clock)
     }
 
     pub fn with_object_store(
-        consumer: QueueConsumer,
+        config: CollectorConfig,
         object_store: Arc<dyn ObjectStore>,
-        heartbeat_interval: Duration,
-    ) -> Self {
-        Self::build(consumer, object_store, heartbeat_interval)
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
+        let heartbeat_interval = Duration::from_millis(config.heartbeat_timeout_ms as u64 / 3);
+        let consumer_config = ConsumerConfig {
+            manifest_path: config.manifest_path,
+            heartbeat_timeout_ms: config.heartbeat_timeout_ms,
+            done_cleanup_threshold: config.done_cleanup_threshold,
+        };
+        let consumer =
+            QueueConsumer::with_object_store(consumer_config, object_store.clone(), clock)?;
+        Ok(Self::build(consumer, object_store, heartbeat_interval))
     }
 
     fn build(
@@ -149,25 +156,20 @@ impl Collector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CollectorConfig;
     use crate::queue::QueueProducer;
-    use crate::queue_config::{ConsumerConfig, ProducerConfig};
     use bytes::Bytes;
     use common::clock::SystemClock;
     use common::storage::config::ObjectStoreConfig;
-    use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::PutPayload;
+    use slatedb::object_store::memory::InMemory;
 
-    fn test_producer_config() -> ProducerConfig {
-        ProducerConfig {
-            object_store: ObjectStoreConfig::InMemory,
-            manifest_path: "test/manifest.json".to_string(),
-        }
-    }
+    const TEST_MANIFEST_PATH: &str = "test/manifest.json";
 
-    fn test_consumer_config() -> ConsumerConfig {
-        ConsumerConfig {
+    fn test_collector_config() -> CollectorConfig {
+        CollectorConfig {
             object_store: ObjectStoreConfig::InMemory,
-            manifest_path: "test/manifest.json".to_string(),
+            manifest_path: TEST_MANIFEST_PATH.to_string(),
             heartbeat_timeout_ms: 30_000,
             done_cleanup_threshold: 100,
         }
@@ -186,11 +188,7 @@ mod tests {
         ]
     }
 
-    async fn write_batch(
-        store: &Arc<dyn ObjectStore>,
-        location: &str,
-        entries: &[KeyValueEntry],
-    ) {
+    async fn write_batch(store: &Arc<dyn ObjectStore>, location: &str, entries: &[KeyValueEntry]) {
         let json = serde_json::to_vec(entries).unwrap();
         let path = Path::from(location);
         store.put(&path, PutPayload::from(json)).await.unwrap();
@@ -198,23 +196,19 @@ mod tests {
 
     fn make_collector(
         store: &Arc<dyn ObjectStore>,
-        consumer_config: ConsumerConfig,
-        heartbeat_interval: Duration,
+        config: CollectorConfig,
     ) -> (QueueProducer, Collector) {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let producer =
-            QueueProducer::with_object_store(test_producer_config(), store.clone()).unwrap();
-        let consumer =
-            QueueConsumer::with_object_store(consumer_config, store.clone(), clock).unwrap();
-        let collector = Collector::with_object_store(consumer, store.clone(), heartbeat_interval);
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+        let collector = Collector::with_object_store(config, store.clone(), clock).unwrap();
         (producer, collector)
     }
 
     #[tokio::test]
     async fn should_collect_enqueued_batch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (producer, collector) =
-            make_collector(&store, test_consumer_config(), Duration::from_secs(10));
+        let (producer, collector) = make_collector(&store, test_collector_config());
 
         let entries = test_entries();
         let location = "batches/batch-001.json";
@@ -233,8 +227,7 @@ mod tests {
     #[tokio::test]
     async fn should_return_none_when_queue_empty() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (_producer, collector) =
-            make_collector(&store, test_consumer_config(), Duration::from_secs(10));
+        let (_producer, collector) = make_collector(&store, test_collector_config());
 
         let result = collector.next_batch().await.unwrap();
         assert!(result.is_none());
@@ -243,8 +236,7 @@ mod tests {
     #[tokio::test]
     async fn should_ack_batch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (producer, collector) =
-            make_collector(&store, test_consumer_config(), Duration::from_secs(10));
+        let (producer, collector) = make_collector(&store, test_collector_config());
 
         let entries = test_entries();
         let location = "batches/batch-002.json";
@@ -262,9 +254,9 @@ mod tests {
     #[tokio::test]
     async fn should_heartbeat_in_flight_batches() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let heartbeat_interval = Duration::from_millis(20);
-        let (producer, collector) =
-            make_collector(&store, test_consumer_config(), heartbeat_interval);
+        let mut config = test_collector_config();
+        config.heartbeat_timeout_ms = 60; // short timeout so heartbeat_interval = 20ms
+        let (producer, collector) = make_collector(&store, config);
 
         let entries = test_entries();
         let location = "batches/batch-003.json";
@@ -304,9 +296,7 @@ mod tests {
     #[tokio::test]
     async fn should_stop_heartbeating_after_ack() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let heartbeat_interval = Duration::from_millis(20);
-        let (producer, collector) =
-            make_collector(&store, test_consumer_config(), heartbeat_interval);
+        let (producer, collector) = make_collector(&store, test_collector_config());
 
         let entries = test_entries();
         let location = "batches/batch-004.json";

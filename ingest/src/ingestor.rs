@@ -145,7 +145,8 @@ impl BatchWriter {
         let flushed_bytes = self.batch.size_bytes;
         let (entries, notifiers) = self.batch.take();
         let result = self.write_and_enqueue(entries).await;
-        self.pending_bytes.fetch_sub(flushed_bytes, Ordering::Release);
+        self.pending_bytes
+            .fetch_sub(flushed_bytes, Ordering::Release);
 
         for tx in notifiers {
             let _ = tx.send(Some(result.clone()));
@@ -202,18 +203,19 @@ pub struct Ingestor {
 }
 
 impl Ingestor {
-    pub fn new(config: IngestorConfig, producer: QueueProducer, clock: Arc<dyn Clock>) -> Result<Self> {
+    pub fn new(config: IngestorConfig, clock: Arc<dyn Clock>) -> Result<Self> {
         let object_store = common::storage::factory::create_object_store(&config.object_store)
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Self::with_object_store(config, object_store, producer, clock)
+        Self::with_object_store(config, object_store, clock)
     }
 
     pub fn with_object_store(
         config: IngestorConfig,
         object_store: Arc<dyn ObjectStore>,
-        producer: QueueProducer,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
+        let producer =
+            QueueProducer::with_object_store(config.manifest_path.clone(), object_store.clone());
         let (tx, rx) = mpsc::unbounded_channel();
         let shutdown = CancellationToken::new();
         let producer = Arc::new(producer);
@@ -297,7 +299,6 @@ impl Ingestor {
 mod tests {
     use super::*;
     use crate::config::IngestorConfig;
-    use crate::queue_config::ProducerConfig;
     use bytes::Bytes;
     use common::clock::SystemClock;
     use common::storage::config::ObjectStoreConfig;
@@ -308,31 +309,19 @@ mod tests {
         IngestorConfig {
             object_store: ObjectStoreConfig::InMemory,
             path_prefix: "test-ingest".to_string(),
+            manifest_path: "test/manifest.json".to_string(),
             batch_interval_ms: 60_000,
             batch_max_bytes: 64 * 1024 * 1024,
             backpressure_at_bytes: None,
         }
     }
 
-    fn test_queue_config() -> ProducerConfig {
-        ProducerConfig {
-            object_store: ObjectStoreConfig::InMemory,
-            manifest_path: "test/manifest.json".to_string(),
-        }
-    }
-
     #[tokio::test]
     async fn should_ingest_entries_and_enqueue_location() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
-        let ingestor = Ingestor::with_object_store(
-            test_config(),
-            store.clone(),
-            producer,
-            Arc::new(SystemClock),
-        )
-        .unwrap();
+        let ingestor =
+            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+                .unwrap();
 
         let entries = vec![
             KeyValueEntry {
@@ -361,15 +350,9 @@ mod tests {
     #[tokio::test]
     async fn should_write_valid_json_to_object_store() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
-        let ingestor = Ingestor::with_object_store(
-            test_config(),
-            store.clone(),
-            producer,
-            Arc::new(SystemClock),
-        )
-        .unwrap();
+        let ingestor =
+            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+                .unwrap();
 
         let entries = vec![KeyValueEntry {
             key: Bytes::from("mykey"),
@@ -403,15 +386,12 @@ mod tests {
     #[tokio::test]
     async fn should_flush_when_batch_size_exceeded() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
 
         let mut config = test_config();
         config.batch_max_bytes = 10; // very small threshold
 
         let ingestor =
-            Ingestor::with_object_store(config, store.clone(), producer, Arc::new(SystemClock))
-                .unwrap();
+            Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
 
         let entries = vec![KeyValueEntry {
             key: Bytes::from("a-long-key"),
@@ -439,16 +419,13 @@ mod tests {
     #[tokio::test]
     async fn should_flush_when_interval_elapsed() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
 
         let mut config = test_config();
         config.batch_interval_ms = 50;
         config.batch_max_bytes = 64 * 1024 * 1024;
 
         let ingestor =
-            Ingestor::with_object_store(config, store.clone(), producer, Arc::new(SystemClock))
-                .unwrap();
+            Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
 
         let mut watcher = ingestor
             .ingest(vec![KeyValueEntry {
@@ -481,15 +458,9 @@ mod tests {
     #[tokio::test]
     async fn should_not_flush_below_thresholds() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
-        let ingestor = Ingestor::with_object_store(
-            test_config(),
-            store.clone(),
-            producer,
-            Arc::new(SystemClock),
-        )
-        .unwrap();
+        let ingestor =
+            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+                .unwrap();
 
         let watcher = ingestor
             .ingest(vec![KeyValueEntry {
@@ -526,15 +497,9 @@ mod tests {
     #[tokio::test]
     async fn should_batch_multiple_ingests_into_single_file() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
-        let ingestor = Ingestor::with_object_store(
-            test_config(),
-            store.clone(),
-            producer,
-            Arc::new(SystemClock),
-        )
-        .unwrap();
+        let ingestor =
+            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+                .unwrap();
 
         let watcher1 = ingestor
             .ingest(vec![KeyValueEntry {
@@ -584,8 +549,6 @@ mod tests {
     #[tokio::test]
     async fn should_apply_backpressure_when_threshold_exceeded() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
 
         let mut config = test_config();
         config.batch_max_bytes = 64 * 1024 * 1024; // large, won't auto-flush
@@ -593,8 +556,7 @@ mod tests {
         config.backpressure_at_bytes = Some(30); // threshold larger than one entry but smaller than two
 
         let ingestor =
-            Ingestor::with_object_store(config, store.clone(), producer, Arc::new(SystemClock))
-                .unwrap();
+            Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
 
         // First ingest (22 bytes: "a-long-key" + "a-long-value") — below 30-byte threshold
         ingestor
@@ -634,15 +596,12 @@ mod tests {
     #[tokio::test]
     async fn should_reject_ingest_exceeding_backpressure_limit() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(test_queue_config(), store.clone()).unwrap();
 
         let mut config = test_config();
         config.backpressure_at_bytes = Some(10);
 
         let ingestor =
-            Ingestor::with_object_store(config, store.clone(), producer, Arc::new(SystemClock))
-                .unwrap();
+            Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
 
         // 22 bytes > 10-byte limit
         let result = ingestor
