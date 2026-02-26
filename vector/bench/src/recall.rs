@@ -565,6 +565,7 @@ impl Benchmark for RecallBenchmark {
             query_latency.record(elapsed_us);
             cold_latencies_us.push(elapsed_us);
         }
+        cold_latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let p90 = percentile(&cold_latencies_us, 90.0);
         println!("p90 = {:.2}", p90 / 1000.0);
         println!("end warmup");
