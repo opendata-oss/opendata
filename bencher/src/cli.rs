@@ -62,6 +62,7 @@ impl Config {
                 storage: StorageConfig::InMemory,
             },
             reporter: None,
+            params: Default::default(),
         }
     }
 }
