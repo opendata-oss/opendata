@@ -31,7 +31,7 @@ fail = "0.5"
 futures = { version = "0.3", features = ["std"] }
 moka = { version = "0.12", features = ["future"] }
 bencher = { path = "./bencher" }
-common = { path = "./common", package = "opendata-common", version = "0.1.6" }
+common = { path = "./common", package = "opendata-common", version = "0.1.7" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 roaring = "0.10"
 rstest = "0.19"

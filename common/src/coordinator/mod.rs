@@ -27,7 +27,7 @@ enum FlushEvent<D: Delta> {
 use crate::StorageRead;
 use crate::storage::StorageSnapshot;
 use async_trait::async_trait;
-pub(crate) use handle::EpochWatcher;
+pub use handle::EpochWatcher;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -228,7 +228,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
             current: delta.reader(),
             frozen: vec![],
             snapshot: initial_snapshot,
-            last_flushed_delta: None,
+            last_written_delta: None,
         };
         let initial_view = Arc::new(BroadcastedView::new(initial_view));
 
@@ -447,7 +447,7 @@ impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
             .await
             .map_err(|e| WriteError::FlushError(e.to_string()))?;
         self.last_flushed_epoch = epoch_range.end - 1;
-        self.watermarks.update_flushed(self.last_flushed_epoch);
+        self.watermarks.update_written(self.last_flushed_epoch);
         self.view.update_flush_finished(snapshot, epoch_range);
         Ok(())
     }
@@ -493,39 +493,39 @@ impl<D: Delta> CurrentDelta<D> {
     }
 }
 
-pub(crate) struct EpochWatermarks {
+pub struct EpochWatermarks {
     applied_tx: tokio::sync::watch::Sender<u64>,
-    flushed_tx: tokio::sync::watch::Sender<u64>,
+    written_tx: tokio::sync::watch::Sender<u64>,
     durable_tx: tokio::sync::watch::Sender<u64>,
 }
 
 impl EpochWatermarks {
-    pub(crate) fn new() -> (Self, EpochWatcher) {
+    pub fn new() -> (Self, EpochWatcher) {
         let (applied_tx, applied_rx) = tokio::sync::watch::channel(0);
-        let (flushed_tx, flushed_rx) = tokio::sync::watch::channel(0);
+        let (written_tx, written_rx) = tokio::sync::watch::channel(0);
         let (durable_tx, durable_rx) = tokio::sync::watch::channel(0);
         let watcher = EpochWatcher {
             applied_rx,
-            flushed_rx,
+            written_rx,
             durable_rx,
         };
         let watermarks = EpochWatermarks {
             applied_tx,
-            flushed_tx,
+            written_tx,
             durable_tx,
         };
         (watermarks, watcher)
     }
 
-    pub(crate) fn update_applied(&self, epoch: u64) {
+    pub fn update_applied(&self, epoch: u64) {
         let _ = self.applied_tx.send(epoch);
     }
 
-    pub(crate) fn update_flushed(&self, epoch: u64) {
-        let _ = self.flushed_tx.send(epoch);
+    pub fn update_written(&self, epoch: u64) {
+        let _ = self.written_tx.send(epoch);
     }
 
-    pub(crate) fn update_durable(&self, epoch: u64) {
+    pub fn update_durable(&self, epoch: u64) {
         let _ = self.durable_tx.send(epoch);
     }
 }
@@ -588,7 +588,7 @@ impl<D: Delta> BroadcastedViewInner<D> {
             current: self.view.current.clone(),
             frozen: new_frozen,
             snapshot,
-            last_flushed_delta: Some(last),
+            last_written_delta: Some(last),
         });
         self.view_tx.send(self.view.clone());
     }
@@ -601,7 +601,7 @@ impl<D: Delta> BroadcastedViewInner<D> {
             current: reader,
             frozen: new_frozen,
             snapshot: self.view.snapshot.clone(),
-            last_flushed_delta: self.view.last_flushed_delta.clone(),
+            last_written_delta: self.view.last_written_delta.clone(),
         });
         self.view_tx.send(self.view.clone());
     }
@@ -636,11 +636,11 @@ pub struct PauseHandle {
 }
 
 impl PauseHandle {
-    fn pause(&self) {
+    pub fn pause(&self) {
         self.pause_tx.send_replace(true);
     }
 
-    fn unpause(&self) {
+    pub fn unpause(&self) {
         self.pause_tx.send_replace(false);
     }
 }
@@ -1050,7 +1050,7 @@ mod tests {
 
         handle.flush(false).await.unwrap();
         // Wait for flush to complete via watermark
-        last_write.wait(Durability::Flushed).await.unwrap();
+        last_write.wait(Durability::Written).await.unwrap();
 
         // then
         let events = flusher.flushed_events();
@@ -1165,7 +1165,7 @@ mod tests {
             .await
             .unwrap();
         handle.flush(false).await.unwrap();
-        write.wait(Durability::Flushed).await.unwrap();
+        write.wait(Durability::Written).await.unwrap();
 
         // then
         assert_eq!(flusher.flushed_events().len(), 1);
@@ -1200,7 +1200,7 @@ mod tests {
         let mut flush_handle = handle.flush(false).await.unwrap();
 
         // then - can wait directly on the flush handle
-        flush_handle.wait(Durability::Flushed).await.unwrap();
+        flush_handle.wait(Durability::Written).await.unwrap();
         assert_eq!(flusher.flushed_events().len(), 1);
 
         // cleanup
@@ -1290,7 +1290,7 @@ mod tests {
             .unwrap();
 
         handle.flush(false).await.unwrap();
-        last_write.wait(Durability::Flushed).await.unwrap();
+        last_write.wait(Durability::Written).await.unwrap();
 
         // then
         let events = flusher.flushed_events();
@@ -1328,7 +1328,7 @@ mod tests {
             .await
             .unwrap();
         handle.flush(false).await.unwrap();
-        write.wait(Durability::Flushed).await.unwrap();
+        write.wait(Durability::Written).await.unwrap();
 
         // Second flush with no new writes
         handle.flush(false).await.unwrap();
@@ -1353,7 +1353,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn should_update_flushed_watermark_after_flush() {
+    async fn should_update_written_watermark_after_flush() {
         // given
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
@@ -1378,8 +1378,8 @@ mod tests {
 
         handle.flush(false).await.unwrap();
 
-        // then - wait for Flushed should succeed after flush completes
-        let result = write_handle.wait(Durability::Flushed).await;
+        // then - wait for Written should succeed after flush completes
+        let result = write_handle.wait(Durability::Written).await;
         assert!(result.is_ok());
 
         // cleanup
@@ -1469,7 +1469,7 @@ mod tests {
             })
             .await
             .unwrap();
-        write.wait(Durability::Flushed).await.unwrap();
+        write.wait(Durability::Written).await.unwrap();
 
         // then
         assert_eq!(flusher.flushed_events().len(), 1);
@@ -1522,7 +1522,7 @@ mod tests {
             })
             .await
             .unwrap();
-        final_write.wait(Durability::Flushed).await.unwrap();
+        final_write.wait(Durability::Written).await.unwrap();
 
         // then - should have flushed (105 bytes > 100 threshold)
         assert_eq!(flusher.flushed_events().len(), 1);
@@ -1876,7 +1876,7 @@ mod tests {
             .unwrap();
 
         handle.flush(false).await.unwrap();
-        last_write.wait(Durability::Flushed).await.unwrap();
+        last_write.wait(Durability::Written).await.unwrap();
 
         // then
         let events = flusher.flushed_events();
@@ -1921,7 +1921,7 @@ mod tests {
             .await
             .unwrap();
         handle.flush(false).await.unwrap();
-        write2.wait(Durability::Flushed).await.unwrap();
+        write2.wait(Durability::Written).await.unwrap();
 
         // when - second batch
         let mut write3 = handle
@@ -1933,7 +1933,7 @@ mod tests {
             .await
             .unwrap();
         handle.flush(false).await.unwrap();
-        write3.wait(Durability::Flushed).await.unwrap();
+        write3.wait(Durability::Written).await.unwrap();
 
         // then
         let events = flusher.flushed_events();
@@ -1987,7 +1987,7 @@ mod tests {
         let epoch2 = write2.epoch().await.unwrap();
 
         handle.flush(false).await.unwrap();
-        write2.wait(Durability::Flushed).await.unwrap();
+        write2.wait(Durability::Written).await.unwrap();
 
         // then - the epoch_range should contain exactly the epochs assigned to writes
         let events = flusher.flushed_events();
@@ -2034,7 +2034,7 @@ mod tests {
             .await
             .unwrap();
         handle.flush(false).await.unwrap();
-        write1.wait(Durability::Flushed).await.unwrap();
+        write1.wait(Durability::Written).await.unwrap();
 
         // Write to key "a" again in second batch (seq 1)
         let mut write2 = handle
@@ -2046,7 +2046,7 @@ mod tests {
             .await
             .unwrap();
         handle.flush(false).await.unwrap();
-        write2.wait(Durability::Flushed).await.unwrap();
+        write2.wait(Durability::Written).await.unwrap();
 
         // then
         let events = flusher.flushed_events();
@@ -2174,8 +2174,8 @@ mod tests {
         // Second broadcast: flush complete
         let result = subscriber.recv().await.unwrap();
 
-        // then - last_flushed_delta should contain the write we made
-        let flushed = result.last_flushed_delta.as_ref().unwrap();
+        // then - last_written_delta should contain the write we made
+        let flushed = result.last_written_delta.as_ref().unwrap();
         assert_eq!(flushed.val.get("a"), Some(&42));
 
         // cleanup
@@ -2222,8 +2222,8 @@ mod tests {
         // Second broadcast: flush complete
         let result = subscriber.recv().await.unwrap();
 
-        // then - epoch range from last_flushed_delta should contain the epochs
-        let flushed = result.last_flushed_delta.as_ref().unwrap();
+        // then - epoch range from last_written_delta should contain the epochs
+        let flushed = result.last_written_delta.as_ref().unwrap();
         let epoch1 = write1.epoch().await.unwrap();
         let epoch2 = write2.epoch().await.unwrap();
         assert!(flushed.epoch_range.contains(&epoch1));
@@ -2302,10 +2302,10 @@ mod tests {
         let state1 = subscriber.recv().await.unwrap();
         assert_eq!(state1.frozen.len(), 1);
 
-        // Second broadcast: flush complete (frozen is empty, last_flushed_delta set)
+        // Second broadcast: flush complete (frozen is empty, last_written_delta set)
         let state2 = subscriber.recv().await.unwrap();
         assert_eq!(state2.frozen.len(), 0);
-        assert!(state2.last_flushed_delta.is_some());
+        assert!(state2.last_written_delta.is_some());
 
         // cleanup
         coordinator.stop().await;
@@ -2464,7 +2464,7 @@ mod tests {
         w3.wait(Durability::Applied).await.unwrap();
 
         ch1.flush(false).await.unwrap();
-        w3.wait(Durability::Flushed).await.unwrap();
+        w3.wait(Durability::Written).await.unwrap();
 
         // then - snapshot should contain writes from both channels
         let snapshot = flusher.storage.snapshot().await.unwrap();

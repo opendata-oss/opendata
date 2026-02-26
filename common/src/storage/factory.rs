@@ -6,6 +6,8 @@
 use std::sync::Arc;
 
 use slatedb::config::Settings;
+use slatedb::db_cache::DbCache;
+pub use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 use slatedb::object_store::{self, ObjectStore};
 use slatedb::{DbBuilder, DbReader};
 use tokio::runtime::Handle;
@@ -44,6 +46,7 @@ use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
 #[derive(Default)]
 pub struct StorageRuntime {
     pub(crate) compaction_runtime: Option<Handle>,
+    pub(crate) block_cache: Option<Arc<dyn DbCache>>,
 }
 
 impl StorageRuntime {
@@ -62,6 +65,47 @@ impl StorageRuntime {
     /// This option only affects SlateDB storage; it is ignored for in-memory storage.
     pub fn with_compaction_runtime(mut self, handle: Handle) -> Self {
         self.compaction_runtime = Some(handle);
+        self
+    }
+
+    /// Sets a block cache for SlateDB reads.
+    ///
+    /// When provided, SlateDB will use this cache for SST block lookups,
+    /// reducing disk I/O on repeated reads. Use `FoyerCache::new_with_opts`
+    /// to control capacity.
+    ///
+    /// This option only affects SlateDB storage; it is ignored for in-memory storage.
+    pub fn with_block_cache(mut self, cache: Arc<dyn DbCache>) -> Self {
+        self.block_cache = Some(cache);
+        self
+    }
+}
+
+/// Runtime options for read-only storage instances.
+///
+/// This struct holds non-serializable runtime configuration for `DbReader`.
+/// Unlike `StorageRuntime`, it only exposes options relevant to readers
+/// (currently just block cache).
+#[derive(Default)]
+pub struct StorageReaderRuntime {
+    pub(crate) block_cache: Option<Arc<dyn DbCache>>,
+}
+
+impl StorageReaderRuntime {
+    /// Creates a new reader runtime with default options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets a block cache for SlateDB reads.
+    ///
+    /// When provided, the `DbReader` will use this cache for SST block lookups,
+    /// reducing disk I/O on repeated reads. Use `FoyerCache::new_with_opts`
+    /// to control capacity.
+    ///
+    /// This option only affects SlateDB storage; it is ignored for in-memory storage.
+    pub fn with_block_cache(mut self, cache: Arc<dyn DbCache>) -> Self {
+        self.block_cache = Some(cache);
         self
     }
 }
@@ -205,6 +249,7 @@ pub async fn create_storage(
 /// Returns an `Arc<dyn StorageRead>` on success, or a `StorageError` on failure.
 pub async fn create_storage_read(
     config: &StorageConfig,
+    runtime: StorageReaderRuntime,
     semantics: StorageSemantics,
     reader_options: slatedb::config::DbReaderOptions,
 ) -> StorageResult<Arc<dyn StorageRead>> {
@@ -224,6 +269,9 @@ pub async fn create_storage_read(
             if let Some(op) = semantics.merge_operator {
                 let adapter = SlateDbStorage::merge_operator_adapter(op);
                 options.merge_operator = Some(Arc::new(adapter));
+            }
+            if let Some(cache) = runtime.block_cache {
+                options.block_cache = Some(cache);
             }
             let reader = DbReader::open(
                 slate_config.path.clone(),
@@ -270,6 +318,11 @@ async fn create_slatedb_storage(
     // Add compaction runtime if provided
     if let Some(handle) = runtime.compaction_runtime {
         db_builder = db_builder.with_compaction_runtime(handle);
+    }
+
+    // Add block cache if provided
+    if let Some(cache) = runtime.block_cache {
+        db_builder = db_builder.with_memory_cache(cache);
     }
 
     let db = db_builder

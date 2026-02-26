@@ -40,6 +40,7 @@ impl ErrorResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResponse {
     pub status: String, // "success" or "error"
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<QueryResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -58,6 +59,7 @@ pub struct QueryResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryRangeResponse {
     pub status: String, // "success" or "error"
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<QueryRangeResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -88,6 +90,7 @@ pub struct VectorSeries {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeriesResponse {
     pub status: String, // "success" or "error"
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Vec<HashMap<String, String>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -99,6 +102,7 @@ pub struct SeriesResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LabelsResponse {
     pub status: String, // "success" or "error"
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -110,6 +114,7 @@ pub struct LabelsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LabelValuesResponse {
     pub status: String, // "success" or "error"
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -121,6 +126,7 @@ pub struct LabelValuesResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataResponse {
     pub status: String, // "success" or "error"
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<HashMap<String, Vec<MetricMetadata>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -134,6 +140,69 @@ pub struct MetricMetadata {
     pub metric_type: String, // "gauge", "counter", "histogram", "summary"
     pub help: String,
     pub unit: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that all response structs omit the `data` key when it is None.
+    #[test]
+    fn error_responses_omit_data_field() {
+        let query = QueryResponse {
+            status: "error".into(),
+            data: None,
+            error: Some("bad".into()),
+            error_type: Some("bad_data".into()),
+        };
+        let json = serde_json::to_value(&query).unwrap();
+        assert!(json.get("data").is_none(), "QueryResponse: {json}");
+
+        let query_range = QueryRangeResponse {
+            status: "error".into(),
+            data: None,
+            error: Some("bad".into()),
+            error_type: Some("bad_data".into()),
+        };
+        let json = serde_json::to_value(&query_range).unwrap();
+        assert!(json.get("data").is_none(), "QueryRangeResponse: {json}");
+
+        let series = SeriesResponse {
+            status: "error".into(),
+            data: None,
+            error: Some("bad".into()),
+            error_type: Some("bad_data".into()),
+        };
+        let json = serde_json::to_value(&series).unwrap();
+        assert!(json.get("data").is_none(), "SeriesResponse: {json}");
+
+        let labels = LabelsResponse {
+            status: "error".into(),
+            data: None,
+            error: Some("bad".into()),
+            error_type: Some("bad_data".into()),
+        };
+        let json = serde_json::to_value(&labels).unwrap();
+        assert!(json.get("data").is_none(), "LabelsResponse: {json}");
+
+        let label_values = LabelValuesResponse {
+            status: "error".into(),
+            data: None,
+            error: Some("bad".into()),
+            error_type: Some("bad_data".into()),
+        };
+        let json = serde_json::to_value(&label_values).unwrap();
+        assert!(json.get("data").is_none(), "LabelValuesResponse: {json}");
+
+        let metadata = MetadataResponse {
+            status: "error".into(),
+            data: None,
+            error: Some("bad".into()),
+            error_type: Some("bad_data".into()),
+        };
+        let json = serde_json::to_value(&metadata).unwrap();
+        assert!(json.get("data").is_none(), "MetadataResponse: {json}");
+    }
 }
 
 /// Response for /federate (federation endpoint)

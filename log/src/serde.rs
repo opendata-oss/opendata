@@ -431,52 +431,6 @@ impl ListingEntryValue {
     }
 }
 
-/// Builder for log entry storage records.
-///
-/// Converts user records into storage records with properly encoded keys.
-/// Uses the delta pattern: receives segment and sequence info from their
-/// respective deltas and produces storage records to be written atomically.
-///
-/// # Usage
-///
-/// ```ignore
-/// use common::Record as StorageRecord;
-///
-/// let mut records = Vec::new();
-/// // ... build sequence and segment deltas ...
-///
-/// LogEntryBuilder::build(&seg_delta, &seq_delta, &user_records, &mut records);
-/// ```
-pub(crate) struct LogEntryBuilder;
-
-impl LogEntryBuilder {
-    /// Builds log entry storage records from user records.
-    ///
-    /// For each user record, creates a storage record with:
-    /// - Key: Encoded `LogEntryKey` with segment_id, user key, and sequence
-    /// - Value: The user-provided value (unchanged)
-    ///
-    /// Records are appended to the provided `records` vec.
-    pub(crate) fn build(
-        segment: &crate::segment::LogSegment,
-        base_sequence: u64,
-        user_records: &[crate::model::Record],
-        records: &mut Vec<common::PutRecordOp>,
-    ) {
-        let segment_start_seq = segment.meta().start_seq;
-
-        for (i, user_record) in user_records.iter().enumerate() {
-            let sequence = base_sequence + i as u64;
-            let entry_key = LogEntryKey::new(segment.id(), user_record.key.clone(), sequence);
-            let storage_record = common::Record::new(
-                entry_key.serialize(segment_start_seq),
-                user_record.value.clone(),
-            );
-            records.push(storage_record.into());
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

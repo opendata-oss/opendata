@@ -34,6 +34,16 @@ pub(crate) fn compute_distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> 
     VectorDistance { score: v, metric }
 }
 
+/// Compute a uniform distance where lower = closer, suitable for comparing
+/// across distance metrics in the boundary replication formula.
+pub(crate) fn raw_distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
+    match metric {
+        DistanceMetric::L2 => compute_distance(a, b, metric).score(),
+        DistanceMetric::Cosine => 1.0 - compute_distance(a, b, metric).score(),
+        DistanceMetric::DotProduct => -compute_distance(a, b, metric).score(),
+    }
+}
+
 /// Compute L2 (Euclidean) distance between two vectors.
 ///
 /// Formula: sqrt(sum((a[i] - b[i])²))

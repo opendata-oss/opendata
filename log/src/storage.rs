@@ -1,62 +1,66 @@
-//! Log-specific storage wrappers.
+//! Log-specific storage extensions.
 //!
-//! This module provides [`LogStorage`] and [`LogStorageRead`] which wrap
-//! the underlying storage traits with log-specific operations like key listing
-//! and segment metadata access.
+//! This module provides [`LogStorageRead`], an extension trait that adds
+//! log-specific read operations (segment scanning, entry scanning, key
+//! listing) to any [`StorageRead`] implementation, and test helpers for
+//! writing log domain types to storage.
 
+use std::collections::BTreeSet;
 use std::ops::Range;
+#[cfg(test)]
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use crate::error::{Error, Result};
-use crate::listing::LogKeyIterator;
 use crate::model::{LogEntry, SegmentId};
 use crate::segment::LogSegment;
-use crate::serde::{LogEntryKey, SegmentMeta, SegmentMetaKey};
+use crate::serde::{ListingEntryKey, LogEntryKey, SegmentMeta, SegmentMetaKey};
 use bytes::Bytes;
-use common::storage::StorageSnapshot;
-use common::{Storage, StorageIterator, StorageRead};
+#[cfg(test)]
+use common::Storage;
+use common::{StorageIterator, StorageRead};
 
-/// Read-only log storage operations.
+/// Extension trait adding log-specific read operations to any [`StorageRead`].
 ///
-/// Wraps `Arc<dyn StorageRead>` with log-specific read operations
-/// for segments and key listings.
-#[derive(Clone)]
-pub(crate) struct LogStorageRead {
-    storage: Arc<dyn StorageRead>,
-}
-
-impl LogStorageRead {
-    /// Creates a new read-only log storage wrapper.
-    pub(crate) fn new(storage: Arc<dyn StorageRead>) -> Self {
-        Self { storage }
-    }
-
-    /// Gets a single record by key.
-    #[cfg(any(test, feature = "http-server"))]
-    pub(crate) async fn get(&self, key: Bytes) -> Result<Option<common::Record>> {
-        self.storage
-            .get(key)
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))
-    }
-
-    /// Returns an iterator over keys present in the given segment range.
+/// Provides default implementations for scanning segments, entries, and listing keys.
+/// Automatically available on all `StorageRead` types via a blanket impl.
+#[async_trait]
+pub(crate) trait LogStorageRead: StorageRead {
+    /// Returns keys present in the given segment range.
     ///
-    /// Keys are deduplicated and returned in lexicographic order.
+    /// Keys are deduplicated and returned in a sorted `BTreeSet`.
     /// The segment range is half-open: [start, end).
-    pub(crate) async fn list_keys(
-        &self,
-        segment_range: Range<SegmentId>,
-    ) -> Result<LogKeyIterator> {
-        LogKeyIterator::open(Arc::clone(&self.storage), segment_range).await
+    async fn list_keys(&self, segment_range: Range<SegmentId>) -> Result<BTreeSet<Bytes>> {
+        if segment_range.start >= segment_range.end {
+            return Ok(BTreeSet::new());
+        }
+
+        let scan_range = ListingEntryKey::scan_range(segment_range);
+        let mut iter = self
+            .scan_iter(scan_range)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut keys = BTreeSet::new();
+        while let Some(record) = iter
+            .next()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?
+        {
+            let entry_key = ListingEntryKey::deserialize(&record.key)?;
+            keys.insert(entry_key.key);
+        }
+
+        Ok(keys)
     }
 
     /// Scans segment metadata records within the given segment ID range.
     ///
     /// Returns segments ordered by segment ID.
-    pub(crate) async fn scan_segments(&self, range: Range<SegmentId>) -> Result<Vec<LogSegment>> {
+    async fn scan_segments(&self, range: Range<SegmentId>) -> Result<Vec<LogSegment>> {
         let scan_range = SegmentMetaKey::scan_range(range);
-        let mut iter = self.storage.scan_iter(scan_range).await?;
+        let mut iter = self.scan_iter(scan_range).await?;
 
         let mut segments = Vec::new();
         while let Some(record) = iter.next().await? {
@@ -71,14 +75,14 @@ impl LogStorageRead {
     /// Scans log entries for a key within a segment and sequence range.
     ///
     /// Returns an iterator that yields `LogEntry` values in sequence order.
-    pub(crate) async fn scan_entries(
+    async fn scan_entries(
         &self,
         segment: &LogSegment,
         key: &Bytes,
         seq_range: Range<u64>,
     ) -> Result<SegmentIterator> {
         let scan_range = LogEntryKey::scan_range(segment, key, seq_range.clone());
-        let inner = self.storage.scan_iter(scan_range).await?;
+        let inner = self.scan_iter(scan_range).await?;
         Ok(SegmentIterator::new(
             inner,
             seq_range,
@@ -86,6 +90,8 @@ impl LogStorageRead {
         ))
     }
 }
+
+impl<T: StorageRead + ?Sized> LogStorageRead for T {}
 
 /// Iterator over log entries within a single segment.
 ///
@@ -141,78 +147,19 @@ impl SegmentIterator {
     }
 }
 
-/// Read-write log storage operations.
+/// Extension trait adding log-specific test write helpers to any [`Storage`].
 ///
-/// Wraps `Arc<dyn Storage>` with log-specific operations.
-#[derive(Clone)]
-pub(crate) struct LogStorage {
-    storage: Arc<dyn Storage>,
-}
-
-impl LogStorage {
-    /// Creates a new log storage wrapper.
-    pub(crate) fn new(storage: Arc<dyn Storage>) -> Self {
-        Self { storage }
-    }
-
-    /// Creates a new log storage with an in-memory backend.
-    #[cfg(test)]
-    pub(crate) fn in_memory() -> Self {
-        use common::storage::in_memory::InMemoryStorage;
-        Self::new(Arc::new(InMemoryStorage::new()))
-    }
-
-    /// Registers storage engine metrics into the given Prometheus registry.
-    #[cfg(feature = "http-server")]
-    pub(crate) fn register_metrics(&self, registry: &mut prometheus_client::registry::Registry) {
-        self.storage.register_metrics(registry);
-    }
-
-    /// Returns a read-only view of this storage.
-    #[cfg(any(test, feature = "http-server"))]
-    pub(crate) fn as_read(&self) -> LogStorageRead {
-        LogStorageRead::new(Arc::clone(&self.storage) as Arc<dyn StorageRead>)
-    }
-
-    /// Closes the underlying storage.
-    pub(crate) async fn close(&self) -> Result<()> {
-        self.storage
-            .close()
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))
-    }
-
-    /// Writes records to storage with options.
-    pub(crate) async fn put_with_options(
-        &self,
-        records: Vec<common::PutRecordOp>,
-        options: common::WriteOptions,
-    ) -> Result<()> {
-        self.storage
-            .put_with_options(records, options)
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))
-    }
-
-    /// Writes a SeqBlock record to storage.
-    #[cfg(test)]
-    pub(crate) async fn write_seq_block(&self, block: &common::SeqBlock) -> Result<()> {
-        use crate::serde::{KEY_VERSION, RecordType};
-        let key = Bytes::from(vec![KEY_VERSION, RecordType::SeqBlock.id()]);
-        let value = block.serialize();
-        self.storage
-            .put(vec![common::Record::new(key, value).into()])
-            .await?;
-        Ok(())
-    }
-
+/// These helpers construct storage records from log domain types (segments,
+/// entries, sequence blocks) and are used by tests to set up storage state
+/// without going through the full write coordinator.
+#[cfg(test)]
+#[async_trait]
+pub(crate) trait LogStorageWrite: Storage {
     /// Writes a segment metadata record to storage.
-    #[cfg(test)]
-    pub(crate) async fn write_segment(&self, segment: &LogSegment) -> Result<()> {
+    async fn write_segment(&self, segment: &LogSegment) -> Result<()> {
         let key = SegmentMetaKey::new(segment.id()).serialize();
         let value = segment.meta().serialize();
-        self.storage
-            .put(vec![common::Record::new(key, value).into()])
+        self.put(vec![common::Record::new(key, value).into()])
             .await?;
         Ok(())
     }
@@ -221,30 +168,35 @@ impl LogStorage {
     ///
     /// This is a low-level API primarily for testing. Production code should
     /// use the higher-level `LogDb::append` method.
-    #[cfg(test)]
-    pub(crate) async fn write_entry(&self, segment: &LogSegment, entry: &LogEntry) -> Result<()> {
+    async fn write_entry(&self, segment: &LogSegment, entry: &LogEntry) -> Result<()> {
         let entry_key = LogEntryKey::new(segment.id(), entry.key.clone(), entry.sequence);
         let record = common::Record {
             key: entry_key.serialize(segment.meta().start_seq),
             value: entry.value.clone(),
         };
-        self.storage.put(vec![record.into()]).await?;
+        self.put(vec![record.into()]).await?;
         Ok(())
     }
 
-    pub(crate) async fn snapshot(&self) -> Result<Arc<dyn StorageSnapshot>> {
-        let snapshot = self
-            .storage
-            .snapshot()
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(snapshot)
-    }
-
-    pub async fn flush(&self) -> Result<()> {
-        self.storage.flush().await?;
+    /// Writes a SeqBlock record to storage.
+    async fn write_seq_block(&self, block: &common::SeqBlock) -> Result<()> {
+        use crate::serde::{KEY_VERSION, RecordType};
+        let key = Bytes::from(vec![KEY_VERSION, RecordType::SeqBlock.id()]);
+        let value = block.serialize();
+        self.put(vec![common::Record::new(key, value).into()])
+            .await?;
         Ok(())
     }
+}
+
+#[cfg(test)]
+impl<T: Storage + ?Sized> LogStorageWrite for T {}
+
+/// Creates an in-memory storage for testing.
+#[cfg(test)]
+pub(crate) fn in_memory_storage() -> Arc<dyn Storage> {
+    use common::storage::in_memory::InMemoryStorage;
+    Arc::new(InMemoryStorage::new())
 }
 
 #[cfg(test)]
@@ -255,17 +207,16 @@ mod tests {
     #[tokio::test]
     async fn should_get_record_when_present() {
         // given
-        let storage = LogStorage::in_memory();
+        let storage = in_memory_storage();
         let key = Bytes::from("test-key");
         let value = Bytes::from("test-value");
         storage
-            .storage
             .put(vec![common::Record::new(key.clone(), value.clone()).into()])
             .await
             .unwrap();
 
         // when
-        let result = storage.as_read().get(key).await.unwrap();
+        let result = storage.get(key).await.unwrap();
 
         // then
         assert!(result.is_some());
@@ -275,10 +226,10 @@ mod tests {
     #[tokio::test]
     async fn should_return_none_when_record_absent() {
         // given
-        let storage = LogStorage::in_memory();
+        let storage = in_memory_storage();
 
         // when
-        let result = storage.as_read().get(Bytes::from("missing")).await.unwrap();
+        let result = storage.get(Bytes::from("missing")).await.unwrap();
 
         // then
         assert!(result.is_none());
@@ -287,7 +238,7 @@ mod tests {
     #[tokio::test]
     async fn should_scan_segments_in_order() {
         // given
-        let storage = LogStorage::in_memory();
+        let storage = in_memory_storage();
         let seg0 = LogSegment::new(0, SegmentMeta::new(0, 100));
         let seg1 = LogSegment::new(1, SegmentMeta::new(100, 200));
         let seg2 = LogSegment::new(2, SegmentMeta::new(200, 300));
@@ -296,7 +247,7 @@ mod tests {
         storage.write_segment(&seg1).await.unwrap();
 
         // when
-        let segments = storage.as_read().scan_segments(0..u32::MAX).await.unwrap();
+        let segments = storage.scan_segments(0..u32::MAX).await.unwrap();
 
         // then
         assert_eq!(segments.len(), 3);
@@ -308,14 +259,14 @@ mod tests {
     #[tokio::test]
     async fn should_scan_segments_with_range() {
         // given
-        let storage = LogStorage::in_memory();
+        let storage = in_memory_storage();
         for i in 0u32..5 {
             let seg = LogSegment::new(i, SegmentMeta::new(i as u64 * 100, i as i64 * 100));
             storage.write_segment(&seg).await.unwrap();
         }
 
         // when
-        let segments = storage.as_read().scan_segments(1..4).await.unwrap();
+        let segments = storage.scan_segments(1..4).await.unwrap();
 
         // then
         assert_eq!(segments.len(), 3);
@@ -327,7 +278,7 @@ mod tests {
     #[tokio::test]
     async fn should_scan_entries_for_key() {
         // given
-        let storage = LogStorage::in_memory();
+        let storage = in_memory_storage();
         let segment = LogSegment::new(0, SegmentMeta::new(0, 100));
         storage.write_segment(&segment).await.unwrap();
 
@@ -343,7 +294,6 @@ mod tests {
 
         // when
         let mut iter = storage
-            .as_read()
             .scan_entries(&segment, &key, 0..u64::MAX)
             .await
             .unwrap();
@@ -362,7 +312,7 @@ mod tests {
     #[tokio::test]
     async fn should_filter_entries_by_sequence_range() {
         // given
-        let storage = LogStorage::in_memory();
+        let storage = in_memory_storage();
         let segment = LogSegment::new(0, SegmentMeta::new(0, 100));
         storage.write_segment(&segment).await.unwrap();
 
@@ -377,11 +327,7 @@ mod tests {
         }
 
         // when - scan only sequences 3..7
-        let mut iter = storage
-            .as_read()
-            .scan_entries(&segment, &key, 3..7)
-            .await
-            .unwrap();
+        let mut iter = storage.scan_entries(&segment, &key, 3..7).await.unwrap();
 
         // then
         let mut entries = Vec::new();
@@ -396,13 +342,12 @@ mod tests {
     #[tokio::test]
     async fn should_return_empty_iterator_for_unknown_key() {
         // given
-        let storage = LogStorage::in_memory();
+        let storage = in_memory_storage();
         let segment = LogSegment::new(0, SegmentMeta::new(0, 100));
         storage.write_segment(&segment).await.unwrap();
 
         // when
         let mut iter = storage
-            .as_read()
             .scan_entries(&segment, &Bytes::from("unknown"), 0..u64::MAX)
             .await
             .unwrap();
@@ -414,7 +359,7 @@ mod tests {
     #[tokio::test]
     async fn should_write_and_read_seq_block() {
         // given
-        let storage = LogStorage::in_memory();
+        let storage = in_memory_storage();
         let block = common::SeqBlock::new(1000, 500);
 
         // when
@@ -423,7 +368,7 @@ mod tests {
         // then
         use crate::serde::{KEY_VERSION, RecordType};
         let key = Bytes::from(vec![KEY_VERSION, RecordType::SeqBlock.id()]);
-        let record = storage.as_read().get(key).await.unwrap().unwrap();
+        let record = storage.get(key).await.unwrap().unwrap();
         let read_block = common::SeqBlock::deserialize(&record.value).unwrap();
         assert_eq!(read_block.base_sequence, 1000);
         assert_eq!(read_block.block_size, 500);
@@ -432,7 +377,7 @@ mod tests {
     #[tokio::test]
     async fn should_put_with_options() {
         // given
-        let storage = LogStorage::in_memory();
+        let storage = in_memory_storage();
         let records = vec![
             common::Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
             common::Record::new(Bytes::from("k2"), Bytes::from("v2")).into(),
@@ -445,32 +390,9 @@ mod tests {
             .unwrap();
 
         // then
-        let r1 = storage.as_read().get(Bytes::from("k1")).await.unwrap();
-        let r2 = storage.as_read().get(Bytes::from("k2")).await.unwrap();
+        let r1 = storage.get(Bytes::from("k1")).await.unwrap();
+        let r2 = storage.get(Bytes::from("k2")).await.unwrap();
         assert_eq!(r1.unwrap().value, Bytes::from("v1"));
         assert_eq!(r2.unwrap().value, Bytes::from("v2"));
-    }
-
-    #[tokio::test]
-    async fn should_clone_log_storage_read() {
-        // given
-        let storage = LogStorage::in_memory();
-        storage
-            .storage
-            .put(vec![
-                common::Record::new(Bytes::from("key"), Bytes::from("value")).into(),
-            ])
-            .await
-            .unwrap();
-
-        let read = storage.as_read();
-
-        // when
-        let cloned = read.clone();
-
-        // then - both should see the same data
-        let r1 = read.get(Bytes::from("key")).await.unwrap();
-        let r2 = cloned.get(Bytes::from("key")).await.unwrap();
-        assert_eq!(r1.unwrap().value, r2.unwrap().value);
     }
 }

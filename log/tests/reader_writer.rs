@@ -222,3 +222,53 @@ async fn flush_guarantees_durability_across_reopen() {
         reader.close().await.expect("Failed to close reader");
     }
 }
+
+#[tokio::test]
+async fn close_without_explicit_flush_guarantees_durability() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let storage = local_storage_config(&temp_dir);
+
+    let key = Bytes::from("implicit-flush-key");
+
+    // Write data and close without calling flush()
+    {
+        let config = Config {
+            storage: storage.clone(),
+            ..Default::default()
+        };
+        let writer = LogDb::open(config).await.expect("Failed to open writer");
+
+        writer
+            .try_append(vec![Record {
+                key: key.clone(),
+                value: Bytes::from("survived"),
+            }])
+            .await
+            .expect("Failed to append");
+
+        writer.close().await.expect("Failed to close writer");
+    }
+
+    // Reopen and verify the record survived
+    {
+        let config = Config {
+            storage: storage.clone(),
+            ..Default::default()
+        };
+        let reader = LogDb::open(config).await.expect("Failed to reopen");
+
+        let mut iter = reader.scan(key, ..).await.expect("Failed to scan");
+
+        let entry = iter
+            .next()
+            .await
+            .expect("Failed to get next")
+            .expect("Expected entry");
+        assert_eq!(entry.sequence, 0);
+        assert_eq!(entry.value, Bytes::from("survived"));
+
+        assert!(iter.next().await.expect("Failed to get next").is_none());
+
+        reader.close().await.expect("Failed to close reader");
+    }
+}
