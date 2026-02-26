@@ -280,11 +280,13 @@ impl From<Params> for Dataset {
             .to_string();
         let default = lookup_dataset(&name).unwrap_or_else(|| panic!("unknown dataset: {}", name));
 
-        let query_pruning_factor = p.get_parse("query_pruning_factor")
+        let query_pruning_factor = p
+            .get_parse("query_pruning_factor")
             .ok()
             .or(default.query_pruning_factor)
             .filter(|f| *f > 0.0);
-        let block_cache_bytes = p.get_parse::<i64>("block_cache_bytes")
+        let block_cache_bytes = p
+            .get_parse::<i64>("block_cache_bytes")
             .ok()
             .or(default.block_cache_bytes.map(|v| v as i64))
             .filter(|b| *b > 0)
