@@ -280,6 +280,16 @@ impl From<Params> for Dataset {
             .to_string();
         let default = lookup_dataset(&name).unwrap_or_else(|| panic!("unknown dataset: {}", name));
 
+        let query_pruning_factor = p.get_parse("query_pruning_factor")
+            .ok()
+            .or(default.query_pruning_factor)
+            .filter(|f| *f > 0.0);
+        let block_cache_bytes = p.get_parse::<i64>("block_cache_bytes")
+            .ok()
+            .or(default.block_cache_bytes.map(|v| v as i64))
+            .filter(|b| *b > 0)
+            .map(|b| b as u64);
+
         Dataset {
             name: default.name,
             dimensions: p.get_parse("dimensions").unwrap_or(default.dimensions),
@@ -296,17 +306,11 @@ impl From<Params> for Dataset {
             merge_threshold: p
                 .get_parse("merge_threshold")
                 .unwrap_or(default.merge_threshold),
-            query_pruning_factor: p
-                .get_parse("query_pruning_factor")
-                .ok()
-                .or(default.query_pruning_factor),
+            query_pruning_factor,
             nprobe: p.get_parse("nprobe").unwrap_or(default.nprobe),
             num_queries: p.get_parse("num_queries").unwrap_or(default.num_queries),
             format: p.get("format").map(str_to_format).unwrap_or(default.format),
-            block_cache_bytes: p
-                .get_parse("block_cache_bytes")
-                .ok()
-                .or(default.block_cache_bytes),
+            block_cache_bytes,
             max_vectors: p.get_parse("max_vectors").ok().or(default.max_vectors),
             data_dir: p
                 .get("data_dir")
