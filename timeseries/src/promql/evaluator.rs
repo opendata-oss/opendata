@@ -3,7 +3,6 @@ use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::Sample;
@@ -11,13 +10,14 @@ use crate::model::SeriesFingerprint;
 use crate::model::{Label, SeriesId, TimeBucket};
 use crate::promql::functions::FunctionRegistry;
 use crate::promql::selector::evaluate_selector_with_reader;
+use crate::promql::timestamp::Timestamp;
 use crate::query::QueryReader;
 use crate::util::Result;
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::*;
 use promql_parser::parser::{
-    AggregateExpr, BinaryExpr, Call, EvalStmt, Expr, LabelModifier, MatrixSelector,
-    VectorMatchCardinality, VectorSelector,
+    AggregateExpr, AtModifier, BinaryExpr, Call, EvalStmt, Expr, LabelModifier, MatrixSelector,
+    Offset, SubqueryExpr, VectorMatchCardinality, VectorSelector,
 };
 
 #[derive(Debug)]
@@ -382,16 +382,25 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 stmt.start, stmt.end
             )));
         }
+
+        // Convert SystemTime to Timestamp at entry point
+        let query_start = Timestamp::from(stmt.start);
+        let query_end = Timestamp::from(stmt.end);
+        let evaluation_ts = query_end; // using end follows the "as-of" convention
+        let interval_ms = stmt.interval.as_millis() as i64;
+        let lookback_delta_ms = stmt.lookback_delta.as_millis() as i64;
+
         let mut result = self
             .evaluate_expr(
                 &stmt.expr,
-                stmt.start,
-                stmt.end,
-                stmt.end, // evaluation_ts: using end follows the "as-of" convention (evaluate at the effective end of the interval)
-                stmt.interval,
-                stmt.lookback_delta,
+                query_start,
+                query_end,
+                evaluation_ts,
+                interval_ms,
+                lookback_delta_ms,
             )
             .await?;
+
         // Deferred __name__ cleanup (mirrors Prometheus cleanupMetricLabels)
         if let ExprResult::InstantVector(ref mut samples) = result {
             for sample in samples.iter_mut() {
@@ -400,6 +409,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 }
             }
         }
+
         Ok(result)
     }
 
@@ -408,11 +418,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     fn evaluate_expr<'a>(
         &'a mut self,
         expr: &'a Expr,
-        query_start: SystemTime,
-        query_end: SystemTime,
-        evaluation_ts: SystemTime,
-        interval: Duration,
-        lookback_delta: Duration,
+        query_start: Timestamp,
+        query_end: Timestamp,
+        evaluation_ts: Timestamp,
+        interval_ms: i64,
+        lookback_delta_ms: i64,
     ) -> Pin<Box<dyn Future<Output = EvalResult<ExprResult>> + Send + 'a>> {
         match expr {
             Expr::Aggregate(aggregate) => {
@@ -421,8 +431,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     query_start,
                     query_end,
                     evaluation_ts,
-                    interval,
-                    lookback_delta,
+                    interval_ms,
+                    lookback_delta_ms,
                 );
                 Box::pin(fut)
             }
@@ -435,8 +445,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     query_start,
                     query_end,
                     evaluation_ts,
-                    interval,
-                    lookback_delta,
+                    interval_ms,
+                    lookback_delta_ms,
                 );
                 Box::pin(fut)
             }
@@ -446,13 +456,21 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     query_start,
                     query_end,
                     evaluation_ts,
-                    interval,
-                    lookback_delta,
+                    interval_ms,
+                    lookback_delta_ms,
                 );
                 Box::pin(fut)
             }
-            Expr::Subquery(_q) => {
-                todo!()
+            Expr::Subquery(q) => {
+                let fut = self.evaluate_subquery(
+                    q,
+                    query_start,
+                    query_end,
+                    evaluation_ts,
+                    interval_ms,
+                    lookback_delta_ms,
+                );
+                Box::pin(fut)
             }
             Expr::NumberLiteral(l) => {
                 let val = l.val;
@@ -473,7 +491,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     query_start,
                     query_end,
                     evaluation_ts,
-                    lookback_delta,
+                    lookback_delta_ms,
                 );
                 Box::pin(fut)
             }
@@ -492,8 +510,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     query_start,
                     query_end,
                     evaluation_ts,
-                    interval,
-                    lookback_delta,
+                    interval_ms,
+                    lookback_delta_ms,
                 );
                 Box::pin(fut)
             }
@@ -506,16 +524,21 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     async fn evaluate_matrix_selector(
         &mut self,
         matrix_selector: MatrixSelector,
-        query_start: SystemTime,
-        query_end: SystemTime,
-        evaluation_ts: SystemTime,
+        query_start: Timestamp,
+        query_end: Timestamp,
+        evaluation_ts: Timestamp,
     ) -> EvalResult<ExprResult> {
         let vector_selector = &matrix_selector.vs;
         let range = matrix_selector.range;
 
         // Apply time modifiers to evaluation_ts
-        let adjusted_eval_ts =
-            self.apply_time_modifiers(vector_selector, query_start, query_end, evaluation_ts)?;
+        let adjusted_eval_ts = self.apply_time_modifiers(
+            vector_selector.at.as_ref(),
+            vector_selector.offset.as_ref(),
+            query_start,
+            query_end,
+            evaluation_ts,
+        )?;
 
         // Example where this matters:
         //   sum_over_time(metric[100s] @ 100 offset 50s)
@@ -525,25 +548,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         // NOTE: Prometheus represents timestamps internally as int64 milliseconds
         // and allows negative timestamps (times before UNIX_EPOCH).
         // See: https://github.com/prometheus/prometheus/blob/main/model/timestamp/timestamp.go
-        //
-        // Rust's SystemTime cannot represent times before UNIX_EPOCH. Subtracting
-        // a range may therefore underflow. To avoid panic, we clamp to UNIX_EPOCH.
-        //
-        // This is a semantic deviation from Prometheus. In practice it is harmless
-        // unless data exists before UNIX_EPOCH.
-        //
-        // TODO: Replace SystemTime with i64 millisecond timestamps across the
-        // evaluator to achieve full PromQL time semantics and remove this clamp.
-        let start = adjusted_eval_ts.checked_sub(range).unwrap_or(UNIX_EPOCH);
-
-        let end_ms = adjusted_eval_ts
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        let start_ms = start
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let end_ms = adjusted_eval_ts.as_millis();
+        let start_ms = end_ms - (range.as_millis() as i64);
 
         // order buckets in chronological order
         let mut buckets = self.reader.list_buckets().await?;
@@ -608,23 +614,133 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         Ok(ExprResult::RangeVector(range_vector))
     }
 
+    async fn evaluate_subquery(
+        &mut self,
+        subquery: &SubqueryExpr,
+        query_start: Timestamp,
+        query_end: Timestamp,
+        evaluation_ts: Timestamp,
+        interval_ms: i64,
+        lookback_delta_ms: i64,
+    ) -> EvalResult<ExprResult> {
+        let adjusted_eval_ts = self.apply_time_modifiers(
+            subquery.at.as_ref(),
+            subquery.offset.as_ref(),
+            query_start,
+            query_end,
+            evaluation_ts,
+        )?;
+
+        // Calculate subquery time range: [adjusted_eval_ts - range, adjusted_eval_ts]
+        let subquery_end_ms = adjusted_eval_ts.as_millis();
+        let range_ms = subquery.range.as_millis() as i64;
+        let subquery_start_ms = subquery_end_ms - range_ms;
+
+        // Subquery step resolution fallback per PromQL spec:
+        // "<resolution> is optional. Default is the global evaluation interval."
+        // See: https://prometheus.io/docs/prometheus/latest/querying/basics/#subquery
+        let step_ms = if let Some(s) = subquery.step {
+            s.as_millis() as i64
+        } else if interval_ms > 0 {
+            interval_ms
+        } else {
+            // See: https://github.com/prometheus/prometheus/blob/main/config/config.go#L169
+            // DefaultGlobalConfig.EvaluationInterval = 1 * time.Minute
+            60_000
+        };
+
+        // Guard against invalid step
+        if step_ms <= 0 {
+            return Err(EvaluationError::InternalError(
+                "subquery step must be > 0".to_string(),
+            ));
+        }
+
+        // Align start time to step interval to ensure consistent evaluation points.
+        // Prometheus: newEv.startTimestamp = newEv.interval * ((ev.startTimestamp - offset - range) / newEv.interval)
+        // Go's division truncates toward zero, but we need floor division for negative timestamps.
+        // Example: -41ms / 10ms
+        //   Go (truncate): -41 / 10 = -4, then -4 * 10 = -40ms (wrong for negatives)
+        //   Rust div_euclid (floor): -41 / 10 = -5, then -5 * 10 = -50ms (correct)
+        // This ensures steps align consistently regardless of whether timestamps are negative.
+        let div = subquery_start_ms.div_euclid(step_ms);
+        let mut aligned_start_ms = div * step_ms;
+        if aligned_start_ms <= subquery_start_ms {
+            aligned_start_ms += step_ms;
+        }
+
+        // Evaluate the inner expression at each step within the subquery range
+        let mut series_map: HashMap<Vec<Label>, Vec<Sample>> = HashMap::new();
+
+        for current_time_ms in (aligned_start_ms..=subquery_end_ms).step_by(step_ms as usize) {
+            let current_time = Timestamp::from_millis(current_time_ms);
+
+            let result = self
+                .evaluate_expr(
+                    &subquery.expr,
+                    query_start,
+                    query_end,
+                    current_time,
+                    step_ms,
+                    lookback_delta_ms,
+                )
+                .await?;
+
+            // PromQL requires subquery inner expression to evaluate to an instant vector.
+            // Enforce this invariant at runtime.
+            let ExprResult::InstantVector(samples) = result else {
+                return Err(EvaluationError::InternalError(
+                    "subquery inner expression must return instant vector".to_string(),
+                ));
+            };
+
+            for sample in samples {
+                let mut labels_key: Vec<Label> = sample
+                    .labels
+                    .iter()
+                    .map(|(k, v)| Label {
+                        name: k.clone(),
+                        value: v.clone(),
+                    })
+                    .collect();
+                labels_key.sort();
+
+                let values = series_map.entry(labels_key).or_default();
+                values.push(Sample {
+                    timestamp_ms: current_time_ms,
+                    value: sample.value,
+                });
+            }
+        }
+
+        let mut range_vector = Vec::new();
+        for (labels, values) in series_map {
+            let labels = self.labels_to_hashmap(&labels);
+            range_vector.push(EvalSamples { values, labels });
+        }
+
+        Ok(ExprResult::RangeVector(range_vector))
+    }
+
     async fn evaluate_vector_selector(
         &mut self,
         vector_selector: &VectorSelector,
-        query_start: SystemTime,
-        query_end: SystemTime,
-        evaluation_ts: SystemTime,
-        lookback_delta: Duration,
+        query_start: Timestamp,
+        query_end: Timestamp,
+        evaluation_ts: Timestamp,
+        lookback_delta_ms: i64,
     ) -> EvalResult<ExprResult> {
         // Apply time modifiers (offset and @)
-        let adjusted_eval_ts =
-            self.apply_time_modifiers(vector_selector, query_start, query_end, evaluation_ts)?;
+        let adjusted_eval_ts = self.apply_time_modifiers(
+            vector_selector.at.as_ref(),
+            vector_selector.offset.as_ref(),
+            query_start,
+            query_end,
+            evaluation_ts,
+        )?;
 
-        let end_ms = adjusted_eval_ts
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        let start_ms = end_ms - (lookback_delta.as_millis() as i64);
+        let end_ms = adjusted_eval_ts.as_millis();
+        let start_ms = end_ms - lookback_delta_ms;
 
         // Get all buckets and sort by start time in reverse order (newest first)
         let mut buckets = self.reader.list_buckets().await?;
@@ -711,47 +827,41 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     /// See: <https://prometheus.io/docs/prometheus/latest/querying/basics/#offset-modifier>
     fn apply_time_modifiers(
         &self,
-        vector_selector: &VectorSelector,
-        query_start: SystemTime,
-        query_end: SystemTime,
-        evaluation_ts: SystemTime,
-    ) -> EvalResult<SystemTime> {
-        use promql_parser::parser::{AtModifier, Offset};
-
-        let mut adjusted_time = evaluation_ts;
-
-        // Apply @ modifier first (sets absolute time)
-        if let Some(at_modifier) = &vector_selector.at {
-            adjusted_time = match at_modifier {
-                AtModifier::At(timestamp) => *timestamp,
-                AtModifier::Start => query_start,
-                AtModifier::End => query_end,
-            };
-        }
+        at: Option<&AtModifier>,
+        offset: Option<&Offset>,
+        query_start: Timestamp,
+        query_end: Timestamp,
+        evaluation_ts: Timestamp,
+    ) -> EvalResult<Timestamp> {
+        let mut adjusted_time_ms = if let Some(at_modifier) = at {
+            match at_modifier {
+                AtModifier::At(timestamp) => Timestamp::from(*timestamp).as_millis(),
+                AtModifier::Start => query_start.as_millis(),
+                AtModifier::End => query_end.as_millis(),
+            }
+        } else {
+            evaluation_ts.as_millis()
+        };
 
         // Apply offset modifier (relative adjustment)
-        if let Some(offset) = &vector_selector.offset {
-            adjusted_time = match offset {
+        if let Some(offset) = offset {
+            adjusted_time_ms = match offset {
                 Offset::Pos(duration) => {
                     // Positive offset: look back in time (subtract duration).
                     // This matches Prometheus semantics: `http_requests_total offset 5m`
                     // queries data from 5 minutes ago.
-                    adjusted_time.checked_sub(*duration).ok_or_else(|| {
-                        EvaluationError::InternalError("offset underflow".to_string())
-                    })?
+                    adjusted_time_ms - (duration.as_millis() as i64)
                 }
                 Offset::Neg(duration) => {
                     // Negative offset: look forward in time (add duration).
                     // This matches Prometheus semantics: `http_requests_total offset -1w`
                     // queries data from 1 week in the future.
-                    adjusted_time.checked_add(*duration).ok_or_else(|| {
-                        EvaluationError::InternalError("offset overflow".to_string())
-                    })?
+                    adjusted_time_ms + (duration.as_millis() as i64)
                 }
             };
         }
 
-        Ok(adjusted_time)
+        Ok(Timestamp::from_millis(adjusted_time_ms))
     }
 
     /// Convert labels to HashMap
@@ -779,11 +889,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     async fn evaluate_call(
         &mut self,
         call: &Call,
-        query_start: SystemTime,
-        query_end: SystemTime,
-        evaluation_ts: SystemTime,
-        interval: Duration,
-        lookback_delta: Duration,
+        query_start: Timestamp,
+        query_end: Timestamp,
+        evaluation_ts: Timestamp,
+        interval_ms: i64,
+        lookback_delta_ms: i64,
     ) -> EvalResult<ExprResult> {
         if call.args.args.len() != 1 {
             return Err(EvaluationError::InternalError(format!(
@@ -811,18 +921,19 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 query_start,
                 query_end,
                 evaluation_ts,
-                interval,
-                lookback_delta,
+                interval_ms,
+                lookback_delta_ms,
             )
             .await?;
 
         let registry = FunctionRegistry::new();
 
-        // Calculate evaluation timestamp in milliseconds
-        let eval_timestamp_ms = evaluation_ts
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        // Handle negative timestamps from subquery steps that go before UNIX_EPOCH.
+        // Example: sum_over_time(metric[100s:1s] @ 50) at 25s
+        //   - Subquery range: [50s - 100s, 50s] = [-50s, 50s]
+        //   - Steps include: -50s, -49s, ..., 0s, 1s, ..., 50s
+        //   - Function is called with evaluation_ts = -50s (negative!)
+        let eval_timestamp_ms = evaluation_ts.as_millis();
 
         match arg_result {
             ExprResult::InstantVector(samples) => {
@@ -858,11 +969,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     async fn eval_single_argument(
         &mut self,
         call: &Call,
-        query_start: SystemTime,
-        query_end: SystemTime,
-        evaluation_ts: SystemTime,
-        interval: Duration,
-        lookback_delta: Duration,
+        query_start: Timestamp,
+        query_end: Timestamp,
+        evaluation_ts: Timestamp,
+        interval_ms: i64,
+        lookback_delta_ms: i64,
     ) -> EvalResult<Vec<EvalSample>> {
         if call.args.args.len() != 1 {
             return Err(EvaluationError::InternalError(format!(
@@ -878,8 +989,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 query_start,
                 query_end,
                 evaluation_ts,
-                interval,
-                lookback_delta,
+                interval_ms,
+                lookback_delta_ms,
             )
             .await?
         {
@@ -897,11 +1008,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     async fn evaluate_binary_expr(
         &mut self,
         expr: &BinaryExpr,
-        query_start: SystemTime,
-        query_end: SystemTime,
-        evaluation_ts: SystemTime,
-        interval: Duration,
-        lookback_delta: Duration,
+        query_start: Timestamp,
+        query_end: Timestamp,
+        evaluation_ts: Timestamp,
+        interval_ms: i64,
+        lookback_delta_ms: i64,
     ) -> EvalResult<ExprResult> {
         let lhs = expr.lhs.as_ref();
         let rhs = expr.rhs.as_ref();
@@ -913,8 +1024,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 query_start,
                 query_end,
                 evaluation_ts,
-                interval,
-                lookback_delta,
+                interval_ms,
+                lookback_delta_ms,
             )
             .await?;
         let right_result = self
@@ -923,8 +1034,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 query_start,
                 query_end,
                 evaluation_ts,
-                interval,
-                lookback_delta,
+                interval_ms,
+                lookback_delta_ms,
             )
             .await?;
 
@@ -1192,11 +1303,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     async fn evaluate_aggregate(
         &mut self,
         aggregate: &AggregateExpr,
-        query_start: SystemTime,
-        query_end: SystemTime,
-        evaluation_ts: SystemTime,
-        interval: Duration,
-        lookback_delta: Duration,
+        query_start: Timestamp,
+        query_end: Timestamp,
+        evaluation_ts: Timestamp,
+        interval_ms: i64,
+        lookback_delta_ms: i64,
     ) -> EvalResult<ExprResult> {
         // Evaluate the inner expression to get all samples
         let result = self
@@ -1205,8 +1316,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 query_start,
                 query_end,
                 evaluation_ts,
-                interval,
-                lookback_delta,
+                interval_ms,
+                lookback_delta_ms,
             )
             .await?;
 
@@ -1249,10 +1360,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         }
 
         // Use the evaluation_ts time as the timestamp for the aggregated result
-        let timestamp_ms = evaluation_ts
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let timestamp_ms = evaluation_ts.as_millis();
 
         // Aggregate each group
         let mut result_samples = Vec::new();
@@ -2474,10 +2582,10 @@ mod tests {
         let result = evaluator
             .evaluate_vector_selector(
                 &selector,
-                query_time,
-                query_time,
-                query_time,
-                lookback_delta,
+                Timestamp::from(query_time),
+                Timestamp::from(query_time),
+                Timestamp::from(query_time),
+                lookback_delta.as_millis() as i64,
             )
             .await
             .unwrap();
@@ -2667,7 +2775,12 @@ mod tests {
             range,
         };
         let result = evaluator
-            .evaluate_matrix_selector(matrix_selector, query_time, query_time, query_time)
+            .evaluate_matrix_selector(
+                matrix_selector,
+                Timestamp::from(query_time),
+                Timestamp::from(query_time),
+                Timestamp::from(query_time),
+            )
             .await
             .unwrap();
 
@@ -2813,11 +2926,11 @@ mod tests {
         let pipeline_result = evaluator
             .evaluate_expr(
                 &expr,
-                query_time - Duration::from_secs(60), // query_start
-                query_time,                           // query_end
-                query_time, // evaluation_ts (for instant queries, equals query_end)
-                Duration::from_secs(15), // 15s step
-                Duration::from_secs(5), // 5s lookback
+                Timestamp::from(query_time - Duration::from_secs(60)), // query_start
+                Timestamp::from(query_time),                           // query_end
+                Timestamp::from(query_time), // evaluation_ts (for instant queries, equals query_end)
+                15_000,                      // 15s step
+                5_000,                       // 5s lookback
             )
             .await
             .unwrap();
@@ -2880,10 +2993,10 @@ mod tests {
         let result = evaluator
             .evaluate_vector_selector(
                 &selector,
-                query_time,
-                query_time,
-                query_time,
-                Duration::from_secs(300),
+                Timestamp::from(query_time),
+                Timestamp::from(query_time),
+                Timestamp::from(query_time),
+                300_000,
             )
             .await
             .unwrap();
@@ -2957,10 +3070,10 @@ mod tests {
         let result = evaluator
             .evaluate_vector_selector(
                 &selector,
-                query_time,
-                query_time,
-                query_time,
-                Duration::from_secs(300),
+                Timestamp::from(query_time),
+                Timestamp::from(query_time),
+                Timestamp::from(query_time),
+                300_000,
             )
             .await
             .unwrap();
@@ -3035,10 +3148,10 @@ mod tests {
         let result = evaluator
             .evaluate_vector_selector(
                 &selector,
-                query_time,
-                query_time,
-                query_time,
-                Duration::from_secs(300),
+                Timestamp::from(query_time),
+                Timestamp::from(query_time),
+                Timestamp::from(query_time),
+                300_000,
             )
             .await
             .unwrap();
@@ -3106,7 +3219,12 @@ mod tests {
 
         let query_time = UNIX_EPOCH + Duration::from_millis(6_300_000);
         let result = evaluator
-            .evaluate_matrix_selector(matrix_selector, query_time, query_time, query_time)
+            .evaluate_matrix_selector(
+                matrix_selector,
+                Timestamp::from(query_time),
+                Timestamp::from(query_time),
+                Timestamp::from(query_time),
+            )
             .await
             .unwrap();
 
@@ -3201,10 +3319,10 @@ mod tests {
         let result_start = evaluator
             .evaluate_vector_selector(
                 &selector_start,
-                query_start,
-                query_end,
-                query_end,
-                Duration::from_secs(300),
+                Timestamp::from(query_start),
+                Timestamp::from(query_end),
+                Timestamp::from(query_end),
+                300_000,
             )
             .await
             .unwrap();
@@ -3229,10 +3347,10 @@ mod tests {
         let result_end = evaluator
             .evaluate_vector_selector(
                 &selector_end,
-                query_start,
-                query_end,
-                query_end,
-                Duration::from_secs(300),
+                Timestamp::from(query_start),
+                Timestamp::from(query_end),
+                Timestamp::from(query_end),
+                300_000,
             )
             .await
             .unwrap();
@@ -3289,10 +3407,10 @@ mod tests {
         let result = evaluator
             .evaluate_vector_selector(
                 &selector,
-                query_time,
-                query_time,
-                query_time,
-                Duration::from_secs(300),
+                Timestamp::from(query_time),
+                Timestamp::from(query_time),
+                Timestamp::from(query_time),
+                300_000,
             )
             .await
             .unwrap();
@@ -3354,10 +3472,10 @@ mod tests {
         let result = evaluator
             .evaluate_vector_selector(
                 &selector,
-                query_time,
-                query_time,
-                query_time,
-                Duration::from_secs(300),
+                Timestamp::from(query_time),
+                Timestamp::from(query_time),
+                Timestamp::from(query_time),
+                300_000,
             )
             .await
             .unwrap();
@@ -3500,6 +3618,95 @@ mod tests {
             samples.is_empty(),
             "No matches expected, got {} samples",
             samples.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn should_handle_subquery_step_fallback_in_instant_context() {
+        use promql_parser::parser::SubqueryExpr;
+
+        // given: data at 0s and 10s
+        let bucket = TimeBucket::hour(0);
+        let mut builder = MockQueryReaderBuilder::new(bucket);
+        builder.add_sample(
+            vec![Label {
+                name: "__name__".to_string(),
+                value: "metric".to_string(),
+            }],
+            MetricType::Gauge,
+            Sample {
+                timestamp_ms: 0,
+                value: 1.0,
+            },
+        );
+        builder.add_sample(
+            vec![Label {
+                name: "__name__".to_string(),
+                value: "metric".to_string(),
+            }],
+            MetricType::Gauge,
+            Sample {
+                timestamp_ms: 10000,
+                value: 2.0,
+            },
+        );
+
+        let reader = builder.build();
+        let mut evaluator = Evaluator::new(&reader);
+
+        // when: subquery with no step in instant query context (interval = 0)
+        let subquery = SubqueryExpr {
+            expr: Box::new(promql_parser::parser::Expr::VectorSelector(
+                promql_parser::parser::VectorSelector {
+                    name: Some("metric".to_string()),
+                    matchers: promql_parser::label::Matchers::empty(),
+                    offset: None,
+                    at: None,
+                },
+            )),
+            range: Duration::from_secs(50),
+            step: None, // No explicit step
+            offset: None,
+            at: None,
+        };
+
+        let eval_time = UNIX_EPOCH + Duration::from_secs(10);
+        let result = evaluator
+            .evaluate_subquery(
+                &subquery,
+                Timestamp::from(eval_time),
+                Timestamp::from(eval_time),
+                Timestamp::from(eval_time),
+                0, // instant query context
+                300_000,
+            )
+            .await;
+
+        // then: should not panic or infinite loop, should use fallback step
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn should_align_negative_timestamps_correctly() {
+        // Test floor division alignment for negative timestamps
+        let subquery_start_ms = -41i64;
+        let step_ms = 10i64;
+
+        // Using regular division (incorrect)
+        let wrong_div = subquery_start_ms / step_ms; // -4 (truncates toward zero)
+        let wrong_aligned = wrong_div * step_ms; // -40
+
+        // Using div_euclid (correct floor division)
+        let correct_div = subquery_start_ms.div_euclid(step_ms); // -5 (floor)
+        let correct_aligned = correct_div * step_ms; // -50
+
+        assert_eq!(wrong_aligned, -40, "Regular division gives -40");
+        assert_eq!(correct_aligned, -50, "Floor division gives -50");
+
+        // Prometheus expects floor division behavior
+        assert_ne!(
+            wrong_aligned, correct_aligned,
+            "Regular division != floor division for negatives"
         );
     }
 }

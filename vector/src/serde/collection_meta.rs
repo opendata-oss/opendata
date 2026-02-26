@@ -50,7 +50,7 @@ use bytes::{Bytes, BytesMut};
 /// - **L2**: Euclidean distance. Lower values = more similar. Best for normalized vectors.
 /// - **Cosine**: Cosine similarity. Higher values = more similar. Automatically normalizes.
 /// - **DotProduct**: Dot product. Higher values = more similar. Fastest but requires normalized vectors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum DistanceMetric {
     /// Euclidean (L2) distance: sqrt(sum((a[i] - b[i])²))

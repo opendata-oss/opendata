@@ -75,6 +75,7 @@ impl Parser {
         let mut commands = Vec::new();
         let lines: Vec<&str> = input.lines().collect();
         let mut i = 0;
+        let mut ignoring = false;
 
         while i < lines.len() {
             let line = lines[i].trim();
@@ -85,14 +86,27 @@ impl Parser {
                 continue;
             }
 
+            // Check for ignore/resume first
+            if line == "ignore" {
+                commands.push(Command::Ignore(IgnoreCmd));
+                ignoring = true;
+                continue;
+            } else if line == "resume" {
+                commands.push(Command::Resume(ResumeCmd));
+                ignoring = false;
+                continue;
+            } else if line == "clear" {
+                commands.push(Command::Clear(ClearCmd));
+                continue;
+            }
+
+            // Skip parsing other commands when ignoring
+            if ignoring {
+                continue;
+            }
+
             // Try each parser dispatcher in order
-            if let Some(cmd) = Self::try_parse_clear(line) {
-                commands.push(cmd);
-            } else if let Some(cmd) = Self::try_parse_ignore(line) {
-                commands.push(cmd);
-            } else if let Some(cmd) = Self::try_parse_resume(line) {
-                commands.push(cmd);
-            } else if let Some(cmd) = Self::try_parse_load(line, &lines, &mut i)? {
+            if let Some(cmd) = Self::try_parse_load(line, &lines, &mut i)? {
                 commands.push(cmd);
             } else if let Some(cmd) = Self::try_parse_eval_instant(line, &lines, &mut i)? {
                 commands.push(cmd);
@@ -102,33 +116,6 @@ impl Parser {
         }
 
         Ok(commands)
-    }
-
-    /// Try to parse "clear" command
-    fn try_parse_clear(line: &str) -> Option<Command> {
-        if line == "clear" {
-            Some(Command::Clear(ClearCmd))
-        } else {
-            None
-        }
-    }
-
-    /// Try to parse "ignore" command
-    fn try_parse_ignore(line: &str) -> Option<Command> {
-        if line == "ignore" {
-            Some(Command::Ignore(IgnoreCmd))
-        } else {
-            None
-        }
-    }
-
-    /// Try to parse "resume" command
-    fn try_parse_resume(line: &str) -> Option<Command> {
-        if line == "resume" {
-            Some(Command::Resume(ResumeCmd))
-        } else {
-            None
-        }
     }
 
     /// Try to parse "load" command (with indented series lines)
@@ -191,6 +178,12 @@ impl Parser {
 
             let trimmed = next_line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
+                *i += 1;
+                continue;
+            }
+
+            // Skip expect directives (not yet implemented)
+            if trimmed.starts_with("expect ") {
                 *i += 1;
                 continue;
             }
@@ -448,7 +441,12 @@ fn parse_expected(line: &str) -> Result<ExpectedSample, String> {
 fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
 
-    // Try suffix-based parsing (strict: requires units)
+    // Try using promql_parser's duration parser which handles compound durations like "5m59s"
+    if let Ok(duration) = promql_parser::util::parse_duration(s) {
+        return Ok(duration);
+    }
+
+    // Fall back to suffix-based parsing (strict: requires units)
     if let Some(ms) = s.strip_suffix("ms") {
         ms.parse::<u64>()
             .map(Duration::from_millis)

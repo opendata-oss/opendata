@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use common::StorageConfig;
+use serde::{Deserialize, Serialize};
 
 // Re-export types from serde layer
 pub use crate::serde::FieldType;
@@ -175,7 +176,7 @@ impl From<crate::serde::FieldValue> for AttributeValue {
 }
 
 /// Configuration for a VectorDb instance.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Storage backend configuration.
     ///
@@ -192,7 +193,8 @@ pub struct Config {
     /// Distance metric for similarity computation (immutable after creation).
     pub distance_metric: DistanceMetric,
 
-    /// How often to flush data to durable storage.
+    /// How often to flush data to durable storage (in seconds).
+    #[serde(with = "duration_secs")]
     pub flush_interval: Duration,
 
     /// Number of vectors in a centroid's posting list that triggers a split.
@@ -218,6 +220,17 @@ pub struct Config {
     /// Target number of centroids per chunk.
     pub chunk_target: u16,
 
+    /// Query-aware dynamic pruning epsilon (ε₂ from SPANN paper).
+    ///
+    /// When set, a posting list is searched only if its centroid's distance
+    /// to the query satisfies `dist(q, c) <= (1 + epsilon) * dist(q, closest)`.
+    /// This reduces query latency by skipping distant posting lists while
+    /// preserving recall.
+    ///
+    /// Typical values: 0.1 to 0.5. `None` disables pruning (all nprobe
+    /// posting lists are searched).
+    pub query_pruning_factor: Option<f32>,
+
     /// Metadata field schema.
     ///
     /// Defines the expected attribute names and types. Writes with unknown
@@ -240,13 +253,14 @@ impl Default for Config {
             rebalance_backpressure_resume_threshold: 8,
             max_rebalance_tasks: 8,
             chunk_target: 4096,
+            query_pruning_factor: None,
             metadata_fields: Vec::new(),
         }
     }
 }
 
 /// Metadata field specification for schema definition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataFieldSpec {
     /// Field name.
     pub name: String,
@@ -292,6 +306,21 @@ pub(crate) fn attributes_to_map(attributes: &[Attribute]) -> HashMap<String, Att
         .iter()
         .map(|attr| (attr.name.clone(), attr.value.clone()))
         .collect()
+}
+
+mod duration_secs {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(d.as_secs())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        let secs = u64::deserialize(d)?;
+        Ok(Duration::from_secs(secs))
+    }
 }
 
 #[cfg(test)]
