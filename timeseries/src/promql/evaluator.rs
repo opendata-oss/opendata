@@ -9,7 +9,7 @@ use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::Sample;
 use crate::model::SeriesFingerprint;
 use crate::model::{Label, SeriesId, TimeBucket};
-use crate::promql::functions::FunctionRegistry;
+use crate::promql::functions::{FunctionRegistry, PromQLArg};
 use crate::promql::selector::evaluate_selector_with_reader;
 use crate::query::QueryReader;
 use crate::util::Result;
@@ -815,7 +815,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             ExprResult::InstantVector(samples) => {
                 // Try instant vector function first
                 if let Some(func) = registry.get(call.func.name) {
-                    let result = func.apply(samples, eval_timestamp_ms)?;
+                    let result =
+                        func.apply(PromQLArg::InstantVector(samples), eval_timestamp_ms)?;
                     Ok(ExprResult::InstantVector(result))
                 } else {
                     Err(EvaluationError::InternalError(format!(
@@ -837,8 +838,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 }
             }
             ExprResult::Scalar(scalar) => {
-                if let Some(func) = registry.get_scalar_function(call.func.name) {
-                    let result = func.apply(scalar, eval_timestamp_ms)?;
+                if let Some(func) = registry.get(call.func.name) {
+                    let result = func.apply(PromQLArg::Scalar(scalar), eval_timestamp_ms)?;
                     Ok(ExprResult::InstantVector(result))
                 } else {
                     Err(EvaluationError::InternalError(format!(
