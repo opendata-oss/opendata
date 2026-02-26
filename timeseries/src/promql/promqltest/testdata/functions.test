@@ -1,0 +1,22 @@
+# Tests for PromQL scalar function arguments
+
+eval instant at 0s vector(1)
+	{} 1
+
+eval instant at 0s vector(0)
+	{} 0
+
+eval instant at 0s vector(-1)
+	{} -1
+
+eval instant at 0s vector(1 - 1)
+	{} 0
+
+eval instant at 0s vector(3 * 4)
+	{} 12
+
+eval instant at 0s vector(20 / 5)
+	{} 4
+
+eval instant at 0s vector(2 + 2)
+	{} 4
