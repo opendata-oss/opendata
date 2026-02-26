@@ -287,7 +287,7 @@ impl LogWriteHandle {
     ) -> Result<Option<AppendOutput>, AppendError> {
         rx.await
             .map_err(|_| AppendError::Shutdown)?
-            .map_err(AppendError::InvalidRecord)
+            .map_err(AppendError::Storage)
     }
 
     /// Receives a unit result from the writer task.
@@ -621,8 +621,8 @@ mod tests {
 
         let result = handle.try_append(make_write(&["key1"], 1000)).await;
         assert!(
-            matches!(&result, Err(AppendError::InvalidRecord(msg)) if msg.contains("test put error")),
-            "expected InvalidRecord with test put error, got: {:?}",
+            matches!(&result, Err(AppendError::Storage(msg)) if msg.contains("test put error")),
+            "expected Storage with test put error, got: {:?}",
             result,
         );
 
@@ -644,8 +644,8 @@ mod tests {
 
         let result = handle.try_append(make_write(&["key1"], 1000)).await;
         assert!(
-            matches!(&result, Err(AppendError::InvalidRecord(msg)) if msg.contains("test snapshot error")),
-            "expected InvalidRecord with test snapshot error, got: {:?}",
+            matches!(&result, Err(AppendError::Storage(msg)) if msg.contains("test snapshot error")),
+            "expected Storage with test snapshot error, got: {:?}",
             result,
         );
     }
@@ -678,19 +678,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_continue_after_transient_put_error() {
+    async fn should_enter_fatal_state_after_put_error() {
         let inner = in_memory_storage();
         let failing = FailingStorage::wrap(inner);
         let (writer, mut handle, _) =
             create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
         let _task = handle.spawn(writer);
 
-        // First append fails, then auto-clears
+        // First append fails
         failing.fail_put_once(common::StorageError::Storage("test put error".into()));
         let result = handle.try_append(make_write(&["key1"], 1000)).await;
         assert!(result.is_err());
 
-        // Recover — writer task should still be alive
+        // FIXME: After a write failure the writer should enter a fatal state and
+        // reject subsequent appends. Currently it recovers, which is incorrect.
         let result = handle
             .try_append(make_write(&["key2"], 2000))
             .await

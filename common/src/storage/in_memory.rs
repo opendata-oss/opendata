@@ -408,7 +408,7 @@ fn check_failure(slot: &FailSlot) -> super::StorageResult<()> {
 }
 
 /// A storage wrapper that delegates to an inner [`Storage`] but can inject
-/// failures into `apply`, `put_with_options`, `flush`, and `snapshot` on demand.
+/// failures into `apply`, `put`/`put_with_options`, `flush`, and `snapshot` on demand.
 ///
 /// Each failure slot is controlled by a lock-free [`ArcSwap`](arc_swap::ArcSwap).
 /// The read path avoids introducing artificial synchronisation that could mask
@@ -463,13 +463,16 @@ impl FailingStorage {
         self.fail_apply.store(Arc::new(Some(Failure::Once(err))));
     }
 
-    /// Makes `put_with_options` return the given error on every subsequent call.
+    /// Makes `put` and `put_with_options` return the given error on every subsequent call.
     pub fn fail_put(&self, err: super::StorageError) {
         self.fail_put
             .store(Arc::new(Some(Failure::Persistent(err))));
     }
 
-    /// Makes `put_with_options` return the given error on the next call only.
+    /// Makes `put` or `put_with_options` return the given error on the next call only.
+    ///
+    /// The failure fires on whichever of the two methods is called first, then
+    /// automatically clears.
     pub fn fail_put_once(&self, err: super::StorageError) {
         self.fail_put.store(Arc::new(Some(Failure::Once(err))));
     }
@@ -521,6 +524,7 @@ impl super::Storage for FailingStorage {
     }
 
     async fn put(&self, records: Vec<super::PutRecordOp>) -> super::StorageResult<()> {
+        check_failure(&self.fail_put)?;
         self.inner.put(records).await
     }
 

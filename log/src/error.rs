@@ -105,8 +105,8 @@ pub enum AppendError {
     Timeout(Vec<Record>),
     /// The writer has shut down.
     Shutdown,
-    /// The writer rejected the write (invalid record, invariant violation, etc.).
-    InvalidRecord(String),
+    /// A storage-level error occurred while processing the write.
+    Storage(String),
 }
 
 impl AppendError {
@@ -117,7 +117,7 @@ impl AppendError {
             AppendError::QueueFull(records) => Some(records),
             AppendError::Timeout(records) => Some(records),
             AppendError::Shutdown => None,
-            AppendError::InvalidRecord(_) => None,
+            AppendError::Storage(_) => None,
         }
     }
 }
@@ -128,7 +128,7 @@ impl std::fmt::Display for AppendError {
             AppendError::QueueFull(_) => write!(f, "write queue full"),
             AppendError::Timeout(_) => write!(f, "write queue timeout"),
             AppendError::Shutdown => write!(f, "writer shut down"),
-            AppendError::InvalidRecord(msg) => write!(f, "invalid record: {}", msg),
+            AppendError::Storage(msg) => write!(f, "storage error: {}", msg),
         }
     }
 }
@@ -141,7 +141,7 @@ impl From<AppendError> for Error {
             AppendError::QueueFull(_) => Error::Internal("write queue full".into()),
             AppendError::Timeout(_) => Error::Internal("write queue timeout".into()),
             AppendError::Shutdown => Error::Internal("writer shut down".into()),
-            AppendError::InvalidRecord(msg) => Error::Internal(msg),
+            AppendError::Storage(msg) => Error::Internal(msg),
         }
     }
 }
