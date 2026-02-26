@@ -199,12 +199,12 @@ pub struct Ingestor {
     handle: tokio::task::JoinHandle<()>,
     producer: Arc<QueueProducer>,
     pending_bytes: Arc<AtomicUsize>,
-    backpressure_at_bytes: Option<usize>,
+    max_unflushed_bytes: usize,
 }
 
 impl Ingestor {
     pub fn new(config: IngestorConfig, clock: Arc<dyn Clock>) -> Result<Self> {
-        let object_store = common::storage::factory::create_object_store(&config.object_store)
+        let object_store = common::storage::factory::create_object_store(&config.object_store_config)
             .map_err(|e| Error::Storage(e.to_string()))?;
         Self::with_object_store(config, object_store, clock)
     }
@@ -224,9 +224,9 @@ impl Ingestor {
         let mut writer = BatchWriter {
             object_store,
             producer: Arc::clone(&producer),
-            path_prefix: config.path_prefix,
-            batch_interval: Duration::from_millis(config.batch_interval_ms),
-            batch_max_bytes: config.batch_max_bytes,
+            path_prefix: config.data_path_prefix,
+            batch_interval: config.flush_interval,
+            batch_max_bytes: config.flush_size_bytes,
             batch: Batch::new(),
             clock,
             pending_bytes: Arc::clone(&pending_bytes),
@@ -240,7 +240,7 @@ impl Ingestor {
             handle,
             producer,
             pending_bytes,
-            backpressure_at_bytes: config.backpressure_at_bytes,
+            max_unflushed_bytes: config.max_unflushed_bytes,
         })
     }
 
@@ -260,16 +260,15 @@ impl Ingestor {
     }
 
     async fn maybe_apply_backpressure(&self, incoming_size: usize) -> Result<()> {
-        if let Some(threshold) = self.backpressure_at_bytes {
-            if incoming_size > threshold {
-                return Err(Error::BackpressureLimitExceeded {
-                    incoming_size,
-                    limit: threshold,
-                });
-            }
-            if self.pending_bytes.load(Ordering::Acquire) + incoming_size >= threshold {
-                self.flush().await?;
-            }
+        let threshold = self.max_unflushed_bytes;
+        if incoming_size > threshold {
+            return Err(Error::BackpressureLimitExceeded {
+                incoming_size,
+                limit: threshold,
+            });
+        }
+        if self.pending_bytes.load(Ordering::Acquire) + incoming_size >= threshold {
+            self.flush().await?;
         }
         Ok(())
     }
@@ -307,12 +306,12 @@ mod tests {
 
     fn test_config() -> IngestorConfig {
         IngestorConfig {
-            object_store: ObjectStoreConfig::InMemory,
-            path_prefix: "test-ingest".to_string(),
+            object_store_config: ObjectStoreConfig::InMemory,
+            data_path_prefix: "test-ingest".to_string(),
             manifest_path: "test/manifest.json".to_string(),
-            batch_interval_ms: 60_000,
-            batch_max_bytes: 64 * 1024 * 1024,
-            backpressure_at_bytes: None,
+            flush_interval: Duration::from_secs(60),
+            flush_size_bytes: 64 * 1024 * 1024,
+            max_unflushed_bytes: usize::MAX,
         }
     }
 
@@ -388,7 +387,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
         let mut config = test_config();
-        config.batch_max_bytes = 10; // very small threshold
+        config.flush_size_bytes = 10; // very small threshold
 
         let ingestor =
             Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
@@ -421,8 +420,8 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
         let mut config = test_config();
-        config.batch_interval_ms = 50;
-        config.batch_max_bytes = 64 * 1024 * 1024;
+        config.flush_interval = Duration::from_millis(50);
+        config.flush_size_bytes = 64 * 1024 * 1024;
 
         let ingestor =
             Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
@@ -551,9 +550,9 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
         let mut config = test_config();
-        config.batch_max_bytes = 64 * 1024 * 1024; // large, won't auto-flush
-        config.batch_interval_ms = 60_000; // large, won't auto-flush
-        config.backpressure_at_bytes = Some(30); // threshold larger than one entry but smaller than two
+        config.flush_size_bytes = 64 * 1024 * 1024; // large, won't auto-flush
+        config.flush_interval = Duration::from_secs(60); // large, won't auto-flush
+        config.max_unflushed_bytes = 30; // threshold larger than one entry but smaller than two
 
         let ingestor =
             Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
@@ -598,7 +597,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
         let mut config = test_config();
-        config.backpressure_at_bytes = Some(10);
+        config.max_unflushed_bytes = 10;
 
         let ingestor =
             Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();

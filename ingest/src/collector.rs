@@ -40,7 +40,7 @@ impl Drop for Collector {
 
 impl Collector {
     pub fn new(config: CollectorConfig, clock: Arc<dyn Clock>) -> Result<Self> {
-        let object_store = common::storage::factory::create_object_store(&config.object_store)
+        let object_store = common::storage::factory::create_object_store(&config.object_store_config)
             .map_err(|e| Error::Storage(e.to_string()))?;
         Self::with_object_store(config, object_store, clock)
     }
@@ -50,10 +50,10 @@ impl Collector {
         object_store: Arc<dyn ObjectStore>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
-        let heartbeat_interval = Duration::from_millis(config.heartbeat_timeout_ms as u64 / 3);
+        let heartbeat_interval = config.heartbeat_timeout / 3;
         let consumer_config = ConsumerConfig {
             manifest_path: config.manifest_path,
-            heartbeat_timeout_ms: config.heartbeat_timeout_ms,
+            heartbeat_timeout_ms: config.heartbeat_timeout.as_millis() as i64,
             done_cleanup_threshold: config.done_cleanup_threshold,
         };
         let consumer =
@@ -168,9 +168,9 @@ mod tests {
 
     fn test_collector_config() -> CollectorConfig {
         CollectorConfig {
-            object_store: ObjectStoreConfig::InMemory,
+            object_store_config: ObjectStoreConfig::InMemory,
             manifest_path: TEST_MANIFEST_PATH.to_string(),
-            heartbeat_timeout_ms: 30_000,
+            heartbeat_timeout: Duration::from_secs(30),
             done_cleanup_threshold: 100,
         }
     }
@@ -255,7 +255,7 @@ mod tests {
     async fn should_heartbeat_in_flight_batches() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let mut config = test_collector_config();
-        config.heartbeat_timeout_ms = 60; // short timeout so heartbeat_interval = 20ms
+        config.heartbeat_timeout = Duration::from_millis(60); // short timeout so heartbeat_interval = 20ms
         let (producer, collector) = make_collector(&store, config);
 
         let entries = test_entries();
