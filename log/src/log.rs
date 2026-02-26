@@ -295,11 +295,13 @@ impl LogDb {
         Ok(())
     }
 
-    /// Closes the log, releasing any resources.
+    /// Closes the log, flushing any pending data and releasing resources.
     ///
-    /// This method should be called before dropping the log to ensure
-    /// proper cleanup. For SlateDB-backed storage, this releases the database fence.
+    /// All appended data is flushed to durable storage before the log is
+    /// closed. For SlateDB-backed storage, this also releases the database
+    /// fence.
     pub async fn close(self) -> Result<()> {
+        self.flush().await?;
         // Drop the handle to signal the writer to stop
         drop(self.handle);
         let _ = self.writer_task.await;
