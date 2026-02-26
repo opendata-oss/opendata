@@ -1,3 +1,4 @@
+mod collector;
 mod config;
 mod error;
 mod ingestor;
@@ -5,7 +6,8 @@ mod model;
 mod queue;
 mod queue_config;
 
-pub use config::Config;
+pub use collector::{CollectedBatch, Collector};
+pub use config::IngestorConfig;
 pub use error::{Error, Result};
 pub use ingestor::{Ingestor, WriteWatcher};
 pub use model::KeyValueEntry;

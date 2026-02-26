@@ -2,7 +2,7 @@ use common::storage::config::ObjectStoreConfig;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
+pub struct IngestorConfig {
     pub object_store: ObjectStoreConfig,
     #[serde(default = "default_path_prefix")]
     pub path_prefix: String,

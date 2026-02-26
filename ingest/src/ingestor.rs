@@ -8,7 +8,7 @@ use slatedb::object_store::{ObjectStore, PutPayload};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::Config;
+use crate::config::IngestorConfig;
 use crate::error::{Error, Result};
 use crate::model::KeyValueEntry;
 use crate::queue::QueueProducer;
@@ -202,14 +202,14 @@ pub struct Ingestor {
 }
 
 impl Ingestor {
-    pub fn new(config: Config, producer: QueueProducer, clock: Arc<dyn Clock>) -> Result<Self> {
+    pub fn new(config: IngestorConfig, producer: QueueProducer, clock: Arc<dyn Clock>) -> Result<Self> {
         let object_store = common::storage::factory::create_object_store(&config.object_store)
             .map_err(|e| Error::Storage(e.to_string()))?;
         Self::with_object_store(config, object_store, producer, clock)
     }
 
     pub fn with_object_store(
-        config: Config,
+        config: IngestorConfig,
         object_store: Arc<dyn ObjectStore>,
         producer: QueueProducer,
         clock: Arc<dyn Clock>,
@@ -296,7 +296,7 @@ impl Ingestor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::IngestorConfig;
     use crate::queue_config::ProducerConfig;
     use bytes::Bytes;
     use common::clock::SystemClock;
@@ -304,8 +304,8 @@ mod tests {
     use slatedb::object_store::ObjectStore;
     use slatedb::object_store::memory::InMemory;
 
-    fn test_config() -> Config {
-        Config {
+    fn test_config() -> IngestorConfig {
+        IngestorConfig {
             object_store: ObjectStoreConfig::InMemory,
             path_prefix: "test-ingest".to_string(),
             batch_interval_ms: 60_000,
