@@ -34,6 +34,7 @@ pub struct opendata_log_object_store_t {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum opendata_log_error_kind_t {
     OPENDATA_LOG_OK = 0,
     OPENDATA_LOG_ERROR_STORAGE,
