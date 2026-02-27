@@ -4,13 +4,15 @@
 //! interacting with OpenData TimeSeries. It exposes write operations for
 //! ingesting time series data.
 
+use std::ops::RangeBounds;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use common::{StorageRuntime, StorageSemantics, create_storage};
 
 use crate::config::Config;
-use crate::error::Result;
-use crate::model::Series;
+use crate::error::{QueryError, Result};
+use crate::model::{InstantSample, Labels, MetricMetadata, RangeSample, Series};
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::Tsdb;
 
@@ -118,6 +120,66 @@ impl TimeSeriesDb {
     /// ```
     pub async fn write(&self, series: Vec<Series>) -> Result<()> {
         self.tsdb.ingest_samples(series).await
+    }
+
+    // ── Read / Query API (RFC 0003) ──────────────────────────────────
+
+    /// Evaluates an instant PromQL query at a single point in time.
+    ///
+    /// If `time` is `None`, the current wall-clock time is used.
+    pub async fn query(
+        &self,
+        _query: &str,
+        _time: Option<SystemTime>,
+    ) -> std::result::Result<Vec<InstantSample>, QueryError> {
+        todo!()
+    }
+
+    /// Evaluates a range PromQL query over a time interval.
+    pub async fn query_range(
+        &self,
+        _query: &str,
+        _start: SystemTime,
+        _end: SystemTime,
+        _step: Duration,
+    ) -> std::result::Result<Vec<RangeSample>, QueryError> {
+        todo!()
+    }
+
+    /// Returns the set of label-sets matching the given series matchers.
+    pub async fn series(
+        &self,
+        _matchers: &[&str],
+        _range: impl RangeBounds<SystemTime>,
+    ) -> std::result::Result<Vec<Labels>, QueryError> {
+        todo!()
+    }
+
+    /// Returns the set of label names matching the given matchers.
+    pub async fn labels(
+        &self,
+        _matchers: Option<&[&str]>,
+        _range: impl RangeBounds<SystemTime>,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        todo!()
+    }
+
+    /// Returns the set of values for a given label name.
+    pub async fn label_values(
+        &self,
+        _label_name: &str,
+        _matchers: Option<&[&str]>,
+        _range: impl RangeBounds<SystemTime>,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        todo!()
+    }
+
+    /// Returns metric metadata, optionally filtered to a single metric.
+    pub async fn metadata(
+        &self,
+        _metric: Option<&str>,
+    ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
+        todo!()
     }
 
     /// Forces flush of all pending data to durable storage.

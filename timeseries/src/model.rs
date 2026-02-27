@@ -396,6 +396,82 @@ impl SeriesBuilder {
     }
 }
 
+/// An ordered set of labels identifying a series.
+///
+/// `Labels` wraps a sorted `Vec<Label>` and provides convenience accessors
+/// for looking up label values and the metric name. This is the type returned
+/// by read/query APIs to identify each result series.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Labels(Vec<Label>);
+
+impl Labels {
+    /// Creates a new `Labels` from a vec of labels.
+    pub fn new(labels: Vec<Label>) -> Self {
+        Self(labels)
+    }
+
+    /// Returns the value of the label with the given name, if present.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|l| l.name == name)
+            .map(|l| l.value.as_str())
+    }
+
+    /// Returns the metric name (value of the `__name__` label).
+    ///
+    /// Returns `""` if no `__name__` label is present.
+    pub fn metric_name(&self) -> &str {
+        self.get("__name__").unwrap_or("")
+    }
+
+    /// Iterates over the labels.
+    pub fn iter(&self) -> impl Iterator<Item = &Label> {
+        self.0.iter()
+    }
+}
+
+/// A single series value at a point in time.
+///
+/// Returned by instant (point-in-time) PromQL queries.
+#[derive(Debug, Clone)]
+pub struct InstantSample {
+    /// The labels identifying this series.
+    pub labels: Labels,
+    /// Timestamp in milliseconds since Unix epoch.
+    pub timestamp_ms: i64,
+    /// The sample value.
+    pub value: f64,
+}
+
+/// A series with values over a time range.
+///
+/// Returned by range PromQL queries.
+#[derive(Debug, Clone)]
+pub struct RangeSample {
+    /// The labels identifying this series.
+    pub labels: Labels,
+    /// Timestamp-value pairs, ordered by timestamp.
+    /// Each tuple is `(timestamp_ms, value)`.
+    pub samples: Vec<(i64, f64)>,
+}
+
+/// Metadata for a metric.
+///
+/// This is the canonical public API type for metric metadata. It uses typed
+/// fields (e.g. `Option<MetricType>`) rather than raw strings.
+#[derive(Debug, Clone)]
+pub struct MetricMetadata {
+    /// The metric name.
+    pub metric_name: String,
+    /// The metric type, if known.
+    pub metric_type: Option<MetricType>,
+    /// Human-readable description of the metric.
+    pub description: Option<String>,
+    /// Unit of measurement (e.g., "bytes", "seconds").
+    pub unit: Option<String>,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct TimeBucket {
     pub(crate) start: BucketStart,
