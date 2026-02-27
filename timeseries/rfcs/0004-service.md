@@ -146,7 +146,7 @@ pub struct OtelConfig {
 
 #### Type Decomposition
 
-The builder walks the OTLP hierarchy (`ResourceMetrics` → `ScopeMetrics` → `Metric` → data points) and collects attributes as labels at each level. OTEL metric types map to Prometheus-style series as follows:
+The builder walks the OTLP hierarchy (`ResourceMetrics` → `ScopeMetrics` → `Metric` → data points) and collects attributes as labels at each level. The mapping follows the [OTLP Prometheus compatibility spec](https://opentelemetry.io/docs/specs/otel/compatibility/prometheus_and_openmetrics/) — including unit suffix normalization and scope labels (`otel_scope_name`, `otel_scope_version`). OTEL metric types map to Prometheus-style series as follows:
 
 | OTEL type | Decomposition | MetricType |
 |---|---|---|
@@ -181,12 +181,6 @@ An earlier draft wrapped `TimeSeriesDb` in an `OtelTimeSeriesDb` that accepted O
 ### Separate server per protocol
 
 Each protocol could run its own server on a different port. This adds operational complexity with no clear benefit. A single server with feature-gated routes is simpler.
-
-## Open Questions
-
-1. **Unit suffix handling** — Should the OTEL `unit` field be appended to the metric name (e.g., `request_duration_seconds`) or stored only as metadata? Prometheus convention appends it.
-
-2. **Scope name as label** — Should `otel_scope_name` and `otel_scope_version` be included as labels by default, or only when explicitly configured?
 
 ## Updates
 

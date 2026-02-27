@@ -205,6 +205,8 @@ pub enum QueryError {
 
 An earlier draft used `QueryRequest`/`QueryResponse` structs with string status fields and optional error messages, mirroring the Prometheus HTTP API format. This is appropriate for a service boundary but awkward for an embedded API — callers shouldn't have to check `response.status == "success"` in Rust. Plain method signatures with `Result` are more natural and let the service layer handle HTTP conventions.
 
+The result types defined here (`InstantSample`, `RangeSample`, `Labels`, `MetricMetadata`) replace the internal evaluator types and become the canonical query result representation. The existing `PromqlRouter` trait reduces to a thin adapter that serializes these types into the Prometheus JSON wire format (status/error envelopes, string-encoded values) for HTTP transport.
+
 ### Separate TimeSeriesDbReader type
 
 Following `LogDb`'s pattern, reads could go through a separate `TimeSeriesDbReader` obtained via `tsdb.reader()`. However, `LogDb` uses a reader because it provides a consistent snapshot view with a fixed offset. PromQL queries are inherently point-in-time (the `time` parameter determines the evaluation point), so a separate reader handle adds indirection without benefit.
