@@ -406,17 +406,12 @@ pub(crate) fn compute_preload_ranges(
     normalize_ranges(ranges_secs)
 }
 
-/// Sort ranges by start, merge overlapping ones, and clamp start to >= 0.
+/// Sort ranges by start and merge overlapping ones.
 /// Adjacent-but-not-overlapping ranges are kept separate since they may map
 /// to different buckets.
 pub(crate) fn normalize_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
     if ranges.is_empty() {
         return ranges;
-    }
-    // Clamp and fix ordering
-    for r in ranges.iter_mut() {
-        r.0 = r.0.max(0);
-        r.1 = r.1.max(r.0);
     }
     ranges.sort_by_key(|&(start, _)| start);
     let mut merged = Vec::with_capacity(ranges.len());
@@ -4043,10 +4038,9 @@ mod tests {
         fn at_with_offset() {
             // query_time=2000s, lookback=300s, @500 offset 5m
             // eval_time = 500 - 300 = 200, data window: [200 - 300, 200] = [-100, 200]
-            // floor(-100000ms / 1000) = -100 → clamped to 0
             let expr = promql_parser::parser::parse("metric_name @ 500 offset 5m").unwrap();
             let result = compute_preload_ranges(&expr, t(2000), t(2000), Duration::from_secs(300));
-            assert_eq!(result, vec![(0, 200)]);
+            assert_eq!(result, vec![(-100, 200)]);
         }
 
         #[test]
@@ -4071,15 +4065,15 @@ mod tests {
         #[test]
         fn nested_binary_produces_disjoint_ranges() {
             // max(metric offset 1h) - max(metric offset 2h) at query_time=7200, lookback=300
-            // Left:  eval=3600, window=[3300, 3600] → [3300, 3600]
-            // Right: eval=0,    window=[-300, 0] → clamped to [0, 0]
+            // Left:  eval=3600, window=[3300, 3600]
+            // Right: eval=0,    window=[-300, 0]
             // Two disjoint ranges (not merged into one)
             let expr = promql_parser::parser::parse(
                 "max(metric_name offset 1h) - max(metric_name offset 2h)",
             )
             .unwrap();
             let result = compute_preload_ranges(&expr, t(7200), t(7200), Duration::from_secs(300));
-            assert_eq!(result, vec![(0, 0), (3300, 3600)]);
+            assert_eq!(result, vec![(-300, 0), (3300, 3600)]);
         }
 
         #[test]
@@ -4140,10 +4134,10 @@ mod tests {
         fn range_query_with_offset() {
             // range [3600, 7200] with lookback=300, offset=1h
             // eval range: [3600-3600, 7200-3600] = [0, 3600]
-            // data window: [0 - 300, 3600] = [-300, 3600] → clamped to [0, 3600]
+            // data window: [0 - 300, 3600] = [-300, 3600]
             let expr = promql_parser::parser::parse("metric_name offset 1h").unwrap();
             let result = compute_preload_ranges(&expr, t(3600), t(7200), Duration::from_secs(300));
-            assert_eq!(result, vec![(0, 3600)]);
+            assert_eq!(result, vec![(-300, 3600)]);
         }
 
         #[test]
@@ -4246,8 +4240,8 @@ mod tests {
                 normalize_ranges(vec![(10, 15), (0, 5)]),
                 vec![(0, 5), (10, 15)]
             );
-            // Negative start gets clamped
-            assert_eq!(normalize_ranges(vec![(-5, 10)]), vec![(0, 10)]);
+            // Negative start is preserved (pre-epoch timestamps are valid)
+            assert_eq!(normalize_ranges(vec![(-5, 10)]), vec![(-5, 10)]);
             // Empty
             assert_eq!(normalize_ranges(vec![]), vec![]);
         }

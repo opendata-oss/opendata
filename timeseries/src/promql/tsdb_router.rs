@@ -30,11 +30,11 @@ use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 ///
 /// Uses `compute_preload_ranges` to account for `offset`/`@` modifiers.
 /// Falls back to a single `[(default_start, default_end)]` for
-/// selector-free expressions. Ranges are already clamped and normalized.
+/// selector-free expressions.
 fn preload_ranges(stmt: &EvalStmt, default_start: i64, default_end: i64) -> Vec<(i64, i64)> {
     let ranges = compute_preload_ranges(&stmt.expr, stmt.start, stmt.end, stmt.lookback_delta);
     if ranges.is_empty() {
-        vec![(default_start.max(0), default_end.max(default_start.max(0)))]
+        vec![(default_start, default_end)]
     } else {
         ranges
     }
