@@ -1,6 +1,6 @@
 # Macros
 
-Procedural macros for OpenData test automation and setup simplification.
+Macros for OpenData test automation and setup simplification.
 
 ## Architecture
 
