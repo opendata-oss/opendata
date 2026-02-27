@@ -64,7 +64,7 @@ pub fn test_impl(args: TokenStream, input: TokenStream) -> TokenStream {
     let fn_name = &item_fn.sig.ident;
 
     // construct inner function name
-    let fn_name_inner = Ident::new(&format!("{}__inner", fn_name), item_fn.sig.ident.span());
+    let fn_name_inner = Ident::new(&format!("{}_inner", fn_name), item_fn.sig.ident.span());
 
     // get statements from function body
     let body = item_fn.block.stmts.clone();
