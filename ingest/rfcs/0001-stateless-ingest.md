@@ -84,13 +84,75 @@ different zones do not incur cross-zonal transfer fees.
                         │        └──────────────┘  │
                         └──────────────────────────┘
 ```
+
+### Queue
+
+The queue coordinates ingestors and collectors via two manifests in object storage,
+the producer manifest (`producer-q` in the diagram) and the consumer manifest (`consumer-q` in the diagram).
+
+The queue producers (used internally by the ingestors) write the locations of the batches of ingested data
+to the producer manifest.
+More specifically, a queue producer reads the producer manifest and loads the list of locations into memory.
+It appends the location of the flushed batch to the end of the list and writes the manifest back to object storage.
+Each write of the producer manifest is a CAS-write.
+That means, a write only succeeds if the producer manifest has not been modified since it was read by the queue producer.
+This ensures that locations appended to the producer manifest are not overwritten by other queue producers.
+However, that also means that queue producers contend for appending their locations.
+
+The queue consumer (used internally by the collector) reads the producer manifest to know the locations of the
+data it needs to read next.
+The queue consumer claims locations of the data batches that will be made available next.
+Once the data is read and processed, the consumer can mark the location as done.
+To avoid contention on the producer manifest, the queue consumer keeps claimed and done locations in the consumer manifest.
+However, once in a while, the queue consumer needs to remove done locations from the producer manifest and
+from the consumer manifest to avoid unbounded growth of those manifests.
+After a configured number of done locations, the queue consumer cleans up both manifests.
+In this way the queue consumer avoids contending too much with the queue producers for the producer manifest.
+
+#### Manifest Format
+
+Both manifests are stored as JSON files in object storage.
+
+The producer manifest contains a list of pending locations:
+```json
+{
+  "pending": [
+    "data/f47ac10b-58cc-4372-a567-0e02b2c3d479.batch",
+    "data/9b2e1c4d-83f5-4a1e-b9d7-6f8e2a3c5b10.batch",
+    "data/3d6f4a9e-c2b7-41d8-9e5f-7a1b3c8d2e6f.batch"
+  ]
+}
+```
+The `pending` list preserves ingestion order. New locations are always appended to the end.
+Locations are removed from the list during cleanup after they have been processed by the consumer.
+
+The consumer manifest contains a map of claimed locations with their heartbeat timestamps
+and a list of done locations:
+```json
+{
+  "claimed": {
+    "data/f47ac10b-58cc-4372-a567-0e02b2c3d479.batch": 1719400000000,
+    "data/9b2e1c4d-83f5-4a1e-b9d7-6f8e2a3c5b10.batch": 1719400005000
+  },
+  "done": [
+    "data/3d6f4a9e-c2b7-41d8-9e5f-7a1b3c8d2e6f.batch"
+  ]
+}
+```
+The `claimed` map associates each claimed location with a timestamp in milliseconds since the Unix epoch.
+This timestamp is set when the location is claimed or refreshed by `heartbeat()`.
+If the timestamp is older than `heartbeat_timeout_ms`, the location is considered stale and may be re-claimed
+by another consumer.
+The `done` list contains locations that have been fully processed. These locations remain in the consumer manifest
+until the `done_cleanup_threshold` is reached, at which point they are removed from both the producer manifest's
+`pending` list and the consumer manifest's `done` list.
+
 ### Ingestor
 
 The ingestor provides an API to ingest a vector of key-value pairs.
 The key-value pairs are buffered in a batch in ingestion order.
 The ingestor flushes the batches of ingested key-value pairs to object storage and appends the locations of the
-flushed objects to a queue with the internally used queue producer (`q-producer` in the diagram).
-The queue is implemented on object storage.
+flushed objects to the queue with the internally used queue producer (`q-producer` in the diagram).
 Flushes are triggered after a given time interval elapsed or if a batch of the ingested data exceeds a given size.
 
 The API of the ingestor is the following:
@@ -234,66 +296,6 @@ This may trigger cleanup of the manifests and the data batch in object storage i
 When the collector is dropped, the background heartbeat task is cancelled.
 In-flight batches that are not acknowledged will eventually become stale and can be re-claimed
 by another collector.
-
-### Queue
-
-The queue consists of two manifests in object storage, i.e., the producer manifest (`producer-q` in the diagram)
-and the consumer manifest (`consumer-q` in the diagram).
-
-The queue producers write the locations of the batches of ingested data to the producer manifest.
-More specifically, a queue producer reads the producer manifest and loads the list of locations into memory.
-It appends the location of the flushed batch to the end of the list and writes the manifest back to object storage.
-Each write of the producer manifest is a CAS-write.
-That means, a write only succeeds if the producer manifest has not been modified since it was read by the queue producer.
-This ensures that locations appended to the producer manifest are not overwritten by other queue producers.
-However, that also means that queue producer contend for appending their locations.
-
-The queue consumer reads the producer manifest to know the locations of the data it needs to read next.
-The queue consumer claims locations of the data batches that will be made available next.
-Once the data is read and processed, the producer can mark the location as done.
-To avoid contention on the producer manifest, the queue consumer keeps claimed and done locations in the consumer manifest.
-However, once in a while, the queue consumer needs to remove done locations from the producer manifest and
-from the consumer manifest to avoid unbounded growth of those manifests.
-After a configured number of done locations, the queue consumer cleans up both manifests.
-In this way the queue consumer avoid contending too much with the queue producers for the producer manifest.
-
-#### Manifest Format
-
-Both manifests are stored as JSON files in object storage.
-
-The producer manifest contains a list of pending locations:
-```json
-{
-  "pending": [
-    "data/f47ac10b-58cc-4372-a567-0e02b2c3d479.batch",
-    "data/9b2e1c4d-83f5-4a1e-b9d7-6f8e2a3c5b10.batch",
-    "data/3d6f4a9e-c2b7-41d8-9e5f-7a1b3c8d2e6f.batch"
-  ]
-}
-```
-The `pending` list preserves ingestion order. New locations are always appended to the end.
-Locations are removed from the list during cleanup after they have been processed by the consumer.
-
-The consumer manifest contains a map of claimed locations with their heartbeat timestamps
-and a list of done locations:
-```json
-{
-  "claimed": {
-    "data/f47ac10b-58cc-4372-a567-0e02b2c3d479.batch": 1719400000000,
-    "data/9b2e1c4d-83f5-4a1e-b9d7-6f8e2a3c5b10.batch": 1719400005000
-  },
-  "done": [
-    "data/3d6f4a9e-c2b7-41d8-9e5f-7a1b3c8d2e6f.batch"
-  ]
-}
-```
-The `claimed` map associates each claimed location with a timestamp in milliseconds since the Unix epoch.
-This timestamp is set when the location is claimed and refreshed by `heartbeat()`.
-If the timestamp is older than `heartbeat_timeout_ms`, the location is considered stale and may be re-claimed
-by another consumer.
-The `done` list contains locations that have been fully processed. These locations remain in the consumer manifest
-until the `done_cleanup_threshold` is reached, at which point they are removed from both the producer manifest's
-`pending` list and the consumer manifest's `done` list.
 
 ### Observability
 
