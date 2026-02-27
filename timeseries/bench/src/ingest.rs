@@ -106,7 +106,7 @@ impl Benchmark for IngestBenchmark {
                 .collect();
 
             let batch_start = std::time::Instant::now();
-            timeseries.ingest_samples(series).await?;
+            timeseries.write(series).await?;
             let ingest_elapsed = batch_start.elapsed();
 
             // Update live metrics

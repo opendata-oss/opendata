@@ -76,10 +76,6 @@ impl TimeSeriesDb {
         Ok(Self { tsdb })
     }
 
-    pub async fn ingest_samples(&self, series: Vec<Series>) -> Result<()> {
-        self.tsdb.ingest_samples(series).await
-    }
-
     /// Writes one or more time series.
     ///
     /// This is the primary write method. It accepts a batch of series,
@@ -140,10 +136,14 @@ impl TimeSeriesDb {
     /// invalid input (e.g., series without a metric name).
     pub async fn write_with_options(
         &self,
-        _series: Vec<Series>,
-        _options: WriteOptions,
+        series: Vec<Series>,
+        options: WriteOptions,
     ) -> Result<()> {
-        todo!()
+        self.tsdb.ingest_samples(series).await?;
+        if options.await_durable {
+            self.tsdb.flush().await?;
+        }
+        Ok(())
     }
 
     /// Forces flush of all pending data to durable storage.
