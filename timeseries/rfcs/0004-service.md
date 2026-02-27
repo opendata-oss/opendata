@@ -82,9 +82,9 @@ The service uses Axum, listens on a single port (default 9090), and handles grac
 |---|---|---|
 | `/api/v1/query` | GET, POST | `tsdb.query(expr, time)` |
 | `/api/v1/query_range` | GET, POST | `tsdb.query_range(expr, start, end, step)` |
-| `/api/v1/series` | GET, POST | `tsdb.series(matchers, start, end)` |
-| `/api/v1/labels` | GET | `tsdb.labels(matchers, start, end)` |
-| `/api/v1/label/{name}/values` | GET | `tsdb.label_values(name, matchers, start, end)` |
+| `/api/v1/series` | GET, POST | `tsdb.series(matchers, start..end)` |
+| `/api/v1/labels` | GET | `tsdb.labels(matchers, start..end)` |
+| `/api/v1/label/{name}/values` | GET | `tsdb.label_values(name, matchers, start..end)` |
 | `/api/v1/metadata` | GET | `tsdb.metadata(metric)` |
 
 Each handler deserializes HTTP parameters, calls the corresponding `TimeSeriesDb` method (RFC 0003), and wraps the result in the Prometheus JSON format (`{"status": "success", "data": ...}`). `QueryError` variants map to HTTP status codes:

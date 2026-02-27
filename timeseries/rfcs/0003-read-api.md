@@ -93,29 +93,29 @@ impl TimeSeriesDb {
     /// Find all series matching the given label matchers.
     ///
     /// Each matcher follows PromQL selector syntax (e.g., `{job="prometheus"}`).
-    /// At least one matcher is required.
+    /// At least one matcher is required. The `range` parameter filters by time
+    /// — use `..` for all time.
     pub async fn series(
         &self,
         matchers: &[&str],
-        start: Option<SystemTime>,
-        end: Option<SystemTime>,
+        range: impl RangeBounds<SystemTime>,
     ) -> Result<Vec<Labels>, QueryError>;
 
     /// List all label names, optionally filtered by matchers and time range.
+    /// Use `..` for all time.
     pub async fn labels(
         &self,
         matchers: Option<&[&str]>,
-        start: Option<SystemTime>,
-        end: Option<SystemTime>,
+        range: impl RangeBounds<SystemTime>,
     ) -> Result<Vec<String>, QueryError>;
 
-    /// List all values for a given label name, optionally filtered by matchers and time range.
+    /// List all values for a given label name, optionally filtered by matchers
+    /// and time range. Use `..` for all time.
     pub async fn label_values(
         &self,
         label_name: &str,
         matchers: Option<&[&str]>,
-        start: Option<SystemTime>,
-        end: Option<SystemTime>,
+        range: impl RangeBounds<SystemTime>,
     ) -> Result<Vec<String>, QueryError>;
 
     /// Return metric metadata for all or a specific metric.
