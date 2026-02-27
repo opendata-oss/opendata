@@ -1,0 +1,33 @@
+language = "C"
+include_guard = "OPENDATA_LOG_H"
+no_includes = true
+sys_includes = ["stdint.h", "stdbool.h", "stddef.h"]
+
+parse.parse_deps = false
+
+[export]
+include = [
+    "opendata_log_error_kind_t",
+    "opendata_log_result_t",
+    "opendata_log_t",
+    "opendata_log_reader_t",
+    "opendata_log_iterator_t",
+    "opendata_log_key_iterator_t",
+    "opendata_log_object_store_t",
+    "opendata_log_config_t",
+    "opendata_log_reader_config_t",
+    "opendata_log_seq_bound_t",
+    "opendata_log_seq_range_t",
+    "opendata_log_segment_bound_t",
+    "opendata_log_segment_range_t",
+    "opendata_log_count_options_t",
+    "opendata_log_segment_t",
+    "OPENDATA_LOG_STORAGE_IN_MEMORY",
+    "OPENDATA_LOG_STORAGE_SLATEDB",
+    "OPENDATA_LOG_BOUND_UNBOUNDED",
+    "OPENDATA_LOG_BOUND_INCLUDED",
+    "OPENDATA_LOG_BOUND_EXCLUDED",
+]
+
+[enum]
+rename_variants = "None"

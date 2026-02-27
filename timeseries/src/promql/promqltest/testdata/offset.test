@@ -1,0 +1,49 @@
+# Tests for offset modifier crossing hour-bucket boundaries.
+# Verifies that bucket preloading accounts for offset/@ modifiers
+# that shift evaluation into different buckets than the query time.
+
+# Load data spanning 3 hour-buckets (0-3600s, 3600-7200s, 7200-10800s).
+# metric increments by 1 every 60s: value at t=N*60s is N.
+load 1m
+  metric{job="test"} 0+1x180
+
+# ── Cross-bucket offset ──────────────────────────────────────────────
+
+# Query at 7200s (bucket 2), offset 1h looks back to 3600s (bucket 1).
+# eval_time = 7200 - 3600 = 3600, value at 3600s = 60.
+eval instant at 2h metric{job="test"} offset 1h
+  metric{job="test"} 60
+
+# Query at 7200s, offset 2h looks back to 0s (bucket 0).
+# eval_time = 7200 - 7200 = 0, value at 0s = 0.
+eval instant at 2h metric{job="test"} offset 2h
+  metric{job="test"} 0
+
+# ── Cross-bucket @ modifier ──────────────────────────────────────────
+
+# Query at 100s but @ pins evaluation to 7200s (bucket 2).
+# value at 7200s = 120.
+eval instant at 100s metric{job="test"} @ 7200
+  metric{job="test"} 120
+
+# ── @ + offset combined across buckets ───────────────────────────────
+
+# @ 7200 offset 1h → eval_time = 7200 - 3600 = 3600, value = 60.
+eval instant at 100s metric{job="test"} @ 7200 offset 1h
+  metric{job="test"} 60
+
+# ── Matrix selector with cross-bucket offset ─────────────────────────
+
+# sum_over_time with range [5m] at eval_time 7200-3600=3600.
+# Range covers (3600-300, 3600] = (3300, 3600], i.e. values at
+# 3360s(=56), 3420s(=57), 3480s(=58), 3540s(=59), 3600s(=60).
+# Sum = 56+57+58+59+60 = 290.
+eval instant at 2h sum_over_time(metric{job="test"}[5m] offset 1h)
+  {job="test"} 290
+
+# ── Disjoint ranges: two offsets in one expression ───────────────────
+
+# metric at 7200s (=120) minus metric offset 2h at 7200s (=0).
+# These need buckets from bucket 0 and bucket 2 (skipping bucket 1).
+eval instant at 2h metric{job="test"} - metric{job="test"} offset 2h
+  {job="test"} 120

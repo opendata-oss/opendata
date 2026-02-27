@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use common::{StorageRuntime, StorageSemantics, create_storage};
 
-use crate::config::{Config, WriteOptions};
+use crate::config::Config;
 use crate::error::Result;
 use crate::model::Series;
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
@@ -76,10 +76,6 @@ impl TimeSeriesDb {
         Ok(Self { tsdb })
     }
 
-    pub async fn ingest_samples(&self, series: Vec<Series>) -> Result<()> {
-        self.tsdb.ingest_samples(series).await
-    }
-
     /// Writes one or more time series.
     ///
     /// This is the primary write method. It accepts a batch of series,
@@ -121,29 +117,7 @@ impl TimeSeriesDb {
     /// ts.write(series).await?;
     /// ```
     pub async fn write(&self, series: Vec<Series>) -> Result<()> {
-        self.write_with_options(series, WriteOptions::default())
-            .await
-    }
-
-    /// Writes one or more time series with custom options.
-    ///
-    /// Allows control over durability guarantees and other write behaviors.
-    ///
-    /// # Arguments
-    ///
-    /// * `series` - The time series data to write.
-    /// * `options` - Write options controlling durability behavior.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the write fails due to storage issues or
-    /// invalid input (e.g., series without a metric name).
-    pub async fn write_with_options(
-        &self,
-        _series: Vec<Series>,
-        _options: WriteOptions,
-    ) -> Result<()> {
-        todo!()
+        self.tsdb.ingest_samples(series).await
     }
 
     /// Forces flush of all pending data to durable storage.

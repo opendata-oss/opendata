@@ -439,6 +439,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
+name = "cbindgen"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eadd868a2ce9ca38de7eeafdcec9c7065ef89b42b32f0839278d55f35c54d1ff"
+dependencies = [
+ "clap",
+ "heck 0.4.1",
+ "indexmap 2.12.1",
+ "log",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "syn 2.0.111",
+ "tempfile",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.49"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2467,7 +2486,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "opendata-common"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2530,8 +2549,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "opendata-log-c"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "cbindgen",
+ "opendata-common",
+ "opendata-log",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "opendata-timeseries"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "axum",
@@ -2589,6 +2620,8 @@ dependencies = [
  "rand 0.8.5",
  "roaring 0.10.12",
  "rstest",
+ "serde",
+ "serde_yaml",
  "tokio",
  "tokio-util",
  "tracing",
@@ -4590,8 +4623,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bencher",
+ "opendata-common",
  "opendata-vector",
+ "serde_yaml",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

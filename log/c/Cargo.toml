@@ -1,0 +1,23 @@
+[package]
+name = "opendata-log-c"
+version.workspace = true
+edition.workspace = true
+description = "C FFI bindings for opendata-log"
+license = "MIT"
+repository = "https://github.com/opendata-oss/opendata"
+
+[lib]
+name = "opendata_log_c"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+log = { path = "..", package = "opendata-log" }
+common = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+cbindgen = "0.28"

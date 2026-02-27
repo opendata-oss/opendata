@@ -1,6 +1,6 @@
 [package]
 name = "opendata-common"
-version = "0.1.7"
+version = "0.1.8"
 edition.workspace = true
 description = "Shared storage foundation for OpenData databases"
 license = "MIT"

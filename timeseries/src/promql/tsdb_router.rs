@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use super::evaluator::{CachedQueryReader, Evaluator, ExprResult};
+use super::evaluator::{CachedQueryReader, Evaluator, ExprResult, compute_preload_ranges};
 use super::parser::Parseable;
 use super::request::{
     FederateRequest, LabelValuesRequest, LabelsRequest, MetadataRequest, QueryRangeRequest,
@@ -25,6 +25,20 @@ use crate::tsdb::Tsdb;
 use async_trait::async_trait;
 use common::clock::SystemClock;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
+
+/// Compute the disjoint preload ranges for bucket discovery.
+///
+/// Uses `compute_preload_ranges` to account for `offset`/`@` modifiers.
+/// Falls back to a single `[(default_start, default_end)]` for
+/// selector-free expressions.
+fn preload_ranges(stmt: &EvalStmt, default_start: i64, default_end: i64) -> Vec<(i64, i64)> {
+    let ranges = compute_preload_ranges(&stmt.expr, stmt.start, stmt.end, stmt.lookback_delta);
+    if ranges.is_empty() {
+        vec![(default_start, default_end)]
+    } else {
+        ranges
+    }
+}
 
 /// Parse a match[] selector string into a VectorSelector
 fn parse_selector(selector: &str) -> Result<VectorSelector, String> {
@@ -102,8 +116,8 @@ impl PromqlRouter for Tsdb {
         };
 
         // Calculate time range for bucket discovery
-        // For instant queries: query_time = stmt.start (which equals stmt.end)
-        // We need buckets covering [query_time - lookback, query_time]
+        // Use compute_preload_ranges to account for offset/@ modifiers
+        // that may shift evaluation into buckets outside the default window.
         let query_time = stmt.start;
         let query_time_secs = query_time
             .duration_since(std::time::UNIX_EPOCH)
@@ -116,11 +130,10 @@ impl PromqlRouter for Tsdb {
             .unwrap_or(Duration::from_secs(0))
             .as_secs() as i64;
 
-        // Get query reader for the time range
-        let reader = match self
-            .query_reader(lookback_start_secs, query_time_secs)
-            .await
-        {
+        let ranges = preload_ranges(&stmt, lookback_start_secs, query_time_secs);
+
+        // Get query reader for the time ranges
+        let reader = match self.query_reader_for_ranges(&ranges).await {
             Ok(reader) => reader,
             Err(e) => {
                 let err = ErrorResponse::internal(e.to_string());
@@ -219,18 +232,21 @@ impl PromqlRouter for Tsdb {
         };
 
         // Calculate time range for bucket discovery
-        // Need buckets covering [start - lookback, end]
-        let start_secs = stmt
+        // Use compute_preload_ranges to account for offset/@ modifiers
+        // that may shift evaluation into buckets outside [start - lookback, end].
+        let default_start_secs = stmt
             .start
             .checked_sub(stmt.lookback_delta)
             .unwrap_or(UNIX_EPOCH)
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::from_secs(0))
             .as_secs() as i64;
-        let end_secs = stmt.end.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let default_end_secs = stmt.end.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
 
-        // Get query reader for the full time range
-        let reader = match self.query_reader(start_secs, end_secs).await {
+        let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
+
+        // Get query reader for the time ranges
+        let reader = match self.query_reader_for_ranges(&ranges).await {
             Ok(reader) => reader,
             Err(e) => {
                 let err = ErrorResponse::internal(e.to_string());
@@ -2133,5 +2149,157 @@ mod tests {
         assert!(data.contains_key("cpu_usage"));
         assert!(data.contains_key("http_requests_total"));
         assert!(data.get("http_requests_total").unwrap().len() == 4)
+    }
+
+    // ── offset/@ preload integration tests ───────────────────────────
+
+    #[tokio::test]
+    async fn should_return_data_for_instant_query_with_offset() {
+        // given: data at 4000s in the hour-60 bucket (3600-7199s)
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+        let sample = create_sample("http_requests", vec![("env", "prod")], 4_000_000, 42.0);
+        mini.ingest(&sample).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        // when: query at time 7600s (next hour bucket) with offset 1h
+        // Without preload fix, the router would only load buckets around 7600s
+        // and miss the data at 4000s.
+        let query_time = UNIX_EPOCH + Duration::from_secs(7600);
+        let request = QueryRequest {
+            query: "http_requests offset 1h".to_string(),
+            time: Some(query_time),
+            timeout: None,
+        };
+        let response = tsdb.query(request).await;
+
+        // then: should find the sample at 4000s
+        assert_eq!(response.status, "success");
+        assert!(response.error.is_none());
+        let data = response.data.unwrap();
+        assert_eq!(data.result_type, "vector");
+        let results: Vec<VectorSeries> = serde_json::from_value(data.result).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].value.1, "42");
+    }
+
+    #[tokio::test]
+    async fn should_return_data_for_range_query_with_offset_crossing_bucket() {
+        // given: data at 4000s and 4060s in the hour-60 bucket (3600-7199s)
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+        let series = Series::builder("http_requests")
+            .label("env", "prod")
+            .sample(4_000_000, 10.0)
+            .sample(4_060_000, 20.0)
+            .build();
+        mini.ingest(&series).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        // when: range query [7600, 7660] with offset 1h
+        // Effective eval range: [7600-3600, 7660-3600] = [4000, 4060]
+        let request = QueryRangeRequest {
+            query: "http_requests offset 1h".to_string(),
+            start: UNIX_EPOCH + Duration::from_secs(7600),
+            end: UNIX_EPOCH + Duration::from_secs(7660),
+            step: Duration::from_secs(60),
+            timeout: None,
+        };
+        let response = tsdb.query_range(request).await;
+
+        // then: should return matrix data
+        assert_eq!(response.status, "success");
+        assert!(response.error.is_none());
+        let data = response.data.unwrap();
+        assert_eq!(data.result_type, "matrix");
+        assert!(!data.result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_not_error_when_offset_shifts_before_epoch() {
+        // given: empty storage
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        // when: query at time 100s with offset 1h pushes eval to -3500s
+        // This must not cause a 500/internal error from get_buckets_in_range
+        let query_time = UNIX_EPOCH + Duration::from_secs(100);
+        let request = QueryRequest {
+            query: "nonexistent_metric offset 1h".to_string(),
+            time: Some(query_time),
+            timeout: None,
+        };
+        let response = tsdb.query(request).await;
+
+        // then: should succeed with empty vector, not an internal error
+        assert_eq!(response.status, "success");
+        assert!(response.error.is_none());
+        let data = response.data.unwrap();
+        assert_eq!(data.result_type, "vector");
+        let results: Vec<VectorSeries> = serde_json::from_value(data.result).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_not_error_for_range_query_with_at_before_epoch() {
+        // given: empty storage
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        // when: range query with @ 0 and large offset pushing into negative territory
+        let request = QueryRangeRequest {
+            query: "nonexistent_metric @ 0 offset 1h".to_string(),
+            start: UNIX_EPOCH + Duration::from_secs(3600),
+            end: UNIX_EPOCH + Duration::from_secs(7200),
+            step: Duration::from_secs(60),
+            timeout: None,
+        };
+        let response = tsdb.query_range(request).await;
+
+        // then: should succeed with empty matrix, not an internal error
+        assert_eq!(response.status, "success");
+        assert!(response.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_return_data_for_range_query_with_at_end() {
+        // given: data at 4000s in the hour-60 bucket (3600-7199s)
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+        let sample = create_sample("http_requests", vec![("env", "prod")], 4_000_000, 42.0);
+        mini.ingest(&sample).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        // when: range query [4000, 8000] with @ end()
+        // At step t=4000: @ end() → 4000 (within lookback of sample at 4000s)
+        // Without the fix, preload would only cover data around t=8000,
+        // missing the sample at 4000s needed for early steps.
+        let request = QueryRangeRequest {
+            query: "http_requests @ end()".to_string(),
+            start: UNIX_EPOCH + Duration::from_secs(4000),
+            end: UNIX_EPOCH + Duration::from_secs(8000),
+            step: Duration::from_secs(1000),
+            timeout: None,
+        };
+        let response = tsdb.query_range(request).await;
+
+        // then: should find the sample (at least at early steps)
+        assert_eq!(response.status, "success");
+        assert!(response.error.is_none());
+        let data = response.data.unwrap();
+        assert_eq!(data.result_type, "matrix");
+        assert!(
+            !data.result.is_empty(),
+            "expected data from early steps with @ end()"
+        );
     }
 }
