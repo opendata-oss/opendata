@@ -211,19 +211,32 @@ Method `close()` flushes unflushed entries and terminates the ingestor.
 ### Data Batch Format
 
 A data batch is the unit of data that an ingestor flushes to object storage.
-Each batch is a JSON array of opaque byte entries serialized in ingestion order:
-```json
-[
-  "PHRpbWVzdGFtcD4...",
-  "dmFsdWUtYmluYXJ5..."
-]
+Each batch is a compact binary file that contains a sequence of length-prefixed records followed by a fixed-size footer:
+
+```ascii
+┌──────────────────────────────────┐
+│  record 0: [len: u32 LE][data]   │
+│  record 1: [len: u32 LE][data]   │
+│  ...                             │
+│  record N: [len: u32 LE][data]   │
+├──────────────────────────────────┤
+│  footer (6 bytes, fixed):        │
+│    record_count : u32 LE         │
+│    version      : u16 LE         │
+└──────────────────────────────────┘
 ```
-Each entry is a `Bytes` value encoded as base64 in the JSON representation.
+
+Each record stores one opaque byte entry preceded by its length as a little-endian `u32`.
+Records are written in ingestion order.
+The footer is always the last 6 bytes of the file: a little-endian `u32` record count followed by a little-endian `u16` version.
+The current version is `1`.
+The footer allows a reader to verify the record count and detect format changes.
+
 The semantics of the entries are defined by the database that consumes the data.
 The ingest module does not interpret the entries; it preserves them as-is.
 
 Each batch is stored under the configured `data_path_prefix` with a ULID filename
-(e.g., `data/01J5T4R3KXBMZ7QV9N2WG8YDHP.json`).
+(e.g., `data/01J5T4R3KXBMZ7QV9N2WG8YDHP.batch`).
 The location (object storage path) of the batch is then enqueued in the producer manifest
 so the collector can discover and read it.
 
