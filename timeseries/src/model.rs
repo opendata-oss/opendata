@@ -5,7 +5,8 @@
 //! series for batched ingestion.
 
 use crate::util::hour_bucket_in_epoch_minutes;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Series ID (unique within a time bucket)
 pub(crate) type SeriesId = u32;
@@ -431,6 +432,17 @@ impl Labels {
     }
 }
 
+impl From<HashMap<String, String>> for Labels {
+    fn from(map: HashMap<String, String>) -> Self {
+        let mut labels: Vec<Label> = map
+            .into_iter()
+            .map(|(name, value)| Label { name, value })
+            .collect();
+        labels.sort();
+        Self(labels)
+    }
+}
+
 /// A single series value at a point in time.
 ///
 /// Returned by instant (point-in-time) PromQL queries.
@@ -460,7 +472,7 @@ pub struct RangeSample {
 ///
 /// This is the canonical public API type for metric metadata. It uses typed
 /// fields (e.g. `Option<MetricType>`) rather than raw strings.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetricMetadata {
     /// The metric name.
     pub metric_name: String,
@@ -470,6 +482,26 @@ pub struct MetricMetadata {
     pub description: Option<String>,
     /// Unit of measurement (e.g., "bytes", "seconds").
     pub unit: Option<String>,
+}
+
+/// Options for PromQL query evaluation.
+///
+/// Provides tuning knobs that apply to both instant and range queries.
+/// Use `Default::default()` for Prometheus-compatible defaults.
+#[derive(Debug, Clone)]
+pub struct QueryOptions {
+    /// How far back to look for a sample when evaluating at a given timestamp.
+    ///
+    /// Defaults to 5 minutes (the Prometheus staleness delta).
+    pub lookback_delta: Duration,
+}
+
+impl Default for QueryOptions {
+    fn default() -> Self {
+        Self {
+            lookback_delta: Duration::from_secs(5 * 60),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

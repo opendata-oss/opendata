@@ -31,7 +31,11 @@ use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 /// Uses `compute_preload_ranges` to account for `offset`/`@` modifiers.
 /// Falls back to a single `[(default_start, default_end)]` for
 /// selector-free expressions.
-fn preload_ranges(stmt: &EvalStmt, default_start: i64, default_end: i64) -> Vec<(i64, i64)> {
+pub(crate) fn preload_ranges(
+    stmt: &EvalStmt,
+    default_start: i64,
+    default_end: i64,
+) -> Vec<(i64, i64)> {
     let ranges = compute_preload_ranges(&stmt.expr, stmt.start, stmt.end, stmt.lookback_delta);
     if ranges.is_empty() {
         vec![(default_start, default_end)]
@@ -41,7 +45,7 @@ fn preload_ranges(stmt: &EvalStmt, default_start: i64, default_end: i64) -> Vec<
 }
 
 /// Parse a match[] selector string into a VectorSelector
-fn parse_selector(selector: &str) -> Result<VectorSelector, String> {
+pub(crate) fn parse_selector(selector: &str) -> Result<VectorSelector, String> {
     let expr = promql_parser::parser::parse(selector).map_err(|e| e.to_string())?;
     match expr {
         Expr::VectorSelector(vs) => Ok(vs),
@@ -50,7 +54,7 @@ fn parse_selector(selector: &str) -> Result<VectorSelector, String> {
 }
 
 /// Get all series IDs matching any of the given selectors (UNION)
-async fn get_matching_series<R: QueryReader>(
+pub(crate) async fn get_matching_series<R: QueryReader>(
     reader: &R,
     bucket: TimeBucket,
     matches: &[String],
@@ -70,7 +74,7 @@ async fn get_matching_series<R: QueryReader>(
 }
 
 /// Get all series across multiple buckets, with fingerprint-based deduplication
-async fn get_matching_series_multi_bucket<R: QueryReader>(
+pub(crate) async fn get_matching_series_multi_bucket<R: QueryReader>(
     reader: &R,
     buckets: &[TimeBucket],
     matches: &[String],
@@ -732,15 +736,33 @@ impl PromqlRouter for Tsdb {
 
     async fn metadata(&self, request: MetadataRequest) -> MetadataResponse {
         let catalog = self.metadata_catalog.read().await;
+
+        // Convert model::MetricMetadata → response::MetricMetadata
+        let convert = |entries: &[crate::model::MetricMetadata]| -> Vec<MetricMetadata> {
+            entries
+                .iter()
+                .map(|m| MetricMetadata {
+                    metric_type: m
+                        .metric_type
+                        .map(|t| t.as_str().to_string())
+                        .unwrap_or_default(),
+                    help: m.description.clone().unwrap_or_default(),
+                    unit: m.unit.clone().unwrap_or_default(),
+                })
+                .collect()
+        };
+
         let mut data: HashMap<String, Vec<MetricMetadata>> =
             if let Some(ref metric) = request.metric {
-                // Filter for specific metric
                 catalog
                     .get(metric)
-                    .map(|entries| [(metric.clone(), entries.clone())].into_iter().collect())
+                    .map(|entries| [(metric.clone(), convert(entries))].into_iter().collect())
                     .unwrap_or_default()
             } else {
-                catalog.clone()
+                catalog
+                    .iter()
+                    .map(|(k, v)| (k.clone(), convert(v)))
+                    .collect()
             };
 
         if let Some(limit) = request.limit {

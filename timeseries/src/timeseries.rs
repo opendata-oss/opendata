@@ -4,17 +4,32 @@
 //! interacting with OpenData TimeSeries. It exposes write operations for
 //! ingesting time series data.
 
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::{StorageRuntime, StorageSemantics, create_storage};
 
 use crate::config::Config;
 use crate::error::{QueryError, Result};
-use crate::model::{InstantSample, Labels, MetricMetadata, RangeSample, Series};
+use crate::model::{InstantSample, Labels, MetricMetadata, QueryOptions, RangeSample, Series};
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::Tsdb;
+
+/// Convert a `RangeBounds<SystemTime>` into `(start_secs, end_secs)`.
+fn range_bounds_to_secs(range: impl RangeBounds<SystemTime>) -> (i64, i64) {
+    let start = match range.start_bound() {
+        Bound::Included(t) => t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+        Bound::Excluded(t) => t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 + 1,
+        Bound::Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        Bound::Included(t) => t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+        Bound::Excluded(t) => t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 - 1,
+        Bound::Unbounded => i64::MAX,
+    };
+    (start, end)
+}
 
 /// A time series database for storing and querying metrics.
 ///
@@ -129,57 +144,66 @@ impl TimeSeriesDb {
     /// If `time` is `None`, the current wall-clock time is used.
     pub async fn query(
         &self,
-        _query: &str,
-        _time: Option<SystemTime>,
+        query: &str,
+        time: Option<SystemTime>,
     ) -> std::result::Result<Vec<InstantSample>, QueryError> {
-        todo!()
+        self.tsdb
+            .eval_query(query, time, &QueryOptions::default())
+            .await
     }
 
     /// Evaluates a range PromQL query over a time interval.
     pub async fn query_range(
         &self,
-        _query: &str,
-        _start: SystemTime,
-        _end: SystemTime,
-        _step: Duration,
+        query: &str,
+        start: SystemTime,
+        end: SystemTime,
+        step: Duration,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-        todo!()
+        self.tsdb
+            .eval_query_range(query, start, end, step, &QueryOptions::default())
+            .await
     }
 
     /// Returns the set of label-sets matching the given series matchers.
     pub async fn series(
         &self,
-        _matchers: &[&str],
-        _range: impl RangeBounds<SystemTime>,
+        matchers: &[&str],
+        range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<Labels>, QueryError> {
-        todo!()
+        let (start, end) = range_bounds_to_secs(range);
+        self.tsdb.find_series(matchers, start, end).await
     }
 
     /// Returns the set of label names matching the given matchers.
     pub async fn labels(
         &self,
-        _matchers: Option<&[&str]>,
-        _range: impl RangeBounds<SystemTime>,
+        matchers: Option<&[&str]>,
+        range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        todo!()
+        let (start, end) = range_bounds_to_secs(range);
+        self.tsdb.find_labels(matchers, start, end).await
     }
 
     /// Returns the set of values for a given label name.
     pub async fn label_values(
         &self,
-        _label_name: &str,
-        _matchers: Option<&[&str]>,
-        _range: impl RangeBounds<SystemTime>,
+        label_name: &str,
+        matchers: Option<&[&str]>,
+        range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        todo!()
+        let (start, end) = range_bounds_to_secs(range);
+        self.tsdb
+            .find_label_values(label_name, matchers, start, end)
+            .await
     }
 
     /// Returns metric metadata, optionally filtered to a single metric.
     pub async fn metadata(
         &self,
-        _metric: Option<&str>,
+        metric: Option<&str>,
     ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
-        todo!()
+        self.tsdb.find_metadata(metric).await
     }
 
     /// Forces flush of all pending data to durable storage.
