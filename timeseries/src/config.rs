@@ -57,20 +57,3 @@ impl Default for Config {
         }
     }
 }
-
-/// Options for write operations.
-///
-/// Controls the durability and behavior of [`TimeSeriesDb::write`](crate::TimeSeriesDb::write)
-/// and [`TimeSeriesDb::write_with_options`](crate::TimeSeriesDb::write_with_options).
-#[derive(Debug, Clone, Default)]
-pub struct WriteOptions {
-    /// Whether to wait for data to be flushed to durable storage before returning.
-    ///
-    /// When `true`, the write operation will not return until the data has
-    /// been persisted to durable storage.
-    ///
-    /// When `false` (the default), the operation returns as soon as the data
-    /// is accepted for ingestion, providing lower latency but with data
-    /// potentially only in memory.
-    pub await_durable: bool,
-}
