@@ -36,3 +36,4 @@ path = "src/bin/gen_sift100k_groundtruth.rs"
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
+opendata-macros.workspace = true
