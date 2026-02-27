@@ -293,28 +293,11 @@ impl TimeSeriesDb {
     /// ```
     pub async fn write(&self, series: Vec<Series>) -> Result<()>;
 
-    /// Write with custom options.
-    ///
-    /// Allows control over durability guarantees and other write behaviors.
-    pub async fn write_with_options(
-        &self,
-        series: Vec<Series>,
-        options: WriteOptions,
-    ) -> Result<()>;
-
     /// Force flush all pending data to durable storage.
     ///
     /// Normally data is flushed according to `flush_interval`, but this
     /// method can be used to ensure durability immediately.
     pub async fn flush(&self) -> Result<()>;
-}
-
-/// Options for the write operation.
-#[derive(Debug, Clone, Default)]
-pub struct WriteOptions {
-    /// Wait for data to be flushed to durable storage before returning.
-    /// Default: false (return immediately after buffering)
-    pub await_durable: bool,
 }
 ```
 
@@ -324,11 +307,10 @@ pub struct WriteOptions {
 |--------|-----|------------|
 | Configuration | `Config` | `Config` |
 | Primary write method | `append(Vec<Record>)` | `write(Vec<Series>)` |
-| Options variant | `append_with_options()` | `write_with_options()` |
 | Data unit | `Record` (key + value bytes) | `Series` (labels + samples) |
 | Identification | `key: Bytes` | `labels` (including `__name__`) |
 | Sequencing | Global sequence number | Timestamp (ms) |
-| Durability control | `WriteOptions::await_durable` | `WriteOptions::await_durable` |
+| Durability control | Explicit `flush()` | Explicit `flush()` |
 
 ## Alternatives
 
@@ -392,4 +374,5 @@ Complex types like histograms are decomposed into simple series at higher layers
 | 2025-12-29 | Separate `name` field on Series; flatten SeriesMetadata into Series; clarify identity fields |
 | 2025-12-29 | Rename `TimeSeriesConfig` to `Config` for consistency with Rust conventions |
 | 2026-01-06 | Store metric name as `__name__` label instead of separate field; add `name()` accessor method |
-| 2026-02-25 | Remove reader placeholder and OTEL module — moved to RFC 0003 and RFC 0004 respectively |
+| 2026-02-26 | Remove `WriteOptions` and `write_with_options()` in favor of explicit `flush()`, matching LogDb |
+| 2026-02-27 | Remove reader placeholder and OTEL module — moved to RFC 0003 and RFC 0004 respectively |
