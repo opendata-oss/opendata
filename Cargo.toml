@@ -56,4 +56,3 @@ dashu-float = "0.4"
 snap = "1"
 criterion = "0.5"
 macros = { path = "./macros" }
-opendata-macros = { path = "./macros" }
