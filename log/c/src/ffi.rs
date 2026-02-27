@@ -148,9 +148,7 @@ pub(crate) fn error_from_append_error(err: &log::AppendError) -> opendata_log_re
         log::AppendError::QueueFull(_) => opendata_log_error_kind_t::OPENDATA_LOG_ERROR_QUEUE_FULL,
         log::AppendError::Timeout(_) => opendata_log_error_kind_t::OPENDATA_LOG_ERROR_TIMEOUT,
         log::AppendError::Shutdown => opendata_log_error_kind_t::OPENDATA_LOG_ERROR_SHUTDOWN,
-        log::AppendError::InvalidRecord(_) => {
-            opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_RECORD
-        }
+        log::AppendError::Storage(_) => opendata_log_error_kind_t::OPENDATA_LOG_ERROR_STORAGE,
     };
     error_result(kind, &err.to_string())
 }
