@@ -69,9 +69,9 @@ different zones do not incur cross-zonal transfer fees.
 │  ┌───────────▼────▼────▼──┐  ┌───┼──┼──┼──────────────────────┐  │
 │  │          data          │  │   │  │  │  queue               │  │
 │  │                        │  │ ┌─▼──▼──▼────┐  ┌────────────┐ │  │
-│  │  f47ac10b-58cc-...     │  │ │ producer-q │  │ consumer-q │ │  │
-│  │  9b2e1c4d-83f5-...     │  │ └────▲───────┘  └────▲───────┘ │  │
-│  │  3d6f4a9e-c2b7-...     │  │      │     ┌─────────┘         │  │
+│  │  01J5T4R3KXBMZ7...     │  │ │ producer-q │  │ consumer-q │ │  │
+│  │  01J5T4R7NP39QW...     │  │ └────▲───────┘  └────▲───────┘ │  │
+│  │  01J5T4RBYW52MK...     │  │      │     ┌─────────┘         │  │
 │  └───────────▲────────────┘  └──────┼─────┼───────────────────┘  │
 └──────────────┼──────────────────────┼─────┼──────────────────────┘
                │                      │     │
@@ -117,9 +117,9 @@ The producer manifest contains a list of pending locations:
 ```json
 {
   "pending": [
-    "data/f47ac10b-58cc-4372-a567-0e02b2c3d479.batch",
-    "data/9b2e1c4d-83f5-4a1e-b9d7-6f8e2a3c5b10.batch",
-    "data/3d6f4a9e-c2b7-41d8-9e5f-7a1b3c8d2e6f.batch"
+    "data/01J5T4R3KXBMZ7QV9N2WG8YDHP.batch",
+    "data/01J5T4R7NP39QW4HJXT6V1BEKM.batch",
+    "data/01J5T4RBYW52MKD8FR0JAN7G9C.batch"
   ]
 }
 ```
@@ -131,11 +131,11 @@ and a list of done locations:
 ```json
 {
   "claimed": {
-    "data/f47ac10b-58cc-4372-a567-0e02b2c3d479.batch": 1719400000000,
-    "data/9b2e1c4d-83f5-4a1e-b9d7-6f8e2a3c5b10.batch": 1719400005000
+    "data/01J5T4R3KXBMZ7QV9N2WG8YDHP.batch": 1719400000000,
+    "data/01J5T4R7NP39QW4HJXT6V1BEKM.batch": 1719400005000
   },
   "done": [
-    "data/3d6f4a9e-c2b7-41d8-9e5f-7a1b3c8d2e6f.batch"
+    "data/01J5T4RBYW52MKD8FR0JAN7G9C.batch"
   ]
 }
 ```
@@ -149,9 +149,9 @@ until the `done_cleanup_threshold` is reached, at which point they are removed f
 
 ### Ingestor
 
-The ingestor provides an API to ingest a vector of key-value pairs.
-The key-value pairs are buffered in a batch in ingestion order.
-The ingestor flushes the batches of ingested key-value pairs to object storage and appends the locations of the
+The ingestor provides an API to ingest a vector of opaque byte entries.
+The entries are buffered in a batch in ingestion order.
+The ingestor flushes the batches of ingested entries to object storage and appends the locations of the
 flushed objects to the queue with the internally used queue producer (`q-producer` in the diagram).
 Flushes are triggered after a given time interval elapsed or if a batch of the ingested data exceeds a given size.
 
@@ -160,7 +160,7 @@ The API of the ingestor is the following:
 impl Ingestor {
   pub fn new(config: IngestorConfig, clock: Arc<dyn Clock>) -> Result<Self> { ... }
 
-  pub async fn ingest(&self, entries: Vec<KeyValueEntry>) -> Result<WriteWatcher> { ... }
+  pub async fn ingest(&self, entries: Vec<Bytes>) -> Result<WriteWatcher> { ... }
 
   pub async fn close(self) -> Result<()> { ... }
 }
@@ -185,14 +185,14 @@ The queue producer manifest takes the name specified in `manifest_path`.
 The config `flush_size_bytes` is a loose limit.
 The batch needs to exceed that size to trigger a flush to object storage.
 The config `max_unflushed_bytes` is also a loose limit.
-Each time the call to `ingest()` sees a size of unflushed key-value pairs in the ingestor that is larger
-than `max_unflushed_bytes`, the call blocks and flushes will be triggered until the size of the unflushed key-value
-pairs is less than `max_unflushed_bytes`.
+Each time the call to `ingest()` sees a size of unflushed entries in the ingestor that is larger
+than `max_unflushed_bytes`, the call blocks and flushes will be triggered until the size of the unflushed entries
+is less than `max_unflushed_bytes`.
 If this backpressure blocking the ingestion becomes an issue, new ingestors can be created to better distribute the
 load.
 
-A call to `ingest()` takes a vector of key-value pairs and returns a `WriteWatcher` with which the caller can await
-the completion of the flush to object storage of the vector of key-value pairs.
+A call to `ingest()` takes a vector of byte entries and returns a `WriteWatcher` with which the caller can await
+the completion of the flush to object storage of the vector of entries.
 
 The `WriteWatcher` has the following API:
 ```rust
@@ -200,47 +200,38 @@ The `WriteWatcher` has the following API:
 
     pub async fn await_durable(&mut self) -> Result<()>
 ```
-As soon as the call to `await_durable().await` returns or the call to `result()` is not `None`, the vector of key-value pairs
-is stored in object storage and the location of the object that contains the vector of key-value pairs is appended to the
+As soon as the call to `await_durable().await` returns or the call to `result()` is not `None`, the vector of entries
+is stored in object storage and the location of the object that contains the vector of entries is appended to the
 queue.
 More specifically, the location is appended to the end of the list of pending locations in the producer queue manifest
 (`producer-q` in the diagram).
 
-Method `close()` flushes unflushed key-value pairs and terminates the ingestor.
+Method `close()` flushes unflushed entries and terminates the ingestor.
 
 ### Data Batch Format
 
 A data batch is the unit of data that an ingestor flushes to object storage.
-Each batch is a JSON array of key-value entries serialized in ingestion order:
+Each batch is a JSON array of opaque byte entries serialized in ingestion order:
 ```json
 [
-  { "key": "Y3B1Lmhvc3QtMQ==", "value": "PHRpbWVzdGFtcD4..." },
-  { "key": "Y3B1Lmhvc3QtMg==", "value": "dmFsdWUtYmluYXJ5..." }
+  "PHRpbWVzdGFtcD4...",
+  "dmFsdWUtYmluYXJ5..."
 ]
 ```
+Each entry is a `Bytes` value encoded as base64 in the JSON representation.
+The semantics of the entries are defined by the database that consumes the data.
+The ingest module does not interpret the entries; it preserves them as-is.
 
-Each entry is a `KeyValueEntry`:
-```rust
-pub struct KeyValueEntry {
-    pub key: Bytes,    // serialized as base64
-    pub value: Bytes,  // serialized as base64
-}
-```
-Both `key` and `value` are opaque byte blobs encoded as base64 in the JSON representation.
-Their semantics are defined by the database that consumes the data
-(e.g., the key could be a metric name for Timeseries or a stream name for Log).
-The ingest module does not interpret keys or values; it preserves them as-is.
-
-Each batch is stored under the configured `data_path_prefix` with a UUID v4 filename
-(e.g., `data/f47ac10b-58cc-4372-a567-0e02b2c3d479.json`).
+Each batch is stored under the configured `data_path_prefix` with a ULID filename
+(e.g., `data/01J5T4R3KXBMZ7QV9N2WG8YDHP.json`).
 The location (object storage path) of the batch is then enqueued in the producer manifest
 so the collector can discover and read it.
 
 
 ### Collector
 
-The collector reads the locations of the ingested key-value pairs in ingestion order from the queue with the
-internal queue consumer (`q-consumer` in the diagram) and returns the batches of key-value pairs.
+The collector reads the locations of the ingested entries in ingestion order from the queue with the
+internal queue consumer (`q-consumer` in the diagram) and returns the batches of entries.
 
 The API of the collector is the following:
 ```rust
@@ -274,16 +265,16 @@ It also spawns a background heartbeat task that periodically refreshes the times
 in-flight batches in the consumer manifest. The heartbeat interval is derived from the configuration
 as `heartbeat_timeout_ms / 3`, ensuring claims stay fresh well before they expire.
 
-A `CollectedBatch` contains the deserialized key-value entries and the location of the batch:
+A `CollectedBatch` contains the deserialized entries and the location of the batch:
 ```rust
 pub struct CollectedBatch {
-    pub entries: Vec<KeyValueEntry>,
+    pub entries: Vec<Bytes>,
     location: String,
 }
 ```
 
 By calling `next_batch()` the collector claims the next available location from the queue, reads the
-data batch from object storage, deserializes the key-value entries, and returns them as a `CollectedBatch`.
+data batch from object storage, deserializes the entries, and returns them as a `CollectedBatch`.
 The batch is tracked as in-flight so the background heartbeat keeps it alive.
 If no location is available in the queue, `None` is returned.
 
