@@ -54,16 +54,16 @@ impl TimeSeriesDb {
     /// If `time` is `None`, evaluates at the current time.
     ///
     /// ```rust
-    /// let results = tsdb.query("rate(http_requests_total[5m])", None).await?;
-    /// for sample in &results {
-    ///     println!("{}: {}", sample.metric_name(), sample.value);
+    /// let result = tsdb.query("rate(http_requests_total[5m])", None).await?;
+    /// for sample in result.into_samples() {
+    ///     println!("{}: {}", sample.labels.metric_name(), sample.value);
     /// }
     /// ```
     pub async fn query(
         &self,
         query: &str,
         time: Option<SystemTime>,
-    ) -> Result<Vec<InstantSample>, QueryError>;
+    ) -> Result<QueryValue, QueryError>;
 
     /// Evaluate a PromQL expression over a time range.
     ///
@@ -132,6 +132,22 @@ impl TimeSeriesDb {
 ### Result Types
 
 ```rust
+/// The result of an instant PromQL query.
+///
+/// PromQL expressions evaluate to either a scalar (e.g. `1+1`) or a
+/// vector of time series samples (e.g. `http_requests_total`).
+#[derive(Debug, Clone)]
+pub enum QueryValue {
+    Scalar { timestamp_ms: i64, value: f64 },
+    Vector(Vec<InstantSample>),
+}
+
+impl QueryValue {
+    /// Flatten into samples, converting a scalar to a single
+    /// `InstantSample` with empty labels.
+    pub fn into_samples(self) -> Vec<InstantSample>;
+}
+
 /// A single series value at a point in time.
 #[derive(Debug, Clone)]
 pub struct InstantSample {
@@ -193,7 +209,7 @@ pub enum QueryError {
 
 | Aspect | LogDb | TimeSeriesDb |
 |--------|-------|--------------|
-| Primary read | `reader.read(offset)` → `Result<Record>` | `tsdb.query(expr, time)` → `Result<Vec<InstantSample>>` |
+| Primary read | `reader.read(offset)` → `Result<Record>` | `tsdb.query(expr, time)` → `Result<QueryValue>` |
 | Range read | `reader.scan(start..end)` → `Result<Vec<Record>>` | `tsdb.query_range(expr, start, end, step)` → `Result<Vec<RangeSample>>` |
 | Discovery | `reader.scan()` | `tsdb.series()`, `tsdb.labels()`, `tsdb.label_values()` |
 | Query language | None (key/offset based) | PromQL |
@@ -220,3 +236,4 @@ An alternative is to expose low-level iterators over stored series and samples, 
 | Date | Description |
 |---|---|
 | 2026-02-25 | Initial draft |
+| 2026-02-27 | `query` returns `QueryValue` enum (scalar vs vector), add `into_samples()` |

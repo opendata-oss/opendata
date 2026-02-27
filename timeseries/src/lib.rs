@@ -68,7 +68,7 @@ mod timeseries;
 pub use config::Config;
 pub use error::{Error, QueryError, Result};
 pub use model::{
-    InstantSample, Label, Labels, MetricMetadata, MetricType, QueryOptions, RangeSample, STALE_NAN,
-    Sample, Series, SeriesBuilder, Temporality, is_stale_nan,
+    InstantSample, Label, Labels, MetricMetadata, MetricType, QueryOptions, QueryValue,
+    RangeSample, STALE_NAN, Sample, Series, SeriesBuilder, Temporality, is_stale_nan,
 };
 pub use timeseries::TimeSeriesDb;

@@ -432,6 +432,12 @@ impl Labels {
     }
 }
 
+impl From<Labels> for HashMap<String, String> {
+    fn from(labels: Labels) -> Self {
+        labels.0.into_iter().map(|l| (l.name, l.value)).collect()
+    }
+}
+
 impl From<HashMap<String, String>> for Labels {
     fn from(map: HashMap<String, String>) -> Self {
         let mut labels: Vec<Label> = map
@@ -440,6 +446,34 @@ impl From<HashMap<String, String>> for Labels {
             .collect();
         labels.sort();
         Self(labels)
+    }
+}
+
+/// The result of an instant PromQL query.
+///
+/// PromQL expressions evaluate to either a scalar (e.g. `1+1`) or a
+/// vector of time series samples (e.g. `http_requests_total`).
+#[derive(Debug, Clone)]
+pub enum QueryValue {
+    Scalar { timestamp_ms: i64, value: f64 },
+    Vector(Vec<InstantSample>),
+}
+
+impl QueryValue {
+    /// Flatten into samples, converting a scalar to a single
+    /// `InstantSample` with empty labels.
+    pub fn into_samples(self) -> Vec<InstantSample> {
+        match self {
+            QueryValue::Scalar {
+                timestamp_ms,
+                value,
+            } => vec![InstantSample {
+                labels: Labels::new(vec![]),
+                timestamp_ms,
+                value,
+            }],
+            QueryValue::Vector(samples) => samples,
+        }
     }
 }
 

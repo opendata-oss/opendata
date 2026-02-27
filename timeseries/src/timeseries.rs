@@ -12,7 +12,7 @@ use common::{StorageRuntime, StorageSemantics, create_storage};
 
 use crate::config::Config;
 use crate::error::{QueryError, Result};
-use crate::model::{InstantSample, Labels, MetricMetadata, QueryOptions, RangeSample, Series};
+use crate::model::{Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Series};
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::Tsdb;
 
@@ -146,7 +146,7 @@ impl TimeSeriesDb {
         &self,
         query: &str,
         time: Option<SystemTime>,
-    ) -> std::result::Result<Vec<InstantSample>, QueryError> {
+    ) -> std::result::Result<QueryValue, QueryError> {
         self.tsdb
             .eval_query(query, time, &QueryOptions::default())
             .await

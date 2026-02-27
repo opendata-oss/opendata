@@ -13,8 +13,8 @@ use crate::error::QueryError;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::minitsdb::{MiniQueryReader, MiniTsdb};
 use crate::model::{
-    InstantSample, Label, Labels, MetricMetadata, QueryOptions, RangeSample, Sample, Series,
-    SeriesId, TimeBucket,
+    InstantSample, Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Sample,
+    Series, SeriesId, TimeBucket,
 };
 use crate::promql::evaluator::{Evaluator, ExprResult};
 use crate::promql::tsdb_router::{get_matching_series_multi_bucket, preload_ranges};
@@ -269,7 +269,7 @@ impl Tsdb {
         query: &str,
         time: Option<std::time::SystemTime>,
         opts: &QueryOptions,
-    ) -> std::result::Result<Vec<InstantSample>, QueryError> {
+    ) -> std::result::Result<QueryValue, QueryError> {
         let expr = promql_parser::parser::parse(query)
             .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
 
@@ -301,20 +301,21 @@ impl Tsdb {
             ExprResult::Scalar(value) => {
                 let timestamp_ms =
                     query_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-                Ok(vec![InstantSample {
-                    labels: Labels::new(vec![]),
+                Ok(QueryValue::Scalar {
                     timestamp_ms,
                     value,
-                }])
-            }
-            ExprResult::InstantVector(samples) => Ok(samples
-                .into_iter()
-                .map(|s| InstantSample {
-                    labels: Labels::from(s.labels),
-                    timestamp_ms: s.timestamp_ms,
-                    value: s.value,
                 })
-                .collect()),
+            }
+            ExprResult::InstantVector(samples) => Ok(QueryValue::Vector(
+                samples
+                    .into_iter()
+                    .map(|s| InstantSample {
+                        labels: Labels::from(s.labels),
+                        timestamp_ms: s.timestamp_ms,
+                        value: s.value,
+                    })
+                    .collect(),
+            )),
             ExprResult::RangeVector(_) => Err(QueryError::Execution(
                 "range vectors not supported for instant queries".to_string(),
             )),
@@ -1089,22 +1090,26 @@ mod tests {
         let query_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(4100);
 
         let opts = QueryOptions::default();
-        let mut results = tsdb
+        let result = tsdb
             .eval_query("http_requests", Some(query_time), &opts)
             .await
             .unwrap();
-        results.sort_by(|a, b| {
+        let mut samples = match result {
+            QueryValue::Vector(samples) => samples,
+            other => panic!("expected Vector, got {:?}", other),
+        };
+        samples.sort_by(|a, b| {
             a.labels
                 .metric_name()
                 .cmp(b.labels.metric_name())
                 .then_with(|| a.labels.get("env").cmp(&b.labels.get("env")))
         });
 
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].labels.get("env"), Some("prod"));
-        assert_eq!(results[0].value, 42.0);
-        assert_eq!(results[1].labels.get("env"), Some("staging"));
-        assert_eq!(results[1].value, 10.0);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].labels.get("env"), Some("prod"));
+        assert_eq!(samples[0].value, 42.0);
+        assert_eq!(samples[1].labels.get("env"), Some("staging"));
+        assert_eq!(samples[1].value, 10.0);
     }
 
     #[tokio::test]
@@ -1118,7 +1123,8 @@ mod tests {
         let results = tsdb
             .eval_query("http_requests", Some(query_time), &wide)
             .await
-            .unwrap();
+            .unwrap()
+            .into_samples();
         assert_eq!(results.len(), 2);
 
         let narrow = QueryOptions {
@@ -1127,7 +1133,8 @@ mod tests {
         let results = tsdb
             .eval_query("http_requests", Some(query_time), &narrow)
             .await
-            .unwrap();
+            .unwrap()
+            .into_samples();
         assert_eq!(
             results.len(),
             0,
@@ -1170,21 +1177,27 @@ mod tests {
         let query_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
 
         let opts = QueryOptions::default();
-        let results = tsdb
+        let result = tsdb
             .eval_query("1+1", Some(query_time), &opts)
             .await
             .unwrap();
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].value, 2.0);
-        assert_eq!(results[0].labels.metric_name(), "");
-        assert_eq!(
-            results[0].timestamp_ms,
-            query_time
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64
-        );
+        match result {
+            QueryValue::Scalar {
+                timestamp_ms,
+                value,
+            } => {
+                assert_eq!(value, 2.0);
+                assert_eq!(
+                    timestamp_ms,
+                    query_time
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64
+                );
+            }
+            other => panic!("expected Scalar, got {:?}", other),
+        }
     }
 
     #[tokio::test]

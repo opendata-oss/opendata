@@ -1,9 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
 
-use super::evaluator::{CachedQueryReader, Evaluator, ExprResult, compute_preload_ranges};
-use super::parser::Parseable;
+use super::evaluator::{CachedQueryReader, compute_preload_ranges};
 use super::request::{
     FederateRequest, LabelValuesRequest, LabelsRequest, MetadataRequest, QueryRangeRequest,
     QueryRequest, SeriesRequest,
@@ -15,15 +12,15 @@ use super::response::{
 };
 use super::router::PromqlRouter;
 use super::selector::evaluate_selector_with_reader;
-use crate::index::InvertedIndexLookup;
-use crate::model::Label;
+use crate::error::QueryError;
+use crate::model::QueryOptions;
+use crate::model::QueryValue;
 use crate::model::SeriesId;
 use crate::model::TimeBucket;
 use crate::promql::response::MetricMetadata;
 use crate::query::QueryReader;
 use crate::tsdb::Tsdb;
 use async_trait::async_trait;
-use common::clock::SystemClock;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 
 /// Compute the disjoint preload ranges for bucket discovery.
@@ -91,86 +88,28 @@ pub(crate) async fn get_matching_series_multi_bucket<R: QueryReader>(
     Ok(bucket_series_map)
 }
 
-/// Convert attributes to a HashMap
-fn labels_to_map(labels: &[Label]) -> HashMap<String, String> {
-    labels
-        .iter()
-        .map(|label| (label.name.clone(), label.value.clone()))
-        .collect()
+/// Convert a `QueryError` into a Prometheus-style `ErrorResponse`.
+fn query_error_response(err: QueryError) -> ErrorResponse {
+    match err {
+        QueryError::InvalidQuery(msg) => ErrorResponse::bad_data(msg),
+        QueryError::Execution(msg) => ErrorResponse::execution(msg),
+        QueryError::Timeout => ErrorResponse::timeout("query timed out"),
+    }
 }
 
 #[async_trait]
 impl PromqlRouter for Tsdb {
     async fn query(&self, request: QueryRequest) -> QueryResponse {
-        // Parse the request to EvalStmt
-        // Note: QueryRequest has a single `time` field for instant queries
-        // The Parseable impl sets stmt.start == stmt.end == time
-        let clock = Arc::new(SystemClock {});
-        let stmt = match request.parse(clock) {
-            Ok(stmt) => stmt,
-            Err(e) => {
-                let err = ErrorResponse::bad_data(e.to_string());
-                return QueryResponse {
-                    status: err.status,
-                    data: None,
-                    error: Some(err.error),
-                    error_type: Some(err.error_type),
-                };
-            }
-        };
-
-        // Calculate time range for bucket discovery
-        // Use compute_preload_ranges to account for offset/@ modifiers
-        // that may shift evaluation into buckets outside the default window.
-        let query_time = stmt.start;
-        let query_time_secs = query_time
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let lookback_start_secs = query_time
-            .checked_sub(stmt.lookback_delta)
-            .unwrap_or(std::time::UNIX_EPOCH)
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_secs() as i64;
-
-        let ranges = preload_ranges(&stmt, lookback_start_secs, query_time_secs);
-
-        // Get query reader for the time ranges
-        let reader = match self.query_reader_for_ranges(&ranges).await {
-            Ok(reader) => reader,
-            Err(e) => {
-                let err = ErrorResponse::internal(e.to_string());
-                return QueryResponse {
-                    status: err.status,
-                    data: None,
-                    error: Some(err.error),
-                    error_type: Some(err.error_type),
-                };
-            }
-        };
-
-        // Wrap reader with cache and evaluate the query
-        let mut evaluator = Evaluator::new(&reader);
-        let result = match evaluator.evaluate(stmt).await {
-            Ok(result) => result,
-            Err(e) => {
-                let err = ErrorResponse::execution(e.to_string());
-                return QueryResponse {
-                    status: err.status,
-                    data: None,
-                    error: Some(err.error),
-                    error_type: Some(err.error_type),
-                };
-            }
-        };
+        let result = self
+            .eval_query(&request.query, request.time, &QueryOptions::default())
+            .await;
 
         match result {
-            ExprResult::Scalar(value) => {
-                // Format as scalar result
-                let query_time_secs = query_time_secs as f64;
-                let scalar_result = (query_time_secs, value.to_string());
-
+            Ok(QueryValue::Scalar {
+                timestamp_ms,
+                value,
+            }) => {
+                let scalar_result = (timestamp_ms as f64 / 1000.0, value.to_string());
                 QueryResponse {
                     status: "success".to_string(),
                     data: Some(QueryResult {
@@ -181,20 +120,18 @@ impl PromqlRouter for Tsdb {
                     error_type: None,
                 }
             }
-            ExprResult::InstantVector(samples) => {
-                // Convert EvalSamples to VectorSeries format
+            Ok(QueryValue::Vector(samples)) => {
                 let result: Vec<VectorSeries> = samples
                     .into_iter()
                     .map(|sample| VectorSeries {
-                        metric: sample.labels,
+                        metric: sample.labels.into(),
                         value: (
-                            sample.timestamp_ms as f64 / 1000.0, // Convert ms to seconds
+                            sample.timestamp_ms as f64 / 1000.0,
                             sample.value.to_string(),
                         ),
                     })
                     .collect();
 
-                // Return success response
                 QueryResponse {
                     status: "success".to_string(),
                     data: Some(QueryResult {
@@ -205,10 +142,8 @@ impl PromqlRouter for Tsdb {
                     error_type: None,
                 }
             }
-            ExprResult::RangeVector(_) => {
-                let err = ErrorResponse::execution(
-                    "Range vectors not supported for instant queries".to_string(),
-                );
+            Err(e) => {
+                let err = query_error_response(e);
                 QueryResponse {
                     status: err.status,
                     data: None,
@@ -220,142 +155,53 @@ impl PromqlRouter for Tsdb {
     }
 
     async fn query_range(&self, request: QueryRangeRequest) -> QueryRangeResponse {
-        // Parse the request to get the expression
-        let clock = Arc::new(SystemClock {});
-        let stmt = match request.parse(clock) {
-            Ok(stmt) => stmt,
+        let result = self
+            .eval_query_range(
+                &request.query,
+                request.start,
+                request.end,
+                request.step,
+                &QueryOptions::default(),
+            )
+            .await;
+
+        match result {
+            Ok(range_samples) => {
+                let result: Vec<MatrixSeries> = range_samples
+                    .into_iter()
+                    .map(|rs| MatrixSeries {
+                        metric: rs.labels.into(),
+                        values: rs
+                            .samples
+                            .into_iter()
+                            .map(|(ts_ms, value)| (ts_ms as f64 / 1000.0, value.to_string()))
+                            .collect(),
+                    })
+                    .collect();
+
+                QueryRangeResponse {
+                    status: "success".to_string(),
+                    data: Some(QueryRangeResult {
+                        result_type: "matrix".to_string(),
+                        result,
+                    }),
+                    error: None,
+                    error_type: None,
+                }
+            }
             Err(e) => {
-                let err = ErrorResponse::bad_data(e.to_string());
-                return QueryRangeResponse {
+                let err = query_error_response(e);
+                QueryRangeResponse {
                     status: err.status,
                     data: None,
                     error: Some(err.error),
                     error_type: Some(err.error_type),
-                };
-            }
-        };
-
-        // Calculate time range for bucket discovery
-        // Use compute_preload_ranges to account for offset/@ modifiers
-        // that may shift evaluation into buckets outside [start - lookback, end].
-        let default_start_secs = stmt
-            .start
-            .checked_sub(stmt.lookback_delta)
-            .unwrap_or(UNIX_EPOCH)
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_secs() as i64;
-        let default_end_secs = stmt.end.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-
-        let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
-
-        // Get query reader for the time ranges
-        let reader = match self.query_reader_for_ranges(&ranges).await {
-            Ok(reader) => reader,
-            Err(e) => {
-                let err = ErrorResponse::internal(e.to_string());
-                return QueryRangeResponse {
-                    status: err.status,
-                    data: None,
-                    error: Some(err.error),
-                    error_type: Some(err.error_type),
-                };
-            }
-        };
-
-        // Evaluate at each step from start to end
-        // Group results by metric labels -> Vec of (timestamp, value)
-        // Use sorted Vec as key since HashMap doesn't implement Hash
-        let mut series_map: HashMap<Vec<(String, String)>, Vec<(f64, String)>> = HashMap::new();
-
-        let mut evaluator = Evaluator::new(&reader);
-        let mut current_time = stmt.start;
-
-        while current_time <= stmt.end {
-            // Create instant query for this timestamp
-            let instant_stmt = EvalStmt {
-                expr: stmt.expr.clone(),
-                start: current_time,
-                end: current_time,
-                interval: Duration::from_secs(0),
-                lookback_delta: stmt.lookback_delta,
-            };
-
-            match evaluator.evaluate(instant_stmt).await {
-                Ok(result) => {
-                    let timestamp_secs = current_time
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs_f64();
-
-                    match result {
-                        ExprResult::InstantVector(samples) => {
-                            for sample in samples {
-                                // Convert labels to sorted vec for use as key
-                                let mut labels_key: Vec<(String, String)> =
-                                    sample.labels.into_iter().collect();
-                                labels_key.sort();
-
-                                let values = series_map.entry(labels_key).or_default();
-                                values.push((timestamp_secs, sample.value.to_string()));
-                            }
-                        }
-                        ExprResult::Scalar(value) => {
-                            // For scalar results in range queries, create a single series with empty labels
-                            let labels_key = vec![];
-                            let values = series_map.entry(labels_key).or_default();
-                            values.push((timestamp_secs, value.to_string()));
-                        }
-                        ExprResult::RangeVector(_) => {
-                            let err = ErrorResponse::execution(
-                                "Range vectors not supported in range query evaluation".to_string(),
-                            );
-                            return QueryRangeResponse {
-                                status: err.status,
-                                data: None,
-                                error: Some(err.error),
-                                error_type: Some(err.error_type),
-                            };
-                        }
-                    }
-                }
-                Err(e) => {
-                    let err = ErrorResponse::execution(e.to_string());
-                    return QueryRangeResponse {
-                        status: err.status,
-                        data: None,
-                        error: Some(err.error),
-                        error_type: Some(err.error_type),
-                    };
                 }
             }
-
-            // Advance to next step
-            current_time += stmt.interval;
-        }
-
-        // Convert to MatrixSeries format
-        let result: Vec<MatrixSeries> = series_map
-            .into_iter()
-            .map(|(labels_vec, values)| {
-                let metric: HashMap<String, String> = labels_vec.into_iter().collect();
-                MatrixSeries { metric, values }
-            })
-            .collect();
-
-        QueryRangeResponse {
-            status: "success".to_string(),
-            data: Some(QueryRangeResult {
-                result_type: "matrix".to_string(),
-                result,
-            }),
-            error: None,
-            error_type: None,
         }
     }
 
     async fn series(&self, request: SeriesRequest) -> SeriesResponse {
-        // Validate matches is non-empty
         if request.matches.is_empty() {
             let err = ErrorResponse::bad_data("at least one match[] required");
             return SeriesResponse {
@@ -366,420 +212,171 @@ impl PromqlRouter for Tsdb {
             };
         }
 
-        // Calculate time range (use defaults if not provided)
         let start_secs = request.start.unwrap_or(0);
         let end_secs = request.end.unwrap_or(i64::MAX);
+        let matchers: Vec<&str> = request.matches.iter().map(|s| s.as_str()).collect();
 
-        // Get query reader for time range
-        let reader = match self.query_reader(start_secs, end_secs).await {
-            Ok(reader) => reader,
+        match self.find_series(&matchers, start_secs, end_secs).await {
+            Ok(labels_vec) => {
+                let mut result: Vec<HashMap<String, String>> =
+                    labels_vec.into_iter().map(|l| l.into()).collect();
+
+                // Sort for consistent output (by metric name, then all labels)
+                result.sort_by(|a, b| {
+                    let a_name = a.get("__name__").map(|s| s.as_str()).unwrap_or("");
+                    let b_name = b.get("__name__").map(|s| s.as_str()).unwrap_or("");
+                    a_name.cmp(b_name).then_with(|| {
+                        let mut a_labels: Vec<_> = a.iter().collect();
+                        let mut b_labels: Vec<_> = b.iter().collect();
+                        a_labels.sort();
+                        b_labels.sort();
+                        a_labels.cmp(&b_labels)
+                    })
+                });
+
+                if let Some(limit) = request.limit {
+                    result.truncate(limit);
+                }
+
+                SeriesResponse {
+                    status: "success".to_string(),
+                    data: Some(result),
+                    error: None,
+                    error_type: None,
+                }
+            }
             Err(e) => {
-                let err = ErrorResponse::internal(e.to_string());
-                return SeriesResponse {
+                let err = query_error_response(e);
+                SeriesResponse {
                     status: err.status,
                     data: None,
                     error: Some(err.error),
                     error_type: Some(err.error_type),
-                };
-            }
-        };
-
-        // Get all buckets for multi-bucket support
-        let buckets = match reader.list_buckets().await {
-            Ok(buckets) => buckets,
-            Err(e) => {
-                let err = ErrorResponse::internal(e.to_string());
-                return SeriesResponse {
-                    status: err.status,
-                    data: None,
-                    error: Some(err.error),
-                    error_type: Some(err.error_type),
-                };
-            }
-        };
-
-        if buckets.is_empty() {
-            // No buckets means no data, return empty result
-            return SeriesResponse {
-                status: "success".to_string(),
-                data: Some(vec![]),
-                error: None,
-                error_type: None,
-            };
-        }
-
-        let bucket_series_map =
-            match get_matching_series_multi_bucket(&reader, &buckets, &request.matches).await {
-                Ok(map) => map,
-                Err(e) => {
-                    let err = ErrorResponse::bad_data(e);
-                    return SeriesResponse {
-                        status: err.status,
-                        data: None,
-                        error: Some(err.error),
-                        error_type: Some(err.error_type),
-                    };
-                }
-            };
-
-        let mut unique_series: HashMap<Vec<Label>, HashMap<String, String>> = HashMap::new();
-
-        for (bucket, series_ids) in bucket_series_map {
-            let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-
-            if series_ids_vec.is_empty() {
-                continue;
-            }
-
-            let forward_index = match reader.forward_index(&bucket, &series_ids_vec).await {
-                Ok(index) => index,
-                Err(e) => {
-                    let err = ErrorResponse::internal(e.to_string());
-                    return SeriesResponse {
-                        status: err.status,
-                        data: None,
-                        error: Some(err.error),
-                        error_type: Some(err.error_type),
-                    };
-                }
-            };
-
-            // Extract label sets and deduplicate by labels
-            for id in &series_ids_vec {
-                if let Some(spec) = forward_index.get_spec(id) {
-                    // Sort by canonical Label ordering (name, then value) for deduplication
-                    let mut sorted_labels = spec.labels.clone();
-                    sorted_labels.sort();
-
-                    if let std::collections::hash_map::Entry::Vacant(e) =
-                        unique_series.entry(sorted_labels)
-                    {
-                        let labels_map = labels_to_map(&spec.labels);
-                        e.insert(labels_map);
-                    }
                 }
             }
-        }
-
-        let mut result: Vec<HashMap<String, String>> = unique_series.into_values().collect();
-
-        // Sort for consistent output (by metric name first, then other labels)
-        result.sort_by(|a, b| {
-            // Compare metric names, using empty string as default
-            let a_name = a.get("__name__").map(|s| s.as_str()).unwrap_or("");
-            let b_name = b.get("__name__").map(|s| s.as_str()).unwrap_or("");
-            a_name.cmp(b_name).then_with(|| {
-                // If metric names are equal, compare all labels
-                let mut a_labels: Vec<_> = a.iter().collect();
-                let mut b_labels: Vec<_> = b.iter().collect();
-                a_labels.sort();
-                b_labels.sort();
-                a_labels.cmp(&b_labels)
-            })
-        });
-
-        if let Some(limit) = request.limit {
-            result.truncate(limit);
-        }
-
-        SeriesResponse {
-            status: "success".to_string(),
-            data: Some(result),
-            error: None,
-            error_type: None,
         }
     }
 
     async fn labels(&self, request: LabelsRequest) -> LabelsResponse {
         let start_secs = request.start.unwrap_or(0);
         let end_secs = request.end.unwrap_or(i64::MAX);
+        let matchers: Option<Vec<&str>> = request
+            .matches
+            .as_ref()
+            .map(|m| m.iter().map(|s| s.as_str()).collect());
 
-        let reader = match self.query_reader(start_secs, end_secs).await {
-            Ok(reader) => reader,
+        match self
+            .find_labels(matchers.as_deref(), start_secs, end_secs)
+            .await
+        {
+            Ok(mut result) => {
+                if let Some(limit) = request.limit {
+                    result.truncate(limit);
+                }
+
+                LabelsResponse {
+                    status: "success".to_string(),
+                    data: Some(result),
+                    error: None,
+                    error_type: None,
+                }
+            }
             Err(e) => {
-                let err = ErrorResponse::internal(e.to_string());
-                return LabelsResponse {
+                let err = query_error_response(e);
+                LabelsResponse {
                     status: err.status,
                     data: None,
                     error: Some(err.error),
                     error_type: Some(err.error_type),
-                };
-            }
-        };
-
-        let buckets = match reader.list_buckets().await {
-            Ok(buckets) => buckets,
-            Err(e) => {
-                let err = ErrorResponse::internal(e.to_string());
-                return LabelsResponse {
-                    status: err.status,
-                    data: None,
-                    error: Some(err.error),
-                    error_type: Some(err.error_type),
-                };
-            }
-        };
-
-        if buckets.is_empty() {
-            // No buckets means no data, return empty result
-            return LabelsResponse {
-                status: "success".to_string(),
-                data: Some(vec![]),
-                error: None,
-                error_type: None,
-            };
-        }
-
-        let mut label_names: HashSet<String> = HashSet::new();
-
-        match &request.matches {
-            Some(matches) if !matches.is_empty() => {
-                let bucket_series_map =
-                    match get_matching_series_multi_bucket(&reader, &buckets, matches).await {
-                        Ok(map) => map,
-                        Err(e) => {
-                            let err = ErrorResponse::bad_data(e);
-                            return LabelsResponse {
-                                status: err.status,
-                                data: None,
-                                error: Some(err.error),
-                                error_type: Some(err.error_type),
-                            };
-                        }
-                    };
-
-                // Collect label names from all matching series across buckets
-                for (bucket, series_ids) in bucket_series_map {
-                    let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-
-                    if series_ids_vec.is_empty() {
-                        continue;
-                    }
-
-                    let forward_index = match reader.forward_index(&bucket, &series_ids_vec).await {
-                        Ok(index) => index,
-                        Err(e) => {
-                            let err = ErrorResponse::internal(e.to_string());
-                            return LabelsResponse {
-                                status: err.status,
-                                data: None,
-                                error: Some(err.error),
-                                error_type: Some(err.error_type),
-                            };
-                        }
-                    };
-
-                    for (_id, spec) in forward_index.all_series() {
-                        for attr in &spec.labels {
-                            label_names.insert(attr.name.clone());
-                        }
-                    }
                 }
             }
-            _ => {
-                // Unfiltered: use inverted index to pull all label kv pairs in bucket
-                for bucket in buckets {
-                    let inverted_index = match reader.all_inverted_index(&bucket).await {
-                        Ok(index) => index,
-                        Err(e) => {
-                            let err = ErrorResponse::internal(e.to_string());
-                            return LabelsResponse {
-                                status: err.status,
-                                data: None,
-                                error: Some(err.error),
-                                error_type: Some(err.error_type),
-                            };
-                        }
-                    };
-                    for attr in inverted_index.all_keys() {
-                        label_names.insert(attr.name);
-                    }
-                }
-            }
-        };
-
-        // Sort and apply limit
-        let mut result: Vec<String> = label_names.into_iter().collect();
-        result.sort();
-        if let Some(limit) = request.limit {
-            result.truncate(limit);
-        }
-
-        LabelsResponse {
-            status: "success".to_string(),
-            data: Some(result),
-            error: None,
-            error_type: None,
         }
     }
 
     async fn label_values(&self, request: LabelValuesRequest) -> LabelValuesResponse {
         let start_secs = request.start.unwrap_or(0);
         let end_secs = request.end.unwrap_or(i64::MAX);
+        let matchers: Option<Vec<&str>> = request
+            .matches
+            .as_ref()
+            .map(|m| m.iter().map(|s| s.as_str()).collect());
 
-        let reader = match self.query_reader(start_secs, end_secs).await {
-            Ok(reader) => reader,
+        match self
+            .find_label_values(
+                &request.label_name,
+                matchers.as_deref(),
+                start_secs,
+                end_secs,
+            )
+            .await
+        {
+            Ok(mut result) => {
+                if let Some(limit) = request.limit {
+                    result.truncate(limit);
+                }
+
+                LabelValuesResponse {
+                    status: "success".to_string(),
+                    data: Some(result),
+                    error: None,
+                    error_type: None,
+                }
+            }
             Err(e) => {
-                let err = ErrorResponse::internal(e.to_string());
-                return LabelValuesResponse {
+                let err = query_error_response(e);
+                LabelValuesResponse {
                     status: err.status,
                     data: None,
                     error: Some(err.error),
                     error_type: Some(err.error_type),
-                };
-            }
-        };
-
-        let buckets = match reader.list_buckets().await {
-            Ok(buckets) => buckets,
-            Err(e) => {
-                let err = ErrorResponse::internal(e.to_string());
-                return LabelValuesResponse {
-                    status: err.status,
-                    data: None,
-                    error: Some(err.error),
-                    error_type: Some(err.error_type),
-                };
-            }
-        };
-
-        if buckets.is_empty() {
-            return LabelValuesResponse {
-                status: "success".to_string(),
-                data: Some(vec![]),
-                error: None,
-                error_type: None,
-            };
-        }
-
-        let mut values: HashSet<String> = HashSet::new();
-
-        match &request.matches {
-            Some(matches) if !matches.is_empty() => {
-                let bucket_series_map =
-                    match get_matching_series_multi_bucket(&reader, &buckets, matches).await {
-                        Ok(map) => map,
-                        Err(e) => {
-                            let err = ErrorResponse::bad_data(e);
-                            return LabelValuesResponse {
-                                status: err.status,
-                                data: None,
-                                error: Some(err.error),
-                                error_type: Some(err.error_type),
-                            };
-                        }
-                    };
-
-                // Collect label values from all matching series across buckets
-                for (bucket, series_ids) in bucket_series_map {
-                    let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-
-                    if series_ids_vec.is_empty() {
-                        continue;
-                    }
-
-                    let forward_index = match reader.forward_index(&bucket, &series_ids_vec).await {
-                        Ok(index) => index,
-                        Err(e) => {
-                            let err = ErrorResponse::internal(e.to_string());
-                            return LabelValuesResponse {
-                                status: err.status,
-                                data: None,
-                                error: Some(err.error),
-                                error_type: Some(err.error_type),
-                            };
-                        }
-                    };
-
-                    for (_id, spec) in forward_index.all_series() {
-                        for attr in &spec.labels {
-                            if attr.name == request.label_name {
-                                values.insert(attr.value.clone());
-                            }
-                        }
-                    }
                 }
             }
-            _ => {
-                for bucket in buckets {
-                    let label_values = match reader.label_values(&bucket, &request.label_name).await
-                    {
-                        Ok(vals) => vals,
-                        Err(e) => {
-                            let err = ErrorResponse::internal(e.to_string());
-                            return LabelValuesResponse {
-                                status: err.status,
-                                data: None,
-                                error: Some(err.error),
-                                error_type: Some(err.error_type),
-                            };
-                        }
-                    };
-                    values.extend(label_values);
-                }
-            }
-        };
-
-        let mut result: Vec<String> = values.into_iter().collect();
-        result.sort();
-        if let Some(limit) = request.limit {
-            result.truncate(limit);
-        }
-
-        LabelValuesResponse {
-            status: "success".to_string(),
-            data: Some(result),
-            error: None,
-            error_type: None,
         }
     }
 
     async fn metadata(&self, request: MetadataRequest) -> MetadataResponse {
-        let catalog = self.metadata_catalog.read().await;
+        match self.find_metadata(request.metric.as_deref()).await {
+            Ok(entries) => {
+                // Group flat Vec<MetricMetadata> by metric_name into
+                // HashMap<String, Vec<response::MetricMetadata>>
+                let mut data: HashMap<String, Vec<MetricMetadata>> = HashMap::new();
+                for m in entries {
+                    data.entry(m.metric_name).or_default().push(MetricMetadata {
+                        metric_type: m
+                            .metric_type
+                            .map(|t| t.as_str().to_string())
+                            .unwrap_or_default(),
+                        help: m.description.unwrap_or_default(),
+                        unit: m.unit.unwrap_or_default(),
+                    });
+                }
 
-        // Convert model::MetricMetadata → response::MetricMetadata
-        let convert = |entries: &[crate::model::MetricMetadata]| -> Vec<MetricMetadata> {
-            entries
-                .iter()
-                .map(|m| MetricMetadata {
-                    metric_type: m
-                        .metric_type
-                        .map(|t| t.as_str().to_string())
-                        .unwrap_or_default(),
-                    help: m.description.clone().unwrap_or_default(),
-                    unit: m.unit.clone().unwrap_or_default(),
-                })
-                .collect()
-        };
+                if let Some(limit) = request.limit {
+                    data = data.into_iter().take(limit).collect();
+                }
 
-        let mut data: HashMap<String, Vec<MetricMetadata>> =
-            if let Some(ref metric) = request.metric {
-                catalog
-                    .get(metric)
-                    .map(|entries| [(metric.clone(), convert(entries))].into_iter().collect())
-                    .unwrap_or_default()
-            } else {
-                catalog
-                    .iter()
-                    .map(|(k, v)| (k.clone(), convert(v)))
-                    .collect()
-            };
+                if let Some(limit_per_metric) = request.limit_per_metric {
+                    for entries in data.values_mut() {
+                        entries.truncate(limit_per_metric);
+                    }
+                }
 
-        if let Some(limit) = request.limit {
-            data = data.into_iter().take(limit).collect();
-        }
-
-        if let Some(limit_per_metric) = request.limit_per_metric {
-            for entries in data.values_mut() {
-                entries.truncate(limit_per_metric);
+                MetadataResponse {
+                    status: "success".to_string(),
+                    data: Some(data),
+                    error: None,
+                    error_type: None,
+                }
             }
-        }
-
-        MetadataResponse {
-            status: ("success".to_string()),
-            data: Some(data),
-            error: None,
-            error_type: None,
+            Err(e) => {
+                let err = query_error_response(e);
+                MetadataResponse {
+                    status: err.status,
+                    data: None,
+                    error: Some(err.error),
+                    error_type: Some(err.error_type),
+                }
+            }
         }
     }
 
@@ -796,6 +393,7 @@ mod tests {
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
     use common::Storage;
     use common::storage::in_memory::InMemoryStorage;
+    use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
 
     async fn create_test_storage() -> Arc<dyn Storage> {
