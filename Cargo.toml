@@ -6,6 +6,7 @@ members = [
     "keyvalue",
     "log",
     "log/bench",
+    "log/c",
     "timeseries",
     "timeseries/bench",
     "vector",

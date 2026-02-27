@@ -8,7 +8,7 @@ use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::Sample;
 use crate::model::SeriesFingerprint;
 use crate::model::{Label, SeriesId, TimeBucket};
-use crate::promql::functions::FunctionRegistry;
+use crate::promql::functions::{FunctionRegistry, PromQLArg};
 use crate::promql::selector::evaluate_selector_with_reader;
 use crate::promql::timestamp::Timestamp;
 use crate::query::QueryReader;
@@ -1218,7 +1218,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             ExprResult::InstantVector(samples) => {
                 // Try instant vector function first
                 if let Some(func) = registry.get(call.func.name) {
-                    let result = func.apply(samples, eval_timestamp_ms)?;
+                    let result =
+                        func.apply(PromQLArg::InstantVector(samples), eval_timestamp_ms)?;
                     Ok(ExprResult::InstantVector(result))
                 } else {
                     Err(EvaluationError::InternalError(format!(
@@ -1239,48 +1240,17 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     )))
                 }
             }
-            ExprResult::Scalar(_) => Err(EvaluationError::InternalError(
-                "Scalar function arguments not yet supported".to_string(),
-            )),
-        }
-    }
-
-    async fn eval_single_argument(
-        &mut self,
-        call: &Call,
-        query_start: Timestamp,
-        query_end: Timestamp,
-        evaluation_ts: Timestamp,
-        interval_ms: i64,
-        lookback_delta_ms: i64,
-    ) -> EvalResult<Vec<EvalSample>> {
-        if call.args.args.len() != 1 {
-            return Err(EvaluationError::InternalError(format!(
-                "{} function requires exactly one argument",
-                call.func.name
-            )));
-        }
-
-        // Evaluate the argument (can be any expression that returns an instant vector)
-        match self
-            .evaluate_expr(
-                call.args.args[0].as_ref(),
-                query_start,
-                query_end,
-                evaluation_ts,
-                interval_ms,
-                lookback_delta_ms,
-            )
-            .await?
-        {
-            // TODO: support functions with scalar args
-            ExprResult::Scalar(_) => Err(EvaluationError::InternalError(
-                "unsupported scalar result".to_string(),
-            )),
-            ExprResult::InstantVector(v) => Ok(v),
-            ExprResult::RangeVector(_) => Err(EvaluationError::InternalError(
-                "range vector handling not yet implemented in eval_single_argument".to_string(),
-            )),
+            ExprResult::Scalar(scalar) => {
+                if let Some(func) = registry.get(call.func.name) {
+                    let result = func.apply(PromQLArg::Scalar(scalar), eval_timestamp_ms)?;
+                    Ok(ExprResult::InstantVector(result))
+                } else {
+                    Err(EvaluationError::InternalError(format!(
+                        "Unknown scalar function: {}",
+                        call.func.name
+                    )))
+                }
+            }
         }
     }
 
@@ -1685,7 +1655,9 @@ mod tests {
     use crate::test_utils::assertions::approx_eq;
     use promql_parser::label::{METRIC_NAME, Matchers};
     use promql_parser::parser::value::ValueType;
-    use promql_parser::parser::{AtModifier, EvalStmt, Offset, VectorSelector};
+    use promql_parser::parser::{
+        AtModifier, EvalStmt, Function, FunctionArgs, NumberLiteral, Offset, VectorSelector,
+    };
     use rstest::rstest;
 
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -3143,6 +3115,77 @@ mod tests {
                 "Test '{}': Expected RangeVector result, got {:?}",
                 test_name, result
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_call_scalar_argument() {
+        let (reader, end_time) = setup_mock_reader(vec![]);
+        let mut evaluator = Evaluator::new(&reader);
+
+        let call = Call {
+            func: Function::new("vector", vec![ValueType::Scalar], false, ValueType::Scalar),
+            args: FunctionArgs::new_args(Expr::NumberLiteral(NumberLiteral { val: 42.0 })),
+        };
+
+        let result = evaluator
+            .evaluate_call(
+                &call,
+                Timestamp::from(end_time),
+                Timestamp::from(end_time),
+                Timestamp::from(end_time),
+                60_000,
+                300_000,
+            )
+            .await
+            .unwrap();
+
+        match result {
+            ExprResult::InstantVector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].value, 42.0);
+                assert!(samples[0].labels.is_empty());
+                let expected_ts = end_time
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64;
+                assert_eq!(samples[0].timestamp_ms, expected_ts);
+            }
+            other => panic!("Expected Instant Vector, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_call_scalar_expression_argument() {
+        let (reader, end_time) = setup_mock_reader(vec![]);
+        let mut evaluator = Evaluator::new(&reader);
+        let call = Call {
+            func: Function::new("vector", vec![ValueType::Scalar], false, ValueType::Scalar),
+            args: FunctionArgs::new_args(Expr::Binary(BinaryExpr {
+                lhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 1.0 })),
+                rhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 1.0 })),
+                op: TokenType::new(T_SUB),
+                modifier: None,
+            })),
+        };
+        let result = evaluator
+            .evaluate_call(
+                &call,
+                Timestamp::from(end_time),
+                Timestamp::from(end_time),
+                Timestamp::from(end_time),
+                60_000,
+                300_000,
+            )
+            .await
+            .unwrap();
+        match result {
+            ExprResult::InstantVector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].value, 0.0);
+                assert!(samples[0].labels.is_empty());
+            }
+            other => panic!("Expected Instant Vector, got {:?}", other),
         }
     }
 
