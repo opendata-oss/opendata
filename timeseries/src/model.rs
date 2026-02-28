@@ -5,7 +5,11 @@
 //! series for batched ingestion.
 
 use crate::util::hour_bucket_in_epoch_minutes;
+use serde::de::{MapAccess, Visitor};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Series ID (unique within a time bucket)
@@ -429,6 +433,53 @@ impl Labels {
     /// Iterates over the labels.
     pub fn iter(&self) -> impl Iterator<Item = &Label> {
         self.0.iter()
+    }
+}
+
+impl Ord for Labels {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl PartialOrd for Labels {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Serialize for Labels {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for label in &self.0 {
+            map.serialize_entry(&label.name, &label.value)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Labels {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct LabelsVisitor;
+
+        impl<'de> Visitor<'de> for LabelsVisitor {
+            type Value = Labels;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a map of label name to label value")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut access: M) -> Result<Labels, M::Error> {
+                let mut labels = Vec::with_capacity(access.size_hint().unwrap_or(0));
+                while let Some((name, value)) = access.next_entry::<String, String>()? {
+                    labels.push(Label { name, value });
+                }
+                labels.sort();
+                Ok(Labels(labels))
+            }
+        }
+
+        deserializer.deserialize_map(LabelsVisitor)
     }
 }
 

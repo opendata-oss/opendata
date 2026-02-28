@@ -324,11 +324,11 @@ impl Tsdb {
     pub(crate) async fn eval_query_range(
         &self,
         query: &str,
-        start: std::time::SystemTime,
-        end: std::time::SystemTime,
+        range: impl std::ops::RangeBounds<std::time::SystemTime>,
         step: Duration,
         opts: &QueryOptions,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
+        let (start, end) = crate::util::range_bounds_to_system_time(range);
         let expr = promql_parser::parser::parse(query)
             .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
 
@@ -1150,7 +1150,7 @@ mod tests {
 
         let wide = QueryOptions::default();
         let results = tsdb
-            .eval_query_range("http_requests", start, end, step, &wide)
+            .eval_query_range("http_requests", start..=end, step, &wide)
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
@@ -1159,7 +1159,7 @@ mod tests {
             lookback_delta: std::time::Duration::from_secs(10),
         };
         let results = tsdb
-            .eval_query_range("http_requests", start, end, step, &narrow)
+            .eval_query_range("http_requests", start..=end, step, &narrow)
             .await
             .unwrap();
         assert!(
@@ -1222,7 +1222,7 @@ mod tests {
 
         let opts = QueryOptions::default();
         let mut results = tsdb
-            .eval_query_range("http_requests", start, end, step, &opts)
+            .eval_query_range("http_requests", start..=end, step, &opts)
             .await
             .unwrap();
         results.sort_by(|a, b| a.labels.get("env").cmp(&b.labels.get("env")));
@@ -1243,7 +1243,7 @@ mod tests {
 
         let opts = QueryOptions::default();
         let results = tsdb
-            .eval_query_range("1+1", start, end, step, &opts)
+            .eval_query_range("1+1", start..=end, step, &opts)
             .await
             .unwrap();
 
@@ -1265,8 +1265,7 @@ mod tests {
         let result = tsdb
             .eval_query_range(
                 "invalid{",
-                start,
-                end,
+                start..=end,
                 std::time::Duration::from_secs(60),
                 &opts,
             )
@@ -1443,7 +1442,7 @@ mod tests {
         let opts = QueryOptions::default();
 
         let results = tsdb
-            .eval_query_range("http_requests offset 1h", start, end, step, &opts)
+            .eval_query_range("http_requests offset 1h", start..=end, step, &opts)
             .await
             .unwrap();
         assert!(!results.is_empty(), "offset range query should find data");
@@ -1465,7 +1464,10 @@ mod tests {
             .await
             .unwrap();
         let samples = result.into_samples();
-        assert!(samples.is_empty(), "before-epoch offset should return empty");
+        assert!(
+            samples.is_empty(),
+            "before-epoch offset should return empty"
+        );
     }
 
     #[tokio::test]
@@ -1479,7 +1481,7 @@ mod tests {
         let opts = QueryOptions::default();
 
         let results = tsdb
-            .eval_query_range("up @ 0 offset 1h", start, end, step, &opts)
+            .eval_query_range("up @ 0 offset 1h", start..=end, step, &opts)
             .await
             .unwrap();
         assert!(
@@ -1504,7 +1506,7 @@ mod tests {
         let opts = QueryOptions::default();
 
         let results = tsdb
-            .eval_query_range("http_requests @ end()", start, end, step, &opts)
+            .eval_query_range("http_requests @ end()", start..=end, step, &opts)
             .await
             .unwrap();
         assert!(!results.is_empty(), "@ end() should find data");
@@ -1535,7 +1537,11 @@ mod tests {
         let mut sorted = results.clone();
         sorted.sort();
         sorted.dedup();
-        assert_eq!(results.len(), sorted.len(), "label names should be deduplicated across buckets");
+        assert_eq!(
+            results.len(),
+            sorted.len(),
+            "label names should be deduplicated across buckets"
+        );
         assert!(results.contains(&"__name__".to_string()));
         assert!(results.contains(&"host".to_string()));
     }
@@ -1556,7 +1562,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(results, vec!["a"], "label values should be deduplicated across buckets");
+        assert_eq!(
+            results,
+            vec!["a"],
+            "label values should be deduplicated across buckets"
+        );
     }
 
     #[tokio::test]

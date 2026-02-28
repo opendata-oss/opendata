@@ -1,8 +1,11 @@
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::ser::{SerializeSeq, SerializeStruct, SerializeTuple};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::error::QueryError;
-use crate::model::{self, QueryValue, RangeSample};
+use crate::model::{self, InstantSample, Labels, QueryValue, RangeSample};
 
 /// Convert a `QueryError` into a Prometheus-style `ErrorResponse`.
 pub(crate) fn query_error_response(err: QueryError) -> ErrorResponse {
@@ -14,42 +17,28 @@ pub(crate) fn query_error_response(err: QueryError) -> ErrorResponse {
 }
 
 /// Convert an instant query result into a Prometheus `QueryResponse`.
-pub(crate) fn query_value_to_response(
-    result: Result<QueryValue, QueryError>,
-) -> QueryResponse {
+pub(crate) fn query_value_to_response(result: Result<QueryValue, QueryError>) -> QueryResponse {
     match result {
         Ok(QueryValue::Scalar {
             timestamp_ms,
             value,
-        }) => {
-            let scalar_result = (timestamp_ms as f64 / 1000.0, value.to_string());
-            QueryResponse {
-                status: "success".to_string(),
-                data: Some(QueryResult {
-                    result_type: "scalar".to_string(),
-                    result: serde_json::to_value(scalar_result).unwrap(),
-                }),
-                error: None,
-                error_type: None,
-            }
-        }
+        }) => QueryResponse {
+            status: "success".to_string(),
+            data: Some(QueryResult {
+                result_type: "scalar".to_string(),
+                result: QueryResultValue::Scalar(timestamp_ms, value),
+            }),
+            error: None,
+            error_type: None,
+        },
         Ok(QueryValue::Vector(samples)) => {
-            let result: Vec<VectorSeries> = samples
-                .into_iter()
-                .map(|sample| VectorSeries {
-                    metric: sample.labels.into(),
-                    value: (
-                        sample.timestamp_ms as f64 / 1000.0,
-                        sample.value.to_string(),
-                    ),
-                })
-                .collect();
+            let result: Vec<VectorSeries> = samples.into_iter().map(VectorSeries).collect();
 
             QueryResponse {
                 status: "success".to_string(),
                 data: Some(QueryResult {
                     result_type: "vector".to_string(),
-                    result: serde_json::to_value(result).unwrap(),
+                    result: QueryResultValue::Vector(result),
                 }),
                 error: None,
                 error_type: None,
@@ -73,17 +62,7 @@ pub(crate) fn range_result_to_response(
 ) -> QueryRangeResponse {
     match result {
         Ok(range_samples) => {
-            let result: Vec<MatrixSeries> = range_samples
-                .into_iter()
-                .map(|rs| MatrixSeries {
-                    metric: rs.labels.into(),
-                    values: rs
-                        .samples
-                        .into_iter()
-                        .map(|(ts_ms, value)| (ts_ms as f64 / 1000.0, value.to_string()))
-                        .collect(),
-                })
-                .collect();
+            let result: Vec<MatrixSeries> = range_samples.into_iter().map(MatrixSeries).collect();
 
             QueryRangeResponse {
                 status: "success".to_string(),
@@ -113,22 +92,9 @@ pub(crate) fn series_to_response(
     limit: Option<usize>,
 ) -> SeriesResponse {
     match result {
-        Ok(labels_vec) => {
-            let mut data: Vec<HashMap<String, String>> =
-                labels_vec.into_iter().map(|l| l.into()).collect();
-
-            // Sort for consistent output (by metric name, then all labels)
-            data.sort_by(|a, b| {
-                let a_name = a.get("__name__").map(|s| s.as_str()).unwrap_or("");
-                let b_name = b.get("__name__").map(|s| s.as_str()).unwrap_or("");
-                a_name.cmp(b_name).then_with(|| {
-                    let mut a_labels: Vec<_> = a.iter().collect();
-                    let mut b_labels: Vec<_> = b.iter().collect();
-                    a_labels.sort();
-                    b_labels.sort();
-                    a_labels.cmp(&b_labels)
-                })
-            });
+        Ok(mut data) => {
+            // Sort for consistent output — Labels is Ord (sorted by name, then value)
+            data.sort();
 
             if let Some(limit) = limit {
                 data.truncate(limit);
@@ -260,6 +226,42 @@ pub(crate) fn metadata_to_response(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Prometheus wire-format serialization helpers
+// ---------------------------------------------------------------------------
+
+/// Serializes an `(i64, f64)` sample as the Prometheus JSON tuple
+/// `[timestamp_secs, "value_string"]` with zero heap allocations.
+struct PromSample(i64, f64);
+
+impl Serialize for PromSample {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut tup = serializer.serialize_tuple(2)?;
+        tup.serialize_element(&(self.0 as f64 / 1000.0))?;
+        let mut buf = ryu::Buffer::new();
+        tup.serialize_element(buf.format(self.1))?;
+        tup.end()
+    }
+}
+
+/// Thin wrapper to serialize `&[(i64, f64)]` as a JSON array of `PromSample`
+/// without collecting into an intermediate `Vec`.
+struct PromSamples<'a>(&'a [(i64, f64)]);
+
+impl Serialize for PromSamples<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for &(ts_ms, value) in self.0 {
+            seq.serialize_element(&PromSample(ts_ms, value))?;
+        }
+        seq.end()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error response
+// ---------------------------------------------------------------------------
+
 /// Error response matching Prometheus API format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
@@ -295,10 +297,13 @@ impl ErrorResponse {
     }
 }
 
-/// Response for /api/v1/query (instant query)
+// ---------------------------------------------------------------------------
+// /api/v1/query (instant query)
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResponse {
-    pub status: String, // "success" or "error"
+    pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<QueryResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -310,14 +315,65 @@ pub struct QueryResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult {
     #[serde(rename = "resultType")]
-    pub result_type: String, // "vector", "scalar", "matrix", "string"
-    pub result: serde_json::Value,
+    pub result_type: String,
+    pub result: QueryResultValue,
 }
 
-/// Response for /api/v1/query_range (range query)
+/// Instant query result — either a scalar or a vector of series.
+///
+/// `Scalar` holds the raw `(timestamp_ms, value)` and serializes using
+/// `PromSample` so the wire format is `[timestamp_secs, "value_string"]`.
+#[derive(Debug, Clone)]
+pub enum QueryResultValue {
+    Scalar(i64, f64),
+    Vector(Vec<VectorSeries>),
+}
+
+impl Serialize for QueryResultValue {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            QueryResultValue::Scalar(ts_ms, value) => {
+                PromSample(*ts_ms, *value).serialize(serializer)
+            }
+            QueryResultValue::Vector(v) => v.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for QueryResultValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Prometheus JSON: scalar = [f64, string], vector = [{metric, value}, ...]
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        if let Some(arr) = raw.as_array() {
+            if arr.len() == 2 && arr[0].is_number() {
+                // Scalar: [timestamp_secs, "value_string"]
+                let ts_secs = arr[0]
+                    .as_f64()
+                    .ok_or_else(|| de::Error::custom("expected f64"))?;
+                let val_str = arr[1]
+                    .as_str()
+                    .ok_or_else(|| de::Error::custom("expected string"))?;
+                let value: f64 = val_str.parse().map_err(de::Error::custom)?;
+                Ok(QueryResultValue::Scalar((ts_secs * 1000.0) as i64, value))
+            } else {
+                // Vector: array of objects
+                let v: Vec<VectorSeries> =
+                    serde_json::from_value(raw).map_err(de::Error::custom)?;
+                Ok(QueryResultValue::Vector(v))
+            }
+        } else {
+            Err(de::Error::custom("expected array"))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /api/v1/query_range (range query)
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryRangeResponse {
-    pub status: String, // "success" or "error"
+    pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<QueryRangeResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -329,28 +385,120 @@ pub struct QueryRangeResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryRangeResult {
     #[serde(rename = "resultType")]
-    pub result_type: String, // typically "matrix"
+    pub result_type: String,
     pub result: Vec<MatrixSeries>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MatrixSeries {
-    pub metric: HashMap<String, String>,
-    pub values: Vec<(f64, String)>, // (timestamp, value)
+// ---------------------------------------------------------------------------
+// MatrixSeries — newtype over RangeSample
+// ---------------------------------------------------------------------------
+
+/// Newtype over `RangeSample` that serializes as the Prometheus wire format:
+/// `{ "metric": {...}, "values": [[ts, "val"], ...] }`.
+#[derive(Debug, Clone)]
+pub struct MatrixSeries(pub RangeSample);
+
+impl Serialize for MatrixSeries {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut s = serializer.serialize_struct("MatrixSeries", 2)?;
+        s.serialize_field("metric", &self.0.labels)?;
+        s.serialize_field("values", &PromSamples(&self.0.samples))?;
+        s.end()
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VectorSeries {
-    pub metric: HashMap<String, String>,
-    pub value: (f64, String), // (timestamp, value)
+impl<'de> Deserialize<'de> for MatrixSeries {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Repr {
+            metric: Labels,
+            values: Vec<(f64, String)>,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        let samples = repr
+            .values
+            .into_iter()
+            .map(|(ts_secs, val_str)| {
+                let value: f64 = val_str.parse().unwrap_or(f64::NAN);
+                ((ts_secs * 1000.0) as i64, value)
+            })
+            .collect();
+        Ok(MatrixSeries(RangeSample {
+            labels: repr.metric,
+            samples,
+        }))
+    }
 }
+
+// ---------------------------------------------------------------------------
+// VectorSeries — newtype over InstantSample
+// ---------------------------------------------------------------------------
+
+/// Newtype over `InstantSample` that serializes as the Prometheus wire format:
+/// `{ "metric": {...}, "value": [ts, "val"] }`.
+#[derive(Debug, Clone)]
+pub struct VectorSeries(pub InstantSample);
+
+impl Serialize for VectorSeries {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut s = serializer.serialize_struct("VectorSeries", 2)?;
+        s.serialize_field("metric", &self.0.labels)?;
+        s.serialize_field("value", &PromSample(self.0.timestamp_ms, self.0.value))?;
+        s.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for VectorSeries {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct VectorSeriesVisitor;
+
+        impl<'de> Visitor<'de> for VectorSeriesVisitor {
+            type Value = VectorSeries;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a VectorSeries object with metric and value fields")
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut metric: Option<Labels> = None;
+                let mut value: Option<(f64, String)> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "metric" => metric = Some(map.next_value()?),
+                        "value" => value = Some(map.next_value()?),
+                        _ => {
+                            let _ = map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                let metric = metric.ok_or_else(|| de::Error::missing_field("metric"))?;
+                let (ts_secs, val_str) = value.ok_or_else(|| de::Error::missing_field("value"))?;
+                let val: f64 = val_str.parse().map_err(de::Error::custom)?;
+
+                Ok(VectorSeries(InstantSample {
+                    labels: metric,
+                    timestamp_ms: (ts_secs * 1000.0) as i64,
+                    value: val,
+                }))
+            }
+        }
+
+        deserializer.deserialize_struct("VectorSeries", &["metric", "value"], VectorSeriesVisitor)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Other response types (unchanged)
+// ---------------------------------------------------------------------------
 
 /// Response for /api/v1/series (series listing)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeriesResponse {
-    pub status: String, // "success" or "error"
+    pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<Vec<HashMap<String, String>>>,
+    pub data: Option<Vec<Labels>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(rename = "errorType", skip_serializing_if = "Option::is_none")]
@@ -360,7 +508,7 @@ pub struct SeriesResponse {
 /// Response for /api/v1/labels (label names)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LabelsResponse {
-    pub status: String, // "success" or "error"
+    pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -372,7 +520,7 @@ pub struct LabelsResponse {
 /// Response for /api/v1/label/{name}/values (label values)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LabelValuesResponse {
-    pub status: String, // "success" or "error"
+    pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -384,7 +532,7 @@ pub struct LabelValuesResponse {
 /// Response for /api/v1/metadata (metric metadata)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataResponse {
-    pub status: String, // "success" or "error"
+    pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<HashMap<String, Vec<MetricMetadata>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -396,15 +544,52 @@ pub struct MetadataResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MetricMetadata {
     #[serde(rename = "type")]
-    pub metric_type: String, // "gauge", "counter", "histogram", "summary"
+    pub metric_type: String,
     pub help: String,
     pub unit: String,
+}
+
+/// Response for /federate (federation endpoint)
+#[derive(Debug, Clone)]
+pub struct FederateResponse {
+    pub content_type: String, // "text/plain; version=0.0.4"
+    pub body: Vec<u8>,        // Prometheus text format
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{InstantSample, Labels, Label, MetricType};
+    use crate::model::{InstantSample, Label, Labels, MetricType};
+
+    // -----------------------------------------------------------------------
+    // PromSample serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prom_sample_serializes_as_tuple() {
+        let sample = PromSample(3_900_000, 42.0);
+        let json = serde_json::to_string(&sample).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.is_array());
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0].as_f64().unwrap(), 3900.0);
+        assert_eq!(arr[1].as_str().unwrap(), "42.0");
+    }
+
+    #[test]
+    fn prom_samples_serializes_as_array() {
+        let samples = vec![(1000, 1.5), (2000, 2.5)];
+        let wrapper = PromSamples(&samples);
+        let json = serde_json::to_string(&wrapper).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0][0].as_f64().unwrap(), 1.0);
+        assert_eq!(arr[0][1].as_str().unwrap(), "1.5");
+        assert_eq!(arr[1][0].as_f64().unwrap(), 2.0);
+        assert_eq!(arr[1][1].as_str().unwrap(), "2.5");
+    }
 
     // -----------------------------------------------------------------------
     // query_value_to_response
@@ -413,18 +598,27 @@ mod tests {
     #[test]
     fn query_value_scalar_response() {
         let result = Ok(QueryValue::Scalar {
-            timestamp_ms: 4000_000,
+            timestamp_ms: 4_000_000,
             value: 42.5,
         });
         let resp = query_value_to_response(result);
-
         assert_eq!(resp.status, "success");
+
+        // Verify the JSON wire format first (before moving data out)
+        let json = serde_json::to_value(&resp).unwrap();
+        let result_arr = &json["data"]["result"];
+        assert_eq!(result_arr[0].as_f64().unwrap(), 4000.0);
+        assert_eq!(result_arr[1].as_str().unwrap(), "42.5");
+
         let data = resp.data.unwrap();
         assert_eq!(data.result_type, "scalar");
-        // Scalar result is a tuple [timestamp_secs, "value"]
-        let arr: (f64, String) = serde_json::from_value(data.result).unwrap();
-        assert_eq!(arr.0, 4000.0, "timestamp should be converted from ms to seconds");
-        assert_eq!(arr.1, "42.5");
+        match data.result {
+            QueryResultValue::Scalar(ts_ms, val) => {
+                assert_eq!(ts_ms, 4_000_000);
+                assert_eq!(val, 42.5);
+            }
+            _ => panic!("expected Scalar variant"),
+        }
     }
 
     #[test]
@@ -434,21 +628,30 @@ mod tests {
                 Label::metric_name("up"),
                 Label::new("job", "prometheus"),
             ]),
-            timestamp_ms: 3900_000,
+            timestamp_ms: 3_900_000,
             value: 1.0,
         }];
         let result = Ok(QueryValue::Vector(samples));
         let resp = query_value_to_response(result);
-
         assert_eq!(resp.status, "success");
+
+        // Verify the JSON wire format first (before moving data out)
+        let json = serde_json::to_value(&resp).unwrap();
+        let first = &json["data"]["result"][0];
+        assert_eq!(first["value"][0].as_f64().unwrap(), 3900.0);
+        assert_eq!(first["value"][1].as_str().unwrap(), "1.0");
+
         let data = resp.data.unwrap();
         assert_eq!(data.result_type, "vector");
-        let results: Vec<VectorSeries> = serde_json::from_value(data.result).unwrap();
+        let results = match data.result {
+            QueryResultValue::Vector(v) => v,
+            _ => panic!("expected Vector variant"),
+        };
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].metric.get("__name__").unwrap(), "up");
-        assert_eq!(results[0].metric.get("job").unwrap(), "prometheus");
-        assert_eq!(results[0].value.0, 3900.0);
-        assert_eq!(results[0].value.1, "1");
+        assert_eq!(results[0].0.labels.get("__name__").unwrap(), "up");
+        assert_eq!(results[0].0.labels.get("job").unwrap(), "prometheus");
+        assert_eq!(results[0].0.timestamp_ms, 3_900_000);
+        assert_eq!(results[0].0.value, 1.0);
     }
 
     #[test]
@@ -466,15 +669,84 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // MatrixSeries serialize/deserialize roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn matrix_series_roundtrip() {
+        let ms = MatrixSeries(RangeSample {
+            labels: Labels::new(vec![Label::metric_name("cpu")]),
+            samples: vec![(1_000, 1.5), (2_000, 2.5)],
+        });
+        let json = serde_json::to_string(&ms).unwrap();
+        let parsed: MatrixSeries = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.0.labels, ms.0.labels);
+        assert_eq!(parsed.0.samples, ms.0.samples);
+    }
+
+    // -----------------------------------------------------------------------
+    // VectorSeries serialize/deserialize roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vector_series_roundtrip() {
+        let vs = VectorSeries(InstantSample {
+            labels: Labels::new(vec![Label::metric_name("up")]),
+            timestamp_ms: 3_900_000,
+            value: 42.0,
+        });
+        let json = serde_json::to_string(&vs).unwrap();
+        let parsed: VectorSeries = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.0.labels, vs.0.labels);
+        assert_eq!(parsed.0.timestamp_ms, vs.0.timestamp_ms);
+        assert_eq!(parsed.0.value, vs.0.value);
+    }
+
+    // -----------------------------------------------------------------------
+    // QueryResultValue serialize/deserialize roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scalar_roundtrip() {
+        let qr = QueryResponse {
+            status: "success".to_string(),
+            data: Some(QueryResult {
+                result_type: "scalar".to_string(),
+                result: QueryResultValue::Scalar(4_000_000, 42.5),
+            }),
+            error: None,
+            error_type: None,
+        };
+        let json = serde_json::to_string(&qr).unwrap();
+        let parsed: QueryResponse = serde_json::from_str(&json).unwrap();
+        match parsed.data.unwrap().result {
+            QueryResultValue::Scalar(ts_ms, val) => {
+                assert_eq!(ts_ms, 4_000_000);
+                assert_eq!(val, 42.5);
+            }
+            _ => panic!("expected Scalar"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // series_to_response — sorting + limit
     // -----------------------------------------------------------------------
 
     #[test]
     fn series_response_sorts_and_limits() {
         let labels_vec = vec![
-            Labels::new(vec![Label::metric_name("zz_metric"), Label::new("env", "prod")]),
-            Labels::new(vec![Label::metric_name("aa_metric"), Label::new("env", "dev")]),
-            Labels::new(vec![Label::metric_name("mm_metric"), Label::new("env", "staging")]),
+            Labels::new(vec![
+                Label::metric_name("zz_metric"),
+                Label::new("env", "prod"),
+            ]),
+            Labels::new(vec![
+                Label::metric_name("aa_metric"),
+                Label::new("env", "dev"),
+            ]),
+            Labels::new(vec![
+                Label::metric_name("mm_metric"),
+                Label::new("env", "staging"),
+            ]),
         ];
         let resp = series_to_response(Ok(labels_vec), Some(2));
 
@@ -484,6 +756,23 @@ mod tests {
         // Should be sorted by __name__
         assert_eq!(data[0].get("__name__").unwrap(), "aa_metric");
         assert_eq!(data[1].get("__name__").unwrap(), "mm_metric");
+    }
+
+    #[test]
+    fn labels_serialize_deserialize_roundtrip() {
+        let labels = Labels::new(vec![
+            Label::metric_name("http_requests"),
+            Label::new("method", "GET"),
+        ]);
+        let json = serde_json::to_string(&labels).unwrap();
+        let parsed: Labels = serde_json::from_str(&json).unwrap();
+        assert_eq!(labels, parsed);
+
+        // Verify JSON shape is a flat object
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.is_object());
+        assert_eq!(value["__name__"], "http_requests");
+        assert_eq!(value["method"], "GET");
     }
 
     // -----------------------------------------------------------------------
@@ -517,8 +806,11 @@ mod tests {
         let resp = metadata_to_response(Ok(entries.clone()), None, Some(1));
         assert_eq!(resp.status, "success");
         let data = resp.data.unwrap();
-        for (_metric, entries) in &data {
-            assert!(entries.len() <= 1, "limit_per_metric=1 should cap each metric to 1 entry");
+        for entries in data.values() {
+            assert!(
+                entries.len() <= 1,
+                "limit_per_metric=1 should cap each metric to 1 entry"
+            );
         }
 
         // limit caps the number of metrics
@@ -587,31 +879,23 @@ mod tests {
                 |(name, has_desc, has_unit)| model::MetricMetadata {
                     metric_name: name,
                     metric_type: Some(MetricType::Gauge),
-                    description: if has_desc {
-                        Some("desc".into())
-                    } else {
-                        None
-                    },
-                    unit: if has_unit {
-                        Some("unit".into())
-                    } else {
-                        None
-                    },
+                    description: if has_desc { Some("desc".into()) } else { None },
+                    unit: if has_unit { Some("unit".into()) } else { None },
                 },
             )
         }
 
         proptest! {
-            /// Scalar timestamp is always converted from ms to seconds.
+            /// Scalar timestamp is always converted from ms to seconds in wire format.
             #[test]
             fn scalar_timestamp_is_ms_to_secs(ts_ms in 0i64..=i64::MAX / 2) {
                 let resp = query_value_to_response(Ok(QueryValue::Scalar {
                     timestamp_ms: ts_ms,
                     value: 1.0,
                 }));
-                let data = resp.data.unwrap();
-                let (ts_secs, _): (f64, String) =
-                    serde_json::from_value(data.result).unwrap();
+                // Verify wire format first (before moving data out)
+                let json = serde_json::to_value(&resp).unwrap();
+                let ts_secs = json["data"]["result"][0].as_f64().unwrap();
                 prop_assert!(
                     (ts_secs - ts_ms as f64 / 1000.0).abs() < 1e-6,
                     "expected {} / 1000 = {}, got {}",
@@ -619,6 +903,14 @@ mod tests {
                     ts_ms as f64 / 1000.0,
                     ts_secs,
                 );
+                // Verify internal representation
+                let data = resp.data.unwrap();
+                match data.result {
+                    QueryResultValue::Scalar(stored_ts, _) => {
+                        prop_assert_eq!(stored_ts, ts_ms);
+                    }
+                    _ => panic!("expected Scalar"),
+                };
             }
 
             /// Vector response preserves all samples and converts timestamps.
@@ -631,7 +923,7 @@ mod tests {
                     .enumerate()
                     .map(|(i, &ts)| InstantSample {
                         labels: Labels::new(vec![Label::metric_name(
-                            &format!("m{i}"),
+                            format!("m{i}"),
                         )]),
                         timestamp_ms: ts,
                         value: i as f64,
@@ -640,16 +932,13 @@ mod tests {
                 let n = samples.len();
                 let resp = query_value_to_response(Ok(QueryValue::Vector(samples)));
                 let data = resp.data.unwrap();
-                let results: Vec<VectorSeries> =
-                    serde_json::from_value(data.result).unwrap();
+                let results = match data.result {
+                    QueryResultValue::Vector(v) => v,
+                    _ => panic!("expected Vector"),
+                };
                 prop_assert_eq!(results.len(), n);
                 for (result, &ts_ms) in results.iter().zip(timestamps.iter()) {
-                    let expected = ts_ms as f64 / 1000.0;
-                    prop_assert!(
-                        (result.value.0 - expected).abs() < 1e-6,
-                        "ts_ms={ts_ms}, expected={expected}, got={}",
-                        result.value.0,
-                    );
+                    prop_assert_eq!(result.0.timestamp_ms, ts_ms);
                 }
             }
 
@@ -662,7 +951,7 @@ mod tests {
                 let data = resp.data.unwrap();
                 let names: Vec<&str> = data
                     .iter()
-                    .map(|m| m.get("__name__").map(|s| s.as_str()).unwrap_or(""))
+                    .map(|m| m.metric_name())
                     .collect();
                 for w in names.windows(2) {
                     prop_assert!(w[0] <= w[1], "not sorted: {:?} > {:?}", w[0], w[1]);
@@ -778,11 +1067,4 @@ mod tests {
         let json = serde_json::to_value(&metadata).unwrap();
         assert!(json.get("data").is_none(), "MetadataResponse: {json}");
     }
-}
-
-/// Response for /federate (federation endpoint)
-#[derive(Debug, Clone)]
-pub struct FederateResponse {
-    pub content_type: String, // "text/plain; version=0.0.4"
-    pub body: Vec<u8>,        // Prometheus text format
 }

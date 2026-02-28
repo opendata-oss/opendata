@@ -8,8 +8,8 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use timeseries::testing::{
-    self, LabelValuesResponse, LabelsResponse, MetadataResponse, QueryRangeResponse,
-    QueryResponse, SeriesResponse, TestTsdb, VectorSeries,
+    self, LabelValuesResponse, LabelsResponse, MetadataResponse, QueryRangeResponse, QueryResponse,
+    QueryResultValue, SeriesResponse, TestTsdb,
 };
 use timeseries::{Label, MetricType, Sample, Series};
 use tower::ServiceExt;
@@ -389,16 +389,18 @@ async fn test_roundtrip() {
     let data = parsed.data.unwrap();
     assert_eq!(data.result_type, "vector");
 
-    // Deserialize the result as a vector of VectorSeries
-    let results: Vec<VectorSeries> = serde_json::from_value(data.result).unwrap();
+    let results = match data.result {
+        QueryResultValue::Vector(v) => v,
+        _ => panic!("expected Vector variant"),
+    };
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].metric.get("__name__").unwrap(),
+        results[0].0.labels.get("__name__").unwrap(),
         "http_requests_total"
     );
-    assert_eq!(results[0].metric.get("method").unwrap(), "GET");
-    // Value should be "42" (string representation)
-    assert_eq!(results[0].value.1, "42");
+    assert_eq!(results[0].0.labels.get("method").unwrap(), "GET");
+    // Value should be 42.0
+    assert_eq!(results[0].0.value, 42.0);
 }
 
 // ---------------------------------------------------------------------------

@@ -20,8 +20,8 @@ use super::request::{
     LabelValuesParams, LabelsParams, MetadataParams, QueryParams, QueryRangeParams, SeriesParams,
 };
 use super::response::{
-    self, LabelValuesResponse, LabelsResponse, MetadataResponse, QueryRangeResponse,
-    QueryResponse, SeriesResponse,
+    self, LabelValuesResponse, LabelsResponse, MetadataResponse, QueryRangeResponse, QueryResponse,
+    SeriesResponse,
 };
 use super::scraper::Scraper;
 use crate::error::Error;
@@ -238,7 +238,7 @@ async fn handle_query_range(
     let step = parse_duration(&params.step)?;
     let result = state
         .tsdb
-        .eval_query_range(&params.query, start, end, step, &QueryOptions::default())
+        .eval_query_range(&params.query, start..=end, step, &QueryOptions::default())
         .await;
     Ok(Json(response::range_result_to_response(result)))
 }

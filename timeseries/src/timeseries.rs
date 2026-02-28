@@ -4,7 +4,7 @@
 //! interacting with OpenData TimeSeries. It exposes write operations for
 //! ingesting time series data.
 
-use std::ops::{Bound, RangeBounds};
+use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +15,7 @@ use crate::error::{QueryError, Result};
 use crate::model::{Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Series};
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::Tsdb;
+use crate::util::range_bounds_to_system_time;
 
 /// Convert a `RangeBounds<SystemTime>` into `(start_secs, end_secs)`.
 fn range_bounds_to_secs(range: impl RangeBounds<SystemTime>) -> (i64, i64) {
@@ -25,23 +26,6 @@ fn range_bounds_to_secs(range: impl RangeBounds<SystemTime>) -> (i64, i64) {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(i64::MAX),
     )
-}
-
-/// Convert a `RangeBounds<SystemTime>` into `(start: SystemTime, end: SystemTime)`.
-fn range_bounds_to_system_time(
-    range: impl RangeBounds<SystemTime>,
-) -> (SystemTime, SystemTime) {
-    let start = match range.start_bound() {
-        Bound::Included(t) => *t,
-        Bound::Excluded(t) => *t + Duration::from_secs(1),
-        Bound::Unbounded => UNIX_EPOCH,
-    };
-    let end = match range.end_bound() {
-        Bound::Included(t) => *t,
-        Bound::Excluded(t) => t.checked_sub(Duration::from_secs(1)).unwrap_or(UNIX_EPOCH),
-        Bound::Unbounded => UNIX_EPOCH + Duration::from_secs(i64::MAX as u64),
-    };
-    (start, end)
 }
 
 /// A time series database for storing and querying metrics.
@@ -172,9 +156,8 @@ impl TimeSeriesDb {
         range: impl RangeBounds<SystemTime>,
         step: Duration,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-        let (start, end) = range_bounds_to_system_time(range);
         self.tsdb
-            .eval_query_range(query, start, end, step, &QueryOptions::default())
+            .eval_query_range(query, range, step, &QueryOptions::default())
             .await
     }
 

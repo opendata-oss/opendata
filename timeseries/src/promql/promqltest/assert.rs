@@ -1,5 +1,5 @@
+use crate::model::Labels;
 use crate::promql::promqltest::dsl::{EvalResult, ExpectedSample};
-use std::collections::HashMap;
 
 /// Compare actual results against expected results
 ///
@@ -34,24 +34,24 @@ pub(super) fn assert_results(
 
     // Sort both sides deterministically - PromQL doesn't guarantee result ordering
     let mut results_sorted = results.to_vec();
-    results_sorted.sort_by_key(|r| label_sort_key(&r.labels));
+    results_sorted.sort_by(|a, b| a.labels.cmp(&b.labels));
 
     let mut expected_sorted = expected.to_vec();
-    expected_sorted.sort_by_key(|e| label_sort_key(&e.labels));
+    expected_sorted.sort_by(|a, b| a.labels.cmp(&b.labels));
 
     for (i, exp) in expected_sorted.iter().enumerate() {
         let result = &results_sorted[i];
 
         // Check all expected labels are present and match
-        for (k, v) in &exp.labels {
-            let actual = result.labels.get(k).ok_or(format!(
+        for label in exp.labels.iter() {
+            let actual = result.labels.get(&label.name).ok_or(format!(
                 "{} eval #{} (query: {}): Missing label '{}'",
-                test_name, eval_num, query, k
+                test_name, eval_num, query, label.name
             ))?;
-            if actual != v {
+            if actual != label.value {
                 return Err(format!(
                     "{} eval #{} (query: {}): Label {} mismatch: expected '{}', got '{}'",
-                    test_name, eval_num, query, k, v, actual
+                    test_name, eval_num, query, label.name, label.value, actual
                 ));
             }
         }
@@ -67,28 +67,26 @@ pub(super) fn assert_results(
     Ok(())
 }
 
-fn label_sort_key(labels: &HashMap<String, String>) -> String {
-    let mut keys: Vec<_> = labels.iter().collect();
-    keys.sort_by_key(|(k, _)| *k);
-    keys.iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Label;
+
+    fn labels_from(pairs: &[(&str, &str)]) -> Labels {
+        let mut labels: Vec<Label> = pairs.iter().map(|(k, v)| Label::new(*k, *v)).collect();
+        labels.sort();
+        Labels::new(labels)
+    }
 
     #[test]
     fn should_match_expected_results() {
         // given
         let results = vec![EvalResult {
-            labels: HashMap::from([("job".to_string(), "test".to_string())]),
+            labels: labels_from(&[("job", "test")]),
             value: 42.0,
         }];
         let expected = vec![ExpectedSample {
-            labels: HashMap::from([("job".to_string(), "test".to_string())]),
+            labels: labels_from(&[("job", "test")]),
             value: 42.0,
         }];
 
@@ -103,7 +101,7 @@ mod tests {
     fn should_reject_count_mismatch() {
         // given
         let results = vec![EvalResult {
-            labels: HashMap::new(),
+            labels: Labels::new(vec![]),
             value: 42.0,
         }];
         let expected = vec![];
@@ -120,11 +118,11 @@ mod tests {
     fn should_reject_mismatched_values() {
         // given
         let results = vec![EvalResult {
-            labels: HashMap::new(),
+            labels: Labels::new(vec![]),
             value: 42.0,
         }];
         let expected = vec![ExpectedSample {
-            labels: HashMap::new(),
+            labels: Labels::new(vec![]),
             value: 99.0,
         }];
 
