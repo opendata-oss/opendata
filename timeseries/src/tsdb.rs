@@ -1413,6 +1413,152 @@ mod tests {
         assert_eq!(results[0].unit, Some("percent".to_string()));
     }
 
+    // -----------------------------------------------------------------------
+    // Offset / @ modifier tests (bucket preloading)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn eval_query_with_offset_should_load_correct_bucket() {
+        // Data at 4000s (bucket hour-60: 3600–7199s).
+        // Query at 7600s with offset 1h → effective time = 4000s.
+        let tsdb = create_tsdb_with_data().await;
+        let query_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(7600);
+        let opts = QueryOptions::default();
+
+        let result = tsdb
+            .eval_query("http_requests offset 1h", Some(query_time), &opts)
+            .await
+            .unwrap();
+        let samples = result.into_samples();
+        assert_eq!(samples.len(), 2, "offset 1h should find data at 4000s");
+    }
+
+    #[tokio::test]
+    async fn eval_query_range_with_offset_crossing_bucket() {
+        // Data at 4000s. Range [7600,7660] with offset 1h → effective [4000,4060].
+        let tsdb = create_tsdb_with_data().await;
+        let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(7600);
+        let end = std::time::UNIX_EPOCH + std::time::Duration::from_secs(7660);
+        let step = std::time::Duration::from_secs(60);
+        let opts = QueryOptions::default();
+
+        let results = tsdb
+            .eval_query_range("http_requests offset 1h", start, end, step, &opts)
+            .await
+            .unwrap();
+        assert!(!results.is_empty(), "offset range query should find data");
+        for rs in &results {
+            assert!(!rs.samples.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn eval_query_with_offset_before_epoch_should_not_error() {
+        // Query at 100s with offset 1h → effective time = -3500s (before epoch).
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+        let query_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let opts = QueryOptions::default();
+
+        let result = tsdb
+            .eval_query("up offset 1h", Some(query_time), &opts)
+            .await
+            .unwrap();
+        let samples = result.into_samples();
+        assert!(samples.is_empty(), "before-epoch offset should return empty");
+    }
+
+    #[tokio::test]
+    async fn eval_query_range_with_at_before_epoch_should_not_error() {
+        // `@ 0 offset 1h` pins evaluation to t=0, then offset pushes to -3600.
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+        let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        let end = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2000);
+        let step = std::time::Duration::from_secs(60);
+        let opts = QueryOptions::default();
+
+        let results = tsdb
+            .eval_query_range("up @ 0 offset 1h", start, end, step, &opts)
+            .await
+            .unwrap();
+        assert!(
+            results.is_empty() || results.iter().all(|rs| rs.samples.is_empty()),
+            "@ 0 offset 1h should return empty matrix"
+        );
+    }
+
+    #[tokio::test]
+    async fn eval_query_range_with_at_end_should_load_correct_bucket() {
+        // Data at 4000s. Range [4000,8000]. `@ end()` pins to 8000s.
+        // With default 5m lookback, sample at 4000s is within range from 8000.
+        // Actually, @ end() pins evaluation to t=8000 for each step, but
+        // lookback only covers 5min=300s. Data at 4000s is 4000s before 8000s,
+        // so it won't be found by lookback. Let's use a range where @ end()
+        // helps: range [3900,4100], data at 4000s, `@ end()` pins to 4100s,
+        // lookback 5min covers it.
+        let tsdb = create_tsdb_with_data().await;
+        let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(3900);
+        let end = std::time::UNIX_EPOCH + std::time::Duration::from_secs(4100);
+        let step = std::time::Duration::from_secs(60);
+        let opts = QueryOptions::default();
+
+        let results = tsdb
+            .eval_query_range("http_requests @ end()", start, end, step, &opts)
+            .await
+            .unwrap();
+        assert!(!results.is_empty(), "@ end() should find data");
+        // All steps should see the same sample (pinned to end)
+        for rs in &results {
+            assert!(!rs.samples.is_empty());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-bucket dedup for labels and label_values
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn find_labels_should_dedup_across_buckets() {
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        // Same series in two different buckets
+        let series1 = create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0);
+        let series2 = create_sample("cpu", vec![("host", "a")], 7_500_000, 2.0);
+        tsdb.ingest_samples(vec![series1, series2]).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        let results = tsdb.find_labels(None, 0, i64::MAX).await.unwrap();
+
+        // Label names should not be duplicated
+        let mut sorted = results.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(results.len(), sorted.len(), "label names should be deduplicated across buckets");
+        assert!(results.contains(&"__name__".to_string()));
+        assert!(results.contains(&"host".to_string()));
+    }
+
+    #[tokio::test]
+    async fn find_label_values_should_dedup_across_buckets() {
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        // Same series in two different buckets
+        let series1 = create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0);
+        let series2 = create_sample("cpu", vec![("host", "a")], 7_500_000, 2.0);
+        tsdb.ingest_samples(vec![series1, series2]).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        let results = tsdb
+            .find_label_values("host", None, 0, i64::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(results, vec!["a"], "label values should be deduplicated across buckets");
+    }
+
     #[tokio::test]
     async fn find_metadata_should_filter_by_metric() {
         let storage = create_test_storage().await;

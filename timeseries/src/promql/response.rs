@@ -404,6 +404,322 @@ pub struct MetricMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{InstantSample, Labels, Label, MetricType};
+
+    // -----------------------------------------------------------------------
+    // query_value_to_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn query_value_scalar_response() {
+        let result = Ok(QueryValue::Scalar {
+            timestamp_ms: 4000_000,
+            value: 42.5,
+        });
+        let resp = query_value_to_response(result);
+
+        assert_eq!(resp.status, "success");
+        let data = resp.data.unwrap();
+        assert_eq!(data.result_type, "scalar");
+        // Scalar result is a tuple [timestamp_secs, "value"]
+        let arr: (f64, String) = serde_json::from_value(data.result).unwrap();
+        assert_eq!(arr.0, 4000.0, "timestamp should be converted from ms to seconds");
+        assert_eq!(arr.1, "42.5");
+    }
+
+    #[test]
+    fn query_value_vector_response() {
+        let samples = vec![InstantSample {
+            labels: Labels::new(vec![
+                Label::metric_name("up"),
+                Label::new("job", "prometheus"),
+            ]),
+            timestamp_ms: 3900_000,
+            value: 1.0,
+        }];
+        let result = Ok(QueryValue::Vector(samples));
+        let resp = query_value_to_response(result);
+
+        assert_eq!(resp.status, "success");
+        let data = resp.data.unwrap();
+        assert_eq!(data.result_type, "vector");
+        let results: Vec<VectorSeries> = serde_json::from_value(data.result).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].metric.get("__name__").unwrap(), "up");
+        assert_eq!(results[0].metric.get("job").unwrap(), "prometheus");
+        assert_eq!(results[0].value.0, 3900.0);
+        assert_eq!(results[0].value.1, "1");
+    }
+
+    #[test]
+    fn query_value_error_response() {
+        let resp = query_value_to_response(Err(QueryError::InvalidQuery("bad syntax".into())));
+        assert_eq!(resp.status, "error");
+        assert_eq!(resp.error_type.as_deref(), Some("bad_data"));
+        assert!(resp.data.is_none());
+
+        let resp = query_value_to_response(Err(QueryError::Execution("boom".into())));
+        assert_eq!(resp.error_type.as_deref(), Some("execution"));
+
+        let resp = query_value_to_response(Err(QueryError::Timeout));
+        assert_eq!(resp.error_type.as_deref(), Some("timeout"));
+    }
+
+    // -----------------------------------------------------------------------
+    // series_to_response — sorting + limit
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn series_response_sorts_and_limits() {
+        let labels_vec = vec![
+            Labels::new(vec![Label::metric_name("zz_metric"), Label::new("env", "prod")]),
+            Labels::new(vec![Label::metric_name("aa_metric"), Label::new("env", "dev")]),
+            Labels::new(vec![Label::metric_name("mm_metric"), Label::new("env", "staging")]),
+        ];
+        let resp = series_to_response(Ok(labels_vec), Some(2));
+
+        assert_eq!(resp.status, "success");
+        let data = resp.data.unwrap();
+        assert_eq!(data.len(), 2, "limit should truncate to 2");
+        // Should be sorted by __name__
+        assert_eq!(data[0].get("__name__").unwrap(), "aa_metric");
+        assert_eq!(data[1].get("__name__").unwrap(), "mm_metric");
+    }
+
+    // -----------------------------------------------------------------------
+    // metadata_to_response — limit + limit_per_metric
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metadata_response_limits() {
+        let entries = vec![
+            model::MetricMetadata {
+                metric_name: "cpu".into(),
+                metric_type: Some(MetricType::Gauge),
+                description: Some("CPU usage".into()),
+                unit: Some("percent".into()),
+            },
+            model::MetricMetadata {
+                metric_name: "cpu".into(),
+                metric_type: Some(MetricType::Gauge),
+                description: Some("CPU total".into()),
+                unit: None,
+            },
+            model::MetricMetadata {
+                metric_name: "mem".into(),
+                metric_type: Some(MetricType::Gauge),
+                description: Some("Memory".into()),
+                unit: Some("bytes".into()),
+            },
+        ];
+
+        // limit_per_metric caps entries per metric
+        let resp = metadata_to_response(Ok(entries.clone()), None, Some(1));
+        assert_eq!(resp.status, "success");
+        let data = resp.data.unwrap();
+        for (_metric, entries) in &data {
+            assert!(entries.len() <= 1, "limit_per_metric=1 should cap each metric to 1 entry");
+        }
+
+        // limit caps the number of metrics
+        let resp = metadata_to_response(Ok(entries), Some(1), None);
+        let data = resp.data.unwrap();
+        assert_eq!(data.len(), 1, "limit=1 should return only 1 metric");
+    }
+
+    #[test]
+    fn metadata_response_converts_types() {
+        let entries = vec![model::MetricMetadata {
+            metric_name: "requests".into(),
+            metric_type: Some(MetricType::Gauge),
+            description: Some("Total requests".into()),
+            unit: Some("1".into()),
+        }];
+        let resp = metadata_to_response(Ok(entries), None, None);
+        let data = resp.data.unwrap();
+        let meta = &data["requests"][0];
+        assert_eq!(meta.metric_type, "gauge");
+        assert_eq!(meta.help, "Total requests");
+        assert_eq!(meta.unit, "1");
+    }
+
+    // -----------------------------------------------------------------------
+    // Property-based tests
+    // -----------------------------------------------------------------------
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Generate an arbitrary metric name (1–20 lowercase alpha chars).
+        fn arb_metric_name() -> impl Strategy<Value = String> {
+            "[a-z][a-z_]{0,19}".prop_filter("non-empty", |s| !s.is_empty())
+        }
+
+        /// Generate an arbitrary label key (1–10 lowercase alpha chars).
+        fn arb_label_key() -> impl Strategy<Value = String> {
+            "[a-z]{1,10}"
+        }
+
+        /// Generate an arbitrary label value.
+        fn arb_label_value() -> impl Strategy<Value = String> {
+            "[a-zA-Z0-9_]{0,20}"
+        }
+
+        /// Generate a Labels with a __name__ and 0–3 extra labels.
+        fn arb_labels() -> impl Strategy<Value = Labels> {
+            (
+                arb_metric_name(),
+                prop::collection::vec((arb_label_key(), arb_label_value()), 0..4),
+            )
+                .prop_map(|(name, pairs)| {
+                    let mut labels = vec![Label::metric_name(&name)];
+                    for (k, v) in pairs {
+                        labels.push(Label::new(k, v));
+                    }
+                    Labels::new(labels)
+                })
+        }
+
+        /// Generate a MetricMetadata entry.
+        fn arb_metadata() -> impl Strategy<Value = model::MetricMetadata> {
+            (arb_metric_name(), any::<bool>(), any::<bool>()).prop_map(
+                |(name, has_desc, has_unit)| model::MetricMetadata {
+                    metric_name: name,
+                    metric_type: Some(MetricType::Gauge),
+                    description: if has_desc {
+                        Some("desc".into())
+                    } else {
+                        None
+                    },
+                    unit: if has_unit {
+                        Some("unit".into())
+                    } else {
+                        None
+                    },
+                },
+            )
+        }
+
+        proptest! {
+            /// Scalar timestamp is always converted from ms to seconds.
+            #[test]
+            fn scalar_timestamp_is_ms_to_secs(ts_ms in 0i64..=i64::MAX / 2) {
+                let resp = query_value_to_response(Ok(QueryValue::Scalar {
+                    timestamp_ms: ts_ms,
+                    value: 1.0,
+                }));
+                let data = resp.data.unwrap();
+                let (ts_secs, _): (f64, String) =
+                    serde_json::from_value(data.result).unwrap();
+                prop_assert!(
+                    (ts_secs - ts_ms as f64 / 1000.0).abs() < 1e-6,
+                    "expected {} / 1000 = {}, got {}",
+                    ts_ms,
+                    ts_ms as f64 / 1000.0,
+                    ts_secs,
+                );
+            }
+
+            /// Vector response preserves all samples and converts timestamps.
+            #[test]
+            fn vector_preserves_samples_and_converts_timestamps(
+                timestamps in prop::collection::vec(0i64..=i64::MAX / 2, 1..10),
+            ) {
+                let samples: Vec<InstantSample> = timestamps
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &ts)| InstantSample {
+                        labels: Labels::new(vec![Label::metric_name(
+                            &format!("m{i}"),
+                        )]),
+                        timestamp_ms: ts,
+                        value: i as f64,
+                    })
+                    .collect();
+                let n = samples.len();
+                let resp = query_value_to_response(Ok(QueryValue::Vector(samples)));
+                let data = resp.data.unwrap();
+                let results: Vec<VectorSeries> =
+                    serde_json::from_value(data.result).unwrap();
+                prop_assert_eq!(results.len(), n);
+                for (result, &ts_ms) in results.iter().zip(timestamps.iter()) {
+                    let expected = ts_ms as f64 / 1000.0;
+                    prop_assert!(
+                        (result.value.0 - expected).abs() < 1e-6,
+                        "ts_ms={ts_ms}, expected={expected}, got={}",
+                        result.value.0,
+                    );
+                }
+            }
+
+            /// series_to_response output is always sorted by __name__.
+            #[test]
+            fn series_output_is_sorted(
+                labels_vec in prop::collection::vec(arb_labels(), 0..20),
+            ) {
+                let resp = series_to_response(Ok(labels_vec), None);
+                let data = resp.data.unwrap();
+                let names: Vec<&str> = data
+                    .iter()
+                    .map(|m| m.get("__name__").map(|s| s.as_str()).unwrap_or(""))
+                    .collect();
+                for w in names.windows(2) {
+                    prop_assert!(w[0] <= w[1], "not sorted: {:?} > {:?}", w[0], w[1]);
+                }
+            }
+
+            /// series_to_response with limit always returns at most `limit` entries.
+            #[test]
+            fn series_limit_is_respected(
+                labels_vec in prop::collection::vec(arb_labels(), 0..20),
+                limit in 0usize..25,
+            ) {
+                let input_len = labels_vec.len();
+                let resp = series_to_response(Ok(labels_vec), Some(limit));
+                let data = resp.data.unwrap();
+                prop_assert!(data.len() <= limit, "len {} > limit {}", data.len(), limit);
+                prop_assert_eq!(data.len(), input_len.min(limit));
+            }
+
+            /// metadata_to_response with limit caps the number of distinct metrics.
+            #[test]
+            fn metadata_limit_caps_metrics(
+                entries in prop::collection::vec(arb_metadata(), 0..20),
+                limit in 1usize..10,
+            ) {
+                let resp = metadata_to_response(Ok(entries), Some(limit), None);
+                let data = resp.data.unwrap();
+                prop_assert!(
+                    data.len() <= limit,
+                    "metric count {} > limit {}",
+                    data.len(),
+                    limit,
+                );
+            }
+
+            /// metadata_to_response with limit_per_metric caps entries per metric.
+            #[test]
+            fn metadata_limit_per_metric_caps_entries(
+                entries in prop::collection::vec(arb_metadata(), 0..20),
+                limit_per in 1usize..5,
+            ) {
+                let resp = metadata_to_response(Ok(entries), None, Some(limit_per));
+                let data = resp.data.unwrap();
+                for (metric, entries) in &data {
+                    prop_assert!(
+                        entries.len() <= limit_per,
+                        "metric {metric}: {} entries > limit_per_metric {limit_per}",
+                        entries.len(),
+                    );
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Existing tests
+    // -----------------------------------------------------------------------
 
     /// Verify that all response structs omit the `data` key when it is None.
     #[test]
