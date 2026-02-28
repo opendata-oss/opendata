@@ -187,6 +187,9 @@ impl From<Error> for ApiError {
 }
 
 /// Extract params from GET (query string) or POST (form body).
+///
+/// Note: `AppState` must implement `Clone` because axum's `FromRequest`
+/// trait requires `S: Clone` for extractors like `Query` and `Form`.
 async fn extract_params<T: serde::de::DeserializeOwned>(
     request: Request,
     state: &AppState,

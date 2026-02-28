@@ -442,7 +442,7 @@ impl Tsdb {
         }
 
         let mut result: Vec<Labels> = unique_series.into_iter().collect();
-        result.sort_by(|a, b| a.metric_name().cmp(b.metric_name()));
+        result.sort();
         Ok(result)
     }
 

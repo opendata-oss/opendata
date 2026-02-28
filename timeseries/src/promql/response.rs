@@ -185,16 +185,10 @@ pub(crate) fn metadata_to_response(
 ) -> MetadataResponse {
     match result {
         Ok(entries) => {
-            let mut data: HashMap<String, Vec<MetricMetadata>> = HashMap::new();
+            let mut data: HashMap<String, Vec<WireMetricMetadata>> = HashMap::new();
             for m in entries {
-                data.entry(m.metric_name).or_default().push(MetricMetadata {
-                    metric_type: m
-                        .metric_type
-                        .map(|t| t.as_str().to_string())
-                        .unwrap_or_default(),
-                    help: m.description.unwrap_or_default(),
-                    unit: m.unit.unwrap_or_default(),
-                });
+                let name = m.metric_name.clone();
+                data.entry(name).or_default().push(WireMetricMetadata(m));
             }
 
             if let Some(limit) = limit {
@@ -354,7 +348,10 @@ impl<'de> Deserialize<'de> for QueryResultValue {
                     .as_str()
                     .ok_or_else(|| de::Error::custom("expected string"))?;
                 let value: f64 = val_str.parse().map_err(de::Error::custom)?;
-                Ok(QueryResultValue::Scalar((ts_secs * 1000.0) as i64, value))
+                Ok(QueryResultValue::Scalar(
+                    (ts_secs * 1000.0).round() as i64,
+                    value,
+                ))
             } else {
                 // Vector: array of objects
                 let v: Vec<VectorSeries> =
@@ -420,7 +417,7 @@ impl<'de> Deserialize<'de> for MatrixSeries {
             .into_iter()
             .map(|(ts_secs, val_str)| {
                 let value: f64 = val_str.parse().unwrap_or(f64::NAN);
-                ((ts_secs * 1000.0) as i64, value)
+                ((ts_secs * 1000.0).round() as i64, value)
             })
             .collect();
         Ok(MatrixSeries(RangeSample {
@@ -479,7 +476,7 @@ impl<'de> Deserialize<'de> for VectorSeries {
 
                 Ok(VectorSeries(InstantSample {
                     labels: metric,
-                    timestamp_ms: (ts_secs * 1000.0) as i64,
+                    timestamp_ms: (ts_secs * 1000.0).round() as i64,
                     value: val,
                 }))
             }
@@ -534,19 +531,78 @@ pub struct LabelValuesResponse {
 pub struct MetadataResponse {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<HashMap<String, Vec<MetricMetadata>>>,
+    pub data: Option<HashMap<String, Vec<WireMetricMetadata>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(rename = "errorType", skip_serializing_if = "Option::is_none")]
     pub error_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct MetricMetadata {
-    #[serde(rename = "type")]
-    pub metric_type: String,
-    pub help: String,
-    pub unit: String,
+/// Newtype over `model::MetricMetadata` that serializes as the Prometheus wire
+/// format: `{"type": "gauge", "help": "...", "unit": "..."}`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WireMetricMetadata(pub model::MetricMetadata);
+
+impl Serialize for WireMetricMetadata {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut s = serializer.serialize_struct("MetricMetadata", 3)?;
+        s.serialize_field(
+            "type",
+            self.0
+                .metric_type
+                .as_ref()
+                .map(|t| t.as_str())
+                .unwrap_or(""),
+        )?;
+        s.serialize_field("help", self.0.description.as_deref().unwrap_or(""))?;
+        s.serialize_field("unit", self.0.unit.as_deref().unwrap_or(""))?;
+        s.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for WireMetricMetadata {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Repr {
+            #[serde(rename = "type", default)]
+            metric_type: String,
+            #[serde(default)]
+            help: String,
+            #[serde(default)]
+            unit: String,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        let metric_type = if repr.metric_type.is_empty() {
+            None
+        } else {
+            Some(match repr.metric_type.as_str() {
+                "gauge" => model::MetricType::Gauge,
+                "counter" => model::MetricType::Sum {
+                    monotonic: true,
+                    temporality: model::Temporality::Unspecified,
+                },
+                "histogram" => model::MetricType::Histogram {
+                    temporality: model::Temporality::Unspecified,
+                },
+                "summary" => model::MetricType::Summary,
+                _ => model::MetricType::Gauge,
+            })
+        };
+        Ok(WireMetricMetadata(model::MetricMetadata {
+            metric_name: String::new(),
+            metric_type,
+            description: if repr.help.is_empty() {
+                None
+            } else {
+                Some(repr.help)
+            },
+            unit: if repr.unit.is_empty() {
+                None
+            } else {
+                Some(repr.unit)
+            },
+        }))
+    }
 }
 
 /// Response for /federate (federation endpoint)
@@ -830,9 +886,9 @@ mod tests {
         let resp = metadata_to_response(Ok(entries), None, None);
         let data = resp.data.unwrap();
         let meta = &data["requests"][0];
-        assert_eq!(meta.metric_type, "gauge");
-        assert_eq!(meta.help, "Total requests");
-        assert_eq!(meta.unit, "1");
+        assert_eq!(meta.0.metric_type.as_ref().unwrap().as_str(), "gauge");
+        assert_eq!(meta.0.description.as_deref().unwrap(), "Total requests");
+        assert_eq!(meta.0.unit.as_deref().unwrap(), "1");
     }
 
     // -----------------------------------------------------------------------

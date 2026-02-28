@@ -21,7 +21,10 @@ use crate::util::range_bounds_to_system_time;
 fn range_bounds_to_secs(range: impl RangeBounds<SystemTime>) -> (i64, i64) {
     let (start, end) = range_bounds_to_system_time(range);
     (
-        start.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+        start
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
         end.duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(i64::MAX),

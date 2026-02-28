@@ -416,6 +416,7 @@ impl Labels {
     }
 
     /// Returns the value of the label with the given name, if present.
+    // TODO: labels are sorted, could use binary_search_by for O(log n)
     pub fn get(&self, name: &str) -> Option<&str> {
         self.0
             .iter()

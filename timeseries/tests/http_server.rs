@@ -440,8 +440,11 @@ async fn test_metadata() {
     );
     let entries = &data["http_requests_total"];
     assert!(!entries.is_empty());
-    assert_eq!(entries[0].metric_type, "gauge");
-    assert_eq!(entries[0].help, "Total HTTP requests");
+    assert_eq!(entries[0].0.metric_type.as_ref().unwrap().as_str(), "gauge");
+    assert_eq!(
+        entries[0].0.description.as_deref().unwrap(),
+        "Total HTTP requests"
+    );
 }
 
 // ---------------------------------------------------------------------------
