@@ -5,7 +5,12 @@
 //! series for batched ingestion.
 
 use crate::util::hour_bucket_in_epoch_minutes;
-use std::time::{SystemTime, UNIX_EPOCH};
+use serde::de::{MapAccess, Visitor};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::HashMap;
+use std::fmt;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Series ID (unique within a time bucket)
 pub(crate) type SeriesId = u32;
@@ -392,6 +397,195 @@ impl SeriesBuilder {
             unit: self.unit,
             description: self.description,
             samples: self.samples,
+        }
+    }
+}
+
+/// An ordered set of labels identifying a series.
+///
+/// `Labels` wraps a sorted `Vec<Label>` and provides convenience accessors
+/// for looking up label values and the metric name. This is the type returned
+/// by read/query APIs to identify each result series.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Labels(Vec<Label>);
+
+impl Labels {
+    /// Creates a new `Labels` from a vec of labels.
+    pub fn new(labels: Vec<Label>) -> Self {
+        Self(labels)
+    }
+
+    /// Returns the value of the label with the given name, if present.
+    // TODO: labels are sorted, could use binary_search_by for O(log n)
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|l| l.name == name)
+            .map(|l| l.value.as_str())
+    }
+
+    /// Returns the metric name (value of the `__name__` label).
+    ///
+    /// Returns `""` if no `__name__` label is present.
+    pub fn metric_name(&self) -> &str {
+        self.get("__name__").unwrap_or("")
+    }
+
+    /// Iterates over the labels.
+    pub fn iter(&self) -> impl Iterator<Item = &Label> {
+        self.0.iter()
+    }
+}
+
+impl Ord for Labels {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl PartialOrd for Labels {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Serialize for Labels {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for label in &self.0 {
+            map.serialize_entry(&label.name, &label.value)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Labels {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct LabelsVisitor;
+
+        impl<'de> Visitor<'de> for LabelsVisitor {
+            type Value = Labels;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a map of label name to label value")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut access: M) -> Result<Labels, M::Error> {
+                let mut labels = Vec::with_capacity(access.size_hint().unwrap_or(0));
+                while let Some((name, value)) = access.next_entry::<String, String>()? {
+                    labels.push(Label { name, value });
+                }
+                labels.sort();
+                Ok(Labels(labels))
+            }
+        }
+
+        deserializer.deserialize_map(LabelsVisitor)
+    }
+}
+
+impl From<Labels> for HashMap<String, String> {
+    fn from(labels: Labels) -> Self {
+        labels.0.into_iter().map(|l| (l.name, l.value)).collect()
+    }
+}
+
+impl From<HashMap<String, String>> for Labels {
+    fn from(map: HashMap<String, String>) -> Self {
+        let mut labels: Vec<Label> = map
+            .into_iter()
+            .map(|(name, value)| Label { name, value })
+            .collect();
+        labels.sort();
+        Self(labels)
+    }
+}
+
+/// The result of an instant PromQL query.
+///
+/// PromQL expressions evaluate to either a scalar (e.g. `1+1`) or a
+/// vector of time series samples (e.g. `http_requests_total`).
+#[derive(Debug, Clone)]
+pub enum QueryValue {
+    Scalar { timestamp_ms: i64, value: f64 },
+    Vector(Vec<InstantSample>),
+}
+
+impl QueryValue {
+    /// Flatten into samples, converting a scalar to a single
+    /// `InstantSample` with empty labels.
+    pub fn into_samples(self) -> Vec<InstantSample> {
+        match self {
+            QueryValue::Scalar {
+                timestamp_ms,
+                value,
+            } => vec![InstantSample {
+                labels: Labels::new(vec![]),
+                timestamp_ms,
+                value,
+            }],
+            QueryValue::Vector(samples) => samples,
+        }
+    }
+}
+
+/// A single series value at a point in time.
+///
+/// Returned by instant (point-in-time) PromQL queries.
+#[derive(Debug, Clone)]
+pub struct InstantSample {
+    /// The labels identifying this series.
+    pub labels: Labels,
+    /// Timestamp in milliseconds since Unix epoch.
+    pub timestamp_ms: i64,
+    /// The sample value.
+    pub value: f64,
+}
+
+/// A series with values over a time range.
+///
+/// Returned by range PromQL queries.
+#[derive(Debug, Clone)]
+pub struct RangeSample {
+    /// The labels identifying this series.
+    pub labels: Labels,
+    /// Timestamp-value pairs, ordered by timestamp.
+    /// Each tuple is `(timestamp_ms, value)`.
+    pub samples: Vec<(i64, f64)>,
+}
+
+/// Metadata for a metric.
+///
+/// This is the canonical public API type for metric metadata. It uses typed
+/// fields (e.g. `Option<MetricType>`) rather than raw strings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricMetadata {
+    /// The metric name.
+    pub metric_name: String,
+    /// The metric type, if known.
+    pub metric_type: Option<MetricType>,
+    /// Human-readable description of the metric.
+    pub description: Option<String>,
+    /// Unit of measurement (e.g., "bytes", "seconds").
+    pub unit: Option<String>,
+}
+
+/// Options for PromQL query evaluation.
+///
+/// Provides tuning knobs that apply to both instant and range queries.
+/// Use `Default::default()` for Prometheus-compatible defaults.
+#[derive(Debug, Clone)]
+pub struct QueryOptions {
+    /// How far back to look for a sample when evaluating at a given timestamp.
+    ///
+    /// Defaults to 5 minutes (the Prometheus staleness delta).
+    pub lookback_delta: Duration,
+}
+
+impl Default for QueryOptions {
+    fn default() -> Self {
+        Self {
+            lookback_delta: Duration::from_secs(5 * 60),
         }
     }
 }

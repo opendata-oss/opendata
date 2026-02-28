@@ -1,3 +1,4 @@
+use crate::model::{Label, Labels};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -48,7 +49,7 @@ pub struct SeriesLoad {
 
 #[derive(Debug, Clone)]
 pub struct ExpectedSample {
-    pub labels: HashMap<String, String>,
+    pub labels: Labels,
     pub value: f64,
     // Future:
     // #[cfg(feature = "histograms")]
@@ -59,7 +60,7 @@ pub struct ExpectedSample {
 
 #[derive(Debug, Clone)]
 pub struct EvalResult {
-    pub labels: HashMap<String, String>,
+    pub labels: Labels,
     pub value: f64,
 }
 
@@ -430,12 +431,23 @@ fn parse_expected(line: &str) -> Result<ExpectedSample, String> {
         return Err(format!("Missing value in expected: {}", line));
     }
 
-    let (_, labels) = parse_metric(metric_part.trim())?;
+    let (metric_name, label_map) = parse_metric(metric_part.trim())?;
     let value = value_str
         .parse::<f64>()
         .map_err(|_| format!("Invalid value '{}' in expected: {}", value_str, line))?;
 
-    Ok(ExpectedSample { labels, value })
+    let mut labels: Vec<Label> = label_map
+        .into_iter()
+        .map(|(k, v)| Label::new(k, v))
+        .collect();
+    if !metric_name.is_empty() {
+        labels.push(Label::metric_name(metric_name));
+    }
+    labels.sort();
+    Ok(ExpectedSample {
+        labels: Labels::new(labels),
+        value,
+    })
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -735,7 +747,7 @@ mod tests {
         match &cmds[0] {
             Command::EvalInstant(cmd) => {
                 assert_eq!(cmd.query, "{job=\"test\"}");
-                assert_eq!(cmd.expected[0].labels.get("job"), Some(&"test".to_string()));
+                assert_eq!(cmd.expected[0].labels.get("job"), Some("test"));
             }
             _ => panic!("Expected EvalInstant command"),
         }

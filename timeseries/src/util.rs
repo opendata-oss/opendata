@@ -1,4 +1,5 @@
 use blake3::Hasher;
+use std::ops::{Bound, RangeBounds};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::Error;
@@ -134,6 +135,28 @@ pub fn time_bucket_size_hours(size: BucketSize) -> u32 {
         return 0;
     }
     2u32.pow((size - 1) as u32)
+}
+
+/// Convert a `RangeBounds<SystemTime>` into `(start: SystemTime, end: SystemTime)`.
+///
+/// `Excluded` bounds are adjusted by 1 ms — the smallest sample timestamp
+/// granularity — so that `start..end` excludes the exact boundary timestamps.
+pub(crate) fn range_bounds_to_system_time(
+    range: impl RangeBounds<SystemTime>,
+) -> (SystemTime, SystemTime) {
+    let start = match range.start_bound() {
+        Bound::Included(t) => *t,
+        Bound::Excluded(t) => *t + Duration::from_millis(1),
+        Bound::Unbounded => UNIX_EPOCH,
+    };
+    let end = match range.end_bound() {
+        Bound::Included(t) => *t,
+        Bound::Excluded(t) => t
+            .checked_sub(Duration::from_millis(1))
+            .unwrap_or(UNIX_EPOCH),
+        Bound::Unbounded => UNIX_EPOCH + Duration::from_secs(i64::MAX as u64),
+    };
+    (start, end)
 }
 
 #[cfg(test)]
