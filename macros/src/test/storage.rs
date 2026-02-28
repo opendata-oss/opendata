@@ -1,4 +1,5 @@
-use proc_macro2::TokenStream;
+use proc_macro_crate::{FoundCrate, crate_name};
+use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::{
     Attribute, Expr, Ident, ItemFn, Token,
@@ -59,6 +60,25 @@ impl Parse for TestMacroArgs {
     }
 }
 
+fn macro_crate_path() -> TokenStream {
+    match crate_name("opendata-common") {
+        Ok(FoundCrate::Itself) => {
+            // macro is expanded inside the defining crate
+            quote!(crate)
+        }
+        Ok(FoundCrate::Name(name)) => {
+            let ident = syn::Ident::new(&name, Span::call_site());
+            quote!(::#ident)
+        }
+        Err(err) => {
+            let msg = format!("failed to resolve macro crate `opendata-common`: {}", err);
+            quote! {
+                compile_error!(#msg);
+            }
+        }
+    }
+}
+
 pub fn test_impl(args: TokenStream, input: TokenStream) -> TokenStream {
     // parse arguments to the macro (see Parse impl for TestMacroArgs for implementation)
     let args_parsed = match parse2::<TestMacroArgs>(args) {
@@ -92,11 +112,14 @@ pub fn test_impl(args: TokenStream, input: TokenStream) -> TokenStream {
     // get statements from function body
     let body = item_fn.block.stmts.clone();
 
+    // determine crate path based on call site
+    let crate_path = macro_crate_path();
+
     // generate storage creation based on whether merge_operator was provided
     let storage_creation = if let Some(merge_op) = args_parsed.merge_operator {
         quote! {
             let storage: std::sync::Arc<dyn Storage> = std::sync::Arc::new(
-                common::storage::in_memory::InMemoryStorage::with_merge_operator(
+                #crate_path::storage::in_memory::InMemoryStorage::with_merge_operator(
                     std::sync::Arc::new(#merge_op)
                 )
             );
@@ -104,7 +127,7 @@ pub fn test_impl(args: TokenStream, input: TokenStream) -> TokenStream {
     } else {
         quote! {
             let storage: std::sync::Arc<dyn Storage> = std::sync::Arc::new(
-                common::storage::in_memory::InMemoryStorage::default()
+                #crate_path::storage::in_memory::InMemoryStorage::default()
             );
         }
     };
