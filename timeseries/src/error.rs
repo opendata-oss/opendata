@@ -100,7 +100,7 @@ impl From<crate::serde::EncodingError> for Error {
 
 /// Error type for PromQL query and discovery operations.
 ///
-/// This is returned by the read/query methods on [`crate::TimeSeriesDb`].
+/// This is returned by the read/query methods on `TimeSeriesDb`.
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
     /// The query string could not be parsed or is otherwise invalid.

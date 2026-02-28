@@ -13,7 +13,7 @@ This RFC defines the read API for `TimeSeriesDb`, using PromQL as the query lang
 
 RFC 0002 establishes `TimeSeriesDb` as the central write entry point with a Prometheus-style data model. The read side needs a corresponding embedded API. PromQL is the natural choice — it is the standard query language for Prometheus-style metrics, and the existing implementation already evaluates PromQL expressions against the storage layer internally.
 
-Today the PromQL evaluation is coupled to the HTTP server through the `PromqlRouter` trait, which uses service-oriented request/response types (string status fields, JSON-style containers). This RFC promotes those operations to the public `TimeSeriesDb` API with idiomatic Rust signatures. The service layer (RFC 0004) becomes a thin HTTP transport on top.
+Previously the PromQL evaluation was coupled to the HTTP server through a `PromqlRouter` trait that used service-oriented request/response types (string status fields, JSON-style containers). This RFC promotes those operations to the public `TimeSeriesDb` API with idiomatic Rust signatures. The service layer (RFC 0004) is a thin HTTP transport that deserializes HTTP parameters, calls these methods, and wraps results in the Prometheus JSON wire format.
 
 ### Why an Embedded API
 
@@ -221,7 +221,7 @@ pub enum QueryError {
 
 An earlier draft used `QueryRequest`/`QueryResponse` structs with string status fields and optional error messages, mirroring the Prometheus HTTP API format. This is appropriate for a service boundary but awkward for an embedded API — callers shouldn't have to check `response.status == "success"` in Rust. Plain method signatures with `Result` are more natural and let the service layer handle HTTP conventions.
 
-The result types defined here (`InstantSample`, `RangeSample`, `Labels`, `MetricMetadata`) replace the internal evaluator types and become the canonical query result representation. The existing `PromqlRouter` trait reduces to a thin adapter that serializes these types into the Prometheus JSON wire format (status/error envelopes, string-encoded values) for HTTP transport.
+The result types defined here (`InstantSample`, `RangeSample`, `Labels`, `MetricMetadata`) replace the internal evaluator types and become the canonical query result representation. The HTTP handlers serialize these types into the Prometheus JSON wire format (status/error envelopes, string-encoded values) directly — no intermediate adapter trait is needed.
 
 ### Separate TimeSeriesDbReader type
 
