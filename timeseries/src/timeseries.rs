@@ -18,15 +18,28 @@ use crate::tsdb::Tsdb;
 
 /// Convert a `RangeBounds<SystemTime>` into `(start_secs, end_secs)`.
 fn range_bounds_to_secs(range: impl RangeBounds<SystemTime>) -> (i64, i64) {
+    let (start, end) = range_bounds_to_system_time(range);
+    (
+        start.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+        end.duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(i64::MAX),
+    )
+}
+
+/// Convert a `RangeBounds<SystemTime>` into `(start: SystemTime, end: SystemTime)`.
+fn range_bounds_to_system_time(
+    range: impl RangeBounds<SystemTime>,
+) -> (SystemTime, SystemTime) {
     let start = match range.start_bound() {
-        Bound::Included(t) => t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
-        Bound::Excluded(t) => t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 + 1,
-        Bound::Unbounded => 0,
+        Bound::Included(t) => *t,
+        Bound::Excluded(t) => *t + Duration::from_secs(1),
+        Bound::Unbounded => UNIX_EPOCH,
     };
     let end = match range.end_bound() {
-        Bound::Included(t) => t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
-        Bound::Excluded(t) => t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 - 1,
-        Bound::Unbounded => i64::MAX,
+        Bound::Included(t) => *t,
+        Bound::Excluded(t) => t.checked_sub(Duration::from_secs(1)).unwrap_or(UNIX_EPOCH),
+        Bound::Unbounded => UNIX_EPOCH + Duration::from_secs(i64::MAX as u64),
     };
     (start, end)
 }
@@ -156,10 +169,10 @@ impl TimeSeriesDb {
     pub async fn query_range(
         &self,
         query: &str,
-        start: SystemTime,
-        end: SystemTime,
+        range: impl RangeBounds<SystemTime>,
         step: Duration,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
+        let (start, end) = range_bounds_to_system_time(range);
         self.tsdb
             .eval_query_range(query, start, end, step, &QueryOptions::default())
             .await

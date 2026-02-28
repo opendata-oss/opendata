@@ -261,8 +261,6 @@ impl Tsdb {
         Ok(())
     }
 
-    // ── Native read methods ──────────────────────────────────────────
-
     /// Evaluate an instant PromQL query, returning typed `InstantSample`s.
     pub(crate) async fn eval_query(
         &self,

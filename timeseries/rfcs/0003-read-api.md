@@ -67,20 +67,20 @@ impl TimeSeriesDb {
 
     /// Evaluate a PromQL expression over a time range.
     ///
-    /// Returns the matching series with values at each step interval
-    /// from `start` to `end`.
+    /// Returns the matching series with values at each step interval.
+    /// The `range` parameter accepts any `RangeBounds<SystemTime>`,
+    /// consistent with the discovery methods.
     ///
     /// ```rust
     /// let results = tsdb.query_range(
     ///     "rate(http_requests_total[5m])",
-    ///     start, end, Duration::from_secs(15),
+    ///     start..=end, Duration::from_secs(15),
     /// ).await?;
     /// ```
     pub async fn query_range(
         &self,
         query: &str,
-        start: SystemTime,
-        end: SystemTime,
+        range: impl RangeBounds<SystemTime>,
         step: Duration,
     ) -> Result<Vec<RangeSample>, QueryError>;
 }
@@ -210,7 +210,7 @@ pub enum QueryError {
 | Aspect | LogDb | TimeSeriesDb |
 |--------|-------|--------------|
 | Primary read | `reader.read(offset)` → `Result<Record>` | `tsdb.query(expr, time)` → `Result<QueryValue>` |
-| Range read | `reader.scan(start..end)` → `Result<Vec<Record>>` | `tsdb.query_range(expr, start, end, step)` → `Result<Vec<RangeSample>>` |
+| Range read | `reader.scan(start..end)` → `Result<Vec<Record>>` | `tsdb.query_range(expr, start..=end, step)` → `Result<Vec<RangeSample>>` |
 | Discovery | `reader.scan()` | `tsdb.series()`, `tsdb.labels()`, `tsdb.label_values()` |
 | Query language | None (key/offset based) | PromQL |
 | Error handling | `Result<T, SlateDbError>` | `Result<T, QueryError>` |
@@ -237,3 +237,4 @@ An alternative is to expose low-level iterators over stored series and samples, 
 |---|---|
 | 2026-02-25 | Initial draft |
 | 2026-02-27 | `query` returns `QueryValue` enum (scalar vs vector), add `into_samples()` |
+| 2026-02-27 | `query_range` takes `impl RangeBounds<SystemTime>` instead of separate `start`/`end`, consistent with discovery methods |
