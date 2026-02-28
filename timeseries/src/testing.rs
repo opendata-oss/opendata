@@ -28,6 +28,9 @@ pub use crate::promql::response::{
     SeriesResponse, VectorSeries,
 };
 
+// Re-export conversion functions for benchmarks.
+pub use crate::promql::response::{query_value_to_response, range_result_to_response};
+
 /// Opaque handle to a test TSDB instance.
 ///
 /// Wraps the internal `Tsdb` so that integration tests can ingest data

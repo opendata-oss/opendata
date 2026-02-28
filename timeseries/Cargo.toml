@@ -63,6 +63,7 @@ snap = { workspace = true, optional = true }
 
 [dev-dependencies]
 common = { workspace = true, features = ["test-utils"] }
+criterion.workspace = true
 fail.workspace = true
 proptest.workspace = true
 rstest.workspace = true
@@ -70,4 +71,9 @@ dashu-float.workspace = true
 
 [[test]]
 name = "http_server"
+required-features = ["testing"]
+
+[[bench]]
+name = "response_serialization"
+harness = false
 required-features = ["testing"]

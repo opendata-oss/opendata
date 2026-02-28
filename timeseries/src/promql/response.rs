@@ -17,7 +17,7 @@ pub(crate) fn query_error_response(err: QueryError) -> ErrorResponse {
 }
 
 /// Convert an instant query result into a Prometheus `QueryResponse`.
-pub(crate) fn query_value_to_response(result: Result<QueryValue, QueryError>) -> QueryResponse {
+pub fn query_value_to_response(result: Result<QueryValue, QueryError>) -> QueryResponse {
     match result {
         Ok(QueryValue::Scalar {
             timestamp_ms,
@@ -57,7 +57,7 @@ pub(crate) fn query_value_to_response(result: Result<QueryValue, QueryError>) ->
 }
 
 /// Convert a range query result into a Prometheus `QueryRangeResponse`.
-pub(crate) fn range_result_to_response(
+pub fn range_result_to_response(
     result: Result<Vec<RangeSample>, QueryError>,
 ) -> QueryRangeResponse {
     match result {
