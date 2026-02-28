@@ -116,12 +116,6 @@ pub enum QueryError {
     Execution(String),
 }
 
-impl From<crate::promql::parser::ParseError> for QueryError {
-    fn from(err: crate::promql::parser::ParseError) -> Self {
-        QueryError::InvalidQuery(err.to_string())
-    }
-}
-
 impl From<crate::promql::evaluator::EvaluationError> for QueryError {
     fn from(err: crate::promql::evaluator::EvaluationError) -> Self {
         QueryError::Execution(err.to_string())

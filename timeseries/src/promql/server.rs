@@ -17,18 +17,17 @@ use super::config::PrometheusConfig;
 use super::metrics::Metrics;
 use super::middleware::{MetricsLayer, TracingLayer};
 use super::request::{
-    LabelValuesParams, LabelsParams, LabelsRequest, QueryParams, QueryRangeParams,
-    QueryRangeRequest, QueryRequest, SeriesParams, SeriesRequest,
+    LabelValuesParams, LabelsParams, MetadataParams, QueryParams, QueryRangeParams, SeriesParams,
 };
 use super::response::{
-    LabelValuesResponse, LabelsResponse, QueryRangeResponse, QueryResponse, SeriesResponse,
+    self, LabelValuesResponse, LabelsResponse, MetadataResponse, QueryRangeResponse,
+    QueryResponse, SeriesResponse,
 };
-use super::router::PromqlRouter;
 use super::scraper::Scraper;
 use crate::error::Error;
-use crate::promql::request::{MetadataParams, MetadataRequest};
-use crate::promql::response::MetadataResponse;
+use crate::model::QueryOptions;
 use crate::tsdb::Tsdb;
+use crate::util::{parse_duration, parse_timestamp, parse_timestamp_to_seconds};
 
 #[derive(Embed)]
 #[folder = "ui/"]
@@ -187,38 +186,45 @@ impl From<Error> for ApiError {
     }
 }
 
+/// Extract params from GET (query string) or POST (form body).
+async fn extract_params<T: serde::de::DeserializeOwned>(
+    request: Request,
+    state: &AppState,
+) -> Result<T, ApiError> {
+    let method = request.method().clone();
+    match method {
+        Method::GET => {
+            let Query(params) = Query::<T>::from_request(request, state)
+                .await
+                .map_err(|e| {
+                    Error::InvalidInput(format!("Failed to parse query parameters: {}", e))
+                })?;
+            Ok(params)
+        }
+        Method::POST => {
+            let Form(params) = Form::<T>::from_request(request, state)
+                .await
+                .map_err(|e| Error::InvalidInput(format!("Failed to parse form body: {}", e)))?;
+            Ok(params)
+        }
+        _ => Err(ApiError(Error::InvalidInput(
+            "Only GET and POST methods are supported".to_string(),
+        ))),
+    }
+}
+
 /// Handle /api/v1/query
 async fn handle_query(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Json<QueryResponse>, ApiError> {
-    let method = request.method().clone();
-
-    let query_request: QueryRequest = match method {
-        Method::GET => {
-            // For GET requests, extract from query parameters
-            let Query(params) = Query::<QueryParams>::from_request(request, &state)
-                .await
-                .map_err(|e| {
-                    Error::InvalidInput(format!("Failed to parse query parameters: {}", e))
-                })?;
-            params.try_into()?
-        }
-        Method::POST => {
-            // For POST requests, extract from form body
-            let Form(params) = Form::<QueryParams>::from_request(request, &state)
-                .await
-                .map_err(|e| Error::InvalidInput(format!("Failed to parse form body: {}", e)))?;
-            params.try_into()?
-        }
-        _ => {
-            return Err(ApiError(Error::InvalidInput(
-                "Only GET and POST methods are supported".to_string(),
-            )));
-        }
-    };
-
-    Ok(Json(state.tsdb.query(query_request).await))
+    let params: QueryParams = extract_params(request, &state).await?;
+    let time = params.time.map(|s| parse_timestamp(&s)).transpose()?;
+    let result = state
+        .tsdb
+        .eval_query(&params.query, time, &QueryOptions::default())
+        .await;
+    Ok(Json(response::query_value_to_response(result)))
 }
 
 /// Handle /api/v1/query_range
@@ -226,33 +232,15 @@ async fn handle_query_range(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Json<QueryRangeResponse>, ApiError> {
-    let method = request.method().clone();
-
-    let query_request: QueryRangeRequest = match method {
-        Method::GET => {
-            // For GET requests, extract from query parameters
-            let Query(params) = Query::<QueryRangeParams>::from_request(request, &state)
-                .await
-                .map_err(|e| {
-                    Error::InvalidInput(format!("Failed to parse query parameters: {}", e))
-                })?;
-            params.try_into()?
-        }
-        Method::POST => {
-            // For POST requests, extract from form body
-            let Form(params) = Form::<QueryRangeParams>::from_request(request, &state)
-                .await
-                .map_err(|e| Error::InvalidInput(format!("Failed to parse form body: {}", e)))?;
-            params.try_into()?
-        }
-        _ => {
-            return Err(ApiError(Error::InvalidInput(
-                "Only GET and POST methods are supported".to_string(),
-            )));
-        }
-    };
-
-    Ok(Json(state.tsdb.query_range(query_request).await))
+    let params: QueryRangeParams = extract_params(request, &state).await?;
+    let start = parse_timestamp(&params.start)?;
+    let end = parse_timestamp(&params.end)?;
+    let step = parse_duration(&params.step)?;
+    let result = state
+        .tsdb
+        .eval_query_range(&params.query, start, end, step, &QueryOptions::default())
+        .await;
+    Ok(Json(response::range_result_to_response(result)))
 }
 
 /// Handle /api/v1/series
@@ -260,33 +248,20 @@ async fn handle_series(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Json<SeriesResponse>, ApiError> {
-    let method = request.method().clone();
-
-    let series_request: SeriesRequest = match method {
-        Method::GET => {
-            // For GET requests, extract from query parameters
-            let Query(params) = Query::<SeriesParams>::from_request(request, &state)
-                .await
-                .map_err(|e| {
-                    Error::InvalidInput(format!("Failed to parse query parameters: {}", e))
-                })?;
-            params.try_into()?
-        }
-        Method::POST => {
-            // For POST requests, extract from form body
-            let Form(params) = Form::<SeriesParams>::from_request(request, &state)
-                .await
-                .map_err(|e| Error::InvalidInput(format!("Failed to parse form body: {}", e)))?;
-            params.try_into()?
-        }
-        _ => {
-            return Err(ApiError(Error::InvalidInput(
-                "Only GET and POST methods are supported".to_string(),
-            )));
-        }
-    };
-
-    Ok(Json(state.tsdb.series(series_request).await))
+    let params: SeriesParams = extract_params(request, &state).await?;
+    let start = params
+        .start
+        .map(|s| parse_timestamp_to_seconds(&s))
+        .transpose()?
+        .unwrap_or(0);
+    let end = params
+        .end
+        .map(|s| parse_timestamp_to_seconds(&s))
+        .transpose()?
+        .unwrap_or(i64::MAX);
+    let matchers: Vec<&str> = params.matches.iter().map(|s| s.as_str()).collect();
+    let result = state.tsdb.find_series(&matchers, start, end).await;
+    Ok(Json(response::series_to_response(result, params.limit)))
 }
 
 /// Handle /api/v1/labels
@@ -294,8 +269,26 @@ async fn handle_labels(
     State(state): State<AppState>,
     Query(params): Query<LabelsParams>,
 ) -> Result<Json<LabelsResponse>, ApiError> {
-    let request: LabelsRequest = params.try_into()?;
-    Ok(Json(state.tsdb.labels(request).await))
+    let start = params
+        .start
+        .map(|s| parse_timestamp_to_seconds(&s))
+        .transpose()?
+        .unwrap_or(0);
+    let end = params
+        .end
+        .map(|s| parse_timestamp_to_seconds(&s))
+        .transpose()?
+        .unwrap_or(i64::MAX);
+    let matchers: Option<Vec<&str>> = if params.matches.is_empty() {
+        None
+    } else {
+        Some(params.matches.iter().map(|s| s.as_str()).collect())
+    };
+    let result = state
+        .tsdb
+        .find_labels(matchers.as_deref(), start, end)
+        .await;
+    Ok(Json(response::labels_to_response(result, params.limit)))
 }
 
 /// Handle /api/v1/label/{name}/values
@@ -304,8 +297,29 @@ async fn handle_label_values(
     Path(name): Path<String>,
     Query(params): Query<LabelValuesParams>,
 ) -> Result<Json<LabelValuesResponse>, ApiError> {
-    let request = params.into_request(name)?;
-    Ok(Json(state.tsdb.label_values(request).await))
+    let start = params
+        .start
+        .map(|s| parse_timestamp_to_seconds(&s))
+        .transpose()?
+        .unwrap_or(0);
+    let end = params
+        .end
+        .map(|s| parse_timestamp_to_seconds(&s))
+        .transpose()?
+        .unwrap_or(i64::MAX);
+    let matchers: Option<Vec<&str>> = if params.matches.is_empty() {
+        None
+    } else {
+        Some(params.matches.iter().map(|s| s.as_str()).collect())
+    };
+    let result = state
+        .tsdb
+        .find_label_values(&name, matchers.as_deref(), start, end)
+        .await;
+    Ok(Json(response::label_values_to_response(
+        result,
+        params.limit,
+    )))
 }
 
 /// Handle /api/v1/metadata
@@ -313,8 +327,12 @@ async fn handle_metadata(
     State(state): State<AppState>,
     Query(params): Query<MetadataParams>,
 ) -> Result<Json<MetadataResponse>, ApiError> {
-    let request: MetadataRequest = params.into();
-    Ok(Json(state.tsdb.metadata(request).await))
+    let result = state.tsdb.find_metadata(params.metric.as_deref()).await;
+    Ok(Json(response::metadata_to_response(
+        result,
+        params.limit,
+        params.limit_per_metric,
+    )))
 }
 
 /// Handle /metrics endpoint - returns Prometheus text format
