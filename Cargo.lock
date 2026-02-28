@@ -2505,6 +2505,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "opendata-ingest"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "opendata-common",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "slatedb",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "opendata-keyvalue"
 version = "0.1.0"
 dependencies = [
