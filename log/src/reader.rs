@@ -588,7 +588,9 @@ impl LogIterator {
 mod tests {
     use super::*;
     use crate::serde::SegmentMeta;
-    use crate::storage::{LogStorageWrite, in_memory_storage};
+    use crate::storage::LogStorageWrite;
+    use common::Storage;
+    use opendata_macros::storage_test;
 
     fn entry(key: &[u8], seq: u64, value: &[u8]) -> LogEntry {
         LogEntry {
@@ -598,9 +600,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn should_return_none_when_no_segments() {
-        let storage = in_memory_storage();
+    #[storage_test]
+    async fn should_return_none_when_no_segments(storage: Arc<dyn Storage>) {
         let segments = vec![];
 
         let mut iter = LogIterator::new(
@@ -613,9 +614,8 @@ mod tests {
         assert!(iter.next().await.unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn should_iterate_entries_in_single_segment() {
-        let storage = in_memory_storage();
+    #[storage_test]
+    async fn should_iterate_entries_in_single_segment(storage: Arc<dyn Storage>) {
         let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
         storage
             .write_entry(&segment, &entry(b"key", 0, b"value0"))
@@ -652,9 +652,8 @@ mod tests {
         assert!(iter.next().await.unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn should_iterate_entries_across_multiple_segments() {
-        let storage = in_memory_storage();
+    #[storage_test]
+    async fn should_iterate_entries_across_multiple_segments(storage: Arc<dyn Storage>) {
         let segment0 = LogSegment::new(0, SegmentMeta::new(0, 1000));
         let segment1 = LogSegment::new(1, SegmentMeta::new(100, 2000));
         // Entries in segment 0 (start_seq = 0)
@@ -704,9 +703,8 @@ mod tests {
         assert!(iter.next().await.unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn should_filter_by_sequence_range() {
-        let storage = in_memory_storage();
+    #[storage_test]
+    async fn should_filter_by_sequence_range(storage: Arc<dyn Storage>) {
         let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
         storage
             .write_entry(&segment, &entry(b"key", 0, b"value0"))
@@ -741,9 +739,8 @@ mod tests {
         assert!(iter.next().await.unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn should_filter_entries_for_specified_key() {
-        let storage = in_memory_storage();
+    #[storage_test]
+    async fn should_filter_entries_for_specified_key(storage: Arc<dyn Storage>) {
         let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
         storage
             .write_entry(&segment, &entry(b"key1", 0, b"k1v0"))
@@ -780,9 +777,8 @@ mod tests {
         assert!(iter.next().await.unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn should_return_none_when_no_entries_in_range() {
-        let storage = in_memory_storage();
+    #[storage_test]
+    async fn should_return_none_when_no_entries_in_range(storage: Arc<dyn Storage>) {
         let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
         storage
             .write_entry(&segment, &entry(b"key", 0, b"value0"))

@@ -48,3 +48,4 @@ proptest.workspace = true
 reqwest.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
+opendata-macros.workspace = true

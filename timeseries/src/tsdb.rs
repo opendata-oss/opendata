@@ -339,13 +339,7 @@ mod tests {
     use crate::model::MetricType;
     use crate::promql::evaluator::EvalSample;
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
-    use common::storage::in_memory::InMemoryStorage;
-
-    async fn create_test_storage() -> Arc<dyn Storage> {
-        Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            OpenTsdbMergeOperator,
-        )))
-    }
+    use opendata_macros::storage_test;
 
     fn create_sample(
         metric_name: &str,
@@ -375,11 +369,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn should_create_tsdb_with_caches() {
-        // given
-        let storage = create_test_storage().await;
-
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_create_tsdb_with_caches(storage: Arc<dyn Storage>) {
         // when
         let tsdb = Tsdb::new(storage);
 
@@ -391,10 +382,9 @@ mod tests {
         assert_eq!(tsdb.query_cache.entry_count(), 0);
     }
 
-    #[tokio::test]
-    async fn should_get_or_create_bucket_for_ingest() {
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_get_or_create_bucket_for_ingest(storage: Arc<dyn Storage>) {
         // given
-        let storage = create_test_storage().await;
         let tsdb = Tsdb::new(storage);
         let bucket = TimeBucket::hour(1000);
 
@@ -408,10 +398,9 @@ mod tests {
         assert_eq!(tsdb.ingest_cache.entry_count(), 1);
     }
 
-    #[tokio::test]
-    async fn should_use_ingest_cache_during_queries() {
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_use_ingest_cache_during_queries(storage: Arc<dyn Storage>) {
         // given: a bucket in the ingest cache
-        let storage = create_test_storage().await;
         let tsdb = Tsdb::new(storage);
         let bucket = TimeBucket::hour(1000);
 
@@ -428,10 +417,9 @@ mod tests {
         assert_eq!(tsdb.query_cache.entry_count(), 0);
     }
 
-    #[tokio::test]
-    async fn should_use_query_cache_for_non_ingest_buckets() {
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_use_query_cache_for_non_ingest_buckets(storage: Arc<dyn Storage>) {
         // given
-        let storage = create_test_storage().await;
         let tsdb = Tsdb::new(storage);
         let bucket = TimeBucket::hour(1000);
 
@@ -447,10 +435,9 @@ mod tests {
         assert_eq!(tsdb.ingest_cache.entry_count(), 0);
     }
 
-    #[tokio::test]
-    async fn should_ingest_and_query_single_bucket() {
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_ingest_and_query_single_bucket(storage: Arc<dyn Storage>) {
         // given
-        let storage = create_test_storage().await;
         let tsdb = Tsdb::new(storage);
 
         // Use hour-aligned bucket (60 minutes = 1 hour)
@@ -480,8 +467,8 @@ mod tests {
         assert_eq!(series_ids.len(), 1);
     }
 
-    #[tokio::test]
-    async fn should_query_across_multiple_buckets_with_evaluator() {
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_query_across_multiple_buckets_with_evaluator(storage: Arc<dyn Storage>) {
         use crate::promql::evaluator::Evaluator;
         use crate::test_utils::assertions::assert_approx_eq;
         use promql_parser::parser::EvalStmt;
@@ -493,7 +480,6 @@ mod tests {
         //   Bucket 120: minutes 120-179, seconds 7200-10799,  ms 7,200,000-10,799,999
         //   Bucket 180: minutes 180-239, seconds 10800-14399, ms 10,800,000-14,399,999
         //   Bucket 240: minutes 240-299, seconds 14400-17999, ms 14,400,000-17,999,999
-        let storage = create_test_storage().await;
         let tsdb = Tsdb::new(storage);
 
         // Buckets 1 & 2: will end up in query cache (ingest, flush, then invalidate from ingest cache)
@@ -669,14 +655,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn should_query_across_multiple_buckets_with_different_series_id_mappings() {
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_query_across_multiple_buckets_with_different_series_id_mappings(
+        storage: Arc<dyn Storage>,
+    ) {
         use crate::promql::evaluator::Evaluator;
         use promql_parser::parser::EvalStmt;
         use std::time::{Duration, UNIX_EPOCH};
 
         // given: Two time buckets with overlapping series but different series IDs
-        let storage = create_test_storage().await;
         let tsdb = Tsdb::new(storage);
         // Bucket 1: hour 60 (covers 3,600,000-7,199,999 ms)
         let bucket1 = TimeBucket::hour(60);

@@ -916,7 +916,7 @@ mod tests {
     use crate::serde::key::{IdDictionaryKey, VectorDataKey};
     use crate::serde::vector_data::VectorDataValue;
     use common::StorageConfig;
-    use common::storage::in_memory::InMemoryStorage;
+    use opendata_macros::storage_test;
     use std::time::Duration;
 
     fn create_test_config() -> Config {
@@ -941,12 +941,6 @@ mod tests {
         vec![vec![1.0; dimensions]]
     }
 
-    fn create_test_storage() -> Arc<dyn Storage> {
-        Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            VectorDbMergeOperator::new(3),
-        )))
-    }
-
     #[tokio::test]
     async fn should_open_vector_db() {
         // given
@@ -959,10 +953,9 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn should_write_and_flush_vectors() {
+    #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
+    async fn should_write_and_flush_vectors(storage: Arc<dyn Storage>) {
         // given
-        let storage = create_test_storage();
         let config = create_test_config();
         let centroids = create_test_centroids(3);
         let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
@@ -1002,10 +995,9 @@ mod tests {
         assert!(dict_entry1.is_some());
     }
 
-    #[tokio::test]
-    async fn should_upsert_existing_vector() {
+    #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
+    async fn should_upsert_existing_vector(storage: Arc<dyn Storage>) {
         // given
-        let storage = create_test_storage();
         let config = create_test_config();
         let centroids = create_test_centroids(3);
         let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
@@ -1322,10 +1314,9 @@ mod tests {
         assert!(!results.is_empty());
     }
 
-    #[tokio::test]
-    async fn should_load_dictionary_on_reopen() {
+    #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
+    async fn should_load_dictionary_on_reopen(storage: Arc<dyn Storage>) {
         // given - create database and write vectors
-        let storage = create_test_storage();
         let config = create_test_config();
         let centroids = create_test_centroids(3);
 

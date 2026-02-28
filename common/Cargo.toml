@@ -37,6 +37,7 @@ slatedb = { workspace = true, features = ["test-util"] }
 serde_yaml.workspace = true
 proptest.workspace = true
 criterion.workspace = true
+opendata-macros.workspace = true
 
 [[bench]]
 name = "varint"

@@ -389,8 +389,11 @@ mod tests {
     use super::*;
     use crate::config::SegmentConfig;
     use crate::serde::SEQ_BLOCK_KEY;
-    use crate::storage::in_memory_storage;
-    use common::storage::in_memory::FailingStorage;
+    use common::{
+        Storage,
+        storage::in_memory::{FailingStorage, InMemoryStorage},
+    };
+    use opendata_macros::storage_test;
 
     async fn create_writer() -> (LogWriter, LogWriteHandle, Arc<dyn common::Storage>) {
         create_writer_with_config(LogWriterConfig::default()).await
@@ -399,7 +402,7 @@ mod tests {
     async fn create_writer_with_config(
         config: LogWriterConfig,
     ) -> (LogWriter, LogWriteHandle, Arc<dyn common::Storage>) {
-        let storage = in_memory_storage();
+        let storage = std::sync::Arc::new(InMemoryStorage::default());
         create_writer_with_storage(storage, config).await
     }
 
@@ -608,10 +611,9 @@ mod tests {
         assert_eq!(handle.durable_epoch(), 1);
     }
 
-    #[tokio::test]
-    async fn should_propagate_put_error_on_append() {
-        let inner = in_memory_storage();
-        let failing = FailingStorage::wrap(inner);
+    #[storage_test]
+    async fn should_propagate_put_error_on_append(storage: Arc<dyn Storage>) {
+        let failing = FailingStorage::wrap(storage);
         let (writer, mut handle, _) =
             create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
         let _task = handle.spawn(writer);
@@ -630,10 +632,9 @@ mod tests {
         assert_eq!(handle.flushed_epoch(), 0);
     }
 
-    #[tokio::test]
-    async fn should_propagate_snapshot_error_on_append() {
-        let inner = in_memory_storage();
-        let failing = FailingStorage::wrap(inner);
+    #[storage_test]
+    async fn should_propagate_snapshot_error_on_append(storage: Arc<dyn Storage>) {
+        let failing = FailingStorage::wrap(storage);
         let (writer, mut handle, _) =
             create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
         let _task = handle.spawn(writer);
@@ -650,10 +651,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn should_propagate_flush_error() {
-        let inner = in_memory_storage();
-        let failing = FailingStorage::wrap(inner);
+    #[storage_test]
+    async fn should_propagate_flush_error(storage: Arc<dyn Storage>) {
+        let failing = FailingStorage::wrap(storage);
         let (writer, mut handle, _) =
             create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
         let _task = handle.spawn(writer);
@@ -677,10 +677,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn should_enter_fatal_state_after_put_error() {
-        let inner = in_memory_storage();
-        let failing = FailingStorage::wrap(inner);
+    #[storage_test]
+    async fn should_enter_fatal_state_after_put_error(storage: Arc<dyn Storage>) {
+        let failing = FailingStorage::wrap(storage);
         let (writer, mut handle, _) =
             create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
         let _task = handle.spawn(writer);
@@ -699,8 +698,8 @@ mod tests {
         assert!(result.is_some());
     }
 
-    #[tokio::test]
-    async fn should_return_shutdown_on_try_append_when_writer_dropped() {
+    #[storage_test]
+    async fn should_return_shutdown_on_try_append_when_writer_dropped(storage: Arc<dyn Storage>) {
         let (writer, mut handle, _) = create_writer().await;
         // Spawn the writer then immediately drop its task to simulate crash
         let task = handle.spawn(writer);
