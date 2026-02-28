@@ -163,6 +163,90 @@ mod tests {
         assert_eq!(buckets.len(), 0);
     }
 
+    fn create_failing_storage() -> Arc<common::storage::in_memory::FailingStorage> {
+        let inner = create_test_storage();
+        common::storage::in_memory::FailingStorage::wrap(inner)
+    }
+
+    fn create_non_empty_frozen() -> FrozenTsdbDelta {
+        let ctx = TsdbContext {
+            bucket: create_test_bucket(),
+            series_dict: Arc::new(HashMap::new()),
+            next_series_id: 0,
+        };
+        let mut delta = TsdbWriteDelta::init(ctx);
+        let series =
+            create_test_series("http_requests", vec![("env", "prod")], create_test_sample());
+        delta.apply(vec![series]).unwrap();
+        let (frozen, _, _) = delta.freeze();
+        frozen
+    }
+
+    #[tokio::test]
+    async fn should_propagate_apply_error() {
+        // given
+        let storage = create_failing_storage();
+        let flusher = TsdbFlusher {
+            storage: storage.clone(),
+        };
+        storage.fail_apply(common::StorageError::Storage("test apply error".into()));
+
+        // when
+        let result = flusher
+            .flush_delta(create_non_empty_frozen(), &(1..2))
+            .await;
+
+        // then
+        let err = result.err().expect("expected apply error");
+        assert!(
+            err.contains("test apply error"),
+            "expected test apply error message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_propagate_snapshot_error_after_apply() {
+        // given
+        let storage = create_failing_storage();
+        let flusher = TsdbFlusher {
+            storage: storage.clone(),
+        };
+        // Apply succeeds, but snapshot after apply fails
+        storage.fail_snapshot(common::StorageError::Storage("test snapshot error".into()));
+
+        // when
+        let result = flusher
+            .flush_delta(create_non_empty_frozen(), &(1..2))
+            .await;
+
+        // then
+        let err = result.err().expect("expected snapshot error");
+        assert!(
+            err.contains("test snapshot error"),
+            "expected test snapshot error message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_propagate_flush_storage_error() {
+        // given
+        let storage = create_failing_storage();
+        let flusher = TsdbFlusher {
+            storage: storage.clone(),
+        };
+        storage.fail_flush(common::StorageError::Storage("test flush error".into()));
+
+        // when
+        let result = flusher.flush_storage().await;
+
+        // then
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("test flush error"),
+            "expected test flush error message"
+        );
+    }
+
     #[tokio::test]
     async fn should_persist_series_dict_entries() {
         // given

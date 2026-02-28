@@ -16,6 +16,7 @@ path = "src/lib.rs"
 [features]
 default = []
 metrics = ["dep:prometheus-client"]
+test-utils = ["dep:arc-swap"]
 
 [dependencies]
 slatedb.workspace = true
@@ -28,6 +29,7 @@ tracing.workspace = true
 uuid.workspace = true
 serde.workspace = true
 prometheus-client = { version = "0.22", optional = true }
+arc-swap = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

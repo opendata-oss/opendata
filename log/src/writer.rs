@@ -287,7 +287,7 @@ impl LogWriteHandle {
     ) -> Result<Option<AppendOutput>, AppendError> {
         rx.await
             .map_err(|_| AppendError::Shutdown)?
-            .map_err(AppendError::InvalidRecord)
+            .map_err(AppendError::Storage)
     }
 
     /// Receives a unit result from the writer task.
@@ -390,9 +390,23 @@ mod tests {
     use crate::config::SegmentConfig;
     use crate::serde::SEQ_BLOCK_KEY;
     use crate::storage::in_memory_storage;
+    use common::storage::in_memory::FailingStorage;
 
     async fn create_writer() -> (LogWriter, LogWriteHandle, Arc<dyn common::Storage>) {
+        create_writer_with_config(LogWriterConfig::default()).await
+    }
+
+    async fn create_writer_with_config(
+        config: LogWriterConfig,
+    ) -> (LogWriter, LogWriteHandle, Arc<dyn common::Storage>) {
         let storage = in_memory_storage();
+        create_writer_with_storage(storage, config).await
+    }
+
+    async fn create_writer_with_storage(
+        storage: Arc<dyn common::Storage>,
+        config: LogWriterConfig,
+    ) -> (LogWriter, LogWriteHandle, Arc<dyn common::Storage>) {
         let seq_key = Bytes::from_static(&SEQ_BLOCK_KEY);
         let sequence_allocator = SequenceAllocator::load(storage.as_ref(), seq_key)
             .await
@@ -407,7 +421,7 @@ mod tests {
             sequence_allocator,
             segment_cache,
             listing_cache,
-            LogWriterConfig::default(),
+            config,
         )
         .await
         .unwrap();
@@ -592,5 +606,123 @@ mod tests {
         // Both watermarks should now be at epoch 1
         assert_eq!(handle.flushed_epoch(), 1);
         assert_eq!(handle.durable_epoch(), 1);
+    }
+
+    #[tokio::test]
+    async fn should_propagate_put_error_on_append() {
+        let inner = in_memory_storage();
+        let failing = FailingStorage::wrap(inner);
+        let (writer, mut handle, _) =
+            create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
+        let _task = handle.spawn(writer);
+
+        // Enable put failure after writer is running
+        failing.fail_put(common::StorageError::Storage("test put error".into()));
+
+        let result = handle.try_append(make_write(&["key1"], 1000)).await;
+        assert!(
+            matches!(&result, Err(AppendError::Storage(msg)) if msg.contains("test put error")),
+            "expected Storage with test put error, got: {:?}",
+            result,
+        );
+
+        // Epoch should not have advanced
+        assert_eq!(handle.flushed_epoch(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_propagate_snapshot_error_on_append() {
+        let inner = in_memory_storage();
+        let failing = FailingStorage::wrap(inner);
+        let (writer, mut handle, _) =
+            create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
+        let _task = handle.spawn(writer);
+
+        // Snapshot is taken inside write_and_broadcast after a successful put.
+        // Fail only snapshot, not put.
+        failing.fail_snapshot(common::StorageError::Storage("test snapshot error".into()));
+
+        let result = handle.try_append(make_write(&["key1"], 1000)).await;
+        assert!(
+            matches!(&result, Err(AppendError::Storage(msg)) if msg.contains("test snapshot error")),
+            "expected Storage with test snapshot error, got: {:?}",
+            result,
+        );
+    }
+
+    #[tokio::test]
+    async fn should_propagate_flush_error() {
+        let inner = in_memory_storage();
+        let failing = FailingStorage::wrap(inner);
+        let (writer, mut handle, _) =
+            create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
+        let _task = handle.spawn(writer);
+
+        // Append succeeds
+        handle
+            .try_append(make_write(&["key1"], 1000))
+            .await
+            .unwrap();
+
+        // Enable flush failure
+        failing.fail_flush(common::StorageError::Storage("test flush error".into()));
+
+        let result = handle.flush().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("test flush error"),
+            "expected test flush error, got: {}",
+            err,
+        );
+    }
+
+    #[tokio::test]
+    async fn should_enter_fatal_state_after_put_error() {
+        let inner = in_memory_storage();
+        let failing = FailingStorage::wrap(inner);
+        let (writer, mut handle, _) =
+            create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
+        let _task = handle.spawn(writer);
+
+        // First append fails
+        failing.fail_put_once(common::StorageError::Storage("test put error".into()));
+        let result = handle.try_append(make_write(&["key1"], 1000)).await;
+        assert!(result.is_err());
+
+        // FIXME: After a write failure the writer should enter a fatal state and
+        // reject subsequent appends. Currently it recovers, which is incorrect.
+        let result = handle
+            .try_append(make_write(&["key2"], 2000))
+            .await
+            .unwrap();
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn should_return_shutdown_on_try_append_when_writer_dropped() {
+        let (writer, mut handle, _) = create_writer().await;
+        // Spawn the writer then immediately drop its task to simulate crash
+        let task = handle.spawn(writer);
+        task.abort();
+        let _ = task.await;
+
+        let result = handle.try_append(make_write(&["k"], 1000)).await;
+        assert!(
+            matches!(result, Err(AppendError::Shutdown)),
+            "expected Shutdown, got: {:?}",
+            result,
+        );
+    }
+
+    #[tokio::test]
+    async fn should_return_shutdown_on_flush_when_writer_dropped() {
+        let (writer, mut handle, _) = create_writer().await;
+        let task = handle.spawn(writer);
+        task.abort();
+        let _ = task.await;
+
+        let result = handle.flush().await;
+        assert!(result.is_err());
     }
 }

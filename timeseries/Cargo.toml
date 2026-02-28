@@ -21,6 +21,7 @@ path = "src/main.rs"
 default = []
 testing = []
 remote-write = ["dep:prost", "dep:snap"]
+bench-internals = []
 
 [dependencies]
 async-trait.workspace = true
@@ -61,12 +62,19 @@ prost = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
 
 [dev-dependencies]
+common = { workspace = true, features = ["test-utils"] }
 fail.workspace = true
 proptest.workspace = true
 rstest.workspace = true
 dashu-float.workspace = true
 opendata-macros.workspace = true
+criterion.workspace = true
 
 [[test]]
 name = "http_server"
 required-features = ["testing"]
+
+[[bench]]
+name = "evaluator_micorbench"
+harness = false
+required-features = ["bench-internals"]

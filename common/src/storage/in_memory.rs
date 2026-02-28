@@ -371,6 +371,191 @@ impl Storage for InMemoryStorage {
     }
 }
 
+/// Injected failure that fires either once or on every call.
+#[cfg(feature = "test-utils")]
+#[derive(Clone)]
+enum Failure {
+    /// Error is returned once, then automatically cleared.
+    Once(super::StorageError),
+    /// Error is returned on every subsequent call until explicitly cleared.
+    Persistent(super::StorageError),
+}
+
+#[cfg(feature = "test-utils")]
+type FailSlot = arc_swap::ArcSwap<Option<Failure>>;
+
+/// Checks a [`FailSlot`] and returns an error if one is set.
+///
+/// For [`Failure::Once`], the slot is atomically swapped to `None` so the
+/// error fires exactly once. For [`Failure::Persistent`], the slot is left
+/// unchanged.
+#[cfg(feature = "test-utils")]
+fn check_failure(slot: &FailSlot) -> super::StorageResult<()> {
+    let guard = slot.load();
+    match guard.as_ref() {
+        None => Ok(()),
+        Some(Failure::Persistent(err)) => Err(err.clone()),
+        Some(Failure::Once(_)) => {
+            // Swap to None; if another thread raced us, one of them gets the
+            // error and the others pass through — reasonable for tests.
+            let prev = slot.swap(Arc::new(None));
+            match prev.as_ref() {
+                Some(Failure::Once(err)) => Err(err.clone()),
+                _ => Ok(()),
+            }
+        }
+    }
+}
+
+/// A storage wrapper that delegates to an inner [`Storage`] but can inject
+/// failures into `apply`, `put`/`put_with_options`, `flush`, and `snapshot` on demand.
+///
+/// Each failure slot is controlled by a lock-free [`ArcSwap`](arc_swap::ArcSwap).
+/// The read path avoids introducing artificial synchronisation that could mask
+/// concurrency bugs in the code under test.
+///
+/// Failures can be *persistent* (returned on every call until cleared) or
+/// *once* (returned on the next call, then automatically cleared).
+///
+/// Gated behind the `test-utils` feature.
+///
+/// # Example
+///
+/// ```ignore
+/// let inner = Arc::new(InMemoryStorage::new());
+/// let storage = FailingStorage::wrap(inner);
+/// storage.fail_put(StorageError::Storage("disk full".into()));
+/// // every put_with_options call now returns Err(...)
+///
+/// storage.fail_flush_once(StorageError::Storage("io error".into()));
+/// // only the next flush call returns Err(...), then auto-clears
+/// ```
+#[cfg(feature = "test-utils")]
+pub struct FailingStorage {
+    inner: Arc<dyn super::Storage>,
+    fail_apply: FailSlot,
+    fail_put: FailSlot,
+    fail_flush: FailSlot,
+    fail_snapshot: FailSlot,
+}
+
+#[cfg(feature = "test-utils")]
+impl FailingStorage {
+    /// Wraps an existing storage, with all failure injections initially `None`.
+    pub fn wrap(inner: Arc<dyn super::Storage>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            fail_apply: arc_swap::ArcSwap::from_pointee(None),
+            fail_put: arc_swap::ArcSwap::from_pointee(None),
+            fail_flush: arc_swap::ArcSwap::from_pointee(None),
+            fail_snapshot: arc_swap::ArcSwap::from_pointee(None),
+        })
+    }
+
+    /// Makes `apply` return the given error on every subsequent call.
+    pub fn fail_apply(&self, err: super::StorageError) {
+        self.fail_apply
+            .store(Arc::new(Some(Failure::Persistent(err))));
+    }
+
+    /// Makes `apply` return the given error on the next call only.
+    pub fn fail_apply_once(&self, err: super::StorageError) {
+        self.fail_apply.store(Arc::new(Some(Failure::Once(err))));
+    }
+
+    /// Makes `put` and `put_with_options` return the given error on every subsequent call.
+    pub fn fail_put(&self, err: super::StorageError) {
+        self.fail_put
+            .store(Arc::new(Some(Failure::Persistent(err))));
+    }
+
+    /// Makes `put` or `put_with_options` return the given error on the next call only.
+    ///
+    /// The failure fires on whichever of the two methods is called first, then
+    /// automatically clears.
+    pub fn fail_put_once(&self, err: super::StorageError) {
+        self.fail_put.store(Arc::new(Some(Failure::Once(err))));
+    }
+
+    /// Makes `flush` return the given error on every subsequent call.
+    pub fn fail_flush(&self, err: super::StorageError) {
+        self.fail_flush
+            .store(Arc::new(Some(Failure::Persistent(err))));
+    }
+
+    /// Makes `flush` return the given error on the next call only.
+    pub fn fail_flush_once(&self, err: super::StorageError) {
+        self.fail_flush.store(Arc::new(Some(Failure::Once(err))));
+    }
+
+    /// Makes `snapshot` return the given error on every subsequent call.
+    pub fn fail_snapshot(&self, err: super::StorageError) {
+        self.fail_snapshot
+            .store(Arc::new(Some(Failure::Persistent(err))));
+    }
+
+    /// Makes `snapshot` return the given error on the next call only.
+    pub fn fail_snapshot_once(&self, err: super::StorageError) {
+        self.fail_snapshot.store(Arc::new(Some(Failure::Once(err))));
+    }
+}
+
+#[cfg(feature = "test-utils")]
+#[async_trait]
+impl super::StorageRead for FailingStorage {
+    async fn get(&self, key: Bytes) -> super::StorageResult<Option<crate::Record>> {
+        self.inner.get(key).await
+    }
+
+    async fn scan_iter(
+        &self,
+        range: crate::BytesRange,
+    ) -> super::StorageResult<Box<dyn super::StorageIterator + Send + 'static>> {
+        self.inner.scan_iter(range).await
+    }
+}
+
+#[cfg(feature = "test-utils")]
+#[async_trait]
+impl super::Storage for FailingStorage {
+    async fn apply(&self, ops: Vec<super::RecordOp>) -> super::StorageResult<()> {
+        check_failure(&self.fail_apply)?;
+        self.inner.apply(ops).await
+    }
+
+    async fn put(&self, records: Vec<super::PutRecordOp>) -> super::StorageResult<()> {
+        check_failure(&self.fail_put)?;
+        self.inner.put(records).await
+    }
+
+    async fn put_with_options(
+        &self,
+        records: Vec<super::PutRecordOp>,
+        options: super::WriteOptions,
+    ) -> super::StorageResult<()> {
+        check_failure(&self.fail_put)?;
+        self.inner.put_with_options(records, options).await
+    }
+
+    async fn merge(&self, records: Vec<super::MergeRecordOp>) -> super::StorageResult<()> {
+        self.inner.merge(records).await
+    }
+
+    async fn snapshot(&self) -> super::StorageResult<Arc<dyn super::StorageSnapshot>> {
+        check_failure(&self.fail_snapshot)?;
+        self.inner.snapshot().await
+    }
+
+    async fn flush(&self) -> super::StorageResult<()> {
+        check_failure(&self.fail_flush)?;
+        self.inner.flush().await
+    }
+
+    async fn close(&self) -> super::StorageResult<()> {
+        self.inner.close().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

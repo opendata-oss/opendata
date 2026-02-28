@@ -19,13 +19,11 @@ It would be useful to expose a low-level API to write time series data and enabl
 - Expose a single batched write API with atomic semantics
 - Abstract over internal bucketing and storage details
 - Follow patterns established by the `LogDb` API and SlateDb's `Db`
-- Support a separate OTEL mapping module (with optional Prometheus-like label validation)
 
 ## Non-Goals
 
-- **Read API** - A `TimeSeriesDbReader` interface will be defined in a follow-up RFC
-- **HTTP endpoints** - Remote Write and OTLP endpoints are out of scope
-- **PromQL** - Query language support is out of scope
+- **Read API / PromQL** — See RFC 0003
+- **HTTP server, remote-write, and OTEL ingest** — See RFC 0004
 - **Strict Prometheus validation** - We intentionally allow lenient label naming
 
 ## Design
@@ -303,92 +301,6 @@ impl TimeSeriesDb {
 }
 ```
 
-#### Reader Access (Placeholder)
-
-```rust
-impl TimeSeriesDb {
-    /// Get a read-only view of the time series database.
-    ///
-    /// The reader provides query access without write capabilities.
-    /// See RFC-XXXX for the TimeSeriesDbReader API.
-    pub fn reader(&self) -> TimeSeriesDbReader;
-}
-
-/// Read-only view of a time series database.
-///
-/// API to be defined in a future RFC.
-pub struct TimeSeriesDbReader {
-    // ...
-}
-```
-
-### OTEL Mapping Module (Future work)
-
-A separate module handles conversion from OpenTelemetry data models to the TimeSeriesDb data model, following the approach used by Prometheus. This module is responsible for:
-
-1. **Type decomposition** - Converting complex OTEL types (histograms, summaries) into multiple simple series
-2. **Label sanitization** - Ensuring label names conform to Prometheus conventions
-3. **Attribute mapping** - Converting OTEL resource/scope/metric attributes to labels
-
-```rust
-/// Hypothetical Module for converting OpenTelemetry metrics to TimeSeries format.
-#[cfg(feature = "otel")]
-pub mod otel {
-    use super::{Series, Label, Sample, MetricType};
-
-    /// Convert OTEL metrics to Series for ingestion.
-    ///
-    /// # Type Decomposition
-    ///
-    /// Complex OTEL metric types are decomposed into simple gauge/counter series:
-    ///
-    /// - OTEL `Gauge` → Single series (MetricType::Gauge)
-    /// - OTEL `Sum` (monotonic) → Single series (MetricType::Counter)
-    /// - OTEL `Sum` (non-monotonic) → Single series (MetricType::Gauge)
-    /// - OTEL `Histogram` → Multiple series: `_bucket` (per le), `_sum`, `_count`
-    /// - OTEL `ExponentialHistogram` → Multiple series following native histogram conventions
-    /// - OTEL `Summary` → Multiple series: `{quantile="..."}`, `_sum`, `_count`
-    ///
-    /// # Label Sanitization
-    ///
-    /// OTEL attribute names are sanitized to conform to Prometheus conventions:
-    /// - Non-alphanumeric characters (except `_`) are replaced with `_`
-    /// - Names starting with a digit are prefixed with `_`
-    ///
-    /// # Attribute Mapping
-    ///
-    /// - OTEL resource attributes → labels with `resource_` prefix (if enabled)
-    /// - OTEL scope attributes → labels with `scope_` prefix (if enabled)
-    /// - OTEL metric attributes → labels directly
-    /// - Metric name → `__name__` label
-    pub fn from_metrics_request(
-        request: &ExportMetricsServiceRequest,
-        config: &OtelConfig,
-    ) -> Result<Vec<Series>>;
-
-    /// Convert a single OTEL metric to Series.
-    pub fn from_metric(
-        metric: &Metric,
-        resource_labels: &[Label],
-        scope_labels: &[Label],
-        config: &OtelConfig,
-    ) -> Result<Vec<Series>>;
-
-    /// Configuration for OTEL to Prometheus mapping.
-    #[derive(Debug, Clone, Default)]
-    pub struct OtelConfig {
-        /// Whether to include resource attributes as labels
-        pub include_resource_attrs: bool,
-
-        /// Whether to include scope attributes as labels
-        pub include_scope_attrs: bool,
-
-        /// Custom label mappings (OTEL attr name → Prometheus label name)
-        pub label_mappings: HashMap<String, String>,
-    }
-}
-```
-
 ### Comparison with LogDb API
 
 | Aspect | LogDb | TimeSeriesDb |
@@ -399,7 +311,6 @@ pub mod otel {
 | Identification | `key: Bytes` | `labels` (including `__name__`) |
 | Sequencing | Global sequence number | Timestamp (ms) |
 | Durability control | Explicit `flush()` | Explicit `flush()` |
-| Reader access | `fn reader() -> LogDbReader` | `fn reader() -> TimeSeriesDbReader` |
 
 ## Alternatives
 
@@ -464,3 +375,4 @@ Complex types like histograms are decomposed into simple series at higher layers
 | 2025-12-29 | Rename `TimeSeriesConfig` to `Config` for consistency with Rust conventions |
 | 2026-01-06 | Store metric name as `__name__` label instead of separate field; add `name()` accessor method |
 | 2026-02-26 | Remove `WriteOptions` and `write_with_options()` in favor of explicit `flush()`, matching LogDb |
+| 2026-02-27 | Remove reader placeholder and OTEL module — moved to RFC 0003 and RFC 0004 respectively |

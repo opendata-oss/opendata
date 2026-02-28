@@ -55,6 +55,9 @@ mod test_utils;
 mod tsdb;
 mod util;
 
+#[cfg(feature = "bench-internals")]
+mod bench_api;
+
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
@@ -65,6 +68,8 @@ pub(crate) mod model;
 mod timeseries;
 
 // Public re-exports
+#[cfg(feature = "bench-internals")]
+pub use bench_api::SubqueryLabelCacheHarness;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use model::{
