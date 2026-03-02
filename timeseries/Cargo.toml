@@ -89,3 +89,8 @@ required-features = ["bench-internals"]
 name = "response_serialization"
 harness = false
 required-features = ["testing"]
+
+[[bench]]
+name = "otel_conversion"
+harness = false
+required-features = ["otel"]
