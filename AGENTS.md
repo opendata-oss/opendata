@@ -14,6 +14,7 @@ OpenData is a collection of deployable database systems that share common infras
 - **timeseries**: Time series database with Prometheus-compatible semantics (time buckets, inverted indexes, Gorilla compression)
 - **vector**: Vector database with SPANN-style ANN search (centroids, posting lists, metadata filtering)
 - **log**: Kafka-like log with per-key streams and global sequence ordering
+- **graph**: Labeled property graph database with GQL queries via Grafeo
 
 ### Shared Architectural Patterns
 

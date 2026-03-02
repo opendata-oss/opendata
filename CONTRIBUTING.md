@@ -17,8 +17,10 @@ Thank you for your interest in contributing to OpenData! We welcome contribution
 OpenData is a Rust workspace containing multiple crates:
 
 - `common` - Shared components and utilities
-- `tsdb` - Object storage-native timeseries database
+- `timeseries` - Object storage-native timeseries database
 - `log` - Object storage-native event streaming backend
+- `vector` - SPANN-style vector database for ANN search
+- `graph` - Labeled property graph database with GQL queries
 
 Before contributing, we recommend reading the [README](README.md) to understand the project architecture and looking at existing issues and pull requests.
 
