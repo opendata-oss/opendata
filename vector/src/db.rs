@@ -572,7 +572,7 @@ impl VectorDb {
         let mut handle = self
             .write_coordinator
             .handle(WRITE_CHANNEL)
-            .flush(false)
+            .flush(true)
             .await?;
         handle.wait(Durability::Written).await?;
         Ok(())
