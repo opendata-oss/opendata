@@ -50,11 +50,6 @@ impl BiMap {
     fn len(&self) -> usize {
         self.by_name.len()
     }
-
-    #[allow(dead_code)]
-    fn names(&self) -> impl Iterator<Item = &ArcStr> {
-        self.by_name.keys()
-    }
 }
 
 impl Catalog {
@@ -95,11 +90,6 @@ impl Catalog {
         self.labels.len()
     }
 
-    #[allow(dead_code)]
-    pub fn all_label_names(&self) -> Vec<ArcStr> {
-        self.labels.names().cloned().collect()
-    }
-
     /// Gets or creates a label, returning (id, records_to_persist).
     ///
     /// If the label is new, returns catalog records that must be written to storage.
@@ -123,18 +113,8 @@ impl Catalog {
         self.edge_types.get_name(id)
     }
 
-    #[allow(dead_code)]
-    pub fn get_edge_type_id(&self, name: &str) -> Option<u32> {
-        self.edge_types.get_id(name)
-    }
-
     pub fn edge_type_count(&self) -> usize {
         self.edge_types.len()
-    }
-
-    #[allow(dead_code)]
-    pub fn all_edge_type_names(&self) -> Vec<ArcStr> {
-        self.edge_types.names().cloned().collect()
     }
 
     pub fn get_or_create_edge_type(
@@ -157,11 +137,6 @@ impl Catalog {
     }
 
     // --- Property Keys ---
-
-    #[allow(dead_code)]
-    pub fn get_prop_key_name(&self, id: u32) -> Option<&ArcStr> {
-        self.prop_keys.get_name(id)
-    }
 
     pub fn get_prop_key_id(&self, name: &str) -> Option<u32> {
         self.prop_keys.get_id(name)

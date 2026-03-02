@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use bytes::{BufMut, Bytes, BytesMut};
 use common::serde::key_prefix::{KeyPrefix, RecordTag};
 use common::serde::terminated_bytes;
@@ -91,6 +89,7 @@ impl EdgeRecordKey {
         buf.freeze()
     }
 
+    #[cfg(test)]
     pub fn decode(data: &[u8]) -> Result<Self, DeserializeError> {
         if data.len() < Self::SIZE {
             return Err(DeserializeError {
@@ -268,15 +267,6 @@ impl ForwardAdjKey {
         BytesRange::prefix(start.freeze())
     }
 
-    /// Scan range for outgoing edges of a specific type from a source node.
-    pub fn src_type_prefix(src: u64, edge_type_id: u32) -> BytesRange {
-        let tag = RecordTag::new(RecordType::ForwardAdj as u8, 0);
-        let mut start = BytesMut::with_capacity(14);
-        KeyPrefix::new(KEY_VERSION, tag).write_to(&mut start);
-        start.put_u64(src);
-        start.put_u32(edge_type_id);
-        BytesRange::prefix(start.freeze())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -331,15 +321,6 @@ impl BackwardAdjKey {
         BytesRange::prefix(start.freeze())
     }
 
-    /// Scan range for incoming edges of a specific type to a destination node.
-    pub fn dst_type_prefix(dst: u64, edge_type_id: u32) -> BytesRange {
-        let tag = RecordTag::new(RecordType::BackwardAdj as u8, 0);
-        let mut start = BytesMut::with_capacity(14);
-        KeyPrefix::new(KEY_VERSION, tag).write_to(&mut start);
-        start.put_u64(dst);
-        start.put_u32(edge_type_id);
-        BytesRange::prefix(start.freeze())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -391,10 +372,6 @@ impl LabelIndexKey {
         BytesRange::prefix(start.freeze())
     }
 
-    /// Scan range for all label index entries.
-    pub fn all_labels_range() -> BytesRange {
-        record_type_range(RecordType::LabelIndex)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -418,15 +395,6 @@ impl PropertyIndexKey {
         buf.extend_from_slice(&self.sortable_value);
         buf.put_u64(self.node_id);
         buf.freeze()
-    }
-
-    /// Scan range for all nodes with a specific property (any value).
-    pub fn prop_prefix(prop_id: u32) -> BytesRange {
-        let tag = RecordTag::new(RecordType::PropertyIndex as u8, 0);
-        let mut start = BytesMut::with_capacity(6);
-        KeyPrefix::new(KEY_VERSION, tag).write_to(&mut start);
-        start.put_u32(prop_id);
-        BytesRange::prefix(start.freeze())
     }
 
     /// Scan range for nodes with a specific property and exact value.
@@ -561,6 +529,7 @@ impl CatalogByNameKey {
         buf.freeze()
     }
 
+    #[cfg(test)]
     pub fn decode(data: &[u8]) -> Result<Self, DeserializeError> {
         if data.len() < 3 {
             return Err(DeserializeError {
@@ -601,6 +570,7 @@ impl MetadataKey {
         buf.freeze()
     }
 
+    #[cfg(test)]
     pub fn decode(data: &[u8]) -> Result<Self, DeserializeError> {
         if data.len() < Self::SIZE {
             return Err(DeserializeError {

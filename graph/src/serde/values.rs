@@ -1,7 +1,5 @@
-#![allow(dead_code)]
-
 use bytes::{BufMut, Bytes, BytesMut};
-use common::serde::sortable::{decode_f64_sortable, decode_i64_sortable, encode_f64_sortable, encode_i64_sortable};
+use common::serde::sortable::{encode_f64_sortable, encode_i64_sortable};
 use common::serde::terminated_bytes;
 use grafeo_common::types::Value;
 
@@ -142,18 +140,6 @@ pub(crate) fn encode_sortable_value(value: &Value) -> Option<Bytes> {
         Value::String(s) => Some(terminated_bytes::serialize_to_bytes(s.as_bytes())),
         _ => None,
     }
-}
-
-/// Decodes a sortable-encoded i64 from an 8-byte slice.
-pub(crate) fn decode_sortable_i64(data: &[u8]) -> i64 {
-    let sortable = u64::from_be_bytes(data[..8].try_into().unwrap());
-    decode_i64_sortable(sortable)
-}
-
-/// Decodes a sortable-encoded f64 from an 8-byte slice.
-pub(crate) fn decode_sortable_f64(data: &[u8]) -> f64 {
-    let sortable = u64::from_be_bytes(data[..8].try_into().unwrap());
-    decode_f64_sortable(sortable)
 }
 
 // ---------------------------------------------------------------------------
