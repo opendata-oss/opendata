@@ -1,5 +1,4 @@
-use crate::model::Labels;
-use crate::promql::promqltest::dsl::{EvalResult, ExpectedSample};
+use crate::model::RangeSample;
 
 /// Compare actual results against expected results
 ///
@@ -15,8 +14,8 @@ use crate::promql::promqltest::dsl::{EvalResult, ExpectedSample};
 /// The implementation achieves this by only checking labels that are present in the
 /// expected sample, not all labels from the actual result.
 pub(super) fn assert_results(
-    results: &[EvalResult],
-    expected: &[ExpectedSample],
+    results: &[RangeSample],
+    expected: &[RangeSample],
     test_name: &str,
     eval_num: usize,
     query: &str,
@@ -56,10 +55,12 @@ pub(super) fn assert_results(
             }
         }
 
-        if (result.value - exp.value).abs() > 1e-6 {
+        let exp_value = exp.samples[0].1;
+        let result_value = result.samples[0].1;
+        if (result_value - exp_value).abs() > 1e-6 {
             return Err(format!(
                 "{} eval #{} (query: {}): Value mismatch: expected {}, got {}",
-                test_name, eval_num, query, exp.value, result.value
+                test_name, eval_num, query, exp_value, result_value
             ));
         }
     }
@@ -70,7 +71,7 @@ pub(super) fn assert_results(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Label;
+    use crate::model::{Label, Labels};
 
     fn labels_from(pairs: &[(&str, &str)]) -> Labels {
         let mut labels: Vec<Label> = pairs.iter().map(|(k, v)| Label::new(*k, *v)).collect();
@@ -78,17 +79,18 @@ mod tests {
         Labels::new(labels)
     }
 
+    fn range_sample(labels: Labels, value: f64) -> RangeSample {
+        RangeSample {
+            labels,
+            samples: vec![(0, value)],
+        }
+    }
+
     #[test]
     fn should_match_expected_results() {
         // given
-        let results = vec![EvalResult {
-            labels: labels_from(&[("job", "test")]),
-            value: 42.0,
-        }];
-        let expected = vec![ExpectedSample {
-            labels: labels_from(&[("job", "test")]),
-            value: 42.0,
-        }];
+        let results = vec![range_sample(labels_from(&[("job", "test")]), 42.0)];
+        let expected = vec![range_sample(labels_from(&[("job", "test")]), 42.0)];
 
         // when
         let result = assert_results(&results, &expected, "test", 1, "metric");
@@ -100,10 +102,7 @@ mod tests {
     #[test]
     fn should_reject_count_mismatch() {
         // given
-        let results = vec![EvalResult {
-            labels: Labels::empty(),
-            value: 42.0,
-        }];
+        let results = vec![range_sample(Labels::empty(), 42.0)];
         let expected = vec![];
 
         // when
@@ -117,14 +116,8 @@ mod tests {
     #[test]
     fn should_reject_mismatched_values() {
         // given
-        let results = vec![EvalResult {
-            labels: Labels::empty(),
-            value: 42.0,
-        }];
-        let expected = vec![ExpectedSample {
-            labels: Labels::empty(),
-            value: 99.0,
-        }];
+        let results = vec![range_sample(Labels::empty(), 42.0)];
+        let expected = vec![range_sample(Labels::empty(), 99.0)];
 
         // when
         let result = assert_results(&results, &expected, "test", 1, "metric");
