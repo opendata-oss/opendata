@@ -24,6 +24,15 @@ pub(crate) struct MiniQueryReader {
     snapshot: Arc<dyn StorageRead>,
 }
 
+impl MiniQueryReader {
+    pub(crate) fn new(bucket: TimeBucket, storage: Arc<dyn StorageRead>) -> Self {
+        Self {
+            bucket,
+            snapshot: storage,
+        }
+    }
+}
+
 #[async_trait]
 impl BucketQueryReader for MiniQueryReader {
     async fn forward_index(

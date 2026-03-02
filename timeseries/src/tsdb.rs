@@ -27,7 +27,7 @@ use crate::util::Result;
 /// Uses `compute_preload_ranges` to account for `offset`/`@` modifiers.
 /// Falls back to a single `[(default_start, default_end)]` for
 /// selector-free expressions.
-fn preload_ranges(stmt: &EvalStmt, default_start: i64, default_end: i64) -> Vec<(i64, i64)> {
+pub(crate) fn preload_ranges(stmt: &EvalStmt, default_start: i64, default_end: i64) -> Vec<(i64, i64)> {
     let ranges = compute_preload_ranges(&stmt.expr, stmt.start, stmt.end, stmt.lookback_delta);
     if ranges.is_empty() {
         vec![(default_start, default_end)]
@@ -81,6 +81,258 @@ async fn get_matching_series_multi_bucket<R: QueryReader>(
     }
 
     Ok(bucket_series_map)
+}
+
+// ── Shared evaluation free functions ────────────────────────────────
+//
+// These are generic over `QueryReader` so they work with both `TsdbQueryReader`
+// (used by `Tsdb`) and `TsdbReader` (used by `TimeSeriesDbReader`).
+
+/// Evaluate an instant PromQL query against the given reader.
+pub(crate) async fn evaluate_instant(
+    reader: &impl QueryReader,
+    stmt: EvalStmt,
+    query_time: std::time::SystemTime,
+) -> std::result::Result<QueryValue, QueryError> {
+    let mut evaluator = Evaluator::new(reader);
+    let result = evaluator.evaluate(stmt).await?;
+
+    match result {
+        ExprResult::Scalar(value) => {
+            let timestamp_ms =
+                query_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+            Ok(QueryValue::Scalar {
+                timestamp_ms,
+                value,
+            })
+        }
+        ExprResult::InstantVector(samples) => Ok(QueryValue::Vector(
+            samples
+                .into_iter()
+                .map(|s| InstantSample {
+                    labels: Labels::from(s.labels),
+                    timestamp_ms: s.timestamp_ms,
+                    value: s.value,
+                })
+                .collect(),
+        )),
+        ExprResult::RangeVector(samples) => Ok(QueryValue::Matrix(
+            samples
+                .into_iter()
+                .map(|s| RangeSample {
+                    labels: Labels::from(s.labels),
+                    samples: s
+                        .values
+                        .into_iter()
+                        .map(|v| (v.timestamp_ms, v.value))
+                        .collect(),
+                })
+                .collect(),
+        )),
+    }
+}
+
+/// Evaluate a range PromQL query against the given reader.
+pub(crate) async fn evaluate_range(
+    reader: &impl QueryReader,
+    stmt: EvalStmt,
+) -> std::result::Result<Vec<RangeSample>, QueryError> {
+    let start = stmt.start;
+    let end = stmt.end;
+    let step = stmt.interval;
+    let lookback_delta = stmt.lookback_delta;
+
+    if step.is_zero() {
+        return Err(QueryError::InvalidQuery(
+            "step must be greater than zero".to_string(),
+        ));
+    }
+
+    let mut series_map: HashMap<Labels, Vec<(i64, f64)>> = HashMap::new();
+    let mut evaluator = Evaluator::new(reader);
+    let mut current_time = start;
+
+    while current_time <= end {
+        let instant_stmt = EvalStmt {
+            expr: stmt.expr.clone(),
+            start: current_time,
+            end: current_time,
+            interval: Duration::from_secs(0),
+            lookback_delta,
+        };
+
+        let result = evaluator.evaluate(instant_stmt).await?;
+        let timestamp_ms = current_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+
+        match result {
+            ExprResult::InstantVector(samples) => {
+                for sample in samples {
+                    let labels = Labels::from(sample.labels);
+                    series_map
+                        .entry(labels)
+                        .or_default()
+                        .push((sample.timestamp_ms, sample.value));
+                }
+            }
+            ExprResult::Scalar(value) => {
+                let labels = Labels::empty();
+                series_map
+                    .entry(labels)
+                    .or_default()
+                    .push((timestamp_ms, value));
+            }
+            ExprResult::RangeVector(_) => {
+                return Err(QueryError::Execution(
+                    "range vectors not supported in range query evaluation".to_string(),
+                ));
+            }
+        }
+
+        current_time += step;
+    }
+
+    Ok(series_map
+        .into_iter()
+        .map(|(labels, samples)| RangeSample { labels, samples })
+        .collect())
+}
+
+/// Discover series matching any of the given selectors.
+pub(crate) async fn discover_series(
+    reader: &impl QueryReader,
+    matchers: &[&str],
+) -> std::result::Result<Vec<Labels>, QueryError> {
+    if matchers.is_empty() {
+        return Err(QueryError::InvalidQuery(
+            "at least one match[] required".to_string(),
+        ));
+    }
+
+    let buckets = reader.list_buckets().await?;
+    if buckets.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let matches: Vec<String> = matchers.iter().map(|s| s.to_string()).collect();
+    let bucket_series_map = get_matching_series_multi_bucket(reader, &buckets, &matches)
+        .await
+        .map_err(QueryError::InvalidQuery)?;
+
+    let mut unique_series: HashSet<Labels> = HashSet::new();
+
+    for (bucket, series_ids) in bucket_series_map {
+        let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
+        if series_ids_vec.is_empty() {
+            continue;
+        }
+        let forward_index = reader.forward_index(&bucket, &series_ids_vec).await?;
+        for (_id, spec) in forward_index.all_series() {
+            let mut sorted_labels = spec.labels.clone();
+            sorted_labels.sort();
+            unique_series.insert(Labels::new(sorted_labels));
+        }
+    }
+
+    let mut result: Vec<Labels> = unique_series.into_iter().collect();
+    result.sort();
+    Ok(result)
+}
+
+/// Discover label names, optionally filtered by matchers.
+pub(crate) async fn discover_labels(
+    reader: &impl QueryReader,
+    matchers: Option<&[&str]>,
+) -> std::result::Result<Vec<String>, QueryError> {
+    let buckets = reader.list_buckets().await?;
+    if buckets.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut label_names: HashSet<String> = HashSet::new();
+
+    match matchers {
+        Some(matches) if !matches.is_empty() => {
+            let matches: Vec<String> = matches.iter().map(|s| s.to_string()).collect();
+            let bucket_series_map =
+                get_matching_series_multi_bucket(reader, &buckets, &matches)
+                    .await
+                    .map_err(QueryError::InvalidQuery)?;
+
+            for (bucket, series_ids) in bucket_series_map {
+                let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
+                if series_ids_vec.is_empty() {
+                    continue;
+                }
+                let forward_index = reader.forward_index(&bucket, &series_ids_vec).await?;
+                for (_id, spec) in forward_index.all_series() {
+                    for attr in &spec.labels {
+                        label_names.insert(attr.name.clone());
+                    }
+                }
+            }
+        }
+        _ => {
+            for bucket in buckets {
+                let inverted_index = reader.all_inverted_index(&bucket).await?;
+                for attr in inverted_index.all_keys() {
+                    label_names.insert(attr.name);
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<String> = label_names.into_iter().collect();
+    result.sort();
+    Ok(result)
+}
+
+/// Discover values for a specific label, optionally filtered by matchers.
+pub(crate) async fn discover_label_values(
+    reader: &impl QueryReader,
+    label_name: &str,
+    matchers: Option<&[&str]>,
+) -> std::result::Result<Vec<String>, QueryError> {
+    let buckets = reader.list_buckets().await?;
+    if buckets.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut values: HashSet<String> = HashSet::new();
+
+    match matchers {
+        Some(matches) if !matches.is_empty() => {
+            let matches: Vec<String> = matches.iter().map(|s| s.to_string()).collect();
+            let bucket_series_map =
+                get_matching_series_multi_bucket(reader, &buckets, &matches)
+                    .await
+                    .map_err(QueryError::InvalidQuery)?;
+
+            for (bucket, series_ids) in bucket_series_map {
+                let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
+                if series_ids_vec.is_empty() {
+                    continue;
+                }
+                let forward_index = reader.forward_index(&bucket, &series_ids_vec).await?;
+                for (_id, spec) in forward_index.all_series() {
+                    for attr in &spec.labels {
+                        if attr.name == label_name {
+                            values.insert(attr.value.clone());
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            for bucket in buckets {
+                let label_vals = reader.label_values(&bucket, label_name).await?;
+                values.extend(label_vals);
+            }
+        }
+    }
+
+    let mut result: Vec<String> = values.into_iter().collect();
+    result.sort();
+    Ok(result)
 }
 
 /// Multi-bucket time series database.
@@ -181,7 +433,7 @@ impl Tsdb {
             readers.push((bucket, reader));
         }
 
-        Ok(TsdbQueryReader::new(self.storage.clone(), readers))
+        Ok(TsdbQueryReader::new(readers))
     }
 
     /// Create a QueryReader for a set of disjoint time ranges.
@@ -200,7 +452,7 @@ impl Tsdb {
             readers.push((bucket, reader));
         }
 
-        Ok(TsdbQueryReader::new(self.storage.clone(), readers))
+        Ok(TsdbQueryReader::new(readers))
     }
 
     /// Flush all dirty buckets in the ingest cache to storage.
@@ -353,42 +605,7 @@ impl Tsdb {
         let ranges = preload_ranges(&stmt, lookback_start_secs, query_time_secs);
         let reader = self.query_reader_for_ranges(&ranges).await?;
 
-        let mut evaluator = Evaluator::new(&reader);
-        let result = evaluator.evaluate(stmt).await?;
-
-        match result {
-            ExprResult::Scalar(value) => {
-                let timestamp_ms =
-                    query_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-                Ok(QueryValue::Scalar {
-                    timestamp_ms,
-                    value,
-                })
-            }
-            ExprResult::InstantVector(samples) => Ok(QueryValue::Vector(
-                samples
-                    .into_iter()
-                    .map(|s| InstantSample {
-                        labels: Labels::from(s.labels),
-                        timestamp_ms: s.timestamp_ms,
-                        value: s.value,
-                    })
-                    .collect(),
-            )),
-            ExprResult::RangeVector(samples) => Ok(QueryValue::Matrix(
-                samples
-                    .into_iter()
-                    .map(|s| RangeSample {
-                        labels: Labels::from(s.labels),
-                        samples: s
-                            .values
-                            .into_iter()
-                            .map(|v| (v.timestamp_ms, v.value))
-                            .collect(),
-                    })
-                    .collect(),
-            )),
-        }
+        evaluate_instant(&reader, stmt, query_time).await
     }
 
     /// Evaluate a range PromQL query, returning typed `RangeSample`s.
@@ -423,54 +640,7 @@ impl Tsdb {
         let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
         let reader = self.query_reader_for_ranges(&ranges).await?;
 
-        // Step through time, collecting per-series samples
-        let mut series_map: HashMap<Labels, Vec<(i64, f64)>> = HashMap::new();
-        let mut evaluator = Evaluator::new(&reader);
-        let mut current_time = start;
-
-        while current_time <= end {
-            let instant_stmt = EvalStmt {
-                expr: stmt.expr.clone(),
-                start: current_time,
-                end: current_time,
-                interval: Duration::from_secs(0),
-                lookback_delta,
-            };
-
-            let result = evaluator.evaluate(instant_stmt).await?;
-            let timestamp_ms = current_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-
-            match result {
-                ExprResult::InstantVector(samples) => {
-                    for sample in samples {
-                        let labels = Labels::from(sample.labels);
-                        series_map
-                            .entry(labels)
-                            .or_default()
-                            .push((sample.timestamp_ms, sample.value));
-                    }
-                }
-                ExprResult::Scalar(value) => {
-                    let labels = Labels::empty();
-                    series_map
-                        .entry(labels)
-                        .or_default()
-                        .push((timestamp_ms, value));
-                }
-                ExprResult::RangeVector(_) => {
-                    return Err(QueryError::Execution(
-                        "range vectors not supported in range query evaluation".to_string(),
-                    ));
-                }
-            }
-
-            current_time += step;
-        }
-
-        Ok(series_map
-            .into_iter()
-            .map(|(labels, samples)| RangeSample { labels, samples })
-            .collect())
+        evaluate_range(&reader, stmt).await
     }
 
     /// Discover series matching any of the given selectors.
@@ -480,41 +650,8 @@ impl Tsdb {
         start_secs: i64,
         end_secs: i64,
     ) -> std::result::Result<Vec<Labels>, QueryError> {
-        if matchers.is_empty() {
-            return Err(QueryError::InvalidQuery(
-                "at least one match[] required".to_string(),
-            ));
-        }
-
         let reader = self.query_reader(start_secs, end_secs).await?;
-        let buckets = reader.list_buckets().await?;
-        if buckets.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let matches: Vec<String> = matchers.iter().map(|s| s.to_string()).collect();
-        let bucket_series_map = get_matching_series_multi_bucket(&reader, &buckets, &matches)
-            .await
-            .map_err(QueryError::InvalidQuery)?;
-
-        let mut unique_series: HashSet<Labels> = HashSet::new();
-
-        for (bucket, series_ids) in bucket_series_map {
-            let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-            if series_ids_vec.is_empty() {
-                continue;
-            }
-            let forward_index = reader.forward_index(&bucket, &series_ids_vec).await?;
-            for (_id, spec) in forward_index.all_series() {
-                let mut sorted_labels = spec.labels.clone();
-                sorted_labels.sort();
-                unique_series.insert(Labels::new(sorted_labels));
-            }
-        }
-
-        let mut result: Vec<Labels> = unique_series.into_iter().collect();
-        result.sort();
-        Ok(result)
+        discover_series(&reader, matchers).await
     }
 
     /// Discover label names, optionally filtered by matchers.
@@ -525,47 +662,7 @@ impl Tsdb {
         end_secs: i64,
     ) -> std::result::Result<Vec<String>, QueryError> {
         let reader = self.query_reader(start_secs, end_secs).await?;
-        let buckets = reader.list_buckets().await?;
-        if buckets.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let mut label_names: HashSet<String> = HashSet::new();
-
-        match matchers {
-            Some(matches) if !matches.is_empty() => {
-                let matches: Vec<String> = matches.iter().map(|s| s.to_string()).collect();
-                let bucket_series_map =
-                    get_matching_series_multi_bucket(&reader, &buckets, &matches)
-                        .await
-                        .map_err(QueryError::InvalidQuery)?;
-
-                for (bucket, series_ids) in bucket_series_map {
-                    let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-                    if series_ids_vec.is_empty() {
-                        continue;
-                    }
-                    let forward_index = reader.forward_index(&bucket, &series_ids_vec).await?;
-                    for (_id, spec) in forward_index.all_series() {
-                        for attr in &spec.labels {
-                            label_names.insert(attr.name.clone());
-                        }
-                    }
-                }
-            }
-            _ => {
-                for bucket in buckets {
-                    let inverted_index = reader.all_inverted_index(&bucket).await?;
-                    for attr in inverted_index.all_keys() {
-                        label_names.insert(attr.name);
-                    }
-                }
-            }
-        }
-
-        let mut result: Vec<String> = label_names.into_iter().collect();
-        result.sort();
-        Ok(result)
+        discover_labels(&reader, matchers).await
     }
 
     /// Discover values for a specific label, optionally filtered by matchers.
@@ -577,47 +674,7 @@ impl Tsdb {
         end_secs: i64,
     ) -> std::result::Result<Vec<String>, QueryError> {
         let reader = self.query_reader(start_secs, end_secs).await?;
-        let buckets = reader.list_buckets().await?;
-        if buckets.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let mut values: HashSet<String> = HashSet::new();
-
-        match matchers {
-            Some(matches) if !matches.is_empty() => {
-                let matches: Vec<String> = matches.iter().map(|s| s.to_string()).collect();
-                let bucket_series_map =
-                    get_matching_series_multi_bucket(&reader, &buckets, &matches)
-                        .await
-                        .map_err(QueryError::InvalidQuery)?;
-
-                for (bucket, series_ids) in bucket_series_map {
-                    let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-                    if series_ids_vec.is_empty() {
-                        continue;
-                    }
-                    let forward_index = reader.forward_index(&bucket, &series_ids_vec).await?;
-                    for (_id, spec) in forward_index.all_series() {
-                        for attr in &spec.labels {
-                            if attr.name == label_name {
-                                values.insert(attr.value.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {
-                for bucket in buckets {
-                    let label_vals = reader.label_values(&bucket, label_name).await?;
-                    values.extend(label_vals);
-                }
-            }
-        }
-
-        let mut result: Vec<String> = values.into_iter().collect();
-        result.sort();
-        Ok(result)
+        discover_label_values(&reader, label_name, matchers).await
     }
 
     /// Return metadata for all (or a specific) metric.
@@ -643,7 +700,7 @@ pub(crate) struct TsdbQueryReader {
 }
 
 impl TsdbQueryReader {
-    pub fn new(_storage: Arc<dyn Storage>, mini_tsdbs: Vec<(TimeBucket, MiniQueryReader)>) -> Self {
+    pub fn new(mini_tsdbs: Vec<(TimeBucket, MiniQueryReader)>) -> Self {
         let bucket_minis = mini_tsdbs.into_iter().collect();
         Self {
             mini_readers: bucket_minis,
@@ -1658,5 +1715,30 @@ mod tests {
 
         let results = tsdb.find_metadata(Some("nonexistent")).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn eval_query_range_rejects_zero_step() {
+        let storage = create_test_storage().await;
+        let tsdb = Tsdb::new(storage);
+
+        tsdb.ingest_samples(vec![create_sample("cpu", vec![], 1_000_000, 1.0)])
+            .await
+            .unwrap();
+        tsdb.flush().await.unwrap();
+
+        let start = UNIX_EPOCH + Duration::from_secs(1000);
+        let end = UNIX_EPOCH + Duration::from_secs(1060);
+        let opts = QueryOptions::default();
+
+        let result = tsdb
+            .eval_query_range("cpu", start..=end, Duration::ZERO, &opts)
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            QueryError::InvalidQuery(_)
+        ));
     }
 }

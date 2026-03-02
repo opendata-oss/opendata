@@ -7,6 +7,8 @@
 use std::time::Duration;
 
 use common::StorageConfig;
+use serde::{Deserialize, Serialize};
+use serde_with::{DurationMilliSeconds, serde_as};
 
 /// Configuration for opening a [`TimeSeriesDb`](crate::TimeSeriesDb) database.
 ///
@@ -54,6 +56,57 @@ impl Default for Config {
             storage: StorageConfig::default(),
             flush_interval: Duration::from_secs(60),
             retention: None,
+        }
+    }
+}
+
+/// Configuration for opening a [`TimeSeriesDbReader`](crate::TimeSeriesDbReader).
+///
+/// This struct holds settings for read-only time series access, including storage
+/// backend configuration and automatic refresh settings.
+///
+/// # Example
+///
+/// ```ignore
+/// use timeseries::ReaderConfig;
+/// use common::StorageConfig;
+/// use std::time::Duration;
+///
+/// let config = ReaderConfig {
+///     storage: StorageConfig::default(),
+///     refresh_interval: Duration::from_secs(1),
+/// };
+/// let reader = TimeSeriesDbReader::open(config).await?;
+/// ```
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReaderConfig {
+    /// Storage backend configuration.
+    ///
+    /// Determines where and how time series data is read. See [`StorageConfig`]
+    /// for available options including in-memory and SlateDB backends.
+    pub storage: StorageConfig,
+
+    /// Interval for discovering new time series data.
+    ///
+    /// The reader periodically polls the SlateDB manifest at this interval
+    /// to discover new data written by other processes.
+    ///
+    /// Defaults to 1 second.
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
+    #[serde(default = "default_refresh_interval")]
+    pub refresh_interval: Duration,
+}
+
+fn default_refresh_interval() -> Duration {
+    Duration::from_secs(1)
+}
+
+impl Default for ReaderConfig {
+    fn default() -> Self {
+        Self {
+            storage: StorageConfig::default(),
+            refresh_interval: default_refresh_interval(),
         }
     }
 }

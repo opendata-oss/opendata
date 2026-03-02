@@ -53,6 +53,7 @@ mod storage;
 #[cfg(test)]
 mod test_utils;
 mod tsdb;
+mod tsdb_reader;
 mod util;
 
 #[cfg(feature = "bench-internals")]
@@ -65,13 +66,15 @@ pub mod testing;
 mod config;
 pub(crate) mod error;
 pub(crate) mod model;
+mod reader;
 mod timeseries;
 
 // Public re-exports
 #[cfg(feature = "bench-internals")]
 pub use bench_api::SubqueryLabelCacheHarness;
-pub use config::Config;
+pub use config::{Config, ReaderConfig};
 pub use error::{Error, QueryError, Result};
+pub use reader::TimeSeriesDbReader;
 pub use model::{
     InstantSample, Label, Labels, MetricMetadata, MetricType, QueryOptions, QueryValue,
     RangeSample, STALE_NAN, Sample, Series, SeriesBuilder, Temporality, is_stale_nan,
