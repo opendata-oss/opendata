@@ -12,8 +12,7 @@ use common::{StorageConfig, StorageRuntime, StorageSemantics, create_storage};
 use common::Storage;
 
 use crate::model::Series;
-use crate::promql::metrics::Metrics;
-use crate::promql::server::build_router;
+use crate::server::{Metrics, build_router};
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::Tsdb;
 
@@ -83,7 +82,7 @@ pub async fn create_test_tsdb_with_config(object_store: ObjectStoreConfig) -> Te
 }
 
 /// Build the production Axum router — same routes, middleware, and state
-/// as [`crate::promql::server::PromqlServer::run()`] but without binding
+/// as [`crate::server::TimeSeriesHttpServer::run()`] but without binding
 /// to a TCP port.
 pub fn build_app(tsdb: &TestTsdb) -> Router {
     let mut metrics = Metrics::new();
