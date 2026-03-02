@@ -21,6 +21,7 @@ path = "src/main.rs"
 default = []
 testing = []
 remote-write = ["dep:prost", "dep:snap"]
+otel = ["dep:opentelemetry-proto", "dep:prost"]
 bench-internals = []
 
 [dependencies]
@@ -58,7 +59,8 @@ roaring = "0.7"
 rust-embed = { version = "8", features = ["mime-guess"] }
 tsz = "0.1"
 
-# Optional dependencies for remote-write feature
+# Optional dependencies for remote-write and otel features
+opentelemetry-proto = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
 
@@ -73,6 +75,10 @@ dashu-float.workspace = true
 [[test]]
 name = "http_server"
 required-features = ["testing"]
+
+[[test]]
+name = "otel_ingest"
+required-features = ["testing", "otel"]
 
 [[bench]]
 name = "evaluator_micorbench"
