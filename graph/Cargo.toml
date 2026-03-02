@@ -1,0 +1,86 @@
+[package]
+name = "opendata-graph"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "graph"
+path = "src/lib.rs"
+
+[[bin]]
+name = "opendata-graph"
+path = "src/main.rs"
+required-features = ["http-server"]
+
+[features]
+default = ["gql", "http-server"]
+http-server = [
+    "dep:axum",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:clap",
+    "dep:prometheus-client",
+    "dep:tracing-subscriber",
+    "common/metrics",
+]
+
+# Query languages (forwarded to grafeo-engine, each enables dep:grafeo-engine)
+gql = ["dep:grafeo-engine", "grafeo-engine/gql"]
+cypher = ["dep:grafeo-engine", "grafeo-engine/cypher"]
+sparql = ["dep:grafeo-engine", "grafeo-engine/sparql", "grafeo-engine/rdf"]
+gremlin = ["dep:grafeo-engine", "grafeo-engine/gremlin"]
+graphql = ["dep:grafeo-engine", "grafeo-engine/graphql"]
+sql-pgq = ["dep:grafeo-engine", "grafeo-engine/sql-pgq"]
+all-languages = ["gql", "cypher", "sparql", "gremlin", "graphql", "sql-pgq"]
+
+# Engine features
+rdf = ["dep:grafeo-engine", "grafeo-engine/rdf"]
+algos = ["dep:grafeo-engine", "grafeo-engine/algos"]
+
+# Protocols
+gwp = ["dep:gwp", "dep:tonic"]
+bolt = ["dep:boltr"]
+
+# Convenience tiers
+lite = ["gql"]
+full = ["all-languages", "rdf", "algos", "gwp", "bolt"]
+
+[dependencies]
+grafeo-engine = { version = "0.5.11", default-features = false, optional = true }
+grafeo-core = { version = "0.5.11", default-features = false }
+grafeo-common = { version = "0.5.11" }
+common.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+dashmap.workspace = true
+parking_lot = "0.12"
+hashbrown = "0.14"
+arcstr = "1.2"
+smallvec = "1.13"
+
+# HTTP server (optional)
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+prometheus-client = { version = "0.23", optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+# Protocols (optional)
+gwp = { version = "0.1", optional = true }
+tonic = { version = "0.14", optional = true }
+boltr = { version = "0.1", optional = true }
+
+[dev-dependencies]
+common = { workspace = true, features = ["test-utils"] }
+rstest.workspace = true
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
+axum.workspace = true
+tower.workspace = true
