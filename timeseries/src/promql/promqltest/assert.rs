@@ -101,7 +101,7 @@ mod tests {
     fn should_reject_count_mismatch() {
         // given
         let results = vec![EvalResult {
-            labels: Labels::new(vec![]),
+            labels: Labels::empty(),
             value: 42.0,
         }];
         let expected = vec![];
@@ -118,11 +118,11 @@ mod tests {
     fn should_reject_mismatched_values() {
         // given
         let results = vec![EvalResult {
-            labels: Labels::new(vec![]),
+            labels: Labels::empty(),
             value: 42.0,
         }];
         let expected = vec![ExpectedSample {
-            labels: Labels::new(vec![]),
+            labels: Labels::empty(),
             value: 99.0,
         }];
 

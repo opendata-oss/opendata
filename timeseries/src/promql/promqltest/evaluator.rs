@@ -26,8 +26,20 @@ pub(super) async fn eval_instant(
             Ok(results)
         }
         QueryValue::Scalar { value, .. } => Ok(vec![EvalResult {
-            labels: Labels::new(vec![]),
+            labels: Labels::empty(),
             value,
         }]),
+        QueryValue::Matrix(range_samples) => {
+            let results = range_samples
+                .into_iter()
+                .flat_map(|rs| {
+                    rs.samples.into_iter().map(move |(_, val)| EvalResult {
+                        labels: rs.labels.clone(),
+                        value: val,
+                    })
+                })
+                .collect();
+            Ok(results)
+        }
     }
 }

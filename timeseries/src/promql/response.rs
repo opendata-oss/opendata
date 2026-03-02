@@ -44,6 +44,19 @@ pub(crate) fn query_value_to_response(result: Result<QueryValue, QueryError>) ->
                 error_type: None,
             }
         }
+        Ok(QueryValue::Matrix(range_samples)) => {
+            let result: Vec<MatrixSeries> = range_samples.into_iter().map(MatrixSeries).collect();
+
+            QueryResponse {
+                status: "success".to_string(),
+                data: Some(QueryResult {
+                    result_type: "matrix".to_string(),
+                    result: QueryResultValue::Matrix(result),
+                }),
+                error: None,
+                error_type: None,
+            }
+        }
         Err(e) => {
             let err = query_error_response(e);
             QueryResponse {
@@ -313,7 +326,7 @@ pub struct QueryResult {
     pub result: QueryResultValue,
 }
 
-/// Instant query result — either a scalar or a vector of series.
+/// Instant query result — a scalar, vector, or matrix.
 ///
 /// `Scalar` holds the raw `(timestamp_ms, value)` and serializes using
 /// `PromSample` so the wire format is `[timestamp_secs, "value_string"]`.
@@ -321,6 +334,7 @@ pub struct QueryResult {
 pub enum QueryResultValue {
     Scalar(i64, f64),
     Vector(Vec<VectorSeries>),
+    Matrix(Vec<MatrixSeries>),
 }
 
 impl Serialize for QueryResultValue {
@@ -330,6 +344,7 @@ impl Serialize for QueryResultValue {
                 PromSample(*ts_ms, *value).serialize(serializer)
             }
             QueryResultValue::Vector(v) => v.serialize(serializer),
+            QueryResultValue::Matrix(m) => m.serialize(serializer),
         }
     }
 }
@@ -352,8 +367,13 @@ impl<'de> Deserialize<'de> for QueryResultValue {
                     (ts_secs * 1000.0).round() as i64,
                     value,
                 ))
+            } else if arr.first().and_then(|v| v.get("values")).is_some() {
+                // Matrix: array of objects with "values" key
+                let m: Vec<MatrixSeries> =
+                    serde_json::from_value(raw).map_err(de::Error::custom)?;
+                Ok(QueryResultValue::Matrix(m))
             } else {
-                // Vector: array of objects
+                // Vector: array of objects with "value" key
                 let v: Vec<VectorSeries> =
                     serde_json::from_value(raw).map_err(de::Error::custom)?;
                 Ok(QueryResultValue::Vector(v))
@@ -711,6 +731,45 @@ mod tests {
     }
 
     #[test]
+    fn query_value_matrix_response() {
+        let range_samples = vec![RangeSample {
+            labels: Labels::new(vec![
+                Label::metric_name("http_requests_total"),
+                Label::new("job", "api"),
+            ]),
+            samples: vec![(1_000_000, 10.0), (2_000_000, 20.0), (3_000_000, 30.0)],
+        }];
+        let result = Ok(QueryValue::Matrix(range_samples));
+        let resp = query_value_to_response(result);
+        assert_eq!(resp.status, "success");
+
+        // Verify the JSON wire format
+        let json = serde_json::to_value(&resp).unwrap();
+        let first = &json["data"]["result"][0];
+        assert_eq!(first["metric"]["__name__"], "http_requests_total");
+        assert_eq!(first["metric"]["job"], "api");
+        let values = first["values"].as_array().unwrap();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0][0].as_f64().unwrap(), 1000.0);
+        assert_eq!(values[0][1].as_str().unwrap(), "10.0");
+        assert_eq!(values[2][0].as_f64().unwrap(), 3000.0);
+        assert_eq!(values[2][1].as_str().unwrap(), "30.0");
+
+        let data = resp.data.unwrap();
+        assert_eq!(data.result_type, "matrix");
+        let results = match data.result {
+            QueryResultValue::Matrix(m) => m,
+            _ => panic!("expected Matrix variant"),
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].0.labels.get("__name__").unwrap(),
+            "http_requests_total"
+        );
+        assert_eq!(results[0].0.samples.len(), 3);
+    }
+
+    #[test]
     fn query_value_error_response() {
         let resp = query_value_to_response(Err(QueryError::InvalidQuery("bad syntax".into())));
         assert_eq!(resp.status, "error");
@@ -781,6 +840,47 @@ mod tests {
                 assert_eq!(val, 42.5);
             }
             _ => panic!("expected Scalar"),
+        }
+    }
+
+    #[test]
+    fn matrix_roundtrip() {
+        let qr = QueryResponse {
+            status: "success".to_string(),
+            data: Some(QueryResult {
+                result_type: "matrix".to_string(),
+                result: QueryResultValue::Matrix(vec![MatrixSeries(RangeSample {
+                    labels: Labels::new(vec![Label::metric_name("cpu")]),
+                    samples: vec![(1_000, 1.5), (2_000, 2.5)],
+                })]),
+            }),
+            error: None,
+            error_type: None,
+        };
+        let json = serde_json::to_string(&qr).unwrap();
+        let parsed: QueryResponse = serde_json::from_str(&json).unwrap();
+        let data = parsed.data.unwrap();
+        assert_eq!(data.result_type, "matrix");
+        match data.result {
+            QueryResultValue::Matrix(m) => {
+                assert_eq!(m.len(), 1);
+                assert_eq!(m[0].0.labels.get("__name__").unwrap(), "cpu");
+                assert_eq!(m[0].0.samples, vec![(1_000, 1.5), (2_000, 2.5)]);
+            }
+            _ => panic!("expected Matrix"),
+        }
+    }
+
+    #[test]
+    fn matrix_empty_result() {
+        let result = Ok(QueryValue::Matrix(vec![]));
+        let resp = query_value_to_response(result);
+        assert_eq!(resp.status, "success");
+        let data = resp.data.unwrap();
+        assert_eq!(data.result_type, "matrix");
+        match data.result {
+            QueryResultValue::Matrix(m) => assert!(m.is_empty()),
+            _ => panic!("expected Matrix variant"),
         }
     }
 

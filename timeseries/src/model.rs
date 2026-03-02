@@ -410,9 +410,24 @@ impl SeriesBuilder {
 pub struct Labels(Vec<Label>);
 
 impl Labels {
+    /// Creates an empty `Labels`.
+    pub fn empty() -> Self {
+        Self(Vec::new())
+    }
+
     /// Creates a new `Labels` from a vec of labels.
     pub fn new(labels: Vec<Label>) -> Self {
         Self(labels)
+    }
+
+    /// Returns the number of labels.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns `true` if there are no labels.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     /// Returns the value of the label with the given name, if present.
@@ -503,28 +518,39 @@ impl From<HashMap<String, String>> for Labels {
 
 /// The result of an instant PromQL query.
 ///
-/// PromQL expressions evaluate to either a scalar (e.g. `1+1`) or a
-/// vector of time series samples (e.g. `http_requests_total`).
+/// PromQL expressions evaluate to either a scalar (e.g. `1+1`), a
+/// vector of time series samples (e.g. `http_requests_total`), or a
+/// matrix of range samples (e.g. `http_requests_total[5m]`).
 #[derive(Debug, Clone)]
 pub enum QueryValue {
     Scalar { timestamp_ms: i64, value: f64 },
     Vector(Vec<InstantSample>),
+    Matrix(Vec<RangeSample>),
 }
 
 impl QueryValue {
-    /// Flatten into samples, converting a scalar to a single
-    /// `InstantSample` with empty labels.
-    pub fn into_samples(self) -> Vec<InstantSample> {
+    /// Convert into the most general representation (`Vec<RangeSample>`).
+    ///
+    /// - `Scalar` becomes a single `RangeSample` with empty labels and one sample.
+    /// - `Vector` becomes one `RangeSample` per instant sample (each with one point).
+    /// - `Matrix` is returned as-is.
+    pub fn into_matrix(self) -> Vec<RangeSample> {
         match self {
             QueryValue::Scalar {
                 timestamp_ms,
                 value,
-            } => vec![InstantSample {
-                labels: Labels::new(vec![]),
-                timestamp_ms,
-                value,
+            } => vec![RangeSample {
+                labels: Labels::empty(),
+                samples: vec![(timestamp_ms, value)],
             }],
-            QueryValue::Vector(samples) => samples,
+            QueryValue::Vector(samples) => samples
+                .into_iter()
+                .map(|s| RangeSample {
+                    labels: s.labels,
+                    samples: vec![(s.timestamp_ms, s.value)],
+                })
+                .collect(),
+            QueryValue::Matrix(range_samples) => range_samples,
         }
     }
 }
@@ -702,5 +728,69 @@ mod tests {
         Series::builder("http_requests")
             .label("__name__", "other_name")
             .build();
+    }
+
+    #[test]
+    fn into_matrix_from_scalar() {
+        let qv = QueryValue::Scalar {
+            timestamp_ms: 5000,
+            value: 42.0,
+        };
+        let result = qv.into_matrix();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].labels, Labels::empty());
+        assert_eq!(result[0].samples, vec![(5000, 42.0)]);
+    }
+
+    #[test]
+    fn into_matrix_from_vector() {
+        let qv = QueryValue::Vector(vec![
+            InstantSample {
+                labels: Labels::new(vec![Label::metric_name("cpu")]),
+                timestamp_ms: 1000,
+                value: 1.0,
+            },
+            InstantSample {
+                labels: Labels::new(vec![Label::metric_name("mem")]),
+                timestamp_ms: 2000,
+                value: 2.0,
+            },
+        ]);
+        let result = qv.into_matrix();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].labels.get("__name__").unwrap(), "cpu");
+        assert_eq!(result[0].samples, vec![(1000, 1.0)]);
+        assert_eq!(result[1].labels.get("__name__").unwrap(), "mem");
+        assert_eq!(result[1].samples, vec![(2000, 2.0)]);
+    }
+
+    #[test]
+    fn into_matrix_from_matrix_is_identity() {
+        let range_samples = vec![
+            RangeSample {
+                labels: Labels::new(vec![Label::metric_name("cpu")]),
+                samples: vec![(1000, 1.0), (2000, 2.0)],
+            },
+            RangeSample {
+                labels: Labels::new(vec![Label::metric_name("mem")]),
+                samples: vec![(3000, 3.0)],
+            },
+        ];
+        let qv = QueryValue::Matrix(range_samples.clone());
+        let result = qv.into_matrix();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].labels, range_samples[0].labels);
+        assert_eq!(result[0].samples, range_samples[0].samples);
+        assert_eq!(result[1].labels, range_samples[1].labels);
+        assert_eq!(result[1].samples, range_samples[1].samples);
+    }
+
+    #[test]
+    fn into_matrix_empty() {
+        let qv = QueryValue::Matrix(vec![]);
+        assert!(qv.into_matrix().is_empty());
+
+        let qv = QueryValue::Vector(vec![]);
+        assert!(qv.into_matrix().is_empty());
     }
 }

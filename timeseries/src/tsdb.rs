@@ -375,8 +375,18 @@ impl Tsdb {
                     })
                     .collect(),
             )),
-            ExprResult::RangeVector(_) => Err(QueryError::Execution(
-                "range vectors not supported for instant queries".to_string(),
+            ExprResult::RangeVector(samples) => Ok(QueryValue::Matrix(
+                samples
+                    .into_iter()
+                    .map(|s| RangeSample {
+                        labels: Labels::from(s.labels),
+                        samples: s
+                            .values
+                            .into_iter()
+                            .map(|v| (v.timestamp_ms, v.value))
+                            .collect(),
+                    })
+                    .collect(),
             )),
         }
     }
@@ -441,7 +451,7 @@ impl Tsdb {
                     }
                 }
                 ExprResult::Scalar(value) => {
-                    let labels = Labels::new(vec![]);
+                    let labels = Labels::empty();
                     series_map
                         .entry(labels)
                         .or_default()
@@ -1183,7 +1193,7 @@ mod tests {
             .eval_query("http_requests", Some(query_time), &wide)
             .await
             .unwrap()
-            .into_samples();
+            .into_matrix();
         assert_eq!(results.len(), 2);
 
         let narrow = QueryOptions {
@@ -1193,7 +1203,7 @@ mod tests {
             .eval_query("http_requests", Some(query_time), &narrow)
             .await
             .unwrap()
-            .into_samples();
+            .into_matrix();
         assert_eq!(
             results.len(),
             0,
@@ -1489,7 +1499,7 @@ mod tests {
             .eval_query("http_requests offset 1h", Some(query_time), &opts)
             .await
             .unwrap();
-        let samples = result.into_samples();
+        let samples = result.into_matrix();
         assert_eq!(samples.len(), 2, "offset 1h should find data at 4000s");
     }
 
@@ -1524,7 +1534,7 @@ mod tests {
             .eval_query("up offset 1h", Some(query_time), &opts)
             .await
             .unwrap();
-        let samples = result.into_samples();
+        let samples = result.into_matrix();
         assert!(
             samples.is_empty(),
             "before-epoch offset should return empty"
