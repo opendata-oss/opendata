@@ -143,9 +143,22 @@ The `claimed` map associates each claimed location with a timestamp in milliseco
 This timestamp is set when the location is claimed or refreshed by `heartbeat()`.
 If the timestamp is older than `heartbeat_timeout_ms`, the location is considered stale and may be re-claimed
 by another consumer.
+Stale locations are always re-claimed before any new pending location is claimed.
 The `done` list contains locations that have been fully processed. These locations remain in the consumer manifest
 until the `done_cleanup_threshold` is reached, at which point they are removed from both the producer manifest's
 `pending` list and the consumer manifest's `done` list.
+
+The queue does not guarantee that the ingestion order is preserved.
+For example the following scenario will re-order batches:
+1. A queue consumer fails after it claimed a location but before moving the location to done.
+2. The new consumer starts but the heartbeat timeout on the location claimed by the failed consumer has not yet elapsed. 
+3. The new consumer will claim pending locations and mark the locations as done until the heartbeat for the location
+   claimed by the failed consumer elapsed.
+
+All pending locations claimed by the new consumer before it can re-claim the location claimed by the
+failed consumer will be done before the location claimed by the failed consumer,
+although the latter were appended to the queue before the former.
+
 
 ### Ingestor
 
@@ -300,6 +313,17 @@ This may trigger cleanup of the manifests and the data batch in object storage i
 When the collector is dropped, the background heartbeat task is cancelled.
 In-flight batches that are not acknowledged will eventually become stale and can be re-claimed
 by another collector.
+
+### Delivery guarantees
+
+Once entries are confirmed to be durable they are guaranteed to be delivered to the caller of the collector 
+at least once.
+If the collector fails after it claimed a location and processed the corresponding batch, but before it was able to 
+acknowledge the batch, the new collector will re-read the batch and re-process it. 
+
+The delivery guarantees of the entries that were not confirmed to be durable depends on the progress tracking of the
+caller of the stateless ingest.
+If they track the progress and re-ingest unacknowledged entries they can achieve at-least-once guarantee.
 
 ### Observability
 
