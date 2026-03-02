@@ -357,6 +357,35 @@ This contention would also affect the queue producers.
 With a queue producer manifest and a queue consumer manifest, we can better decouple producer contention from
 consumer contention.
 
+
+### Using a counter for the batch names
+
+We could use a counter for the batch names to impose an order.
+During the flushing of batches, the ingestor:
+1. lists the prefix to which the batches are written, 
+2. finds the name with the largest number, 
+3. increases it, and 
+4. conditionally tries to write the batch named with the increased number.
+
+If the write fails because a batch with that name already exists, the ingestor increases the number again, 
+tries to write the batch again, and so forth.
+
+The collector:
+1. lists the prefix to which the batches are written,
+2. finds the batch with the lowest number,
+3. makes that batch available.
+
+Once the batch is acknowledged, the batch is removed from the prefix.
+
+This approach has the disadvantages that it cannot be easily used with multiple collectors, since a collector cannot
+know if the batch with the name with the lowest number has been already claimed by a different collector.
+
+It is also not clear if the conflict resolution would have a higher latency 
+since the conflict would be on the data batches and the conditional write is checked at the end of the write.
+That means, that maybe all the data is first send to object storage to then discover that there is a different
+object with the same name. This aspect would require some experiments.
+
+
 ## Open Questions
 
 - What format should we use for the data batches?
