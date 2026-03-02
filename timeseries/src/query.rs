@@ -86,7 +86,7 @@ pub(crate) trait QueryReader: Send + Sync {
     ) -> Result<Vec<Sample>>;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bench-internals"))]
 pub(crate) mod test_utils {
     use super::*;
     use crate::index::{ForwardIndex, InvertedIndex, SeriesSpec};

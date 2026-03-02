@@ -24,6 +24,7 @@ use common::{StorageRuntime, StorageSemantics};
 use promql::config::{CliArgs, PrometheusConfig, load_config};
 use promql::server::{PromqlServer, ServerConfig};
 use storage::merge_operator::OpenTsdbMergeOperator;
+use tracing_subscriber::EnvFilter;
 use tsdb::Tsdb;
 
 #[tokio::main]
@@ -31,7 +32,9 @@ async fn main() {
     // Initialize tracing with configurable log level via RUST_LOG environment variable
     // Default to "info" if RUST_LOG is not set
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE) // Only exit events with timing
         .with_target(true)
         .with_line_number(true)
