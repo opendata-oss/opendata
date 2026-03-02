@@ -14,4 +14,3 @@ pub(crate) mod scraper;
 pub(crate) mod selector;
 pub(crate) mod server;
 mod timestamp;
-pub(crate) mod tsdb_router;

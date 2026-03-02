@@ -5,7 +5,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use async_trait::async_trait;
 use common::Storage;
 use moka::future::Cache;
-use promql_parser::parser::EvalStmt;
+use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 use tokio::sync::RwLock;
 use tracing::error;
 
@@ -16,11 +16,72 @@ use crate::model::{
     InstantSample, Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Sample,
     Series, SeriesId, TimeBucket,
 };
-use crate::promql::evaluator::{Evaluator, ExprResult};
-use crate::promql::tsdb_router::{get_matching_series_multi_bucket, preload_ranges};
+use crate::promql::evaluator::{CachedQueryReader, Evaluator, ExprResult, compute_preload_ranges};
+use crate::promql::selector::evaluate_selector_with_reader;
 use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::util::Result;
+
+/// Compute the disjoint preload ranges for bucket discovery.
+///
+/// Uses `compute_preload_ranges` to account for `offset`/`@` modifiers.
+/// Falls back to a single `[(default_start, default_end)]` for
+/// selector-free expressions.
+fn preload_ranges(stmt: &EvalStmt, default_start: i64, default_end: i64) -> Vec<(i64, i64)> {
+    let ranges = compute_preload_ranges(&stmt.expr, stmt.start, stmt.end, stmt.lookback_delta);
+    if ranges.is_empty() {
+        vec![(default_start, default_end)]
+    } else {
+        ranges
+    }
+}
+
+/// Parse a match[] selector string into a VectorSelector
+fn parse_selector(selector: &str) -> std::result::Result<VectorSelector, String> {
+    let expr = promql_parser::parser::parse(selector).map_err(|e| e.to_string())?;
+    match expr {
+        Expr::VectorSelector(vs) => Ok(vs),
+        _ => Err("Expected a vector selector".to_string()),
+    }
+}
+
+/// Get all series IDs matching any of the given selectors (UNION)
+async fn get_matching_series<R: QueryReader>(
+    reader: &R,
+    bucket: TimeBucket,
+    matches: &[String],
+) -> std::result::Result<HashSet<SeriesId>, String> {
+    let mut all_series = HashSet::new();
+
+    let mut cached_reader = CachedQueryReader::new(reader);
+    for selector_str in matches {
+        let selector = parse_selector(selector_str)?;
+        let series = evaluate_selector_with_reader(&mut cached_reader, bucket, &selector)
+            .await
+            .map_err(|e| e.to_string())?;
+        all_series.extend(series);
+    }
+
+    Ok(all_series)
+}
+
+/// Get all series across multiple buckets, with fingerprint-based deduplication
+async fn get_matching_series_multi_bucket<R: QueryReader>(
+    reader: &R,
+    buckets: &[TimeBucket],
+    matches: &[String],
+) -> std::result::Result<HashMap<TimeBucket, HashSet<SeriesId>>, String> {
+    let mut bucket_series_map = HashMap::new();
+
+    for &bucket in buckets {
+        let series = get_matching_series(reader, bucket, matches).await?;
+        if !series.is_empty() {
+            bucket_series_map.insert(bucket, series);
+        }
+    }
+
+    Ok(bucket_series_map)
+}
 
 /// Multi-bucket time series database.
 ///
