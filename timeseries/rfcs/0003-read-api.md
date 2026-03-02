@@ -55,8 +55,10 @@ impl TimeSeriesDb {
     ///
     /// ```rust
     /// let result = tsdb.query("rate(http_requests_total[5m])", None).await?;
-    /// for sample in result.into_samples() {
-    ///     println!("{}: {}", sample.labels.metric_name(), sample.value);
+    /// for rs in result.into_matrix() {
+    ///     for (ts, val) in &rs.samples {
+    ///         println!("{}: {} = {}", rs.labels.metric_name(), ts, val);
+    ///     }
     /// }
     /// ```
     pub async fn query(
@@ -134,18 +136,23 @@ impl TimeSeriesDb {
 ```rust
 /// The result of an instant PromQL query.
 ///
-/// PromQL expressions evaluate to either a scalar (e.g. `1+1`) or a
-/// vector of time series samples (e.g. `http_requests_total`).
+/// PromQL expressions evaluate to either a scalar (e.g. `1+1`), a
+/// vector of time series samples (e.g. `http_requests_total`), or a
+/// matrix of range samples (e.g. `http_requests_total[5m]`).
 #[derive(Debug, Clone)]
 pub enum QueryValue {
     Scalar { timestamp_ms: i64, value: f64 },
     Vector(Vec<InstantSample>),
+    Matrix(Vec<RangeSample>),
 }
 
 impl QueryValue {
-    /// Flatten into samples, converting a scalar to a single
-    /// `InstantSample` with empty labels.
-    pub fn into_samples(self) -> Vec<InstantSample>;
+    /// Convert into the most general representation (`Vec<RangeSample>`).
+    ///
+    /// - `Scalar` becomes a single `RangeSample` with empty labels and one sample.
+    /// - `Vector` becomes one `RangeSample` per instant sample (each with one point).
+    /// - `Matrix` is returned as-is.
+    pub fn into_matrix(self) -> Vec<RangeSample>;
 }
 
 /// A single series value at a point in time.
@@ -171,6 +178,10 @@ pub struct RangeSample {
 pub struct Labels(Vec<Label>);
 
 impl Labels {
+    pub fn empty() -> Self;
+    pub fn new(labels: Vec<Label>) -> Self;
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
     pub fn get(&self, name: &str) -> Option<&str>;
     pub fn metric_name(&self) -> &str;
     pub fn iter(&self) -> impl Iterator<Item = &Label>;
