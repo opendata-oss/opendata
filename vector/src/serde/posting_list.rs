@@ -481,6 +481,159 @@ pub(crate) fn merge_posting_list(
     result.freeze()
 }
 
+/// K-way byte-level merge for posting lists across multiple operands.
+///
+/// Merges `existing` (oldest, priority 0) with `operands` (priority 1..N, newest last)
+/// using a min-heap over raw byte cursors. For equal IDs, the highest-priority (newest)
+/// entry wins. Operands are ordered oldest-to-newest per SlateDB convention.
+///
+/// Short-circuits: returns the single input as-is when only one source is present.
+pub(crate) fn merge_batch_posting_list(
+    existing: Option<Bytes>,
+    operands: &[Bytes],
+    dimensions: usize,
+) -> Bytes {
+    // Short-circuit: single source, no merge needed
+    if operands.is_empty() {
+        return existing.unwrap_or_default();
+    }
+    if operands.len() == 1 && existing.is_none() {
+        return operands[0].clone();
+    }
+
+    let vector_size = dimensions * 4;
+    let append_size = 1 + 8 + vector_size;
+    let delete_size = 1 + 8;
+
+    // Each cursor: (Bytes buffer, priority). Higher priority = newer.
+    // existing_value has priority 0, operands[0] has priority 1, ..., operands[N-1] has priority N.
+    struct Cursor {
+        buf: Bytes,
+        priority: usize,
+    }
+
+    let peek_entry = |buf: &[u8], append_size: usize, delete_size: usize| -> Option<(u64, usize)> {
+        if buf.is_empty() {
+            return None;
+        }
+        assert!(buf.len() >= delete_size);
+        let entry_type = buf[0];
+        let id = u64::from_le_bytes([
+            buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
+        ]);
+        let entry_size = if entry_type == POSTING_UPDATE_TYPE_APPEND_BYTE {
+            append_size
+        } else {
+            delete_size
+        };
+        Some((id, entry_size))
+    };
+
+    // Heap entry: (id, Reverse(priority), cursor_index)
+    // BinaryHeap is max-heap, so we use Reverse for id (want smallest first)
+    // and raw priority (want largest/newest to win on ties).
+    #[derive(Eq, PartialEq)]
+    struct HeapEntry {
+        id: u64,
+        priority: usize,
+        cursor_idx: usize,
+        entry_size: usize,
+    }
+
+    impl Ord for HeapEntry {
+        fn cmp(&self, other: &Self) -> Ordering {
+            // Min-heap by id, max-heap by priority for ties
+            other
+                .id
+                .cmp(&self.id)
+                .then_with(|| self.priority.cmp(&other.priority))
+        }
+    }
+
+    impl PartialOrd for HeapEntry {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut cursors: Vec<Cursor> = Vec::with_capacity(1 + operands.len());
+
+    if let Some(ex) = existing
+        && !ex.is_empty()
+    {
+        cursors.push(Cursor {
+            buf: ex,
+            priority: 0,
+        });
+    }
+    for (i, op) in operands.iter().enumerate() {
+        if !op.is_empty() {
+            cursors.push(Cursor {
+                buf: op.clone(),
+                priority: i + 1,
+            });
+        }
+    }
+
+    if cursors.is_empty() {
+        return Bytes::new();
+    }
+
+    let total_size: usize = cursors.iter().map(|c| c.buf.len()).sum();
+    let mut result = BytesMut::with_capacity(total_size);
+    let mut heap = BinaryHeap::with_capacity(cursors.len());
+
+    // Seed the heap
+    for (idx, cursor) in cursors.iter().enumerate() {
+        if let Some((id, entry_size)) = peek_entry(&cursor.buf, append_size, delete_size) {
+            heap.push(HeapEntry {
+                id,
+                priority: cursor.priority,
+                cursor_idx: idx,
+                entry_size,
+            });
+        }
+    }
+
+    while let Some(winner) = heap.pop() {
+        let id = winner.id;
+
+        // Write the winner's entry bytes
+        let cursor = &mut cursors[winner.cursor_idx];
+        result.put_slice(&cursor.buf[..winner.entry_size]);
+        cursor.buf.advance(winner.entry_size);
+
+        // Advance the winner's cursor
+        if let Some((next_id, next_size)) = peek_entry(&cursor.buf, append_size, delete_size) {
+            heap.push(HeapEntry {
+                id: next_id,
+                priority: cursor.priority,
+                cursor_idx: winner.cursor_idx,
+                entry_size: next_size,
+            });
+        }
+
+        // Skip all other entries with the same id (losers)
+        while heap.peek().is_some_and(|e| e.id == id) {
+            let loser = heap.pop().unwrap();
+            let cursor = &mut cursors[loser.cursor_idx];
+            cursor.buf.advance(loser.entry_size);
+
+            // Advance the loser's cursor
+            if let Some((next_id, next_size)) = peek_entry(&cursor.buf, append_size, delete_size) {
+                heap.push(HeapEntry {
+                    id: next_id,
+                    priority: cursor.priority,
+                    cursor_idx: loser.cursor_idx,
+                    entry_size: next_size,
+                });
+            }
+        }
+    }
+
+    result.freeze()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1060,5 +1213,137 @@ mod tests {
         assert_eq!(posting_list[1].id(), 2);
         assert_eq!(posting_list[2].id(), 4);
         assert_eq!(posting_list[3].id(), 5);
+    }
+
+    #[test]
+    fn should_merge_batch_posting_list_newer_operand_wins() {
+        // given - 3 operands with overlapping IDs; operands[2] is newest
+        let op0 = PostingListValue::from_posting_updates(vec![
+            PostingUpdate::append(1, vec![10.0]),
+            PostingUpdate::append(2, vec![20.0]),
+        ])
+        .unwrap()
+        .encode_to_bytes();
+        let op1 = PostingListValue::from_posting_updates(vec![
+            PostingUpdate::append(2, vec![200.0]),
+            PostingUpdate::append(3, vec![30.0]),
+        ])
+        .unwrap()
+        .encode_to_bytes();
+        let op2 = PostingListValue::from_posting_updates(vec![
+            PostingUpdate::append(2, vec![2000.0]),
+            PostingUpdate::append(4, vec![40.0]),
+        ])
+        .unwrap()
+        .encode_to_bytes();
+
+        // when
+        let merged = merge_batch_posting_list(None, &[op0, op1, op2], 1);
+        let decoded = PostingListValue::decode_from_bytes(&merged, 1).unwrap();
+
+        // then - id 2 has value from op2 (newest), all 4 ids present
+        assert_eq!(decoded.len(), 4);
+        assert_eq!(decoded.postings[0].id(), 1);
+        assert_eq!(decoded.postings[0].vector().unwrap(), &[10.0]);
+        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[1].vector().unwrap(), &[2000.0]);
+        assert_eq!(decoded.postings[2].id(), 3);
+        assert_eq!(decoded.postings[2].vector().unwrap(), &[30.0]);
+        assert_eq!(decoded.postings[3].id(), 4);
+        assert_eq!(decoded.postings[3].vector().unwrap(), &[40.0]);
+    }
+
+    #[test]
+    fn should_merge_batch_posting_list_with_existing_value() {
+        // given - existing + 2 operands
+        let existing = PostingListValue::from_posting_updates(vec![
+            PostingUpdate::append(1, vec![1.0, 2.0]),
+            PostingUpdate::append(3, vec![3.0, 4.0]),
+        ])
+        .unwrap()
+        .encode_to_bytes();
+        let op0 =
+            PostingListValue::from_posting_updates(vec![PostingUpdate::append(2, vec![5.0, 6.0])])
+                .unwrap()
+                .encode_to_bytes();
+        let op1 =
+            PostingListValue::from_posting_updates(vec![PostingUpdate::append(4, vec![7.0, 8.0])])
+                .unwrap()
+                .encode_to_bytes();
+
+        // when
+        let merged = merge_batch_posting_list(Some(existing), &[op0, op1], 2);
+        let decoded = PostingListValue::decode_from_bytes(&merged, 2).unwrap();
+
+        // then - all 4 ids present in sorted order
+        assert_eq!(decoded.len(), 4);
+        assert_eq!(decoded.postings[0].id(), 1);
+        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[2].id(), 3);
+        assert_eq!(decoded.postings[3].id(), 4);
+    }
+
+    #[test]
+    fn should_merge_batch_posting_list_single_operand_no_existing() {
+        // given - single operand, no existing
+        let op = PostingListValue::from_posting_updates(vec![
+            PostingUpdate::append(1, vec![1.0]),
+            PostingUpdate::append(2, vec![2.0]),
+        ])
+        .unwrap()
+        .encode_to_bytes();
+        let original = op.clone();
+
+        // when
+        let merged = merge_batch_posting_list(None, &[op], 1);
+
+        // then - returns operand as-is (short-circuit)
+        assert_eq!(merged, original);
+    }
+
+    #[test]
+    fn should_merge_batch_posting_list_no_operands_returns_existing() {
+        // given - existing value, no operands
+        let existing = PostingListValue::from_posting_updates(vec![
+            PostingUpdate::append(1, vec![1.0]),
+            PostingUpdate::append(2, vec![2.0]),
+        ])
+        .unwrap()
+        .encode_to_bytes();
+        let original = existing.clone();
+
+        // when
+        let merged = merge_batch_posting_list(Some(existing), &[], 1);
+
+        // then - returns existing as-is
+        assert_eq!(merged, original);
+    }
+
+    #[test]
+    fn should_merge_batch_posting_list_delete_in_newer_wins() {
+        // given - older operand appends id 2, newer operand deletes id 2
+        let op0 = PostingListValue::from_posting_updates(vec![
+            PostingUpdate::append(1, vec![1.0]),
+            PostingUpdate::append(2, vec![2.0]),
+            PostingUpdate::append(3, vec![3.0]),
+        ])
+        .unwrap()
+        .encode_to_bytes();
+        let op1 = PostingListValue::from_posting_updates(vec![PostingUpdate::delete(2)])
+            .unwrap()
+            .encode_to_bytes();
+
+        // when
+        let merged = merge_batch_posting_list(None, &[op0, op1], 1);
+        let decoded = PostingListValue::decode_from_bytes(&merged, 1).unwrap();
+
+        // then - id 2 is a delete (from newer operand)
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded.postings[0].id(), 1);
+        assert!(decoded.postings[0].is_append());
+        assert_eq!(decoded.postings[1].id(), 2);
+        assert!(decoded.postings[1].is_delete());
+        assert_eq!(decoded.postings[2].id(), 3);
+        assert!(decoded.postings[2].is_append());
     }
 }

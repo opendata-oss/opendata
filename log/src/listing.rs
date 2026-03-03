@@ -132,9 +132,12 @@ impl ListingCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{LogStorageRead, in_memory_storage};
+    use crate::storage::LogStorageRead;
+    use common::Storage;
 
     mod log_key_iterator {
+        use opendata_macros::storage_test;
+
         use super::*;
 
         async fn write_listing_entry(storage: &dyn common::Storage, segment_id: u32, key: &[u8]) {
@@ -150,11 +153,8 @@ mod tests {
                 .unwrap();
         }
 
-        #[tokio::test]
-        async fn should_return_empty_for_empty_range() {
-            // given
-            let storage = in_memory_storage();
-
+        #[storage_test]
+        async fn should_return_empty_for_empty_range(storage: Arc<dyn Storage>) {
             // when
             let keys = storage.list_keys(0..0).await.unwrap();
 
@@ -162,11 +162,8 @@ mod tests {
             assert!(keys.is_empty());
         }
 
-        #[tokio::test]
-        async fn should_return_empty_when_no_listing_entries() {
-            // given
-            let storage = in_memory_storage();
-
+        #[storage_test]
+        async fn should_return_empty_when_no_listing_entries(storage: Arc<dyn Storage>) {
             // when
             let keys = storage.list_keys(0..10).await.unwrap();
 
@@ -174,10 +171,9 @@ mod tests {
             assert!(keys.is_empty());
         }
 
-        #[tokio::test]
-        async fn should_iterate_keys_in_single_segment() {
+        #[storage_test]
+        async fn should_iterate_keys_in_single_segment(storage: Arc<dyn Storage>) {
             // given
-            let storage = in_memory_storage();
             write_listing_entry(&*storage, 0, b"key-a").await;
             write_listing_entry(&*storage, 0, b"key-b").await;
             write_listing_entry(&*storage, 0, b"key-c").await;
@@ -192,10 +188,9 @@ mod tests {
             assert_eq!(keys[2], Bytes::from("key-c"));
         }
 
-        #[tokio::test]
-        async fn should_iterate_keys_across_multiple_segments() {
+        #[storage_test]
+        async fn should_iterate_keys_across_multiple_segments(storage: Arc<dyn Storage>) {
             // given
-            let storage = in_memory_storage();
             write_listing_entry(&*storage, 0, b"key-a").await;
             write_listing_entry(&*storage, 1, b"key-b").await;
             write_listing_entry(&*storage, 2, b"key-c").await;
@@ -207,10 +202,9 @@ mod tests {
             assert_eq!(keys.len(), 3);
         }
 
-        #[tokio::test]
-        async fn should_deduplicate_keys_across_segments() {
+        #[storage_test]
+        async fn should_deduplicate_keys_across_segments(storage: Arc<dyn Storage>) {
             // given - same key in multiple segments
-            let storage = in_memory_storage();
             write_listing_entry(&*storage, 0, b"shared-key").await;
             write_listing_entry(&*storage, 1, b"shared-key").await;
             write_listing_entry(&*storage, 2, b"shared-key").await;
@@ -223,10 +217,9 @@ mod tests {
             assert!(keys.contains(&Bytes::from("shared-key")));
         }
 
-        #[tokio::test]
-        async fn should_respect_segment_range() {
+        #[storage_test]
+        async fn should_respect_segment_range(storage: Arc<dyn Storage>) {
             // given
-            let storage = in_memory_storage();
             write_listing_entry(&*storage, 0, b"key-0").await;
             write_listing_entry(&*storage, 1, b"key-1").await;
             write_listing_entry(&*storage, 2, b"key-2").await;
@@ -241,10 +234,9 @@ mod tests {
             assert_eq!(keys[1], Bytes::from("key-2"));
         }
 
-        #[tokio::test]
-        async fn should_return_keys_in_lexicographic_order() {
+        #[storage_test]
+        async fn should_return_keys_in_lexicographic_order(storage: Arc<dyn Storage>) {
             // given - keys inserted out of order
-            let storage = in_memory_storage();
             write_listing_entry(&*storage, 0, b"zebra").await;
             write_listing_entry(&*storage, 0, b"apple").await;
             write_listing_entry(&*storage, 0, b"mango").await;

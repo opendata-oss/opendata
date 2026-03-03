@@ -7,10 +7,10 @@ use std::time::Duration;
 use tokio::time::interval;
 
 use super::config::{PrometheusConfig, ScrapeConfig};
-use super::metrics::{Metrics, ScrapeLabels};
 use super::openmetrics::parse_openmetrics;
 use crate::error::Error;
 use crate::model::{Label, MetricType, Sample, Series};
+use crate::server::metrics::{Metrics, ScrapeLabels};
 use crate::tsdb::Tsdb;
 use crate::util::Result;
 
