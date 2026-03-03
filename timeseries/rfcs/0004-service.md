@@ -74,87 +74,31 @@ The `otel` feature is usable without `http-server` — the builder can be used s
 
 The service uses Axum, listens on a single port (default 9090), and handles graceful shutdown (SIGINT/SIGTERM) with a TSDB flush.
 
-### Amendment: Source/Sink Pipeline Architecture
+### Amendment: TimeSeries Binding to Shared Write Pipeline
 
-To support both direct ingestion into `TimeSeriesDb` and ingestion through the stateless ingest module ([RFC 0001: Stateless Ingest](../../ingest/rfcs/0001-stateless-ingest.md)), the write path is modeled as a pipeline over a normalized `Vec<Series>` payload.
+TimeSeries adopts the cross-project write pipeline model defined in [RFC 0006: Write Pipeline (Source/Sink)](../../rfcs/0006-write-pipeline.md).
 
-#### Core Model
+For TimeSeries, the pipeline payload type is `Vec<Series>`.
 
-- **Source** emits `Vec<Series>`.
-- **Sink** accepts `Vec<Series>`.
-- **Sink/Source pair** implements both and acts as an intermediate stage.
+TimeSeries-specific bindings:
 
-All write pipelines start from a source and end at a sink:
+- **Push sources**:
+  - `POST /api/v1/write` (Prometheus Remote Write 1.0) decodes to `Vec<Series>`.
+  - `POST /v1/metrics` (OTLP/HTTP) uses `OtelSeriesBuilder` and emits `Vec<Series>`.
+- **Terminal sink**:
+  - `TsdbSink` writes to `TimeSeriesDb::write()` / `Tsdb::ingest_samples()`.
+- **Optional intermediate sink/source stage**:
+  - Stateless ingest (RFC 0001) can be inserted between protocol sources and `TsdbSink`.
+  - TimeSeries defines the record serialization for `Vec<Series>` used by this stage.
 
-- Direct: `HttpSource -> TsdbSink`
-- Buffered: `HttpSource -> StatelessIngest (sink/source pair) -> TsdbSink`
+Durability policy for the stateless ingest sink path: endpoint success SHOULD be returned only after object-store durability (`WriteWatcher::await_durable()`).
 
-This isolates protocol parsing from delivery mechanics and lets us compose additional stages (for example LogDb) without changing endpoint logic.
-
-#### Push/Pull Semantics
-
-Sources come in two forms:
-
-- **Push source**: receives upstream writes and immediately pushes `Vec<Series>` to a downstream sink.
-  - HTTP endpoints are push sources.
-- **Pull source**: exposes batches for downstream consumers to fetch, then acknowledge.
-  - Collector-side stateless ingest is a pull source.
-
-Proposed contracts:
-
-```rust
-#[async_trait]
-pub trait Sink {
-    async fn accept(&self, series: Vec<Series>) -> Result<SinkAck>;
-}
-
-#[async_trait]
-pub trait PullSource {
-    async fn next_batch(&self) -> Result<Option<SeriesBatch>>;
-    async fn ack(&self, batch: &SeriesBatch) -> Result<()>;
-}
-```
-
-Push sources are endpoint handlers that parse protocol payloads and call `Sink::accept`.
-
-#### Protocol Sources
-
-The service defines push sources for ingest endpoints:
-
-| Endpoint | Source output |
-|---|---|
-| `POST /api/v1/write` (Prometheus Remote Write 1.0) | `Vec<Series>` |
-| `POST /v1/metrics` (OTLP/HTTP) | `Vec<Series>` via `OtelSeriesBuilder` |
-
-Both sources perform format validation/decoding and emit the same normalized series model.
-
-#### Sink and Sink/Source Implementations
-
-- **TsdbSink**: terminal sink; writes to `TimeSeriesDb::write()` / `Tsdb::ingest_samples()`.
-- **StatelessIngestSink**: accepts `Vec<Series>`, serializes records, and writes durable batches through RFC 0001 `Ingestor`.
-- **StatelessIngestSource**: reads batches via RFC 0001 `Collector`, deserializes records, and emits `Vec<Series>` to downstream sinks.
-
-The stateless ingest pair is a reusable intermediate stage, not a terminal writer.
-
-#### Acknowledgement and Durability
-
-For `StatelessIngestSink`, ingest endpoints SHOULD return success only after durability in object storage (`WriteWatcher::await_durable()`).
-
-Rationale:
-- Endpoint acknowledgement reflects durable acceptance, not in-memory buffering.
-- Retry behavior stays predictable for remote-write and OTLP clients.
-- Collector + `ack()` preserve at-least-once delivery semantics.
-
-#### Server Composition
-
-The service can be composed into two server modes:
+Server composition remains:
 
 | Mode | Routes |
 |---|---|
 | **Full server** | Query APIs + ingest APIs + health + metrics + UI |
 | **Write-only server** | Ingest APIs + health + metrics |
-
-Both modes reuse the same source/sink contracts; only route composition changes.
 
 #### Endpoints
 
@@ -270,4 +214,4 @@ Each protocol could run its own server on a different port. This adds operationa
 |---|---|
 | 2026-02-24 | Initial draft (as RFC 0003: OTLP Metrics Ingest) |
 | 2026-02-25 | Restructured as TimeSeries Service RFC covering HTTP server, remote-write, and OTEL ingest |
-| 2026-03-03 | Amendment: source/sink pipeline model with push/pull semantics, stateless ingest sink/source pair, and full vs write-only server composition |
+| 2026-03-03 | Amendment: TimeSeries binding to shared source/sink pipeline model; generic pipeline semantics moved to RFC 0006 |
