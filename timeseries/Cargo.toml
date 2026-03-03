@@ -80,7 +80,7 @@ fail.workspace = true
 proptest.workspace = true
 rstest.workspace = true
 dashu-float.workspace = true
-tempfile = "3"
+tempfile.workspace = true
 opendata-macros.workspace = true
 
 
