@@ -718,6 +718,7 @@ mod tests {
     use crate::promql::evaluator::EvalSample;
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
     use opendata_macros::storage_test;
+    use slatedb::object_store::memory::InMemory;
 
     fn create_sample(
         metric_name: &str,
@@ -1127,8 +1128,8 @@ mod tests {
     // ── Native read method tests ─────────────────────────────────────
 
     async fn create_tsdb_with_data() -> Tsdb {
-        let storage = create_test_storage().await;
-        let tsdb = Tsdb::new(storage);
+        let storage = InMemory::new();
+        let tsdb = Tsdb::new(storage.clone());
 
         // Ingest two series into bucket at minute 60 (covers 3,600,000–7,199,999 ms)
         let series = vec![
