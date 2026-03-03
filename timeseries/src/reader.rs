@@ -16,7 +16,6 @@ use common::storage::factory::create_storage_read;
 use common::{StorageReaderRuntime, StorageSemantics};
 use futures::stream::{self, StreamExt};
 use moka::future::Cache;
-use tokio::sync::RwLock;
 
 use crate::config::ReaderConfig;
 use crate::error::{QueryError, Result};
@@ -147,8 +146,6 @@ pub struct TimeSeriesDbReader {
     storage: Arc<dyn StorageRead>,
     /// LRU cache for read-only query buckets.
     query_cache: Cache<TimeBucket, Arc<MiniQueryReader>>,
-    /// Metadata catalog (always empty for reader — metadata is populated during writes).
-    metadata_catalog: RwLock<HashMap<String, Vec<MetricMetadata>>>,
 }
 
 impl TimeSeriesDbReader {
@@ -181,7 +178,6 @@ impl TimeSeriesDbReader {
         Self {
             storage,
             query_cache,
-            metadata_catalog: RwLock::new(HashMap::new()),
         }
     }
 
@@ -301,10 +297,6 @@ impl TsdbReadEngine for TimeSeriesDbReader {
             .await;
 
         Ok(ReaderQueryReader::new(readers))
-    }
-
-    fn metadata_catalog(&self) -> &RwLock<HashMap<String, Vec<MetricMetadata>>> {
-        &self.metadata_catalog
     }
 }
 

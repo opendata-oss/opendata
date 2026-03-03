@@ -90,7 +90,7 @@ async fn get_matching_series_multi_bucket<R: QueryReader>(
 
 // ── TsdbReadEngine trait ─────────────────────────────────────────────────
 //
-// Factors out the 6 duplicated eval/find methods shared between `Tsdb`
+// Factors out the 5 duplicated eval/find methods shared between `Tsdb`
 // (writer) and `TimeSeriesDbReader` (reader). Each implementor provides
 // its own `QueryReader` construction; the query logic lives once in the
 // default methods.
@@ -105,10 +105,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
     /// Build a query reader spanning a set of disjoint ranges (seconds).
     async fn make_query_reader_for_ranges(&self, ranges: &[(i64, i64)]) -> Result<Self::QR>;
 
-    /// Access the metadata catalog.
-    fn metadata_catalog(&self) -> &RwLock<HashMap<String, Vec<MetricMetadata>>>;
-
-    // ── Provided: 6 default methods written once ──
+    // ── Provided: 5 default methods written once ──
 
     /// Evaluate an instant PromQL query, returning typed `InstantSample`s.
     async fn eval_query(
@@ -211,21 +208,6 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
     ) -> std::result::Result<Vec<String>, QueryError> {
         let reader = self.make_query_reader(start_secs, end_secs).await?;
         discover_label_values(&reader, label_name, matchers).await
-    }
-
-    /// Return metadata for all (or a specific) metric.
-    async fn find_metadata(
-        &self,
-        metric: Option<&str>,
-    ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
-        let catalog = self.metadata_catalog().read().await;
-
-        let entries: Vec<MetricMetadata> = match metric {
-            Some(name) => catalog.get(name).cloned().unwrap_or_default(),
-            None => catalog.values().flatten().cloned().collect(),
-        };
-
-        Ok(entries)
     }
 }
 
@@ -772,6 +754,21 @@ impl Tsdb {
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
         eval_query_range_bounds(self, query, range, step, opts).await
     }
+
+    /// Return metadata for all (or a specific) metric.
+    pub(crate) async fn find_metadata(
+        &self,
+        metric: Option<&str>,
+    ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
+        let catalog = self.metadata_catalog.read().await;
+
+        let entries: Vec<MetricMetadata> = match metric {
+            Some(name) => catalog.get(name).cloned().unwrap_or_default(),
+            None => catalog.values().flatten().cloned().collect(),
+        };
+
+        Ok(entries)
+    }
 }
 
 #[async_trait]
@@ -784,10 +781,6 @@ impl TsdbReadEngine for Tsdb {
 
     async fn make_query_reader_for_ranges(&self, ranges: &[(i64, i64)]) -> Result<TsdbQueryReader> {
         self.query_reader_for_ranges(ranges).await
-    }
-
-    fn metadata_catalog(&self) -> &RwLock<HashMap<String, Vec<MetricMetadata>>> {
-        &self.metadata_catalog
     }
 }
 
