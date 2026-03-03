@@ -74,6 +74,68 @@ The `otel` feature is usable without `http-server` — the builder can be used s
 
 The service uses Axum, listens on a single port (default 9090), and handles graceful shutdown (SIGINT/SIGTERM) with a TSDB flush.
 
+### Amendment: Protocol Adapters and Pluggable Ingest Sinks
+
+To support both direct ingestion into `TimeSeriesDb` and ingestion through the stateless ingest module ([RFC 0001: Stateless Ingest](../../ingest/rfcs/0001-stateless-ingest.md)), the ingest path is split into two explicit layers:
+
+1. **Protocol adapters**: Parse transport/wire format into `Vec<Series>`.
+2. **Ingest sink**: Persist or forward normalized `Vec<Series>`.
+
+This keeps protocol-specific parsing logic independent from storage/write strategy and enables deployment-specific routing without duplicating endpoint logic.
+
+#### Protocol Adapters
+
+The service defines protocol adapters for each ingest endpoint:
+
+| Endpoint | Adapter output |
+|---|---|
+| `POST /api/v1/write` (Prometheus Remote Write 1.0) | `Vec<Series>` |
+| `POST /v1/metrics` (OTLP/HTTP) | `Vec<Series>` via `OtelSeriesBuilder` |
+
+Both adapters perform format validation/decoding and produce the same normalized `Vec<Series>` model used by the write API.
+
+#### Ingest Sink Interface
+
+After protocol decoding, the handler delegates to a sink abstraction:
+
+```rust
+#[async_trait]
+pub trait IngestSink {
+    async fn ingest(&self, series: Vec<Series>) -> Result<IngestResult>;
+}
+```
+
+Implementations:
+
+- **DirectTsdbSink**: calls `TimeSeriesDb::write()` / `Tsdb::ingest_samples()`.
+- **StatelessIngestSink**: encodes entries and calls RFC 0001 `Ingestor::ingest()`.
+
+`StatelessIngestSink` uses the ingest module as an opaque durable queue and leaves ordering, retries, and at-least-once behavior to RFC 0001 collector + acknowledgement flow.
+
+#### Acknowledgement Semantics
+
+For `StatelessIngestSink`, success responses from ingest endpoints SHOULD be returned only after entries are durable in object storage (i.e. `WriteWatcher::await_durable()` has completed).
+
+Rationale:
+- Aligns endpoint acknowledgement with durability, not in-memory acceptance.
+- Keeps retry behavior predictable for remote-write and OTLP clients.
+- Preserves at-least-once guarantees with collector-side idempotency.
+
+#### Server Composition
+
+The service can be composed into two server modes:
+
+| Mode | Routes |
+|---|---|
+| **Full server** | Query APIs + ingest APIs + health + metrics + UI |
+| **Write-only server** | Ingest APIs + health + metrics |
+
+Both modes reuse the same protocol adapters and sink abstraction. The difference is only route composition.
+
+This enables deployments such as:
+- zonal write-only ingest endpoints (remote-write and/or OTLP) using `StatelessIngestSink` for HA and cross-zone cost savings;
+- central full query+ingest endpoints using `DirectTsdbSink`.
+
 #### Endpoints
 
 **PromQL query endpoints** (always available with `http-server`):
@@ -103,7 +165,7 @@ Each handler deserializes HTTP parameters, calls the corresponding `TimeSeriesDb
 | Encoding | Snappy-compressed protobuf `WriteRequest` |
 | Success | `204 No Content` |
 
-The handler decompresses, decodes the `WriteRequest` (a flat list of label/sample pairs), converts to `Vec<Series>`, and calls `tsdb.write()`.
+The handler decompresses, decodes the `WriteRequest` (a flat list of label/sample pairs), converts to `Vec<Series>`, and delegates to the configured ingest sink.
 
 **OTLP endpoint** (feature: `otel` + `http-server`):
 
@@ -113,7 +175,7 @@ The handler decompresses, decodes the `WriteRequest` (a flat list of label/sampl
 | Encoding | Protobuf `ExportMetricsServiceRequest` |
 | Success | `200 OK` with protobuf `ExportMetricsServiceResponse` |
 
-The handler decodes the request, calls `OtelSeriesBuilder::build()` to decompose OTEL metrics into `Vec<Series>`, and calls `tsdb.write()`.
+The handler decodes the request, calls `OtelSeriesBuilder::build()` to decompose OTEL metrics into `Vec<Series>`, and delegates to the configured ingest sink.
 
 ### OtelSeriesBuilder
 
@@ -188,3 +250,4 @@ Each protocol could run its own server on a different port. This adds operationa
 |---|---|
 | 2026-02-24 | Initial draft (as RFC 0003: OTLP Metrics Ingest) |
 | 2026-02-25 | Restructured as TimeSeries Service RFC covering HTTP server, remote-write, and OTEL ingest |
+| 2026-03-03 | Amendment: protocol adapters + pluggable ingest sink to support direct TSDB and stateless ingest; added full vs write-only server composition |
