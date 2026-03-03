@@ -4,7 +4,7 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
-use vector::{Config, DistanceMetric, Vector, VectorDb};
+use vector::{Config, DistanceMetric, Vector, VectorDb, VectorDbRead};
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
