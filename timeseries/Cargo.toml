@@ -28,7 +28,7 @@ http-server = [
     "dep:clap",
     "dep:prometheus-client",
 ]
-testing = ["http-server"]
+testing = []
 remote-write = ["http-server", "dep:prost", "dep:snap"]
 bench-internals = []
 
@@ -81,7 +81,7 @@ dashu-float.workspace = true
 
 [[test]]
 name = "http_server"
-required-features = ["testing"]
+required-features = ["testing", "http-server"]
 
 [[bench]]
 name = "evaluator_micorbench"
