@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::{BufMut, Bytes, BytesMut};
 use common::clock::Clock;
 use slatedb::object_store::path::Path;
 use slatedb::object_store::{
@@ -20,9 +21,230 @@ fn millis(time: SystemTime) -> i64 {
         .as_millis() as i64
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+const PRODUCER_MANIFEST_VERSION: u16 = 1;
+const FOOTER_SIZE: usize = 6; // 4 bytes entry_count + 2 bytes version
+
+#[derive(Debug, Clone)]
+struct ProducerEntry {
+    location: String,
+    ingestion_time_ms: i64,
+    metadata: Bytes,
+}
+
+#[derive(Debug, Clone)]
 struct ProducerManifest {
-    pending: Vec<String>,
+    data: Bytes,
+    appended: BytesMut,
+    appended_count: usize,
+}
+
+impl ProducerManifest {
+    /// Create an empty manifest with a valid footer.
+    fn empty() -> Self {
+        let mut buf = BytesMut::with_capacity(FOOTER_SIZE);
+        buf.put_u32_le(0);
+        buf.put_u16_le(PRODUCER_MANIFEST_VERSION);
+        Self {
+            data: buf.freeze(),
+            appended: BytesMut::new(),
+            appended_count: 0,
+        }
+    }
+
+    /// Wrap raw binary data as a producer manifest, validating the footer.
+    fn from_bytes(data: Bytes) -> Result<Self> {
+        if data.is_empty() {
+            return Err(Error::Serialization(
+                "producer manifest data must not be empty".to_string(),
+            ));
+        }
+        if data.len() < FOOTER_SIZE {
+            return Err(Error::Serialization(
+                "producer manifest too short for footer".to_string(),
+            ));
+        }
+        let version_start = data.len() - 2;
+        let version = u16::from_le_bytes(data[version_start..].try_into().unwrap());
+        if version != PRODUCER_MANIFEST_VERSION {
+            return Err(Error::Serialization(format!(
+                "unsupported producer manifest version: {}",
+                version
+            )));
+        }
+        Ok(Self {
+            data,
+            appended: BytesMut::new(),
+            appended_count: 0,
+        })
+    }
+
+    /// Build a manifest from a slice of entries (for full rebuild, e.g. cleanup).
+    fn from_entries(entries: &[ProducerEntry]) -> Self {
+        let mut buf = BytesMut::new();
+        for entry in entries {
+            Self::encode_entry(&mut buf, entry);
+        }
+        buf.put_u32_le(entries.len() as u32);
+        buf.put_u16_le(PRODUCER_MANIFEST_VERSION);
+        Self {
+            data: buf.freeze(),
+            appended: BytesMut::new(),
+            appended_count: 0,
+        }
+    }
+
+    /// Number of entries (read from the footer, O(1)).
+    fn entries_count(&self) -> usize {
+        let base = self.existing_entries_count();
+        base + self.appended_count
+    }
+
+    /// Whether the manifest contains no entries.
+    fn is_empty(&self) -> bool {
+        self.entries_count() == 0
+    }
+
+    /// Iterate over decoded entries.
+    fn iter(&self) -> ProducerManifestIter<'_> {
+        let base_count = self.existing_entries_count();
+        let entries_end = if self.data.is_empty() {
+            0
+        } else {
+            self.data.len() - FOOTER_SIZE
+        };
+        ProducerManifestIter {
+            data: &self.data,
+            offset: 0,
+            remaining: base_count,
+            entries_end,
+            appended: &self.appended,
+            appended_offset: 0,
+            appended_remaining: self.appended_count,
+        }
+    }
+
+    fn existing_entries_count(&self) -> usize {
+        if self.data.is_empty() {
+            0
+        } else {
+            let footer_start = self.data.len() - FOOTER_SIZE;
+            u32::from_le_bytes(
+                self.data[footer_start..footer_start + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize
+        }
+    }
+
+    /// Append a single entry without copying existing data.
+    /// The entry is encoded and stored internally; bytes are merged in `to_bytes()`.
+    fn append(&mut self, entry: &ProducerEntry) {
+        Self::encode_entry(&mut self.appended, entry);
+        self.appended_count += 1;
+    }
+
+    /// Serialize the manifest to bytes for writing to object storage.
+    /// When an entry was appended, this merges existing data with the appended
+    /// entry and writes a new footer.
+    fn to_bytes(&self) -> Bytes {
+        if self.appended.is_empty() {
+            return self.data.clone();
+        }
+        let (prefix, base_count) = if self.data.is_empty() {
+            (&[] as &[u8], 0u32)
+        } else {
+            let footer_start = self.data.len() - FOOTER_SIZE;
+            let count = u32::from_le_bytes(
+                self.data[footer_start..footer_start + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            (&self.data[..footer_start], count)
+        };
+        let mut buf = BytesMut::with_capacity(prefix.len() + self.appended.len() + FOOTER_SIZE);
+        buf.extend_from_slice(prefix);
+        buf.extend_from_slice(&self.appended);
+        buf.put_u32_le(base_count + self.appended_count as u32);
+        buf.put_u16_le(PRODUCER_MANIFEST_VERSION);
+        buf.freeze()
+    }
+
+    fn encode_entry(buf: &mut BytesMut, entry: &ProducerEntry) {
+        let entry_len = 2 + entry.location.len() + 8 + entry.metadata.len();
+        buf.put_u32_le(entry_len as u32);
+        buf.put_u16_le(entry.location.len() as u16);
+        buf.extend_from_slice(entry.location.as_bytes());
+        buf.put_i64_le(entry.ingestion_time_ms);
+        buf.extend_from_slice(&entry.metadata);
+    }
+}
+
+/// Decode a single entry from binary data at the given offset.
+fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<ProducerEntry> {
+    if *offset + 4 > end {
+        return Err(Error::Serialization(
+            "producer manifest truncated: not enough bytes for entry_len".to_string(),
+        ));
+    }
+
+    let entry_len = u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap()) as usize;
+    *offset += 4;
+
+    if *offset + entry_len > end {
+        return Err(Error::Serialization(
+            "producer manifest truncated: entry extends beyond data".to_string(),
+        ));
+    }
+
+    let location_len = u16::from_le_bytes(data[*offset..*offset + 2].try_into().unwrap()) as usize;
+    *offset += 2;
+
+    let location = String::from_utf8(data[*offset..*offset + location_len].to_vec())
+        .map_err(|e| Error::Serialization(e.to_string()))?;
+    *offset += location_len;
+
+    let ingestion_time_ms = i64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
+    *offset += 8;
+
+    let metadata_len = entry_len - 2 - location_len - 8;
+    let metadata = Bytes::copy_from_slice(&data[*offset..*offset + metadata_len]);
+    *offset += metadata_len;
+
+    Ok(ProducerEntry {
+        location,
+        ingestion_time_ms,
+        metadata,
+    })
+}
+
+struct ProducerManifestIter<'a> {
+    data: &'a [u8],
+    offset: usize,
+    remaining: usize,
+    entries_end: usize,
+    appended: &'a [u8],
+    appended_offset: usize,
+    appended_remaining: usize,
+}
+
+impl<'a> Iterator for ProducerManifestIter<'a> {
+    type Item = Result<ProducerEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining > 0 {
+            self.remaining -= 1;
+            Some(decode_entry(self.data, &mut self.offset, self.entries_end))
+        } else if self.appended_remaining > 0 {
+            self.appended_remaining -= 1;
+            Some(decode_entry(
+                self.appended,
+                &mut self.appended_offset,
+                self.appended.len(),
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -95,6 +317,50 @@ impl ManifestStore {
             Err(e) => Err(ManifestWriteError::Fatal(Error::Storage(e.to_string()))),
         }
     }
+
+    async fn read_producer_manifest(&self) -> Result<(ProducerManifest, Option<UpdateVersion>)> {
+        let path = Path::from(self.manifest_path.as_str());
+        match self.object_store.get(&path).await {
+            Ok(result) => {
+                let version = UpdateVersion {
+                    e_tag: result.meta.e_tag.clone(),
+                    version: result.meta.version.clone(),
+                };
+                let bytes = result
+                    .bytes()
+                    .await
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                let manifest = ProducerManifest::from_bytes(bytes)?;
+                Ok((manifest, Some(version)))
+            }
+            Err(ObjectStoreError::NotFound { .. }) => Ok((ProducerManifest::empty(), None)),
+            Err(e) => Err(Error::Storage(e.to_string())),
+        }
+    }
+
+    async fn write_producer_manifest(
+        &self,
+        manifest: &ProducerManifest,
+        version: Option<UpdateVersion>,
+    ) -> std::result::Result<(), ManifestWriteError> {
+        let path = Path::from(self.manifest_path.as_str());
+        let put_mode = match version {
+            Some(v) => PutMode::Update(v),
+            None => PutMode::Create,
+        };
+        let data = manifest.to_bytes();
+
+        match self
+            .object_store
+            .put_opts(&path, PutPayload::from(data.to_vec()), put_mode.into())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(ObjectStoreError::Precondition { .. })
+            | Err(ObjectStoreError::AlreadyExists { .. }) => Err(ManifestWriteError::Conflict),
+            Err(e) => Err(ManifestWriteError::Fatal(Error::Storage(e.to_string()))),
+        }
+    }
 }
 
 struct ConflictCounter {
@@ -130,26 +396,41 @@ impl ConflictCounter {
 
 pub struct QueueProducer {
     manifest_store: ManifestStore,
+    clock: Arc<dyn Clock>,
     counter: ConflictCounter,
 }
 
 impl QueueProducer {
-    pub fn with_object_store(manifest_path: String, object_store: Arc<dyn ObjectStore>) -> Self {
+    pub fn with_object_store(
+        manifest_path: String,
+        object_store: Arc<dyn ObjectStore>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             manifest_store: ManifestStore {
                 object_store,
                 manifest_path,
             },
+            clock,
             counter: ConflictCounter::new(),
         }
     }
 
-    pub async fn enqueue(&self, location: String) -> Result<()> {
+    pub async fn enqueue(&self, location: String, metadata: Bytes) -> Result<()> {
+        let entry = ProducerEntry {
+            location,
+            ingestion_time_ms: millis(self.clock.now()),
+            metadata,
+        };
         loop {
-            let (mut manifest, version): (ProducerManifest, _) = self.manifest_store.read().await?;
-            manifest.pending.push(location.clone());
+            let (mut manifest, version) = self.manifest_store.read_producer_manifest().await?;
+            manifest.append(&entry);
             self.counter.record_write();
-            match self.manifest_store.write(&manifest, version).await {
+            match self
+                .manifest_store
+                .write_producer_manifest(&manifest, version)
+                .await
+            {
                 Ok(()) => return Ok(()),
                 Err(ManifestWriteError::Conflict) => {
                     self.counter.record_conflict();
@@ -172,13 +453,11 @@ pub struct QueueConsumer {
     done_cleanup_threshold: usize,
     clock: Arc<dyn Clock>,
     counter: ConflictCounter,
+    producer_len: AtomicU64,
 }
 
 fn consumer_manifest_path(producer_path: &str) -> String {
-    match producer_path.rsplit_once('.') {
-        Some((base, ext)) => format!("{}.consumer.{}", base, ext),
-        None => format!("{}.consumer", producer_path),
-    }
+    format!("{}.consumer.json", producer_path)
 }
 
 impl QueueConsumer {
@@ -201,12 +480,13 @@ impl QueueConsumer {
             done_cleanup_threshold: config.done_cleanup_threshold,
             clock,
             counter: ConflictCounter::new(),
+            producer_len: AtomicU64::new(0),
         })
     }
 
     pub async fn claim(&self) -> Result<Option<String>> {
         loop {
-            let (producer, _): (ProducerManifest, _) = self.producer_store.read().await?;
+            let (producer, _) = self.read_producer_manifest().await?;
             let (mut consumer, version): (ConsumerManifest, _) = self.consumer_store.read().await?;
             let now = millis(self.clock.now());
 
@@ -223,10 +503,18 @@ impl QueueConsumer {
                 loc
             } else {
                 // Find first pending location not already claimed or done
-                match producer.pending.iter().find(|loc| {
-                    !consumer.claimed.contains_key(loc.as_str()) && !consumer.done.contains(loc)
-                }) {
-                    Some(loc) => loc.clone(),
+                let mut found = None;
+                for entry in producer.iter() {
+                    let entry = entry?;
+                    if !consumer.claimed.contains_key(entry.location.as_str())
+                        && !consumer.done.contains(&entry.location)
+                    {
+                        found = Some(entry.location);
+                        break;
+                    }
+                }
+                match found {
+                    Some(loc) => loc,
                     None => return Ok(None),
                 }
             };
@@ -269,14 +557,22 @@ impl QueueConsumer {
         let done_set: std::collections::HashSet<&str> =
             consumer.done.iter().map(|s| s.as_str()).collect();
 
-        // CAS-loop: remove done locations from producer pending
+        // CAS-loop: remove done locations from producer manifest (iterate, filter, rebuild)
         loop {
-            let (mut producer, version): (ProducerManifest, _) = self.producer_store.read().await?;
-            producer
-                .pending
-                .retain(|loc| !done_set.contains(loc.as_str()));
+            let (producer, version) = self.read_producer_manifest().await?;
+            let kept: Vec<ProducerEntry> = producer
+                .iter()
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|entry| !done_set.contains(entry.location.as_str()))
+                .collect();
+            let producer = ProducerManifest::from_entries(&kept);
             self.counter.record_write();
-            match self.producer_store.write(&producer, version).await {
+            match self
+                .producer_store
+                .write_producer_manifest(&producer, version)
+                .await
+            {
                 Ok(()) => break,
                 Err(ManifestWriteError::Conflict) => {
                     self.counter.record_conflict();
@@ -317,9 +613,15 @@ impl QueueConsumer {
         }
     }
 
-    pub async fn len(&self) -> Result<usize> {
-        let (producer, _): (ProducerManifest, _) = self.producer_store.read().await?;
-        Ok(producer.pending.len())
+    pub fn len(&self) -> usize {
+        self.producer_len.load(Ordering::Relaxed) as usize
+    }
+
+    async fn read_producer_manifest(&self) -> Result<(ProducerManifest, Option<UpdateVersion>)> {
+        let result = self.producer_store.read_producer_manifest().await?;
+        self.producer_len
+            .store(result.0.entries_count() as u64, Ordering::Relaxed);
+        Ok(result)
     }
 
     pub fn conflict_rate(&self) -> f64 {
@@ -333,7 +635,7 @@ mod tests {
     use common::clock::SystemClock;
     use slatedb::object_store::memory::InMemory;
 
-    const TEST_MANIFEST_PATH: &str = "test/manifest.json";
+    const TEST_MANIFEST_PATH: &str = "test/manifest";
 
     fn test_consumer_config() -> ConsumerConfig {
         ConsumerConfig {
@@ -347,7 +649,7 @@ mod tests {
         let path = Path::from(path);
         let result = store.get(&path).await.unwrap();
         let bytes = result.bytes().await.unwrap();
-        serde_json::from_slice(&bytes).unwrap()
+        ProducerManifest::from_bytes(bytes).unwrap()
     }
 
     async fn read_consumer_manifest(store: &Arc<dyn ObjectStore>, path: &str) -> ConsumerManifest {
@@ -365,53 +667,65 @@ mod tests {
     #[tokio::test]
     async fn should_enqueue_locations_to_manifest() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
-
-        producer
-            .enqueue("path/to/file1.json".to_string())
-            .await
-            .unwrap();
-        producer
-            .enqueue("path/to/file2.json".to_string())
-            .await
-            .unwrap();
-
-        let manifest = read_producer_manifest(&store, "test/manifest.json").await;
-        assert_eq!(
-            manifest.pending,
-            vec!["path/to/file1.json", "path/to/file2.json"]
+        let producer = QueueProducer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
         );
+
+        producer
+            .enqueue("path/to/file1.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
+        producer
+            .enqueue("path/to/file2.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
+
+        let manifest = read_producer_manifest(&store, "test/manifest").await;
+        let locations: Vec<String> = manifest.iter().map(|e| e.unwrap().location).collect();
+        assert_eq!(locations, vec!["path/to/file1.json", "path/to/file2.json"]);
     }
 
     #[tokio::test]
     async fn should_merge_with_existing_manifest() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
-        // Pre-populate manifest
-        let existing = ProducerManifest {
-            pending: vec!["existing/file.json".to_string()],
-        };
-        let json = serde_json::to_vec(&existing).unwrap();
-        let path = Path::from("test/manifest.json");
-        store.put(&path, PutPayload::from(json)).await.unwrap();
+        // Pre-populate manifest with binary format
+        let existing = ProducerManifest::from_entries(&[ProducerEntry {
+            location: "existing/file.json".to_string(),
+            ingestion_time_ms: 1000,
+            metadata: Bytes::new(),
+        }]);
+        let path = Path::from("test/manifest");
+        store
+            .put(&path, PutPayload::from(existing.to_bytes().to_vec()))
+            .await
+            .unwrap();
 
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
-        producer.enqueue("new/file.json".to_string()).await.unwrap();
-
-        let manifest = read_producer_manifest(&store, "test/manifest.json").await;
-        assert_eq!(
-            manifest.pending,
-            vec!["existing/file.json", "new/file.json"]
+        let producer = QueueProducer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
         );
+        producer
+            .enqueue("new/file.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
+
+        let manifest = read_producer_manifest(&store, "test/manifest").await;
+        let locations: Vec<String> = manifest.iter().map(|e| e.unwrap().location).collect();
+        assert_eq!(locations, vec!["existing/file.json", "new/file.json"]);
     }
 
     #[tokio::test]
     async fn should_claim_earliest_pending_location() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+        let producer = QueueProducer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
+        );
         let consumer = QueueConsumer::with_object_store(
             test_consumer_config(),
             store.clone(),
@@ -419,15 +733,25 @@ mod tests {
         )
         .unwrap();
 
-        producer.enqueue("first.json".to_string()).await.unwrap();
-        producer.enqueue("second.json".to_string()).await.unwrap();
+        producer
+            .enqueue("first.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
+        producer
+            .enqueue("second.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
 
         let claimed = consumer.claim().await.unwrap();
         assert_eq!(claimed, Some("first.json".to_string()));
 
         // Producer manifest still has both pending items (read-only from consumer)
-        let producer_manifest = read_producer_manifest(&store, "test/manifest.json").await;
-        assert_eq!(producer_manifest.pending, vec!["first.json", "second.json"]);
+        let producer_manifest = read_producer_manifest(&store, "test/manifest").await;
+        let locations: Vec<String> = producer_manifest
+            .iter()
+            .map(|e| e.unwrap().location)
+            .collect();
+        assert_eq!(locations, vec!["first.json", "second.json"]);
 
         // Consumer manifest tracks the claim
         let consumer_manifest = read_consumer_manifest(&store, "test/manifest.consumer.json").await;
@@ -451,8 +775,11 @@ mod tests {
     #[tokio::test]
     async fn should_dequeue_claimed_location() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+        let producer = QueueProducer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
+        );
         let consumer = QueueConsumer::with_object_store(
             test_consumer_config(),
             store.clone(),
@@ -461,7 +788,7 @@ mod tests {
         .unwrap();
 
         producer
-            .enqueue("to_process.json".to_string())
+            .enqueue("to_process.json".to_string(), Bytes::new())
             .await
             .unwrap();
         let claimed = consumer.claim().await.unwrap();
@@ -471,8 +798,12 @@ mod tests {
         assert!(removed);
 
         // Producer manifest still has the pending item
-        let producer_manifest = read_producer_manifest(&store, "test/manifest.json").await;
-        assert_eq!(producer_manifest.pending, vec!["to_process.json"]);
+        let producer_manifest = read_producer_manifest(&store, "test/manifest").await;
+        let locations: Vec<String> = producer_manifest
+            .iter()
+            .map(|e| e.unwrap().location)
+            .collect();
+        assert_eq!(locations, vec!["to_process.json"]);
 
         // Consumer manifest: claimed is empty, done has the location
         let consumer_manifest = read_consumer_manifest(&store, "test/manifest.consumer.json").await;
@@ -497,12 +828,18 @@ mod tests {
     #[tokio::test]
     async fn should_handle_concurrent_claims() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+        let producer = QueueProducer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
+        );
 
         let n = 5;
         for i in 0..n {
-            producer.enqueue(format!("file_{}.json", i)).await.unwrap();
+            producer
+                .enqueue(format!("file_{}.json", i), Bytes::new())
+                .await
+                .unwrap();
         }
 
         let mut join_handles = Vec::new();
@@ -528,8 +865,8 @@ mod tests {
         assert_eq!(claimed_locations.len(), n);
 
         // Producer manifest still has all pending items
-        let producer_manifest = read_producer_manifest(&store, "test/manifest.json").await;
-        assert_eq!(producer_manifest.pending.len(), n);
+        let producer_manifest = read_producer_manifest(&store, "test/manifest").await;
+        assert_eq!(producer_manifest.entries_count(), n);
 
         // Consumer manifest has all claimed
         let consumer_manifest = read_consumer_manifest(&store, "test/manifest.consumer.json").await;
@@ -539,8 +876,11 @@ mod tests {
     #[tokio::test]
     async fn should_heartbeat_claimed_locations() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+        let producer = QueueProducer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
+        );
         let consumer = QueueConsumer::with_object_store(
             test_consumer_config(),
             store.clone(),
@@ -548,8 +888,14 @@ mod tests {
         )
         .unwrap();
 
-        producer.enqueue("a.json".to_string()).await.unwrap();
-        producer.enqueue("b.json".to_string()).await.unwrap();
+        producer
+            .enqueue("a.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
+        producer
+            .enqueue("b.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
         consumer.claim().await.unwrap();
         consumer.claim().await.unwrap();
 
@@ -567,8 +913,11 @@ mod tests {
     #[tokio::test]
     async fn should_overwrite_heartbeat_timestamps() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+        let producer = QueueProducer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
+        );
         let consumer = QueueConsumer::with_object_store(
             test_consumer_config(),
             store.clone(),
@@ -576,7 +925,10 @@ mod tests {
         )
         .unwrap();
 
-        producer.enqueue("a.json".to_string()).await.unwrap();
+        producer
+            .enqueue("a.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
         consumer.claim().await.unwrap();
 
         consumer.heartbeat(&["a.json".to_string()]).await.unwrap();
@@ -595,8 +947,11 @@ mod tests {
     #[tokio::test]
     async fn should_skip_unknown_locations_in_heartbeat() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+        let producer = QueueProducer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
+        );
         let consumer = QueueConsumer::with_object_store(
             test_consumer_config(),
             store.clone(),
@@ -604,7 +959,10 @@ mod tests {
         )
         .unwrap();
 
-        producer.enqueue("a.json".to_string()).await.unwrap();
+        producer
+            .enqueue("a.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
         consumer.claim().await.unwrap();
 
         consumer
@@ -623,8 +981,11 @@ mod tests {
         let mut consumer_config = test_consumer_config();
         consumer_config.heartbeat_timeout_ms = 50;
 
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+        let producer = QueueProducer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
+        );
         let consumer1 = QueueConsumer::with_object_store(
             consumer_config.clone(),
             store.clone(),
@@ -635,7 +996,10 @@ mod tests {
             QueueConsumer::with_object_store(consumer_config, store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        producer.enqueue("a.json".to_string()).await.unwrap();
+        producer
+            .enqueue("a.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
         let claimed = consumer1.claim().await.unwrap();
         assert_eq!(claimed, Some("a.json".to_string()));
 
@@ -660,8 +1024,11 @@ mod tests {
         let mut consumer_config = test_consumer_config();
         consumer_config.heartbeat_timeout_ms = 200;
 
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+        let producer = QueueProducer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
+        );
         let consumer1 = QueueConsumer::with_object_store(
             consumer_config.clone(),
             store.clone(),
@@ -672,7 +1039,10 @@ mod tests {
             QueueConsumer::with_object_store(consumer_config, store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        producer.enqueue("a.json".to_string()).await.unwrap();
+        producer
+            .enqueue("a.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
         consumer1.claim().await.unwrap();
 
         // Heartbeat keeps it fresh
@@ -690,8 +1060,11 @@ mod tests {
         let mut consumer_config = test_consumer_config();
         consumer_config.heartbeat_timeout_ms = 50;
 
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+        let producer = QueueProducer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
+        );
         let consumer = QueueConsumer::with_object_store(
             consumer_config.clone(),
             store.clone(),
@@ -699,12 +1072,18 @@ mod tests {
         )
         .unwrap();
 
-        producer.enqueue("old.json".to_string()).await.unwrap();
+        producer
+            .enqueue("old.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
         consumer.claim().await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-        producer.enqueue("newer.json".to_string()).await.unwrap();
+        producer
+            .enqueue("newer.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
         consumer.claim().await.unwrap();
 
         // Wait for both to become stale
@@ -723,8 +1102,11 @@ mod tests {
         let mut consumer_config = test_consumer_config();
         consumer_config.heartbeat_timeout_ms = 50;
 
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+        let producer = QueueProducer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
+        );
         let consumer1 = QueueConsumer::with_object_store(
             consumer_config.clone(),
             store.clone(),
@@ -735,14 +1117,20 @@ mod tests {
             QueueConsumer::with_object_store(consumer_config, store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        producer.enqueue("claimed.json".to_string()).await.unwrap();
+        producer
+            .enqueue("claimed.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
         consumer1.claim().await.unwrap();
 
         // Wait for heartbeat to expire
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
 
         // Enqueue a new pending item
-        producer.enqueue("pending.json".to_string()).await.unwrap();
+        producer
+            .enqueue("pending.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
 
         // consumer2 should prefer the stale claimed item
         let claimed = consumer2.claim().await.unwrap();
@@ -752,8 +1140,11 @@ mod tests {
     #[tokio::test]
     async fn should_accumulate_done_in_consumer_manifest_after_dequeue() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+        let producer = QueueProducer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
+        );
         let consumer = QueueConsumer::with_object_store(
             test_consumer_config(),
             store.clone(),
@@ -761,8 +1152,14 @@ mod tests {
         )
         .unwrap();
 
-        producer.enqueue("a.json".to_string()).await.unwrap();
-        producer.enqueue("b.json".to_string()).await.unwrap();
+        producer
+            .enqueue("a.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
+        producer
+            .enqueue("b.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
         consumer.claim().await.unwrap();
         consumer.claim().await.unwrap();
 
@@ -776,8 +1173,8 @@ mod tests {
         assert!(consumer_manifest.done.contains(&"b.json".to_string()));
 
         // Producer manifest still has both in pending (no flush yet)
-        let producer_manifest = read_producer_manifest(&store, "test/manifest.json").await;
-        assert_eq!(producer_manifest.pending.len(), 2);
+        let producer_manifest = read_producer_manifest(&store, "test/manifest").await;
+        assert_eq!(producer_manifest.entries_count(), 2);
     }
 
     #[tokio::test]
@@ -786,28 +1183,44 @@ mod tests {
         let mut consumer_config = test_consumer_config();
         consumer_config.done_cleanup_threshold = 2;
 
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+        let producer = QueueProducer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
+        );
         let consumer =
             QueueConsumer::with_object_store(consumer_config, store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        producer.enqueue("a.json".to_string()).await.unwrap();
-        producer.enqueue("b.json".to_string()).await.unwrap();
-        producer.enqueue("c.json".to_string()).await.unwrap();
+        producer
+            .enqueue("a.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
+        producer
+            .enqueue("b.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
+        producer
+            .enqueue("c.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
 
         consumer.claim().await.unwrap();
         consumer.claim().await.unwrap();
 
         // First dequeue — done has 1 item, below threshold
         consumer.dequeue("a.json").await.unwrap();
-        let producer_manifest = read_producer_manifest(&store, "test/manifest.json").await;
-        assert_eq!(producer_manifest.pending.len(), 3); // still all three
+        let producer_manifest = read_producer_manifest(&store, "test/manifest").await;
+        assert_eq!(producer_manifest.entries_count(), 3); // still all three
 
         // Second dequeue — done reaches threshold (2), triggers cleanup
         consumer.dequeue("b.json").await.unwrap();
-        let producer_manifest = read_producer_manifest(&store, "test/manifest.json").await;
-        assert_eq!(producer_manifest.pending, vec!["c.json"]);
+        let producer_manifest = read_producer_manifest(&store, "test/manifest").await;
+        let locations: Vec<String> = producer_manifest
+            .iter()
+            .map(|e| e.unwrap().location)
+            .collect();
+        assert_eq!(locations, vec!["c.json"]);
     }
 
     #[tokio::test]
@@ -816,14 +1229,23 @@ mod tests {
         let mut consumer_config = test_consumer_config();
         consumer_config.done_cleanup_threshold = 2;
 
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+        let producer = QueueProducer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
+        );
         let consumer =
             QueueConsumer::with_object_store(consumer_config, store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        producer.enqueue("a.json".to_string()).await.unwrap();
-        producer.enqueue("b.json".to_string()).await.unwrap();
+        producer
+            .enqueue("a.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
+        producer
+            .enqueue("b.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
 
         consumer.claim().await.unwrap();
         consumer.claim().await.unwrap();
@@ -835,15 +1257,18 @@ mod tests {
         assert!(consumer_manifest.done.is_empty());
 
         // Producer pending should also be empty
-        let producer_manifest = read_producer_manifest(&store, "test/manifest.json").await;
-        assert!(producer_manifest.pending.is_empty());
+        let producer_manifest = read_producer_manifest(&store, "test/manifest").await;
+        assert!(producer_manifest.is_empty());
     }
 
     #[tokio::test]
     async fn should_not_reclaim_done_locations() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+        let producer = QueueProducer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
+        );
         let consumer = QueueConsumer::with_object_store(
             test_consumer_config(),
             store.clone(),
@@ -851,12 +1276,288 @@ mod tests {
         )
         .unwrap();
 
-        producer.enqueue("a.json".to_string()).await.unwrap();
+        producer
+            .enqueue("a.json".to_string(), Bytes::new())
+            .await
+            .unwrap();
         consumer.claim().await.unwrap();
         consumer.dequeue("a.json").await.unwrap();
 
         // "a.json" is still in producer pending but in consumer done — should not be claimed again
         let claimed = consumer.claim().await.unwrap();
         assert_eq!(claimed, None);
+    }
+
+    // ---- Unit-test helpers ----
+
+    fn entry(location: &str, time_ms: i64, metadata: &[u8]) -> ProducerEntry {
+        ProducerEntry {
+            location: location.to_string(),
+            ingestion_time_ms: time_ms,
+            metadata: Bytes::from(metadata.to_vec()),
+        }
+    }
+
+    fn collect_locations(manifest: &ProducerManifest) -> Vec<String> {
+        manifest.iter().map(|e| e.unwrap().location).collect()
+    }
+
+    #[test]
+    fn should_create_empty_manifest() {
+        let m = ProducerManifest::empty();
+
+        assert_eq!(m.entries_count(), 0);
+        assert!(m.is_empty());
+        assert_eq!(m.iter().count(), 0);
+
+        let bytes = m.to_bytes();
+        assert_eq!(bytes.len(), FOOTER_SIZE);
+        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 0);
+        assert_eq!(
+            u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+            PRODUCER_MANIFEST_VERSION
+        );
+    }
+
+    #[test]
+    fn should_parse_valid_manifest_bytes() {
+        let entries = vec![entry("a", 1, b"x"), entry("b", 2, b"y")];
+        let data = ProducerManifest::from_entries(&entries).to_bytes();
+
+        let m = ProducerManifest::from_bytes(data).unwrap();
+
+        assert_eq!(m.entries_count(), 2);
+    }
+
+    #[test]
+    fn should_parse_footer_only_bytes() {
+        let mut buf = BytesMut::with_capacity(FOOTER_SIZE);
+        buf.put_u32_le(0);
+        buf.put_u16_le(PRODUCER_MANIFEST_VERSION);
+
+        let m = ProducerManifest::from_bytes(buf.freeze()).unwrap();
+
+        assert_eq!(m.entries_count(), 0);
+    }
+
+    #[test]
+    fn should_reject_empty_bytes() {
+        let err = ProducerManifest::from_bytes(Bytes::new()).unwrap_err();
+
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn should_reject_bytes_too_short_for_footer() {
+        let err = ProducerManifest::from_bytes(Bytes::from_static(&[0; 5])).unwrap_err();
+
+        assert!(err.to_string().contains("too short for footer"));
+    }
+
+    #[test]
+    fn should_reject_wrong_version() {
+        let mut buf = BytesMut::with_capacity(FOOTER_SIZE);
+        buf.put_u32_le(0);
+        buf.put_u16_le(99);
+
+        let err = ProducerManifest::from_bytes(buf.freeze()).unwrap_err();
+
+        assert!(err.to_string().contains("unsupported"));
+        assert!(err.to_string().contains("99"));
+    }
+
+    #[test]
+    fn should_reject_version_zero() {
+        let mut buf = BytesMut::with_capacity(FOOTER_SIZE);
+        buf.put_u32_le(0);
+        buf.put_u16_le(0);
+
+        let err = ProducerManifest::from_bytes(buf.freeze()).unwrap_err();
+
+        assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn should_make_appended_entry_accessible_via_iter() {
+        let mut m = ProducerManifest::empty();
+
+        m.append(&entry("loc", 42, b"meta"));
+
+        let entries: Vec<ProducerEntry> = m.iter().map(|e| e.unwrap()).collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].location, "loc");
+        assert_eq!(entries[0].ingestion_time_ms, 42);
+        assert_eq!(entries[0].metadata, &b"meta"[..]);
+    }
+
+    #[test]
+    fn should_append_to_existing_base_entries() {
+        let base = ProducerManifest::from_entries(&[entry("base", 1, b"")]);
+        let data = base.to_bytes();
+        let mut m = ProducerManifest::from_bytes(data).unwrap();
+
+        m.append(&entry("appended", 2, b""));
+
+        assert_eq!(m.entries_count(), 2);
+        assert_eq!(collect_locations(&m), vec!["base", "appended"]);
+    }
+
+    #[test]
+    fn should_preserve_append_order() {
+        let mut m = ProducerManifest::empty();
+
+        m.append(&entry("a", 1, b""));
+        m.append(&entry("b", 2, b""));
+        m.append(&entry("c", 3, b""));
+
+        assert_eq!(collect_locations(&m), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn should_create_empty_manifest_from_empty_slice() {
+        let m = ProducerManifest::from_entries(&[]);
+
+        assert_eq!(m.entries_count(), 0);
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn should_create_manifest_from_multiple_entries() {
+        let entries = vec![
+            entry("x", 10, b"m1"),
+            entry("y", 20, b"m2"),
+            entry("z", 30, b"m3"),
+        ];
+
+        let m = ProducerManifest::from_entries(&entries);
+
+        assert_eq!(m.entries_count(), 3);
+        let decoded: Vec<ProducerEntry> = m.iter().map(|e| e.unwrap()).collect();
+        assert_eq!(decoded[0].location, "x");
+        assert_eq!(decoded[0].ingestion_time_ms, 10);
+        assert_eq!(decoded[0].metadata, &b"m1"[..]);
+        assert_eq!(decoded[1].location, "y");
+        assert_eq!(decoded[1].ingestion_time_ms, 20);
+        assert_eq!(decoded[1].metadata, &b"m2"[..]);
+        assert_eq!(decoded[2].location, "z");
+        assert_eq!(decoded[2].ingestion_time_ms, 30);
+        assert_eq!(decoded[2].metadata, &b"m3"[..]);
+    }
+
+    #[test]
+    fn should_handle_entry_with_empty_location() {
+        let m = ProducerManifest::from_entries(&[entry("", 0, b"")]);
+
+        let decoded: Vec<ProducerEntry> = m.iter().map(|e| e.unwrap()).collect();
+        assert_eq!(decoded[0].location, "");
+        assert_eq!(decoded[0].ingestion_time_ms, 0);
+        assert!(decoded[0].metadata.is_empty());
+    }
+
+    #[test]
+    fn should_handle_entry_with_large_metadata() {
+        let big_meta = vec![0xAB_u8; 1024];
+
+        let m = ProducerManifest::from_entries(&[entry("loc", 1, &big_meta)]);
+
+        let decoded: Vec<ProducerEntry> = m.iter().map(|e| e.unwrap()).collect();
+        assert_eq!(decoded[0].metadata.len(), 1024);
+        assert_eq!(&decoded[0].metadata[..], &big_meta[..]);
+    }
+
+    #[test]
+    fn should_handle_negative_ingestion_time() {
+        let m = ProducerManifest::from_entries(&[entry("loc", -1000, b"")]);
+
+        let decoded: Vec<ProducerEntry> = m.iter().map(|e| e.unwrap()).collect();
+        assert_eq!(decoded[0].ingestion_time_ms, -1000);
+    }
+
+    #[test]
+    fn should_return_footer_for_empty_manifest() {
+        let m = ProducerManifest::empty();
+
+        let bytes = m.to_bytes();
+
+        assert_eq!(bytes.len(), FOOTER_SIZE);
+        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 0);
+        assert_eq!(
+            u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+            PRODUCER_MANIFEST_VERSION
+        );
+    }
+
+    #[test]
+    fn should_merge_base_and_appended() {
+        let base = ProducerManifest::from_entries(&[entry("base", 1, b"")]);
+        let mut m = ProducerManifest::from_bytes(base.to_bytes()).unwrap();
+        m.append(&entry("appended", 2, b""));
+
+        let serialized = m.to_bytes();
+        let reparsed = ProducerManifest::from_bytes(serialized).unwrap();
+
+        assert_eq!(reparsed.entries_count(), 2);
+        assert_eq!(collect_locations(&reparsed), vec!["base", "appended"]);
+    }
+
+    #[test]
+    fn should_write_correct_footer_count() {
+        let base = ProducerManifest::from_entries(&[entry("a", 1, b""), entry("b", 2, b"")]);
+        let mut m = ProducerManifest::from_bytes(base.to_bytes()).unwrap();
+        m.append(&entry("c", 3, b""));
+        m.append(&entry("d", 4, b""));
+        m.append(&entry("e", 5, b""));
+
+        let bytes = m.to_bytes();
+
+        let footer_start = bytes.len() - FOOTER_SIZE;
+        let count = u32::from_le_bytes(bytes[footer_start..footer_start + 4].try_into().unwrap());
+        let version = u16::from_le_bytes(bytes[footer_start + 4..].try_into().unwrap());
+        assert_eq!(count, 5);
+        assert_eq!(version, PRODUCER_MANIFEST_VERSION);
+    }
+
+    #[test]
+    fn should_round_trip_from_entries_to_bytes_from_bytes() {
+        let entries = vec![entry("a", 10, b"m1"), entry("b", 20, b"m2")];
+        let original = ProducerManifest::from_entries(&entries);
+
+        let reparsed = ProducerManifest::from_bytes(original.to_bytes()).unwrap();
+
+        assert_eq!(reparsed.entries_count(), 2);
+        let decoded: Vec<ProducerEntry> = reparsed.iter().map(|e| e.unwrap()).collect();
+        assert_eq!(decoded[0].location, "a");
+        assert_eq!(decoded[0].ingestion_time_ms, 10);
+        assert_eq!(decoded[0].metadata, &b"m1"[..]);
+        assert_eq!(decoded[1].location, "b");
+        assert_eq!(decoded[1].ingestion_time_ms, 20);
+        assert_eq!(decoded[1].metadata, &b"m2"[..]);
+    }
+
+    #[test]
+    fn should_round_trip_append_serialize_reparse() {
+        let mut m = ProducerManifest::empty();
+        m.append(&entry("x", 100, b"data"));
+        m.append(&entry("y", 200, b"more"));
+
+        let reparsed = ProducerManifest::from_bytes(m.to_bytes()).unwrap();
+
+        assert_eq!(reparsed.entries_count(), 2);
+        assert_eq!(collect_locations(&reparsed), vec!["x", "y"]);
+    }
+
+    #[test]
+    fn should_chain_serialize_reparse_append() {
+        let original = ProducerManifest::from_entries(&[entry("a", 1, b"")]);
+        let mut m = ProducerManifest::from_bytes(original.to_bytes()).unwrap();
+        m.append(&entry("b", 2, b""));
+
+        let mut m2 = ProducerManifest::from_bytes(m.to_bytes()).unwrap();
+        m2.append(&entry("c", 3, b""));
+
+        let final_m = ProducerManifest::from_bytes(m2.to_bytes()).unwrap();
+
+        assert_eq!(final_m.entries_count(), 3);
+        assert_eq!(collect_locations(&final_m), vec!["a", "b", "c"]);
     }
 }

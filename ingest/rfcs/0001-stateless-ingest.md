@@ -111,22 +111,40 @@ In this way the queue consumer avoids contending too much with the queue produce
 
 #### Manifest Format
 
-Both manifests are stored as JSON files in object storage.
+The producer manifest uses a compact binary format that supports appending new entries
+without deserializing existing entries. Each entry records the object storage location,
+ingestion time, and optional extensible metadata:
 
-The producer manifest contains a list of pending locations:
-```json
-{
-  "pending": [
-    "data/01J5T4R3KXBMZ7QV9N2WG8YDHP.batch",
-    "data/01J5T4R7NP39QW4HJXT6V1BEKM.batch",
-    "data/01J5T4RBYW52MKD8FR0JAN7G9C.batch"
-  ]
-}
+```ascii
+┌──────────────────────────────────────────────────────────────┐
+│  entry 0: [entry_len: u32 LE][location_len: u16 LE]         │
+│           [location: bytes][ingestion_time_ms: i64 LE]       │
+│           [metadata: bytes]                                  │
+│  entry 1: ...                                                │
+│  ...                                                         │
+│  entry N: ...                                                │
+├──────────────────────────────────────────────────────────────┤
+│  footer (6 bytes):                                           │
+│    entry_count : u32 LE                                      │
+│    version     : u16 LE  (= 1)                               │
+└──────────────────────────────────────────────────────────────┘
 ```
-The `pending` list preserves ingestion order. New locations are always appended to the end.
-Locations are removed from the list during cleanup after they have been processed by the consumer.
 
-The consumer manifest contains a map of claimed locations with their heartbeat timestamps
+- `entry_len` is the total number of bytes after this field: `2 + location_len + 8 + metadata_len`.
+- `location` is the UTF-8 encoded object storage path of the data batch.
+- `ingestion_time_ms` is the wall-clock time in milliseconds since the Unix epoch when the entry was enqueued.
+- `metadata` is an opaque byte payload whose length is implicit: `entry_len - 2 - location_len - 8`.
+  This field enables extensible per-entry metadata (e.g., flatbuffers) without a format change.
+- The footer is always the last 6 bytes. It allows readers to verify the entry count and detect format changes.
+
+To append a new entry a producer reads the raw bytes, strips the 6-byte footer, appends the encoded entry,
+and writes a new footer with the incremented entry count.
+Existing entries are never deserialized during append, which keeps the write path O(1) in the number of entries.
+Entries are listed in ingestion order. Entries are removed from the manifest during cleanup
+after they have been processed by the consumer; cleanup requires a full decode-filter-encode cycle.
+
+The consumer manifest is stored as a JSON file in object storage.
+It contains a map of claimed locations with their heartbeat timestamps
 and a list of done locations:
 ```json
 {
@@ -186,7 +204,7 @@ The configurations for the ingestor are:
 pub struct IngestorConfig {
   pub object_store_config: ObjectStoreConfig,  // configuration of the object store from opendata/common
   pub data_path_prefix: String,                // path prefix where to store the data objects, default: "ingest"
-  pub manifest_path: String,                   // path to the queue manifest, default: "ingest/manifest.json"
+  pub manifest_path: String,                   // path to the queue manifest, default: "ingest/manifest"
   pub flush_interval: Duration,                // time interval that once elapsed triggers a flush of the
                                                // current batch to object storage, default: 100ms
   pub flush_size_bytes: usize,                 // size in bytes that triggers a flush if the current batch exceeds it,
@@ -275,7 +293,7 @@ The configurations for the collector are:
 ```rust
 pub struct CollectorConfig {
     pub object_store_config: ObjectStoreConfig,  // configuration of the object store from opendata/common
-    pub manifest_path: String,                   // path to the queue manifest, default: "ingest/manifest.json"
+    pub manifest_path: String,                   // path to the queue manifest, default: "ingest/manifest"
     pub heartbeat_timeout_ms: Duration,          // duration after which a claimed location is considered failed,
                                                  // default: 30s
     pub done_cleanup_threshold: usize,           // number of done locations at which a cleanup of the locations
@@ -283,8 +301,8 @@ pub struct CollectorConfig {
 }
 ```
 The queue producer manifest takes the name specified in `manifest_path`.
-The queue consumer manifest is derived from `manifest_path` by adding `consumer` in front of the file extension
-or to the end of the `manifest_path` if the path does not have an extension.
+The queue consumer manifest is derived from `manifest_path` by appending `.consumer.json`
+(e.g., `ingest/manifest` → `ingest/manifest.consumer.json`).
 
 The collector internally creates a queue consumer and an object store client from the configuration.
 It also spawns a background heartbeat task that periodically refreshes the timestamps of all
