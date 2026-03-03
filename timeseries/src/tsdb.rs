@@ -718,12 +718,7 @@ mod tests {
     use crate::promql::evaluator::EvalSample;
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
     use common::storage::in_memory::InMemoryStorage;
-
-    async fn create_test_storage() -> Arc<dyn Storage> {
-        Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            OpenTsdbMergeOperator,
-        )))
-    }
+    use opendata_macros::storage_test;
 
     fn create_sample(
         metric_name: &str,
@@ -753,11 +748,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn should_create_tsdb_with_caches() {
-        // given
-        let storage = create_test_storage().await;
-
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_create_tsdb_with_caches(storage: Arc<dyn Storage>) {
         // when
         let tsdb = Tsdb::new(storage);
 
@@ -769,10 +761,9 @@ mod tests {
         assert_eq!(tsdb.query_cache.entry_count(), 0);
     }
 
-    #[tokio::test]
-    async fn should_get_or_create_bucket_for_ingest() {
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_get_or_create_bucket_for_ingest(storage: Arc<dyn Storage>) {
         // given
-        let storage = create_test_storage().await;
         let tsdb = Tsdb::new(storage);
         let bucket = TimeBucket::hour(1000);
 
@@ -786,10 +777,9 @@ mod tests {
         assert_eq!(tsdb.ingest_cache.entry_count(), 1);
     }
 
-    #[tokio::test]
-    async fn should_use_ingest_cache_during_queries() {
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_use_ingest_cache_during_queries(storage: Arc<dyn Storage>) {
         // given: a bucket in the ingest cache
-        let storage = create_test_storage().await;
         let tsdb = Tsdb::new(storage);
         let bucket = TimeBucket::hour(1000);
 
@@ -806,10 +796,9 @@ mod tests {
         assert_eq!(tsdb.query_cache.entry_count(), 0);
     }
 
-    #[tokio::test]
-    async fn should_use_query_cache_for_non_ingest_buckets() {
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_use_query_cache_for_non_ingest_buckets(storage: Arc<dyn Storage>) {
         // given
-        let storage = create_test_storage().await;
         let tsdb = Tsdb::new(storage);
         let bucket = TimeBucket::hour(1000);
 
@@ -825,10 +814,9 @@ mod tests {
         assert_eq!(tsdb.ingest_cache.entry_count(), 0);
     }
 
-    #[tokio::test]
-    async fn should_ingest_and_query_single_bucket() {
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_ingest_and_query_single_bucket(storage: Arc<dyn Storage>) {
         // given
-        let storage = create_test_storage().await;
         let tsdb = Tsdb::new(storage);
 
         // Use hour-aligned bucket (60 minutes = 1 hour)
@@ -858,8 +846,8 @@ mod tests {
         assert_eq!(series_ids.len(), 1);
     }
 
-    #[tokio::test]
-    async fn should_query_across_multiple_buckets_with_evaluator() {
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_query_across_multiple_buckets_with_evaluator(storage: Arc<dyn Storage>) {
         use crate::promql::evaluator::Evaluator;
         use crate::test_utils::assertions::assert_approx_eq;
         use promql_parser::parser::EvalStmt;
@@ -871,7 +859,6 @@ mod tests {
         //   Bucket 120: minutes 120-179, seconds 7200-10799,  ms 7,200,000-10,799,999
         //   Bucket 180: minutes 180-239, seconds 10800-14399, ms 10,800,000-14,399,999
         //   Bucket 240: minutes 240-299, seconds 14400-17999, ms 14,400,000-17,999,999
-        let storage = create_test_storage().await;
         let tsdb = Tsdb::new(storage);
 
         // Buckets 1 & 2: will end up in query cache (ingest, flush, then invalidate from ingest cache)
@@ -1047,14 +1034,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn should_query_across_multiple_buckets_with_different_series_id_mappings() {
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_query_across_multiple_buckets_with_different_series_id_mappings(
+        storage: Arc<dyn Storage>,
+    ) {
         use crate::promql::evaluator::Evaluator;
         use promql_parser::parser::EvalStmt;
         use std::time::{Duration, UNIX_EPOCH};
 
         // given: Two time buckets with overlapping series but different series IDs
-        let storage = create_test_storage().await;
         let tsdb = Tsdb::new(storage);
         // Bucket 1: hour 60 (covers 3,600,000-7,199,999 ms)
         let bucket1 = TimeBucket::hour(60);
@@ -1140,8 +1128,9 @@ mod tests {
     // ── Native read method tests ─────────────────────────────────────
 
     async fn create_tsdb_with_data() -> Tsdb {
-        let storage = create_test_storage().await;
-        let tsdb = Tsdb::new(storage);
+        let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        ))));
 
         // Ingest two series into bucket at minute 60 (covers 3,600,000–7,199,999 ms)
         let series = vec![
@@ -1239,9 +1228,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn eval_query_should_return_scalar() {
-        let storage = create_test_storage().await;
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn eval_query_should_return_scalar(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
         let query_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
 
@@ -1269,9 +1257,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn eval_query_should_return_error_for_invalid_query() {
-        let storage = create_test_storage().await;
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn eval_query_should_return_error_for_invalid_query(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
 
         let opts = QueryOptions::default();
@@ -1304,9 +1291,8 @@ mod tests {
         assert_eq!(results[1].labels.get("env"), Some("staging"));
     }
 
-    #[tokio::test]
-    async fn eval_query_range_should_return_scalar() {
-        let storage = create_test_storage().await;
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn eval_query_range_should_return_scalar(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
         let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
         let end = std::time::UNIX_EPOCH + std::time::Duration::from_secs(160);
@@ -1325,9 +1311,8 @@ mod tests {
         assert_eq!(results[0].samples[1].1, 2.0);
     }
 
-    #[tokio::test]
-    async fn eval_query_range_should_return_error_for_invalid_query() {
-        let storage = create_test_storage().await;
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn eval_query_range_should_return_error_for_invalid_query(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
         let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
         let end = std::time::UNIX_EPOCH + std::time::Duration::from_secs(200);
@@ -1365,9 +1350,8 @@ mod tests {
         assert_eq!(results[1].get("env"), Some("staging"));
     }
 
-    #[tokio::test]
-    async fn find_series_should_error_on_empty_matchers() {
-        let storage = create_test_storage().await;
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn find_series_should_error_on_empty_matchers(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
 
         let result = tsdb.find_series(&[], 0, i64::MAX).await;
@@ -1379,9 +1363,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn find_series_should_dedup_across_buckets() {
-        let storage = create_test_storage().await;
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn find_series_should_dedup_across_buckets(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
 
         // Same series in two different buckets
@@ -1421,9 +1404,8 @@ mod tests {
         assert!(results.contains(&"env".to_string()));
     }
 
-    #[tokio::test]
-    async fn find_labels_should_return_empty_for_no_data() {
-        let storage = create_test_storage().await;
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn find_labels_should_return_empty_for_no_data(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
 
         let results = tsdb.find_labels(None, 0, 100).await.unwrap();
@@ -1455,18 +1437,16 @@ mod tests {
         assert_eq!(results, vec!["prod"]);
     }
 
-    #[tokio::test]
-    async fn find_label_values_should_return_empty_for_no_data() {
-        let storage = create_test_storage().await;
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn find_label_values_should_return_empty_for_no_data(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
 
         let results = tsdb.find_label_values("env", None, 0, 100).await.unwrap();
         assert!(results.is_empty());
     }
 
-    #[tokio::test]
-    async fn find_metadata_should_return_all() {
-        let storage = create_test_storage().await;
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn find_metadata_should_return_all(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
 
         let mut series = create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0);
@@ -1522,10 +1502,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn eval_query_with_offset_before_epoch_should_not_error() {
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn eval_query_with_offset_before_epoch_should_not_error(storage: Arc<dyn Storage>) {
         // Query at 100s with offset 1h → effective time = -3500s (before epoch).
-        let storage = create_test_storage().await;
         let tsdb = Tsdb::new(storage);
         let query_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
         let opts = QueryOptions::default();
@@ -1541,10 +1520,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn eval_query_range_with_at_before_epoch_should_not_error() {
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn eval_query_range_with_at_before_epoch_should_not_error(storage: Arc<dyn Storage>) {
         // `@ 0 offset 1h` pins evaluation to t=0, then offset pushes to -3600.
-        let storage = create_test_storage().await;
         let tsdb = Tsdb::new(storage);
         let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000);
         let end = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2000);
@@ -1591,9 +1569,8 @@ mod tests {
     // Multi-bucket dedup for labels and label_values
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn find_labels_should_dedup_across_buckets() {
-        let storage = create_test_storage().await;
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn find_labels_should_dedup_across_buckets(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
 
         // Same series in two different buckets
@@ -1617,9 +1594,8 @@ mod tests {
         assert!(results.contains(&"host".to_string()));
     }
 
-    #[tokio::test]
-    async fn find_label_values_should_dedup_across_buckets() {
-        let storage = create_test_storage().await;
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn find_label_values_should_dedup_across_buckets(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
 
         // Same series in two different buckets
@@ -1640,9 +1616,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn find_metadata_should_filter_by_metric() {
-        let storage = create_test_storage().await;
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn find_metadata_should_filter_by_metric(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
 
         tsdb.ingest_samples(vec![
