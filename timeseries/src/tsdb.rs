@@ -88,7 +88,7 @@ async fn get_matching_series_multi_bucket<R: QueryReader>(
     Ok(bucket_series_map)
 }
 
-// ── TsdbEngine trait ─────────────────────────────────────────────────
+// ── TsdbReadEngine trait ─────────────────────────────────────────────────
 //
 // Factors out the 6 duplicated eval/find methods shared between `Tsdb`
 // (writer) and `TimeSeriesDbReader` (reader). Each implementor provides
@@ -96,7 +96,7 @@ async fn get_matching_series_multi_bucket<R: QueryReader>(
 // default methods.
 
 #[async_trait]
-pub(crate) trait TsdbEngine: Send + Sync {
+pub(crate) trait TsdbReadEngine: Send + Sync {
     type QR: QueryReader + Send + Sync;
 
     /// Build a query reader spanning `[start, end]` (seconds).
@@ -230,8 +230,8 @@ pub(crate) trait TsdbEngine: Send + Sync {
 }
 
 /// Evaluate a range query using Rust range bounds, converting to
-/// `(start, end)` exactly once before dispatching to `TsdbEngine`.
-pub(crate) async fn eval_query_range_bounds<E: TsdbEngine + ?Sized>(
+/// `(start, end)` exactly once before dispatching to `TsdbReadEngine`.
+pub(crate) async fn eval_query_range_bounds<E: TsdbReadEngine + ?Sized>(
     engine: &E,
     query: &str,
     range: impl RangeBounds<SystemTime>,
@@ -243,7 +243,7 @@ pub(crate) async fn eval_query_range_bounds<E: TsdbEngine + ?Sized>(
 }
 
 /// Discover series over a time range specified as Rust range bounds.
-pub(crate) async fn find_series_in_range<E: TsdbEngine + ?Sized>(
+pub(crate) async fn find_series_in_range<E: TsdbReadEngine + ?Sized>(
     engine: &E,
     matchers: &[&str],
     range: impl RangeBounds<SystemTime>,
@@ -253,7 +253,7 @@ pub(crate) async fn find_series_in_range<E: TsdbEngine + ?Sized>(
 }
 
 /// Discover label names over a time range specified as Rust range bounds.
-pub(crate) async fn find_labels_in_range<E: TsdbEngine + ?Sized>(
+pub(crate) async fn find_labels_in_range<E: TsdbReadEngine + ?Sized>(
     engine: &E,
     matchers: Option<&[&str]>,
     range: impl RangeBounds<SystemTime>,
@@ -263,7 +263,7 @@ pub(crate) async fn find_labels_in_range<E: TsdbEngine + ?Sized>(
 }
 
 /// Discover label values over a time range specified as Rust range bounds.
-pub(crate) async fn find_label_values_in_range<E: TsdbEngine + ?Sized>(
+pub(crate) async fn find_label_values_in_range<E: TsdbReadEngine + ?Sized>(
     engine: &E,
     label_name: &str,
     matchers: Option<&[&str]>,
@@ -761,8 +761,8 @@ impl Tsdb {
     /// Evaluate a range PromQL query, returning typed `RangeSample`s.
     ///
     /// This inherent method converts `impl RangeBounds<SystemTime>` to the
-    /// `(start, end)` pair expected by `TsdbEngine`. The other 5 read methods
-    /// live on the `TsdbEngine` trait directly (identical signatures).
+    /// `(start, end)` pair expected by `TsdbReadEngine`. The other 5 read methods
+    /// live on the `TsdbReadEngine` trait directly (identical signatures).
     pub(crate) async fn eval_query_range(
         &self,
         query: &str,
@@ -775,7 +775,7 @@ impl Tsdb {
 }
 
 #[async_trait]
-impl TsdbEngine for Tsdb {
+impl TsdbReadEngine for Tsdb {
     type QR = TsdbQueryReader;
 
     async fn make_query_reader(&self, start: i64, end: i64) -> Result<TsdbQueryReader> {

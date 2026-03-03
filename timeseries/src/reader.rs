@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use common::StorageRead;
 use common::storage::factory::create_storage_read;
 use common::{StorageReaderRuntime, StorageSemantics};
+use futures::stream::{self, StreamExt};
 use moka::future::Cache;
 use tokio::sync::RwLock;
 
@@ -29,7 +30,7 @@ use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::{
-    TsdbEngine, eval_query_range_bounds, find_label_values_in_range, find_labels_in_range,
+    TsdbReadEngine, eval_query_range_bounds, find_label_values_in_range, find_labels_in_range,
     find_series_in_range,
 };
 
@@ -147,7 +148,7 @@ pub struct TimeSeriesDbReader {
     /// LRU cache for read-only query buckets.
     query_cache: Cache<TimeBucket, Arc<MiniQueryReader>>,
     /// Metadata catalog (always empty for reader — metadata is populated during writes).
-    metadata_catalog_: RwLock<HashMap<String, Vec<MetricMetadata>>>,
+    metadata_catalog: RwLock<HashMap<String, Vec<MetricMetadata>>>,
 }
 
 impl TimeSeriesDbReader {
@@ -175,24 +176,12 @@ impl TimeSeriesDbReader {
     }
 
     /// Creates a TimeSeriesDbReader from an existing storage implementation.
-    #[cfg(test)]
     pub(crate) fn from_storage(storage: Arc<dyn StorageRead>) -> Self {
         let query_cache = Cache::builder().max_capacity(50).build();
         Self {
             storage,
             query_cache,
-            metadata_catalog_: RwLock::new(HashMap::new()),
-        }
-    }
-
-    /// Creates a TimeSeriesDbReader from an existing storage implementation.
-    #[cfg(not(test))]
-    fn from_storage(storage: Arc<dyn StorageRead>) -> Self {
-        let query_cache = Cache::builder().max_capacity(50).build();
-        Self {
-            storage,
-            query_cache,
-            metadata_catalog_: RwLock::new(HashMap::new()),
+            metadata_catalog: RwLock::new(HashMap::new()),
         }
     }
 
@@ -216,7 +205,7 @@ impl TimeSeriesDbReader {
         query: &str,
         time: Option<SystemTime>,
     ) -> std::result::Result<QueryValue, QueryError> {
-        <Self as TsdbEngine>::eval_query(self, query, time, &QueryOptions::default()).await
+        <Self as TsdbReadEngine>::eval_query(self, query, time, &QueryOptions::default()).await
     }
 
     /// Evaluates a range PromQL query over a time interval.
@@ -260,19 +249,22 @@ impl TimeSeriesDbReader {
     /// Returns metric metadata, optionally filtered to a single metric.
     ///
     /// Note: metadata is populated from write operations and not persisted to
-    /// storage. A reader opened against existing data will return empty metadata.
+    /// storage. A reader opened against existing data will always return empty.
     pub async fn metadata(
         &self,
-        metric: Option<&str>,
+        _metric: Option<&str>,
     ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
-        <Self as TsdbEngine>::find_metadata(self, metric).await
+        Ok(vec![])
     }
 }
 
-// ── TsdbEngine for TimeSeriesDbReader ────────────────────────────────
+// ── TsdbReadEngine for TimeSeriesDbReader ────────────────────────────
+
+/// Maximum number of buckets to load concurrently.
+const BUCKET_LOAD_CONCURRENCY: usize = 8;
 
 #[async_trait]
-impl TsdbEngine for TimeSeriesDbReader {
+impl TsdbReadEngine for TimeSeriesDbReader {
     type QR = ReaderQueryReader;
 
     async fn make_query_reader(&self, start: i64, end: i64) -> Result<ReaderQueryReader> {
@@ -281,11 +273,14 @@ impl TsdbEngine for TimeSeriesDbReader {
             .get_buckets_in_range(Some(start), Some(end))
             .await?;
 
-        let mut readers = Vec::new();
-        for bucket in buckets {
-            let mini = self.get_or_load_bucket(bucket).await;
-            readers.push((bucket, mini));
-        }
+        let readers: Vec<_> = stream::iter(buckets)
+            .map(|bucket| async move {
+                let mini = self.get_or_load_bucket(bucket).await;
+                (bucket, mini)
+            })
+            .buffer_unordered(BUCKET_LOAD_CONCURRENCY)
+            .collect()
+            .await;
 
         Ok(ReaderQueryReader::new(readers))
     }
@@ -296,17 +291,20 @@ impl TsdbEngine for TimeSeriesDbReader {
     ) -> Result<ReaderQueryReader> {
         let buckets = self.storage.get_buckets_for_ranges(ranges).await?;
 
-        let mut readers = Vec::new();
-        for bucket in buckets {
-            let mini = self.get_or_load_bucket(bucket).await;
-            readers.push((bucket, mini));
-        }
+        let readers: Vec<_> = stream::iter(buckets)
+            .map(|bucket| async move {
+                let mini = self.get_or_load_bucket(bucket).await;
+                (bucket, mini)
+            })
+            .buffer_unordered(BUCKET_LOAD_CONCURRENCY)
+            .collect()
+            .await;
 
         Ok(ReaderQueryReader::new(readers))
     }
 
     fn metadata_catalog(&self) -> &RwLock<HashMap<String, Vec<MetricMetadata>>> {
-        &self.metadata_catalog_
+        &self.metadata_catalog
     }
 }
 

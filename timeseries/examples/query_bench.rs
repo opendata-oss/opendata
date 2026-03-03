@@ -96,108 +96,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("query_name,query_type,duration_ms,result_count");
 
     for (name, query) in QUERIES {
-        if name.starts_with("instant_") {
-            let start = Instant::now();
-            let result = reader.query(query, Some(now)).await;
-            let elapsed = start.elapsed();
+        let start = Instant::now();
 
-            let count = match &result {
-                Ok(timeseries::QueryValue::Vector(v)) => v.len(),
-                Ok(timeseries::QueryValue::Matrix(m)) => m.len(),
-                Ok(timeseries::QueryValue::Scalar { .. }) => 1,
-                Err(_) => 0,
+        let (query_type, err, count): (&str, Option<String>, usize) =
+            if name.starts_with("instant_") {
+                let r = reader.query(query, Some(now)).await;
+                let count = match &r {
+                    Ok(timeseries::QueryValue::Vector(v)) => v.len(),
+                    Ok(timeseries::QueryValue::Matrix(m)) => m.len(),
+                    Ok(timeseries::QueryValue::Scalar { .. }) => 1,
+                    Err(_) => 0,
+                };
+                ("instant", r.err().map(|e| e.to_string()), count)
+            } else if name.starts_with("range_") {
+                let r = reader.query_range(query, range_start..=now, step).await;
+                (
+                    "range",
+                    r.as_ref().err().map(|e| e.to_string()),
+                    r.as_ref().map_or(0, |v| v.len()),
+                )
+            } else if *name == "series_discovery" {
+                let r = reader.series(&[query], range_start..=now).await;
+                (
+                    "series",
+                    r.as_ref().err().map(|e| e.to_string()),
+                    r.as_ref().map_or(0, |v| v.len()),
+                )
+            } else if *name == "label_names" {
+                let r = reader.labels(None, range_start..=now).await;
+                (
+                    "labels",
+                    r.as_ref().err().map(|e| e.to_string()),
+                    r.as_ref().map_or(0, |v| v.len()),
+                )
+            } else if *name == "label_values" {
+                let r = reader.label_values(query, None, range_start..=now).await;
+                (
+                    "label_values",
+                    r.as_ref().err().map(|e| e.to_string()),
+                    r.as_ref().map_or(0, |v| v.len()),
+                )
+            } else {
+                continue;
             };
 
-            println!(
-                "{},instant,{:.3},{}",
-                name,
-                elapsed.as_secs_f64() * 1000.0,
-                count
-            );
-
-            if let Err(e) = result {
-                eprintln!("  error: {}", e);
-            }
-        } else if name.starts_with("range_") {
-            let start = Instant::now();
-            let result = reader.query_range(query, range_start..=now, step).await;
-            let elapsed = start.elapsed();
-
-            let count = match &result {
-                Ok(samples) => samples.len(),
-                Err(_) => 0,
-            };
-
-            println!(
-                "{},range,{:.3},{}",
-                name,
-                elapsed.as_secs_f64() * 1000.0,
-                count
-            );
-
-            if let Err(e) = result {
-                eprintln!("  error: {}", e);
-            }
-        } else if *name == "series_discovery" {
-            let start = Instant::now();
-            let result = reader.series(&[query], range_start..=now).await;
-            let elapsed = start.elapsed();
-
-            let count = match &result {
-                Ok(series) => series.len(),
-                Err(_) => 0,
-            };
-
-            println!(
-                "{},series,{:.3},{}",
-                name,
-                elapsed.as_secs_f64() * 1000.0,
-                count
-            );
-
-            if let Err(e) = result {
-                eprintln!("  error: {}", e);
-            }
-        } else if *name == "label_names" {
-            let start = Instant::now();
-            let result = reader.labels(None, range_start..=now).await;
-            let elapsed = start.elapsed();
-
-            let count = match &result {
-                Ok(labels) => labels.len(),
-                Err(_) => 0,
-            };
-
-            println!(
-                "{},labels,{:.3},{}",
-                name,
-                elapsed.as_secs_f64() * 1000.0,
-                count
-            );
-
-            if let Err(e) = result {
-                eprintln!("  error: {}", e);
-            }
-        } else if *name == "label_values" {
-            let start = Instant::now();
-            let result = reader.label_values(query, None, range_start..=now).await;
-            let elapsed = start.elapsed();
-
-            let count = match &result {
-                Ok(values) => values.len(),
-                Err(_) => 0,
-            };
-
-            println!(
-                "{},label_values,{:.3},{}",
-                name,
-                elapsed.as_secs_f64() * 1000.0,
-                count
-            );
-
-            if let Err(e) = result {
-                eprintln!("  error: {}", e);
-            }
+        let elapsed = start.elapsed();
+        println!(
+            "{},{},{:.3},{}",
+            name,
+            query_type,
+            elapsed.as_secs_f64() * 1000.0,
+            count
+        );
+        if let Some(e) = err {
+            eprintln!("  error: {}", e);
         }
     }
 

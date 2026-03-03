@@ -2743,7 +2743,7 @@ mod tests {
         let flusher = TestFlusher::default();
         let mut config = test_config();
         config.flush_size_threshold = usize::MAX;
-        config.flush_interval = Duration::from_secs(24 * 60 * 60);
+        config.flush_interval = Duration::from_hours(24);
         let mut coordinator = WriteCoordinator::new(
             config,
             vec!["a", "b"],

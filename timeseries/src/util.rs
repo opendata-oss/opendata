@@ -452,4 +452,39 @@ mod tests {
         assert_eq!(time_bucket_size_hours(4), 8);
         assert_eq!(time_bucket_size_hours(5), 16);
     }
+
+    #[test]
+    fn range_bounds_to_secs_rejects_pre_epoch_start() {
+        use super::range_bounds_to_secs;
+        use std::time::UNIX_EPOCH;
+
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(1);
+        let after_epoch = UNIX_EPOCH + Duration::from_secs(100);
+        let result = range_bounds_to_secs(pre_epoch..=after_epoch);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("before Unix epoch"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn range_bounds_to_secs_rejects_pre_epoch_end() {
+        use super::range_bounds_to_secs;
+        use std::time::UNIX_EPOCH;
+
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(1);
+        let result = range_bounds_to_secs(UNIX_EPOCH..=pre_epoch);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("before Unix epoch"),
+            "unexpected error: {}",
+            err
+        );
+    }
 }
