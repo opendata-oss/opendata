@@ -19,10 +19,6 @@ use opentelemetry_proto::tonic::{
 };
 use timeseries::otel::{OtelConfig, OtelConverter};
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 fn kv(key: &str, value: &str) -> KeyValue {
     KeyValue {
         key: key.to_string(),
