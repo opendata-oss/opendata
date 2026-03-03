@@ -338,7 +338,6 @@ mod tests {
 
         // verify wrapper body contains storage creation with merge operator
         assert!(wrapper.attrs.iter().any(|attr| {
-            println!("{}", attr.to_token_stream());
             attr.to_token_stream().to_string()
                 == "# [tokio :: test (flavor = \"multi_thread\" , worker_threads = 2)]"
         }));
