@@ -74,52 +74,76 @@ The `otel` feature is usable without `http-server` — the builder can be used s
 
 The service uses Axum, listens on a single port (default 9090), and handles graceful shutdown (SIGINT/SIGTERM) with a TSDB flush.
 
-### Amendment: Protocol Adapters and Pluggable Ingest Sinks
+### Amendment: Source/Sink Pipeline Architecture
 
-To support both direct ingestion into `TimeSeriesDb` and ingestion through the stateless ingest module ([RFC 0001: Stateless Ingest](../../ingest/rfcs/0001-stateless-ingest.md)), the ingest path is split into two explicit layers:
+To support both direct ingestion into `TimeSeriesDb` and ingestion through the stateless ingest module ([RFC 0001: Stateless Ingest](../../ingest/rfcs/0001-stateless-ingest.md)), the write path is modeled as a pipeline over a normalized `Vec<Series>` payload.
 
-1. **Protocol adapters**: Parse transport/wire format into `Vec<Series>`.
-2. **Ingest sink**: Persist or forward normalized `Vec<Series>`.
+#### Core Model
 
-This keeps protocol-specific parsing logic independent from storage/write strategy and enables deployment-specific routing without duplicating endpoint logic.
+- **Source** emits `Vec<Series>`.
+- **Sink** accepts `Vec<Series>`.
+- **Sink/Source pair** implements both and acts as an intermediate stage.
 
-#### Protocol Adapters
+All write pipelines start from a source and end at a sink:
 
-The service defines protocol adapters for each ingest endpoint:
+- Direct: `HttpSource -> TsdbSink`
+- Buffered: `HttpSource -> StatelessIngest (sink/source pair) -> TsdbSink`
 
-| Endpoint | Adapter output |
+This isolates protocol parsing from delivery mechanics and lets us compose additional stages (for example LogDb) without changing endpoint logic.
+
+#### Push/Pull Semantics
+
+Sources come in two forms:
+
+- **Push source**: receives upstream writes and immediately pushes `Vec<Series>` to a downstream sink.
+  - HTTP endpoints are push sources.
+- **Pull source**: exposes batches for downstream consumers to fetch, then acknowledge.
+  - Collector-side stateless ingest is a pull source.
+
+Proposed contracts:
+
+```rust
+#[async_trait]
+pub trait Sink {
+    async fn accept(&self, series: Vec<Series>) -> Result<SinkAck>;
+}
+
+#[async_trait]
+pub trait PullSource {
+    async fn next_batch(&self) -> Result<Option<SeriesBatch>>;
+    async fn ack(&self, batch: &SeriesBatch) -> Result<()>;
+}
+```
+
+Push sources are endpoint handlers that parse protocol payloads and call `Sink::accept`.
+
+#### Protocol Sources
+
+The service defines push sources for ingest endpoints:
+
+| Endpoint | Source output |
 |---|---|
 | `POST /api/v1/write` (Prometheus Remote Write 1.0) | `Vec<Series>` |
 | `POST /v1/metrics` (OTLP/HTTP) | `Vec<Series>` via `OtelSeriesBuilder` |
 
-Both adapters perform format validation/decoding and produce the same normalized `Vec<Series>` model used by the write API.
+Both sources perform format validation/decoding and emit the same normalized series model.
 
-#### Ingest Sink Interface
+#### Sink and Sink/Source Implementations
 
-After protocol decoding, the handler delegates to a sink abstraction:
+- **TsdbSink**: terminal sink; writes to `TimeSeriesDb::write()` / `Tsdb::ingest_samples()`.
+- **StatelessIngestSink**: accepts `Vec<Series>`, serializes records, and writes durable batches through RFC 0001 `Ingestor`.
+- **StatelessIngestSource**: reads batches via RFC 0001 `Collector`, deserializes records, and emits `Vec<Series>` to downstream sinks.
 
-```rust
-#[async_trait]
-pub trait IngestSink {
-    async fn ingest(&self, series: Vec<Series>) -> Result<IngestResult>;
-}
-```
+The stateless ingest pair is a reusable intermediate stage, not a terminal writer.
 
-Implementations:
+#### Acknowledgement and Durability
 
-- **DirectTsdbSink**: calls `TimeSeriesDb::write()` / `Tsdb::ingest_samples()`.
-- **StatelessIngestSink**: encodes entries and calls RFC 0001 `Ingestor::ingest()`.
-
-`StatelessIngestSink` uses the ingest module as an opaque durable queue and leaves ordering, retries, and at-least-once behavior to RFC 0001 collector + acknowledgement flow.
-
-#### Acknowledgement Semantics
-
-For `StatelessIngestSink`, success responses from ingest endpoints SHOULD be returned only after entries are durable in object storage (i.e. `WriteWatcher::await_durable()` has completed).
+For `StatelessIngestSink`, ingest endpoints SHOULD return success only after durability in object storage (`WriteWatcher::await_durable()`).
 
 Rationale:
-- Aligns endpoint acknowledgement with durability, not in-memory acceptance.
-- Keeps retry behavior predictable for remote-write and OTLP clients.
-- Preserves at-least-once guarantees with collector-side idempotency.
+- Endpoint acknowledgement reflects durable acceptance, not in-memory buffering.
+- Retry behavior stays predictable for remote-write and OTLP clients.
+- Collector + `ack()` preserve at-least-once delivery semantics.
 
 #### Server Composition
 
@@ -130,11 +154,7 @@ The service can be composed into two server modes:
 | **Full server** | Query APIs + ingest APIs + health + metrics + UI |
 | **Write-only server** | Ingest APIs + health + metrics |
 
-Both modes reuse the same protocol adapters and sink abstraction. The difference is only route composition.
-
-This enables deployments such as:
-- zonal write-only ingest endpoints (remote-write and/or OTLP) using `StatelessIngestSink` for HA and cross-zone cost savings;
-- central full query+ingest endpoints using `DirectTsdbSink`.
+Both modes reuse the same source/sink contracts; only route composition changes.
 
 #### Endpoints
 
@@ -250,4 +270,4 @@ Each protocol could run its own server on a different port. This adds operationa
 |---|---|
 | 2026-02-24 | Initial draft (as RFC 0003: OTLP Metrics Ingest) |
 | 2026-02-25 | Restructured as TimeSeries Service RFC covering HTTP server, remote-write, and OTEL ingest |
-| 2026-03-03 | Amendment: protocol adapters + pluggable ingest sink to support direct TSDB and stateless ingest; added full vs write-only server composition |
+| 2026-03-03 | Amendment: source/sink pipeline model with push/pull semantics, stateless ingest sink/source pair, and full vs write-only server composition |
