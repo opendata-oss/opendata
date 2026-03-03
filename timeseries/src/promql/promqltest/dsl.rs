@@ -1,3 +1,4 @@
+use crate::model::{Label, Labels, RangeSample};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,7 +16,7 @@ pub struct LoadCmd {
 pub struct EvalInstantCmd {
     pub time: SystemTime,
     pub query: String,
-    pub expected: Vec<ExpectedSample>,
+    pub expected: Vec<RangeSample>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,23 +45,6 @@ pub enum Command {
 pub struct SeriesLoad {
     pub labels: HashMap<String, String>, // includes __name__
     pub values: Vec<(i64, f64)>,         // (step_index, value)
-}
-
-#[derive(Debug, Clone)]
-pub struct ExpectedSample {
-    pub labels: HashMap<String, String>,
-    pub value: f64,
-    // Future:
-    // #[cfg(feature = "histograms")]
-    // pub histogram: Option<Histogram>,
-    // #[cfg(feature = "range-vectors")]
-    // pub range_values: Option<Vec<(i64, f64)>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct EvalResult {
-    pub labels: HashMap<String, String>,
-    pub value: f64,
 }
 
 // ============================================================================
@@ -393,7 +377,7 @@ fn parse_values(s: &str) -> Result<Vec<(i64, f64)>, String> {
     }
 }
 
-fn parse_expected(line: &str) -> Result<ExpectedSample, String> {
+fn parse_expected(line: &str) -> Result<RangeSample, String> {
     let mut chars = line.chars().peekable();
     let mut metric_part = String::new();
 
@@ -430,12 +414,23 @@ fn parse_expected(line: &str) -> Result<ExpectedSample, String> {
         return Err(format!("Missing value in expected: {}", line));
     }
 
-    let (_, labels) = parse_metric(metric_part.trim())?;
+    let (metric_name, label_map) = parse_metric(metric_part.trim())?;
     let value = value_str
         .parse::<f64>()
         .map_err(|_| format!("Invalid value '{}' in expected: {}", value_str, line))?;
 
-    Ok(ExpectedSample { labels, value })
+    let mut labels: Vec<Label> = label_map
+        .into_iter()
+        .map(|(k, v)| Label::new(k, v))
+        .collect();
+    if !metric_name.is_empty() {
+        labels.push(Label::metric_name(metric_name));
+    }
+    labels.sort();
+    Ok(RangeSample {
+        labels: Labels::new(labels),
+        samples: vec![(0, value)],
+    })
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -735,7 +730,7 @@ mod tests {
         match &cmds[0] {
             Command::EvalInstant(cmd) => {
                 assert_eq!(cmd.query, "{job=\"test\"}");
-                assert_eq!(cmd.expected[0].labels.get("job"), Some(&"test".to_string()));
+                assert_eq!(cmd.expected[0].labels.get("job"), Some("test"));
             }
             _ => panic!("Expected EvalInstant command"),
         }

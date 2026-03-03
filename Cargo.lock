@@ -2581,6 +2581,7 @@ dependencies = [
  "roaring 0.7.0",
  "rstest",
  "rust-embed",
+ "ryu",
  "serde",
  "serde_json",
  "serde_yaml",
