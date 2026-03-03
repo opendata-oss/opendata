@@ -10,7 +10,7 @@
 //! use std::time::Duration;
 //!
 //! #[tokio::main]
-//! async fn main() -> anyhow::Result<()> {
+//! async fn main() -> vector::Result<()> {
 //!     let config = Config {
 //!         dimensions: 384,
 //!         distance_metric: DistanceMetric::Cosine,
@@ -35,6 +35,7 @@
 pub mod db;
 pub mod delta;
 pub mod distance;
+pub(crate) mod error;
 pub mod flusher;
 pub mod hnsw;
 pub(crate) mod lire;
@@ -48,6 +49,7 @@ pub(crate) mod test_utils;
 
 // Public API exports
 pub use db::VectorDb;
+pub use error::{Error, Result};
 pub use model::{
     Attribute, AttributeValue, Config, DistanceMetric, FieldType, MetadataFieldSpec, SearchResult,
     Vector, VectorBuilder,

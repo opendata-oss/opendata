@@ -15,6 +15,7 @@ use crate::delta::{
     VectorDbDeltaContext, VectorDbDeltaOpts, VectorDbWrite, VectorDbWriteDelta, VectorWrite,
 };
 use crate::distance;
+use crate::error::{Error, Result};
 use crate::flusher::VectorDbFlusher;
 use crate::hnsw::{CentroidGraph, build_centroid_graph};
 use crate::lire::rebalancer::{IndexRebalancer, IndexRebalancerOpts};
@@ -26,7 +27,6 @@ use crate::serde::key::SeqBlockKey;
 use crate::serde::posting_list::PostingList;
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
-use anyhow::{Context, Result};
 use common::SequenceAllocator;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};
 use common::storage::factory::create_storage;
@@ -100,7 +100,7 @@ impl VectorDb {
             StorageSemantics::new().with_merge_operator(Arc::new(merge_op)),
         )
         .await
-        .context("Failed to create storage")?;
+        .map_err(|e| Error::Storage(format!("Failed to create storage: {e}")))?;
 
         Self::load_or_init_db(storage, config, centroids).await
     }
@@ -248,19 +248,19 @@ impl VectorDb {
 
         // No existing centroids - validate and write the provided ones
         if centroids.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Centroids must be provided when creating a new database"
+            return Err(Error::InvalidInput(
+                "Centroids must be provided when creating a new database".to_string(),
             ));
         }
 
         // Validate centroid dimensions
         for centroid in &centroids {
             if centroid.len() != config.dimensions as usize {
-                return Err(anyhow::anyhow!(
+                return Err(Error::InvalidInput(format!(
                     "Centroid dimension mismatch: expected {}, got {}",
                     config.dimensions,
                     centroid.len()
-                ));
+                )));
             }
         }
 
@@ -327,8 +327,11 @@ impl VectorDb {
 
             // Decode the value to get internal_id
             let mut slice = record.value.as_ref();
-            let internal_id = common::serde::encoding::decode_u64(&mut slice)
-                .context("failed to decode internal ID from ID dictionary")?;
+            let internal_id = common::serde::encoding::decode_u64(&mut slice).map_err(|e| {
+                Error::Encoding(format!(
+                    "failed to decode internal ID from ID dictionary: {e}"
+                ))
+            })?;
 
             dictionary.insert(external_id, internal_id);
         }
@@ -388,11 +391,12 @@ impl VectorDb {
             .write_coordinator
             .handle(WRITE_CHANNEL)
             .write(VectorDbWrite::Write(writes))
-            .await?;
+            .await
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
         write_handle
             .wait(Durability::Applied)
             .await
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
 
         Ok(())
     }
@@ -436,11 +440,12 @@ impl VectorDb {
             .write_coordinator
             .handle(WRITE_CHANNEL)
             .write_timeout(VectorDbWrite::Write(writes), timeout)
-            .await?;
+            .await
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
         write_handle
             .wait(Durability::Applied)
             .await
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
 
         Ok(())
     }
@@ -452,10 +457,10 @@ impl VectorDb {
     fn prepare_vector_write(&self, vector: Vector) -> Result<VectorWrite> {
         // Validate external ID length
         if vector.id.len() > 64 {
-            return Err(anyhow::anyhow!(
+            return Err(Error::InvalidInput(format!(
                 "External ID too long: {} bytes (max 64)",
                 vector.id.len()
-            ));
+            )));
         }
 
         // Convert attributes to map for validation
@@ -465,26 +470,26 @@ impl VectorDb {
         let values = match attributes.get(VECTOR_FIELD_NAME) {
             Some(AttributeValue::Vector(v)) => v.clone(),
             Some(_) => {
-                return Err(anyhow::anyhow!(
+                return Err(Error::InvalidInput(format!(
                     "Field '{}' must have type Vector",
                     VECTOR_FIELD_NAME
-                ));
+                )));
             }
             None => {
-                return Err(anyhow::anyhow!(
+                return Err(Error::InvalidInput(format!(
                     "Missing required field '{}'",
                     VECTOR_FIELD_NAME
-                ));
+                )));
             }
         };
 
         // Validate dimensions
         if values.len() != self.config.dimensions as usize {
-            return Err(anyhow::anyhow!(
+            return Err(Error::InvalidInput(format!(
                 "Vector dimension mismatch: expected {}, got {}",
                 self.config.dimensions,
                 values.len()
-            ));
+            )));
         }
 
         // Validate attributes against schema (if schema is defined)
@@ -531,20 +536,18 @@ impl VectorDb {
                     };
 
                     if actual_type != *expected_type {
-                        return Err(anyhow::anyhow!(
+                        return Err(Error::InvalidInput(format!(
                             "Type mismatch for field '{}': expected {:?}, got {:?}",
-                            field_name,
-                            expected_type,
-                            actual_type
-                        ));
+                            field_name, expected_type, actual_type
+                        )));
                     }
                 }
                 None => {
-                    return Err(anyhow::anyhow!(
+                    return Err(Error::InvalidInput(format!(
                         "Unknown metadata field: '{}'. Valid fields: {:?}",
                         field_name,
                         schema.keys().collect::<Vec<_>>()
-                    ));
+                    )));
                 }
             }
         }
@@ -573,8 +576,12 @@ impl VectorDb {
             .write_coordinator
             .handle(WRITE_CHANNEL)
             .flush(false)
-            .await?;
-        handle.wait(Durability::Written).await?;
+            .await
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
+        handle
+            .wait(Durability::Written)
+            .await
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
         Ok(())
     }
 
@@ -618,11 +625,11 @@ impl VectorDb {
         nprobe: usize,
     ) -> Result<Vec<SearchResult>> {
         if query.len() != self.config.dimensions as usize {
-            return Err(anyhow::anyhow!(
+            return Err(Error::InvalidInput(format!(
                 "Query dimension mismatch: expected {}, got {}",
                 self.config.dimensions,
                 query.len()
-            ));
+            )));
         }
 
         // Brute-force: compute distance from query to every centroid
@@ -664,11 +671,11 @@ impl VectorDb {
     ) -> Result<Vec<SearchResult>> {
         // 1. Validate query dimensions
         if query.len() != self.config.dimensions as usize {
-            return Err(anyhow::anyhow!(
+            return Err(Error::InvalidInput(format!(
                 "Query dimension mismatch: expected {}, got {}",
                 self.config.dimensions,
                 query.len()
-            ));
+            )));
         }
 
         // 2. Search HNSW for nearest centroids
@@ -785,14 +792,15 @@ impl VectorDb {
                     })
                     .collect();
                 scored.sort_unstable_by(|a, b| a.distance.cmp(&b.distance));
-                Ok::<_, anyhow::Error>(scored)
+                Ok::<_, Error>(scored)
             }));
         }
 
         let results = futures::future::join_all(handles).await;
         let mut sorted_lists: Vec<Vec<ScoredCandidate>> = Vec::with_capacity(results.len());
         for result in results {
-            let scored = result??;
+            let scored =
+                result.map_err(|e| Error::Internal(format!("task join error: {}", e)))??;
             if !scored.is_empty() {
                 sorted_lists.push(scored);
             }

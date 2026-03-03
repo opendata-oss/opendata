@@ -1,7 +1,7 @@
 use crate::delta::VectorDbWriteDelta;
+use crate::error::Result;
 use crate::serde::posting_list::{PostingList, PostingListValue, merge_decoded_posting_lists};
 use crate::storage::VectorDbStorageReadExt;
-use anyhow::Result;
 use common::coordinator::View;
 use std::sync::Arc;
 
