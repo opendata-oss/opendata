@@ -176,6 +176,33 @@ pub trait MergeOperator: Send + Sync {
     /// # Returns
     /// The merged value.
     fn merge(&self, key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes;
+
+    /// Merges a batch of operands with an optional existing value.
+    ///
+    /// The default implementation applies pairwise merging. Implementations can
+    /// override this for better performance by constructing a single merge result once
+    /// for multiple input values.
+    ///
+    /// # Arguments
+    /// * `key` - The key associated with the values being merged
+    /// * `existing_value` - The current value stored in the database (if any)
+    /// * `operands` - A slice of operands to merge, ordered from oldest to newest
+    fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
+        default_merge_batch(key, existing_value, operands, |k, e, v| self.merge(k, e, v))
+    }
+}
+
+pub fn default_merge_batch(
+    key: &Bytes,
+    existing_value: Option<Bytes>,
+    operands: &[Bytes],
+    merge: impl Fn(&Bytes, Option<Bytes>, Bytes) -> Bytes,
+) -> Bytes {
+    let mut result = existing_value;
+    for operand in operands {
+        result = Some(merge(key, result, operand.clone()));
+    }
+    result.expect("merge_batch called with no existing value and no operands")
 }
 
 /// Iterator over storage records.

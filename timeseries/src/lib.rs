@@ -49,6 +49,8 @@ mod minitsdb;
 mod promql;
 mod query;
 mod serde;
+#[cfg(feature = "http-server")]
+mod server;
 mod storage;
 #[cfg(test)]
 mod test_utils;

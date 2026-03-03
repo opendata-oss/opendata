@@ -16,20 +16,29 @@ path = "src/lib.rs"
 [[bin]]
 name = "opendata-timeseries"
 path = "src/main.rs"
+required-features = ["http-server"]
 
 [features]
 default = []
+http-server = [
+    "dep:axum",
+    "dep:axum-extra",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:clap",
+    "dep:prometheus-client",
+]
 testing = []
-remote-write = ["dep:prost", "dep:snap"]
+remote-write = ["http-server", "dep:prost", "dep:snap"]
 bench-internals = []
 
 [dependencies]
 async-trait.workspace = true
-axum.workspace = true
-axum-extra.workspace = true
+axum = { workspace = true, optional = true }
+axum-extra = { workspace = true, optional = true }
 bytes.workspace = true
 chrono.workspace = true
-clap.workspace = true
+clap = { workspace = true, optional = true }
 config.workspace = true
 dashmap.workspace = true
 moka.workspace = true
@@ -41,15 +50,15 @@ serde_yaml.workspace = true
 slatedb.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tower.workspace = true
-tower-http.workspace = true
+tower = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 
 blake3 = "1.8.2"
 mime_guess = "2"
-prometheus-client = "0.22"
+prometheus-client = { version = "0.22", optional = true }
 promql-parser = "0.6"
 regex = "1.0"
 ryu = "1"
@@ -73,7 +82,7 @@ opendata-macros.workspace = true
 
 [[test]]
 name = "http_server"
-required-features = ["testing"]
+required-features = ["testing", "http-server"]
 
 [[bench]]
 name = "evaluator_micorbench"

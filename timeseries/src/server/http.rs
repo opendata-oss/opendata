@@ -13,19 +13,19 @@ use axum_extra::extract::{Form, Query};
 use rust_embed::Embed;
 use tokio::signal;
 
-use super::config::PrometheusConfig;
 use super::metrics::Metrics;
 use super::middleware::{MetricsLayer, TracingLayer};
-use super::request::{
+use crate::error::Error;
+use crate::model::QueryOptions;
+use crate::promql::config::PrometheusConfig;
+use crate::promql::request::{
     LabelValuesParams, LabelsParams, MetadataParams, QueryParams, QueryRangeParams, SeriesParams,
 };
-use super::response::{
+use crate::promql::response::{
     self, LabelValuesResponse, LabelsResponse, MetadataResponse, QueryRangeResponse, QueryResponse,
     SeriesResponse,
 };
-use super::scraper::Scraper;
-use crate::error::Error;
-use crate::model::QueryOptions;
+use crate::promql::scraper::Scraper;
 use crate::tsdb::Tsdb;
 use crate::util::{parse_duration, parse_timestamp, parse_timestamp_to_seconds};
 
@@ -57,7 +57,7 @@ impl Default for ServerConfig {
 
 /// Build the production Axum router with all routes, middleware, and state.
 ///
-/// Used by `PromqlServer::run()` and the `testing` module for integration tests.
+/// Used by `TimeSeriesHttpServer::run()` and the `testing` module for integration tests.
 pub(crate) fn build_router(tsdb: Arc<Tsdb>, metrics: Arc<Metrics>) -> Router {
     let state = AppState {
         tsdb,
@@ -93,13 +93,13 @@ pub(crate) fn build_router(tsdb: Arc<Tsdb>, metrics: Arc<Metrics>) -> Router {
 }
 
 /// Prometheus-compatible HTTP server
-pub(crate) struct PromqlServer {
+pub(crate) struct TimeSeriesHttpServer {
     tsdb: Arc<Tsdb>,
     config: ServerConfig,
     storage: Arc<dyn common::Storage>,
 }
 
-impl PromqlServer {
+impl TimeSeriesHttpServer {
     pub(crate) fn new(
         tsdb: Arc<Tsdb>,
         config: ServerConfig,

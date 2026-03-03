@@ -4,13 +4,16 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use clap::Parser;
 use common::storage::config::StorageConfig;
 use serde::Deserialize;
 
 use crate::util::Result;
 
+#[cfg(feature = "http-server")]
+use clap::Parser;
+
 /// CLI arguments for the server.
+#[cfg(feature = "http-server")]
 #[derive(Parser, Debug)]
 #[command(name = "timeseries")]
 #[command(about = "Prometheus-compatible time series database")]

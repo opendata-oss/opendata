@@ -186,7 +186,7 @@ impl From<Error> for RemoteWriteError {
     )
 )]
 pub async fn handle_remote_write(
-    State(state): State<super::server::AppState>,
+    State(state): State<super::http::AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> std::result::Result<StatusCode, RemoteWriteError> {

@@ -27,7 +27,7 @@ const SAMPLE_TS_SECS: i64 = 3900;
 
 async fn setup() -> (Router, TestTsdb) {
     let tsdb = testing::create_test_tsdb().await;
-    let app = testing::build_app(&tsdb);
+    let app = testing::http::build_app(&tsdb);
     (app, tsdb)
 }
 

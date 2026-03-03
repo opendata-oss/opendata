@@ -9,6 +9,7 @@ mod model;
 mod promql;
 mod query;
 mod serde;
+mod server;
 mod storage;
 #[cfg(test)]
 mod test_utils;
@@ -22,7 +23,7 @@ use common::storage::factory::create_storage;
 use common::{StorageRuntime, StorageSemantics};
 
 use promql::config::{CliArgs, PrometheusConfig, load_config};
-use promql::server::{PromqlServer, ServerConfig};
+use server::{ServerConfig, TimeSeriesHttpServer};
 use storage::merge_operator::OpenTsdbMergeOperator;
 use tracing_subscriber::EnvFilter;
 use tsdb::Tsdb;
@@ -88,7 +89,7 @@ async fn main() {
     };
 
     // Create and run server
-    let server = PromqlServer::new(tsdb, config, storage);
+    let server = TimeSeriesHttpServer::new(tsdb, config, storage);
 
     tracing::info!(
         "Starting timeseries Prometheus-compatible server on port {}...",
