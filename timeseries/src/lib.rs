@@ -82,5 +82,5 @@ pub use model::{
     RangeSample, STALE_NAN, Sample, Series, SeriesBuilder, Temporality, is_stale_nan,
 };
 #[cfg(feature = "otel")]
-pub use otel::{OtelConfig, OtelSeriesBuilder};
+pub use otel::{OtelConfig, OtelConverter};
 pub use timeseries::TimeSeriesDb;

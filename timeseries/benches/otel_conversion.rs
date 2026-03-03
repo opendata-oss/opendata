@@ -1,6 +1,6 @@
 //! Microbenchmarks for OTLP → Series conversion.
 //!
-//! Measures the cost of `OtelSeriesBuilder::build()` — converting an
+//! Measures the cost of `OtelConverter::convert()` — converting an
 //! `ExportMetricsServiceRequest` into `Vec<Series>`.
 //!
 //! Run:
@@ -17,7 +17,7 @@ use opentelemetry_proto::tonic::{
     },
     resource::v1::Resource,
 };
-use timeseries::otel::{OtelConfig, OtelSeriesBuilder};
+use timeseries::otel::{OtelConfig, OtelConverter};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -147,7 +147,7 @@ fn build_request(metrics: Vec<Metric>) -> ExportMetricsServiceRequest {
 
 fn bench_gauge_conversion(c: &mut Criterion) {
     let mut group = c.benchmark_group("otel_gauge_conversion");
-    let builder = OtelSeriesBuilder::new(OtelConfig::default());
+    let builder = OtelConverter::new(OtelConfig::default());
 
     for &(num_metrics, dps_per_metric) in &[(10, 1), (100, 1), (100, 10), (1000, 1)] {
         let total_dps = num_metrics * dps_per_metric;
@@ -161,7 +161,7 @@ fn bench_gauge_conversion(c: &mut Criterion) {
             BenchmarkId::new("build", format!("{num_metrics}m×{dps_per_metric}dp")),
             |b| {
                 b.iter(|| {
-                    let series = builder.build(black_box(&request)).unwrap();
+                    let series = builder.convert(black_box(&request)).unwrap();
                     black_box(series);
                 });
             },
@@ -173,7 +173,7 @@ fn bench_gauge_conversion(c: &mut Criterion) {
 
 fn bench_mixed_conversion(c: &mut Criterion) {
     let mut group = c.benchmark_group("otel_mixed_conversion");
-    let builder = OtelSeriesBuilder::new(OtelConfig::default());
+    let builder = OtelConverter::new(OtelConfig::default());
 
     for &total_metrics in &[30, 300, 900] {
         let per_type = total_metrics / 3;
@@ -197,7 +197,7 @@ fn bench_mixed_conversion(c: &mut Criterion) {
             BenchmarkId::new("build", format!("{total_metrics}m_mixed")),
             |b| {
                 b.iter(|| {
-                    let series = builder.build(black_box(&request)).unwrap();
+                    let series = builder.convert(black_box(&request)).unwrap();
                     black_box(series);
                 });
             },

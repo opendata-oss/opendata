@@ -1,6 +1,6 @@
 //! OpenTelemetry metrics to Series conversion.
 //!
-//! This module provides [`OtelSeriesBuilder`], which decomposes an OTLP
+//! This module provides [`OtelConverter`], which converts an OTLP
 //! `ExportMetricsServiceRequest` into `Vec<Series>` suitable for
 //! [`TimeSeriesDb::write()`](crate::TimeSeriesDb::write).
 
@@ -13,7 +13,7 @@ use opentelemetry_proto::tonic::{
 use crate::error::Error;
 use crate::model::{Label, MetricType, Sample, Series, Temporality};
 
-/// Configuration for [`OtelSeriesBuilder`].
+/// Configuration for [`OtelConverter`].
 #[derive(Debug, Clone)]
 pub struct OtelConfig {
     /// Include resource attributes as labels on every series. Default: `true`.
@@ -33,22 +33,22 @@ impl Default for OtelConfig {
 
 /// Converts OTLP `ExportMetricsServiceRequest` into `Vec<Series>`.
 ///
-/// The builder walks the OTLP hierarchy (ResourceMetrics → ScopeMetrics →
+/// The converter walks the OTLP hierarchy (ResourceMetrics → ScopeMetrics →
 /// Metric → data points) and decomposes each OTEL metric type into
 /// Prometheus-compatible series following the
 /// [OTLP Prometheus compatibility spec](https://opentelemetry.io/docs/specs/otel/compatibility/prometheus_and_openmetrics/).
-pub struct OtelSeriesBuilder {
+pub struct OtelConverter {
     config: OtelConfig,
 }
 
-impl OtelSeriesBuilder {
-    /// Creates a new builder with the given configuration.
+impl OtelConverter {
+    /// Creates a new converter with the given configuration.
     pub fn new(config: OtelConfig) -> Self {
         Self { config }
     }
 
     /// Decompose an OTLP export request into Series.
-    pub fn build(&self, request: &ExportMetricsServiceRequest) -> Result<Vec<Series>, Error> {
+    pub fn convert(&self, request: &ExportMetricsServiceRequest) -> Result<Vec<Series>, Error> {
         let mut result = Vec::new();
         for rm in &request.resource_metrics {
             self.convert_resource_metrics(rm, &mut result);
@@ -286,9 +286,9 @@ fn to_temporality(t: i32) -> Temporality {
     }
 }
 
-// Per-type conversion methods as free functions that take &OtelSeriesBuilder
+// Per-type conversion methods as free functions that take &OtelConverter
 // (implemented via an impl block to keep them organized)
-impl OtelSeriesBuilder {
+impl OtelConverter {
     #[allow(clippy::too_many_arguments)]
     fn convert_gauge(
         &self,
@@ -867,8 +867,8 @@ mod tests {
     }
 
     fn build_default(request: &ExportMetricsServiceRequest) -> Vec<Series> {
-        let builder = OtelSeriesBuilder::new(OtelConfig::default());
-        builder.build(request).expect("build should succeed")
+        let builder = OtelConverter::new(OtelConfig::default());
+        builder.convert(request).expect("convert should succeed")
     }
 
     fn ts_nanos(ms: u64) -> u64 {
@@ -1483,11 +1483,11 @@ mod tests {
             )],
         )]);
 
-        let builder = OtelSeriesBuilder::new(OtelConfig {
+        let builder = OtelConverter::new(OtelConfig {
             include_resource_attrs: false,
             include_scope_attrs: true,
         });
-        let series = builder.build(&request).expect("build should succeed");
+        let series = builder.convert(&request).expect("convert should succeed");
         let matched = find_series(&series, "cpu_temp");
         assert_eq!(matched.len(), 1);
         assert_eq!(
@@ -1518,11 +1518,11 @@ mod tests {
             )],
         )]);
 
-        let builder = OtelSeriesBuilder::new(OtelConfig {
+        let builder = OtelConverter::new(OtelConfig {
             include_resource_attrs: true,
             include_scope_attrs: false,
         });
-        let series = builder.build(&request).expect("build should succeed");
+        let series = builder.convert(&request).expect("convert should succeed");
         let matched = find_series(&series, "cpu_temp");
         assert_eq!(matched.len(), 1);
         assert_eq!(

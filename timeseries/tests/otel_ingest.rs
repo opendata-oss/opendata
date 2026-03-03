@@ -2,7 +2,7 @@
 //! Integration tests for OTEL → TSDB → PromQL roundtrip.
 //!
 //! Exercises the full end-to-end path: build OTLP request → convert to Series
-//! via `OtelSeriesBuilder` → ingest into TSDB → flush → query back via PromQL
+//! via [`OtelConverter`] → ingest into TSDB → flush → query back via PromQL
 //! → assert results.
 
 use axum::Router;
@@ -22,7 +22,7 @@ use opentelemetry_proto::tonic::{
 use timeseries::testing::{
     self, MetadataResponse, QueryResponse, QueryResultValue, SeriesResponse, TestTsdb,
 };
-use timeseries::{OtelConfig, OtelSeriesBuilder};
+use timeseries::{OtelConfig, OtelConverter};
 use tower::ServiceExt;
 
 /// Timestamp in milliseconds — 3,900,000 ms = 3900 s, within bucket hour-60.
@@ -202,7 +202,7 @@ fn make_summary_dp(
 
 async fn setup() -> (Router, TestTsdb) {
     let tsdb = testing::create_test_tsdb().await;
-    let app = testing::build_app(&tsdb);
+    let app = testing::http::build_app(&tsdb);
     (app, tsdb)
 }
 
@@ -215,8 +215,8 @@ async fn body_string(resp: axum::response::Response) -> String {
 
 /// Convert an OTLP request to Series and ingest + flush into the test TSDB.
 async fn build_and_ingest(tsdb: &TestTsdb, request: &ExportMetricsServiceRequest) {
-    let builder = OtelSeriesBuilder::new(OtelConfig::default());
-    let series = builder.build(request).expect("OtelSeriesBuilder::build");
+    let builder = OtelConverter::new(OtelConfig::default());
+    let series = builder.convert(request).expect("OtelConverter::convert");
     tsdb.ingest_samples(series).await;
     tsdb.flush().await;
 }
