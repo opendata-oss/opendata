@@ -1783,9 +1783,8 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    #[tokio::test]
-    async fn eval_query_range_rejects_zero_step() {
-        let storage = create_test_storage().await;
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn eval_query_range_rejects_zero_step(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
 
         tsdb.ingest_samples(vec![create_sample("cpu", vec![], 1_000_000, 1.0)])

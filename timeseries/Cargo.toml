@@ -100,3 +100,4 @@ required-features = ["testing"]
 
 [[example]]
 name = "query_bench"
+required-features = ["http-server"]
