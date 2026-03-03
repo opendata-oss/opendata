@@ -698,8 +698,8 @@ mod tests {
         assert!(result.is_some());
     }
 
-    #[storage_test]
-    async fn should_return_shutdown_on_try_append_when_writer_dropped(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_return_shutdown_on_try_append_when_writer_dropped() {
         let (writer, mut handle, _) = create_writer().await;
         // Spawn the writer then immediately drop its task to simulate crash
         let task = handle.spawn(writer);
