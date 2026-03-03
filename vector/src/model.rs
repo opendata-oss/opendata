@@ -259,6 +259,27 @@ impl Default for Config {
     }
 }
 
+/// Configuration for a read-only vector database client.
+#[derive(Debug, Clone)]
+pub struct ReaderConfig {
+    /// Storage backend configuration.
+    pub storage: StorageConfig,
+
+    /// Vector dimensionality.
+    pub dimensions: u16,
+
+    /// Distance metric for similarity computation.
+    pub distance_metric: DistanceMetric,
+
+    /// Query-aware dynamic pruning epsilon (SPANN §3.2).
+    ///
+    /// See [`Config::query_pruning_factor`] for details.
+    pub query_pruning_factor: Option<f32>,
+
+    /// Metadata field schema.
+    pub metadata_fields: Vec<MetadataFieldSpec>,
+}
+
 /// Metadata field specification for schema definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataFieldSpec {

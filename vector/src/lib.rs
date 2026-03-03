@@ -39,6 +39,8 @@ pub mod flusher;
 pub mod hnsw;
 pub(crate) mod lire;
 pub mod model;
+pub(crate) mod query_engine;
+pub mod reader;
 pub mod serde;
 pub(crate) mod storage;
 pub(crate) mod view_reader;
@@ -50,6 +52,7 @@ pub(crate) mod test_utils;
 pub use db::VectorDb;
 pub use error::{Error, Result};
 pub use model::{
-    Attribute, AttributeValue, Config, DistanceMetric, FieldType, MetadataFieldSpec, SearchResult,
-    Vector, VectorBuilder,
+    Attribute, AttributeValue, Config, DistanceMetric, FieldType, MetadataFieldSpec, ReaderConfig,
+    SearchResult, Vector, VectorBuilder,
 };
+pub use reader::VectorDbReader;

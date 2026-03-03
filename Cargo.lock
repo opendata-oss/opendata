@@ -2649,6 +2649,7 @@ dependencies = [
  "rstest",
  "serde",
  "serde_yaml",
+ "slatedb",
  "tempfile",
  "tokio",
  "tokio-util",
