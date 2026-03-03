@@ -1,10 +1,11 @@
 use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::{Span, TokenStream};
-use quote::quote;
+use quote::{ToTokens, quote};
 use syn::{
-    Attribute, Expr, Ident, ItemFn, Token,
+    Attribute, Error, Expr, Ident, ItemFn, Token,
     parse::{Parse, ParseStream},
     parse_quote, parse2,
+    spanned::Spanned,
 };
 
 /// Parsed arguments for the storage test macro
@@ -109,6 +110,39 @@ pub fn test_impl(args: TokenStream, input: TokenStream) -> TokenStream {
     // construct inner function name
     let fn_name_inner = Ident::new(&format!("{}_inner", fn_name), item_fn.sig.ident.span());
 
+    // validate that the function only has a single parameter of type Arc<dyn Storage>
+    if item_fn.sig.inputs.len() != 1 {
+        return Error::new(
+            item_fn.span(),
+            "expected single parameter of type Arc<dyn Storage>",
+        )
+        .to_compile_error();
+    }
+
+    // validate type of parameter
+    let input_name = match &item_fn.sig.inputs[0] {
+        syn::FnArg::Typed(pat_type) => {
+            if &*pat_type.ty.to_token_stream().to_string() != "Arc < dyn Storage >" {
+                return Error::new(
+                    item_fn.span(),
+                    format!(
+                        "parameter '{}' must be of type Arc<dyn Storage>",
+                        pat_type.pat.to_token_stream()
+                    ),
+                )
+                .to_compile_error();
+            }
+            pat_type.pat.to_token_stream()
+        }
+        _ => {
+            return Error::new(
+                item_fn.span(),
+                "first parameter must be of type Arc<dyn Storage>",
+            )
+            .to_compile_error();
+        }
+    };
+
     // get statements from function body
     let body = item_fn.block.stmts.clone();
 
@@ -118,7 +152,7 @@ pub fn test_impl(args: TokenStream, input: TokenStream) -> TokenStream {
     // generate storage creation based on whether merge_operator was provided
     let storage_creation = if let Some(merge_op) = args_parsed.merge_operator {
         quote! {
-            let storage: std::sync::Arc<dyn Storage> = std::sync::Arc::new(
+            let #input_name: std::sync::Arc<dyn Storage> = std::sync::Arc::new(
                 #crate_path::storage::in_memory::InMemoryStorage::with_merge_operator(
                     std::sync::Arc::new(#merge_op)
                 )
@@ -126,7 +160,7 @@ pub fn test_impl(args: TokenStream, input: TokenStream) -> TokenStream {
         }
     } else {
         quote! {
-            let storage: std::sync::Arc<dyn Storage> = std::sync::Arc::new(
+            let #input_name: std::sync::Arc<dyn Storage> = std::sync::Arc::new(
                 #crate_path::storage::in_memory::InMemoryStorage::default()
             );
         }
@@ -137,11 +171,11 @@ pub fn test_impl(args: TokenStream, input: TokenStream) -> TokenStream {
         #[allow(unused_must_use)]
         async fn #fn_name() {
             #storage_creation
-            #fn_name_inner(storage.clone()).await;
-            let _ = storage.close().await;
+            #fn_name_inner(#input_name.clone()).await;
+            let _ = #input_name.close().await;
         }
 
-        async fn #fn_name_inner(storage: std::sync::Arc<dyn Storage>) {
+        async fn #fn_name_inner(#input_name: std::sync::Arc<dyn Storage>) {
             #(#body)*
         }
     }
@@ -191,7 +225,7 @@ mod tests {
     #[test]
     fn test_simple_function() {
         let input = quote! {
-            async fn my_test() {
+            async fn my_test(storage_test: Arc<dyn Storage>) {
                 assert_eq!(1, 1);
             }
         };
@@ -225,8 +259,8 @@ mod tests {
                 .block
                 .to_token_stream()
                 .to_string()
-                .contains("storage . close ()"),
-            "Wrapper should call storage.close()"
+                .contains("storage_test . close ()"),
+            "Wrapper should call storage_test.close()"
         );
 
         // verify inner function exists with correct name
@@ -249,7 +283,7 @@ mod tests {
                 .unwrap()
                 .to_token_stream()
                 .to_string(),
-            "storage : std :: sync :: Arc < dyn Storage >",
+            "storage_test : std :: sync :: Arc < dyn Storage >",
             "Inner function first parameter should be dynamic storage Arc"
         );
 
@@ -265,7 +299,7 @@ mod tests {
     fn test_with_merge_operator() {
         let args = quote! { merge_operator = MyMergeOp };
         let input = quote! {
-            async fn my_test() {
+            async fn my_test(storage_test: Arc<dyn Storage>) {
                 assert_eq!(1, 1);
             }
         };
@@ -301,8 +335,8 @@ mod tests {
             "Wrapper should call the inner function"
         );
         assert!(
-            wrapper_code.contains("storage . close ()"),
-            "Wrapper should call storage.close()"
+            wrapper_code.contains("storage_test . close ()"),
+            "Wrapper should call storage_test.close()"
         );
 
         // Verify inner function exists
@@ -315,7 +349,7 @@ mod tests {
     fn test_tokio_macro_args() {
         let input = quote! {
             #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-            async fn my_test() {
+            async fn my_test(storage_test: Arc<dyn Storage>) {
                 assert_eq!(1, 1);
             }
         };
