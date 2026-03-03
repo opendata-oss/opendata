@@ -13,7 +13,7 @@ This RFC defines the read API for `TimeSeriesDb`, using PromQL as the query lang
 
 RFC 0002 establishes `TimeSeriesDb` as the central write entry point with a Prometheus-style data model. The read side needs a corresponding embedded API. PromQL is the natural choice — it is the standard query language for Prometheus-style metrics, and the existing implementation already evaluates PromQL expressions against the storage layer internally.
 
-Today the PromQL evaluation is coupled to the HTTP server through the `PromqlRouter` trait, which uses service-oriented request/response types (string status fields, JSON-style containers). This RFC promotes those operations to the public `TimeSeriesDb` API with idiomatic Rust signatures. The service layer (RFC 0004) becomes a thin HTTP transport on top.
+Previously the PromQL evaluation was coupled to the HTTP server through a `PromqlRouter` trait that used service-oriented request/response types (string status fields, JSON-style containers). This RFC promotes those operations to the public `TimeSeriesDb` API with idiomatic Rust signatures. The service layer (RFC 0004) is a thin HTTP transport that deserializes HTTP parameters, calls these methods, and wraps results in the Prometheus JSON wire format.
 
 ### Why an Embedded API
 
@@ -54,33 +54,35 @@ impl TimeSeriesDb {
     /// If `time` is `None`, evaluates at the current time.
     ///
     /// ```rust
-    /// let results = tsdb.query("rate(http_requests_total[5m])", None).await?;
-    /// for sample in &results {
-    ///     println!("{}: {}", sample.metric_name(), sample.value);
+    /// let result = tsdb.query("rate(http_requests_total[5m])", None).await?;
+    /// for rs in result.into_matrix() {
+    ///     for (ts, val) in &rs.samples {
+    ///         println!("{}: {} = {}", rs.labels.metric_name(), ts, val);
+    ///     }
     /// }
     /// ```
     pub async fn query(
         &self,
         query: &str,
         time: Option<SystemTime>,
-    ) -> Result<Vec<InstantSample>, QueryError>;
+    ) -> Result<QueryValue, QueryError>;
 
     /// Evaluate a PromQL expression over a time range.
     ///
-    /// Returns the matching series with values at each step interval
-    /// from `start` to `end`.
+    /// Returns the matching series with values at each step interval.
+    /// The `range` parameter accepts any `RangeBounds<SystemTime>`,
+    /// consistent with the discovery methods.
     ///
     /// ```rust
     /// let results = tsdb.query_range(
     ///     "rate(http_requests_total[5m])",
-    ///     start, end, Duration::from_secs(15),
+    ///     start..=end, Duration::from_secs(15),
     /// ).await?;
     /// ```
     pub async fn query_range(
         &self,
         query: &str,
-        start: SystemTime,
-        end: SystemTime,
+        range: impl RangeBounds<SystemTime>,
         step: Duration,
     ) -> Result<Vec<RangeSample>, QueryError>;
 }
@@ -132,6 +134,27 @@ impl TimeSeriesDb {
 ### Result Types
 
 ```rust
+/// The result of an instant PromQL query.
+///
+/// PromQL expressions evaluate to either a scalar (e.g. `1+1`), a
+/// vector of time series samples (e.g. `http_requests_total`), or a
+/// matrix of range samples (e.g. `http_requests_total[5m]`).
+#[derive(Debug, Clone)]
+pub enum QueryValue {
+    Scalar { timestamp_ms: i64, value: f64 },
+    Vector(Vec<InstantSample>),
+    Matrix(Vec<RangeSample>),
+}
+
+impl QueryValue {
+    /// Convert into the most general representation (`Vec<RangeSample>`).
+    ///
+    /// - `Scalar` becomes a single `RangeSample` with empty labels and one sample.
+    /// - `Vector` becomes one `RangeSample` per instant sample (each with one point).
+    /// - `Matrix` is returned as-is.
+    pub fn into_matrix(self) -> Vec<RangeSample>;
+}
+
 /// A single series value at a point in time.
 #[derive(Debug, Clone)]
 pub struct InstantSample {
@@ -155,6 +178,10 @@ pub struct RangeSample {
 pub struct Labels(Vec<Label>);
 
 impl Labels {
+    pub fn empty() -> Self;
+    pub fn new(labels: Vec<Label>) -> Self;
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
     pub fn get(&self, name: &str) -> Option<&str>;
     pub fn metric_name(&self) -> &str;
     pub fn iter(&self) -> impl Iterator<Item = &Label>;
@@ -193,8 +220,8 @@ pub enum QueryError {
 
 | Aspect | LogDb | TimeSeriesDb |
 |--------|-------|--------------|
-| Primary read | `reader.read(offset)` → `Result<Record>` | `tsdb.query(expr, time)` → `Result<Vec<InstantSample>>` |
-| Range read | `reader.scan(start..end)` → `Result<Vec<Record>>` | `tsdb.query_range(expr, start, end, step)` → `Result<Vec<RangeSample>>` |
+| Primary read | `reader.read(offset)` → `Result<Record>` | `tsdb.query(expr, time)` → `Result<QueryValue>` |
+| Range read | `reader.scan(start..end)` → `Result<Vec<Record>>` | `tsdb.query_range(expr, start..=end, step)` → `Result<Vec<RangeSample>>` |
 | Discovery | `reader.scan()` | `tsdb.series()`, `tsdb.labels()`, `tsdb.label_values()` |
 | Query language | None (key/offset based) | PromQL |
 | Error handling | `Result<T, SlateDbError>` | `Result<T, QueryError>` |
@@ -205,7 +232,7 @@ pub enum QueryError {
 
 An earlier draft used `QueryRequest`/`QueryResponse` structs with string status fields and optional error messages, mirroring the Prometheus HTTP API format. This is appropriate for a service boundary but awkward for an embedded API — callers shouldn't have to check `response.status == "success"` in Rust. Plain method signatures with `Result` are more natural and let the service layer handle HTTP conventions.
 
-The result types defined here (`InstantSample`, `RangeSample`, `Labels`, `MetricMetadata`) replace the internal evaluator types and become the canonical query result representation. The existing `PromqlRouter` trait reduces to a thin adapter that serializes these types into the Prometheus JSON wire format (status/error envelopes, string-encoded values) for HTTP transport.
+The result types defined here (`InstantSample`, `RangeSample`, `Labels`, `MetricMetadata`) replace the internal evaluator types and become the canonical query result representation. The HTTP handlers serialize these types into the Prometheus JSON wire format (status/error envelopes, string-encoded values) directly — no intermediate adapter trait is needed.
 
 ### Separate TimeSeriesDbReader type
 
@@ -220,3 +247,5 @@ An alternative is to expose low-level iterators over stored series and samples, 
 | Date | Description |
 |---|---|
 | 2026-02-25 | Initial draft |
+| 2026-02-27 | `query` returns `QueryValue` enum (scalar vs vector), add `into_samples()` |
+| 2026-02-27 | `query_range` takes `impl RangeBounds<SystemTime>` instead of separate `start`/`end`, consistent with discovery methods |

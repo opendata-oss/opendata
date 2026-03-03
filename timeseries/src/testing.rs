@@ -23,9 +23,13 @@ pub use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig};
 
 // Re-export production types so integration tests use the real types.
 pub use crate::promql::response::{
-    ErrorResponse, LabelValuesResponse, LabelsResponse, MatrixSeries, QueryRangeResponse,
-    QueryRangeResult, QueryResponse, QueryResult, SeriesResponse, VectorSeries,
+    ErrorResponse, LabelValuesResponse, LabelsResponse, MatrixSeries, MetadataResponse,
+    QueryRangeResponse, QueryRangeResult, QueryResponse, QueryResult, QueryResultValue,
+    SeriesResponse, VectorSeries,
 };
+
+// Re-export conversion functions for benchmarks.
+pub use crate::promql::response::{query_value_to_response, range_result_to_response};
 
 /// Opaque handle to a test TSDB instance.
 ///

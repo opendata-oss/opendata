@@ -8,8 +8,8 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use timeseries::testing::{
-    self, LabelValuesResponse, LabelsResponse, QueryRangeResponse, QueryResponse, SeriesResponse,
-    TestTsdb, VectorSeries,
+    self, LabelValuesResponse, LabelsResponse, MetadataResponse, QueryRangeResponse, QueryResponse,
+    QueryResultValue, SeriesResponse, TestTsdb,
 };
 use timeseries::{Label, MetricType, Sample, Series};
 use tower::ServiceExt;
@@ -389,16 +389,89 @@ async fn test_roundtrip() {
     let data = parsed.data.unwrap();
     assert_eq!(data.result_type, "vector");
 
-    // Deserialize the result as a vector of VectorSeries
-    let results: Vec<VectorSeries> = serde_json::from_value(data.result).unwrap();
+    let results = match data.result {
+        QueryResultValue::Vector(v) => v,
+        _ => panic!("expected Vector variant"),
+    };
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].metric.get("__name__").unwrap(),
+        results[0].0.labels.get("__name__").unwrap(),
         "http_requests_total"
     );
-    assert_eq!(results[0].metric.get("method").unwrap(), "GET");
-    // Value should be "42" (string representation)
-    assert_eq!(results[0].value.1, "42");
+    assert_eq!(results[0].0.labels.get("method").unwrap(), "GET");
+    // Value should be 42.0
+    assert_eq!(results[0].0.value, 42.0);
+}
+
+// ---------------------------------------------------------------------------
+// /api/v1/metadata
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_metadata() {
+    let (app, tsdb) = setup().await;
+
+    // Ingest data with metadata
+    let series = vec![Series {
+        labels: vec![
+            Label::metric_name("http_requests_total"),
+            Label::new("method", "GET"),
+        ],
+        metric_type: Some(MetricType::Gauge),
+        unit: Some("requests".to_string()),
+        description: Some("Total HTTP requests".to_string()),
+        samples: vec![Sample::new(SAMPLE_TS_MS, 42.0)],
+    }];
+    tsdb.ingest_samples(series).await;
+    tsdb.flush().await;
+
+    let req = Request::get("/api/v1/metadata")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let parsed: MetadataResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(parsed.status, "success");
+    let data = parsed.data.unwrap();
+    assert!(
+        data.contains_key("http_requests_total"),
+        "metadata should contain ingested metric"
+    );
+    let entries = &data["http_requests_total"];
+    assert!(!entries.is_empty());
+    assert_eq!(entries[0].0.metric_type.as_ref().unwrap().as_str(), "gauge");
+    assert_eq!(
+        entries[0].0.description.as_deref().unwrap(),
+        "Total HTTP requests"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Limit parameter
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_series_with_limit() {
+    let (app, _) = setup_with_data().await;
+    // There are 2 http_requests_total series; limit=1 should return only 1.
+    let form_body = format!(
+        "match[]=http_requests_total&start={}&end={}&limit=1",
+        SAMPLE_TS_SECS - 300,
+        SAMPLE_TS_SECS + 300,
+    );
+    let req = Request::post("/api/v1/series")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(form_body))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let parsed: SeriesResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(parsed.status, "success");
+    let data = parsed.data.unwrap();
+    assert_eq!(data.len(), 1, "limit=1 should return only 1 series");
 }
 
 // ---------------------------------------------------------------------------
