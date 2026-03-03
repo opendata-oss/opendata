@@ -85,18 +85,18 @@ impl OtelConverter {
         resource_labels: &[Label],
         result: &mut Vec<Series>,
     ) {
-        let scope = sm.scope.as_ref();
-        let scope_name = scope.map(|s| s.name.as_str()).unwrap_or("");
-        let scope_version = scope.map(|s| s.version.as_str()).unwrap_or("");
-
         let mut base_labels = resource_labels.to_vec();
-        base_labels.push(Label::new("otel_scope_name", scope_name));
-        base_labels.push(Label::new("otel_scope_version", scope_version));
 
-        if self.config.include_scope_attrs
-            && let Some(s) = scope
-        {
-            base_labels.extend(collect_labels(&s.attributes));
+        if let Some(s) = sm.scope.as_ref() {
+            if !s.name.is_empty() {
+                base_labels.push(Label::new("otel_scope_name", &s.name));
+            }
+            if !s.version.is_empty() {
+                base_labels.push(Label::new("otel_scope_version", &s.version));
+            }
+            if self.config.include_scope_attrs {
+                base_labels.extend(collect_labels(&s.attributes));
+            }
         }
 
         for metric in &sm.metrics {
@@ -167,8 +167,8 @@ impl OtelConverter {
         description: &str,
         metric_type: MetricType,
         base_labels: &[Label],
-        dp_labels: Vec<Label>,
-        extra_labels: Vec<Label>,
+        dp_labels: &[Label],
+        extra_labels: &[Label],
         timestamp_ms: i64,
         value: f64,
     ) -> Series {
@@ -176,8 +176,8 @@ impl OtelConverter {
             Vec::with_capacity(1 + base_labels.len() + dp_labels.len() + extra_labels.len());
         labels.push(Label::metric_name(name));
         labels.extend_from_slice(base_labels);
-        labels.extend(dp_labels);
-        labels.extend(extra_labels);
+        labels.extend_from_slice(dp_labels);
+        labels.extend_from_slice(extra_labels);
 
         Series {
             labels,
@@ -315,8 +315,8 @@ impl OtelConverter {
                 description,
                 MetricType::Gauge,
                 base_labels,
-                dp_labels,
-                vec![],
+                &dp_labels,
+                &[],
                 timestamp_ms,
                 value,
             ));
@@ -371,8 +371,8 @@ impl OtelConverter {
                 description,
                 metric_type,
                 base_labels,
-                dp_labels,
-                vec![],
+                &dp_labels,
+                &[],
                 timestamp_ms,
                 value,
             ));
@@ -405,15 +405,15 @@ impl OtelConverter {
             let mut cumulative: u64 = 0;
             for (i, bound) in dp.explicit_bounds.iter().enumerate() {
                 cumulative += dp.bucket_counts.get(i).copied().unwrap_or(0);
-                let le_label = vec![Label::new("le", format_float(*bound))];
+                let le_label = [Label::new("le", format_float(*bound))];
                 result.push(Self::make_series(
                     &bucket_name,
                     unit,
                     description,
                     metric_type,
                     base_labels,
-                    dp_labels.clone(),
-                    le_label,
+                    &dp_labels,
+                    &le_label,
                     timestamp_ms,
                     cumulative as f64,
                 ));
@@ -425,14 +425,15 @@ impl OtelConverter {
                 .get(dp.explicit_bounds.len())
                 .copied()
                 .unwrap_or(0);
+            let inf_label = [Label::new("le", "+Inf")];
             result.push(Self::make_series(
                 &bucket_name,
                 unit,
                 description,
                 metric_type,
                 base_labels,
-                dp_labels.clone(),
-                vec![Label::new("le", "+Inf")],
+                &dp_labels,
+                &inf_label,
                 timestamp_ms,
                 cumulative as f64,
             ));
@@ -445,8 +446,8 @@ impl OtelConverter {
                     description,
                     metric_type,
                     base_labels,
-                    dp_labels.clone(),
-                    vec![],
+                    &dp_labels,
+                    &[],
                     timestamp_ms,
                     sum,
                 ));
@@ -459,14 +460,20 @@ impl OtelConverter {
                 description,
                 metric_type,
                 base_labels,
-                dp_labels,
-                vec![],
+                &dp_labels,
+                &[],
                 timestamp_ms,
                 dp.count as f64,
             ));
         }
     }
 
+    /// Convert an OTLP ExponentialHistogram to classic Prometheus `_bucket`/`_sum`/`_count` series.
+    ///
+    /// Only positive buckets and `zero_count` are converted to `le`-style buckets. Negative
+    /// buckets (representing negative measurement values) cannot be expressed as classic
+    /// Prometheus buckets; the OTLP spec maps them to Prometheus Native Histograms instead.
+    /// Negative observations are still reflected in `_count` and the `+Inf` bucket.
     #[allow(clippy::too_many_arguments)]
     fn convert_exp_histogram(
         &self,
@@ -489,13 +496,22 @@ impl OtelConverter {
             let timestamp_ms = (dp.time_unix_nano / 1_000_000) as i64;
             let dp_labels = collect_labels(&dp.attributes);
 
-            // Convert exponential buckets to explicit boundaries + cumulative counts
+            // Convert exponential buckets to classic Prometheus le-style buckets.
+            //
+            // Negative buckets (for negative measurement values) are not converted.
+            // The OTLP spec maps ExponentialHistograms to Prometheus Native Histograms
+            // which can represent negative ranges natively; classic le-buckets cannot.
+            // Negative bucket counts are still included in _count and +Inf.
             let base = 2_f64.powf(2_f64.powi(-dp.scale));
 
             let mut explicit_bounds = Vec::new();
             let mut cumulative_counts = Vec::new();
-            let mut cumulative: u64 = 0;
 
+            // Start cumulative from zero_count so that the first positive bucket
+            // includes observations in the zero range.
+            let mut cumulative: u64 = dp.zero_count;
+
+            // Positive buckets.
             if let Some(ref positive) = dp.positive {
                 let offset = positive.offset;
                 for (i, &count) in positive.bucket_counts.iter().enumerate() {
@@ -506,30 +522,32 @@ impl OtelConverter {
                 }
             }
 
-            // Emit bucket series
+            // Emit bucket series.
             for (bound, cum_count) in explicit_bounds.iter().zip(cumulative_counts.iter()) {
+                let le_label = [Label::new("le", format_float(*bound))];
                 result.push(Self::make_series(
                     &bucket_name,
                     unit,
                     description,
                     metric_type,
                     base_labels,
-                    dp_labels.clone(),
-                    vec![Label::new("le", format_float(*bound))],
+                    &dp_labels,
+                    &le_label,
                     timestamp_ms,
                     *cum_count as f64,
                 ));
             }
 
-            // +Inf bucket
+            // +Inf bucket.
+            let inf_label = [Label::new("le", "+Inf")];
             result.push(Self::make_series(
                 &bucket_name,
                 unit,
                 description,
                 metric_type,
                 base_labels,
-                dp_labels.clone(),
-                vec![Label::new("le", "+Inf")],
+                &dp_labels,
+                &inf_label,
                 timestamp_ms,
                 dp.count as f64,
             ));
@@ -542,8 +560,8 @@ impl OtelConverter {
                     description,
                     metric_type,
                     base_labels,
-                    dp_labels.clone(),
-                    vec![],
+                    &dp_labels,
+                    &[],
                     timestamp_ms,
                     sum,
                 ));
@@ -556,8 +574,8 @@ impl OtelConverter {
                 description,
                 metric_type,
                 base_labels,
-                dp_labels,
-                vec![],
+                &dp_labels,
+                &[],
                 timestamp_ms,
                 dp.count as f64,
             ));
@@ -583,14 +601,15 @@ impl OtelConverter {
 
             // Per-quantile series
             for q in &dp.quantile_values {
+                let q_label = [Label::new("quantile", format_float(q.quantile))];
                 result.push(Self::make_series(
                     &base_name,
                     unit,
                     description,
                     MetricType::Summary,
                     base_labels,
-                    dp_labels.clone(),
-                    vec![Label::new("quantile", format_float(q.quantile))],
+                    &dp_labels,
+                    &q_label,
                     timestamp_ms,
                     q.value,
                 ));
@@ -603,8 +622,8 @@ impl OtelConverter {
                 description,
                 MetricType::Summary,
                 base_labels,
-                dp_labels.clone(),
-                vec![],
+                &dp_labels,
+                &[],
                 timestamp_ms,
                 dp.sum,
             ));
@@ -616,8 +635,8 @@ impl OtelConverter {
                 description,
                 MetricType::Summary,
                 base_labels,
-                dp_labels,
-                vec![],
+                &dp_labels,
+                &[],
                 timestamp_ms,
                 dp.count as f64,
             ));
@@ -1288,6 +1307,137 @@ mod tests {
     }
 
     #[test]
+    fn should_include_zero_count_in_exp_histogram_buckets() {
+        // Exponential histogram with scale=0, zero_count=5, positive=[1, 2, 3]
+        // The zero bucket count should be included in the cumulative counts.
+        // Expected cumulative: bucket at le=2 → 5+1=6, le=4 → 6+2=8, le=8 → 8+3=11 (wait, we
+        // need to think about this more carefully)
+        //
+        // With scale=0: base = 2^(2^0) = 2
+        // Positive bucket boundaries: base^(offset+i+1) with offset=0 → [2, 4, 8]
+        // zero_count = 5 should appear in cumulative counts before positive buckets.
+        // Cumulative: le=2 → 5+1=6, le=4 → 6+2=8, le=8 → 8+3=11
+        // +Inf → dp.count = 11
+        let request = make_request(vec![make_resource_metrics(
+            vec![],
+            vec![make_scope_metrics(
+                "test",
+                "1.0",
+                vec![make_exp_histogram(
+                    "request_size",
+                    "",
+                    "",
+                    vec![ExponentialHistogramDataPoint {
+                        attributes: vec![],
+                        start_time_unix_nano: 0,
+                        time_unix_nano: ts_nanos(1000),
+                        count: 11,
+                        sum: Some(30.0),
+                        scale: 0,
+                        zero_count: 5,
+                        positive: Some(Buckets {
+                            offset: 0,
+                            bucket_counts: vec![1, 2, 3],
+                        }),
+                        negative: None,
+                        flags: 0,
+                        exemplars: vec![],
+                        min: None,
+                        max: None,
+                        zero_threshold: 0.0,
+                    }],
+                    AggregationTemporality::Cumulative as i32,
+                )],
+            )],
+        )]);
+
+        let series = build_default(&request);
+        let buckets = find_series(&series, "_bucket");
+
+        // First positive bucket should include zero_count in its cumulative.
+        let first_positive = buckets
+            .iter()
+            .find(|s| get_label(s, "le") == Some("2"))
+            .expect("should have le=2 bucket");
+        assert_eq!(
+            first_positive.samples[0].value, 6.0,
+            "first positive bucket should include zero_count (5) + bucket count (1) = 6"
+        );
+
+        // +Inf should equal dp.count
+        let inf = buckets
+            .iter()
+            .find(|s| get_label(s, "le") == Some("+Inf"))
+            .expect("should have +Inf bucket");
+        assert_eq!(inf.samples[0].value, 11.0);
+    }
+
+    #[test]
+    fn should_not_emit_negative_bucket_boundaries_in_exp_histogram() {
+        // Negative buckets cannot be represented as classic Prometheus le-style buckets.
+        // They should be silently skipped (counts still appear in +Inf via dp.count).
+        let request = make_request(vec![make_resource_metrics(
+            vec![],
+            vec![make_scope_metrics(
+                "test",
+                "1.0",
+                vec![make_exp_histogram(
+                    "temperature_delta",
+                    "",
+                    "",
+                    vec![ExponentialHistogramDataPoint {
+                        attributes: vec![],
+                        start_time_unix_nano: 0,
+                        time_unix_nano: ts_nanos(1000),
+                        count: 10,
+                        sum: Some(-5.0),
+                        scale: 0,
+                        zero_count: 4,
+                        positive: Some(Buckets {
+                            offset: 0,
+                            bucket_counts: vec![1],
+                        }),
+                        negative: Some(Buckets {
+                            offset: 0,
+                            bucket_counts: vec![2, 3],
+                        }),
+                        flags: 0,
+                        exemplars: vec![],
+                        min: None,
+                        max: None,
+                        zero_threshold: 0.0,
+                    }],
+                    AggregationTemporality::Cumulative as i32,
+                )],
+            )],
+        )]);
+
+        let series = build_default(&request);
+        let buckets = find_series(&series, "_bucket");
+
+        // No negative le values should be emitted.
+        let negative_buckets: Vec<_> = buckets
+            .iter()
+            .filter(|s| {
+                get_label(s, "le")
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .is_some_and(|v| v < 0.0)
+            })
+            .collect();
+        assert!(
+            negative_buckets.is_empty(),
+            "should not produce buckets with negative le values"
+        );
+
+        // +Inf still reflects total dp.count (including negative observations).
+        let inf = buckets
+            .iter()
+            .find(|s| get_label(s, "le") == Some("+Inf"))
+            .expect("should have +Inf bucket");
+        assert_eq!(inf.samples[0].value, 10.0);
+    }
+
+    #[test]
     fn should_decompose_summary_into_quantile_sum_count() {
         let request = make_request(vec![make_resource_metrics(
             vec![],
@@ -1533,6 +1683,41 @@ mod tests {
         // Scope name/version labels should still be present even when scope attrs are disabled,
         // as they are considered scope identity, not attributes.
         assert_eq!(get_label(matched[0], "otel_scope_name"), Some("test"));
+    }
+
+    #[test]
+    fn should_omit_scope_labels_when_scope_is_empty() {
+        let request = make_request(vec![make_resource_metrics(
+            vec![],
+            vec![make_scope_metrics(
+                "",
+                "",
+                vec![make_gauge(
+                    "cpu_temp",
+                    "",
+                    "",
+                    vec![make_number_dp(
+                        number_data_point::Value::AsDouble(70.0),
+                        ts_nanos(1000),
+                        vec![],
+                    )],
+                )],
+            )],
+        )]);
+
+        let series = build_default(&request);
+        let matched = find_series(&series, "cpu_temp");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(
+            get_label(matched[0], "otel_scope_name"),
+            None,
+            "empty scope name should not produce a label"
+        );
+        assert_eq!(
+            get_label(matched[0], "otel_scope_version"),
+            None,
+            "empty scope version should not produce a label"
+        );
     }
 
     #[test]
