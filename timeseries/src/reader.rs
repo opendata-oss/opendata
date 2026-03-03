@@ -22,8 +22,7 @@ use crate::error::{QueryError, Result};
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::minitsdb::MiniQueryReader;
 use crate::model::{
-    Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Sample, SeriesId,
-    TimeBucket,
+    Label, Labels, QueryOptions, QueryValue, RangeSample, Sample, SeriesId, TimeBucket,
 };
 use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::OpenTsdbStorageReadExt;
@@ -169,12 +168,19 @@ impl TimeSeriesDbReader {
             reader_options,
         )
         .await?;
-        Ok(Self::from_storage(storage))
+        Ok(Self::from_storage_with_capacity(
+            storage,
+            config.cache_capacity,
+        ))
     }
 
     /// Creates a TimeSeriesDbReader from an existing storage implementation.
     pub(crate) fn from_storage(storage: Arc<dyn StorageRead>) -> Self {
-        let query_cache = Cache::builder().max_capacity(50).build();
+        Self::from_storage_with_capacity(storage, 50)
+    }
+
+    fn from_storage_with_capacity(storage: Arc<dyn StorageRead>, cache_capacity: u64) -> Self {
+        let query_cache = Cache::builder().max_capacity(cache_capacity).build();
         Self {
             storage,
             query_cache,
@@ -240,17 +246,6 @@ impl TimeSeriesDbReader {
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
         find_label_values_in_range(self, label_name, matchers, range).await
-    }
-
-    /// Returns metric metadata, optionally filtered to a single metric.
-    ///
-    /// Note: metadata is populated from write operations and not persisted to
-    /// storage. A reader opened against existing data will always return empty.
-    pub async fn metadata(
-        &self,
-        _metric: Option<&str>,
-    ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
-        Ok(vec![])
     }
 }
 
@@ -463,27 +458,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reader_metadata_is_empty() {
-        // Metadata is populated during writes and not persisted to storage.
-        // A reader opened against existing data should return empty metadata.
-        let storage = create_shared_storage();
-
-        let tsdb = crate::tsdb::Tsdb::new(storage.clone());
-        let series = vec![
-            Series::builder("http_requests_total")
-                .label("method", "GET")
-                .sample(1700000000000, 100.0)
-                .build(),
-        ];
-        tsdb.ingest_samples(series).await.unwrap();
-        tsdb.flush().await.unwrap();
-
-        let reader = TimeSeriesDbReader::from_storage(storage);
-        let metadata = reader.metadata(None).await.unwrap();
-        assert!(metadata.is_empty());
-    }
-
-    #[tokio::test]
     async fn reader_query_range() {
         let storage = create_shared_storage();
 
@@ -562,6 +536,7 @@ mod tests {
         let reader = TimeSeriesDbReader::open(ReaderConfig {
             storage: storage_config.clone(),
             refresh_interval: Duration::from_millis(100),
+            ..Default::default()
         })
         .await
         .unwrap();

@@ -75,6 +75,7 @@ impl Default for Config {
 /// let config = ReaderConfig {
 ///     storage: StorageConfig::default(),
 ///     refresh_interval: Duration::from_secs(1),
+///     ..Default::default()
 /// };
 /// let reader = TimeSeriesDbReader::open(config).await?;
 /// ```
@@ -96,10 +97,24 @@ pub struct ReaderConfig {
     #[serde_as(as = "DurationMilliSeconds<u64>")]
     #[serde(default = "default_refresh_interval")]
     pub refresh_interval: Duration,
+
+    /// Maximum number of bucket readers to cache in memory.
+    ///
+    /// Each bucket reader holds open references to the underlying storage for
+    /// a single time bucket. Increasing this value trades memory for reduced
+    /// storage lookups on repeated queries.
+    ///
+    /// Defaults to 50.
+    #[serde(default = "default_cache_capacity")]
+    pub cache_capacity: u64,
 }
 
 fn default_refresh_interval() -> Duration {
     Duration::from_secs(1)
+}
+
+fn default_cache_capacity() -> u64 {
+    50
 }
 
 impl Default for ReaderConfig {
@@ -107,6 +122,7 @@ impl Default for ReaderConfig {
         Self {
             storage: StorageConfig::default(),
             refresh_interval: default_refresh_interval(),
+            cache_capacity: default_cache_capacity(),
         }
     }
 }
