@@ -109,9 +109,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             println!(
-                "{},{},{:.3},{}",
+                "{},instant,{:.3},{}",
                 name,
-                "instant",
                 elapsed.as_secs_f64() * 1000.0,
                 count
             );
@@ -130,9 +129,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             println!(
-                "{},{},{:.3},{}",
+                "{},range,{:.3},{}",
                 name,
-                "range",
                 elapsed.as_secs_f64() * 1000.0,
                 count
             );
@@ -151,9 +149,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             println!(
-                "{},{},{:.3},{}",
+                "{},series,{:.3},{}",
                 name,
-                "series",
                 elapsed.as_secs_f64() * 1000.0,
                 count
             );
@@ -172,9 +169,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             println!(
-                "{},{},{:.3},{}",
+                "{},labels,{:.3},{}",
                 name,
-                "labels",
                 elapsed.as_secs_f64() * 1000.0,
                 count
             );
@@ -193,9 +189,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             println!(
-                "{},{},{:.3},{}",
+                "{},label_values,{:.3},{}",
                 name,
-                "label_values",
                 elapsed.as_secs_f64() * 1000.0,
                 count
             );
