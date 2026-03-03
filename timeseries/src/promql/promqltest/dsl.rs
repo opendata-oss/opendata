@@ -1,4 +1,4 @@
-use crate::model::{Label, Labels};
+use crate::model::{Label, Labels, RangeSample};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,7 +16,7 @@ pub struct LoadCmd {
 pub struct EvalInstantCmd {
     pub time: SystemTime,
     pub query: String,
-    pub expected: Vec<ExpectedSample>,
+    pub expected: Vec<RangeSample>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,23 +45,6 @@ pub enum Command {
 pub struct SeriesLoad {
     pub labels: HashMap<String, String>, // includes __name__
     pub values: Vec<(i64, f64)>,         // (step_index, value)
-}
-
-#[derive(Debug, Clone)]
-pub struct ExpectedSample {
-    pub labels: Labels,
-    pub value: f64,
-    // Future:
-    // #[cfg(feature = "histograms")]
-    // pub histogram: Option<Histogram>,
-    // #[cfg(feature = "range-vectors")]
-    // pub range_values: Option<Vec<(i64, f64)>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct EvalResult {
-    pub labels: Labels,
-    pub value: f64,
 }
 
 // ============================================================================
@@ -394,7 +377,7 @@ fn parse_values(s: &str) -> Result<Vec<(i64, f64)>, String> {
     }
 }
 
-fn parse_expected(line: &str) -> Result<ExpectedSample, String> {
+fn parse_expected(line: &str) -> Result<RangeSample, String> {
     let mut chars = line.chars().peekable();
     let mut metric_part = String::new();
 
@@ -444,9 +427,9 @@ fn parse_expected(line: &str) -> Result<ExpectedSample, String> {
         labels.push(Label::metric_name(metric_name));
     }
     labels.sort();
-    Ok(ExpectedSample {
+    Ok(RangeSample {
         labels: Labels::new(labels),
-        value,
+        samples: vec![(0, value)],
     })
 }
 

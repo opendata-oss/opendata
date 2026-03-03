@@ -3,15 +3,15 @@
 //! Routes merge operations to the appropriate merge function based on the
 //! record type encoded in the key.
 
-use bytes::Bytes;
-use common::serde::key_prefix::KeyPrefix;
-use roaring::RoaringTreemap;
-use std::io::Cursor;
-
 use crate::serde::centroid_chunk::CentroidChunkValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
-use crate::serde::posting_list::merge_posting_list;
+use crate::serde::posting_list::{merge_batch_posting_list, merge_posting_list};
 use crate::serde::{EncodingError, KEY_VERSION, RecordType};
+use bytes::Bytes;
+use common::serde::key_prefix::KeyPrefix;
+use common::storage::default_merge_batch;
+use roaring::RoaringTreemap;
+use std::io::Cursor;
 
 /// Merge operator for vector database that handles merging of different record types.
 ///
@@ -67,6 +67,20 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
                 // just use new value. These should use Put, not Merge, but handle gracefully
                 new_value
             }
+        }
+    }
+
+    fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
+        let prefix =
+            KeyPrefix::from_bytes_versioned(key, KEY_VERSION).expect("Failed to decode key prefix");
+        let record_type = RecordType::from_id(prefix.tag().record_type())
+            .expect("Failed to get record type from record tag");
+
+        match record_type {
+            RecordType::PostingList => {
+                merge_batch_posting_list(existing_value, operands, self.dimensions)
+            }
+            _ => default_merge_batch(key, existing_value, operands, |k, e, v| self.merge(k, e, v)),
         }
     }
 }
