@@ -70,7 +70,6 @@ proptest.workspace = true
 rstest.workspace = true
 dashu-float.workspace = true
 opendata-macros.workspace = true
-criterion.workspace = true
 
 [[test]]
 name = "http_server"
