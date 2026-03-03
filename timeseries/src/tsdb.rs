@@ -1271,6 +1271,7 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
     async fn eval_query_range_should_return_range_samples() {
         let tsdb = create_tsdb_with_data().await;
         let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(4000);
