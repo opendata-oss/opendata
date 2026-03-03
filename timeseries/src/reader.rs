@@ -5,19 +5,112 @@
 //! coexists with a production writer without fencing — unlike `Db::open()`,
 //! which always fences the previous writer.
 
+use std::collections::HashMap;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use async_trait::async_trait;
+use common::StorageRead;
 use common::storage::factory::create_storage_read;
 use common::{StorageReaderRuntime, StorageSemantics};
+use moka::future::Cache;
+use tokio::sync::RwLock;
 
 use crate::config::ReaderConfig;
 use crate::error::{QueryError, Result};
-use crate::model::{Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample};
+use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
+use crate::minitsdb::MiniQueryReader;
+use crate::model::{
+    Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Sample, SeriesId,
+    TimeBucket,
+};
+use crate::query::{BucketQueryReader, QueryReader};
+use crate::storage::OpenTsdbStorageReadExt;
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
-use crate::tsdb_reader::TsdbReader;
-use crate::util::range_bounds_to_secs;
+use crate::tsdb::{
+    TsdbEngine, eval_query_range_bounds, find_label_values_in_range, find_labels_in_range,
+    find_series_in_range,
+};
+
+// ── ReaderQueryReader ────────────────────────────────────────────────
+
+/// QueryReader implementation for read-only access.
+///
+/// Wraps `Arc<MiniQueryReader>` per bucket (unlike `TsdbQueryReader` which
+/// uses owned `MiniQueryReader`).
+pub(crate) struct ReaderQueryReader {
+    mini_readers: HashMap<TimeBucket, Arc<MiniQueryReader>>,
+}
+
+impl ReaderQueryReader {
+    fn new(readers: Vec<(TimeBucket, Arc<MiniQueryReader>)>) -> Self {
+        Self {
+            mini_readers: readers.into_iter().collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl QueryReader for ReaderQueryReader {
+    async fn list_buckets(&self) -> Result<Vec<TimeBucket>> {
+        Ok(self.mini_readers.keys().cloned().collect())
+    }
+
+    async fn forward_index(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.forward_index(series_ids).await
+    }
+
+    async fn inverted_index(
+        &self,
+        bucket: &TimeBucket,
+        terms: &[Label],
+    ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.inverted_index(terms).await
+    }
+
+    async fn all_inverted_index(
+        &self,
+        bucket: &TimeBucket,
+    ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.all_inverted_index().await
+    }
+
+    async fn label_values(&self, bucket: &TimeBucket, label_name: &str) -> Result<Vec<String>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.label_values(label_name).await
+    }
+
+    async fn samples(
+        &self,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Sample>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.samples(series_id, start_ms, end_ms).await
+    }
+}
+
+// ── TimeSeriesDbReader ───────────────────────────────────────────────
 
 /// A read-only view of a time series database.
 ///
@@ -50,7 +143,11 @@ use crate::util::range_bounds_to_secs;
 /// let result = reader.query("rate(http_requests_total[5m])", None).await?;
 /// ```
 pub struct TimeSeriesDbReader {
-    reader: TsdbReader,
+    storage: Arc<dyn StorageRead>,
+    /// LRU cache for read-only query buckets.
+    query_cache: Cache<TimeBucket, Arc<MiniQueryReader>>,
+    /// Metadata catalog (always empty for reader — metadata is populated during writes).
+    metadata_catalog_: RwLock<HashMap<String, Vec<MetricMetadata>>>,
 }
 
 impl TimeSeriesDbReader {
@@ -74,18 +171,42 @@ impl TimeSeriesDbReader {
             reader_options,
         )
         .await?;
-        Ok(Self {
-            reader: TsdbReader::new(storage),
-        })
+        Ok(Self::from_storage(storage))
     }
 
     /// Creates a TimeSeriesDbReader from an existing storage implementation.
     #[cfg(test)]
-    pub(crate) fn from_storage(storage: Arc<dyn common::StorageRead>) -> Self {
+    pub(crate) fn from_storage(storage: Arc<dyn StorageRead>) -> Self {
+        let query_cache = Cache::builder().max_capacity(50).build();
         Self {
-            reader: TsdbReader::new(storage),
+            storage,
+            query_cache,
+            metadata_catalog_: RwLock::new(HashMap::new()),
         }
     }
+
+    /// Creates a TimeSeriesDbReader from an existing storage implementation.
+    #[cfg(not(test))]
+    fn from_storage(storage: Arc<dyn StorageRead>) -> Self {
+        let query_cache = Cache::builder().max_capacity(50).build();
+        Self {
+            storage,
+            query_cache,
+            metadata_catalog_: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Get a cached bucket reader, loading from storage if needed.
+    async fn get_or_load_bucket(&self, bucket: TimeBucket) -> Arc<MiniQueryReader> {
+        let storage = self.storage.clone();
+        self.query_cache
+            .get_with(bucket, async move {
+                Arc::new(MiniQueryReader::new(bucket, storage))
+            })
+            .await
+    }
+
+    // ── Public inherent methods ───────────────────────────────────────
 
     /// Evaluates an instant PromQL query at a single point in time.
     ///
@@ -95,9 +216,7 @@ impl TimeSeriesDbReader {
         query: &str,
         time: Option<SystemTime>,
     ) -> std::result::Result<QueryValue, QueryError> {
-        self.reader
-            .eval_query(query, time, &QueryOptions::default())
-            .await
+        <Self as TsdbEngine>::eval_query(self, query, time, &QueryOptions::default()).await
     }
 
     /// Evaluates a range PromQL query over a time interval.
@@ -107,9 +226,7 @@ impl TimeSeriesDbReader {
         range: impl RangeBounds<SystemTime>,
         step: Duration,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-        self.reader
-            .eval_query_range(query, range, step, &QueryOptions::default())
-            .await
+        eval_query_range_bounds(self, query, range, step, &QueryOptions::default()).await
     }
 
     /// Returns the set of label-sets matching the given series matchers.
@@ -118,8 +235,7 @@ impl TimeSeriesDbReader {
         matchers: &[&str],
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<Labels>, QueryError> {
-        let (start, end) = range_bounds_to_secs(range)?;
-        self.reader.find_series(matchers, start, end).await
+        find_series_in_range(self, matchers, range).await
     }
 
     /// Returns the set of label names matching the given matchers.
@@ -128,8 +244,7 @@ impl TimeSeriesDbReader {
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        let (start, end) = range_bounds_to_secs(range)?;
-        self.reader.find_labels(matchers, start, end).await
+        find_labels_in_range(self, matchers, range).await
     }
 
     /// Returns the set of values for a given label name.
@@ -139,10 +254,7 @@ impl TimeSeriesDbReader {
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        let (start, end) = range_bounds_to_secs(range)?;
-        self.reader
-            .find_label_values(label_name, matchers, start, end)
-            .await
+        find_label_values_in_range(self, label_name, matchers, range).await
     }
 
     /// Returns metric metadata, optionally filtered to a single metric.
@@ -153,7 +265,48 @@ impl TimeSeriesDbReader {
         &self,
         metric: Option<&str>,
     ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
-        self.reader.find_metadata(metric).await
+        <Self as TsdbEngine>::find_metadata(self, metric).await
+    }
+}
+
+// ── TsdbEngine for TimeSeriesDbReader ────────────────────────────────
+
+#[async_trait]
+impl TsdbEngine for TimeSeriesDbReader {
+    type QR = ReaderQueryReader;
+
+    async fn make_query_reader(&self, start: i64, end: i64) -> Result<ReaderQueryReader> {
+        let buckets = self
+            .storage
+            .get_buckets_in_range(Some(start), Some(end))
+            .await?;
+
+        let mut readers = Vec::new();
+        for bucket in buckets {
+            let mini = self.get_or_load_bucket(bucket).await;
+            readers.push((bucket, mini));
+        }
+
+        Ok(ReaderQueryReader::new(readers))
+    }
+
+    async fn make_query_reader_for_ranges(
+        &self,
+        ranges: &[(i64, i64)],
+    ) -> Result<ReaderQueryReader> {
+        let buckets = self.storage.get_buckets_for_ranges(ranges).await?;
+
+        let mut readers = Vec::new();
+        for bucket in buckets {
+            let mini = self.get_or_load_bucket(bucket).await;
+            readers.push((bucket, mini));
+        }
+
+        Ok(ReaderQueryReader::new(readers))
+    }
+
+    fn metadata_catalog(&self) -> &RwLock<HashMap<String, Vec<MetricMetadata>>> {
+        &self.metadata_catalog_
     }
 }
 
@@ -277,10 +430,12 @@ mod tests {
         let tsdb = crate::tsdb::Tsdb::new(storage.clone());
 
         // Write initial data
-        let series = vec![Series::builder("metric_a")
-            .label("env", "prod")
-            .sample(1700000000000, 1.0)
-            .build()];
+        let series = vec![
+            Series::builder("metric_a")
+                .label("env", "prod")
+                .sample(1700000000000, 1.0)
+                .build(),
+        ];
         tsdb.ingest_samples(series).await.unwrap();
         tsdb.flush().await.unwrap();
 
@@ -296,10 +451,12 @@ mod tests {
         }
 
         // Writer can still write more data (no fencing error)
-        let more_series = vec![Series::builder("metric_a")
-            .label("env", "prod")
-            .sample(1700000002000, 2.0)
-            .build()];
+        let more_series = vec![
+            Series::builder("metric_a")
+                .label("env", "prod")
+                .sample(1700000002000, 2.0)
+                .build(),
+        ];
         tsdb.ingest_samples(more_series).await.unwrap();
         tsdb.flush().await.unwrap();
 
@@ -322,10 +479,12 @@ mod tests {
         let storage = create_shared_storage();
 
         let tsdb = crate::tsdb::Tsdb::new(storage.clone());
-        let series = vec![Series::builder("http_requests_total")
-            .label("method", "GET")
-            .sample(1700000000000, 100.0)
-            .build()];
+        let series = vec![
+            Series::builder("http_requests_total")
+                .label("method", "GET")
+                .sample(1700000000000, 100.0)
+                .build(),
+        ];
         tsdb.ingest_samples(series).await.unwrap();
         tsdb.flush().await.unwrap();
 
@@ -339,14 +498,16 @@ mod tests {
         let storage = create_shared_storage();
 
         let tsdb = crate::tsdb::Tsdb::new(storage.clone());
-        let series = vec![Series::builder("counter")
-            .label("job", "test")
-            .sample(1700000000000, 100.0)
-            .sample(1700000015000, 115.0)
-            .sample(1700000030000, 130.0)
-            .sample(1700000045000, 145.0)
-            .sample(1700000060000, 160.0)
-            .build()];
+        let series = vec![
+            Series::builder("counter")
+                .label("job", "test")
+                .sample(1700000000000, 100.0)
+                .sample(1700000015000, 115.0)
+                .sample(1700000030000, 130.0)
+                .sample(1700000045000, 145.0)
+                .sample(1700000060000, 160.0)
+                .build(),
+        ];
         tsdb.ingest_samples(series).await.unwrap();
         tsdb.flush().await.unwrap();
 
@@ -374,7 +535,9 @@ mod tests {
     #[tokio::test]
     async fn slatedb_writer_and_reader_coexist_no_fencing() {
         use crate::{Config, ReaderConfig, TimeSeriesDb};
-        use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
+        use common::storage::config::{
+            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+        };
 
         let tmp_dir = tempfile::tempdir().unwrap();
         let storage_config = common::StorageConfig::SlateDb(SlateDbStorageConfig {
@@ -394,12 +557,14 @@ mod tests {
         .await
         .unwrap();
 
-        let series = vec![Series::builder("http_requests_total")
-            .label("method", "GET")
-            .label("status", "200")
-            .sample(1700000000000, 100.0)
-            .sample(1700000001000, 101.0)
-            .build()];
+        let series = vec![
+            Series::builder("http_requests_total")
+                .label("method", "GET")
+                .label("status", "200")
+                .sample(1700000000000, 100.0)
+                .sample(1700000001000, 101.0)
+                .build(),
+        ];
         writer.write(series).await.unwrap();
         writer.flush().await.unwrap();
 
@@ -426,17 +591,22 @@ mod tests {
         }
 
         // 4. Writer can still write after reader opened (no fencing)
-        let more_series = vec![Series::builder("http_requests_total")
-            .label("method", "GET")
-            .label("status", "200")
-            .sample(1700000002000, 102.0)
-            .build()];
+        let more_series = vec![
+            Series::builder("http_requests_total")
+                .label("method", "GET")
+                .label("status", "200")
+                .sample(1700000002000, 102.0)
+                .build(),
+        ];
         writer.write(more_series).await.unwrap();
         writer.flush().await.unwrap();
 
         // 5. Verify writer is still functional by querying through the writer
         let query_time2 = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000002000);
-        let writer_result = writer.query("http_requests_total", Some(query_time2)).await.unwrap();
+        let writer_result = writer
+            .query("http_requests_total", Some(query_time2))
+            .await
+            .unwrap();
         match &writer_result {
             QueryValue::Vector(samples) => {
                 assert_eq!(samples.len(), 1);
@@ -460,11 +630,87 @@ mod tests {
             .unwrap();
         match &reader_result {
             QueryValue::Vector(samples) => {
-                assert_eq!(samples.len(), 1, "reader should still work after writer writes more data");
+                assert_eq!(
+                    samples.len(),
+                    1,
+                    "reader should still work after writer writes more data"
+                );
                 assert_eq!(samples[0].value, 101.0);
             }
             _ => panic!("expected Vector from reader, got {:?}", reader_result),
         }
+    }
+
+    /// Writer and reader must return identical timestamps for query_range
+    /// with an inclusive end (`..=end`) where end is step-aligned. This
+    /// guards against the regression where double-converting through
+    /// `range_bounds_to_system_time` shifted the inclusive end by 1ms.
+    #[tokio::test]
+    async fn writer_and_reader_query_range_parity_at_boundary() {
+        use crate::model::QueryOptions;
+
+        let storage = create_shared_storage();
+        let tsdb = crate::tsdb::Tsdb::new(storage.clone());
+
+        // 5 samples at 15s intervals: t+0, t+15, t+30, t+45, t+60
+        let series = vec![
+            Series::builder("gauge")
+                .label("job", "test")
+                .sample(1700000000000, 1.0)
+                .sample(1700000015000, 2.0)
+                .sample(1700000030000, 3.0)
+                .sample(1700000045000, 4.0)
+                .sample(1700000060000, 5.0)
+                .build(),
+        ];
+        tsdb.ingest_samples(series).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        let reader = TimeSeriesDbReader::from_storage(storage.clone());
+
+        // Use Tsdb directly for the writer side (same data, same storage)
+        let writer_tsdb = crate::tsdb::Tsdb::new(storage);
+
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1700000000);
+        let end = SystemTime::UNIX_EPOCH + Duration::from_secs(1700000060);
+        let step = Duration::from_secs(15);
+
+        let reader_result = reader
+            .query_range("gauge", start..=end, step)
+            .await
+            .unwrap();
+        let writer_result = writer_tsdb
+            .eval_query_range("gauge", start..=end, step, &QueryOptions::default())
+            .await
+            .unwrap();
+
+        // Extract sorted (timestamp_ms, value) pairs for comparison
+        let extract_timestamps = |samples: &[RangeSample]| -> Vec<Vec<i64>> {
+            let mut result: Vec<Vec<i64>> = samples
+                .iter()
+                .map(|rs| rs.samples.iter().map(|(ts, _)| *ts).collect())
+                .collect();
+            result.sort();
+            result
+        };
+
+        let reader_ts = extract_timestamps(&reader_result);
+        let writer_ts = extract_timestamps(&writer_result);
+
+        assert_eq!(
+            reader_ts, writer_ts,
+            "reader and writer must produce identical timestamps for the same range query"
+        );
+        // The final step at t+60s must be present (inclusive end).
+        let all_ts: Vec<i64> = reader_result
+            .iter()
+            .flat_map(|rs| rs.samples.iter().map(|(ts, _)| *ts))
+            .collect();
+        assert!(
+            all_ts.contains(&1700000060000),
+            "inclusive end (t+60s) must be included; got timestamps: {:?}",
+            all_ts,
+        );
     }
 
     #[tokio::test]
@@ -472,10 +718,12 @@ mod tests {
         let storage = create_shared_storage();
 
         let tsdb = crate::tsdb::Tsdb::new(storage.clone());
-        let series = vec![Series::builder("counter")
-            .label("job", "test")
-            .sample(1700000000000, 100.0)
-            .build()];
+        let series = vec![
+            Series::builder("counter")
+                .label("job", "test")
+                .sample(1700000000000, 100.0)
+                .build(),
+        ];
         tsdb.ingest_samples(series).await.unwrap();
         tsdb.flush().await.unwrap();
 

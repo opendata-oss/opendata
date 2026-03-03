@@ -12,10 +12,12 @@ use common::{StorageRuntime, StorageSemantics, create_storage};
 
 use crate::config::Config;
 use crate::error::{QueryError, Result};
-use crate::model::{Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Series};
+use crate::model::{Labels, MetricMetadata, QueryValue, RangeSample, Series};
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
-use crate::tsdb::Tsdb;
-use crate::util::range_bounds_to_secs;
+use crate::tsdb::{
+    Tsdb, TsdbEngine, eval_query_range_bounds, find_label_values_in_range, find_labels_in_range,
+    find_series_in_range,
+};
 
 /// A time series database for storing and querying metrics.
 ///
@@ -134,7 +136,7 @@ impl TimeSeriesDb {
         time: Option<SystemTime>,
     ) -> std::result::Result<QueryValue, QueryError> {
         self.tsdb
-            .eval_query(query, time, &QueryOptions::default())
+            .eval_query(query, time, &crate::model::QueryOptions::default())
             .await
     }
 
@@ -145,9 +147,15 @@ impl TimeSeriesDb {
         range: impl RangeBounds<SystemTime>,
         step: Duration,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-        self.tsdb
-            .eval_query_range(query, range, step, &QueryOptions::default())
-            .await
+        // Route through shared range helpers so bound conversion happens once.
+        eval_query_range_bounds(
+            &self.tsdb,
+            query,
+            range,
+            step,
+            &crate::model::QueryOptions::default(),
+        )
+        .await
     }
 
     /// Returns the set of label-sets matching the given series matchers.
@@ -156,8 +164,7 @@ impl TimeSeriesDb {
         matchers: &[&str],
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<Labels>, QueryError> {
-        let (start, end) = range_bounds_to_secs(range)?;
-        self.tsdb.find_series(matchers, start, end).await
+        find_series_in_range(&self.tsdb, matchers, range).await
     }
 
     /// Returns the set of label names matching the given matchers.
@@ -166,8 +173,7 @@ impl TimeSeriesDb {
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        let (start, end) = range_bounds_to_secs(range)?;
-        self.tsdb.find_labels(matchers, start, end).await
+        find_labels_in_range(&self.tsdb, matchers, range).await
     }
 
     /// Returns the set of values for a given label name.
@@ -177,10 +183,7 @@ impl TimeSeriesDb {
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        let (start, end) = range_bounds_to_secs(range)?;
-        self.tsdb
-            .find_label_values(label_name, matchers, start, end)
-            .await
+        find_label_values_in_range(&self.tsdb, label_name, matchers, range).await
     }
 
     /// Returns metric metadata, optionally filtered to a single metric.

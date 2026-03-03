@@ -20,19 +20,43 @@ use timeseries::{ReaderConfig, TimeSeriesDbReader};
 const QUERIES: &[(&str, &str)] = &[
     ("instant_simple", "up"),
     ("instant_rate", "rate(http_requests_total[5m])"),
-    ("instant_sum_rate", "sum(rate(http_requests_total[5m])) by (status)"),
-    ("instant_histogram", "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))"),
-    ("instant_topk", "topk(10, sum(rate(http_requests_total[5m])) by (handler))"),
+    (
+        "instant_sum_rate",
+        "sum(rate(http_requests_total[5m])) by (status)",
+    ),
+    (
+        "instant_histogram",
+        "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+    ),
+    (
+        "instant_topk",
+        "topk(10, sum(rate(http_requests_total[5m])) by (handler))",
+    ),
     ("instant_absent", "absent(nonexistent_metric)"),
     ("instant_scalar", "scalar(sum(up))"),
     ("instant_count", "count(up) by (job)"),
-    ("instant_avg", "avg(rate(http_requests_total[5m])) by (method)"),
+    (
+        "instant_avg",
+        "avg(rate(http_requests_total[5m])) by (method)",
+    ),
     ("range_rate", "rate(http_requests_total[5m])"),
-    ("range_sum_rate", "sum(rate(http_requests_total[5m])) by (status)"),
-    ("range_histogram", "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))"),
-    ("range_topk", "topk(10, sum(rate(http_requests_total[5m])) by (handler))"),
+    (
+        "range_sum_rate",
+        "sum(rate(http_requests_total[5m])) by (status)",
+    ),
+    (
+        "range_histogram",
+        "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+    ),
+    (
+        "range_topk",
+        "topk(10, sum(rate(http_requests_total[5m])) by (handler))",
+    ),
     ("range_count", "count(up) by (job)"),
-    ("range_avg", "avg(rate(http_requests_total[5m])) by (method)"),
+    (
+        "range_avg",
+        "avg(rate(http_requests_total[5m])) by (method)",
+    ),
     ("series_discovery", "{job=~\".+\"}"),
     ("label_names", ""),
     ("label_values", "__name__"),

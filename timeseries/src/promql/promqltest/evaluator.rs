@@ -1,6 +1,6 @@
 use crate::model::{Labels, QueryOptions, QueryValue};
 use crate::promql::promqltest::dsl::EvalResult;
-use crate::tsdb::Tsdb;
+use crate::tsdb::{Tsdb, TsdbEngine};
 use std::time::SystemTime;
 
 /// Execute instant query and return structured results

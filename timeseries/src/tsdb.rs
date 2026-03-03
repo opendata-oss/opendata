@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::RangeBounds;
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use common::Storage;
@@ -27,7 +28,11 @@ use crate::util::Result;
 /// Uses `compute_preload_ranges` to account for `offset`/`@` modifiers.
 /// Falls back to a single `[(default_start, default_end)]` for
 /// selector-free expressions.
-pub(crate) fn preload_ranges(stmt: &EvalStmt, default_start: i64, default_end: i64) -> Vec<(i64, i64)> {
+pub(crate) fn preload_ranges(
+    stmt: &EvalStmt,
+    default_start: i64,
+    default_end: i64,
+) -> Vec<(i64, i64)> {
     let ranges = compute_preload_ranges(&stmt.expr, stmt.start, stmt.end, stmt.lookback_delta);
     if ranges.is_empty() {
         vec![(default_start, default_end)]
@@ -83,10 +88,192 @@ async fn get_matching_series_multi_bucket<R: QueryReader>(
     Ok(bucket_series_map)
 }
 
-// ── Shared evaluation free functions ────────────────────────────────
+// ── TsdbEngine trait ─────────────────────────────────────────────────
 //
-// These are generic over `QueryReader` so they work with both `TsdbQueryReader`
-// (used by `Tsdb`) and `TsdbReader` (used by `TimeSeriesDbReader`).
+// Factors out the 6 duplicated eval/find methods shared between `Tsdb`
+// (writer) and `TimeSeriesDbReader` (reader). Each implementor provides
+// its own `QueryReader` construction; the query logic lives once in the
+// default methods.
+
+#[async_trait]
+pub(crate) trait TsdbEngine: Send + Sync {
+    type QR: QueryReader + Send + Sync;
+
+    /// Build a query reader spanning `[start, end]` (seconds).
+    async fn make_query_reader(&self, start: i64, end: i64) -> Result<Self::QR>;
+
+    /// Build a query reader spanning a set of disjoint ranges (seconds).
+    async fn make_query_reader_for_ranges(&self, ranges: &[(i64, i64)]) -> Result<Self::QR>;
+
+    /// Access the metadata catalog.
+    fn metadata_catalog(&self) -> &RwLock<HashMap<String, Vec<MetricMetadata>>>;
+
+    // ── Provided: 6 default methods written once ──
+
+    /// Evaluate an instant PromQL query, returning typed `InstantSample`s.
+    async fn eval_query(
+        &self,
+        query: &str,
+        time: Option<std::time::SystemTime>,
+        opts: &QueryOptions,
+    ) -> std::result::Result<QueryValue, QueryError> {
+        let expr = promql_parser::parser::parse(query)
+            .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
+
+        let query_time = time.unwrap_or_else(std::time::SystemTime::now);
+        let lookback_delta = opts.lookback_delta;
+        let stmt = EvalStmt {
+            expr,
+            start: query_time,
+            end: query_time,
+            interval: Duration::from_secs(0),
+            lookback_delta,
+        };
+
+        let query_time_secs = query_time.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let lookback_start_secs = query_time
+            .checked_sub(lookback_delta)
+            .unwrap_or(UNIX_EPOCH)
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs() as i64;
+
+        let ranges = preload_ranges(&stmt, lookback_start_secs, query_time_secs);
+        let reader = self.make_query_reader_for_ranges(&ranges).await?;
+
+        evaluate_instant(&reader, stmt, query_time).await
+    }
+
+    /// Evaluate a range PromQL query, returning typed `RangeSample`s.
+    async fn eval_query_range(
+        &self,
+        query: &str,
+        start: std::time::SystemTime,
+        end: std::time::SystemTime,
+        step: Duration,
+        opts: &QueryOptions,
+    ) -> std::result::Result<Vec<RangeSample>, QueryError> {
+        let expr = promql_parser::parser::parse(query)
+            .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
+
+        let lookback_delta = opts.lookback_delta;
+        let stmt = EvalStmt {
+            expr,
+            start,
+            end,
+            interval: step,
+            lookback_delta,
+        };
+
+        let default_start_secs = start
+            .checked_sub(lookback_delta)
+            .unwrap_or(UNIX_EPOCH)
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs() as i64;
+        let default_end_secs = end.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
+        let reader = self.make_query_reader_for_ranges(&ranges).await?;
+
+        evaluate_range(&reader, stmt).await
+    }
+
+    /// Discover series matching any of the given selectors.
+    async fn find_series(
+        &self,
+        matchers: &[&str],
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<Labels>, QueryError> {
+        let reader = self.make_query_reader(start_secs, end_secs).await?;
+        discover_series(&reader, matchers).await
+    }
+
+    /// Discover label names, optionally filtered by matchers.
+    async fn find_labels(
+        &self,
+        matchers: Option<&[&str]>,
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        let reader = self.make_query_reader(start_secs, end_secs).await?;
+        discover_labels(&reader, matchers).await
+    }
+
+    /// Discover values for a specific label, optionally filtered by matchers.
+    async fn find_label_values(
+        &self,
+        label_name: &str,
+        matchers: Option<&[&str]>,
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        let reader = self.make_query_reader(start_secs, end_secs).await?;
+        discover_label_values(&reader, label_name, matchers).await
+    }
+
+    /// Return metadata for all (or a specific) metric.
+    async fn find_metadata(
+        &self,
+        metric: Option<&str>,
+    ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
+        let catalog = self.metadata_catalog().read().await;
+
+        let entries: Vec<MetricMetadata> = match metric {
+            Some(name) => catalog.get(name).cloned().unwrap_or_default(),
+            None => catalog.values().flatten().cloned().collect(),
+        };
+
+        Ok(entries)
+    }
+}
+
+/// Evaluate a range query using Rust range bounds, converting to
+/// `(start, end)` exactly once before dispatching to `TsdbEngine`.
+pub(crate) async fn eval_query_range_bounds<E: TsdbEngine + ?Sized>(
+    engine: &E,
+    query: &str,
+    range: impl RangeBounds<SystemTime>,
+    step: Duration,
+    opts: &QueryOptions,
+) -> std::result::Result<Vec<RangeSample>, QueryError> {
+    let (start, end) = crate::util::range_bounds_to_system_time(range);
+    E::eval_query_range(engine, query, start, end, step, opts).await
+}
+
+/// Discover series over a time range specified as Rust range bounds.
+pub(crate) async fn find_series_in_range<E: TsdbEngine + ?Sized>(
+    engine: &E,
+    matchers: &[&str],
+    range: impl RangeBounds<SystemTime>,
+) -> std::result::Result<Vec<Labels>, QueryError> {
+    let (start, end) = crate::util::range_bounds_to_secs(range)?;
+    E::find_series(engine, matchers, start, end).await
+}
+
+/// Discover label names over a time range specified as Rust range bounds.
+pub(crate) async fn find_labels_in_range<E: TsdbEngine + ?Sized>(
+    engine: &E,
+    matchers: Option<&[&str]>,
+    range: impl RangeBounds<SystemTime>,
+) -> std::result::Result<Vec<String>, QueryError> {
+    let (start, end) = crate::util::range_bounds_to_secs(range)?;
+    E::find_labels(engine, matchers, start, end).await
+}
+
+/// Discover label values over a time range specified as Rust range bounds.
+pub(crate) async fn find_label_values_in_range<E: TsdbEngine + ?Sized>(
+    engine: &E,
+    label_name: &str,
+    matchers: Option<&[&str]>,
+    range: impl RangeBounds<SystemTime>,
+) -> std::result::Result<Vec<String>, QueryError> {
+    let (start, end) = crate::util::range_bounds_to_secs(range)?;
+    E::find_label_values(engine, label_name, matchers, start, end).await
+}
+
+// ── Shared evaluation free functions ────────────────────────────────
 
 /// Evaluate an instant PromQL query against the given reader.
 pub(crate) async fn evaluate_instant(
@@ -99,8 +286,7 @@ pub(crate) async fn evaluate_instant(
 
     match result {
         ExprResult::Scalar(value) => {
-            let timestamp_ms =
-                query_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+            let timestamp_ms = query_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
             Ok(QueryValue::Scalar {
                 timestamp_ms,
                 value,
@@ -253,10 +439,9 @@ pub(crate) async fn discover_labels(
     match matchers {
         Some(matches) if !matches.is_empty() => {
             let matches: Vec<String> = matches.iter().map(|s| s.to_string()).collect();
-            let bucket_series_map =
-                get_matching_series_multi_bucket(reader, &buckets, &matches)
-                    .await
-                    .map_err(QueryError::InvalidQuery)?;
+            let bucket_series_map = get_matching_series_multi_bucket(reader, &buckets, &matches)
+                .await
+                .map_err(QueryError::InvalidQuery)?;
 
             for (bucket, series_ids) in bucket_series_map {
                 let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
@@ -302,10 +487,9 @@ pub(crate) async fn discover_label_values(
     match matchers {
         Some(matches) if !matches.is_empty() => {
             let matches: Vec<String> = matches.iter().map(|s| s.to_string()).collect();
-            let bucket_series_map =
-                get_matching_series_multi_bucket(reader, &buckets, &matches)
-                    .await
-                    .map_err(QueryError::InvalidQuery)?;
+            let bucket_series_map = get_matching_series_multi_bucket(reader, &buckets, &matches)
+                .await
+                .map_err(QueryError::InvalidQuery)?;
 
             for (bucket, series_ids) in bucket_series_map {
                 let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
@@ -574,41 +758,11 @@ impl Tsdb {
         Ok(())
     }
 
-    /// Evaluate an instant PromQL query, returning typed `InstantSample`s.
-    pub(crate) async fn eval_query(
-        &self,
-        query: &str,
-        time: Option<std::time::SystemTime>,
-        opts: &QueryOptions,
-    ) -> std::result::Result<QueryValue, QueryError> {
-        let expr = promql_parser::parser::parse(query)
-            .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
-
-        let query_time = time.unwrap_or_else(std::time::SystemTime::now);
-        let lookback_delta = opts.lookback_delta;
-        let stmt = EvalStmt {
-            expr,
-            start: query_time,
-            end: query_time,
-            interval: Duration::from_secs(0),
-            lookback_delta,
-        };
-
-        let query_time_secs = query_time.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-        let lookback_start_secs = query_time
-            .checked_sub(lookback_delta)
-            .unwrap_or(UNIX_EPOCH)
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_secs() as i64;
-
-        let ranges = preload_ranges(&stmt, lookback_start_secs, query_time_secs);
-        let reader = self.query_reader_for_ranges(&ranges).await?;
-
-        evaluate_instant(&reader, stmt, query_time).await
-    }
-
     /// Evaluate a range PromQL query, returning typed `RangeSample`s.
+    ///
+    /// This inherent method converts `impl RangeBounds<SystemTime>` to the
+    /// `(start, end)` pair expected by `TsdbEngine`. The other 5 read methods
+    /// live on the `TsdbEngine` trait directly (identical signatures).
     pub(crate) async fn eval_query_range(
         &self,
         query: &str,
@@ -616,80 +770,24 @@ impl Tsdb {
         step: Duration,
         opts: &QueryOptions,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-        let (start, end) = crate::util::range_bounds_to_system_time(range);
-        let expr = promql_parser::parser::parse(query)
-            .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
+        eval_query_range_bounds(self, query, range, step, opts).await
+    }
+}
 
-        let lookback_delta = opts.lookback_delta;
-        let stmt = EvalStmt {
-            expr,
-            start,
-            end,
-            interval: step,
-            lookback_delta,
-        };
+#[async_trait]
+impl TsdbEngine for Tsdb {
+    type QR = TsdbQueryReader;
 
-        let default_start_secs = start
-            .checked_sub(lookback_delta)
-            .unwrap_or(UNIX_EPOCH)
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_secs() as i64;
-        let default_end_secs = end.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-
-        let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
-        let reader = self.query_reader_for_ranges(&ranges).await?;
-
-        evaluate_range(&reader, stmt).await
+    async fn make_query_reader(&self, start: i64, end: i64) -> Result<TsdbQueryReader> {
+        self.query_reader(start, end).await
     }
 
-    /// Discover series matching any of the given selectors.
-    pub(crate) async fn find_series(
-        &self,
-        matchers: &[&str],
-        start_secs: i64,
-        end_secs: i64,
-    ) -> std::result::Result<Vec<Labels>, QueryError> {
-        let reader = self.query_reader(start_secs, end_secs).await?;
-        discover_series(&reader, matchers).await
+    async fn make_query_reader_for_ranges(&self, ranges: &[(i64, i64)]) -> Result<TsdbQueryReader> {
+        self.query_reader_for_ranges(ranges).await
     }
 
-    /// Discover label names, optionally filtered by matchers.
-    pub(crate) async fn find_labels(
-        &self,
-        matchers: Option<&[&str]>,
-        start_secs: i64,
-        end_secs: i64,
-    ) -> std::result::Result<Vec<String>, QueryError> {
-        let reader = self.query_reader(start_secs, end_secs).await?;
-        discover_labels(&reader, matchers).await
-    }
-
-    /// Discover values for a specific label, optionally filtered by matchers.
-    pub(crate) async fn find_label_values(
-        &self,
-        label_name: &str,
-        matchers: Option<&[&str]>,
-        start_secs: i64,
-        end_secs: i64,
-    ) -> std::result::Result<Vec<String>, QueryError> {
-        let reader = self.query_reader(start_secs, end_secs).await?;
-        discover_label_values(&reader, label_name, matchers).await
-    }
-
-    /// Return metadata for all (or a specific) metric.
-    pub(crate) async fn find_metadata(
-        &self,
-        metric: Option<&str>,
-    ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
-        let catalog = self.metadata_catalog.read().await;
-
-        let entries: Vec<MetricMetadata> = match metric {
-            Some(name) => catalog.get(name).cloned().unwrap_or_default(),
-            None => catalog.values().flatten().cloned().collect(),
-        };
-
-        Ok(entries)
+    fn metadata_catalog(&self) -> &RwLock<HashMap<String, Vec<MetricMetadata>>> {
+        &self.metadata_catalog
     }
 }
 
@@ -1736,9 +1834,6 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            QueryError::InvalidQuery(_)
-        ));
+        assert!(matches!(result.unwrap_err(), QueryError::InvalidQuery(_)));
     }
 }

@@ -26,7 +26,7 @@ use super::response::{
 use super::scraper::Scraper;
 use crate::error::Error;
 use crate::model::QueryOptions;
-use crate::tsdb::Tsdb;
+use crate::tsdb::{Tsdb, TsdbEngine};
 use crate::util::{parse_duration, parse_timestamp, parse_timestamp_to_seconds};
 
 #[derive(Embed)]
