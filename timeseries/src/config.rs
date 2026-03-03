@@ -113,8 +113,11 @@ fn default_refresh_interval() -> Duration {
     Duration::from_secs(1)
 }
 
+/// Default number of bucket readers cached in memory.
+pub(crate) const DEFAULT_CACHE_CAPACITY: u64 = 50;
+
 fn default_cache_capacity() -> u64 {
-    50
+    DEFAULT_CACHE_CAPACITY
 }
 
 impl Default for ReaderConfig {

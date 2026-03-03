@@ -176,7 +176,7 @@ impl TimeSeriesDbReader {
 
     /// Creates a TimeSeriesDbReader from an existing storage implementation.
     pub(crate) fn from_storage(storage: Arc<dyn StorageRead>) -> Self {
-        Self::from_storage_with_capacity(storage, 50)
+        Self::from_storage_with_capacity(storage, crate::config::DEFAULT_CACHE_CAPACITY)
     }
 
     fn from_storage_with_capacity(storage: Arc<dyn StorageRead>, cache_capacity: u64) -> Self {
@@ -708,5 +708,43 @@ mod tests {
             "expected InvalidQuery, got {:?}",
             err
         );
+    }
+
+    #[test]
+    fn reader_config_deserializes_default_cache_capacity() {
+        let yaml = r#"
+storage:
+  type: InMemory
+"#;
+        let config: crate::config::ReaderConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.cache_capacity, crate::config::DEFAULT_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn reader_config_honors_custom_cache_capacity() {
+        let yaml = r#"
+storage:
+  type: InMemory
+cache_capacity: 200
+"#;
+        let config: crate::config::ReaderConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.cache_capacity, 200);
+    }
+
+    #[test]
+    fn from_storage_uses_default_cache_capacity() {
+        let storage = create_shared_storage();
+        let reader = TimeSeriesDbReader::from_storage(storage);
+        assert_eq!(
+            reader.query_cache.policy().max_capacity(),
+            Some(crate::config::DEFAULT_CACHE_CAPACITY)
+        );
+    }
+
+    #[test]
+    fn from_storage_with_capacity_honors_custom_value() {
+        let storage = create_shared_storage();
+        let reader = TimeSeriesDbReader::from_storage_with_capacity(storage, 123);
+        assert_eq!(reader.query_cache.policy().max_capacity(), Some(123));
     }
 }
