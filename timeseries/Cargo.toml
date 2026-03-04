@@ -30,6 +30,7 @@ http-server = [
 ]
 testing = []
 remote-write = ["http-server", "dep:prost", "dep:snap"]
+otel = ["dep:opentelemetry-proto", "dep:prost"]
 bench-internals = []
 
 [dependencies]
@@ -69,7 +70,8 @@ roaring = "0.7"
 rust-embed = { version = "8", features = ["mime-guess"] }
 tsz = "0.1"
 
-# Optional dependencies for remote-write feature
+# Optional dependencies for remote-write and otel features
+opentelemetry-proto = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
 
@@ -88,6 +90,10 @@ opendata-macros.workspace = true
 name = "http_server"
 required-features = ["testing", "http-server"]
 
+[[test]]
+name = "otel_ingest"
+required-features = ["testing", "otel"]
+
 [[bench]]
 name = "evaluator_micorbench"
 harness = false
@@ -97,6 +103,11 @@ required-features = ["bench-internals"]
 name = "response_serialization"
 harness = false
 required-features = ["testing"]
+
+[[bench]]
+name = "otel_conversion"
+harness = false
+required-features = ["otel"]
 
 [[example]]
 name = "query_bench"

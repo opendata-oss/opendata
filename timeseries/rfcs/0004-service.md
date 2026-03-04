@@ -17,7 +17,7 @@ RFCs 0002 and 0003 define `TimeSeriesDb` as a self-contained embedded database w
 
 - Expose `TimeSeriesDb` query and write APIs over HTTP
 - Provide Prometheus-compatible query and remote-write endpoints
-- Support OTLP/HTTP metrics ingestion with `OtelSeriesBuilder` for type decomposition
+- Support OTLP/HTTP metrics ingestion with `OtelConverter` for type decomposition
 - Feature-gate each protocol independently
 
 ## Non-Goals
@@ -37,8 +37,8 @@ RFCs 0002 and 0003 define `TimeSeriesDb` as a self-contained embedded database w
    GET /api/v1/query_range  (snappy + protobuf)         (protobuf)
    GET /api/v1/series             │                           │
    ...                            │                     ┌─────┴──────┐
-          │                       │                     │OtelSeries- │
-          │                       │                     │Builder     │
+          │                       │                     │    Otel-   │
+          │                       │                     │  Converter │
           │                       │                     └─────┬──────┘
           │                       │                     Vec<Series>
           └───────────┬───────────┴───────────┬───────────────┘
@@ -66,9 +66,9 @@ otel = ["dep:opentelemetry-proto", "dep:prost"]
 |---|---|---|
 | `http-server` | PromQL endpoints, server lifecycle | axum, tokio, tower |
 | `remote-write` | `POST /api/v1/write` (implies `http-server`) | prost, snap |
-| `otel` | `OtelSeriesBuilder`; `POST /v1/metrics` when `http-server` also enabled | opentelemetry-proto, prost |
+| `otel` | `OtelConverter`; `POST /v1/metrics` when `http-server` also enabled | opentelemetry-proto, prost |
 
-The `otel` feature is usable without `http-server` — the builder can be used standalone for programmatic conversion (e.g., replaying OTEL data from `LogDb`).
+The `otel` feature is usable without `http-server` — the converter can be used standalone for programmatic conversion (e.g., replaying OTEL data from `LogDb`).
 
 ### HTTP Server
 
@@ -113,23 +113,23 @@ The handler decompresses, decodes the `WriteRequest` (a flat list of label/sampl
 | Encoding | Protobuf `ExportMetricsServiceRequest` |
 | Success | `200 OK` with protobuf `ExportMetricsServiceResponse` |
 
-The handler decodes the request, calls `OtelSeriesBuilder::build()` to decompose OTEL metrics into `Vec<Series>`, and calls `tsdb.write()`.
+The handler decodes the request, calls `OtelConverter::convert()` to decompose OTEL metrics into `Vec<Series>`, and calls `tsdb.write()`.
 
-### OtelSeriesBuilder
+### OtelConverter
 
-The builder decomposes OpenTelemetry metrics into `Vec<Series>` suitable for `TimeSeriesDb::write()`. It is gated behind the `otel` feature and has no dependency on the HTTP server.
+The converter decomposes OpenTelemetry metrics into `Vec<Series>` suitable for `TimeSeriesDb::write()`. It is gated behind the `otel` feature and has no dependency on the HTTP server.
 
 ```rust
 #[cfg(feature = "otel")]
-pub struct OtelSeriesBuilder {
+pub struct OtelConverter {
     config: OtelConfig,
 }
 
-impl OtelSeriesBuilder {
+impl OtelConverter {
     pub fn new(config: OtelConfig) -> Self;
 
-    /// Decompose an OTLP export request into Series.
-    pub fn build(
+    /// Convert an OTLP export request into Series.
+    pub fn convert(
         &self,
         request: &ExportMetricsServiceRequest,
     ) -> Result<Vec<Series>>;
@@ -146,7 +146,7 @@ pub struct OtelConfig {
 
 #### Type Decomposition
 
-The builder walks the OTLP hierarchy (`ResourceMetrics` → `ScopeMetrics` → `Metric` → data points) and collects attributes as labels at each level. The mapping follows the [OTLP Prometheus compatibility spec](https://opentelemetry.io/docs/specs/otel/compatibility/prometheus_and_openmetrics/) — including unit suffix normalization and scope labels (`otel_scope_name`, `otel_scope_version`). OTEL metric types map to Prometheus-style series as follows:
+The converter walks the OTLP hierarchy (`ResourceMetrics` → `ScopeMetrics` → `Metric` → data points) and collects attributes as labels at each level. The mapping follows the [OTLP Prometheus compatibility spec](https://opentelemetry.io/docs/specs/otel/compatibility/prometheus_and_openmetrics/) — including unit suffix normalization and scope labels (`otel_scope_name`, `otel_scope_version`). OTEL metric types map to Prometheus-style series as follows:
 
 | OTEL type | Decomposition | MetricType |
 |---|---|---|
@@ -162,11 +162,11 @@ The builder walks the OTLP hierarchy (`ResourceMetrics` → `ScopeMetrics` → `
 
 ```toml
 [dependencies]
-opentelemetry-proto = { version = "0.28", optional = true, features = ["metrics", "gen-prost"] }
+opentelemetry-proto = { version = "0.28", optional = true, features = ["metrics", "gen-tonic-messages"] }
 prost = { version = "0.13", optional = true }
 ```
 
-We use `gen-prost` (not `gen-tonic`) — only message types are needed, not gRPC service definitions.
+We use `gen-tonic-messages` (not `gen-tonic`) — only message types are needed, not gRPC transport. The `gen-tonic-messages` feature pulls in `tonic` and `prost` for message definitions without enabling `tonic/transport`.
 
 ## Alternatives Considered
 
@@ -174,9 +174,9 @@ We use `gen-prost` (not `gen-tonic`) — only message types are needed, not gRPC
 
 An earlier draft used gRPC via tonic as the primary OTLP transport. This requires a separate port (4317), a tonic dependency, and HTTP/2 support. OTLP/HTTP is simpler — it runs on the existing Axum server, shares the same port, and requires no new networking dependencies. gRPC can be added later as a separate feature flag.
 
-### OtelTimeSeriesDb wrapper instead of OtelSeriesBuilder
+### OtelTimeSeriesDb wrapper instead of OtelConverter
 
-An earlier draft wrapped `TimeSeriesDb` in an `OtelTimeSeriesDb` that accepted OTEL requests and wrote decomposed series internally. This couples the conversion and storage steps. The builder approach keeps them explicit — `build()` produces series, then the caller writes them — and composes naturally with `TimeSeriesDb::write()`.
+An earlier draft wrapped `TimeSeriesDb` in an `OtelTimeSeriesDb` that accepted OTEL requests and wrote decomposed series internally. This couples the conversion and storage steps. The converter approach keeps them explicit — `convert()` produces series, then the caller writes them — and composes naturally with `TimeSeriesDb::write()`.
 
 ### Separate server per protocol
 
