@@ -12,7 +12,7 @@ use crate::server::{Metrics, build_router};
 use super::TestTsdb;
 
 /// Build the production Axum router — same routes, middleware, and state
-/// as [`crate::server::TimeSeriesHttpServer::run()`] but without binding
+/// as `crate::server::TimeSeriesHttpServer::run()` but without binding
 /// to a TCP port.
 pub fn build_app(tsdb: &TestTsdb) -> Router {
     let mut metrics = Metrics::new();

@@ -19,22 +19,23 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use timeseries::{TimeSeriesDb, Config, Series};
+//! ```
+//! # use timeseries::{TimeSeriesDb, Config, Series};
+//! # use common::StorageConfig;
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+//! let ts = TimeSeriesDb::open(config).await?;
 //!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let ts = TimeSeriesDb::open(Config::default()).await?;
+//! let series = Series::builder("http_requests_total")
+//!     .label("method", "GET")
+//!     .label("status", "200")
+//!     .sample_now(1.0)
+//!     .build();
 //!
-//!     let series = Series::builder("http_requests_total")
-//!         .label("method", "GET")
-//!         .label("status", "200")
-//!         .sample_now(1.0)
-//!         .build();
-//!
-//!     ts.write(vec![series]).await?;
-//!     Ok(())
-//! }
+//! ts.write(vec![series]).await?;
+//! # Ok(())
+//! # }
 //! ```
 
 // Internal modules are shared with the binary target (main.rs) which

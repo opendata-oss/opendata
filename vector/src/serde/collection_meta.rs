@@ -53,11 +53,11 @@ use bytes::{Bytes, BytesMut};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum DistanceMetric {
-    /// Euclidean (L2) distance: sqrt(sum((a[i] - b[i])²))
+    /// Euclidean (L2) distance: sqrt(sum((a\[i\] - b\[i\])²))
     L2 = 0,
     /// Cosine similarity: dot(a, b) / (|a| * |b|)
     Cosine = 1,
-    /// Dot product: sum(a[i] * b[i])
+    /// Dot product: sum(a\[i\] * b\[i\])
     DotProduct = 2,
 }
 

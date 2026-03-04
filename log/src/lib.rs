@@ -21,24 +21,29 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use log::{LogDb, Config, Record};
-//! use bytes::Bytes;
-//!
-//! // Open a log
-//! let log = LogDb::open(Config::default()).await?;
+//! ```
+//! # use log::{LogDb, LogRead, Config, Record};
+//! # use bytes::Bytes;
+//! # use common::StorageConfig;
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+//! let log = LogDb::open(config).await?;
 //!
 //! // Append records
 //! let records = vec![
 //!     Record { key: Bytes::from("orders"), value: Bytes::from("order-123") },
 //! ];
 //! log.try_append(records).await?;
+//! log.flush().await?;
 //!
 //! // Scan a key's log
-//! let mut iter = log.scan(Bytes::from("orders"), ..);
+//! let mut iter = log.scan(Bytes::from("orders"), ..).await?;
 //! while let Some(entry) = iter.next().await? {
 //!     println!("seq={}, value={:?}", entry.sequence, entry.value);
 //! }
+//! # Ok(())
+//! # }
 //! ```
 
 mod config;
