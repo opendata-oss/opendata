@@ -270,7 +270,10 @@ pub trait Storage: StorageRead {
         options: WriteOptions,
     ) -> StorageResult<()>;
 
-    async fn put(&self, records: Vec<PutRecordOp>) -> StorageResult<()>;
+    async fn put(&self, records: Vec<PutRecordOp>) -> StorageResult<()> {
+        self.put_with_options(records, WriteOptions::default())
+            .await
+    }
 
     /// Writes records to storage with custom options.
     ///

@@ -261,14 +261,6 @@ impl Storage for InMemoryStorage {
         Ok(())
     }
 
-    /// Writes a batch of records to the in-memory store with default options.
-    ///
-    /// Delegates to [`put_with_options`](Self::put_with_options) with default options.
-    async fn put(&self, records: Vec<PutRecordOp>) -> StorageResult<()> {
-        self.put_with_options(records, WriteOptions::default())
-            .await
-    }
-
     /// Writes a batch of records to the in-memory store.
     ///
     /// All records are written atomically within a single write lock acquisition.
@@ -533,11 +525,6 @@ impl super::Storage for FailingStorage {
     ) -> super::StorageResult<()> {
         check_failure(&self.fail_apply)?;
         self.inner.apply_with_options(ops, options).await
-    }
-
-    async fn put(&self, records: Vec<super::PutRecordOp>) -> super::StorageResult<()> {
-        check_failure(&self.fail_put)?;
-        self.inner.put(records).await
     }
 
     async fn put_with_options(

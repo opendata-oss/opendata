@@ -235,11 +235,6 @@ impl Storage for SlateDbStorage {
         Ok(())
     }
 
-    async fn put(&self, records: Vec<PutRecordOp>) -> StorageResult<()> {
-        self.put_with_options(records, WriteOptions::default())
-            .await
-    }
-
     async fn put_with_options(
         &self,
         records: Vec<PutRecordOp>,

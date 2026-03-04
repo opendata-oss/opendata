@@ -358,10 +358,6 @@ mod tests {
                 self.check_failure()
             }
 
-            async fn put(&self, _records: Vec<PutRecordOp>) -> common::StorageResult<()> {
-                self.check_failure()
-            }
-
             async fn put_with_options(
                 &self,
                 _records: Vec<PutRecordOp>,
