@@ -210,86 +210,73 @@ impl TimeSeriesValue {
     }
 }
 
-/// Merges two compressed time series byte values into a single compressed value.
+/// Merges a batch of compressed time series byte values into a single compressed value.
 ///
-/// This function performs an efficient sorted merge of two Gorilla-compressed time series
+/// This function performs an efficient sorted merge of Gorilla-compressed time series
 /// without fully deserializing them into memory. Samples are merged in timestamp order,
-/// with duplicates resolved by keeping the value from `other` (last write wins).
+/// with duplicates resolved by keeping the value from the newest operand (last write wins).
 ///
 /// This is designed for use in merge operators during compaction.
 ///
 /// # Arguments
 ///
-/// * `base` - The base compressed time series value
-/// * `other` - The time series value to merge into the base
+/// * `existing` - The existing compressed time series value (if any)
+/// * `operands` - A slice of compressed time series operands, ordered oldest to newest
 ///
 /// # Returns
 ///
 /// A new compressed `Bytes` value containing the merged series
-pub(crate) fn merge_time_series(base: Bytes, other: Bytes) -> Result<Bytes, EncodingError> {
-    // Handle empty cases
-    if base.is_empty() {
-        return Ok(other);
+pub(crate) fn merge_batch_time_series(
+    existing: Option<Bytes>,
+    operands: &[Bytes],
+) -> Result<Bytes, EncodingError> {
+    let mut sources: Vec<&Bytes> = Vec::new();
+    if let Some(ref existing) = existing
+        && !existing.is_empty()
+    {
+        sources.push(existing);
     }
-    if other.is_empty() {
-        return Ok(base);
-    }
-
-    // Create iterators for both series
-    let mut base_iter =
-        TimeSeriesIterator::new(base.as_ref()).expect("Base series should not be empty");
-    let mut other_iter =
-        TimeSeriesIterator::new(other.as_ref()).expect("Other series should not be empty");
-
-    // Get first sample from each iterator to determine the earliest timestamp
-    let mut base_sample = base_iter.next().transpose()?;
-    let mut other_sample = other_iter.next().transpose()?;
-
-    let start_time = match (&base_sample, &other_sample) {
-        (Some(bs), Some(os)) => bs.timestamp_ms.min(os.timestamp_ms),
-        (Some(bs), None) => bs.timestamp_ms,
-        (None, Some(os)) => os.timestamp_ms,
-        (None, None) => {
-            // Both iterators returned None immediately - treat as empty
-            return Ok(Bytes::new());
+    for operand in operands {
+        if !operand.is_empty() {
+            sources.push(operand);
         }
-    };
+    }
 
-    // Create encoder for output
+    // Handle edge cases
+    if sources.is_empty() {
+        return Ok(Bytes::new());
+    }
+    if sources.len() == 1 {
+        return Ok(sources[0].clone());
+    }
+
+    // Decode all sources into (priority, timestamp, value) triples.
+    // Priority is the source index: higher index = newer = wins on tie.
+    let mut samples: Vec<(usize, i64, f64)> = Vec::new();
+    for (priority, source) in sources.iter().enumerate() {
+        let iter = TimeSeriesIterator::new(source.as_ref()).expect("Series should not be empty");
+        for result in iter {
+            let sample = result?;
+            samples.push((priority, sample.timestamp_ms, sample.value));
+        }
+    }
+    // If all iterators returned None immediately, treat as empty.
+    if samples.is_empty() {
+        return Ok(Bytes::new());
+    }
+
+    // Sort by timestamp ascending, then by priority descending (newest first)
+    samples.sort_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
+    // Dedup by timestamp, keeping the first (highest priority) entry (last write wins)
+    samples.dedup_by(|a, b| a.1 == b.1);
+
+    // Encode the merged result
     let writer = BufferedWriter::new();
-    let mut encoder = StdEncoder::new(start_time as u64, writer);
+    let start_time = samples[0].1 as u64;
+    let mut encoder = StdEncoder::new(start_time, writer);
 
-    // Sorted merge with deduplication (keeping 'other' value on timestamp collision)
-    while base_sample.is_some() || other_sample.is_some() {
-        match (&base_sample, &other_sample) {
-            (Some(bs), Some(os)) => {
-                if bs.timestamp_ms < os.timestamp_ms {
-                    // Take from base
-                    encoder.encode(DataPoint::new(bs.timestamp_ms as u64, bs.value));
-                    base_sample = base_iter.next().transpose()?;
-                } else if bs.timestamp_ms > os.timestamp_ms {
-                    // Take from other
-                    encoder.encode(DataPoint::new(os.timestamp_ms as u64, os.value));
-                    other_sample = other_iter.next().transpose()?;
-                } else {
-                    // Equal timestamps: take from other (last write wins)
-                    encoder.encode(DataPoint::new(os.timestamp_ms as u64, os.value));
-                    base_sample = base_iter.next().transpose()?;
-                    other_sample = other_iter.next().transpose()?;
-                }
-            }
-            (Some(bs), None) => {
-                // Only base remaining
-                encoder.encode(DataPoint::new(bs.timestamp_ms as u64, bs.value));
-                base_sample = base_iter.next().transpose()?;
-            }
-            (None, Some(os)) => {
-                // Only other remaining
-                encoder.encode(DataPoint::new(os.timestamp_ms as u64, os.value));
-                other_sample = other_iter.next().transpose()?;
-            }
-            (None, None) => break,
-        }
+    for &(_, timestamp, value) in &samples {
+        encoder.encode(DataPoint::new(timestamp as u64, value));
     }
 
     // Close encoder to get compressed data
@@ -438,7 +425,7 @@ mod tests {
         let other_bytes = other.encode().unwrap();
 
         // when: merge the series
-        let merged_bytes = merge_time_series(base_bytes, other_bytes).unwrap();
+        let merged_bytes = merge_batch_time_series(Some(base_bytes), &[other_bytes]).unwrap();
         let merged = TimeSeriesValue::decode(merged_bytes.as_ref()).unwrap();
 
         // then: should have 4 points with duplicates resolved (last write wins)
@@ -493,7 +480,7 @@ mod tests {
         let other_bytes = other.encode().unwrap();
 
         // when: merge the series
-        let merged_bytes = merge_time_series(base_bytes, other_bytes).unwrap();
+        let merged_bytes = merge_batch_time_series(Some(base_bytes), &[other_bytes]).unwrap();
         let merged = TimeSeriesValue::decode(merged_bytes.as_ref()).unwrap();
 
         // then: should have all 6 points in sorted order
@@ -504,5 +491,234 @@ mod tests {
         assert_eq!(merged.points[3].timestamp_ms, 4000);
         assert_eq!(merged.points[4].timestamp_ms, 5000);
         assert_eq!(merged.points[5].timestamp_ms, 6000);
+    }
+
+    #[test]
+    fn should_batch_merge_return_empty_when_no_existing_and_no_operands() {
+        // given - nothing
+
+        // when
+        let merged = merge_batch_time_series(None, &[]).unwrap();
+
+        // then
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn should_batch_merge_return_existing_when_no_operands() {
+        // given
+        let existing = TimeSeriesValue {
+            points: vec![
+                Sample {
+                    timestamp_ms: 1000,
+                    value: 10.0,
+                },
+                Sample {
+                    timestamp_ms: 2000,
+                    value: 20.0,
+                },
+            ],
+        };
+        let existing_bytes = existing.encode().unwrap();
+
+        // when
+        let merged = merge_batch_time_series(Some(existing_bytes.clone()), &[]).unwrap();
+
+        // then
+        assert_eq!(merged, existing_bytes);
+    }
+
+    #[test]
+    fn should_batch_merge_return_operand_when_no_existing_and_single_operand() {
+        // given
+        let op = TimeSeriesValue {
+            points: vec![Sample {
+                timestamp_ms: 1000,
+                value: 10.0,
+            }],
+        };
+        let op_bytes = op.encode().unwrap();
+
+        // when
+        let merged = merge_batch_time_series(None, std::slice::from_ref(&op_bytes)).unwrap();
+
+        // then
+        assert_eq!(merged, op_bytes);
+    }
+
+    #[test]
+    fn should_batch_merge_skip_empty_operands() {
+        // given
+        let existing = TimeSeriesValue {
+            points: vec![Sample {
+                timestamp_ms: 1000,
+                value: 10.0,
+            }],
+        };
+        let existing_bytes = existing.encode().unwrap();
+
+        // when
+        let merged =
+            merge_batch_time_series(Some(existing_bytes.clone()), &[Bytes::new(), Bytes::new()])
+                .unwrap();
+
+        // then - only existing remains, single source passthrough
+        assert_eq!(merged, existing_bytes);
+    }
+
+    #[test]
+    fn should_batch_merge_return_empty_when_all_sources_empty() {
+        // given - empty existing and empty operands
+
+        // when
+        let merged =
+            merge_batch_time_series(Some(Bytes::new()), &[Bytes::new(), Bytes::new()]).unwrap();
+
+        // then
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn should_batch_merge_multiple_operands_with_last_write_wins() {
+        // given: three operands where later ones override earlier timestamps
+        let op0 = TimeSeriesValue {
+            points: vec![
+                Sample {
+                    timestamp_ms: 1000,
+                    value: 10.0,
+                },
+                Sample {
+                    timestamp_ms: 2000,
+                    value: 20.0,
+                },
+            ],
+        }
+        .encode()
+        .unwrap();
+        let op1 = TimeSeriesValue {
+            points: vec![
+                Sample {
+                    timestamp_ms: 2000,
+                    value: 200.0,
+                },
+                Sample {
+                    timestamp_ms: 3000,
+                    value: 30.0,
+                },
+            ],
+        }
+        .encode()
+        .unwrap();
+        let op2 = TimeSeriesValue {
+            points: vec![
+                Sample {
+                    timestamp_ms: 3000,
+                    value: 300.0,
+                },
+                Sample {
+                    timestamp_ms: 4000,
+                    value: 40.0,
+                },
+            ],
+        }
+        .encode()
+        .unwrap();
+
+        // when - no existing value
+        let merged = merge_batch_time_series(None, &[op0, op1, op2]).unwrap();
+        let decoded = TimeSeriesValue::decode(merged.as_ref()).unwrap();
+
+        // then - timestamp 2000 takes op1's value, timestamp 3000 takes op2's value
+        let expected = vec![
+            Sample {
+                timestamp_ms: 1000,
+                value: 10.0,
+            },
+            Sample {
+                timestamp_ms: 2000,
+                value: 200.0,
+            },
+            Sample {
+                timestamp_ms: 3000,
+                value: 300.0,
+            },
+            Sample {
+                timestamp_ms: 4000,
+                value: 40.0,
+            },
+        ];
+        assert_eq!(decoded.points, expected);
+    }
+
+    #[test]
+    fn should_batch_merge_existing_with_multiple_operands() {
+        // given
+        let existing = TimeSeriesValue {
+            points: vec![
+                Sample {
+                    timestamp_ms: 1000,
+                    value: 1.0,
+                },
+                Sample {
+                    timestamp_ms: 2000,
+                    value: 2.0,
+                },
+            ],
+        }
+        .encode()
+        .unwrap();
+        let op0 = TimeSeriesValue {
+            points: vec![
+                Sample {
+                    timestamp_ms: 2000,
+                    value: 20.0,
+                },
+                Sample {
+                    timestamp_ms: 3000,
+                    value: 30.0,
+                },
+            ],
+        }
+        .encode()
+        .unwrap();
+        let op1 = TimeSeriesValue {
+            points: vec![
+                Sample {
+                    timestamp_ms: 3000,
+                    value: 300.0,
+                },
+                Sample {
+                    timestamp_ms: 4000,
+                    value: 40.0,
+                },
+            ],
+        }
+        .encode()
+        .unwrap();
+
+        // when
+        let merged = merge_batch_time_series(Some(existing), &[op0, op1]).unwrap();
+        let decoded = TimeSeriesValue::decode(merged.as_ref()).unwrap();
+
+        // then - existing ts=2000 overridden by op0, op0 ts=3000 overridden by op1
+        let expected = vec![
+            Sample {
+                timestamp_ms: 1000,
+                value: 1.0,
+            },
+            Sample {
+                timestamp_ms: 2000,
+                value: 20.0,
+            },
+            Sample {
+                timestamp_ms: 3000,
+                value: 300.0,
+            },
+            Sample {
+                timestamp_ms: 4000,
+                value: 40.0,
+            },
+        ];
+        assert_eq!(decoded.points, expected);
     }
 }
