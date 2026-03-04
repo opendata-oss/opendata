@@ -2,6 +2,38 @@
 
 A key-oriented log database built on an LSM tree (SlateDB).
 
+## Quickstart
+
+Prerequisites: `curl` and `jq`
+
+### 1. Run the HTTP server
+
+```bash
+cargo run -p opendata-log --features http-server -- --in-memory --port 8080
+```
+
+### 2. Check health
+
+```bash
+curl -s http://localhost:8080/-/healthy
+```
+
+### 3. Append records
+
+Use `application/protobuf+json` (byte fields are base64-encoded):
+
+```bash
+curl -s -X POST 'http://localhost:8080/api/v1/log/append' \
+  -H 'Content-Type: application/protobuf+json' \
+  -d '{"records":[{"key":"b3JkZXJz","value":"b3JkZXItMQ=="},{"key":"b3JkZXJz","value":"b3JkZXItMg=="}],"awaitDurable":true}'
+```
+
+### 4. Scan records for a key
+
+```bash
+curl -s 'http://localhost:8080/api/v1/log/scan?key=orders' | jq .
+```
+
 ## Design
 
 The log database leans into its LSM representation: log streams are indexed by arbitrary byte keys within a shared global keyspace. The diagram below shows a simplified representation of the key structure within the LSM.

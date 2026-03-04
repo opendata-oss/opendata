@@ -249,3 +249,4 @@ An alternative is to expose low-level iterators over stored series and samples, 
 | 2026-02-25 | Initial draft |
 | 2026-02-27 | `query` returns `QueryValue` enum (scalar vs vector), add `into_samples()` |
 | 2026-02-27 | `query_range` takes `impl RangeBounds<SystemTime>` instead of separate `start`/`end`, consistent with discovery methods |
+| 2026-03-02 | `TimeSeriesDbReader` introduced as a separate read-only type for fencing safety (SlateDB's `DbReader` coexists with a writer without fencing). This is orthogonal to the API design — the reader exposes the same read methods as `TimeSeriesDb`. |
