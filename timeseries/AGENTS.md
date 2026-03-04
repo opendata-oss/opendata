@@ -29,7 +29,7 @@ See `rfcs/0001-tsdb-storage.md` for the complete storage design and `rfcs/0002-w
 - `src/serde/` - Record serialization (mirrors common patterns)
 - `src/promql/` - PromQL query engine and HTTP server
 - `src/index.rs` - Index operations
-- `src/head.rs` - In-memory head block for recent data
+- `src/delta.rs` - In-memory delta/head data for recent writes
 
 ### Query Path
 

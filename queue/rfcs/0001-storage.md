@@ -186,7 +186,7 @@ The used wire protocol depends on the provider.
 
 ### Specification of records
 
-All records in the OpenData-Queue system conform to the common record key prefix defined in [RFC 0001: Record Key Prefix](rfcs/0001-record-key-prefix.md).
+All records in the OpenData-Queue system conform to the common record key prefix defined in [RFC 0001: Record Key Prefix](../../rfcs/0001-record-key-prefix.md).
 
 ```ascii
 ┌─────────┬────────────┬─────────────────────┐
@@ -245,7 +245,7 @@ The length of the payload can be computed from the length of the value.
 ### Metadata log
 
 The metadata log stores the metadata of the published messages.
-The metadata log is an instance of [OpenData-Log](log/rfcs/0001-storage.md).
+The metadata log is an instance of [OpenData-Log](../../log/rfcs/0001-storage.md).
 
 #### Metadata record
 
