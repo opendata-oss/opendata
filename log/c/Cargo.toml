@@ -17,7 +17,7 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
 
 [build-dependencies]
 cbindgen = "0.28"
