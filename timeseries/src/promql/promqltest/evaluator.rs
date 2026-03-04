@@ -1,5 +1,5 @@
 use crate::model::{QueryOptions, RangeSample};
-use crate::tsdb::Tsdb;
+use crate::tsdb::{Tsdb, TsdbReadEngine};
 use std::time::SystemTime;
 
 /// Execute instant query and return structured results

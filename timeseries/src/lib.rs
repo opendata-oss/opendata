@@ -70,12 +70,13 @@ pub mod testing;
 mod config;
 pub(crate) mod error;
 pub(crate) mod model;
+mod reader;
 mod timeseries;
 
 // Public re-exports
 #[cfg(feature = "bench-internals")]
 pub use bench_api::SubqueryLabelCacheHarness;
-pub use config::Config;
+pub use config::{Config, ReaderConfig};
 pub use error::{Error, QueryError, Result};
 pub use model::{
     InstantSample, Label, Labels, MetricMetadata, MetricType, QueryOptions, QueryValue,
@@ -83,4 +84,5 @@ pub use model::{
 };
 #[cfg(feature = "otel")]
 pub use otel::{OtelConfig, OtelConverter};
+pub use reader::TimeSeriesDbReader;
 pub use timeseries::TimeSeriesDb;

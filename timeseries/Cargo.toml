@@ -42,11 +42,13 @@ chrono.workspace = true
 clap = { workspace = true, optional = true }
 config.workspace = true
 dashmap.workspace = true
+futures.workspace = true
 moka.workspace = true
 common = { workspace = true, features = ["metrics"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_with.workspace = true
 serde_yaml.workspace = true
 slatedb.workspace = true
 thiserror.workspace = true
@@ -80,7 +82,9 @@ fail.workspace = true
 proptest.workspace = true
 rstest.workspace = true
 dashu-float.workspace = true
+tempfile.workspace = true
 opendata-macros.workspace = true
+
 
 [[test]]
 name = "http_server"
@@ -104,3 +108,7 @@ required-features = ["testing"]
 name = "otel_conversion"
 harness = false
 required-features = ["otel"]
+
+[[example]]
+name = "query_bench"
+required-features = ["http-server"]
