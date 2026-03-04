@@ -16,14 +16,15 @@ use tokio::signal;
 use super::metrics::Metrics;
 use super::middleware::{MetricsLayer, TracingLayer};
 use crate::error::Error;
-use crate::model::QueryOptions;
+use crate::model::{QueryOptions, QueryValue};
 use crate::promql::config::PrometheusConfig;
 use crate::promql::request::{
-    LabelValuesParams, LabelsParams, MetadataParams, QueryParams, QueryRangeParams, SeriesParams,
+    FederateParams, LabelValuesParams, LabelsParams, MetadataParams, QueryParams, QueryRangeParams,
+    SeriesParams,
 };
 use crate::promql::response::{
-    self, LabelValuesResponse, LabelsResponse, MetadataResponse, QueryRangeResponse, QueryResponse,
-    SeriesResponse,
+    self, FederateResponse, LabelValuesResponse, LabelsResponse, MetadataResponse,
+    QueryRangeResponse, QueryResponse, SeriesResponse,
 };
 use crate::promql::scraper::Scraper;
 use crate::tsdb::{Tsdb, TsdbReadEngine};
@@ -75,6 +76,7 @@ pub(crate) fn build_router(tsdb: Arc<Tsdb>, metrics: Arc<Metrics>) -> Router {
         .route("/api/v1/labels", get(handle_labels))
         .route("/api/v1/label/{name}/values", get(handle_label_values))
         .route("/api/v1/metadata", get(handle_metadata))
+        .route("/federate", get(handle_federate))
         .route("/metrics", get(handle_metrics))
         .route("/-/healthy", get(handle_healthy))
         .route("/-/ready", get(handle_ready));
@@ -184,6 +186,17 @@ impl IntoResponse for ApiError {
 impl From<Error> for ApiError {
     fn from(err: Error) -> Self {
         ApiError(err)
+    }
+}
+
+impl IntoResponse for FederateResponse {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, self.content_type)],
+            self.body,
+        )
+            .into_response()
     }
 }
 
@@ -337,6 +350,106 @@ async fn handle_metadata(
         params.limit,
         params.limit_per_metric,
     )))
+}
+
+/// Handle /federate by returning recent samples matching the query in text format
+/// https://prometheus.io/docs/prometheus/latest/federation/
+/// https://prometheus.io/docs/instrumenting/exposition_formats/
+async fn handle_federate(
+    State(state): State<AppState>,
+    Query(params): Query<FederateParams>,
+) -> Result<FederateResponse, ApiError> {
+    use std::collections::HashSet;
+
+    if params.matches.is_empty() {
+        return Err(
+            Error::InvalidInput("at least one match[] parameter is required".to_string()).into(),
+        );
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut body = String::new();
+
+    for selector in &params.matches {
+        let result = state
+            .tsdb
+            .eval_query(selector, None, &QueryOptions::default())
+            .await
+            .map_err(|e| match e {
+                crate::error::QueryError::InvalidQuery(msg) => Error::InvalidInput(msg),
+                crate::error::QueryError::Execution(msg) => Error::Internal(msg),
+                crate::error::QueryError::Timeout => Error::Internal("query timed out".to_string()),
+            })?;
+
+        let samples = match result {
+            QueryValue::Vector(s) => s,
+            _ => continue,
+        };
+
+        for sample in samples {
+            // Build dedup key from the full label set
+            let key: String = sample
+                .labels
+                .iter()
+                .map(|l| format!("{}={}", l.name, l.value))
+                .collect::<Vec<_>>()
+                .join("\x00");
+            if !seen.insert(key) {
+                continue;
+            }
+
+            let metric_name = sample.labels.metric_name();
+            let extra_labels: Vec<_> = sample
+                .labels
+                .iter()
+                .filter(|l| l.name != "__name__")
+                .collect();
+
+            body.push_str(metric_name);
+            if !extra_labels.is_empty() {
+                body.push('{');
+                for (i, l) in extra_labels.iter().enumerate() {
+                    if i > 0 {
+                        body.push(',');
+                    }
+                    body.push_str(&l.name);
+                    body.push_str("=\"");
+                    push_escaped_label_value(&mut body, &l.value);
+                    body.push('"');
+                }
+                body.push('}');
+            }
+            body.push(' ');
+            if sample.value.is_nan() {
+                body.push_str("NaN");
+            } else if sample.value == f64::INFINITY {
+                body.push_str("+Inf");
+            } else if sample.value == f64::NEG_INFINITY {
+                body.push_str("-Inf");
+            } else {
+                body.push_str(&sample.value.to_string());
+            }
+            body.push(' ');
+            body.push_str(&sample.timestamp_ms.to_string());
+            body.push('\n');
+        }
+    }
+
+    Ok(FederateResponse {
+        content_type: "text/plain; version=0.0.4; charset=utf-8".to_string(),
+        body: body.into_bytes(),
+    })
+}
+
+fn push_escaped_label_value(buf: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '\\' => buf.push_str("\\\\"),
+            '"' => buf.push_str("\\\""),
+            '\n' => buf.push_str("\\n"),
+            _ => buf.push(c),
+        }
+    }
 }
 
 /// Handle /metrics endpoint - returns Prometheus text format
