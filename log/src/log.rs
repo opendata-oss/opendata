@@ -75,11 +75,13 @@ use crate::writer::{LogWrite, LogWriteHandle, LogWriter, LogWriterConfig, Writte
 ///
 /// # Example
 ///
-/// ```ignore
-/// use log::{LogDb, LogRead, Record};
-/// use bytes::Bytes;
-///
-/// // Open a log (implementation details TBD)
+/// ```
+/// # use log::{LogDb, LogRead, Config, Record};
+/// # use bytes::Bytes;
+/// # use common::StorageConfig;
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
 /// let log = LogDb::open(config).await?;
 ///
 /// // Append records
@@ -88,12 +90,15 @@ use crate::writer::{LogWrite, LogWriteHandle, LogWriter, LogWriterConfig, Writte
 ///     Record { key: Bytes::from("user:456"), value: Bytes::from("event-b") },
 /// ];
 /// log.try_append(records).await?;
+/// log.flush().await?;
 ///
 /// // Scan entries for a specific key
 /// let mut iter = log.scan(Bytes::from("user:123"), ..).await?;
 /// while let Some(entry) = iter.next().await? {
 ///     println!("seq={}: {:?}", entry.sequence, entry.value);
 /// }
+/// # Ok(())
+/// # }
 /// ```
 pub struct LogDb {
     handle: LogWriteHandle,
@@ -141,7 +146,7 @@ impl LogDb {
     /// Records are assigned sequence numbers in the order they appear in the
     /// input vector. All records in a single append call are written atomically.
     ///
-    /// Fails immediately with [`AppendError::QueueFull`] if the write queue
+    /// Fails immediately with [`AppendError::QueueFull`](crate::AppendError::QueueFull) if the write queue
     /// is full. The returned error contains the original batch so callers can
     /// retry without cloning.
     ///
@@ -177,7 +182,7 @@ impl LogDb {
     /// Records are assigned sequence numbers in the order they appear in the
     /// input vector. All records in a single append call are written atomically.
     ///
-    /// Returns [`AppendError::Timeout`] if the queue does not drain within the
+    /// Returns [`AppendError::Timeout`](crate::AppendError::Timeout) if the queue does not drain within the
     /// deadline. The returned error contains the original batch for retry.
     ///
     /// Durability is **not** awaited. Call [`flush()`](LogDb::flush) after

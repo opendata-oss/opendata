@@ -31,8 +31,13 @@ pub type Sequence = u64;
 ///
 /// # Example
 ///
-/// ```ignore
-/// // List all segments
+/// ```no_run
+/// # use log::{LogDb, LogRead, Config};
+/// # use common::StorageConfig;
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+/// # let log = LogDb::open(config).await?;
 /// let segments = log.list_segments(..).await?;
 /// for segment in segments {
 ///     println!(
@@ -40,6 +45,8 @@ pub type Sequence = u64;
 ///         segment.id, segment.start_seq, segment.start_time_ms
 ///     );
 /// }
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
@@ -99,9 +106,19 @@ pub struct Record {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
+/// # use log::{LogDb, Config, Record};
+/// # use bytes::Bytes;
+/// # use common::StorageConfig;
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+/// # let log = LogDb::open(config).await?;
+/// # let records = vec![Record { key: Bytes::from("k"), value: Bytes::from("v") }];
 /// let result = log.try_append(records).await?;
 /// println!("Appended starting at sequence {}", result.start_sequence);
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendOutput {
@@ -123,14 +140,24 @@ pub struct AppendOutput {
 ///
 /// # Example
 ///
-/// ```ignore
-/// let mut iter = log.scan(key, ..);
+/// ```no_run
+/// # use log::{LogDb, LogRead, Config};
+/// # use bytes::Bytes;
+/// # use common::StorageConfig;
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+/// # let log = LogDb::open(config).await?;
+/// # let key = Bytes::from("orders");
+/// let mut iter = log.scan(key, ..).await?;
 /// while let Some(entry) = iter.next().await? {
 ///     println!(
 ///         "key={:?}, seq={}, value={:?}",
 ///         entry.key, entry.sequence, entry.value
 ///     );
 /// }
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEntry {

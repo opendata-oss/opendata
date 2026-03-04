@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
@@ -203,6 +204,102 @@ pub struct EvalSample {
 pub struct EvalSamples {
     pub(crate) values: Vec<Sample>,
     pub(crate) labels: HashMap<String, String>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum KAggregationOrder {
+    Top,
+    Bottom,
+}
+
+#[derive(Clone, Copy)]
+struct AggregationEvalContext {
+    // Keep timing inputs bundled so k-aggregation helpers stay small and
+    // always use a consistent eval context.
+    query_start: Timestamp,
+    query_end: Timestamp,
+    evaluation_ts: Timestamp,
+    interval_ms: i64,
+    lookback_delta_ms: i64,
+}
+
+/// Compares values for topk/bottomk aggregation.
+/// NaN values are always considered "greater" (sorted last) regardless of order.
+/// Uses partial_cmp for IEEE 754 semantics (-0.0 == +0.0), matching Prometheus.
+fn compare_k_values(left: f64, right: f64, order: KAggregationOrder) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => match order {
+            KAggregationOrder::Top => right.partial_cmp(&left).unwrap_or(Ordering::Equal),
+            KAggregationOrder::Bottom => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+struct KHeapEntry {
+    value: f64,
+    index: usize,
+    order: KAggregationOrder,
+}
+
+impl PartialEq for KHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index
+            && self.order == other.order
+            && self.value.to_bits() == other.value.to_bits()
+    }
+}
+
+impl Eq for KHeapEntry {}
+
+impl PartialOrd for KHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for KHeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap is a max-heap. Define "greater" as "worse" so heap.peek()
+        // returns the least desirable currently selected sample.
+        compare_k_values(self.value, other.value, self.order)
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
+fn select_k_indices_with_heap(
+    samples: &[EvalSample],
+    keep: usize,
+    order: KAggregationOrder,
+) -> Vec<usize> {
+    if keep == 0 || samples.is_empty() {
+        return Vec::new();
+    }
+    let mut heap = BinaryHeap::with_capacity(keep);
+    for (idx, sample) in samples.iter().enumerate() {
+        let entry = KHeapEntry {
+            value: sample.value,
+            index: idx,
+            order,
+        };
+        if heap.len() < keep {
+            heap.push(entry);
+            continue;
+        }
+
+        if let Some(worst) = heap.peek()
+            && compare_k_values(sample.value, worst.value, order).is_lt()
+        {
+            // Replace only when the candidate outranks the current worst,
+            // preserving the "peek is worst-kept" invariant.
+            heap.pop();
+            heap.push(entry);
+        }
+    }
+    heap.into_iter().map(|entry| entry.index).collect()
 }
 
 pub(crate) struct Evaluator<'reader, R: QueryReader> {
@@ -1709,6 +1806,178 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         key_vec
     }
 
+    async fn evaluate_aggregation_param_as_scalar(
+        &mut self,
+        param: Option<&Expr>,
+        query_start: Timestamp,
+        query_end: Timestamp,
+        evaluation_ts: Timestamp,
+        interval_ms: i64,
+        lookback_delta_ms: i64,
+    ) -> EvalResult<f64> {
+        let Some(param_expr) = param else {
+            return Err(EvaluationError::InternalError(
+                "aggregation requires a scalar parameter".to_string(),
+            ));
+        };
+
+        let param_value = match self
+            .evaluate_expr(
+                param_expr,
+                query_start,
+                query_end,
+                evaluation_ts,
+                interval_ms,
+                lookback_delta_ms,
+            )
+            .await?
+        {
+            ExprResult::Scalar(value) => value,
+            // `scalar()` currently returns an instant vector in this engine.
+            // Accept a single-element vector here so k-aggregations can consume scalar params.
+            ExprResult::InstantVector(mut samples) => {
+                if samples.len() == 1 {
+                    samples.pop().map(|sample| sample.value).ok_or_else(|| {
+                        EvaluationError::InternalError(
+                            "aggregation parameter expected one sample".to_string(),
+                        )
+                    })?
+                } else {
+                    f64::NAN
+                }
+            }
+            ExprResult::RangeVector(_) => {
+                return Err(EvaluationError::InternalError(
+                    "aggregation parameter cannot be a range vector".to_string(),
+                ));
+            }
+        };
+
+        Ok(param_value)
+    }
+
+    // topk/bottomk params are scalar floats, but selection needs a bounded count.
+    // Coerce once to match PromQL-like behavior: clamp to input size and treat
+    // k < 1 as empty output.
+    fn coerce_k_size(k_param: f64, input_len: usize) -> usize {
+        let max_k = input_len as i64;
+        let coerced = (k_param as i64).min(max_k);
+        if coerced < 1 { 0 } else { coerced as usize }
+    }
+
+    // Group key construction clones label strings. This is acceptable since
+    // topk's dominant cost is sorting/selection. If profiling shows this is hot,
+    // consider using series fingerprints as group keys instead.
+    fn group_samples_for_k_aggregation(
+        samples: Vec<EvalSample>,
+        modifier: Option<&LabelModifier>,
+    ) -> HashMap<Vec<(String, String)>, Vec<EvalSample>> {
+        let mut groups: HashMap<Vec<(String, String)>, Vec<EvalSample>> = HashMap::new();
+        for mut sample in samples {
+            // Materialize pending metric-name drops before grouping so __name__
+            // doesn't incorrectly affect bucket assignment.
+            if sample.drop_name {
+                sample.labels.remove(METRIC_NAME);
+                sample.drop_name = false;
+            }
+
+            let mut group_key: Vec<(String, String)> = match modifier {
+                None => Vec::new(),
+                Some(LabelModifier::Include(label_list)) => sample
+                    .labels
+                    .iter()
+                    .filter(|(name, _)| label_list.labels.contains(name))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+                Some(LabelModifier::Exclude(label_list)) => sample
+                    .labels
+                    .iter()
+                    .filter(|(name, _)| !label_list.labels.contains(name))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+            };
+            group_key.sort();
+            groups.entry(group_key).or_default().push(sample);
+        }
+        groups
+    }
+
+    fn select_k_from_group(
+        mut samples: Vec<EvalSample>,
+        k: usize,
+        order: KAggregationOrder,
+    ) -> Vec<EvalSample> {
+        let keep = k.min(samples.len());
+        let mut selected_indices = select_k_indices_with_heap(&samples, keep, order);
+        // Remove from highest index first so swap_remove cannot invalidate
+        // indices we still need to read.
+        selected_indices.sort_unstable_by(|left, right| right.cmp(left));
+
+        let mut result = Vec::with_capacity(selected_indices.len());
+        for idx in selected_indices {
+            result.push(samples.swap_remove(idx));
+        }
+        result.sort_by(|left, right| compare_k_values(left.value, right.value, order));
+        result
+    }
+
+    async fn evaluate_k_aggregate(
+        &mut self,
+        aggregate: &AggregateExpr,
+        mut samples: Vec<EvalSample>,
+        eval_ctx: AggregationEvalContext,
+    ) -> EvalResult<Vec<EvalSample>> {
+        let order = match aggregate.op.id() {
+            T_TOPK => KAggregationOrder::Top,
+            T_BOTTOMK => KAggregationOrder::Bottom,
+            _ => {
+                return Err(EvaluationError::InternalError(format!(
+                    "evaluate_k_aggregate called for non-k aggregation operator: {:?}",
+                    aggregate.op
+                )));
+            }
+        };
+
+        let k_param = self
+            .evaluate_aggregation_param_as_scalar(
+                aggregate.param.as_deref(),
+                eval_ctx.query_start,
+                eval_ctx.query_end,
+                eval_ctx.evaluation_ts,
+                eval_ctx.interval_ms,
+                eval_ctx.lookback_delta_ms,
+            )
+            .await?;
+        let k = Self::coerce_k_size(k_param, samples.len());
+        if k == 0 {
+            return Ok(vec![]);
+        }
+
+        // k-aggregation without `by` / `without`: all samples belong to one
+        // implicit group, so skip hashmap bucketing overhead.
+        if aggregate.modifier.is_none() {
+            if samples.iter().any(|sample| sample.drop_name) {
+                for sample in &mut samples {
+                    if sample.drop_name {
+                        sample.labels.remove(METRIC_NAME);
+                        sample.drop_name = false;
+                    }
+                }
+            }
+            return Ok(Self::select_k_from_group(samples, k, order));
+        }
+
+        // Histogram samples are not yet represented in EvalSample.
+        // This path is isolated so histogram handling can be added later
+        // without changing k-aggregation grouping/selection flow.
+        let grouped = Self::group_samples_for_k_aggregation(samples, aggregate.modifier.as_ref());
+        let mut result = Vec::new();
+        for group_samples in grouped.into_values() {
+            result.extend(Self::select_k_from_group(group_samples, k, order));
+        }
+        Ok(result)
+    }
+
     /// Compute a match signature for a sample's labels per Prometheus binary op semantics.
     /// - No modifier: match on ALL labels except `__name__`
     /// - `on(l1, l2)` (Include): match only on listed labels
@@ -1782,6 +2051,25 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         // If there are no samples, return empty result
         if samples.is_empty() {
             return Ok(ExprResult::InstantVector(vec![]));
+        }
+
+        // `topk`/`bottomk` are selection aggregations, not reduction aggregations.
+        // They must keep full EvalSample records so the selected output series
+        // retain their original labels/timestamps. The generic path below is a
+        // reducer: it collapses each group to Vec<f64> and emits one value per
+        // group, which discards per-series identity and cannot express k-selection.
+        if matches!(aggregate.op.id(), T_TOPK | T_BOTTOMK) {
+            let eval_ctx = AggregationEvalContext {
+                query_start,
+                query_end,
+                evaluation_ts,
+                interval_ms,
+                lookback_delta_ms,
+            };
+            let k_samples = self
+                .evaluate_k_aggregate(aggregate, samples, eval_ctx)
+                .await?;
+            return Ok(ExprResult::InstantVector(k_samples));
         }
 
         // Group samples by their grouping key (which consumes the filtered labels)
@@ -2650,6 +2938,54 @@ mod tests {
         vec![
             (4.0, vec![]), // 4 series
         ]
+    )]
+    #[case(
+        "aggregation_topk",
+        "topk(2, http_requests_total)",
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+            ("http_requests_total", vec![("env", "staging"), ("method", "GET")], 2, 30.0),
+            ("http_requests_total", vec![("env", "staging"), ("method", "POST")], 3, 40.0),
+        ],
+        vec![
+            (30.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "GET")]),
+            (40.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "POST")]),
+        ]
+    )]
+    #[case(
+        "aggregation_topk_by_env",
+        r#"topk by (env) (1, http_requests_total)"#,
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+            ("http_requests_total", vec![("env", "staging"), ("method", "GET")], 2, 30.0),
+            ("http_requests_total", vec![("env", "staging"), ("method", "POST")], 3, 40.0),
+        ],
+        vec![
+            (20.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "POST")]),
+            (40.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "POST")]),
+        ]
+    )]
+    #[case(
+        "aggregation_topk_materializes_drop_name",
+        "topk(1, http_requests_total + 1)",
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+        ],
+        vec![
+            (21.0, vec![("env", "prod"), ("method", "POST")]),
+        ]
+    )]
+    #[case(
+        "aggregation_topk_zero_k_returns_empty",
+        "topk(0, http_requests_total)",
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+        ],
+        vec![]
     )]
     // Aggregations with grouping
     #[case(

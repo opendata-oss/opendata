@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use common::Storage;
+use futures::TryStreamExt;
 use moka::future::Cache;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 use tokio::sync::RwLock;
@@ -621,12 +622,20 @@ impl Tsdb {
         Ok(TsdbQueryReader::new(readers))
     }
 
-    /// Flush all dirty buckets in the ingest cache to storage.
+    /// Flush all dirty buckets to durable storage.
+    ///
+    /// First flushes each bucket's delta to the storage memtable in parallel,
+    /// then issues a single `storage.flush()` to persist everything durably.
     pub(crate) async fn flush(&self) -> Result<()> {
         // Note: moka's iter() returns a clone of the current entries
-        for (_, mini) in &self.ingest_cache {
-            mini.flush().await?;
-        }
+        let futs: futures::stream::FuturesUnordered<_> = self
+            .ingest_cache
+            .iter()
+            .map(|(_, mini)| async move { mini.flush_written().await })
+            .collect();
+        futs.try_collect::<Vec<_>>().await?;
+
+        self.storage.flush().await?;
         Ok(())
     }
 

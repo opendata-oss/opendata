@@ -27,22 +27,23 @@ use crate::tsdb::{
 ///
 /// # Example
 ///
-/// ```ignore
-/// use timeseries::{TimeSeriesDb, Config, Series};
+/// ```
+/// # use timeseries::{TimeSeriesDb, Config, Series};
+/// # use common::StorageConfig;
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+/// let ts = TimeSeriesDb::open(config).await?;
 ///
-/// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let ts = TimeSeriesDb::open(Config::default()).await?;
+/// let series = Series::builder("http_requests_total")
+///     .label("method", "GET")
+///     .label("status", "200")
+///     .sample_now(1.0)
+///     .build();
 ///
-///     let series = Series::builder("http_requests_total")
-///         .label("method", "GET")
-///         .label("status", "200")
-///         .sample_now(1.0)
-///         .build();
-///
-///     ts.write(vec![series]).await?;
-///     Ok(())
-/// }
+/// ts.write(vec![series]).await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct TimeSeriesDb {
     // Internal Tsdb - not exposed
@@ -65,10 +66,15 @@ impl TimeSeriesDb {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// use timeseries::{TimeSeriesDb, Config};
-    ///
-    /// let ts = TimeSeriesDb::open(Config::default()).await?;
+    /// ```
+    /// # use timeseries::{TimeSeriesDb, Config};
+    /// # use common::StorageConfig;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+    /// let ts = TimeSeriesDb::open(config).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn open(config: Config) -> Result<Self> {
         let storage = create_storage(
@@ -106,7 +112,13 @@ impl TimeSeriesDb {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use timeseries::{TimeSeriesDb, Config, Series};
+    /// # use common::StorageConfig;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+    /// # let ts = TimeSeriesDb::open(config).await?;
     /// let series = vec![
     ///     Series::builder("cpu_usage")
     ///         .label("host", "server1")
@@ -120,6 +132,8 @@ impl TimeSeriesDb {
     /// ];
     ///
     /// ts.write(series).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn write(&self, series: Vec<Series>) -> Result<()> {
         self.tsdb.ingest_samples(series).await

@@ -52,3 +52,11 @@ jobs:
 
       - name: Run tests
         run: cargo test --all --all-features
+
+      - name: Check documentation builds
+        run: cargo doc --all --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+      - name: Run doc tests
+        run: cargo test --doc --all

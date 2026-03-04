@@ -606,6 +606,66 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn should_persist_data_after_flush_and_writer_reopen() {
+        use crate::{Config, TimeSeriesDb};
+        use common::storage::config::{
+            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+        };
+
+        // given
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage_config = common::StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp_dir.path().to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+        });
+
+        let writer = TimeSeriesDb::open(Config {
+            storage: storage_config.clone(),
+            flush_interval: Duration::from_secs(60),
+            retention: None,
+        })
+        .await
+        .unwrap();
+
+        let series = vec![
+            Series::builder("flush_durability_metric")
+                .label("env", "test")
+                .sample(1700000001000, 7.0)
+                .build(),
+        ];
+        writer.write(series).await.unwrap();
+
+        // when
+        writer.flush().await.unwrap();
+        drop(writer);
+
+        let reopened = TimeSeriesDb::open(Config {
+            storage: storage_config,
+            flush_interval: Duration::from_secs(60),
+            retention: None,
+        })
+        .await
+        .unwrap();
+        let query_time = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000001000);
+        let result = reopened
+            .query("flush_durability_metric", Some(query_time))
+            .await
+            .unwrap();
+
+        // then
+        match result {
+            QueryValue::Vector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].value, 7.0);
+            }
+            _ => panic!("expected Vector result after reopen"),
+        }
+    }
+
     /// Writer and reader must return identical timestamps for query_range
     /// with an inclusive end (`..=end`) where end is step-aligned. This
     /// guards against the regression where double-converting through

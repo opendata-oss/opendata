@@ -40,3 +40,4 @@ path = "src/bin/gen_sift100k_groundtruth.rs"
 common = { workspace = true, features = ["test-utils"] }
 tracing-subscriber.workspace = true
 opendata-macros.workspace = true
+tempfile.workspace = true
