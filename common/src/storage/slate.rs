@@ -410,24 +410,9 @@ mod tests {
     use super::*;
     use crate::BytesRange;
     use slatedb::DbBuilder;
-    use slatedb::clock::{LogicalClock, MockSystemClock, SystemClock};
     use slatedb::config::{DbReaderOptions, Settings};
     use slatedb::object_store::memory::InMemory;
-
-    /// Adapter that bridges [`MockSystemClock`] to [`LogicalClock`].
-    ///
-    /// SlateDB uses `LogicalClock` (not `SystemClock`) for TTL expiration.
-    /// This wrapper lets us control TTL time via `MockSystemClock::set()`.
-    #[derive(Debug)]
-    struct MockLogicalClockAdapter {
-        system_clock: Arc<MockSystemClock>,
-    }
-
-    impl LogicalClock for MockLogicalClockAdapter {
-        fn now(&self) -> i64 {
-            self.system_clock.now().timestamp_millis()
-        }
-    }
+    use slatedb_common::clock::MockSystemClock;
 
     #[tokio::test]
     async fn should_read_data_written_by_storage_via_reader() {
@@ -565,16 +550,13 @@ mod tests {
         let object_store = Arc::new(InMemory::new());
         let path = "/test/ttl_db";
         let clock = Arc::new(MockSystemClock::new());
-        let logical_clock = Arc::new(MockLogicalClockAdapter {
-            system_clock: clock.clone(),
-        });
 
         let db = DbBuilder::new(path, object_store)
             .with_settings(Settings {
                 default_ttl: Some(30_000),
                 ..Default::default()
             })
-            .with_logical_clock(logical_clock)
+            .with_system_clock(clock.clone())
             .build()
             .await
             .unwrap();
@@ -653,9 +635,6 @@ mod tests {
         let object_store = Arc::new(InMemory::new());
         let path = "/test/merge_ttl_db";
         let clock = Arc::new(MockSystemClock::new());
-        let logical_clock = Arc::new(MockLogicalClockAdapter {
-            system_clock: clock.clone(),
-        });
 
         let merge_op: Arc<dyn MergeOperator> = Arc::new(ConcatMergeOperator);
         let slate_merge_op = SlateDbStorage::merge_operator_adapter(merge_op);
@@ -664,7 +643,7 @@ mod tests {
                 default_ttl: Some(30_000),
                 ..Default::default()
             })
-            .with_logical_clock(logical_clock)
+            .with_system_clock(clock.clone())
             .with_merge_operator(Arc::new(slate_merge_op))
             .build()
             .await

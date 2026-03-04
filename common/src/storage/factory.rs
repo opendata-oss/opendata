@@ -322,12 +322,12 @@ async fn create_slatedb_storage(
 
     // Add compaction runtime if provided
     if let Some(handle) = runtime.compaction_runtime {
-        db_builder = db_builder.with_compaction_runtime(handle);
+        db_builder = db_builder.with_gc_runtime(handle);
     }
 
     // Add block cache if provided
     if let Some(cache) = runtime.block_cache {
-        db_builder = db_builder.with_memory_cache(cache);
+        db_builder = db_builder.with_db_cache(cache);
     }
 
     let db = db_builder

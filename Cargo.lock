@@ -2499,6 +2499,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "slatedb",
+ "slatedb-common",
  "tokio",
  "tokio-util",
  "tracing",
@@ -3924,9 +3925,9 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 
 [[package]]
 name = "slatedb"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "588e9ae32019696205a05e54e4456486e8d11b69c72662739be853736833b3dd"
+checksum = "251fe5f092b750f8f14ebcd8035b77c93b32d7692af52362d37ebcf65a2f2272"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3955,6 +3956,8 @@ dependencies = [
  "serde",
  "serde_json",
  "siphasher",
+ "slatedb-common",
+ "slatedb-txn-obj",
  "sysinfo",
  "thiserror 1.0.69",
  "thread_local",
@@ -3965,6 +3968,32 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "slatedb-common"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "956d2acdf732e99ce90a64881a63444e12aa31a828a25a843556c99549bc8b3e"
+dependencies = [
+ "chrono",
+ "tokio",
+]
+
+[[package]]
+name = "slatedb-txn-obj"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "234ea1e0455546b87d54f3c2128ae2f1b2aa243f465cfbe2468f4a6afaab9e7b"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "log",
+ "object_store",
+ "slatedb-common",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
