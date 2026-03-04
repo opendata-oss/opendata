@@ -17,8 +17,10 @@ Thank you for your interest in contributing to OpenData! We welcome contribution
 OpenData is a Rust workspace containing multiple crates:
 
 - `common` - Shared components and utilities
-- `tsdb` - Object storage-native timeseries database
-- `log` - Object storage-native event streaming backend
+- `timeseries` (`opendata-timeseries`) - Object storage-native timeseries database
+- `log` (`opendata-log`) - Object storage-native event streaming backend
+- `vector` (`opendata-vector`) - Vector similarity search database
+- `keyvalue` (`opendata-keyvalue`) - Key-value database
 
 Before contributing, we recommend reading the [README](README.md) to understand the project architecture and looking at existing issues and pull requests.
 
@@ -148,7 +150,15 @@ fn should_return_error_when_input_is_invalid() {
 cargo test --all                    # Run all tests
 cargo test --all -- --nocapture     # Run with output
 cargo test -p timeseries             # Run tests for a specific crate
+cargo test --all --all-features      # Match CI coverage
 ```
+
+## Pull Request Process
+
+1. Ensure formatting, clippy, and tests pass locally
+2. Keep commits focused and include tests/docs for behavior changes
+3. Open a PR with a clear summary, testing notes, and any RFC references
+4. Address review feedback and re-run checks before merge
 
 ## License
 

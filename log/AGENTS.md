@@ -39,7 +39,7 @@ This preserves lexicographic ordering and enables prefix-based range queries.
 - `src/reader.rs` - `LogDbReader` for read-only access
 - `src/model.rs` - Public types (Record, LogEntry)
 - `src/serde.rs` - Key/value encoding
-- `src/sequence.rs` - Block-based sequence allocation
+- `common/src/sequence.rs` - Block-based sequence allocation
 
 ### APIs
 
