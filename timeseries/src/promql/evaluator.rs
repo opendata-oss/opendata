@@ -1837,10 +1837,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             // Accept a single-element vector here so k-aggregations can consume scalar params.
             ExprResult::InstantVector(mut samples) => {
                 if samples.len() == 1 {
-                    samples
-                        .pop()
-                        .expect("single-sample vector must have one value")
-                        .value
+                    samples.pop().map(|sample| sample.value).ok_or_else(|| {
+                        EvaluationError::InternalError(
+                            "aggregation parameter expected one sample".to_string(),
+                        )
+                    })?
                 } else {
                     f64::NAN
                 }
