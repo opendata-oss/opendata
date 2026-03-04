@@ -257,7 +257,18 @@ pub trait Storage: StorageRead {
     /// All operations in the batch are written together in a single `WriteBatch`,
     /// so either all succeed or none are visible. This is the primary write method
     /// used by flushers that produce a mix of operation types from a frozen delta.
-    async fn apply(&self, ops: Vec<RecordOp>) -> StorageResult<()>;
+    ///
+    /// Uses `WriteOptions::default()` (`await_durable: false`).
+    async fn apply(&self, ops: Vec<RecordOp>) -> StorageResult<()> {
+        self.apply_with_options(ops, WriteOptions::default()).await
+    }
+
+    /// Applies a batch of mixed operations with custom write options.
+    async fn apply_with_options(
+        &self,
+        ops: Vec<RecordOp>,
+        options: WriteOptions,
+    ) -> StorageResult<()>;
 
     async fn put(&self, records: Vec<PutRecordOp>) -> StorageResult<()>;
 
@@ -284,7 +295,19 @@ pub trait Storage: StorageRead {
     ///
     /// The merge operation is atomic - all merges in the batch are applied
     /// together or not at all.
-    async fn merge(&self, records: Vec<MergeRecordOp>) -> StorageResult<()>;
+    ///
+    /// Uses `WriteOptions::default()` (`await_durable: false`).
+    async fn merge(&self, records: Vec<MergeRecordOp>) -> StorageResult<()> {
+        self.merge_with_options(records, WriteOptions::default())
+            .await
+    }
+
+    /// Merges values with custom write options.
+    async fn merge_with_options(
+        &self,
+        records: Vec<MergeRecordOp>,
+        options: WriteOptions,
+    ) -> StorageResult<()>;
 
     /// Creates a point-in-time snapshot of the storage.
     ///

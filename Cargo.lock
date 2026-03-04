@@ -2633,6 +2633,7 @@ dependencies = [
  "rstest",
  "serde",
  "serde_yaml",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

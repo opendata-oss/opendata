@@ -210,7 +210,11 @@ impl StorageSnapshot for InMemoryStorageSnapshot {}
 
 #[async_trait]
 impl Storage for InMemoryStorage {
-    async fn apply(&self, records: Vec<RecordOp>) -> StorageResult<()> {
+    async fn apply_with_options(
+        &self,
+        records: Vec<RecordOp>,
+        _options: WriteOptions,
+    ) -> StorageResult<()> {
         let mut data = self
             .data
             .write()
@@ -305,7 +309,11 @@ impl Storage for InMemoryStorage {
     ///
     /// If no merge operator is configured, this method will return a
     /// `StorageError::Storage` error.
-    async fn merge(&self, records: Vec<MergeRecordOp>) -> StorageResult<()> {
+    async fn merge_with_options(
+        &self,
+        records: Vec<MergeRecordOp>,
+        _options: WriteOptions,
+    ) -> StorageResult<()> {
         let merge_op = self
             .merge_operator
             .as_ref()
@@ -518,9 +526,13 @@ impl super::StorageRead for FailingStorage {
 #[cfg(feature = "test-utils")]
 #[async_trait]
 impl super::Storage for FailingStorage {
-    async fn apply(&self, ops: Vec<super::RecordOp>) -> super::StorageResult<()> {
+    async fn apply_with_options(
+        &self,
+        ops: Vec<super::RecordOp>,
+        options: super::WriteOptions,
+    ) -> super::StorageResult<()> {
         check_failure(&self.fail_apply)?;
-        self.inner.apply(ops).await
+        self.inner.apply_with_options(ops, options).await
     }
 
     async fn put(&self, records: Vec<super::PutRecordOp>) -> super::StorageResult<()> {
@@ -537,8 +549,12 @@ impl super::Storage for FailingStorage {
         self.inner.put_with_options(records, options).await
     }
 
-    async fn merge(&self, records: Vec<super::MergeRecordOp>) -> super::StorageResult<()> {
-        self.inner.merge(records).await
+    async fn merge_with_options(
+        &self,
+        records: Vec<super::MergeRecordOp>,
+        options: super::WriteOptions,
+    ) -> super::StorageResult<()> {
+        self.inner.merge_with_options(records, options).await
     }
 
     async fn snapshot(&self) -> super::StorageResult<Arc<dyn super::StorageSnapshot>> {
