@@ -17,6 +17,7 @@ pub struct EvalInstantCmd {
     pub time: SystemTime,
     pub query: String,
     pub expected: Vec<RangeSample>,
+    pub expect_ordered: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +153,7 @@ impl Parser {
         let time = parse_time(&time_str)?;
 
         let mut expected = Vec::new();
+        let mut expect_ordered = false;
 
         // Collect indented expected result lines
         while *i < lines.len() {
@@ -166,8 +168,11 @@ impl Parser {
                 continue;
             }
 
-            // Skip expect directives (not yet implemented)
+            // We only implement ordering for now; other directives remain no-ops.
             if trimmed.starts_with("expect ") {
+                if trimmed == "expect ordered" {
+                    expect_ordered = true;
+                }
                 *i += 1;
                 continue;
             }
@@ -180,6 +185,7 @@ impl Parser {
             time,
             query,
             expected,
+            expect_ordered,
         })))
     }
 
@@ -315,7 +321,8 @@ fn parse_multiple_value_exprs(s: &str) -> Result<Vec<(i64, f64)>, String> {
     // We treat multiple value expressions as sequential blocks to guarantee
     // monotonically increasing step indices at parse time.
     //
-    // Example: "0+10x3 100+20x2" produces steps [0,1,2,3,4] not [0,1,2,0,1]
+    // Example: "0+10x3 100+20x2" produces steps [0,1,2,3,4,5,6]
+    // (x3 => 4 samples, x2 => 3 samples) instead of [0,1,2,3,0,1,2]
     //
     // Why this matters:
     // 1. Predictable behavior: Test authors see sequential timestamps
@@ -341,7 +348,9 @@ fn parse_values(s: &str) -> Result<Vec<(i64, f64)>, String> {
     let s = s.trim();
 
     // Check for expansion syntax: "start+step x count"
-    // Example: "0+10x100" → [0, 10, 20, ..., 990]
+    // Prometheus promqltest semantics are inclusive:
+    // "0+10x5" => 6 samples: [0, 10, 20, 30, 40, 50].
+    // Example: "0+10x100" => [0, 10, 20, ..., 1000].
     if s.contains('+') && s.contains('x') {
         let (lhs, count_str) = s
             .split_once('x')
@@ -360,7 +369,7 @@ fn parse_values(s: &str) -> Result<Vec<(i64, f64)>, String> {
             .parse()
             .map_err(|_| format!("Invalid count: {}", count_str))?;
 
-        Ok((0..count)
+        Ok((0..=count)
             .map(|i| (i as i64, start + step * i as f64))
             .collect())
     } else {
@@ -570,6 +579,27 @@ mod tests {
             Command::EvalInstant(cmd) => {
                 assert_eq!(cmd.query, "metric");
                 assert_eq!(cmd.expected.len(), 1);
+                assert!(!cmd.expect_ordered);
+            }
+            _ => panic!("Expected EvalInstant command"),
+        }
+    }
+
+    #[test]
+    fn should_parse_expect_ordered_directive() {
+        // given
+        let input = "eval instant at 10s metric\n  expect ordered\n  {job=\"1\"} 5";
+
+        // when
+        let cmds = Parser::parse_file(input).unwrap();
+
+        // then
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            Command::EvalInstant(cmd) => {
+                assert_eq!(cmd.query, "metric");
+                assert!(cmd.expect_ordered);
+                assert_eq!(cmd.expected.len(), 1);
             }
             _ => panic!("Expected EvalInstant command"),
         }
@@ -586,7 +616,14 @@ mod tests {
         // then
         assert_eq!(
             vals,
-            vec![(0, 0.0), (1, 10.0), (2, 20.0), (3, 30.0), (4, 40.0)]
+            vec![
+                (0, 0.0),
+                (1, 10.0),
+                (2, 20.0),
+                (3, 30.0),
+                (4, 40.0),
+                (5, 50.0),
+            ]
         );
     }
 
@@ -601,7 +638,15 @@ mod tests {
         // then
         assert_eq!(
             vals,
-            vec![(0, 0.0), (1, 10.0), (2, 20.0), (3, 100.0), (4, 120.0),]
+            vec![
+                (0, 0.0),
+                (1, 10.0),
+                (2, 20.0),
+                (3, 30.0),
+                (4, 100.0),
+                (5, 120.0),
+                (6, 140.0),
+            ]
         );
     }
 
@@ -633,9 +678,11 @@ mod tests {
                 (0, 0.0),
                 (1, 10.0),
                 (2, 20.0),
-                (3, 100.0),
-                (4, 105.0),
-                (5, 110.0),
+                (3, 30.0),
+                (4, 100.0),
+                (5, 105.0),
+                (6, 110.0),
+                (7, 115.0),
             ]
         );
     }
@@ -648,7 +695,8 @@ mod tests {
         // when
         let vals = parse_multiple_value_exprs(input).unwrap();
 
-        // then - we produce sequential steps [0,1,2,3,4] not overlapping [0,1,2,0,1]
+        // then - we produce sequential steps [0,1,2,3,4,5,6]
+        // not overlapping [0,1,2,3,0,1,2]
         // This guarantees strictly increasing timestamps when steps are converted
         // to wall-clock time, preventing Gorilla/tsz encoder panics.
         assert_eq!(
@@ -657,13 +705,15 @@ mod tests {
                 (0, 0.0),  // First expression
                 (1, 10.0), // First expression
                 (2, 20.0), // First expression
-                (3, 0.0),  // Second expression (step 3, not 0)
-                (4, 20.0), // Second expression (step 4, not 1)
+                (3, 30.0), // First expression
+                (4, 0.0),  // Second expression (step 4, not 0)
+                (5, 20.0), // Second expression (step 5, not 1)
+                (6, 40.0), // Second expression (step 6, not 2)
             ]
         );
 
         // Without sequential blocks, this would produce:
-        // [(0, 0.0), (1, 10.0), (2, 20.0), (0, 0.0), (1, 20.0)]
+        // [(0, 0.0), (1, 10.0), (2, 20.0), (3, 30.0), (0, 0.0), (1, 20.0), (2, 40.0)]
         // which has backwards timestamps after sorting
     }
 
