@@ -112,88 +112,87 @@ impl OtelConverter {
         result: &mut Vec<Series>,
     ) {
         let name = &metric.name;
-        let unit = &metric.unit;
-        let description = &metric.description;
+        let mut ctx = SeriesCollector {
+            unit: &metric.unit,
+            description: &metric.description,
+            base_labels,
+            result,
+        };
 
         match &metric.data {
             Some(metric::Data::Gauge(g)) => {
-                self.convert_gauge(name, unit, description, &g.data_points, base_labels, result);
+                self.convert_gauge(name, &g.data_points, &mut ctx);
             }
             Some(metric::Data::Sum(s)) => {
                 self.convert_sum(
                     name,
-                    unit,
-                    description,
                     &s.data_points,
                     s.aggregation_temporality,
                     s.is_monotonic,
-                    base_labels,
-                    result,
+                    &mut ctx,
                 );
             }
             Some(metric::Data::Histogram(h)) => {
-                self.convert_histogram(
-                    name,
-                    unit,
-                    description,
-                    &h.data_points,
-                    h.aggregation_temporality,
-                    base_labels,
-                    result,
-                );
+                self.convert_histogram(name, &h.data_points, h.aggregation_temporality, &mut ctx);
             }
             Some(metric::Data::ExponentialHistogram(eh)) => {
                 self.convert_exp_histogram(
                     name,
-                    unit,
-                    description,
                     &eh.data_points,
                     eh.aggregation_temporality,
-                    base_labels,
-                    result,
+                    &mut ctx,
                 );
             }
             Some(metric::Data::Summary(s)) => {
-                self.convert_summary(name, unit, description, &s.data_points, base_labels, result);
+                self.convert_summary(name, &s.data_points, &mut ctx);
             }
             None => {}
         }
     }
+}
 
-    #[allow(clippy::too_many_arguments)]
-    fn make_series(
+/// Accumulates `Series` from a single OTLP metric, carrying the fields that are
+/// constant across all data points (unit, description, base labels).
+struct SeriesCollector<'a> {
+    unit: &'a str,
+    description: &'a str,
+    base_labels: &'a [Label],
+    result: &'a mut Vec<Series>,
+}
+
+impl SeriesCollector<'_> {
+    fn push(
+        &mut self,
         name: &str,
-        unit: &str,
-        description: &str,
         metric_type: MetricType,
-        base_labels: &[Label],
-        dp_labels: &[Label],
+        point_labels: &[Label],
         extra_labels: &[Label],
         timestamp_ms: i64,
         value: f64,
-    ) -> Series {
-        let mut labels =
-            Vec::with_capacity(1 + base_labels.len() + dp_labels.len() + extra_labels.len());
+    ) {
+        let mut labels = Vec::with_capacity(
+            1 + self.base_labels.len() + point_labels.len() + extra_labels.len(),
+        );
         labels.push(Label::metric_name(name));
-        labels.extend_from_slice(base_labels);
-        labels.extend_from_slice(dp_labels);
+        labels.extend_from_slice(self.base_labels);
+        labels.extend_from_slice(point_labels);
         labels.extend_from_slice(extra_labels);
 
-        Series {
+        self.result.push(Series {
             labels,
             metric_type: Some(metric_type),
-            unit: if unit.is_empty() {
+            unit: if self.unit.is_empty() {
                 None
             } else {
-                Some(unit.to_string())
+                Some(self.unit.to_string())
             },
-            description: if description.is_empty() {
+            description: if self.description.is_empty() {
                 None
             } else {
-                Some(description.to_string())
+                Some(self.description.to_string())
             },
             samples: vec![Sample::new(timestamp_ms, value)],
-        }
+        });
     }
 }
 
@@ -253,10 +252,14 @@ fn build_metric_name(name: &str, unit: &str, is_monotonic_counter: bool) -> Stri
 
 fn format_float(v: f64) -> String {
     if v.fract() == 0.0 && v.is_finite() {
-        format!("{}", v as i64)
-    } else {
-        format!("{}", v)
+        // Use i64 formatting when the value fits, otherwise fall back to f64
+        // which avoids silent saturation for values beyond i64 range.
+        let i = v as i64;
+        if i as f64 == v {
+            return format!("{i}");
+        }
     }
+    format!("{v}")
 }
 
 fn kv_to_label(kv: &KeyValue) -> Option<Label> {
@@ -286,20 +289,15 @@ fn to_temporality(t: i32) -> Temporality {
     }
 }
 
-// Per-type conversion methods as free functions that take &OtelConverter
-// (implemented via an impl block to keep them organized)
+// Per-type conversion methods.
 impl OtelConverter {
-    #[allow(clippy::too_many_arguments)]
     fn convert_gauge(
         &self,
         name: &str,
-        unit: &str,
-        description: &str,
         data_points: &[opentelemetry_proto::tonic::metrics::v1::NumberDataPoint],
-        base_labels: &[Label],
-        result: &mut Vec<Series>,
+        ctx: &mut SeriesCollector<'_>,
     ) {
-        let metric_name = build_metric_name(name, unit, false);
+        let metric_name = build_metric_name(name, ctx.unit, false);
         for dp in data_points {
             let value = match dp.value {
                 Some(number_data_point::Value::AsDouble(v)) => v,
@@ -307,33 +305,25 @@ impl OtelConverter {
                 None => continue,
             };
             let timestamp_ms = (dp.time_unix_nano / 1_000_000) as i64;
-            let dp_labels = collect_labels(&dp.attributes);
-
-            result.push(Self::make_series(
+            let point_labels = collect_labels(&dp.attributes);
+            ctx.push(
                 &metric_name,
-                unit,
-                description,
                 MetricType::Gauge,
-                base_labels,
-                &dp_labels,
+                &point_labels,
                 &[],
                 timestamp_ms,
                 value,
-            ));
+            );
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn convert_sum(
         &self,
         name: &str,
-        unit: &str,
-        description: &str,
         data_points: &[opentelemetry_proto::tonic::metrics::v1::NumberDataPoint],
         temporality: i32,
         is_monotonic: bool,
-        base_labels: &[Label],
-        result: &mut Vec<Series>,
+        ctx: &mut SeriesCollector<'_>,
     ) {
         let temp = to_temporality(temporality);
 
@@ -354,7 +344,7 @@ impl OtelConverter {
             (MetricType::Gauge, false)
         };
 
-        let metric_name = build_metric_name(name, unit, is_counter);
+        let metric_name = build_metric_name(name, ctx.unit, is_counter);
 
         for dp in data_points {
             let value = match dp.value {
@@ -363,60 +353,49 @@ impl OtelConverter {
                 None => continue,
             };
             let timestamp_ms = (dp.time_unix_nano / 1_000_000) as i64;
-            let dp_labels = collect_labels(&dp.attributes);
-
-            result.push(Self::make_series(
+            let point_labels = collect_labels(&dp.attributes);
+            ctx.push(
                 &metric_name,
-                unit,
-                description,
                 metric_type,
-                base_labels,
-                &dp_labels,
+                &point_labels,
                 &[],
                 timestamp_ms,
                 value,
-            ));
+            );
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn convert_histogram(
         &self,
         name: &str,
-        unit: &str,
-        description: &str,
         data_points: &[opentelemetry_proto::tonic::metrics::v1::HistogramDataPoint],
         temporality: i32,
-        base_labels: &[Label],
-        result: &mut Vec<Series>,
+        ctx: &mut SeriesCollector<'_>,
     ) {
         let temp = to_temporality(temporality);
         let metric_type = MetricType::Histogram { temporality: temp };
-        let base_name = build_metric_name(name, unit, false);
+        let base_name = build_metric_name(name, ctx.unit, false);
         let bucket_name = format!("{}_bucket", base_name);
         let sum_name = format!("{}_sum", base_name);
         let count_name = format!("{}_count", base_name);
 
         for dp in data_points {
             let timestamp_ms = (dp.time_unix_nano / 1_000_000) as i64;
-            let dp_labels = collect_labels(&dp.attributes);
+            let point_labels = collect_labels(&dp.attributes);
 
             // Bucket series — cumulative counts
             let mut cumulative: u64 = 0;
             for (i, bound) in dp.explicit_bounds.iter().enumerate() {
                 cumulative += dp.bucket_counts.get(i).copied().unwrap_or(0);
                 let le_label = [Label::new("le", format_float(*bound))];
-                result.push(Self::make_series(
+                ctx.push(
                     &bucket_name,
-                    unit,
-                    description,
                     metric_type,
-                    base_labels,
-                    &dp_labels,
+                    &point_labels,
                     &le_label,
                     timestamp_ms,
                     cumulative as f64,
-                ));
+                );
             }
 
             // +Inf bucket
@@ -426,45 +405,36 @@ impl OtelConverter {
                 .copied()
                 .unwrap_or(0);
             let inf_label = [Label::new("le", "+Inf")];
-            result.push(Self::make_series(
+            ctx.push(
                 &bucket_name,
-                unit,
-                description,
                 metric_type,
-                base_labels,
-                &dp_labels,
+                &point_labels,
                 &inf_label,
                 timestamp_ms,
                 cumulative as f64,
-            ));
+            );
 
             // _sum
             if let Some(sum) = dp.sum {
-                result.push(Self::make_series(
+                ctx.push(
                     &sum_name,
-                    unit,
-                    description,
                     metric_type,
-                    base_labels,
-                    &dp_labels,
+                    &point_labels,
                     &[],
                     timestamp_ms,
                     sum,
-                ));
+                );
             }
 
             // _count
-            result.push(Self::make_series(
+            ctx.push(
                 &count_name,
-                unit,
-                description,
                 metric_type,
-                base_labels,
-                &dp_labels,
+                &point_labels,
                 &[],
                 timestamp_ms,
                 dp.count as f64,
-            ));
+            );
         }
     }
 
@@ -474,27 +444,23 @@ impl OtelConverter {
     /// buckets (representing negative measurement values) cannot be expressed as classic
     /// Prometheus buckets; the OTLP spec maps them to Prometheus Native Histograms instead.
     /// Negative observations are still reflected in `_count` and the `+Inf` bucket.
-    #[allow(clippy::too_many_arguments)]
     fn convert_exp_histogram(
         &self,
         name: &str,
-        unit: &str,
-        description: &str,
         data_points: &[opentelemetry_proto::tonic::metrics::v1::ExponentialHistogramDataPoint],
         temporality: i32,
-        base_labels: &[Label],
-        result: &mut Vec<Series>,
+        ctx: &mut SeriesCollector<'_>,
     ) {
         let temp = to_temporality(temporality);
         let metric_type = MetricType::Histogram { temporality: temp };
-        let base_name = build_metric_name(name, unit, false);
+        let base_name = build_metric_name(name, ctx.unit, false);
         let bucket_name = format!("{}_bucket", base_name);
         let sum_name = format!("{}_sum", base_name);
         let count_name = format!("{}_count", base_name);
 
         for dp in data_points {
             let timestamp_ms = (dp.time_unix_nano / 1_000_000) as i64;
-            let dp_labels = collect_labels(&dp.attributes);
+            let point_labels = collect_labels(&dp.attributes);
 
             // Convert exponential buckets to classic Prometheus le-style buckets.
             //
@@ -525,121 +491,97 @@ impl OtelConverter {
             // Emit bucket series.
             for (bound, cum_count) in explicit_bounds.iter().zip(cumulative_counts.iter()) {
                 let le_label = [Label::new("le", format_float(*bound))];
-                result.push(Self::make_series(
+                ctx.push(
                     &bucket_name,
-                    unit,
-                    description,
                     metric_type,
-                    base_labels,
-                    &dp_labels,
+                    &point_labels,
                     &le_label,
                     timestamp_ms,
                     *cum_count as f64,
-                ));
+                );
             }
 
             // +Inf bucket.
             let inf_label = [Label::new("le", "+Inf")];
-            result.push(Self::make_series(
+            ctx.push(
                 &bucket_name,
-                unit,
-                description,
                 metric_type,
-                base_labels,
-                &dp_labels,
+                &point_labels,
                 &inf_label,
                 timestamp_ms,
                 dp.count as f64,
-            ));
+            );
 
             // _sum
             if let Some(sum) = dp.sum {
-                result.push(Self::make_series(
+                ctx.push(
                     &sum_name,
-                    unit,
-                    description,
                     metric_type,
-                    base_labels,
-                    &dp_labels,
+                    &point_labels,
                     &[],
                     timestamp_ms,
                     sum,
-                ));
+                );
             }
 
             // _count
-            result.push(Self::make_series(
+            ctx.push(
                 &count_name,
-                unit,
-                description,
                 metric_type,
-                base_labels,
-                &dp_labels,
+                &point_labels,
                 &[],
                 timestamp_ms,
                 dp.count as f64,
-            ));
+            );
         }
     }
 
     fn convert_summary(
         &self,
         name: &str,
-        unit: &str,
-        description: &str,
         data_points: &[opentelemetry_proto::tonic::metrics::v1::SummaryDataPoint],
-        base_labels: &[Label],
-        result: &mut Vec<Series>,
+        ctx: &mut SeriesCollector<'_>,
     ) {
-        let base_name = build_metric_name(name, unit, false);
+        let base_name = build_metric_name(name, ctx.unit, false);
         let sum_name = format!("{}_sum", base_name);
         let count_name = format!("{}_count", base_name);
 
         for dp in data_points {
             let timestamp_ms = (dp.time_unix_nano / 1_000_000) as i64;
-            let dp_labels = collect_labels(&dp.attributes);
+            let point_labels = collect_labels(&dp.attributes);
 
             // Per-quantile series
             for q in &dp.quantile_values {
                 let q_label = [Label::new("quantile", format_float(q.quantile))];
-                result.push(Self::make_series(
+                ctx.push(
                     &base_name,
-                    unit,
-                    description,
                     MetricType::Summary,
-                    base_labels,
-                    &dp_labels,
+                    &point_labels,
                     &q_label,
                     timestamp_ms,
                     q.value,
-                ));
+                );
             }
 
             // _sum
-            result.push(Self::make_series(
+            ctx.push(
                 &sum_name,
-                unit,
-                description,
                 MetricType::Summary,
-                base_labels,
-                &dp_labels,
+                &point_labels,
                 &[],
                 timestamp_ms,
                 dp.sum,
-            ));
+            );
 
             // _count
-            result.push(Self::make_series(
+            ctx.push(
                 &count_name,
-                unit,
-                description,
                 MetricType::Summary,
-                base_labels,
-                &dp_labels,
+                &point_labels,
                 &[],
                 timestamp_ms,
                 dp.count as f64,
-            ));
+            );
         }
     }
 }
@@ -1883,5 +1825,26 @@ mod tests {
             1,
             "dots in metric name should be replaced with underscores"
         );
+    }
+
+    #[test]
+    fn format_float_should_handle_values_beyond_i64_range() {
+        // 1e19 exceeds i64::MAX (~9.2e18). format_float should not saturate.
+        assert_eq!(format_float(1e19), "10000000000000000000");
+        assert_eq!(format_float(-1e19), "-10000000000000000000");
+    }
+
+    #[test]
+    fn format_float_should_format_whole_numbers_without_decimal() {
+        assert_eq!(format_float(1.0), "1");
+        assert_eq!(format_float(100.0), "100");
+        assert_eq!(format_float(0.0), "0");
+        assert_eq!(format_float(-5.0), "-5");
+    }
+
+    #[test]
+    fn format_float_should_preserve_fractional_values() {
+        assert_eq!(format_float(0.5), "0.5");
+        assert_eq!(format_float(0.99), "0.99");
     }
 }

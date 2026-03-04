@@ -162,11 +162,11 @@ The converter walks the OTLP hierarchy (`ResourceMetrics` → `ScopeMetrics` →
 
 ```toml
 [dependencies]
-opentelemetry-proto = { version = "0.28", optional = true, features = ["metrics", "gen-prost"] }
+opentelemetry-proto = { version = "0.28", optional = true, features = ["metrics", "gen-tonic-messages"] }
 prost = { version = "0.13", optional = true }
 ```
 
-We use `gen-prost` (not `gen-tonic`) — only message types are needed, not gRPC service definitions.
+We use `gen-tonic-messages` (not `gen-tonic`) — only message types are needed, not gRPC transport. The `gen-tonic-messages` feature pulls in `tonic` and `prost` for message definitions without enabling `tonic/transport`.
 
 ## Alternatives Considered
 
