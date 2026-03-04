@@ -16,6 +16,7 @@ use crate::model::RangeSample;
 pub(super) fn assert_results(
     results: &[RangeSample],
     expected: &[RangeSample],
+    expect_ordered: bool,
     test_name: &str,
     eval_num: usize,
     query: &str,
@@ -31,12 +32,14 @@ pub(super) fn assert_results(
         ));
     }
 
-    // Sort both sides deterministically - PromQL doesn't guarantee result ordering
+    // Most instant vectors are unordered in PromQL, but promqltest supports
+    // `expect ordered` for order-sensitive checks (e.g. topk/bottomk).
     let mut results_sorted = results.to_vec();
-    results_sorted.sort_by(|a, b| a.labels.cmp(&b.labels));
-
     let mut expected_sorted = expected.to_vec();
-    expected_sorted.sort_by(|a, b| a.labels.cmp(&b.labels));
+    if !expect_ordered {
+        results_sorted.sort_by(|a, b| a.labels.cmp(&b.labels));
+        expected_sorted.sort_by(|a, b| a.labels.cmp(&b.labels));
+    }
 
     for (i, exp) in expected_sorted.iter().enumerate() {
         let result = &results_sorted[i];
@@ -93,7 +96,7 @@ mod tests {
         let expected = vec![range_sample(labels_from(&[("job", "test")]), 42.0)];
 
         // when
-        let result = assert_results(&results, &expected, "test", 1, "metric");
+        let result = assert_results(&results, &expected, false, "test", 1, "metric");
 
         // then
         assert!(result.is_ok());
@@ -106,7 +109,7 @@ mod tests {
         let expected = vec![];
 
         // when
-        let result = assert_results(&results, &expected, "test", 1, "metric");
+        let result = assert_results(&results, &expected, false, "test", 1, "metric");
 
         // then
         assert!(result.is_err());
@@ -120,10 +123,49 @@ mod tests {
         let expected = vec![range_sample(Labels::empty(), 99.0)];
 
         // when
-        let result = assert_results(&results, &expected, "test", 1, "metric");
+        let result = assert_results(&results, &expected, false, "test", 1, "metric");
 
         // then
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Value mismatch"));
+    }
+
+    #[test]
+    fn should_reject_order_mismatch_when_ordered() {
+        // given
+        let results = vec![
+            range_sample(labels_from(&[("instance", "b")]), 2.0),
+            range_sample(labels_from(&[("instance", "a")]), 1.0),
+        ];
+        let expected = vec![
+            range_sample(labels_from(&[("instance", "a")]), 1.0),
+            range_sample(labels_from(&[("instance", "b")]), 2.0),
+        ];
+
+        // when
+        let result = assert_results(&results, &expected, true, "test", 1, "metric");
+
+        // then
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Label instance mismatch"));
+    }
+
+    #[test]
+    fn should_allow_order_mismatch_when_not_ordered() {
+        // given
+        let results = vec![
+            range_sample(labels_from(&[("instance", "b")]), 2.0),
+            range_sample(labels_from(&[("instance", "a")]), 1.0),
+        ];
+        let expected = vec![
+            range_sample(labels_from(&[("instance", "a")]), 1.0),
+            range_sample(labels_from(&[("instance", "b")]), 2.0),
+        ];
+
+        // when
+        let result = assert_results(&results, &expected, false, "test", 1, "metric");
+
+        // then
+        assert!(result.is_ok());
     }
 }
