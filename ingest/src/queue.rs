@@ -22,10 +22,11 @@ fn millis(time: SystemTime) -> i64 {
 }
 
 const PRODUCER_MANIFEST_VERSION: u16 = 1;
-const FOOTER_SIZE: usize = 6; // 4 bytes entry_count + 2 bytes version
+const FOOTER_SIZE: usize = 14; // 4 bytes entry_count + 8 bytes next_sequence + 2 bytes version
 
 #[derive(Debug, Clone)]
 struct ProducerEntry {
+    sequence: u64,
     location: String,
     ingestion_time_ms: i64,
     metadata: Bytes,
@@ -36,6 +37,7 @@ struct ProducerManifest {
     data: Bytes,
     appended: BytesMut,
     appended_count: usize,
+    next_sequence: u64,
 }
 
 impl ProducerManifest {
@@ -43,11 +45,13 @@ impl ProducerManifest {
     fn empty() -> Self {
         let mut buf = BytesMut::with_capacity(FOOTER_SIZE);
         buf.put_u32_le(0);
+        buf.put_u64_le(0);
         buf.put_u16_le(PRODUCER_MANIFEST_VERSION);
         Self {
             data: buf.freeze(),
             appended: BytesMut::new(),
             appended_count: 0,
+            next_sequence: 0,
         }
     }
 
@@ -71,25 +75,32 @@ impl ProducerManifest {
                 version
             )));
         }
+        let next_seq_start = data.len() - 10;
+        let next_sequence =
+            u64::from_le_bytes(data[next_seq_start..next_seq_start + 8].try_into().unwrap());
         Ok(Self {
             data,
             appended: BytesMut::new(),
             appended_count: 0,
+            next_sequence,
         })
     }
 
     /// Build a manifest from a slice of entries (for full rebuild, e.g. cleanup).
     fn from_entries(entries: &[ProducerEntry]) -> Self {
+        let next_sequence = entries.iter().map(|e| e.sequence + 1).max().unwrap_or(0);
         let mut buf = BytesMut::new();
         for entry in entries {
             Self::encode_entry(&mut buf, entry);
         }
         buf.put_u32_le(entries.len() as u32);
+        buf.put_u64_le(next_sequence);
         buf.put_u16_le(PRODUCER_MANIFEST_VERSION);
         Self {
             data: buf.freeze(),
             appended: BytesMut::new(),
             appended_count: 0,
+            next_sequence,
         }
     }
 
@@ -138,9 +149,32 @@ impl ProducerManifest {
 
     /// Append a single entry without copying existing data.
     /// The entry is encoded and stored internally; bytes are merged in `to_bytes()`.
+    /// The entry's sequence number is overwritten with the manifest's next sequence.
     fn append(&mut self, entry: &ProducerEntry) {
-        Self::encode_entry(&mut self.appended, entry);
+        let sequenced = ProducerEntry {
+            sequence: self.next_sequence,
+            ..entry.clone()
+        };
+        Self::encode_entry(&mut self.appended, &sequenced);
+        self.next_sequence += 1;
         self.appended_count += 1;
+    }
+
+    /// Remove all entries with sequence <= `through_sequence`, returning them.
+    fn dequeue(&mut self, through_sequence: u64) -> Vec<ProducerEntry> {
+        let next_seq = self.next_sequence;
+        let all: Vec<ProducerEntry> = self.iter().map(|e| e.unwrap()).collect();
+        let (removed, remaining): (Vec<_>, Vec<_>) = all
+            .into_iter()
+            .partition(|e| e.sequence <= through_sequence);
+        *self = Self::from_entries(&remaining);
+        self.next_sequence = next_seq;
+        // Update the data bytes to reflect the preserved next_sequence
+        let mut buf = BytesMut::from(self.data.as_ref());
+        let ns_start = buf.len() - 10;
+        buf[ns_start..ns_start + 8].copy_from_slice(&next_seq.to_le_bytes());
+        self.data = buf.freeze();
+        removed
     }
 
     /// Serialize the manifest to bytes for writing to object storage.
@@ -165,13 +199,15 @@ impl ProducerManifest {
         buf.extend_from_slice(prefix);
         buf.extend_from_slice(&self.appended);
         buf.put_u32_le(base_count + self.appended_count as u32);
+        buf.put_u64_le(self.next_sequence);
         buf.put_u16_le(PRODUCER_MANIFEST_VERSION);
         buf.freeze()
     }
 
     fn encode_entry(buf: &mut BytesMut, entry: &ProducerEntry) {
-        let entry_len = 2 + entry.location.len() + 8 + entry.metadata.len();
+        let entry_len = 8 + 2 + entry.location.len() + 8 + entry.metadata.len();
         buf.put_u32_le(entry_len as u32);
+        buf.put_u64_le(entry.sequence);
         buf.put_u16_le(entry.location.len() as u16);
         buf.extend_from_slice(entry.location.as_bytes());
         buf.put_i64_le(entry.ingestion_time_ms);
@@ -196,6 +232,9 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<ProducerE
         ));
     }
 
+    let sequence = u64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
+    *offset += 8;
+
     let location_len = u16::from_le_bytes(data[*offset..*offset + 2].try_into().unwrap()) as usize;
     *offset += 2;
 
@@ -206,11 +245,12 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<ProducerE
     let ingestion_time_ms = i64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
     *offset += 8;
 
-    let metadata_len = entry_len - 2 - location_len - 8;
+    let metadata_len = entry_len - 8 - 2 - location_len - 8;
     let metadata = Bytes::copy_from_slice(&data[*offset..*offset + metadata_len]);
     *offset += metadata_len;
 
     Ok(ProducerEntry {
+        sequence,
         location,
         ingestion_time_ms,
         metadata,
@@ -418,6 +458,7 @@ impl QueueProducer {
 
     pub async fn enqueue(&self, location: String, metadata: Bytes) -> Result<()> {
         let entry = ProducerEntry {
+            sequence: 0,
             location,
             ingestion_time_ms: millis(self.clock.now()),
             metadata,
@@ -693,6 +734,7 @@ mod tests {
 
         // Pre-populate manifest with binary format
         let existing = ProducerManifest::from_entries(&[ProducerEntry {
+            sequence: 0,
             location: "existing/file.json".to_string(),
             ingestion_time_ms: 1000,
             metadata: Bytes::new(),
@@ -1292,6 +1334,16 @@ mod tests {
 
     fn entry(location: &str, time_ms: i64, metadata: &[u8]) -> ProducerEntry {
         ProducerEntry {
+            sequence: 0,
+            location: location.to_string(),
+            ingestion_time_ms: time_ms,
+            metadata: Bytes::from(metadata.to_vec()),
+        }
+    }
+
+    fn entry_seq(seq: u64, location: &str, time_ms: i64, metadata: &[u8]) -> ProducerEntry {
+        ProducerEntry {
+            sequence: seq,
             location: location.to_string(),
             ingestion_time_ms: time_ms,
             metadata: Bytes::from(metadata.to_vec()),
@@ -1313,15 +1365,16 @@ mod tests {
         let bytes = m.to_bytes();
         assert_eq!(bytes.len(), FOOTER_SIZE);
         assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 0);
+        assert_eq!(u64::from_le_bytes(bytes[4..12].try_into().unwrap()), 0);
         assert_eq!(
-            u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+            u16::from_le_bytes(bytes[12..14].try_into().unwrap()),
             PRODUCER_MANIFEST_VERSION
         );
     }
 
     #[test]
     fn should_parse_valid_manifest_bytes() {
-        let entries = vec![entry("a", 1, b"x"), entry("b", 2, b"y")];
+        let entries = vec![entry_seq(0, "a", 1, b"x"), entry_seq(1, "b", 2, b"y")];
         let data = ProducerManifest::from_entries(&entries).to_bytes();
 
         let m = ProducerManifest::from_bytes(data).unwrap();
@@ -1333,11 +1386,18 @@ mod tests {
     fn should_parse_footer_only_bytes() {
         let mut buf = BytesMut::with_capacity(FOOTER_SIZE);
         buf.put_u32_le(0);
+        buf.put_u64_le(42);
         buf.put_u16_le(PRODUCER_MANIFEST_VERSION);
 
         let m = ProducerManifest::from_bytes(buf.freeze()).unwrap();
 
         assert_eq!(m.entries_count(), 0);
+
+        // Appended entry should get sequence 42
+        let mut m = m;
+        m.append(&entry("loc", 1, b""));
+        let entries: Vec<ProducerEntry> = m.iter().map(|e| e.unwrap()).collect();
+        assert_eq!(entries[0].sequence, 42);
     }
 
     #[test]
@@ -1349,7 +1409,7 @@ mod tests {
 
     #[test]
     fn should_reject_bytes_too_short_for_footer() {
-        let err = ProducerManifest::from_bytes(Bytes::from_static(&[0; 5])).unwrap_err();
+        let err = ProducerManifest::from_bytes(Bytes::from_static(&[0; 13])).unwrap_err();
 
         assert!(err.to_string().contains("too short for footer"));
     }
@@ -1358,6 +1418,7 @@ mod tests {
     fn should_reject_wrong_version() {
         let mut buf = BytesMut::with_capacity(FOOTER_SIZE);
         buf.put_u32_le(0);
+        buf.put_u64_le(0);
         buf.put_u16_le(99);
 
         let err = ProducerManifest::from_bytes(buf.freeze()).unwrap_err();
@@ -1370,6 +1431,7 @@ mod tests {
     fn should_reject_version_zero() {
         let mut buf = BytesMut::with_capacity(FOOTER_SIZE);
         buf.put_u32_le(0);
+        buf.put_u64_le(0);
         buf.put_u16_le(0);
 
         let err = ProducerManifest::from_bytes(buf.freeze()).unwrap_err();
@@ -1385,6 +1447,7 @@ mod tests {
 
         let entries: Vec<ProducerEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sequence, 0);
         assert_eq!(entries[0].location, "loc");
         assert_eq!(entries[0].ingestion_time_ms, 42);
         assert_eq!(entries[0].metadata, &b"meta"[..]);
@@ -1392,7 +1455,7 @@ mod tests {
 
     #[test]
     fn should_append_to_existing_base_entries() {
-        let base = ProducerManifest::from_entries(&[entry("base", 1, b"")]);
+        let base = ProducerManifest::from_entries(&[entry_seq(0, "base", 1, b"")]);
         let data = base.to_bytes();
         let mut m = ProducerManifest::from_bytes(data).unwrap();
 
@@ -1400,6 +1463,9 @@ mod tests {
 
         assert_eq!(m.entries_count(), 2);
         assert_eq!(collect_locations(&m), vec!["base", "appended"]);
+        let entries: Vec<ProducerEntry> = m.iter().map(|e| e.unwrap()).collect();
+        assert_eq!(entries[0].sequence, 0);
+        assert_eq!(entries[1].sequence, 1);
     }
 
     #[test]
@@ -1411,34 +1477,46 @@ mod tests {
         m.append(&entry("c", 3, b""));
 
         assert_eq!(collect_locations(&m), vec!["a", "b", "c"]);
+        let entries: Vec<ProducerEntry> = m.iter().map(|e| e.unwrap()).collect();
+        assert_eq!(entries[0].sequence, 0);
+        assert_eq!(entries[1].sequence, 1);
+        assert_eq!(entries[2].sequence, 2);
     }
 
     #[test]
     fn should_create_empty_manifest_from_empty_slice() {
-        let m = ProducerManifest::from_entries(&[]);
+        let mut m = ProducerManifest::from_entries(&[]);
 
         assert_eq!(m.entries_count(), 0);
         assert!(m.is_empty());
+
+        m.append(&entry("loc", 1, b""));
+        let entries: Vec<ProducerEntry> = m.iter().map(|e| e.unwrap()).collect();
+        assert_eq!(entries[0].sequence, 0);
     }
 
     #[test]
     fn should_create_manifest_from_multiple_entries() {
         let entries = vec![
-            entry("x", 10, b"m1"),
-            entry("y", 20, b"m2"),
-            entry("z", 30, b"m3"),
+            entry_seq(0, "x", 10, b"m1"),
+            entry_seq(1, "y", 20, b"m2"),
+            entry_seq(2, "z", 30, b"m3"),
         ];
 
         let m = ProducerManifest::from_entries(&entries);
 
         assert_eq!(m.entries_count(), 3);
+        assert_eq!(m.next_sequence, 3);
         let decoded: Vec<ProducerEntry> = m.iter().map(|e| e.unwrap()).collect();
+        assert_eq!(decoded[0].sequence, 0);
         assert_eq!(decoded[0].location, "x");
         assert_eq!(decoded[0].ingestion_time_ms, 10);
         assert_eq!(decoded[0].metadata, &b"m1"[..]);
+        assert_eq!(decoded[1].sequence, 1);
         assert_eq!(decoded[1].location, "y");
         assert_eq!(decoded[1].ingestion_time_ms, 20);
         assert_eq!(decoded[1].metadata, &b"m2"[..]);
+        assert_eq!(decoded[2].sequence, 2);
         assert_eq!(decoded[2].location, "z");
         assert_eq!(decoded[2].ingestion_time_ms, 30);
         assert_eq!(decoded[2].metadata, &b"m3"[..]);
@@ -1446,7 +1524,7 @@ mod tests {
 
     #[test]
     fn should_handle_entry_with_empty_location() {
-        let m = ProducerManifest::from_entries(&[entry("", 0, b"")]);
+        let m = ProducerManifest::from_entries(&[entry_seq(0, "", 0, b"")]);
 
         let decoded: Vec<ProducerEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(decoded[0].location, "");
@@ -1458,7 +1536,7 @@ mod tests {
     fn should_handle_entry_with_large_metadata() {
         let big_meta = vec![0xAB_u8; 1024];
 
-        let m = ProducerManifest::from_entries(&[entry("loc", 1, &big_meta)]);
+        let m = ProducerManifest::from_entries(&[entry_seq(0, "loc", 1, &big_meta)]);
 
         let decoded: Vec<ProducerEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(decoded[0].metadata.len(), 1024);
@@ -1467,7 +1545,7 @@ mod tests {
 
     #[test]
     fn should_handle_negative_ingestion_time() {
-        let m = ProducerManifest::from_entries(&[entry("loc", -1000, b"")]);
+        let m = ProducerManifest::from_entries(&[entry_seq(0, "loc", -1000, b"")]);
 
         let decoded: Vec<ProducerEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(decoded[0].ingestion_time_ms, -1000);
@@ -1481,15 +1559,16 @@ mod tests {
 
         assert_eq!(bytes.len(), FOOTER_SIZE);
         assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 0);
+        assert_eq!(u64::from_le_bytes(bytes[4..12].try_into().unwrap()), 0);
         assert_eq!(
-            u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+            u16::from_le_bytes(bytes[12..14].try_into().unwrap()),
             PRODUCER_MANIFEST_VERSION
         );
     }
 
     #[test]
     fn should_merge_base_and_appended() {
-        let base = ProducerManifest::from_entries(&[entry("base", 1, b"")]);
+        let base = ProducerManifest::from_entries(&[entry_seq(0, "base", 1, b"")]);
         let mut m = ProducerManifest::from_bytes(base.to_bytes()).unwrap();
         m.append(&entry("appended", 2, b""));
 
@@ -1498,11 +1577,15 @@ mod tests {
 
         assert_eq!(reparsed.entries_count(), 2);
         assert_eq!(collect_locations(&reparsed), vec!["base", "appended"]);
+        let entries: Vec<ProducerEntry> = reparsed.iter().map(|e| e.unwrap()).collect();
+        assert_eq!(entries[0].sequence, 0);
+        assert_eq!(entries[1].sequence, 1);
     }
 
     #[test]
     fn should_write_correct_footer_count() {
-        let base = ProducerManifest::from_entries(&[entry("a", 1, b""), entry("b", 2, b"")]);
+        let base =
+            ProducerManifest::from_entries(&[entry_seq(0, "a", 1, b""), entry_seq(1, "b", 2, b"")]);
         let mut m = ProducerManifest::from_bytes(base.to_bytes()).unwrap();
         m.append(&entry("c", 3, b""));
         m.append(&entry("d", 4, b""));
@@ -1512,23 +1595,31 @@ mod tests {
 
         let footer_start = bytes.len() - FOOTER_SIZE;
         let count = u32::from_le_bytes(bytes[footer_start..footer_start + 4].try_into().unwrap());
-        let version = u16::from_le_bytes(bytes[footer_start + 4..].try_into().unwrap());
+        let next_seq = u64::from_le_bytes(
+            bytes[footer_start + 4..footer_start + 12]
+                .try_into()
+                .unwrap(),
+        );
+        let version = u16::from_le_bytes(bytes[footer_start + 12..].try_into().unwrap());
         assert_eq!(count, 5);
+        assert_eq!(next_seq, 5);
         assert_eq!(version, PRODUCER_MANIFEST_VERSION);
     }
 
     #[test]
     fn should_round_trip_from_entries_to_bytes_from_bytes() {
-        let entries = vec![entry("a", 10, b"m1"), entry("b", 20, b"m2")];
+        let entries = vec![entry_seq(0, "a", 10, b"m1"), entry_seq(1, "b", 20, b"m2")];
         let original = ProducerManifest::from_entries(&entries);
 
         let reparsed = ProducerManifest::from_bytes(original.to_bytes()).unwrap();
 
         assert_eq!(reparsed.entries_count(), 2);
         let decoded: Vec<ProducerEntry> = reparsed.iter().map(|e| e.unwrap()).collect();
+        assert_eq!(decoded[0].sequence, 0);
         assert_eq!(decoded[0].location, "a");
         assert_eq!(decoded[0].ingestion_time_ms, 10);
         assert_eq!(decoded[0].metadata, &b"m1"[..]);
+        assert_eq!(decoded[1].sequence, 1);
         assert_eq!(decoded[1].location, "b");
         assert_eq!(decoded[1].ingestion_time_ms, 20);
         assert_eq!(decoded[1].metadata, &b"m2"[..]);
@@ -1548,7 +1639,7 @@ mod tests {
 
     #[test]
     fn should_chain_serialize_reparse_append() {
-        let original = ProducerManifest::from_entries(&[entry("a", 1, b"")]);
+        let original = ProducerManifest::from_entries(&[entry_seq(0, "a", 1, b"")]);
         let mut m = ProducerManifest::from_bytes(original.to_bytes()).unwrap();
         m.append(&entry("b", 2, b""));
 
@@ -1559,5 +1650,76 @@ mod tests {
 
         assert_eq!(final_m.entries_count(), 3);
         assert_eq!(collect_locations(&final_m), vec!["a", "b", "c"]);
+        let entries: Vec<ProducerEntry> = final_m.iter().map(|e| e.unwrap()).collect();
+        assert_eq!(entries[2].sequence, 2);
+    }
+
+    #[test]
+    fn should_dequeue_entries_through_sequence() {
+        let mut m = ProducerManifest::empty();
+        for _ in 0..5 {
+            m.append(&entry("loc", 1, b""));
+        }
+
+        let removed = m.dequeue(2);
+
+        assert_eq!(removed.len(), 3);
+        assert_eq!(removed[0].sequence, 0);
+        assert_eq!(removed[1].sequence, 1);
+        assert_eq!(removed[2].sequence, 2);
+        assert_eq!(m.entries_count(), 2);
+        let remaining: Vec<ProducerEntry> = m.iter().map(|e| e.unwrap()).collect();
+        assert_eq!(remaining[0].sequence, 3);
+        assert_eq!(remaining[1].sequence, 4);
+        assert_eq!(m.next_sequence, 5);
+    }
+
+    #[test]
+    fn should_dequeue_all_entries() {
+        let mut m = ProducerManifest::empty();
+        for _ in 0..3 {
+            m.append(&entry("loc", 1, b""));
+        }
+
+        let removed = m.dequeue(2);
+
+        assert_eq!(removed.len(), 3);
+        assert!(m.is_empty());
+        assert_eq!(m.next_sequence, 3);
+    }
+
+    #[test]
+    fn should_dequeue_nothing_when_sequence_below_first() {
+        let entries = vec![
+            entry_seq(5, "a", 1, b""),
+            entry_seq(6, "b", 2, b""),
+            entry_seq(7, "c", 3, b""),
+        ];
+        let mut m = ProducerManifest::from_entries(&entries);
+
+        let removed = m.dequeue(3);
+
+        assert!(removed.is_empty());
+        assert_eq!(m.entries_count(), 3);
+    }
+
+    #[test]
+    fn should_append_after_dequeue() {
+        let mut m = ProducerManifest::empty();
+        for _ in 0..3 {
+            m.append(&entry("loc", 1, b""));
+        }
+
+        m.dequeue(0);
+
+        assert_eq!(m.entries_count(), 2);
+        let remaining: Vec<ProducerEntry> = m.iter().map(|e| e.unwrap()).collect();
+        assert_eq!(remaining[0].sequence, 1);
+        assert_eq!(remaining[1].sequence, 2);
+
+        m.append(&entry("new", 4, b""));
+        let all: Vec<ProducerEntry> = m.iter().map(|e| e.unwrap()).collect();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[2].sequence, 3);
     }
 }

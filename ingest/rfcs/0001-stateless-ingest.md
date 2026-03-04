@@ -117,31 +117,37 @@ ingestion time, and optional extensible metadata:
 
 ```ascii
 ┌──────────────────────────────────────────────────────────────┐
-│  entry 0: [entry_len: u32 LE][location_len: u16 LE]         │
-│           [location: bytes][ingestion_time_ms: i64 LE]       │
-│           [metadata: bytes]                                  │
+│  entry 0: [entry_len: u32 LE][sequence: u64 LE]              │
+│           [location_len: u16 LE][location: bytes]            │
+│           [ingestion_time_ms: i64 LE][metadata: bytes]       │
 │  entry 1: ...                                                │
 │  ...                                                         │
 │  entry N: ...                                                │
 ├──────────────────────────────────────────────────────────────┤
-│  footer (6 bytes):                                           │
-│    entry_count : u32 LE                                      │
-│    version     : u16 LE  (= 1)                               │
+│  footer (14 bytes):                                          │
+│    entry_count    : u32 LE                                   │
+│    next_sequence  : u64 LE                                   │
+│    version        : u16 LE  (= 1)                            │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- `entry_len` is the total number of bytes after this field: `2 + location_len + 8 + metadata_len`.
+- `entry_len` is the total number of bytes after this field: `8 + 2 + location_len + 8 + metadata_len`.
+- `sequence` is a monotonically increasing u64, auto-assigned by the manifest on append.
+  Sequences are contiguous but can start at any value (e.g., after dequeue, entries 5,6,7 are valid).
 - `location` is the UTF-8 encoded object storage path of the data batch.
 - `ingestion_time_ms` is the wall-clock time in milliseconds since the Unix epoch when the entry was enqueued.
-- `metadata` is an opaque byte payload whose length is implicit: `entry_len - 2 - location_len - 8`.
+- `metadata` is an opaque byte payload whose length is implicit: `entry_len - 8 - 2 - location_len - 8`.
   This field enables extensible per-entry metadata (e.g., flatbuffers) without a format change.
-- The footer is always the last 6 bytes. It allows readers to verify the entry count and detect format changes.
+- The footer is always the last 14 bytes. `next_sequence` stores the sequence number that will be assigned
+  to the next appended entry. It allows readers to verify the entry count and detect format changes.
 
-To append a new entry a producer reads the raw bytes, strips the 6-byte footer, appends the encoded entry,
-and writes a new footer with the incremented entry count.
+To append a new entry a producer reads the raw bytes, strips the 14-byte footer, appends the encoded entry
+(with the sequence number from `next_sequence`), and writes a new footer with the incremented entry count
+and incremented `next_sequence`.
 Existing entries are never deserialized during append, which keeps the write path O(1) in the number of entries.
-Entries are listed in ingestion order. Entries are removed from the manifest during cleanup
-after they have been processed by the consumer; cleanup requires a full decode-filter-encode cycle.
+Entries are listed in ingestion order. A `dequeue(n)` operation removes all entries with `sequence <= n`
+and returns them; this requires a full decode-filter-encode cycle. Entries are also removed from the manifest
+during cleanup after they have been processed by the consumer.
 
 The consumer manifest is stored as a JSON file in object storage.
 It contains a map of claimed locations with their heartbeat timestamps
