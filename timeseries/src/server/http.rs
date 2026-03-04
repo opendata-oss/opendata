@@ -26,7 +26,8 @@ use crate::promql::response::{
     SeriesResponse,
 };
 use crate::promql::scraper::Scraper;
-use crate::tsdb::Tsdb;
+use crate::tsdb::{Tsdb, TsdbReadEngine};
+
 use crate::util::{parse_duration, parse_timestamp, parse_timestamp_to_seconds};
 
 #[derive(Embed)]

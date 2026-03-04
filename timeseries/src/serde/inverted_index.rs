@@ -4,7 +4,7 @@ use super::*;
 use bytes::Bytes;
 use roaring::RoaringBitmap;
 
-/// InvertedIndex value: RoaringBitmap<u32> encoding series IDs
+/// InvertedIndex value: `RoaringBitmap<u32>` encoding series IDs
 #[derive(Debug, Clone, PartialEq)]
 pub struct InvertedIndexValue {
     pub postings: RoaringBitmap,

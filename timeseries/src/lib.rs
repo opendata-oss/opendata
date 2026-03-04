@@ -19,22 +19,23 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use timeseries::{TimeSeriesDb, Config, Series};
+//! ```
+//! # use timeseries::{TimeSeriesDb, Config, Series};
+//! # use common::StorageConfig;
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+//! let ts = TimeSeriesDb::open(config).await?;
 //!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let ts = TimeSeriesDb::open(Config::default()).await?;
+//! let series = Series::builder("http_requests_total")
+//!     .label("method", "GET")
+//!     .label("status", "200")
+//!     .sample_now(1.0)
+//!     .build();
 //!
-//!     let series = Series::builder("http_requests_total")
-//!         .label("method", "GET")
-//!         .label("status", "200")
-//!         .sample_now(1.0)
-//!         .build();
-//!
-//!     ts.write(vec![series]).await?;
-//!     Ok(())
-//! }
+//! ts.write(vec![series]).await?;
+//! # Ok(())
+//! # }
 //! ```
 
 // Internal modules are shared with the binary target (main.rs) which
@@ -60,6 +61,9 @@ mod util;
 #[cfg(feature = "bench-internals")]
 mod bench_api;
 
+#[cfg(feature = "otel")]
+pub mod otel;
+
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
@@ -67,15 +71,19 @@ pub mod testing;
 mod config;
 pub(crate) mod error;
 pub(crate) mod model;
+mod reader;
 mod timeseries;
 
 // Public re-exports
 #[cfg(feature = "bench-internals")]
 pub use bench_api::SubqueryLabelCacheHarness;
-pub use config::Config;
+pub use config::{Config, ReaderConfig};
 pub use error::{Error, QueryError, Result};
 pub use model::{
     InstantSample, Label, Labels, MetricMetadata, MetricType, QueryOptions, QueryValue,
     RangeSample, STALE_NAN, Sample, Series, SeriesBuilder, Temporality, is_stale_nan,
 };
+#[cfg(feature = "otel")]
+pub use otel::{OtelConfig, OtelConverter};
+pub use reader::TimeSeriesDbReader;
 pub use timeseries::TimeSeriesDb;

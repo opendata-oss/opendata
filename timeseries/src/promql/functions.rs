@@ -532,7 +532,7 @@ impl RangeFunction for CountOverTimeFunction {
 ///   - NaN values propagate through the calculation
 ///
 /// References:
-///   - https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm
+///   - <https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm>
 ///   - Prometheus: `promql/functions.go::varianceOverTime`
 fn variance_kahan(values: &[Sample]) -> f64 {
     if values.is_empty() {

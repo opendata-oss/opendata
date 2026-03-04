@@ -9,22 +9,26 @@ use common::StorageConfig;
 use serde::{Deserialize, Serialize};
 use serde_with::{DurationMilliSeconds, serde_as};
 
-/// Configuration for opening a [`Log`](crate::Log).
+/// Configuration for opening a [`LogDb`](crate::LogDb).
 ///
 /// This struct holds all the settings needed to initialize a log instance,
 /// including storage backend configuration.
 ///
 /// # Example
 ///
-/// ```ignore
-/// use log::Config;
+/// ```no_run
+/// use log::{Config, SegmentConfig};
 /// use common::StorageConfig;
 ///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = Config {
 ///     storage: StorageConfig::default(),
 ///     segmentation: SegmentConfig::default(),
 /// };
-/// let log = LogDb::open(config).await?;
+/// let log = log::LogDb::open(config).await?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -60,7 +64,7 @@ pub struct SegmentConfig {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
     /// use std::time::Duration;
     /// use log::SegmentConfig;
     ///
@@ -110,16 +114,20 @@ pub struct CountOptions {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
 /// use log::ReaderConfig;
 /// use common::StorageConfig;
 /// use std::time::Duration;
 ///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = ReaderConfig {
 ///     storage: StorageConfig::default(),
 ///     refresh_interval: Duration::from_secs(1),
 /// };
-/// let reader = LogDbReader::open(config).await?;
+/// let reader = log::LogDbReader::open(config).await?;
+/// # Ok(())
+/// # }
 /// ```
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
