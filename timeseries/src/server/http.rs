@@ -353,8 +353,8 @@ async fn handle_metadata(
 }
 
 /// Handle /federate by returning recent samples matching the query in text format
-/// https://prometheus.io/docs/prometheus/latest/federation/
-/// https://prometheus.io/docs/instrumenting/exposition_formats/
+/// <https://prometheus.io/docs/prometheus/latest/federation/>
+/// <https://prometheus.io/docs/instrumenting/exposition_formats/>
 async fn handle_federate(
     State(state): State<AppState>,
     Query(params): Query<FederateParams>,
