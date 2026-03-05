@@ -25,6 +25,7 @@ use serde_with::{DurationMilliSeconds, serde_as};
 /// let config = Config {
 ///     storage: StorageConfig::default(),
 ///     segmentation: SegmentConfig::default(),
+///     ..Default::default()
 /// };
 /// let log = log::LogDb::open(config).await?;
 /// # Ok(())
@@ -44,6 +45,18 @@ pub struct Config {
     /// time-based queries and retention management.
     #[serde(default)]
     pub segmentation: SegmentConfig,
+
+    /// Whether reads should only see data confirmed durable by the storage engine.
+    ///
+    /// When `true`, the read view advances only after the storage engine reports
+    /// that written data has been durably persisted (e.g., flushed to the WAL and
+    /// object store). This provides stronger consistency guarantees at the cost
+    /// of higher read latency.
+    ///
+    /// When `false` (the default), reads see data as soon as it hits the
+    /// memtable, which is faster but means visible data may not yet be durable.
+    #[serde(default)]
+    pub read_durable: bool,
 }
 
 /// Configuration for log segmentation.

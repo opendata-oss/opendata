@@ -47,6 +47,7 @@
 //! ```
 
 mod config;
+mod durable;
 mod error;
 mod listing;
 mod log;

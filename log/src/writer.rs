@@ -36,7 +36,10 @@ use crate::serde::LogEntryKey;
 pub(crate) struct WrittenView {
     pub epoch: u64,
     pub snapshot: Arc<dyn common::storage::StorageSnapshot>,
-    pub segments: Arc<[LogSegment]>,
+    /// Storage engine sequence number for this write.
+    pub seqnum: u64,
+    /// New segment created by this write, if any.
+    pub segment: Option<LogSegment>,
 }
 
 /// The write type for the log writer.
@@ -84,7 +87,6 @@ pub(crate) struct LogWriter {
     listing_cache: ListingCache,
     epoch: u64,
     written_tx: watch::Sender<WrittenView>,
-    segments_snapshot: Arc<[LogSegment]>,
     watermarks: EpochWatermarks,
 }
 
@@ -100,11 +102,11 @@ impl LogWriter {
         let (cmd_tx, cmd_rx) = mpsc::channel(config.queue_capacity);
 
         let initial_snapshot = storage.snapshot().await.map_err(|e| e.to_string())?;
-        let segments_snapshot: Arc<[LogSegment]> = segment_cache.all().into();
         let initial_view = WrittenView {
             epoch: 0,
             snapshot: initial_snapshot,
-            segments: Arc::clone(&segments_snapshot),
+            seqnum: 0,
+            segment: None,
         };
         let (written_tx, written_rx) = watch::channel(initial_view);
         let (watermarks, watcher) = EpochWatermarks::new();
@@ -116,7 +118,6 @@ impl LogWriter {
             listing_cache,
             epoch: 0,
             written_tx,
-            segments_snapshot,
             watermarks,
         };
 
@@ -220,21 +221,24 @@ impl LogWriter {
         let options = WriteOptions {
             await_durable: false,
         };
-        self.storage
+        let write_result = self
+            .storage
             .put_with_options(records, options)
             .await
             .map_err(|e| e.to_string())?;
 
-        if assignment.is_new {
-            self.segments_snapshot = self.segment_cache.all().into();
-        }
-
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
         self.epoch += 1;
+        let new_segment = if assignment.is_new {
+            Some(assignment.segment.clone())
+        } else {
+            None
+        };
         self.written_tx.send_replace(WrittenView {
             epoch: self.epoch,
             snapshot,
-            segments: Arc::clone(&self.segments_snapshot),
+            seqnum: write_result.seqnum,
+            segment: new_segment,
         });
         self.watermarks.update_written(self.epoch);
         Ok(())
@@ -577,7 +581,7 @@ mod tests {
         written_rx.changed().await.unwrap();
         let view = written_rx.borrow_and_update().clone();
         assert_eq!(view.epoch, 1);
-        assert_eq!(view.segments.len(), 1);
+        assert!(view.segment.is_some());
     }
 
     #[tokio::test]

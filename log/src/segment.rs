@@ -103,6 +103,14 @@ impl SegmentCache {
         }
     }
 
+    /// Creates an empty cache with the given config.
+    pub(crate) fn new_empty(config: SegmentConfig) -> Self {
+        Self {
+            segments: BTreeMap::new(),
+            config,
+        }
+    }
+
     /// Returns the latest segment, if any exist.
     pub(crate) fn latest(&self) -> Option<LogSegment> {
         self.segments.values().next_back().cloned()

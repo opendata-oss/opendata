@@ -212,6 +212,19 @@ blocks up to the given duration. Both return the original batch inside
 retryable errors (`QueueFull`, `Timeout`) so callers can retry without
 cloning.
 
+### Read Semantics
+
+Appended records are not immediately visible to reads. Visibility depends on which read mode is configured.
+
+**Written mode (default)** provides read-your-writes consistency: after an append returns, subsequent reads on the same `LogDb` instance are guaranteed to see the appended data — even before `flush()` is called. Data visible in this mode may not yet be durable; a crash could lose it.
+
+**Durable mode** (`read_durable: true`) only makes data visible to reads after SlateDB confirms it is durable (WAL flushed to object storage). Reads may return stale results until persistence completes, but everything returned is guaranteed to survive a crash. An explicit `flush()` can be used to force durability.
+
+| Mode | Reads see data after | Crash-safe |
+|------|---------------------|------------|
+| Written (default) | Append completes | No |
+| Durable | Data is persisted | Yes |
+
 ### Scan API
 
 The scan API mirrors SlateDB's scan API. A key is provided along with a sequence number range.
@@ -338,3 +351,4 @@ Messaging systems often expose a way to attach headers to messages in order to e
 | 2026-01-06 | Added TerminatedBytes encoding for variable-length keys |
 | 2026-01-07 | Changed TerminatedBytes delimiter to 0x00 for prefix-friendly ordering |
 | 2026-02-11 | Replaced `append`/`append_with_options` with `try_append`/`append_timeout`; durability is now a separate `flush()` call |
+| 2026-03-05 | Added Read Semantics section describing flushed vs durable read modes |

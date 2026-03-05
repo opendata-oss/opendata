@@ -354,29 +354,37 @@ mod tests {
                 &self,
                 _ops: Vec<RecordOp>,
                 _options: common::WriteOptions,
-            ) -> common::StorageResult<()> {
-                self.check_failure()
+            ) -> common::StorageResult<common::storage::WriteResult> {
+                self.check_failure()?;
+                Ok(common::storage::WriteResult { seqnum: 0 })
             }
 
             async fn put_with_options(
                 &self,
                 _records: Vec<PutRecordOp>,
                 _options: common::WriteOptions,
-            ) -> common::StorageResult<()> {
-                self.check_failure()
+            ) -> common::StorageResult<common::storage::WriteResult> {
+                self.check_failure()?;
+                Ok(common::storage::WriteResult { seqnum: 0 })
             }
 
             async fn merge_with_options(
                 &self,
                 _records: Vec<MergeRecordOp>,
                 _options: common::WriteOptions,
-            ) -> common::StorageResult<()> {
-                self.check_failure()
+            ) -> common::StorageResult<common::storage::WriteResult> {
+                self.check_failure()?;
+                Ok(common::storage::WriteResult { seqnum: 0 })
             }
 
             async fn snapshot(&self) -> common::StorageResult<Arc<dyn StorageSnapshot>> {
                 self.check_failure()?;
                 Ok(Arc::new(ConfigurableStorage::new()))
+            }
+
+            fn subscribe_durable(&self) -> tokio::sync::watch::Receiver<u64> {
+                let (_, rx) = tokio::sync::watch::channel(0);
+                rx
             }
 
             async fn flush(&self) -> common::StorageResult<()> {

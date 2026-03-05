@@ -293,6 +293,7 @@ pub(crate) unsafe fn build_config(
     Ok(Config {
         storage,
         segmentation: SegmentConfig { seal_interval },
+        ..Default::default()
     })
 }
 
