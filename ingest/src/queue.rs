@@ -12,7 +12,6 @@ use slatedb::object_store::{
 };
 
 use crate::error::{Error, Result};
-use crate::queue_config::ConsumerConfig;
 
 fn millis(time: SystemTime) -> i64 {
     time.duration_since(UNIX_EPOCH)
@@ -561,14 +560,14 @@ pub struct QueueConsumer {
 
 impl QueueConsumer {
     pub fn with_object_store(
-        config: ConsumerConfig,
+        manifest_path: String,
         object_store: Arc<dyn ObjectStore>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             manifest_store: ManifestStore {
                 object_store,
-                manifest_path: config.manifest_path,
+                manifest_path,
             },
             epoch: AtomicU64::new(0),
             clock,
@@ -667,12 +666,6 @@ mod tests {
 
     const TEST_MANIFEST_PATH: &str = "test/manifest";
 
-    fn test_consumer_config() -> ConsumerConfig {
-        ConsumerConfig {
-            manifest_path: TEST_MANIFEST_PATH.to_string(),
-        }
-    }
-
     async fn read_producer_manifest(store: &Arc<dyn ObjectStore>, path: &str) -> Manifest {
         let path = Path::from(path);
         let result = store.get(&path).await.unwrap();
@@ -738,7 +731,7 @@ mod tests {
     async fn should_initialize_consumer_and_increment_epoch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let consumer = QueueConsumer::with_object_store(
-            test_consumer_config(),
+            TEST_MANIFEST_PATH.to_string(),
             store.clone(),
             Arc::new(SystemClock),
         );
@@ -753,7 +746,7 @@ mod tests {
     async fn should_peek_none_when_queue_is_empty() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let consumer = QueueConsumer::with_object_store(
-            test_consumer_config(),
+            TEST_MANIFEST_PATH.to_string(),
             store.clone(),
             Arc::new(SystemClock),
         );
@@ -786,7 +779,7 @@ mod tests {
             .unwrap();
 
         let consumer = QueueConsumer::with_object_store(
-            test_consumer_config(),
+            TEST_MANIFEST_PATH.to_string(),
             store.clone(),
             Arc::new(SystemClock),
         );
@@ -812,7 +805,7 @@ mod tests {
             .unwrap();
 
         let consumer = QueueConsumer::with_object_store(
-            test_consumer_config(),
+            TEST_MANIFEST_PATH.to_string(),
             store.clone(),
             Arc::new(SystemClock),
         );
@@ -826,14 +819,14 @@ mod tests {
     async fn should_fence_old_consumer_on_peek() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let consumer_a = QueueConsumer::with_object_store(
-            test_consumer_config(),
+            TEST_MANIFEST_PATH.to_string(),
             store.clone(),
             Arc::new(SystemClock),
         );
         consumer_a.initialize().await.unwrap();
 
         let consumer_b = QueueConsumer::with_object_store(
-            test_consumer_config(),
+            TEST_MANIFEST_PATH.to_string(),
             store.clone(),
             Arc::new(SystemClock),
         );
@@ -847,14 +840,14 @@ mod tests {
     async fn should_fence_old_consumer_on_dequeue() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let consumer_a = QueueConsumer::with_object_store(
-            test_consumer_config(),
+            TEST_MANIFEST_PATH.to_string(),
             store.clone(),
             Arc::new(SystemClock),
         );
         consumer_a.initialize().await.unwrap();
 
         let consumer_b = QueueConsumer::with_object_store(
-            test_consumer_config(),
+            TEST_MANIFEST_PATH.to_string(),
             store.clone(),
             Arc::new(SystemClock),
         );
@@ -883,7 +876,7 @@ mod tests {
             .unwrap();
 
         let consumer = QueueConsumer::with_object_store(
-            test_consumer_config(),
+            TEST_MANIFEST_PATH.to_string(),
             store.clone(),
             Arc::new(SystemClock),
         );
@@ -916,7 +909,7 @@ mod tests {
             .unwrap();
 
         let consumer = QueueConsumer::with_object_store(
-            test_consumer_config(),
+            TEST_MANIFEST_PATH.to_string(),
             store.clone(),
             Arc::new(SystemClock),
         );
@@ -950,7 +943,7 @@ mod tests {
             .unwrap();
 
         let consumer = QueueConsumer::with_object_store(
-            test_consumer_config(),
+            TEST_MANIFEST_PATH.to_string(),
             store.clone(),
             Arc::new(SystemClock),
         );
