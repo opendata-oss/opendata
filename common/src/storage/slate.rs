@@ -33,7 +33,10 @@ impl prometheus_client::encoding::EncodeMetric for ReadableStatGauge {
     }
 
     fn metric_type(&self) -> prometheus_client::metrics::MetricType {
-        prometheus_client::metrics::MetricType::Gauge
+        match self.0.metric_type() {
+            slatedb::stats::MetricType::Counter => prometheus_client::metrics::MetricType::Counter,
+            slatedb::stats::MetricType::Gauge => prometheus_client::metrics::MetricType::Gauge,
+        }
     }
 }
 
@@ -938,5 +941,64 @@ mod tests {
         );
 
         storage.close().await.unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "metrics"))]
+mod metrics_tests {
+    use super::ReadableStatGauge;
+    use prometheus_client::encoding::EncodeMetric;
+    use slatedb::stats::{MetricType as SlateMetricType, ReadableStat};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct MockStat {
+        metric_type: SlateMetricType,
+    }
+
+    impl ReadableStat for MockStat {
+        fn get(&self) -> i64 {
+            0
+        }
+
+        fn metric_type(&self) -> SlateMetricType {
+            self.metric_type
+        }
+    }
+
+    #[test]
+    fn should_return_counter_when_slate_metric_type_is_counter() {
+        // given
+        let stat = Arc::new(MockStat {
+            metric_type: SlateMetricType::Counter,
+        });
+        let gauge = ReadableStatGauge(stat);
+
+        // when
+        let result = gauge.metric_type();
+
+        // then
+        assert!(matches!(
+            result,
+            prometheus_client::metrics::MetricType::Counter,
+        ));
+    }
+
+    #[test]
+    fn should_return_gauge_when_slate_metric_type_is_gauge() {
+        // given
+        let stat = Arc::new(MockStat {
+            metric_type: SlateMetricType::Gauge,
+        });
+        let gauge = ReadableStatGauge(stat);
+
+        // when
+        let result = gauge.metric_type();
+
+        // then
+        assert!(matches!(
+            result,
+            prometheus_client::metrics::MetricType::Gauge,
+        ));
     }
 }
