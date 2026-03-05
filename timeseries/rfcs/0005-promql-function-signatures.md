@@ -120,11 +120,12 @@ References:
 ### Alignment with Rust `promql-parser` (0.6.x)
 
 The parser used in this crate (`promql-parser = "0.6"`) is mostly aligned with
-Prometheus at signature/type-check level, with one important representation
-difference:
+Prometheus at signature/type-check level, with two key representation
+differences:
 
 - Rust parser `Function` exposes `name`, `arg_types`, `variadic: bool`,
   `return_type` (no integer variadic count field).
+- Rust parser `Function` does not expose Prometheus `Experimental` metadata.
 - Arity/type-checking is implemented in parser AST validation.
 - Non-variadic functions require exact arity.
 - Variadic functions allow at least `len(arg_types) - 1`.
@@ -137,10 +138,12 @@ Implication for this RFC:
 - AST metadata on `Call.func` is reliable for baseline type expectations.
 - Rust parser `variadic: bool` is not rich enough to represent Prometheus
   `Variadic int` semantics exactly.
+- Rust parser metadata cannot carry Prometheus `Experimental` function state.
 - Evaluator must not encode arity behavior through scattered function-name
   exceptions.
-- Add a Prometheus-derived internal signature layer for arity semantics and a
-  normalized arity model for evaluator dispatch.
+- For this phase, use parser metadata as the runtime signature source and defer
+  Prometheus-exact variadic cardinality and experimental metadata parity to an
+  upstream `promql-parser` contribution.
 
 ### Proposed Function Argument Model
 
@@ -174,10 +177,16 @@ pub(crate) trait PromQLFunction {
 Notes:
 
 - Return type becomes `ExprResult` (not always instant vector).
+- Keep one `PromQLFunction` trait: dispatch is runtime by function name, so
+  splitting traits by return shape would still require a single dynamic
+  dispatch boundary while adding registry complexity.
+- Type safety is enforced by parser metadata and evaluator return-shape checks
+  (`Call.func.return_type` against `ExprResult`).
 - String arguments are read from `ctx.raw_args`; corresponding
   `evaluated_args[idx]` is `None` (Prometheus-compatible shape).
-- Existing one-arg function implementations remain usable through compatibility
-  adapters during migration.
+- Existing one-arg implementations are ported directly to the evolved
+  `PromQLFunction` interface in the same change; no compatibility adapter layer
+  is kept.
 
 ### Scalar Boundary Semantics
 
@@ -193,112 +202,42 @@ Boundary rule:
 
 ### Signature Source of Truth
 
-We use two signature sources, each for a different job:
+For this RFC phase, parser metadata on `Call.func` is the runtime signature
+source:
 
-- Parser metadata on `Call.func` (`arg_types`, `return_type`) for type checking:
-  argument type expectations and return-type expectations.
-- Internal Prometheus-derived `FunctionSignature` table for arity semantics:
-  exact arity, bounded optional arity, and unbounded variadic arity.
-
-Why two layers:
-
-- The Rust parser already carries useful type metadata on AST call nodes.
-- The Rust parser only exposes `variadic: bool`, which is not enough to model
-  Prometheus `Variadic int` behavior exactly.
+- `arg_types`: argument type expectations.
+- `return_type`: return-type expectations.
+- `variadic`: current parser-supported variadic/arity behavior.
 
 Evaluator still performs runtime validation as a safety layer, because tests and
 internal AST construction paths can bypass normal parser entry points.
 
-### FunctionSignature Table (Prometheus-derived)
-
-For Prometheus-exact arity semantics, evaluator uses an internal signature table
-keyed by function name and synced from Prometheus function definitions.
-
-```rust
-pub(crate) struct FunctionSignature {
-    pub arg_types: Vec<ValueType>,
-    pub variadic: i32, // 0 exact, >0 bounded optional count, <0 unbounded
-    pub return_type: ValueType,
-    pub experimental: bool,
-}
-```
-
-Table policy:
-
-- Source: Prometheus `promql/parser/functions.go` equivalent.
-- Key: function name.
-- Use: arity/variadic semantics and feature-gate behavior for experimental
-  functions.
-- Consistency checks: evaluator can assert parser metadata and table metadata
-  remain in sync for `arg_types`/`return_type`.
-
-### Internal Normalized Arity Model
-
-To avoid long-term name-based variadic handling in evaluator, introduce a
-normalized arity model derived from `FunctionSignature`.
-
-```rust
-pub(crate) struct NormalizedArity {
-    pub min_args: usize,
-    pub max_args: Option<usize>, // None == unbounded
-    pub arg_types: Vec<ValueType>,
-}
-```
-
-Normalization rules:
-
-- `variadic == 0`: `min_args == max_args == len(arg_types)`.
-- `variadic > 0`: `min_args = len(arg_types) - 1`, and `max_args` is `Some`
-  with the bounded optional count added to `min_args`.
-- `variadic < 0`: `min_args = len(arg_types) - 1`, `max_args = None`.
-- Variadic overflow type-check uses the final declared argument type.
-
-Transition strategy:
-
-- Maintain the internal signature table in one module and use it as the only
-  arity source for evaluator.
-- If parser metadata changes in future crate versions, update mapping/sync logic
-  in one place without changing evaluator dispatch.
-
 ### Variadic and Optional Argument Semantics
 
-Adopt Prometheus semantics through `FunctionSignature.variadic`:
+For this phase, adopt parser-supported semantics:
 
 - Non-variadic: exact arity.
-- Bounded optional variadic (`variadic > 0`): allow omitted trailing defaults
-  and enforce max args.
-- Unbounded variadic (`variadic < 0`): allow infinite variadic tail.
-- Maximum arity comes from `NormalizedArity.max_args` (bounded or unbounded).
-- Variadic overflow uses the final declared arg type for type checks.
+- Variadic: minimum arity is `len(arg_types) - 1`.
+- Maximum arity follows parser behavior for supported functions (currently
+  unbounded only where parser handles it explicitly).
+- Variadic overflow type-check uses the final declared arg type.
+- Default argument materialization remains inside function implementations,
+  matching Prometheus behavior.
+- Prometheus-exact `Variadic int` and `Experimental` metadata parity is deferred
+  to upstream `promql-parser` improvements.
 
-For initial rollout, implement the subset needed by first target functions:
+### Evaluator Responsibilities
 
-- Optional second arg: `round(v, to_nearest=1)`
-- Unbounded variadic strings: `label_join(...src_labels)`
-- Optional instant-vector defaults: time-component functions (`year`, `month`,
-  `day_of_month`, etc.) in later phase.
-- Default argument filling remains inside function implementations (for example:
-  `round`, date/time helpers), matching Prometheus behavior.
+At a high level, evaluator-side function handling is responsible for:
 
-### Evaluator Call Flow
-
-`evaluate_call` will:
-
-1. Read baseline parser metadata from `Call.func`.
-2. Resolve `FunctionSignature` by function name.
-3. Normalize `FunctionSignature` to `NormalizedArity`.
-4. Validate argument count against normalized arity.
-5. Optionally assert parser/table metadata consistency (`arg_types`,
-   `return_type`).
-6. Apply explicit special-path handlers for `label_replace` and `label_join`
-   before generic registry dispatch. Add `info` to this branch when parser
-   support is available in the Rust parser.
-7. Keep original raw args (`call.args.args`) for handler context.
-8. Evaluate non-string args; place string arg slots as `None` in
-   `evaluated_args`.
-9. Dispatch to function implementation with both evaluated args and raw args.
-10. Validate returned `ExprResult` against expected return type.
-11. Return `ExprResult` directly.
+- Validating call arity and argument types using parser metadata, with runtime
+  guards for non-parser call paths.
+- Preserving special handling for series/label-oriented functions
+  (`label_replace`, `label_join`, and `info` when parser support exists).
+- Passing both raw AST arguments and evaluated argument values into function
+  execution.
+- Enforcing result-shape expectations at the boundary (`ExprResult` consistency
+  with the function signature).
 
 ### Registry Design
 
@@ -309,30 +248,6 @@ pub(crate) struct FunctionRegistry {
     functions: HashMap<String, Box<dyn PromQLFunction>>,
 }
 ```
-
-### Migration Plan (Low Technical Debt)
-
-Recommended path: single-interface cutover in one merge, with no long-lived
-adapter layer.
-
-Implementation sequence:
-
-1. Add new argument/context types and evolve `PromQLFunction` signature.
-2. Add small helper extractors for common current patterns (single instant
-   argument, single range argument, single scalar argument).
-3. Mechanically port existing function implementations to the evolved
-   `PromQLFunction` using those helpers so behavior stays the same.
-4. Switch evaluator dispatch to the unified call path in the same PR.
-5. Remove old one-arg traits and legacy argument plumbing in the same PR.
-
-This keeps migration code short-lived and avoids carrying compatibility wrappers
-across releases.
-
-If work must be split across multiple PRs, any compatibility wrapper must be:
-
-- Private to the PromQL module.
-- Covered by parity tests.
-- Removed before the final merge that enables new multi-argument behavior.
 
 ### Initial Function Rollout (Post-Refactor)
 
@@ -386,8 +301,8 @@ directly.
 
 - Should optional/defaulted arguments be materialized in evaluator before
   dispatch, or inside function handlers?
-- Should experimental Prometheus functions be feature-gated in the function
-  registry?
+- Once `promql-parser` exposes experimental metadata, should experimental
+  functions be feature-gated in the function registry?
 - Do we want to support all string-argument functions in one phase, or stage
   `label_replace` before `label_join`?
 
