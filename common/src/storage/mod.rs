@@ -208,6 +208,9 @@ pub fn default_merge_batch(
 /// Iterator over storage records.
 #[async_trait]
 pub trait StorageIterator {
+    /// Returns the next record from this iterator.
+    ///
+    /// Returns `Ok(None)` when the iterator is exhausted.
     async fn next(&mut self) -> StorageResult<Option<Record>>;
 }
 
@@ -218,6 +221,9 @@ pub trait StorageIterator {
 /// we can write code that works with both storage types.
 #[async_trait]
 pub trait StorageRead: Send + Sync {
+    /// Retrieves a single record by exact key.
+    ///
+    /// Returns `Ok(None)` if the key is not present.
     async fn get(&self, key: Bytes) -> StorageResult<Option<Record>>;
 
     /// Returns an iterator over records in the given range.
@@ -257,9 +263,33 @@ pub trait Storage: StorageRead {
     /// All operations in the batch are written together in a single `WriteBatch`,
     /// so either all succeed or none are visible. This is the primary write method
     /// used by flushers that produce a mix of operation types from a frozen delta.
-    async fn apply(&self, ops: Vec<RecordOp>) -> StorageResult<()>;
+    ///
+    /// Uses `WriteOptions::default()` (`await_durable: false`).
+    async fn apply(&self, ops: Vec<RecordOp>) -> StorageResult<()> {
+        self.apply_with_options(ops, WriteOptions::default()).await
+    }
 
-    async fn put(&self, records: Vec<PutRecordOp>) -> StorageResult<()>;
+    /// Applies a batch of mixed operations with custom write options.
+    ///
+    /// `options.await_durable` controls whether this call returns only after
+    /// the batch reaches durable storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch cannot be applied.
+    async fn apply_with_options(
+        &self,
+        ops: Vec<RecordOp>,
+        options: WriteOptions,
+    ) -> StorageResult<()>;
+
+    /// Writes records to storage.
+    ///
+    /// Uses `WriteOptions::default()` (`await_durable: false`).
+    async fn put(&self, records: Vec<PutRecordOp>) -> StorageResult<()> {
+        self.put_with_options(records, WriteOptions::default())
+            .await
+    }
 
     /// Writes records to storage with custom options.
     ///
@@ -270,6 +300,10 @@ pub trait Storage: StorageRead {
     ///
     /// * `records` - The records to write
     /// * `options` - Write options controlling durability behavior
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any write in the batch fails.
     async fn put_with_options(
         &self,
         records: Vec<PutRecordOp>,
@@ -284,7 +318,27 @@ pub trait Storage: StorageRead {
     ///
     /// The merge operation is atomic - all merges in the batch are applied
     /// together or not at all.
-    async fn merge(&self, records: Vec<MergeRecordOp>) -> StorageResult<()>;
+    ///
+    /// Uses `WriteOptions::default()` (`await_durable: false`).
+    async fn merge(&self, records: Vec<MergeRecordOp>) -> StorageResult<()> {
+        self.merge_with_options(records, WriteOptions::default())
+            .await
+    }
+
+    /// Merges values with custom write options.
+    ///
+    /// `options.await_durable` controls whether this call returns only after
+    /// the batch reaches durable storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no merge operator is configured or if the merge
+    /// operation fails.
+    async fn merge_with_options(
+        &self,
+        records: Vec<MergeRecordOp>,
+        options: WriteOptions,
+    ) -> StorageResult<()>;
 
     /// Creates a point-in-time snapshot of the storage.
     ///
@@ -298,12 +352,20 @@ pub trait Storage: StorageRead {
     /// This ensures that all writes that have been acknowledged are persisted
     /// to durable storage. For SlateDB, this flushes the memtable to the WAL
     /// and object store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if durability cannot be established.
     async fn flush(&self) -> StorageResult<()>;
 
     /// Closes the storage, releasing any resources.
     ///
     /// This method should be called before dropping the storage to ensure
     /// proper cleanup. For SlateDB, this releases the database fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if resource shutdown fails.
     async fn close(&self) -> StorageResult<()>;
 
     /// Registers storage engine metrics into the given Prometheus registry.

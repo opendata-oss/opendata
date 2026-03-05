@@ -2486,7 +2486,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "opendata-common"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2499,6 +2499,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "slatedb",
+ "slatedb-common",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2518,7 +2519,7 @@ dependencies = [
 
 [[package]]
 name = "opendata-log"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2567,7 +2568,7 @@ dependencies = [
 
 [[package]]
 name = "opendata-timeseries"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-trait",
  "axum",
@@ -2633,6 +2634,7 @@ dependencies = [
  "rstest",
  "serde",
  "serde_yaml",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
@@ -3923,9 +3925,9 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 
 [[package]]
 name = "slatedb"
-version = "0.10.1"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "588e9ae32019696205a05e54e4456486e8d11b69c72662739be853736833b3dd"
+checksum = "dc33982c2d4f2f66fddb6e4bd050c6fcc415944221c0c2775a407b5af0af3388"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3954,6 +3956,8 @@ dependencies = [
  "serde",
  "serde_json",
  "siphasher",
+ "slatedb-common",
+ "slatedb-txn-obj",
  "sysinfo",
  "thiserror 1.0.69",
  "thread_local",
@@ -3964,6 +3968,32 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "slatedb-common"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30f25d1e125ea2f5dcf315e7cc40bc4adce655b382d2350ec37b66d7e97802ff"
+dependencies = [
+ "chrono",
+ "tokio",
+]
+
+[[package]]
+name = "slatedb-txn-obj"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc5f20e6b8c7d01cb6a4050a495d3a2e8c435bc8ce439c9b0b72fa2d3096bed8"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "log",
+ "object_store",
+ "slatedb-common",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

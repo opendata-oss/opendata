@@ -555,12 +555,11 @@ impl VectorDb {
         Ok(())
     }
 
-    /// Force flush all pending data to storage.
+    /// Force flush all pending data to durable storage.
     ///
-    /// Normally data is flushed according to `flush_interval`, and is then
-    /// readable. This method can be used to make writes readable immediately.
-    /// TODO: extend with an option to make durable, or support reading unflushed
-    ///       and change the meaning here to mean flushed durably
+    /// Flushes the in-memory delta to the storage memtable, then persists
+    /// to durable storage. After this returns, data is both readable and
+    /// durable.
     ///
     /// # Atomic Flush
     ///
@@ -568,6 +567,7 @@ impl VectorDb {
     /// 1. All pending writes are frozen into an immutable delta
     /// 2. RecordOps are applied in one batch via `storage.apply()`
     /// 3. The snapshot is updated for queries
+    /// 4. Data is flushed to durable storage
     ///
     /// This ensures ID dictionary updates, deletes, and new records are all
     /// applied together, maintaining consistency.
@@ -575,11 +575,11 @@ impl VectorDb {
         let mut handle = self
             .write_coordinator
             .handle(WRITE_CHANNEL)
-            .flush(false)
+            .flush(true)
             .await
             .map_err(|e| Error::Internal(format!("{}", e)))?;
         handle
-            .wait(Durability::Written)
+            .wait(Durability::Durable)
             .await
             .map_err(|e| Error::Internal(format!("{}", e)))?;
         Ok(())
@@ -1448,6 +1448,48 @@ mod tests {
 
         // then - sorted by ascending distance: c1 (1.0), c2 (3.0), c0 (5.0)
         assert_eq!(result, vec![1, 2, 0]);
+    }
+
+    #[tokio::test]
+    async fn flush_should_be_durable_across_reopen() {
+        use common::storage::config::{
+            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+        };
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage_config = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp_dir.path().to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+        });
+
+        let config = Config {
+            storage: storage_config.clone(),
+            dimensions: 3,
+            distance_metric: DistanceMetric::Cosine,
+            ..Default::default()
+        };
+
+        // Write vectors and flush
+        let db = VectorDb::open(config.clone()).await.unwrap();
+        db.write(vec![
+            Vector::new("vec-1", vec![1.0, 0.0, 0.0]),
+            Vector::new("vec-2", vec![0.0, 1.0, 0.0]),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+        drop(db);
+
+        // Reopen from durable state — data should be visible
+        let db2 = VectorDb::open(config).await.unwrap();
+        let results = db2.search(&[1.0, 0.0, 0.0], 10).await.unwrap();
+        assert!(
+            !results.is_empty(),
+            "expected data to be durable after flush, but search returned no results"
+        );
     }
 
     #[tokio::test]

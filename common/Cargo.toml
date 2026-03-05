@@ -1,6 +1,6 @@
 [package]
 name = "opendata-common"
-version = "0.1.8"
+version = "0.1.9"
 edition.workspace = true
 description = "Shared storage foundation for OpenData databases"
 license = "MIT"
@@ -34,6 +34,7 @@ arc-swap = { version = "1", optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 slatedb = { workspace = true, features = ["test-util"] }
+slatedb-common = { workspace = true, features = ["test-util"] }
 serde_yaml.workspace = true
 proptest.workspace = true
 criterion.workspace = true
