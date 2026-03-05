@@ -552,15 +552,15 @@ async fn try_advance_read_view(
     durability: Durability,
     through_seq: u64,
 ) -> Option<u64> {
-    if let Some((seqnum, epoch, snapshot, new_segment_id)) = tracker.advance(through_seq) {
+    if let Some(advanced) = tracker.advance(through_seq) {
         let mut rv = read_view.write().await;
-        rv.update_snapshot(snapshot as Arc<dyn common::StorageRead>);
+        rv.update_snapshot(advanced.snapshot as Arc<dyn common::StorageRead>);
 
         // Refresh segments from the snapshot when the writer reports a new segment.
-        if new_segment_id != *known_segment_id {
+        if advanced.last_segment_id != *known_segment_id {
             match rv.refresh_segments(*known_segment_id).await {
                 Ok(()) => {
-                    *known_segment_id = new_segment_id;
+                    *known_segment_id = advanced.last_segment_id;
                 }
                 Err(e) => {
                     tracing::warn!("failed to refresh segments: {e}");
@@ -569,10 +569,10 @@ async fn try_advance_read_view(
         }
 
         match durability {
-            Durability::Written => watermarks.update_written(epoch),
-            Durability::Durable | Durability::Applied => watermarks.update_durable(epoch),
+            Durability::Written => watermarks.update_written(advanced.epoch),
+            Durability::Durable | Durability::Applied => watermarks.update_durable(advanced.epoch),
         }
-        return Some(seqnum);
+        return Some(advanced.seqnum);
     }
     None
 }

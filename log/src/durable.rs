@@ -19,6 +19,14 @@ pub(crate) struct PendingEntry {
     pub last_segment_id: Option<SegmentId>,
 }
 
+/// The latest entry applied while advancing a watermark.
+pub(crate) struct AdvanceResult {
+    pub seqnum: u64,
+    pub epoch: u64,
+    pub snapshot: Arc<dyn StorageSnapshot>,
+    pub last_segment_id: Option<SegmentId>,
+}
+
 /// Buffers pending writes and produces read views when a watermark advances.
 ///
 /// Used by both the written and durable subscriber tasks. The written path
@@ -42,14 +50,10 @@ impl ViewTracker {
         self.pending.push_back(entry);
     }
 
-    /// Drains entries where `seqnum <= durable_seq`. Returns the
-    /// `(seqnum, epoch, snapshot, last_segment_id)` of the last drained entry,
-    /// if any.
-    pub(crate) fn advance(
-        &mut self,
-        durable_seq: u64,
-    ) -> Option<(u64, u64, Arc<dyn StorageSnapshot>, Option<SegmentId>)> {
-        let mut last: Option<(u64, u64, Arc<dyn StorageSnapshot>, Option<SegmentId>)> = None;
+    /// Drains entries where `seqnum <= durable_seq`. Returns the last drained
+    /// entry, if any.
+    pub(crate) fn advance(&mut self, durable_seq: u64) -> Option<AdvanceResult> {
+        let mut last: Option<AdvanceResult> = None;
 
         while self
             .pending
@@ -57,12 +61,12 @@ impl ViewTracker {
             .is_some_and(|e| e.seqnum <= durable_seq)
         {
             let entry = self.pending.pop_front().unwrap();
-            last = Some((
-                entry.seqnum,
-                entry.epoch,
-                entry.snapshot,
-                entry.last_segment_id,
-            ));
+            last = Some(AdvanceResult {
+                seqnum: entry.seqnum,
+                epoch: entry.epoch,
+                snapshot: entry.snapshot,
+                last_segment_id: entry.last_segment_id,
+            });
         }
 
         last
@@ -94,10 +98,10 @@ mod tests {
 
         let result = tracker.advance(1);
         assert!(result.is_some());
-        let (seqnum, epoch, _, last_segment_id) = result.unwrap();
-        assert_eq!(seqnum, 1);
-        assert_eq!(epoch, 10);
-        assert_eq!(last_segment_id, Some(7));
+        let result = result.unwrap();
+        assert_eq!(result.seqnum, 1);
+        assert_eq!(result.epoch, 10);
+        assert_eq!(result.last_segment_id, Some(7));
     }
 
     #[tokio::test]
@@ -143,10 +147,10 @@ mod tests {
 
         let result = tracker.advance(3);
         assert!(result.is_some());
-        let (seqnum, epoch, _, last_segment_id) = result.unwrap();
-        assert_eq!(seqnum, 3);
-        assert_eq!(epoch, 2); // last drained entry had epoch 2
-        assert_eq!(last_segment_id, Some(1));
+        let result = result.unwrap();
+        assert_eq!(result.seqnum, 3);
+        assert_eq!(result.epoch, 2); // last drained entry had epoch 2
+        assert_eq!(result.last_segment_id, Some(1));
         assert_eq!(tracker.pending.len(), 1); // seqnum=5 still pending
     }
 
