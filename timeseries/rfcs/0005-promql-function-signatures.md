@@ -176,16 +176,10 @@ pub(crate) trait PromQLFunction {
 
 Phase 2 (target):
 
-- Introduce typed argument values and call context for unified dispatch,
-  especially for string-argument functions.
+- Reuse `ExprResult` directly for evaluated non-string arguments and add call
+  context for unified dispatch, especially for string-argument functions.
 
 ```rust
-pub(crate) enum FunctionArgValue {
-    Scalar(f64),
-    InstantVector(Vec<EvalSample>),
-    RangeVector(Vec<EvalSamples>),
-}
-
 pub(crate) struct FunctionCallContext<'a> {
     pub eval_timestamp_ms: i64,
     pub raw_args: &'a [Box<Expr>],
@@ -194,7 +188,7 @@ pub(crate) struct FunctionCallContext<'a> {
 pub(crate) trait PromQLFunction {
     fn apply(
         &self,
-        evaluated_args: Vec<Option<FunctionArgValue>>,
+        evaluated_args: Vec<Option<ExprResult>>,
         ctx: &FunctionCallContext<'_>,
     ) -> EvalResult<ExprResult>;
 }
@@ -211,8 +205,8 @@ Notes:
   dispatch boundary while adding registry complexity.
 - Type safety is enforced by parser metadata and evaluator validation in both
   phases.
-- String-argument handling through `raw_args` and `Option<FunctionArgValue>`
-  slots is a Phase 2 target.
+- String-argument handling through `raw_args` and `None` argument slots is a
+  Phase 2 target.
 
 ### Scalar Boundary Semantics
 
