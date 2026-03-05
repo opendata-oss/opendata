@@ -3,6 +3,7 @@ pub enum Error {
     Storage(String),
     Serialization(String),
     BackpressureLimitExceeded { incoming_size: usize, limit: usize },
+    Fenced,
 }
 
 impl std::error::Error for Error {}
@@ -20,6 +21,7 @@ impl std::fmt::Display for Error {
                 "Incoming size {} exceeds backpressure limit {}",
                 incoming_size, limit
             ),
+            Error::Fenced => write!(f, "consumer fenced: epoch mismatch"),
         }
     }
 }

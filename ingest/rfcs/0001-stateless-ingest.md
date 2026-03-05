@@ -64,21 +64,21 @@ different zones do not incur cross-zonal transfer fees.
                │    │ └────────────┐    │            │    │
                │    │    ┌─────────┼────┼────────────┘    │
 ┌──────────────┼────┼────┼─────────┼────┼─────────────────┼────────┐
-│ Object Store │    │    │         │  ┌─┘                 │        │
-│ Bucket       │    │    │         │  │  ┌────────────────┘        │
-│  ┌───────────▼────▼────▼──┐  ┌───┼──┼──┼──────────────────────┐  │
-│  │          data          │  │   │  │  │  queue               │  │
-│  │                        │  │ ┌─▼──▼──▼────┐  ┌────────────┐ │  │
-│  │  01J5T4R3KXBMZ7...     │  │ │ producer-q │  │ consumer-q │ │  │
-│  │  01J5T4R7NP39QW...     │  │ └────▲───────┘  └────▲───────┘ │  │
-│  │  01J5T4RBYW52MK...     │  │      │     ┌─────────┘         │  │
-│  └───────────▲────────────┘  └──────┼─────┼───────────────────┘  │
-└──────────────┼──────────────────────┼─────┼──────────────────────┘
-               │                      │     │
-               │                      │     │
-               │        ┌─────────────┼─────┼──────┐
-               │        │ Writer      │     │      │
-               │        │        ┌────▼─────▼───┐  │     ┌────────────┐
+│ Object Store │    │    │         │    └────┐            │        │
+│ Bucket       │    │    │         └──────┐  │  ┌─────────┘        │
+│  ┌───────────▼────▼────▼──┐  ┌──────────┼──┼──┼───────────────┐  │
+│  │          data          │  │  queue   │  │  │               │  │
+│  │                        │  │        ┌─▼──▼──▼────┐          │  │
+│  │  01J5T4R3KXBMZ7...     │  │        │ q-manifest │          │  │
+│  │  01J5T4R7NP39QW...     │  │        └────▲───────┘          │  │
+│  │  01J5T4RBYW52MK...     │  │             │                  │  │
+│  └───────────▲────────────┘  └─────────────┼──────────────────┘  │
+└──────────────┼─────────────────────────────┼─────────────────────┘
+               │                             │
+               │                             │
+               │        ┌────────────────────┼─────┐
+               │        │ Writer             │     │
+               │        │        ┌───────────▼──┐  │     ┌────────────┐
                └────────┼────────▶  Collector   │  ├────▶│  Database  │
                         │        │  q-consumer  │  │     └────────────┘
                         │        └──────────────┘  │
@@ -87,31 +87,33 @@ different zones do not incur cross-zonal transfer fees.
 
 ### Queue
 
-The queue coordinates ingestors and collectors via two manifests in object storage,
-the producer manifest (`producer-q` in the diagram) and the consumer manifest (`consumer-q` in the diagram).
+The queue coordinates ingestors and collectors via a single queue manifest in object storage
+(`q-manifest` in the diagram).
 
 The queue producers (used internally by the ingestors) write the locations of the batches of ingested data
-to the producer manifest.
-More specifically, a queue producer reads the producer manifest and loads the list of locations into memory.
+to the queue manifest.
+More specifically, a queue producer reads the manifest and loads the list of locations into memory.
 It appends the location of the flushed batch to the end of the list and writes the manifest back to object storage.
-Each write of the producer manifest is a CAS-write.
-That means, a write only succeeds if the producer manifest has not been modified since it was read by the queue producer.
-This ensures that locations appended to the producer manifest are not overwritten by other queue producers.
+Each write of the queue manifest is a CAS-write.
+That means, a write only succeeds if the queue manifest has not been modified since it was read by the queue producer.
+This ensures that locations appended to the queue manifest are not overwritten by other queue producers.
 However, that also means that queue producers contend for appending their locations.
 
-The queue consumer (used internally by the collector) reads the producer manifest to know the locations of the
+The queue consumer (used internally by the collector) reads the queue manifest to know the locations of the
 data it needs to read next.
-The queue consumer claims locations of the data batches that will be made available next.
-Once the data is read and processed, the consumer can mark the location as done.
-To avoid contention on the producer manifest, the queue consumer keeps claimed and done locations in the consumer manifest.
-However, once in a while, the queue consumer needs to remove done locations from the producer manifest and
-from the consumer manifest to avoid unbounded growth of those manifests.
-After a configured number of done locations, the queue consumer cleans up both manifests.
-In this way the queue consumer avoids contending too much with the queue producers for the producer manifest.
+On startup, the consumer increments an `epoch` counter stored in the queue manifest footer.
+Only a consumer whose epoch matches the manifest's current epoch may perform queue operations.
+If a new consumer starts and increments the epoch, any previous consumer is fenced —
+its subsequent queue operations fail with a `Fenced` error.
+This epoch-based fencing replaces heartbeat-based claim tracking and ensures
+only a single active consumer processes entries at any time.
+
+When the consumer has processed entries, it calls `dequeue(through_sequence)` which removes
+all entries with sequence numbers up to and including `through_sequence` from the queue manifest.
 
 #### Manifest Format
 
-The producer manifest uses a compact binary format that supports appending new entries
+The queue manifest uses a compact binary format that supports appending new entries
 without deserializing existing entries. Each entry records the object storage location,
 ingestion time, and optional extensible metadata:
 
@@ -124,9 +126,10 @@ ingestion time, and optional extensible metadata:
 │  ...                                                         │
 │  entry N: ...                                                │
 ├──────────────────────────────────────────────────────────────┤
-│  footer (14 bytes):                                          │
+│  footer (22 bytes):                                          │
 │    entry_count    : u32 LE                                   │
 │    next_sequence  : u64 LE                                   │
+│    epoch          : u64 LE                                   │
 │    version        : u16 LE  (= 1)                            │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -138,50 +141,21 @@ ingestion time, and optional extensible metadata:
 - `ingestion_time_ms` is the wall-clock time in milliseconds since the Unix epoch when the entry was enqueued.
 - `metadata` is an opaque byte payload whose length is implicit: `entry_len - 8 - 2 - location_len - 8`.
   This field enables extensible per-entry metadata (e.g., flatbuffers) without a format change.
-- The footer is always the last 14 bytes. `next_sequence` stores the sequence number that will be assigned
-  to the next appended entry. It allows readers to verify the entry count and detect format changes.
+- The footer is always the last 22 bytes. `next_sequence` stores the sequence number that will be assigned
+  to the next appended entry. `epoch` is a monotonically increasing counter used for consumer fencing:
+  a new consumer increments the epoch on initialization, and only a consumer whose epoch matches the
+  manifest's epoch may perform queue operations. It allows readers to verify the entry count and detect format changes.
 
-To append a new entry a producer reads the raw bytes, strips the 14-byte footer, appends the encoded entry
+To append a new entry a producer reads the raw bytes, strips the 22-byte footer, appends the encoded entry
 (with the sequence number from `next_sequence`), and writes a new footer with the incremented entry count
 and incremented `next_sequence`.
 Existing entries are never deserialized during append, which keeps the write path O(1) in the number of entries.
 Entries are listed in ingestion order. A `dequeue(n)` operation removes all entries with `sequence <= n`
-and returns them; this requires a full decode-filter-encode cycle. Entries are also removed from the manifest
-during cleanup after they have been processed by the consumer.
+and returns them.
 
-The consumer manifest is stored as a JSON file in object storage.
-It contains a map of claimed locations with their heartbeat timestamps
-and a list of done locations:
-```json
-{
-  "claimed": {
-    "data/01J5T4R3KXBMZ7QV9N2WG8YDHP.batch": 1719400000000,
-    "data/01J5T4R7NP39QW4HJXT6V1BEKM.batch": 1719400005000
-  },
-  "done": [
-    "data/01J5T4RBYW52MKD8FR0JAN7G9C.batch"
-  ]
-}
-```
-The `claimed` map associates each claimed location with a timestamp in milliseconds since the Unix epoch.
-This timestamp is set when the location is claimed or refreshed by `heartbeat()`.
-If the timestamp is older than `heartbeat_timeout_ms`, the location is considered stale and may be re-claimed
-by another consumer.
-Stale locations are always re-claimed before any new pending location is claimed.
-The `done` list contains locations that have been fully processed. These locations remain in the consumer manifest
-until the `done_cleanup_threshold` is reached, at which point they are removed from both the producer manifest's
-`pending` list and the consumer manifest's `done` list.
-
-The queue does not guarantee that the ingestion order is preserved.
-For example the following scenario will re-order batches:
-1. A queue consumer fails after it claimed a location but before moving the location to done.
-2. The new consumer starts but the heartbeat timeout on the location claimed by the failed consumer has not yet elapsed. 
-3. The new consumer will claim pending locations and mark the locations as done until the heartbeat for the location
-   claimed by the failed consumer elapsed.
-
-All pending locations claimed by the new consumer before it can re-claim the location claimed by the
-failed consumer will be done before the location claimed by the failed consumer,
-although the latter were appended to the queue before the former.
+The queue guarantees that entries are processed in ingestion order within a single active consumer.
+If a consumer fails, the new consumer increments the epoch, fencing the old one,
+and resumes processing from the earliest unprocessed entry in the queue manifest.
 
 
 ### Ingestor
@@ -218,7 +192,7 @@ pub struct IngestorConfig {
   pub max_unflushed_bytes: usize,              // limit in bytes that triggers backpressure, default: usize:MAX
 }
 ```
-The queue producer manifest takes the name specified in `manifest_path`.
+The queue manifest takes the name specified in `manifest_path`.
 The config `flush_size_bytes` is a loose limit.
 The batch needs to exceed that size to trigger a flush to object storage.
 The config `max_unflushed_bytes` is also a loose limit.
@@ -240,8 +214,8 @@ The `WriteWatcher` has the following API:
 As soon as the call to `await_durable().await` returns or the call to `result()` is not `None`, the vector of entries
 is stored in object storage and the location of the object that contains the vector of entries is appended to the
 queue.
-More specifically, the location is appended to the end of the list of pending locations in the producer queue manifest
-(`producer-q` in the diagram).
+More specifically, the location is appended to the end of the list of pending locations in the queue manifest
+(`q-manifest` in the diagram).
 
 Method `close()` flushes unflushed entries and terminates the ingestor.
 
@@ -274,7 +248,7 @@ The ingest module does not interpret the entries; it preserves them as-is.
 
 Each batch is stored under the configured `data_path_prefix` with a ULID filename
 (e.g., `data/01J5T4R3KXBMZ7QV9N2WG8YDHP.batch`).
-The location (object storage path) of the batch is then enqueued in the producer manifest
+The location (object storage path) of the batch is then enqueued in the queue manifest
 so the collector can discover and read it.
 
 
@@ -300,20 +274,13 @@ The configurations for the collector are:
 pub struct CollectorConfig {
     pub object_store_config: ObjectStoreConfig,  // configuration of the object store from opendata/common
     pub manifest_path: String,                   // path to the queue manifest, default: "ingest/manifest"
-    pub heartbeat_timeout_ms: Duration,          // duration after which a claimed location is considered failed,
-                                                 // default: 30s
-    pub done_cleanup_threshold: usize,           // number of done locations at which a cleanup of the locations
-                                                 // and corresponding data batches is triggered, default: 100
 }
 ```
-The queue producer manifest takes the name specified in `manifest_path`.
-The queue consumer manifest is derived from `manifest_path` by appending `.consumer.json`
-(e.g., `ingest/manifest` → `ingest/manifest.consumer.json`).
+The queue manifest takes the name specified in `manifest_path`.
 
 The collector internally creates a queue consumer and an object store client from the configuration.
-It also spawns a background heartbeat task that periodically refreshes the timestamps of all
-in-flight batches in the consumer manifest. The heartbeat interval is derived from the configuration
-as `heartbeat_timeout_ms / 3`, ensuring claims stay fresh well before they expire.
+On startup, the queue consumer initializes by incrementing the epoch in the queue manifest,
+fencing any previous consumer instance.
 
 A `CollectedBatch` contains the deserialized entries and the location of the batch:
 ```rust
@@ -323,20 +290,17 @@ pub struct CollectedBatch {
 }
 ```
 
-By calling `next_batch()` the collector claims the next available location from the queue, reads the
-data batch from object storage, deserializes the entries, and returns them as a `CollectedBatch`.
-The batch is tracked as in-flight so the background heartbeat keeps it alive.
-If no location is available in the queue, `None` is returned.
+By calling `next_batch()` the collector iterates over the entries in the queue manifest via the
+queue consumer, reads the next data batch from object storage, deserializes the entries, and returns
+them as a `CollectedBatch`.
+If no entries are available in the queue, `None` is returned.
 
 By calling `ack()` the caller confirms that the batch has been fully processed.
-The method removes the batch from the in-flight set so the background heartbeat stops refreshing it,
-and calls `dequeue()` on the queue consumer to mark the location as done.
-This may trigger cleanup of the manifests and the data batch in object storage if the
-`done_cleanup_threshold` is reached.
+The method calls `dequeue()` on the queue consumer to remove the acknowledged entries from the
+queue manifest.
 
-When the collector is dropped, the background heartbeat task is cancelled.
-In-flight batches that are not acknowledged will eventually become stale and can be re-claimed
-by another collector.
+If the collector fails, a new collector can be started. It will increment the epoch,
+fencing the old consumer, and resume from the earliest unprocessed entry.
 
 ### Delivery guarantees
 
@@ -354,7 +318,7 @@ If they track the progress and re-ingest unacknowledged entries they can achieve
 TBD
 
 Some ideas:
-- conflict rate for producer and consumer manifest
+- conflict rate for queue manifest
 - queue length
 - size of all data batches
 
@@ -374,12 +338,12 @@ In the future, it might be necessary to revise this decision and implement the s
 contention gets worse.
 
 
-### Using one single manifest for the queue
+### Using two manifests for the queue (previous approach)
 
-With a very fast collector, the contention on the manifest would be quite high.
-This contention would also affect the queue producers.
-With a queue producer manifest and a queue consumer manifest, we can better decouple producer contention from
-consumer contention.
+The previous design used a separate consumer manifest (JSON) to track claimed and done locations
+with heartbeat-based timeouts. This was replaced by epoch-based fencing in the single queue manifest,
+which simplifies the design for the single-consumer model and eliminates the need for heartbeats,
+stale reclaim logic, and a separate consumer manifest file.
 
 
 ### Using a counter for the batch names
