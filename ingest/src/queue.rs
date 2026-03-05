@@ -501,6 +501,11 @@ impl ConflictCounter {
     }
 }
 
+/// A producer that appends entries to a shared manifest in object storage.
+///
+/// Writes use optimistic concurrency: the manifest is read, modified locally,
+/// and written back with a conditional put. On conflict the operation is
+/// retried automatically until it succeeds.
 pub struct QueueProducer {
     manifest_store: ManifestStore,
     clock: Arc<dyn Clock>,
@@ -508,6 +513,7 @@ pub struct QueueProducer {
 }
 
 impl QueueProducer {
+    /// Create a new producer backed by the given [`ObjectStore`].
     pub fn with_object_store(
         manifest_path: String,
         object_store: Arc<dyn ObjectStore>,
@@ -523,6 +529,9 @@ impl QueueProducer {
         }
     }
 
+    /// Append an entry to the queue with the given `location` and `metadata`.
+    ///
+    /// The write is retried automatically on optimistic-concurrency conflicts.
     pub async fn enqueue(&self, location: String, metadata: Bytes) -> Result<()> {
         let entry = QueueEntry {
             sequence: 0,
@@ -545,11 +554,20 @@ impl QueueProducer {
         }
     }
 
+    /// Return the percentage of manifest writes that encountered a conflict.
     pub fn conflict_rate(&self) -> f64 {
         self.counter.conflict_rate()
     }
 }
 
+/// A consumer that reads and dequeues entries from a shared manifest in
+/// object storage.
+///
+/// Single-consumer semantics are enforced through an epoch stored in the
+/// manifest. Calling [`QueueConsumer::initialize`] increments the epoch,
+/// fencing any previous consumer instance. Every subsequent read or dequeue
+/// checks that the local epoch still matches the manifest, returning
+/// [`Error::Fenced`] if another consumer has taken over.
 pub struct QueueConsumer {
     manifest_store: ManifestStore,
     epoch: AtomicU64,
@@ -559,6 +577,9 @@ pub struct QueueConsumer {
 }
 
 impl QueueConsumer {
+    /// Create a new consumer backed by the given [`ObjectStore`].
+    ///
+    /// The consumer is not active until [`QueueConsumer::initialize`] is called.
     pub fn with_object_store(
         manifest_path: String,
         object_store: Arc<dyn ObjectStore>,
@@ -640,6 +661,7 @@ impl QueueConsumer {
         }
     }
 
+    /// Return the number of entries in the queue as of the last manifest read or write.
     pub fn len(&self) -> usize {
         self.queue_len.load(Ordering::Relaxed) as usize
     }
@@ -665,6 +687,7 @@ impl QueueConsumer {
         result
     }
 
+    /// Return the percentage of manifest writes that encountered a conflict.
     pub fn conflict_rate(&self) -> f64 {
         self.counter.conflict_rate()
     }
