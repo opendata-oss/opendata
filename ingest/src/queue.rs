@@ -401,6 +401,13 @@ impl Iterator for ManifestIter<'_> {
                 &mut self.appended_offset,
                 self.appended.len(),
             ))
+        } else if self.offset != self.entries_end {
+            let err = Some(Err(Error::Serialization(format!(
+                "base entries did not consume all bytes: offset {} != entries_end {}",
+                self.offset, self.entries_end
+            ))));
+            self.offset = self.entries_end;
+            err
         } else {
             None
         }
@@ -1070,6 +1077,37 @@ mod tests {
         let err = Manifest::from_bytes(buf.freeze()).unwrap_err();
 
         assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn should_reject_trailing_bytes_before_footer() {
+        // Build a valid entry manually, then add garbage bytes before the footer.
+        let mut buf = BytesMut::new();
+        let location = "loc";
+        let entry_len = SEQUENCE_SIZE + LOCATION_LEN_SIZE + location.len() + INGESTION_TIME_MS_SIZE;
+        buf.put_u32_le(entry_len as u32); // entry_len prefix
+        buf.put_u64_le(0); // sequence
+        buf.put_u16_le(location.len() as u16);
+        buf.extend_from_slice(location.as_bytes());
+        buf.put_i64_le(1000); // ingestion_time_ms
+        // trailing garbage before footer
+        buf.extend_from_slice(&[0xFFu8; 5]);
+        // footer: entry_count=1
+        buf.put_u32_le(1);
+        buf.put_u64_le(1);
+        buf.put_u64_le(0);
+        buf.put_u16_le(MANIFEST_VERSION);
+
+        let manifest = Manifest::from_bytes(buf.freeze()).unwrap();
+        let items: Vec<Result<QueueEntry>> = manifest.iter().collect();
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_ok());
+        let err = items[1].as_ref().unwrap_err();
+        assert!(
+            err.to_string().contains("did not consume all bytes"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
