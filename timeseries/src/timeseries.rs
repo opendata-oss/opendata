@@ -219,4 +219,74 @@ impl TimeSeriesDb {
     pub async fn flush(&self) -> Result<()> {
         self.tsdb.flush().await
     }
+
+    /// Closes the time series database, flushing any pending data and releasing
+    /// resources.
+    ///
+    /// All written data is flushed to durable storage before the database is
+    /// closed. For SlateDB-backed storage, this also releases the database
+    /// fence.
+    pub async fn close(self) -> Result<()> {
+        self.tsdb.close().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Label, Sample, Series};
+    use common::StorageConfig;
+    use common::storage::config::{
+        LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+    };
+
+    #[tokio::test]
+    async fn close_without_explicit_flush_guarantees_durability() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "ts-data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp_dir.path().to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+        });
+
+        // Write a series and close without calling flush()
+        {
+            let tsdb = TimeSeriesDb::open(Config {
+                storage: storage.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+            tsdb.write(vec![Series::new(
+                "cpu_usage",
+                vec![Label::new("host", "server1")],
+                vec![Sample::new(3_900_000, 0.42)],
+            )])
+            .await
+            .unwrap();
+
+            tsdb.close().await.unwrap();
+        }
+
+        // Reopen and verify the series survived
+        let tsdb = TimeSeriesDb::open(Config {
+            storage: storage.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let series = tsdb
+            .series(&["{__name__=\"cpu_usage\"}"], ..)
+            .await
+            .unwrap();
+
+        assert!(
+            !series.is_empty(),
+            "expected series to survive close without explicit flush"
+        );
+    }
 }

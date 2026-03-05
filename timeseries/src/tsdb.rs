@@ -639,6 +639,12 @@ impl Tsdb {
         Ok(())
     }
 
+    pub(crate) async fn close(self) -> Result<()> {
+        self.flush().await?;
+        self.storage.close().await?;
+        Ok(())
+    }
+
     /// Ingest series into the TSDB.
     /// Each series is split by time bucket based on sample timestamps.
     #[tracing::instrument(

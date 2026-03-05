@@ -578,6 +578,21 @@ impl VectorDb {
         Ok(())
     }
 
+    /// Closes the vector database, flushing any pending data and releasing resources.
+    ///
+    /// All written data is flushed to durable storage before the database is
+    /// closed. For SlateDB-backed storage, this also releases the database
+    /// fence.
+    pub async fn close(self) -> Result<()> {
+        self.flush().await?;
+        self.write_coordinator
+            .stop()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.storage.close().await?;
+        Ok(())
+    }
+
     pub fn num_centroids(&self) -> usize {
         self.centroid_graph.len()
     }
@@ -1482,6 +1497,44 @@ mod tests {
             !results.is_empty(),
             "expected data to be durable after flush, but search returned no results"
         );
+    }
+
+    #[tokio::test]
+    async fn close_without_explicit_flush_guarantees_durability() {
+        use common::storage::config::{
+            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+        };
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage_config = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp_dir.path().to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+        });
+
+        let config = Config {
+            storage: storage_config.clone(),
+            dimensions: 3,
+            distance_metric: DistanceMetric::L2,
+            ..Default::default()
+        };
+
+        // Write a vector and close without calling flush()
+        {
+            let db = VectorDb::open(config.clone()).await.unwrap();
+            db.write(vec![Vector::new("vec-1", vec![1.0, 0.0, 0.0])])
+                .await
+                .unwrap();
+            db.close().await.unwrap();
+        }
+
+        // Reopen and verify the vector survived
+        let db2 = VectorDb::open(config).await.unwrap();
+        let results = db2.search(&[1.0, 0.0, 0.0], 1).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].external_id, "vec-1");
     }
 
     #[tokio::test]
