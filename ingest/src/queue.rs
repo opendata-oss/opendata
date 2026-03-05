@@ -583,8 +583,7 @@ impl QueueConsumer {
             let (mut manifest, version) = self.read_manifest().await?;
             let new_epoch = manifest.epoch + 1;
             manifest.set_epoch(new_epoch);
-            self.counter.record_write();
-            match self.manifest_store.write(&manifest, version).await {
+            match self.write_manifest(&manifest, version).await {
                 Ok(()) => {
                     self.epoch.store(new_epoch, Ordering::Relaxed);
                     return Ok(());
@@ -630,8 +629,7 @@ impl QueueConsumer {
                 return Err(Error::Fenced);
             }
             let removed = manifest.dequeue(through_sequence);
-            self.counter.record_write();
-            match self.manifest_store.write(&manifest, version).await {
+            match self.write_manifest(&manifest, version).await {
                 Ok(()) => return Ok(removed),
                 Err(ManifestWriteError::Conflict) => {
                     self.counter.record_conflict();
@@ -651,6 +649,20 @@ impl QueueConsumer {
         self.queue_len
             .store(result.0.entries_count() as u64, Ordering::Relaxed);
         Ok(result)
+    }
+
+    async fn write_manifest(
+        &self,
+        manifest: &Manifest,
+        version: Option<UpdateVersion>,
+    ) -> std::result::Result<(), ManifestWriteError> {
+        self.counter.record_write();
+        let result = self.manifest_store.write(manifest, version).await;
+        if result.is_ok() {
+            self.queue_len
+                .store(manifest.entries_count() as u64, Ordering::Relaxed);
+        }
+        result
     }
 
     pub fn conflict_rate(&self) -> f64 {
