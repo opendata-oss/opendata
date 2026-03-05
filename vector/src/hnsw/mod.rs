@@ -5,7 +5,7 @@
 
 mod usearch;
 
-use anyhow::Result;
+use crate::error::Result;
 
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::collection_meta::DistanceMetric;

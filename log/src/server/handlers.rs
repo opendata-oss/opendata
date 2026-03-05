@@ -350,11 +350,11 @@ mod tests {
 
         #[async_trait]
         impl Storage for ConfigurableStorage {
-            async fn apply(&self, _ops: Vec<RecordOp>) -> common::StorageResult<()> {
-                self.check_failure()
-            }
-
-            async fn put(&self, _records: Vec<PutRecordOp>) -> common::StorageResult<()> {
+            async fn apply_with_options(
+                &self,
+                _ops: Vec<RecordOp>,
+                _options: common::WriteOptions,
+            ) -> common::StorageResult<()> {
                 self.check_failure()
             }
 
@@ -366,7 +366,11 @@ mod tests {
                 self.check_failure()
             }
 
-            async fn merge(&self, _records: Vec<MergeRecordOp>) -> common::StorageResult<()> {
+            async fn merge_with_options(
+                &self,
+                _records: Vec<MergeRecordOp>,
+                _options: common::WriteOptions,
+            ) -> common::StorageResult<()> {
                 self.check_failure()
             }
 

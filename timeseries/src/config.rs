@@ -17,17 +17,21 @@ use serde_with::{DurationMilliSeconds, serde_as};
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
 /// use timeseries::Config;
 /// use common::StorageConfig;
 /// use std::time::Duration;
 ///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = Config {
 ///     storage: StorageConfig::default(),
 ///     flush_interval: Duration::from_secs(30),
 ///     retention: Some(Duration::from_secs(86400 * 7)), // 7 days
 /// };
-/// let ts = TimeSeriesDb::open(config).await?;
+/// let ts = timeseries::TimeSeriesDb::open(config).await?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct Config {

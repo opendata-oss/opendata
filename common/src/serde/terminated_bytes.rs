@@ -11,7 +11,7 @@
 //! Using `0x00` as the terminator ensures shorter keys sort before longer
 //! keys with the same prefix (e.g., "/foo" < "/foo/bar").
 //!
-//! For prefix-based range queries, use [`crate::bytes::lex_increment`] to compute
+//! For prefix-based range queries, use `crate::bytes::lex_increment` to compute
 //! the exclusive upper bound.
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -123,7 +123,7 @@ pub fn deserialize(buf: &mut &[u8]) -> Result<Bytes, DeserializeError> {
 
 /// Creates a [`BytesRange`] for scanning all keys with the given logical prefix.
 ///
-/// The prefix is first incremented using [`lex_increment`], then both bounds
+/// The prefix is first incremented using `lex_increment`, then both bounds
 /// are serialized using [`serialize`].
 ///
 /// # Examples

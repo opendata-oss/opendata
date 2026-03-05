@@ -27,22 +27,23 @@ use crate::tsdb::{
 ///
 /// # Example
 ///
-/// ```ignore
-/// use timeseries::{TimeSeriesDb, Config, Series};
+/// ```
+/// # use timeseries::{TimeSeriesDb, Config, Series};
+/// # use common::StorageConfig;
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+/// let ts = TimeSeriesDb::open(config).await?;
 ///
-/// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let ts = TimeSeriesDb::open(Config::default()).await?;
+/// let series = Series::builder("http_requests_total")
+///     .label("method", "GET")
+///     .label("status", "200")
+///     .sample_now(1.0)
+///     .build();
 ///
-///     let series = Series::builder("http_requests_total")
-///         .label("method", "GET")
-///         .label("status", "200")
-///         .sample_now(1.0)
-///         .build();
-///
-///     ts.write(vec![series]).await?;
-///     Ok(())
-/// }
+/// ts.write(vec![series]).await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct TimeSeriesDb {
     // Internal Tsdb - not exposed
@@ -65,10 +66,15 @@ impl TimeSeriesDb {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// use timeseries::{TimeSeriesDb, Config};
-    ///
-    /// let ts = TimeSeriesDb::open(Config::default()).await?;
+    /// ```
+    /// # use timeseries::{TimeSeriesDb, Config};
+    /// # use common::StorageConfig;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+    /// let ts = TimeSeriesDb::open(config).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn open(config: Config) -> Result<Self> {
         let storage = create_storage(
@@ -106,7 +112,13 @@ impl TimeSeriesDb {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use timeseries::{TimeSeriesDb, Config, Series};
+    /// # use common::StorageConfig;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+    /// # let ts = TimeSeriesDb::open(config).await?;
     /// let series = vec![
     ///     Series::builder("cpu_usage")
     ///         .label("host", "server1")
@@ -120,6 +132,8 @@ impl TimeSeriesDb {
     /// ];
     ///
     /// ts.write(series).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn write(&self, series: Vec<Series>) -> Result<()> {
         self.tsdb.ingest_samples(series).await
@@ -204,5 +218,75 @@ impl TimeSeriesDb {
     /// Returns an error if the flush fails due to storage issues.
     pub async fn flush(&self) -> Result<()> {
         self.tsdb.flush().await
+    }
+
+    /// Closes the time series database, flushing any pending data and releasing
+    /// resources.
+    ///
+    /// All written data is flushed to durable storage before the database is
+    /// closed. For SlateDB-backed storage, this also releases the database
+    /// fence.
+    pub async fn close(self) -> Result<()> {
+        self.tsdb.close().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Label, Sample, Series};
+    use common::StorageConfig;
+    use common::storage::config::{
+        LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+    };
+
+    #[tokio::test]
+    async fn close_without_explicit_flush_guarantees_durability() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "ts-data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp_dir.path().to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+        });
+
+        // Write a series and close without calling flush()
+        {
+            let tsdb = TimeSeriesDb::open(Config {
+                storage: storage.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+            tsdb.write(vec![Series::new(
+                "cpu_usage",
+                vec![Label::new("host", "server1")],
+                vec![Sample::new(3_900_000, 0.42)],
+            )])
+            .await
+            .unwrap();
+
+            tsdb.close().await.unwrap();
+        }
+
+        // Reopen and verify the series survived
+        let tsdb = TimeSeriesDb::open(Config {
+            storage: storage.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let series = tsdb
+            .series(&["{__name__=\"cpu_usage\"}"], ..)
+            .await
+            .unwrap();
+
+        assert!(
+            !series.is_empty(),
+            "expected series to survive close without explicit flush"
+        );
     }
 }

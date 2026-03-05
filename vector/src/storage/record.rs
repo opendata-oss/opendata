@@ -3,7 +3,7 @@
 //! These functions build RecordOp instances for common write patterns without
 //! requiring a storage reference, since they only encode keys and values.
 
-use anyhow::Result;
+use crate::error::Result;
 use bytes::BytesMut;
 use common::Record;
 use common::storage::RecordOp;

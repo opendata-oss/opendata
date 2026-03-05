@@ -1,6 +1,7 @@
-use anyhow::{Context, Result};
 use async_trait::async_trait;
 use common::{BytesRange, StorageRead};
+
+use crate::error::{Error, Result};
 use std::ops::Bound::Included;
 
 use crate::serde::centroid_chunk::CentroidChunkValue;
@@ -42,8 +43,11 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         match record {
             Some(record) => {
                 let mut slice = record.value.as_ref();
-                let internal_id = common::serde::encoding::decode_u64(&mut slice)
-                    .context("failed to decode internal ID from ID dictionary")?;
+                let internal_id = common::serde::encoding::decode_u64(&mut slice).map_err(|e| {
+                    Error::Encoding(format!(
+                        "failed to decode internal ID from ID dictionary: {e}"
+                    ))
+                })?;
                 Ok(Some(internal_id))
             }
             None => Ok(None),
@@ -137,8 +141,9 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         let record = self.get(key).await?;
         match record {
             Some(record) => {
-                let value = CentroidStatsValue::decode_from_bytes(&record.value)
-                    .context("failed to decode CentroidStatsValue")?;
+                let value = CentroidStatsValue::decode_from_bytes(&record.value).map_err(|e| {
+                    Error::Encoding(format!("failed to decode CentroidStatsValue: {e}"))
+                })?;
                 Ok(value)
             }
             None => Ok(CentroidStatsValue::new(0)),
@@ -162,8 +167,9 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         let mut stats = Vec::new();
         for record in records {
             let key = CentroidStatsKey::decode(&record.key)?;
-            let value = CentroidStatsValue::decode_from_bytes(&record.value)
-                .context("failed to decode CentroidStatsValue")?;
+            let value = CentroidStatsValue::decode_from_bytes(&record.value).map_err(|e| {
+                Error::Encoding(format!("failed to decode CentroidStatsValue: {e}"))
+            })?;
             stats.push((key.centroid_id, value));
         }
 

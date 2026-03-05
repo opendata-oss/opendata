@@ -117,6 +117,7 @@ where
                     assert_results(
                         &result,
                         &eval_cmd.expected,
+                        eval_cmd.expect_ordered,
                         name,
                         eval_count,
                         &eval_cmd.query,
