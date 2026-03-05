@@ -365,10 +365,7 @@ The collector:
 
 Once the batch is acknowledged, the batch is removed from the prefix.
 
-This approach has the disadvantages that it cannot be easily used with multiple collectors, since a collector cannot
-know if the batch with the name with the lowest number has been already claimed by a different collector.
-
-It is also not clear if the conflict resolution would have a higher latency 
+It is not clear if the conflict resolution would have a higher latency 
 since the conflict would be on the data batches and the conditional write is checked at the end of the write.
 That means, that maybe all the data is first send to object storage to then discover that there is a different
 object with the same name. This aspect would require some experiments.
@@ -382,9 +379,10 @@ object with the same name. This aspect would require some experiments.
 
 ## Updates
 
-| Date       | Description |
-|------------|-------------|
-| 2026-02-26 | Initial draft |
+| Date       | Description                                |
+|------------|--------------------------------------------|
+| 2026-02-26 | Initial draft                              |
+| 2026-03-05 | Added binary formats for queue and batches |
 
 
 
