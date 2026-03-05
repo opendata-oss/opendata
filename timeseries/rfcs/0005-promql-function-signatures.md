@@ -147,7 +147,37 @@ Implication for this RFC:
 
 ### Proposed Function Argument Model
 
-Introduce typed function arguments:
+Use a phased argument model so current behavior stays stable while we move
+toward the target interface.
+
+Phase 1:
+
+- Keep existing `PromQLArg` (`InstantVector`, `Scalar`) for instant/scalar
+  function dispatch.
+- Keep existing `RangeFunction` path for matrix/range functions.
+- Extend `PromQLFunction` with multi-arg support via `apply_args`, with a
+  default unary fallback.
+
+```rust
+pub(crate) trait PromQLFunction {
+    fn apply(
+        &self,
+        arg: PromQLArg,
+        eval_timestamp_ms: i64,
+    ) -> EvalResult<Vec<EvalSample>>;
+
+    fn apply_args(
+        &self,
+        args: Vec<PromQLArg>,
+        eval_timestamp_ms: i64,
+    ) -> EvalResult<Vec<EvalSample>>;
+}
+```
+
+Phase 2 (target):
+
+- Introduce typed argument values and call context for unified dispatch,
+  especially for string-argument functions.
 
 ```rust
 pub(crate) enum FunctionArgValue {
@@ -160,11 +190,7 @@ pub(crate) struct FunctionCallContext<'a> {
     pub eval_timestamp_ms: i64,
     pub raw_args: &'a [Box<Expr>],
 }
-```
 
-Evolve the existing `PromQLFunction` trait (same name, new unified signature):
-
-```rust
 pub(crate) trait PromQLFunction {
     fn apply(
         &self,
@@ -176,29 +202,30 @@ pub(crate) trait PromQLFunction {
 
 Notes:
 
-- Return type becomes `ExprResult` (not always instant vector).
+- Phase 1 keeps return values as instant vectors for function handlers, matching
+  current engine behavior.
+- Phase 2 target keeps one `PromQLFunction` trait with `ExprResult` return to
+  unify scalar/vector boundaries.
 - Keep one `PromQLFunction` trait: dispatch is runtime by function name, so
   splitting traits by return shape would still require a single dynamic
   dispatch boundary while adding registry complexity.
-- Type safety is enforced by parser metadata and evaluator return-shape checks
-  (`Call.func.return_type` against `ExprResult`).
-- String arguments are read from `ctx.raw_args`; corresponding
-  `evaluated_args[idx]` is `None` (Prometheus-compatible shape).
-- Existing one-arg implementations are ported directly to the evolved
-  `PromQLFunction` interface in the same change; no compatibility adapter layer
-  is kept.
+- Type safety is enforced by parser metadata and evaluator validation in both
+  phases.
+- String-argument handling through `raw_args` and `Option<FunctionArgValue>`
+  slots is a Phase 2 target.
 
 ### Scalar Boundary Semantics
 
 Prometheus function internals represent scalar results as vector samples. This
-engine intentionally keeps scalar results as `ExprResult::Scalar` at the
-function boundary.
+engine targets keeping scalar results as `ExprResult::Scalar` at the function
+boundary once the unified Phase 2 interface lands.
 
 Boundary rule:
 
-- Function handlers may use internal scalar/vector helper representations as
-  needed, but final outputs for scalar-returning signatures must surface as
-  `ExprResult::Scalar`.
+- Phase 1 keeps current vector-oriented handler returns.
+- In Phase 2, function handlers may use internal scalar/vector helper
+  representations as needed, but final outputs for scalar-returning signatures
+  must surface as `ExprResult::Scalar`.
 
 ### Signature Source of Truth
 
@@ -218,8 +245,10 @@ For this phase, adopt parser-supported semantics:
 
 - Non-variadic: exact arity.
 - Variadic: minimum arity is `len(arg_types) - 1`.
-- Maximum arity follows parser behavior for supported functions (currently
-  unbounded only where parser handles it explicitly).
+- Phase 1 implementation keeps variadic maximum arity bounded to
+  `len(arg_types)` in evaluator validation.
+- Unbounded variadic tails (for example `label_join(...src_labels)`) are
+  deferred until string-argument function support lands.
 - Variadic overflow type-check uses the final declared arg type.
 - Default argument materialization remains inside function implementations,
   matching Prometheus behavior.

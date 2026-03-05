@@ -1455,6 +1455,74 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         hasher.finish() as SeriesFingerprint
     }
 
+    fn call_arity_bounds(call: &Call) -> (usize, usize) {
+        let expected_args_len = call.func.arg_types.len();
+        if call.func.variadic {
+            // Phase 1 intentionally keeps variadic arity bounded to parser arg_types length.
+            // Unbounded variadics (for example label_join string tails) are deferred until
+            // string-argument function support lands.
+            (expected_args_len.saturating_sub(1), expected_args_len)
+        } else {
+            (expected_args_len, expected_args_len)
+        }
+    }
+
+    fn expected_call_arg_type(
+        call: &Call,
+        idx: usize,
+    ) -> EvalResult<promql_parser::parser::value::ValueType> {
+        if idx < call.func.arg_types.len() {
+            return Ok(call.func.arg_types[idx]);
+        }
+
+        call.func.arg_types.last().copied().ok_or_else(|| {
+            EvaluationError::InternalError(format!(
+                "function '{}' has invalid empty argument signature",
+                call.func.name
+            ))
+        })
+    }
+
+    fn validate_call_signature(&self, call: &Call) -> EvalResult<()> {
+        let actual_args_len = call.args.args.len();
+        let (min_args, max_args) = Self::call_arity_bounds(call);
+
+        if min_args == max_args {
+            if actual_args_len != min_args {
+                return Err(EvaluationError::InternalError(format!(
+                    "expected {} argument(s) in call to '{}', got {}",
+                    min_args, call.func.name, actual_args_len
+                )));
+            }
+        } else if actual_args_len < min_args {
+            return Err(EvaluationError::InternalError(format!(
+                "expected at least {} argument(s) in call to '{}', got {}",
+                min_args, call.func.name, actual_args_len
+            )));
+        } else if actual_args_len > max_args {
+            return Err(EvaluationError::InternalError(format!(
+                "expected at most {} argument(s) in call to '{}', got {}",
+                max_args, call.func.name, actual_args_len
+            )));
+        }
+
+        for (idx, arg) in call.args.args.iter().enumerate() {
+            let expected_type = Self::expected_call_arg_type(call, idx)?;
+            let actual_type = arg.value_type();
+            if actual_type != expected_type {
+                return Err(EvaluationError::InternalError(format!(
+                    "expected argument {} to function '{}' to be {}, got {}",
+                    idx + 1,
+                    call.func.name,
+                    expected_type,
+                    actual_type
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     async fn evaluate_call(
         &mut self,
         call: &Call,
@@ -1464,36 +1532,37 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         interval_ms: i64,
         lookback_delta_ms: i64,
     ) -> EvalResult<ExprResult> {
-        if call.args.args.len() != 1 {
-            return Err(EvaluationError::InternalError(format!(
-                "{} function requires exactly one argument",
-                call.func.name
-            )));
-        }
+        self.validate_call_signature(call)?;
 
-        // Check for string literal arguments before evaluation.
-        // String literals are valid as function arguments in PromQL (e.g., label_replace),
-        // but we don't yet support evaluating them as function arguments.
-        let arg = call.args.args[0].as_ref();
-        if let Expr::StringLiteral(lit) = arg {
-            return Err(EvaluationError::InternalError(format!(
-                "string literal \"{}\" passed as argument to function '{}': \
-                 string arguments are not yet supported",
-                lit.val, call.func.name
-            )));
-        }
+        // Evaluate all non-string arguments. We keep rejecting string literals
+        // here until string-argument functions are implemented.
+        let mut arg_results = Vec::with_capacity(call.args.args.len());
+        let mut has_range_arg = false;
+        for arg in &call.args.args {
+            if let Expr::StringLiteral(lit) = arg.as_ref() {
+                return Err(EvaluationError::InternalError(format!(
+                    "string literal \"{}\" passed as argument to function '{}': \
+                     string arguments are not yet supported",
+                    lit.val, call.func.name
+                )));
+            }
 
-        // Evaluate the argument
-        let arg_result = self
-            .evaluate_expr(
-                arg,
-                query_start,
-                query_end,
-                evaluation_ts,
-                interval_ms,
-                lookback_delta_ms,
-            )
-            .await?;
+            let arg_result = self
+                .evaluate_expr(
+                    arg,
+                    query_start,
+                    query_end,
+                    evaluation_ts,
+                    interval_ms,
+                    lookback_delta_ms,
+                )
+                .await?;
+
+            if matches!(arg_result, ExprResult::RangeVector(_)) {
+                has_range_arg = true;
+            }
+            arg_results.push(arg_result);
+        }
 
         let registry = FunctionRegistry::new();
 
@@ -1504,43 +1573,57 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         //   - Function is called with evaluation_ts = -50s (negative!)
         let eval_timestamp_ms = evaluation_ts.as_millis();
 
-        match arg_result {
-            ExprResult::InstantVector(samples) => {
-                // Try instant vector function first
-                if let Some(func) = registry.get(call.func.name) {
-                    let result =
-                        func.apply(PromQLArg::InstantVector(samples), eval_timestamp_ms)?;
-                    Ok(ExprResult::InstantVector(result))
-                } else {
-                    Err(EvaluationError::InternalError(format!(
-                        "Unknown instant vector function: {}",
+        if has_range_arg {
+            if arg_results.len() != 1 {
+                return Err(EvaluationError::InternalError(format!(
+                    "range-vector functions currently require exactly one argument: {}",
+                    call.func.name
+                )));
+            }
+
+            return match arg_results.remove(0) {
+                ExprResult::RangeVector(samples) => {
+                    if let Some(func) = registry.get_range_function(call.func.name) {
+                        let result = func.apply(samples, eval_timestamp_ms)?;
+                        Ok(ExprResult::InstantVector(result))
+                    } else {
+                        Err(EvaluationError::InternalError(format!(
+                            "Unknown range vector function: {}",
+                            call.func.name
+                        )))
+                    }
+                }
+                _ => Err(EvaluationError::InternalError(format!(
+                    "mixed range/non-range function arguments are not supported: {}",
+                    call.func.name
+                ))),
+            };
+        }
+
+        let mut evaluated_args = Vec::with_capacity(arg_results.len());
+        for arg_result in arg_results {
+            match arg_result {
+                ExprResult::InstantVector(samples) => {
+                    evaluated_args.push(PromQLArg::InstantVector(samples))
+                }
+                ExprResult::Scalar(scalar) => evaluated_args.push(PromQLArg::Scalar(scalar)),
+                ExprResult::RangeVector(_) => {
+                    return Err(EvaluationError::InternalError(format!(
+                        "unexpected range-vector argument dispatch for function: {}",
                         call.func.name
-                    )))
+                    )));
                 }
             }
-            ExprResult::RangeVector(samples) => {
-                // Try range vector function
-                if let Some(func) = registry.get_range_function(call.func.name) {
-                    let result = func.apply(samples, eval_timestamp_ms)?;
-                    Ok(ExprResult::InstantVector(result))
-                } else {
-                    Err(EvaluationError::InternalError(format!(
-                        "Unknown range vector function: {}",
-                        call.func.name
-                    )))
-                }
-            }
-            ExprResult::Scalar(scalar) => {
-                if let Some(func) = registry.get(call.func.name) {
-                    let result = func.apply(PromQLArg::Scalar(scalar), eval_timestamp_ms)?;
-                    Ok(ExprResult::InstantVector(result))
-                } else {
-                    Err(EvaluationError::InternalError(format!(
-                        "Unknown scalar function: {}",
-                        call.func.name
-                    )))
-                }
-            }
+        }
+
+        if let Some(func) = registry.get(call.func.name) {
+            let result = func.apply_args(evaluated_args, eval_timestamp_ms)?;
+            Ok(ExprResult::InstantVector(result))
+        } else {
+            Err(EvaluationError::InternalError(format!(
+                "Unknown instant/scalar function: {}",
+                call.func.name
+            )))
         }
     }
 
@@ -2257,6 +2340,13 @@ mod tests {
             .evaluate(stmt)
             .await
             .map(|result| result.expect_instant_vector("Expected instant vector result"))
+    }
+
+    fn scalar_to_vector_expr(value: f64) -> Expr {
+        Expr::Call(Call {
+            func: Function::new("vector", vec![ValueType::Scalar], false, ValueType::Vector),
+            args: FunctionArgs::new_args(Expr::NumberLiteral(NumberLiteral { val: value })),
+        })
     }
 
     /// Helper to convert label vec to HashMap for comparison
@@ -3302,7 +3392,7 @@ mod tests {
             expr: promql_parser::parser::Expr::Call(promql_parser::parser::Call {
                 func: promql_parser::parser::Function {
                     name: "label_replace",
-                    arg_types: vec![],
+                    arg_types: vec![ValueType::String],
                     variadic: false,
                     return_type: ValueType::Vector,
                 },
@@ -3795,6 +3885,297 @@ mod tests {
             }
             other => panic!("Expected Instant Vector, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_call_with_optional_second_argument() {
+        let (reader, end_time) = setup_mock_reader(vec![]);
+        let mut evaluator = Evaluator::new(&reader);
+
+        let call = Call {
+            func: Function::new(
+                "round",
+                vec![ValueType::Vector, ValueType::Scalar],
+                true,
+                ValueType::Vector,
+            ),
+            args: FunctionArgs {
+                args: vec![
+                    Box::new(scalar_to_vector_expr(1.25)),
+                    Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.1 })),
+                ],
+            },
+        };
+
+        let result = evaluator
+            .evaluate_call(
+                &call,
+                Timestamp::from(end_time),
+                Timestamp::from(end_time),
+                Timestamp::from(end_time),
+                60_000,
+                300_000,
+            )
+            .await
+            .unwrap();
+
+        match result {
+            ExprResult::InstantVector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].value, 1.3);
+            }
+            other => panic!("Expected Instant Vector, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_call_when_optional_argument_is_omitted() {
+        let (reader, end_time) = setup_mock_reader(vec![]);
+        let mut evaluator = Evaluator::new(&reader);
+
+        let call = Call {
+            func: Function::new(
+                "round",
+                vec![ValueType::Vector, ValueType::Scalar],
+                true,
+                ValueType::Vector,
+            ),
+            args: FunctionArgs {
+                args: vec![Box::new(scalar_to_vector_expr(1.6))],
+            },
+        };
+
+        let result = evaluator
+            .evaluate_call(
+                &call,
+                Timestamp::from(end_time),
+                Timestamp::from(end_time),
+                Timestamp::from(end_time),
+                60_000,
+                300_000,
+            )
+            .await
+            .unwrap();
+
+        match result {
+            ExprResult::InstantVector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].value, 2.0);
+            }
+            other => panic!("Expected Instant Vector, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_error_when_call_has_too_many_arguments() {
+        let (reader, end_time) = setup_mock_reader(vec![]);
+        let mut evaluator = Evaluator::new(&reader);
+
+        let call = Call {
+            func: Function::new(
+                "round",
+                vec![ValueType::Vector, ValueType::Scalar],
+                true,
+                ValueType::Vector,
+            ),
+            args: FunctionArgs {
+                args: vec![
+                    Box::new(scalar_to_vector_expr(1.0)),
+                    Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.1 })),
+                    Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.2 })),
+                ],
+            },
+        };
+
+        let result = evaluator
+            .evaluate_call(
+                &call,
+                Timestamp::from(end_time),
+                Timestamp::from(end_time),
+                Timestamp::from(end_time),
+                60_000,
+                300_000,
+            )
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected at most 2 argument(s) in call to 'round', got 3"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn should_error_when_optional_argument_has_wrong_type() {
+        let (reader, end_time) = setup_mock_reader(vec![]);
+        let mut evaluator = Evaluator::new(&reader);
+
+        let call = Call {
+            func: Function::new(
+                "round",
+                vec![ValueType::Vector, ValueType::Scalar],
+                true,
+                ValueType::Vector,
+            ),
+            args: FunctionArgs {
+                args: vec![
+                    Box::new(scalar_to_vector_expr(1.0)),
+                    Box::new(Expr::StringLiteral(promql_parser::parser::StringLiteral {
+                        val: "x".to_string(),
+                    })),
+                ],
+            },
+        };
+
+        let result = evaluator
+            .evaluate_call(
+                &call,
+                Timestamp::from(end_time),
+                Timestamp::from(end_time),
+                Timestamp::from(end_time),
+                60_000,
+                300_000,
+            )
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected argument 2 to function 'round' to be scalar, got string"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn should_error_when_first_argument_has_wrong_type() {
+        let (reader, end_time) = setup_mock_reader(vec![]);
+        let mut evaluator = Evaluator::new(&reader);
+
+        let call = Call {
+            func: Function::new(
+                "round",
+                vec![ValueType::Vector, ValueType::Scalar],
+                true,
+                ValueType::Vector,
+            ),
+            args: FunctionArgs {
+                args: vec![
+                    Box::new(Expr::NumberLiteral(NumberLiteral { val: 1.0 })),
+                    Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.1 })),
+                ],
+            },
+        };
+
+        let result = evaluator
+            .evaluate_call(
+                &call,
+                Timestamp::from(end_time),
+                Timestamp::from(end_time),
+                Timestamp::from(end_time),
+                60_000,
+                300_000,
+            )
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected argument 1 to function 'round' to be vector, got scalar"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_clamp_family_queries() {
+        let test_data = vec![
+            ("test_clamp", vec![("src", "clamp-a")], 0, -50.0),
+            ("test_clamp", vec![("src", "clamp-b")], 1, 0.0),
+            ("test_clamp", vec![("src", "clamp-c")], 2, 100.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        let clamp_result = parse_and_evaluate(
+            &mut evaluator,
+            "clamp(test_clamp, -25, 75)",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .unwrap();
+        assert_results_match(
+            &clamp_result,
+            &[
+                (-25.0, vec![("__name__", "test_clamp"), ("src", "clamp-a")]),
+                (0.0, vec![("__name__", "test_clamp"), ("src", "clamp-b")]),
+                (75.0, vec![("__name__", "test_clamp"), ("src", "clamp-c")]),
+            ],
+        );
+
+        let clamp_min_result = parse_and_evaluate(
+            &mut evaluator,
+            "clamp_min(test_clamp, -25)",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .unwrap();
+        assert_results_match(
+            &clamp_min_result,
+            &[
+                (-25.0, vec![("__name__", "test_clamp"), ("src", "clamp-a")]),
+                (0.0, vec![("__name__", "test_clamp"), ("src", "clamp-b")]),
+                (100.0, vec![("__name__", "test_clamp"), ("src", "clamp-c")]),
+            ],
+        );
+
+        let clamp_max_result = parse_and_evaluate(
+            &mut evaluator,
+            "clamp_max(test_clamp, 75)",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .unwrap();
+        assert_results_match(
+            &clamp_max_result,
+            &[
+                (-50.0, vec![("__name__", "test_clamp"), ("src", "clamp-a")]),
+                (0.0, vec![("__name__", "test_clamp"), ("src", "clamp-b")]),
+                (75.0, vec![("__name__", "test_clamp"), ("src", "clamp-c")]),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn should_return_empty_vector_for_clamp_when_min_exceeds_max() {
+        let test_data = vec![
+            ("test_clamp", vec![("src", "clamp-a")], 0, -50.0),
+            ("test_clamp", vec![("src", "clamp-b")], 1, 0.0),
+            ("test_clamp", vec![("src", "clamp-c")], 2, 100.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "clamp(test_clamp, 5, -5)",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_empty());
     }
 
     #[tokio::test]
