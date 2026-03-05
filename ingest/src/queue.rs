@@ -22,6 +22,8 @@ fn millis(time: SystemTime) -> i64 {
 
 const MANIFEST_VERSION: u16 = 1;
 const ENTRY_LEN_SIZE: usize = 4;
+const LOCATION_LEN_SIZE: usize = 2;
+const INGESTION_TIME_MS_SIZE: usize = 8;
 const ENTRIES_COUNT_SIZE: usize = 4;
 const SEQUENCE_SIZE: usize = 8;
 const EPOCH_SIZE: usize = 8;
@@ -103,7 +105,8 @@ impl Manifest {
         })
     }
 
-    /// Build a manifest from a slice of entries (for full rebuild, e.g. cleanup).
+    /// Build a manifest from a slice of entries.
+    #[cfg(test)]
     fn from_entries(entries: &[QueueEntry]) -> Self {
         let next_sequence = entries.iter().map(|e| e.sequence + 1).max().unwrap_or(0);
         let mut buf = BytesMut::new();
@@ -331,20 +334,37 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntr
         ));
     }
 
-    let sequence = u64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
-    *offset += 8;
+    let sequence = u64::from_le_bytes(data[*offset..*offset + SEQUENCE_SIZE].try_into().unwrap());
+    *offset += SEQUENCE_SIZE;
 
-    let location_len = u16::from_le_bytes(data[*offset..*offset + 2].try_into().unwrap()) as usize;
-    *offset += 2;
+    let location_len = u16::from_le_bytes(
+        data[*offset..*offset + LOCATION_LEN_SIZE]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    *offset += LOCATION_LEN_SIZE;
+
+    let min_entry_len = SEQUENCE_SIZE + LOCATION_LEN_SIZE + INGESTION_TIME_MS_SIZE + location_len;
+    if entry_len < min_entry_len {
+        return Err(Error::Serialization(format!(
+            "entry_len {} is less than minimum {} for location_len {}",
+            entry_len, min_entry_len, location_len
+        )));
+    }
 
     let location = String::from_utf8(data[*offset..*offset + location_len].to_vec())
         .map_err(|e| Error::Serialization(e.to_string()))?;
     *offset += location_len;
 
-    let ingestion_time_ms = i64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
-    *offset += 8;
+    let ingestion_time_ms = i64::from_le_bytes(
+        data[*offset..*offset + INGESTION_TIME_MS_SIZE]
+            .try_into()
+            .unwrap(),
+    );
+    *offset += INGESTION_TIME_MS_SIZE;
 
-    let metadata_len = entry_len - 8 - 2 - location_len - 8;
+    let metadata_len =
+        entry_len - SEQUENCE_SIZE - LOCATION_LEN_SIZE - location_len - INGESTION_TIME_MS_SIZE;
     let metadata = Bytes::copy_from_slice(&data[*offset..*offset + metadata_len]);
     *offset += metadata_len;
 
@@ -1050,6 +1070,54 @@ mod tests {
         let err = Manifest::from_bytes(buf.freeze()).unwrap_err();
 
         assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn should_reject_entry_with_entry_len_below_minimum() {
+        let mut buf = BytesMut::new();
+        // entry_len too small: less than SEQUENCE_SIZE + LOCATION_LEN_SIZE + INGESTION_TIME_MS_SIZE (18)
+        let bad_entry_len = (SEQUENCE_SIZE + LOCATION_LEN_SIZE + INGESTION_TIME_MS_SIZE - 1) as u32;
+        buf.put_u32_le(bad_entry_len);
+        buf.extend_from_slice(&[0u8; 17]); // enough raw bytes to not truncate
+        // footer
+        buf.put_u32_le(1);
+        buf.put_u64_le(1);
+        buf.put_u64_le(0);
+        buf.put_u16_le(MANIFEST_VERSION);
+
+        let manifest = Manifest::from_bytes(buf.freeze()).unwrap();
+        let err = manifest.iter().next().unwrap().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("entry_len 17 is less than minimum 18 for location_len 0")
+        );
+    }
+
+    #[test]
+    fn should_reject_entry_with_entry_len_below_minimum_for_location() {
+        let mut buf = BytesMut::new();
+        let location = "abc";
+        // entry_len covers fixed fields but not the full location
+        let bad_entry_len =
+            SEQUENCE_SIZE + LOCATION_LEN_SIZE + INGESTION_TIME_MS_SIZE + location.len() - 1;
+        buf.put_u32_le(bad_entry_len as u32);
+        buf.put_u64_le(0); // sequence
+        buf.put_u16_le(location.len() as u16); // location_len
+        buf.extend_from_slice(&[0u8; 20]); // padding so entry doesn't extend beyond data
+        // footer
+        buf.put_u32_le(1);
+        buf.put_u64_le(1);
+        buf.put_u64_le(0);
+        buf.put_u16_le(MANIFEST_VERSION);
+
+        let manifest = Manifest::from_bytes(buf.freeze()).unwrap();
+        let err = manifest.iter().next().unwrap().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("entry_len 20 is less than minimum 21"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
