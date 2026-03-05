@@ -84,6 +84,8 @@ pub(crate) fn build_router(tsdb: Arc<Tsdb>, metrics: Arc<Metrics>) -> Router {
         "/api/v1/write",
         post(super::remote_write::handle_remote_write),
     );
+    #[cfg(feature = "otel")]
+    let app = app.route("/v1/metrics", post(super::otel::handle_otel_metrics));
 
     app.route("/", get(handle_ui_redirect))
         .route("/query", get(handle_ui_index))
