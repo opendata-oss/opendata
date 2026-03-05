@@ -595,7 +595,7 @@ impl VectorDb {
         self.write_coordinator
             .stop()
             .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(Error::Internal)?;
         self.storage.close().await?;
         Ok(())
     }
