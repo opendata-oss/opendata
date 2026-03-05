@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 
 use crate::error::AppendError;
 use crate::listing::ListingCache;
-use crate::model::{AppendOutput, Record as UserRecord};
+use crate::model::{AppendOutput, Record as UserRecord, SegmentId};
 use crate::segment::{LogSegment, SegmentAssignment, SegmentCache};
 use crate::serde::LogEntryKey;
 
@@ -38,8 +38,11 @@ pub(crate) struct WrittenView {
     pub snapshot: Arc<dyn common::storage::StorageSnapshot>,
     /// Storage engine sequence number for this write.
     pub seqnum: u64,
-    /// New segment created by this write, if any.
-    pub segment: Option<LogSegment>,
+    /// ID of the most recently created segment, if any.
+    /// Subscribers compare this against their local state to detect new segments
+    /// and reload them from the snapshot. This is safe under watch coalescing
+    /// because it is a monotonic watermark, not an incremental delta.
+    pub last_segment_id: Option<SegmentId>,
 }
 
 /// The write type for the log writer.
@@ -88,6 +91,7 @@ pub(crate) struct LogWriter {
     epoch: u64,
     written_tx: watch::Sender<WrittenView>,
     watermarks: EpochWatermarks,
+    last_segment_id: Option<SegmentId>,
 }
 
 impl LogWriter {
@@ -102,11 +106,12 @@ impl LogWriter {
         let (cmd_tx, cmd_rx) = mpsc::channel(config.queue_capacity);
 
         let initial_snapshot = storage.snapshot().await.map_err(|e| e.to_string())?;
+        let last_segment_id = segment_cache.latest().map(|s| s.id());
         let initial_view = WrittenView {
             epoch: 0,
             snapshot: initial_snapshot,
             seqnum: 0,
-            segment: None,
+            last_segment_id,
         };
         let (written_tx, written_rx) = watch::channel(initial_view);
         let (watermarks, watcher) = EpochWatermarks::new();
@@ -119,6 +124,7 @@ impl LogWriter {
             epoch: 0,
             written_tx,
             watermarks,
+            last_segment_id,
         };
 
         let handle = LogWriteHandle {
@@ -229,16 +235,14 @@ impl LogWriter {
 
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
         self.epoch += 1;
-        let new_segment = if assignment.is_new {
-            Some(assignment.segment.clone())
-        } else {
-            None
-        };
+        if assignment.is_new {
+            self.last_segment_id = Some(assignment.segment.id());
+        }
         self.written_tx.send_replace(WrittenView {
             epoch: self.epoch,
             snapshot,
             seqnum: write_result.seqnum,
-            segment: new_segment,
+            last_segment_id: self.last_segment_id,
         });
         self.watermarks.update_written(self.epoch);
         Ok(())
@@ -581,7 +585,7 @@ mod tests {
         written_rx.changed().await.unwrap();
         let view = written_rx.borrow_and_update().clone();
         assert_eq!(view.epoch, 1);
-        assert!(view.segment.is_some());
+        assert!(view.last_segment_id.is_some());
     }
 
     #[tokio::test]

@@ -63,6 +63,8 @@ pub struct opendata_log_config_t {
     pub object_store: *const opendata_log_object_store_t,
     pub settings_path: *const c_char,
     pub seal_interval_ms: i64,
+    /// When true, reads only see data confirmed durable by the storage engine.
+    pub read_durable: bool,
 }
 
 #[repr(C)]
@@ -293,7 +295,7 @@ pub(crate) unsafe fn build_config(
     Ok(Config {
         storage,
         segmentation: SegmentConfig { seal_interval },
-        ..Default::default()
+        read_durable: config.read_durable,
     })
 }
 
