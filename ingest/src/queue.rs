@@ -20,6 +20,7 @@ fn millis(time: SystemTime) -> i64 {
 }
 
 const MANIFEST_VERSION: u16 = 1;
+const UNINITIALIZED_EPOCH: u64 = u64::MAX;
 const ENTRY_LEN_SIZE: usize = 4;
 const LOCATION_LEN_SIZE: usize = 2;
 const INGESTION_TIME_MS_SIZE: usize = 8;
@@ -590,7 +591,7 @@ impl QueueConsumer {
                 object_store,
                 manifest_path,
             },
-            epoch: AtomicU64::new(0),
+            epoch: AtomicU64::new(UNINITIALIZED_EPOCH),
             clock,
             counter: ConflictCounter::new(),
             queue_len: AtomicU64::new(0),
@@ -602,7 +603,10 @@ impl QueueConsumer {
     pub async fn initialize(&self) -> Result<()> {
         loop {
             let (mut manifest, version) = self.read_manifest().await?;
-            let new_epoch = manifest.epoch + 1;
+            let mut new_epoch = manifest.epoch.wrapping_add(1);
+            if new_epoch == UNINITIALIZED_EPOCH {
+                new_epoch = new_epoch.wrapping_add(1);
+            }
             manifest.set_epoch(new_epoch);
             match self.write_manifest(&manifest, version).await {
                 Ok(()) => {
@@ -890,6 +894,53 @@ mod tests {
 
         let result = consumer_a.dequeue(0).await;
         assert!(matches!(result, Err(Error::Fenced)));
+    }
+
+    #[tokio::test]
+    async fn should_fence_uninitialized_consumer() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let producer = QueueProducer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
+        );
+
+        producer
+            .enqueue("a.batch".to_string(), Bytes::new())
+            .await
+            .unwrap();
+
+        let consumer = QueueConsumer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
+        );
+
+        let result = consumer.peek().await;
+        assert!(matches!(result, Err(Error::Fenced)));
+    }
+
+    #[tokio::test]
+    async fn should_wrap_epoch_to_zero_at_max() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let mut manifest = Manifest::empty();
+        manifest.set_epoch(u64::MAX - 1);
+        let path = Path::from(TEST_MANIFEST_PATH);
+        store
+            .put(&path, PutPayload::from(manifest.to_bytes().to_vec()))
+            .await
+            .unwrap();
+
+        let consumer = QueueConsumer::with_object_store(
+            TEST_MANIFEST_PATH.to_string(),
+            store.clone(),
+            Arc::new(SystemClock),
+        );
+        consumer.initialize().await.unwrap();
+
+        let manifest = read_producer_manifest(&store, TEST_MANIFEST_PATH).await;
+        assert_eq!(manifest.epoch, 0);
     }
 
     #[tokio::test]
