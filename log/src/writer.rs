@@ -385,8 +385,8 @@ impl LogWriteHandle {
         Self::recv_epoch(result_rx).await
     }
 
-    /// The highest epoch flushed to storage (but not necessarily durable).
-    pub(crate) fn flushed_epoch(&self) -> u64 {
+    /// The highest epoch that has reached written visibility.
+    pub(crate) fn written_epoch(&self) -> u64 {
         *self.watcher.written_rx.borrow()
     }
 
@@ -396,7 +396,6 @@ impl LogWriteHandle {
     }
 
     /// Returns the durable epoch (highest epoch that has been flushed to disk).
-    #[cfg(test)]
     pub(crate) fn durable_epoch(&self) -> u64 {
         *self.watcher.durable_rx.borrow()
     }
@@ -474,8 +473,8 @@ mod tests {
             .unwrap();
         assert_eq!(result.unwrap().start_sequence, 0);
 
-        // Verify flushed epoch advanced
-        assert_eq!(handle.flushed_epoch(), 1);
+        // Verify written epoch advanced
+        assert_eq!(handle.written_epoch(), 1);
 
         // Verify data is in storage
         handle.flush().await.unwrap();
@@ -503,7 +502,7 @@ mod tests {
             .unwrap();
         assert_eq!(r2.start_sequence, 2);
 
-        assert_eq!(handle.flushed_epoch(), 2);
+        assert_eq!(handle.written_epoch(), 2);
     }
 
     #[tokio::test]
@@ -514,7 +513,7 @@ mod tests {
         let result = handle.try_append(make_write(&[], 1000)).await.unwrap();
         assert!(result.is_none());
         // Epoch should not advance for empty writes
-        assert_eq!(handle.flushed_epoch(), 0);
+        assert_eq!(handle.written_epoch(), 0);
     }
 
     #[tokio::test]
@@ -527,11 +526,11 @@ mod tests {
             .try_append(make_write(&["key1"], 1000))
             .await
             .unwrap();
-        assert_eq!(handle.flushed_epoch(), 1);
+        assert_eq!(handle.written_epoch(), 1);
 
         // Force seal — should create segment 1
         handle.force_seal(2000).await.unwrap();
-        assert_eq!(handle.flushed_epoch(), 2);
+        assert_eq!(handle.written_epoch(), 2);
 
         // Verify two segments exist in storage
         handle.flush().await.unwrap();
@@ -599,17 +598,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_advance_flushed_watermark_on_append() {
+    async fn should_advance_written_watermark_on_append() {
         let (writer, mut handle, _storage) = create_writer().await;
         let _task = handle.spawn(writer);
 
-        assert_eq!(handle.flushed_epoch(), 0);
+        assert_eq!(handle.written_epoch(), 0);
         assert_eq!(handle.durable_epoch(), 0);
 
         handle.try_append(make_write(&["k1"], 1000)).await.unwrap();
 
         // Written watermark should advance, durable should not
-        assert_eq!(handle.flushed_epoch(), 1);
+        assert_eq!(handle.written_epoch(), 1);
         assert_eq!(handle.durable_epoch(), 0);
     }
 
@@ -619,13 +618,13 @@ mod tests {
         let _task = handle.spawn(writer);
 
         handle.try_append(make_write(&["k1"], 1000)).await.unwrap();
-        assert_eq!(handle.flushed_epoch(), 1);
+        assert_eq!(handle.written_epoch(), 1);
         assert_eq!(handle.durable_epoch(), 0);
 
         handle.flush().await.unwrap();
 
         // Both watermarks should now be at epoch 1
-        assert_eq!(handle.flushed_epoch(), 1);
+        assert_eq!(handle.written_epoch(), 1);
         assert_eq!(handle.durable_epoch(), 1);
     }
 
@@ -647,7 +646,7 @@ mod tests {
         );
 
         // Epoch should not have advanced
-        assert_eq!(handle.flushed_epoch(), 0);
+        assert_eq!(handle.written_epoch(), 0);
     }
 
     #[storage_test]

@@ -7,7 +7,6 @@
 
 use std::ops::RangeBounds;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -105,7 +104,6 @@ pub struct LogDb {
     epoch_watcher: EpochWatcher,
     read_subscriber_task: JoinHandle<()>,
     read_visibility: ReadVisibility,
-    required_visible_durable_epoch: AtomicU64,
 }
 
 impl LogDb {
@@ -284,23 +282,15 @@ impl LogDb {
     /// This method ensures that all acknowledged writes are durably persisted
     /// to storage.
     pub async fn flush(&self) -> Result<()> {
-        let durable_epoch = self.handle.flush().await?;
-        if self.read_visibility.is_remote() {
-            self.required_visible_durable_epoch
-                .fetch_max(durable_epoch, Ordering::Relaxed);
-        }
+        self.handle.flush().await?;
         Ok(())
     }
 
     /// Waits for read-side visibility to reach the current requirement.
     async fn sync_reads(&self) -> Result<()> {
-        let (target, durability) = if self.read_visibility.is_remote() {
-            (
-                self.required_visible_durable_epoch.load(Ordering::Relaxed),
-                Durability::Durable,
-            )
-        } else {
-            (self.handle.flushed_epoch(), Durability::Written)
+        let (target, durability) = match self.read_visibility {
+            ReadVisibility::Remote => (self.handle.durable_epoch(), Durability::Durable),
+            ReadVisibility::Memory => (self.handle.written_epoch(), Durability::Written),
         };
         self.epoch_watcher
             .clone()
@@ -398,7 +388,6 @@ impl LogDb {
             epoch_watcher,
             read_subscriber_task,
             read_visibility,
-            required_visible_durable_epoch: AtomicU64::new(0),
         })
     }
 }
