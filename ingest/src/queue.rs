@@ -711,17 +711,20 @@ mod tests {
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("path/to/file1.json".to_string(), Bytes::new(), 0)
+            .enqueue("path/to/file1.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("path/to/file2.json".to_string(), Bytes::new(), 0)
+            .enqueue("path/to/file2.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
         let manifest = read_producer_manifest(&store, "test/manifest").await;
         let locations: Vec<String> = manifest.iter().map(|e| e.unwrap().location).collect();
-        assert_eq!(locations, vec!["path/to/file1.json", "path/to/file2.json"]);
+        assert_eq!(
+            locations,
+            vec!["path/to/file1.batch", "path/to/file2.batch"]
+        );
     }
 
     #[tokio::test]
@@ -730,7 +733,7 @@ mod tests {
 
         let existing = Manifest::from_entries(&[QueueEntry {
             sequence: 0,
-            location: "existing/file.json".to_string(),
+            location: "existing/file.batch".to_string(),
             ingestion_time_ms: 1000,
             metadata: Bytes::new(),
         }]);
@@ -743,13 +746,13 @@ mod tests {
         let producer =
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         producer
-            .enqueue("new/file.json".to_string(), Bytes::new(), 0)
+            .enqueue("new/file.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
         let manifest = read_producer_manifest(&store, "test/manifest").await;
         let locations: Vec<String> = manifest.iter().map(|e| e.unwrap().location).collect();
-        assert_eq!(locations, vec!["existing/file.json", "new/file.json"]);
+        assert_eq!(locations, vec!["existing/file.batch", "new/file.batch"]);
     }
 
     #[tokio::test]
@@ -788,15 +791,15 @@ mod tests {
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new(), 0)
+            .enqueue("a.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("b.json".to_string(), Bytes::new(), 0)
+            .enqueue("b.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("c.json".to_string(), Bytes::new(), 0)
+            .enqueue("c.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -808,7 +811,7 @@ mod tests {
         consumer.initialize().await.unwrap();
 
         let entry = consumer.read(1).await.unwrap().unwrap();
-        assert_eq!(entry.location, "b.json");
+        assert_eq!(entry.location, "b.batch");
         assert_eq!(entry.sequence, 1);
     }
 
@@ -819,7 +822,7 @@ mod tests {
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new(), 0)
+            .enqueue("a.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -930,11 +933,11 @@ mod tests {
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new(), 0)
+            .enqueue("a.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("b.json".to_string(), Bytes::new(), 0)
+            .enqueue("b.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -946,7 +949,7 @@ mod tests {
         consumer.initialize().await.unwrap();
 
         let entry = consumer.peek().await.unwrap().unwrap();
-        assert_eq!(entry.location, "a.json");
+        assert_eq!(entry.location, "a.batch");
     }
 
     #[tokio::test]
@@ -956,15 +959,15 @@ mod tests {
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new(), 0)
+            .enqueue("a.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("b.json".to_string(), Bytes::new(), 0)
+            .enqueue("b.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("c.json".to_string(), Bytes::new(), 0)
+            .enqueue("c.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -977,11 +980,11 @@ mod tests {
 
         let removed = consumer.dequeue(1).await.unwrap();
         assert_eq!(removed.len(), 2);
-        assert_eq!(removed[0].location, "a.json");
-        assert_eq!(removed[1].location, "b.json");
+        assert_eq!(removed[0].location, "a.batch");
+        assert_eq!(removed[1].location, "b.batch");
 
         let next = consumer.peek().await.unwrap().unwrap();
-        assert_eq!(next.location, "c.json");
+        assert_eq!(next.location, "c.batch");
     }
 
     #[tokio::test]
@@ -991,11 +994,11 @@ mod tests {
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new(), 0)
+            .enqueue("a.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("b.json".to_string(), Bytes::new(), 0)
+            .enqueue("b.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -1009,12 +1012,12 @@ mod tests {
         consumer.dequeue(1).await.unwrap();
 
         producer
-            .enqueue("c.json".to_string(), Bytes::new(), 0)
+            .enqueue("c.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
         let next = consumer.peek().await.unwrap().unwrap();
-        assert_eq!(next.location, "c.json");
+        assert_eq!(next.location, "c.batch");
         assert_eq!(next.sequence, 2);
     }
 
