@@ -2,7 +2,7 @@
 //!
 //! This module provides [`OtelConverter`], which converts an OTLP
 //! `ExportMetricsServiceRequest` into `Vec<Series>` suitable for
-//! [`TimeSeriesDb::write()`](crate::TimeSeriesDb::write).
+//! `TimeSeriesDb::write()`.
 
 use opentelemetry_proto::tonic::{
     collector::metrics::v1::ExportMetricsServiceRequest,
