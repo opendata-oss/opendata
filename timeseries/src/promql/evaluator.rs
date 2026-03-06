@@ -1455,14 +1455,16 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         hasher.finish() as SeriesFingerprint
     }
 
-    fn call_arity_bounds(call: &Call) -> (usize, usize) {
+    fn call_arity_bounds(call: &Call) -> (usize, Option<usize>) {
         let expected_args_len = call.func.arg_types.len();
-        if call.func.variadic {
-            // RFC-5 currently scopes variadic arity to parser `arg_types` length.
-            // Unbounded variadics (for example label_join string tails) remain deferred.
-            (expected_args_len.saturating_sub(1), expected_args_len)
-        } else {
-            (expected_args_len, expected_args_len)
+        match call.func.variadic {
+            0 => (expected_args_len, Some(expected_args_len)),
+            n if n > 0 => {
+                let min_args = expected_args_len.saturating_sub(1);
+                let max_args = min_args.saturating_add(n as usize);
+                (min_args, Some(max_args))
+            }
+            _ => (expected_args_len.saturating_sub(1), None),
         }
     }
 
@@ -1474,7 +1476,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             return Ok(call.func.arg_types[idx]);
         }
 
-        if !call.func.variadic {
+        if call.func.variadic == 0 {
             return Err(EvaluationError::InternalError(format!(
                 "unexpected argument index {} for non-variadic function '{}'",
                 idx, call.func.name
@@ -1493,7 +1495,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let actual_args_len = call.args.args.len();
         let (min_args, max_args) = Self::call_arity_bounds(call);
 
-        if min_args == max_args {
+        if max_args == Some(min_args) {
             if actual_args_len != min_args {
                 return Err(EvaluationError::InternalError(format!(
                     "expected {} argument(s) in call to '{}', got {}",
@@ -1505,7 +1507,9 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 "expected at least {} argument(s) in call to '{}', got {}",
                 min_args, call.func.name, actual_args_len
             )));
-        } else if actual_args_len > max_args {
+        } else if let Some(max_args) = max_args
+            && actual_args_len > max_args
+        {
             return Err(EvaluationError::InternalError(format!(
                 "expected at most {} argument(s) in call to '{}', got {}",
                 max_args, call.func.name, actual_args_len
@@ -2350,7 +2354,13 @@ mod tests {
 
     fn scalar_to_vector_expr(value: f64) -> Expr {
         Expr::Call(Call {
-            func: Function::new("vector", vec![ValueType::Scalar], false, ValueType::Vector),
+            func: Function::new(
+                "vector",
+                vec![ValueType::Scalar],
+                0,
+                ValueType::Vector,
+                false,
+            ),
             args: FunctionArgs::new_args(Expr::NumberLiteral(NumberLiteral { val: value })),
         })
     }
@@ -3399,8 +3409,9 @@ mod tests {
                 func: promql_parser::parser::Function {
                     name: "label_replace",
                     arg_types: vec![ValueType::String],
-                    variadic: false,
+                    variadic: 0,
                     return_type: ValueType::Vector,
+                    experimental: false,
                 },
                 args: promql_parser::parser::FunctionArgs {
                     args: vec![Box::new(promql_parser::parser::Expr::StringLiteral(
@@ -3828,7 +3839,13 @@ mod tests {
         let mut evaluator = Evaluator::new(&reader);
 
         let call = Call {
-            func: Function::new("vector", vec![ValueType::Scalar], false, ValueType::Scalar),
+            func: Function::new(
+                "vector",
+                vec![ValueType::Scalar],
+                0,
+                ValueType::Scalar,
+                false,
+            ),
             args: FunctionArgs::new_args(Expr::NumberLiteral(NumberLiteral { val: 42.0 })),
         };
 
@@ -3864,7 +3881,13 @@ mod tests {
         let (reader, end_time) = setup_mock_reader(vec![]);
         let mut evaluator = Evaluator::new(&reader);
         let call = Call {
-            func: Function::new("vector", vec![ValueType::Scalar], false, ValueType::Scalar),
+            func: Function::new(
+                "vector",
+                vec![ValueType::Scalar],
+                0,
+                ValueType::Scalar,
+                false,
+            ),
             args: FunctionArgs::new_args(Expr::Binary(BinaryExpr {
                 lhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 1.0 })),
                 rhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 1.0 })),
@@ -3902,8 +3925,9 @@ mod tests {
             func: Function::new(
                 "round",
                 vec![ValueType::Vector, ValueType::Scalar],
-                true,
+                1,
                 ValueType::Vector,
+                false,
             ),
             args: FunctionArgs {
                 args: vec![
@@ -3943,8 +3967,9 @@ mod tests {
             func: Function::new(
                 "round",
                 vec![ValueType::Vector, ValueType::Scalar],
-                true,
+                1,
                 ValueType::Vector,
+                false,
             ),
             args: FunctionArgs {
                 args: vec![Box::new(scalar_to_vector_expr(1.6))],
@@ -3981,8 +4006,9 @@ mod tests {
             func: Function::new(
                 "round",
                 vec![ValueType::Vector, ValueType::Scalar],
-                true,
+                1,
                 ValueType::Vector,
+                false,
             ),
             args: FunctionArgs {
                 args: vec![
@@ -4023,8 +4049,9 @@ mod tests {
             func: Function::new(
                 "round",
                 vec![ValueType::Vector, ValueType::Scalar],
-                true,
+                1,
                 ValueType::Vector,
+                false,
             ),
             args: FunctionArgs {
                 args: vec![
@@ -4066,8 +4093,9 @@ mod tests {
             func: Function::new(
                 "round",
                 vec![ValueType::Vector, ValueType::Scalar],
-                true,
+                1,
                 ValueType::Vector,
+                false,
             ),
             args: FunctionArgs {
                 args: vec![
