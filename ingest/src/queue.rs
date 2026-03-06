@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -14,8 +12,11 @@ use crate::error::{Error, Result};
 
 const MANIFEST_VERSION: u16 = 1;
 const UNINITIALIZED_EPOCH: u64 = u64::MAX;
+#[allow(dead_code)]
 const ENTRY_LEN_SIZE: usize = 4;
+#[allow(dead_code)]
 const LOCATION_LEN_SIZE: usize = 2;
+#[allow(dead_code)]
 const INGESTION_TIME_MS_SIZE: usize = 8;
 const ENTRIES_COUNT_SIZE: usize = 4;
 const SEQUENCE_SIZE: usize = 8;
@@ -120,17 +121,20 @@ impl Manifest {
     }
 
     /// Number of entries (read from the footer, O(1)).
+    #[allow(dead_code)]
     fn entries_count(&self) -> usize {
         let base = self.existing_entries_count();
         base + self.appended_count
     }
 
     /// Whether the manifest contains no entries.
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.entries_count() == 0
     }
 
     /// Return a borrowing iterator that lazily deserializes entries.
+    #[allow(dead_code)]
     pub(crate) fn iter(&self) -> ManifestIter<'_> {
         let base_count = self.existing_entries_count();
         let entries_end = if self.data.is_empty() {
@@ -149,6 +153,7 @@ impl Manifest {
         }
     }
 
+    #[allow(dead_code)]
     fn existing_entries_count(&self) -> usize {
         if self.data.is_empty() {
             0
@@ -179,6 +184,7 @@ impl Manifest {
     ///
     /// Optimized to avoid deserializing/re-serializing remaining entries: only the
     /// removed entries are fully decoded, while remaining entries are byte-copied.
+    #[allow(dead_code)]
     fn dequeue(&mut self, through_sequence: u64) -> Vec<QueueEntry> {
         let next_seq = self.next_sequence;
         let epoch = self.epoch;
@@ -226,6 +232,7 @@ impl Manifest {
     }
 
     /// Set the epoch and patch the data bytes in place.
+    #[allow(dead_code)]
     fn set_epoch(&mut self, epoch: u64) {
         self.epoch = epoch;
         let mut buf = BytesMut::from(self.data.as_ref());
@@ -273,6 +280,7 @@ impl Manifest {
     }
 }
 
+#[allow(dead_code)]
 /// Walk entries in `data[0..end]`, splitting at `through_sequence`.
 /// Entries with sequence <= through_sequence are fully decoded and returned.
 /// Returns (removed_entries, remaining_start_offset, remaining_count).
@@ -309,6 +317,7 @@ fn split_entries(
     (removed, end, 0)
 }
 
+#[allow(dead_code)]
 /// Decode a single entry from binary data at the given offset.
 fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntry> {
     if *offset + ENTRY_LEN_SIZE > end {
@@ -369,6 +378,7 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntr
     })
 }
 
+#[allow(dead_code)]
 /// Borrowing iterator over manifest entries. Lazily deserializes each entry.
 pub(crate) struct ManifestIter<'a> {
     data: &'a [u8],
@@ -561,6 +571,7 @@ impl QueueProducer {
 /// fencing any previous consumer instance. Every subsequent read or dequeue
 /// checks that the local epoch still matches the manifest, returning
 /// [`Error::Fenced`] if another consumer has taken over.
+#[allow(dead_code)]
 pub struct QueueConsumer {
     manifest_store: ManifestStore,
     epoch: AtomicU64,
@@ -569,6 +580,7 @@ pub struct QueueConsumer {
     queue_len: AtomicU64,
 }
 
+#[allow(dead_code)]
 impl QueueConsumer {
     /// Create a new consumer backed by the given [`ObjectStore`].
     ///
