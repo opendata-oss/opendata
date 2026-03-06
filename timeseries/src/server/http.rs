@@ -17,7 +17,9 @@ use super::metrics::Metrics;
 use super::middleware::{MetricsLayer, TracingLayer};
 use crate::error::Error;
 use crate::model::QueryOptions;
-use crate::promql::config::PrometheusConfig;
+#[cfg(feature = "otel")]
+use crate::otel::{OtelConfig, OtelConverter};
+use crate::promql::config::{OtelServerConfig, PrometheusConfig};
 use crate::promql::request::{
     LabelValuesParams, LabelsParams, MetadataParams, QueryParams, QueryRangeParams, SeriesParams,
 };
@@ -39,6 +41,8 @@ struct UiAssets;
 pub(crate) struct AppState {
     pub(crate) tsdb: Arc<Tsdb>,
     pub(crate) metrics: Arc<Metrics>,
+    #[cfg(feature = "otel")]
+    pub(crate) otel_converter: Arc<OtelConverter>,
 }
 
 /// Server configuration
@@ -59,10 +63,19 @@ impl Default for ServerConfig {
 /// Build the production Axum router with all routes, middleware, and state.
 ///
 /// Used by `TimeSeriesHttpServer::run()` and the `testing` module for integration tests.
-pub(crate) fn build_router(tsdb: Arc<Tsdb>, metrics: Arc<Metrics>) -> Router {
+pub(crate) fn build_router(
+    tsdb: Arc<Tsdb>,
+    metrics: Arc<Metrics>,
+    _otel_config: OtelServerConfig,
+) -> Router {
     let state = AppState {
         tsdb,
         metrics: metrics.clone(),
+        #[cfg(feature = "otel")]
+        otel_converter: Arc::new(OtelConverter::new(OtelConfig {
+            include_resource_attrs: _otel_config.include_resource_attrs,
+            include_scope_attrs: _otel_config.include_scope_attrs,
+        })),
     };
 
     let app = Router::new()
@@ -139,7 +152,11 @@ impl TimeSeriesHttpServer {
         }
 
         // Build router with metrics middleware
-        let app = build_router(self.tsdb.clone(), metrics);
+        let app = build_router(
+            self.tsdb.clone(),
+            metrics,
+            self.config.prometheus_config.otel.clone(),
+        );
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.port));
         tracing::info!("Starting Prometheus-compatible server on {}", addr);

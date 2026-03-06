@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use axum::Router;
 
+use crate::promql::config::OtelServerConfig;
 use crate::server::{Metrics, build_router};
 
 use super::TestTsdb;
@@ -17,5 +18,9 @@ use super::TestTsdb;
 pub fn build_app(tsdb: &TestTsdb) -> Router {
     let mut metrics = Metrics::new();
     tsdb.storage.register_metrics(metrics.registry_mut());
-    build_router(tsdb.inner.clone(), Arc::new(metrics))
+    build_router(
+        tsdb.inner.clone(),
+        Arc::new(metrics),
+        OtelServerConfig::default(),
+    )
 }

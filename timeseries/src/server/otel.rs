@@ -13,7 +13,6 @@ use opentelemetry_proto::tonic::collector::metrics::v1::{
 use prost::Message;
 
 use crate::error::Error;
-use crate::otel::{OtelConfig, OtelConverter};
 
 /// Minimal wire-compatible protobuf for `google.rpc.Status`.
 #[derive(Clone, PartialEq, Message)]
@@ -114,8 +113,7 @@ pub async fn handle_otel_metrics(
     let request = ExportMetricsServiceRequest::decode(body.as_ref())
         .map_err(|e| Error::InvalidInput(format!("Protobuf decode failed: {e}")))?;
 
-    let converter = OtelConverter::new(OtelConfig::default());
-    let series = converter.convert(&request)?;
+    let series = state.otel_converter.convert(&request)?;
     let total_samples: usize = series.iter().map(|s| s.samples.len()).sum();
 
     tracing::Span::current().record("series_count", series.len());
