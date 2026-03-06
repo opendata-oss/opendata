@@ -141,43 +141,19 @@ Implication for this RFC:
 - Rust parser metadata cannot carry Prometheus `Experimental` function state.
 - Evaluator must not encode arity behavior through scattered function-name
   exceptions.
-- For this phase, use parser metadata as the runtime signature source and defer
+- Use parser metadata as the runtime signature source, and defer
   Prometheus-exact variadic cardinality and experimental metadata parity to an
   upstream `promql-parser` contribution.
+  Tracking issue: <https://github.com/GreptimeTeam/promql-parser/issues/129>.
 
 ### Proposed Function Argument Model
 
-Use a phased argument model so current behavior stays stable while we move
-toward the target interface.
+Use one unified function-call interface at the function boundary.
 
-Phase 1:
-
-- Keep existing `PromQLArg` (`InstantVector`, `Scalar`) for instant/scalar
-  function dispatch.
-- Keep existing `RangeFunction` path for matrix/range functions.
-- Extend `PromQLFunction` with multi-arg support via `apply_args`, with a
-  default unary fallback.
-
-```rust
-pub(crate) trait PromQLFunction {
-    fn apply(
-        &self,
-        arg: PromQLArg,
-        eval_timestamp_ms: i64,
-    ) -> EvalResult<Vec<EvalSample>>;
-
-    fn apply_args(
-        &self,
-        args: Vec<PromQLArg>,
-        eval_timestamp_ms: i64,
-    ) -> EvalResult<Vec<EvalSample>>;
-}
-```
-
-Phase 2 (target):
-
-- Reuse `ExprResult` directly for evaluated non-string arguments and add call
-  context for unified dispatch, especially for string-argument functions.
+- Reuse `ExprResult` directly for evaluated non-string arguments.
+- Pass `raw_args` for handlers that must inspect AST literals (for example
+  string-argument functions).
+- Keep one `PromQLFunction` trait for runtime dispatch by function name.
 
 ```rust
 pub(crate) struct FunctionCallContext<'a> {
@@ -196,35 +172,27 @@ pub(crate) trait PromQLFunction {
 
 Notes:
 
-- Phase 1 keeps return values as instant vectors for function handlers, matching
-  current engine behavior.
-- Phase 2 target keeps one `PromQLFunction` trait with `ExprResult` return to
-  unify scalar/vector boundaries.
 - Keep one `PromQLFunction` trait: dispatch is runtime by function name, so
   splitting traits by return shape would still require a single dynamic
   dispatch boundary while adding registry complexity.
-- Type safety is enforced by parser metadata and evaluator validation in both
-  phases.
-- String-argument handling through `raw_args` and `None` argument slots is a
-  Phase 2 target.
+- Type safety is enforced by parser metadata and evaluator validation.
+- String-argument handling uses `raw_args` with `None` in evaluated argument
+  slots.
 
 ### Scalar Boundary Semantics
 
 Prometheus function internals represent scalar results as vector samples. This
-engine targets keeping scalar results as `ExprResult::Scalar` at the function
-boundary once the unified Phase 2 interface lands.
+engine keeps scalar results as `ExprResult::Scalar` at the function boundary.
 
 Boundary rule:
 
-- Phase 1 keeps current vector-oriented handler returns.
-- In Phase 2, function handlers may use internal scalar/vector helper
-  representations as needed, but final outputs for scalar-returning signatures
-  must surface as `ExprResult::Scalar`.
+- Function handlers may use internal scalar/vector helper representations as
+  needed, but final outputs for scalar-returning signatures must surface as
+  `ExprResult::Scalar`.
 
 ### Signature Source of Truth
 
-For this RFC phase, parser metadata on `Call.func` is the runtime signature
-source:
+Parser metadata on `Call.func` is the runtime signature source:
 
 - `arg_types`: argument type expectations.
 - `return_type`: return-type expectations.
@@ -235,11 +203,11 @@ internal AST construction paths can bypass normal parser entry points.
 
 ### Variadic and Optional Argument Semantics
 
-For this phase, adopt parser-supported semantics:
+Use parser-supported semantics:
 
 - Non-variadic: exact arity.
 - Variadic: minimum arity is `len(arg_types) - 1`.
-- Phase 1 implementation keeps variadic maximum arity bounded to
+- Current implementation scope keeps variadic maximum arity bounded to
   `len(arg_types)` in evaluator validation.
 - Unbounded variadic tails (for example `label_join(...src_labels)`) are
   deferred until string-argument function support lands.
@@ -334,3 +302,8 @@ directly.
 | Date       | Description |
 |------------|-------------|
 | 2026-03-04 | Initial draft |
+| 2026-03-05 | Clarified Rust `promql-parser` alignment: parser metadata is runtime signature source; Prometheus-exact variadic cardinality and `Experimental` metadata remain upstream follow-ups. |
+| 2026-03-05 | Added upstream tracking link for richer parser function metadata: <https://github.com/GreptimeTeam/promql-parser/issues/129>. |
+| 2026-03-05 | Refocused design sections on target architecture and removed rollout sequencing details from core RFC sections. |
+| 2026-03-05 | Simplified target argument model to reuse `ExprResult` for evaluated args (no duplicate `FunctionArgValue` enum), with `raw_args` plus `None` slots for string literals. |
+| 2026-03-05 | Clarified current variadic scope: bounded optional-arity support is in scope; unbounded variadic tails (for example `label_join` extra labels) are deferred. |
