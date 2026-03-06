@@ -22,7 +22,6 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::config::{CountOptions, ScanOptions, SegmentConfig};
-use crate::durable::{PendingEntry, ViewTracker};
 use crate::error::{AppendResult, Error, Result};
 use crate::listing::ListingCache;
 use crate::listing::LogKeyIterator;
@@ -31,6 +30,7 @@ use crate::range::{normalize_segment_id, normalize_sequence};
 use crate::reader::{LogIterator, LogRead, LogReadView};
 use crate::segment::SegmentCache;
 use crate::serde::SEQ_BLOCK_KEY;
+use crate::view_tracker::{PendingEntry, ViewTracker};
 use crate::writer::{LogWrite, LogWriteHandle, LogWriter, LogWriterConfig, WrittenView};
 
 /// The main log interface providing read and write operations.
@@ -104,7 +104,7 @@ pub struct LogDb {
     clock: Arc<dyn Clock>,
     read_view: Arc<RwLock<LogReadView>>,
     epoch_watcher: EpochWatcher,
-    written_subscriber_task: JoinHandle<()>,
+    read_subscriber_task: JoinHandle<()>,
     read_durable: bool,
     required_visible_durable_seq: AtomicU64,
     visible_durable_seq: Arc<AtomicU64>,
@@ -323,7 +323,7 @@ impl LogDb {
             if visible >= required {
                 return Ok(());
             }
-            if self.written_subscriber_task.is_finished() {
+            if self.read_subscriber_task.is_finished() {
                 return Err(Error::Internal("durable subscriber shut down".into()));
             }
             let notified = self.visible_durable_notify.notified();
@@ -345,7 +345,7 @@ impl LogDb {
         // Drop the handle to signal the writer to stop
         drop(self.handle);
         let _ = self.writer_task.await;
-        self.written_subscriber_task.abort();
+        self.read_subscriber_task.abort();
         self.storage
             .close()
             .await
@@ -406,7 +406,7 @@ impl LogDb {
             segment_cache,
         )));
 
-        let (epoch_watcher, written_subscriber_task) = if read_durable {
+        let (epoch_watcher, read_subscriber_task) = if read_durable {
             spawn_durable_subscriber(
                 written_rx,
                 Arc::clone(&read_view),
@@ -426,7 +426,7 @@ impl LogDb {
             clock,
             read_view,
             epoch_watcher,
-            written_subscriber_task,
+            read_subscriber_task,
             read_durable,
             required_visible_durable_seq: AtomicU64::new(0),
             visible_durable_seq,

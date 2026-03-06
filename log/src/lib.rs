@@ -47,7 +47,6 @@
 //! ```
 
 mod config;
-mod durable;
 mod error;
 mod listing;
 mod log;
@@ -59,6 +58,7 @@ mod serde;
 #[cfg(feature = "http-server")]
 pub mod server;
 mod storage;
+mod view_tracker;
 mod writer;
 
 pub use config::{Config, CountOptions, ReaderConfig, ScanOptions, SegmentConfig};
