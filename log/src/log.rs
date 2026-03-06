@@ -29,7 +29,7 @@ use crate::range::{normalize_segment_id, normalize_sequence};
 use crate::reader::{LogIterator, LogRead, LogReadView};
 use crate::segment::SegmentCache;
 use crate::serde::SEQ_BLOCK_KEY;
-use crate::view_tracker::{PendingEntry, ViewTracker};
+use crate::view_tracker::{ViewEntry, ViewTracker};
 use crate::writer::{LogWrite, LogWriteHandle, LogWriter, LogWriterConfig, WrittenView};
 
 /// The main log interface providing read and write operations.
@@ -292,22 +292,19 @@ impl LogDb {
         Ok(())
     }
 
-    /// Waits for the read view to reflect all writes up to the current
-    /// visibility requirement.
-    async fn sync_to_written(&self) -> Result<()> {
-        if self.read_durable {
-            let target = self.required_visible_durable_epoch.load(Ordering::Relaxed);
-            self.epoch_watcher
-                .clone()
-                .wait(target, Durability::Durable)
-                .await
-                .map_err(|_| Error::Internal("writer shut down".into()))?;
-            return Ok(());
-        }
-        let target = self.handle.flushed_epoch();
+    /// Waits for read-side visibility to reach the current requirement.
+    async fn sync_reads(&self) -> Result<()> {
+        let (target, durability) = if self.read_durable {
+            (
+                self.required_visible_durable_epoch.load(Ordering::Relaxed),
+                Durability::Durable,
+            )
+        } else {
+            (self.handle.flushed_epoch(), Durability::Written)
+        };
         self.epoch_watcher
             .clone()
-            .wait(target, Durability::Written)
+            .wait(target, durability)
             .await
             .map_err(|_| Error::Internal("writer shut down".into()))?;
         Ok(())
@@ -414,7 +411,7 @@ impl LogRead for LogDb {
         seq_range: impl RangeBounds<Sequence> + Send,
         options: ScanOptions,
     ) -> Result<LogIterator> {
-        self.sync_to_written().await?;
+        self.sync_reads().await?;
         let seq_range = normalize_sequence(&seq_range);
         let view = self.read_view.read().await;
         Ok(view.scan_with_options(key, seq_range, &options))
@@ -433,7 +430,7 @@ impl LogRead for LogDb {
         &self,
         segment_range: impl RangeBounds<SegmentId> + Send,
     ) -> Result<LogKeyIterator> {
-        self.sync_to_written().await?;
+        self.sync_reads().await?;
         let segment_range = normalize_segment_id(&segment_range);
         let view = self.read_view.read().await;
         view.list_keys(segment_range).await
@@ -443,7 +440,7 @@ impl LogRead for LogDb {
         &self,
         seq_range: impl RangeBounds<Sequence> + Send,
     ) -> Result<Vec<Segment>> {
-        self.sync_to_written().await?;
+        self.sync_reads().await?;
         let seq_range = normalize_sequence(&seq_range);
         let view = self.read_view.read().await;
         Ok(view.list_segments(&seq_range))
@@ -558,7 +555,7 @@ fn spawn_written_subscriber(
         while written_rx.changed().await.is_ok() {
             let view = written_rx.borrow_and_update().clone();
             let seqnum = view.seqnum;
-            tracker.push(PendingEntry {
+            tracker.push(ViewEntry {
                 seqnum,
                 epoch: view.epoch,
                 snapshot: view.snapshot,
@@ -610,7 +607,7 @@ fn spawn_durable_subscriber(
                         break;
                     }
                     let view = written_rx.borrow_and_update().clone();
-                    tracker.push(PendingEntry {
+                    tracker.push(ViewEntry {
                         seqnum: view.seqnum,
                         epoch: view.epoch,
                         snapshot: view.snapshot,

@@ -11,16 +11,9 @@ use std::sync::Arc;
 use crate::model::SegmentId;
 use common::storage::StorageSnapshot;
 
-/// A pending write waiting for durable confirmation.
-pub(crate) struct PendingEntry {
+/// A write-aligned read view entry.
+pub(crate) struct ViewEntry {
     pub seqnum: u64,
-    pub epoch: u64,
-    pub snapshot: Arc<dyn StorageSnapshot>,
-    pub last_segment_id: Option<SegmentId>,
-}
-
-/// The latest entry applied while advancing a watermark.
-pub(crate) struct AdvanceResult {
     pub epoch: u64,
     pub snapshot: Arc<dyn StorageSnapshot>,
     pub last_segment_id: Option<SegmentId>,
@@ -33,7 +26,7 @@ pub(crate) struct AdvanceResult {
 /// pass-through. The durable path advances only when the storage engine
 /// confirms durability.
 pub(crate) struct ViewTracker {
-    pending: VecDeque<PendingEntry>,
+    pending: VecDeque<ViewEntry>,
 }
 
 impl ViewTracker {
@@ -45,26 +38,21 @@ impl ViewTracker {
     }
 
     /// Appends a pending entry to the queue.
-    pub(crate) fn push(&mut self, entry: PendingEntry) {
+    pub(crate) fn push(&mut self, entry: ViewEntry) {
         self.pending.push_back(entry);
     }
 
     /// Drains entries where `seqnum <= durable_seq`. Returns the last drained
     /// entry, if any.
-    pub(crate) fn advance(&mut self, durable_seq: u64) -> Option<AdvanceResult> {
-        let mut last: Option<AdvanceResult> = None;
+    pub(crate) fn advance(&mut self, durable_seq: u64) -> Option<ViewEntry> {
+        let mut last: Option<ViewEntry> = None;
 
         while self
             .pending
             .front()
             .is_some_and(|e| e.seqnum <= durable_seq)
         {
-            let entry = self.pending.pop_front().unwrap();
-            last = Some(AdvanceResult {
-                epoch: entry.epoch,
-                snapshot: entry.snapshot,
-                last_segment_id: entry.last_segment_id,
-            });
+            last = Some(self.pending.pop_front().unwrap());
         }
 
         last
@@ -87,7 +75,7 @@ mod tests {
         let mut tracker = ViewTracker::new();
         let snap = make_snapshot().await;
 
-        tracker.push(PendingEntry {
+        tracker.push(ViewEntry {
             seqnum: 1,
             epoch: 10,
             snapshot: snap.clone(),
@@ -106,7 +94,7 @@ mod tests {
         let mut tracker = ViewTracker::new();
         let snap = make_snapshot().await;
 
-        tracker.push(PendingEntry {
+        tracker.push(ViewEntry {
             seqnum: 5,
             epoch: 1,
             snapshot: snap,
@@ -123,19 +111,19 @@ mod tests {
     async fn partial_advance_leaves_remaining_entries() {
         let mut tracker = ViewTracker::new();
 
-        tracker.push(PendingEntry {
+        tracker.push(ViewEntry {
             seqnum: 1,
             epoch: 1,
             snapshot: make_snapshot().await,
             last_segment_id: Some(0),
         });
-        tracker.push(PendingEntry {
+        tracker.push(ViewEntry {
             seqnum: 3,
             epoch: 2,
             snapshot: make_snapshot().await,
             last_segment_id: Some(1),
         });
-        tracker.push(PendingEntry {
+        tracker.push(ViewEntry {
             seqnum: 5,
             epoch: 3,
             snapshot: make_snapshot().await,
