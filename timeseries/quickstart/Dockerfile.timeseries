@@ -13,7 +13,7 @@ WORKDIR /app
 COPY . ./
 
 # Build the timeseries binary
-RUN cargo build --release -p timeseries
+RUN cargo build --release -p opendata-timeseries --features http-server
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -27,7 +27,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy the built binary
-COPY --from=builder /app/target/release/timeseries /app/timeseries
+COPY --from=builder /app/target/release/opendata-timeseries /app/timeseries
 
 # Create data directory
 RUN mkdir -p /app/data
