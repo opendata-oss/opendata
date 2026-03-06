@@ -171,7 +171,7 @@ The API of the ingestor is the following:
 impl Ingestor {
   pub fn new(config: IngestorConfig, clock: Arc<dyn Clock>) -> Result<Self> { ... }
 
-  pub async fn ingest(&self, data: Vec<Bytes>, metadata: Bytes) -> Result<WriteHandle> { ... }
+  pub async fn ingest(&self, entries: Vec<Bytes>, metadata: Bytes) -> Result<WriteHandle> { ... }
 
   pub async fn close(self) -> Result<()> { ... }
 }
