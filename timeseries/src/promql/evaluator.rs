@@ -1686,6 +1686,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
                 let mut result = Vec::new();
                 let mut one_to_one_seen: HashSet<Vec<(String, String)>> = HashSet::new();
+                // PromQL grouped matching (`group_left` / `group_right`) requires every
+                // output time series to remain uniquely identifiable. Two different matches
+                // are not allowed to collapse to the same final output labels.
+                // Keep a set of final output label keys and fail on duplicates.
+                let mut grouped_result_seen: HashSet<Vec<(String, String)>> = HashSet::new();
 
                 for many_sample in many_vec {
                     let key = Self::compute_binary_match_key(&many_sample.labels, matching);
@@ -1696,7 +1701,9 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                         None => continue, // silently dropped if unmatched on "one" side
                     };
 
-                    // One-to-one check: only error on duplicate left keys that have a right match
+                    // One-to-one vector matching must be unique on both sides. We already
+                    // validated uniqueness on the "one" map build; this guards the "many"
+                    // iteration path when card=OneToOne.
                     if is_one_to_one && !one_to_one_seen.insert(key) {
                         return Err(EvaluationError::InternalError(
                             "many-to-many matching not allowed: found duplicate series on the left side of the operation".to_string(),
@@ -1712,29 +1719,68 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
                     match self.apply_binary_op(op, lhs, rhs) {
                         Ok(value) => {
-                            // For comparison ops without bool, filter out false results
-                            if is_comparison && !return_bool && value == 0.0 {
-                                continue;
-                            }
                             let mut result_labels = Self::result_metric(
                                 many_sample.labels,
                                 op,
                                 if is_one_to_one { matching } else { None }, // should only be filtered for one-to-one case
                             );
-                            // Copy extra labels from the "one" side (in the group_left / group_right case only).
+                            // For `group_left(<labels>)` / `group_right(<labels>)`, each listed
+                            // label must come from the "one" side. Use set-or-remove semantics:
+                            // - if present on "one" side, copy/overwrite it in output
+                            // - if absent on "one" side, remove it from output
+                            // This avoids leaking stale values from the "many" side.
                             if let Some(extra) = group_labels {
-                                result_labels.extend(extra.iter().filter_map(|name| {
-                                    one_sample
-                                        .labels
-                                        .get(name)
-                                        .map(|v| (name.clone(), v.clone()))
-                                }));
+                                for name in extra {
+                                    match one_sample.labels.get(name) {
+                                        Some(v) => {
+                                            result_labels.insert(name.clone(), v.clone());
+                                        }
+                                        None => {
+                                            result_labels.remove(name);
+                                        }
+                                    }
+                                }
                             }
+
+                            let drop_name = many_sample.drop_name || return_bool;
+                            if !is_one_to_one {
+                                // Duplicate detection must use the final output labelset.
+                                // `__name__` may be removed later (arithmetic, or comparison
+                                // with `bool`), so mirror that here before computing the key.
+                                // This intentionally runs before non-bool comparison filtering
+                                // so invalid grouped cardinality still errors even when the
+                                // comparison result would be filtered out.
+                                let mut result_label_key = result_labels.clone();
+                                if drop_name {
+                                    result_label_key.remove(METRIC_NAME);
+                                }
+                                let key = Self::labels_to_grouping_key(result_label_key);
+                                if !grouped_result_seen.insert(key) {
+                                    return Err(EvaluationError::InternalError(
+                                        "multiple matches for labels: grouping labels must ensure unique matches"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+
+                            // For comparison ops without bool, filter out false results.
+                            if is_comparison && !return_bool && value == 0.0 {
+                                continue;
+                            }
+                            // PromQL comparison operators without `bool` are filters.
+                            // For vector-vector comparisons (one-to-one and grouped), keep
+                            // matched true pairs and propagate the original LHS sample value
+                            // instead of the computed predicate value (1/0).
+                            let output_value = if is_comparison && !return_bool {
+                                lhs
+                            } else {
+                                value
+                            };
                             result.push(EvalSample {
                                 timestamp_ms: many_sample.timestamp_ms,
-                                value,
+                                value: output_value,
                                 labels: result_labels,
-                                drop_name: many_sample.drop_name || return_bool,
+                                drop_name,
                             });
                         }
                         Err(e) => return Err(e),
@@ -2721,8 +2767,8 @@ mod tests {
             ("memory_bytes", vec![("env", "staging")], 3, 100.0),
         ],
         vec![
-            // 150 > 100 = true; __name__ preserved for comparison ops
-            (1.0, vec![("__name__", "cpu_usage"), ("env", "prod")]),
+            // 150 > 100 = true; non-bool comparison propagates lhs value
+            (150.0, vec![("__name__", "cpu_usage"), ("env", "prod")]),
             // 50 > 100 = false, filtered out
         ]
     )]
@@ -2760,8 +2806,8 @@ mod tests {
             ("memory_bytes", vec![("env", "staging")], 3, 100.0),
         ],
         vec![
-            // 150 > 100 = true; on(env) keeps only env label
-            (1.0, vec![("env", "prod")]),
+            // 150 > 100 = true; on(env) keeps only env label, value stays from lhs
+            (150.0, vec![("env", "prod")]),
             // 50 > 100 = false, filtered out
         ]
     )]
@@ -2774,7 +2820,7 @@ mod tests {
         ],
         vec![
             // ignoring(instance) comparison preserves __name__ but removes instance
-            (1.0, vec![("__name__", "cpu_usage"), ("env", "prod")]),
+            (150.0, vec![("__name__", "cpu_usage"), ("env", "prod")]),
         ]
     )]
     #[case(
@@ -2785,8 +2831,8 @@ mod tests {
         ],
         vec![
             // on(__name__) comparison without bool: Prometheus preserves __name__
-            // (shouldDropMetricName only returns true for comparisons when ReturnBool is set)
-            (1.0, vec![("__name__", "cpu_usage")]),
+            // and propagates lhs value.
+            (150.0, vec![("__name__", "cpu_usage")]),
         ]
     )]
     #[case(
@@ -4641,11 +4687,11 @@ mod tests {
         .await
         .expect("group_left comparison should evaluate successfully");
 
-        // then: only the 150 > 100 result survives; comparison preserves __name__
+        // then: only the 150 > 100 result survives; non-bool comparison propagates lhs sample value
         assert_results_match(
             &result,
             &[(
-                1.0,
+                150.0,
                 vec![
                     ("__name__", "cpu_usage"),
                     ("env", "prod"),
@@ -4868,11 +4914,11 @@ mod tests {
         .await
         .expect("group_right comparison should evaluate successfully");
 
-        // then: only 150 > 100 survives; comparison preserves __name__ from many (right) side
+        // then: only 150 > 100 survives; non-bool comparison propagates lhs sample value
         assert_results_match(
             &result,
             &[(
-                1.0,
+                150.0,
                 vec![
                     ("__name__", "memory_bytes"),
                     ("env", "prod"),
@@ -5074,6 +5120,119 @@ mod tests {
                     vec![("env", "prod"), ("instance", "i2"), ("region", "us-east")],
                 ),
             ],
+        );
+    }
+
+    #[tokio::test]
+    async fn should_error_when_group_left_produces_duplicate_output_labelsets() {
+        // given: two many-side series differ only by metric name. Arithmetic drops __name__,
+        // so both outputs collapse to the same label set and must be rejected.
+        let test_data: TestSampleData = vec![
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i1")],
+                0,
+                50.0,
+            ),
+            (
+                "cpu_usage_alt",
+                vec![("env", "prod"), ("instance", "i1")],
+                1,
+                60.0,
+            ),
+            ("memory_bytes", vec![("env", "prod")], 2, 100.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            r#"{__name__=~"cpu_usage|cpu_usage_alt"} + on(env) group_left memory_bytes"#,
+            end_time,
+            lookback_delta,
+        )
+        .await;
+
+        // then: Prometheus requires output series to remain uniquely identifiable
+        assert!(
+            result.is_err(),
+            "Expected error for duplicate output label sets in group_left result"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_remove_group_left_extra_label_when_one_side_lacks_it() {
+        // given: many-side sample already has region label, but one-side match has no region.
+        // group_left(region) should remove region from output, not preserve stale value.
+        let test_data: TestSampleData = vec![
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i1"), ("region", "stale")],
+                0,
+                50.0,
+            ),
+            ("memory_bytes", vec![("env", "prod")], 1, 100.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "cpu_usage + on(env) group_left(region) memory_bytes",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .expect("group_left(region) query should evaluate successfully");
+
+        // then: region must not be present because one-side series has no region label
+        assert_results_match(
+            &result,
+            &[(150.0, vec![("env", "prod"), ("instance", "i1")])],
+        );
+    }
+
+    #[tokio::test]
+    async fn should_error_grouped_comparison_duplicates_before_false_filter() {
+        // given: two many-side series collapse to identical output labels after inner arithmetic
+        // drops __name__. Both comparisons are false, but grouped duplicate validation should
+        // still run before non-bool filter drop.
+        let test_data: TestSampleData = vec![
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i1")],
+                0,
+                10.0,
+            ),
+            (
+                "cpu_usage_alt",
+                vec![("env", "prod"), ("instance", "i1")],
+                1,
+                20.0,
+            ),
+            ("memory_bytes", vec![("env", "prod")], 2, 100.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            r#"({__name__=~"cpu_usage|cpu_usage_alt"} + 0) > on(env) group_left memory_bytes"#,
+            end_time,
+            lookback_delta,
+        )
+        .await;
+
+        // then: duplicate output labels must error even though both comparisons are false
+        assert!(
+            result.is_err(),
+            "Expected duplicate-match error before comparison false filtering"
         );
     }
 
