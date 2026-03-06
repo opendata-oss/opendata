@@ -42,7 +42,7 @@ The pipeline is generic over payload `T`:
 
 - `Source<T>` emits payloads.
 - `Sink<T>` accepts payloads.
-- Intermediate stages may implement both (`Sink<T> + Source<T>`).
+- Intermediate stages may implement both (`Sink<T> + Source<T>`, or `Sink<T> + Source<U>` when a stage transforms the payload type).
 
 Conceptual direct pipeline:
 
@@ -53,7 +53,7 @@ Source<T> -> Sink<T>
 Conceptual staged pipeline:
 
 ```text
-Source<T> -> StageA(Sink<T> + Source<T>) -> StageB(Sink<T> + Source<T>) -> Sink<T>
+Source<T> -> StageA(Sink<T> + Source<U>) -> StageB(Sink<U> + Source<V>) -> Sink<V>
 ```
 
 ### System Roles in OpenData
@@ -150,11 +150,6 @@ Rejected because this duplicates semantics and blocks shared ingest components.
 
 A single canonical payload for all systems could be defined.
 Rejected because data models differ significantly and would require lossy or over-generalized abstractions.
-
-## Open Questions
-
-- Should `nack` be part of the pull-source contract in addition to timeout-based redelivery?
-- Should a shared `Batch` metadata schema (ids, trace fields) be standardized in `common`?
 
 ## Updates
 
