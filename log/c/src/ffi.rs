@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
-use log::{Config, ReaderConfig, SegmentConfig};
+use log::{Config, ReadVisibility, ReaderConfig, SegmentConfig};
 use tokio::runtime::Runtime;
 
 pub struct opendata_log_t {
@@ -295,7 +295,11 @@ pub(crate) unsafe fn build_config(
     Ok(Config {
         storage,
         segmentation: SegmentConfig { seal_interval },
-        read_durable: config.read_durable,
+        read_visibility: if config.read_durable {
+            ReadVisibility::Remote
+        } else {
+            ReadVisibility::Memory
+        },
     })
 }
 

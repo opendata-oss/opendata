@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use common::StorageConfig;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_with::{DurationMilliSeconds, serde_as};
 
 /// Configuration for opening a [`LogDb`](crate::LogDb).
@@ -46,17 +46,57 @@ pub struct Config {
     #[serde(default)]
     pub segmentation: SegmentConfig,
 
-    /// Whether reads should only see data confirmed durable by the storage engine.
+    /// Read visibility level.
     ///
-    /// When `true`, the read view advances only after the storage engine reports
-    /// that written data has been durably persisted (e.g., flushed to the WAL and
-    /// object store). This provides stronger consistency guarantees at the cost
-    /// of higher read latency.
+    /// `Memory` (default) exposes writes as soon as they are visible in memory.
+    /// `Remote` only exposes writes after remote/object-store durability is
+    /// confirmed by the storage engine.
     ///
-    /// When `false` (the default), reads see data as soon as it hits the
-    /// memtable, which is faster but means visible data may not yet be durable.
-    #[serde(default)]
-    pub read_durable: bool,
+    /// Backward-compatibility: legacy boolean `read_durable` values are accepted
+    /// and mapped as `false => Memory`, `true => Remote`.
+    #[serde(
+        default,
+        alias = "read_durable",
+        deserialize_with = "deserialize_read_visibility"
+    )]
+    pub read_visibility: ReadVisibility,
+}
+
+/// Read visibility levels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadVisibility {
+    /// Return reads once data is visible in memory (fast, not crash-safe).
+    #[default]
+    Memory,
+    /// Return reads only after remote/object-store durability is confirmed.
+    Remote,
+}
+
+impl ReadVisibility {
+    pub fn is_remote(self) -> bool {
+        matches!(self, Self::Remote)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ReadVisibilityCompat {
+    Bool(bool),
+    Level(ReadVisibility),
+}
+
+fn deserialize_read_visibility<'de, D>(deserializer: D) -> Result<ReadVisibility, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<ReadVisibilityCompat>::deserialize(deserializer)?;
+    Ok(match value {
+        None => ReadVisibility::default(),
+        Some(ReadVisibilityCompat::Bool(false)) => ReadVisibility::Memory,
+        Some(ReadVisibilityCompat::Bool(true)) => ReadVisibility::Remote,
+        Some(ReadVisibilityCompat::Level(level)) => level,
+    })
 }
 
 /// Configuration for log segmentation.
@@ -173,5 +213,56 @@ impl Default for ReaderConfig {
             storage: StorageConfig::default(),
             refresh_interval: default_refresh_interval(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct DurabilityOnly {
+        #[serde(
+            default,
+            alias = "read_durable",
+            deserialize_with = "deserialize_read_visibility"
+        )]
+        read_visibility: ReadVisibility,
+    }
+
+    #[test]
+    fn should_default_read_visibility_to_memory_when_missing() {
+        // given
+        let json = "{}";
+
+        // when
+        let cfg: DurabilityOnly = serde_json::from_str(json).unwrap();
+
+        // then
+        assert_eq!(cfg.read_visibility, ReadVisibility::Memory);
+    }
+
+    #[test]
+    fn should_deserialize_legacy_bool_true_as_remote() {
+        // given
+        let json = r#"{"read_durable": true}"#;
+
+        // when
+        let cfg: DurabilityOnly = serde_json::from_str(json).unwrap();
+
+        // then
+        assert_eq!(cfg.read_visibility, ReadVisibility::Remote);
+    }
+
+    #[test]
+    fn should_deserialize_enum_remote() {
+        // given
+        let json = r#"{"read_visibility": "remote"}"#;
+
+        // when
+        let cfg: DurabilityOnly = serde_json::from_str(json).unwrap();
+
+        // then
+        assert_eq!(cfg.read_visibility, ReadVisibility::Remote);
     }
 }

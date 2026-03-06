@@ -214,16 +214,16 @@ cloning.
 
 ### Read Semantics
 
-Appended records are not immediately visible to reads. Visibility depends on which read mode is configured.
+Appended records are not immediately visible to reads. Visibility depends on `ReadVisibility`.
 
-**Written mode (default)** provides read-your-writes consistency: after an append returns, subsequent reads on the same `LogDb` instance are guaranteed to see the appended data — even before `flush()` is called. Data visible in this mode may not yet be durable; a crash could lose it.
+**Memory mode (default)** provides read-your-writes consistency: after an append returns, subsequent reads on the same `LogDb` instance are guaranteed to see the appended data — even before `flush()` is called. Data visible in this mode may not yet be durable; a crash could lose it.
 
-**Durable mode** (`read_durable: true`) only makes data visible to reads after SlateDB confirms it is durable (WAL flushed to object storage). Reads may return stale results until persistence completes, but everything returned is guaranteed to survive a crash. An explicit `flush()` can be used to force durability.
+**Remote mode** (`read_visibility: remote`) only makes data visible to reads after SlateDB confirms it is durable (WAL flushed to object storage). Reads may return stale results until persistence completes, but everything returned is guaranteed to survive a crash. An explicit `flush()` can be used to force durability.
 
 | Mode | Reads see data after | Crash-safe |
 |------|---------------------|------------|
-| Written (default) | Append completes | No |
-| Durable | Data is persisted | Yes |
+| Memory (default) | Append completes | No |
+| Remote | Data is persisted | Yes |
 
 ### Scan API
 

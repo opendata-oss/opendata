@@ -95,12 +95,33 @@ fn default_scan_options() -> ScanOptions {
 /// LSM-tree semantics with cloud-native durability.
 pub struct SlateDbStorage {
     pub(super) db: Arc<Db>,
+    durable_tx: watch::Sender<u64>,
+    durable_bridge_abort: tokio::task::AbortHandle,
 }
 
 impl SlateDbStorage {
     /// Creates a new SlateDbStorage instance wrapping the given SlateDB database.
     pub fn new(db: Arc<Db>) -> Self {
-        Self { db }
+        let slate_rx = db.subscribe();
+        let (durable_tx, _) = watch::channel(slate_rx.borrow().durable_seq);
+        let task = tokio::spawn({
+            let tx = durable_tx.clone();
+            async move {
+                let mut slate_rx = slate_rx;
+                while slate_rx.changed().await.is_ok() {
+                    let durable_seq = slate_rx.borrow_and_update().durable_seq;
+                    if tx.send(durable_seq).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Self {
+            db,
+            durable_tx,
+            durable_bridge_abort: task.abort_handle(),
+        }
     }
 
     /// Creates a SlateDB `MergeOperator` from our common `MergeOperator` trait.
@@ -297,18 +318,7 @@ impl Storage for SlateDbStorage {
     }
 
     fn subscribe_durable(&self) -> watch::Receiver<u64> {
-        let slate_rx = self.db.subscribe();
-        let (tx, rx) = watch::channel(slate_rx.borrow().durable_seq);
-        tokio::spawn(async move {
-            let mut slate_rx = slate_rx;
-            while slate_rx.changed().await.is_ok() {
-                let durable_seq = slate_rx.borrow_and_update().durable_seq;
-                if tx.send(durable_seq).is_err() {
-                    break;
-                }
-            }
-        });
-        rx
+        self.durable_tx.subscribe()
     }
 
     async fn snapshot(&self) -> StorageResult<Arc<dyn StorageSnapshot>> {
@@ -326,6 +336,8 @@ impl Storage for SlateDbStorage {
     }
 
     async fn close(&self) -> StorageResult<()> {
+        // Stop durable bridge first so no status subscriber outlives DB close.
+        self.durable_bridge_abort.abort();
         self.db.close().await.map_err(StorageError::from_storage)?;
         Ok(())
     }

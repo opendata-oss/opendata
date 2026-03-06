@@ -20,7 +20,7 @@ use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::config::{CountOptions, ScanOptions, SegmentConfig};
+use crate::config::{CountOptions, ReadVisibility, ScanOptions, SegmentConfig};
 use crate::error::{AppendResult, Error, Result};
 use crate::listing::ListingCache;
 use crate::listing::LogKeyIterator;
@@ -51,12 +51,12 @@ use crate::writer::{LogWrite, LogWriteHandle, LogWriter, LogWriterConfig, Writte
 ///
 /// # Visibility and Durability
 ///
-/// Visibility depends on `Config::read_durable`:
+/// Visibility depends on `Config::read_visibility`:
 ///
-/// - **Written mode** (`read_durable = false`, default): reads wait for the
+/// - **Memory mode** (`read_visibility = memory`, default): reads wait for the
 ///   written watermark, so appends are visible quickly (typically without
 ///   explicit `flush()`), but data returned may not yet be crash-safe.
-/// - **Durable mode** (`read_durable = true`): reads observe only snapshots
+/// - **Remote mode** (`read_visibility = remote`): reads observe only snapshots
 ///   confirmed durable by storage, so unflushed writes are not visible.
 ///
 /// [`flush()`](LogDb::flush) always forces durability in storage. In durable
@@ -104,7 +104,7 @@ pub struct LogDb {
     read_view: Arc<RwLock<LogReadView>>,
     epoch_watcher: EpochWatcher,
     read_subscriber_task: JoinHandle<()>,
-    read_durable: bool,
+    read_visibility: ReadVisibility,
     required_visible_durable_epoch: AtomicU64,
 }
 
@@ -285,7 +285,7 @@ impl LogDb {
     /// to storage.
     pub async fn flush(&self) -> Result<()> {
         let durable_epoch = self.handle.flush().await?;
-        if self.read_durable {
+        if self.read_visibility.is_remote() {
             self.required_visible_durable_epoch
                 .fetch_max(durable_epoch, Ordering::Relaxed);
         }
@@ -294,7 +294,7 @@ impl LogDb {
 
     /// Waits for read-side visibility to reach the current requirement.
     async fn sync_reads(&self) -> Result<()> {
-        let (target, durability) = if self.read_durable {
+        let (target, durability) = if self.read_visibility.is_remote() {
             (
                 self.required_visible_durable_epoch.load(Ordering::Relaxed),
                 Durability::Durable,
@@ -331,20 +331,20 @@ impl LogDb {
     /// Creates a LogDb from an existing storage implementation.
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn common::Storage>) -> Result<Self> {
-        Self::from_storage(storage, SegmentConfig::default(), false).await
+        Self::from_storage(storage, SegmentConfig::default(), ReadVisibility::Memory).await
     }
 
-    /// Creates a LogDb with `read_durable: true` from an existing storage implementation.
+    /// Creates a LogDb with `ReadVisibility::Remote` from an existing storage implementation.
     #[cfg(test)]
     pub(crate) async fn new_durable(storage: Arc<dyn common::Storage>) -> Result<Self> {
-        Self::from_storage(storage, SegmentConfig::default(), true).await
+        Self::from_storage(storage, SegmentConfig::default(), ReadVisibility::Remote).await
     }
 
     /// Shared construction logic used by both `LogDb::new` and `LogDbBuilder::build`.
     async fn from_storage(
         storage: Arc<dyn common::Storage>,
         segment_config: SegmentConfig,
-        read_durable: bool,
+        read_visibility: ReadVisibility,
     ) -> Result<Self> {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
@@ -378,7 +378,7 @@ impl LogDb {
             segment_cache,
         )));
 
-        let (epoch_watcher, read_subscriber_task) = if read_durable {
+        let (epoch_watcher, read_subscriber_task) = if read_visibility.is_remote() {
             spawn_durable_subscriber(
                 written_rx,
                 Arc::clone(&read_view),
@@ -397,7 +397,7 @@ impl LogDb {
             read_view,
             epoch_watcher,
             read_subscriber_task,
-            read_durable,
+            read_visibility,
             required_visible_durable_epoch: AtomicU64::new(0),
         })
     }
@@ -506,7 +506,12 @@ impl LogDbBuilder {
         .await
         .map_err(|e| Error::Storage(e.to_string()))?;
 
-        LogDb::from_storage(storage, self.config.segmentation, self.config.read_durable).await
+        LogDb::from_storage(
+            storage,
+            self.config.segmentation,
+            self.config.read_visibility,
+        )
+        .await
     }
 }
 
@@ -576,7 +581,7 @@ fn spawn_written_subscriber(
     (watcher, task)
 }
 
-/// Spawns subscriber tasks for `read_durable` mode.
+/// Spawns subscriber tasks for `ReadVisibility::Remote` mode.
 ///
 /// A single task watches both the WrittenView channel and the durable
 /// sequence watermark. When a new WrittenView arrives, it's pushed into
