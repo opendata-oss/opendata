@@ -171,7 +171,7 @@ The API of the ingestor is the following:
 impl Ingestor {
   pub fn new(config: IngestorConfig, clock: Arc<dyn Clock>) -> Result<Self> { ... }
 
-  pub async fn ingest(&self, entries: Vec<Bytes>) -> Result<WriteWatcher> { ... }
+  pub async fn ingest(&self, entries: Vec<Bytes>, metadata: Bytes) -> Result<WriteHandle> { ... }
 
   pub async fn close(self) -> Result<()> { ... }
 }
@@ -182,14 +182,33 @@ The configurations for the ingestor are:
 
 ```rust
 pub struct IngestorConfig {
-  pub object_store_config: ObjectStoreConfig,  // configuration of the object store from opendata/common
-  pub data_path_prefix: String,                // path prefix where to store the data objects, default: "ingest"
-  pub manifest_path: String,                   // path to the queue manifest, default: "ingest/manifest"
-  pub flush_interval: Duration,                // time interval that once elapsed triggers a flush of the
-                                               // current batch to object storage, default: 100ms
-  pub flush_size_bytes: usize,                 // size in bytes that triggers a flush if the current batch exceeds it,
-                                               // default: 64 MiB
-  pub max_unflushed_bytes: usize,              // limit in bytes that triggers backpressure, default: usize:MAX
+  /// Determines where and how ingest data is persisted. See [`StorageConfig`].
+  pub storage: StorageConfig,
+
+  /// Path prefix for data batch objects in object storage.
+  ///
+  /// Defaults to `"ingest"`.
+  pub data_path_prefix: String,
+
+  /// Path to the queue manifest in object storage.
+  ///
+  /// Defaults to `"ingest/manifest"`.
+  pub manifest_path: String,
+
+  /// Time interval that triggers the flush of the current batch to object storage when elapsed.
+  ///
+  /// Defaults to 100 ms.
+  pub flush_interval: Duration,
+
+  /// Batch size in bytes that triggers a flush when exceeded.
+  ///
+  /// Defaults to 64 MiB.
+  pub flush_size_bytes: usize,
+
+  /// Unflushed-bytes limit that triggers backpressure.
+  ///
+  /// Defaults to `usize::MAX`.
+  pub max_unflushed_bytes: usize,
 }
 ```
 The queue manifest takes the name specified in `manifest_path`.
@@ -202,10 +221,13 @@ is less than `max_unflushed_bytes`.
 If this backpressure blocking the ingestion becomes an issue, new ingestors can be created to better distribute the
 load.
 
-A call to `ingest()` takes a vector of byte entries and returns a `WriteWatcher` with which the caller can await
-the completion of the flush to object storage of the vector of entries.
+A call to `ingest()` takes a vector of byte entries and opaque metadata, and returns a `WriteHandle` with which
+the caller can await the completion of the flush to object storage of the vector of entries.
+The metadata is written to the queue manifest entry (not to the data batch) and can be used by the collector
+to interpret the batch without reading it.
+The ingestor also records the ingestion time and passes it to the queue entry.
 
-The `WriteWatcher` has the following API:
+The `WriteHandle` has the following API:
 ```rust
     pub fn result(&self) -> Option<Result<()>>
 
@@ -262,13 +284,27 @@ The API of the collector is the following:
 impl Collector {
   pub fn new(config: CollectorConfig, clock: Arc<dyn Clock>) -> Result<Self> { ... }
 
+  pub async fn initialize(&self, last_acked_sequence: Option<u64>) -> Result<()> { ... }
+
   pub async fn next_batch(&self) -> Result<Option<CollectedBatch>> { ... }
 
-  pub async fn ack(&self, batch: &CollectedBatch) -> Result<()> { ... }
+  pub async fn ack(&self, sequence: u64) -> Result<()> { ... }
+
+  pub async fn flush(&self) -> Result<()> { ... }
 }
 ```
 
 A collector is constructed by calling `new()` passing to it the configuration and a clock.
+After construction, the caller must call `initialize()` before using the collector.
+This method increments the epoch in the queue manifest, fencing any previous consumer instance.
+Only a consumer whose epoch matches the manifest's current epoch may perform queue operations;
+if a new collector starts and calls `initialize()`, any previous collector's subsequent
+`next_batch()` or `ack()` calls will fail with a `Fenced` error.
+
+The `last_acked_sequence` parameter controls where the collector starts reading:
+- `None` — start from the earliest available entry in the queue.
+- `Some(seq)` — resume after sequence `seq`, so the next call to `next_batch()` reads sequence `seq + 1`.
+
 The configurations for the collector are:
 ```rust
 pub struct CollectorConfig {
@@ -279,38 +315,52 @@ pub struct CollectorConfig {
 The queue manifest takes the name specified in `manifest_path`.
 
 The collector internally creates a queue consumer and an object store client from the configuration.
-On startup, the queue consumer initializes by incrementing the epoch in the queue manifest,
-fencing any previous consumer instance.
 
-A `CollectedBatch` contains the deserialized entries and the location of the batch:
+A `CollectedBatch` contains the deserialized entries, the sequence number, and the location of the batch:
 ```rust
 pub struct CollectedBatch {
     pub entries: Vec<Bytes>,
-    location: String,
+    pub sequence: u64,
+    pub location: String,
 }
 ```
 
-By calling `next_batch()` the collector iterates over the entries in the queue manifest via the
-queue consumer, reads the next data batch from object storage, deserializes the entries, and returns
-them as a `CollectedBatch`.
-If no entries are available in the queue, `None` is returned.
+By calling `next_batch()` the collector reads the next data batch from object storage via the
+queue consumer, deserializes the entries, and returns them as a `CollectedBatch`.
+On the first call (when no batch has been acked yet), it peeks the earliest entry in the queue.
+On subsequent calls, it reads the entry with sequence `last_acked_sequence + 1`.
+If no entries are available, `None` is returned.
 
-By calling `ack()` the caller confirms that the batch has been fully processed.
-The method calls `dequeue()` on the queue consumer to remove the acknowledged entries from the
-queue manifest.
+By calling `ack(sequence)` the caller confirms that the batch with the given sequence number
+has been fully processed. Acks must be in order — acking a sequence that is not immediately
+after the last acked sequence returns an error. To amortize the cost of manifest writes,
+the collector batches acks and only calls `dequeue()` on the queue consumer every 100 acks.
+
+By calling `flush()` the caller forces the collector to dequeue all acked entries from the
+queue manifest immediately.
 
 If the collector fails, a new collector can be started. It will increment the epoch,
-fencing the old consumer, and resume from the earliest unprocessed entry.
+fencing the old consumer. If the caller tracks the last acked sequence, it can pass it to
+`initialize(Some(seq))` to resume where it left off. Otherwise, `initialize(None)` starts
+from the earliest unprocessed entry.
 
 ### Delivery guarantees
 
-Once entries are confirmed to be durable they are guaranteed to be delivered to the caller of the collector 
-at least once.
-If the collector fails after it claimed a location and processed the corresponding batch, but before it was able to 
-acknowledge the batch, the new collector will re-read the batch and re-process it. 
+Due to the sequence number attached to each ingested batch and the collector API that allows to
+read queue entries depending on the sequence number, exactly-once delivery is possible.
 
-The delivery guarantees of the entries that were not confirmed to be durable depends on the progress tracking of the
-caller of the stateless ingest.
+To achieve exactly-once the caller of the collector is required to atomically write the
+batch and the corresponding sequence number to the OpenData subsystem.
+The stored sequence number in the subsystem can than be used to retrieve the next batch of
+ingested data.
+
+Since the batch and the corresponding sequence number are atomically written to the
+OpenData subsystem, the sequence number always represents the last written batch.
+After a failure, the ingest can continue at the first batch that was not ingested.
+No data is ingested twice.
+
+The delivery guarantees of the entries on the ingestor-side that were not confirmed to be 
+durable before a failure depends on the progress tracking of the caller of the ingestor.
 If they track the progress and re-ingest unacknowledged entries they can achieve at-least-once guarantee.
 
 ### Observability
