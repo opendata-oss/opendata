@@ -6,6 +6,8 @@ mod flusher;
 mod index;
 mod minitsdb;
 mod model;
+#[cfg(feature = "otel")]
+mod otel;
 mod promql;
 mod query;
 mod serde;

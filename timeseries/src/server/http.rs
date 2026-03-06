@@ -6,7 +6,7 @@ use axum::extract::{FromRequest, Path, State};
 use axum::http::{Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
-#[cfg(feature = "remote-write")]
+#[cfg(any(feature = "remote-write", feature = "otel"))]
 use axum::routing::post;
 use axum::{Json, Router};
 use axum_extra::extract::{Form, Query};

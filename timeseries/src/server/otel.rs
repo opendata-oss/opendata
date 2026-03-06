@@ -13,28 +13,72 @@ use opentelemetry_proto::tonic::collector::metrics::v1::{
 use prost::Message;
 
 use crate::error::Error;
-use crate::{OtelConfig, OtelConverter};
+use crate::otel::{OtelConfig, OtelConverter};
+
+/// Minimal wire-compatible protobuf for `google.rpc.Status`.
+#[derive(Clone, PartialEq, Message)]
+struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<Any>,
+}
+
+/// Minimal wire-compatible protobuf for `google.protobuf.Any`.
+#[derive(Clone, PartialEq, Message)]
+struct Any {
+    #[prost(string, tag = "1")]
+    type_url: String,
+    #[prost(bytes = "vec", tag = "2")]
+    value: Vec<u8>,
+}
 
 /// Error response for OTLP metrics ingest requests.
-pub struct OtelIngestError(Error);
+pub struct OtelIngestError {
+    status: StatusCode,
+    rpc_code: i32,
+    message: String,
+}
 
 impl IntoResponse for OtelIngestError {
     fn into_response(self) -> Response {
-        let status = match self.0 {
-            Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
-            Error::Storage(_) | Error::Encoding(_) | Error::Internal(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
-            Error::Backpressure => StatusCode::SERVICE_UNAVAILABLE,
+        let status = RpcStatus {
+            code: self.rpc_code,
+            message: self.message,
+            details: vec![],
         };
+        let encoded = status.encode_to_vec();
 
-        (status, self.0.to_string()).into_response()
+        (
+            self.status,
+            [("content-type", "application/x-protobuf")],
+            encoded,
+        )
+            .into_response()
     }
 }
 
 impl From<Error> for OtelIngestError {
     fn from(err: Error) -> Self {
-        Self(err)
+        match err {
+            Error::InvalidInput(message) => Self {
+                status: StatusCode::BAD_REQUEST,
+                rpc_code: 3, // INVALID_ARGUMENT
+                message,
+            },
+            Error::Storage(message) | Error::Encoding(message) | Error::Internal(message) => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                rpc_code: 13, // INTERNAL
+                message,
+            },
+            Error::Backpressure => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                rpc_code: 14, // UNAVAILABLE
+                message: "Backpressure: write queue is full".to_string(),
+            },
+        }
     }
 }
 
