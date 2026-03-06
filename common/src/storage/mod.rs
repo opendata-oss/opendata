@@ -161,6 +161,13 @@ impl StorageError {
 /// Result type alias for storage operations
 pub type StorageResult<T> = std::result::Result<T, StorageError>;
 
+/// Result of a write operation, containing the sequence number assigned by the storage engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteResult {
+    /// The sequence number assigned to this write by the underlying storage engine.
+    pub seqnum: u64,
+}
+
 /// Trait for merging existing values with new values.
 ///
 /// Merge operators must be associative: `merge(merge(a, b), c) == merge(a, merge(b, c))`.
@@ -265,7 +272,7 @@ pub trait Storage: StorageRead {
     /// used by flushers that produce a mix of operation types from a frozen delta.
     ///
     /// Uses `WriteOptions::default()` (`await_durable: false`).
-    async fn apply(&self, ops: Vec<RecordOp>) -> StorageResult<()> {
+    async fn apply(&self, ops: Vec<RecordOp>) -> StorageResult<WriteResult> {
         self.apply_with_options(ops, WriteOptions::default()).await
     }
 
@@ -281,12 +288,12 @@ pub trait Storage: StorageRead {
         &self,
         ops: Vec<RecordOp>,
         options: WriteOptions,
-    ) -> StorageResult<()>;
+    ) -> StorageResult<WriteResult>;
 
     /// Writes records to storage.
     ///
     /// Uses `WriteOptions::default()` (`await_durable: false`).
-    async fn put(&self, records: Vec<PutRecordOp>) -> StorageResult<()> {
+    async fn put(&self, records: Vec<PutRecordOp>) -> StorageResult<WriteResult> {
         self.put_with_options(records, WriteOptions::default())
             .await
     }
@@ -308,7 +315,7 @@ pub trait Storage: StorageRead {
         &self,
         records: Vec<PutRecordOp>,
         options: WriteOptions,
-    ) -> StorageResult<()>;
+    ) -> StorageResult<WriteResult>;
 
     /// Merges values for the given keys using the configured merge operator.
     ///
@@ -320,7 +327,7 @@ pub trait Storage: StorageRead {
     /// together or not at all.
     ///
     /// Uses `WriteOptions::default()` (`await_durable: false`).
-    async fn merge(&self, records: Vec<MergeRecordOp>) -> StorageResult<()> {
+    async fn merge(&self, records: Vec<MergeRecordOp>) -> StorageResult<WriteResult> {
         self.merge_with_options(records, WriteOptions::default())
             .await
     }
@@ -338,7 +345,7 @@ pub trait Storage: StorageRead {
         &self,
         records: Vec<MergeRecordOp>,
         options: WriteOptions,
-    ) -> StorageResult<()>;
+    ) -> StorageResult<WriteResult>;
 
     /// Creates a point-in-time snapshot of the storage.
     ///
@@ -367,6 +374,14 @@ pub trait Storage: StorageRead {
     ///
     /// Returns an error if resource shutdown fails.
     async fn close(&self) -> StorageResult<()>;
+
+    /// Subscribes to the durable sequence watermark.
+    ///
+    /// Returns a `watch::Receiver<u64>` that tracks the highest sequence number
+    /// confirmed durable by the storage engine. For SlateDB, this maps to
+    /// `DbStatus::durable_seq`. For in-memory storage, writes are immediately
+    /// "durable" so the watermark matches the latest written seqnum.
+    fn subscribe_durable(&self) -> tokio::sync::watch::Receiver<u64>;
 
     /// Registers storage engine metrics into the given Prometheus registry.
     ///

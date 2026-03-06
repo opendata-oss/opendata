@@ -19,15 +19,16 @@ use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::config::{CountOptions, ScanOptions, SegmentConfig};
+use crate::config::{CountOptions, ReadVisibility, ScanOptions, SegmentConfig};
 use crate::error::{AppendResult, Error, Result};
 use crate::listing::ListingCache;
 use crate::listing::LogKeyIterator;
 use crate::model::{AppendOutput, Record, Segment, SegmentId, Sequence};
 use crate::range::{normalize_segment_id, normalize_sequence};
 use crate::reader::{LogIterator, LogRead, LogReadView};
-use crate::segment::{LogSegment, SegmentCache};
+use crate::segment::SegmentCache;
 use crate::serde::SEQ_BLOCK_KEY;
+use crate::view_tracker::{ViewEntry, ViewTracker};
 use crate::writer::{LogWrite, LogWriteHandle, LogWriter, LogWriterConfig, WrittenView};
 
 /// The main log interface providing read and write operations.
@@ -49,23 +50,17 @@ use crate::writer::{LogWrite, LogWriteHandle, LogWriter, LogWriterConfig, Writte
 ///
 /// # Visibility and Durability
 ///
-/// Appended records are not immediately visible to reads. The
-/// [`flush()`](LogDb::flush) method ensures all pending data is durably
-/// persisted to storage, but does not block on reader synchronization.
-/// Instead, read operations ([`scan`](LogRead::scan),
-/// [`list_keys`](LogRead::list_keys),
-/// [`list_segments`](LogRead::list_segments)) synchronize themselves by
-/// waiting for the reader view to catch up to the coordinator's current
-/// flushed watermark before returning results. This means:
+/// Visibility depends on `Config::read_visibility`:
 ///
-/// - After `flush()`, subsequent reads are guaranteed to see all flushed
-///   data.
-/// - Data that becomes visible through background flush activity (without
-///   an explicit `flush()` call) may not yet be durable.
+/// - **Memory mode** (`read_visibility = memory`, default): reads wait for the
+///   written watermark, so appends are visible quickly (typically without
+///   explicit `flush()`), but data returned may not yet be crash-safe.
+/// - **Remote mode** (`read_visibility = remote`): reads observe only snapshots
+///   confirmed durable by storage, so unflushed writes are not visible.
 ///
-/// In the future, stronger guarantees such as a "read-durable" mode may
-/// be introduced, where the read view advances only after data is
-/// confirmed durable.
+/// [`flush()`](LogDb::flush) always forces durability in storage. In durable
+/// mode it also establishes an internal read barrier: subsequent reads wait
+/// until the durable read view has caught up to at least that flush point.
 ///
 /// # Writer Semantics
 ///
@@ -107,7 +102,8 @@ pub struct LogDb {
     clock: Arc<dyn Clock>,
     read_view: Arc<RwLock<LogReadView>>,
     epoch_watcher: EpochWatcher,
-    flushed_subscriber_task: JoinHandle<()>,
+    read_subscriber_task: JoinHandle<()>,
+    read_visibility: ReadVisibility,
 }
 
 impl LogDb {
@@ -286,15 +282,19 @@ impl LogDb {
     /// This method ensures that all acknowledged writes are durably persisted
     /// to storage.
     pub async fn flush(&self) -> Result<()> {
-        self.handle.flush().await
+        self.handle.flush().await?;
+        Ok(())
     }
 
-    /// Waits for the flushed subscriber to apply all writes up to the current epoch.
-    async fn sync_to_flushed(&self) -> Result<()> {
-        let target = self.handle.flushed_epoch();
+    /// Waits for read-side visibility to reach the current requirement.
+    async fn sync_reads(&self) -> Result<()> {
+        let (target, durability) = match self.read_visibility {
+            ReadVisibility::Remote => (self.handle.durable_epoch(), Durability::Durable),
+            ReadVisibility::Memory => (self.handle.written_epoch(), Durability::Written),
+        };
         self.epoch_watcher
             .clone()
-            .wait(target, Durability::Written)
+            .wait(target, durability)
             .await
             .map_err(|_| Error::Internal("writer shut down".into()))?;
         Ok(())
@@ -310,7 +310,7 @@ impl LogDb {
         // Drop the handle to signal the writer to stop
         drop(self.handle);
         let _ = self.writer_task.await;
-        self.flushed_subscriber_task.abort();
+        self.read_subscriber_task.abort();
         self.storage
             .close()
             .await
@@ -321,13 +321,20 @@ impl LogDb {
     /// Creates a LogDb from an existing storage implementation.
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn common::Storage>) -> Result<Self> {
-        Self::from_storage(storage, SegmentConfig::default()).await
+        Self::from_storage(storage, SegmentConfig::default(), ReadVisibility::Memory).await
+    }
+
+    /// Creates a LogDb with `ReadVisibility::Remote` from an existing storage implementation.
+    #[cfg(test)]
+    pub(crate) async fn new_durable(storage: Arc<dyn common::Storage>) -> Result<Self> {
+        Self::from_storage(storage, SegmentConfig::default(), ReadVisibility::Remote).await
     }
 
     /// Shared construction logic used by both `LogDb::new` and `LogDbBuilder::build`.
     async fn from_storage(
         storage: Arc<dyn common::Storage>,
         segment_config: SegmentConfig,
+        read_visibility: ReadVisibility,
     ) -> Result<Self> {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
@@ -355,13 +362,22 @@ impl LogDb {
         let written_rx = handle.written_rx();
         let writer_task = handle.spawn(writer);
 
+        let initial_segment_id = segment_cache.latest().map(|s| s.id());
         let read_view = Arc::new(RwLock::new(LogReadView::new(
             snapshot as Arc<dyn common::StorageRead>,
             segment_cache,
         )));
 
-        let (epoch_watcher, flushed_subscriber_task) =
-            spawn_flushed_subscriber(written_rx, Arc::clone(&read_view));
+        let (epoch_watcher, read_subscriber_task) = if read_visibility.is_remote() {
+            spawn_durable_subscriber(
+                written_rx,
+                Arc::clone(&read_view),
+                &storage,
+                initial_segment_id,
+            )
+        } else {
+            spawn_written_subscriber(written_rx, Arc::clone(&read_view), initial_segment_id)
+        };
 
         Ok(Self {
             handle,
@@ -370,7 +386,8 @@ impl LogDb {
             clock,
             read_view,
             epoch_watcher,
-            flushed_subscriber_task,
+            read_subscriber_task,
+            read_visibility,
         })
     }
 }
@@ -383,7 +400,7 @@ impl LogRead for LogDb {
         seq_range: impl RangeBounds<Sequence> + Send,
         options: ScanOptions,
     ) -> Result<LogIterator> {
-        self.sync_to_flushed().await?;
+        self.sync_reads().await?;
         let seq_range = normalize_sequence(&seq_range);
         let view = self.read_view.read().await;
         Ok(view.scan_with_options(key, seq_range, &options))
@@ -402,7 +419,7 @@ impl LogRead for LogDb {
         &self,
         segment_range: impl RangeBounds<SegmentId> + Send,
     ) -> Result<LogKeyIterator> {
-        self.sync_to_flushed().await?;
+        self.sync_reads().await?;
         let segment_range = normalize_segment_id(&segment_range);
         let view = self.read_view.read().await;
         view.list_keys(segment_range).await
@@ -412,7 +429,7 @@ impl LogRead for LogDb {
         &self,
         seq_range: impl RangeBounds<Sequence> + Send,
     ) -> Result<Vec<Segment>> {
-        self.sync_to_flushed().await?;
+        self.sync_reads().await?;
         let seq_range = normalize_sequence(&seq_range);
         let view = self.read_view.read().await;
         Ok(view.list_segments(&seq_range))
@@ -478,35 +495,142 @@ impl LogDbBuilder {
         .await
         .map_err(|e| Error::Storage(e.to_string()))?;
 
-        LogDb::from_storage(storage, self.config.segmentation).await
+        LogDb::from_storage(
+            storage,
+            self.config.segmentation,
+            self.config.read_visibility,
+        )
+        .await
     }
 }
 
-fn spawn_flushed_subscriber(
+/// Tries to advance the tracker and, on success, applies the new snapshot
+/// to the shared read view and refreshes segments if needed.
+async fn try_advance_read_view(
+    tracker: &mut ViewTracker,
+    read_view: &RwLock<LogReadView>,
+    watermarks: &EpochWatermarks,
+    known_segment_id: &mut Option<SegmentId>,
+    durability: Durability,
+    through_seq: u64,
+) {
+    if let Some(advanced) = tracker.advance(through_seq) {
+        let mut rv = read_view.write().await;
+        rv.update_snapshot(advanced.snapshot as Arc<dyn common::StorageRead>);
+
+        // Refresh segments from the snapshot when the writer reports a new segment.
+        if advanced.last_segment_id != *known_segment_id {
+            match rv.refresh_segments(*known_segment_id).await {
+                Ok(()) => {
+                    *known_segment_id = advanced.last_segment_id;
+                }
+                Err(e) => {
+                    tracing::warn!("failed to refresh segments: {e}");
+                }
+            }
+        }
+
+        match durability {
+            Durability::Written => watermarks.update_written(advanced.epoch),
+            Durability::Durable | Durability::Applied => watermarks.update_durable(advanced.epoch),
+        }
+    }
+}
+
+fn spawn_written_subscriber(
     mut written_rx: watch::Receiver<WrittenView>,
     read_view: Arc<RwLock<LogReadView>>,
+    initial_segment_id: Option<SegmentId>,
 ) -> (EpochWatcher, JoinHandle<()>) {
     let (watermarks, watcher) = EpochWatermarks::new();
+    let mut tracker = ViewTracker::new();
+    let mut known_segment_id = initial_segment_id;
     let task = tokio::spawn(async move {
-        let mut last_segments: Option<Arc<[LogSegment]>> = None;
         while written_rx.changed().await.is_ok() {
             let view = written_rx.borrow_and_update().clone();
+            let seqnum = view.seqnum;
+            tracker.push(ViewEntry {
+                seqnum,
+                epoch: view.epoch,
+                snapshot: view.snapshot,
+                last_segment_id: view.last_segment_id,
+            });
 
-            let mut rv = read_view.write().await;
-            rv.update_snapshot(view.snapshot as Arc<dyn common::StorageRead>);
-
-            // Only rebuild segment cache when segments actually changed
-            if !last_segments
-                .as_ref()
-                .is_some_and(|s| Arc::ptr_eq(s, &view.segments))
-            {
-                rv.replace_segments(&view.segments);
-                last_segments = Some(Arc::clone(&view.segments));
-            }
-
-            watermarks.update_written(view.epoch);
+            try_advance_read_view(
+                &mut tracker,
+                &read_view,
+                &watermarks,
+                &mut known_segment_id,
+                Durability::Written,
+                seqnum,
+            )
+            .await;
         }
     });
+    (watcher, task)
+}
+
+/// Spawns subscriber tasks for `ReadVisibility::Remote` mode.
+///
+/// A single task watches both the WrittenView channel and the durable
+/// sequence watermark. When a new WrittenView arrives, it's pushed into
+/// the ViewTracker and the "written" watermark is advanced. When
+/// the durable_seq advances, the tracker is drained and the LogReadView
+/// and "durable" watermark are updated.
+fn spawn_durable_subscriber(
+    mut written_rx: watch::Receiver<WrittenView>,
+    read_view: Arc<RwLock<LogReadView>>,
+    storage: &Arc<dyn common::Storage>,
+    initial_segment_id: Option<SegmentId>,
+) -> (EpochWatcher, JoinHandle<()>) {
+    let (watermarks, watcher) = EpochWatermarks::new();
+    let mut durable_rx = storage.subscribe_durable();
+    let mut tracker = ViewTracker::new();
+    let mut known_segment_id = initial_segment_id;
+
+    let task = tokio::spawn(async move {
+        // Track the latest known durable_seq so we can re-check after new
+        // writes arrive (the durable notification may arrive before the
+        // WrittenView is pushed).
+        let mut last_durable_seq: u64 = *durable_rx.borrow();
+
+        loop {
+            tokio::select! {
+                result = written_rx.changed() => {
+                    if result.is_err() {
+                        break;
+                    }
+                    let view = written_rx.borrow_and_update().clone();
+                    tracker.push(ViewEntry {
+                        seqnum: view.seqnum,
+                        epoch: view.epoch,
+                        snapshot: view.snapshot,
+                        last_segment_id: view.last_segment_id,
+                    });
+                    watermarks.update_written(view.epoch);
+
+                    // Re-check: the durable watermark may already cover this entry
+                    try_advance_read_view(
+                        &mut tracker, &read_view, &watermarks, &mut known_segment_id,
+                        Durability::Durable, last_durable_seq,
+                    )
+                    .await;
+                }
+                result = durable_rx.changed() => {
+                    if result.is_err() {
+                        break;
+                    }
+                    last_durable_seq = *durable_rx.borrow_and_update();
+                    try_advance_read_view(
+                        &mut tracker, &read_view, &watermarks, &mut known_segment_id,
+                        Durability::Durable, last_durable_seq,
+                    )
+                    .await;
+                }
+            }
+        }
+    });
+
     (watcher, task)
 }
 
@@ -1771,5 +1895,152 @@ mod tests {
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].id, 0);
         assert_eq!(segments[0].start_seq, 0);
+    }
+
+    /// Helper: creates a SlateDB-backed storage using an in-memory object store.
+    /// With `start_paused = true`, SlateDB's WAL flush timer is frozen so writes
+    /// remain non-durable until an explicit `flush()` call.
+    async fn slate_storage() -> Arc<dyn common::Storage> {
+        use common::storage::slate::SlateDbStorage;
+        use slatedb::DbBuilder;
+        use slatedb::object_store::memory::InMemory;
+
+        let object_store = Arc::new(InMemory::new());
+        let db = DbBuilder::new("/test/read_durable", object_store)
+            .build()
+            .await
+            .unwrap();
+        Arc::new(SlateDbStorage::new(Arc::new(db)))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn should_not_see_unflushed_writes_in_read_durable_mode() {
+        let storage = slate_storage().await;
+        let log = LogDb::new_durable(storage).await.unwrap();
+
+        // Append records — data is in memtable but not durable (time is paused)
+        log.try_append(vec![Record {
+            key: Bytes::from("key1"),
+            value: Bytes::from("value1"),
+        }])
+        .await
+        .unwrap();
+
+        // In read_durable mode, sync_to_flushed is a no-op — the read view
+        // only advances when data becomes durable. So scan returns immediately
+        // but yields no results because the view hasn't advanced yet.
+        let mut iter = log.scan(Bytes::from("key1"), ..).await.unwrap();
+        assert!(
+            iter.next().await.unwrap().is_none(),
+            "should not see non-durable writes"
+        );
+
+        // Now flush — makes data durable, which advances the read view
+        log.flush().await.unwrap();
+
+        let mut iter = log.scan(Bytes::from("key1"), ..).await.unwrap();
+        let entry = iter.next().await.unwrap().unwrap();
+        assert_eq!(entry.value, Bytes::from("value1"));
+        assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn should_read_durable_preserves_multiple_appends() {
+        let storage = slate_storage().await;
+        let log = LogDb::new_durable(storage).await.unwrap();
+
+        log.try_append(vec![
+            Record {
+                key: Bytes::from("k"),
+                value: Bytes::from("v1"),
+            },
+            Record {
+                key: Bytes::from("k"),
+                value: Bytes::from("v2"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        log.try_append(vec![Record {
+            key: Bytes::from("k"),
+            value: Bytes::from("v3"),
+        }])
+        .await
+        .unwrap();
+
+        // Not visible yet — read view hasn't advanced
+        let mut iter = log.scan(Bytes::from("k"), ..).await.unwrap();
+        assert!(
+            iter.next().await.unwrap().is_none(),
+            "should not see non-durable writes"
+        );
+
+        // Flush and verify all data
+        log.flush().await.unwrap();
+
+        let mut iter = log.scan(Bytes::from("k"), ..).await.unwrap();
+        let e0 = iter.next().await.unwrap().unwrap();
+        assert_eq!(e0.value, Bytes::from("v1"));
+        let e1 = iter.next().await.unwrap().unwrap();
+        assert_eq!(e1.value, Bytes::from("v2"));
+        let e2 = iter.next().await.unwrap().unwrap();
+        assert_eq!(e2.value, Bytes::from("v3"));
+        assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn should_not_see_unflushed_writes_in_read_durable_mode_in_memory() {
+        let storage =
+            Arc::new(common::storage::in_memory::InMemoryStorage::new().with_deferred_durability());
+        let log = LogDb::new_durable(Arc::clone(&storage) as Arc<dyn common::Storage>)
+            .await
+            .unwrap();
+
+        // Append records — written but not durable
+        log.try_append(vec![Record {
+            key: Bytes::from("key1"),
+            value: Bytes::from("value1"),
+        }])
+        .await
+        .unwrap();
+
+        // Scan returns empty — data is not yet durable
+        let mut iter = log.scan(Bytes::from("key1"), ..).await.unwrap();
+        assert!(
+            iter.next().await.unwrap().is_none(),
+            "should not see non-durable writes"
+        );
+
+        // Flush makes data durable
+        common::Storage::flush(storage.as_ref()).await.unwrap();
+        // This bypasses LogDb::flush barrier tracking, so allow subscriber propagation.
+        tokio::task::yield_now().await;
+
+        let mut iter = log.scan(Bytes::from("key1"), ..).await.unwrap();
+        let entry = iter.next().await.unwrap().unwrap();
+        assert_eq!(entry.value, Bytes::from("value1"));
+        assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn should_see_writes_immediately_in_flushed_mode() {
+        // In flushed (default) mode, writes become visible via sync_to_flushed
+        // even without an explicit flush() and even with a paused clock.
+        let storage = slate_storage().await;
+        let log = LogDb::new(storage).await.unwrap();
+
+        log.try_append(vec![Record {
+            key: Bytes::from("key1"),
+            value: Bytes::from("value1"),
+        }])
+        .await
+        .unwrap();
+
+        // No flush, no clock advance — scan should still see the write
+        let mut iter = log.scan(Bytes::from("key1"), ..).await.unwrap();
+        let entry = iter.next().await.unwrap().unwrap();
+        assert_eq!(entry.value, Bytes::from("value1"));
+        assert!(iter.next().await.unwrap().is_none());
     }
 }

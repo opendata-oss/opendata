@@ -280,6 +280,7 @@ async fn setup_test_log_with_segment_interval(interval: Duration) -> Arc<LogDb> 
         segmentation: SegmentConfig {
             seal_interval: Some(interval),
         },
+        ..Default::default()
     };
     Arc::new(LogDb::open(config).await.expect("Failed to open log"))
 }

@@ -4,7 +4,8 @@ use crate::storage::{MergeOptions, PutOptions};
 use crate::{
     BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult, Ttl,
     storage::{
-        MergeOperator, MergeRecordOp, PutRecordOp, RecordOp, Storage, StorageSnapshot, WriteOptions,
+        MergeOperator, MergeRecordOp, PutRecordOp, RecordOp, Storage, StorageSnapshot,
+        WriteOptions, WriteResult,
     },
 };
 use async_trait::async_trait;
@@ -14,6 +15,7 @@ use slatedb::{
     Db, DbIterator, DbReader, DbSnapshot, MergeOperator as SlateDbMergeOperator,
     MergeOperatorError, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
 };
+use tokio::sync::watch;
 
 /// Thin wrapper that exposes a SlateDB [`ReadableStat`] as a Prometheus gauge.
 ///
@@ -93,12 +95,33 @@ fn default_scan_options() -> ScanOptions {
 /// LSM-tree semantics with cloud-native durability.
 pub struct SlateDbStorage {
     pub(super) db: Arc<Db>,
+    durable_tx: watch::Sender<u64>,
+    durable_bridge_abort: tokio::task::AbortHandle,
 }
 
 impl SlateDbStorage {
     /// Creates a new SlateDbStorage instance wrapping the given SlateDB database.
     pub fn new(db: Arc<Db>) -> Self {
-        Self { db }
+        let slate_rx = db.subscribe();
+        let (durable_tx, _) = watch::channel(slate_rx.borrow().durable_seq);
+        let task = tokio::spawn({
+            let tx = durable_tx.clone();
+            async move {
+                let mut slate_rx = slate_rx;
+                while slate_rx.changed().await.is_ok() {
+                    let durable_seq = slate_rx.borrow_and_update().durable_seq;
+                    if tx.send(durable_seq).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Self {
+            db,
+            durable_tx,
+            durable_bridge_abort: task.abort_handle(),
+        }
     }
 
     /// Creates a SlateDB `MergeOperator` from our common `MergeOperator` trait.
@@ -215,7 +238,7 @@ impl Storage for SlateDbStorage {
         &self,
         records: Vec<RecordOp>,
         options: WriteOptions,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<WriteResult> {
         let mut batch = WriteBatch::new();
         for op in records {
             match op {
@@ -231,18 +254,21 @@ impl Storage for SlateDbStorage {
         let slate_options = SlateDbWriteOptions {
             await_durable: options.await_durable,
         };
-        self.db
+        let write_handle = self
+            .db
             .write_with_options(batch, &slate_options)
             .await
             .map_err(StorageError::from_storage)?;
-        Ok(())
+        Ok(WriteResult {
+            seqnum: write_handle.seqnum(),
+        })
     }
 
     async fn put_with_options(
         &self,
         records: Vec<PutRecordOp>,
         options: WriteOptions,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<WriteResult> {
         let mut batch = WriteBatch::new();
         for op in records {
             batch.put_with_options(op.record.key, op.record.value, &op.options.into());
@@ -250,18 +276,21 @@ impl Storage for SlateDbStorage {
         let slate_options = SlateDbWriteOptions {
             await_durable: options.await_durable,
         };
-        self.db
+        let write_handle = self
+            .db
             .write_with_options(batch, &slate_options)
             .await
             .map_err(StorageError::from_storage)?;
-        Ok(())
+        Ok(WriteResult {
+            seqnum: write_handle.seqnum(),
+        })
     }
 
     async fn merge_with_options(
         &self,
         records: Vec<MergeRecordOp>,
         options: WriteOptions,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<WriteResult> {
         let mut batch = WriteBatch::new();
         for op in records {
             batch.merge_with_options(op.record.key, op.record.value, &op.options.into());
@@ -269,7 +298,8 @@ impl Storage for SlateDbStorage {
         let slate_options = SlateDbWriteOptions {
             await_durable: options.await_durable,
         };
-        self.db
+        let write_handle = self
+            .db
             .write_with_options(batch, &slate_options)
             .await
             .map_err(|e| {
@@ -282,7 +312,13 @@ impl Storage for SlateDbStorage {
                     StorageError::from_storage(e)
                 }
             })?;
-        Ok(())
+        Ok(WriteResult {
+            seqnum: write_handle.seqnum(),
+        })
+    }
+
+    fn subscribe_durable(&self) -> watch::Receiver<u64> {
+        self.durable_tx.subscribe()
     }
 
     async fn snapshot(&self) -> StorageResult<Arc<dyn StorageSnapshot>> {
@@ -300,6 +336,8 @@ impl Storage for SlateDbStorage {
     }
 
     async fn close(&self) -> StorageResult<()> {
+        // Stop durable bridge first so no status subscriber outlives DB close.
+        self.durable_bridge_abort.abort();
         self.db.close().await.map_err(StorageError::from_storage)?;
         Ok(())
     }

@@ -48,6 +48,10 @@ typedef struct opendata_log_config_t {
   const struct opendata_log_object_store_t *object_store;
   const char *settings_path;
   int64_t seal_interval_ms;
+  /**
+   * When true, reads only see data confirmed durable by the storage engine.
+   */
+  bool read_durable;
 } opendata_log_config_t;
 
 typedef struct opendata_log_seq_bound_t {
