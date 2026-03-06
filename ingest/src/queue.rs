@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::clock::Clock;
@@ -12,12 +11,6 @@ use slatedb::object_store::{
 };
 
 use crate::error::{Error, Result};
-
-fn millis(time: SystemTime) -> i64 {
-    time.duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_millis() as i64
-}
 
 const MANIFEST_VERSION: u16 = 1;
 const UNINITIALIZED_EPOCH: u64 = u64::MAX;
@@ -509,7 +502,6 @@ impl ConflictCounter {
 /// retried automatically until it succeeds.
 pub struct QueueProducer {
     manifest_store: ManifestStore,
-    clock: Arc<dyn Clock>,
     counter: ConflictCounter,
 }
 
@@ -518,14 +510,12 @@ impl QueueProducer {
     pub fn with_object_store(
         manifest_path: String,
         object_store: Arc<dyn ObjectStore>,
-        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             manifest_store: ManifestStore {
                 object_store,
                 manifest_path,
             },
-            clock,
             counter: ConflictCounter::new(),
         }
     }
@@ -533,11 +523,16 @@ impl QueueProducer {
     /// Append an entry to the queue with the given `location` and `metadata`.
     ///
     /// The write is retried automatically on optimistic-concurrency conflicts.
-    pub async fn enqueue(&self, location: String, metadata: Bytes) -> Result<()> {
+    pub async fn enqueue(
+        &self,
+        location: String,
+        metadata: Bytes,
+        ingestion_time_ms: i64,
+    ) -> Result<()> {
         let entry = QueueEntry {
             sequence: 0,
             location,
-            ingestion_time_ms: millis(self.clock.now()),
+            ingestion_time_ms,
             metadata,
         };
         loop {
@@ -718,15 +713,14 @@ mod tests {
         let producer = QueueProducer::with_object_store(
             TEST_MANIFEST_PATH.to_string(),
             store.clone(),
-            Arc::new(SystemClock),
         );
 
         producer
-            .enqueue("path/to/file1.json".to_string(), Bytes::new())
+            .enqueue("path/to/file1.json".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("path/to/file2.json".to_string(), Bytes::new())
+            .enqueue("path/to/file2.json".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -754,10 +748,9 @@ mod tests {
         let producer = QueueProducer::with_object_store(
             TEST_MANIFEST_PATH.to_string(),
             store.clone(),
-            Arc::new(SystemClock),
         );
         producer
-            .enqueue("new/file.json".to_string(), Bytes::new())
+            .enqueue("new/file.json".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -801,19 +794,18 @@ mod tests {
         let producer = QueueProducer::with_object_store(
             TEST_MANIFEST_PATH.to_string(),
             store.clone(),
-            Arc::new(SystemClock),
         );
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new())
+            .enqueue("a.json".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("b.json".to_string(), Bytes::new())
+            .enqueue("b.json".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("c.json".to_string(), Bytes::new())
+            .enqueue("c.json".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -835,11 +827,10 @@ mod tests {
         let producer = QueueProducer::with_object_store(
             TEST_MANIFEST_PATH.to_string(),
             store.clone(),
-            Arc::new(SystemClock),
         );
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new())
+            .enqueue("a.json".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -949,15 +940,14 @@ mod tests {
         let producer = QueueProducer::with_object_store(
             TEST_MANIFEST_PATH.to_string(),
             store.clone(),
-            Arc::new(SystemClock),
         );
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new())
+            .enqueue("a.json".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("b.json".to_string(), Bytes::new())
+            .enqueue("b.json".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -978,19 +968,18 @@ mod tests {
         let producer = QueueProducer::with_object_store(
             TEST_MANIFEST_PATH.to_string(),
             store.clone(),
-            Arc::new(SystemClock),
         );
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new())
+            .enqueue("a.json".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("b.json".to_string(), Bytes::new())
+            .enqueue("b.json".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("c.json".to_string(), Bytes::new())
+            .enqueue("c.json".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -1016,15 +1005,14 @@ mod tests {
         let producer = QueueProducer::with_object_store(
             TEST_MANIFEST_PATH.to_string(),
             store.clone(),
-            Arc::new(SystemClock),
         );
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new())
+            .enqueue("a.json".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("b.json".to_string(), Bytes::new())
+            .enqueue("b.json".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -1038,7 +1026,7 @@ mod tests {
         consumer.dequeue(1).await.unwrap();
 
         producer
-            .enqueue("c.json".to_string(), Bytes::new())
+            .enqueue("c.json".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
