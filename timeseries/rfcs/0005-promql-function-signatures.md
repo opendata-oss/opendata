@@ -60,6 +60,18 @@ Without generalization, PromQL support growth becomes brittle and repetitive.
 
 ## Design
 
+### Decisions
+
+- Use parser metadata on `Call.func` (`arg_types`, `return_type`, `variadic`,
+  `experimental`) as the signature source of truth.
+- Use one runtime-dispatched `PromQLFunction` interface at the function
+  boundary.
+- Keep a thin evaluator runtime signature guard for non-parser AST entry paths
+  (for example manually constructed calls in tests/internal paths).
+- Keep scalar-return boundary semantics as `ExprResult::Scalar`.
+- Preserve explicit special handling for series/label-oriented functions
+  (`label_replace`, `label_join`, and `info` when supported).
+
 ### Current State
 
 Function handling currently uses function traits that accept a single argument
@@ -117,34 +129,25 @@ References:
 - Prometheus function docs (default/variadic argument behavior):
   <https://prometheus.io/docs/prometheus/latest/querying/functions>
 
-### Alignment with Rust `promql-parser` (0.6.x)
+### Alignment with Rust `promql-parser` (0.8.x)
 
-The parser used in this crate (`promql-parser = "0.6"`) is mostly aligned with
-Prometheus at signature/type-check level, with two key representation
-differences:
+The parser used in this crate (`promql-parser = "0.8"`) now carries
+Prometheus-style function signature metadata directly on `Call.func`:
 
-- Rust parser `Function` exposes `name`, `arg_types`, `variadic: bool`,
-  `return_type` (no integer variadic count field).
-- Rust parser `Function` does not expose Prometheus `Experimental` metadata.
+- `Function` exposes `name`, `arg_types`, `variadic: i32`, `return_type`, and
+  `experimental`.
 - Arity/type-checking is implemented in parser AST validation.
-- Non-variadic functions require exact arity.
-- Variadic functions allow at least `len(arg_types) - 1`.
-- For `label_join`, `sort_by_label`, and `sort_by_label_desc`, max arity is
-  unbounded.
+- Variadic cardinality follows Prometheus semantics:
+  `0` exact, `>0` bounded optional, `<0` unbounded.
 - Type-checking for variadic overflow reuses the final declared arg type.
 
 Implication for this RFC:
 
-- AST metadata on `Call.func` is reliable for baseline type expectations.
-- Rust parser `variadic: bool` is not rich enough to represent Prometheus
-  `Variadic int` semantics exactly.
-- Rust parser metadata cannot carry Prometheus `Experimental` function state.
-- Evaluator must not encode arity behavior through scattered function-name
-  exceptions.
-- Use parser metadata as the runtime signature source, and defer
-  Prometheus-exact variadic cardinality and experimental metadata parity to an
-  upstream `promql-parser` contribution.
-  Tracking issue: <https://github.com/GreptimeTeam/promql-parser/issues/129>.
+- `Call.func` metadata is the runtime signature source for both type
+  expectations and arity semantics.
+- Evaluator arity checks should align directly to parser cardinality semantics
+  (no function-name exceptions needed for arity bounds).
+- `experimental` metadata is available for registry policy decisions.
 
 ### Proposed Function Argument Model
 
@@ -196,7 +199,8 @@ Parser metadata on `Call.func` is the runtime signature source:
 
 - `arg_types`: argument type expectations.
 - `return_type`: return-type expectations.
-- `variadic`: current parser-supported variadic/arity behavior.
+- `variadic`: Prometheus-style variadic cardinality (`0`, `>0`, `<0`).
+- `experimental`: function experimental status.
 
 Evaluator still performs runtime validation as a safety layer, because tests and
 internal AST construction paths can bypass normal parser entry points.
@@ -205,17 +209,16 @@ internal AST construction paths can bypass normal parser entry points.
 
 Use parser-supported semantics:
 
-- Non-variadic: exact arity.
-- Variadic: minimum arity is `len(arg_types) - 1`.
-- Current implementation scope keeps variadic maximum arity bounded to
-  `len(arg_types)` in evaluator validation.
-- Unbounded variadic tails (for example `label_join(...src_labels)`) are
-  deferred until string-argument function support lands.
+- `variadic == 0`: exact arity `len(arg_types)`.
+- `variadic > 0`: minimum arity `len(arg_types) - 1`; maximum arity is
+  `min + variadic`.
+- `variadic < 0`: minimum arity `len(arg_types) - 1`; maximum arity unbounded.
 - Variadic overflow type-check uses the final declared arg type.
 - Default argument materialization remains inside function implementations,
   matching Prometheus behavior.
-- Prometheus-exact `Variadic int` and `Experimental` metadata parity is deferred
-  to upstream `promql-parser` improvements.
+- Support for unbounded variadic string-tail behavior (for example full
+  `label_join(...src_labels)` handling) still depends on string-argument
+  function implementation in this engine.
 
 ### Evaluator Responsibilities
 
@@ -240,33 +243,15 @@ pub(crate) struct FunctionRegistry {
 }
 ```
 
-### Initial Function Rollout (Post-Refactor)
-
-After core refactor lands, implement high-impact functions in this order:
-
-1. `round(v, to_nearest=1)` (fix optional scalar arg support)
-2. `clamp`, `clamp_min`, `clamp_max`
-3. `time()`, `pi()` scalar returns
-4. `scalar(v)` returning scalar `ExprResult`
-5. `label_replace`, `label_join` (string and variadic strings)
-
 ### Testing Strategy
 
-Add and/or update tests in:
-
-- `timeseries/src/promql/evaluator.rs`
-- `timeseries/src/promql/functions.rs`
-- `timeseries/src/promql/promqltest/testdata/functions.test`
-- `timeseries/src/promql/promqltest/testdata/aggregators.test`
-
-Test categories:
+Coverage should include:
 
 - Arity validation (exact, optional, variadic, zero-arg)
 - Type validation (scalar/vector/matrix/string mismatch paths)
 - Scalar-return behavior through query and range-query pipelines
-- Multi-arg function correctness against Prometheus behavior
-- String-argument functions (`label_replace`, `label_join`) using raw AST args
-  and evaluated-value slots
+- Multi-argument function correctness against Prometheus behavior
+- String-argument functions using raw AST args and evaluated-value slots
 
 ## Alternatives Considered
 
@@ -292,10 +277,8 @@ directly.
 
 - Should optional/defaulted arguments be materialized in evaluator before
   dispatch, or inside function handlers?
-- Once `promql-parser` exposes experimental metadata, should experimental
-  functions be feature-gated in the function registry?
-- Do we want to support all string-argument functions in one phase, or stage
-  `label_replace` before `label_join`?
+- Should experimental functions be feature-gated in the function registry?
+- Should string-argument functions be delivered in one step or staged?
 
 ## Updates
 
@@ -307,3 +290,5 @@ directly.
 | 2026-03-05 | Refocused design sections on target architecture and removed rollout sequencing details from core RFC sections. |
 | 2026-03-05 | Simplified target argument model to reuse `ExprResult` for evaluated args (no duplicate `FunctionArgValue` enum), with `raw_args` plus `None` slots for string literals. |
 | 2026-03-05 | Clarified current variadic scope: bounded optional-arity support is in scope; unbounded variadic tails (for example `label_join` extra labels) are deferred. |
+| 2026-03-06 | Updated alignment for `promql-parser` `v0.8.x` (`variadic: i32`, `experimental: bool`) and switched RFC variadic semantics to Prometheus-style cardinality. |
+| 2026-03-06 | Added explicit architecture decisions section and reduced implementation-detail sections to keep RFC scope high-level. |
