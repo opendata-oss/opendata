@@ -16,7 +16,6 @@ use common::clock::{Clock, SystemClock};
 use common::coordinator::{Durability, EpochWatcher, EpochWatermarks};
 use common::storage::factory::create_storage;
 use common::{StorageRuntime, StorageSemantics};
-use tokio::sync::Notify;
 use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -106,9 +105,7 @@ pub struct LogDb {
     epoch_watcher: EpochWatcher,
     read_subscriber_task: JoinHandle<()>,
     read_durable: bool,
-    required_visible_durable_seq: AtomicU64,
-    visible_durable_seq: Arc<AtomicU64>,
-    visible_durable_notify: Arc<Notify>,
+    required_visible_durable_epoch: AtomicU64,
 }
 
 impl LogDb {
@@ -287,23 +284,25 @@ impl LogDb {
     /// This method ensures that all acknowledged writes are durably persisted
     /// to storage.
     pub async fn flush(&self) -> Result<()> {
-        self.handle.flush().await?;
+        let durable_epoch = self.handle.flush().await?;
         if self.read_durable {
-            let durable_seq = *self.storage.subscribe_durable().borrow();
-            self.required_visible_durable_seq
-                .fetch_max(durable_seq, Ordering::Relaxed);
+            self.required_visible_durable_epoch
+                .fetch_max(durable_epoch, Ordering::Relaxed);
         }
         Ok(())
     }
 
-    /// Waits for the read view to reflect all writes up to the current epoch.
-    ///
-    /// In `read_durable` mode this is a no-op: the durable subscriber only
-    /// advances the read view after data is confirmed durable, so reads
-    /// already gate on durable state and need no additional synchronization.
+    /// Waits for the read view to reflect all writes up to the current
+    /// visibility requirement.
     async fn sync_to_written(&self) -> Result<()> {
         if self.read_durable {
-            return self.wait_for_required_visible_durable().await;
+            let target = self.required_visible_durable_epoch.load(Ordering::Relaxed);
+            self.epoch_watcher
+                .clone()
+                .wait(target, Durability::Durable)
+                .await
+                .map_err(|_| Error::Internal("writer shut down".into()))?;
+            return Ok(());
         }
         let target = self.handle.flushed_epoch();
         self.epoch_watcher
@@ -312,27 +311,6 @@ impl LogDb {
             .await
             .map_err(|_| Error::Internal("writer shut down".into()))?;
         Ok(())
-    }
-
-    /// In read-durable mode, waits until the read view has advanced to at
-    /// least the required durable sequence (set by flush barriers).
-    async fn wait_for_required_visible_durable(&self) -> Result<()> {
-        loop {
-            let required = self.required_visible_durable_seq.load(Ordering::Relaxed);
-            let visible = self.visible_durable_seq.load(Ordering::Relaxed);
-            if visible >= required {
-                return Ok(());
-            }
-            if self.read_subscriber_task.is_finished() {
-                return Err(Error::Internal("durable subscriber shut down".into()));
-            }
-            let notified = self.visible_durable_notify.notified();
-            let visible = self.visible_durable_seq.load(Ordering::Relaxed);
-            if visible >= required {
-                return Ok(());
-            }
-            notified.await;
-        }
     }
 
     /// Closes the log, flushing any pending data and releasing resources.
@@ -396,9 +374,6 @@ impl LogDb {
 
         let written_rx = handle.written_rx();
         let writer_task = handle.spawn(writer);
-        let initial_durable_seq = *storage.subscribe_durable().borrow();
-        let visible_durable_seq = Arc::new(AtomicU64::new(initial_durable_seq));
-        let visible_durable_notify = Arc::new(Notify::new());
 
         let initial_segment_id = segment_cache.latest().map(|s| s.id());
         let read_view = Arc::new(RwLock::new(LogReadView::new(
@@ -412,8 +387,6 @@ impl LogDb {
                 Arc::clone(&read_view),
                 &storage,
                 initial_segment_id,
-                Arc::clone(&visible_durable_seq),
-                Arc::clone(&visible_durable_notify),
             )
         } else {
             spawn_written_subscriber(written_rx, Arc::clone(&read_view), initial_segment_id)
@@ -428,9 +401,7 @@ impl LogDb {
             epoch_watcher,
             read_subscriber_task,
             read_durable,
-            required_visible_durable_seq: AtomicU64::new(0),
-            visible_durable_seq,
-            visible_durable_notify,
+            required_visible_durable_epoch: AtomicU64::new(0),
         })
     }
 }
@@ -551,7 +522,7 @@ async fn try_advance_read_view(
     known_segment_id: &mut Option<SegmentId>,
     durability: Durability,
     through_seq: u64,
-) -> Option<u64> {
+) {
     if let Some(advanced) = tracker.advance(through_seq) {
         let mut rv = read_view.write().await;
         rv.update_snapshot(advanced.snapshot as Arc<dyn common::StorageRead>);
@@ -572,9 +543,7 @@ async fn try_advance_read_view(
             Durability::Written => watermarks.update_written(advanced.epoch),
             Durability::Durable | Durability::Applied => watermarks.update_durable(advanced.epoch),
         }
-        return Some(advanced.seqnum);
     }
-    None
 }
 
 fn spawn_written_subscriber(
@@ -622,8 +591,6 @@ fn spawn_durable_subscriber(
     read_view: Arc<RwLock<LogReadView>>,
     storage: &Arc<dyn common::Storage>,
     initial_segment_id: Option<SegmentId>,
-    visible_durable_seq: Arc<AtomicU64>,
-    visible_durable_notify: Arc<Notify>,
 ) -> (EpochWatcher, JoinHandle<()>) {
     let (watermarks, watcher) = EpochWatermarks::new();
     let mut durable_rx = storage.subscribe_durable();
@@ -656,11 +623,7 @@ fn spawn_durable_subscriber(
                         &mut tracker, &read_view, &watermarks, &mut known_segment_id,
                         Durability::Durable, last_durable_seq,
                     )
-                    .await
-                    .inspect(|seq| {
-                        visible_durable_seq.store(*seq, Ordering::Relaxed);
-                        visible_durable_notify.notify_waiters();
-                    });
+                    .await;
                 }
                 result = durable_rx.changed() => {
                     if result.is_err() {
@@ -671,11 +634,7 @@ fn spawn_durable_subscriber(
                         &mut tracker, &read_view, &watermarks, &mut known_segment_id,
                         Durability::Durable, last_durable_seq,
                     )
-                    .await
-                    .inspect(|seq| {
-                        visible_durable_seq.store(*seq, Ordering::Relaxed);
-                        visible_durable_notify.notify_waiters();
-                    });
+                    .await;
                 }
             }
         }

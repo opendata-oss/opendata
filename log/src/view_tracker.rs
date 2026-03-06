@@ -21,7 +21,6 @@ pub(crate) struct PendingEntry {
 
 /// The latest entry applied while advancing a watermark.
 pub(crate) struct AdvanceResult {
-    pub seqnum: u64,
     pub epoch: u64,
     pub snapshot: Arc<dyn StorageSnapshot>,
     pub last_segment_id: Option<SegmentId>,
@@ -62,7 +61,6 @@ impl ViewTracker {
         {
             let entry = self.pending.pop_front().unwrap();
             last = Some(AdvanceResult {
-                seqnum: entry.seqnum,
                 epoch: entry.epoch,
                 snapshot: entry.snapshot,
                 last_segment_id: entry.last_segment_id,
@@ -99,7 +97,6 @@ mod tests {
         let result = tracker.advance(1);
         assert!(result.is_some());
         let result = result.unwrap();
-        assert_eq!(result.seqnum, 1);
         assert_eq!(result.epoch, 10);
         assert_eq!(result.last_segment_id, Some(7));
     }
@@ -148,7 +145,6 @@ mod tests {
         let result = tracker.advance(3);
         assert!(result.is_some());
         let result = result.unwrap();
-        assert_eq!(result.seqnum, 3);
         assert_eq!(result.epoch, 2); // last drained entry had epoch 2
         assert_eq!(result.last_segment_id, Some(1));
         assert_eq!(tracker.pending.len(), 1); // seqnum=5 still pending

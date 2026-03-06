@@ -65,7 +65,7 @@ pub(crate) enum WriterCommand {
         result_tx: oneshot::Sender<Result<(), String>>,
     },
     Flush {
-        result_tx: oneshot::Sender<Result<(), String>>,
+        result_tx: oneshot::Sender<Result<u64, String>>,
     },
 }
 
@@ -249,10 +249,10 @@ impl LogWriter {
     }
 
     /// Flushes all pending writes to durable storage.
-    async fn handle_flush(&mut self) -> Result<(), String> {
+    async fn handle_flush(&mut self) -> Result<u64, String> {
         self.storage.flush().await.map_err(|e| e.to_string())?;
         self.watermarks.update_durable(self.epoch);
-        Ok(())
+        Ok(self.epoch)
     }
 
     /// Builds log entry storage records from user records and appends them.
@@ -299,9 +299,19 @@ impl LogWriteHandle {
     }
 
     /// Receives a unit result from the writer task.
+    #[cfg(test)]
     async fn recv_cmd(
         rx: oneshot::Receiver<Result<(), String>>,
     ) -> Result<(), crate::error::Error> {
+        rx.await
+            .map_err(|_| crate::error::Error::Internal("writer shut down".into()))?
+            .map_err(crate::error::Error::Storage)
+    }
+
+    /// Receives an epoch result from the writer task.
+    async fn recv_epoch(
+        rx: oneshot::Receiver<Result<u64, String>>,
+    ) -> Result<u64, crate::error::Error> {
         rx.await
             .map_err(|_| crate::error::Error::Internal("writer shut down".into()))?
             .map_err(crate::error::Error::Storage)
@@ -366,13 +376,13 @@ impl LogWriteHandle {
     }
 
     /// Flush all pending writes to durable storage.
-    pub(crate) async fn flush(&self) -> Result<(), crate::error::Error> {
+    pub(crate) async fn flush(&self) -> Result<u64, crate::error::Error> {
         let (result_tx, result_rx) = oneshot::channel();
         self.cmd_tx
             .send(WriterCommand::Flush { result_tx })
             .await
             .map_err(|_| crate::error::Error::Internal("writer shut down".into()))?;
-        Self::recv_cmd(result_rx).await
+        Self::recv_epoch(result_rx).await
     }
 
     /// The highest epoch flushed to storage (but not necessarily durable).
