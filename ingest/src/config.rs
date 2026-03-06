@@ -4,7 +4,6 @@ use common::StorageConfig;
 use serde::{Deserialize, Serialize};
 use serde_with::{DurationMilliSeconds, serde_as};
 
-
 /// Configuration for an [`Ingestor`](crate::Ingestor).
 ///
 /// Controls where data batches and the queue manifest are stored, how often
@@ -66,4 +65,3 @@ fn default_flush_size_bytes() -> usize {
 fn default_max_unflushed_bytes() -> usize {
     usize::MAX
 }
-

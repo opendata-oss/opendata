@@ -507,10 +507,7 @@ pub struct QueueProducer {
 
 impl QueueProducer {
     /// Create a new producer backed by the given [`ObjectStore`].
-    pub fn with_object_store(
-        manifest_path: String,
-        object_store: Arc<dyn ObjectStore>,
-    ) -> Self {
+    pub fn with_object_store(manifest_path: String, object_store: Arc<dyn ObjectStore>) -> Self {
         Self {
             manifest_store: ManifestStore {
                 object_store,
@@ -710,10 +707,8 @@ mod tests {
     #[tokio::test]
     async fn should_enqueue_locations_to_manifest() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
             .enqueue("path/to/file1.json".to_string(), Bytes::new(), 0)
@@ -745,10 +740,8 @@ mod tests {
             .await
             .unwrap();
 
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         producer
             .enqueue("new/file.json".to_string(), Bytes::new(), 0)
             .await
@@ -791,10 +784,8 @@ mod tests {
     #[tokio::test]
     async fn should_read_entry_by_sequence() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
             .enqueue("a.json".to_string(), Bytes::new(), 0)
@@ -824,10 +815,8 @@ mod tests {
     #[tokio::test]
     async fn should_read_none_for_missing_sequence() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
             .enqueue("a.json".to_string(), Bytes::new(), 0)
@@ -937,10 +926,8 @@ mod tests {
     #[tokio::test]
     async fn should_peek_first_entry_with_valid_epoch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
             .enqueue("a.json".to_string(), Bytes::new(), 0)
@@ -965,10 +952,8 @@ mod tests {
     #[tokio::test]
     async fn should_dequeue_entries_with_valid_epoch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
             .enqueue("a.json".to_string(), Bytes::new(), 0)
@@ -1002,10 +987,8 @@ mod tests {
     #[tokio::test]
     async fn should_enqueue_after_consumer_dequeue() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
             .enqueue("a.json".to_string(), Bytes::new(), 0)
