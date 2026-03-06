@@ -164,7 +164,9 @@ impl BatchWriter {
         }
         let flushed_bytes = self.batch.size_bytes;
         let (entries, metadata, ingestion_time_ms, notifiers) = self.batch.take();
-        let result = self.write_and_enqueue(entries, metadata, ingestion_time_ms).await;
+        let result = self
+            .write_and_enqueue(entries, metadata, ingestion_time_ms)
+            .await;
         self.pending_bytes
             .fetch_sub(flushed_bytes, Ordering::Release);
 
@@ -175,7 +177,12 @@ impl BatchWriter {
         result
     }
 
-    async fn write_and_enqueue(&self, entries: Vec<Bytes>, metadata: Bytes, ingestion_time_ms: i64) -> Result<()> {
+    async fn write_and_enqueue(
+        &self,
+        entries: Vec<Bytes>,
+        metadata: Bytes,
+        ingestion_time_ms: i64,
+    ) -> Result<()> {
         let location = if entries.is_empty() {
             String::new()
         } else {
@@ -201,8 +208,19 @@ impl BatchWriter {
 
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                IngestMessage::Write { entries, metadata, ingestion_time_ms, notifier } => {
-                    self.batch.add(entries, metadata, ingestion_time_ms, notifier, self.clock.now());
+                IngestMessage::Write {
+                    entries,
+                    metadata,
+                    ingestion_time_ms,
+                    notifier,
+                } => {
+                    self.batch.add(
+                        entries,
+                        metadata,
+                        ingestion_time_ms,
+                        notifier,
+                        self.clock.now(),
+                    );
                 }
                 IngestMessage::Flush { done } => {
                     flush_responders.push(done);
@@ -231,9 +249,7 @@ pub struct Ingestor {
 impl Ingestor {
     pub fn new(config: IngestorConfig, clock: Arc<dyn Clock>) -> Result<Self> {
         let object_store_config = match &config.storage {
-            common::StorageConfig::InMemory => {
-                common::storage::config::ObjectStoreConfig::InMemory
-            }
+            common::StorageConfig::InMemory => common::storage::config::ObjectStoreConfig::InMemory,
             common::StorageConfig::SlateDb(c) => c.object_store.clone(),
         };
         let object_store = common::storage::factory::create_object_store(&object_store_config)
@@ -246,10 +262,8 @@ impl Ingestor {
         object_store: Arc<dyn ObjectStore>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
-        let producer = QueueProducer::with_object_store(
-            config.manifest_path.clone(),
-            object_store.clone(),
-        );
+        let producer =
+            QueueProducer::with_object_store(config.manifest_path.clone(), object_store.clone());
         let (tx, rx) = mpsc::unbounded_channel();
         let shutdown = CancellationToken::new();
         let producer = Arc::new(producer);
@@ -339,11 +353,11 @@ mod tests {
     use crate::model::decode_batch;
     use crate::queue::{Manifest, QueueEntry};
     use bytes::Bytes;
-    use std::time::UNIX_EPOCH;
-    use common::clock::{MockClock, SystemClock};
     use common::StorageConfig;
+    use common::clock::{MockClock, SystemClock};
     use slatedb::object_store::ObjectStore;
     use slatedb::object_store::memory::InMemory;
+    use std::time::UNIX_EPOCH;
 
     async fn read_manifest_entries(store: &Arc<dyn ObjectStore>, path: &str) -> Vec<QueueEntry> {
         let path = slatedb::object_store::path::Path::from(path);
@@ -370,8 +384,14 @@ mod tests {
             Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        ingestor.ingest(vec![Bytes::from("data1")], Bytes::new()).await.unwrap();
-        ingestor.ingest(vec![Bytes::from("data2")], Bytes::new()).await.unwrap();
+        ingestor
+            .ingest(vec![Bytes::from("data1")], Bytes::new())
+            .await
+            .unwrap();
+        ingestor
+            .ingest(vec![Bytes::from("data2")], Bytes::new())
+            .await
+            .unwrap();
         ingestor.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
@@ -433,7 +453,10 @@ mod tests {
         let ingestor =
             Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
 
-        let mut watcher = ingestor.ingest(vec![Bytes::from("v1")], Bytes::new()).await.unwrap();
+        let mut watcher = ingestor
+            .ingest(vec![Bytes::from("v1")], Bytes::new())
+            .await
+            .unwrap();
 
         assert!(watcher.result().is_none());
         let manifest_path = slatedb::object_store::path::Path::from("test/manifest");
@@ -452,7 +475,10 @@ mod tests {
             Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        let watcher = ingestor.ingest(vec![Bytes::from("v")], Bytes::new()).await.unwrap();
+        let watcher = ingestor
+            .ingest(vec![Bytes::from("v")], Bytes::new())
+            .await
+            .unwrap();
 
         assert!(watcher.result().is_none());
 
@@ -474,8 +500,14 @@ mod tests {
             Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        let watcher1 = ingestor.ingest(vec![Bytes::from("data1")], Bytes::new()).await.unwrap();
-        let watcher2 = ingestor.ingest(vec![Bytes::from("data2")], Bytes::new()).await.unwrap();
+        let watcher1 = ingestor
+            .ingest(vec![Bytes::from("data1")], Bytes::new())
+            .await
+            .unwrap();
+        let watcher2 = ingestor
+            .ingest(vec![Bytes::from("data2")], Bytes::new())
+            .await
+            .unwrap();
 
         ingestor.flush().await.unwrap();
 
@@ -554,8 +586,7 @@ mod tests {
         let fixed_time = UNIX_EPOCH + Duration::from_millis(1_700_000_000_000);
         let clock = Arc::new(MockClock::with_time(fixed_time));
 
-        let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), clock).unwrap();
+        let ingestor = Ingestor::with_object_store(test_config(), store.clone(), clock).unwrap();
 
         let metadata = Bytes::from(r#"{"topic":"events"}"#);
         ingestor
