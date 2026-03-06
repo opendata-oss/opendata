@@ -9,6 +9,10 @@
 
 #define OPENDATA_LOG_STORAGE_SLATEDB 1
 
+#define OPENDATA_LOG_READ_VISIBILITY_MEMORY 0
+
+#define OPENDATA_LOG_READ_VISIBILITY_REMOTE 1
+
 #define OPENDATA_LOG_BOUND_UNBOUNDED 0
 
 #define OPENDATA_LOG_BOUND_INCLUDED 1
@@ -49,9 +53,11 @@ typedef struct opendata_log_config_t {
   const char *settings_path;
   int64_t seal_interval_ms;
   /**
-   * When true, reads only see data confirmed durable by the storage engine.
+   * Controls which data is visible to reads.
+   * Use `OPENDATA_LOG_READ_VISIBILITY_MEMORY` (default) to include in-memory data,
+   * or `OPENDATA_LOG_READ_VISIBILITY_REMOTE` to only see data confirmed durable.
    */
-  bool read_durable;
+  uint8_t read_visibility;
 } opendata_log_config_t;
 
 typedef struct opendata_log_seq_bound_t {

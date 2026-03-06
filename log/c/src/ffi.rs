@@ -56,6 +56,9 @@ pub struct opendata_log_result_t {
 pub const OPENDATA_LOG_STORAGE_IN_MEMORY: u8 = 0;
 pub const OPENDATA_LOG_STORAGE_SLATEDB: u8 = 1;
 
+pub const OPENDATA_LOG_READ_VISIBILITY_MEMORY: u8 = 0;
+pub const OPENDATA_LOG_READ_VISIBILITY_REMOTE: u8 = 1;
+
 #[repr(C)]
 pub struct opendata_log_config_t {
     pub storage_type: u8,
@@ -63,8 +66,10 @@ pub struct opendata_log_config_t {
     pub object_store: *const opendata_log_object_store_t,
     pub settings_path: *const c_char,
     pub seal_interval_ms: i64,
-    /// When true, reads only see data confirmed durable by the storage engine.
-    pub read_durable: bool,
+    /// Controls which data is visible to reads.
+    /// Use `OPENDATA_LOG_READ_VISIBILITY_MEMORY` (default) to include in-memory data,
+    /// or `OPENDATA_LOG_READ_VISIBILITY_REMOTE` to only see data confirmed durable.
+    pub read_visibility: u8,
 }
 
 #[repr(C)]
@@ -295,10 +300,15 @@ pub(crate) unsafe fn build_config(
     Ok(Config {
         storage,
         segmentation: SegmentConfig { seal_interval },
-        read_visibility: if config.read_durable {
-            ReadVisibility::Remote
-        } else {
-            ReadVisibility::Memory
+        read_visibility: match config.read_visibility {
+            OPENDATA_LOG_READ_VISIBILITY_REMOTE => ReadVisibility::Remote,
+            OPENDATA_LOG_READ_VISIBILITY_MEMORY => ReadVisibility::Memory,
+            other => {
+                return Err(error_result(
+                    opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,
+                    &format!("invalid read_visibility: {other}"),
+                ));
+            }
         },
     })
 }
