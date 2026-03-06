@@ -2515,7 +2515,7 @@ dependencies = [
  "bytes",
  "opendata-common",
  "serde",
- "serde_json",
+ "serde_with",
  "slatedb",
  "tokio",
  "tokio-util",

@@ -2,11 +2,14 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::error::{Error, Result};
 
+const ENTRY_LEN_SIZE: usize = 4;
 const FORMAT_VERSION: u16 = 1;
-const FOOTER_SIZE: usize = 6; // record_count(4) + version(2)
+const ENTRIES_COUNT_SIZE: usize = 4;
+const VERSION_SIZE: usize = 2;
+const FOOTER_SIZE: usize = ENTRIES_COUNT_SIZE + VERSION_SIZE;
 
 pub(crate) fn encode_batch(entries: &[Bytes]) -> Bytes {
-    let data_size: usize = entries.iter().map(|e| 4 + e.len()).sum();
+    let data_size: usize = entries.iter().map(|e| ENTRY_LEN_SIZE + e.len()).sum();
     let mut buf = BytesMut::with_capacity(data_size + FOOTER_SIZE);
 
     for entry in entries {
@@ -43,7 +46,7 @@ pub(crate) fn decode_batch(mut data: Bytes) -> Result<Vec<Bytes>> {
 
     let mut entries = Vec::with_capacity(record_count);
     for _ in 0..record_count {
-        if data.remaining() < 4 {
+        if data.remaining() < ENTRY_LEN_SIZE {
             return Err(Error::Serialization("truncated record length".to_string()));
         }
         let len = data.get_u32_le() as usize;
@@ -93,8 +96,7 @@ mod tests {
     fn should_reject_truncated_data() {
         let entries = vec![Bytes::from("hello")];
         let mut encoded = BytesMut::from(encode_batch(&entries).as_ref());
-        encoded.truncate(encoded.len() - FOOTER_SIZE - 1); // chop record data
-        // re-append a valid footer
+        encoded.truncate(encoded.len() - FOOTER_SIZE - 1);
         encoded.put_u32_le(1);
         encoded.put_u16_le(FORMAT_VERSION);
         let result = decode_batch(encoded.freeze());
@@ -104,8 +106,8 @@ mod tests {
     #[test]
     fn should_reject_unsupported_version() {
         let mut buf = BytesMut::new();
-        buf.put_u32_le(0); // record_count
-        buf.put_u16_le(99); // bad version
+        buf.put_u32_le(0);
+        buf.put_u16_le(99);
         let result = decode_batch(buf.freeze());
         assert!(result.is_err());
     }
