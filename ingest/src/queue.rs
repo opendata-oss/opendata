@@ -680,7 +680,7 @@ impl QueueConsumer {
 
     /// Return the first entry in the queue without dequeueing it.
     /// Returns `Fenced` if the consumer's epoch does not match the manifest's epoch.
-    async fn peek(&self) -> Result<Option<QueueEntry>> {
+    pub(crate) async fn peek(&self) -> Result<Option<QueueEntry>> {
         let (manifest, _) = self.read_manifest().await?;
         if manifest.epoch != self.epoch.load(Ordering::Relaxed) {
             return Err(Error::Fenced);
@@ -690,7 +690,7 @@ impl QueueConsumer {
 
     /// Return the entry with the given sequence number, or None if not found.
     /// Returns `Fenced` if the consumer's epoch does not match the manifest's epoch.
-    async fn read(&self, sequence: u64) -> Result<Option<QueueEntry>> {
+    pub(crate) async fn read(&self, sequence: u64) -> Result<Option<QueueEntry>> {
         let (manifest, _) = self.read_manifest().await?;
         if manifest.epoch != self.epoch.load(Ordering::Relaxed) {
             return Err(Error::Fenced);
@@ -703,7 +703,7 @@ impl QueueConsumer {
 
     /// Remove all entries with sequence <= `through_sequence`, returning the removed entries.
     /// Returns `Fenced` if the consumer's epoch does not match the manifest's epoch.
-    async fn dequeue(&self, through_sequence: u64) -> Result<Vec<QueueEntry>> {
+    pub(crate) async fn dequeue(&self, through_sequence: u64) -> Result<Vec<QueueEntry>> {
         loop {
             let (mut manifest, version) = self.read_manifest().await?;
             if manifest.epoch != self.epoch.load(Ordering::Relaxed) {

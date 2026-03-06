@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use common::StorageConfig;
-use common::storage::config::ObjectStoreConfig;
 use serde::{Deserialize, Serialize};
 use serde_with::{DurationMilliSeconds, serde_as};
 
@@ -48,15 +47,19 @@ pub struct IngestorConfig {
     pub max_buffered_inputs: usize,
 }
 
+/// Configuration for a [`Collector`](crate::Collector).
+///
+/// Controls where the queue manifest and data batches are read from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectorConfig {
-    pub object_store_config: ObjectStoreConfig,
+    /// Determines where and how ingest data is read. See [`StorageConfig`].
+    pub storage: StorageConfig,
+
+    /// Path to the queue manifest in object storage.
+    ///
+    /// Defaults to `"ingest/manifest"`.
     #[serde(default = "default_manifest_path")]
     pub manifest_path: String,
-    #[serde(default = "default_heartbeat_timeout", with = "duration_millis")]
-    pub heartbeat_timeout: Duration,
-    #[serde(default = "default_done_cleanup_threshold")]
-    pub done_cleanup_threshold: usize,
 }
 
 fn default_data_path_prefix() -> String {
@@ -77,27 +80,4 @@ fn default_flush_size_bytes() -> usize {
 
 fn default_max_buffered_inputs() -> usize {
     1000
-}
-
-fn default_heartbeat_timeout() -> Duration {
-    Duration::from_secs(30)
-}
-
-fn default_done_cleanup_threshold() -> usize {
-    100
-}
-
-mod duration_millis {
-    use std::time::Duration;
-
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_u64(duration.as_millis() as u64)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
-        let millis = u64::deserialize(deserializer)?;
-        Ok(Duration::from_millis(millis))
-    }
 }
