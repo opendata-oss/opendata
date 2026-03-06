@@ -383,7 +383,12 @@ async fn handle_federate(
 
         let samples = match result {
             QueryValue::Vector(s) => s,
-            _ => continue,
+            _ => {
+                return Err(Error::InvalidInput(format!(
+                    "match[] must be a vector selector, got: {selector}"
+                ))
+                .into());
+            }
         };
 
         for sample in samples {
