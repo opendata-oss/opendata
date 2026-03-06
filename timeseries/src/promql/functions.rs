@@ -219,6 +219,9 @@ impl PromQLFunction for RoundFunction {
         let to_nearest = match args_iter.next() {
             None => 1.0,
             Some(second_arg) => {
+                // Defensive check: evaluator signature validation should already
+                // enforce max arity on query-path calls. Keep this guard for
+                // direct function calls in unit tests and internal call sites.
                 if args_iter.next().is_some() {
                     return Err(EvaluationError::InternalError(
                         "round accepts at most two arguments".to_string(),

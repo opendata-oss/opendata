@@ -1458,9 +1458,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     fn call_arity_bounds(call: &Call) -> (usize, usize) {
         let expected_args_len = call.func.arg_types.len();
         if call.func.variadic {
-            // Phase 1 intentionally keeps variadic arity bounded to parser arg_types length.
-            // Unbounded variadics (for example label_join string tails) are deferred until
-            // string-argument function support lands.
+            // RFC-5 currently scopes variadic arity to parser `arg_types` length.
+            // Unbounded variadics (for example label_join string tails) remain deferred.
             (expected_args_len.saturating_sub(1), expected_args_len)
         } else {
             (expected_args_len, expected_args_len)
@@ -1473,6 +1472,13 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     ) -> EvalResult<promql_parser::parser::value::ValueType> {
         if idx < call.func.arg_types.len() {
             return Ok(call.func.arg_types[idx]);
+        }
+
+        if !call.func.variadic {
+            return Err(EvaluationError::InternalError(format!(
+                "unexpected argument index {} for non-variadic function '{}'",
+                idx, call.func.name
+            )));
         }
 
         call.func.arg_types.last().copied().ok_or_else(|| {
