@@ -297,11 +297,11 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         // A mock storage that can be configured to fail after initialization
-        struct ConfigurableStorage {
+        struct ToggleFailStorage {
             should_fail: AtomicBool,
         }
 
-        impl ConfigurableStorage {
+        impl ToggleFailStorage {
             fn new() -> Self {
                 Self {
                     should_fail: AtomicBool::new(false),
@@ -331,7 +331,7 @@ mod tests {
         }
 
         #[async_trait]
-        impl StorageRead for ConfigurableStorage {
+        impl StorageRead for ToggleFailStorage {
             async fn get(&self, _key: Bytes) -> common::StorageResult<Option<Record>> {
                 self.check_failure()?;
                 Ok(None)
@@ -346,10 +346,10 @@ mod tests {
             }
         }
 
-        impl StorageSnapshot for ConfigurableStorage {}
+        impl StorageSnapshot for ToggleFailStorage {}
 
         #[async_trait]
-        impl Storage for ConfigurableStorage {
+        impl Storage for ToggleFailStorage {
             async fn apply_with_options(
                 &self,
                 _ops: Vec<RecordOp>,
@@ -379,7 +379,7 @@ mod tests {
 
             async fn snapshot(&self) -> common::StorageResult<Arc<dyn StorageSnapshot>> {
                 self.check_failure()?;
-                Ok(Arc::new(ConfigurableStorage::new()))
+                Ok(Arc::new(ToggleFailStorage::new()))
             }
 
             fn subscribe_durable(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -397,7 +397,7 @@ mod tests {
         }
 
         // given - a log backed by configurable storage
-        let storage = Arc::new(ConfigurableStorage::new());
+        let storage = Arc::new(ToggleFailStorage::new());
         let log = Arc::new(LogDb::new(storage.clone()).await.unwrap());
         let metrics = Arc::new(Metrics::new());
         let state = AppState { log, metrics };
