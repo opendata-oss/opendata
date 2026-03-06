@@ -329,11 +329,11 @@ mod tests {
             self.centroids.iter().map(|(id, _)| *id).collect()
         }
 
-        fn add_centroid(&self, _entry: &CentroidEntry) -> anyhow::Result<()> {
+        fn add_centroid(&self, _entry: &CentroidEntry) -> crate::error::Result<()> {
             Ok(())
         }
 
-        fn remove_centroid(&self, _centroid_id: u64) -> anyhow::Result<()> {
+        fn remove_centroid(&self, _centroid_id: u64) -> crate::error::Result<()> {
             Ok(())
         }
 
@@ -666,11 +666,11 @@ mod tests {
                 }
             }
 
-            fn add_centroid(&self, _entry: &CentroidEntry) -> anyhow::Result<()> {
+            fn add_centroid(&self, _entry: &CentroidEntry) -> crate::error::Result<()> {
                 Ok(())
             }
 
-            fn remove_centroid(&self, _centroid_id: u64) -> anyhow::Result<()> {
+            fn remove_centroid(&self, _centroid_id: u64) -> crate::error::Result<()> {
                 Ok(())
             }
 
@@ -848,11 +848,11 @@ mod tests {
                 }
             }
 
-            fn add_centroid(&self, _entry: &CentroidEntry) -> anyhow::Result<()> {
+            fn add_centroid(&self, _entry: &CentroidEntry) -> crate::error::Result<()> {
                 Ok(())
             }
 
-            fn remove_centroid(&self, _centroid_id: u64) -> anyhow::Result<()> {
+            fn remove_centroid(&self, _centroid_id: u64) -> crate::error::Result<()> {
                 Ok(())
             }
 

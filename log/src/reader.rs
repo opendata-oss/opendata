@@ -38,13 +38,12 @@ use common::{StorageRead, StorageReaderRuntime, StorageSemantics};
 ///
 /// # Example
 ///
-/// ```ignore
-/// use log::LogRead;
+/// ```no_run
+/// use log::{LogRead, Result};
 /// use bytes::Bytes;
 ///
-/// async fn process_log(reader: &impl LogRead) -> Result<()> {
-///     // Works with both LogDb and LogDbReader
-///     let mut iter = reader.scan(Bytes::from("orders"), ..);
+/// async fn process_log(reader: &(impl LogRead + Sync)) -> Result<()> {
+///     let mut iter = reader.scan(Bytes::from("orders"), ..).await?;
 ///     while let Some(entry) = iter.next().await? {
 ///         println!("seq={}: {:?}", entry.sequence, entry.value);
 ///     }
@@ -166,7 +165,13 @@ pub trait LogRead {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use log::{LogDb, LogRead, Config};
+    /// # use common::StorageConfig;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+    /// # let log = LogDb::open(config).await?;
     /// // List all keys
     /// let mut iter = log.list_keys(..).await?;
     ///
@@ -175,6 +180,8 @@ pub trait LogRead {
     /// let start = segments.first().map(|s| s.id).unwrap_or(0);
     /// let end = segments.last().map(|s| s.id + 1).unwrap_or(0);
     /// let mut iter = log.list_keys(start..end).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     async fn list_keys(
         &self,
@@ -199,12 +206,20 @@ pub trait LogRead {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use log::{LogDb, LogRead, Config};
+    /// # use common::StorageConfig;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+    /// # let log = LogDb::open(config).await?;
     /// // List all segments
     /// let segments = log.list_segments(..).await?;
     ///
     /// // List segments overlapping a specific range
     /// let segments = log.list_segments(100..200).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     async fn list_segments(
         &self,
@@ -232,9 +247,18 @@ impl LogReadView {
         self.storage = snapshot;
     }
 
-    /// Replaces the segment cache contents with the given segments.
-    pub(crate) fn replace_segments(&mut self, segments: &[LogSegment]) {
-        self.segments.replace_all(segments);
+    /// Incrementally loads new segments from the current storage snapshot.
+    ///
+    /// Only loads segments with ID > `after_segment_id`. This is used by
+    /// subscriber tasks to refresh segments without needing segments propagated
+    /// through the watch channel.
+    pub(crate) async fn refresh_segments(
+        &mut self,
+        after_segment_id: Option<SegmentId>,
+    ) -> crate::error::Result<()> {
+        self.segments
+            .refresh(self.storage.as_ref(), after_segment_id)
+            .await
     }
 
     /// Scans entries for a key within a sequence number range with custom options.
@@ -279,8 +303,15 @@ impl LogReadView {
 ///
 /// A `LogDbReader` is created by calling [`LogDbReader::open`]:
 ///
-/// ```ignore
+/// ```no_run
+/// # use log::{LogDbReader, ReaderConfig};
+/// # use common::StorageConfig;
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = ReaderConfig { storage: StorageConfig::default(), ..Default::default() };
 /// let reader = LogDbReader::open(config).await?;
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// # Thread Safety
@@ -290,17 +321,18 @@ impl LogReadView {
 ///
 /// # Example
 ///
-/// ```ignore
-/// use log::{LogDbReader, LogRead};
+/// ```no_run
+/// use log::{LogDbReader, LogRead, LogEntry};
 /// use bytes::Bytes;
+/// use std::time::Duration;
 ///
-/// async fn consume_events(reader: LogDbReader, key: Bytes) -> Result<()> {
+/// async fn consume_events(reader: LogDbReader, key: Bytes) -> log::Result<()> {
 ///     let mut checkpoint: u64 = 0;
 ///
 ///     loop {
-///         let mut iter = reader.scan(key.clone(), checkpoint..);
+///         let mut iter = reader.scan(key.clone(), checkpoint..).await?;
 ///         while let Some(entry) = iter.next().await? {
-///             process_entry(&entry);
+///             println!("entry: {:?}", entry);
 ///             checkpoint = entry.sequence + 1;
 ///         }
 ///
@@ -338,11 +370,13 @@ impl LogDbReader {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
     /// use log::{LogDbReader, LogRead, ReaderConfig};
     /// use common::StorageConfig;
     /// use bytes::Bytes;
     ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let config = ReaderConfig {
     ///     storage: StorageConfig::default(),
     ///     ..Default::default()
@@ -357,6 +391,8 @@ impl LogDbReader {
     ///
     /// // Gracefully shut down when done
     /// reader.close().await;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn open(config: ReaderConfig) -> Result<Self> {
         let reader_options = slatedb::config::DbReaderOptions {

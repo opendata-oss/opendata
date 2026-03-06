@@ -6,30 +6,18 @@
 
 use std::ops::RangeBounds;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use common::{StorageRuntime, StorageSemantics, create_storage};
 
 use crate::config::Config;
 use crate::error::{QueryError, Result};
-use crate::model::{Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Series};
+use crate::model::{Labels, MetricMetadata, QueryValue, RangeSample, Series};
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
-use crate::tsdb::Tsdb;
-use crate::util::range_bounds_to_system_time;
-
-/// Convert a `RangeBounds<SystemTime>` into `(start_secs, end_secs)`.
-fn range_bounds_to_secs(range: impl RangeBounds<SystemTime>) -> (i64, i64) {
-    let (start, end) = range_bounds_to_system_time(range);
-    (
-        start
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0),
-        end.duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(i64::MAX),
-    )
-}
+use crate::tsdb::{
+    Tsdb, TsdbReadEngine, eval_query_range_bounds, find_label_values_in_range,
+    find_labels_in_range, find_series_in_range,
+};
 
 /// A time series database for storing and querying metrics.
 ///
@@ -39,22 +27,23 @@ fn range_bounds_to_secs(range: impl RangeBounds<SystemTime>) -> (i64, i64) {
 ///
 /// # Example
 ///
-/// ```ignore
-/// use timeseries::{TimeSeriesDb, Config, Series};
+/// ```
+/// # use timeseries::{TimeSeriesDb, Config, Series};
+/// # use common::StorageConfig;
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+/// let ts = TimeSeriesDb::open(config).await?;
 ///
-/// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let ts = TimeSeriesDb::open(Config::default()).await?;
+/// let series = Series::builder("http_requests_total")
+///     .label("method", "GET")
+///     .label("status", "200")
+///     .sample_now(1.0)
+///     .build();
 ///
-///     let series = Series::builder("http_requests_total")
-///         .label("method", "GET")
-///         .label("status", "200")
-///         .sample_now(1.0)
-///         .build();
-///
-///     ts.write(vec![series]).await?;
-///     Ok(())
-/// }
+/// ts.write(vec![series]).await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct TimeSeriesDb {
     // Internal Tsdb - not exposed
@@ -77,10 +66,15 @@ impl TimeSeriesDb {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// use timeseries::{TimeSeriesDb, Config};
-    ///
-    /// let ts = TimeSeriesDb::open(Config::default()).await?;
+    /// ```
+    /// # use timeseries::{TimeSeriesDb, Config};
+    /// # use common::StorageConfig;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+    /// let ts = TimeSeriesDb::open(config).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn open(config: Config) -> Result<Self> {
         let storage = create_storage(
@@ -118,7 +112,13 @@ impl TimeSeriesDb {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use timeseries::{TimeSeriesDb, Config, Series};
+    /// # use common::StorageConfig;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+    /// # let ts = TimeSeriesDb::open(config).await?;
     /// let series = vec![
     ///     Series::builder("cpu_usage")
     ///         .label("host", "server1")
@@ -132,6 +132,8 @@ impl TimeSeriesDb {
     /// ];
     ///
     /// ts.write(series).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn write(&self, series: Vec<Series>) -> Result<()> {
         self.tsdb.ingest_samples(series).await
@@ -148,7 +150,7 @@ impl TimeSeriesDb {
         time: Option<SystemTime>,
     ) -> std::result::Result<QueryValue, QueryError> {
         self.tsdb
-            .eval_query(query, time, &QueryOptions::default())
+            .eval_query(query, time, &crate::model::QueryOptions::default())
             .await
     }
 
@@ -159,9 +161,15 @@ impl TimeSeriesDb {
         range: impl RangeBounds<SystemTime>,
         step: Duration,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-        self.tsdb
-            .eval_query_range(query, range, step, &QueryOptions::default())
-            .await
+        // Route through shared range helpers so bound conversion happens once.
+        eval_query_range_bounds(
+            &self.tsdb,
+            query,
+            range,
+            step,
+            &crate::model::QueryOptions::default(),
+        )
+        .await
     }
 
     /// Returns the set of label-sets matching the given series matchers.
@@ -170,8 +178,7 @@ impl TimeSeriesDb {
         matchers: &[&str],
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<Labels>, QueryError> {
-        let (start, end) = range_bounds_to_secs(range);
-        self.tsdb.find_series(matchers, start, end).await
+        find_series_in_range(&self.tsdb, matchers, range).await
     }
 
     /// Returns the set of label names matching the given matchers.
@@ -180,8 +187,7 @@ impl TimeSeriesDb {
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        let (start, end) = range_bounds_to_secs(range);
-        self.tsdb.find_labels(matchers, start, end).await
+        find_labels_in_range(&self.tsdb, matchers, range).await
     }
 
     /// Returns the set of values for a given label name.
@@ -191,10 +197,7 @@ impl TimeSeriesDb {
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        let (start, end) = range_bounds_to_secs(range);
-        self.tsdb
-            .find_label_values(label_name, matchers, start, end)
-            .await
+        find_label_values_in_range(&self.tsdb, label_name, matchers, range).await
     }
 
     /// Returns metric metadata, optionally filtered to a single metric.
@@ -215,5 +218,75 @@ impl TimeSeriesDb {
     /// Returns an error if the flush fails due to storage issues.
     pub async fn flush(&self) -> Result<()> {
         self.tsdb.flush().await
+    }
+
+    /// Closes the time series database, flushing any pending data and releasing
+    /// resources.
+    ///
+    /// All written data is flushed to durable storage before the database is
+    /// closed. For SlateDB-backed storage, this also releases the database
+    /// fence.
+    pub async fn close(self) -> Result<()> {
+        self.tsdb.close().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Label, Sample, Series};
+    use common::StorageConfig;
+    use common::storage::config::{
+        LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+    };
+
+    #[tokio::test]
+    async fn close_without_explicit_flush_guarantees_durability() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "ts-data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp_dir.path().to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+        });
+
+        // Write a series and close without calling flush()
+        {
+            let tsdb = TimeSeriesDb::open(Config {
+                storage: storage.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+            tsdb.write(vec![Series::new(
+                "cpu_usage",
+                vec![Label::new("host", "server1")],
+                vec![Sample::new(3_900_000, 0.42)],
+            )])
+            .await
+            .unwrap();
+
+            tsdb.close().await.unwrap();
+        }
+
+        // Reopen and verify the series survived
+        let tsdb = TimeSeriesDb::open(Config {
+            storage: storage.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let series = tsdb
+            .series(&["{__name__=\"cpu_usage\"}"], ..)
+            .await
+            .unwrap();
+
+        assert!(
+            !series.is_empty(),
+            "expected series to survive close without explicit flush"
+        );
     }
 }

@@ -159,6 +159,29 @@ pub(crate) fn range_bounds_to_system_time(
     (start, end)
 }
 
+/// Convert a `RangeBounds<SystemTime>` into `(start_secs, end_secs)` as `i64`.
+///
+/// Returns an error if either bound resolves to a time before the Unix epoch.
+/// Unbounded starts resolve to 0, unbounded ends resolve to `i64::MAX`.
+pub(crate) fn range_bounds_to_secs(
+    range: impl RangeBounds<SystemTime>,
+) -> std::result::Result<(i64, i64), crate::error::QueryError> {
+    let (start, end) = range_bounds_to_system_time(range);
+    let start_secs = start
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .map_err(|_| {
+            crate::error::QueryError::InvalidQuery("start time is before Unix epoch".to_string())
+        })?;
+    let end_secs = end
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .map_err(|_| {
+            crate::error::QueryError::InvalidQuery("end time is before Unix epoch".to_string())
+        })?;
+    Ok((start_secs, end_secs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -428,5 +451,40 @@ mod tests {
         assert_eq!(time_bucket_size_hours(3), 4);
         assert_eq!(time_bucket_size_hours(4), 8);
         assert_eq!(time_bucket_size_hours(5), 16);
+    }
+
+    #[test]
+    fn range_bounds_to_secs_rejects_pre_epoch_start() {
+        use super::range_bounds_to_secs;
+        use std::time::UNIX_EPOCH;
+
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(1);
+        let after_epoch = UNIX_EPOCH + Duration::from_secs(100);
+        let result = range_bounds_to_secs(pre_epoch..=after_epoch);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("before Unix epoch"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn range_bounds_to_secs_rejects_pre_epoch_end() {
+        use super::range_bounds_to_secs;
+        use std::time::UNIX_EPOCH;
+
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(1);
+        let result = range_bounds_to_secs(UNIX_EPOCH..=pre_epoch);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("before Unix epoch"),
+            "unexpected error: {}",
+            err
+        );
     }
 }

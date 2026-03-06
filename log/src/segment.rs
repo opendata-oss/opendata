@@ -144,15 +144,6 @@ impl SegmentCache {
         self.segments.insert(segment.meta.start_seq, segment);
     }
 
-    /// Replaces all segments in the cache with the given segments.
-    pub(crate) fn replace_all(&mut self, segments: &[LogSegment]) {
-        self.segments.clear();
-        for segment in segments {
-            self.segments
-                .insert(segment.meta.start_seq, segment.clone());
-        }
-    }
-
     /// Refreshes the cache by loading segments from storage.
     ///
     /// If `after_segment_id` is `Some(id)`, only loads segments with id > `id` and appends them.
@@ -713,5 +704,100 @@ mod tests {
         assert_eq!(meta.start_seq, 42);
         assert_eq!(meta.start_time_ms, 5000);
         assert_eq!(records[0].options, PutOptions { ttl: Ttl::NoExpiry })
+    }
+
+    #[storage_test]
+    async fn refresh_with_none_reloads_all_segments(storage: Arc<dyn Storage>) {
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
+            .await
+            .unwrap();
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+
+        // Start with an empty cache and refresh from storage
+        let mut fresh = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
+            .await
+            .unwrap();
+        // Clear it to simulate a stale cache
+        fresh.segments.clear();
+        assert_eq!(fresh.all().len(), 0);
+
+        fresh.refresh(storage.as_ref(), None).await.unwrap();
+        assert_eq!(fresh.all().len(), 2);
+        assert_eq!(fresh.all()[0].id(), 0);
+        assert_eq!(fresh.all()[1].id(), 1);
+    }
+
+    #[storage_test]
+    async fn refresh_with_after_id_loads_only_newer_segments(storage: Arc<dyn Storage>) {
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
+            .await
+            .unwrap();
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(200, 3000)).await;
+
+        // Start a cache that only knows about segment 0
+        let mut partial = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
+            .await
+            .unwrap();
+        partial.segments.retain(|_, seg| seg.id() == 0);
+        assert_eq!(partial.all().len(), 1);
+
+        // Refresh loading only segments after id 0
+        partial.refresh(storage.as_ref(), Some(0)).await.unwrap();
+
+        // Should now have all 3 segments
+        assert_eq!(partial.all().len(), 3);
+        assert_eq!(partial.all()[0].id(), 0);
+        assert_eq!(partial.all()[1].id(), 1);
+        assert_eq!(partial.all()[2].id(), 2);
+    }
+
+    #[storage_test]
+    async fn refresh_with_after_id_is_noop_when_no_newer_segments(storage: Arc<dyn Storage>) {
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
+            .await
+            .unwrap();
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+
+        // Refresh after the latest segment — nothing new
+        cache.refresh(storage.as_ref(), Some(1)).await.unwrap();
+        assert_eq!(cache.all().len(), 2);
+    }
+
+    #[storage_test]
+    async fn refresh_with_none_replaces_stale_entries(storage: Arc<dyn Storage>) {
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
+            .await
+            .unwrap();
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+
+        // Manually insert a bogus segment that doesn't exist in storage
+        cache.insert(LogSegment::new(99, SegmentMeta::new(9999, 9999)));
+        assert_eq!(cache.all().len(), 2);
+
+        // Full refresh should clear the bogus entry
+        cache.refresh(storage.as_ref(), None).await.unwrap();
+        assert_eq!(cache.all().len(), 1);
+        assert_eq!(cache.all()[0].id(), 0);
+    }
+
+    #[storage_test]
+    async fn refresh_with_after_id_preserves_existing_entries(storage: Arc<dyn Storage>) {
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
+            .await
+            .unwrap();
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+
+        // Manually insert a bogus segment — incremental refresh should NOT clear it
+        cache.insert(LogSegment::new(99, SegmentMeta::new(9999, 9999)));
+        assert_eq!(cache.all().len(), 3);
+
+        cache.refresh(storage.as_ref(), Some(1)).await.unwrap();
+        // Bogus entry persists because incremental refresh only appends
+        assert_eq!(cache.all().len(), 3);
     }
 }

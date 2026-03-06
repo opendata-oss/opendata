@@ -1,6 +1,6 @@
 [package]
 name = "opendata-log"
-version = "0.2.1"
+version = "0.2.2"
 edition.workspace = true
 description = "Key-oriented log database built on SlateDB"
 license = "MIT"
@@ -46,6 +46,6 @@ base64.workspace = true
 common = { workspace = true, features = ["test-utils"] }
 proptest.workspace = true
 reqwest.workspace = true
-tempfile = "3"
+tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 opendata-macros.workspace = true

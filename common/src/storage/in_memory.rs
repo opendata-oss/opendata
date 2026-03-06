@@ -5,7 +5,9 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use super::{MergeOperator, MergeRecordOp, PutRecordOp, Storage, StorageSnapshot, WriteOptions};
+use super::{
+    MergeOperator, MergeRecordOp, PutRecordOp, Storage, StorageSnapshot, WriteOptions, WriteResult,
+};
 use crate::storage::RecordOp;
 use crate::{BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult, Ttl};
 
@@ -61,16 +63,25 @@ pub struct InMemoryStorage {
     merge_operator: Option<Arc<dyn MergeOperator + Send + Sync>>,
     clock: Arc<dyn Clock>,
     default_ttl: Option<u64>,
+    written_seq: std::sync::atomic::AtomicU64,
+    durable_seq: std::sync::atomic::AtomicU64,
+    durable_tx: tokio::sync::watch::Sender<u64>,
+    defer_durability: bool,
 }
 
 impl InMemoryStorage {
     /// Creates a new InMemoryStorage instance with an empty store.
     pub fn new() -> Self {
+        let (durable_tx, _) = tokio::sync::watch::channel(0);
         Self {
             data: Arc::new(RwLock::new(BTreeMap::new())),
             merge_operator: None,
             clock: Arc::new(WallClock),
             default_ttl: None,
+            written_seq: std::sync::atomic::AtomicU64::new(0),
+            durable_seq: std::sync::atomic::AtomicU64::new(0),
+            durable_tx,
+            defer_durability: false,
         }
     }
 
@@ -80,11 +91,16 @@ impl InMemoryStorage {
     /// existing values with new values. If no merge operator is provided, the
     /// `merge` method will return an error.
     pub fn with_merge_operator(merge_operator: Arc<dyn MergeOperator + Send + Sync>) -> Self {
+        let (durable_tx, _) = tokio::sync::watch::channel(0);
         Self {
             data: Arc::new(RwLock::new(BTreeMap::new())),
             merge_operator: Some(merge_operator),
             clock: Arc::new(WallClock),
             default_ttl: None,
+            written_seq: std::sync::atomic::AtomicU64::new(0),
+            durable_seq: std::sync::atomic::AtomicU64::new(0),
+            durable_tx,
+            defer_durability: false,
         }
     }
 
@@ -98,6 +114,56 @@ impl InMemoryStorage {
     pub fn with_default_ttl(mut self, ttl: u64) -> Self {
         self.default_ttl = Some(ttl);
         self
+    }
+
+    /// Enables deferred durability mode.
+    ///
+    /// When enabled, writes are not marked as durable until [`flush()`](Storage::flush)
+    /// or [`flush_to()`](Self::flush_to) is called. This is useful for testing
+    /// `read_durable` behavior without depending on SlateDB internals.
+    pub fn with_deferred_durability(mut self) -> Self {
+        self.defer_durability = true;
+        self
+    }
+
+    /// Advances the durable watermark to a specific sequence number.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `seq` is greater than the current written sequence number
+    /// or less than the current durable sequence number.
+    pub fn flush_to(&self, seq: u64) {
+        let written = self.written_seq.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            seq <= written,
+            "cannot flush beyond written seqnum: flush_to({seq}) but written is {written}"
+        );
+        let durable = self.durable_seq.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            seq >= durable,
+            "cannot move durable seqnum backwards: flush_to({seq}) but durable is {durable}"
+        );
+        self.durable_seq
+            .store(seq, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.durable_tx.send(seq);
+    }
+
+    /// Allocates the next sequence number.
+    ///
+    /// When `defer_durability` is false (default), the sequence number is
+    /// immediately marked as durable. When true, durability is deferred
+    /// until an explicit flush.
+    fn next_seqnum(&self) -> u64 {
+        let seq = self
+            .written_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if !self.defer_durability {
+            self.durable_seq
+                .store(seq, std::sync::atomic::Ordering::Relaxed);
+            let _ = self.durable_tx.send(seq);
+        }
+        seq
     }
 }
 
@@ -210,7 +276,11 @@ impl StorageSnapshot for InMemoryStorageSnapshot {}
 
 #[async_trait]
 impl Storage for InMemoryStorage {
-    async fn apply(&self, records: Vec<RecordOp>) -> StorageResult<()> {
+    async fn apply_with_options(
+        &self,
+        records: Vec<RecordOp>,
+        _options: WriteOptions,
+    ) -> StorageResult<WriteResult> {
         let mut data = self
             .data
             .write()
@@ -254,15 +324,9 @@ impl Storage for InMemoryStorage {
             }
         }
 
-        Ok(())
-    }
-
-    /// Writes a batch of records to the in-memory store with default options.
-    ///
-    /// Delegates to [`put_with_options`](Self::put_with_options) with default options.
-    async fn put(&self, records: Vec<PutRecordOp>) -> StorageResult<()> {
-        self.put_with_options(records, WriteOptions::default())
-            .await
+        Ok(WriteResult {
+            seqnum: self.next_seqnum(),
+        })
     }
 
     /// Writes a batch of records to the in-memory store.
@@ -274,7 +338,7 @@ impl Storage for InMemoryStorage {
         &self,
         records: Vec<PutRecordOp>,
         _options: WriteOptions,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<WriteResult> {
         let mut data = self
             .data
             .write()
@@ -292,7 +356,9 @@ impl Storage for InMemoryStorage {
             );
         }
 
-        Ok(())
+        Ok(WriteResult {
+            seqnum: self.next_seqnum(),
+        })
     }
 
     /// Merges values for the given keys using the configured merge operator.
@@ -305,7 +371,11 @@ impl Storage for InMemoryStorage {
     ///
     /// If no merge operator is configured, this method will return a
     /// `StorageError::Storage` error.
-    async fn merge(&self, records: Vec<MergeRecordOp>) -> StorageResult<()> {
+    async fn merge_with_options(
+        &self,
+        records: Vec<MergeRecordOp>,
+        _options: WriteOptions,
+    ) -> StorageResult<WriteResult> {
         let merge_op = self
             .merge_operator
             .as_ref()
@@ -338,7 +408,9 @@ impl Storage for InMemoryStorage {
             );
         }
 
-        Ok(())
+        Ok(WriteResult {
+            seqnum: self.next_seqnum(),
+        })
     }
 
     /// Creates a point-in-time snapshot of the in-memory storage.
@@ -360,8 +432,14 @@ impl Storage for InMemoryStorage {
         }))
     }
 
+    fn subscribe_durable(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.durable_tx.subscribe()
+    }
+
     async fn flush(&self) -> StorageResult<()> {
-        // No-op for in-memory storage - all writes are immediately visible
+        if self.defer_durability {
+            self.flush_to(self.written_seq.load(std::sync::atomic::Ordering::Relaxed));
+        }
         Ok(())
     }
 
@@ -518,32 +596,39 @@ impl super::StorageRead for FailingStorage {
 #[cfg(feature = "test-utils")]
 #[async_trait]
 impl super::Storage for FailingStorage {
-    async fn apply(&self, ops: Vec<super::RecordOp>) -> super::StorageResult<()> {
+    async fn apply_with_options(
+        &self,
+        ops: Vec<super::RecordOp>,
+        options: super::WriteOptions,
+    ) -> super::StorageResult<super::WriteResult> {
         check_failure(&self.fail_apply)?;
-        self.inner.apply(ops).await
-    }
-
-    async fn put(&self, records: Vec<super::PutRecordOp>) -> super::StorageResult<()> {
-        check_failure(&self.fail_put)?;
-        self.inner.put(records).await
+        self.inner.apply_with_options(ops, options).await
     }
 
     async fn put_with_options(
         &self,
         records: Vec<super::PutRecordOp>,
         options: super::WriteOptions,
-    ) -> super::StorageResult<()> {
+    ) -> super::StorageResult<super::WriteResult> {
         check_failure(&self.fail_put)?;
         self.inner.put_with_options(records, options).await
     }
 
-    async fn merge(&self, records: Vec<super::MergeRecordOp>) -> super::StorageResult<()> {
-        self.inner.merge(records).await
+    async fn merge_with_options(
+        &self,
+        records: Vec<super::MergeRecordOp>,
+        options: super::WriteOptions,
+    ) -> super::StorageResult<super::WriteResult> {
+        self.inner.merge_with_options(records, options).await
     }
 
     async fn snapshot(&self) -> super::StorageResult<Arc<dyn super::StorageSnapshot>> {
         check_failure(&self.fail_snapshot)?;
         self.inner.snapshot().await
+    }
+
+    fn subscribe_durable(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.inner.subscribe_durable()
     }
 
     async fn flush(&self) -> super::StorageResult<()> {
@@ -964,6 +1049,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_return_monotonically_increasing_seqnums_from_put() {
+        let storage = InMemoryStorage::new();
+
+        let r1 = storage
+            .put(vec![
+                Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+            ])
+            .await
+            .unwrap();
+        let r2 = storage
+            .put(vec![
+                Record::new(Bytes::from("k2"), Bytes::from("v2")).into(),
+            ])
+            .await
+            .unwrap();
+        let r3 = storage
+            .put(vec![
+                Record::new(Bytes::from("k3"), Bytes::from("v3")).into(),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(r1.seqnum, 1);
+        assert_eq!(r2.seqnum, 2);
+        assert_eq!(r3.seqnum, 3);
+    }
+
+    #[tokio::test]
+    async fn should_return_monotonically_increasing_seqnums_from_apply() {
+        let storage = InMemoryStorage::new();
+
+        let r1 = storage
+            .apply(vec![RecordOp::Put(PutRecordOp::new(Record::new(
+                Bytes::from("k1"),
+                Bytes::from("v1"),
+            )))])
+            .await
+            .unwrap();
+        let r2 = storage
+            .apply(vec![RecordOp::Put(PutRecordOp::new(Record::new(
+                Bytes::from("k2"),
+                Bytes::from("v2"),
+            )))])
+            .await
+            .unwrap();
+
+        assert_eq!(r1.seqnum, 1);
+        assert_eq!(r2.seqnum, 2);
+    }
+
+    #[tokio::test]
+    async fn should_share_seqnum_counter_across_write_methods() {
+        let merge_op = Arc::new(AppendMergeOperator);
+        let storage = InMemoryStorage::with_merge_operator(merge_op);
+
+        let r1 = storage
+            .put(vec![
+                Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+            ])
+            .await
+            .unwrap();
+        let r2 = storage
+            .merge(vec![
+                Record::new(Bytes::from("k1"), Bytes::from("v2")).into(),
+            ])
+            .await
+            .unwrap();
+        let r3 = storage
+            .apply(vec![RecordOp::Put(PutRecordOp::new(Record::new(
+                Bytes::from("k2"),
+                Bytes::from("v3"),
+            )))])
+            .await
+            .unwrap();
+
+        assert_eq!(r1.seqnum, 1);
+        assert_eq!(r2.seqnum, 2);
+        assert_eq!(r3.seqnum, 3);
+    }
+
+    #[tokio::test]
+    async fn should_start_durable_subscriber_at_zero() {
+        let storage = InMemoryStorage::new();
+        let rx = storage.subscribe_durable();
+        assert_eq!(*rx.borrow(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_advance_durable_watermark_on_each_write() {
+        let storage = InMemoryStorage::new();
+        let rx = storage.subscribe_durable();
+
+        storage
+            .put(vec![
+                Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(*rx.borrow(), 1);
+
+        storage
+            .put(vec![
+                Record::new(Bytes::from("k2"), Bytes::from("v2")).into(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(*rx.borrow(), 2);
+    }
+
+    #[tokio::test]
     async fn should_merge_empty_values() {
         // given
         let merge_op = Arc::new(AppendMergeOperator);
@@ -980,5 +1175,283 @@ mod tests {
         // then
         assert!(result.is_some());
         assert_eq!(result.unwrap().value, Bytes::new());
+    }
+
+    #[tokio::test]
+    async fn should_not_advance_durable_watermark_when_deferred() {
+        let storage = InMemoryStorage::new().with_deferred_durability();
+        let rx = storage.subscribe_durable();
+
+        storage
+            .put(vec![
+                Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(*rx.borrow(), 0, "durable watermark should not advance");
+
+        storage
+            .put(vec![
+                Record::new(Bytes::from("k2"), Bytes::from("v2")).into(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(*rx.borrow(), 0, "durable watermark should still be 0");
+    }
+
+    #[tokio::test]
+    async fn should_advance_durable_watermark_on_flush_when_deferred() {
+        let storage = InMemoryStorage::new().with_deferred_durability();
+        let rx = storage.subscribe_durable();
+
+        storage
+            .put(vec![
+                Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+            ])
+            .await
+            .unwrap();
+        storage
+            .put(vec![
+                Record::new(Bytes::from("k2"), Bytes::from("v2")).into(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(*rx.borrow(), 0);
+
+        storage.flush().await.unwrap();
+        assert_eq!(*rx.borrow(), 2, "flush should advance to current seqnum");
+    }
+
+    #[tokio::test]
+    async fn should_advance_durable_watermark_to_specific_seq() {
+        let storage = InMemoryStorage::new().with_deferred_durability();
+        let rx = storage.subscribe_durable();
+
+        // Write 3 records
+        for i in 1..=3 {
+            storage
+                .put(vec![
+                    Record::new(Bytes::from(format!("k{i}")), Bytes::from(format!("v{i}"))).into(),
+                ])
+                .await
+                .unwrap();
+        }
+        assert_eq!(*rx.borrow(), 0);
+
+        // Partially flush through seqnum 2
+        storage.flush_to(2);
+        assert_eq!(*rx.borrow(), 2, "should advance to requested seqnum");
+
+        // Flush the rest
+        storage.flush_to(3);
+        assert_eq!(*rx.borrow(), 3);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "cannot move durable seqnum backwards")]
+    async fn should_panic_when_flush_to_moves_backwards() {
+        let storage = InMemoryStorage::new().with_deferred_durability();
+        for i in 1..=3 {
+            storage
+                .put(vec![
+                    Record::new(Bytes::from(format!("k{i}")), Bytes::from(format!("v{i}"))).into(),
+                ])
+                .await
+                .unwrap();
+        }
+
+        storage.flush_to(2);
+        storage.flush_to(1);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "cannot flush beyond written seqnum")]
+    async fn should_panic_when_flush_to_exceeds_written() {
+        let storage = InMemoryStorage::new().with_deferred_durability();
+        storage
+            .put(vec![
+                Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+            ])
+            .await
+            .unwrap();
+
+        storage.flush_to(5);
+    }
+
+    #[tokio::test]
+    async fn should_see_data_in_snapshot_before_flush_when_deferred() {
+        let storage = InMemoryStorage::new().with_deferred_durability();
+
+        storage
+            .put(vec![
+                Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+            ])
+            .await
+            .unwrap();
+
+        // Data is written but not durable — snapshots should still see it
+        let snapshot = storage.snapshot().await.unwrap();
+        let result = snapshot.get(Bytes::from("k1")).await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().value, Bytes::from("v1"));
+
+        // But durable watermark is still 0
+        let rx = storage.subscribe_durable();
+        assert_eq!(*rx.borrow(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_not_advance_durable_watermark_on_apply_when_deferred() {
+        let storage = InMemoryStorage::new().with_deferred_durability();
+        let rx = storage.subscribe_durable();
+
+        storage
+            .apply(vec![RecordOp::Put(PutRecordOp::new(Record::new(
+                Bytes::from("k1"),
+                Bytes::from("v1"),
+            )))])
+            .await
+            .unwrap();
+        assert_eq!(*rx.borrow(), 0);
+
+        storage
+            .apply(vec![RecordOp::Delete(Bytes::from("k1"))])
+            .await
+            .unwrap();
+        assert_eq!(*rx.borrow(), 0);
+
+        storage.flush().await.unwrap();
+        assert_eq!(*rx.borrow(), 2);
+    }
+
+    #[tokio::test]
+    async fn should_not_advance_durable_watermark_on_merge_when_deferred() {
+        let merge_op = Arc::new(AppendMergeOperator);
+        let storage = InMemoryStorage::with_merge_operator(merge_op).with_deferred_durability();
+        let rx = storage.subscribe_durable();
+
+        storage
+            .merge(vec![
+                Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(*rx.borrow(), 0);
+
+        storage
+            .merge(vec![
+                Record::new(Bytes::from("k1"), Bytes::from("v2")).into(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(*rx.borrow(), 0);
+
+        storage.flush().await.unwrap();
+        assert_eq!(*rx.borrow(), 2);
+    }
+
+    #[tokio::test]
+    async fn should_support_multiple_flush_cycles_when_deferred() {
+        let storage = InMemoryStorage::new().with_deferred_durability();
+        let rx = storage.subscribe_durable();
+
+        // First cycle: write and flush
+        storage
+            .put(vec![
+                Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+            ])
+            .await
+            .unwrap();
+        storage.flush().await.unwrap();
+        assert_eq!(*rx.borrow(), 1);
+
+        // Second cycle: write more and flush again
+        storage
+            .put(vec![
+                Record::new(Bytes::from("k2"), Bytes::from("v2")).into(),
+            ])
+            .await
+            .unwrap();
+        storage
+            .put(vec![
+                Record::new(Bytes::from("k3"), Bytes::from("v3")).into(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(*rx.borrow(), 1, "should not advance before second flush");
+
+        storage.flush().await.unwrap();
+        assert_eq!(*rx.borrow(), 3);
+    }
+
+    #[tokio::test]
+    async fn should_flush_on_empty_storage_when_deferred() {
+        let storage = InMemoryStorage::new().with_deferred_durability();
+        let rx = storage.subscribe_durable();
+
+        // Flushing with no writes should be fine (sends 0 again)
+        storage.flush().await.unwrap();
+        assert_eq!(*rx.borrow(), 0);
+
+        // flush_to(0) should also be fine
+        storage.flush_to(0);
+        assert_eq!(*rx.borrow(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_defer_durability_across_mixed_write_methods() {
+        let merge_op = Arc::new(AppendMergeOperator);
+        let storage = InMemoryStorage::with_merge_operator(merge_op).with_deferred_durability();
+        let rx = storage.subscribe_durable();
+
+        // put, apply, merge — all should defer
+        storage
+            .put(vec![
+                Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+            ])
+            .await
+            .unwrap();
+        storage
+            .apply(vec![RecordOp::Put(PutRecordOp::new(Record::new(
+                Bytes::from("k2"),
+                Bytes::from("v2"),
+            )))])
+            .await
+            .unwrap();
+        storage
+            .merge(vec![
+                Record::new(Bytes::from("k3"), Bytes::from("v3")).into(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(*rx.borrow(), 0);
+
+        // Partially flush through seqnum 2
+        storage.flush_to(2);
+        assert_eq!(*rx.borrow(), 2);
+
+        // Flush the rest
+        storage.flush().await.unwrap();
+        assert_eq!(*rx.borrow(), 3);
+    }
+
+    #[tokio::test]
+    async fn should_read_data_written_before_flush_when_deferred() {
+        let storage = InMemoryStorage::new().with_deferred_durability();
+
+        storage
+            .put(vec![
+                Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+                Record::new(Bytes::from("k2"), Bytes::from("v2")).into(),
+            ])
+            .await
+            .unwrap();
+
+        // get and scan see data even though it is not yet durable
+        let result = storage.get(Bytes::from("k1")).await.unwrap();
+        assert_eq!(result.unwrap().value, Bytes::from("v1"));
+
+        let scanned = storage.scan(BytesRange::unbounded()).await.unwrap();
+        assert_eq!(scanned.len(), 2);
     }
 }
