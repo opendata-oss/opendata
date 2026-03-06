@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{BufMut, Bytes, BytesMut};
-use common::clock::Clock;
 use slatedb::object_store::path::Path;
 use slatedb::object_store::{
     Error as ObjectStoreError, ObjectStore, PutMode, PutPayload, UpdateVersion,
@@ -127,20 +126,18 @@ impl Manifest {
     }
 
     /// Number of entries (read from the footer, O(1)).
-    #[allow(dead_code)]
     fn entries_count(&self) -> usize {
         let base = self.existing_entries_count();
         base + self.appended_count
     }
 
     /// Whether the manifest contains no entries.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.entries_count() == 0
     }
 
     /// Return a borrowing iterator that lazily deserializes entries.
-    #[allow(dead_code)]
     pub(crate) fn iter(&self) -> ManifestIter<'_> {
         let base_count = self.existing_entries_count();
         let entries_end = if self.data.is_empty() {
@@ -189,7 +186,6 @@ impl Manifest {
     ///
     /// Optimized to avoid deserializing/re-serializing remaining entries: only the
     /// removed entries are fully decoded, while remaining entries are byte-copied.
-    #[allow(dead_code)]
     fn dequeue(&mut self, through_sequence: u64) -> Result<Vec<QueueEntry>> {
         let next_seq = self.next_sequence;
         let epoch = self.epoch;
@@ -237,7 +233,6 @@ impl Manifest {
     }
 
     /// Set the epoch and patch the data bytes in place.
-    #[allow(dead_code)]
     fn set_epoch(&mut self, epoch: u64) {
         self.epoch = epoch;
         let mut buf = BytesMut::from(self.data.as_ref());
@@ -623,32 +618,24 @@ impl QueueProducer {
 /// fencing any previous consumer instance. Every subsequent read or dequeue
 /// checks that the local epoch still matches the manifest, returning
 /// [`Error::Fenced`] if another consumer has taken over.
-#[allow(dead_code)]
 pub struct QueueConsumer {
     manifest_store: ManifestStore,
     epoch: AtomicU64,
-    clock: Arc<dyn Clock>,
     counter: ConflictCounter,
     queue_len: AtomicU64,
 }
 
-#[allow(dead_code)]
 impl QueueConsumer {
     /// Create a new consumer backed by the given [`ObjectStore`].
     ///
     /// The consumer is not active until [`QueueConsumer::initialize`] is called.
-    pub fn with_object_store(
-        manifest_path: String,
-        object_store: Arc<dyn ObjectStore>,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
+    pub fn with_object_store(manifest_path: String, object_store: Arc<dyn ObjectStore>) -> Self {
         Self {
             manifest_store: ManifestStore {
                 object_store,
                 manifest_path,
             },
             epoch: AtomicU64::new(UNINITIALIZED_EPOCH),
-            clock,
             counter: ConflictCounter::new(),
             queue_len: AtomicU64::new(0),
         }
@@ -756,7 +743,6 @@ impl QueueConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::clock::SystemClock;
     use slatedb::object_store::memory::InMemory;
 
     const TEST_MANIFEST_PATH: &str = "test/manifest";
@@ -771,11 +757,8 @@ mod tests {
     #[tokio::test]
     async fn should_initialize_consumer_and_increment_epoch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         consumer.initialize().await.unwrap();
 
@@ -786,11 +769,8 @@ mod tests {
     #[tokio::test]
     async fn should_peek_none_when_queue_is_empty() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer.initialize().await.unwrap();
 
         let result = consumer.peek().await.unwrap();
@@ -816,11 +796,8 @@ mod tests {
             .await
             .unwrap();
 
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer.initialize().await.unwrap();
 
         let entry = consumer.read(1).await.unwrap().unwrap();
@@ -839,11 +816,8 @@ mod tests {
             .await
             .unwrap();
 
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer.initialize().await.unwrap();
 
         let result = consumer.read(99).await.unwrap();
@@ -853,18 +827,12 @@ mod tests {
     #[tokio::test]
     async fn should_fence_old_consumer_on_peek() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let consumer_a = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer_a =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer_a.initialize().await.unwrap();
 
-        let consumer_b = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer_b =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer_b.initialize().await.unwrap();
 
         let result = consumer_a.peek().await;
@@ -874,18 +842,12 @@ mod tests {
     #[tokio::test]
     async fn should_fence_old_consumer_on_dequeue() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let consumer_a = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer_a =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer_a.initialize().await.unwrap();
 
-        let consumer_b = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer_b =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer_b.initialize().await.unwrap();
 
         let result = consumer_a.dequeue(0).await;
@@ -903,11 +865,8 @@ mod tests {
             .await
             .unwrap();
 
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         let result = consumer.peek().await;
         assert!(matches!(result, Err(Error::Fenced)));
@@ -925,11 +884,8 @@ mod tests {
             .await
             .unwrap();
 
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer.initialize().await.unwrap();
 
         let manifest = read_producer_manifest(&store, TEST_MANIFEST_PATH).await;
@@ -951,11 +907,8 @@ mod tests {
             .await
             .unwrap();
 
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer.initialize().await.unwrap();
 
         let entry = consumer.peek().await.unwrap().unwrap();
@@ -981,11 +934,8 @@ mod tests {
             .await
             .unwrap();
 
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer.initialize().await.unwrap();
 
         let removed = consumer.dequeue(1).await.unwrap();
@@ -1012,11 +962,8 @@ mod tests {
             .await
             .unwrap();
 
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer.initialize().await.unwrap();
 
         consumer.dequeue(1).await.unwrap();

@@ -2,7 +2,6 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use common::clock::Clock;
 use slatedb::object_store::ObjectStore;
 use slatedb::object_store::path::Path;
 
@@ -37,24 +36,19 @@ pub struct Collector {
 }
 
 impl Collector {
-    /// Create a new collector from the given configuration and clock.
-    pub fn new(config: CollectorConfig, clock: Arc<dyn Clock>) -> Result<Self> {
+    /// Create a new collector from the given configuration.
+    pub fn new(config: CollectorConfig) -> Result<Self> {
         let object_store_config = match &config.storage {
             common::StorageConfig::InMemory => common::storage::config::ObjectStoreConfig::InMemory,
             common::StorageConfig::SlateDb(c) => c.object_store.clone(),
         };
         let object_store = common::storage::factory::create_object_store(&object_store_config)
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(Self::with_object_store(config, object_store, clock))
+        Ok(Self::with_object_store(config, object_store))
     }
 
-    fn with_object_store(
-        config: CollectorConfig,
-        object_store: Arc<dyn ObjectStore>,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
-        let consumer =
-            QueueConsumer::with_object_store(config.manifest_path, object_store.clone(), clock);
+    fn with_object_store(config: CollectorConfig, object_store: Arc<dyn ObjectStore>) -> Self {
+        let consumer = QueueConsumer::with_object_store(config.manifest_path, object_store.clone());
         Self {
             consumer,
             object_store,
@@ -179,7 +173,6 @@ mod tests {
     use crate::queue::QueueProducer;
     use bytes::Bytes;
     use common::StorageConfig;
-    use common::clock::SystemClock;
     use slatedb::object_store::PutPayload;
     use slatedb::object_store::memory::InMemory;
 
@@ -206,10 +199,9 @@ mod tests {
         store: &Arc<dyn ObjectStore>,
         config: CollectorConfig,
     ) -> (QueueProducer, Collector) {
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let producer =
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
-        let collector = Collector::with_object_store(config, store.clone(), clock);
+        let collector = Collector::with_object_store(config, store.clone());
         (producer, collector)
     }
 
