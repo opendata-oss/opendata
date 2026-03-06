@@ -894,14 +894,11 @@ mod tests {
     #[tokio::test]
     async fn should_fence_uninitialized_consumer() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.batch".to_string(), Bytes::new())
+            .enqueue("a.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
