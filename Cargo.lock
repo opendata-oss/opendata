@@ -3037,9 +3037,9 @@ dependencies = [
 
 [[package]]
 name = "promql-parser"
-version = "0.6.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "328fe69c2443ec4f8e6c33ea925dde04a1026e6c95928e89ed02343944cac9bf"
+checksum = "df2791a28f8ea7e48f2838999c06d089184d44adb860feab682d45dd190ef718"
 dependencies = [
  "cfgrammar",
  "chrono",
@@ -3047,7 +3047,6 @@ dependencies = [
  "lrlex",
  "lrpar",
  "regex",
- "unescaper",
 ]
 
 [[package]]
@@ -4667,15 +4666,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1b88fcfe09e89d3866a5c11019378088af2d24c3fbd4f0543f96b479ec90697"
 dependencies = [
  "version_check",
-]
-
-[[package]]
-name = "unescaper"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4064ed685c487dbc25bd3f0e9548f2e34bab9d18cefc700f9ec2dba74ba1138e"
-dependencies = [
- "thiserror 2.0.17",
 ]
 
 [[package]]

@@ -136,6 +136,24 @@ pub(crate) trait PromQLFunction {
     /// Apply the function to the input samples.
     /// `eval_timestamp_ms` is the evaluation timestamp in milliseconds since UNIX epoch.
     fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<Vec<EvalSample>>;
+
+    /// Apply the function to one or more evaluated arguments.
+    ///
+    /// Default behavior preserves current unary-function semantics.
+    fn apply_args(
+        &self,
+        mut args: Vec<PromQLArg>,
+        eval_timestamp_ms: i64,
+    ) -> EvalResult<Vec<EvalSample>> {
+        if args.len() != 1 {
+            return Err(EvaluationError::InternalError(format!(
+                "function requires exactly one argument, got {}",
+                args.len()
+            )));
+        }
+
+        self.apply(args.remove(0), eval_timestamp_ms)
+    }
 }
 
 /// Trait for PromQL functions that operate on range vectors (matrix selectors)
@@ -159,6 +177,214 @@ impl PromQLFunction for UnaryFunction {
         let mut samples = arg.into_instant_vector()?;
         for sample in &mut samples {
             sample.value = (self.op)(sample.value);
+        }
+        Ok(samples)
+    }
+}
+
+/// Round function with optional scalar second argument (`to_nearest`).
+struct RoundFunction;
+
+impl RoundFunction {
+    fn round_to_nearest(value: f64, to_nearest: f64) -> f64 {
+        if to_nearest == 0.0 {
+            return value;
+        }
+        let inv = 1.0 / to_nearest;
+        (value * inv + 0.5).floor() / inv
+    }
+}
+
+impl PromQLFunction for RoundFunction {
+    fn apply(&self, arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<Vec<EvalSample>> {
+        let mut samples = arg.into_instant_vector()?;
+        for sample in &mut samples {
+            sample.value = Self::round_to_nearest(sample.value, 1.0);
+        }
+        Ok(samples)
+    }
+
+    fn apply_args(
+        &self,
+        args: Vec<PromQLArg>,
+        _eval_timestamp_ms: i64,
+    ) -> EvalResult<Vec<EvalSample>> {
+        let mut args_iter = args.into_iter();
+        let Some(first_arg) = args_iter.next() else {
+            return Err(EvaluationError::InternalError(
+                "round requires at least one argument".to_string(),
+            ));
+        };
+        let mut samples = first_arg.into_instant_vector()?;
+        let to_nearest = match args_iter.next() {
+            None => 1.0,
+            Some(second_arg) => {
+                // Defensive check: evaluator signature validation should already
+                // enforce max arity on query-path calls. Keep this guard for
+                // direct function calls in unit tests and internal call sites.
+                if args_iter.next().is_some() {
+                    return Err(EvaluationError::InternalError(
+                        "round accepts at most two arguments".to_string(),
+                    ));
+                }
+                second_arg.into_scalar()?.abs()
+            }
+        };
+
+        for sample in &mut samples {
+            sample.value = Self::round_to_nearest(sample.value, to_nearest);
+        }
+        Ok(samples)
+    }
+}
+
+#[inline]
+fn min_with_nan(left: f64, right: f64) -> f64 {
+    if left.is_nan() || right.is_nan() {
+        f64::NAN
+    } else if left < right {
+        left
+    } else {
+        right
+    }
+}
+
+#[inline]
+fn max_with_nan(left: f64, right: f64) -> f64 {
+    if left.is_nan() || right.is_nan() {
+        f64::NAN
+    } else if left > right {
+        left
+    } else {
+        right
+    }
+}
+
+struct ClampMaxFunction;
+
+impl PromQLFunction for ClampMaxFunction {
+    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<Vec<EvalSample>> {
+        Err(EvaluationError::InternalError(
+            "clamp_max requires two arguments".to_string(),
+        ))
+    }
+
+    fn apply_args(
+        &self,
+        args: Vec<PromQLArg>,
+        _eval_timestamp_ms: i64,
+    ) -> EvalResult<Vec<EvalSample>> {
+        let mut args_iter = args.into_iter();
+        let Some(first_arg) = args_iter.next() else {
+            return Err(EvaluationError::InternalError(
+                "clamp_max requires two arguments".to_string(),
+            ));
+        };
+        let Some(second_arg) = args_iter.next() else {
+            return Err(EvaluationError::InternalError(
+                "clamp_max requires two arguments".to_string(),
+            ));
+        };
+        if args_iter.next().is_some() {
+            return Err(EvaluationError::InternalError(
+                "clamp_max accepts at most two arguments".to_string(),
+            ));
+        }
+
+        let mut samples = first_arg.into_instant_vector()?;
+        let max = second_arg.into_scalar()?;
+        for sample in &mut samples {
+            sample.value = min_with_nan(sample.value, max);
+        }
+        Ok(samples)
+    }
+}
+
+struct ClampMinFunction;
+
+impl PromQLFunction for ClampMinFunction {
+    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<Vec<EvalSample>> {
+        Err(EvaluationError::InternalError(
+            "clamp_min requires two arguments".to_string(),
+        ))
+    }
+
+    fn apply_args(
+        &self,
+        args: Vec<PromQLArg>,
+        _eval_timestamp_ms: i64,
+    ) -> EvalResult<Vec<EvalSample>> {
+        let mut args_iter = args.into_iter();
+        let Some(first_arg) = args_iter.next() else {
+            return Err(EvaluationError::InternalError(
+                "clamp_min requires two arguments".to_string(),
+            ));
+        };
+        let Some(second_arg) = args_iter.next() else {
+            return Err(EvaluationError::InternalError(
+                "clamp_min requires two arguments".to_string(),
+            ));
+        };
+        if args_iter.next().is_some() {
+            return Err(EvaluationError::InternalError(
+                "clamp_min accepts at most two arguments".to_string(),
+            ));
+        }
+
+        let mut samples = first_arg.into_instant_vector()?;
+        let min = second_arg.into_scalar()?;
+        for sample in &mut samples {
+            sample.value = max_with_nan(sample.value, min);
+        }
+        Ok(samples)
+    }
+}
+
+struct ClampFunction;
+
+impl PromQLFunction for ClampFunction {
+    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<Vec<EvalSample>> {
+        Err(EvaluationError::InternalError(
+            "clamp requires three arguments".to_string(),
+        ))
+    }
+
+    fn apply_args(
+        &self,
+        args: Vec<PromQLArg>,
+        _eval_timestamp_ms: i64,
+    ) -> EvalResult<Vec<EvalSample>> {
+        let mut args_iter = args.into_iter();
+        let Some(first_arg) = args_iter.next() else {
+            return Err(EvaluationError::InternalError(
+                "clamp requires three arguments".to_string(),
+            ));
+        };
+        let Some(second_arg) = args_iter.next() else {
+            return Err(EvaluationError::InternalError(
+                "clamp requires three arguments".to_string(),
+            ));
+        };
+        let Some(third_arg) = args_iter.next() else {
+            return Err(EvaluationError::InternalError(
+                "clamp requires three arguments".to_string(),
+            ));
+        };
+        if args_iter.next().is_some() {
+            return Err(EvaluationError::InternalError(
+                "clamp accepts at most three arguments".to_string(),
+            ));
+        }
+
+        let mut samples = first_arg.into_instant_vector()?;
+        let min = second_arg.into_scalar()?;
+        let max = third_arg.into_scalar()?;
+        if min > max {
+            return Ok(vec![]);
+        }
+
+        for sample in &mut samples {
+            sample.value = max_with_nan(min_with_nan(sample.value, max), min);
         }
         Ok(samples)
     }
@@ -201,6 +427,9 @@ impl FunctionRegistry {
             "atanh".to_string(),
             Box::new(UnaryFunction { op: f64::atanh }),
         );
+        functions.insert("clamp".to_string(), Box::new(ClampFunction));
+        functions.insert("clamp_max".to_string(), Box::new(ClampMaxFunction));
+        functions.insert("clamp_min".to_string(), Box::new(ClampMinFunction));
         functions.insert(
             "ceil".to_string(),
             Box::new(UnaryFunction { op: f64::ceil }),
@@ -236,10 +465,7 @@ impl FunctionRegistry {
                 op: f64::to_radians,
             }),
         );
-        functions.insert(
-            "round".to_string(),
-            Box::new(UnaryFunction { op: f64::round }),
-        );
+        functions.insert("round".to_string(), Box::new(RoundFunction));
         functions.insert("sin".to_string(), Box::new(UnaryFunction { op: f64::sin }));
         functions.insert(
             "sinh".to_string(),
@@ -679,6 +905,133 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].value, 5.0);
         assert_eq!(result[1].value, 3.0);
+    }
+
+    #[test]
+    fn should_apply_round_with_optional_to_nearest() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("round").unwrap();
+
+        let samples = vec![
+            create_sample(1.24),
+            create_sample(1.25),
+            create_sample(1.26),
+            create_sample(-1.25),
+        ];
+        let result = func
+            .apply_args(
+                vec![PromQLArg::InstantVector(samples), PromQLArg::Scalar(0.1)],
+                1000,
+            )
+            .unwrap();
+
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].value, 1.2);
+        assert_eq!(result[1].value, 1.3);
+        assert_eq!(result[2].value, 1.3);
+        assert_eq!(result[3].value, -1.2);
+    }
+
+    #[test]
+    fn should_apply_clamp_functions() {
+        let registry = FunctionRegistry::new();
+        let clamp = registry.get("clamp").unwrap();
+        let clamp_min = registry.get("clamp_min").unwrap();
+        let clamp_max = registry.get("clamp_max").unwrap();
+
+        let samples = vec![
+            create_sample(-50.0),
+            create_sample(0.0),
+            create_sample(100.0),
+        ];
+
+        let clamped = clamp
+            .apply_args(
+                vec![
+                    PromQLArg::InstantVector(samples.clone()),
+                    PromQLArg::Scalar(-25.0),
+                    PromQLArg::Scalar(75.0),
+                ],
+                1000,
+            )
+            .unwrap();
+        assert_eq!(clamped[0].value, -25.0);
+        assert_eq!(clamped[1].value, 0.0);
+        assert_eq!(clamped[2].value, 75.0);
+
+        let min_clamped = clamp_min
+            .apply_args(
+                vec![
+                    PromQLArg::InstantVector(samples.clone()),
+                    PromQLArg::Scalar(-25.0),
+                ],
+                1000,
+            )
+            .unwrap();
+        assert_eq!(min_clamped[0].value, -25.0);
+        assert_eq!(min_clamped[1].value, 0.0);
+        assert_eq!(min_clamped[2].value, 100.0);
+
+        let max_clamped = clamp_max
+            .apply_args(
+                vec![PromQLArg::InstantVector(samples), PromQLArg::Scalar(75.0)],
+                1000,
+            )
+            .unwrap();
+        assert_eq!(max_clamped[0].value, -50.0);
+        assert_eq!(max_clamped[1].value, 0.0);
+        assert_eq!(max_clamped[2].value, 75.0);
+    }
+
+    #[test]
+    fn should_return_empty_for_clamp_when_min_exceeds_max() {
+        let registry = FunctionRegistry::new();
+        let clamp = registry.get("clamp").unwrap();
+        let samples = vec![
+            create_sample(-50.0),
+            create_sample(0.0),
+            create_sample(100.0),
+        ];
+
+        let result = clamp
+            .apply_args(
+                vec![
+                    PromQLArg::InstantVector(samples),
+                    PromQLArg::Scalar(5.0),
+                    PromQLArg::Scalar(-5.0),
+                ],
+                1000,
+            )
+            .unwrap();
+
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn should_propagate_nan_when_clamp_bound_is_nan() {
+        let registry = FunctionRegistry::new();
+        let clamp = registry.get("clamp").unwrap();
+        let samples = vec![
+            create_sample(-50.0),
+            create_sample(0.0),
+            create_sample(100.0),
+        ];
+
+        let result = clamp
+            .apply_args(
+                vec![
+                    PromQLArg::InstantVector(samples),
+                    PromQLArg::Scalar(0.0),
+                    PromQLArg::Scalar(f64::NAN),
+                ],
+                1000,
+            )
+            .unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert!(result[0].value.is_nan());
+        assert!(result[1].value.is_nan());
+        assert!(result[2].value.is_nan());
     }
 
     #[test]
