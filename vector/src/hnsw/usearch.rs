@@ -79,7 +79,6 @@ impl UsearchCentroidGraph {
         // Convert distance metric to usearch MetricKind
         let metric = match distance_metric {
             DistanceMetric::L2 => MetricKind::L2sq,
-            DistanceMetric::Cosine => MetricKind::Cos,
             DistanceMetric::DotProduct => MetricKind::IP,
         };
 
@@ -245,25 +244,6 @@ mod tests {
         // then
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], 1);
-    }
-
-    #[test]
-    fn should_build_and_search_cosine_graph() {
-        // given - 3 centroids
-        let centroids = vec![
-            CentroidEntry::new(10, vec![1.0, 0.0]),
-            CentroidEntry::new(20, vec![0.0, 1.0]),
-            CentroidEntry::new(30, vec![1.0, 1.0]),
-        ];
-
-        // when
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::Cosine).unwrap();
-        let query = vec![0.9, 0.1];
-        let results = graph.search(&query, 1);
-
-        // then
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0], 10);
     }
 
     #[test]

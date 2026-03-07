@@ -11,21 +11,13 @@ pub(crate) trait Clustering {
 }
 
 /// K-means with L2-based initialization and arithmetic mean centroids.
-/// Suitable for L2 and DotProduct metrics.
 pub(crate) struct KMeansPP {
     metric: DistanceMetric,
 }
 
-/// Spherical k-means: cosine-aware initialization and L2-normalized centroids.
-/// Suitable for Cosine metric.
-pub(crate) struct SphericalKMeans;
-
 /// Create a clustering strategy appropriate for the given distance metric.
 pub(crate) fn for_metric(metric: DistanceMetric) -> Box<dyn Clustering + Send> {
-    match metric {
-        DistanceMetric::Cosine => Box::new(SphericalKMeans),
-        _ => Box::new(KMeansPP { metric }),
-    }
+    Box::new(KMeansPP { metric })
 }
 
 /// Compute the arithmetic mean vector of a set of vectors.
@@ -44,14 +36,6 @@ fn mean_vector(vectors: &[&[f32]], dimensions: usize) -> Vec<f32> {
         *val /= n;
     }
     mean
-}
-
-/// L2-normalize a vector in place.
-fn normalize(v: &mut [f32]) {
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        v.iter_mut().for_each(|x| *x /= norm);
-    }
 }
 
 /// Farthest-pair initialization using a given distance metric.
@@ -87,54 +71,6 @@ fn kmeans_pp_init_l2(vectors: &[(u64, &[f32])]) -> (usize, usize) {
                 .zip(vectors[idx_a].1.iter())
                 .map(|(a, b)| (a - b) * (a - b))
                 .sum()
-        })
-        .collect();
-    let total: f32 = distances.iter().sum();
-
-    let idx_b = if total > 0.0 {
-        let threshold = rng.gen_range(0.0..total);
-        let mut cumsum = 0.0;
-        let mut chosen = 0;
-        for (i, &d) in distances.iter().enumerate() {
-            cumsum += d;
-            if cumsum >= threshold {
-                chosen = i;
-                break;
-            }
-        }
-        chosen
-    } else if idx_a == 0 {
-        1
-    } else {
-        0
-    };
-
-    (idx_a, idx_b)
-}
-
-/// K-means++ initialization using cosine dissimilarity (1 - cosine_similarity).
-/// Picks first centroid randomly, then picks second with probability proportional
-/// to `1.0 - cosine_similarity` from the first.
-fn kmeans_pp_init_cosine(vectors: &[(u64, &[f32])]) -> (usize, usize) {
-    let mut rng = rand::thread_rng();
-    let idx_a = rng.gen_range(0..vectors.len());
-
-    let distances: Vec<f32> = vectors
-        .iter()
-        .map(|(_, v)| {
-            let dot: f32 = v
-                .iter()
-                .zip(vectors[idx_a].1.iter())
-                .map(|(a, b)| a * b)
-                .sum();
-            let norm_v: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let norm_a: f32 = vectors[idx_a].1.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let sim = if norm_v > 0.0 && norm_a > 0.0 {
-                dot / (norm_v * norm_a)
-            } else {
-                0.0
-            };
-            (1.0 - sim).max(0.0)
         })
         .collect();
     let total: f32 = distances.iter().sum();
@@ -218,11 +154,6 @@ fn kmeans_loop(
 /// Identity update — no post-processing after computing the mean.
 fn identity(_v: &mut [f32]) {}
 
-/// Normalize the centroid vector to unit length.
-fn normalize_centroid(v: &mut [f32]) {
-    normalize(v);
-}
-
 impl Clustering for KMeansPP {
     fn two_means(&self, vectors: &[(u64, &[f32])], dimensions: usize) -> (Vec<f32>, Vec<f32>) {
         assert!(vectors.len() >= 2, "two_means requires at least 2 vectors");
@@ -237,32 +168,6 @@ impl Clustering for KMeansPP {
         let mut c1 = vectors[idx_b].1.to_vec();
 
         kmeans_loop(vectors, dimensions, self.metric, &mut c0, &mut c1, identity);
-
-        (c0, c1)
-    }
-}
-
-impl Clustering for SphericalKMeans {
-    fn two_means(&self, vectors: &[(u64, &[f32])], dimensions: usize) -> (Vec<f32>, Vec<f32>) {
-        assert!(vectors.len() >= 2, "two_means requires at least 2 vectors");
-
-        let (idx_a, idx_b) = if vectors.len() <= 100 {
-            farthest_pair_init(vectors, DistanceMetric::Cosine)
-        } else {
-            kmeans_pp_init_cosine(vectors)
-        };
-
-        let mut c0 = vectors[idx_a].1.to_vec();
-        let mut c1 = vectors[idx_b].1.to_vec();
-
-        kmeans_loop(
-            vectors,
-            dimensions,
-            DistanceMetric::Cosine,
-            &mut c0,
-            &mut c1,
-            normalize_centroid,
-        );
 
         (c0, c1)
     }
@@ -317,54 +222,6 @@ mod tests {
             "centroids should match inputs: c0={:?}, c1={:?}",
             c0,
             c1
-        );
-    }
-
-    #[test]
-    fn should_work_with_cosine_metric() {
-        // given - vectors pointing in different directions
-        let vectors: Vec<(u64, Vec<f32>)> = vec![
-            (1, vec![1.0, 0.0, 0.0]),
-            (2, vec![0.9, 0.1, 0.0]),
-            (3, vec![0.0, 0.0, 1.0]),
-            (4, vec![0.0, 0.1, 0.9]),
-        ];
-        let refs: Vec<(u64, &[f32])> = vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
-
-        // when
-        let clustering = for_metric(DistanceMetric::Cosine);
-        let (c0, c1) = clustering.two_means(&refs, 3);
-
-        // then - centroids should separate into two groups
-        assert_ne!(c0, c1, "centroids should be different");
-    }
-
-    #[test]
-    fn should_produce_normalized_centroids_for_spherical_kmeans() {
-        // given - vectors in different directions (not unit length)
-        let vectors: Vec<(u64, Vec<f32>)> = vec![
-            (1, vec![3.0, 0.0, 0.0]),
-            (2, vec![2.7, 0.3, 0.0]),
-            (3, vec![0.0, 0.0, 5.0]),
-            (4, vec![0.0, 0.5, 4.5]),
-        ];
-        let refs: Vec<(u64, &[f32])> = vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
-
-        // when
-        let (c0, c1) = SphericalKMeans.two_means(&refs, 3);
-
-        // then - both centroids should be approximately unit length
-        let norm_c0: f32 = c0.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let norm_c1: f32 = c1.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!(
-            (norm_c0 - 1.0).abs() < 1e-5,
-            "c0 should be unit length, got norm {}",
-            norm_c0
-        );
-        assert!(
-            (norm_c1 - 1.0).abs() < 1e-5,
-            "c1 should be unit length, got norm {}",
-            norm_c1
         );
     }
 
