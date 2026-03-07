@@ -51,5 +51,5 @@ pub use db::VectorDb;
 pub use error::{Error, Result};
 pub use model::{
     Attribute, AttributeValue, Config, DistanceMetric, FieldType, MetadataFieldSpec, SearchResult,
-    Vector, VectorBuilder,
+    Vector, VectorBuilder, VectorRecord,
 };

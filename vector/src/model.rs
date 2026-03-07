@@ -283,6 +283,23 @@ impl MetadataFieldSpec {
     }
 }
 
+/// A vector record retrieved by ID.
+///
+/// All attributes (including the vector embedding) are stored in the `fields` map.
+/// The vector is stored under the special field name `"vector"`.
+///
+/// Returned by [`crate::db::VectorDb::get()`] operations.
+#[derive(Debug, Clone)]
+pub struct VectorRecord {
+    /// External vector ID (user-provided)
+    pub external_id: String,
+    /// All fields including vector and metadata.
+    ///
+    /// The vector embedding is stored under the key `"vector"` as
+    /// `AttributeValue::Vector(Vec<f32>)`.
+    pub fields: HashMap<String, AttributeValue>,
+}
+
 /// A search result with vector, score, and metadata.
 #[derive(Debug, Clone)]
 pub struct SearchResult {

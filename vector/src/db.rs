@@ -20,7 +20,8 @@ use crate::flusher::VectorDbFlusher;
 use crate::hnsw::{CentroidGraph, build_centroid_graph};
 use crate::lire::rebalancer::{IndexRebalancer, IndexRebalancerOpts};
 use crate::model::{
-    AttributeValue, Config, SearchResult, VECTOR_FIELD_NAME, Vector, attributes_to_map,
+    AttributeValue, Config, SearchResult, VECTOR_FIELD_NAME, Vector, VectorRecord,
+    attributes_to_map,
 };
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::key::SeqBlockKey;
@@ -728,6 +729,49 @@ impl VectorDb {
 
         // 5. K-way merge and resolve top-k forward index lookups
         self.resolve_top_k(sorted_lists, k, snapshot.as_ref()).await
+    }
+
+    /// Retrieve a vector record by its external ID.
+    ///
+    /// This is a point lookup operation that retrieves a single record with all its fields.
+    /// Returns `None` if the record doesn't exist or has been deleted.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - External ID of the record to retrieve
+    ///
+    /// # Returns
+    ///
+    /// `Some(VectorRecord)` if found, `None` if not found or deleted.
+    pub async fn get(&self, id: &str) -> Result<Option<VectorRecord>> {
+        let snapshot = self.write_coordinator.view().snapshot.clone();
+        let dimensions = self.config.dimensions as usize;
+
+        // 1. Lookup internal ID from IdDictionary
+        let Some(internal_id) = snapshot.lookup_internal_id(id).await? else {
+            return Ok(None);
+        };
+
+        // 2. Load vector data
+        //
+        // No deletion check needed: the IdDictionary always points to the latest
+        // internal ID. On upsert, the old VectorData is hard-deleted and the dictionary
+        // is updated to the new internal ID. The deletions bitmap is only used to filter
+        // stale posting list entries during search.
+        let Some(vector_data) = snapshot.get_vector_data(internal_id, dimensions).await? else {
+            return Ok(None);
+        };
+
+        // 3. Construct VectorRecord with all fields
+        let fields: HashMap<String, AttributeValue> = vector_data
+            .fields()
+            .map(|field| (field.field_name.clone(), field.value.clone().into()))
+            .collect();
+
+        Ok(Some(VectorRecord {
+            external_id: vector_data.external_id().to_string(),
+            fields,
+        }))
     }
 
     /// Apply query-aware dynamic pruning
@@ -1561,6 +1605,102 @@ mod tests {
                 e
             ),
             Ok(_) => panic!("expected error when no centroids provided"),
+        }
+    }
+
+    #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
+    async fn should_get_vector_by_id(storage: Arc<dyn Storage>) {
+        // given
+        let config = create_test_config();
+        let centroids = create_test_centroids(3);
+        let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
+            .await
+            .unwrap();
+
+        let vectors = vec![
+            Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
+                .attribute("category", "shoes")
+                .attribute("price", 99i64)
+                .build(),
+            Vector::builder("vec-2", vec![0.0, 1.0, 0.0])
+                .attribute("category", "boots")
+                .attribute("price", 149i64)
+                .build(),
+        ];
+        db.write(vectors).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when
+        let record = db.get("vec-1").await.unwrap();
+
+        // then
+        assert!(record.is_some());
+        let record = record.unwrap();
+        assert_eq!(record.external_id, "vec-1");
+        assert_eq!(
+            record.fields.get("category"),
+            Some(&AttributeValue::String("shoes".to_string()))
+        );
+        assert_eq!(record.fields.get("price"), Some(&AttributeValue::Int64(99)));
+        match record.fields.get(VECTOR_FIELD_NAME) {
+            Some(AttributeValue::Vector(v)) => assert_eq!(v, &[1.0, 0.0, 0.0]),
+            other => panic!("expected vector field, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_return_none_for_nonexistent_id() {
+        // given
+        let config = create_test_config();
+        let db = VectorDb::open(config).await.unwrap();
+
+        // when
+        let record = db.get("does-not-exist").await.unwrap();
+
+        // then
+        assert!(record.is_none());
+    }
+
+    #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
+    async fn should_return_none_for_deleted_vector(storage: Arc<dyn Storage>) {
+        // given - write a vector, then upsert it (old version becomes deleted)
+        let config = create_test_config();
+        let centroids = create_test_centroids(3);
+        let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
+            .await
+            .unwrap();
+
+        let vector1 = Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
+            .attribute("category", "shoes")
+            .attribute("price", 99i64)
+            .build();
+        db.write(vec![vector1]).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when - upsert with new values
+        let vector2 = Vector::builder("vec-1", vec![0.0, 1.0, 0.0])
+            .attribute("category", "boots")
+            .attribute("price", 199i64)
+            .build();
+        db.write(vec![vector2]).await.unwrap();
+        db.flush().await.unwrap();
+
+        // then - get should return the updated version
+        let record = db.get("vec-1").await.unwrap();
+        assert!(record.is_some());
+        let record = record.unwrap();
+        assert_eq!(record.external_id, "vec-1");
+        assert_eq!(
+            record.fields.get("category"),
+            Some(&AttributeValue::String("boots".to_string()))
+        );
+        assert_eq!(
+            record.fields.get("price"),
+            Some(&AttributeValue::Int64(199))
+        );
+        match record.fields.get(VECTOR_FIELD_NAME) {
+            Some(AttributeValue::Vector(v)) => assert_eq!(v, &[0.0, 1.0, 0.0]),
+            other => panic!("expected vector field, got: {:?}", other),
         }
     }
 }
