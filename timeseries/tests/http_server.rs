@@ -25,6 +25,13 @@ const SAMPLE_TS_MS: i64 = 3_900_000;
 /// Same instant expressed in seconds (for query params).
 const SAMPLE_TS_SECS: i64 = 3900;
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
 async fn setup() -> (Router, TestTsdb) {
     let tsdb = testing::create_test_tsdb().await;
     let app = testing::http::build_app(&tsdb);
@@ -33,11 +40,17 @@ async fn setup() -> (Router, TestTsdb) {
 
 async fn setup_with_data() -> (Router, TestTsdb) {
     let (app, tsdb) = setup().await;
-    ingest_test_data(&tsdb).await;
+    ingest_test_data(&tsdb, SAMPLE_TS_MS).await;
     (app, tsdb)
 }
 
-async fn ingest_test_data(tsdb: &TestTsdb) {
+async fn setup_with_recent_data() -> (Router, TestTsdb) {
+    let (app, tsdb) = setup().await;
+    ingest_test_data(&tsdb, now_ms()).await;
+    (app, tsdb)
+}
+
+async fn ingest_test_data(tsdb: &TestTsdb, base_ts_ms: i64) {
     let series = vec![
         Series {
             labels: vec![
@@ -48,7 +61,7 @@ async fn ingest_test_data(tsdb: &TestTsdb) {
             metric_type: Some(MetricType::Gauge),
             unit: None,
             description: None,
-            samples: vec![Sample::new(SAMPLE_TS_MS, 42.0)],
+            samples: vec![Sample::new(base_ts_ms, 42.0)],
         },
         Series {
             labels: vec![
@@ -59,7 +72,7 @@ async fn ingest_test_data(tsdb: &TestTsdb) {
             metric_type: Some(MetricType::Gauge),
             unit: None,
             description: None,
-            samples: vec![Sample::new(SAMPLE_TS_MS + 1, 7.0)],
+            samples: vec![Sample::new(base_ts_ms + 1, 7.0)],
         },
     ];
 
@@ -448,6 +461,170 @@ async fn test_metadata() {
 }
 
 // ---------------------------------------------------------------------------
+// /federate
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_federate_no_match_returns_error() {
+    let (app, _) = setup().await;
+    let req = Request::get("/federate").body(Body::empty()).unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_federate_single_selector() {
+    let (app, _) = setup_with_recent_data().await;
+    let req = Request::get("/federate?match[]=http_requests_total")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        content_type.contains("text/plain"),
+        "expected text/plain content type, got: {content_type}"
+    );
+    let body = body_string(resp).await;
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(lines.len(), 2, "expected 2 series, got: {body}");
+    assert!(
+        lines.iter().all(|l| l.starts_with("http_requests_total{")),
+        "all lines should start with metric name, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_federate_multiple_selectors_dedup() {
+    let (app, _) = setup_with_recent_data().await;
+    // Both selectors match the same 2 series — should still return only 2 lines
+    let req = Request::get(
+        "/federate?match[]=http_requests_total&match[]=%7B__name__%3D%22http_requests_total%22%7D",
+    )
+    .body(Body::empty())
+    .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "dedup should prevent duplicates, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_federate_label_value_escaping() {
+    let (app, tsdb) = setup().await;
+
+    // Ingest a series with a label value that needs escaping
+    let series = vec![Series {
+        labels: vec![
+            Label::metric_name("test_metric"),
+            Label::new("path", "/api/v1\"weird\\path\nhere"),
+        ],
+        metric_type: Some(MetricType::Gauge),
+        unit: None,
+        description: None,
+        samples: vec![Sample::new(now_ms(), 1.0)],
+    }];
+    tsdb.ingest_samples(series).await;
+    tsdb.flush().await;
+
+    let req = Request::get("/federate?match[]=test_metric")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(
+        body.contains(r#"path="/api/v1\"weird\\path\nhere""#),
+        "label value should be escaped, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_federate_nonexistent_metric() {
+    let (app, _) = setup_with_data().await;
+    let req = Request::get("/federate?match[]=nonexistent_metric")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(
+        body.is_empty(),
+        "no matching series should return empty body, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_federate_dedup_with_unsorted_labels() {
+    let (app, tsdb) = setup().await;
+    let now_ms = now_ms();
+
+    // Ingest the same logical series twice with labels in different order.
+    // The TSDB may normalise order, but the dedup key must handle both cases.
+    let series = vec![
+        Series {
+            labels: vec![
+                Label::metric_name("order_test"),
+                Label::new("a", "1"),
+                Label::new("b", "2"),
+            ],
+            metric_type: Some(MetricType::Gauge),
+            unit: None,
+            description: None,
+            samples: vec![Sample::new(now_ms, 10.0)],
+        },
+        Series {
+            labels: vec![
+                Label::metric_name("order_test"),
+                Label::new("b", "2"),
+                Label::new("a", "1"),
+            ],
+            metric_type: Some(MetricType::Gauge),
+            unit: None,
+            description: None,
+            samples: vec![Sample::new(now_ms + 1, 20.0)],
+        },
+    ];
+    tsdb.ingest_samples(series).await;
+    tsdb.flush().await;
+
+    let req = Request::get("/federate?match[]=order_test")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "same series with different label order should dedup to 1 line, got: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Limit parameter
 // ---------------------------------------------------------------------------
 
@@ -519,7 +696,7 @@ async fn test_slatedb_metrics_reflect_writes() {
     let baseline_write_ops = parse_metric_value(&baseline_text, "slatedb_db_write_ops");
 
     // Ingest data and flush to trigger SlateDB writes
-    ingest_test_data(&tsdb).await;
+    ingest_test_data(&tsdb, SAMPLE_TS_MS).await;
 
     // Check that write_ops increased
     let req = Request::get("/metrics").body(Body::empty()).unwrap();

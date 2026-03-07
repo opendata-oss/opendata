@@ -247,9 +247,18 @@ impl LogReadView {
         self.storage = snapshot;
     }
 
-    /// Replaces the segment cache contents with the given segments.
-    pub(crate) fn replace_segments(&mut self, segments: &[LogSegment]) {
-        self.segments.replace_all(segments);
+    /// Incrementally loads new segments from the current storage snapshot.
+    ///
+    /// Only loads segments with ID > `after_segment_id`. This is used by
+    /// subscriber tasks to refresh segments without needing segments propagated
+    /// through the watch channel.
+    pub(crate) async fn refresh_segments(
+        &mut self,
+        after_segment_id: Option<SegmentId>,
+    ) -> crate::error::Result<()> {
+        self.segments
+            .refresh(self.storage.as_ref(), after_segment_id)
+            .await
     }
 
     /// Scans entries for a key within a sequence number range with custom options.

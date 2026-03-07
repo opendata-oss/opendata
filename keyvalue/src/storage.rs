@@ -129,7 +129,8 @@ impl KeyValueStorage {
         self.storage
             .put_with_options(vec![record.into()], storage_options)
             .await
-            .map_err(|e| Error::Storage(e.to_string()))
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
     }
 
     /// Deletes a key. No-op if key does not exist.
