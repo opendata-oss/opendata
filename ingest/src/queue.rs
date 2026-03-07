@@ -1,8 +1,5 @@
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::clock::Clock;
@@ -13,16 +10,13 @@ use slatedb::object_store::{
 
 use crate::error::{Error, Result};
 
-fn millis(time: SystemTime) -> i64 {
-    time.duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_millis() as i64
-}
-
 const MANIFEST_VERSION: u16 = 1;
 const UNINITIALIZED_EPOCH: u64 = u64::MAX;
+#[allow(dead_code)]
 const ENTRY_LEN_SIZE: usize = 4;
+#[allow(dead_code)]
 const LOCATION_LEN_SIZE: usize = 2;
+#[allow(dead_code)]
 const INGESTION_TIME_MS_SIZE: usize = 8;
 const ENTRIES_COUNT_SIZE: usize = 4;
 const SEQUENCE_SIZE: usize = 8;
@@ -31,15 +25,15 @@ const VERSION_SIZE: usize = 2;
 const FOOTER_SIZE: usize = ENTRIES_COUNT_SIZE + SEQUENCE_SIZE + EPOCH_SIZE + VERSION_SIZE;
 
 #[derive(Debug, Clone)]
-struct QueueEntry {
-    sequence: u64,
-    location: String,
-    ingestion_time_ms: i64,
-    metadata: Bytes,
+pub(crate) struct QueueEntry {
+    pub(crate) sequence: u64,
+    pub(crate) location: String,
+    pub(crate) ingestion_time_ms: i64,
+    pub(crate) metadata: Bytes,
 }
 
 #[derive(Debug, Clone)]
-struct Manifest {
+pub(crate) struct Manifest {
     data: Bytes,
     appended: BytesMut,
     appended_count: usize,
@@ -65,7 +59,7 @@ impl Manifest {
     }
 
     /// Wrap raw binary data as a queue manifest, validating the footer.
-    fn from_bytes(data: Bytes) -> Result<Self> {
+    pub(crate) fn from_bytes(data: Bytes) -> Result<Self> {
         if data.is_empty() {
             return Err(Error::Serialization(
                 "queue manifest data must not be empty".to_string(),
@@ -127,18 +121,21 @@ impl Manifest {
     }
 
     /// Number of entries (read from the footer, O(1)).
+    #[allow(dead_code)]
     fn entries_count(&self) -> usize {
         let base = self.existing_entries_count();
         base + self.appended_count
     }
 
     /// Whether the manifest contains no entries.
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.entries_count() == 0
     }
 
     /// Return a borrowing iterator that lazily deserializes entries.
-    fn iter(&self) -> ManifestIter<'_> {
+    #[allow(dead_code)]
+    pub(crate) fn iter(&self) -> ManifestIter<'_> {
         let base_count = self.existing_entries_count();
         let entries_end = if self.data.is_empty() {
             0
@@ -156,6 +153,7 @@ impl Manifest {
         }
     }
 
+    #[allow(dead_code)]
     fn existing_entries_count(&self) -> usize {
         if self.data.is_empty() {
             0
@@ -186,6 +184,7 @@ impl Manifest {
     ///
     /// Optimized to avoid deserializing/re-serializing remaining entries: only the
     /// removed entries are fully decoded, while remaining entries are byte-copied.
+    #[allow(dead_code)]
     fn dequeue(&mut self, through_sequence: u64) -> Vec<QueueEntry> {
         let next_seq = self.next_sequence;
         let epoch = self.epoch;
@@ -233,6 +232,7 @@ impl Manifest {
     }
 
     /// Set the epoch and patch the data bytes in place.
+    #[allow(dead_code)]
     fn set_epoch(&mut self, epoch: u64) {
         self.epoch = epoch;
         let mut buf = BytesMut::from(self.data.as_ref());
@@ -280,6 +280,7 @@ impl Manifest {
     }
 }
 
+#[allow(dead_code)]
 /// Walk entries in `data[0..end]`, splitting at `through_sequence`.
 /// Entries with sequence <= through_sequence are fully decoded and returned.
 /// Returns (removed_entries, remaining_start_offset, remaining_count).
@@ -316,6 +317,7 @@ fn split_entries(
     (removed, end, 0)
 }
 
+#[allow(dead_code)]
 /// Decode a single entry from binary data at the given offset.
 fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntry> {
     if *offset + ENTRY_LEN_SIZE > end {
@@ -376,8 +378,9 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntr
     })
 }
 
+#[allow(dead_code)]
 /// Borrowing iterator over manifest entries. Lazily deserializes each entry.
-struct ManifestIter<'a> {
+pub(crate) struct ManifestIter<'a> {
     data: &'a [u8],
     offset: usize,
     remaining: usize,
@@ -509,23 +512,17 @@ impl ConflictCounter {
 /// retried automatically until it succeeds.
 pub struct QueueProducer {
     manifest_store: ManifestStore,
-    clock: Arc<dyn Clock>,
     counter: ConflictCounter,
 }
 
 impl QueueProducer {
     /// Create a new producer backed by the given [`ObjectStore`].
-    pub fn with_object_store(
-        manifest_path: String,
-        object_store: Arc<dyn ObjectStore>,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
+    pub fn with_object_store(manifest_path: String, object_store: Arc<dyn ObjectStore>) -> Self {
         Self {
             manifest_store: ManifestStore {
                 object_store,
                 manifest_path,
             },
-            clock,
             counter: ConflictCounter::new(),
         }
     }
@@ -533,11 +530,16 @@ impl QueueProducer {
     /// Append an entry to the queue with the given `location` and `metadata`.
     ///
     /// The write is retried automatically on optimistic-concurrency conflicts.
-    pub async fn enqueue(&self, location: String, metadata: Bytes) -> Result<()> {
+    pub async fn enqueue(
+        &self,
+        location: String,
+        metadata: Bytes,
+        ingestion_time_ms: i64,
+    ) -> Result<()> {
         let entry = QueueEntry {
             sequence: 0,
             location,
-            ingestion_time_ms: millis(self.clock.now()),
+            ingestion_time_ms,
             metadata,
         };
         loop {
@@ -569,6 +571,7 @@ impl QueueProducer {
 /// fencing any previous consumer instance. Every subsequent read or dequeue
 /// checks that the local epoch still matches the manifest, returning
 /// [`Error::Fenced`] if another consumer has taken over.
+#[allow(dead_code)]
 pub struct QueueConsumer {
     manifest_store: ManifestStore,
     epoch: AtomicU64,
@@ -577,6 +580,7 @@ pub struct QueueConsumer {
     queue_len: AtomicU64,
 }
 
+#[allow(dead_code)]
 impl QueueConsumer {
     /// Create a new consumer backed by the given [`ObjectStore`].
     ///
@@ -715,24 +719,24 @@ mod tests {
     #[tokio::test]
     async fn should_enqueue_locations_to_manifest() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("path/to/file1.json".to_string(), Bytes::new())
+            .enqueue("path/to/file1.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("path/to/file2.json".to_string(), Bytes::new())
+            .enqueue("path/to/file2.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
         let manifest = read_producer_manifest(&store, "test/manifest").await;
         let locations: Vec<String> = manifest.iter().map(|e| e.unwrap().location).collect();
-        assert_eq!(locations, vec!["path/to/file1.json", "path/to/file2.json"]);
+        assert_eq!(
+            locations,
+            vec!["path/to/file1.batch", "path/to/file2.batch"]
+        );
     }
 
     #[tokio::test]
@@ -741,7 +745,7 @@ mod tests {
 
         let existing = Manifest::from_entries(&[QueueEntry {
             sequence: 0,
-            location: "existing/file.json".to_string(),
+            location: "existing/file.batch".to_string(),
             ingestion_time_ms: 1000,
             metadata: Bytes::new(),
         }]);
@@ -751,19 +755,16 @@ mod tests {
             .await
             .unwrap();
 
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         producer
-            .enqueue("new/file.json".to_string(), Bytes::new())
+            .enqueue("new/file.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
         let manifest = read_producer_manifest(&store, "test/manifest").await;
         let locations: Vec<String> = manifest.iter().map(|e| e.unwrap().location).collect();
-        assert_eq!(locations, vec!["existing/file.json", "new/file.json"]);
+        assert_eq!(locations, vec!["existing/file.batch", "new/file.batch"]);
     }
 
     #[tokio::test]
@@ -798,22 +799,19 @@ mod tests {
     #[tokio::test]
     async fn should_read_entry_by_sequence() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new())
+            .enqueue("a.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("b.json".to_string(), Bytes::new())
+            .enqueue("b.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("c.json".to_string(), Bytes::new())
+            .enqueue("c.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -825,21 +823,18 @@ mod tests {
         consumer.initialize().await.unwrap();
 
         let entry = consumer.read(1).await.unwrap().unwrap();
-        assert_eq!(entry.location, "b.json");
+        assert_eq!(entry.location, "b.batch");
         assert_eq!(entry.sequence, 1);
     }
 
     #[tokio::test]
     async fn should_read_none_for_missing_sequence() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new())
+            .enqueue("a.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -899,14 +894,11 @@ mod tests {
     #[tokio::test]
     async fn should_fence_uninitialized_consumer() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.batch".to_string(), Bytes::new())
+            .enqueue("a.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -946,18 +938,15 @@ mod tests {
     #[tokio::test]
     async fn should_peek_first_entry_with_valid_epoch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new())
+            .enqueue("a.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("b.json".to_string(), Bytes::new())
+            .enqueue("b.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -969,28 +958,25 @@ mod tests {
         consumer.initialize().await.unwrap();
 
         let entry = consumer.peek().await.unwrap().unwrap();
-        assert_eq!(entry.location, "a.json");
+        assert_eq!(entry.location, "a.batch");
     }
 
     #[tokio::test]
     async fn should_dequeue_entries_with_valid_epoch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new())
+            .enqueue("a.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("b.json".to_string(), Bytes::new())
+            .enqueue("b.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("c.json".to_string(), Bytes::new())
+            .enqueue("c.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -1003,28 +989,25 @@ mod tests {
 
         let removed = consumer.dequeue(1).await.unwrap();
         assert_eq!(removed.len(), 2);
-        assert_eq!(removed[0].location, "a.json");
-        assert_eq!(removed[1].location, "b.json");
+        assert_eq!(removed[0].location, "a.batch");
+        assert_eq!(removed[1].location, "b.batch");
 
         let next = consumer.peek().await.unwrap().unwrap();
-        assert_eq!(next.location, "c.json");
+        assert_eq!(next.location, "c.batch");
     }
 
     #[tokio::test]
     async fn should_enqueue_after_consumer_dequeue() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new())
+            .enqueue("a.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
         producer
-            .enqueue("b.json".to_string(), Bytes::new())
+            .enqueue("b.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
@@ -1038,12 +1021,12 @@ mod tests {
         consumer.dequeue(1).await.unwrap();
 
         producer
-            .enqueue("c.json".to_string(), Bytes::new())
+            .enqueue("c.batch".to_string(), Bytes::new(), 0)
             .await
             .unwrap();
 
         let next = consumer.peek().await.unwrap().unwrap();
-        assert_eq!(next.location, "c.json");
+        assert_eq!(next.location, "c.batch");
         assert_eq!(next.sequence, 2);
     }
 

@@ -171,7 +171,7 @@ The API of the ingestor is the following:
 impl Ingestor {
   pub fn new(config: IngestorConfig, clock: Arc<dyn Clock>) -> Result<Self> { ... }
 
-  pub async fn ingest(&self, entries: Vec<Bytes>) -> Result<WriteWatcher> { ... }
+  pub async fn ingest(&self, entries: Vec<Bytes>, metadata: Bytes) -> Result<WriteHandle> { ... }
 
   pub async fn close(self) -> Result<()> { ... }
 }
@@ -182,14 +182,33 @@ The configurations for the ingestor are:
 
 ```rust
 pub struct IngestorConfig {
-  pub object_store_config: ObjectStoreConfig,  // configuration of the object store from opendata/common
-  pub data_path_prefix: String,                // path prefix where to store the data objects, default: "ingest"
-  pub manifest_path: String,                   // path to the queue manifest, default: "ingest/manifest"
-  pub flush_interval: Duration,                // time interval that once elapsed triggers a flush of the
-                                               // current batch to object storage, default: 100ms
-  pub flush_size_bytes: usize,                 // size in bytes that triggers a flush if the current batch exceeds it,
-                                               // default: 64 MiB
-  pub max_unflushed_bytes: usize,              // limit in bytes that triggers backpressure, default: usize:MAX
+  /// Determines where and how ingest data is persisted. See [`StorageConfig`].
+  pub storage: StorageConfig,
+
+  /// Path prefix for data batch objects in object storage.
+  ///
+  /// Defaults to `"ingest"`.
+  pub data_path_prefix: String,
+
+  /// Path to the queue manifest in object storage.
+  ///
+  /// Defaults to `"ingest/manifest"`.
+  pub manifest_path: String,
+
+  /// Time interval that triggers the flush of the current batch to object storage when elapsed.
+  ///
+  /// Defaults to 100 ms.
+  pub flush_interval: Duration,
+
+  /// Batch size in bytes that triggers a flush when exceeded.
+  ///
+  /// Defaults to 64 MiB.
+  pub flush_size_bytes: usize,
+
+  /// Unflushed-bytes limit that triggers backpressure.
+  ///
+  /// Defaults to `usize::MAX`.
+  pub max_unflushed_bytes: usize,
 }
 ```
 The queue manifest takes the name specified in `manifest_path`.
@@ -202,10 +221,13 @@ is less than `max_unflushed_bytes`.
 If this backpressure blocking the ingestion becomes an issue, new ingestors can be created to better distribute the
 load.
 
-A call to `ingest()` takes a vector of byte entries and returns a `WriteWatcher` with which the caller can await
-the completion of the flush to object storage of the vector of entries.
+A call to `ingest()` takes a vector of byte entries and opaque metadata, and returns a `WriteHandle` with which
+the caller can await the completion of the flush to object storage of the vector of entries.
+The metadata is written to the queue manifest entry (not to the data batch) and can be used by the collector
+to interpret the batch without reading it.
+The ingestor also records the ingestion time and passes it to the queue entry.
 
-The `WriteWatcher` has the following API:
+The `WriteHandle` has the following API:
 ```rust
     pub fn result(&self) -> Option<Result<()>>
 
