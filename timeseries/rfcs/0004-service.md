@@ -74,6 +74,32 @@ The `otel` feature is usable without `http-server` — the converter can be used
 
 The service uses Axum, listens on a single port (default 9090), and handles graceful shutdown (SIGINT/SIGTERM) with a TSDB flush.
 
+### Amendment: TimeSeries Binding to Shared Write Pipeline
+
+TimeSeries adopts the cross-project write pipeline model defined in [RFC 0006: Write Pipeline (Source/Sink)](../../rfcs/0006-write-pipeline.md).
+
+For TimeSeries, the pipeline payload type is `Vec<Series>`.
+
+TimeSeries-specific bindings:
+
+- **Push sources**:
+  - `POST /api/v1/write` (Prometheus Remote Write 1.0) decodes to `Vec<Series>`.
+  - `POST /v1/metrics` (OTLP/HTTP) uses `OtelSeriesBuilder` and emits `Vec<Series>`.
+- **Terminal sink**:
+  - `TsdbSink` writes to `TimeSeriesDb::write()` / `Tsdb::ingest_samples()`.
+- **Optional intermediate sink/source stage**:
+  - Stateless ingest (RFC 0001) can be inserted between protocol sources and `TsdbSink`.
+  - TimeSeries defines the record serialization for `Vec<Series>` used by this stage.
+
+Durability policy for the stateless ingest sink path: endpoint success SHOULD be returned only after object-store durability (`WriteWatcher::await_durable()`).
+
+Server composition remains:
+
+| Mode | Routes |
+|---|---|
+| **Full server** | Query APIs + ingest APIs + health + metrics + UI |
+| **Write-only server** | Ingest APIs + health + metrics |
+
 #### Endpoints
 
 **PromQL query endpoints** (always available with `http-server`):
@@ -103,7 +129,7 @@ Each handler deserializes HTTP parameters, calls the corresponding `TimeSeriesDb
 | Encoding | Snappy-compressed protobuf `WriteRequest` |
 | Success | `204 No Content` |
 
-The handler decompresses, decodes the `WriteRequest` (a flat list of label/sample pairs), converts to `Vec<Series>`, and calls `tsdb.write()`.
+The handler decompresses, decodes the `WriteRequest` (a flat list of label/sample pairs), converts to `Vec<Series>`, and delegates to the configured ingest sink.
 
 **OTLP endpoint** (feature: `otel` + `http-server`):
 
@@ -113,7 +139,7 @@ The handler decompresses, decodes the `WriteRequest` (a flat list of label/sampl
 | Encoding | Protobuf `ExportMetricsServiceRequest` |
 | Success | `200 OK` with protobuf `ExportMetricsServiceResponse` |
 
-The handler decodes the request, calls `OtelConverter::convert()` to decompose OTEL metrics into `Vec<Series>`, and calls `tsdb.write()`.
+The handler decodes the request, calls `OtelConverter::convert()` to decompose OTEL metrics into `Vec<Series>`, and delegates to the configured ingest sink.
 
 ### OtelConverter
 
@@ -188,3 +214,4 @@ Each protocol could run its own server on a different port. This adds operationa
 |---|---|
 | 2026-02-24 | Initial draft (as RFC 0003: OTLP Metrics Ingest) |
 | 2026-02-25 | Restructured as TimeSeries Service RFC covering HTTP server, remote-write, and OTEL ingest |
+| 2026-03-03 | Amendment: TimeSeries binding to shared source/sink pipeline model; generic pipeline semantics moved to RFC 0006 |
