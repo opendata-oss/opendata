@@ -47,16 +47,13 @@ use bytes::{Bytes, BytesMut};
 /// The distance metric determines how vector similarity is computed during search.
 /// This is set at collection creation and cannot be changed afterward.
 ///
-/// - **L2**: Euclidean distance. Lower values = more similar. Best for normalized vectors.
-/// - **Cosine**: Cosine similarity. Higher values = more similar. Automatically normalizes.
-/// - **DotProduct**: Dot product. Higher values = more similar. Fastest but requires normalized vectors.
+/// - **L2**: Euclidean distance. Lower values = more similar.
+/// - **DotProduct**: Dot product. Higher values = more similar. Requires normalized vectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum DistanceMetric {
     /// Euclidean (L2) distance: sqrt(sum((a\[i\] - b\[i\])²))
     L2 = 0,
-    /// Cosine similarity: dot(a, b) / (|a| * |b|)
-    Cosine = 1,
     /// Dot product: sum(a\[i\] * b\[i\])
     DotProduct = 2,
 }
@@ -65,7 +62,6 @@ impl DistanceMetric {
     pub fn from_byte(byte: u8) -> Result<Self, EncodingError> {
         match byte {
             0 => Ok(DistanceMetric::L2),
-            1 => Ok(DistanceMetric::Cosine),
             2 => Ok(DistanceMetric::DotProduct),
             _ => Err(EncodingError {
                 message: format!("Invalid distance metric: {}", byte),
@@ -148,7 +144,7 @@ impl Decode for MetadataFieldSpec {
 /// ┌────────────────────────────────────────────────────────────────┐
 /// │  schema_version:    u32                                        │
 /// │  dimensions:        u16                                        │
-/// │  distance_metric:   u8   (0=L2, 1=cosine, 2=dot_product)       │
+/// │  distance_metric:   u8   (0=L2, 2=dot_product)                  │
 /// │  chunk_target:      u16  (centroids per chunk, default 4096)   │
 /// │  metadata_fields:   Array<MetadataFieldSpec>                   │
 /// │                                                                │
@@ -263,7 +259,7 @@ mod tests {
         // given
         let value = CollectionMetaValue::new(
             1536,
-            DistanceMetric::Cosine,
+            DistanceMetric::DotProduct,
             4096,
             vec![
                 MetadataFieldSpec::new("category", FieldType::String, true),
@@ -299,7 +295,7 @@ mod tests {
         // given
         let value = CollectionMetaValue::new(
             1536,
-            DistanceMetric::Cosine,
+            DistanceMetric::DotProduct,
             4096,
             vec![
                 MetadataFieldSpec::new("category", FieldType::String, true),
@@ -324,7 +320,7 @@ mod tests {
         // given
         let value = CollectionMetaValue::new(
             1536,
-            DistanceMetric::Cosine,
+            DistanceMetric::DotProduct,
             4096,
             vec![
                 MetadataFieldSpec::new("category", FieldType::String, true),
@@ -342,11 +338,7 @@ mod tests {
 
     #[test]
     fn should_preserve_all_distance_metrics() {
-        for metric in [
-            DistanceMetric::L2,
-            DistanceMetric::Cosine,
-            DistanceMetric::DotProduct,
-        ] {
+        for metric in [DistanceMetric::L2, DistanceMetric::DotProduct] {
             // given
             let value = CollectionMetaValue::new(128, metric, 2048, vec![]);
 

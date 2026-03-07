@@ -293,7 +293,6 @@ pub struct SearchResult {
     /// Similarity score (interpretation depends on distance metric)
     ///
     /// - L2: Lower scores = more similar
-    /// - Cosine: Higher scores = more similar (range: -1 to 1)
     /// - DotProduct: Higher scores = more similar
     pub score: f32,
     /// Attribute key-value pairs
