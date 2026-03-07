@@ -27,6 +27,7 @@ rstest.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
+slatedb.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 log = "0.4.29"
