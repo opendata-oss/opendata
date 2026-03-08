@@ -90,7 +90,6 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
 /// Used for:
 /// - Deletions: Union deleted vector IDs
 /// - MetadataIndex: Union vector IDs matching a metadata filter
-#[allow(dead_code)]
 fn merge_roaring_treemap(existing: Bytes, new_value: Bytes) -> Result<Bytes, EncodingError> {
     // Deserialize both bitmaps
     let existing_bitmap = RoaringTreemap::deserialize_from(Cursor::new(existing.as_ref()))

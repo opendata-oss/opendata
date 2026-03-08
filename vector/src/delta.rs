@@ -24,7 +24,8 @@ use std::sync::{Arc, OnceLock};
 use crate::hnsw::CentroidGraph;
 use crate::lire::commands::RebalanceCommand;
 use crate::lire::rebalancer::IndexRebalancer;
-use crate::model::AttributeValue;
+use crate::model::{AttributeValue, MetadataFieldSpec, VECTOR_FIELD_NAME};
+use crate::serde::FieldValue;
 use crate::serde::posting_list::PostingUpdate;
 use crate::storage::record;
 use common::SequenceAllocator;
@@ -32,6 +33,7 @@ use common::coordinator::{Delta, PauseHandle};
 use common::storage::RecordOp;
 use dashmap::DashMap;
 use roaring::RoaringTreemap;
+use std::collections::HashSet;
 use tracing::debug;
 // ============================================================================
 // WriteCoordinator Integration Types
@@ -65,6 +67,19 @@ pub(crate) struct VectorDbDeltaOpts {
     pub(crate) max_pending_and_running_rebalance_tasks: usize,
     pub(crate) split_threshold_vectors: usize,
     pub(crate) rebalance_backpressure_resume_threshold: usize,
+    /// Names of indexed metadata fields (for maintaining the inverted index).
+    pub(crate) indexed_fields: HashSet<String>,
+}
+
+impl VectorDbDeltaOpts {
+    /// Build the set of indexed field names from metadata field specs.
+    pub(crate) fn indexed_fields_from(specs: &[MetadataFieldSpec]) -> HashSet<String> {
+        specs
+            .iter()
+            .filter(|s| s.indexed)
+            .map(|s| s.name.clone())
+            .collect()
+    }
 }
 
 /// Image containing shared state for the delta.
@@ -179,6 +194,13 @@ impl Delta for VectorDbWriteDelta {
             ops.push(record::merge_centroid_stats(*centroid_id, count));
         }
 
+        // Finalize metadata inverted index merges
+        for (encoded_key, vector_ids) in &view.metadata_index_updates {
+            if let Ok(op) = record::merge_metadata_index_bitmap(encoded_key.clone(), vector_ids) {
+                ops.push(op);
+            }
+        }
+
         // Finalize deleted vectors merge
         if !view.deleted_centroids.is_empty() {
             let op = record::merge_deleted_vectors(view.deleted_centroids.clone())
@@ -257,6 +279,18 @@ impl VectorDbWriteDelta {
                 &write.attributes,
             ));
 
+            // Accumulate metadata inverted index postings for indexed attributes
+            for (attr_name, attr_value) in &write.attributes {
+                if attr_name == VECTOR_FIELD_NAME {
+                    continue;
+                }
+                if !self.ctx.opts.indexed_fields.contains(attr_name) {
+                    continue;
+                }
+                let field_value: FieldValue = attr_value.clone().into();
+                view.add_to_metadata_index(attr_name.clone(), field_value, new_internal_id);
+            }
+
             // Accumulate posting list update
             view.add_to_posting(centroid_id, new_internal_id, write.values);
             self.ctx.rebalancer.update_counts(&[(centroid_id, 1)])
@@ -272,6 +306,9 @@ impl VectorDbWriteDelta {
 pub(crate) struct VectorDbDeltaView {
     pub(crate) posting_updates: HashMap<u64, Vec<PostingUpdate>>,
     pub(crate) deleted_centroids: RoaringTreemap,
+    /// Accumulated metadata index postings: encoded key → set of vector IDs.
+    /// Built into merge ops during freeze().
+    pub(crate) metadata_index_updates: HashMap<bytes::Bytes, RoaringTreemap>,
 }
 
 impl VectorDbDeltaView {
@@ -279,6 +316,7 @@ impl VectorDbDeltaView {
         Self {
             posting_updates: HashMap::new(),
             deleted_centroids: RoaringTreemap::new(),
+            metadata_index_updates: HashMap::new(),
         }
     }
 
@@ -287,6 +325,20 @@ impl VectorDbDeltaView {
             .entry(centroid_id)
             .or_default()
             .push(PostingUpdate::append(vector_id, vector));
+    }
+
+    pub(crate) fn add_to_metadata_index(
+        &mut self,
+        field_name: String,
+        field_value: FieldValue,
+        vector_id: u64,
+    ) {
+        let key = crate::serde::key::MetadataIndexKey::new(field_name, field_value).encode();
+        #[allow(clippy::unwrap_or_default)]
+        self.metadata_index_updates
+            .entry(key)
+            .or_insert_with(RoaringTreemap::new)
+            .insert(vector_id);
     }
 
     pub(crate) fn delete_from_posting(&mut self, centroid_id: u64, vector_id: u64) {
@@ -379,6 +431,7 @@ mod tests {
                 max_pending_and_running_rebalance_tasks: usize::MAX,
                 split_threshold_vectors: usize::MAX,
                 rebalance_backpressure_resume_threshold: 0,
+                indexed_fields: HashSet::new(),
             },
             dictionary: Arc::new(DashMap::new()),
             centroid_graph,
@@ -711,6 +764,7 @@ mod tests {
                 max_pending_and_running_rebalance_tasks: usize::MAX,
                 split_threshold_vectors: usize::MAX,
                 rebalance_backpressure_resume_threshold: 0,
+                indexed_fields: HashSet::new(),
             },
             dictionary: Arc::new(DashMap::new()),
             centroid_graph,
@@ -833,6 +887,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_emit_metadata_index_merge_ops_for_indexed_fields() {
+        // given - context with "category" as an indexed field
+        let storage: Arc<dyn common::Storage> = Arc::new(InMemoryStorage::new());
+        let key = Bytes::from_static(&[0x01, 0x02]);
+        let id_allocator = SequenceAllocator::load(storage.as_ref(), key)
+            .await
+            .unwrap();
+        let centroid_graph: Arc<dyn CentroidGraph> =
+            Arc::new(MockCentroidGraph::new(vec![(1, vec![0.0; 3])]));
+        let rebalancer = IndexRebalancer::new(
+            IndexRebalancerOpts {
+                dimensions: 3,
+                distance_metric: DistanceMetric::L2,
+                split_search_neighbourhood: 4,
+                split_threshold_vectors: 10_000,
+                merge_threshold_vectors: 0,
+                max_rebalance_tasks: 0,
+            },
+            centroid_graph.clone(),
+            HashMap::new(),
+            Arc::new(std::sync::OnceLock::new()),
+        );
+
+        let ctx = VectorDbDeltaContext {
+            opts: VectorDbDeltaOpts {
+                dimensions: 3,
+                chunk_target: 4096,
+                max_pending_and_running_rebalance_tasks: usize::MAX,
+                split_threshold_vectors: usize::MAX,
+                rebalance_backpressure_resume_threshold: 0,
+                indexed_fields: HashSet::from(["category".to_string()]),
+            },
+            dictionary: Arc::new(DashMap::new()),
+            centroid_graph,
+            id_allocator,
+            current_chunk_id: 0,
+            current_chunk_count: 0,
+            rebalancer,
+            pause_handle: Arc::new(OnceLock::new()),
+        };
+        let mut delta = VectorDbWriteDelta::init(ctx);
+
+        let writes = vec![
+            VectorWrite {
+                external_id: "vec-1".to_string(),
+                values: vec![1.0, 0.0, 0.0],
+                attributes: vec![
+                    (
+                        "vector".to_string(),
+                        AttributeValue::Vector(vec![1.0, 0.0, 0.0]),
+                    ),
+                    (
+                        "category".to_string(),
+                        AttributeValue::String("shoes".to_string()),
+                    ),
+                ],
+            },
+            VectorWrite {
+                external_id: "vec-2".to_string(),
+                values: vec![0.0, 1.0, 0.0],
+                attributes: vec![
+                    (
+                        "vector".to_string(),
+                        AttributeValue::Vector(vec![0.0, 1.0, 0.0]),
+                    ),
+                    (
+                        "category".to_string(),
+                        AttributeValue::String("shoes".to_string()),
+                    ),
+                ],
+            },
+            VectorWrite {
+                external_id: "vec-3".to_string(),
+                values: vec![0.0, 0.0, 1.0],
+                attributes: vec![
+                    (
+                        "vector".to_string(),
+                        AttributeValue::Vector(vec![0.0, 0.0, 1.0]),
+                    ),
+                    (
+                        "category".to_string(),
+                        AttributeValue::String("boots".to_string()),
+                    ),
+                ],
+            },
+        ];
+
+        // when
+        delta.apply(VectorDbWrite::Write(writes)).unwrap();
+        let (frozen, _view, _ctx) = delta.freeze();
+
+        // then - should have metadata index merge ops
+        let metadata_prefix = crate::serde::RecordType::MetadataIndex.prefix();
+        let mut prefix_buf = bytes::BytesMut::with_capacity(2);
+        metadata_prefix.write_to(&mut prefix_buf);
+        let prefix = prefix_buf.freeze();
+
+        let metadata_merges: Vec<_> = frozen
+            .ops
+            .iter()
+            .filter(|op| is_merge_with_key_prefix(op, &prefix))
+            .collect();
+
+        // Should have exactly 2 merge ops: one for (category, "shoes") and one for (category, "boots")
+        assert_eq!(
+            metadata_merges.len(),
+            2,
+            "should have 2 metadata index merge ops (one per unique field/value pair)"
+        );
+
+        // Decode the bitmaps and verify: "shoes" should have 2 vector IDs, "boots" should have 1
+        let mut bitmap_sizes: Vec<u64> = metadata_merges
+            .iter()
+            .map(|op| {
+                let RecordOp::Merge(record) = op else {
+                    panic!("expected merge op");
+                };
+                let bitmap = crate::serde::metadata_index::MetadataIndexValue::decode_from_bytes(
+                    &record.record.value,
+                )
+                .unwrap();
+                bitmap.len()
+            })
+            .collect();
+        bitmap_sizes.sort();
+        assert_eq!(
+            bitmap_sizes,
+            vec![1, 2],
+            "should have bitmaps with 1 and 2 entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_emit_metadata_index_ops_for_non_indexed_fields() {
+        // given - context with NO indexed fields
+        let ctx = create_test_context(1).await;
+        let mut delta = VectorDbWriteDelta::init(ctx);
+
+        let write = create_vector_write("vec-1", vec![1.0, 2.0, 3.0]);
+
+        // when
+        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
+        let (frozen, _view, _ctx) = delta.freeze();
+
+        // then - should have NO metadata index merge ops
+        let metadata_prefix = crate::serde::RecordType::MetadataIndex.prefix();
+        let mut prefix_buf = bytes::BytesMut::with_capacity(2);
+        metadata_prefix.write_to(&mut prefix_buf);
+        let prefix = prefix_buf.freeze();
+
+        let metadata_merges = frozen
+            .ops
+            .iter()
+            .filter(|op| is_merge_with_key_prefix(op, &prefix))
+            .count();
+        assert_eq!(
+            metadata_merges, 0,
+            "should have no metadata index ops when no fields are indexed"
+        );
+    }
+
+    #[tokio::test]
     async fn should_update_centroid_counts_per_centroid() {
         // given - create a mock that routes vectors to different centroids
         struct MultiCentroidGraph;
@@ -893,6 +1109,7 @@ mod tests {
                 max_pending_and_running_rebalance_tasks: usize::MAX,
                 split_threshold_vectors: usize::MAX,
                 rebalance_backpressure_resume_threshold: 0,
+                indexed_fields: HashSet::new(),
             },
             dictionary: Arc::new(DashMap::new()),
             centroid_graph,
