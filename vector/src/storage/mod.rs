@@ -8,9 +8,10 @@ use crate::serde::centroid_chunk::CentroidChunkValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::deletions::DeletionsValue;
 use crate::serde::key::{
-    CentroidChunkKey, CentroidStatsKey, DeletionsKey, IdDictionaryKey, PostingListKey,
-    VectorDataKey,
+    CentroidChunkKey, CentroidStatsKey, DeletionsKey, IdDictionaryKey, MetadataIndexKey,
+    PostingListKey, VectorDataKey,
 };
+use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::PostingListValue;
 use crate::serde::vector_data::VectorDataValue;
 
@@ -174,6 +175,27 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         }
 
         Ok(stats)
+    }
+
+    /// Load a metadata index entry for a specific field/value pair.
+    ///
+    /// Returns a bitmap of vector IDs that have the given value for the field.
+    /// Returns an empty bitmap if no entry exists.
+    #[allow(dead_code)]
+    async fn get_metadata_index(
+        &self,
+        field: &str,
+        value: crate::serde::FieldValue,
+    ) -> Result<MetadataIndexValue> {
+        let key = MetadataIndexKey::new(field, value).encode();
+        let record = self.get(key).await?;
+        match record {
+            Some(record) => {
+                let value = MetadataIndexValue::decode_from_bytes(&record.value)?;
+                Ok(value)
+            }
+            None => Ok(MetadataIndexValue::new()),
+        }
     }
 
     /// Scan all centroid chunks to load centroids.

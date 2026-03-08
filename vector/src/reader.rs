@@ -7,7 +7,7 @@
 
 use crate::error::{Error, Result};
 use crate::hnsw::{CentroidGraph, build_centroid_graph};
-use crate::model::{ReaderConfig, SearchResult};
+use crate::model::{Query, ReaderConfig, SearchResult};
 use crate::query_engine::{QueryEngine, QueryEngineOptions};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::storage::VectorDbStorageReadExt;
@@ -95,40 +95,34 @@ impl VectorDbReader {
         )
     }
 
-    /// Search for k-nearest neighbors to a query vector.
-    pub async fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
-        self.query_engine().search(query, k).await
+    /// Search for nearest neighbors using a Query specification.
+    pub async fn search(&self, query: &Query) -> Result<Vec<SearchResult>> {
+        self.query_engine().search(query).await
+    }
+
+    /// Search with an explicit nprobe setting.
+    pub async fn search_with_nprobe(
+        &self,
+        query: &Query,
+        nprobe: usize,
+    ) -> Result<Vec<SearchResult>> {
+        self.query_engine().search_with_nprobe(query, nprobe).await
     }
 
     /// Search using brute-force centroid lookup (for diagnostics).
     pub async fn search_exact_nprobe(
         &self,
-        query: &[f32],
-        k: usize,
+        query: &Query,
         nprobe: usize,
     ) -> Result<Vec<SearchResult>> {
-        self.query_engine()
-            .search_exact_nprobe(query, k, nprobe)
-            .await
-    }
-
-    /// Search with a specific nprobe value.
-    pub async fn search_with_nprobe(
-        &self,
-        query: &[f32],
-        k: usize,
-        nprobe: usize,
-    ) -> Result<Vec<SearchResult>> {
-        self.query_engine()
-            .search_with_nprobe(query, k, nprobe)
-            .await
+        self.query_engine().search_exact_nprobe(query, nprobe).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::VectorDb;
-    use crate::model::{Config, ReaderConfig, Vector};
+    use crate::model::{Config, Query, ReaderConfig, Vector};
     use crate::reader::VectorDbReader;
     use crate::serde::collection_meta::DistanceMetric;
     use common::StorageConfig;
@@ -181,7 +175,10 @@ mod tests {
             metadata_fields: vec![],
         };
         let reader = VectorDbReader::open(reader_config).await.unwrap();
-        let results = reader.search(&[1.0, 0.0, 0.0], 2).await.unwrap();
+        let results = reader
+            .search(&Query::new(vec![1.0, 0.0, 0.0]).with_limit(2))
+            .await
+            .unwrap();
 
         // then - closest vector should be vec-1
         assert_eq!(results.len(), 2);

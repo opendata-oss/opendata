@@ -52,7 +52,7 @@ pub(crate) mod test_utils;
 pub use db::VectorDb;
 pub use error::{Error, Result};
 pub use model::{
-    Attribute, AttributeValue, Config, DistanceMetric, FieldType, MetadataFieldSpec, ReaderConfig,
-    SearchResult, Vector, VectorBuilder,
+    Attribute, AttributeValue, Config, DistanceMetric, FieldType, Filter, MetadataFieldSpec, Query,
+    ReaderConfig, SearchResult, Vector, VectorBuilder,
 };
 pub use reader::VectorDbReader;

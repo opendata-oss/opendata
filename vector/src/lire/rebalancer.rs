@@ -1007,6 +1007,7 @@ mod tests {
                     max_pending_and_running_rebalance_tasks: usize::MAX,
                     split_threshold_vectors: usize::MAX / 2,
                     rebalance_backpressure_resume_threshold: 0,
+                    indexed_fields: std::collections::HashSet::new(),
                 },
                 dictionary: Arc::new(DashMap::new()),
                 centroid_graph: centroid_graph.clone(),
