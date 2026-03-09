@@ -153,12 +153,19 @@ Implication for this RFC:
 
 Use one unified function-call interface at the function boundary.
 
-- Reuse `ExprResult` directly for evaluated non-string arguments.
+- Use `PromQLArg` as the function-input channel.
+- Keep `ExprResult` as the expression-output channel.
 - Pass `raw_args` for handlers that must inspect AST literals (for example
   string-argument functions).
 - Keep one `PromQLFunction` trait for runtime dispatch by function name.
 
 ```rust
+pub(crate) enum PromQLArg {
+    Scalar(f64),
+    InstantVector(Vec<EvalSample>),
+    RangeVector(Vec<EvalSamples>),
+}
+
 pub(crate) struct FunctionCallContext<'a> {
     pub eval_timestamp_ms: i64,
     pub raw_args: &'a [Box<Expr>],
@@ -167,7 +174,7 @@ pub(crate) struct FunctionCallContext<'a> {
 pub(crate) trait PromQLFunction {
     fn apply(
         &self,
-        evaluated_args: Vec<Option<ExprResult>>,
+        evaluated_args: Vec<Option<PromQLArg>>,
         ctx: &FunctionCallContext<'_>,
     ) -> EvalResult<ExprResult>;
 }
@@ -181,6 +188,9 @@ Notes:
 - Type safety is enforced by parser metadata and evaluator validation.
 - String-argument handling uses `raw_args` with `None` in evaluated argument
   slots.
+- `ExprResult` is intentionally not widened with `String` for this change:
+  function string literals are modeled as function inputs, while expression
+  outputs remain scalar/vector/matrix.
 
 ### Scalar Boundary Semantics
 
@@ -288,7 +298,8 @@ directly.
 | 2026-03-05 | Clarified Rust `promql-parser` alignment: parser metadata is runtime signature source; Prometheus-exact variadic cardinality and `Experimental` metadata remain upstream follow-ups. |
 | 2026-03-05 | Added upstream tracking link for richer parser function metadata: <https://github.com/GreptimeTeam/promql-parser/issues/129>. |
 | 2026-03-05 | Refocused design sections on target architecture and removed rollout sequencing details from core RFC sections. |
-| 2026-03-05 | Simplified target argument model to reuse `ExprResult` for evaluated args (no duplicate `FunctionArgValue` enum), with `raw_args` plus `None` slots for string literals. |
+| 2026-03-05 | Simplified target argument model by removing duplicate `FunctionArgValue`; use one function-input channel plus `raw_args` with `None` slots for string literals. |
 | 2026-03-05 | Clarified current variadic scope: bounded optional-arity support is in scope; unbounded variadic tails (for example `label_join` extra labels) are deferred. |
 | 2026-03-06 | Updated alignment for `promql-parser` `v0.8.x` (`variadic: i32`, `experimental: bool`) and switched RFC variadic semantics to Prometheus-style cardinality. |
 | 2026-03-06 | Added explicit architecture decisions section and reduced implementation-detail sections to keep RFC scope high-level. |
+| 2026-03-09 | Clarified input/output separation for function execution: `PromQLArg` for function inputs, `ExprResult` for expression outputs. |
