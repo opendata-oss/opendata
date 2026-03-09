@@ -23,10 +23,13 @@ pub struct WriteHandle {
 }
 
 impl WriteHandle {
+    /// Return the outcome of the write if the batch has already been flushed,
+    /// or `None` if the flush has not completed yet.
     pub fn result(&self) -> Option<Result<()>> {
         self.rx.borrow().clone()
     }
 
+    /// Wait until the batch containing this write has been durably flushed.
     pub async fn await_durable(&mut self) -> Result<()> {
         self.rx
             .wait_for(|v| v.is_some())
@@ -247,6 +250,7 @@ pub struct Ingestor {
 }
 
 impl Ingestor {
+    /// Create a new ingestor from the given configuration and clock.
     pub fn new(config: IngestorConfig, clock: Arc<dyn Clock>) -> Result<Self> {
         let object_store_config = match &config.storage {
             common::StorageConfig::InMemory => common::storage::config::ObjectStoreConfig::InMemory,
@@ -293,6 +297,10 @@ impl Ingestor {
         })
     }
 
+    /// Submit a set of entries and associated metadata for ingestion.
+    ///
+    /// Returns a [`WriteHandle`] that can be used to check or await durability.
+    /// Applies backpressure by flushing when unflushed bytes exceed the limit.
     pub async fn ingest(&self, entries: Vec<Bytes>, metadata: Bytes) -> Result<WriteHandle> {
         let incoming_size: usize = entries.iter().map(|b| b.len()).sum();
         self.maybe_apply_backpressure(incoming_size).await?;
@@ -325,7 +333,8 @@ impl Ingestor {
         Ok(())
     }
 
-    pub async fn flush(&self) -> Result<()> {
+    /// Flush the current batch, blocking until all pending entries are durably written.
+    async fn flush(&self) -> Result<()> {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(IngestMessage::Flush { done: done_tx })
@@ -335,10 +344,12 @@ impl Ingestor {
             .map_err(|_| Error::Storage("ingestor shut down".to_string()))?
     }
 
+    /// Return the fraction of manifest writes that encountered optimistic-concurrency conflicts.
     pub fn conflict_rate(&self) -> f64 {
         self.producer.conflict_rate()
     }
 
+    /// Shut down the ingestor, flushing any remaining buffered entries before returning.
     pub async fn close(self) -> Result<()> {
         self.cancellation_token.cancel();
         let _ = self.handle.await;
