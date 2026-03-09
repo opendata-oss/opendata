@@ -320,14 +320,7 @@ impl Ingestor {
     }
 
     async fn maybe_apply_backpressure(&self, incoming_size: usize) -> Result<()> {
-        let threshold = self.max_unflushed_bytes;
-        if incoming_size > threshold {
-            return Err(Error::BackpressureLimitExceeded {
-                incoming_size,
-                limit: threshold,
-            });
-        }
-        if self.pending_bytes.load(Ordering::Acquire) + incoming_size >= threshold {
+        if self.pending_bytes.load(Ordering::Acquire) + incoming_size >= self.max_unflushed_bytes {
             self.flush().await?;
         }
         Ok(())
@@ -565,30 +558,6 @@ mod tests {
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
         assert_eq!(entries.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn should_reject_ingest_exceeding_backpressure_limit() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-
-        let mut config = test_config();
-        config.max_unflushed_bytes = 10;
-
-        let ingestor =
-            Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
-
-        // 22 bytes > 10-byte limit
-        let result = ingestor
-            .ingest(vec![Bytes::from("abcdefghijklmnopqrstuv")], Bytes::new())
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(Error::BackpressureLimitExceeded {
-                incoming_size: 22,
-                limit: 10
-            })
-        ));
     }
 
     #[tokio::test]
