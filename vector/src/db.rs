@@ -990,7 +990,7 @@ mod tests {
         Config {
             storage: StorageConfig::InMemory,
             dimensions: 3,
-            distance_metric: DistanceMetric::Cosine,
+            distance_metric: DistanceMetric::L2,
             flush_interval: Duration::from_secs(60),
             split_threshold_vectors: 10_000,
             merge_threshold_vectors: 200,
@@ -1141,7 +1141,7 @@ mod tests {
         Config {
             storage: StorageConfig::InMemory,
             dimensions,
-            distance_metric: DistanceMetric::Cosine,
+            distance_metric: DistanceMetric::L2,
             flush_interval: Duration::from_secs(60),
             split_threshold_vectors: 10_000,
             merge_threshold_vectors: 200,
@@ -1214,10 +1214,10 @@ mod tests {
             );
         }
 
-        // Verify results are sorted by score (cosine similarity, higher = better)
+        // Verify results are sorted by score (L2 distance, lower = better)
         for i in 1..results.len() {
             assert!(
-                results[i - 1].score >= results[i].score,
+                results[i - 1].score <= results[i].score,
                 "Results not sorted by score"
             );
         }
@@ -1527,7 +1527,7 @@ mod tests {
         let config = Config {
             storage: storage_config.clone(),
             dimensions: 3,
-            distance_metric: DistanceMetric::Cosine,
+            distance_metric: DistanceMetric::L2,
             ..Default::default()
         };
 

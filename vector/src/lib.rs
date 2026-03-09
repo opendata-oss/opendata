@@ -12,7 +12,7 @@
 //! # async fn main() -> vector::Result<()> {
 //! let config = Config {
 //!     dimensions: 384,
-//!     distance_metric: DistanceMetric::Cosine,
+//!     distance_metric: DistanceMetric::L2,
 //!     flush_interval: Duration::from_secs(60),
 //!     ..Default::default()
 //! };

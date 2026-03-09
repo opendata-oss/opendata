@@ -23,6 +23,22 @@ Run the HTTP server directly from source:
 cargo run -p opendata-timeseries --features remote-write -- --port 9090
 ```
 
+### OTLP ingest config
+
+To enable OTLP/HTTP metrics ingest (`POST /v1/metrics`), include the `otel`
+feature when starting the server and configure OTEL label behavior in
+`prometheus.yaml`:
+
+```bash
+cargo run -p opendata-timeseries --features "http-server,otel" -- --config ./prometheus.yaml --port 9090
+```
+
+```yaml
+otel:
+  include_resource_attrs: true  # default: true
+  include_scope_attrs: true     # default: true
+```
+
 ### 1. Start the quickstart stack
 
 ```bash

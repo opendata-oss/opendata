@@ -6,7 +6,7 @@ use axum::extract::{FromRequest, Path, State};
 use axum::http::{Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
-#[cfg(feature = "remote-write")]
+#[cfg(any(feature = "remote-write", feature = "otel"))]
 use axum::routing::post;
 use axum::{Json, Router};
 use axum_extra::extract::{Form, Query};
@@ -17,7 +17,9 @@ use super::metrics::Metrics;
 use super::middleware::{MetricsLayer, TracingLayer};
 use crate::error::Error;
 use crate::model::{QueryOptions, QueryValue};
-use crate::promql::config::PrometheusConfig;
+#[cfg(feature = "otel")]
+use crate::otel::{OtelConfig, OtelConverter};
+use crate::promql::config::{OtelServerConfig, PrometheusConfig};
 use crate::promql::request::{
     FederateParams, LabelValuesParams, LabelsParams, MetadataParams, QueryParams, QueryRangeParams,
     SeriesParams,
@@ -40,6 +42,8 @@ struct UiAssets;
 pub(crate) struct AppState {
     pub(crate) tsdb: Arc<Tsdb>,
     pub(crate) metrics: Arc<Metrics>,
+    #[cfg(feature = "otel")]
+    pub(crate) otel_converter: Arc<OtelConverter>,
 }
 
 /// Server configuration
@@ -60,10 +64,19 @@ impl Default for ServerConfig {
 /// Build the production Axum router with all routes, middleware, and state.
 ///
 /// Used by `TimeSeriesHttpServer::run()` and the `testing` module for integration tests.
-pub(crate) fn build_router(tsdb: Arc<Tsdb>, metrics: Arc<Metrics>) -> Router {
+pub(crate) fn build_router(
+    tsdb: Arc<Tsdb>,
+    metrics: Arc<Metrics>,
+    _otel_config: OtelServerConfig,
+) -> Router {
     let state = AppState {
         tsdb,
         metrics: metrics.clone(),
+        #[cfg(feature = "otel")]
+        otel_converter: Arc::new(OtelConverter::new(OtelConfig {
+            include_resource_attrs: _otel_config.include_resource_attrs,
+            include_scope_attrs: _otel_config.include_scope_attrs,
+        })),
     };
 
     let app = Router::new()
@@ -86,6 +99,8 @@ pub(crate) fn build_router(tsdb: Arc<Tsdb>, metrics: Arc<Metrics>) -> Router {
         "/api/v1/write",
         post(super::remote_write::handle_remote_write),
     );
+    #[cfg(feature = "otel")]
+    let app = app.route("/v1/metrics", post(super::otel::handle_otel_metrics));
 
     app.route("/", get(handle_ui_redirect))
         .route("/query", get(handle_ui_index))
@@ -139,7 +154,11 @@ impl TimeSeriesHttpServer {
         }
 
         // Build router with metrics middleware
-        let app = build_router(self.tsdb.clone(), metrics);
+        let app = build_router(
+            self.tsdb.clone(),
+            metrics,
+            self.config.prometheus_config.otel.clone(),
+        );
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.port));
         tracing::info!("Starting Prometheus-compatible server on {}", addr);

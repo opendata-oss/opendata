@@ -35,6 +35,8 @@ pub struct PrometheusConfig {
     #[serde(default)]
     pub scrape_configs: Vec<ScrapeConfig>,
     #[serde(default)]
+    pub otel: OtelServerConfig,
+    #[serde(default)]
     pub storage: StorageConfig,
     /// Flush interval in seconds for persisting data to storage.
     /// Defaults to 5 seconds.
@@ -51,10 +53,33 @@ impl Default for PrometheusConfig {
         Self {
             global: GlobalConfig::default(),
             scrape_configs: Vec::new(),
+            otel: OtelServerConfig::default(),
             storage: StorageConfig::default(),
             flush_interval_secs: default_flush_interval_secs(),
         }
     }
+}
+
+/// OTEL ingest configuration for the HTTP server.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OtelServerConfig {
+    #[serde(default = "default_true")]
+    pub include_resource_attrs: bool,
+    #[serde(default = "default_true")]
+    pub include_scope_attrs: bool,
+}
+
+impl Default for OtelServerConfig {
+    fn default() -> Self {
+        Self {
+            include_resource_attrs: true,
+            include_scope_attrs: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Global configuration defaults.
@@ -216,6 +241,8 @@ scrape_configs:
         // then
         assert_eq!(config.global.scrape_interval, "30s");
         assert_eq!(config.scrape_configs.len(), 2);
+        assert!(config.otel.include_resource_attrs);
+        assert!(config.otel.include_scope_attrs);
 
         let prometheus_job = &config.scrape_configs[0];
         assert_eq!(prometheus_job.job_name, "prometheus");
@@ -275,5 +302,40 @@ scrape_configs:
             job_without_override.effective_interval(&global),
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn should_parse_otel_config() {
+        // given
+        let yaml = r#"
+otel:
+  include_resource_attrs: false
+  include_scope_attrs: true
+"#;
+
+        // when
+        let config: PrometheusConfig = serde_yaml::from_str(yaml).unwrap();
+
+        // then
+        assert!(!config.otel.include_resource_attrs);
+        assert!(config.otel.include_scope_attrs);
+    }
+
+    #[test]
+    fn should_use_default_otel_config() {
+        // given
+        let yaml = r#"
+scrape_configs:
+  - job_name: test
+    static_configs:
+      - targets: ['localhost:9090']
+"#;
+
+        // when
+        let config: PrometheusConfig = serde_yaml::from_str(yaml).unwrap();
+
+        // then
+        assert!(config.otel.include_resource_attrs);
+        assert!(config.otel.include_scope_attrs);
     }
 }

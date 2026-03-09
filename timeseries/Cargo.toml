@@ -92,7 +92,7 @@ required-features = ["testing", "http-server"]
 
 [[test]]
 name = "otel_ingest"
-required-features = ["testing", "otel"]
+required-features = ["testing", "otel", "http-server"]
 
 [[bench]]
 name = "evaluator_micorbench"

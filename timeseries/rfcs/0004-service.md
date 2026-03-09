@@ -110,10 +110,15 @@ The handler decompresses, decodes the `WriteRequest` (a flat list of label/sampl
 | Aspect | Value |
 |---|---|
 | Path | `POST /v1/metrics` |
-| Encoding | Protobuf `ExportMetricsServiceRequest` |
-| Success | `200 OK` with protobuf `ExportMetricsServiceResponse` |
+| Encoding | OTLP/HTTP protobuf (`application/x-protobuf`) `ExportMetricsServiceRequest` |
+| Success | `200 OK` with protobuf `ExportMetricsServiceResponse` (including `partial_success` when applicable) |
 
 The handler decodes the request, calls `OtelConverter::convert()` to decompose OTEL metrics into `Vec<Series>`, and calls `tsdb.write()`.
+
+OTLP/HTTP response semantics follow the OTLP protocol spec:
+- On success, return `200 OK` with `ExportMetricsServiceResponse`.
+- On partial acceptance, still return `200 OK` and populate `partial_success`.
+- On failures (`4xx`/`5xx`), return OTLP protobuf error details (`google.rpc.Status`) with the same content type as the request.
 
 ### OtelConverter
 
@@ -146,16 +151,19 @@ pub struct OtelConfig {
 
 #### Type Decomposition
 
-The converter walks the OTLP hierarchy (`ResourceMetrics` → `ScopeMetrics` → `Metric` → data points) and collects attributes as labels at each level. The mapping follows the [OTLP Prometheus compatibility spec](https://opentelemetry.io/docs/specs/otel/compatibility/prometheus_and_openmetrics/) — including unit suffix normalization and scope labels (`otel_scope_name`, `otel_scope_version`). OTEL metric types map to Prometheus-style series as follows:
+The converter walks the OTLP hierarchy (`ResourceMetrics` → `ScopeMetrics` → `Metric` → data points) and collects attributes as labels at each level. The mapping follows the [OTLP Prometheus compatibility spec](https://opentelemetry.io/docs/specs/otel/compatibility/prometheus_and_openmetrics/) — including unit suffix normalization and scope labels (`otel_scope_name`, `otel_scope_version`, `otel_scope_schema_url`). OTEL metric types map to Prometheus-style series as follows:
 
 | OTEL type | Decomposition | MetricType |
 |---|---|---|
 | Gauge | Single series | Gauge |
 | Sum (monotonic, cumulative) | Single series with `_total` suffix | Counter |
 | Sum (non-monotonic) | Single series | Gauge |
-| Sum (delta) | Dropped with warning | — |
-| Histogram | `_bucket` (per `le`), `_sum`, `_count` | Counter |
-| Exponential Histogram | Converted to explicit boundaries, then same as Histogram | Counter |
+| Sum (delta, monotonic) | SHOULD be converted to cumulative counter series; if not feasible, MAY be dropped | Counter |
+| Sum (delta, non-monotonic) | MUST be dropped | — |
+| Histogram (cumulative) | `_bucket` (per `le`), `_sum`, `_count` | Counter |
+| Histogram (delta) | SHOULD be aggregated to cumulative; otherwise MUST be dropped | Counter |
+| Exponential Histogram (cumulative) | SHOULD map to Native Histogram; MAY be converted to fixed buckets | Counter |
+| Exponential Histogram (delta) | MUST be dropped | — |
 | Summary | Per-quantile series + `_sum`, `_count` | Gauge / Counter |
 
 #### Dependencies
@@ -188,3 +196,11 @@ Each protocol could run its own server on a different port. This adds operationa
 |---|---|
 | 2026-02-24 | Initial draft (as RFC 0003: OTLP Metrics Ingest) |
 | 2026-02-25 | Restructured as TimeSeries Service RFC covering HTTP server, remote-write, and OTEL ingest |
+| 2026-03-05 | Aligned OTLP endpoint and OTLP-to-Prometheus mapping language with OTLP and compatibility specs; added references |
+
+## References
+
+- OTLP protocol: <https://opentelemetry.io/docs/specs/otlp/>
+- OTLP exporter endpoint defaults (`/v1/metrics` for OTLP/HTTP): <https://opentelemetry.io/docs/specs/otel/protocol/exporter/>
+- OTLP-to-Prometheus/OpenMetrics compatibility mapping: <https://opentelemetry.io/docs/specs/otel/compatibility/prometheus_and_openmetrics/>
+- Prometheus remote-write 1.0 spec: <https://prometheus.io/docs/specs/prw/remote_write_spec/>

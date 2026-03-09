@@ -19,6 +19,7 @@ use opentelemetry_proto::tonic::{
     },
     resource::v1::Resource,
 };
+use prost::Message;
 use timeseries::testing::{
     self, MetadataResponse, QueryResponse, QueryResultValue, SeriesResponse, TestTsdb,
 };
@@ -33,6 +34,14 @@ const SAMPLE_TS_NANOS: u64 = SAMPLE_TS_MS * 1_000_000;
 
 /// Same instant expressed in seconds (for query params).
 const SAMPLE_TS_SECS: i64 = 3900;
+
+#[derive(Clone, PartialEq, Message)]
+struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+}
 
 fn kv(key: &str, value: &str) -> KeyValue {
     KeyValue {
@@ -213,12 +222,133 @@ async fn body_string(resp: axum::response::Response) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
+async fn ingest_via_http(
+    app: &Router,
+    request: &ExportMetricsServiceRequest,
+) -> axum::response::Response {
+    let body = request.encode_to_vec();
+    let req = Request::post("/v1/metrics")
+        .header("content-type", "application/x-protobuf")
+        .body(Body::from(body))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap()
+}
+
 /// Convert an OTLP request to Series and ingest + flush into the test TSDB.
 async fn build_and_ingest(tsdb: &TestTsdb, request: &ExportMetricsServiceRequest) {
     let builder = OtelConverter::new(OtelConfig::default());
     let series = builder.convert(request).expect("OtelConverter::convert");
     tsdb.ingest_samples(series).await;
     tsdb.flush().await;
+}
+
+#[tokio::test]
+async fn test_otel_http_endpoint_should_ingest_and_return_protobuf_response() {
+    let (app, tsdb) = setup().await;
+
+    let request = make_request(vec![make_resource_metrics(
+        vec![],
+        vec![make_scope_metrics(
+            "test",
+            "1.0",
+            vec![make_gauge(
+                "cpu_temperature_http",
+                "",
+                "CPU temperature",
+                vec![make_number_dp(
+                    number_data_point::Value::AsDouble(73.5),
+                    SAMPLE_TS_NANOS,
+                    vec![kv("host", "server-http")],
+                )],
+            )],
+        )],
+    )]);
+
+    let resp = ingest_via_http(&app, &request).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/x-protobuf"
+    );
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let parsed =
+        opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceResponse::decode(
+            body.as_ref(),
+        )
+        .unwrap();
+    assert!(
+        parsed.partial_success.is_none(),
+        "successful ingest should not set partial_success"
+    );
+
+    tsdb.flush().await;
+
+    let uri = format!(
+        "/api/v1/query?query=cpu_temperature_http&time={}",
+        SAMPLE_TS_SECS
+    );
+    let req = Request::get(&uri).body(Body::empty()).unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let parsed: QueryResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+    let data = parsed.data.unwrap();
+    let results = match data.result {
+        QueryResultValue::Vector(v) => v,
+        _ => panic!("expected Vector"),
+    };
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0.value, 73.5);
+}
+
+#[tokio::test]
+async fn test_otel_http_endpoint_should_reject_invalid_content_type() {
+    let (app, _) = setup().await;
+
+    let req = Request::post("/v1/metrics")
+        .header("content-type", "application/json")
+        .body(Body::from("{}".to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/x-protobuf"
+    );
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status = RpcStatus::decode(body.as_ref()).unwrap();
+    assert_eq!(status.code, 3, "expected INVALID_ARGUMENT");
+    assert!(status.message.contains("Invalid Content-Type"));
+}
+
+#[tokio::test]
+async fn test_otel_http_endpoint_should_reject_malformed_protobuf() {
+    let (app, _) = setup().await;
+
+    let req = Request::post("/v1/metrics")
+        .header("content-type", "application/x-protobuf")
+        .body(Body::from(vec![0x08, 0x96, 0x01]))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/x-protobuf"
+    );
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status = RpcStatus::decode(body.as_ref()).unwrap();
+    assert_eq!(status.code, 3, "expected INVALID_ARGUMENT");
+    assert!(status.message.contains("Protobuf decode failed"));
 }
 
 #[tokio::test]
