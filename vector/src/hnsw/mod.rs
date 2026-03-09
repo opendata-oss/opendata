@@ -47,11 +47,7 @@ pub trait CentroidGraph: Send + Sync {
     /// as deleted at the given epoch and excluded from searches at that epoch or later.
     fn remove_centroid(&self, centroid_id: u64, epoch: u64) -> Result<()>;
 
-    /// Clean out mutation tracking entries that are fully below the watermark.
-    ///
-    /// Entries where both the added epoch and deleted epoch (if set) are below the
-    /// watermark are removed from the mutations map. Soft-deleted centroids whose
-    /// deletion epoch is below the watermark are hard-removed from the underlying index.
+    /// Set the retention watermark to the given epoch.
     fn update_retention_watermark(&self, epoch: u64);
 
     /// Get the vector for a centroid by its ID.

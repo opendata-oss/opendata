@@ -1,5 +1,6 @@
 //! HNSW implementation using the usearch library.
 
+use std::cmp::max;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::RwLock;
@@ -40,6 +41,10 @@ struct UsearchCentroidGraphInner {
     /// Tracks recent mutations for epoch-based snapshot reads.
     /// Keyed by centroid_id.
     mutations: HashMap<u64, CentroidMutation>,
+    /// The latest retention watermark set by the caller.
+    retention_watermark: u64,
+    /// The watermark up to which mutations have actually been cleaned.
+    cleaned_watermark: u64,
 }
 
 /// HNSW graph implementation using the usearch library.
@@ -149,6 +154,8 @@ impl UsearchCentroidGraph {
                 centroid_vectors,
                 next_key,
                 mutations,
+                retention_watermark: 0,
+                cleaned_watermark: 0,
             }),
         })
     }
@@ -181,10 +188,7 @@ impl CentroidGraph for UsearchCentroidGraph {
     }
 
     fn update_retention_watermark(&self, epoch: u64) {
-        self.inner
-            .write()
-            .expect("lock poisoned")
-            .update_retention_watermark(epoch);
+        self.inner.write().expect("lock poisoned").update_retention_watermark(epoch);
     }
 
     fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>> {
@@ -325,12 +329,22 @@ impl UsearchCentroidGraphInner {
     }
 
     fn update_retention_watermark(&mut self, epoch: u64) {
+        self.retention_watermark = max(self.retention_watermark, epoch);
+        self.clean_mutations();
+    }
+
+    fn clean_mutations(&mut self) {
+        let watermark = self.retention_watermark;
+        if watermark <= self.cleaned_watermark {
+            return;
+        }
+
         // Collect centroid_ids whose mutations are fully below the watermark.
         let to_remove: Vec<u64> = self
             .mutations
             .iter()
             .filter(|(_, m)| {
-                m.added_epoch < epoch && m.deleted_epoch.map_or(true, |d| d < epoch)
+                m.added_epoch < watermark && m.deleted_epoch.map_or(true, |d| d < watermark)
             })
             .map(|(cid, _)| *cid)
             .collect();
@@ -347,6 +361,8 @@ impl UsearchCentroidGraphInner {
                 }
             }
         }
+
+        self.cleaned_watermark = watermark;
     }
 
     fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>> {
@@ -633,7 +649,7 @@ mod tests {
         let results = graph.search_at_epoch(&[0.0, 0.9], 2, 2);
         assert!(results.contains(&2));
 
-        // when - advance watermark past the deletion
+        // when - advance watermark past the deletion and clean
         graph.update_retention_watermark(4);
 
         // then - centroid 2 is hard-removed; its vector is gone
@@ -652,7 +668,7 @@ mod tests {
         ];
         let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
 
-        // when - advance watermark past the add epoch
+        // when - advance watermark past the add epoch and clean
         graph.update_retention_watermark(2);
 
         // then - mutations are cleaned but centroids remain in the index
@@ -671,7 +687,7 @@ mod tests {
             .unwrap();
         graph.remove_centroid(2, 8).unwrap();
 
-        // when - watermark at 6 (between add and delete)
+        // when - watermark at 6 (between add and delete) and clean
         graph.update_retention_watermark(6);
 
         // then - centroid 2's mutation is NOT cleaned (deleted_epoch 8 >= watermark 6)
