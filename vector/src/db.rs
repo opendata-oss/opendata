@@ -13,7 +13,8 @@
 
 use crate::VectorDbReader;
 use crate::delta::{
-    VectorDbDeltaContext, VectorDbDeltaOpts, VectorDbWrite, VectorDbWriteDelta, VectorWrite,
+    VectorDbDeltaContext, VectorDbDeltaOpts, VectorDbFrozenView, VectorDbWrite, VectorDbWriteDelta,
+    VectorWrite,
 };
 use crate::error::{Error, Result};
 use crate::flusher::VectorDbFlusher;
@@ -232,12 +233,14 @@ impl VectorDb {
             flush_interval: Duration::from_secs(5),
             flush_size_threshold: 64 * 1024 * 1024,
         };
-        let mut write_coordinator = WriteCoordinator::new(
+        let initial_frozen_view = Arc::new(VectorDbFrozenView::new(centroid_graph.snapshot()?));
+        let mut write_coordinator = WriteCoordinator::new_with_last_written_delta(
             coordinator_config,
             vec![WRITE_CHANNEL.to_string(), REBALANCE_CHANNEL.to_string()],
             ctx,
             snapshot.clone(),
             flusher,
+            Some(initial_frozen_view),
         );
         handle_tx
             .set(write_coordinator.handle(REBALANCE_CHANNEL))
@@ -646,13 +649,20 @@ impl VectorDb {
 
     /// Create a QueryEngine from the current snapshot for executing queries.
     pub(crate) fn query_engine(&self) -> QueryEngine {
-        let snapshot = self.write_coordinator.view().snapshot.clone();
+        let view = self.write_coordinator.view();
+        let centroid_graph = view
+            .last_written_delta
+            .as_ref()
+            .expect("last_written_delta should always be present")
+            .val
+            .centroid_graph
+            .clone();
         let options = QueryEngineOptions {
             dimensions: self.config.dimensions,
             distance_metric: self.config.distance_metric,
             query_pruning_factor: self.config.query_pruning_factor,
         };
-        QueryEngine::new(options, self.centroid_graph.clone(), snapshot)
+        QueryEngine::new(options, centroid_graph, view.snapshot.clone())
     }
 
     /// Search using brute-force centroid lookup (for diagnostics).

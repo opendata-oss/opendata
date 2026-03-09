@@ -44,7 +44,8 @@ impl ViewReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delta::VectorDbDeltaView;
+    use crate::delta::{VectorDbDeltaView, VectorDbFrozenView};
+    use crate::hnsw::CentroidGraphRead;
     use crate::serde::key::PostingListKey;
     use crate::serde::posting_list::PostingUpdate;
     use common::Record;
@@ -53,6 +54,18 @@ mod tests {
     use common::storage::in_memory::InMemoryStorage;
     use roaring::RoaringTreemap;
     use std::collections::HashMap;
+    struct NullCentroidGraph;
+    impl CentroidGraphRead for NullCentroidGraph {
+        fn search(&self, _query: &[f32], _k: usize) -> Vec<u64> {
+            vec![]
+        }
+        fn get_centroid_vector(&self, _centroid_id: u64) -> Option<Vec<f32>> {
+            None
+        }
+        fn len(&self) -> usize {
+            0
+        }
+    }
 
     /// Build a VectorDbDeltaView with the given posting updates for a centroid.
     fn make_delta_view(centroid_id: u64, updates: Vec<PostingUpdate>) -> VectorDbDeltaView {
@@ -63,6 +76,17 @@ mod tests {
             deleted_centroids: RoaringTreemap::new(),
             metadata_index_updates: HashMap::new(),
         }
+    }
+
+    /// Build an Arc<VectorDbFrozenView> with the given posting updates for a centroid.
+    fn make_frozen_view(centroid_id: u64, updates: Vec<PostingUpdate>) -> Arc<VectorDbFrozenView> {
+        let dv = make_delta_view(centroid_id, updates);
+        Arc::new(VectorDbFrozenView {
+            posting_updates: dv.posting_updates,
+            deleted_centroids: dv.deleted_centroids,
+            metadata_index_updates: dv.metadata_index_updates,
+            centroid_graph: Arc::new(NullCentroidGraph),
+        })
     }
 
     /// Write a posting list to in-memory storage for the given centroid.
@@ -117,13 +141,13 @@ mod tests {
     async fn should_read_postings_from_frozen_deltas() {
         // given - current is empty, one frozen delta has postings
         let centroid_id = 1u64;
-        let frozen_view = Arc::new(make_delta_view(
+        let frozen_view = make_frozen_view(
             centroid_id,
             vec![
                 PostingUpdate::append(20, vec![3.0]),
                 PostingUpdate::append(21, vec![4.0]),
             ],
-        ));
+        );
 
         let storage = InMemoryStorage::new();
         let snapshot = storage.snapshot().await.unwrap();
@@ -195,10 +219,7 @@ mod tests {
         let centroid_id = 1u64;
 
         let current_view = make_delta_view(centroid_id, vec![PostingUpdate::append(1, vec![10.0])]);
-        let frozen_view = Arc::new(make_delta_view(
-            centroid_id,
-            vec![PostingUpdate::append(2, vec![20.0])],
-        ));
+        let frozen_view = make_frozen_view(centroid_id, vec![PostingUpdate::append(2, vec![20.0])]);
         let storage = InMemoryStorage::new();
         write_snapshot_postings(
             &storage,
@@ -236,10 +257,7 @@ mod tests {
 
         let current_view =
             make_delta_view(centroid_id, vec![PostingUpdate::append(5, vec![100.0])]);
-        let frozen_view = Arc::new(make_delta_view(
-            centroid_id,
-            vec![PostingUpdate::append(5, vec![50.0])],
-        ));
+        let frozen_view = make_frozen_view(centroid_id, vec![PostingUpdate::append(5, vec![50.0])]);
 
         let storage = InMemoryStorage::new();
         let snapshot = storage.snapshot().await.unwrap();
@@ -269,10 +287,7 @@ mod tests {
         // given - frozen and snapshot both have ID 7 with different vectors
         let centroid_id = 1u64;
 
-        let frozen_view = Arc::new(make_delta_view(
-            centroid_id,
-            vec![PostingUpdate::append(7, vec![70.0])],
-        ));
+        let frozen_view = make_frozen_view(centroid_id, vec![PostingUpdate::append(7, vec![70.0])]);
 
         let storage = InMemoryStorage::new();
         write_snapshot_postings(
@@ -348,10 +363,7 @@ mod tests {
 
         let current_view =
             make_delta_view(centroid_id, vec![PostingUpdate::append(3, vec![300.0])]);
-        let frozen_view = Arc::new(make_delta_view(
-            centroid_id,
-            vec![PostingUpdate::append(3, vec![30.0])],
-        ));
+        let frozen_view = make_frozen_view(centroid_id, vec![PostingUpdate::append(3, vec![30.0])]);
         let storage = InMemoryStorage::new();
         write_snapshot_postings(
             &storage,
@@ -386,14 +398,10 @@ mod tests {
         // given - two frozen deltas with overlapping ID; first frozen is newer
         let centroid_id = 1u64;
 
-        let frozen_newer = Arc::new(make_delta_view(
-            centroid_id,
-            vec![PostingUpdate::append(4, vec![400.0])],
-        ));
-        let frozen_older = Arc::new(make_delta_view(
-            centroid_id,
-            vec![PostingUpdate::append(4, vec![40.0])],
-        ));
+        let frozen_newer =
+            make_frozen_view(centroid_id, vec![PostingUpdate::append(4, vec![400.0])]);
+        let frozen_older =
+            make_frozen_view(centroid_id, vec![PostingUpdate::append(4, vec![40.0])]);
 
         let storage = InMemoryStorage::new();
         let snapshot = storage.snapshot().await.unwrap();

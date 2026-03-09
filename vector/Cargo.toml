@@ -30,6 +30,7 @@ serde_yaml.workspace = true
 slatedb.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 log = "0.4.29"
 rand = "0.8"
 

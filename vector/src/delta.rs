@@ -21,7 +21,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use crate::hnsw::CentroidGraph;
+use crate::hnsw::{CentroidGraph, CentroidGraphRead};
 use crate::lire::commands::RebalanceCommand;
 use crate::lire::rebalancer::IndexRebalancer;
 use crate::model::{AttributeValue, MetadataFieldSpec, VECTOR_FIELD_NAME};
@@ -144,7 +144,7 @@ impl Delta for VectorDbWriteDelta {
     type Write = VectorDbWrite;
     type DeltaView = Arc<std::sync::RwLock<VectorDbDeltaView>>;
     type Frozen = VectorDbImmutableDelta;
-    type FrozenView = Arc<VectorDbDeltaView>;
+    type FrozenView = Arc<VectorDbFrozenView>;
     type ApplyResult = Arc<dyn Any + Send + Sync + 'static>;
 
     fn init(context: VectorDbDeltaContext) -> Self {
@@ -158,10 +158,11 @@ impl Delta for VectorDbWriteDelta {
     fn apply(
         &mut self,
         write: Self::Write,
+        epoch: u64,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         let result = match write {
             VectorDbWrite::Write(writes) => self.apply_write(writes),
-            VectorDbWrite::Rebalance(cmd) => self.apply_rebalance_cmd(cmd),
+            VectorDbWrite::Rebalance(cmd) => self.apply_rebalance_cmd(cmd, epoch),
         };
         self.toggle_rebalance_backpressure();
         result
@@ -183,7 +184,18 @@ impl Delta for VectorDbWriteDelta {
     fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
         self.ctx.rebalancer.log_summary();
         let mut ops = self.ops;
-        let view = self.view.read().expect("lock poisoned").clone();
+        let delta_view = self.view.read().expect("lock poisoned").clone();
+        let centroid_graph = self
+            .ctx
+            .centroid_graph
+            .snapshot()
+            .expect("centroid graph snapshot should succeed");
+        let view = VectorDbFrozenView {
+            posting_updates: delta_view.posting_updates,
+            deleted_centroids: delta_view.deleted_centroids,
+            metadata_index_updates: delta_view.metadata_index_updates,
+            centroid_graph,
+        };
 
         // Finalize posting list merges and centroid stats deltas
         for (centroid_id, updates) in &view.posting_updates {
@@ -311,6 +323,26 @@ pub(crate) struct VectorDbDeltaView {
     pub(crate) metadata_index_updates: HashMap<bytes::Bytes, RoaringTreemap>,
 }
 
+/// Read-only view of a frozen delta, including a centroid graph snapshot.
+#[derive(Clone)]
+pub(crate) struct VectorDbFrozenView {
+    pub(crate) posting_updates: HashMap<u64, Vec<PostingUpdate>>,
+    pub(crate) deleted_centroids: RoaringTreemap,
+    pub(crate) metadata_index_updates: HashMap<bytes::Bytes, RoaringTreemap>,
+    pub(crate) centroid_graph: Arc<dyn CentroidGraphRead>,
+}
+
+impl VectorDbFrozenView {
+    pub(crate) fn new(centroid_graph: Arc<dyn CentroidGraphRead>) -> Self {
+        Self {
+            posting_updates: HashMap::new(),
+            deleted_centroids: RoaringTreemap::new(),
+            metadata_index_updates: HashMap::new(),
+            centroid_graph,
+        }
+    }
+}
+
 impl VectorDbDeltaView {
     fn new() -> Self {
         Self {
@@ -352,7 +384,7 @@ impl VectorDbDeltaView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hnsw::CentroidGraph;
+    use crate::hnsw::{CentroidGraph, CentroidGraphRead};
     use crate::lire::rebalancer::{IndexRebalancer, IndexRebalancerOpts};
     use crate::model::AttributeValue;
     use crate::serde::centroid_chunk::CentroidEntry;
@@ -376,17 +408,9 @@ mod tests {
         }
     }
 
-    impl CentroidGraph for MockCentroidGraph {
+    impl CentroidGraphRead for MockCentroidGraph {
         fn search(&self, _query: &[f32], _k: usize) -> Vec<u64> {
             self.centroids.iter().map(|(id, _)| *id).collect()
-        }
-
-        fn add_centroid(&self, _entry: &CentroidEntry) -> crate::error::Result<()> {
-            Ok(())
-        }
-
-        fn remove_centroid(&self, _centroid_id: u64) -> crate::error::Result<()> {
-            Ok(())
         }
 
         fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>> {
@@ -398,6 +422,20 @@ mod tests {
 
         fn len(&self) -> usize {
             self.centroids.len()
+        }
+    }
+
+    impl CentroidGraph for MockCentroidGraph {
+        fn add_centroid(&self, _entry: &CentroidEntry, _epoch: u64) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        fn remove_centroid(&self, _centroid_id: u64, _epoch: u64) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> crate::error::Result<Arc<dyn CentroidGraphRead>> {
+            Ok(Arc::new(MockCentroidGraph::new(self.centroids.clone())))
         }
     }
 
@@ -483,7 +521,7 @@ mod tests {
         let write = create_vector_write("vec-1", vec![1.0, 2.0, 3.0]);
 
         // when
-        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
+        delta.apply(VectorDbWrite::Write(vec![write]), 0).unwrap();
         let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have ops for ID dictionary put and vector data put
@@ -515,7 +553,7 @@ mod tests {
         let write = create_vector_write("vec-1", vec![1.0, 2.0, 3.0]);
 
         // when
-        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
+        delta.apply(VectorDbWrite::Write(vec![write]), 0).unwrap();
         let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have a merge op for the posting list of centroid 42
@@ -541,7 +579,7 @@ mod tests {
         let write = create_vector_write("vec-1", vec![1.0, 2.0, 3.0]);
 
         // when
-        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
+        delta.apply(VectorDbWrite::Write(vec![write]), 0).unwrap();
 
         // then - dictionary should be updated in memory
         assert!(dictionary.contains_key("vec-1"));
@@ -555,12 +593,12 @@ mod tests {
         let ctx = create_test_context(1).await;
         let mut delta = VectorDbWriteDelta::init(ctx);
         let write = create_vector_write("vec-1", vec![1.0, 2.0, 3.0]);
-        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
+        delta.apply(VectorDbWrite::Write(vec![write]), 0).unwrap();
         let write = create_vector_write("vec-1", vec![4.0, 5.0, 6.0]);
         let first_id = *delta.ctx.dictionary.get("vec-1").unwrap();
 
         // when:
-        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
+        delta.apply(VectorDbWrite::Write(vec![write]), 0).unwrap();
         let (frozen, _view, ctx) = delta.freeze();
 
         // then - should have put for new ID dictionary entry only
@@ -599,7 +637,7 @@ mod tests {
         let write = create_vector_write("vec-1", vec![4.0, 5.0, 6.0]);
 
         // when
-        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
+        delta.apply(VectorDbWrite::Write(vec![write]), 0).unwrap();
         let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have posting list merge for the new vector
@@ -620,12 +658,12 @@ mod tests {
         let ctx = create_test_context(1).await;
         let mut delta = VectorDbWriteDelta::init(ctx);
         let write = create_vector_write("vec-1", vec![4.0, 5.0, 6.0]);
-        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
+        delta.apply(VectorDbWrite::Write(vec![write]), 0).unwrap();
         let old_internal_id = *delta.ctx.dictionary.get("vec-1").unwrap();
 
         // when
         let write = create_vector_write("vec-1", vec![4.0, 5.0, 6.0]);
-        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
+        delta.apply(VectorDbWrite::Write(vec![write]), 0).unwrap();
         let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have delete op for old vector data
@@ -650,7 +688,7 @@ mod tests {
         ];
 
         // when
-        delta.apply(VectorDbWrite::Write(writes)).unwrap();
+        delta.apply(VectorDbWrite::Write(writes), 0).unwrap();
         let (frozen, _view, ctx) = delta.freeze();
 
         // then - should have 3 vectors in dictionary
@@ -690,7 +728,7 @@ mod tests {
         ];
 
         // when
-        delta.apply(VectorDbWrite::Write(writes)).unwrap();
+        delta.apply(VectorDbWrite::Write(writes), 0).unwrap();
 
         // then - internal IDs should be sequential starting from 0
         let id1 = *dictionary.get("vec-1").unwrap();
@@ -707,7 +745,7 @@ mod tests {
         // given - create a mock that returns different centroids based on query
         struct MultiCentroidGraph;
 
-        impl CentroidGraph for MultiCentroidGraph {
+        impl CentroidGraphRead for MultiCentroidGraph {
             fn search(&self, query: &[f32], _k: usize) -> Vec<u64> {
                 // Return centroid based on which dimension has highest value
                 if query[0] > query[1] && query[0] > query[2] {
@@ -719,20 +757,30 @@ mod tests {
                 }
             }
 
-            fn add_centroid(&self, _entry: &CentroidEntry) -> crate::error::Result<()> {
-                Ok(())
-            }
-
-            fn remove_centroid(&self, _centroid_id: u64) -> crate::error::Result<()> {
-                Ok(())
-            }
-
             fn get_centroid_vector(&self, _centroid_id: u64) -> Option<Vec<f32>> {
                 None
             }
 
             fn len(&self) -> usize {
                 3
+            }
+        }
+
+        impl CentroidGraph for MultiCentroidGraph {
+            fn add_centroid(
+                &self,
+                _entry: &CentroidEntry,
+                _epoch: u64,
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+
+            fn remove_centroid(&self, _centroid_id: u64, _epoch: u64) -> crate::error::Result<()> {
+                Ok(())
+            }
+
+            fn snapshot(&self) -> crate::error::Result<Arc<dyn CentroidGraphRead>> {
+                Ok(Arc::new(MultiCentroidGraph))
             }
         }
 
@@ -785,7 +833,7 @@ mod tests {
         ];
 
         // when
-        delta.apply(VectorDbWrite::Write(writes)).unwrap();
+        delta.apply(VectorDbWrite::Write(writes), 0).unwrap();
         let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have posting list merges for centroids 1, 2, and 3
@@ -815,7 +863,7 @@ mod tests {
         ];
 
         // when
-        delta.apply(VectorDbWrite::Write(writes)).unwrap();
+        delta.apply(VectorDbWrite::Write(writes), 0).unwrap();
         let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have a centroid stats merge op with delta = 2
@@ -851,7 +899,7 @@ mod tests {
 
         // when - add a vector
         let write = create_vector_write("vec-1", vec![1.0, 2.0, 3.0]);
-        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
+        delta.apply(VectorDbWrite::Write(vec![write]), 0).unwrap();
 
         // then - size should be non-zero
         let size = delta.estimate_size();
@@ -871,7 +919,7 @@ mod tests {
             create_vector_write("vec-2", vec![1.0, 0.0, 0.0]),
             create_vector_write("vec-1", vec![0.0, 1.0, 0.0]),
         ];
-        delta.apply(VectorDbWrite::Write(writes)).unwrap();
+        delta.apply(VectorDbWrite::Write(writes), 0).unwrap();
 
         // then - reader should see posting updates for both vectors
         let view = reader.read().expect("lock poisoned");
@@ -975,7 +1023,7 @@ mod tests {
         ];
 
         // when
-        delta.apply(VectorDbWrite::Write(writes)).unwrap();
+        delta.apply(VectorDbWrite::Write(writes), 0).unwrap();
         let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have metadata index merge ops
@@ -1028,7 +1076,7 @@ mod tests {
         let write = create_vector_write("vec-1", vec![1.0, 2.0, 3.0]);
 
         // when
-        delta.apply(VectorDbWrite::Write(vec![write])).unwrap();
+        delta.apply(VectorDbWrite::Write(vec![write]), 0).unwrap();
         let (frozen, _view, _ctx) = delta.freeze();
 
         // then - should have NO metadata index merge ops
@@ -1053,7 +1101,7 @@ mod tests {
         // given - create a mock that routes vectors to different centroids
         struct MultiCentroidGraph;
 
-        impl CentroidGraph for MultiCentroidGraph {
+        impl CentroidGraphRead for MultiCentroidGraph {
             fn search(&self, query: &[f32], _k: usize) -> Vec<u64> {
                 if query[0] > query[1] && query[0] > query[2] {
                     vec![1]
@@ -1064,20 +1112,30 @@ mod tests {
                 }
             }
 
-            fn add_centroid(&self, _entry: &CentroidEntry) -> crate::error::Result<()> {
-                Ok(())
-            }
-
-            fn remove_centroid(&self, _centroid_id: u64) -> crate::error::Result<()> {
-                Ok(())
-            }
-
             fn get_centroid_vector(&self, _centroid_id: u64) -> Option<Vec<f32>> {
                 None
             }
 
             fn len(&self) -> usize {
                 3
+            }
+        }
+
+        impl CentroidGraph for MultiCentroidGraph {
+            fn add_centroid(
+                &self,
+                _entry: &CentroidEntry,
+                _epoch: u64,
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+
+            fn remove_centroid(&self, _centroid_id: u64, _epoch: u64) -> crate::error::Result<()> {
+                Ok(())
+            }
+
+            fn snapshot(&self) -> crate::Result<Arc<dyn CentroidGraphRead>> {
+                Ok(Arc::new(MultiCentroidGraph))
             }
         }
 
@@ -1130,7 +1188,7 @@ mod tests {
         ];
 
         // when
-        delta.apply(VectorDbWrite::Write(writes)).unwrap();
+        delta.apply(VectorDbWrite::Write(writes), 0).unwrap();
         let (frozen, _view, ctx) = delta.freeze();
 
         // then - rebalancer should have correct counts per centroid

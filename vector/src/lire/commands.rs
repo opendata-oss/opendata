@@ -274,12 +274,13 @@ impl VectorDbWriteDelta {
     pub(crate) fn apply_rebalance_cmd(
         &mut self,
         cmd: RebalanceCommand,
+        epoch: u64,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         match cmd {
-            RebalanceCommand::Split(cmd) => self.apply_split_cmd(cmd),
+            RebalanceCommand::Split(cmd) => self.apply_split_cmd(cmd, epoch),
             RebalanceCommand::SplitSweep(cmd) => self.apply_split_sweep_cmd(cmd),
             RebalanceCommand::SplitReassign(cmd) => self.apply_split_reassign_cmd(cmd),
-            RebalanceCommand::Merge(cmd) => self.apply_merge_cmd(cmd),
+            RebalanceCommand::Merge(cmd) => self.apply_merge_cmd(cmd, epoch),
             RebalanceCommand::MergeSweep(cmd) => self.apply_merge_sweep_cmd(cmd),
             RebalanceCommand::MergeReassign(cmd) => self.apply_merge_reassign_cmd(cmd),
             RebalanceCommand::SplitFinish(cmd) => self.apply_finish_split(cmd),
@@ -290,6 +291,7 @@ impl VectorDbWriteDelta {
     pub(crate) fn apply_split_cmd(
         &mut self,
         cmd: SplitCommand,
+        epoch: u64,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         let (c0_id, seq_alloc_put) = self.ctx.id_allocator.allocate_one();
         if let Some(seq_alloc_put) = seq_alloc_put {
@@ -328,17 +330,17 @@ impl VectorDbWriteDelta {
         // 1. Remove c from the centroid graph
         self.ctx
             .centroid_graph
-            .remove_centroid(cmd.c)
+            .remove_centroid(cmd.c, epoch)
             .map_err(|e| e.to_string())?;
 
         // 2. Add c0 and c1 to centroid graph
         self.ctx
             .centroid_graph
-            .add_centroid(&c0)
+            .add_centroid(&c0, epoch)
             .map_err(|e| e.to_string())?;
         self.ctx
             .centroid_graph
-            .add_centroid(&c1)
+            .add_centroid(&c1, epoch)
             .map_err(|e| e.to_string())?;
 
         let mut view = self.view.write().expect("lock poisoned");
@@ -469,6 +471,7 @@ impl VectorDbWriteDelta {
     pub(crate) fn apply_merge_cmd(
         &mut self,
         cmd: MergeCommand,
+        epoch: u64,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         let c_from_id = cmd.c_from.centroid_id();
         let c_from_postings = cmd.c_from.postings();
@@ -476,7 +479,7 @@ impl VectorDbWriteDelta {
         // 1. Remove c_other from centroid graph
         self.ctx
             .centroid_graph
-            .remove_centroid(c_from_id)
+            .remove_centroid(c_from_id, epoch)
             .map_err(|e| e.to_string())?;
 
         let mut view = self.view.write().expect("lock poisoned");

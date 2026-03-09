@@ -759,17 +759,6 @@ impl IndexRebalancerTask {
             .await
             .map_err(|e| e.to_string())?;
 
-        // Safety check: if c has < 1 vector (e.g. drained by concurrent ops), abort.
-        if posting_list.is_empty() {
-            warn!(
-                c_from,
-                num_vectors = posting_list.len(),
-                "cannot merge empty centroid",
-            );
-            self.send_finish_merge(c_to).await?;
-            return Ok(());
-        }
-
         // Track original vector IDs for sweep phase, and save (id, vector)
         // pairs for reassignment in Phase 3.
         let original_vector_ids: HashSet<u64> = posting_list.iter().map(|p| p.id()).collect();
@@ -890,7 +879,7 @@ mod tests {
     use super::*;
     use crate::delta::{VectorDbDeltaContext, VectorDbDeltaOpts, VectorDbWriteDelta};
     use crate::flusher::VectorDbFlusher;
-    use crate::hnsw::build_centroid_graph;
+    use crate::hnsw::{CentroidGraphRead, build_centroid_graph};
     use crate::serde::centroid_chunk::CentroidEntry;
     use crate::serde::collection_meta::DistanceMetric;
     use crate::serde::key::SeqBlockKey;
@@ -1408,17 +1397,9 @@ mod tests {
         centroids: Vec<(u64, Vec<f32>)>,
     }
 
-    impl CentroidGraph for MockCentroidGraph {
+    impl CentroidGraphRead for MockCentroidGraph {
         fn search(&self, _query: &[f32], _k: usize) -> Vec<u64> {
             self.centroids.iter().map(|(id, _)| *id).collect()
-        }
-
-        fn add_centroid(&self, _entry: &CentroidEntry) -> crate::error::Result<()> {
-            Ok(())
-        }
-
-        fn remove_centroid(&self, _centroid_id: u64) -> crate::error::Result<()> {
-            Ok(())
         }
 
         fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>> {
@@ -1430,6 +1411,22 @@ mod tests {
 
         fn len(&self) -> usize {
             self.centroids.len()
+        }
+    }
+
+    impl CentroidGraph for MockCentroidGraph {
+        fn add_centroid(&self, _entry: &CentroidEntry, _epoch: u64) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        fn remove_centroid(&self, _centroid_id: u64, _epoch: u64) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> crate::Result<Arc<dyn CentroidGraphRead>> {
+            Ok(Arc::new(MockCentroidGraph {
+                centroids: self.centroids.clone(),
+            }))
         }
     }
 

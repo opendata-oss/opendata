@@ -126,7 +126,7 @@ mod tests {
         let mut delta = TsdbWriteDelta::init(ctx);
         let series =
             create_test_series("http_requests", vec![("env", "prod")], create_test_sample());
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series], 0).unwrap();
         let (frozen, _, _) = delta.freeze();
 
         // when
@@ -177,7 +177,7 @@ mod tests {
         let mut delta = TsdbWriteDelta::init(ctx);
         let series =
             create_test_series("http_requests", vec![("env", "prod")], create_test_sample());
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series], 0).unwrap();
         let (frozen, _, _) = delta.freeze();
         frozen
     }
@@ -269,7 +269,7 @@ mod tests {
                 value: 99.0,
             },
         );
-        delta.apply(vec![series1, series2]).unwrap();
+        delta.apply(vec![series1, series2], 0).unwrap();
         let (frozen, _, _) = delta.freeze();
 
         // when

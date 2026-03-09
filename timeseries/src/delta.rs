@@ -141,7 +141,7 @@ impl Delta for TsdbWriteDelta {
         }
     }
 
-    fn apply(&mut self, write: Self::Write) -> Result<Self::ApplyResult, String> {
+    fn apply(&mut self, write: Self::Write, _epoch: u64) -> Result<Self::ApplyResult, String> {
         for series in &write {
             self.ingest(series)?;
         }
@@ -228,7 +228,7 @@ mod tests {
             create_test_series("http_requests", vec![("env", "prod")], create_test_sample());
 
         // when
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series], 0).unwrap();
 
         // then
         assert_eq!(delta.next_series_id, 1);
@@ -254,8 +254,8 @@ mod tests {
         let series2 = create_test_series("http_requests", vec![("env", "prod")], sample2);
 
         // when
-        delta.apply(vec![series1]).unwrap();
-        delta.apply(vec![series2]).unwrap();
+        delta.apply(vec![series1], 0).unwrap();
+        delta.apply(vec![series2], 0).unwrap();
 
         // then
         assert_eq!(delta.next_series_id, 1); // Only one series created
@@ -270,7 +270,7 @@ mod tests {
         let mut delta = TsdbWriteDelta::init(ctx);
         let series =
             create_test_series("http_requests", vec![("env", "prod")], create_test_sample());
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series], 0).unwrap();
 
         // when: freeze and create new delta
         let (frozen, _, new_ctx) = delta.freeze();
@@ -282,7 +282,7 @@ mod tests {
             value: 99.0,
         };
         let series2 = create_test_series("http_requests", vec![("env", "prod")], sample2);
-        delta2.apply(vec![series2]).unwrap();
+        delta2.apply(vec![series2], 0).unwrap();
 
         // then: should reuse series_id from frozen context
         assert_eq!(delta2.next_series_id, 1); // No new ID allocated
@@ -306,7 +306,7 @@ mod tests {
         let series = create_test_series("http_requests", vec![("env", "prod")], bad_sample);
 
         // when
-        let result = delta.apply(vec![series]);
+        let result = delta.apply(vec![series], 0);
 
         // then
         assert!(result.is_err());
@@ -326,7 +326,7 @@ mod tests {
                 value: i as f64,
             };
             let series = create_test_series("metric", vec![("k", "v")], sample);
-            delta.apply(vec![series]).unwrap();
+            delta.apply(vec![series], 0).unwrap();
         }
 
         // then
@@ -371,8 +371,8 @@ mod tests {
         );
 
         // when
-        delta.apply(vec![series1]).unwrap();
-        delta.apply(vec![series2]).unwrap();
+        delta.apply(vec![series1], 0).unwrap();
+        delta.apply(vec![series2], 0).unwrap();
 
         // then
         assert_eq!(delta.next_series_id, 2);
@@ -402,8 +402,8 @@ mod tests {
         );
 
         // when
-        delta.apply(vec![series1]).unwrap();
-        delta.apply(vec![series2]).unwrap();
+        delta.apply(vec![series1], 0).unwrap();
+        delta.apply(vec![series2], 0).unwrap();
 
         // then
         assert_eq!(delta.next_series_id, 1); // Same series_id reused
@@ -428,7 +428,7 @@ mod tests {
         });
 
         // when
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series], 0).unwrap();
 
         // then
         let series_spec = delta.forward_index.series.get(&0).unwrap();
@@ -457,7 +457,7 @@ mod tests {
         );
 
         // when
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series], 0).unwrap();
 
         // then: __name__ label + 3 explicit labels = 4
         assert_eq!(delta.inverted_index.postings.len(), 4);
@@ -481,7 +481,7 @@ mod tests {
         let series = create_test_series("metric", vec![], create_test_sample());
 
         // when
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series], 0).unwrap();
 
         // then
         assert_eq!(delta.next_series_id, 1);
@@ -505,7 +505,7 @@ mod tests {
         series.metric_type = Some(MetricType::Gauge);
 
         // when
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series], 0).unwrap();
 
         // then
         let series_spec = delta.forward_index.series.get(&0).unwrap();
@@ -535,7 +535,7 @@ mod tests {
             create_test_series("http_requests", vec![("env", "prod")], create_test_sample());
 
         // when
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series], 0).unwrap();
 
         // then
         assert_eq!(delta.next_series_id, 43); // No new ID allocated

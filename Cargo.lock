@@ -2658,6 +2658,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "usearch",
+ "uuid",
 ]
 
 [[package]]

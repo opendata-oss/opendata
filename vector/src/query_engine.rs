@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::hnsw::CentroidGraph;
+use crate::hnsw::CentroidGraphRead;
 use crate::model::{Filter, Query, SearchResult};
 use crate::serde::collection_meta::DistanceMetric;
 use crate::serde::posting_list::PostingList;
@@ -31,14 +31,14 @@ pub(crate) struct QueryEngineOptions {
 /// snapshot. `QueryEngine` is also used by `VectorDbReader` for read-only access.
 pub(crate) struct QueryEngine {
     options: QueryEngineOptions,
-    centroid_graph: Arc<dyn CentroidGraph>,
+    centroid_graph: Arc<dyn CentroidGraphRead>,
     storage: Arc<dyn StorageRead>,
 }
 
 impl QueryEngine {
     pub(crate) fn new(
         options: QueryEngineOptions,
-        centroid_graph: Arc<dyn CentroidGraph>,
+        centroid_graph: Arc<dyn CentroidGraphRead>,
         storage: Arc<dyn StorageRead>,
     ) -> Self {
         Self {

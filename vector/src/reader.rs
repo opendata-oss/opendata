@@ -8,7 +8,7 @@
 use crate::Vector;
 use crate::db::VectorDbRead;
 use crate::error::{Error, Result};
-use crate::hnsw::{CentroidGraph, build_centroid_graph};
+use crate::hnsw::{CentroidGraphRead, build_centroid_graph};
 use crate::model::{Query, ReaderConfig, SearchResult};
 use crate::query_engine::{QueryEngine, QueryEngineOptions};
 use crate::serde::centroid_chunk::CentroidEntry;
@@ -73,6 +73,7 @@ impl VectorDbReader {
             .collect();
 
         let centroid_graph = build_centroid_graph(live_centroids, config.distance_metric)?;
+        let centroid_graph: Arc<dyn CentroidGraphRead> = centroid_graph.snapshot()?;
 
         let options = QueryEngineOptions {
             dimensions: config.dimensions,
@@ -80,7 +81,6 @@ impl VectorDbReader {
             query_pruning_factor: config.query_pruning_factor,
         };
 
-        let centroid_graph: Arc<dyn CentroidGraph> = Arc::from(centroid_graph);
         let query_engine = QueryEngine::new(options, centroid_graph, storage);
         Ok(Self::new(query_engine))
     }

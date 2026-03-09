@@ -6,6 +6,7 @@
 mod usearch;
 
 use crate::error::Result;
+use std::sync::Arc;
 
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::collection_meta::DistanceMetric;
@@ -13,11 +14,9 @@ use crate::serde::collection_meta::DistanceMetric;
 // Re-export implementations
 pub use usearch::UsearchCentroidGraph;
 
-/// Trait for HNSW-based centroid graph implementations.
+/// Reader trait for HNSW-based centroid graph implementations.
 ///
-/// The graph stores centroids and enables fast approximate nearest neighbor search
-/// to find relevant clusters during query execution.
-pub trait CentroidGraph: Send + Sync {
+pub trait CentroidGraphRead: Send + Sync {
     /// Search for k nearest centroids to a query vector.
     ///
     /// # Arguments
@@ -27,16 +26,6 @@ pub trait CentroidGraph: Send + Sync {
     /// # Returns
     /// Vector of centroid_ids sorted by similarity (closest first)
     fn search(&self, query: &[f32], k: usize) -> Vec<u64>;
-
-    /// Add a centroid to the graph.
-    ///
-    /// Uses interior mutability since the graph is behind `Arc<dyn CentroidGraph>`.
-    fn add_centroid(&self, entry: &CentroidEntry) -> Result<()>;
-
-    /// Remove a centroid from the graph by its ID.
-    ///
-    /// Uses interior mutability since the graph is behind `Arc<dyn CentroidGraph>`.
-    fn remove_centroid(&self, centroid_id: u64) -> Result<()>;
 
     /// Get the vector for a centroid by its ID.
     ///
@@ -52,7 +41,30 @@ pub trait CentroidGraph: Send + Sync {
     }
 }
 
+/// Trait for HNSW-based centroid graph implementations.
+///
+/// The graph stores centroids and enables fast approximate nearest neighbor search
+/// to find relevant clusters during query execution.
+pub trait CentroidGraph: CentroidGraphRead + Send + Sync {
+    /// Add a centroid to the graph, recording the mutation at the given epoch.
+    ///
+    /// Uses interior mutability since the graph is behind `Arc<dyn CentroidGraph>`.
+    fn add_centroid(&self, entry: &CentroidEntry, epoch: u64) -> Result<()>;
+
+    /// Remove a centroid from the graph by its ID at the given epoch.
+    ///
+    /// This is a soft delete: the centroid remains in the underlying index so that
+    /// snapshot reads at earlier epochs can still find it. The centroid is recorded
+    /// as deleted at the given epoch and excluded from searches at that epoch or later.
+    fn remove_centroid(&self, centroid_id: u64, epoch: u64) -> Result<()>;
+
+    /// Take a snapshot of the centroid graph
+    fn snapshot(&self) -> Result<Arc<dyn CentroidGraphRead>>;
+}
+
 /// Build a centroid graph using the default implementation (usearch).
+///
+/// All initial centroids are recorded as added at the given `epoch`.
 pub fn build_centroid_graph(
     centroids: Vec<CentroidEntry>,
     distance_metric: DistanceMetric,
