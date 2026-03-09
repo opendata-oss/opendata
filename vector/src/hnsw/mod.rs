@@ -28,15 +28,31 @@ pub trait CentroidGraph: Send + Sync {
     /// Vector of centroid_ids sorted by similarity (closest first)
     fn search(&self, query: &[f32], k: usize) -> Vec<u64>;
 
-    /// Add a centroid to the graph.
+    /// Search for k nearest centroids visible at a given epoch.
     ///
-    /// Uses interior mutability since the graph is behind `Arc<dyn CentroidGraph>`.
-    fn add_centroid(&self, entry: &CentroidEntry) -> Result<()>;
+    /// A centroid is visible at an epoch if it was added at or before the epoch
+    /// and has not been deleted as of the epoch. Centroids not tracked in the
+    /// mutations map are always considered visible.
+    fn search_at_epoch(&self, query: &[f32], k: usize, epoch: u64) -> Vec<u64>;
 
-    /// Remove a centroid from the graph by its ID.
+    /// Add a centroid to the graph, recording the mutation at the given epoch.
     ///
     /// Uses interior mutability since the graph is behind `Arc<dyn CentroidGraph>`.
-    fn remove_centroid(&self, centroid_id: u64) -> Result<()>;
+    fn add_centroid(&self, entry: &CentroidEntry, epoch: u64) -> Result<()>;
+
+    /// Remove a centroid from the graph by its ID at the given epoch.
+    ///
+    /// This is a soft delete: the centroid remains in the underlying index so that
+    /// snapshot reads at earlier epochs can still find it. The centroid is recorded
+    /// as deleted at the given epoch and excluded from searches at that epoch or later.
+    fn remove_centroid(&self, centroid_id: u64, epoch: u64) -> Result<()>;
+
+    /// Clean out mutation tracking entries that are fully below the watermark.
+    ///
+    /// Entries where both the added epoch and deleted epoch (if set) are below the
+    /// watermark are removed from the mutations map. Soft-deleted centroids whose
+    /// deletion epoch is below the watermark are hard-removed from the underlying index.
+    fn update_retention_watermark(&self, epoch: u64);
 
     /// Get the vector for a centroid by its ID.
     ///
@@ -53,11 +69,14 @@ pub trait CentroidGraph: Send + Sync {
 }
 
 /// Build a centroid graph using the default implementation (usearch).
+///
+/// All initial centroids are recorded as added at the given `epoch`.
 pub fn build_centroid_graph(
     centroids: Vec<CentroidEntry>,
     distance_metric: DistanceMetric,
+    epoch: u64,
 ) -> Result<Box<dyn CentroidGraph>> {
-    let graph = UsearchCentroidGraph::build(centroids, distance_metric)?;
+    let graph = UsearchCentroidGraph::build(centroids, distance_metric, epoch)?;
     Ok(Box::new(graph))
 }
 
@@ -74,7 +93,7 @@ mod tests {
             CentroidEntry::new(3, vec![0.0, 0.0, 1.0]),
         ];
         let graph: Box<dyn CentroidGraph> =
-            Box::new(UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap());
+            Box::new(UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 0).unwrap());
 
         // when / then
         assert_eq!(graph.len(), 3);
@@ -94,7 +113,7 @@ mod tests {
         ];
 
         // when
-        let graph = build_centroid_graph(centroids, DistanceMetric::L2).unwrap();
+        let graph = build_centroid_graph(centroids, DistanceMetric::L2, 0).unwrap();
 
         // then
         assert_eq!(graph.len(), 2);

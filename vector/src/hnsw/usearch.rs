@@ -17,6 +17,14 @@ use super::CentroidGraph;
 /// Kept artificially high to avoid usearch deadlock issues near capacity limits.
 const INITIAL_CAPACITY: usize = 200_000;
 
+/// Tracks when a centroid was added and optionally deleted, for epoch-based
+/// snapshot visibility.
+#[derive(Debug, Clone)]
+struct CentroidMutation {
+    added_epoch: u64,
+    deleted_epoch: Option<u64>,
+}
+
 /// Inner state for UsearchCentroidGraph, protected by a single RwLock.
 struct UsearchCentroidGraphInner {
     /// The usearch index (thread-safe internally)
@@ -29,6 +37,9 @@ struct UsearchCentroidGraphInner {
     centroid_vectors: HashMap<u64, Vec<f32>>,
     /// Next usearch key to allocate
     next_key: u64,
+    /// Tracks recent mutations for epoch-based snapshot reads.
+    /// Keyed by centroid_id.
+    mutations: HashMap<u64, CentroidMutation>,
 }
 
 /// HNSW graph implementation using the usearch library.
@@ -57,7 +68,11 @@ impl UsearchCentroidGraph {
     ///
     /// # Returns
     /// A UsearchCentroidGraph ready for searching
-    pub fn build(centroids: Vec<CentroidEntry>, distance_metric: DistanceMetric) -> Result<Self> {
+    pub fn build(
+        centroids: Vec<CentroidEntry>,
+        distance_metric: DistanceMetric,
+        epoch: u64,
+    ) -> Result<Self> {
         if centroids.is_empty() {
             return Err(Error::InvalidInput(
                 "Cannot build HNSW graph with no centroids".to_string(),
@@ -105,6 +120,7 @@ impl UsearchCentroidGraph {
         let mut key_to_centroid = HashMap::with_capacity(centroids.len());
         let mut centroid_to_key = HashMap::with_capacity(centroids.len());
         let mut centroid_vectors = HashMap::with_capacity(centroids.len());
+        let mut mutations = HashMap::with_capacity(centroids.len());
 
         for (key, centroid) in centroids.iter().enumerate() {
             let key = key as u64;
@@ -114,6 +130,13 @@ impl UsearchCentroidGraph {
             key_to_centroid.insert(key, centroid.centroid_id);
             centroid_to_key.insert(centroid.centroid_id, key);
             centroid_vectors.insert(centroid.centroid_id, centroid.vector.clone());
+            mutations.insert(
+                centroid.centroid_id,
+                CentroidMutation {
+                    added_epoch: epoch,
+                    deleted_epoch: None,
+                },
+            );
         }
 
         let next_key = centroids.len() as u64;
@@ -125,6 +148,7 @@ impl UsearchCentroidGraph {
                 centroid_to_key,
                 centroid_vectors,
                 next_key,
+                mutations,
             }),
         })
     }
@@ -135,18 +159,32 @@ impl CentroidGraph for UsearchCentroidGraph {
         self.inner.read().expect("lock poisoned").search(query, k)
     }
 
-    fn add_centroid(&self, entry: &CentroidEntry) -> Result<()> {
+    fn search_at_epoch(&self, query: &[f32], k: usize, epoch: u64) -> Vec<u64> {
         self.inner
-            .write()
+            .read()
             .expect("lock poisoned")
-            .add_centroid(entry)
+            .search_at_epoch(query, k, epoch)
     }
 
-    fn remove_centroid(&self, centroid_id: u64) -> Result<()> {
+    fn add_centroid(&self, entry: &CentroidEntry, epoch: u64) -> Result<()> {
         self.inner
             .write()
             .expect("lock poisoned")
-            .remove_centroid(centroid_id)
+            .add_centroid(entry, epoch)
+    }
+
+    fn remove_centroid(&self, centroid_id: u64, epoch: u64) -> Result<()> {
+        self.inner
+            .write()
+            .expect("lock poisoned")
+            .remove_centroid(centroid_id, epoch)
+    }
+
+    fn update_retention_watermark(&self, epoch: u64) {
+        self.inner
+            .write()
+            .expect("lock poisoned")
+            .update_retention_watermark(epoch);
     }
 
     fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>> {
@@ -163,28 +201,79 @@ impl CentroidGraph for UsearchCentroidGraph {
 
 impl UsearchCentroidGraphInner {
     fn search(&self, query: &[f32], k: usize) -> Vec<u64> {
+        let live_count = self.live_count();
+        let k = k.min(live_count);
+        if k == 0 {
+            return Vec::new();
+        }
+
+        let results = match self.index.filtered_search(query, k, |key| {
+            self.key_to_centroid
+                .get(&key)
+                .map_or(false, |cid| !self.is_deleted(*cid))
+        }) {
+            Ok(matches) => matches,
+            Err(_) => return Vec::new(),
+        };
+
+        results
+            .keys
+            .iter()
+            .filter_map(|&key| self.key_to_centroid.get(&key).copied())
+            .collect()
+    }
+
+    fn search_at_epoch(&self, query: &[f32], k: usize, epoch: u64) -> Vec<u64> {
         let k = k.min(self.key_to_centroid.len());
         if k == 0 {
             return Vec::new();
         }
 
-        // Search usearch index — request more than k to account for removed entries
-        let search_k = (k + 10).min(self.key_to_centroid.len() + 10);
-        let results = match self.index.search(query, search_k) {
+        let results = match self.index.filtered_search(query, k, |key| {
+            self.key_to_centroid
+                .get(&key)
+                .map_or(false, |cid| self.is_visible_at_epoch(*cid, epoch))
+        }) {
             Ok(matches) => matches,
             Err(_) => return Vec::new(),
         };
 
-        // Map keys back to centroid_ids, filtering out removed entries
         results
             .keys
             .iter()
             .filter_map(|&key| self.key_to_centroid.get(&key).copied())
-            .take(k)
             .collect()
     }
 
-    fn add_centroid(&mut self, entry: &CentroidEntry) -> Result<()> {
+    /// A centroid is visible at an epoch if:
+    /// - It has no mutation entry (predates tracking, always visible), OR
+    /// - It was added at or before the epoch AND not deleted as of the epoch
+    fn is_visible_at_epoch(&self, centroid_id: u64, epoch: u64) -> bool {
+        match self.mutations.get(&centroid_id) {
+            None => true,
+            Some(m) => {
+                m.added_epoch <= epoch
+                    && m.deleted_epoch.map_or(true, |deleted| deleted > epoch)
+            }
+        }
+    }
+
+    /// Returns true if the centroid has been soft-deleted (has a deleted_epoch set).
+    fn is_deleted(&self, centroid_id: u64) -> bool {
+        self.mutations
+            .get(&centroid_id)
+            .is_some_and(|m| m.deleted_epoch.is_some())
+    }
+
+    /// Number of live (non-deleted) centroids.
+    fn live_count(&self) -> usize {
+        self.key_to_centroid
+            .values()
+            .filter(|cid| !self.is_deleted(**cid))
+            .count()
+    }
+
+    fn add_centroid(&mut self, entry: &CentroidEntry, epoch: u64) -> Result<()> {
         let key = self.next_key;
         self.next_key += 1;
 
@@ -196,22 +285,68 @@ impl UsearchCentroidGraphInner {
         self.centroid_to_key.insert(entry.centroid_id, key);
         self.centroid_vectors
             .insert(entry.centroid_id, entry.vector.clone());
+        self.mutations.insert(
+            entry.centroid_id,
+            CentroidMutation {
+                added_epoch: epoch,
+                deleted_epoch: None,
+            },
+        );
 
         Ok(())
     }
 
-    fn remove_centroid(&mut self, centroid_id: u64) -> Result<()> {
-        let key = self.centroid_to_key.remove(&centroid_id).ok_or_else(|| {
-            Error::Internal(format!("Centroid {} not found in graph", centroid_id))
-        })?;
+    fn remove_centroid(&mut self, centroid_id: u64, epoch: u64) -> Result<()> {
+        if !self.centroid_to_key.contains_key(&centroid_id) {
+            return Err(Error::Internal(format!(
+                "Centroid {} not found in graph",
+                centroid_id
+            )));
+        }
 
-        self.key_to_centroid.remove(&key);
-        self.centroid_vectors.remove(&centroid_id);
-        self.index
-            .remove(key)
-            .map_err(|e| Error::Internal(e.to_string()))?;
+        // Soft delete: record the deletion epoch but keep the centroid in the
+        // usearch index so snapshot reads at earlier epochs can still find it.
+        match self.mutations.get_mut(&centroid_id) {
+            Some(m) => {
+                m.deleted_epoch = Some(epoch);
+            }
+            None => {
+                self.mutations.insert(
+                    centroid_id,
+                    CentroidMutation {
+                        added_epoch: 0,
+                        deleted_epoch: Some(epoch),
+                    },
+                );
+            }
+        }
 
         Ok(())
+    }
+
+    fn update_retention_watermark(&mut self, epoch: u64) {
+        // Collect centroid_ids whose mutations are fully below the watermark.
+        let to_remove: Vec<u64> = self
+            .mutations
+            .iter()
+            .filter(|(_, m)| {
+                m.added_epoch < epoch && m.deleted_epoch.map_or(true, |d| d < epoch)
+            })
+            .map(|(cid, _)| *cid)
+            .collect();
+
+        for centroid_id in to_remove {
+            let mutation = self.mutations.remove(&centroid_id).unwrap();
+
+            // If the centroid was deleted, hard-remove it from the index now.
+            if mutation.deleted_epoch.is_some() {
+                if let Some(key) = self.centroid_to_key.remove(&centroid_id) {
+                    self.key_to_centroid.remove(&key);
+                    self.centroid_vectors.remove(&centroid_id);
+                    let _ = self.index.remove(key);
+                }
+            }
+        }
     }
 
     fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>> {
@@ -219,7 +354,7 @@ impl UsearchCentroidGraphInner {
     }
 
     fn len(&self) -> usize {
-        self.key_to_centroid.len()
+        self.live_count()
     }
 }
 
@@ -237,7 +372,7 @@ mod tests {
         ];
 
         // when
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 0).unwrap();
         let query = vec![0.9, 0.1, 0.1];
         let results = graph.search(&query, 1);
 
@@ -258,7 +393,7 @@ mod tests {
         ];
 
         // when
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 0).unwrap();
         let query = vec![2.1];
         let results = graph.search(&query, 3);
 
@@ -273,7 +408,7 @@ mod tests {
         let centroids: Vec<CentroidEntry> = vec![];
 
         // when
-        let result = UsearchCentroidGraph::build(centroids, DistanceMetric::L2);
+        let result = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 0);
 
         // then
         assert!(result.is_err());
@@ -294,7 +429,7 @@ mod tests {
         ];
 
         // when
-        let result = UsearchCentroidGraph::build(centroids, DistanceMetric::L2);
+        let result = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 0);
 
         // then
         assert!(result.is_err());
@@ -315,7 +450,7 @@ mod tests {
         ];
 
         // when
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 0).unwrap();
         let results = graph.search(&[1.5], 10);
 
         // then
@@ -329,12 +464,12 @@ mod tests {
             CentroidEntry::new(1, vec![1.0, 0.0, 0.0]),
             CentroidEntry::new(2, vec![0.0, 1.0, 0.0]),
         ];
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
         assert_eq!(graph.len(), 2);
 
         // when - add a third centroid
         let new_entry = CentroidEntry::new(3, vec![0.0, 0.0, 1.0]);
-        graph.add_centroid(&new_entry).unwrap();
+        graph.add_centroid(&new_entry, 2).unwrap();
 
         // then - graph has 3 centroids and can find the new one
         assert_eq!(graph.len(), 3);
@@ -350,10 +485,10 @@ mod tests {
             CentroidEntry::new(2, vec![0.0, 1.0, 0.0]),
             CentroidEntry::new(3, vec![0.0, 0.0, 1.0]),
         ];
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
 
         // when - remove centroid 2
-        graph.remove_centroid(2).unwrap();
+        graph.remove_centroid(2, 2).unwrap();
 
         // then - graph has 2 centroids and search near [0, 1, 0] returns 1 or 3
         assert_eq!(graph.len(), 2);
@@ -370,12 +505,12 @@ mod tests {
             CentroidEntry::new(2, vec![0.0, 1.0]),
             CentroidEntry::new(3, vec![-1.0, 0.0]),
         ];
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
 
         // when - remove centroid 1, add centroid 4
-        graph.remove_centroid(1).unwrap();
+        graph.remove_centroid(1, 2).unwrap();
         graph
-            .add_centroid(&CentroidEntry::new(4, vec![0.5, 0.5]))
+            .add_centroid(&CentroidEntry::new(4, vec![0.5, 0.5]), 2)
             .unwrap();
 
         // then
@@ -391,7 +526,7 @@ mod tests {
             CentroidEntry::new(1, vec![1.0, 0.0, 0.0]),
             CentroidEntry::new(2, vec![0.0, 1.0, 0.0]),
         ];
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 0).unwrap();
 
         // when/then
         assert_eq!(graph.get_centroid_vector(1), Some(vec![1.0, 0.0, 0.0]));
@@ -400,19 +535,149 @@ mod tests {
     }
 
     #[test]
-    fn should_track_vectors_on_add_and_remove() {
+    fn should_track_vectors_on_add_and_remove_after_watermark() {
         // given
         let centroids = vec![CentroidEntry::new(1, vec![1.0, 0.0])];
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
 
-        // when - add centroid
+        // when - add centroid at epoch 2
         graph
-            .add_centroid(&CentroidEntry::new(2, vec![0.0, 1.0]))
+            .add_centroid(&CentroidEntry::new(2, vec![0.0, 1.0]), 2)
             .unwrap();
         assert_eq!(graph.get_centroid_vector(2), Some(vec![0.0, 1.0]));
 
-        // when - remove centroid
-        graph.remove_centroid(2).unwrap();
+        // when - remove centroid at epoch 3, then advance watermark past it
+        graph.remove_centroid(2, 3).unwrap();
+        graph.update_retention_watermark(4);
         assert_eq!(graph.get_centroid_vector(2), None);
+    }
+
+    // ========================================================================
+    // Epoch-based snapshot read tests
+    // ========================================================================
+
+    #[test]
+    fn search_at_epoch_should_exclude_centroids_added_after_epoch() {
+        // given - build with 2 centroids at epoch 1, add a third at epoch 5
+        let centroids = vec![
+            CentroidEntry::new(1, vec![1.0, 0.0, 0.0]),
+            CentroidEntry::new(2, vec![0.0, 1.0, 0.0]),
+        ];
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
+        graph
+            .add_centroid(&CentroidEntry::new(3, vec![0.0, 0.0, 1.0]), 5)
+            .unwrap();
+
+        // when - search at epoch 3 (before centroid 3 was added)
+        let results = graph.search_at_epoch(&[0.0, 0.0, 0.9], 3, 3);
+
+        // then - centroid 3 should NOT be visible
+        assert!(!results.contains(&3));
+        assert_eq!(results.len(), 2);
+
+        // when - search at epoch 5 (when centroid 3 was added)
+        let results = graph.search_at_epoch(&[0.0, 0.0, 0.9], 3, 5);
+
+        // then - centroid 3 should be visible and closest
+        assert_eq!(results[0], 3);
+    }
+
+    #[test]
+    fn search_at_epoch_should_include_deleted_centroid_at_earlier_epoch() {
+        // given - build at epoch 1, delete centroid 2 at epoch 5
+        let centroids = vec![
+            CentroidEntry::new(1, vec![1.0, 0.0, 0.0]),
+            CentroidEntry::new(2, vec![0.0, 1.0, 0.0]),
+            CentroidEntry::new(3, vec![0.0, 0.0, 1.0]),
+        ];
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
+        graph.remove_centroid(2, 5).unwrap();
+
+        // when - search at epoch 3 (before deletion)
+        let results = graph.search_at_epoch(&[0.0, 0.9, 0.0], 3, 3);
+
+        // then - centroid 2 should still be visible
+        assert!(results.contains(&2));
+
+        // when - search at epoch 5 (at deletion)
+        let results = graph.search_at_epoch(&[0.0, 0.9, 0.0], 3, 5);
+
+        // then - centroid 2 should NOT be visible
+        assert!(!results.contains(&2));
+    }
+
+    #[test]
+    fn search_at_epoch_should_see_centroid_added_at_exact_epoch() {
+        let centroids = vec![CentroidEntry::new(1, vec![1.0, 0.0])];
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
+        graph
+            .add_centroid(&CentroidEntry::new(2, vec![0.0, 1.0]), 5)
+            .unwrap();
+
+        // Searching at the exact epoch the centroid was added — it should be visible.
+        let results = graph.search_at_epoch(&[0.0, 0.9], 2, 5);
+        assert!(results.contains(&2));
+    }
+
+    #[test]
+    fn update_retention_watermark_should_hard_remove_deleted_centroids() {
+        // given - build at epoch 1, delete at epoch 3
+        let centroids = vec![
+            CentroidEntry::new(1, vec![1.0, 0.0]),
+            CentroidEntry::new(2, vec![0.0, 1.0]),
+        ];
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
+        graph.remove_centroid(2, 3).unwrap();
+
+        // The soft-deleted centroid is still visible at epoch 2
+        let results = graph.search_at_epoch(&[0.0, 0.9], 2, 2);
+        assert!(results.contains(&2));
+
+        // when - advance watermark past the deletion
+        graph.update_retention_watermark(4);
+
+        // then - centroid 2 is hard-removed; its vector is gone
+        assert_eq!(graph.get_centroid_vector(2), None);
+        // and the mutation map entry is cleaned
+        let inner = graph.inner.read().unwrap();
+        assert!(!inner.mutations.contains_key(&2));
+    }
+
+    #[test]
+    fn update_retention_watermark_should_clean_live_entries_below_watermark() {
+        // given - build at epoch 1
+        let centroids = vec![
+            CentroidEntry::new(1, vec![1.0, 0.0]),
+            CentroidEntry::new(2, vec![0.0, 1.0]),
+        ];
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
+
+        // when - advance watermark past the add epoch
+        graph.update_retention_watermark(2);
+
+        // then - mutations are cleaned but centroids remain in the index
+        let inner = graph.inner.read().unwrap();
+        assert!(inner.mutations.is_empty());
+        assert_eq!(inner.key_to_centroid.len(), 2);
+    }
+
+    #[test]
+    fn update_retention_watermark_should_not_clean_entries_at_or_above_watermark() {
+        // given - add centroid at epoch 5, delete at epoch 8
+        let centroids = vec![CentroidEntry::new(1, vec![1.0, 0.0])];
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
+        graph
+            .add_centroid(&CentroidEntry::new(2, vec![0.0, 1.0]), 5)
+            .unwrap();
+        graph.remove_centroid(2, 8).unwrap();
+
+        // when - watermark at 6 (between add and delete)
+        graph.update_retention_watermark(6);
+
+        // then - centroid 2's mutation is NOT cleaned (deleted_epoch 8 >= watermark 6)
+        let inner = graph.inner.read().unwrap();
+        assert!(inner.mutations.contains_key(&2));
+        // centroid 1's mutation IS cleaned (added at 1, not deleted, both < 6)
+        assert!(!inner.mutations.contains_key(&1));
     }
 }

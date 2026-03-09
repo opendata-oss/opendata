@@ -328,17 +328,17 @@ impl VectorDbWriteDelta {
         // 1. Remove c from the centroid graph
         self.ctx
             .centroid_graph
-            .remove_centroid(cmd.c)
+            .remove_centroid(cmd.c, 0)
             .map_err(|e| e.to_string())?;
 
         // 2. Add c0 and c1 to centroid graph
         self.ctx
             .centroid_graph
-            .add_centroid(&c0)
+            .add_centroid(&c0, 0)
             .map_err(|e| e.to_string())?;
         self.ctx
             .centroid_graph
-            .add_centroid(&c1)
+            .add_centroid(&c1, 0)
             .map_err(|e| e.to_string())?;
 
         let mut view = self.view.write().expect("lock poisoned");
@@ -476,7 +476,7 @@ impl VectorDbWriteDelta {
         // 1. Remove c_other from centroid graph
         self.ctx
             .centroid_graph
-            .remove_centroid(c_from_id)
+            .remove_centroid(c_from_id, 0)
             .map_err(|e| e.to_string())?;
 
         let mut view = self.view.write().expect("lock poisoned");

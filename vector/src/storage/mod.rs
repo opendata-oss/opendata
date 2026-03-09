@@ -154,7 +154,6 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     /// Scan all centroid stats records.
     ///
     /// Returns a map of centroid_id to accumulated vector count.
-    #[allow(dead_code)]
     async fn scan_all_centroid_stats(&self) -> Result<Vec<(u64, CentroidStatsValue)>> {
         let mut prefix_buf = bytes::BytesMut::with_capacity(2);
         crate::serde::RecordType::CentroidStats
