@@ -1455,84 +1455,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         hasher.finish() as SeriesFingerprint
     }
 
-    fn call_arity_bounds(call: &Call) -> (usize, Option<usize>) {
-        let expected_args_len = call.func.arg_types.len();
-        match call.func.variadic {
-            0 => (expected_args_len, Some(expected_args_len)),
-            n if n > 0 => {
-                let min_args = expected_args_len.saturating_sub(1);
-                let max_args = min_args.saturating_add(n as usize);
-                (min_args, Some(max_args))
-            }
-            _ => (expected_args_len.saturating_sub(1), None),
-        }
-    }
-
-    fn expected_call_arg_type(
-        call: &Call,
-        idx: usize,
-    ) -> EvalResult<promql_parser::parser::value::ValueType> {
-        if idx < call.func.arg_types.len() {
-            return Ok(call.func.arg_types[idx]);
-        }
-
-        if call.func.variadic == 0 {
-            return Err(EvaluationError::InternalError(format!(
-                "unexpected argument index {} for non-variadic function '{}'",
-                idx, call.func.name
-            )));
-        }
-
-        call.func.arg_types.last().copied().ok_or_else(|| {
-            EvaluationError::InternalError(format!(
-                "function '{}' has invalid empty argument signature",
-                call.func.name
-            ))
-        })
-    }
-
-    fn validate_call_signature(&self, call: &Call) -> EvalResult<()> {
-        let actual_args_len = call.args.args.len();
-        let (min_args, max_args) = Self::call_arity_bounds(call);
-
-        if max_args == Some(min_args) {
-            if actual_args_len != min_args {
-                return Err(EvaluationError::InternalError(format!(
-                    "expected {} argument(s) in call to '{}', got {}",
-                    min_args, call.func.name, actual_args_len
-                )));
-            }
-        } else if actual_args_len < min_args {
-            return Err(EvaluationError::InternalError(format!(
-                "expected at least {} argument(s) in call to '{}', got {}",
-                min_args, call.func.name, actual_args_len
-            )));
-        } else if let Some(max_args) = max_args
-            && actual_args_len > max_args
-        {
-            return Err(EvaluationError::InternalError(format!(
-                "expected at most {} argument(s) in call to '{}', got {}",
-                max_args, call.func.name, actual_args_len
-            )));
-        }
-
-        for (idx, arg) in call.args.args.iter().enumerate() {
-            let expected_type = Self::expected_call_arg_type(call, idx)?;
-            let actual_type = arg.value_type();
-            if actual_type != expected_type {
-                return Err(EvaluationError::InternalError(format!(
-                    "expected argument {} to function '{}' to be {}, got {}",
-                    idx + 1,
-                    call.func.name,
-                    expected_type,
-                    actual_type
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
     async fn evaluate_call(
         &mut self,
         call: &Call,
@@ -1542,8 +1464,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         interval_ms: i64,
         lookback_delta_ms: i64,
     ) -> EvalResult<ExprResult> {
-        self.validate_call_signature(call)?;
-
         // Evaluate all non-string arguments. We keep rejecting string literals
         // here until string-argument functions are implemented.
         let mut arg_results = Vec::with_capacity(call.args.args.len());
@@ -4034,7 +3954,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             err.to_string()
-                .contains("expected at most 2 argument(s) in call to 'round', got 3"),
+                .contains("round accepts at most two arguments"),
             "unexpected error: {}",
             err
         );
@@ -4077,8 +3997,9 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            err.to_string()
-                .contains("expected argument 2 to function 'round' to be scalar, got string"),
+            err.to_string().contains("string literal")
+                && err.to_string().contains("round")
+                && err.to_string().contains("not yet supported"),
             "unexpected error: {}",
             err
         );
@@ -4119,8 +4040,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            err.to_string()
-                .contains("expected argument 1 to function 'round' to be vector, got scalar"),
+            err.to_string().contains("expected instant vector"),
             "unexpected error: {}",
             err
         );
