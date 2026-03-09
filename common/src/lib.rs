@@ -5,6 +5,7 @@ pub mod display;
 pub mod sequence;
 pub mod serde;
 pub mod storage;
+pub mod cell;
 
 pub use bytes::BytesRange;
 pub use clock::Clock;

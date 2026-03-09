@@ -47,6 +47,7 @@ pub(crate) mod view_reader;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
+mod snapshot;
 
 // Public API exports
 pub use db::VectorDb;
