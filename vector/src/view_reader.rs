@@ -62,6 +62,7 @@ mod tests {
             posting_updates,
             deleted_centroids: RoaringTreemap::new(),
             metadata_index_updates: HashMap::new(),
+            centroid_graph: None,
         }
     }
 
@@ -133,6 +134,7 @@ mod tests {
                 posting_updates: HashMap::new(),
                 deleted_centroids: RoaringTreemap::new(),
                 metadata_index_updates: HashMap::new(),
+                centroid_graph: None,
             })),
             frozen: vec![EpochStamped {
                 val: frozen_view,
@@ -173,6 +175,7 @@ mod tests {
                 posting_updates: HashMap::new(),
                 deleted_centroids: RoaringTreemap::new(),
                 metadata_index_updates: HashMap::new(),
+                centroid_graph: None,
             })),
             frozen: vec![],
             snapshot,
@@ -288,6 +291,7 @@ mod tests {
                 posting_updates: HashMap::new(),
                 deleted_centroids: RoaringTreemap::new(),
                 metadata_index_updates: HashMap::new(),
+                centroid_graph: None,
             })),
             frozen: vec![EpochStamped {
                 val: frozen_view,
@@ -403,6 +407,7 @@ mod tests {
                 posting_updates: HashMap::new(),
                 deleted_centroids: RoaringTreemap::new(),
                 metadata_index_updates: HashMap::new(),
+                centroid_graph: None,
             })),
             frozen: vec![
                 EpochStamped {

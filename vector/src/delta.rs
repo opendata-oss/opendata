@@ -21,7 +21,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use crate::hnsw::CentroidGraph;
+use crate::hnsw::{CentroidGraph, CentroidGraphRead};
 use crate::lire::commands::RebalanceCommand;
 use crate::lire::rebalancer::IndexRebalancer;
 use crate::model::{AttributeValue, MetadataFieldSpec, VECTOR_FIELD_NAME};
@@ -183,7 +183,8 @@ impl Delta for VectorDbWriteDelta {
     fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
         self.ctx.rebalancer.log_summary();
         let mut ops = self.ops;
-        let view = self.view.read().expect("lock poisoned").clone();
+        let mut view = self.view.read().expect("lock poisoned").clone();
+        view.centroid_graph = self.ctx.centroid_graph.snapshot().ok();
 
         // Finalize posting list merges and centroid stats deltas
         for (centroid_id, updates) in &view.posting_updates {
@@ -310,6 +311,9 @@ pub(crate) struct VectorDbDeltaView {
     /// Accumulated metadata index postings: encoded key → set of vector IDs.
     /// Built into merge ops during freeze().
     pub(crate) metadata_index_updates: HashMap<bytes::Bytes, RoaringTreemap>,
+    /// Snapshot of the centroid graph at freeze time. Present on frozen views,
+    /// absent on the mutable current delta view.
+    pub(crate) centroid_graph: Option<Arc<dyn CentroidGraphRead>>,
 }
 
 impl VectorDbDeltaView {
@@ -318,6 +322,16 @@ impl VectorDbDeltaView {
             posting_updates: HashMap::new(),
             deleted_centroids: RoaringTreemap::new(),
             metadata_index_updates: HashMap::new(),
+            centroid_graph: None,
+        }
+    }
+
+    pub(crate) fn with_centroid_graph(centroid_graph: Arc<dyn CentroidGraphRead>) -> Self {
+        Self {
+            posting_updates: HashMap::new(),
+            deleted_centroids: RoaringTreemap::new(),
+            metadata_index_updates: HashMap::new(),
+            centroid_graph: Some(centroid_graph),
         }
     }
 
@@ -404,7 +418,7 @@ mod tests {
         }
 
         fn snapshot(&self) -> crate::error::Result<Arc<dyn CentroidGraphRead>> {
-            todo!()
+            Ok(Arc::new(MockCentroidGraph::new(self.centroids.clone())))
         }
     }
 
@@ -753,7 +767,7 @@ mod tests {
             }
 
             fn snapshot(&self) -> crate::error::Result<Arc<dyn CentroidGraphRead>> {
-                todo!()
+                Ok(Arc::new(MultiCentroidGraph))
             }
         }
 
@@ -1112,7 +1126,7 @@ mod tests {
             }
 
             fn snapshot(&self) -> crate::Result<Arc<dyn CentroidGraphRead>> {
-                todo!()
+                Ok(Arc::new(MultiCentroidGraph))
             }
         }
 

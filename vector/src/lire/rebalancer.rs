@@ -1435,7 +1435,9 @@ mod tests {
         }
 
         fn snapshot(&self) -> crate::Result<Arc<dyn CentroidGraphRead>> {
-            todo!()
+            Ok(Arc::new(MockCentroidGraph {
+                centroids: self.centroids.clone(),
+            }))
         }
     }
 

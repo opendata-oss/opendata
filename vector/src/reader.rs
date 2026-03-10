@@ -6,7 +6,7 @@
 //! writer.
 
 use crate::error::{Error, Result};
-use crate::hnsw::{CentroidGraph, build_centroid_graph};
+use crate::hnsw::{CentroidGraphRead, build_centroid_graph};
 use crate::model::{Query, ReaderConfig, SearchResult};
 use crate::query_engine::{QueryEngine, QueryEngineOptions};
 use crate::serde::centroid_chunk::CentroidEntry;
@@ -27,7 +27,7 @@ use std::sync::Arc;
 pub struct VectorDbReader {
     options: QueryEngineOptions,
     storage: Arc<dyn StorageRead>,
-    centroid_graph: Arc<dyn CentroidGraph>,
+    centroid_graph: Arc<dyn CentroidGraphRead>,
 }
 
 impl VectorDbReader {
@@ -73,6 +73,7 @@ impl VectorDbReader {
             .collect();
 
         let centroid_graph = build_centroid_graph(live_centroids, config.distance_metric)?;
+        let centroid_graph: Arc<dyn CentroidGraphRead> = centroid_graph.snapshot()?;
 
         let options = QueryEngineOptions {
             dimensions: config.dimensions,
@@ -83,7 +84,7 @@ impl VectorDbReader {
         Ok(Self {
             options,
             storage,
-            centroid_graph: Arc::from(centroid_graph),
+            centroid_graph,
         })
     }
 
