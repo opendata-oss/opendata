@@ -347,7 +347,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         let write_epoch = self.epoch;
         self.epoch += 1;
 
-        let result = self.delta.apply(write);
+        let result = self.delta.apply(write, write_epoch);
         // Ignore error if receiver was dropped (fire-and-forget write)
         let _ = result_tx.send(
             result
@@ -753,7 +753,7 @@ mod tests {
             }
         }
 
-        fn apply(&mut self, write: Self::Write) -> Result<(), String> {
+        fn apply(&mut self, write: Self::Write, _epoch: u64) -> Result<(), String> {
             if let Some(error) = &self.context.error {
                 return Err(error.clone());
             }

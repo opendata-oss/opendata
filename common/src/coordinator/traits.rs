@@ -58,7 +58,9 @@ pub trait Delta: Sized + Send + Sync + 'static {
     fn init(context: Self::Context) -> Self;
 
     /// Apply a write to the delta and return a result for the caller.
-    fn apply(&mut self, write: Self::Write) -> Result<Self::ApplyResult, String>;
+    ///
+    /// The `epoch` is the write epoch assigned by the coordinator for this write.
+    fn apply(&mut self, write: Self::Write, epoch: u64) -> Result<Self::ApplyResult, String>;
 
     /// Estimate the size of the delta in bytes.
     fn estimate_size(&self) -> usize;
