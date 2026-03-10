@@ -327,7 +327,7 @@ impl Ingestor {
     }
 
     /// Flush the current batch, blocking until all pending entries are durably written.
-    async fn flush(&self) -> Result<()> {
+    pub async fn flush(&self) -> Result<()> {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(IngestMessage::Flush { done: done_tx })
