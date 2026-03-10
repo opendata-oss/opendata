@@ -215,7 +215,7 @@ mod tests {
         let location = "batches/batch-001";
         write_batch(&store, location, &entries).await;
         producer
-            .enqueue(location.to_string(), Bytes::new(), 0)
+            .enqueue(location.to_string(), vec![], 0)
             .await
             .unwrap();
 
@@ -246,7 +246,7 @@ mod tests {
         let location = "batches/batch-002";
         write_batch(&store, location, &entries).await;
         producer
-            .enqueue(location.to_string(), Bytes::new(), 0)
+            .enqueue(location.to_string(), vec![], 0)
             .await
             .unwrap();
 
@@ -269,11 +269,11 @@ mod tests {
         write_batch(&store, "batches/first", &entries).await;
         write_batch(&store, "batches/second", &entries).await;
         producer
-            .enqueue("batches/first".to_string(), Bytes::new(), 0)
+            .enqueue("batches/first".to_string(), vec![], 0)
             .await
             .unwrap();
         producer
-            .enqueue("batches/second".to_string(), Bytes::new(), 1)
+            .enqueue("batches/second".to_string(), vec![], 1)
             .await
             .unwrap();
 
@@ -295,7 +295,7 @@ mod tests {
         let entries = test_entries();
         write_batch(&store, "batches/first", &entries).await;
         producer
-            .enqueue("batches/first".to_string(), Bytes::new(), 0)
+            .enqueue("batches/first".to_string(), vec![], 0)
             .await
             .unwrap();
 
@@ -316,11 +316,11 @@ mod tests {
         write_batch(&store, "batches/first", &entries).await;
         write_batch(&store, "batches/second", &entries).await;
         producer
-            .enqueue("batches/first".to_string(), Bytes::new(), 0)
+            .enqueue("batches/first".to_string(), vec![], 0)
             .await
             .unwrap();
         producer
-            .enqueue("batches/second".to_string(), Bytes::new(), 1)
+            .enqueue("batches/second".to_string(), vec![], 1)
             .await
             .unwrap();
 
@@ -340,11 +340,11 @@ mod tests {
         write_batch(&store, "batches/first", &entries).await;
         write_batch(&store, "batches/second", &entries).await;
         producer
-            .enqueue("batches/first".to_string(), Bytes::new(), 0)
+            .enqueue("batches/first".to_string(), vec![], 0)
             .await
             .unwrap();
         producer
-            .enqueue("batches/second".to_string(), Bytes::new(), 1)
+            .enqueue("batches/second".to_string(), vec![], 1)
             .await
             .unwrap();
 
@@ -368,10 +368,7 @@ mod tests {
         for i in 0..count {
             let location = format!("batches/batch-{:04}", i);
             write_batch(&store, &location, &entries).await;
-            producer
-                .enqueue(location, Bytes::new(), i as i64)
-                .await
-                .unwrap();
+            producer.enqueue(location, vec![], i as i64).await.unwrap();
         }
 
         // Ack all entries; dequeue fires at DEQUEUE_INTERVAL
@@ -402,11 +399,11 @@ mod tests {
         write_batch(&store, "batches/first", &entries).await;
         write_batch(&store, "batches/second", &entries).await;
         producer
-            .enqueue("batches/first".to_string(), Bytes::new(), 0)
+            .enqueue("batches/first".to_string(), vec![], 0)
             .await
             .unwrap();
         producer
-            .enqueue("batches/second".to_string(), Bytes::new(), 1)
+            .enqueue("batches/second".to_string(), vec![], 1)
             .await
             .unwrap();
 
@@ -431,7 +428,7 @@ mod tests {
         let entries = test_entries();
         write_batch(&store, "batches/first", &entries).await;
         producer
-            .enqueue("batches/first".to_string(), Bytes::new(), 0)
+            .enqueue("batches/first".to_string(), vec![], 0)
             .await
             .unwrap();
 
@@ -455,7 +452,7 @@ mod tests {
         let entries = test_entries();
         write_batch(&store, "batches/first", &entries).await;
         producer
-            .enqueue("batches/first".to_string(), Bytes::new(), 0)
+            .enqueue("batches/first".to_string(), vec![], 0)
             .await
             .unwrap();
 
@@ -479,7 +476,7 @@ mod tests {
         for (i, loc) in locations.iter().enumerate() {
             write_batch(&store, loc, &entries).await;
             producer
-                .enqueue(loc.to_string(), Bytes::new(), i as i64)
+                .enqueue(loc.to_string(), vec![], i as i64)
                 .await
                 .unwrap();
         }
@@ -505,7 +502,7 @@ mod tests {
         for i in 0..5 {
             let loc = format!("batches/placeholder-{}", i);
             write_batch(&store, &loc, &entries).await;
-            producer.enqueue(loc, Bytes::new(), i).await.unwrap();
+            producer.enqueue(loc, vec![], i).await.unwrap();
         }
         // Use a temporary collector to dequeue placeholders
         let (_, tmp_collector) = make_collector(&store, test_collector_config());
@@ -519,7 +516,7 @@ mod tests {
         // Now enqueue the real entry — it gets sequence 5
         write_batch(&store, "batches/pre-existing", &entries).await;
         producer
-            .enqueue("batches/pre-existing".to_string(), Bytes::new(), 10)
+            .enqueue("batches/pre-existing".to_string(), vec![], 10)
             .await
             .unwrap();
 
@@ -541,11 +538,11 @@ mod tests {
         write_batch(&store, "batches/first", &entries).await;
         write_batch(&store, "batches/second", &entries).await;
         producer
-            .enqueue("batches/first".to_string(), Bytes::new(), 0)
+            .enqueue("batches/first".to_string(), vec![], 0)
             .await
             .unwrap();
         producer
-            .enqueue("batches/second".to_string(), Bytes::new(), 1)
+            .enqueue("batches/second".to_string(), vec![], 1)
             .await
             .unwrap();
 
