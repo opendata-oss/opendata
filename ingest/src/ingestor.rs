@@ -54,7 +54,7 @@ enum IngestMessage {
 
 struct Batch {
     entries: Vec<Bytes>,
-    metadata: Bytes,
+    metadata: Vec<Bytes>,
     ingestion_time_ms: i64,
     notifiers: Vec<Notifier>,
     size_bytes: usize,
@@ -65,7 +65,7 @@ impl Batch {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
-            metadata: Bytes::new(),
+            metadata: Vec::new(),
             ingestion_time_ms: 0,
             notifiers: Vec::new(),
             size_bytes: 0,
@@ -83,7 +83,7 @@ impl Batch {
     ) {
         self.size_bytes += entries.iter().map(|b| b.len()).sum::<usize>();
         self.entries.extend(entries);
-        self.metadata = metadata;
+        self.metadata.push(metadata);
         if self.ingestion_time_ms == 0 {
             self.ingestion_time_ms = ingestion_time_ms;
         }
@@ -93,7 +93,7 @@ impl Batch {
         }
     }
 
-    fn take(&mut self) -> (Vec<Bytes>, Bytes, i64, Vec<Notifier>) {
+    fn take(&mut self) -> (Vec<Bytes>, Vec<Bytes>, i64, Vec<Notifier>) {
         self.size_bytes = 0;
         self.started_at = None;
         (
@@ -105,7 +105,7 @@ impl Batch {
     }
 
     fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.metadata.is_empty()
+        self.entries.is_empty() && self.metadata.iter().all(|m| m.is_empty())
     }
 }
 
@@ -183,7 +183,7 @@ impl BatchWriter {
     async fn write_and_enqueue(
         &self,
         entries: Vec<Bytes>,
-        metadata: Bytes,
+        metadata: Vec<Bytes>,
         ingestion_time_ms: i64,
     ) -> Result<()> {
         let location = if entries.is_empty() {
@@ -577,7 +577,7 @@ mod tests {
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].metadata, metadata);
+        assert_eq!(entries[0].metadata, vec![metadata]);
         assert_eq!(entries[0].ingestion_time_ms, 1_700_000_000_000);
     }
 
@@ -660,7 +660,7 @@ mod tests {
         let entries = read_manifest_entries(&store, "test/manifest").await;
         assert_eq!(entries.len(), 1);
         assert!(entries[0].location.is_empty());
-        assert_eq!(entries[0].metadata, metadata);
+        assert_eq!(entries[0].metadata, vec![metadata]);
     }
 
     #[tokio::test]

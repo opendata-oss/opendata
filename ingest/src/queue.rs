@@ -18,6 +18,10 @@ const ENTRY_LEN_SIZE: usize = 4;
 const LOCATION_LEN_SIZE: usize = 2;
 #[allow(dead_code)]
 const INGESTION_TIME_MS_SIZE: usize = 8;
+#[allow(dead_code)]
+const METADATA_COUNT_SIZE: usize = 4;
+#[allow(dead_code)]
+const METADATA_LEN_SIZE: usize = 4;
 const ENTRIES_COUNT_SIZE: usize = 4;
 const SEQUENCE_SIZE: usize = 8;
 const EPOCH_SIZE: usize = 8;
@@ -29,7 +33,7 @@ pub(crate) struct QueueEntry {
     pub(crate) sequence: u64,
     pub(crate) location: String,
     pub(crate) ingestion_time_ms: i64,
-    pub(crate) metadata: Bytes,
+    pub(crate) metadata: Vec<Bytes>,
 }
 
 #[derive(Debug, Clone)]
@@ -270,13 +274,33 @@ impl Manifest {
     }
 
     fn encode_entry(buf: &mut BytesMut, entry: &QueueEntry) {
-        let entry_len = 8 + 2 + entry.location.len() + 8 + entry.metadata.len();
+        let metadata_size: usize = if entry.metadata.is_empty() {
+            0
+        } else {
+            METADATA_COUNT_SIZE
+                + entry
+                    .metadata
+                    .iter()
+                    .map(|m| METADATA_LEN_SIZE + m.len())
+                    .sum::<usize>()
+        };
+        let entry_len = SEQUENCE_SIZE
+            + LOCATION_LEN_SIZE
+            + entry.location.len()
+            + INGESTION_TIME_MS_SIZE
+            + metadata_size;
         buf.put_u32_le(entry_len as u32);
         buf.put_u64_le(entry.sequence);
         buf.put_u16_le(entry.location.len() as u16);
         buf.extend_from_slice(entry.location.as_bytes());
         buf.put_i64_le(entry.ingestion_time_ms);
-        buf.extend_from_slice(&entry.metadata);
+        if !entry.metadata.is_empty() {
+            buf.put_u32_le(entry.metadata.len() as u32);
+            for m in &entry.metadata {
+                buf.put_u32_le(m.len() as u32);
+                buf.extend_from_slice(m);
+            }
+        }
     }
 }
 
@@ -365,10 +389,30 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntr
     );
     *offset += INGESTION_TIME_MS_SIZE;
 
-    let metadata_len =
-        entry_len - SEQUENCE_SIZE - LOCATION_LEN_SIZE - location_len - INGESTION_TIME_MS_SIZE;
-    let metadata = Bytes::copy_from_slice(&data[*offset..*offset + metadata_len]);
-    *offset += metadata_len;
+    let consumed = SEQUENCE_SIZE + LOCATION_LEN_SIZE + location_len + INGESTION_TIME_MS_SIZE;
+    let metadata = if entry_len > consumed {
+        let metadata_count = u32::from_le_bytes(
+            data[*offset..*offset + METADATA_COUNT_SIZE]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        *offset += METADATA_COUNT_SIZE;
+
+        let mut metadata = Vec::with_capacity(metadata_count);
+        for _ in 0..metadata_count {
+            let m_len = u32::from_le_bytes(
+                data[*offset..*offset + METADATA_LEN_SIZE]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            *offset += METADATA_LEN_SIZE;
+            metadata.push(Bytes::copy_from_slice(&data[*offset..*offset + m_len]));
+            *offset += m_len;
+        }
+        metadata
+    } else {
+        vec![]
+    };
 
     Ok(QueueEntry {
         sequence,
@@ -533,9 +577,14 @@ impl QueueProducer {
     pub async fn enqueue(
         &self,
         location: String,
-        metadata: Bytes,
+        metadata: Vec<Bytes>,
         ingestion_time_ms: i64,
     ) -> Result<()> {
+        let metadata = if metadata.iter().all(|m| m.is_empty()) {
+            vec![]
+        } else {
+            metadata
+        };
         let entry = QueueEntry {
             sequence: 0,
             location,
@@ -723,11 +772,11 @@ mod tests {
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("path/to/file1.batch".to_string(), Bytes::new(), 0)
+            .enqueue("path/to/file1.batch".to_string(), vec![], 0)
             .await
             .unwrap();
         producer
-            .enqueue("path/to/file2.batch".to_string(), Bytes::new(), 0)
+            .enqueue("path/to/file2.batch".to_string(), vec![], 0)
             .await
             .unwrap();
 
@@ -747,7 +796,7 @@ mod tests {
             sequence: 0,
             location: "existing/file.batch".to_string(),
             ingestion_time_ms: 1000,
-            metadata: Bytes::new(),
+            metadata: vec![],
         }]);
         let path = Path::from("test/manifest");
         store
@@ -758,7 +807,7 @@ mod tests {
         let producer =
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         producer
-            .enqueue("new/file.batch".to_string(), Bytes::new(), 0)
+            .enqueue("new/file.batch".to_string(), vec![], 0)
             .await
             .unwrap();
 
@@ -803,15 +852,15 @@ mod tests {
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.batch".to_string(), Bytes::new(), 0)
+            .enqueue("a.batch".to_string(), vec![], 0)
             .await
             .unwrap();
         producer
-            .enqueue("b.batch".to_string(), Bytes::new(), 0)
+            .enqueue("b.batch".to_string(), vec![], 0)
             .await
             .unwrap();
         producer
-            .enqueue("c.batch".to_string(), Bytes::new(), 0)
+            .enqueue("c.batch".to_string(), vec![], 0)
             .await
             .unwrap();
 
@@ -834,7 +883,7 @@ mod tests {
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.batch".to_string(), Bytes::new(), 0)
+            .enqueue("a.batch".to_string(), vec![], 0)
             .await
             .unwrap();
 
@@ -898,7 +947,7 @@ mod tests {
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.batch".to_string(), Bytes::new(), 0)
+            .enqueue("a.batch".to_string(), vec![], 0)
             .await
             .unwrap();
 
@@ -942,11 +991,11 @@ mod tests {
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.batch".to_string(), Bytes::new(), 0)
+            .enqueue("a.batch".to_string(), vec![], 0)
             .await
             .unwrap();
         producer
-            .enqueue("b.batch".to_string(), Bytes::new(), 0)
+            .enqueue("b.batch".to_string(), vec![], 0)
             .await
             .unwrap();
 
@@ -968,15 +1017,15 @@ mod tests {
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.batch".to_string(), Bytes::new(), 0)
+            .enqueue("a.batch".to_string(), vec![], 0)
             .await
             .unwrap();
         producer
-            .enqueue("b.batch".to_string(), Bytes::new(), 0)
+            .enqueue("b.batch".to_string(), vec![], 0)
             .await
             .unwrap();
         producer
-            .enqueue("c.batch".to_string(), Bytes::new(), 0)
+            .enqueue("c.batch".to_string(), vec![], 0)
             .await
             .unwrap();
 
@@ -1003,11 +1052,11 @@ mod tests {
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.batch".to_string(), Bytes::new(), 0)
+            .enqueue("a.batch".to_string(), vec![], 0)
             .await
             .unwrap();
         producer
-            .enqueue("b.batch".to_string(), Bytes::new(), 0)
+            .enqueue("b.batch".to_string(), vec![], 0)
             .await
             .unwrap();
 
@@ -1021,7 +1070,7 @@ mod tests {
         consumer.dequeue(1).await.unwrap();
 
         producer
-            .enqueue("c.batch".to_string(), Bytes::new(), 0)
+            .enqueue("c.batch".to_string(), vec![], 0)
             .await
             .unwrap();
 
@@ -1030,21 +1079,21 @@ mod tests {
         assert_eq!(next.sequence, 2);
     }
 
-    fn entry(location: &str, time_ms: i64, metadata: &[u8]) -> QueueEntry {
+    fn entry(location: &str, time_ms: i64, metadata: Vec<Bytes>) -> QueueEntry {
         QueueEntry {
             sequence: 0,
             location: location.to_string(),
             ingestion_time_ms: time_ms,
-            metadata: Bytes::from(metadata.to_vec()),
+            metadata,
         }
     }
 
-    fn entry_seq(seq: u64, location: &str, time_ms: i64, metadata: &[u8]) -> QueueEntry {
+    fn entry_seq(seq: u64, location: &str, time_ms: i64, metadata: Vec<Bytes>) -> QueueEntry {
         QueueEntry {
             sequence: seq,
             location: location.to_string(),
             ingestion_time_ms: time_ms,
-            metadata: Bytes::from(metadata.to_vec()),
+            metadata,
         }
     }
 
@@ -1073,7 +1122,10 @@ mod tests {
 
     #[test]
     fn should_parse_valid_manifest_bytes() {
-        let entries = vec![entry_seq(0, "a", 1, b"x"), entry_seq(1, "b", 2, b"y")];
+        let entries = vec![
+            entry_seq(0, "a", 1, vec![Bytes::from("x")]),
+            entry_seq(1, "b", 2, vec![Bytes::from("y")]),
+        ];
         let data = Manifest::from_entries(&entries).to_bytes();
 
         let m = Manifest::from_bytes(data).unwrap();
@@ -1095,7 +1147,7 @@ mod tests {
         assert_eq!(m.epoch, 0);
 
         let mut m = m;
-        m.append(&entry("loc", 1, b""));
+        m.append(&entry("loc", 1, vec![]));
         let entries: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(entries[0].sequence, 42);
     }
@@ -1224,23 +1276,23 @@ mod tests {
     fn should_make_appended_entry_accessible_via_iter() {
         let mut m = Manifest::empty();
 
-        m.append(&entry("loc", 42, b"meta"));
+        m.append(&entry("loc", 42, vec![Bytes::from("meta")]));
 
         let entries: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].sequence, 0);
         assert_eq!(entries[0].location, "loc");
         assert_eq!(entries[0].ingestion_time_ms, 42);
-        assert_eq!(entries[0].metadata, &b"meta"[..]);
+        assert_eq!(entries[0].metadata, vec![Bytes::from("meta")]);
     }
 
     #[test]
     fn should_append_to_existing_base_entries() {
-        let base = Manifest::from_entries(&[entry_seq(0, "base", 1, b"")]);
+        let base = Manifest::from_entries(&[entry_seq(0, "base", 1, vec![])]);
         let data = base.to_bytes();
         let mut m = Manifest::from_bytes(data).unwrap();
 
-        m.append(&entry("appended", 2, b""));
+        m.append(&entry("appended", 2, vec![]));
 
         assert_eq!(m.entries_count(), 2);
         assert_eq!(collect_locations(&m), vec!["base", "appended"]);
@@ -1253,9 +1305,9 @@ mod tests {
     fn should_preserve_append_order() {
         let mut m = Manifest::empty();
 
-        m.append(&entry("a", 1, b""));
-        m.append(&entry("b", 2, b""));
-        m.append(&entry("c", 3, b""));
+        m.append(&entry("a", 1, vec![]));
+        m.append(&entry("b", 2, vec![]));
+        m.append(&entry("c", 3, vec![]));
 
         assert_eq!(collect_locations(&m), vec!["a", "b", "c"]);
         let entries: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
@@ -1271,7 +1323,7 @@ mod tests {
         assert_eq!(m.entries_count(), 0);
         assert!(m.is_empty());
 
-        m.append(&entry("loc", 1, b""));
+        m.append(&entry("loc", 1, vec![]));
         let entries: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(entries[0].sequence, 0);
     }
@@ -1279,9 +1331,9 @@ mod tests {
     #[test]
     fn should_create_manifest_from_multiple_entries() {
         let entries = vec![
-            entry_seq(0, "x", 10, b"m1"),
-            entry_seq(1, "y", 20, b"m2"),
-            entry_seq(2, "z", 30, b"m3"),
+            entry_seq(0, "x", 10, vec![Bytes::from("m1")]),
+            entry_seq(1, "y", 20, vec![Bytes::from("m2")]),
+            entry_seq(2, "z", 30, vec![Bytes::from("m3")]),
         ];
 
         let m = Manifest::from_entries(&entries);
@@ -1292,20 +1344,20 @@ mod tests {
         assert_eq!(decoded[0].sequence, 0);
         assert_eq!(decoded[0].location, "x");
         assert_eq!(decoded[0].ingestion_time_ms, 10);
-        assert_eq!(decoded[0].metadata, &b"m1"[..]);
+        assert_eq!(decoded[0].metadata, vec![Bytes::from("m1")]);
         assert_eq!(decoded[1].sequence, 1);
         assert_eq!(decoded[1].location, "y");
         assert_eq!(decoded[1].ingestion_time_ms, 20);
-        assert_eq!(decoded[1].metadata, &b"m2"[..]);
+        assert_eq!(decoded[1].metadata, vec![Bytes::from("m2")]);
         assert_eq!(decoded[2].sequence, 2);
         assert_eq!(decoded[2].location, "z");
         assert_eq!(decoded[2].ingestion_time_ms, 30);
-        assert_eq!(decoded[2].metadata, &b"m3"[..]);
+        assert_eq!(decoded[2].metadata, vec![Bytes::from("m3")]);
     }
 
     #[test]
     fn should_handle_entry_with_empty_location() {
-        let m = Manifest::from_entries(&[entry_seq(0, "", 0, b"")]);
+        let m = Manifest::from_entries(&[entry_seq(0, "", 0, vec![])]);
 
         let decoded: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(decoded[0].location, "");
@@ -1315,18 +1367,18 @@ mod tests {
 
     #[test]
     fn should_handle_entry_with_large_metadata() {
-        let big_meta = vec![0xAB_u8; 1024];
+        let big_meta = Bytes::from(vec![0xAB_u8; 1024]);
 
-        let m = Manifest::from_entries(&[entry_seq(0, "loc", 1, &big_meta)]);
+        let m = Manifest::from_entries(&[entry_seq(0, "loc", 1, vec![big_meta.clone()])]);
 
         let decoded: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
-        assert_eq!(decoded[0].metadata.len(), 1024);
-        assert_eq!(&decoded[0].metadata[..], &big_meta[..]);
+        assert_eq!(decoded[0].metadata.len(), 1);
+        assert_eq!(decoded[0].metadata[0], big_meta);
     }
 
     #[test]
     fn should_handle_negative_ingestion_time() {
-        let m = Manifest::from_entries(&[entry_seq(0, "loc", -1000, b"")]);
+        let m = Manifest::from_entries(&[entry_seq(0, "loc", -1000, vec![])]);
 
         let decoded: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(decoded[0].ingestion_time_ms, -1000);
@@ -1350,9 +1402,9 @@ mod tests {
 
     #[test]
     fn should_merge_base_and_appended() {
-        let base = Manifest::from_entries(&[entry_seq(0, "base", 1, b"")]);
+        let base = Manifest::from_entries(&[entry_seq(0, "base", 1, vec![])]);
         let mut m = Manifest::from_bytes(base.to_bytes()).unwrap();
-        m.append(&entry("appended", 2, b""));
+        m.append(&entry("appended", 2, vec![]));
 
         let serialized = m.to_bytes();
         let reparsed = Manifest::from_bytes(serialized).unwrap();
@@ -1366,11 +1418,12 @@ mod tests {
 
     #[test]
     fn should_write_correct_footer_count() {
-        let base = Manifest::from_entries(&[entry_seq(0, "a", 1, b""), entry_seq(1, "b", 2, b"")]);
+        let base =
+            Manifest::from_entries(&[entry_seq(0, "a", 1, vec![]), entry_seq(1, "b", 2, vec![])]);
         let mut m = Manifest::from_bytes(base.to_bytes()).unwrap();
-        m.append(&entry("c", 3, b""));
-        m.append(&entry("d", 4, b""));
-        m.append(&entry("e", 5, b""));
+        m.append(&entry("c", 3, vec![]));
+        m.append(&entry("d", 4, vec![]));
+        m.append(&entry("e", 5, vec![]));
 
         let bytes = m.to_bytes();
 
@@ -1395,7 +1448,10 @@ mod tests {
 
     #[test]
     fn should_round_trip_from_entries_to_bytes_from_bytes() {
-        let entries = vec![entry_seq(0, "a", 10, b"m1"), entry_seq(1, "b", 20, b"m2")];
+        let entries = vec![
+            entry_seq(0, "a", 10, vec![Bytes::from("m1")]),
+            entry_seq(1, "b", 20, vec![Bytes::from("m2")]),
+        ];
         let original = Manifest::from_entries(&entries);
 
         let reparsed = Manifest::from_bytes(original.to_bytes()).unwrap();
@@ -1405,18 +1461,18 @@ mod tests {
         assert_eq!(decoded[0].sequence, 0);
         assert_eq!(decoded[0].location, "a");
         assert_eq!(decoded[0].ingestion_time_ms, 10);
-        assert_eq!(decoded[0].metadata, &b"m1"[..]);
+        assert_eq!(decoded[0].metadata, vec![Bytes::from("m1")]);
         assert_eq!(decoded[1].sequence, 1);
         assert_eq!(decoded[1].location, "b");
         assert_eq!(decoded[1].ingestion_time_ms, 20);
-        assert_eq!(decoded[1].metadata, &b"m2"[..]);
+        assert_eq!(decoded[1].metadata, vec![Bytes::from("m2")]);
     }
 
     #[test]
     fn should_round_trip_append_serialize_reparse() {
         let mut m = Manifest::empty();
-        m.append(&entry("x", 100, b"data"));
-        m.append(&entry("y", 200, b"more"));
+        m.append(&entry("x", 100, vec![Bytes::from("data")]));
+        m.append(&entry("y", 200, vec![Bytes::from("more")]));
 
         let reparsed = Manifest::from_bytes(m.to_bytes()).unwrap();
 
@@ -1426,12 +1482,12 @@ mod tests {
 
     #[test]
     fn should_chain_serialize_reparse_append() {
-        let original = Manifest::from_entries(&[entry_seq(0, "a", 1, b"")]);
+        let original = Manifest::from_entries(&[entry_seq(0, "a", 1, vec![])]);
         let mut m = Manifest::from_bytes(original.to_bytes()).unwrap();
-        m.append(&entry("b", 2, b""));
+        m.append(&entry("b", 2, vec![]));
 
         let mut m2 = Manifest::from_bytes(m.to_bytes()).unwrap();
-        m2.append(&entry("c", 3, b""));
+        m2.append(&entry("c", 3, vec![]));
 
         let final_m = Manifest::from_bytes(m2.to_bytes()).unwrap();
 
@@ -1445,7 +1501,7 @@ mod tests {
     fn should_dequeue_entries_through_sequence() {
         let mut m = Manifest::empty();
         for _ in 0..5 {
-            m.append(&entry("loc", 1, b""));
+            m.append(&entry("loc", 1, vec![]));
         }
 
         let removed = m.dequeue(2);
@@ -1465,7 +1521,7 @@ mod tests {
     fn should_dequeue_all_entries() {
         let mut m = Manifest::empty();
         for _ in 0..3 {
-            m.append(&entry("loc", 1, b""));
+            m.append(&entry("loc", 1, vec![]));
         }
 
         let removed = m.dequeue(2);
@@ -1478,9 +1534,9 @@ mod tests {
     #[test]
     fn should_dequeue_nothing_when_sequence_below_first() {
         let entries = vec![
-            entry_seq(5, "a", 1, b""),
-            entry_seq(6, "b", 2, b""),
-            entry_seq(7, "c", 3, b""),
+            entry_seq(5, "a", 1, vec![]),
+            entry_seq(6, "b", 2, vec![]),
+            entry_seq(7, "c", 3, vec![]),
         ];
         let mut m = Manifest::from_entries(&entries);
 
@@ -1494,7 +1550,7 @@ mod tests {
     fn should_append_after_dequeue() {
         let mut m = Manifest::empty();
         for _ in 0..3 {
-            m.append(&entry("loc", 1, b""));
+            m.append(&entry("loc", 1, vec![]));
         }
 
         m.dequeue(0);
@@ -1504,7 +1560,7 @@ mod tests {
         assert_eq!(remaining[0].sequence, 1);
         assert_eq!(remaining[1].sequence, 2);
 
-        m.append(&entry("new", 4, b""));
+        m.append(&entry("new", 4, vec![]));
         let all: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(all.len(), 3);
         assert_eq!(all[2].sequence, 3);

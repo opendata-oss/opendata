@@ -121,7 +121,10 @@ ingestion time, and optional extensible metadata:
 ┌──────────────────────────────────────────────────────────────┐
 │  entry 0: [entry_len: u32 LE][sequence: u64 LE]              │
 │           [location_len: u16 LE][location: bytes]            │
-│           [ingestion_time_ms: i64 LE][metadata: bytes]       │
+│           [ingestion_time_ms: i64 LE]                        │
+│           [metadata_count: u32 LE]        ← optional         │
+│           [metadata 0: [len: u32 LE][data: bytes]]           │
+│           [metadata 1: ...]                                  │
 │  entry 1: ...                                                │
 │  ...                                                         │
 │  entry N: ...                                                │
@@ -134,13 +137,18 @@ ingestion time, and optional extensible metadata:
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- `entry_len` is the total number of bytes after this field: `8 + 2 + location_len + 8 + metadata_len`.
+- `entry_len` is the total number of bytes after this field.
+  Without metadata: `8 + 2 + location_len + 8`.
+  With metadata: `8 + 2 + location_len + 8 + 4 + Σ(4 + metadata_i_len)`.
 - `sequence` is a monotonically increasing u64, auto-assigned by the manifest on append.
   Sequences are contiguous but can start at any value (e.g., after dequeue, entries 5,6,7 are valid).
 - `location` is the UTF-8 encoded object storage path of the data batch.
 - `ingestion_time_ms` is the wall-clock time in milliseconds since the Unix epoch when the entry was enqueued.
-- `metadata` is an opaque byte payload whose length is implicit: `entry_len - 8 - 2 - location_len - 8`.
-  This field enables extensible per-entry metadata (e.g., flatbuffers) without a format change.
+- `metadata_count` and the subsequent length-prefixed metadata items are only present when at least one
+  metadata item is non-empty. Each metadata item is an opaque byte payload preceded by its length as a
+  little-endian `u32`. When all metadata items are empty, the metadata section is omitted entirely and
+  `entry_len` covers only the fixed fields. The decoder detects the presence of metadata by comparing
+  `entry_len` against the fixed-fields size.
 - The footer is always the last 22 bytes. `next_sequence` stores the sequence number that will be assigned
   to the next appended entry. `epoch` is a monotonically increasing counter used for consumer fencing:
   a new consumer increments the epoch on initialization, and only a consumer whose epoch matches the
@@ -223,8 +231,10 @@ load.
 
 A call to `ingest()` takes a vector of byte entries and opaque metadata, and returns a `WriteHandle` with which
 the caller can await the completion of the flush to object storage of the vector of entries.
-The metadata is written to the queue manifest entry (not to the data batch) and can be used by the collector
-to interpret the batch without reading it.
+Because multiple `ingest()` calls may be batched into a single flush, the metadata from each call is
+collected into a vector and written to the queue manifest entry (not to the data batch).
+The collector can use the metadata vector to interpret the batch without reading it.
+If all metadata items in the vector are empty, no metadata is stored in the queue entry.
 The ingestor also records the ingestion time and passes it to the queue entry.
 
 The `WriteHandle` has the following API:
@@ -395,9 +405,9 @@ object with the same name. This aspect would require some experiments.
 
 ## Open Questions
 
-- What format should we use for the data batches?
-- Should the clean-up of the data batches happen independently of the clean-up of the queue?
-- Should we also track the age of claimed/done batches to see if batches fall too much behind?
+- Should we ingest metadata per entry or metadata per vector of entries, i.e., per call to `Ingestor::ingest()`?
+- Should we store the metadata in the queue and in the data batches or is it enough to store it in the queue?
+
 
 ## Updates
 
@@ -405,6 +415,7 @@ object with the same name. This aspect would require some experiments.
 |------------|--------------------------------------------|
 | 2026-02-26 | Initial draft                              |
 | 2026-03-05 | Added binary formats for queue and batches |
+| 2026-03-10 | Changed queue entry metadata to a vector of length-prefixed items |
 
 
 
