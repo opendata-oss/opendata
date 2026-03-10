@@ -66,8 +66,6 @@ Without generalization, PromQL support growth becomes brittle and repetitive.
   `experimental`) as the signature source of truth.
 - Use one runtime-dispatched `PromQLFunction` interface at the function
   boundary.
-- Keep a thin evaluator runtime signature guard for non-parser AST entry paths
-  (for example manually constructed calls in tests/internal paths).
 - Keep scalar-return boundary semantics as `ExprResult::Scalar`.
 - Preserve explicit special handling for series/label-oriented functions
   (`label_replace`, `label_join`, and `info` when supported).
@@ -82,15 +80,15 @@ Module responsibilities today:
 
 - `functions.rs`: function trait definitions, function registry, and
   implementation bodies.
-- `evaluator.rs`: function-call orchestration (arity gate, argument evaluation,
-  dispatch, and result wrapping).
+- `evaluator.rs`: function-call orchestration (argument evaluation, unsupported
+  argument rejection, dispatch, and result wrapping).
 
 After this RFC:
 
 - `functions.rs`: generalized function interfaces, function implementations, and
   registry wiring.
-- `evaluator.rs`: signature resolution/validation, argument materialization,
-  special call-path handling, and unified dispatch.
+- `evaluator.rs`: signature-aware argument materialization, special call-path
+  handling, and unified dispatch.
 
 Both modules must change together. Updating `functions.rs` alone cannot unlock
 multi-argument function support without evaluator-side call-path changes.
@@ -145,8 +143,6 @@ Implication for this RFC:
 
 - `Call.func` metadata is the runtime signature source for both type
   expectations and arity semantics.
-- Evaluator arity checks should align directly to parser cardinality semantics
-  (no function-name exceptions needed for arity bounds).
 - `experimental` metadata is available for registry policy decisions.
 
 ### Proposed Function Argument Model
@@ -185,7 +181,8 @@ Notes:
 - Keep one `PromQLFunction` trait: dispatch is runtime by function name, so
   splitting traits by return shape would still require a single dynamic
   dispatch boundary while adding registry complexity.
-- Type safety is enforced by parser metadata and evaluator validation.
+- Type safety for parsed queries is enforced by parser metadata and parser AST
+  validation.
 - String-argument handling uses `raw_args` with `None` in evaluated argument
   slots.
 - `ExprResult` is intentionally not widened with `String` for this change:
@@ -212,9 +209,6 @@ Parser metadata on `Call.func` is the runtime signature source:
 - `variadic`: Prometheus-style variadic cardinality (`0`, `>0`, `<0`).
 - `experimental`: function experimental status.
 
-Evaluator still performs runtime validation as a safety layer, because tests and
-internal AST construction paths can bypass normal parser entry points.
-
 ### Variadic and Optional Argument Semantics
 
 Use parser-supported semantics:
@@ -234,8 +228,7 @@ Use parser-supported semantics:
 
 At a high level, evaluator-side function handling is responsible for:
 
-- Validating call arity and argument types using parser metadata, with runtime
-  guards for non-parser call paths.
+- Materializing supported argument values for dispatch.
 - Preserving special handling for series/label-oriented functions
   (`label_replace`, `label_join`, and `info` when parser support exists).
 - Passing both raw AST arguments and evaluated argument values into function
@@ -276,12 +269,6 @@ Prometheus uses an evaluation signature optimized for its engine internals.
 We considered matching it exactly. We chose a typed enum argument list because
 it is easier to reason about in Rust and maps naturally to current evaluator
 results.
-
-### Parser-Only Validation
-
-Relying exclusively on parser validation was considered. We still keep runtime
-checks for robustness in tests and internal call paths that construct AST nodes
-directly.
 
 ## Open Questions
 
