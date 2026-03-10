@@ -759,17 +759,6 @@ impl IndexRebalancerTask {
             .await
             .map_err(|e| e.to_string())?;
 
-        // Safety check: if c has < 1 vector (e.g. drained by concurrent ops), abort.
-        if posting_list.is_empty() {
-            warn!(
-                c_from,
-                num_vectors = posting_list.len(),
-                "cannot merge empty centroid",
-            );
-            self.send_finish_merge(c_to).await?;
-            return Ok(());
-        }
-
         // Track original vector IDs for sweep phase, and save (id, vector)
         // pairs for reassignment in Phase 3.
         let original_vector_ids: HashSet<u64> = posting_list.iter().map(|p| p.id()).collect();
