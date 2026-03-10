@@ -890,7 +890,7 @@ mod tests {
     use super::*;
     use crate::delta::{VectorDbDeltaContext, VectorDbDeltaOpts, VectorDbWriteDelta};
     use crate::flusher::VectorDbFlusher;
-    use crate::hnsw::build_centroid_graph;
+    use crate::hnsw::{build_centroid_graph, CentroidGraphRead};
     use crate::serde::centroid_chunk::CentroidEntry;
     use crate::serde::collection_meta::DistanceMetric;
     use crate::serde::key::SeqBlockKey;
@@ -1408,24 +1408,10 @@ mod tests {
         centroids: Vec<(u64, Vec<f32>)>,
     }
 
-    impl CentroidGraph for MockCentroidGraph {
+    impl CentroidGraphRead for MockCentroidGraph {
         fn search(&self, _query: &[f32], _k: usize) -> Vec<u64> {
             self.centroids.iter().map(|(id, _)| *id).collect()
         }
-
-        fn search_at_epoch(&self, query: &[f32], k: usize, _epoch: u64) -> Vec<u64> {
-            self.search(query, k)
-        }
-
-        fn add_centroid(&self, _entry: &CentroidEntry, _epoch: u64) -> crate::error::Result<()> {
-            Ok(())
-        }
-
-        fn remove_centroid(&self, _centroid_id: u64, _epoch: u64) -> crate::error::Result<()> {
-            Ok(())
-        }
-
-        fn update_retention_watermark(&self, _epoch: u64) {}
 
         fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>> {
             self.centroids
@@ -1436,6 +1422,20 @@ mod tests {
 
         fn len(&self) -> usize {
             self.centroids.len()
+        }
+    }
+
+    impl CentroidGraph for MockCentroidGraph {
+        fn add_centroid(&self, _entry: &CentroidEntry, _epoch: u64) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        fn remove_centroid(&self, _centroid_id: u64, _epoch: u64) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> crate::Result<Arc<dyn CentroidGraphRead>> {
+            todo!()
         }
     }
 

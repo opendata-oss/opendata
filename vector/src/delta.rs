@@ -305,6 +305,7 @@ impl VectorDbWriteDelta {
 #[derive(Clone)]
 pub(crate) struct VectorDbDeltaView {
     pub(crate) posting_updates: HashMap<u64, Vec<PostingUpdate>>,
+    // TODO: remove me I think
     pub(crate) deleted_centroids: RoaringTreemap,
     /// Accumulated metadata index postings: encoded key → set of vector IDs.
     /// Built into merge ops during freeze().
@@ -352,7 +353,7 @@ impl VectorDbDeltaView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hnsw::CentroidGraph;
+    use crate::hnsw::{CentroidGraph, CentroidGraphRead};
     use crate::lire::rebalancer::{IndexRebalancer, IndexRebalancerOpts};
     use crate::model::AttributeValue;
     use crate::serde::centroid_chunk::CentroidEntry;
@@ -1073,7 +1074,7 @@ mod tests {
         // given - create a mock that routes vectors to different centroids
         struct MultiCentroidGraph;
 
-        impl CentroidGraph for MultiCentroidGraph {
+        impl CentroidGraphRead for MultiCentroidGraph {
             fn search(&self, query: &[f32], _k: usize) -> Vec<u64> {
                 if query[0] > query[1] && query[0] > query[2] {
                     vec![1]
@@ -1084,10 +1085,16 @@ mod tests {
                 }
             }
 
-            fn search_at_epoch(&self, query: &[f32], k: usize, _epoch: u64) -> Vec<u64> {
-                self.search(query, k)
+            fn get_centroid_vector(&self, _centroid_id: u64) -> Option<Vec<f32>> {
+                None
             }
 
+            fn len(&self) -> usize {
+                3
+            }
+        }
+
+        impl CentroidGraph for MultiCentroidGraph {
             fn add_centroid(
                 &self,
                 _entry: &CentroidEntry,
@@ -1104,14 +1111,8 @@ mod tests {
                 Ok(())
             }
 
-            fn update_retention_watermark(&self, _epoch: u64) {}
-
-            fn get_centroid_vector(&self, _centroid_id: u64) -> Option<Vec<f32>> {
-                None
-            }
-
-            fn len(&self) -> usize {
-                3
+            fn snapshot(&self) -> crate::Result<Arc<dyn CentroidGraphRead>> {
+                todo!()
             }
         }
 

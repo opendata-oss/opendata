@@ -5,81 +5,85 @@ use uuid::Uuid;
 use common::cell::AtomicCell;
 use common::coordinator::View;
 use crate::delta::VectorDbWriteDelta;
+use crate::hnsw::CentroidGraph;
 
-pub(crate) struct SnapshotBroker {
-    inner: Mutex<SnapshotBrokerInner>,
+pub(crate) struct CentroidGraphViewBroker {
+    inner: Mutex<CentroidGraphViewBrokerInner>,
+    centroid_graph: Arc<dyn CentroidGraph>,
 }
 
-impl SnapshotBroker {
-    pub(crate) fn new() -> Self {
+impl CentroidGraphViewBroker {
+    pub(crate) fn new(centroid_graph: Arc<dyn CentroidGraph>) -> Self {
         Self {
             inner: Mutex::new(
-                SnapshotBrokerInner {
+                CentroidGraphViewBrokerInner {
                     snapshots: HashMap::new(),
-                    retention_watermark: Arc::new(AtomicCell::new(None)),
+                    retention_watermark: None,
                 }
-            )
+            ),
+            centroid_graph,
         }
     }
 }
 
-impl SnapshotBroker {
-    pub(crate) fn reserve_snapshot(self: &Arc<Self>, epoch: u64) -> SnapshotToken {
+impl CentroidGraphViewBroker {
+    pub(crate) fn view(self: &Arc<Self>, epoch: u64) -> CentroidGraphView {
         let id = uuid::Uuid::new_v4();
         let mut inner = self.inner.lock().expect("lock poisoned");
-        inner.acquire_snapshot(id, epoch);
-        SnapshotToken {
+        inner.hold(id, epoch);
+        CentroidGraphView {
             id,
             epoch,
             broker: Arc::clone(self),
+            centroid_graph: self.centroid_graph.clone(),
         }
     }
 
-    fn release_snapshot(&self, id: Uuid) {
-        self.inner.lock().expect("lock poisoned").release_snapshot(id);
+    fn release(&self, id: Uuid) {
+        let retention_watermark = self.inner.lock().expect("lock poisoned").release(id);
+        // self.centroid_graph.update_retention_watermark(retention_watermark)
     }
 }
 
-struct SnapshotBrokerInner {
+struct CentroidGraphViewBrokerInner {
     snapshots: HashMap<Uuid, u64>,
-    retention_watermark: Arc<AtomicCell<Option<u64>>>,
+    retention_watermark: Option<u64>,
 }
 
-impl SnapshotBrokerInner {
-    fn acquire_snapshot(&mut self, id: Uuid, epoch: u64) {
-        let current_wm = self.retention_watermark.get();
-        if let Some(current_wm) = current_wm {
+impl CentroidGraphViewBrokerInner {
+    fn hold(&mut self, id: Uuid, epoch: u64) {
+        if let Some(current_wm) = self.retention_watermark {
             assert!(epoch >= current_wm);
         }
         self.snapshots.insert(id, epoch);
     }
 
-    fn release_snapshot(&mut self, id: Uuid) {
+    fn release(&mut self, id: Uuid) -> Option<u64> {
         self.snapshots.remove(&id);
         self.update_watermark();
+        self.retention_watermark
     }
 
     fn update_watermark(&mut self) {
-        self.retention_watermark.set(
-            self.snapshots.values().min().cloned()
-        );
+        self.retention_watermark = self.snapshots.values().cloned().min();
     }
 }
 
-pub(crate) struct SnapshotToken {
+pub(crate) struct CentroidGraphView {
     id: Uuid,
     epoch: u64,
-    broker: Arc<SnapshotBroker>,
+    broker: Arc<CentroidGraphViewBroker>,
+    centroid_graph: Arc<dyn CentroidGraph>,
 }
 
-impl SnapshotToken {
-    pub(crate) fn epoch(&self) -> u64 {
-        self.epoch
+impl CentroidGraphView {
+    pub(crate) fn search(&self, query: &[f32], k: usize) -> Vec<u64> {
+        self.centroid_graph.search_at_epoch(query, k, self.epoch)
     }
 }
 
-impl Drop for SnapshotToken {
+impl Drop for CentroidGraphView {
     fn drop(&mut self) {
-        self.broker.release_snapshot(self.id);
+        self.broker.release(self.id);
     }
 }
