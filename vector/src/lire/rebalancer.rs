@@ -971,7 +971,7 @@ mod tests {
 
             // 7. Build centroid graph
             let centroid_graph: Arc<dyn CentroidGraph> =
-                Arc::from(build_centroid_graph(entries.clone(), distance_metric, 0).unwrap());
+                Arc::from(build_centroid_graph(entries.clone(), distance_metric).unwrap());
 
             // 8. Build delta context
             let chunk_target = 4096;

@@ -72,7 +72,7 @@ impl VectorDbReader {
             .filter(|c| !deletions.contains(c.centroid_id))
             .collect();
 
-        let centroid_graph = build_centroid_graph(live_centroids, config.distance_metric, 0)?;
+        let centroid_graph = build_centroid_graph(live_centroids, config.distance_metric)?;
 
         let options = QueryEngineOptions {
             dimensions: config.dimensions,

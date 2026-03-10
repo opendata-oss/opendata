@@ -55,7 +55,6 @@ impl UsearchCentroidGraph {
     pub fn build(
         centroids: Vec<CentroidEntry>,
         distance_metric: DistanceMetric,
-        epoch: u64,
     ) -> Result<Self> {
         if centroids.is_empty() {
             return Err(Error::InvalidInput(
@@ -258,7 +257,7 @@ impl UsearchCentroidGraphInner {
     /// - It was added at or before the epoch AND not deleted as of the epoch
     fn is_visible_at_epoch(&self, centroid_id: u64, epoch: u64) -> bool {
         // should only be called for centroids that are not hard-deleted
-        assert!(self.key_to_centroid.get(&centroid_id).is_some());
+        assert!(self.centroid_to_key.get(&centroid_id).is_some());
         match self.mutations.get(&centroid_id) {
             None => true,
             Some(m) => {
@@ -450,7 +449,7 @@ mod tests {
         ];
 
         // when
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 0).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
         let query = vec![0.9, 0.1, 0.1];
         let results = graph.search(&query, 1);
 
@@ -471,7 +470,7 @@ mod tests {
         ];
 
         // when
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 0).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
         let query = vec![2.1];
         let results = graph.search(&query, 3);
 
@@ -486,7 +485,7 @@ mod tests {
         let centroids: Vec<CentroidEntry> = vec![];
 
         // when
-        let result = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 0);
+        let result = UsearchCentroidGraph::build(centroids, DistanceMetric::L2);
 
         // then
         assert!(result.is_err());
@@ -507,7 +506,7 @@ mod tests {
         ];
 
         // when
-        let result = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 0);
+        let result = UsearchCentroidGraph::build(centroids, DistanceMetric::L2);
 
         // then
         assert!(result.is_err());
@@ -528,7 +527,7 @@ mod tests {
         ];
 
         // when
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 0).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
         let results = graph.search(&[1.5], 10);
 
         // then
@@ -542,7 +541,7 @@ mod tests {
             CentroidEntry::new(1, vec![1.0, 0.0, 0.0]),
             CentroidEntry::new(2, vec![0.0, 1.0, 0.0]),
         ];
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
         assert_eq!(graph.len(), 2);
 
         // when - add a third centroid
@@ -563,7 +562,7 @@ mod tests {
             CentroidEntry::new(2, vec![0.0, 1.0, 0.0]),
             CentroidEntry::new(3, vec![0.0, 0.0, 1.0]),
         ];
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
 
         // when - remove centroid 2
         graph.remove_centroid(2, 2).unwrap();
@@ -583,7 +582,7 @@ mod tests {
             CentroidEntry::new(2, vec![0.0, 1.0]),
             CentroidEntry::new(3, vec![-1.0, 0.0]),
         ];
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
 
         // when - remove centroid 1, add centroid 4
         graph.remove_centroid(1, 2).unwrap();
@@ -604,7 +603,7 @@ mod tests {
             CentroidEntry::new(1, vec![1.0, 0.0, 0.0]),
             CentroidEntry::new(2, vec![0.0, 1.0, 0.0]),
         ];
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 0).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
 
         // when/then
         assert_eq!(graph.get_centroid_vector(1), Some(vec![1.0, 0.0, 0.0]));
@@ -623,7 +622,7 @@ mod tests {
             CentroidEntry::new(1, vec![1.0, 0.0, 0.0]),
             CentroidEntry::new(2, vec![0.0, 1.0, 0.0]),
         ];
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
         let snapshot = graph.snapshot().unwrap();
         graph
             .add_centroid(&CentroidEntry::new(3, vec![0.0, 0.0, 1.0]), 5)
@@ -648,7 +647,7 @@ mod tests {
             CentroidEntry::new(2, vec![0.0, 1.0, 0.0]),
             CentroidEntry::new(3, vec![0.0, 0.0, 1.0]),
         ];
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
         let snapshot = graph.snapshot().unwrap();
         graph.remove_centroid(2, 5).unwrap();
 
@@ -668,7 +667,7 @@ mod tests {
             CentroidEntry::new(1, vec![1.0, 0.0]),
             CentroidEntry::new(2, vec![0.0, 1.0]),
         ];
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
         let c2_key = graph.inner.read().unwrap().centroid_to_key[&2];
         let snapshot = graph.snapshot().unwrap();
         graph.remove_centroid(2, 3).unwrap();
@@ -697,7 +696,7 @@ mod tests {
             CentroidEntry::new(1, vec![1.0, 0.0]),
             CentroidEntry::new(2, vec![0.0, 1.0]),
         ];
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
         let snapshot = graph.snapshot().unwrap();
         graph.add_centroid(&CentroidEntry::new(3, vec![0.0, 0.0]), 3).unwrap();
 
@@ -715,7 +714,7 @@ mod tests {
     fn update_retention_watermark_should_not_clean_entries_at_or_above_watermark() {
         // given - add centroid at epoch 5, delete at epoch 8
         let centroids = vec![CentroidEntry::new(1, vec![1.0, 0.0])];
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 1).unwrap();
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
         graph
             .add_centroid(&CentroidEntry::new(2, vec![0.0, 1.0]), 5)
             .unwrap();

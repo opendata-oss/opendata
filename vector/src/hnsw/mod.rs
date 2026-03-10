@@ -68,9 +68,8 @@ pub trait CentroidGraph: CentroidGraphRead + Send + Sync {
 pub fn build_centroid_graph(
     centroids: Vec<CentroidEntry>,
     distance_metric: DistanceMetric,
-    epoch: u64,
 ) -> Result<Box<dyn CentroidGraph>> {
-    let graph = UsearchCentroidGraph::build(centroids, distance_metric, epoch)?;
+    let graph = UsearchCentroidGraph::build(centroids, distance_metric)?;
     Ok(Box::new(graph))
 }
 
@@ -87,7 +86,7 @@ mod tests {
             CentroidEntry::new(3, vec![0.0, 0.0, 1.0]),
         ];
         let graph: Box<dyn CentroidGraph> =
-            Box::new(UsearchCentroidGraph::build(centroids, DistanceMetric::L2, 0).unwrap());
+            Box::new(UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap());
 
         // when / then
         assert_eq!(graph.len(), 3);
@@ -107,7 +106,7 @@ mod tests {
         ];
 
         // when
-        let graph = build_centroid_graph(centroids, DistanceMetric::L2, 0).unwrap();
+        let graph = build_centroid_graph(centroids, DistanceMetric::L2).unwrap();
 
         // then
         assert_eq!(graph.len(), 2);

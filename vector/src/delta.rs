@@ -377,24 +377,10 @@ mod tests {
         }
     }
 
-    impl CentroidGraph for MockCentroidGraph {
+    impl CentroidGraphRead for MockCentroidGraph {
         fn search(&self, _query: &[f32], _k: usize) -> Vec<u64> {
             self.centroids.iter().map(|(id, _)| *id).collect()
         }
-
-        fn search_at_epoch(&self, query: &[f32], k: usize, _epoch: u64) -> Vec<u64> {
-            self.search(query, k)
-        }
-
-        fn add_centroid(&self, _entry: &CentroidEntry, _epoch: u64) -> crate::error::Result<()> {
-            Ok(())
-        }
-
-        fn remove_centroid(&self, _centroid_id: u64, _epoch: u64) -> crate::error::Result<()> {
-            Ok(())
-        }
-
-        fn update_retention_watermark(&self, _epoch: u64) {}
 
         fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>> {
             self.centroids
@@ -405,6 +391,20 @@ mod tests {
 
         fn len(&self) -> usize {
             self.centroids.len()
+        }
+    }
+
+    impl CentroidGraph for MockCentroidGraph {
+        fn add_centroid(&self, _entry: &CentroidEntry, _epoch: u64) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        fn remove_centroid(&self, _centroid_id: u64, _epoch: u64) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> crate::error::Result<Arc<dyn CentroidGraphRead>> {
+            todo!()
         }
     }
 
@@ -714,7 +714,7 @@ mod tests {
         // given - create a mock that returns different centroids based on query
         struct MultiCentroidGraph;
 
-        impl CentroidGraph for MultiCentroidGraph {
+        impl CentroidGraphRead for MultiCentroidGraph {
             fn search(&self, query: &[f32], _k: usize) -> Vec<u64> {
                 // Return centroid based on which dimension has highest value
                 if query[0] > query[1] && query[0] > query[2] {
@@ -726,10 +726,16 @@ mod tests {
                 }
             }
 
-            fn search_at_epoch(&self, query: &[f32], k: usize, _epoch: u64) -> Vec<u64> {
-                self.search(query, k)
+            fn get_centroid_vector(&self, _centroid_id: u64) -> Option<Vec<f32>> {
+                None
             }
 
+            fn len(&self) -> usize {
+                3
+            }
+        }
+
+        impl CentroidGraph for MultiCentroidGraph {
             fn add_centroid(
                 &self,
                 _entry: &CentroidEntry,
@@ -746,14 +752,8 @@ mod tests {
                 Ok(())
             }
 
-            fn update_retention_watermark(&self, _epoch: u64) {}
-
-            fn get_centroid_vector(&self, _centroid_id: u64) -> Option<Vec<f32>> {
-                None
-            }
-
-            fn len(&self) -> usize {
-                3
+            fn snapshot(&self) -> crate::error::Result<Arc<dyn CentroidGraphRead>> {
+                todo!()
             }
         }
 

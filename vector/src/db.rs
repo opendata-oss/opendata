@@ -240,7 +240,7 @@ impl VectorDb {
                 .into_iter()
                 .filter(|c| !deletions.contains(c.centroid_id))
                 .collect();
-            let graph = build_centroid_graph(live_centroids, config.distance_metric, 0)?;
+            let graph = build_centroid_graph(live_centroids, config.distance_metric)?;
             return Ok((Arc::from(graph), last_chunk_id, last_chunk_count));
         }
 
@@ -298,7 +298,7 @@ impl VectorDb {
         };
 
         // Build and return the graph
-        let graph = build_centroid_graph(entries, config.distance_metric, 0)?;
+        let graph = build_centroid_graph(entries, config.distance_metric)?;
         Ok((Arc::from(graph), last_chunk_id, last_chunk_count))
     }
 
