@@ -237,15 +237,21 @@ The collector can use the metadata vector to interpret the batch without reading
 If all metadata items in the vector are empty, no metadata is stored in the queue entry.
 The ingestor also records the ingestion time and passes it to the queue entry.
 
-The `WriteHandle` has the following API:
+The `WriteHandle` contains a `DurabilityWatcher` that allows the caller to check or await durability:
 ```rust
+pub struct WriteHandle {
+    pub watcher: DurabilityWatcher,
+}
+
+impl DurabilityWatcher {
     pub fn result(&self) -> Option<Result<()>>
 
     pub async fn await_durable(&mut self) -> Result<()>
+}
 ```
-As soon as the call to `await_durable().await` returns or the call to `result()` is not `None`, the vector of entries
-is stored in object storage and the location of the object that contains the vector of entries is appended to the
-queue.
+As soon as the call to `watcher.await_durable().await` returns or the call to `watcher.result()` is not `None`,
+the vector of entries is stored in object storage and the location of the object that contains the vector of entries
+is appended to the queue.
 More specifically, the location is appended to the end of the list of pending locations in the queue manifest
 (`q-manifest` in the diagram).
 
@@ -416,6 +422,7 @@ object with the same name. This aspect would require some experiments.
 | 2026-02-26 | Initial draft                              |
 | 2026-03-05 | Added binary formats for queue and batches |
 | 2026-03-10 | Changed queue entry metadata to a vector of length-prefixed items |
+| 2026-03-10 | Moved durability API into DurabilityWatcher inside WriteHandle |
 
 
 

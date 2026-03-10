@@ -18,11 +18,11 @@ use crate::util::millis;
 type Notifier = tokio::sync::watch::Sender<Option<Result<()>>>;
 
 #[derive(Clone)]
-pub struct WriteHandle {
+pub struct DurabilityWatcher {
     rx: tokio::sync::watch::Receiver<Option<Result<()>>>,
 }
 
-impl WriteHandle {
+impl DurabilityWatcher {
     /// Return the outcome of the write if the batch has already been flushed,
     /// or `None` if the flush has not completed yet.
     pub fn result(&self) -> Option<Result<()>> {
@@ -38,6 +38,10 @@ impl WriteHandle {
             .clone()
             .expect("value must be present after wait_for")
     }
+}
+
+pub struct WriteHandle {
+    pub watcher: DurabilityWatcher,
 }
 
 enum IngestMessage {
@@ -316,7 +320,9 @@ impl Ingestor {
             .map_err(|_| Error::Storage("ingestor shut down".to_string()))?;
         self.pending_bytes
             .fetch_add(incoming_size, Ordering::Release);
-        Ok(WriteHandle { rx: notifier_rx })
+        Ok(WriteHandle {
+            watcher: DurabilityWatcher { rx: notifier_rx },
+        })
     }
 
     async fn maybe_apply_backpressure(&self, incoming_size: usize) -> Result<()> {
@@ -440,7 +446,7 @@ mod tests {
             .ingest(vec![Bytes::from("some-long-data")], Bytes::new())
             .await
             .unwrap();
-        watcher.await_durable().await.unwrap();
+        watcher.watcher.await_durable().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
         assert_eq!(entries.len(), 1);
@@ -462,11 +468,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(watcher.result().is_none());
+        assert!(watcher.watcher.result().is_none());
         let manifest_path = slatedb::object_store::path::Path::from("test/manifest");
         assert!(store.get(&manifest_path).await.is_err());
 
-        watcher.await_durable().await.unwrap();
+        watcher.watcher.await_durable().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
         assert_eq!(entries.len(), 1);
@@ -484,14 +490,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(watcher.result().is_none());
+        assert!(watcher.watcher.result().is_none());
 
         let manifest_path = slatedb::object_store::path::Path::from("test/manifest");
         assert!(store.get(&manifest_path).await.is_err());
 
         ingestor.flush().await.unwrap();
 
-        assert!(watcher.result().unwrap().is_ok());
+        assert!(watcher.watcher.result().unwrap().is_ok());
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
         assert_eq!(entries.len(), 1);
@@ -515,8 +521,8 @@ mod tests {
 
         ingestor.flush().await.unwrap();
 
-        assert!(watcher1.result().unwrap().is_ok());
-        assert!(watcher2.result().unwrap().is_ok());
+        assert!(watcher1.watcher.result().unwrap().is_ok());
+        assert!(watcher2.watcher.result().unwrap().is_ok());
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
         assert_eq!(entries.len(), 1);
