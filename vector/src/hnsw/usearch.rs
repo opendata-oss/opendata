@@ -267,13 +267,6 @@ impl UsearchCentroidGraphInner {
         }
     }
 
-    /// Returns true if the centroid has been soft-deleted (has a deleted_epoch set).
-    fn is_deleted(&self, centroid_id: u64) -> bool {
-        self.mutations
-            .get(&centroid_id)
-            .is_some_and(|m| m.deleted_epoch.is_some())
-    }
-
     fn live_count(&self) -> usize {
         self.live_count_at_epoch(self.snapshots.latest_epoch())
     }
@@ -353,7 +346,7 @@ impl UsearchCentroidGraphInner {
             .mutations
             .iter()
             .filter(|(_, m)| {
-                m.added_epoch < watermark && m.deleted_epoch.map_or(true, |d| d < watermark)
+                m.added_epoch <= watermark && m.deleted_epoch.map_or(true, |d| d <= watermark)
             })
             .map(|(cid, _)| *cid)
             .collect();
@@ -711,25 +704,27 @@ mod tests {
     }
 
     #[test]
-    fn update_retention_watermark_should_not_clean_entries_at_or_above_watermark() {
+    fn drop_snapshot_should_not_interfere_with_other_snapshot() {
         // given - add centroid at epoch 5, delete at epoch 8
         let centroids = vec![CentroidEntry::new(1, vec![1.0, 0.0])];
         let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
+        let snap1 = graph.snapshot().unwrap();
         graph
             .add_centroid(&CentroidEntry::new(2, vec![0.0, 1.0]), 5)
             .unwrap();
-        let snap1 = graph.snapshot().unwrap();
-        graph.remove_centroid(2, 8).unwrap();
         let snap2 = graph.snapshot().unwrap();
+        graph.remove_centroid(2, 8).unwrap();
 
         // when
         drop(snap1);
         graph.clean_mutations();
 
         // then - centroid 2's mutation is NOT cleaned
-        let inner = graph.inner.read().unwrap();
-        assert!(inner.mutations.contains_key(&2));
-        assert_eq!(inner.mutations.len(), 1);
+        {
+            let inner = graph.inner.read().unwrap();
+            assert!(inner.mutations.contains_key(&2));
+            assert_eq!(inner.mutations.len(), 1);
+        }
         drop(snap2);
     }
 }
