@@ -259,13 +259,21 @@ fn max_with_nan(left: f64, right: f64) -> f64 {
     }
 }
 
+fn exact_arity_error(
+    function_name: &str,
+    expected_args: usize,
+    actual_args: usize,
+) -> EvaluationError {
+    EvaluationError::InternalError(format!(
+        "{function_name} requires exactly {expected_args} argument(s), got {actual_args}"
+    ))
+}
+
 struct ClampMaxFunction;
 
 impl PromQLFunction for ClampMaxFunction {
     fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<Vec<EvalSample>> {
-        Err(EvaluationError::InternalError(
-            "clamp_max requires two arguments".to_string(),
-        ))
+        Err(exact_arity_error("clamp_max", 2, 1))
     }
 
     fn apply_args(
@@ -273,22 +281,13 @@ impl PromQLFunction for ClampMaxFunction {
         args: Vec<PromQLArg>,
         _eval_timestamp_ms: i64,
     ) -> EvalResult<Vec<EvalSample>> {
-        let mut args_iter = args.into_iter();
-        let Some(first_arg) = args_iter.next() else {
-            return Err(EvaluationError::InternalError(
-                "clamp_max requires two arguments".to_string(),
-            ));
-        };
-        let Some(second_arg) = args_iter.next() else {
-            return Err(EvaluationError::InternalError(
-                "clamp_max requires two arguments".to_string(),
-            ));
-        };
-        if args_iter.next().is_some() {
-            return Err(EvaluationError::InternalError(
-                "clamp_max accepts at most two arguments".to_string(),
-            ));
+        if args.len() != 2 {
+            return Err(exact_arity_error("clamp_max", 2, args.len()));
         }
+
+        let mut args_iter = args.into_iter();
+        let first_arg = args_iter.next().expect("validated args.len() == 2");
+        let second_arg = args_iter.next().expect("validated args.len() == 2");
 
         let mut samples = first_arg.into_instant_vector()?;
         let max = second_arg.into_scalar()?;
@@ -303,9 +302,7 @@ struct ClampMinFunction;
 
 impl PromQLFunction for ClampMinFunction {
     fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<Vec<EvalSample>> {
-        Err(EvaluationError::InternalError(
-            "clamp_min requires two arguments".to_string(),
-        ))
+        Err(exact_arity_error("clamp_min", 2, 1))
     }
 
     fn apply_args(
@@ -313,22 +310,13 @@ impl PromQLFunction for ClampMinFunction {
         args: Vec<PromQLArg>,
         _eval_timestamp_ms: i64,
     ) -> EvalResult<Vec<EvalSample>> {
-        let mut args_iter = args.into_iter();
-        let Some(first_arg) = args_iter.next() else {
-            return Err(EvaluationError::InternalError(
-                "clamp_min requires two arguments".to_string(),
-            ));
-        };
-        let Some(second_arg) = args_iter.next() else {
-            return Err(EvaluationError::InternalError(
-                "clamp_min requires two arguments".to_string(),
-            ));
-        };
-        if args_iter.next().is_some() {
-            return Err(EvaluationError::InternalError(
-                "clamp_min accepts at most two arguments".to_string(),
-            ));
+        if args.len() != 2 {
+            return Err(exact_arity_error("clamp_min", 2, args.len()));
         }
+
+        let mut args_iter = args.into_iter();
+        let first_arg = args_iter.next().expect("validated args.len() == 2");
+        let second_arg = args_iter.next().expect("validated args.len() == 2");
 
         let mut samples = first_arg.into_instant_vector()?;
         let min = second_arg.into_scalar()?;
@@ -343,9 +331,7 @@ struct ClampFunction;
 
 impl PromQLFunction for ClampFunction {
     fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<Vec<EvalSample>> {
-        Err(EvaluationError::InternalError(
-            "clamp requires three arguments".to_string(),
-        ))
+        Err(exact_arity_error("clamp", 3, 1))
     }
 
     fn apply_args(
@@ -353,27 +339,14 @@ impl PromQLFunction for ClampFunction {
         args: Vec<PromQLArg>,
         _eval_timestamp_ms: i64,
     ) -> EvalResult<Vec<EvalSample>> {
-        let mut args_iter = args.into_iter();
-        let Some(first_arg) = args_iter.next() else {
-            return Err(EvaluationError::InternalError(
-                "clamp requires three arguments".to_string(),
-            ));
-        };
-        let Some(second_arg) = args_iter.next() else {
-            return Err(EvaluationError::InternalError(
-                "clamp requires three arguments".to_string(),
-            ));
-        };
-        let Some(third_arg) = args_iter.next() else {
-            return Err(EvaluationError::InternalError(
-                "clamp requires three arguments".to_string(),
-            ));
-        };
-        if args_iter.next().is_some() {
-            return Err(EvaluationError::InternalError(
-                "clamp accepts at most three arguments".to_string(),
-            ));
+        if args.len() != 3 {
+            return Err(exact_arity_error("clamp", 3, args.len()));
         }
+
+        let mut args_iter = args.into_iter();
+        let first_arg = args_iter.next().expect("validated args.len() == 3");
+        let second_arg = args_iter.next().expect("validated args.len() == 3");
+        let third_arg = args_iter.next().expect("validated args.len() == 3");
 
         let mut samples = first_arg.into_instant_vector()?;
         let min = second_arg.into_scalar()?;
@@ -1004,6 +977,100 @@ mod tests {
 
         assert!(
             err.to_string().contains("expected instant vector"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn should_include_actual_argument_count_in_clamp_errors() {
+        let registry = FunctionRegistry::new();
+        let clamp = registry.get("clamp").unwrap();
+
+        let err = clamp.apply_args(vec![], 1000).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("clamp requires exactly 3 argument(s), got 0"),
+            "unexpected error: {}",
+            err
+        );
+
+        let err = clamp
+            .apply_args(
+                vec![
+                    PromQLArg::InstantVector(vec![create_sample(1.0)]),
+                    PromQLArg::Scalar(0.0),
+                    PromQLArg::Scalar(1.0),
+                    PromQLArg::Scalar(2.0),
+                ],
+                1000,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("clamp requires exactly 3 argument(s), got 4"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn should_include_actual_argument_count_in_clamp_min_errors() {
+        let registry = FunctionRegistry::new();
+        let clamp_min = registry.get("clamp_min").unwrap();
+
+        let err = clamp_min.apply_args(vec![], 1000).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("clamp_min requires exactly 2 argument(s), got 0"),
+            "unexpected error: {}",
+            err
+        );
+
+        let err = clamp_min
+            .apply_args(
+                vec![
+                    PromQLArg::InstantVector(vec![create_sample(1.0)]),
+                    PromQLArg::Scalar(0.0),
+                    PromQLArg::Scalar(1.0),
+                ],
+                1000,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("clamp_min requires exactly 2 argument(s), got 3"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn should_include_actual_argument_count_in_clamp_max_errors() {
+        let registry = FunctionRegistry::new();
+        let clamp_max = registry.get("clamp_max").unwrap();
+
+        let err = clamp_max.apply_args(vec![], 1000).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("clamp_max requires exactly 2 argument(s), got 0"),
+            "unexpected error: {}",
+            err
+        );
+
+        let err = clamp_max
+            .apply_args(
+                vec![
+                    PromQLArg::InstantVector(vec![create_sample(1.0)]),
+                    PromQLArg::Scalar(0.0),
+                    PromQLArg::Scalar(1.0),
+                ],
+                1000,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("clamp_max requires exactly 2 argument(s), got 3"),
             "unexpected error: {}",
             err
         );
