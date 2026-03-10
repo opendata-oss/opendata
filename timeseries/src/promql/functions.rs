@@ -932,6 +932,84 @@ mod tests {
     }
 
     #[test]
+    fn should_apply_round_when_optional_argument_is_omitted() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("round").unwrap();
+
+        let result = func
+            .apply_args(
+                vec![PromQLArg::InstantVector(vec![create_sample(1.6)])],
+                1000,
+            )
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 2.0);
+    }
+
+    #[test]
+    fn should_error_when_round_has_too_many_arguments() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("round").unwrap();
+
+        let err = func
+            .apply_args(
+                vec![
+                    PromQLArg::InstantVector(vec![create_sample(1.0)]),
+                    PromQLArg::Scalar(0.1),
+                    PromQLArg::Scalar(0.2),
+                ],
+                1000,
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("round accepts at most two arguments"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn should_error_when_round_second_argument_is_not_scalar() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("round").unwrap();
+
+        let err = func
+            .apply_args(
+                vec![
+                    PromQLArg::InstantVector(vec![create_sample(1.0)]),
+                    PromQLArg::InstantVector(vec![create_sample(0.1)]),
+                ],
+                1000,
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("expected scalar"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn should_error_when_round_first_argument_is_not_vector() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("round").unwrap();
+
+        let err = func
+            .apply_args(vec![PromQLArg::Scalar(1.0), PromQLArg::Scalar(0.1)], 1000)
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("expected instant vector"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
     fn should_apply_clamp_functions() {
         let registry = FunctionRegistry::new();
         let clamp = registry.get("clamp").unwrap();
@@ -1007,19 +1085,35 @@ mod tests {
     }
 
     #[test]
-    fn should_propagate_nan_when_clamp_bound_is_nan() {
+    fn should_propagate_nan_when_clamp_bounds_or_samples_are_nan() {
         let registry = FunctionRegistry::new();
         let clamp = registry.get("clamp").unwrap();
-        let samples = vec![
+        let bound_samples = vec![
             create_sample(-50.0),
             create_sample(0.0),
             create_sample(100.0),
         ];
 
-        let result = clamp
+        let min_nan_result = clamp
             .apply_args(
                 vec![
-                    PromQLArg::InstantVector(samples),
+                    PromQLArg::InstantVector(bound_samples.clone()),
+                    PromQLArg::Scalar(f64::NAN),
+                    PromQLArg::Scalar(100.0),
+                ],
+                1000,
+            )
+            .unwrap();
+
+        assert_eq!(min_nan_result.len(), 3);
+        assert!(min_nan_result[0].value.is_nan());
+        assert!(min_nan_result[1].value.is_nan());
+        assert!(min_nan_result[2].value.is_nan());
+
+        let max_nan_result = clamp
+            .apply_args(
+                vec![
+                    PromQLArg::InstantVector(bound_samples),
                     PromQLArg::Scalar(0.0),
                     PromQLArg::Scalar(f64::NAN),
                 ],
@@ -1027,10 +1121,120 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(result.len(), 3);
-        assert!(result[0].value.is_nan());
-        assert!(result[1].value.is_nan());
-        assert!(result[2].value.is_nan());
+        assert_eq!(max_nan_result.len(), 3);
+        assert!(max_nan_result[0].value.is_nan());
+        assert!(max_nan_result[1].value.is_nan());
+        assert!(max_nan_result[2].value.is_nan());
+
+        let sample_nan_result = clamp
+            .apply_args(
+                vec![
+                    PromQLArg::InstantVector(vec![
+                        create_sample(-50.0),
+                        create_sample(f64::NAN),
+                        create_sample(100.0),
+                    ]),
+                    PromQLArg::Scalar(-25.0),
+                    PromQLArg::Scalar(75.0),
+                ],
+                1000,
+            )
+            .unwrap();
+
+        assert_eq!(sample_nan_result.len(), 3);
+        assert_eq!(sample_nan_result[0].value, -25.0);
+        assert!(sample_nan_result[1].value.is_nan());
+        assert_eq!(sample_nan_result[2].value, 75.0);
+    }
+
+    #[test]
+    fn should_propagate_nan_when_clamp_min_bound_or_samples_are_nan() {
+        let registry = FunctionRegistry::new();
+        let clamp_min = registry.get("clamp_min").unwrap();
+        let bound_samples = vec![
+            create_sample(-50.0),
+            create_sample(0.0),
+            create_sample(100.0),
+        ];
+
+        let min_nan_result = clamp_min
+            .apply_args(
+                vec![
+                    PromQLArg::InstantVector(bound_samples),
+                    PromQLArg::Scalar(f64::NAN),
+                ],
+                1000,
+            )
+            .unwrap();
+
+        assert_eq!(min_nan_result.len(), 3);
+        assert!(min_nan_result[0].value.is_nan());
+        assert!(min_nan_result[1].value.is_nan());
+        assert!(min_nan_result[2].value.is_nan());
+
+        let sample_nan_result = clamp_min
+            .apply_args(
+                vec![
+                    PromQLArg::InstantVector(vec![
+                        create_sample(-50.0),
+                        create_sample(f64::NAN),
+                        create_sample(100.0),
+                    ]),
+                    PromQLArg::Scalar(-25.0),
+                ],
+                1000,
+            )
+            .unwrap();
+
+        assert_eq!(sample_nan_result.len(), 3);
+        assert_eq!(sample_nan_result[0].value, -25.0);
+        assert!(sample_nan_result[1].value.is_nan());
+        assert_eq!(sample_nan_result[2].value, 100.0);
+    }
+
+    #[test]
+    fn should_propagate_nan_when_clamp_max_bound_or_samples_are_nan() {
+        let registry = FunctionRegistry::new();
+        let clamp_max = registry.get("clamp_max").unwrap();
+        let bound_samples = vec![
+            create_sample(-50.0),
+            create_sample(0.0),
+            create_sample(100.0),
+        ];
+
+        let max_nan_result = clamp_max
+            .apply_args(
+                vec![
+                    PromQLArg::InstantVector(bound_samples),
+                    PromQLArg::Scalar(f64::NAN),
+                ],
+                1000,
+            )
+            .unwrap();
+
+        assert_eq!(max_nan_result.len(), 3);
+        assert!(max_nan_result[0].value.is_nan());
+        assert!(max_nan_result[1].value.is_nan());
+        assert!(max_nan_result[2].value.is_nan());
+
+        let sample_nan_result = clamp_max
+            .apply_args(
+                vec![
+                    PromQLArg::InstantVector(vec![
+                        create_sample(-50.0),
+                        create_sample(f64::NAN),
+                        create_sample(100.0),
+                    ]),
+                    PromQLArg::Scalar(75.0),
+                ],
+                1000,
+            )
+            .unwrap();
+
+        assert_eq!(sample_nan_result.len(), 3);
+        assert_eq!(sample_nan_result[0].value, -50.0);
+        assert!(sample_nan_result[1].value.is_nan());
+        assert_eq!(sample_nan_result[2].value, 75.0);
     }
 
     #[test]
