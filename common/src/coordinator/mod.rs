@@ -87,6 +87,17 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         initial_snapshot: Arc<dyn StorageSnapshot>,
         flusher: F,
     ) -> WriteCoordinator<D, F> {
+        Self::new_with_last_written_delta(config, channels, initial_context, initial_snapshot, flusher, None)
+    }
+
+    pub fn new_with_last_written_delta(
+        config: WriteCoordinatorConfig,
+        channels: Vec<impl ToString>,
+        initial_context: D::Context,
+        initial_snapshot: Arc<dyn StorageSnapshot>,
+        flusher: F,
+        initial_last_written_delta: Option<D::FrozenView>,
+    ) -> WriteCoordinator<D, F> {
         let (watermarks, watcher) = EpochWatermarks::new();
         let watermarks = Arc::new(watermarks);
 
@@ -114,6 +125,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
             config,
             initial_context,
             initial_snapshot,
+            initial_last_written_delta,
             write_rxs,
             flush_tx,
             watermarks.clone(),
@@ -216,6 +228,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         config: WriteCoordinatorConfig,
         initial_context: D::Context,
         initial_snapshot: Arc<dyn StorageSnapshot>,
+        initial_last_written_delta: Option<D::FrozenView>,
         write_rxs: Vec<PausableReceiver<D>>,
         flush_tx: mpsc::Sender<FlushEvent<D>>,
         watermarks: Arc<EpochWatermarks>,
@@ -228,7 +241,8 @@ impl<D: Delta> WriteCoordinatorTask<D> {
             current: delta.reader(),
             frozen: vec![],
             snapshot: initial_snapshot,
-            last_written_delta: None,
+            last_written_delta: initial_last_written_delta
+                .map(|v| EpochStamped::new(v, 0..0)),
         };
         let initial_view = Arc::new(BroadcastedView::new(initial_view));
 
