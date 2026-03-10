@@ -15,6 +15,12 @@ use crate::model::encode_batch;
 use crate::queue::QueueProducer;
 use crate::util::millis;
 
+/// A single entry to be ingested, pairing opaque data with optional metadata.
+pub struct IngestEntry {
+    pub data: Bytes,
+    pub metadata: Bytes,
+}
+
 type Notifier = tokio::sync::watch::Sender<Option<Result<()>>>;
 
 #[derive(Clone)]
@@ -46,8 +52,7 @@ pub struct WriteHandle {
 
 enum IngestMessage {
     Write {
-        entries: Vec<Bytes>,
-        metadata: Bytes,
+        entries: Vec<IngestEntry>,
         ingestion_time_ms: i64,
         notifier: Notifier,
     },
@@ -79,15 +84,16 @@ impl Batch {
 
     fn add(
         &mut self,
-        entries: Vec<Bytes>,
-        metadata: Bytes,
+        entries: Vec<IngestEntry>,
         ingestion_time_ms: i64,
         notifier: Notifier,
         now: SystemTime,
     ) {
-        self.size_bytes += entries.iter().map(|b| b.len()).sum::<usize>();
-        self.entries.extend(entries);
-        self.metadata.push(metadata);
+        for entry in entries {
+            self.size_bytes += entry.data.len();
+            self.entries.push(entry.data);
+            self.metadata.push(entry.metadata);
+        }
         if self.ingestion_time_ms == 0 {
             self.ingestion_time_ms = ingestion_time_ms;
         }
@@ -146,8 +152,8 @@ impl BatchWriter {
                 },
                 msg = rx.recv() => {
                     match msg {
-                        Some(IngestMessage::Write { entries, metadata, ingestion_time_ms, notifier }) => {
-                            self.batch.add(entries, metadata, ingestion_time_ms, notifier, self.clock.now());
+                        Some(IngestMessage::Write { entries, ingestion_time_ms, notifier }) => {
+                            self.batch.add(entries, ingestion_time_ms, notifier, self.clock.now());
                             if self.batch.size_bytes >= self.batch_max_bytes {
                                 let _ = self.write_batch().await;
                             }
@@ -190,10 +196,11 @@ impl BatchWriter {
         metadata: Vec<Bytes>,
         ingestion_time_ms: i64,
     ) -> Result<()> {
-        let location = if entries.is_empty() {
+        let non_empty: Vec<Bytes> = entries.into_iter().filter(|e| !e.is_empty()).collect();
+        let location = if non_empty.is_empty() {
             String::new()
         } else {
-            let payload = encode_batch(&entries);
+            let payload = encode_batch(&non_empty);
             let id = ulid::Ulid::new();
             let path = Path::from(format!("{}/{}.batch", self.path_prefix, id));
             self.object_store
@@ -217,17 +224,11 @@ impl BatchWriter {
             match msg {
                 IngestMessage::Write {
                     entries,
-                    metadata,
                     ingestion_time_ms,
                     notifier,
                 } => {
-                    self.batch.add(
-                        entries,
-                        metadata,
-                        ingestion_time_ms,
-                        notifier,
-                        self.clock.now(),
-                    );
+                    self.batch
+                        .add(entries, ingestion_time_ms, notifier, self.clock.now());
                 }
                 IngestMessage::Flush { done } => {
                     flush_responders.push(done);
@@ -301,19 +302,18 @@ impl Ingestor {
         })
     }
 
-    /// Submit a set of entries and associated metadata for ingestion.
+    /// Submit a set of entries for ingestion. Each entry pairs opaque data with metadata.
     ///
     /// Returns a [`WriteHandle`] that can be used to check or await durability.
     /// Applies backpressure by flushing when unflushed bytes exceed the limit.
-    pub async fn ingest(&self, entries: Vec<Bytes>, metadata: Bytes) -> Result<WriteHandle> {
-        let incoming_size: usize = entries.iter().map(|b| b.len()).sum();
+    pub async fn ingest(&self, entries: Vec<IngestEntry>) -> Result<WriteHandle> {
+        let incoming_size: usize = entries.iter().map(|e| e.data.len()).sum();
         self.maybe_apply_backpressure(incoming_size).await?;
         let ingestion_time_ms = millis(self.clock.now());
         let (notifier_tx, notifier_rx) = tokio::sync::watch::channel(None);
         self.tx
             .send(IngestMessage::Write {
                 entries,
-                metadata,
                 ingestion_time_ms,
                 notifier: notifier_tx,
             })
@@ -376,6 +376,13 @@ mod tests {
         manifest.iter().map(|e| e.unwrap()).collect()
     }
 
+    fn ie(data: &str) -> IngestEntry {
+        IngestEntry {
+            data: Bytes::from(data.to_string()),
+            metadata: Bytes::new(),
+        }
+    }
+
     fn test_config() -> IngestorConfig {
         IngestorConfig {
             storage: StorageConfig::InMemory,
@@ -394,14 +401,8 @@ mod tests {
             Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        ingestor
-            .ingest(vec![Bytes::from("data1")], Bytes::new())
-            .await
-            .unwrap();
-        ingestor
-            .ingest(vec![Bytes::from("data2")], Bytes::new())
-            .await
-            .unwrap();
+        ingestor.ingest(vec![ie("data1")]).await.unwrap();
+        ingestor.ingest(vec![ie("data2")]).await.unwrap();
         ingestor.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
@@ -417,10 +418,7 @@ mod tests {
             Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        ingestor
-            .ingest(vec![Bytes::from("mydata")], Bytes::new())
-            .await
-            .unwrap();
+        ingestor.ingest(vec![ie("mydata")]).await.unwrap();
         ingestor.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
@@ -442,10 +440,7 @@ mod tests {
         let ingestor =
             Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
 
-        let mut watcher = ingestor
-            .ingest(vec![Bytes::from("some-long-data")], Bytes::new())
-            .await
-            .unwrap();
+        let mut watcher = ingestor.ingest(vec![ie("some-long-data")]).await.unwrap();
         watcher.watcher.await_durable().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
@@ -463,10 +458,7 @@ mod tests {
         let ingestor =
             Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
 
-        let mut watcher = ingestor
-            .ingest(vec![Bytes::from("v1")], Bytes::new())
-            .await
-            .unwrap();
+        let mut watcher = ingestor.ingest(vec![ie("v1")]).await.unwrap();
 
         assert!(watcher.watcher.result().is_none());
         let manifest_path = slatedb::object_store::path::Path::from("test/manifest");
@@ -485,10 +477,7 @@ mod tests {
             Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        let watcher = ingestor
-            .ingest(vec![Bytes::from("v")], Bytes::new())
-            .await
-            .unwrap();
+        let watcher = ingestor.ingest(vec![ie("v")]).await.unwrap();
 
         assert!(watcher.watcher.result().is_none());
 
@@ -510,14 +499,8 @@ mod tests {
             Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        let watcher1 = ingestor
-            .ingest(vec![Bytes::from("data1")], Bytes::new())
-            .await
-            .unwrap();
-        let watcher2 = ingestor
-            .ingest(vec![Bytes::from("data2")], Bytes::new())
-            .await
-            .unwrap();
+        let watcher1 = ingestor.ingest(vec![ie("data1")]).await.unwrap();
+        let watcher2 = ingestor.ingest(vec![ie("data2")]).await.unwrap();
 
         ingestor.flush().await.unwrap();
 
@@ -549,7 +532,7 @@ mod tests {
 
         // First ingest (22 bytes) — below 30-byte threshold
         ingestor
-            .ingest(vec![Bytes::from("abcdefghijklmnopqrstuv")], Bytes::new())
+            .ingest(vec![ie("abcdefghijklmnopqrstuv")])
             .await
             .unwrap();
 
@@ -558,7 +541,7 @@ mod tests {
 
         // Second ingest (22 bytes) — pending(22) + incoming(22) = 44 >= 30, triggers backpressure flush
         ingestor
-            .ingest(vec![Bytes::from("abcdefghijklmnopqrstuv")], Bytes::new())
+            .ingest(vec![ie("abcdefghijklmnopqrstuv")])
             .await
             .unwrap();
 
@@ -576,7 +559,10 @@ mod tests {
 
         let metadata = Bytes::from(r#"{"topic":"events"}"#);
         ingestor
-            .ingest(vec![Bytes::from("payload")], metadata.clone())
+            .ingest(vec![IngestEntry {
+                data: Bytes::from("payload"),
+                metadata: metadata.clone(),
+            }])
             .await
             .unwrap();
         ingestor.flush().await.unwrap();
@@ -594,10 +580,7 @@ mod tests {
             Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        ingestor
-            .ingest(vec![Bytes::from("unflushed")], Bytes::new())
-            .await
-            .unwrap();
+        ingestor.ingest(vec![ie("unflushed")]).await.unwrap();
 
         ingestor.close().await.unwrap();
 
@@ -617,16 +600,10 @@ mod tests {
             Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        ingestor
-            .ingest(vec![Bytes::from("batch1")], Bytes::new())
-            .await
-            .unwrap();
+        ingestor.ingest(vec![ie("batch1")]).await.unwrap();
         ingestor.flush().await.unwrap();
 
-        ingestor
-            .ingest(vec![Bytes::from("batch2")], Bytes::new())
-            .await
-            .unwrap();
+        ingestor.ingest(vec![ie("batch2")]).await.unwrap();
         ingestor.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
@@ -660,7 +637,13 @@ mod tests {
                 .unwrap();
 
         let metadata = Bytes::from(r#"{"checkpoint":true}"#);
-        ingestor.ingest(vec![], metadata.clone()).await.unwrap();
+        ingestor
+            .ingest(vec![IngestEntry {
+                data: Bytes::new(),
+                metadata: metadata.clone(),
+            }])
+            .await
+            .unwrap();
         ingestor.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
@@ -676,7 +659,7 @@ mod tests {
             Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        ingestor.ingest(vec![], Bytes::new()).await.unwrap();
+        ingestor.ingest(vec![]).await.unwrap();
         ingestor.flush().await.unwrap();
 
         let manifest_path = slatedb::object_store::path::Path::from("test/manifest");

@@ -168,18 +168,26 @@ and resumes processing from the earliest unprocessed entry in the queue manifest
 
 ### Ingestor
 
-The ingestor provides an API to ingest a vector of opaque byte entries.
+The ingestor provides an API to ingest a vector of `IngestEntry` structs, each containing opaque byte data and metadata.
 The entries are buffered in a batch in ingestion order.
 The ingestor flushes the batches of ingested entries to object storage and appends the locations of the
 flushed objects to the queue with the internally used queue producer (`q-producer` in the diagram).
 Flushes are triggered after a given time interval elapsed or if a batch of the ingested data exceeds a given size.
+
+Each ingest entry is defined as:
+```rust
+pub struct IngestEntry {
+    pub data: Bytes,
+    pub metadata: Bytes,
+}
+```
 
 The API of the ingestor is the following:
 ```rust
 impl Ingestor {
   pub fn new(config: IngestorConfig, clock: Arc<dyn Clock>) -> Result<Self> { ... }
 
-  pub async fn ingest(&self, entries: Vec<Bytes>, metadata: Bytes) -> Result<WriteHandle> { ... }
+  pub async fn ingest(&self, entries: Vec<IngestEntry>) -> Result<WriteHandle> { ... }
 
   pub async fn close(self) -> Result<()> { ... }
 }
@@ -229,10 +237,11 @@ is less than `max_unflushed_bytes`.
 If this backpressure blocking the ingestion becomes an issue, new ingestors can be created to better distribute the
 load.
 
-A call to `ingest()` takes a vector of byte entries and opaque metadata, and returns a `WriteHandle` with which
-the caller can await the completion of the flush to object storage of the vector of entries.
-Because multiple `ingest()` calls may be batched into a single flush, the metadata from each call is
-collected into a vector and written to the queue manifest entry (not to the data batch).
+A call to `ingest()` takes a vector of `IngestEntry` structs and returns a `WriteHandle` with which
+the caller can await the completion of the flush to object storage of the data entries.
+Each `IngestEntry` pairs a data entry with its metadata. The `Batch` keeps separate vectors for data entries
+and metadata. Because multiple `ingest()` calls may be batched into a single flush, the metadata from each
+entry is collected into a vector and written to the queue manifest entry (not to the data batch).
 The collector can use the metadata vector to interpret the batch without reading it.
 If all metadata items in the vector are empty, no metadata is stored in the queue entry.
 The ingestor also records the ingestion time and passes it to the queue entry.
@@ -411,7 +420,6 @@ object with the same name. This aspect would require some experiments.
 
 ## Open Questions
 
-- Should we ingest metadata per entry or metadata per vector of entries, i.e., per call to `Ingestor::ingest()`?
 - Should we store the metadata in the queue and in the data batches or is it enough to store it in the queue?
 
 
@@ -423,6 +431,7 @@ object with the same name. This aspect would require some experiments.
 | 2026-03-05 | Added binary formats for queue and batches |
 | 2026-03-10 | Changed queue entry metadata to a vector of length-prefixed items |
 | 2026-03-10 | Moved durability API into DurabilityWatcher inside WriteHandle |
+| 2026-03-10 | Changed ingest() to take Vec\<IngestEntry\> with per-entry data and metadata |
 
 
 

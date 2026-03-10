@@ -7,4 +7,4 @@ mod util;
 
 pub use config::IngestorConfig;
 pub use error::{Error, Result};
-pub use ingestor::{DurabilityWatcher, Ingestor, WriteHandle};
+pub use ingestor::{DurabilityWatcher, IngestEntry, Ingestor, WriteHandle};
