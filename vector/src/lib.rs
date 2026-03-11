@@ -42,6 +42,8 @@ pub mod model;
 pub(crate) mod query_engine;
 pub mod reader;
 pub mod serde;
+#[cfg(feature = "http-server")]
+pub mod server;
 pub(crate) mod storage;
 pub(crate) mod view_reader;
 
