@@ -39,11 +39,12 @@ pub struct IngestorConfig {
     #[serde(default = "default_flush_size_bytes")]
     pub flush_size_bytes: usize,
 
-    /// Unflushed-bytes limit that triggers backpressure.
+    /// Maximum number of input entries vectors that can be buffered for the background
+    /// batch writer before backpressure is applied.
     ///
-    /// Defaults to `usize::MAX`.
-    #[serde(default = "default_max_unflushed_bytes")]
-    pub max_unflushed_bytes: usize,
+    /// Defaults to 1000.
+    #[serde(default = "default_max_buffered_inputs")]
+    pub max_buffered_inputs: usize,
 }
 
 fn default_data_path_prefix() -> String {
@@ -62,6 +63,6 @@ fn default_flush_size_bytes() -> usize {
     64 * 1024 * 1024
 }
 
-fn default_max_unflushed_bytes() -> usize {
-    usize::MAX
+fn default_max_buffered_inputs() -> usize {
+    1000
 }

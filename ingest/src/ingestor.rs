@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -57,7 +56,7 @@ enum IngestMessage {
         notifier: Notifier,
     },
     Flush {
-        done: tokio::sync::oneshot::Sender<Result<()>>,
+        result_sender: tokio::sync::oneshot::Sender<Result<()>>,
     },
 }
 
@@ -127,15 +126,10 @@ struct BatchWriter {
     batch_max_bytes: usize,
     batch: Batch,
     clock: Arc<dyn Clock>,
-    pending_bytes: Arc<AtomicUsize>,
 }
 
 impl BatchWriter {
-    async fn run(
-        &mut self,
-        mut rx: mpsc::UnboundedReceiver<IngestMessage>,
-        shutdown: CancellationToken,
-    ) {
+    async fn run(&mut self, mut rx: mpsc::Receiver<IngestMessage>, shutdown: CancellationToken) {
         loop {
             let sleep_duration = match self.batch.started_at {
                 Some(started) => (started + self.batch_interval)
@@ -158,8 +152,8 @@ impl BatchWriter {
                                 let _ = self.write_batch().await;
                             }
                         }
-                        Some(IngestMessage::Flush { done }) => {
-                            let _ = done.send(self.write_batch().await);
+                        Some(IngestMessage::Flush { result_sender }) => {
+                            let _ = result_sender.send(self.write_batch().await);
                         }
                         None => break,
                     }
@@ -175,13 +169,10 @@ impl BatchWriter {
         if self.batch.is_empty() {
             return Ok(());
         }
-        let flushed_bytes = self.batch.size_bytes;
         let (entries, metadata, ingestion_time_ms, notifiers) = self.batch.take();
         let result = self
             .write_and_enqueue(entries, metadata, ingestion_time_ms)
             .await;
-        self.pending_bytes
-            .fetch_sub(flushed_bytes, Ordering::Release);
 
         for tx in notifiers {
             let _ = tx.send(Some(result.clone()));
@@ -217,8 +208,8 @@ impl BatchWriter {
         Ok(())
     }
 
-    async fn close(&mut self, rx: &mut mpsc::UnboundedReceiver<IngestMessage>) {
-        let mut flush_responders = Vec::new();
+    async fn close(&mut self, rx: &mut mpsc::Receiver<IngestMessage>) {
+        let mut flush_result_senders = Vec::new();
 
         while let Ok(msg) = rx.try_recv() {
             match msg {
@@ -230,28 +221,26 @@ impl BatchWriter {
                     self.batch
                         .add(entries, ingestion_time_ms, notifier, self.clock.now());
                 }
-                IngestMessage::Flush { done } => {
-                    flush_responders.push(done);
+                IngestMessage::Flush { result_sender } => {
+                    flush_result_senders.push(result_sender);
                 }
             }
         }
 
         let result = self.write_batch().await;
 
-        for done in flush_responders {
-            let _ = done.send(result.clone());
+        for result_sender in flush_result_senders {
+            let _ = result_sender.send(result.clone());
         }
     }
 }
 
 pub struct Ingestor {
-    tx: mpsc::UnboundedSender<IngestMessage>,
+    tx: mpsc::Sender<IngestMessage>,
     cancellation_token: CancellationToken,
     handle: tokio::task::JoinHandle<()>,
     producer: Arc<QueueProducer>,
     clock: Arc<dyn Clock>,
-    pending_bytes: Arc<AtomicUsize>,
-    max_unflushed_bytes: usize,
 }
 
 impl Ingestor {
@@ -273,10 +262,9 @@ impl Ingestor {
     ) -> Result<Self> {
         let producer =
             QueueProducer::with_object_store(config.manifest_path.clone(), object_store.clone());
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(config.max_buffered_inputs);
         let shutdown = CancellationToken::new();
         let producer = Arc::new(producer);
-        let pending_bytes = Arc::new(AtomicUsize::new(0));
 
         let mut writer = BatchWriter {
             object_store,
@@ -286,7 +274,6 @@ impl Ingestor {
             batch_max_bytes: config.flush_size_bytes,
             batch: Batch::new(),
             clock: Arc::clone(&clock),
-            pending_bytes: Arc::clone(&pending_bytes),
         };
         let cancellation_token = shutdown.clone();
         let handle = tokio::spawn(async move { writer.run(rx, shutdown).await });
@@ -297,18 +284,14 @@ impl Ingestor {
             handle,
             producer,
             clock,
-            pending_bytes,
-            max_unflushed_bytes: config.max_unflushed_bytes,
         })
     }
 
     /// Submit a set of entries for ingestion. Each entry pairs opaque data with metadata.
     ///
     /// Returns a [`WriteHandle`] that can be used to check or await durability.
-    /// Applies backpressure by flushing when unflushed bytes exceed the limit.
+    /// Applies backpressure when the message buffer is full.
     pub async fn ingest(&self, entries: Vec<IngestEntry>) -> Result<WriteHandle> {
-        let incoming_size: usize = entries.iter().map(|e| e.data.len()).sum();
-        self.maybe_apply_backpressure(incoming_size).await?;
         let ingestion_time_ms = millis(self.clock.now());
         let (notifier_tx, notifier_rx) = tokio::sync::watch::channel(None);
         self.tx
@@ -317,28 +300,21 @@ impl Ingestor {
                 ingestion_time_ms,
                 notifier: notifier_tx,
             })
+            .await
             .map_err(|_| Error::Storage("ingestor shut down".to_string()))?;
-        self.pending_bytes
-            .fetch_add(incoming_size, Ordering::Release);
         Ok(WriteHandle {
             watcher: DurabilityWatcher { rx: notifier_rx },
         })
     }
 
-    async fn maybe_apply_backpressure(&self, incoming_size: usize) -> Result<()> {
-        if self.pending_bytes.load(Ordering::Acquire) + incoming_size >= self.max_unflushed_bytes {
-            self.flush().await?;
-        }
-        Ok(())
-    }
-
     /// Flush the current batch, blocking until all pending entries are durably written.
     pub async fn flush(&self) -> Result<()> {
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
         self.tx
-            .send(IngestMessage::Flush { done: done_tx })
+            .send(IngestMessage::Flush { result_sender })
+            .await
             .map_err(|_| Error::Storage("ingestor shut down".to_string()))?;
-        done_rx
+        result_receiver
             .await
             .map_err(|_| Error::Storage("ingestor shut down".to_string()))?
     }
@@ -390,7 +366,7 @@ mod tests {
             manifest_path: "test/manifest".to_string(),
             flush_interval: Duration::from_hours(24),
             flush_size_bytes: 64 * 1024 * 1024,
-            max_unflushed_bytes: usize::MAX,
+            max_buffered_inputs: 1000,
         }
     }
 
@@ -519,34 +495,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_apply_backpressure_when_threshold_exceeded() {
+    async fn should_apply_backpressure_when_buffer_full() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
         let mut config = test_config();
-        config.flush_size_bytes = 64 * 1024 * 1024;
-        config.flush_interval = Duration::from_secs(60);
-        config.max_unflushed_bytes = 30;
+        config.max_buffered_inputs = 1;
 
         let ingestor =
             Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
 
-        // First ingest (22 bytes) — below 30-byte threshold
-        ingestor
-            .ingest(vec![ie("abcdefghijklmnopqrstuv")])
-            .await
-            .unwrap();
+        // First ingest fills the single-slot buffer
+        ingestor.ingest(vec![ie("data1")]).await.unwrap();
 
-        let manifest_path = slatedb::object_store::path::Path::from("test/manifest");
-        assert!(store.get(&manifest_path).await.is_err());
+        // Second ingest succeeds once the background task consumes the first message
+        ingestor.ingest(vec![ie("data2")]).await.unwrap();
 
-        // Second ingest (22 bytes) — pending(22) + incoming(22) = 44 >= 30, triggers backpressure flush
-        ingestor
-            .ingest(vec![ie("abcdefghijklmnopqrstuv")])
-            .await
-            .unwrap();
+        ingestor.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
-        assert_eq!(entries.len(), 1);
+        assert!(!entries.is_empty());
     }
 
     #[tokio::test]

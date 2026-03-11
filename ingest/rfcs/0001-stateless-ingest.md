@@ -221,21 +221,18 @@ pub struct IngestorConfig {
   /// Defaults to 64 MiB.
   pub flush_size_bytes: usize,
 
-  /// Unflushed-bytes limit that triggers backpressure.
+  /// Maximum number of input entries vectors that can be buffered before backpressure is applied.
   ///
-  /// Defaults to `usize::MAX`.
-  pub max_unflushed_bytes: usize,
+  /// Defaults to 1000.
+  pub max_buffered_inputs: usize,
 }
 ```
 The queue manifest takes the name specified in `manifest_path`.
 The config `flush_size_bytes` is a loose limit.
 The batch needs to exceed that size to trigger a flush to object storage.
-The config `max_unflushed_bytes` is also a loose limit.
-Each time the call to `ingest()` sees a size of unflushed entries in the ingestor that is larger
-than `max_unflushed_bytes`, the call blocks and flushes will be triggered until the size of the unflushed entries
-is less than `max_unflushed_bytes`.
-If this backpressure blocking the ingestion becomes an issue, new ingestors can be created to better distribute the
-load.
+The config `max_buffered_inputs` limits the number of `ingest()` calls that can be buffered. 
+When the buffer is full, `ingest()` blocks until the background task consumes a message.
+If this backpressure becomes an issue, new ingestors can be created to better distribute the load.
 
 A call to `ingest()` takes a vector of `IngestEntry` structs and returns a `WriteHandle` with which
 the caller can await the completion of the flush to object storage of the data entries.
@@ -432,6 +429,7 @@ object with the same name. This aspect would require some experiments.
 | 2026-03-10 | Changed queue entry metadata to a vector of length-prefixed items |
 | 2026-03-10 | Moved durability API into DurabilityWatcher inside WriteHandle |
 | 2026-03-10 | Changed ingest() to take Vec\<IngestEntry\> with per-entry data and metadata |
+| 2026-03-11 | Replaced max_unflushed_bytes with max_buffered_inputs using a bounded channel |
 
 
 
