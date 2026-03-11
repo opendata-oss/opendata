@@ -2492,6 +2492,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "criterion",
+ "foyer",
  "futures",
  "opendata-macros",
  "prometheus-client",

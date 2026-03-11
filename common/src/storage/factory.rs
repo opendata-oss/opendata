@@ -10,8 +10,10 @@ use super::in_memory::InMemoryStorage;
 use super::slate::{SlateDbStorage, SlateDbStorageReader};
 use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
 use slatedb::config::Settings;
+pub use slatedb::db_cache::CachedEntry;
 use slatedb::db_cache::DbCache;
 pub use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
+pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 use slatedb::object_store::{self, ObjectStore};
 use slatedb::{DbBuilder, DbReader};
 use tokio::runtime::Handle;
@@ -336,4 +338,53 @@ async fn create_slatedb_storage(
         .map_err(|e| StorageError::Storage(format!("Failed to create SlateDB: {}", e)))?;
 
     Ok(SlateDbStorage::new(Arc::new(db)))
+}
+
+/// Configuration for building a [`FoyerHybridCache`] with both in-memory and on-disk tiers.
+pub struct HybridCacheConfig {
+    /// In-memory cache capacity in bytes.
+    pub memory_capacity: u64,
+    /// On-disk cache capacity in bytes.
+    pub disk_capacity: u64,
+    /// Path for the on-disk cache directory.
+    pub disk_path: String,
+}
+
+/// Creates a [`FoyerHybridCache`] with the given configuration.
+///
+/// The hybrid cache uses foyer's tiered caching: hot blocks are served from
+/// memory, while evicted blocks spill to a fast local disk (ideally NVMe).
+///
+/// # Errors
+///
+/// Returns an error if the disk cache directory cannot be initialized.
+pub async fn create_hybrid_cache(config: &HybridCacheConfig) -> StorageResult<FoyerHybridCache> {
+    use foyer::{DirectFsDeviceOptions, Engine, HybridCacheBuilder};
+
+    let memory_capacity = usize::try_from(config.memory_capacity).map_err(|_| {
+        StorageError::Storage(format!(
+            "memory_capacity {} exceeds usize::MAX on this platform",
+            config.memory_capacity
+        ))
+    })?;
+    let disk_capacity = usize::try_from(config.disk_capacity).map_err(|_| {
+        StorageError::Storage(format!(
+            "disk_capacity {} exceeds usize::MAX on this platform",
+            config.disk_capacity
+        ))
+    })?;
+
+    let cache = HybridCacheBuilder::new()
+        .with_name("slatedb_block_cache")
+        .memory(memory_capacity)
+        .with_weighter(|_, v: &CachedEntry| v.size())
+        .storage(Engine::large())
+        .with_device_options(
+            DirectFsDeviceOptions::new(&config.disk_path).with_capacity(disk_capacity),
+        )
+        .build()
+        .await
+        .map_err(|e| StorageError::Storage(format!("Failed to create hybrid cache: {}", e)))?;
+
+    Ok(FoyerHybridCache::new_with_cache(cache))
 }

@@ -7,6 +7,8 @@ use std::time::Duration;
 use common::storage::config::StorageConfig;
 use serde::Deserialize;
 
+use crate::config::BlockCacheConfig;
+
 use crate::util::Result;
 
 #[cfg(feature = "http-server")]
@@ -42,6 +44,9 @@ pub struct PrometheusConfig {
     /// Defaults to 5 seconds.
     #[serde(default = "default_flush_interval_secs")]
     pub flush_interval_secs: u64,
+    /// Optional hybrid block cache (in-memory + on-disk).
+    #[serde(default)]
+    pub block_cache: Option<BlockCacheConfig>,
 }
 
 fn default_flush_interval_secs() -> u64 {
@@ -56,6 +61,7 @@ impl Default for PrometheusConfig {
             otel: OtelServerConfig::default(),
             storage: StorageConfig::default(),
             flush_interval_secs: default_flush_interval_secs(),
+            block_cache: None,
         }
     }
 }
@@ -337,5 +343,33 @@ scrape_configs:
         // then
         assert!(config.otel.include_resource_attrs);
         assert!(config.otel.include_scope_attrs);
+    }
+
+    #[test]
+    fn should_parse_block_cache_config() {
+        let yaml = r#"
+block_cache:
+  memory_capacity: 8589934592
+  disk_capacity: 150323855360
+  disk_path: /mnt/nvme/block-cache
+"#;
+        let config: PrometheusConfig = serde_yaml::from_str(yaml).unwrap();
+
+        let cache = config.block_cache.expect("block_cache should be present");
+        assert_eq!(cache.memory_capacity, 8589934592);
+        assert_eq!(cache.disk_capacity, 150323855360);
+        assert_eq!(cache.disk_path, "/mnt/nvme/block-cache");
+    }
+
+    #[test]
+    fn should_default_block_cache_to_none() {
+        let yaml = r#"
+scrape_configs:
+  - job_name: test
+    static_configs:
+      - targets: ['localhost:9090']
+"#;
+        let config: PrometheusConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.block_cache.is_none());
     }
 }

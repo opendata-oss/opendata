@@ -20,6 +20,7 @@ test-utils = ["dep:arc-swap"]
 
 [dependencies]
 slatedb.workspace = true
+foyer.workspace = true
 bytes.workspace = true
 futures.workspace = true
 async-trait.workspace = true

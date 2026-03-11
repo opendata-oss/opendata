@@ -12,7 +12,8 @@ pub use sequence::{DEFAULT_BLOCK_SIZE, SequenceAllocator, SequenceError, Sequenc
 pub use serde::seq_block::SeqBlock;
 pub use storage::config::StorageConfig;
 pub use storage::factory::{
-    StorageReaderRuntime, StorageRuntime, StorageSemantics, create_storage, create_storage_read,
+    HybridCacheConfig, StorageReaderRuntime, StorageRuntime, StorageSemantics, create_hybrid_cache,
+    create_storage, create_storage_read,
 };
 pub use storage::loader::{LoadMetadata, LoadResult, LoadSpec, Loadable, Loader};
 pub use storage::{

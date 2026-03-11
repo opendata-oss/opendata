@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod config;
 mod delta;
 mod error;
 mod flusher;
@@ -69,9 +70,34 @@ async fn main() {
         prometheus_config.storage
     );
     let merge_operator = Arc::new(OpenTsdbMergeOperator);
+    let mut runtime = StorageRuntime::new();
+    if let Some(ref cache_config) = prometheus_config.block_cache {
+        if matches!(prometheus_config.storage, common::StorageConfig::SlateDb(_)) {
+            let hybrid_config = common::HybridCacheConfig {
+                memory_capacity: cache_config.memory_capacity,
+                disk_capacity: cache_config.disk_capacity,
+                disk_path: cache_config.disk_path.clone(),
+            };
+            let cache = common::create_hybrid_cache(&hybrid_config)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!("Failed to create hybrid block cache: {}", e);
+                    std::process::exit(1);
+                });
+            runtime = runtime.with_block_cache(Arc::new(cache));
+            tracing::info!(
+                memory_mb = cache_config.memory_capacity / (1024 * 1024),
+                disk_mb = cache_config.disk_capacity / (1024 * 1024),
+                disk_path = %cache_config.disk_path,
+                "hybrid block cache enabled"
+            );
+        } else {
+            tracing::warn!("block_cache config ignored for non-SlateDB storage");
+        }
+    }
     let storage = create_storage(
         &prometheus_config.storage,
-        StorageRuntime::new(),
+        runtime,
         StorageSemantics::new().with_merge_operator(merge_operator),
     )
     .await
