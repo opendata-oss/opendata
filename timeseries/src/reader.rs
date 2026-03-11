@@ -107,6 +107,19 @@ impl QueryReader for ReaderQueryReader {
         })?;
         mini.samples(series_id, start_ms, end_ms).await
     }
+
+    async fn batch_samples(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<HashMap<SeriesId, Vec<Sample>>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.batch_samples(series_ids, start_ms, end_ms).await
+    }
 }
 
 // ── TimeSeriesDbReader ───────────────────────────────────────────────
@@ -157,10 +170,14 @@ impl TimeSeriesDbReader {
     ///
     /// Returns an error if the storage backend cannot be initialized.
     pub async fn open(config: ReaderConfig) -> Result<Self> {
-        let reader_options = slatedb::config::DbReaderOptions {
+        let mut reader_options = slatedb::config::DbReaderOptions {
             manifest_poll_interval: config.refresh_interval,
+            skip_wal_replay: config.skip_wal_replay,
             ..Default::default()
         };
+        if let Some(lifetime) = config.checkpoint_lifetime {
+            reader_options.checkpoint_lifetime = lifetime;
+        }
         let storage = create_storage_read(
             &config.storage,
             StorageReaderRuntime::new(),

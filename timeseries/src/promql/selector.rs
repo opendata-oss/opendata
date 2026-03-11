@@ -10,6 +10,83 @@ use promql_parser::label::{METRIC_NAME, MatchOp};
 use promql_parser::parser::VectorSelector;
 use regex_syntax::hir::{Hir, HirKind};
 
+// ── SelectorTerms ────────────────────────────────────────────────────
+
+/// Pre-computed selector terms extracted from a `VectorSelector`.
+///
+/// This is a pure computation (no I/O) that can be used to drive both
+/// inverted index lookups and parallel preloading.
+pub(crate) struct SelectorTerms {
+    /// Terms that must ALL match (AND) — equality matchers + metric name.
+    pub and_terms: Vec<Label>,
+    /// Groups of terms where ANY can match (OR) — regex alternation matchers.
+    pub or_groups: Vec<Vec<Label>>,
+    /// Whether the selector has `label=""` matchers requiring post-filtering.
+    pub has_empty_string_matchers: bool,
+    /// Whether the selector has `!=` or `!~` matchers requiring post-filtering.
+    pub has_negative_matchers: bool,
+}
+
+impl SelectorTerms {
+    /// All terms (AND + all OR groups flattened) for inverted index preloading.
+    pub fn all_terms(&self) -> Vec<Label> {
+        self.or_groups
+            .iter()
+            .flat_map(|terms| terms.iter().cloned())
+            .chain(self.and_terms.iter().cloned())
+            .collect()
+    }
+}
+
+/// Extract selector terms from a `VectorSelector` without any I/O.
+///
+/// Reuses the same logic as `find_candidates_with_reader` but separated
+/// into a pure function for use in preloading.
+pub(crate) fn extract_selector_terms(selector: &VectorSelector) -> SelectorTerms {
+    let mut and_terms = Vec::new();
+    let mut or_groups = Vec::new();
+
+    if let Some(ref name) = selector.name {
+        and_terms.push(Label {
+            name: METRIC_NAME.to_string(),
+            value: name.clone(),
+        });
+    }
+
+    for matcher in &selector.matchers.matchers {
+        match &matcher.op {
+            MatchOp::Equal => {
+                if !matcher.value.is_empty() {
+                    and_terms.push(Label {
+                        name: matcher.name.clone(),
+                        value: matcher.value.clone(),
+                    });
+                }
+            }
+            MatchOp::Re(_) => {
+                if let Ok(values) = parse_limited_regex(&matcher.value) {
+                    let or_terms: Vec<Label> = values
+                        .into_iter()
+                        .map(|value| Label {
+                            name: matcher.name.clone(),
+                            value,
+                        })
+                        .collect();
+                    or_groups.push(or_terms);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    SelectorTerms {
+        and_terms,
+        or_groups,
+        has_empty_string_matchers: has_empty_string_matchers(selector),
+        has_negative_matchers: has_negative_matchers(selector),
+    }
+}
+
 fn parse_literal(hir: &Hir, pattern: &str) -> std::result::Result<String, String> {
     match hir.kind() {
         HirKind::Empty => Err(format!("empty alternative in pattern: {}", pattern)),
@@ -1391,5 +1468,131 @@ mod tests {
 
         // then: should find exactly 3 series (excluding host-50)
         assert_eq!(result.len(), 3, "Should find 3 matching series");
+    }
+
+    // ── extract_selector_terms tests ────────────────────────────────────
+
+    #[test]
+    fn extract_terms_metric_name_only() {
+        let selector = VectorSelector {
+            name: Some("http_requests_total".to_string()),
+            matchers: empty_matchers(),
+            offset: None,
+            at: None,
+        };
+        let terms = extract_selector_terms(&selector);
+        assert_eq!(terms.and_terms.len(), 1);
+        assert_eq!(terms.and_terms[0].name, METRIC_NAME);
+        assert_eq!(terms.and_terms[0].value, "http_requests_total");
+        assert!(terms.or_groups.is_empty());
+        assert!(!terms.has_empty_string_matchers);
+        assert!(!terms.has_negative_matchers);
+    }
+
+    #[test]
+    fn extract_terms_equality_matcher() {
+        let selector = VectorSelector {
+            name: Some("cpu".to_string()),
+            matchers: Matchers {
+                matchers: vec![Matcher::new(MatchOp::Equal, "host", "server1")],
+                or_matchers: vec![],
+            },
+            offset: None,
+            at: None,
+        };
+        let terms = extract_selector_terms(&selector);
+        assert_eq!(terms.and_terms.len(), 2); // metric name + host
+        assert!(terms.and_terms.iter().any(|l| l.name == "host" && l.value == "server1"));
+        assert!(terms.or_groups.is_empty());
+    }
+
+    #[test]
+    fn extract_terms_regex_creates_or_group() {
+        let matcher = create_regex_matcher("method", "GET|POST").unwrap();
+        let selector = VectorSelector {
+            name: Some("http_requests_total".to_string()),
+            matchers: Matchers {
+                matchers: vec![matcher],
+                or_matchers: vec![],
+            },
+            offset: None,
+            at: None,
+        };
+        let terms = extract_selector_terms(&selector);
+        assert_eq!(terms.and_terms.len(), 1); // metric name only
+        assert_eq!(terms.or_groups.len(), 1);
+        assert_eq!(terms.or_groups[0].len(), 2);
+        let values: Vec<&str> = terms.or_groups[0].iter().map(|l| l.value.as_str()).collect();
+        assert!(values.contains(&"GET"));
+        assert!(values.contains(&"POST"));
+    }
+
+    #[test]
+    fn extract_terms_negative_matcher_flagged() {
+        let selector = VectorSelector {
+            name: Some("metric".to_string()),
+            matchers: Matchers {
+                matchers: vec![Matcher::new(MatchOp::NotEqual, "env", "staging")],
+                or_matchers: vec![],
+            },
+            offset: None,
+            at: None,
+        };
+        let terms = extract_selector_terms(&selector);
+        assert!(terms.has_negative_matchers);
+        // NotEqual is not added to and_terms
+        assert_eq!(terms.and_terms.len(), 1); // metric name only
+    }
+
+    #[test]
+    fn extract_terms_empty_string_matcher_flagged() {
+        let selector = VectorSelector {
+            name: Some("metric".to_string()),
+            matchers: Matchers {
+                matchers: vec![Matcher::new(MatchOp::Equal, "label", "")],
+                or_matchers: vec![],
+            },
+            offset: None,
+            at: None,
+        };
+        let terms = extract_selector_terms(&selector);
+        assert!(terms.has_empty_string_matchers);
+        // Empty string matcher is not added to and_terms
+        assert_eq!(terms.and_terms.len(), 1); // metric name only
+    }
+
+    #[test]
+    fn extract_terms_all_terms_flattens_and_and_or() {
+        let matcher = create_regex_matcher("method", "GET|POST").unwrap();
+        let selector = VectorSelector {
+            name: Some("http_requests_total".to_string()),
+            matchers: Matchers {
+                matchers: vec![
+                    Matcher::new(MatchOp::Equal, "env", "prod"),
+                    matcher,
+                ],
+                or_matchers: vec![],
+            },
+            offset: None,
+            at: None,
+        };
+        let terms = extract_selector_terms(&selector);
+        let all = terms.all_terms();
+        // Should contain: metric name + env=prod (AND) + method=GET + method=POST (OR)
+        assert_eq!(all.len(), 4);
+    }
+
+    #[test]
+    fn extract_terms_no_name_no_matchers() {
+        let selector = VectorSelector {
+            name: None,
+            matchers: empty_matchers(),
+            offset: None,
+            at: None,
+        };
+        let terms = extract_selector_terms(&selector);
+        assert!(terms.and_terms.is_empty());
+        assert!(terms.or_groups.is_empty());
+        assert!(terms.all_terms().is_empty());
     }
 }

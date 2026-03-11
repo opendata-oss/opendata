@@ -622,6 +622,12 @@ pub(crate) struct TimeBucket {
     pub(crate) size: BucketSize,
 }
 
+impl std::fmt::Display for TimeBucket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}m+{}m", self.start, self.size_in_mins())
+    }
+}
+
 impl TimeBucket {
     pub(crate) fn hour(start: BucketStart) -> Self {
         Self { start, size: 1 }

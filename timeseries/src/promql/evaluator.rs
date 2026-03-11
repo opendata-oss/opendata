@@ -5,12 +5,16 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use std::time::Instant;
+use futures::future::join_all;
+use tracing::info;
+
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::Sample;
 use crate::model::SeriesFingerprint;
 use crate::model::{Label, SeriesId, TimeBucket};
 use crate::promql::functions::{FunctionRegistry, PromQLArg};
-use crate::promql::selector::evaluate_selector_with_reader;
+use crate::promql::selector::{evaluate_selector_with_reader, extract_selector_terms};
 use crate::promql::timestamp::Timestamp;
 use crate::query::QueryReader;
 use crate::util::Result;
@@ -77,6 +81,10 @@ impl QueryReaderEvalCache {
         Self {
             cache: HashMap::new(),
         }
+    }
+
+    pub(crate) fn has_bucket(&self, bucket: &TimeBucket) -> bool {
+        self.cache.contains_key(bucket)
     }
 
     pub(crate) fn get_bucket_cache_mut(
@@ -324,6 +332,12 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         self.reader.list_buckets().await
     }
 
+    /// Returns true if the cache already has data for this bucket,
+    /// indicating preloading is unnecessary (a previous step already populated it).
+    pub(crate) fn is_bucket_cached(&self, bucket: &TimeBucket) -> bool {
+        self.cache.has_bucket(bucket)
+    }
+
     pub(crate) async fn forward_index(
         &mut self,
         bucket: &TimeBucket,
@@ -425,6 +439,156 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             .collect();
 
         Ok(filtered)
+    }
+
+    // ── Parallel preloading ──────────────────────────────────────────
+
+    /// Preload inverted indexes for all buckets in parallel (bounded concurrency).
+    ///
+    /// Results are inserted into the per-query cache so subsequent
+    /// sequential bucket iteration hits the cache on every call.
+    pub(crate) async fn preload_inverted_indexes(
+        &mut self,
+        buckets: &[TimeBucket],
+        terms: &[Label],
+    ) -> Result<()> {
+        let mut sorted_terms = terms.to_vec();
+        sorted_terms.sort();
+
+        let reader = self.reader;
+        let sem = Arc::new(tokio::sync::Semaphore::new(8));
+        let futs: Vec<_> = buckets
+            .iter()
+            .map(|bucket| {
+                let t = sorted_terms.clone();
+                let b = *bucket;
+                let sem = sem.clone();
+                async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    let result = reader.inverted_index(&b, &t).await;
+                    (b, result)
+                }
+            })
+            .collect();
+
+        let results = join_all(futs).await;
+        for (bucket, result) in results {
+            if let Ok(index) = result {
+                self.cache
+                    .cache_inverted_index(bucket, sorted_terms.clone(), index);
+            }
+        }
+        Ok(())
+    }
+
+    /// Compute candidate series IDs per bucket from cached inverted indexes.
+    ///
+    /// This is a no-I/O operation — it reads from the per-query cache
+    /// that was populated by `preload_inverted_indexes`.
+    pub(crate) fn compute_candidates_from_cache(
+        &self,
+        buckets: &[TimeBucket],
+        terms: &crate::promql::selector::SelectorTerms,
+    ) -> Vec<(TimeBucket, Vec<SeriesId>)> {
+        let mut sorted_all = terms.all_terms();
+        sorted_all.sort();
+
+        let mut result = Vec::new();
+        for &bucket in buckets {
+            if let Some(inverted) = self.cache.get_inverted_index(&bucket, &sorted_all) {
+                let mut result_set: HashSet<SeriesId> = if !terms.and_terms.is_empty() {
+                    inverted.intersect(terms.and_terms.clone()).iter().collect()
+                } else {
+                    HashSet::new()
+                };
+
+                for or_terms in &terms.or_groups {
+                    let mut or_result = HashSet::new();
+                    for term in or_terms {
+                        let term_result = inverted.intersect(vec![term.clone()]);
+                        or_result.extend(term_result.iter());
+                    }
+                    if terms.and_terms.is_empty() && result_set.is_empty() {
+                        result_set = or_result;
+                    } else {
+                        result_set = result_set.intersection(&or_result).cloned().collect();
+                    }
+                }
+
+                if !result_set.is_empty() {
+                    result.push((bucket, result_set.into_iter().collect()));
+                }
+            }
+        }
+        result
+    }
+
+    /// Preload forward indexes for all (bucket, candidates) pairs in parallel.
+    pub(crate) async fn preload_forward_indexes(
+        &mut self,
+        bucket_candidates: &[(TimeBucket, Vec<SeriesId>)],
+    ) -> Result<()> {
+        let reader = self.reader;
+        let sem = Arc::new(tokio::sync::Semaphore::new(8));
+        let futs: Vec<_> = bucket_candidates
+            .iter()
+            .map(|(bucket, candidates)| {
+                let mut sorted = candidates.clone();
+                sorted.sort();
+                let b = *bucket;
+                let sem = sem.clone();
+                async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    let result = reader.forward_index(&b, &sorted).await;
+                    (b, sorted, result)
+                }
+            })
+            .collect();
+
+        let results = join_all(futs).await;
+        for (bucket, sorted_ids, result) in results {
+            if let Ok(index) = result {
+                self.cache.cache_forward_index(bucket, sorted_ids, index);
+            }
+        }
+        Ok(())
+    }
+
+    /// Preload samples for candidate series across all buckets using parallel point reads.
+    /// Each (bucket, series_id) issues one `get()` that reads only the specific SST
+    /// block from S3. Parallelism is bounded by a semaphore to avoid overwhelming the
+    /// network. The block cache retains fetched blocks for subsequent query steps.
+    pub(crate) async fn preload_samples(
+        &mut self,
+        bucket_candidates: &[(TimeBucket, Vec<SeriesId>)],
+    ) -> Result<()> {
+        let reader = self.reader;
+        let sem = Arc::new(tokio::sync::Semaphore::new(32));
+        let futs: Vec<_> = bucket_candidates
+            .iter()
+            .flat_map(|(bucket, ids)| {
+                ids.iter().map({
+                    let sem = sem.clone();
+                    move |&id| {
+                        let b = *bucket;
+                        let sem = sem.clone();
+                        async move {
+                            let _permit = sem.acquire().await.unwrap();
+                            let result = reader.samples(&b, id, i64::MIN, i64::MAX).await;
+                            (b, id, result)
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let results = join_all(futs).await;
+        for (bucket, series_id, result) in results {
+            if let Ok(samples) = result {
+                self.cache.cache_samples(bucket, series_id, samples);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -931,29 +1095,70 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let mut buckets = self.reader.list_buckets().await?;
         buckets.sort_by(|a, b| a.start.cmp(&b.start));
 
+        // Filter to time-range-overlapping buckets
+        let relevant_buckets: Vec<TimeBucket> = buckets
+            .iter()
+            .filter(|bucket| {
+                let bucket_start_ms = (bucket.start as i64) * 60 * 1000;
+                let bucket_end_ms = bucket_start_ms + (bucket.size_in_mins() as i64) * 60 * 1000;
+                bucket_end_ms >= start_ms && bucket_start_ms <= end_ms
+            })
+            .copied()
+            .collect();
+
+        // Parallel preload indexes + samples on the first step only (subsequent steps hit cache)
+        let needs_preload = relevant_buckets
+            .first()
+            .map_or(false, |b| !self.reader.is_bucket_cached(b));
+        if needs_preload {
+            let terms = extract_selector_terms(vector_selector);
+            let all_terms = terms.all_terms();
+            if !all_terms.is_empty() {
+                self.reader
+                    .preload_inverted_indexes(&relevant_buckets, &all_terms)
+                    .await?;
+                let candidates =
+                    self.reader
+                        .compute_candidates_from_cache(&relevant_buckets, &terms);
+                self.reader.preload_forward_indexes(&candidates).await?;
+                self.reader.preload_samples(&candidates).await?;
+            }
+        }
+
         // Group samples by series (using sorted label vector as key since HashMap doesn't impl Hash)
         let mut series_map: SeriesMap = HashMap::new();
 
-        for bucket in buckets {
-            // Check if bucket overlaps with our time range
-            let bucket_start_ms = (bucket.start as i64) * 60 * 1000; // Convert minutes to milliseconds
-            let bucket_end_ms = bucket_start_ms + (bucket.size_in_mins() as i64) * 60 * 1000;
-            if bucket_end_ms < start_ms || bucket_start_ms > end_ms {
-                continue;
-            }
+        let matrix_start = Instant::now();
+        let total_buckets = buckets.len();
+        let mut buckets_processed = 0u32;
+        let mut total_samples_fetched = 0usize;
 
+        for bucket in relevant_buckets {
+            let bucket_start_time = Instant::now();
+
+            let selector_start = Instant::now();
             let candidates =
                 evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
                     .await
                     .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+            let selector_ms = selector_start.elapsed().as_millis();
 
             if candidates.is_empty() {
+                info!(
+                    bucket = %bucket,
+                    selector_ms,
+                    "matrix_selector bucket skipped (no candidates)"
+                );
                 continue;
             }
 
+            let fwd_start = Instant::now();
             let candidates_vec: Vec<_> = candidates.into_iter().collect();
             let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
+            let fwd_index_ms = fwd_start.elapsed().as_millis();
 
+            let samples_start = Instant::now();
+            let mut bucket_samples = 0usize;
             for series_id in candidates_vec {
                 let series_spec = match forward_index_view.get_spec(&series_id) {
                     Some(spec) => spec,
@@ -970,6 +1175,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     .samples(&bucket, series_id, start_ms, end_ms)
                     .await?;
 
+                bucket_samples += sample_data.len();
+
                 let mut labels_key: Vec<Label> = series_spec.labels.clone();
                 // Sort by canonical Label ordering (name, then value) for series grouping
                 labels_key.sort();
@@ -979,6 +1186,20 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     values.push(sample);
                 }
             }
+            let samples_ms = samples_start.elapsed().as_millis();
+
+            total_samples_fetched += bucket_samples;
+            buckets_processed += 1;
+
+            info!(
+                bucket = %bucket,
+                selector_ms,
+                fwd_index_ms,
+                samples_ms,
+                bucket_samples,
+                bucket_ms = bucket_start_time.elapsed().as_millis(),
+                "matrix_selector bucket processed"
+            );
         }
 
         let mut range_vector = Vec::new();
@@ -986,6 +1207,15 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             let labels = self.labels_to_hashmap(&labels);
             range_vector.push(EvalSamples { values, labels });
         }
+
+        info!(
+            total_ms = matrix_start.elapsed().as_millis(),
+            total_buckets,
+            buckets_processed,
+            series_count = range_vector.len(),
+            total_samples_fetched,
+            "matrix_selector complete"
+        );
 
         Ok(ExprResult::RangeVector(range_vector))
     }
@@ -1151,24 +1381,43 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         range_start_ms: i64,
         range_end_ms: i64,
     ) -> EvalResult<HashMap<SeriesFingerprint, (HashMap<String, String>, Vec<Sample>)>> {
+        let fetch_start = Instant::now();
         let mut buckets = self.reader.list_buckets().await?;
         buckets.sort_by(|a, b| b.start.cmp(&a.start));
 
+        let total_buckets = buckets.len();
         let mut series_samples = HashMap::new();
+        let mut buckets_processed = 0u32;
+        let mut total_samples_fetched = 0usize;
 
         for bucket in buckets {
+            let bucket_start = Instant::now();
+
+            let selector_start = Instant::now();
             let candidates =
                 evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
                     .await
                     .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+            let selector_ms = selector_start.elapsed().as_millis() as u64;
 
             if candidates.is_empty() {
+                info!(
+                    bucket = %bucket,
+                    selector_ms,
+                    "bucket empty, skipping"
+                );
                 continue;
             }
 
             let candidates_vec: Vec<_> = candidates.into_iter().collect();
-            let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
+            let num_candidates = candidates_vec.len();
 
+            let fwd_start = Instant::now();
+            let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
+            let fwd_ms = fwd_start.elapsed().as_millis() as u64;
+
+            let samples_start = Instant::now();
+            let mut bucket_sample_count = 0usize;
             for series_id in candidates_vec {
                 let Some(series_spec) = forward_index_view.get_spec(&series_id) else {
                     continue;
@@ -1185,6 +1434,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     continue;
                 }
 
+                bucket_sample_count += samples.len();
+
                 let entry = series_samples.entry(fingerprint).or_insert_with(|| {
                     let labels = self.labels_to_hashmap(&series_spec.labels);
                     (labels, Vec::new())
@@ -1192,12 +1443,38 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
                 entry.1.extend(samples);
             }
+            let samples_ms = samples_start.elapsed().as_millis() as u64;
+            total_samples_fetched += bucket_sample_count;
+            buckets_processed += 1;
+
+            info!(
+                bucket = %bucket,
+                bucket_ms = bucket_start.elapsed().as_millis() as u64,
+                selector_ms,
+                fwd_index_ms = fwd_ms,
+                samples_ms,
+                candidates = num_candidates,
+                samples = bucket_sample_count,
+                "bucket processed"
+            );
         }
 
+        let dedup_start = Instant::now();
         for (_fp, (_labels, samples)) in series_samples.iter_mut() {
             samples.sort_by_key(|s| s.timestamp_ms);
             samples.dedup_by_key(|s| s.timestamp_ms);
         }
+        let dedup_ms = dedup_start.elapsed().as_millis() as u64;
+
+        info!(
+            total_ms = fetch_start.elapsed().as_millis() as u64,
+            total_buckets,
+            buckets_processed,
+            series_count = series_samples.len(),
+            total_samples_fetched,
+            dedup_ms,
+            "fetch_series_samples complete"
+        );
 
         Ok(series_samples)
     }
@@ -1315,12 +1592,28 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let mut buckets = self.reader.list_buckets().await?;
         buckets.sort_by(|a, b| b.start.cmp(&a.start)); // newest first
 
+        // Parallel preload indexes + samples on the first step only (subsequent steps hit cache)
+        let needs_preload = buckets
+            .first()
+            .map_or(false, |b| !self.reader.is_bucket_cached(b));
+        if needs_preload {
+            let terms = extract_selector_terms(vector_selector);
+            let all_terms = terms.all_terms();
+            if !all_terms.is_empty() {
+                self.reader
+                    .preload_inverted_indexes(&buckets, &all_terms)
+                    .await?;
+                let candidates = self.reader.compute_candidates_from_cache(&buckets, &terms);
+                self.reader.preload_forward_indexes(&candidates).await?;
+                self.reader.preload_samples(&candidates).await?;
+            }
+        }
+
         let mut series_with_results: HashSet<SeriesFingerprint> = HashSet::new();
         let mut samples = Vec::new();
 
         // Iterate through buckets in reverse time order (newest first)
         for bucket in buckets {
-            // Find matching series in this bucket
             let candidates =
                 evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
                     .await
@@ -1330,12 +1623,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 continue;
             }
 
-            // Batch load forward index for all candidates upfront
             let candidates_vec: Vec<_> = candidates.into_iter().collect();
             let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
 
             for series_id in candidates_vec {
-                // Get series spec from forward index view (batched lookup)
                 let series_spec = match forward_index_view.get_spec(&series_id) {
                     Some(spec) => spec,
                     None => {
@@ -1352,7 +1643,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     continue;
                 }
 
-                // Read samples from this bucket within the lookback window
                 let sample_data = self
                     .reader
                     .samples(&bucket, series_id, start_ms, end_ms)
@@ -1360,7 +1650,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
                 // Find the best (latest) point in the time range
                 if let Some(best_sample) = sample_data.last() {
-                    // Convert attributes to labels HashMap
                     let labels = self.labels_to_hashmap(&series_spec.labels);
 
                     samples.push(EvalSample {
@@ -1370,7 +1659,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                         drop_name: false,
                     });
 
-                    // Mark this series fingerprint as found so we don't add it again from older buckets
                     series_with_results.insert(fingerprint);
                 }
             }
@@ -5580,6 +5868,233 @@ mod tests {
             assert_eq!(normalize_ranges(vec![(-5, 10)]), vec![(-5, 10)]);
             // Empty
             assert_eq!(normalize_ranges(vec![]), vec![]);
+        }
+    }
+
+    // ── CachedQueryReader preload + compute_candidates tests ────────────
+
+    mod preload_tests {
+        use super::*;
+        use crate::model::{MetricType, Sample, TimeBucket};
+        use crate::promql::selector::{SelectorTerms, extract_selector_terms};
+
+        use promql_parser::label::{MatchOp, Matcher, Matchers};
+        use promql_parser::parser::VectorSelector;
+
+        fn bucket() -> TimeBucket {
+            TimeBucket { start: 100, size: 1 }
+        }
+
+        fn bucket2() -> TimeBucket {
+            TimeBucket { start: 200, size: 1 }
+        }
+
+        fn build_multi_bucket_reader() -> crate::query::test_utils::MockQueryReader {
+            use crate::query::test_utils::MockMultiBucketQueryReaderBuilder;
+
+            let mut builder = MockMultiBucketQueryReaderBuilder::new();
+            // Bucket 1: series 0 (cpu, host=a) and series 1 (cpu, host=b)
+            for host in &["a", "b"] {
+                builder.add_sample(
+                    bucket(),
+                    vec![
+                        Label { name: "__name__".to_string(), value: "cpu".to_string() },
+                        Label { name: "host".to_string(), value: host.to_string() },
+                    ],
+                    MetricType::Gauge,
+                    Sample { timestamp_ms: 1000, value: 1.0 },
+                );
+            }
+            // Bucket 2: same series
+            for host in &["a", "b"] {
+                builder.add_sample(
+                    bucket2(),
+                    vec![
+                        Label { name: "__name__".to_string(), value: "cpu".to_string() },
+                        Label { name: "host".to_string(), value: host.to_string() },
+                    ],
+                    MetricType::Gauge,
+                    Sample { timestamp_ms: 2000, value: 2.0 },
+                );
+            }
+            builder.build()
+        }
+
+        #[tokio::test]
+        async fn preload_inverted_indexes_populates_cache() {
+            let reader = build_multi_bucket_reader();
+            let mut cached = CachedQueryReader::new(&reader);
+            let terms = vec![Label { name: "__name__".to_string(), value: "cpu".to_string() }];
+
+            cached.preload_inverted_indexes(&[bucket(), bucket2()], &terms).await.unwrap();
+
+            // Cache should be populated for both buckets
+            assert!(cached.is_bucket_cached(&bucket()));
+            assert!(cached.is_bucket_cached(&bucket2()));
+        }
+
+        #[tokio::test]
+        async fn preload_forward_indexes_populates_cache() {
+            let reader = build_multi_bucket_reader();
+            let mut cached = CachedQueryReader::new(&reader);
+
+            let candidates = vec![
+                (bucket(), vec![0u32, 1u32]),
+                (bucket2(), vec![0u32, 1u32]),
+            ];
+            cached.preload_forward_indexes(&candidates).await.unwrap();
+
+            // Forward index should be cached — subsequent call should hit cache
+            let fwd = cached.forward_index(&bucket(), &[0, 1]).await.unwrap();
+            assert!(fwd.get_spec(&0).is_some());
+        }
+
+        #[tokio::test]
+        async fn preload_samples_populates_cache() {
+            let reader = build_multi_bucket_reader();
+            let mut cached = CachedQueryReader::new(&reader);
+
+            let candidates = vec![
+                (bucket(), vec![0u32, 1u32]),
+                (bucket2(), vec![0u32, 1u32]),
+            ];
+            cached.preload_samples(&candidates).await.unwrap();
+
+            // Samples should be cached — call samples() and verify it returns data
+            let samples = cached.samples(&bucket(), 0, 0, 5000).await.unwrap();
+            assert_eq!(samples.len(), 1);
+            assert_eq!(samples[0].value, 1.0);
+
+            let samples2 = cached.samples(&bucket2(), 1, 0, 5000).await.unwrap();
+            assert_eq!(samples2.len(), 1);
+            assert_eq!(samples2[0].value, 2.0);
+        }
+
+        #[tokio::test]
+        async fn compute_candidates_from_cache_and_terms() {
+            let reader = build_multi_bucket_reader();
+            let mut cached = CachedQueryReader::new(&reader);
+
+            let terms = vec![
+                Label { name: "__name__".to_string(), value: "cpu".to_string() },
+                Label { name: "host".to_string(), value: "a".to_string() },
+            ];
+
+            // Preload inverted indexes first
+            cached.preload_inverted_indexes(&[bucket(), bucket2()], &terms).await.unwrap();
+
+            // Build SelectorTerms with both AND terms
+            let selector_terms = SelectorTerms {
+                and_terms: terms.clone(),
+                or_groups: vec![],
+                has_empty_string_matchers: false,
+                has_negative_matchers: false,
+            };
+
+            let candidates = cached.compute_candidates_from_cache(
+                &[bucket(), bucket2()],
+                &selector_terms,
+            );
+
+            // Should find candidates in both buckets, only host=a (series 0)
+            assert_eq!(candidates.len(), 2);
+            for (_, ids) in &candidates {
+                assert_eq!(ids.len(), 1);
+                assert!(ids.contains(&0));
+            }
+        }
+
+        #[tokio::test]
+        async fn compute_candidates_or_groups() {
+            let reader = build_multi_bucket_reader();
+            let mut cached = CachedQueryReader::new(&reader);
+
+            // Preload with all terms we'll need
+            let all_terms = vec![
+                Label { name: "__name__".to_string(), value: "cpu".to_string() },
+                Label { name: "host".to_string(), value: "a".to_string() },
+                Label { name: "host".to_string(), value: "b".to_string() },
+            ];
+            cached.preload_inverted_indexes(&[bucket()], &all_terms).await.unwrap();
+
+            let selector_terms = SelectorTerms {
+                and_terms: vec![
+                    Label { name: "__name__".to_string(), value: "cpu".to_string() },
+                ],
+                or_groups: vec![vec![
+                    Label { name: "host".to_string(), value: "a".to_string() },
+                    Label { name: "host".to_string(), value: "b".to_string() },
+                ]],
+                has_empty_string_matchers: false,
+                has_negative_matchers: false,
+            };
+
+            let candidates = cached.compute_candidates_from_cache(&[bucket()], &selector_terms);
+
+            // OR group: host=a OR host=b, intersected with __name__=cpu → both series
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].1.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn compute_candidates_empty_for_uncached_bucket() {
+            let reader = build_multi_bucket_reader();
+            let cached = CachedQueryReader::new(&reader);
+
+            let selector_terms = SelectorTerms {
+                and_terms: vec![Label { name: "__name__".to_string(), value: "cpu".to_string() }],
+                or_groups: vec![],
+                has_empty_string_matchers: false,
+                has_negative_matchers: false,
+            };
+
+            // No preloading done — should return empty
+            let unknown_bucket = TimeBucket { start: 999, size: 1 };
+            let candidates = cached.compute_candidates_from_cache(&[unknown_bucket], &selector_terms);
+            assert!(candidates.is_empty());
+        }
+
+        #[tokio::test]
+        async fn full_preload_pipeline() {
+            // End-to-end: extract terms → preload indexes → compute candidates → preload samples
+            let reader = build_multi_bucket_reader();
+            let mut cached = CachedQueryReader::new(&reader);
+
+            let selector = VectorSelector {
+                name: Some("cpu".to_string()),
+                matchers: Matchers {
+                    matchers: vec![Matcher::new(MatchOp::Equal, "host", "a")],
+                    or_matchers: vec![],
+                },
+                offset: None,
+                at: None,
+            };
+
+            let terms = extract_selector_terms(&selector);
+            let all_terms = terms.all_terms();
+            let buckets = vec![bucket(), bucket2()];
+
+            // Phase 1: inverted indexes
+            cached.preload_inverted_indexes(&buckets, &all_terms).await.unwrap();
+
+            // Phase 2: compute candidates
+            let candidates = cached.compute_candidates_from_cache(&buckets, &terms);
+            assert_eq!(candidates.len(), 2); // both buckets
+
+            // Phase 3: forward indexes
+            cached.preload_forward_indexes(&candidates).await.unwrap();
+
+            // Phase 4: samples
+            cached.preload_samples(&candidates).await.unwrap();
+
+            // Verify everything is cached — samples for host=a in both buckets
+            let s1 = cached.samples(&bucket(), 0, 0, 5000).await.unwrap();
+            assert_eq!(s1.len(), 1);
+            assert_eq!(s1[0].value, 1.0);
+
+            let s2 = cached.samples(&bucket2(), 0, 0, 5000).await.unwrap();
+            assert_eq!(s2.len(), 1);
+            assert_eq!(s2[0].value, 2.0);
         }
     }
 }

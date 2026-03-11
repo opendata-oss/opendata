@@ -111,6 +111,26 @@ pub struct ReaderConfig {
     /// Defaults to 50.
     #[serde(default = "default_cache_capacity")]
     pub cache_capacity: u64,
+
+    /// Lifetime of the reader's checkpoint before it is refreshed.
+    ///
+    /// Must be at least `2 * refresh_interval`. When the checkpoint expires,
+    /// the reader re-establishes a new one from the latest manifest state.
+    ///
+    /// Defaults to 10 minutes.
+    #[serde_as(as = "Option<DurationMilliSeconds<u64>>")]
+    #[serde(default)]
+    pub checkpoint_lifetime: Option<Duration>,
+
+    /// Skip WAL replay when refreshing the reader's checkpoint.
+    ///
+    /// When true, the reader only reads compacted SST data and ignores the WAL.
+    /// This avoids 404 errors from GC'd WAL segments but means the reader may
+    /// not see the most recent unflushed writes.
+    ///
+    /// Defaults to false.
+    #[serde(default)]
+    pub skip_wal_replay: bool,
 }
 
 fn default_refresh_interval() -> Duration {
@@ -130,6 +150,8 @@ impl Default for ReaderConfig {
             storage: StorageConfig::default(),
             refresh_interval: default_refresh_interval(),
             cache_capacity: default_cache_capacity(),
+            checkpoint_lifetime: None,
+            skip_wal_replay: false,
         }
     }
 }

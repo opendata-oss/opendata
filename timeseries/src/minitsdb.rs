@@ -8,6 +8,8 @@ use common::{Storage, StorageRead};
 
 const WRITE_CHANNEL: &str = "write";
 
+use tracing::{debug, instrument};
+
 use crate::delta::{TsdbContext, TsdbWriteDelta};
 use crate::error::Error;
 use crate::flusher::TsdbFlusher;
@@ -15,6 +17,7 @@ use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::model::{Label, Sample, Series, SeriesId, TimeBucket};
 use crate::query::BucketQueryReader;
 use crate::serde::key::TimeSeriesKey;
+use crate::serde::TimeBucketScoped;
 use crate::serde::timeseries::TimeSeriesIterator;
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::util::Result;
@@ -35,6 +38,7 @@ impl MiniQueryReader {
 
 #[async_trait]
 impl BucketQueryReader for MiniQueryReader {
+    #[instrument(skip(self), fields(bucket = %self.bucket, num_series = series_ids.len()))]
     async fn forward_index(
         &self,
         series_ids: &[SeriesId],
@@ -46,6 +50,7 @@ impl BucketQueryReader for MiniQueryReader {
         Ok(Box::new(forward_index))
     }
 
+    #[instrument(skip(self), fields(bucket = %self.bucket))]
     async fn all_forward_index(
         &self,
     ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
@@ -53,6 +58,7 @@ impl BucketQueryReader for MiniQueryReader {
         Ok(Box::new(forward_index))
     }
 
+    #[instrument(skip(self), fields(bucket = %self.bucket, num_terms = terms.len()))]
     async fn inverted_index(
         &self,
         terms: &[Label],
@@ -64,6 +70,7 @@ impl BucketQueryReader for MiniQueryReader {
         Ok(Box::new(inverted_index))
     }
 
+    #[instrument(skip(self), fields(bucket = %self.bucket))]
     async fn all_inverted_index(
         &self,
     ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
@@ -71,12 +78,14 @@ impl BucketQueryReader for MiniQueryReader {
         Ok(Box::new(inverted_index))
     }
 
+    #[instrument(skip(self), fields(bucket = %self.bucket))]
     async fn label_values(&self, label_name: &str) -> Result<Vec<String>> {
         self.snapshot
             .get_label_values(&self.bucket, label_name)
             .await
     }
 
+    #[instrument(skip(self), fields(bucket = %self.bucket))]
     async fn samples(
         &self,
         series_id: SeriesId,
@@ -97,15 +106,80 @@ impl BucketQueryReader for MiniQueryReader {
 
                 let samples: Vec<Sample> = iter
                     .filter_map(|r| r.ok())
-                    // Filter by time range: timestamp > start_ms && timestamp <= end_ms
-                    // Following PromQL lookback window semantics with exclusive start
                     .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
                     .collect();
+
+                debug!(
+                    bucket = %self.bucket,
+                    series_id,
+                    sample_count = samples.len(),
+                    "fetched samples"
+                );
 
                 Ok(samples)
             }
             None => Ok(Vec::new()),
         }
+    }
+
+    #[instrument(skip(self, series_ids), fields(bucket = %self.bucket, num_series = series_ids.len()))]
+    async fn batch_samples(
+        &self,
+        series_ids: &[SeriesId],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<HashMap<SeriesId, Vec<Sample>>> {
+        use std::collections::HashSet;
+
+        let wanted: HashSet<SeriesId> = series_ids.iter().copied().collect();
+        let range = TimeSeriesKey::bucket_range(&self.bucket);
+        let mut iter = self
+            .snapshot
+            .scan_iter(range)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut result: HashMap<SeriesId, Vec<Sample>> = HashMap::new();
+        let mut scanned = 0u32;
+        let mut matched = 0u32;
+
+        while let Some(record) = iter
+            .next()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?
+        {
+            let key = TimeSeriesKey::decode(&record.key)
+                .map_err(|e| Error::Internal(format!("Failed to decode TimeSeries key: {}", e)))?;
+
+            scanned += 1;
+            let series_id = key.series_id;
+
+            if !wanted.contains(&series_id) {
+                continue;
+            }
+            matched += 1;
+
+            if let Some(ts_iter) = TimeSeriesIterator::new(record.value.as_ref()) {
+                let samples: Vec<Sample> = ts_iter
+                    .filter_map(|r| r.ok())
+                    .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
+                    .collect();
+
+                if !samples.is_empty() {
+                    result.entry(series_id).or_default().extend(samples);
+                }
+            }
+        }
+
+        debug!(
+            bucket = %self.bucket,
+            scanned,
+            matched,
+            series_with_data = result.len(),
+            "batch_samples scan complete"
+        );
+
+        Ok(result)
     }
 }
 

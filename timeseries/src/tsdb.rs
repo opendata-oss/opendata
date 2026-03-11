@@ -9,7 +9,7 @@ use futures::TryStreamExt;
 use moka::future::Cache;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 use tokio::sync::RwLock;
-use tracing::error;
+use tracing::{error, info};
 
 use crate::error::QueryError;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
@@ -20,7 +20,7 @@ use crate::model::{
 };
 use crate::promql::evaluator::{CachedQueryReader, Evaluator, ExprResult, compute_preload_ranges};
 use crate::promql::selector::evaluate_selector_with_reader;
-use crate::query::{BucketQueryReader, QueryReader};
+use crate::query::{BucketQueryReader, QueryReader, SharedIndexCache};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::util::Result;
 
@@ -138,6 +138,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
 
         let ranges = preload_ranges(&stmt, lookback_start_secs, query_time_secs);
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
+        let reader = SharedIndexCache::new(reader);
 
         evaluate_instant(&reader, stmt, query_time).await
     }
@@ -173,6 +174,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
 
         let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
+        let reader = SharedIndexCache::new(reader);
 
         evaluate_range(&reader, stmt).await
     }
@@ -321,7 +323,15 @@ pub(crate) async fn evaluate_range(
     let mut evaluator = Evaluator::new(reader);
     let mut current_time = start;
 
+    let range_start_time = std::time::Instant::now();
+    let mut step_count = 0u64;
+    let mut slowest_step_ms = 0u128;
+    let mut fastest_step_ms = u128::MAX;
+    let mut total_step_ms = 0u128;
+
     while current_time <= end {
+        let step_start = std::time::Instant::now();
+
         let instant_stmt = EvalStmt {
             expr: stmt.expr.clone(),
             start: current_time,
@@ -357,8 +367,31 @@ pub(crate) async fn evaluate_range(
             }
         }
 
+        let step_elapsed = step_start.elapsed().as_millis();
+        total_step_ms += step_elapsed;
+        if step_elapsed > slowest_step_ms {
+            slowest_step_ms = step_elapsed;
+        }
+        if step_elapsed < fastest_step_ms {
+            fastest_step_ms = step_elapsed;
+        }
+        step_count += 1;
+
         current_time += step;
     }
+
+    let total_ms = range_start_time.elapsed().as_millis();
+    let avg_step_ms = if step_count > 0 { total_step_ms / step_count as u128 } else { 0 };
+    if fastest_step_ms == u128::MAX { fastest_step_ms = 0; }
+    info!(
+        total_ms,
+        steps = step_count,
+        avg_step_ms,
+        min_step_ms = fastest_step_ms,
+        max_step_ms = slowest_step_ms,
+        series = series_map.len(),
+        "evaluate_range complete"
+    );
 
     Ok(series_map
         .into_iter()
@@ -871,6 +904,19 @@ impl QueryReader for TsdbQueryReader {
             crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
         })?;
         mini.samples(series_id, start_ms, end_ms).await
+    }
+
+    async fn batch_samples(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<HashMap<SeriesId, Vec<Sample>>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.batch_samples(series_ids, start_ms, end_ms).await
     }
 }
 
