@@ -70,6 +70,7 @@ pub async fn create_test_tsdb_with_config(object_store: ObjectStoreConfig) -> Te
         path: "bench-data".to_string(),
         object_store,
         settings_path: None,
+        block_cache: None,
     });
     let storage = create_storage(
         &config,

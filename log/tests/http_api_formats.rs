@@ -759,6 +759,7 @@ async fn setup_slatedb_test_app() -> Router {
             path: "test-metrics".to_string(),
             object_store: ObjectStoreConfig::InMemory,
             settings_path: None,
+            block_cache: None,
         }),
         ..Default::default()
     };

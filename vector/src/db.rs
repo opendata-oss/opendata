@@ -906,6 +906,7 @@ mod tests {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            block_cache: None,
         });
 
         let config = Config {
@@ -948,6 +949,7 @@ mod tests {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            block_cache: None,
         });
 
         let config = Config {

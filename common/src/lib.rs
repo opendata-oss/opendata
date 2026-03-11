@@ -10,10 +10,9 @@ pub use bytes::BytesRange;
 pub use clock::Clock;
 pub use sequence::{DEFAULT_BLOCK_SIZE, SequenceAllocator, SequenceError, SequenceResult};
 pub use serde::seq_block::SeqBlock;
-pub use storage::config::StorageConfig;
+pub use storage::config::{BlockCacheConfig, FoyerHybridCacheConfig, StorageConfig};
 pub use storage::factory::{
-    HybridCacheConfig, StorageReaderRuntime, StorageRuntime, StorageSemantics, create_hybrid_cache,
-    create_storage, create_storage_read,
+    StorageReaderRuntime, StorageRuntime, StorageSemantics, create_storage, create_storage_read,
 };
 pub use storage::loader::{LoadMetadata, LoadResult, LoadSpec, Loadable, Loader};
 pub use storage::{

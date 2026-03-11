@@ -24,6 +24,7 @@ impl Default for StorageConfig {
                 path: ".data".to_string(),
             }),
             settings_path: None,
+            block_cache: None,
         })
     }
 }
@@ -44,6 +45,32 @@ pub struct SlateDbStorageConfig {
     /// and merges any `SLATEDB_` prefixed environment variables.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settings_path: Option<String>,
+
+    /// Optional block cache for SST block lookups.
+    ///
+    /// When configured, reduces object store reads by caching hot blocks
+    /// in memory and/or on local disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_cache: Option<BlockCacheConfig>,
+}
+
+/// Block cache configuration for SlateDB.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum BlockCacheConfig {
+    /// Two-tier cache using foyer: in-memory + on-disk (ideally NVMe).
+    FoyerHybrid(FoyerHybridCacheConfig),
+}
+
+/// Configuration for foyer's hybrid (memory + disk) block cache.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FoyerHybridCacheConfig {
+    /// In-memory cache capacity in bytes.
+    pub memory_capacity: u64,
+    /// On-disk cache capacity in bytes.
+    pub disk_capacity: u64,
+    /// Path for the on-disk cache directory.
+    pub disk_path: String,
 }
 
 impl Default for SlateDbStorageConfig {
@@ -52,6 +79,7 @@ impl Default for SlateDbStorageConfig {
             path: "data".to_string(),
             object_store: ObjectStoreConfig::default(),
             settings_path: None,
+            block_cache: None,
         }
     }
 }
@@ -68,6 +96,7 @@ impl StorageConfig {
                 path: format!("{}/{}", config.path, suffix),
                 object_store: config.object_store.clone(),
                 settings_path: config.settings_path.clone(),
+                block_cache: config.block_cache.clone(),
             }),
         }
     }
@@ -236,6 +265,7 @@ object_store:
                 path: "/tmp/slatedb".to_string(),
             }),
             settings_path: None,
+            block_cache: None,
         });
 
         // when
@@ -245,7 +275,54 @@ object_store:
         assert!(yaml.contains("type: SlateDb"));
         assert!(yaml.contains("path: my-data"));
         assert!(yaml.contains("type: Local"));
-        // settings_path should be omitted when None
+        // settings_path and block_cache should be omitted when None
         assert!(!yaml.contains("settings_path"));
+        assert!(!yaml.contains("block_cache"));
+    }
+
+    #[test]
+    fn should_deserialize_block_cache_config() {
+        let yaml = r#"
+type: SlateDb
+path: data
+object_store:
+  type: InMemory
+block_cache:
+  type: FoyerHybrid
+  memory_capacity: 8589934592
+  disk_capacity: 150323855360
+  disk_path: /mnt/nvme/block-cache
+"#;
+        let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            StorageConfig::SlateDb(slate_config) => {
+                let cache = slate_config.block_cache.expect("block_cache should be set");
+                match cache {
+                    BlockCacheConfig::FoyerHybrid(foyer) => {
+                        assert_eq!(foyer.memory_capacity, 8589934592);
+                        assert_eq!(foyer.disk_capacity, 150323855360);
+                        assert_eq!(foyer.disk_path, "/mnt/nvme/block-cache");
+                    }
+                }
+            }
+            _ => panic!("Expected SlateDb config"),
+        }
+    }
+
+    #[test]
+    fn should_default_block_cache_to_none() {
+        let yaml = r#"
+type: SlateDb
+path: data
+object_store:
+  type: InMemory
+"#;
+        let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            StorageConfig::SlateDb(slate_config) => {
+                assert!(slate_config.block_cache.is_none());
+            }
+            _ => panic!("Expected SlateDb config"),
+        }
     }
 }

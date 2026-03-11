@@ -77,29 +77,9 @@ impl TimeSeriesDb {
     /// # }
     /// ```
     pub async fn open(config: Config) -> Result<Self> {
-        let mut runtime = StorageRuntime::new();
-        if let Some(ref cache_config) = config.block_cache {
-            if matches!(config.storage, common::StorageConfig::SlateDb(_)) {
-                let hybrid_config = common::HybridCacheConfig {
-                    memory_capacity: cache_config.memory_capacity,
-                    disk_capacity: cache_config.disk_capacity,
-                    disk_path: cache_config.disk_path.clone(),
-                };
-                let cache = common::create_hybrid_cache(&hybrid_config).await?;
-                runtime = runtime.with_block_cache(Arc::new(cache));
-                tracing::info!(
-                    memory_mb = cache_config.memory_capacity / (1024 * 1024),
-                    disk_mb = cache_config.disk_capacity / (1024 * 1024),
-                    disk_path = %cache_config.disk_path,
-                    "hybrid block cache enabled for writer"
-                );
-            } else {
-                tracing::warn!("block_cache config ignored for non-SlateDB storage");
-            }
-        }
         let storage = create_storage(
             &config.storage,
-            runtime,
+            StorageRuntime::new(),
             StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
         )
         .await?;
@@ -269,6 +249,7 @@ mod tests {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            block_cache: None,
         });
 
         // Write a series and close without calling flush()
@@ -308,21 +289,5 @@ mod tests {
             !series.is_empty(),
             "expected series to survive close without explicit flush"
         );
-    }
-
-    #[tokio::test]
-    async fn open_with_inmemory_and_block_cache_ignores_cache() {
-        // block_cache should be silently ignored for InMemory storage
-        let tsdb = TimeSeriesDb::open(Config {
-            storage: StorageConfig::InMemory,
-            block_cache: Some(crate::config::BlockCacheConfig {
-                memory_capacity: 1024 * 1024,
-                disk_capacity: 1024 * 1024,
-                disk_path: "/nonexistent/path".to_string(),
-            }),
-            ..Default::default()
-        })
-        .await;
-        assert!(tsdb.is_ok(), "InMemory + block_cache should not fail");
     }
 }

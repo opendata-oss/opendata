@@ -2501,6 +2501,7 @@ dependencies = [
  "serde_yaml",
  "slatedb",
  "slatedb-common",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

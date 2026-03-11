@@ -162,30 +162,9 @@ impl TimeSeriesDbReader {
             ..Default::default()
         };
 
-        let mut runtime = StorageReaderRuntime::new();
-        if let Some(ref cache_config) = config.block_cache {
-            if matches!(config.storage, common::StorageConfig::SlateDb(_)) {
-                let hybrid_config = common::HybridCacheConfig {
-                    memory_capacity: cache_config.memory_capacity,
-                    disk_capacity: cache_config.disk_capacity,
-                    disk_path: cache_config.disk_path.clone(),
-                };
-                let cache = common::create_hybrid_cache(&hybrid_config).await?;
-                runtime = runtime.with_block_cache(Arc::new(cache));
-                tracing::info!(
-                    memory_mb = cache_config.memory_capacity / (1024 * 1024),
-                    disk_mb = cache_config.disk_capacity / (1024 * 1024),
-                    disk_path = %cache_config.disk_path,
-                    "hybrid block cache enabled"
-                );
-            } else {
-                tracing::warn!("block_cache config ignored for non-SlateDB storage");
-            }
-        }
-
         let storage = create_storage_read(
             &config.storage,
-            runtime,
+            StorageReaderRuntime::new(),
             StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
             reader_options,
         )
@@ -532,6 +511,7 @@ mod tests {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            block_cache: None,
         });
 
         // 1. Open writer and write data
@@ -539,7 +519,6 @@ mod tests {
             storage: storage_config.clone(),
             flush_interval: Duration::from_secs(60),
             retention: None,
-            block_cache: None,
         })
         .await
         .unwrap();
@@ -644,13 +623,13 @@ mod tests {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            block_cache: None,
         });
 
         let writer = TimeSeriesDb::open(Config {
             storage: storage_config.clone(),
             flush_interval: Duration::from_secs(60),
             retention: None,
-            block_cache: None,
         })
         .await
         .unwrap();
@@ -671,7 +650,6 @@ mod tests {
             storage: storage_config,
             flush_interval: Duration::from_secs(60),
             retention: None,
-            block_cache: None,
         })
         .await
         .unwrap();
@@ -831,23 +809,5 @@ cache_capacity: 200
         let storage = create_shared_storage();
         let reader = TimeSeriesDbReader::from_storage_with_capacity(storage, 123);
         assert_eq!(reader.query_cache.policy().max_capacity(), Some(123));
-    }
-
-    #[tokio::test]
-    async fn open_reader_with_inmemory_and_block_cache_ignores_cache() {
-        let reader = TimeSeriesDbReader::open(ReaderConfig {
-            storage: common::StorageConfig::InMemory,
-            block_cache: Some(crate::config::BlockCacheConfig {
-                memory_capacity: 1024 * 1024,
-                disk_capacity: 1024 * 1024,
-                disk_path: "/nonexistent/path".to_string(),
-            }),
-            ..Default::default()
-        })
-        .await;
-        assert!(
-            reader.is_ok(),
-            "InMemory + block_cache should not fail for reader"
-        );
     }
 }

@@ -28,7 +28,6 @@ use serde_with::{DurationMilliSeconds, serde_as};
 ///     storage: StorageConfig::default(),
 ///     flush_interval: Duration::from_secs(30),
 ///     retention: Some(Duration::from_secs(86400 * 7)), // 7 days
-///     block_cache: None,
 /// };
 /// let ts = timeseries::TimeSeriesDb::open(config).await?;
 /// # Ok(())
@@ -53,12 +52,6 @@ pub struct Config {
     /// Data older than this duration may be automatically deleted during
     /// compaction. Set to `None` to retain data indefinitely.
     pub retention: Option<Duration>,
-
-    /// Block cache configuration.
-    ///
-    /// When set, enables a hybrid (in-memory + on-disk) block cache for SST
-    /// block lookups. This is used by both the writer and reader paths.
-    pub block_cache: Option<BlockCacheConfig>,
 }
 
 impl Default for Config {
@@ -67,7 +60,6 @@ impl Default for Config {
             storage: StorageConfig::default(),
             flush_interval: Duration::from_secs(60),
             retention: None,
-            block_cache: None,
         }
     }
 }
@@ -119,37 +111,6 @@ pub struct ReaderConfig {
     /// Defaults to 50.
     #[serde(default = "default_cache_capacity")]
     pub cache_capacity: u64,
-
-    /// Block cache configuration.
-    ///
-    /// When set, enables a hybrid (in-memory + on-disk) block cache for SST
-    /// block lookups. This dramatically reduces S3 reads by caching hot blocks
-    /// in RAM and warm blocks on local disk (ideally NVMe).
-    #[serde(default)]
-    pub block_cache: Option<BlockCacheConfig>,
-}
-
-/// Configuration for the hybrid block cache.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlockCacheConfig {
-    /// In-memory cache capacity in bytes.
-    ///
-    /// Hot SST blocks are served directly from memory. Set this to a
-    /// significant fraction of available RAM (e.g., 8-12 GiB on a 32 GiB node).
-    pub memory_capacity: u64,
-
-    /// On-disk cache capacity in bytes.
-    ///
-    /// Evicted blocks spill to local disk. Best performance with NVMe SSDs.
-    /// Set to the usable capacity of the local disk (e.g., 140 GiB on a
-    /// 150 GiB NVMe drive).
-    pub disk_capacity: u64,
-
-    /// Path for the on-disk cache directory.
-    ///
-    /// Should point to a fast local disk, ideally an NVMe instance store
-    /// volume (e.g., `/mnt/nvme/block-cache`).
-    pub disk_path: String,
 }
 
 fn default_refresh_interval() -> Duration {
@@ -169,7 +130,6 @@ impl Default for ReaderConfig {
             storage: StorageConfig::default(),
             refresh_interval: default_refresh_interval(),
             cache_capacity: default_cache_capacity(),
-            block_cache: None,
         }
     }
 }
