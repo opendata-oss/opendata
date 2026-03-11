@@ -122,8 +122,8 @@ struct BatchWriter {
     object_store: Arc<dyn ObjectStore>,
     producer: Arc<QueueProducer>,
     path_prefix: String,
-    batch_interval: Duration,
-    batch_max_bytes: usize,
+    flush_interval: Duration,
+    flush_size_bytes: usize,
     batch: Batch,
     clock: Arc<dyn Clock>,
 }
@@ -132,10 +132,10 @@ impl BatchWriter {
     async fn run(&mut self, mut rx: mpsc::Receiver<IngestMessage>, shutdown: CancellationToken) {
         loop {
             let sleep_duration = match self.batch.started_at {
-                Some(started) => (started + self.batch_interval)
+                Some(started) => (started + self.flush_interval)
                     .duration_since(self.clock.now())
                     .unwrap_or(Duration::ZERO),
-                None => self.batch_interval,
+                None => self.flush_interval,
             };
 
             tokio::select! {
@@ -148,7 +148,7 @@ impl BatchWriter {
                     match msg {
                         Some(IngestMessage::Write { entries, ingestion_time_ms, notifier }) => {
                             self.batch.add(entries, ingestion_time_ms, notifier, self.clock.now());
-                            if self.batch.size_bytes >= self.batch_max_bytes {
+                            if self.batch.size_bytes >= self.flush_size_bytes {
                                 let _ = self.write_batch().await;
                             }
                         }
@@ -270,8 +270,8 @@ impl Ingestor {
             object_store,
             producer: Arc::clone(&producer),
             path_prefix: config.data_path_prefix,
-            batch_interval: config.flush_interval,
-            batch_max_bytes: config.flush_size_bytes,
+            flush_interval: config.flush_interval,
+            flush_size_bytes: config.flush_size_bytes,
             batch: Batch::new(),
             clock: Arc::clone(&clock),
         };
