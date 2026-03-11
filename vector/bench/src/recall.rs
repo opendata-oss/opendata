@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use bencher::{Bench, Benchmark, Params, Summary};
 use common::StorageRuntime;
 use common::storage::factory::{FoyerCache, FoyerCacheOptions};
-use vector::{Config, DistanceMetric, SearchResult, Vector, VectorDb};
+use vector::{Config, DistanceMetric, SearchResult, Vector, VectorDb, VectorDbRead};
 
 const DEFAULT_NUM_QUERIES: usize = 100;
 
