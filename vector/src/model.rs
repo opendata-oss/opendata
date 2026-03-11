@@ -328,6 +328,93 @@ pub struct SearchResult {
     pub attributes: HashMap<String, AttributeValue>,
 }
 
+/// Query specification for vector search.
+///
+/// Constructed using the builder pattern:
+///
+/// ```ignore
+/// let query = Query::new(embedding)
+///     .with_limit(10)
+///     .with_filter(Filter::eq("category", "shoes"));
+/// ```
+#[derive(Debug, Clone)]
+pub struct Query {
+    /// Query vector (required).
+    pub vector: Vec<f32>,
+    /// Maximum number of results to return (default: 10).
+    pub limit: usize,
+    /// Optional metadata filter.
+    pub filter: Option<Filter>,
+}
+
+impl Query {
+    /// Creates a new query with the given vector.
+    pub fn new(vector: Vec<f32>) -> Self {
+        Self {
+            vector,
+            limit: 10,
+            filter: None,
+        }
+    }
+
+    /// Sets the maximum number of results to return.
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Sets the metadata filter.
+    pub fn with_filter(mut self, filter: Filter) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+}
+
+/// Metadata filter for search queries.
+///
+/// Filters are composed using simple predicates and logical operators.
+/// All filters are evaluated against the metadata inverted indexes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Filter {
+    /// Field equals value.
+    Eq(String, AttributeValue),
+    /// Field not equals value.
+    Neq(String, AttributeValue),
+    /// Field is in set of values.
+    In(String, Vec<AttributeValue>),
+    /// All filters must match (logical AND).
+    And(Vec<Filter>),
+    /// Any filter must match (logical OR).
+    Or(Vec<Filter>),
+}
+
+impl Filter {
+    /// Creates an equality filter.
+    pub fn eq(field: impl Into<String>, value: impl Into<AttributeValue>) -> Self {
+        Filter::Eq(field.into(), value.into())
+    }
+
+    /// Creates a not-equals filter.
+    pub fn neq(field: impl Into<String>, value: impl Into<AttributeValue>) -> Self {
+        Filter::Neq(field.into(), value.into())
+    }
+
+    /// Creates an in-set filter.
+    pub fn in_set(field: impl Into<String>, values: Vec<AttributeValue>) -> Self {
+        Filter::In(field.into(), values)
+    }
+
+    /// Combines filters with logical AND.
+    pub fn and(filters: Vec<Filter>) -> Self {
+        Filter::And(filters)
+    }
+
+    /// Combines filters with logical OR.
+    pub fn or(filters: Vec<Filter>) -> Self {
+        Filter::Or(filters)
+    }
+}
+
 /// Helper to build a metadata map from attributes.
 pub(crate) fn attributes_to_map(attributes: &[Attribute]) -> HashMap<String, AttributeValue> {
     attributes

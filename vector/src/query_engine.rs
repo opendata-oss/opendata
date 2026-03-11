@@ -1,11 +1,12 @@
 use crate::error::{Error, Result};
 use crate::hnsw::CentroidGraph;
-use crate::model::{AttributeValue, SearchResult};
+use crate::model::{AttributeValue, Filter, Query, SearchResult};
 use crate::serde::collection_meta::DistanceMetric;
 use crate::serde::posting_list::PostingList;
 use crate::storage::VectorDbStorageReadExt;
 use crate::{Attribute, Vector, distance};
 use common::storage::StorageRead;
+use roaring::RoaringTreemap;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
@@ -78,33 +79,33 @@ impl QueryEngine {
         }))
     }
 
-    pub(crate) async fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
-        let nprobe = k.clamp(10, 100);
-        self.search_with_nprobe(query, k, nprobe).await
+    pub(crate) async fn search(&self, query: &Query) -> Result<Vec<SearchResult>> {
+        let nprobe = query.limit.clamp(10, 100);
+        self.search_with_nprobe(query, nprobe).await
     }
 
     pub(crate) async fn search_exact_nprobe(
         &self,
-        query: &[f32],
-        k: usize,
+        query: &Query,
         nprobe: usize,
     ) -> Result<Vec<SearchResult>> {
-        if query.len() != self.options.dimensions as usize {
+        if query.vector.len() != self.options.dimensions as usize {
             return Err(Error::InvalidInput(format!(
                 "Query dimension mismatch: expected {}, got {}",
                 self.options.dimensions,
-                query.len()
+                query.vector.len()
             )));
         }
 
         // Brute-force: compute distance from query to every centroid
         let num_centroids = self.centroid_graph.len();
-        let all_centroid_ids = self.centroid_graph.search(query, num_centroids);
+        let all_centroid_ids = self.centroid_graph.search(&query.vector, num_centroids);
         let mut scored: Vec<(u64, distance::VectorDistance)> = all_centroid_ids
             .iter()
             .filter_map(|&cid| {
                 let cv = self.centroid_graph.get_centroid_vector(cid)?;
-                let d = distance::compute_distance(query, &cv, self.options.distance_metric);
+                let d =
+                    distance::compute_distance(&query.vector, &cv, self.options.distance_metric);
                 Some((cid, d))
             })
             .collect();
@@ -115,33 +116,38 @@ impl QueryEngine {
             return Ok(Vec::new());
         }
 
-        let centroid_ids = self.prune_centroids(&centroid_ids, query);
+        let centroid_ids = self.prune_centroids(&centroid_ids, &query.vector);
 
-        let sorted_lists = self.load_and_score(&centroid_ids, query).await?;
+        let mut sorted_lists = self.load_and_score(&centroid_ids, &query.vector).await?;
         if sorted_lists.is_empty() {
             return Ok(Vec::new());
         }
-        self.resolve_top_k(sorted_lists, k).await
+
+        // Apply metadata filter
+        if let Some(filter) = &query.filter {
+            Self::apply_filter(&mut sorted_lists, filter, self.storage.as_ref()).await?;
+        }
+
+        self.resolve_top_k(sorted_lists, query.limit).await
     }
 
     pub(crate) async fn search_with_nprobe(
         &self,
-        query: &[f32],
-        k: usize,
+        query: &Query,
         nprobe: usize,
     ) -> Result<Vec<SearchResult>> {
         // 1. Validate query dimensions
-        if query.len() != self.options.dimensions as usize {
+        if query.vector.len() != self.options.dimensions as usize {
             return Err(Error::InvalidInput(format!(
                 "Query dimension mismatch: expected {}, got {}",
                 self.options.dimensions,
-                query.len()
+                query.vector.len()
             )));
         }
 
         // 2. Search HNSW for nearest centroids
         let num_centroids = nprobe;
-        let centroid_ids = self.centroid_graph.search(query, num_centroids);
+        let centroid_ids = self.centroid_graph.search(&query.vector, num_centroids);
         debug!(
             "searched for {} centroids, found: {}",
             num_centroids,
@@ -154,23 +160,28 @@ impl QueryEngine {
 
         // 3. Dynamic pruning: skip posting lists whose centroids are far from query
         let original_ncentroids = centroid_ids.len();
-        let centroid_ids = self.prune_centroids(&centroid_ids, query);
+        let centroid_ids = self.prune_centroids(&centroid_ids, &query.vector);
         debug!(
             "query: {:?}, before pruning: {} centroids, after dynamic pruning: {} centroids",
-            query,
+            query.vector,
             original_ncentroids,
             centroid_ids.len()
         );
 
         // 4. Load posting lists and score candidates
-        let sorted_lists = self.load_and_score(&centroid_ids, query).await?;
+        let mut sorted_lists = self.load_and_score(&centroid_ids, &query.vector).await?;
 
         if sorted_lists.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 5. K-way merge and resolve top-k forward index lookups
-        self.resolve_top_k(sorted_lists, k).await
+        // 5. Apply metadata filter (if provided)
+        if let Some(filter) = &query.filter {
+            Self::apply_filter(&mut sorted_lists, filter, self.storage.as_ref()).await?;
+        }
+
+        // 6. K-way merge and resolve top-k forward index lookups
+        self.resolve_top_k(sorted_lists, query.limit).await
     }
 
     /// Apply query-aware dynamic pruning
@@ -341,6 +352,91 @@ impl QueryEngine {
 
         Ok(results)
     }
+
+    /// Apply a metadata filter to scored candidate lists.
+    ///
+    /// Collects all candidate IDs into a bitmap, evaluates the filter against
+    /// the inverted index, then retains only candidates that pass the filter.
+    async fn apply_filter(
+        sorted_lists: &mut [Vec<ScoredCandidate>],
+        filter: &Filter,
+        storage: &dyn StorageRead,
+    ) -> Result<()> {
+        // Collect all candidate internal IDs
+        let mut candidates = RoaringTreemap::new();
+        for list in sorted_lists.iter() {
+            for candidate in list {
+                candidates.insert(candidate.internal_id);
+            }
+        }
+
+        // Evaluate filter to get allowed IDs
+        let allowed = Self::evaluate_filter(filter, &candidates, storage).await?;
+
+        // Filter each list
+        for list in sorted_lists.iter_mut() {
+            list.retain(|c| allowed.contains(c.internal_id));
+        }
+
+        Ok(())
+    }
+
+    /// Recursively evaluate a filter against the metadata inverted index.
+    ///
+    /// Returns a bitmap of vector IDs that match the filter.
+    /// For Neq, the `candidates` bitmap is used as the universe for complement.
+    fn evaluate_filter<'a>(
+        filter: &'a Filter,
+        candidates: &'a RoaringTreemap,
+        storage: &'a dyn StorageRead,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RoaringTreemap>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            match filter {
+                Filter::Eq(field, value) => {
+                    let field_value: crate::serde::FieldValue = value.clone().into();
+                    let bitmap = storage.get_metadata_index(field, field_value).await?;
+                    Ok(bitmap.vector_ids)
+                }
+                Filter::Neq(field, value) => {
+                    let field_value: crate::serde::FieldValue = value.clone().into();
+                    let bitmap = storage.get_metadata_index(field, field_value).await?;
+                    let mut result = candidates.clone();
+                    result -= &bitmap.vector_ids;
+                    Ok(result)
+                }
+                Filter::In(field, values) => {
+                    let mut result = RoaringTreemap::new();
+                    for value in values {
+                        let field_value: crate::serde::FieldValue = value.clone().into();
+                        let bitmap = storage.get_metadata_index(field, field_value).await?;
+                        result |= &bitmap.vector_ids;
+                    }
+                    Ok(result)
+                }
+                Filter::And(filters) => {
+                    if filters.is_empty() {
+                        return Ok(candidates.clone());
+                    }
+                    let mut result =
+                        Self::evaluate_filter(&filters[0], candidates, storage).await?;
+                    for f in &filters[1..] {
+                        let sub = Self::evaluate_filter(f, candidates, storage).await?;
+                        result &= &sub;
+                    }
+                    Ok(result)
+                }
+                Filter::Or(filters) => {
+                    let mut result = RoaringTreemap::new();
+                    for f in filters {
+                        let sub = Self::evaluate_filter(f, candidates, storage).await?;
+                        result |= &sub;
+                    }
+                    Ok(result)
+                }
+            }
+        })
+    }
 }
 
 struct ScoredCandidate {
@@ -375,7 +471,7 @@ impl Ord for MergeEntry {
 mod tests {
     use crate::AttributeValue;
     use crate::db::{VectorDb, VectorDbRead};
-    use crate::model::{Config, VECTOR_FIELD_NAME, Vector};
+    use crate::model::{Config, Query, VECTOR_FIELD_NAME, Vector};
     use crate::serde::collection_meta::DistanceMetric;
     use common::{StorageConfig, StorageRuntime};
 
@@ -512,8 +608,8 @@ mod tests {
         db.flush().await.unwrap();
 
         // when - search for vector similar to cluster 0
-        let query = vec![1.0; 128];
-        let results = db.query_engine().search(&query, 10).await.unwrap();
+        let q = Query::new(vec![1.0; 128]).with_limit(10);
+        let results = db.query_engine().search(&q).await.unwrap();
 
         // then - should find vectors from cluster 0
         assert_eq!(results.len(), 10);
@@ -552,7 +648,7 @@ mod tests {
         // when - search
         let results = db
             .query_engine()
-            .search(&[1.0, 0.0, 0.0], 10)
+            .search(&Query::new(vec![1.0, 0.0, 0.0]).with_limit(10))
             .await
             .unwrap();
 
@@ -586,7 +682,11 @@ mod tests {
         db.flush().await.unwrap();
 
         // when - search for vectors near origin
-        let results = db.query_engine().search(&[0.0, 0.0, 0.0], 3).await.unwrap();
+        let results = db
+            .query_engine()
+            .search(&Query::new(vec![0.0, 0.0, 0.0]).with_limit(3))
+            .await
+            .unwrap();
 
         // then - should be sorted by L2 distance (lower = better)
         assert_eq!(results.len(), 3);
@@ -610,7 +710,10 @@ mod tests {
         let db = VectorDb::open(config).await.unwrap();
 
         // when - query with wrong dimensions
-        let result = db.query_engine().search(&[1.0, 2.0], 10).await;
+        let result = db
+            .query_engine()
+            .search(&Query::new(vec![1.0, 2.0]).with_limit(10))
+            .await;
 
         // then - should fail
         assert!(result.is_err());
@@ -631,7 +734,7 @@ mod tests {
         // when
         let results = db
             .query_engine()
-            .search(&[1.0, 0.0, 0.0], 10)
+            .search(&Query::new(vec![1.0, 0.0, 0.0]).with_limit(10))
             .await
             .unwrap();
 
@@ -652,11 +755,217 @@ mod tests {
         db.flush().await.unwrap();
 
         // when - search for k=5
-        let results = db.query_engine().search(&[1.0, 0.0], 5).await.unwrap();
+        let results = db
+            .query_engine()
+            .search(&Query::new(vec![1.0, 0.0]).with_limit(5))
+            .await
+            .unwrap();
 
         // then
         assert_eq!(results.len(), 5);
     }
+
+    // --- Filter tests ---
+
+    use crate::model::{Filter, MetadataFieldSpec};
+    use crate::serde::FieldType;
+
+    fn create_filterable_config() -> Config {
+        Config {
+            storage: StorageConfig::InMemory,
+            dimensions: 3,
+            distance_metric: DistanceMetric::L2,
+            metadata_fields: vec![
+                MetadataFieldSpec::new("category", FieldType::String, true),
+                MetadataFieldSpec::new("price", FieldType::Int64, true),
+                MetadataFieldSpec::new("active", FieldType::Bool, true),
+            ],
+            ..Default::default()
+        }
+    }
+
+    async fn setup_filterable_db() -> VectorDb {
+        let config = create_filterable_config();
+        let db = VectorDb::open(config).await.unwrap();
+
+        let vectors = vec![
+            Vector::builder("shoes-1", vec![1.0, 0.0, 0.0])
+                .attribute("category", "shoes")
+                .attribute("price", 50i64)
+                .attribute("active", true)
+                .build(),
+            Vector::builder("shoes-2", vec![0.9, 0.1, 0.0])
+                .attribute("category", "shoes")
+                .attribute("price", 100i64)
+                .attribute("active", false)
+                .build(),
+            Vector::builder("boots-1", vec![0.0, 1.0, 0.0])
+                .attribute("category", "boots")
+                .attribute("price", 150i64)
+                .attribute("active", true)
+                .build(),
+            Vector::builder("hats-1", vec![0.0, 0.0, 1.0])
+                .attribute("category", "hats")
+                .attribute("price", 25i64)
+                .attribute("active", true)
+                .build(),
+        ];
+        db.write(vectors).await.unwrap();
+        db.flush().await.unwrap();
+        db
+    }
+
+    /// Collect result IDs into a sorted Vec for deterministic comparison.
+    fn result_ids(results: &[crate::model::SearchResult]) -> Vec<String> {
+        let mut ids: Vec<String> = results.iter().map(|r| r.external_id.clone()).collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn should_filter_with_eq() {
+        let db = setup_filterable_db().await;
+
+        let q = Query::new(vec![1.0, 0.0, 0.0])
+            .with_limit(10)
+            .with_filter(Filter::eq("category", "shoes"));
+        let results = db.search(&q).await.unwrap();
+
+        assert_eq!(result_ids(&results), vec!["shoes-1", "shoes-2"]);
+    }
+
+    #[tokio::test]
+    async fn should_filter_with_neq() {
+        let db = setup_filterable_db().await;
+
+        let q = Query::new(vec![1.0, 0.0, 0.0])
+            .with_limit(10)
+            .with_filter(Filter::neq("category", "shoes"));
+        let results = db.search(&q).await.unwrap();
+
+        assert_eq!(result_ids(&results), vec!["boots-1", "hats-1"]);
+    }
+
+    #[tokio::test]
+    async fn should_filter_with_in() {
+        let db = setup_filterable_db().await;
+
+        let q = Query::new(vec![1.0, 0.0, 0.0])
+            .with_limit(10)
+            .with_filter(Filter::in_set(
+                "category",
+                vec!["shoes".into(), "boots".into()],
+            ));
+        let results = db.search(&q).await.unwrap();
+
+        assert_eq!(result_ids(&results), vec!["boots-1", "shoes-1", "shoes-2"]);
+    }
+
+    #[tokio::test]
+    async fn should_filter_with_and() {
+        let db = setup_filterable_db().await;
+
+        // category=shoes AND active=true -> only shoes-1
+        let q = Query::new(vec![1.0, 0.0, 0.0])
+            .with_limit(10)
+            .with_filter(Filter::and(vec![
+                Filter::eq("category", "shoes"),
+                Filter::eq("active", true),
+            ]));
+        let results = db.search(&q).await.unwrap();
+
+        assert_eq!(result_ids(&results), vec!["shoes-1"]);
+    }
+
+    #[tokio::test]
+    async fn should_filter_with_or() {
+        let db = setup_filterable_db().await;
+
+        // category=hats OR category=boots -> boots-1 and hats-1
+        let q = Query::new(vec![1.0, 0.0, 0.0])
+            .with_limit(10)
+            .with_filter(Filter::or(vec![
+                Filter::eq("category", "hats"),
+                Filter::eq("category", "boots"),
+            ]));
+        let results = db.search(&q).await.unwrap();
+
+        assert_eq!(result_ids(&results), vec!["boots-1", "hats-1"]);
+    }
+
+    #[tokio::test]
+    async fn should_filter_with_int_eq() {
+        let db = setup_filterable_db().await;
+
+        let q = Query::new(vec![1.0, 0.0, 0.0])
+            .with_limit(10)
+            .with_filter(Filter::eq("price", 50i64));
+        let results = db.search(&q).await.unwrap();
+
+        assert_eq!(result_ids(&results), vec!["shoes-1"]);
+    }
+
+    #[tokio::test]
+    async fn should_return_empty_when_filter_matches_nothing() {
+        let db = setup_filterable_db().await;
+
+        let q = Query::new(vec![1.0, 0.0, 0.0])
+            .with_limit(10)
+            .with_filter(Filter::eq("category", "sandals"));
+        let results = db.search(&q).await.unwrap();
+
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_search_without_filter() {
+        let db = setup_filterable_db().await;
+
+        // No filter - should return all 4 vectors
+        let q = Query::new(vec![1.0, 0.0, 0.0]).with_limit(10);
+        let results = db.search(&q).await.unwrap();
+
+        assert_eq!(
+            result_ids(&results),
+            vec!["boots-1", "hats-1", "shoes-1", "shoes-2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn should_filter_with_nested_and_or() {
+        let db = setup_filterable_db().await;
+
+        // (category=shoes AND active=true) OR category=hats -> shoes-1 and hats-1
+        let q = Query::new(vec![1.0, 0.0, 0.0])
+            .with_limit(10)
+            .with_filter(Filter::or(vec![
+                Filter::and(vec![
+                    Filter::eq("category", "shoes"),
+                    Filter::eq("active", true),
+                ]),
+                Filter::eq("category", "hats"),
+            ]));
+        let results = db.search(&q).await.unwrap();
+
+        assert_eq!(result_ids(&results), vec!["hats-1", "shoes-1"]);
+    }
+
+    #[tokio::test]
+    async fn should_respect_limit_with_filter() {
+        let db = setup_filterable_db().await;
+
+        // Filter matches 3 results but limit is 1
+        let q = Query::new(vec![1.0, 0.0, 0.0])
+            .with_limit(1)
+            .with_filter(Filter::neq("category", "hats"));
+        let results = db.search(&q).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        // Closest to [1,0,0] among shoes-1, shoes-2, boots-1 is shoes-1
+        assert_eq!(results[0].external_id, "shoes-1");
+    }
+
+    // --- Search tests ---
 
     #[tokio::test]
     async fn should_search_across_multiple_centroids() {
@@ -679,7 +988,11 @@ mod tests {
         db.flush().await.unwrap();
 
         // when - search in between centroids 1 and 2
-        let results = db.query_engine().search(&[0.7, 0.7], 10).await.unwrap();
+        let results = db
+            .query_engine()
+            .search(&Query::new(vec![0.7, 0.7]).with_limit(10))
+            .await
+            .unwrap();
 
         // then - should find vectors from multiple centroids
         assert!(!results.is_empty());

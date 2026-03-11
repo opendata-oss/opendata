@@ -19,13 +19,14 @@ use crate::flusher::VectorDbFlusher;
 use crate::hnsw::{CentroidGraph, build_centroid_graph};
 use crate::lire::rebalancer::{IndexRebalancer, IndexRebalancerOpts};
 use crate::model::{
-    AttributeValue, Config, SearchResult, VECTOR_FIELD_NAME, Vector, attributes_to_map,
+    AttributeValue, Config, Query, SearchResult, VECTOR_FIELD_NAME, Vector, attributes_to_map,
 };
 use crate::query_engine::{QueryEngine, QueryEngineOptions};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::key::SeqBlockKey;
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
+use async_trait::async_trait;
 use common::SequenceAllocator;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};
 use common::storage::factory::create_storage;
@@ -40,6 +41,7 @@ pub(crate) const WRITE_CHANNEL: &str = "write";
 pub(crate) const REBALANCE_CHANNEL: &str = "rebalance";
 
 /// Trait for querying the vector db
+#[async_trait]
 pub trait VectorDbRead {
     /// Search for k-nearest neighbors to a query vector.
     ///
@@ -50,8 +52,7 @@ pub trait VectorDbRead {
     /// 4. Score candidates and return top-k
     ///
     /// # Arguments
-    /// * `query` - Query vector
-    /// * `k` - Number of nearest neighbors to return
+    /// * `query` - search query
     ///
     /// # Returns
     /// Vector of SearchResults sorted by similarity (best first)
@@ -60,18 +61,9 @@ pub trait VectorDbRead {
     /// Returns an error if:
     /// - Query dimensions don't match collection dimensions
     /// - Storage read fails
-    fn search(
-        &self,
-        query: &[f32],
-        k: usize,
-    ) -> impl std::future::Future<Output = Result<Vec<SearchResult>>> + Send;
+    async fn search(&self, query: &Query) -> Result<Vec<SearchResult>>;
 
-    fn search_with_nprobe(
-        &self,
-        query: &[f32],
-        k: usize,
-        nprobe: usize,
-    ) -> impl std::future::Future<Output = Result<Vec<SearchResult>>> + Send;
+    async fn search_with_nprobe(&self, query: &Query, nprobe: usize) -> Result<Vec<SearchResult>>;
 
     /// Retrieve a vector record by its external ID.
     ///
@@ -85,7 +77,7 @@ pub trait VectorDbRead {
     /// # Returns
     ///
     /// `Some(VectorRecord)` if found, `None` if not found or deleted.
-    fn get(&self, id: &str) -> impl std::future::Future<Output = Result<Option<Vector>>> + Send;
+    async fn get(&self, id: &str) -> Result<Option<Vector>>;
 }
 
 /// Vector database for storing and querying embedding vectors.
@@ -222,6 +214,7 @@ impl VectorDb {
                 rebalance_backpressure_resume_threshold: config
                     .rebalance_backpressure_resume_threshold,
                 split_threshold_vectors: config.split_threshold_vectors,
+                indexed_fields: VectorDbDeltaOpts::indexed_fields_from(&config.metadata_fields),
             },
             dictionary: Arc::clone(&dictionary),
             centroid_graph: Arc::clone(&centroid_graph),
@@ -662,34 +655,23 @@ impl VectorDb {
     }
 
     /// Search using brute-force centroid lookup (for diagnostics).
-    /// Compares all centroids to the query to find the true nearest ones,
-    /// bypassing HNSW entirely.
     pub async fn search_exact_nprobe(
         &self,
-        query: &[f32],
-        k: usize,
+        query: &Query,
         nprobe: usize,
     ) -> Result<Vec<SearchResult>> {
-        self.query_engine()
-            .search_exact_nprobe(query, k, nprobe)
-            .await
+        self.query_engine().search_exact_nprobe(query, nprobe).await
     }
 }
 
+#[async_trait]
 impl VectorDbRead for VectorDb {
-    async fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
-        self.query_engine().search(query, k).await
+    async fn search(&self, query: &Query) -> Result<Vec<SearchResult>> {
+        self.query_engine().search(query).await
     }
 
-    async fn search_with_nprobe(
-        &self,
-        query: &[f32],
-        k: usize,
-        nprobe: usize,
-    ) -> Result<Vec<SearchResult>> {
-        self.query_engine()
-            .search_with_nprobe(query, k, nprobe)
-            .await
+    async fn search_with_nprobe(&self, query: &Query, nprobe: usize) -> Result<Vec<SearchResult>> {
+        self.query_engine().search_with_nprobe(query, nprobe).await
     }
 
     async fn get(&self, id: &str) -> Result<Option<Vector>> {
@@ -889,7 +871,10 @@ mod tests {
             .unwrap();
 
         // then - should be able to search (dictionary and centroids loaded from storage)
-        let results = db2.search(&[1.0, 0.0, 0.0], 10).await.unwrap();
+        let results = db2
+            .search(&Query::new(vec![1.0, 0.0, 0.0]).with_limit(10))
+            .await
+            .unwrap();
         assert!(!results.is_empty());
     }
 
@@ -929,7 +914,10 @@ mod tests {
 
         // Reopen from durable state — data should be visible
         let db2 = VectorDb::open(config).await.unwrap();
-        let results = db2.search(&[1.0, 0.0, 0.0], 10).await.unwrap();
+        let results = db2
+            .search(&Query::new(vec![1.0, 0.0, 0.0]).with_limit(10))
+            .await
+            .unwrap();
         assert!(
             !results.is_empty(),
             "expected data to be durable after flush, but search returned no results"
@@ -937,6 +925,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::needless_return)]
     async fn close_without_explicit_flush_guarantees_durability() {
         use common::storage::config::{
             LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
@@ -970,7 +959,10 @@ mod tests {
 
         // Reopen and verify the vector survived
         let db2 = VectorDb::open(config).await.unwrap();
-        let results = db2.search(&[1.0, 0.0, 0.0], 1).await.unwrap();
+        let results = db2
+            .search(&Query::new(vec![1.0, 0.0, 0.0]).with_limit(1))
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].external_id, "vec-1");
     }
