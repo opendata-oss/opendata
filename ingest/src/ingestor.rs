@@ -11,14 +11,8 @@ use tokio_util::sync::CancellationToken;
 use crate::config::IngestorConfig;
 use crate::error::{Error, Result};
 use crate::model::encode_batch;
-use crate::queue::QueueProducer;
+use crate::queue::{Metadata, QueueProducer};
 use crate::util::millis;
-
-/// A single entry to be ingested, pairing opaque data with optional metadata.
-pub struct IngestEntry {
-    pub data: Bytes,
-    pub metadata: Bytes,
-}
 
 type Notifier = tokio::sync::watch::Sender<Option<Result<()>>>;
 
@@ -51,7 +45,8 @@ pub struct WriteHandle {
 
 enum IngestMessage {
     Write {
-        entries: Vec<IngestEntry>,
+        entries: Vec<Bytes>,
+        metadata: Bytes,
         ingestion_time_ms: i64,
         notifier: Notifier,
     },
@@ -60,11 +55,21 @@ enum IngestMessage {
     },
 }
 
-struct Batch {
+#[derive(Default)]
+struct DataAndNotifiers {
     entries: Vec<Bytes>,
-    metadata: Vec<Bytes>,
-    ingestion_time_ms: i64,
+    metadata: Vec<Metadata>,
     notifiers: Vec<Notifier>,
+}
+
+impl DataAndNotifiers {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.metadata.is_empty() && self.notifiers.is_empty()
+    }
+}
+
+struct Batch {
+    data_and_notifiers: DataAndNotifiers,
     size_bytes: usize,
     started_at: Option<SystemTime>,
 }
@@ -72,10 +77,7 @@ struct Batch {
 impl Batch {
     fn new() -> Self {
         Self {
-            entries: Vec::new(),
-            metadata: Vec::new(),
-            ingestion_time_ms: 0,
-            notifiers: Vec::new(),
+            data_and_notifiers: DataAndNotifiers::default(),
             size_bytes: 0,
             started_at: None,
         }
@@ -83,38 +85,34 @@ impl Batch {
 
     fn add(
         &mut self,
-        entries: Vec<IngestEntry>,
+        entries: Vec<Bytes>,
+        metadata: Bytes,
         ingestion_time_ms: i64,
         notifier: Notifier,
         now: SystemTime,
     ) {
-        for entry in entries {
-            self.size_bytes += entry.data.len();
-            self.entries.push(entry.data);
-            self.metadata.push(entry.metadata);
-        }
-        if self.ingestion_time_ms == 0 {
-            self.ingestion_time_ms = ingestion_time_ms;
-        }
-        self.notifiers.push(notifier);
+        let start_index = self.data_and_notifiers.entries.len() as u32;
+        self.size_bytes += entries.iter().map(|e| e.len()).sum::<usize>();
+        self.data_and_notifiers.entries.extend(entries);
+        self.data_and_notifiers.metadata.push(Metadata {
+            start_index,
+            ingestion_time_ms,
+            payload: metadata,
+        });
+        self.data_and_notifiers.notifiers.push(notifier);
         if self.started_at.is_none() {
             self.started_at = Some(now);
         }
     }
 
-    fn take(&mut self) -> (Vec<Bytes>, Vec<Bytes>, i64, Vec<Notifier>) {
+    fn take(&mut self) -> DataAndNotifiers {
         self.size_bytes = 0;
         self.started_at = None;
-        (
-            std::mem::take(&mut self.entries),
-            std::mem::take(&mut self.metadata),
-            std::mem::replace(&mut self.ingestion_time_ms, 0),
-            std::mem::take(&mut self.notifiers),
-        )
+        std::mem::take(&mut self.data_and_notifiers)
     }
 
     fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.metadata.iter().all(|m| m.is_empty())
+        self.data_and_notifiers.is_empty()
     }
 }
 
@@ -146,8 +144,8 @@ impl BatchWriter {
                 },
                 msg = rx.recv() => {
                     match msg {
-                        Some(IngestMessage::Write { entries, ingestion_time_ms, notifier }) => {
-                            self.batch.add(entries, ingestion_time_ms, notifier, self.clock.now());
+                        Some(IngestMessage::Write { entries, metadata, ingestion_time_ms, notifier }) => {
+                            self.batch.add(entries, metadata, ingestion_time_ms, notifier, self.clock.now());
                             if self.batch.size_bytes >= self.flush_size_bytes {
                                 let _ = self.write_batch().await;
                             }
@@ -169,24 +167,19 @@ impl BatchWriter {
         if self.batch.is_empty() {
             return Ok(());
         }
-        let (entries, metadata, ingestion_time_ms, notifiers) = self.batch.take();
+        let data_and_notifiers = self.batch.take();
         let result = self
-            .write_and_enqueue(entries, metadata, ingestion_time_ms)
+            .write_and_enqueue(data_and_notifiers.entries, data_and_notifiers.metadata)
             .await;
 
-        for tx in notifiers {
+        for tx in data_and_notifiers.notifiers {
             let _ = tx.send(Some(result.clone()));
         }
 
         result
     }
 
-    async fn write_and_enqueue(
-        &self,
-        entries: Vec<Bytes>,
-        metadata: Vec<Bytes>,
-        ingestion_time_ms: i64,
-    ) -> Result<()> {
+    async fn write_and_enqueue(&self, entries: Vec<Bytes>, metadata: Vec<Metadata>) -> Result<()> {
         let non_empty: Vec<Bytes> = entries.into_iter().filter(|e| !e.is_empty()).collect();
         let location = if non_empty.is_empty() {
             String::new()
@@ -201,9 +194,7 @@ impl BatchWriter {
             path.to_string()
         };
 
-        self.producer
-            .enqueue(location, metadata, ingestion_time_ms)
-            .await?;
+        self.producer.enqueue(location, metadata).await?;
 
         Ok(())
     }
@@ -215,11 +206,17 @@ impl BatchWriter {
             match msg {
                 IngestMessage::Write {
                     entries,
+                    metadata,
                     ingestion_time_ms,
                     notifier,
                 } => {
-                    self.batch
-                        .add(entries, ingestion_time_ms, notifier, self.clock.now());
+                    self.batch.add(
+                        entries,
+                        metadata,
+                        ingestion_time_ms,
+                        notifier,
+                        self.clock.now(),
+                    );
                 }
                 IngestMessage::Flush { result_sender } => {
                     flush_result_senders.push(result_sender);
@@ -287,16 +284,20 @@ impl Ingestor {
         })
     }
 
-    /// Submit a set of entries for ingestion. Each entry pairs opaque data with metadata.
+    /// Submit a set of entries and associated metadata for ingestion.
     ///
     /// Returns a [`WriteHandle`] that can be used to check or await durability.
     /// Applies backpressure when the message buffer is full.
-    pub async fn ingest(&self, entries: Vec<IngestEntry>) -> Result<WriteHandle> {
+    pub async fn ingest(&self, entries: Vec<Bytes>, metadata: Bytes) -> Result<WriteHandle> {
+        if entries.is_empty() {
+            return Err(Error::InvalidInput("entries must not be empty".to_string()));
+        }
         let ingestion_time_ms = millis(self.clock.now());
         let (notifier_tx, notifier_rx) = tokio::sync::watch::channel(None);
         self.tx
             .send(IngestMessage::Write {
                 entries,
+                metadata,
                 ingestion_time_ms,
                 notifier: notifier_tx,
             })
@@ -352,13 +353,6 @@ mod tests {
         manifest.iter().map(|e| e.unwrap()).collect()
     }
 
-    fn ie(data: &str) -> IngestEntry {
-        IngestEntry {
-            data: Bytes::from(data.to_string()),
-            metadata: Bytes::new(),
-        }
-    }
-
     fn test_config() -> IngestorConfig {
         IngestorConfig {
             storage: StorageConfig::InMemory,
@@ -377,8 +371,14 @@ mod tests {
             Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        ingestor.ingest(vec![ie("data1")]).await.unwrap();
-        ingestor.ingest(vec![ie("data2")]).await.unwrap();
+        ingestor
+            .ingest(vec![Bytes::from("data1")], Bytes::new())
+            .await
+            .unwrap();
+        ingestor
+            .ingest(vec![Bytes::from("data2")], Bytes::new())
+            .await
+            .unwrap();
         ingestor.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
@@ -394,7 +394,10 @@ mod tests {
             Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        ingestor.ingest(vec![ie("mydata")]).await.unwrap();
+        ingestor
+            .ingest(vec![Bytes::from("mydata")], Bytes::new())
+            .await
+            .unwrap();
         ingestor.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
@@ -416,7 +419,10 @@ mod tests {
         let ingestor =
             Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
 
-        let mut watcher = ingestor.ingest(vec![ie("some-long-data")]).await.unwrap();
+        let mut watcher = ingestor
+            .ingest(vec![Bytes::from("some-long-data")], Bytes::new())
+            .await
+            .unwrap();
         watcher.watcher.await_durable().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
@@ -434,7 +440,10 @@ mod tests {
         let ingestor =
             Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
 
-        let mut watcher = ingestor.ingest(vec![ie("v1")]).await.unwrap();
+        let mut watcher = ingestor
+            .ingest(vec![Bytes::from("v1")], Bytes::new())
+            .await
+            .unwrap();
 
         assert!(watcher.watcher.result().is_none());
         let manifest_path = slatedb::object_store::path::Path::from("test/manifest");
@@ -453,7 +462,10 @@ mod tests {
             Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        let watcher = ingestor.ingest(vec![ie("v")]).await.unwrap();
+        let watcher = ingestor
+            .ingest(vec![Bytes::from("v")], Bytes::new())
+            .await
+            .unwrap();
 
         assert!(watcher.watcher.result().is_none());
 
@@ -475,8 +487,14 @@ mod tests {
             Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        let watcher1 = ingestor.ingest(vec![ie("data1")]).await.unwrap();
-        let watcher2 = ingestor.ingest(vec![ie("data2")]).await.unwrap();
+        let watcher1 = ingestor
+            .ingest(vec![Bytes::from("data1")], Bytes::new())
+            .await
+            .unwrap();
+        let watcher2 = ingestor
+            .ingest(vec![Bytes::from("data2")], Bytes::new())
+            .await
+            .unwrap();
 
         ingestor.flush().await.unwrap();
 
@@ -505,10 +523,16 @@ mod tests {
             Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
 
         // First ingest fills the single-slot buffer
-        ingestor.ingest(vec![ie("data1")]).await.unwrap();
+        ingestor
+            .ingest(vec![Bytes::from("data1")], Bytes::new())
+            .await
+            .unwrap();
 
         // Second ingest succeeds once the background task consumes the first message
-        ingestor.ingest(vec![ie("data2")]).await.unwrap();
+        ingestor
+            .ingest(vec![Bytes::from("data2")], Bytes::new())
+            .await
+            .unwrap();
 
         ingestor.flush().await.unwrap();
 
@@ -526,18 +550,16 @@ mod tests {
 
         let metadata = Bytes::from(r#"{"topic":"events"}"#);
         ingestor
-            .ingest(vec![IngestEntry {
-                data: Bytes::from("payload"),
-                metadata: metadata.clone(),
-            }])
+            .ingest(vec![Bytes::from("payload")], metadata.clone())
             .await
             .unwrap();
         ingestor.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].metadata, vec![metadata]);
-        assert_eq!(entries[0].ingestion_time_ms, 1_700_000_000_000);
+        assert_eq!(entries[0].metadata.len(), 1);
+        assert_eq!(entries[0].metadata[0].payload, metadata);
+        assert_eq!(entries[0].metadata[0].ingestion_time_ms, 1_700_000_000_000);
     }
 
     #[tokio::test]
@@ -547,7 +569,10 @@ mod tests {
             Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        ingestor.ingest(vec![ie("unflushed")]).await.unwrap();
+        ingestor
+            .ingest(vec![Bytes::from("unflushed")], Bytes::new())
+            .await
+            .unwrap();
 
         ingestor.close().await.unwrap();
 
@@ -567,10 +592,16 @@ mod tests {
             Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        ingestor.ingest(vec![ie("batch1")]).await.unwrap();
+        ingestor
+            .ingest(vec![Bytes::from("batch1")], Bytes::new())
+            .await
+            .unwrap();
         ingestor.flush().await.unwrap();
 
-        ingestor.ingest(vec![ie("batch2")]).await.unwrap();
+        ingestor
+            .ingest(vec![Bytes::from("batch2")], Bytes::new())
+            .await
+            .unwrap();
         ingestor.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
@@ -597,39 +628,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_enqueue_without_batch_when_data_empty_and_metadata_present() {
+    async fn should_not_flush_empty_batch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let ingestor =
             Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        let metadata = Bytes::from(r#"{"checkpoint":true}"#);
-        ingestor
-            .ingest(vec![IngestEntry {
-                data: Bytes::new(),
-                metadata: metadata.clone(),
-            }])
-            .await
-            .unwrap();
-        ingestor.flush().await.unwrap();
-
-        let entries = read_manifest_entries(&store, "test/manifest").await;
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].location.is_empty());
-        assert_eq!(entries[0].metadata, vec![metadata]);
-    }
-
-    #[tokio::test]
-    async fn should_skip_enqueue_when_data_and_metadata_empty() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
-                .unwrap();
-
-        ingestor.ingest(vec![]).await.unwrap();
         ingestor.flush().await.unwrap();
 
         let manifest_path = slatedb::object_store::path::Path::from("test/manifest");
         assert!(store.get(&manifest_path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn should_reject_empty_entries() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ingestor =
+            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+                .unwrap();
+
+        let result = ingestor.ingest(vec![], Bytes::new()).await;
+        assert!(matches!(result, Err(Error::InvalidInput(_))));
+
+        let result = ingestor.ingest(vec![], Bytes::from("meta")).await;
+        assert!(matches!(result, Err(Error::InvalidInput(_))));
     }
 }

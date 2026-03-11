@@ -2,6 +2,7 @@
 pub enum Error {
     Storage(String),
     Serialization(String),
+    InvalidInput(String),
     Fenced,
 }
 
@@ -12,6 +13,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Storage(msg) => write!(f, "Storage error: {}", msg),
             Error::Serialization(msg) => write!(f, "Serialization error: {}", msg),
+            Error::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
             Error::Fenced => write!(f, "consumer fenced: epoch mismatch"),
         }
     }

@@ -114,16 +114,18 @@ all entries with sequence numbers up to and including `through_sequence` from th
 #### Manifest Format
 
 The queue manifest uses a compact binary format that supports appending new entries
-without deserializing existing entries. Each entry records the object storage location,
-ingestion time, and optional extensible metadata:
+without deserializing existing entries. Each entry records the object storage location
+and a list of metadata items that describe ranges of records in the data batch:
 
 ```ascii
 ┌──────────────────────────────────────────────────────────────┐
 │  entry 0: [entry_len: u32 LE][sequence: u64 LE]              │
 │           [location_len: u16 LE][location: bytes]            │
-│           [ingestion_time_ms: i64 LE]                        │
-│           [metadata_count: u32 LE]        ← optional         │
-│           [metadata 0: [len: u32 LE][data: bytes]]           │
+│           [metadata_count: u32 LE]                           │
+│           [metadata 0: [start_index: u32 LE]                 │
+│                        [ingestion_time_ms: i64 LE]           │
+│                        [payload_len: u32 LE]                 │
+│                        [payload: bytes]]                     │
 │           [metadata 1: ...]                                  │
 │  entry 1: ...                                                │
 │  ...                                                         │
@@ -137,18 +139,19 @@ ingestion time, and optional extensible metadata:
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- `entry_len` is the total number of bytes after this field.
-  Without metadata: `8 + 2 + location_len + 8`.
-  With metadata: `8 + 2 + location_len + 8 + 4 + Σ(4 + metadata_i_len)`.
+- `entry_len` is the total number of bytes after this field:
+  `8 + 2 + location_len + 4 + Σ(4 + 8 + 4 + payload_i_len)`.
 - `sequence` is a monotonically increasing u64, auto-assigned by the manifest on append.
   Sequences are contiguous but can start at any value (e.g., after dequeue, entries 5,6,7 are valid).
 - `location` is the UTF-8 encoded object storage path of the data batch.
-- `ingestion_time_ms` is the wall-clock time in milliseconds since the Unix epoch when the entry was enqueued.
-- `metadata_count` and the subsequent length-prefixed metadata items are only present when at least one
-  metadata item is non-empty. Each metadata item is an opaque byte payload preceded by its length as a
-  little-endian `u32`. When all metadata items are empty, the metadata section is omitted entirely and
-  `entry_len` covers only the fixed fields. The decoder detects the presence of metadata by comparing
-  `entry_len` against the fixed-fields size.
+- `metadata_count` is the number of metadata items in this entry. Each metadata item describes a range
+  of records in the data batch that share the same metadata and ingestion time.
+- Each metadata item contains:
+  - `start_index` (u32 LE): the index of the first record in the data batch to which this metadata applies.
+    The range extends to the next metadata item's `start_index` or to the end of the batch.
+  - `ingestion_time_ms` (i64 LE): wall-clock time in milliseconds since the Unix epoch when
+    the records in this range were ingested.
+  - `payload_len` (u32 LE) and `payload` (bytes): an opaque byte payload of application-defined metadata.
 - The footer is always the last 22 bytes. `next_sequence` stores the sequence number that will be assigned
   to the next appended entry. `epoch` is a monotonically increasing counter used for consumer fencing:
   a new consumer increments the epoch on initialization, and only a consumer whose epoch matches the
@@ -168,26 +171,18 @@ and resumes processing from the earliest unprocessed entry in the queue manifest
 
 ### Ingestor
 
-The ingestor provides an API to ingest a vector of `IngestEntry` structs, each containing opaque byte data and metadata.
+The ingestor provides an API to ingest a vector of opaque byte entries with associated metadata.
 The entries are buffered in a batch in ingestion order.
 The ingestor flushes the batches of ingested entries to object storage and appends the locations of the
 flushed objects to the queue with the internally used queue producer (`q-producer` in the diagram).
 Flushes are triggered after a given time interval elapsed or if a batch of the ingested data exceeds a given size.
-
-Each ingest entry is defined as:
-```rust
-pub struct IngestEntry {
-    pub data: Bytes,
-    pub metadata: Bytes,
-}
-```
 
 The API of the ingestor is the following:
 ```rust
 impl Ingestor {
   pub fn new(config: IngestorConfig, clock: Arc<dyn Clock>) -> Result<Self> { ... }
 
-  pub async fn ingest(&self, entries: Vec<IngestEntry>) -> Result<WriteHandle> { ... }
+  pub async fn ingest(&self, entries: Vec<Bytes>, metadata: Bytes) -> Result<WriteHandle> { ... }
 
   pub async fn close(self) -> Result<()> { ... }
 }
@@ -234,14 +229,12 @@ The config `max_buffered_inputs` limits the number of `ingest()` calls that can 
 When the buffer is full, `ingest()` blocks until the background task consumes a message.
 If this backpressure becomes an issue, new ingestors can be created to better distribute the load.
 
-A call to `ingest()` takes a vector of `IngestEntry` structs and returns a `WriteHandle` with which
-the caller can await the completion of the flush to object storage of the data entries.
-Each `IngestEntry` pairs a data entry with its metadata. The `Batch` keeps separate vectors for data entries
-and metadata. Because multiple `ingest()` calls may be batched into a single flush, the metadata from each
-entry is collected into a vector and written to the queue manifest entry (not to the data batch).
-The collector can use the metadata vector to interpret the batch without reading it.
-If all metadata items in the vector are empty, no metadata is stored in the queue entry.
-The ingestor also records the ingestion time and passes it to the queue entry.
+A call to `ingest()` takes a vector of opaque byte entries and a metadata payload, and returns a `WriteHandle`
+with which the caller can await the completion of the flush to object storage of the data entries.
+Because multiple `ingest()` calls may be batched into a single flush, each call's metadata is stored
+as a separate metadata item in the queue manifest entry with a `start_index` pointing to the first record
+in the data batch that the metadata applies to. The ingestion time is also recorded per metadata item.
+The collector can use the metadata items to interpret ranges of records in the batch without reading it.
 
 The `WriteHandle` contains a `DurabilityWatcher` that allows the caller to check or await durability:
 ```rust
@@ -417,7 +410,7 @@ object with the same name. This aspect would require some experiments.
 
 ## Open Questions
 
-- Should we store the metadata in the queue and in the data batches or is it enough to store it in the queue?
+None at this time.
 
 
 ## Updates
@@ -430,6 +423,8 @@ object with the same name. This aspect would require some experiments.
 | 2026-03-10 | Moved durability API into DurabilityWatcher inside WriteHandle |
 | 2026-03-10 | Changed ingest() to take Vec\<IngestEntry\> with per-entry data and metadata |
 | 2026-03-11 | Replaced max_unflushed_bytes with max_buffered_inputs using a bounded channel |
+| 2026-03-11 | Changed queue metadata to per-range format with start_index and ingestion_time per metadata item |
+| 2026-03-11 | Replaced IngestEntry with ingest(entries: Vec\<Bytes\>, metadata: Bytes) |
 
 
 
