@@ -33,7 +33,7 @@ pub struct IngestorConfig {
     #[serde(default = "default_flush_interval")]
     pub flush_interval: Duration,
 
-    /// Batch size in bytes that triggers a flush when exceeded.
+    /// Batch size in bytes (entries and metadata) that triggers a flush when exceeded.
     ///
     /// Defaults to 64 MiB.
     #[serde(default = "default_flush_size_bytes")]

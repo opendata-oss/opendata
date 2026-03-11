@@ -108,7 +108,7 @@ impl Batch {
         notifier: Notifier,
         now: SystemTime,
     ) {
-        self.size_bytes += entries.iter().map(|e| e.len()).sum::<usize>();
+        self.size_bytes += entries.iter().map(|e| e.len()).sum::<usize>() + metadata.len();
         self.data_and_notifiers
             .add(entries, metadata, ingestion_time_ms, notifier);
         if self.started_at.is_none() {

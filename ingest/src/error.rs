@@ -14,7 +14,7 @@ impl std::fmt::Display for Error {
             Error::Storage(msg) => write!(f, "Storage error: {}", msg),
             Error::Serialization(msg) => write!(f, "Serialization error: {}", msg),
             Error::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
-            Error::Fenced => write!(f, "consumer fenced: epoch mismatch"),
+            Error::Fenced => write!(f, "Consumer fenced: epoch mismatch"),
         }
     }
 }
