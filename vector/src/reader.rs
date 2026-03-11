@@ -15,7 +15,6 @@ use crate::serde::centroid_chunk::CentroidEntry;
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
 use common::StorageSemantics;
-use common::storage::StorageRead;
 use common::storage::factory::{StorageReaderRuntime, create_storage_read};
 use std::sync::Arc;
 
@@ -27,9 +26,7 @@ use std::sync::Arc;
 ///       a later improvement. In the interim we'll first add support for creating
 ///       a reader from a checkpoint.
 pub struct VectorDbReader {
-    options: QueryEngineOptions,
-    storage: Arc<dyn StorageRead>,
-    centroid_graph: Arc<dyn CentroidGraph>,
+    query_engine: QueryEngine,
 }
 
 impl VectorDbReader {
@@ -82,19 +79,9 @@ impl VectorDbReader {
             query_pruning_factor: config.query_pruning_factor,
         };
 
-        Ok(Self {
-            options,
-            storage,
-            centroid_graph: Arc::from(centroid_graph),
-        })
-    }
-
-    fn query_engine(&self) -> QueryEngine {
-        QueryEngine::new(
-            self.options.clone(),
-            self.centroid_graph.clone(),
-            self.storage.clone(),
-        )
+        let centroid_graph: Arc<dyn CentroidGraph> = Arc::from(centroid_graph);
+        let query_engine = QueryEngine::new(options, centroid_graph, storage);
+        Ok(Self { query_engine })
     }
 
     /// Search using brute-force centroid lookup (for diagnostics).
@@ -104,7 +91,7 @@ impl VectorDbReader {
         k: usize,
         nprobe: usize,
     ) -> Result<Vec<SearchResult>> {
-        self.query_engine()
+        self.query_engine
             .search_exact_nprobe(query, k, nprobe)
             .await
     }
@@ -112,7 +99,7 @@ impl VectorDbReader {
 
 impl VectorDbRead for VectorDbReader {
     async fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
-        self.query_engine().search(query, k).await
+        self.query_engine.search(query, k).await
     }
 
     async fn search_with_nprobe(
@@ -121,13 +108,11 @@ impl VectorDbRead for VectorDbReader {
         k: usize,
         nprobe: usize,
     ) -> Result<Vec<SearchResult>> {
-        self.query_engine()
-            .search_with_nprobe(query, k, nprobe)
-            .await
+        self.query_engine.search_with_nprobe(query, k, nprobe).await
     }
 
     async fn get(&self, id: &str) -> Result<Option<Vector>> {
-        self.query_engine().get(id).await
+        self.query_engine.get(id).await
     }
 }
 

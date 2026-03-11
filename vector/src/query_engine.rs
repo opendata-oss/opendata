@@ -117,14 +117,11 @@ impl QueryEngine {
 
         let centroid_ids = self.prune_centroids(&centroid_ids, query);
 
-        let sorted_lists = self
-            .load_and_score(&centroid_ids, query, self.storage.clone())
-            .await?;
+        let sorted_lists = self.load_and_score(&centroid_ids, query).await?;
         if sorted_lists.is_empty() {
             return Ok(Vec::new());
         }
-        self.resolve_top_k(sorted_lists, k, self.storage.as_ref())
-            .await
+        self.resolve_top_k(sorted_lists, k).await
     }
 
     pub(crate) async fn search_with_nprobe(
@@ -166,17 +163,14 @@ impl QueryEngine {
         );
 
         // 4. Load posting lists and score candidates
-        let sorted_lists = self
-            .load_and_score(&centroid_ids, query, self.storage.clone())
-            .await?;
+        let sorted_lists = self.load_and_score(&centroid_ids, query).await?;
 
         if sorted_lists.is_empty() {
             return Ok(Vec::new());
         }
 
         // 5. K-way merge and resolve top-k forward index lookups
-        self.resolve_top_k(sorted_lists, k, self.storage.as_ref())
-            .await
+        self.resolve_top_k(sorted_lists, k).await
     }
 
     /// Apply query-aware dynamic pruning
@@ -232,7 +226,6 @@ impl QueryEngine {
         &self,
         centroid_ids: &[u64],
         query: &[f32],
-        storage: Arc<dyn StorageRead>,
     ) -> Result<Vec<Vec<ScoredCandidate>>> {
         let dimensions = self.options.dimensions as usize;
         let metric = self.options.distance_metric;
@@ -240,7 +233,7 @@ impl QueryEngine {
 
         let mut handles = Vec::with_capacity(centroid_ids.len());
         for &cid in centroid_ids {
-            let snap = storage.clone();
+            let snap = self.storage.clone();
             let q = query_vec.clone();
             handles.push(tokio::spawn(async move {
                 let posting_list: PostingList =
@@ -280,7 +273,6 @@ impl QueryEngine {
         &self,
         sorted_lists: Vec<Vec<ScoredCandidate>>,
         k: usize,
-        storage: &dyn StorageRead,
     ) -> Result<Vec<SearchResult>> {
         let dimensions = self.options.dimensions as usize;
 
@@ -320,7 +312,7 @@ impl QueryEngine {
             // Resolve forward index lookups for the batch concurrently.
             let futures: Vec<_> = batch
                 .iter()
-                .map(|sr| storage.get_vector_data(sr.internal_id, dimensions))
+                .map(|sr| self.storage.get_vector_data(sr.internal_id, dimensions))
                 .collect();
             let loaded = futures::future::join_all(futures).await;
 
