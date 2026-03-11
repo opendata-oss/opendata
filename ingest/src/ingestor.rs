@@ -63,6 +63,23 @@ struct DataAndNotifiers {
 }
 
 impl DataAndNotifiers {
+    fn add(
+        &mut self,
+        entries: Vec<Bytes>,
+        metadata: Bytes,
+        ingestion_time_ms: i64,
+        notifier: Notifier,
+    ) {
+        let start_index = self.entries.len() as u32;
+        self.entries.extend(entries);
+        self.metadata.push(Metadata {
+            start_index,
+            ingestion_time_ms,
+            payload: metadata,
+        });
+        self.notifiers.push(notifier);
+    }
+
     fn is_empty(&self) -> bool {
         self.entries.is_empty() && self.metadata.is_empty() && self.notifiers.is_empty()
     }
@@ -91,15 +108,9 @@ impl Batch {
         notifier: Notifier,
         now: SystemTime,
     ) {
-        let start_index = self.data_and_notifiers.entries.len() as u32;
         self.size_bytes += entries.iter().map(|e| e.len()).sum::<usize>();
-        self.data_and_notifiers.entries.extend(entries);
-        self.data_and_notifiers.metadata.push(Metadata {
-            start_index,
-            ingestion_time_ms,
-            payload: metadata,
-        });
-        self.data_and_notifiers.notifiers.push(notifier);
+        self.data_and_notifiers
+            .add(entries, metadata, ingestion_time_ms, notifier);
         if self.started_at.is_none() {
             self.started_at = Some(now);
         }
@@ -180,21 +191,15 @@ impl BatchWriter {
     }
 
     async fn write_and_enqueue(&self, entries: Vec<Bytes>, metadata: Vec<Metadata>) -> Result<()> {
-        let non_empty: Vec<Bytes> = entries.into_iter().filter(|e| !e.is_empty()).collect();
-        let location = if non_empty.is_empty() {
-            String::new()
-        } else {
-            let payload = encode_batch(&non_empty);
-            let id = ulid::Ulid::new();
-            let path = Path::from(format!("{}/{}.batch", self.path_prefix, id));
-            self.object_store
-                .put(&path, PutPayload::from(payload))
-                .await
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            path.to_string()
-        };
+        let payload = encode_batch(&entries);
+        let id = ulid::Ulid::new();
+        let path = Path::from(format!("{}/{}.batch", self.path_prefix, id));
+        self.object_store
+            .put(&path, PutPayload::from(payload))
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
 
-        self.producer.enqueue(location, metadata).await?;
+        self.producer.enqueue(path.to_string(), metadata).await?;
 
         Ok(())
     }
@@ -638,6 +643,84 @@ mod tests {
 
         let manifest_path = slatedb::object_store::path::Path::from("test/manifest");
         assert!(store.get(&manifest_path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn should_preserve_all_empty_entries_batch() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ingestor =
+            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+                .unwrap();
+
+        ingestor
+            .ingest(vec![Bytes::new(), Bytes::new()], Bytes::from("meta"))
+            .await
+            .unwrap();
+        ingestor.flush().await.unwrap();
+
+        let entries = read_manifest_entries(&store, "test/manifest").await;
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].location.is_empty());
+        assert_eq!(entries[0].metadata.len(), 1);
+        assert_eq!(entries[0].metadata[0].payload, Bytes::from("meta"));
+        assert_eq!(entries[0].metadata[0].start_index, 0);
+
+        let data = store
+            .get(&Path::from(entries[0].location.clone()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let records = decode_batch(data).unwrap();
+        assert_eq!(records, vec![Bytes::new(), Bytes::new()]);
+    }
+
+    #[tokio::test]
+    async fn should_preserve_empty_and_non_empty_entries_in_batch() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ingestor =
+            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+                .unwrap();
+
+        ingestor
+            .ingest(
+                vec![
+                    Bytes::from("a"),
+                    Bytes::new(),
+                    Bytes::from("b"),
+                    Bytes::new(),
+                ],
+                Bytes::from("meta"),
+            )
+            .await
+            .unwrap();
+        ingestor.flush().await.unwrap();
+
+        let entries = read_manifest_entries(&store, "test/manifest").await;
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].location.is_empty());
+        assert_eq!(entries[0].metadata.len(), 1);
+        assert_eq!(entries[0].metadata[0].payload, Bytes::from("meta"));
+        assert_eq!(entries[0].metadata[0].start_index, 0);
+
+        let data = store
+            .get(&Path::from(entries[0].location.clone()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let records = decode_batch(data).unwrap();
+        assert_eq!(
+            records,
+            vec![
+                Bytes::from("a"),
+                Bytes::new(),
+                Bytes::from("b"),
+                Bytes::new()
+            ]
+        );
     }
 
     #[tokio::test]
