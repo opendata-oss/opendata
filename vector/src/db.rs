@@ -11,6 +11,7 @@
 //! - Delta handles dictionary lookup, centroid assignment, and builds RecordOps
 //! - Flusher applies ops atomically to storage
 
+use crate::VectorDbReader;
 use crate::delta::{
     VectorDbDeltaContext, VectorDbDeltaOpts, VectorDbWrite, VectorDbWriteDelta, VectorWrite,
 };
@@ -662,6 +663,10 @@ impl VectorDb {
     ) -> Result<Vec<SearchResult>> {
         self.query_engine().search_exact_nprobe(query, nprobe).await
     }
+
+    pub async fn snapshot(&self) -> Box<dyn VectorDbRead> {
+        Box::new(VectorDbReader::new(self.query_engine())) as Box<dyn VectorDbRead>
+    }
 }
 
 #[async_trait]
@@ -964,7 +969,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].external_id, "vec-1");
+        assert_eq!(results[0].vector.id, "vec-1");
     }
 
     #[tokio::test]

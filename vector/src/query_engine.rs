@@ -1,14 +1,15 @@
 use crate::error::{Error, Result};
 use crate::hnsw::CentroidGraph;
-use crate::model::{AttributeValue, Filter, Query, SearchResult};
+use crate::model::{Filter, Query, SearchResult};
 use crate::serde::collection_meta::DistanceMetric;
 use crate::serde::posting_list::PostingList;
+use crate::serde::vector_data::VectorDataValue;
 use crate::storage::VectorDbStorageReadExt;
 use crate::{Attribute, Vector, distance};
 use common::storage::StorageRead;
 use roaring::RoaringTreemap;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -67,16 +68,18 @@ impl QueryEngine {
             return Ok(None);
         };
 
-        // 3. Construct VectorRecord with all fields
+        Ok(Some(Self::vector_data_to_vector(&vector_data)))
+    }
+
+    fn vector_data_to_vector(vector_data: &VectorDataValue) -> Vector {
         let attributes = vector_data
             .fields()
             .map(|field| Attribute::new(field.field_name.clone(), field.value.clone().into()))
             .collect();
-
-        Ok(Some(Vector {
+        Vector {
             id: vector_data.external_id().to_string(),
             attributes,
-        }))
+        }
     }
 
     pub(crate) async fn search(&self, query: &Query) -> Result<Vec<SearchResult>> {
@@ -331,17 +334,9 @@ impl QueryEngine {
                 let Some(vector_data) = vector_data? else {
                     continue;
                 };
-
-                let metadata: HashMap<String, AttributeValue> = vector_data
-                    .fields()
-                    .map(|field| (field.field_name.clone(), field.value.clone().into()))
-                    .collect();
-
                 results.push(SearchResult {
-                    internal_id: sr.internal_id,
-                    external_id: vector_data.external_id().to_string(),
                     score: sr.distance.score(),
-                    attributes: metadata,
+                    vector: Self::vector_data_to_vector(&vector_data),
                 });
 
                 if results.len() == k {
@@ -615,9 +610,9 @@ mod tests {
         assert_eq!(results.len(), 10);
         for result in &results {
             assert!(
-                result.external_id.starts_with("vec-0-"),
+                result.vector.id.starts_with("vec-0-"),
                 "Expected cluster 0 vector, got: {}",
-                result.external_id
+                result.vector.id
             );
         }
         // Verify results are sorted by score (L2 distance, lower = better)
@@ -654,13 +649,15 @@ mod tests {
 
         // then - should only return the new version (not the deleted one)
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].external_id, "vec-1");
+        assert_eq!(results[0].vector.id, "vec-1");
         let vector = results[0]
+            .vector
             .attributes
             .iter()
-            .find(|f| f.0 == "vector")
+            .find(|f| f.name == "vector")
             .unwrap()
-            .1;
+            .value
+            .clone();
         let crate::model::AttributeValue::Vector(vector) = vector.clone() else {
             panic!("unexpected attr type");
         };
@@ -690,9 +687,9 @@ mod tests {
 
         // then - should be sorted by L2 distance (lower = better)
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0].external_id, "close");
-        assert_eq!(results[1].external_id, "medium");
-        assert_eq!(results[2].external_id, "far");
+        assert_eq!(results[0].vector.id, "close");
+        assert_eq!(results[1].vector.id, "medium");
+        assert_eq!(results[2].vector.id, "far");
 
         // Verify scores are increasing (L2 distance)
         for i in 1..results.len() {
@@ -817,7 +814,7 @@ mod tests {
 
     /// Collect result IDs into a sorted Vec for deterministic comparison.
     fn result_ids(results: &[crate::model::SearchResult]) -> Vec<String> {
-        let mut ids: Vec<String> = results.iter().map(|r| r.external_id.clone()).collect();
+        let mut ids: Vec<String> = results.iter().map(|r| r.vector.id.clone()).collect();
         ids.sort();
         ids
     }
@@ -962,7 +959,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         // Closest to [1,0,0] among shoes-1, shoes-2, boots-1 is shoes-1
-        assert_eq!(results[0].external_id, "shoes-1");
+        assert_eq!(results[0].vector.id, "shoes-1");
     }
 
     // --- Search tests ---

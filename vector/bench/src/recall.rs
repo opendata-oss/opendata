@@ -136,7 +136,8 @@ fn recall_at_k(results: &[SearchResult], ground_truth: &[i32], k: usize) -> f64 
         .iter()
         .take(k)
         .filter(|r| {
-            r.external_id
+            r.vector
+                .id
                 .parse::<i32>()
                 .map(|id| gt_set.contains(&id))
                 .unwrap_or(false)

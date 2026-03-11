@@ -73,7 +73,8 @@ fn recall_at_k(results: &[vector::SearchResult], ground_truth: &[i32], k: usize)
         .iter()
         .take(k)
         .filter(|r| {
-            r.external_id
+            r.vector
+                .id
                 .parse::<i32>()
                 .map(|id| gt_set.contains(&id))
                 .unwrap_or(false)

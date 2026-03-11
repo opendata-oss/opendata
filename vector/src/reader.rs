@@ -82,7 +82,11 @@ impl VectorDbReader {
 
         let centroid_graph: Arc<dyn CentroidGraph> = Arc::from(centroid_graph);
         let query_engine = QueryEngine::new(options, centroid_graph, storage);
-        Ok(Self { query_engine })
+        Ok(Self::new(query_engine))
+    }
+
+    pub(crate) fn new(query_engine: QueryEngine) -> Self {
+        Self { query_engine }
     }
 }
 
@@ -166,6 +170,6 @@ mod tests {
 
         // then - closest vector should be vec-1
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].external_id, "vec-1");
+        assert_eq!(results[0].vector.id, "vec-1");
     }
 }

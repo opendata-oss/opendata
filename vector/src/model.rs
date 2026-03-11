@@ -268,7 +268,7 @@ impl Default for Config {
 }
 
 /// Configuration for a read-only vector database client.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReaderConfig {
     /// Storage backend configuration.
     pub storage: StorageConfig,
@@ -315,17 +315,13 @@ impl MetadataFieldSpec {
 /// A search result with vector, score, and metadata.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
-    /// Internal vector ID
-    pub internal_id: u64,
-    /// External vector ID (user-provided)
-    pub external_id: String,
     /// Similarity score (interpretation depends on distance metric)
     ///
     /// - L2: Lower scores = more similar
     /// - DotProduct: Higher scores = more similar
     pub score: f32,
-    /// Attribute key-value pairs
-    pub attributes: HashMap<String, AttributeValue>,
+    /// The vector found by search
+    pub vector: Vector,
 }
 
 /// Query specification for vector search.
