@@ -100,15 +100,15 @@ eval instant at 25s metric{job="1"} @ 50 + metric{job="1"} @ 100
   {job="1"} 15
 
 # ignoring label_replace function
-ignore
+
 
 eval instant at 25s rate(metric{job="1"}[100s] @ 100) + label_replace(rate(metric{job="2"}[123s] @ 200), "job", "1", "", "")
   {job="1"} 0.3
   
-resume
+
 
 # ignoring aggregator functions
-ignore
+
 
 eval instant at 25s sum_over_time(metric{job="1"}[100s] @ 100) + label_replace(sum_over_time(metric{job="2"}[100s] @ 100), "job", "1", "", "")
   {job="1"} 165
@@ -116,7 +116,7 @@ eval instant at 25s sum_over_time(metric{job="1"}[100s] @ 100) + label_replace(s
 eval instant at 25s sum_over_time(metric{job="1"}[100] @ 100) + label_replace(sum_over_time(metric{job="2"}[100] @ 100), "job", "1", "", "")
   {job="1"} 165
 
-resume
+
 
 
 # Subqueries.

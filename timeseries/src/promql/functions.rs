@@ -1,7 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::evaluator::{EvalResult, EvalSample, EvalSamples};
 use crate::{model::Sample, promql::evaluator::EvaluationError};
+use promql_parser::label::METRIC_NAME;
+use promql_parser::parser::Expr;
+use regex::Regex;
 
 /// Kahan summation increment with Neumaier improvement (1974)
 ///
@@ -111,6 +114,12 @@ pub(crate) enum PromQLArg {
     InstantVector(Vec<EvalSample>),
     Scalar(f64),
 }
+
+pub(crate) struct FunctionCallContext<'a> {
+    pub eval_timestamp_ms: i64,
+    pub raw_args: &'a [Box<Expr>],
+}
+
 impl PromQLArg {
     pub fn into_instant_vector(self) -> EvalResult<Vec<EvalSample>> {
         match self {
@@ -153,6 +162,24 @@ pub(crate) trait PromQLFunction {
         }
 
         self.apply(args.remove(0), eval_timestamp_ms)
+    }
+
+    fn apply_call(
+        &self,
+        evaluated_args: Vec<Option<PromQLArg>>,
+        ctx: &FunctionCallContext<'_>,
+    ) -> EvalResult<Vec<EvalSample>> {
+        let mut args = Vec::with_capacity(evaluated_args.len());
+        for arg in evaluated_args {
+            let Some(arg) = arg else {
+                return Err(EvaluationError::InternalError(
+                    "string arguments are not yet supported for this function".to_string(),
+                ));
+            };
+            args.push(arg);
+        }
+
+        self.apply_args(args, ctx.eval_timestamp_ms)
     }
 }
 
@@ -269,6 +296,54 @@ fn exact_arity_error(
     ))
 }
 
+fn min_arity_error(function_name: &str, min_args: usize, actual_args: usize) -> EvaluationError {
+    EvaluationError::InternalError(format!(
+        "{function_name} requires at least {min_args} argument(s), got {actual_args}"
+    ))
+}
+
+// Prometheus' current UTF-8 label-name validation only rejects empty names.
+// Rust strings are already guaranteed to be valid UTF-8.
+fn is_valid_label_name(label: &str) -> bool {
+    !label.is_empty()
+}
+
+fn output_labelset_key(labels: &HashMap<String, String>, drop_name: bool) -> Vec<(String, String)> {
+    let mut key: Vec<(String, String)> = labels
+        .iter()
+        .filter(|(name, _)| !drop_name || name.as_str() != METRIC_NAME)
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    key.sort_unstable();
+    key
+}
+
+fn extract_string_arg(expr: &Expr, function_name: &str, arg_index: usize) -> EvalResult<String> {
+    match expr {
+        Expr::StringLiteral(string) => Ok(string.val.clone()),
+        Expr::Paren(paren) => extract_string_arg(&paren.expr, function_name, arg_index),
+        _ => Err(EvaluationError::InternalError(format!(
+            "expected string literal for argument {} to function '{}'",
+            arg_index + 1,
+            function_name
+        ))),
+    }
+}
+
+fn ensure_unique_labelsets(samples: &[EvalSample]) -> EvalResult<()> {
+    let mut seen_labelsets = HashSet::with_capacity(samples.len());
+    for sample in samples {
+        let labelset_key = output_labelset_key(&sample.labels, sample.drop_name);
+        if !seen_labelsets.insert(labelset_key) {
+            return Err(EvaluationError::InternalError(
+                "vector cannot contain metrics with the same labelset".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 struct ClampMaxFunction;
 
 impl PromQLFunction for ClampMaxFunction {
@@ -362,6 +437,140 @@ impl PromQLFunction for ClampFunction {
     }
 }
 
+struct LabelReplaceFunction;
+
+impl PromQLFunction for LabelReplaceFunction {
+    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<Vec<EvalSample>> {
+        Err(exact_arity_error("label_replace", 5, 1))
+    }
+
+    fn apply_call(
+        &self,
+        evaluated_args: Vec<Option<PromQLArg>>,
+        ctx: &FunctionCallContext<'_>,
+    ) -> EvalResult<Vec<EvalSample>> {
+        if evaluated_args.len() != 5 || ctx.raw_args.len() != 5 {
+            return Err(exact_arity_error("label_replace", 5, ctx.raw_args.len()));
+        }
+
+        let mut args_iter = evaluated_args.into_iter();
+        let Some(PromQLArg::InstantVector(mut samples)) = args_iter
+            .next()
+            .expect("validated evaluated_args.len() == 5")
+        else {
+            return Err(EvaluationError::InternalError(
+                "label_replace expects an instant vector as its first argument".to_string(),
+            ));
+        };
+
+        let dst_label = extract_string_arg(&ctx.raw_args[1], "label_replace", 1)?;
+        let replacement = extract_string_arg(&ctx.raw_args[2], "label_replace", 2)?;
+        let src_label = extract_string_arg(&ctx.raw_args[3], "label_replace", 3)?;
+        let regex_src = extract_string_arg(&ctx.raw_args[4], "label_replace", 4)?;
+
+        if !is_valid_label_name(&dst_label) {
+            return Err(EvaluationError::InternalError(format!(
+                "invalid label name {:?}",
+                dst_label
+            )));
+        }
+
+        let regex = Regex::new(&format!("^(?s:{regex_src})$"))
+            .map_err(|err| EvaluationError::InternalError(err.to_string()))?;
+
+        for sample in &mut samples {
+            let src_value = sample.labels.get(&src_label).cloned().unwrap_or_default();
+
+            if let Some(captures) = regex.captures(&src_value) {
+                let mut replaced = String::new();
+                captures.expand(&replacement, &mut replaced);
+
+                if replaced.is_empty() {
+                    sample.labels.remove(&dst_label);
+                } else {
+                    sample.labels.insert(dst_label.clone(), replaced);
+                }
+
+                if dst_label == METRIC_NAME {
+                    sample.drop_name = false;
+                }
+            }
+        }
+
+        ensure_unique_labelsets(&samples)?;
+        Ok(samples)
+    }
+}
+
+struct LabelJoinFunction;
+
+impl PromQLFunction for LabelJoinFunction {
+    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<Vec<EvalSample>> {
+        Err(min_arity_error("label_join", 3, 1))
+    }
+
+    fn apply_call(
+        &self,
+        evaluated_args: Vec<Option<PromQLArg>>,
+        ctx: &FunctionCallContext<'_>,
+    ) -> EvalResult<Vec<EvalSample>> {
+        let actual_args = ctx.raw_args.len();
+        if actual_args < 3 || evaluated_args.len() != actual_args {
+            return Err(min_arity_error("label_join", 3, actual_args));
+        }
+
+        let mut args_iter = evaluated_args.into_iter();
+        let Some(PromQLArg::InstantVector(mut samples)) = args_iter
+            .next()
+            .expect("validated evaluated_args.len() == ctx.raw_args.len() >= 3")
+        else {
+            return Err(EvaluationError::InternalError(
+                "label_join expects an instant vector as its first argument".to_string(),
+            ));
+        };
+
+        let dst_label = extract_string_arg(&ctx.raw_args[1], "label_join", 1)?;
+        let separator = extract_string_arg(&ctx.raw_args[2], "label_join", 2)?;
+        let src_labels = ctx.raw_args[3..]
+            .iter()
+            .enumerate()
+            .map(|(index, arg)| extract_string_arg(arg, "label_join", index + 3))
+            .collect::<EvalResult<Vec<_>>>()?;
+
+        if !is_valid_label_name(&dst_label) {
+            return Err(EvaluationError::InternalError(format!(
+                "invalid label name {:?}",
+                dst_label
+            )));
+        }
+
+        for sample in &mut samples {
+            let mut joined = String::new();
+            for (index, src_label) in src_labels.iter().enumerate() {
+                if index > 0 {
+                    joined.push_str(&separator);
+                }
+                if let Some(value) = sample.labels.get(src_label) {
+                    joined.push_str(value);
+                }
+            }
+
+            if joined.is_empty() {
+                sample.labels.remove(&dst_label);
+            } else {
+                sample.labels.insert(dst_label.clone(), joined);
+            }
+
+            if dst_label == METRIC_NAME {
+                sample.drop_name = false;
+            }
+        }
+
+        ensure_unique_labelsets(&samples)?;
+        Ok(samples)
+    }
+}
+
 /// Function registry that maps function names to their implementations
 pub(crate) struct FunctionRegistry {
     functions: HashMap<String, Box<dyn PromQLFunction>>,
@@ -422,6 +631,8 @@ impl FunctionRegistry {
             "floor".to_string(),
             Box::new(UnaryFunction { op: f64::floor }),
         );
+        functions.insert("label_join".to_string(), Box::new(LabelJoinFunction));
+        functions.insert("label_replace".to_string(), Box::new(LabelReplaceFunction));
         functions.insert("ln".to_string(), Box::new(UnaryFunction { op: f64::ln }));
         functions.insert(
             "log10".to_string(),
@@ -802,6 +1013,8 @@ impl PromQLFunction for VectorFunction {
 mod tests {
     use super::*;
     use crate::model::Sample;
+    use promql_parser::label::METRIC_NAME;
+    use promql_parser::parser::{Expr, ParenExpr, StringLiteral};
     use rstest::rstest;
     use std::collections::HashMap;
 
@@ -864,6 +1077,55 @@ mod tests {
             labels: HashMap::new(),
             drop_name: false,
         }
+    }
+
+    fn create_sample_with_labels(value: f64, labels: &[(&str, &str)]) -> EvalSample {
+        EvalSample {
+            timestamp_ms: 1000,
+            value,
+            labels: labels
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            drop_name: false,
+        }
+    }
+
+    fn string_arg(value: &str) -> Expr {
+        Expr::StringLiteral(StringLiteral {
+            val: value.to_string(),
+        })
+    }
+
+    fn paren_string_arg(value: &str) -> Expr {
+        Expr::Paren(ParenExpr {
+            expr: Box::new(string_arg(value)),
+        })
+    }
+
+    fn box_exprs(args: Vec<Expr>) -> Box<[Box<Expr>]> {
+        args.into_iter().map(Box::new).collect()
+    }
+
+    fn label_replace_raw_args(dst: &str, replacement: &str, src: &str, regex: &str) -> Vec<Expr> {
+        vec![
+            Expr::NumberLiteral(promql_parser::parser::NumberLiteral { val: 0.0 }),
+            paren_string_arg(dst),
+            string_arg(replacement),
+            string_arg(src),
+            string_arg(regex),
+        ]
+    }
+
+    fn label_join_raw_args(dst: &str, separator: &str, src_labels: &[&str]) -> Vec<Expr> {
+        let mut args = vec![
+            Expr::NumberLiteral(promql_parser::parser::NumberLiteral { val: 0.0 }),
+            paren_string_arg(dst),
+            string_arg(separator),
+        ];
+
+        args.extend(src_labels.iter().map(|label| string_arg(label)));
+        args
     }
 
     #[test]
@@ -980,6 +1242,490 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[test]
+    fn should_apply_label_replace_with_full_string_match() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("label_replace").unwrap();
+        let raw_args = box_exprs(label_replace_raw_args(
+            "dst",
+            "destination-value-$1",
+            "src",
+            "source-value-(.*)",
+        ));
+        let ctx = FunctionCallContext {
+            eval_timestamp_ms: 1000,
+            raw_args: &raw_args,
+        };
+
+        let result = func
+            .apply_call(
+                vec![
+                    Some(PromQLArg::InstantVector(vec![
+                        create_sample_with_labels(
+                            1.0,
+                            &[(METRIC_NAME, "testmetric"), ("src", "source-value-10")],
+                        ),
+                        create_sample_with_labels(
+                            2.0,
+                            &[(METRIC_NAME, "testmetric"), ("src", "source-value-20")],
+                        ),
+                    ])),
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+                &ctx,
+            )
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0].labels.get("dst"),
+            Some(&"destination-value-10".to_string())
+        );
+        assert_eq!(
+            result[1].labels.get("dst"),
+            Some(&"destination-value-20".to_string())
+        );
+    }
+
+    #[test]
+    fn should_apply_label_replace_with_dotall_regex() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("label_replace").unwrap();
+        let raw_args = box_exprs(label_replace_raw_args(
+            "dst",
+            "matched",
+            "src",
+            "source.*10",
+        ));
+        let ctx = FunctionCallContext {
+            eval_timestamp_ms: 1000,
+            raw_args: &raw_args,
+        };
+
+        let result = func
+            .apply_call(
+                vec![
+                    Some(PromQLArg::InstantVector(vec![create_sample_with_labels(
+                        1.0,
+                        &[(METRIC_NAME, "testmetric"), ("src", "source\nvalue-10")],
+                    )])),
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+                &ctx,
+            )
+            .unwrap();
+
+        assert_eq!(result[0].labels.get("dst"), Some(&"matched".to_string()));
+    }
+
+    #[test]
+    fn should_not_apply_label_replace_on_substring_match() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("label_replace").unwrap();
+        let raw_args = box_exprs(label_replace_raw_args(
+            "dst",
+            "value-$1",
+            "src",
+            "value-(.*)",
+        ));
+        let ctx = FunctionCallContext {
+            eval_timestamp_ms: 1000,
+            raw_args: &raw_args,
+        };
+
+        let result = func
+            .apply_call(
+                vec![
+                    Some(PromQLArg::InstantVector(vec![create_sample_with_labels(
+                        1.0,
+                        &[
+                            (METRIC_NAME, "testmetric"),
+                            ("src", "source-value-10"),
+                            ("dst", "original-destination-value"),
+                        ],
+                    )])),
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+                &ctx,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result[0].labels.get("dst"),
+            Some(&"original-destination-value".to_string())
+        );
+    }
+
+    #[test]
+    fn should_drop_destination_label_when_label_replace_replacement_is_empty() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("label_replace").unwrap();
+        let raw_args = box_exprs(label_replace_raw_args("dst", "", "dst", ".*"));
+        let ctx = FunctionCallContext {
+            eval_timestamp_ms: 1000,
+            raw_args: &raw_args,
+        };
+
+        let result = func
+            .apply_call(
+                vec![
+                    Some(PromQLArg::InstantVector(vec![create_sample_with_labels(
+                        1.0,
+                        &[
+                            (METRIC_NAME, "testmetric"),
+                            ("src", "source-value-10"),
+                            ("dst", "original-destination-value"),
+                        ],
+                    )])),
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+                &ctx,
+            )
+            .unwrap();
+
+        assert!(!result[0].labels.contains_key("dst"));
+    }
+
+    #[test]
+    fn should_apply_label_replace_with_utf8_destination_label_name() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("label_replace").unwrap();
+        let raw_args = box_exprs(label_replace_raw_args(
+            "\u{00ff}",
+            "value-$1",
+            "src",
+            "source-value-(.*)",
+        ));
+        let ctx = FunctionCallContext {
+            eval_timestamp_ms: 1000,
+            raw_args: &raw_args,
+        };
+
+        let result = func
+            .apply_call(
+                vec![
+                    Some(PromQLArg::InstantVector(vec![create_sample_with_labels(
+                        1.0,
+                        &[(METRIC_NAME, "testmetric"), ("src", "source-value-10")],
+                    )])),
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+                &ctx,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result[0].labels.get("\u{00ff}"),
+            Some(&"value-10".to_string())
+        );
+    }
+
+    #[test]
+    fn should_error_when_label_replace_destination_label_is_empty() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("label_replace").unwrap();
+        let raw_args = box_exprs(label_replace_raw_args("", "", "src", "(.*)"));
+        let ctx = FunctionCallContext {
+            eval_timestamp_ms: 1000,
+            raw_args: &raw_args,
+        };
+
+        let err = func
+            .apply_call(
+                vec![
+                    Some(PromQLArg::InstantVector(vec![create_sample_with_labels(
+                        1.0,
+                        &[(METRIC_NAME, "testmetric"), ("src", "source-value-10")],
+                    )])),
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+                &ctx,
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("invalid label name"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn should_error_when_label_replace_produces_duplicate_output_labelsets() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("label_replace").unwrap();
+        let raw_args = box_exprs(label_replace_raw_args("src", "", "", ""));
+        let ctx = FunctionCallContext {
+            eval_timestamp_ms: 1000,
+            raw_args: &raw_args,
+        };
+
+        let err = func
+            .apply_call(
+                vec![
+                    Some(PromQLArg::InstantVector(vec![
+                        create_sample_with_labels(
+                            1.0,
+                            &[(METRIC_NAME, "testmetric"), ("src", "source-value-10")],
+                        ),
+                        create_sample_with_labels(
+                            2.0,
+                            &[(METRIC_NAME, "testmetric"), ("src", "source-value-20")],
+                        ),
+                    ])),
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+                &ctx,
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("vector cannot contain metrics with the same labelset"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn should_apply_label_join_with_source_labels_in_order() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("label_join").unwrap();
+        let raw_args = box_exprs(label_join_raw_args("dst", "-", &["src", "src1", "src2"]));
+        let ctx = FunctionCallContext {
+            eval_timestamp_ms: 1000,
+            raw_args: &raw_args,
+        };
+
+        let result = func
+            .apply_call(
+                vec![
+                    Some(PromQLArg::InstantVector(vec![
+                        create_sample_with_labels(
+                            1.0,
+                            &[
+                                (METRIC_NAME, "testmetric"),
+                                ("src", "a"),
+                                ("src1", "b"),
+                                ("src2", "c"),
+                            ],
+                        ),
+                        create_sample_with_labels(
+                            2.0,
+                            &[
+                                (METRIC_NAME, "testmetric"),
+                                ("src", "d"),
+                                ("src1", "e"),
+                                ("src2", "f"),
+                            ],
+                        ),
+                    ])),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+                &ctx,
+            )
+            .unwrap();
+
+        assert_eq!(result[0].labels.get("dst"), Some(&"a-b-c".to_string()));
+        assert_eq!(result[1].labels.get("dst"), Some(&"d-e-f".to_string()));
+    }
+
+    #[test]
+    fn should_apply_label_join_without_source_labels() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("label_join").unwrap();
+        let raw_args = box_exprs(label_join_raw_args("dst", ", ", &[]));
+        let ctx = FunctionCallContext {
+            eval_timestamp_ms: 1000,
+            raw_args: &raw_args,
+        };
+
+        let result = func
+            .apply_call(
+                vec![
+                    Some(PromQLArg::InstantVector(vec![create_sample_with_labels(
+                        1.0,
+                        &[
+                            (METRIC_NAME, "testmetric"),
+                            ("src", "a"),
+                            ("src1", "b"),
+                            ("dst", "original-destination-value"),
+                        ],
+                    )])),
+                    None,
+                    None,
+                ],
+                &ctx,
+            )
+            .unwrap();
+
+        assert!(!result[0].labels.contains_key("dst"));
+    }
+
+    #[test]
+    fn should_error_when_label_join_destination_label_is_empty() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("label_join").unwrap();
+        let raw_args = box_exprs(label_join_raw_args("", "-", &["src"]));
+        let ctx = FunctionCallContext {
+            eval_timestamp_ms: 1000,
+            raw_args: &raw_args,
+        };
+
+        let err = func
+            .apply_call(
+                vec![
+                    Some(PromQLArg::InstantVector(vec![create_sample_with_labels(
+                        1.0,
+                        &[(METRIC_NAME, "testmetric"), ("src", "a")],
+                    )])),
+                    None,
+                    None,
+                    None,
+                ],
+                &ctx,
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("invalid label name"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn should_error_when_label_join_produces_duplicate_output_labelsets() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("label_join").unwrap();
+        let raw_args = box_exprs(label_join_raw_args("label", "", &["this"]));
+        let ctx = FunctionCallContext {
+            eval_timestamp_ms: 1000,
+            raw_args: &raw_args,
+        };
+
+        let err = func
+            .apply_call(
+                vec![
+                    Some(PromQLArg::InstantVector(vec![
+                        create_sample_with_labels(
+                            1.0,
+                            &[(METRIC_NAME, "dup"), ("label", "a"), ("this", "a")],
+                        ),
+                        create_sample_with_labels(
+                            2.0,
+                            &[(METRIC_NAME, "dup"), ("label", "b"), ("this", "a")],
+                        ),
+                    ])),
+                    None,
+                    None,
+                    None,
+                ],
+                &ctx,
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("vector cannot contain metrics with the same labelset"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn should_preserve_metric_name_when_label_replace_writes_name_label() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("label_replace").unwrap();
+        let raw_args = box_exprs(label_replace_raw_args(
+            "__name__", "rate_$1", "__name__", "(.+)",
+        ));
+        let ctx = FunctionCallContext {
+            eval_timestamp_ms: 1000,
+            raw_args: &raw_args,
+        };
+        let mut sample =
+            create_sample_with_labels(1.0, &[(METRIC_NAME, "metric_total"), ("env", "1")]);
+        sample.drop_name = true;
+
+        let result = func
+            .apply_call(
+                vec![
+                    Some(PromQLArg::InstantVector(vec![sample])),
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+                &ctx,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result[0].labels.get(METRIC_NAME),
+            Some(&"rate_metric_total".to_string())
+        );
+        assert!(!result[0].drop_name);
+    }
+
+    #[test]
+    fn should_preserve_metric_name_when_label_join_writes_name_label() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get("label_join").unwrap();
+        let raw_args = box_exprs(label_join_raw_args("__name__", "_", &["__name__", "env"]));
+        let ctx = FunctionCallContext {
+            eval_timestamp_ms: 1000,
+            raw_args: &raw_args,
+        };
+        let mut sample =
+            create_sample_with_labels(1.0, &[(METRIC_NAME, "metric_total"), ("env", "1")]);
+        sample.drop_name = true;
+
+        let result = func
+            .apply_call(
+                vec![
+                    Some(PromQLArg::InstantVector(vec![sample])),
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+                &ctx,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result[0].labels.get(METRIC_NAME),
+            Some(&"metric_total_1".to_string())
+        );
+        assert!(!result[0].drop_name);
     }
 
     #[test]
