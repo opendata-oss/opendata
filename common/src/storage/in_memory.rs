@@ -651,16 +651,26 @@ mod tests {
     struct AppendMergeOperator;
 
     impl MergeOperator for AppendMergeOperator {
-        fn merge(&self, _key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
-            match existing_value {
-                Some(existing) => {
-                    let mut result = BytesMut::from(existing);
-                    result.extend_from_slice(b",");
-                    result.extend_from_slice(&new_value);
+        fn merge(&self, key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
+            self.merge_batch(key, existing_value, &[new_value])
+        }
+
+        fn merge_batch(
+            &self,
+            _key: &Bytes,
+            existing_value: Option<Bytes>,
+            operands: &[Bytes],
+        ) -> Bytes {
+            operands
+                .iter()
+                .fold(existing_value.unwrap_or_default(), |acc, operand| {
+                    let mut result = BytesMut::from(acc);
+                    if !result.is_empty() {
+                        result.extend_from_slice(b",");
+                    }
+                    result.extend_from_slice(operand);
                     result.freeze()
-                }
-                None => new_value,
-            }
+                })
         }
     }
 

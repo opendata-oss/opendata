@@ -657,16 +657,21 @@ mod tests {
     struct ConcatMergeOperator;
 
     impl MergeOperator for ConcatMergeOperator {
-        fn merge(&self, _key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
-            match existing_value {
-                Some(existing) => {
-                    let mut result = Vec::with_capacity(existing.len() + new_value.len());
-                    result.extend_from_slice(&existing);
-                    result.extend_from_slice(&new_value);
-                    Bytes::from(result)
-                }
-                None => new_value,
+        fn merge(&self, key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
+            self.merge_batch(key, existing_value, &[new_value])
+        }
+
+        fn merge_batch(
+            &self,
+            _key: &Bytes,
+            existing_value: Option<Bytes>,
+            operands: &[Bytes],
+        ) -> Bytes {
+            let mut result = existing_value.unwrap_or_default().to_vec();
+            for operand in operands {
+                result.extend_from_slice(operand);
             }
+            Bytes::from(result)
         }
     }
 
