@@ -82,6 +82,15 @@ impl CompactionScheduler for L0OnlyCompactionScheduler {
             specs.push(CompactionSpec::new(batch, dst));
         }
 
+        eprintln!(
+            "[l0-compactor] propose: l0={} srs={} active={} available={} proposed={}",
+            manifest.l0.len(),
+            manifest.compacted.len(),
+            active_count,
+            available.len(),
+            specs.len(),
+        );
+
         specs
     }
 
