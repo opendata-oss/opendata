@@ -284,11 +284,9 @@ pub(crate) fn merge_batch_time_series(
     loop {
         // Find the minimum timestamp among all heads
         let mut min_ts = i64::MAX;
-        for head in &heads {
-            if let Some(s) = head {
-                if s.timestamp_ms < min_ts {
-                    min_ts = s.timestamp_ms;
-                }
+        for s in heads.iter().flatten() {
+            if s.timestamp_ms < min_ts {
+                min_ts = s.timestamp_ms;
             }
         }
         if min_ts == i64::MAX {
@@ -299,17 +297,17 @@ pub(crate) fn merge_batch_time_series(
         // Advance all heads that match this timestamp.
         let mut best_value = 0.0f64;
         for i in 0..num_sources {
-            if let Some(ref s) = heads[i] {
-                if s.timestamp_ms == min_ts {
-                    // Higher index = higher priority, so always overwrite
-                    best_value = s.value;
-                    // Advance this iterator
-                    heads[i] = match iters[i].next() {
-                        Some(Ok(s)) => Some(s),
-                        Some(Err(e)) => return Err(e),
-                        None => None,
-                    };
-                }
+            if let Some(ref s) = heads[i]
+                && s.timestamp_ms == min_ts
+            {
+                // Higher index = higher priority, so always overwrite
+                best_value = s.value;
+                // Advance this iterator
+                heads[i] = match iters[i].next() {
+                    Some(Ok(s)) => Some(s),
+                    Some(Err(e)) => return Err(e),
+                    None => None,
+                };
             }
         }
 
