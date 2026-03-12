@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::future::Future;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -50,6 +51,41 @@ pub(crate) type EvalResult<T> = std::result::Result<T, EvaluationError>;
 /// Type alias for complex HashMap used in matrix selector evaluation.
 /// Maps from label key (sorted vector of label pairs) to samples vector
 type SeriesMap = HashMap<Vec<Label>, Vec<Sample>>;
+type FingerprintHashMap<V> = HashMap<SeriesFingerprint, V, BuildHasherDefault<FingerprintHasher>>;
+type FingerprintHashSet = HashSet<SeriesFingerprint, BuildHasherDefault<FingerprintHasher>>;
+
+#[derive(Default)]
+struct FingerprintHasher(u64);
+
+impl Hasher for FingerprintHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = 0u64;
+        for chunk in bytes.chunks(8) {
+            let mut padded = [0u8; 8];
+            padded[..chunk.len()].copy_from_slice(chunk);
+            hash ^= u64::from_le_bytes(padded).rotate_left(13);
+        }
+        self.0 = hash;
+    }
+
+    fn write_u128(&mut self, value: u128) {
+        let lower = value as u64;
+        let upper = (value >> 64) as u64;
+        self.0 = lower ^ upper.rotate_left(32);
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.0 = value as u64;
+    }
+}
 
 pub(crate) struct QueryReaderBucketEvalCache {
     // Map from terms (series_ids for forward, labels for inverted) to cached results
@@ -1222,11 +1258,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         vector_selector: &VectorSelector,
         range_start_ms: i64,
         range_end_ms: i64,
-    ) -> EvalResult<HashMap<SeriesFingerprint, (HashMap<String, String>, Vec<Sample>)>> {
+    ) -> EvalResult<FingerprintHashMap<(HashMap<String, String>, Vec<Sample>)>> {
         let mut buckets = self.reader.list_buckets().await?;
         buckets.sort_by(|a, b| b.start.cmp(&a.start));
 
-        let mut series_samples = HashMap::new();
+        let mut series_samples = FingerprintHashMap::default();
 
         for bucket in buckets {
             let candidates =
@@ -1281,7 +1317,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     /// sample within the lookback window. Uses > (not >=) for start boundary to match
     /// Prometheus staleness semantics.
     fn bucket_series_samples(
-        series_samples: HashMap<SeriesFingerprint, (HashMap<String, String>, Vec<Sample>)>,
+        series_samples: FingerprintHashMap<(HashMap<String, String>, Vec<Sample>)>,
         aligned_start_ms: i64,
         subquery_end_ms: i64,
         step_ms: i64,
@@ -1387,7 +1423,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let mut buckets = self.reader.list_buckets().await?;
         buckets.sort_by(|a, b| b.start.cmp(&a.start)); // newest first
 
-        let mut series_with_results: HashSet<SeriesFingerprint> = HashSet::new();
+        let mut series_with_results = FingerprintHashSet::default();
         let mut samples = Vec::new();
 
         // Iterate through buckets in reverse time order (newest first)
@@ -2219,7 +2255,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let mut buckets = self.reader.list_buckets().await?;
         buckets.sort_by(|a, b| b.start.cmp(&a.start));
 
-        let mut series_with_results: HashSet<SeriesFingerprint> = HashSet::new();
+        let mut series_with_results = FingerprintHashSet::default();
         let mut groups: HashMap<Vec<(String, String)>, ReductionState> = HashMap::new();
 
         for bucket in buckets {

@@ -16,9 +16,11 @@ Warm-cache median latency by optimization:
 - `timeseries: fast-path reduction aggregates over vector selectors`: `325.1ms`
 - `timeseries: materialize cached forward and inverted query views`: `322.0ms`
 - `timeseries: avoid set churn for simple reader selectors`: `303.0ms`
+- `timeseries: use an integer hasher for fingerprint-keyed evaluator state`: `270.4ms`
 
 Interpretation:
 
 - The shared-label plus fingerprint caching and the aggregate fast path are the clear high-impact general wins.
 - The cached forward/inverted view materialization is measurable but small.
 - The selector vectorization is intentionally isolated in its own commit so it can be reverted easily if the team decides the extra code is not worth a roughly `6%` improvement on this benchmark.
+- The integer-hasher change is a general improvement for fingerprint-keyed maps/sets. After it landed, the remaining profile shifted away from `HashSet::insert` and more clearly toward allocator churn plus residual SlateDB point-read work.
