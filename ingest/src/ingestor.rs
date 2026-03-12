@@ -18,19 +18,19 @@ type Notifier = tokio::sync::watch::Sender<Option<Result<()>>>;
 
 #[derive(Clone)]
 pub struct DurabilityWatcher {
-    rx: tokio::sync::watch::Receiver<Option<Result<()>>>,
+    receiver: tokio::sync::watch::Receiver<Option<Result<()>>>,
 }
 
 impl DurabilityWatcher {
     /// Return the outcome of the write if the batch has already been flushed,
     /// or `None` if the flush has not completed yet.
     pub fn result(&self) -> Option<Result<()>> {
-        self.rx.borrow().clone()
+        self.receiver.borrow().clone()
     }
 
     /// Wait until the batch containing this write has been durably flushed.
     pub async fn await_durable(&mut self) -> Result<()> {
-        self.rx
+        self.receiver
             .wait_for(|v| v.is_some())
             .await
             .map_err(|_| Error::Storage("ingestor shut down".to_string()))?
@@ -44,7 +44,7 @@ pub struct WriteHandle {
 }
 
 enum IngestMessage {
-    Write {
+    Add {
         entries: Vec<Bytes>,
         metadata: Bytes,
         ingestion_time_ms: i64,
@@ -127,17 +127,36 @@ impl Batch {
     }
 }
 
-struct BatchWriter {
+struct BatchWriterTask {
     object_store: Arc<dyn ObjectStore>,
     producer: Arc<QueueProducer>,
-    path_prefix: String,
+    data_path_prefix: String,
     flush_interval: Duration,
     flush_size_bytes: usize,
     batch: Batch,
     clock: Arc<dyn Clock>,
 }
 
-impl BatchWriter {
+impl BatchWriterTask {
+    fn new(
+        object_store: Arc<dyn ObjectStore>,
+        producer: Arc<QueueProducer>,
+        data_path_prefix: String,
+        flush_interval: Duration,
+        flush_size_bytes: usize,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            object_store,
+            producer,
+            data_path_prefix,
+            flush_interval,
+            flush_size_bytes,
+            batch: Batch::new(),
+            clock,
+        }
+    }
+
     async fn run(&mut self, mut rx: mpsc::Receiver<IngestMessage>, shutdown: CancellationToken) {
         loop {
             let sleep_duration = match self.batch.started_at {
@@ -150,12 +169,11 @@ impl BatchWriter {
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => {
-                    self.close(&mut rx).await;
                     return;
                 },
                 msg = rx.recv() => {
                     match msg {
-                        Some(IngestMessage::Write { entries, metadata, ingestion_time_ms, notifier }) => {
+                        Some(IngestMessage::Add { entries, metadata, ingestion_time_ms, notifier }) => {
                             self.batch.add(entries, metadata, ingestion_time_ms, notifier, self.clock.now());
                             if self.batch.size_bytes >= self.flush_size_bytes {
                                 let _ = self.write_batch().await;
@@ -183,8 +201,8 @@ impl BatchWriter {
             .write_and_enqueue(data_and_notifiers.entries, data_and_notifiers.metadata)
             .await;
 
-        for tx in data_and_notifiers.notifiers {
-            let _ = tx.send(Some(result.clone()));
+        for notifier in data_and_notifiers.notifiers {
+            let _ = notifier.send(Some(result.clone()));
         }
 
         result
@@ -193,7 +211,7 @@ impl BatchWriter {
     async fn write_and_enqueue(&self, entries: Vec<Bytes>, metadata: Vec<Metadata>) -> Result<()> {
         let payload = encode_batch(&entries);
         let id = ulid::Ulid::new();
-        let path = Path::from(format!("{}/{}.batch", self.path_prefix, id));
+        let path = Path::from(format!("{}/{}.batch", self.data_path_prefix, id));
         self.object_store
             .put(&path, PutPayload::from(payload))
             .await
@@ -203,45 +221,94 @@ impl BatchWriter {
 
         Ok(())
     }
+}
 
-    async fn close(&mut self, rx: &mut mpsc::Receiver<IngestMessage>) {
-        let mut flush_result_senders = Vec::new();
+struct BatchWriter {
+    producer: Arc<QueueProducer>,
+    sender: mpsc::Sender<IngestMessage>,
+    cancellation_token: CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
 
-        while let Ok(msg) = rx.try_recv() {
-            match msg {
-                IngestMessage::Write {
-                    entries,
-                    metadata,
-                    ingestion_time_ms,
-                    notifier,
-                } => {
-                    self.batch.add(
-                        entries,
-                        metadata,
-                        ingestion_time_ms,
-                        notifier,
-                        self.clock.now(),
-                    );
-                }
-                IngestMessage::Flush { result_sender } => {
-                    flush_result_senders.push(result_sender);
-                }
-            }
+impl BatchWriter {
+    fn new(
+        object_store: Arc<dyn ObjectStore>,
+        queue_manifest_path: String,
+        data_path_prefix: String,
+        flush_interval: Duration,
+        flush_size_bytes: usize,
+        max_buffered_inputs: usize,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        let (sender, receiver) = mpsc::channel(max_buffered_inputs);
+        let producer = Arc::new(QueueProducer::with_object_store(
+            queue_manifest_path,
+            object_store.clone(),
+        ));
+        let mut task = BatchWriterTask::new(
+            object_store,
+            producer.clone(),
+            data_path_prefix,
+            flush_interval,
+            flush_size_bytes,
+            clock,
+        );
+        let shutdown = CancellationToken::new();
+        let cancellation_token = shutdown.clone();
+        let handle = tokio::spawn(async move { task.run(receiver, shutdown).await });
+        Self {
+            producer,
+            sender,
+            cancellation_token,
+            handle,
         }
+    }
 
-        let result = self.write_batch().await;
+    async fn add(
+        &self,
+        entries: Vec<Bytes>,
+        metadata: Bytes,
+        ingestion_time_ms: i64,
+    ) -> Result<DurabilityWatcher> {
+        let (notifier_sender, notifier_receiver) = tokio::sync::watch::channel(None);
+        self.sender
+            .send(IngestMessage::Add {
+                entries,
+                metadata,
+                ingestion_time_ms,
+                notifier: notifier_sender,
+            })
+            .await
+            .map_err(|_| Error::Storage("ingestor shut down".to_string()))?;
+        Ok(DurabilityWatcher {
+            receiver: notifier_receiver,
+        })
+    }
 
-        for result_sender in flush_result_senders {
-            let _ = result_sender.send(result.clone());
-        }
+    async fn flush(&self) -> Result<()> {
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(IngestMessage::Flush { result_sender })
+            .await
+            .map_err(|_| Error::Storage("ingestor shut down".to_string()))?;
+        result_receiver
+            .await
+            .map_err(|_| Error::Storage("ingestor shut down".to_string()))?
+    }
+
+    fn conflict_rate(&self) -> f64 {
+        self.producer.conflict_rate()
+    }
+    async fn close(self) -> Result<()> {
+        self.flush().await?;
+        self.cancellation_token.cancel();
+        let _ = self.handle.await;
+        Ok(())
     }
 }
 
 pub struct Ingestor {
-    tx: mpsc::Sender<IngestMessage>,
-    cancellation_token: CancellationToken,
-    handle: tokio::task::JoinHandle<()>,
-    producer: Arc<QueueProducer>,
+    writer: BatchWriter,
     clock: Arc<dyn Clock>,
 }
 
@@ -262,31 +329,16 @@ impl Ingestor {
         object_store: Arc<dyn ObjectStore>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
-        let producer =
-            QueueProducer::with_object_store(config.manifest_path.clone(), object_store.clone());
-        let (tx, rx) = mpsc::channel(config.max_buffered_inputs);
-        let shutdown = CancellationToken::new();
-        let producer = Arc::new(producer);
-
-        let mut writer = BatchWriter {
+        let writer = BatchWriter::new(
             object_store,
-            producer: Arc::clone(&producer),
-            path_prefix: config.data_path_prefix,
-            flush_interval: config.flush_interval,
-            flush_size_bytes: config.flush_size_bytes,
-            batch: Batch::new(),
-            clock: Arc::clone(&clock),
-        };
-        let cancellation_token = shutdown.clone();
-        let handle = tokio::spawn(async move { writer.run(rx, shutdown).await });
-
-        Ok(Self {
-            tx,
-            cancellation_token,
-            handle,
-            producer,
-            clock,
-        })
+            config.manifest_path,
+            config.data_path_prefix,
+            config.flush_interval,
+            config.flush_size_bytes,
+            config.max_buffered_inputs,
+            clock.clone(),
+        );
+        Ok(Self { writer, clock })
     }
 
     /// Submit a set of entries and associated metadata for ingestion.
@@ -298,43 +350,28 @@ impl Ingestor {
             return Err(Error::InvalidInput("entries must not be empty".to_string()));
         }
         let ingestion_time_ms = millis(self.clock.now());
-        let (notifier_tx, notifier_rx) = tokio::sync::watch::channel(None);
-        self.tx
-            .send(IngestMessage::Write {
-                entries,
-                metadata,
-                ingestion_time_ms,
-                notifier: notifier_tx,
-            })
-            .await
-            .map_err(|_| Error::Storage("ingestor shut down".to_string()))?;
+        let durability_watcher = self
+            .writer
+            .add(entries, metadata, ingestion_time_ms)
+            .await?;
         Ok(WriteHandle {
-            watcher: DurabilityWatcher { rx: notifier_rx },
+            watcher: durability_watcher,
         })
     }
 
     /// Flush the current batch, blocking until all pending entries are durably written.
     pub async fn flush(&self) -> Result<()> {
-        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(IngestMessage::Flush { result_sender })
-            .await
-            .map_err(|_| Error::Storage("ingestor shut down".to_string()))?;
-        result_receiver
-            .await
-            .map_err(|_| Error::Storage("ingestor shut down".to_string()))?
+        self.writer.flush().await
     }
 
     /// Return the fraction of manifest writes that encountered optimistic-concurrency conflicts.
     pub fn conflict_rate(&self) -> f64 {
-        self.producer.conflict_rate()
+        self.writer.conflict_rate()
     }
 
     /// Shut down the ingestor, flushing any remaining buffered entries before returning.
     pub async fn close(self) -> Result<()> {
-        self.cancellation_token.cancel();
-        let _ = self.handle.await;
-        Ok(())
+        self.writer.close().await
     }
 }
 
