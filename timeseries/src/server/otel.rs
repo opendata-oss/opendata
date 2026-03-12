@@ -119,7 +119,10 @@ pub async fn handle_otel_metrics(
     tracing::Span::current().record("series_count", series.len());
     tracing::Span::current().record("samples_count", total_samples);
 
-    state.tsdb.ingest_samples(series).await?;
+    let writer = state.writer.as_ref().ok_or_else(|| {
+        crate::error::Error::InvalidInput("write not available in reader mode".to_string())
+    })?;
+    writer.ingest_samples(series).await?;
 
     let response = ExportMetricsServiceResponse {
         partial_success: None,

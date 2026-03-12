@@ -20,6 +20,7 @@ pub fn build_app(tsdb: &TestTsdb) -> Router {
     tsdb.storage.register_metrics(metrics.registry_mut());
     build_router(
         tsdb.inner.clone(),
+        Some(tsdb.inner.clone()),
         Arc::new(metrics),
         OtelServerConfig::default(),
     )

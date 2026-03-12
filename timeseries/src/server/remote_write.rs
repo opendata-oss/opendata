@@ -236,7 +236,11 @@ pub async fn handle_remote_write(
     );
 
     // Ingest samples into the TSDB
-    match state.tsdb.ingest_samples(samples).await {
+    let writer = state
+        .writer
+        .as_ref()
+        .ok_or_else(|| Error::InvalidInput("write not available in reader mode".to_string()))?;
+    match writer.ingest_samples(samples).await {
         Ok(()) => {
             // Increment successful ingestion counter
             state

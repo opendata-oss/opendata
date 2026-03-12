@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod config;
 mod delta;
 mod error;
 mod flusher;
@@ -10,6 +11,7 @@ mod model;
 mod otel;
 mod promql;
 mod query;
+mod reader;
 mod serde;
 mod server;
 mod storage;
@@ -63,39 +65,50 @@ async fn main() {
         PrometheusConfig::default()
     };
 
-    // Create storage based on configuration
-    tracing::info!(
-        "Creating storage with config: {:?}",
-        prometheus_config.storage
-    );
-    let merge_operator = Arc::new(OpenTsdbMergeOperator);
-    let storage = create_storage(
-        &prometheus_config.storage,
-        StorageRuntime::new(),
-        StorageSemantics::new().with_merge_operator(merge_operator),
-    )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::error!("Failed to create storage: {}", e);
-        std::process::exit(1);
-    });
-    tracing::info!("Storage created successfully");
-
-    // Create Tsdb
-    let tsdb = Arc::new(Tsdb::new(storage.clone()));
-
-    // Create server configuration
     let config = ServerConfig {
         port: args.port,
-        prometheus_config,
+        prometheus_config: prometheus_config.clone(),
     };
 
-    // Create and run server
-    let server = TimeSeriesHttpServer::new(tsdb, config, storage);
+    if args.reader {
+        tracing::info!("Starting in reader mode (no writer fencing)");
+        let reader_config = crate::config::ReaderConfig {
+            storage: prometheus_config.storage,
+            ..Default::default()
+        };
+        let reader = reader::TimeSeriesDbReader::open(reader_config)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to open reader: {}", e);
+                std::process::exit(1);
+            });
+        let server = TimeSeriesHttpServer::new_reader(Arc::new(reader), config);
+        tracing::info!("Starting timeseries reader server on port {}...", args.port);
+        server.run().await;
+    } else {
+        tracing::info!(
+            "Creating storage with config: {:?}",
+            prometheus_config.storage
+        );
+        let merge_operator = Arc::new(OpenTsdbMergeOperator);
+        let storage = create_storage(
+            &prometheus_config.storage,
+            StorageRuntime::new(),
+            StorageSemantics::new().with_merge_operator(merge_operator),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to create storage: {}", e);
+            std::process::exit(1);
+        });
+        tracing::info!("Storage created successfully");
 
-    tracing::info!(
-        "Starting timeseries Prometheus-compatible server on port {}...",
-        args.port
-    );
-    server.run().await;
+        let tsdb = Arc::new(Tsdb::new(storage.clone()));
+        let server = TimeSeriesHttpServer::new(tsdb, config, storage);
+        tracing::info!(
+            "Starting timeseries Prometheus-compatible server on port {}...",
+            args.port
+        );
+        server.run().await;
+    }
 }

@@ -28,8 +28,8 @@ use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::{
-    TsdbReadEngine, eval_query_range_bounds, find_label_values_in_range, find_labels_in_range,
-    find_series_in_range,
+    ReadEngine, TsdbReadEngine, eval_query_range_bounds, find_label_values_in_range,
+    find_labels_in_range, find_series_in_range,
 };
 
 // ── ReaderQueryReader ────────────────────────────────────────────────
@@ -293,6 +293,57 @@ impl TsdbReadEngine for TimeSeriesDbReader {
             .await;
 
         Ok(ReaderQueryReader::new(readers))
+    }
+}
+
+#[async_trait]
+impl ReadEngine for TimeSeriesDbReader {
+    async fn eval_query(
+        &self,
+        query: &str,
+        time: Option<SystemTime>,
+        opts: &QueryOptions,
+    ) -> std::result::Result<QueryValue, QueryError> {
+        TsdbReadEngine::eval_query(self, query, time, opts).await
+    }
+
+    async fn eval_query_range(
+        &self,
+        query: &str,
+        start: SystemTime,
+        end: SystemTime,
+        step: Duration,
+        opts: &QueryOptions,
+    ) -> std::result::Result<Vec<RangeSample>, QueryError> {
+        TsdbReadEngine::eval_query_range(self, query, start, end, step, opts).await
+    }
+
+    async fn find_series(
+        &self,
+        matchers: &[&str],
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<Labels>, QueryError> {
+        TsdbReadEngine::find_series(self, matchers, start_secs, end_secs).await
+    }
+
+    async fn find_labels(
+        &self,
+        matchers: Option<&[&str]>,
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        TsdbReadEngine::find_labels(self, matchers, start_secs, end_secs).await
+    }
+
+    async fn find_label_values(
+        &self,
+        label_name: &str,
+        matchers: Option<&[&str]>,
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        TsdbReadEngine::find_label_values(self, label_name, matchers, start_secs, end_secs).await
     }
 }
 

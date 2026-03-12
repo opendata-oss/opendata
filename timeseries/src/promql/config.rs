@@ -25,6 +25,10 @@ pub struct CliArgs {
     /// Port to listen on
     #[arg(short, long, default_value = "9090", env = "OPEN_TSDB_PORT")]
     pub port: u16,
+
+    /// Run in read-only mode using DbReader (no writer fencing)
+    #[arg(long, default_value = "false", env = "OPEN_TSDB_READER_MODE")]
+    pub reader: bool,
 }
 
 /// Root configuration matching prometheus.yaml structure.

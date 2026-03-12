@@ -256,6 +256,61 @@ pub(crate) async fn find_label_values_in_range<E: TsdbReadEngine + ?Sized>(
     E::find_label_values(engine, label_name, matchers, start, end).await
 }
 
+// ── ReadEngine: object-safe facade for HTTP handlers ────────────────
+//
+// `TsdbReadEngine` has an associated type, so it cannot be used as
+// `dyn TsdbReadEngine`. `ReadEngine` wraps the same 5 read methods
+// plus `find_metadata` behind an object-safe async trait so that
+// `AppState` can hold either a `Tsdb` or a `TimeSeriesDbReader`.
+
+#[async_trait]
+pub(crate) trait ReadEngine: Send + Sync {
+    async fn eval_query(
+        &self,
+        query: &str,
+        time: Option<SystemTime>,
+        opts: &QueryOptions,
+    ) -> std::result::Result<QueryValue, QueryError>;
+
+    async fn eval_query_range(
+        &self,
+        query: &str,
+        start: SystemTime,
+        end: SystemTime,
+        step: Duration,
+        opts: &QueryOptions,
+    ) -> std::result::Result<Vec<RangeSample>, QueryError>;
+
+    async fn find_series(
+        &self,
+        matchers: &[&str],
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<Labels>, QueryError>;
+
+    async fn find_labels(
+        &self,
+        matchers: Option<&[&str]>,
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<String>, QueryError>;
+
+    async fn find_label_values(
+        &self,
+        label_name: &str,
+        matchers: Option<&[&str]>,
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<String>, QueryError>;
+
+    async fn find_metadata(
+        &self,
+        _metric: Option<&str>,
+    ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
+        Ok(vec![])
+    }
+}
+
 // ── Shared evaluation free functions ────────────────────────────────
 
 /// Evaluate an instant PromQL query against the given reader.
@@ -755,11 +810,19 @@ impl Tsdb {
         Ok(())
     }
 
+    pub(crate) async fn eval_query(
+        &self,
+        query: &str,
+        time: Option<SystemTime>,
+        opts: &QueryOptions,
+    ) -> std::result::Result<QueryValue, QueryError> {
+        TsdbReadEngine::eval_query(self, query, time, opts).await
+    }
+
     /// Evaluate a range PromQL query, returning typed `RangeSample`s.
     ///
     /// This inherent method converts `impl RangeBounds<SystemTime>` to the
-    /// `(start, end)` pair expected by `TsdbReadEngine`. The other 5 read methods
-    /// live on the `TsdbReadEngine` trait directly (identical signatures).
+    /// `(start, end)` pair expected by `TsdbReadEngine`.
     pub(crate) async fn eval_query_range(
         &self,
         query: &str,
@@ -768,6 +831,34 @@ impl Tsdb {
         opts: &QueryOptions,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
         eval_query_range_bounds(self, query, range, step, opts).await
+    }
+
+    pub(crate) async fn find_series(
+        &self,
+        matchers: &[&str],
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<Labels>, QueryError> {
+        TsdbReadEngine::find_series(self, matchers, start_secs, end_secs).await
+    }
+
+    pub(crate) async fn find_labels(
+        &self,
+        matchers: Option<&[&str]>,
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        TsdbReadEngine::find_labels(self, matchers, start_secs, end_secs).await
+    }
+
+    pub(crate) async fn find_label_values(
+        &self,
+        label_name: &str,
+        matchers: Option<&[&str]>,
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        TsdbReadEngine::find_label_values(self, label_name, matchers, start_secs, end_secs).await
     }
 
     /// Return metadata for all (or a specific) metric.
@@ -796,6 +887,64 @@ impl TsdbReadEngine for Tsdb {
 
     async fn make_query_reader_for_ranges(&self, ranges: &[(i64, i64)]) -> Result<TsdbQueryReader> {
         self.query_reader_for_ranges(ranges).await
+    }
+}
+
+#[async_trait]
+impl ReadEngine for Tsdb {
+    async fn eval_query(
+        &self,
+        query: &str,
+        time: Option<SystemTime>,
+        opts: &QueryOptions,
+    ) -> std::result::Result<QueryValue, QueryError> {
+        TsdbReadEngine::eval_query(self, query, time, opts).await
+    }
+
+    async fn eval_query_range(
+        &self,
+        query: &str,
+        start: SystemTime,
+        end: SystemTime,
+        step: Duration,
+        opts: &QueryOptions,
+    ) -> std::result::Result<Vec<RangeSample>, QueryError> {
+        TsdbReadEngine::eval_query_range(self, query, start, end, step, opts).await
+    }
+
+    async fn find_series(
+        &self,
+        matchers: &[&str],
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<Labels>, QueryError> {
+        TsdbReadEngine::find_series(self, matchers, start_secs, end_secs).await
+    }
+
+    async fn find_labels(
+        &self,
+        matchers: Option<&[&str]>,
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        TsdbReadEngine::find_labels(self, matchers, start_secs, end_secs).await
+    }
+
+    async fn find_label_values(
+        &self,
+        label_name: &str,
+        matchers: Option<&[&str]>,
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        TsdbReadEngine::find_label_values(self, label_name, matchers, start_secs, end_secs).await
+    }
+
+    async fn find_metadata(
+        &self,
+        metric: Option<&str>,
+    ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
+        Tsdb::find_metadata(self, metric).await
     }
 }
 

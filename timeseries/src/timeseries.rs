@@ -15,8 +15,8 @@ use crate::error::{QueryError, Result};
 use crate::model::{Labels, MetricMetadata, QueryValue, RangeSample, Series};
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::{
-    Tsdb, TsdbReadEngine, eval_query_range_bounds, find_label_values_in_range,
-    find_labels_in_range, find_series_in_range,
+    Tsdb, eval_query_range_bounds, find_label_values_in_range, find_labels_in_range,
+    find_series_in_range,
 };
 
 /// A time series database for storing and querying metrics.

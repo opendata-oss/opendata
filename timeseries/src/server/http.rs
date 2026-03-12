@@ -29,7 +29,7 @@ use crate::promql::response::{
     QueryRangeResponse, QueryResponse, SeriesResponse,
 };
 use crate::promql::scraper::Scraper;
-use crate::tsdb::{Tsdb, TsdbReadEngine};
+use crate::tsdb::{ReadEngine, Tsdb};
 
 use crate::util::{parse_duration, parse_timestamp, parse_timestamp_to_seconds};
 
@@ -40,7 +40,9 @@ struct UiAssets;
 /// Shared application state.
 #[derive(Clone)]
 pub(crate) struct AppState {
-    pub(crate) tsdb: Arc<Tsdb>,
+    pub(crate) tsdb: Arc<dyn ReadEngine>,
+    /// Present only in writer mode. Write handlers (remote_write, otel) use this.
+    pub(crate) writer: Option<Arc<Tsdb>>,
     pub(crate) metrics: Arc<Metrics>,
     #[cfg(feature = "otel")]
     pub(crate) otel_converter: Arc<OtelConverter>,
@@ -65,12 +67,14 @@ impl Default for ServerConfig {
 ///
 /// Used by `TimeSeriesHttpServer::run()` and the `testing` module for integration tests.
 pub(crate) fn build_router(
-    tsdb: Arc<Tsdb>,
+    tsdb: Arc<dyn ReadEngine>,
+    writer: Option<Arc<Tsdb>>,
     metrics: Arc<Metrics>,
     _otel_config: OtelServerConfig,
 ) -> Router {
     let state = AppState {
         tsdb,
+        writer,
         metrics: metrics.clone(),
         #[cfg(feature = "otel")]
         otel_converter: Arc::new(OtelConverter::new(OtelConfig {
@@ -112,9 +116,10 @@ pub(crate) fn build_router(
 
 /// Prometheus-compatible HTTP server
 pub(crate) struct TimeSeriesHttpServer {
-    tsdb: Arc<Tsdb>,
+    tsdb: Arc<dyn ReadEngine>,
+    writer: Option<Arc<Tsdb>>,
     config: ServerConfig,
-    storage: Arc<dyn common::Storage>,
+    storage: Option<Arc<dyn common::Storage>>,
 }
 
 impl TimeSeriesHttpServer {
@@ -124,9 +129,19 @@ impl TimeSeriesHttpServer {
         storage: Arc<dyn common::Storage>,
     ) -> Self {
         Self {
-            tsdb,
+            tsdb: tsdb.clone(),
+            writer: Some(tsdb),
             config,
-            storage,
+            storage: Some(storage),
+        }
+    }
+
+    pub(crate) fn new_reader(tsdb: Arc<dyn ReadEngine>, config: ServerConfig) -> Self {
+        Self {
+            tsdb,
+            writer: None,
+            config,
+            storage: None,
         }
     }
 
@@ -134,28 +149,35 @@ impl TimeSeriesHttpServer {
     pub(crate) async fn run(self) {
         // Create metrics registry and register storage engine metrics
         let mut metrics = Metrics::new();
-        self.storage.register_metrics(metrics.registry_mut());
+        if let Some(storage) = &self.storage {
+            storage.register_metrics(metrics.registry_mut());
+        }
         let metrics = Arc::new(metrics);
 
-        // Start the scraper if there are scrape configs
-        if !self.config.prometheus_config.scrape_configs.is_empty() {
-            let scraper = Arc::new(Scraper::new(
-                self.tsdb.clone(),
-                self.config.prometheus_config.clone(),
-                metrics.clone(),
-            ));
-            scraper.run();
-            tracing::info!(
-                "Started scraper with {} job(s)",
-                self.config.prometheus_config.scrape_configs.len()
-            );
+        // Start the scraper only in writer mode
+        if let Some(writer) = &self.writer {
+            if !self.config.prometheus_config.scrape_configs.is_empty() {
+                let scraper = Arc::new(Scraper::new(
+                    writer.clone(),
+                    self.config.prometheus_config.clone(),
+                    metrics.clone(),
+                ));
+                scraper.run();
+                tracing::info!(
+                    "Started scraper with {} job(s)",
+                    self.config.prometheus_config.scrape_configs.len()
+                );
+            } else {
+                tracing::info!("No scrape configs found, scraper not started");
+            }
         } else {
-            tracing::info!("No scrape configs found, scraper not started");
+            tracing::info!("Running in reader mode, scraper disabled");
         }
 
         // Build router with metrics middleware
         let app = build_router(
             self.tsdb.clone(),
+            self.writer.clone(),
             metrics,
             self.config.prometheus_config.otel.clone(),
         );
@@ -169,10 +191,12 @@ impl TimeSeriesHttpServer {
             .await
             .unwrap();
 
-        // Flush TSDB on shutdown to persist any buffered data
-        tracing::info!("Flushing TSDB before shutdown...");
-        if let Err(e) = self.tsdb.flush().await {
-            tracing::error!("Failed to flush TSDB on shutdown: {}", e);
+        // Flush TSDB on shutdown only in writer mode
+        if let Some(writer) = &self.writer {
+            tracing::info!("Flushing TSDB before shutdown...");
+            if let Err(e) = writer.flush().await {
+                tracing::error!("Failed to flush TSDB on shutdown: {}", e);
+            }
         }
 
         tracing::info!("Server shut down gracefully");
@@ -274,7 +298,7 @@ async fn handle_query_range(
     let step = parse_duration(&params.step)?;
     let result = state
         .tsdb
-        .eval_query_range(&params.query, start..=end, step, &QueryOptions::default())
+        .eval_query_range(&params.query, start, end, step, &QueryOptions::default())
         .await;
     Ok(Json(response::range_result_to_response(result)))
 }
