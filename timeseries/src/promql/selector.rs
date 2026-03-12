@@ -64,8 +64,6 @@ async fn find_candidates_with_reader<'reader, R: QueryReader>(
     bucket: &crate::model::TimeBucket,
     selector: &VectorSelector,
 ) -> Result<Vec<SeriesId>> {
-    use std::collections::HashSet;
-
     let mut and_terms = Vec::new(); // Terms that must ALL match (AND)
     let mut or_groups = Vec::new(); // Groups of terms where ANY can match (OR)
 
@@ -144,6 +142,10 @@ async fn find_candidates_with_reader<'reader, R: QueryReader>(
         .collect::<Vec<_>>();
     let inverted_index_view = reader.inverted_index(bucket, &all_terms).await?;
 
+    if !and_terms.is_empty() && or_groups.is_empty() {
+        return Ok(inverted_index_view.intersect(and_terms).iter().collect());
+    }
+
     // Start with AND terms intersection
     let mut result_set: HashSet<SeriesId> = if !and_terms.is_empty() {
         inverted_index_view
@@ -180,14 +182,14 @@ pub(crate) async fn evaluate_selector_with_reader<'reader, R: QueryReader>(
     reader: &mut CachedQueryReader<'reader, R>,
     bucket: crate::model::TimeBucket,
     selector: &VectorSelector,
-) -> Result<HashSet<SeriesId>> {
+) -> Result<Vec<SeriesId>> {
     let candidates = find_candidates_with_reader(reader, &bucket, selector).await?;
 
     // If there are negative matchers or empty string matchers, we need to filter using forward index
     if candidates.is_empty()
         || (!has_negative_matchers(selector) && !has_empty_string_matchers(selector))
     {
-        return Ok(candidates.into_iter().collect());
+        return Ok(candidates);
     }
 
     // Get forward index view for candidates to apply filtering
@@ -206,7 +208,7 @@ pub(crate) async fn evaluate_selector_with_reader<'reader, R: QueryReader>(
             .map_err(crate::error::Error::InvalidInput)?;
     }
 
-    Ok(filtered.into_iter().collect())
+    Ok(filtered)
 }
 
 /// Evaluate selector on in-memory indexes.
