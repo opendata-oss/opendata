@@ -292,11 +292,7 @@ pub(crate) mod test_utils {
             if !forward_index.series.contains_key(&series_id) {
                 forward_index.series.insert(
                     series_id,
-                    SeriesSpec {
-                        unit: None,
-                        metric_type: Some(metric_type),
-                        labels: labels.clone(),
-                    },
+                    SeriesSpec::new(None, Some(metric_type), labels.clone()),
                 );
 
                 // Add to inverted index for this bucket

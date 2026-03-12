@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use crate::model::MetricType;
-use crate::model::{Label, SeriesId};
+use crate::model::{Label, SeriesFingerprint, SeriesId};
+use crate::util::Fingerprint;
 use dashmap::{DashMap, mapref::one::Ref};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
@@ -8,7 +11,24 @@ use std::collections::HashMap;
 pub(crate) struct SeriesSpec {
     pub(crate) unit: Option<String>,
     pub(crate) metric_type: Option<MetricType>,
-    pub(crate) labels: Vec<Label>,
+    pub(crate) labels: Arc<[Label]>,
+    pub(crate) fingerprint: SeriesFingerprint,
+}
+
+impl SeriesSpec {
+    pub(crate) fn new(
+        unit: Option<String>,
+        metric_type: Option<MetricType>,
+        labels: Vec<Label>,
+    ) -> Self {
+        let fingerprint = labels.fingerprint();
+        Self {
+            unit,
+            metric_type,
+            labels: Arc::<[Label]>::from(labels),
+            fingerprint,
+        }
+    }
 }
 
 /// Trait for looking up series specs by ID.

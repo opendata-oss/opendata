@@ -182,11 +182,7 @@ impl From<ForwardIndexValue> for SeriesSpec {
             _ => None, // Unknown types map to None
         };
 
-        SeriesSpec {
-            unit: value.metric_unit,
-            metric_type,
-            labels: value.labels,
-        }
+        SeriesSpec::new(value.metric_unit, metric_type, value.labels)
     }
 }
 

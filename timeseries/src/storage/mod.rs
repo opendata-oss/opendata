@@ -302,7 +302,7 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
             metric_unit: series_spec.unit,
             metric_meta: series_spec.metric_type.into(),
             label_count: series_spec.labels.len() as u16,
-            labels: series_spec.labels,
+            labels: series_spec.labels.iter().cloned().collect(),
         }
         .encode();
         Ok(RecordOp::Put(Record { key, value }.into()))

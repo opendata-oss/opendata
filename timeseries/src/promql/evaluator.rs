@@ -971,7 +971,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     .samples(&bucket, series_id, start_ms, end_ms)
                     .await?;
 
-                let mut labels_key: Vec<Label> = series_spec.labels.clone();
+                let mut labels_key: Vec<Label> = series_spec.labels.as_ref().to_vec();
                 // Sort by canonical Label ordering (name, then value) for series grouping
                 labels_key.sort();
 
@@ -1175,7 +1175,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     continue;
                 };
 
-                let fingerprint = self.compute_fingerprint(&series_spec.labels);
+                let fingerprint = series_spec.fingerprint;
 
                 let samples = self
                     .reader
@@ -1346,7 +1346,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                         )));
                     }
                 };
-                let fingerprint = self.compute_fingerprint(&series_spec.labels);
+                let fingerprint = series_spec.fingerprint;
 
                 // Skip if we already found a sample for this series in a newer bucket
                 if series_with_results.contains(&fingerprint) {
@@ -1440,20 +1440,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             .iter()
             .map(|label| (label.name.clone(), label.value.clone()))
             .collect()
-    }
-
-    /// Compute fingerprint from labels (simple hash for deduplication)
-    fn compute_fingerprint(&self, labels: &[Label]) -> SeriesFingerprint {
-        // Use a simple hash of sorted labels
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        let mut sorted_labels: Vec<_> = labels.iter().collect();
-        sorted_labels.sort_by(|a, b| a.name.cmp(&b.name));
-        for label in sorted_labels {
-            label.name.hash(&mut hasher);
-            label.value.hash(&mut hasher);
-        }
-        hasher.finish() as SeriesFingerprint
     }
 
     async fn evaluate_call(

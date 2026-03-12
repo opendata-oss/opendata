@@ -99,11 +99,7 @@ impl TsdbWriteDelta {
 
         self.series_dict_delta.insert(fingerprint, series_id);
 
-        let series_spec = SeriesSpec {
-            unit: unit.clone(),
-            metric_type,
-            labels: labels.to_vec(),
-        };
+        let series_spec = SeriesSpec::new(unit.clone(), metric_type, labels.to_vec());
 
         self.forward_index.series.insert(series_id, series_spec);
 

@@ -509,11 +509,7 @@ mod tests {
             ];
             forward.series.insert(
                 id,
-                SeriesSpec {
-                    unit: None,
-                    metric_type: Some(MetricType::Gauge),
-                    labels: attrs.clone(),
-                },
+                SeriesSpec::new(None, Some(MetricType::Gauge), attrs.clone()),
             );
             for attr in attrs {
                 inverted
@@ -1151,11 +1147,7 @@ mod tests {
         ];
         forward.series.insert(
             1,
-            SeriesSpec {
-                unit: None,
-                metric_type: Some(MetricType::Gauge),
-                labels: series1_labels.clone(),
-            },
+            SeriesSpec::new(None, Some(MetricType::Gauge), series1_labels.clone()),
         );
         for label in series1_labels {
             inverted
@@ -1179,11 +1171,7 @@ mod tests {
         ];
         forward.series.insert(
             2,
-            SeriesSpec {
-                unit: None,
-                metric_type: Some(MetricType::Gauge),
-                labels: series2_labels.clone(),
-            },
+            SeriesSpec::new(None, Some(MetricType::Gauge), series2_labels.clone()),
         );
         for label in series2_labels {
             inverted
@@ -1211,11 +1199,7 @@ mod tests {
         ];
         forward.series.insert(
             3,
-            SeriesSpec {
-                unit: None,
-                metric_type: Some(MetricType::Gauge),
-                labels: series3_labels.clone(),
-            },
+            SeriesSpec::new(None, Some(MetricType::Gauge), series3_labels.clone()),
         );
         for label in series3_labels {
             inverted
@@ -1243,11 +1227,7 @@ mod tests {
         ];
         forward.series.insert(
             4,
-            SeriesSpec {
-                unit: None,
-                metric_type: Some(MetricType::Gauge),
-                labels: series4_labels.clone(),
-            },
+            SeriesSpec::new(None, Some(MetricType::Gauge), series4_labels.clone()),
         );
         for label in series4_labels {
             inverted

@@ -396,7 +396,7 @@ pub(crate) async fn discover_series(
         }
         let forward_index = reader.forward_index(&bucket, &series_ids_vec).await?;
         for (_id, spec) in forward_index.all_series() {
-            let mut sorted_labels = spec.labels.clone();
+            let mut sorted_labels = spec.labels.as_ref().to_vec();
             sorted_labels.sort();
             unique_series.insert(Labels::new(sorted_labels));
         }
@@ -433,7 +433,7 @@ pub(crate) async fn discover_labels(
                 }
                 let forward_index = reader.forward_index(&bucket, &series_ids_vec).await?;
                 for (_id, spec) in forward_index.all_series() {
-                    for attr in &spec.labels {
+                    for attr in spec.labels.iter() {
                         label_names.insert(attr.name.clone());
                     }
                 }
@@ -481,7 +481,7 @@ pub(crate) async fn discover_label_values(
                 }
                 let forward_index = reader.forward_index(&bucket, &series_ids_vec).await?;
                 for (_id, spec) in forward_index.all_series() {
-                    for attr in &spec.labels {
+                    for attr in spec.labels.iter() {
                         if attr.name == label_name {
                             values.insert(attr.value.clone());
                         }
