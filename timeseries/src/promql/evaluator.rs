@@ -96,9 +96,12 @@ impl QueryReaderEvalCache {
         forward_index: Box<dyn ForwardIndexLookup + Send + Sync + 'static>,
     ) {
         let bucket_cache = self.get_bucket_cache_mut(&bucket);
+        let cached_index = CachedForwardIndex {
+            data: forward_index.all_series().into_iter().collect(),
+        };
         bucket_cache
             .forward_index_cache
-            .insert(series_ids, forward_index.into());
+            .insert(series_ids, Arc::new(cached_index));
     }
 
     pub(crate) fn get_forward_index(
@@ -119,9 +122,12 @@ impl QueryReaderEvalCache {
         result: Box<dyn InvertedIndexLookup + Send + Sync + 'static>,
     ) {
         let bucket_cache = self.get_bucket_cache_mut(&bucket);
+        let cached_index = CachedInvertedIndex {
+            result: result.intersect(terms.clone()),
+        };
         bucket_cache
             .inverted_index_cache
-            .insert(terms, result.into());
+            .insert(terms, Arc::new(cached_index));
     }
 
     pub(crate) fn get_inverted_index(
