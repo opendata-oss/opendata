@@ -79,6 +79,7 @@ impl Default for Config {
 /// let config = ReaderConfig {
 ///     storage: StorageConfig::default(),
 ///     refresh_interval: Duration::from_secs(1),
+///     checkpoint_lifetime: Duration::from_secs(600),
 ///     ..Default::default()
 /// };
 /// let reader = TimeSeriesDbReader::open(config).await?;
@@ -102,6 +103,15 @@ pub struct ReaderConfig {
     #[serde(default = "default_refresh_interval")]
     pub refresh_interval: Duration,
 
+    /// Lifetime for the checkpoint maintained by the underlying SlateDB reader.
+    ///
+    /// This must be at least twice `refresh_interval` per SlateDB validation rules.
+    ///
+    /// Defaults to 10 minutes, matching SlateDB's default.
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
+    #[serde(default = "default_checkpoint_lifetime")]
+    pub checkpoint_lifetime: Duration,
+
     /// Maximum number of bucket readers to cache in memory.
     ///
     /// Each bucket reader holds open references to the underlying storage for
@@ -117,6 +127,10 @@ fn default_refresh_interval() -> Duration {
     Duration::from_secs(1)
 }
 
+fn default_checkpoint_lifetime() -> Duration {
+    Duration::from_secs(10 * 60)
+}
+
 /// Default number of bucket readers cached in memory.
 pub(crate) const DEFAULT_CACHE_CAPACITY: u64 = 50;
 
@@ -129,6 +143,7 @@ impl Default for ReaderConfig {
         Self {
             storage: StorageConfig::default(),
             refresh_interval: default_refresh_interval(),
+            checkpoint_lifetime: default_checkpoint_lifetime(),
             cache_capacity: default_cache_capacity(),
         }
     }

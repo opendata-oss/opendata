@@ -40,3 +40,13 @@ Takeaway:
 
 - The forward-index entry cache is not a universal latency reduction for every query shape.
 - It is still worth keeping because it improves the two higher-cardinality queries that were dominated by `CachedForwardIndex::get_spec`, while leaving the already-optimized `process_rate` query effectively flat.
+
+Benchmark caveat observed on the perf branch:
+
+- Some longer attach-profile runs on commit `64f1073` failed with an intermittent SlateDB merge-ordering error that did not correlate with the evaluator changes under test.
+- Exact log lines captured during those failed runs:
+  - `thread_saturation`: `invalid sequence number ordering during merge. expected sequence numbers in descending order, but found 120126 followed by 120128`
+  - `thread_saturation`: `invalid sequence number ordering during merge. expected sequence numbers in descending order, but found 120127 followed by 120128`
+  - `origin_events_2d`: `invalid sequence number ordering during merge. expected sequence numbers in descending order, but found 120181 followed by 120183`
+  - `origin_events_2d`: `invalid sequence number ordering during merge. expected sequence numbers in descending order, but found 120182 followed by 120183`
+- Normal warm-cache benchmark runs without the longer attach/profiling flow still completed successfully, so these failures were treated as storage-state noise and excluded from optimization comparisons.
