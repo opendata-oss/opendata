@@ -5,7 +5,7 @@
 
 use crate::serde::centroid_chunk::CentroidChunkValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
-use crate::serde::posting_list::{merge_batch_posting_list, merge_posting_list};
+use crate::serde::posting_list::merge_batch_posting_list;
 use crate::serde::{EncodingError, KEY_VERSION, RecordType};
 use bytes::Bytes;
 use common::serde::key_prefix::KeyPrefix;
@@ -31,43 +31,7 @@ impl VectorDbMergeOperator {
 
 impl common::storage::MergeOperator for VectorDbMergeOperator {
     fn merge(&self, key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
-        // If no existing value, just return the new value
-        let Some(existing) = existing_value else {
-            return new_value;
-        };
-
-        let prefix =
-            KeyPrefix::from_bytes_versioned(key, KEY_VERSION).expect("Failed to decode key prefix");
-
-        let record_tag = prefix.tag();
-
-        let record_type_id = record_tag.record_type();
-        let record_type =
-            RecordType::from_id(record_type_id).expect("Failed to get record type from record tag");
-
-        match record_type {
-            RecordType::Deletions | RecordType::MetadataIndex => {
-                // Deletions and MetadataIndex use RoaringTreemap and merge via union
-                merge_roaring_treemap(existing, new_value).expect("Failed to merge RoaringTreemap")
-            }
-            RecordType::PostingList => {
-                // PostingList deduplicates by id, keeping only the last update per id
-                merge_posting_list(existing, new_value, self.dimensions)
-            }
-            RecordType::CentroidStats => {
-                // CentroidStats sums i32 deltas
-                merge_centroid_stats(existing, new_value)
-            }
-            RecordType::CentroidChunk => {
-                // CentroidChunk appends new entries to existing chunk
-                merge_centroid_chunk(existing, new_value, self.dimensions)
-            }
-            _ => {
-                // For other record types (IdDictionary, VectorData, VectorMeta, etc.),
-                // just use new value. These should use Put, not Merge, but handle gracefully
-                new_value
-            }
-        }
+        self.merge_batch(key, existing_value, &[new_value])
     }
 
     fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
@@ -89,7 +53,11 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
             RecordType::CentroidChunk => {
                 merge_batch_centroid_chunk(existing_value, operands, self.dimensions)
             }
-            _ => default_merge_batch(key, existing_value, operands, |k, e, v| self.merge(k, e, v)),
+            _ => {
+                // For other record types (IdDictionary, VectorData, VectorMeta, etc.), just use new value
+                // for each pairwise merge. These should use Put, not Merge, but handle gracefully
+                default_merge_batch(key, existing_value, operands, |_k, _e, v| v)
+            }
         }
     }
 }
@@ -123,36 +91,6 @@ fn merge_batch_roaring_treemap(
         merged |= bitmap;
     }
 
-    let mut buf = Vec::new();
-    merged.serialize_into(&mut buf).map_err(|e| EncodingError {
-        message: format!("Failed to serialize merged RoaringTreemap: {}", e),
-    })?;
-    Ok(Bytes::from(buf))
-}
-
-/// Merge two RoaringTreemap values by unioning them.
-///
-/// Used for:
-/// - Deletions: Union deleted vector IDs
-/// - MetadataIndex: Union vector IDs matching a metadata filter
-fn merge_roaring_treemap(existing: Bytes, new_value: Bytes) -> Result<Bytes, EncodingError> {
-    // Deserialize both bitmaps
-    let existing_bitmap = RoaringTreemap::deserialize_from(Cursor::new(existing.as_ref()))
-        .map_err(|e| EncodingError {
-            message: format!("Failed to deserialize existing RoaringTreemap: {}", e),
-        })?;
-
-    let new_bitmap =
-        RoaringTreemap::deserialize_from(Cursor::new(new_value.as_ref())).map_err(|e| {
-            EncodingError {
-                message: format!("Failed to deserialize new RoaringTreemap: {}", e),
-            }
-        })?;
-
-    // Union the bitmaps
-    let merged = existing_bitmap | new_bitmap;
-
-    // Serialize result
     let mut buf = Vec::new();
     merged.serialize_into(&mut buf).map_err(|e| EncodingError {
         message: format!("Failed to serialize merged RoaringTreemap: {}", e),
@@ -200,27 +138,6 @@ fn merge_batch_centroid_chunk(
     }
 
     CentroidChunkValue::new(entries).encode_to_bytes(dimensions)
-}
-
-/// Merge two CentroidChunk values by appending entries from new to existing.
-fn merge_centroid_chunk(existing: Bytes, new_value: Bytes, dimensions: usize) -> Bytes {
-    let existing_chunk = CentroidChunkValue::decode_from_bytes(&existing, dimensions)
-        .expect("Failed to decode existing CentroidChunkValue");
-    let new_chunk = CentroidChunkValue::decode_from_bytes(&new_value, dimensions)
-        .expect("Failed to decode new CentroidChunkValue");
-    let mut combined_entries = existing_chunk.entries;
-    combined_entries.extend(new_chunk.entries);
-    CentroidChunkValue::new(combined_entries).encode_to_bytes(dimensions)
-}
-
-/// Merge two CentroidStats values by summing their i32 deltas.
-fn merge_centroid_stats(existing: Bytes, new_value: Bytes) -> Bytes {
-    let existing_stats = CentroidStatsValue::decode_from_bytes(&existing)
-        .expect("Failed to decode existing CentroidStatsValue");
-    let new_stats = CentroidStatsValue::decode_from_bytes(&new_value)
-        .expect("Failed to decode new CentroidStatsValue");
-    let merged = CentroidStatsValue::new(existing_stats.num_vectors + new_stats.num_vectors);
-    merged.encode_to_bytes()
 }
 
 #[cfg(test)]
@@ -313,7 +230,7 @@ mod tests {
             .unwrap();
 
         // when
-        let merged = merge_roaring_treemap(existing_value, new_value).unwrap();
+        let merged = merge_batch_roaring_treemap(Some(existing_value), &[new_value]).unwrap();
         let decoded = DeletionsValue::decode_from_bytes(&merged).unwrap();
 
         // then
@@ -365,7 +282,7 @@ mod tests {
             .unwrap();
 
         // when
-        let merged = merge_roaring_treemap(existing_value, new_value).unwrap();
+        let merged = merge_batch_roaring_treemap(Some(existing_value), &[new_value]).unwrap();
         let decoded = MetadataIndexValue::decode_from_bytes(&merged).unwrap();
 
         // then
