@@ -86,6 +86,9 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
                 merge_batch_posting_list(existing_value, operands, self.dimensions)
             }
             RecordType::CentroidStats => merge_batch_centroid_stats(existing_value, operands),
+            RecordType::CentroidChunk => {
+                merge_batch_centroid_chunk(existing_value, operands, self.dimensions)
+            }
             _ => default_merge_batch(key, existing_value, operands, |k, e, v| self.merge(k, e, v)),
         }
     }
@@ -176,6 +179,29 @@ fn merge_batch_centroid_stats(existing: Option<Bytes>, operands: &[Bytes]) -> By
     CentroidStatsValue::new(total).encode_to_bytes()
 }
 
+/// Batch merge CentroidChunk values by appending entries from all operands.
+fn merge_batch_centroid_chunk(
+    existing: Option<Bytes>,
+    operands: &[Bytes],
+    dimensions: usize,
+) -> Bytes {
+    let mut entries = if let Some(existing) = existing {
+        CentroidChunkValue::decode_from_bytes(&existing, dimensions)
+            .expect("Failed to decode existing CentroidChunkValue")
+            .entries
+    } else {
+        Vec::new()
+    };
+
+    for operand in operands {
+        let chunk = CentroidChunkValue::decode_from_bytes(operand, dimensions)
+            .expect("Failed to decode operand CentroidChunkValue");
+        entries.extend(chunk.entries);
+    }
+
+    CentroidChunkValue::new(entries).encode_to_bytes(dimensions)
+}
+
 /// Merge two CentroidChunk values by appending entries from new to existing.
 fn merge_centroid_chunk(existing: Bytes, new_value: Bytes, dimensions: usize) -> Bytes {
     let existing_chunk = CentroidChunkValue::decode_from_bytes(&existing, dimensions)
@@ -201,9 +227,11 @@ fn merge_centroid_stats(existing: Bytes, new_value: Bytes) -> Bytes {
 mod tests {
     use super::*;
     use crate::serde::FieldValue;
+    use crate::serde::centroid_chunk::CentroidEntry;
     use crate::serde::deletions::DeletionsValue;
     use crate::serde::key::{
-        CentroidStatsKey, DeletionsKey, IdDictionaryKey, MetadataIndexKey, PostingListKey,
+        CentroidChunkKey, CentroidStatsKey, DeletionsKey, IdDictionaryKey, MetadataIndexKey,
+        PostingListKey,
     };
     use crate::serde::metadata_index::MetadataIndexValue;
     use crate::serde::posting_list::{PostingListValue, PostingUpdate};
@@ -522,6 +550,80 @@ mod tests {
         // then
         let decoded = CentroidStatsValue::decode_from_bytes(&merged).unwrap();
         assert_eq!(decoded.num_vectors, 12);
+    }
+
+    #[test]
+    fn should_batch_merge_centroid_chunk_no_existing() {
+        // given
+        let dimensions = 2;
+        let op0 = CentroidChunkValue::new(vec![CentroidEntry::new(1, vec![1.0, 2.0])])
+            .encode_to_bytes(dimensions);
+        let op1 = CentroidChunkValue::new(vec![
+            CentroidEntry::new(2, vec![3.0, 4.0]),
+            CentroidEntry::new(3, vec![5.0, 6.0]),
+        ])
+        .encode_to_bytes(dimensions);
+
+        // when
+        let merged = merge_batch_centroid_chunk(None, &[op0, op1], dimensions);
+
+        // then
+        let decoded = CentroidChunkValue::decode_from_bytes(&merged, dimensions).unwrap();
+        assert_eq!(decoded.entries.len(), 3);
+        assert_eq!(decoded.entries[0].centroid_id, 1);
+        assert_eq!(decoded.entries[1].centroid_id, 2);
+        assert_eq!(decoded.entries[2].centroid_id, 3);
+        assert_eq!(decoded.entries[0].vector, vec![1.0, 2.0]);
+        assert_eq!(decoded.entries[1].vector, vec![3.0, 4.0]);
+        assert_eq!(decoded.entries[2].vector, vec![5.0, 6.0]);
+    }
+
+    #[test]
+    fn should_batch_merge_centroid_chunk_with_existing() {
+        // given
+        let dimensions = 2;
+        let existing = CentroidChunkValue::new(vec![CentroidEntry::new(1, vec![1.0, 2.0])])
+            .encode_to_bytes(dimensions);
+        let op0 = CentroidChunkValue::new(vec![CentroidEntry::new(2, vec![3.0, 4.0])])
+            .encode_to_bytes(dimensions);
+        let op1 = CentroidChunkValue::new(vec![CentroidEntry::new(3, vec![5.0, 6.0])])
+            .encode_to_bytes(dimensions);
+
+        // when
+        let merged = merge_batch_centroid_chunk(Some(existing), &[op0, op1], dimensions);
+
+        // then
+        let decoded = CentroidChunkValue::decode_from_bytes(&merged, dimensions).unwrap();
+        assert_eq!(decoded.entries.len(), 3);
+        assert_eq!(decoded.entries[0].centroid_id, 1);
+        assert_eq!(decoded.entries[1].centroid_id, 2);
+        assert_eq!(decoded.entries[2].centroid_id, 3);
+        assert_eq!(decoded.entries[0].vector, vec![1.0, 2.0]);
+        assert_eq!(decoded.entries[1].vector, vec![3.0, 4.0]);
+        assert_eq!(decoded.entries[2].vector, vec![5.0, 6.0]);
+    }
+
+    #[test]
+    fn should_route_merge_batch_centroid_chunk() {
+        // given
+        let dimensions = 2;
+        let operator = VectorDbMergeOperator::new(dimensions);
+        let key = CentroidChunkKey::new(1).encode();
+        let existing = CentroidChunkValue::new(vec![CentroidEntry::new(1, vec![1.0, 2.0])])
+            .encode_to_bytes(dimensions);
+        let op0 = CentroidChunkValue::new(vec![CentroidEntry::new(2, vec![3.0, 4.0])])
+            .encode_to_bytes(dimensions);
+
+        // when
+        let merged = operator.merge_batch(&key, Some(existing), &[op0]);
+
+        // then
+        let decoded = CentroidChunkValue::decode_from_bytes(&merged, dimensions).unwrap();
+        assert_eq!(decoded.entries.len(), 2);
+        assert_eq!(decoded.entries[0].centroid_id, 1);
+        assert_eq!(decoded.entries[1].centroid_id, 2);
+        assert_eq!(decoded.entries[0].vector, vec![1.0, 2.0]);
+        assert_eq!(decoded.entries[1].vector, vec![3.0, 4.0]);
     }
 
     #[test]
