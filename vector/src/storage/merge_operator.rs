@@ -85,6 +85,7 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
             RecordType::PostingList => {
                 merge_batch_posting_list(existing_value, operands, self.dimensions)
             }
+            RecordType::CentroidStats => merge_batch_centroid_stats(existing_value, operands),
             _ => default_merge_batch(key, existing_value, operands, |k, e, v| self.merge(k, e, v)),
         }
     }
@@ -154,6 +155,25 @@ fn merge_roaring_treemap(existing: Bytes, new_value: Bytes) -> Result<Bytes, Enc
         message: format!("Failed to serialize merged RoaringTreemap: {}", e),
     })?;
     Ok(Bytes::from(buf))
+}
+
+/// Batch merge CentroidStats values by summing all i32 deltas at once.
+fn merge_batch_centroid_stats(existing: Option<Bytes>, operands: &[Bytes]) -> Bytes {
+    let mut total = if let Some(existing) = existing {
+        CentroidStatsValue::decode_from_bytes(&existing)
+            .expect("Failed to decode existing CentroidStatsValue")
+            .num_vectors
+    } else {
+        0
+    };
+
+    for operand in operands {
+        total += CentroidStatsValue::decode_from_bytes(operand)
+            .expect("Failed to decode operand CentroidStatsValue")
+            .num_vectors;
+    }
+
+    CentroidStatsValue::new(total).encode_to_bytes()
 }
 
 /// Merge two CentroidChunk values by appending entries from new to existing.
@@ -455,6 +475,53 @@ mod tests {
             "Failed test case: {}",
             description
         );
+    }
+
+    #[test]
+    fn should_batch_merge_centroid_stats_no_existing() {
+        // given
+        let op0 = CentroidStatsValue::new(3).encode_to_bytes();
+        let op1 = CentroidStatsValue::new(5).encode_to_bytes();
+        let op2 = CentroidStatsValue::new(-2).encode_to_bytes();
+
+        // when
+        let merged = merge_batch_centroid_stats(None, &[op0, op1, op2]);
+
+        // then
+        let decoded = CentroidStatsValue::decode_from_bytes(&merged).unwrap();
+        assert_eq!(decoded.num_vectors, 6);
+    }
+
+    #[test]
+    fn should_batch_merge_centroid_stats_with_existing() {
+        // given
+        let existing = CentroidStatsValue::new(10).encode_to_bytes();
+        let op0 = CentroidStatsValue::new(3).encode_to_bytes();
+        let op1 = CentroidStatsValue::new(-7).encode_to_bytes();
+
+        // when
+        let merged = merge_batch_centroid_stats(Some(existing), &[op0, op1]);
+
+        // then
+        let decoded = CentroidStatsValue::decode_from_bytes(&merged).unwrap();
+        assert_eq!(decoded.num_vectors, 6);
+    }
+
+    #[test]
+    fn should_route_merge_batch_centroid_stats() {
+        // given
+        let operator = VectorDbMergeOperator::new(3);
+        let key = CentroidStatsKey::new(1).encode();
+        let existing = CentroidStatsValue::new(10).encode_to_bytes();
+        let op0 = CentroidStatsValue::new(5).encode_to_bytes();
+        let op1 = CentroidStatsValue::new(-3).encode_to_bytes();
+
+        // when
+        let merged = operator.merge_batch(&key, Some(existing), &[op0, op1]);
+
+        // then
+        let decoded = CentroidStatsValue::decode_from_bytes(&merged).unwrap();
+        assert_eq!(decoded.num_vectors, 12);
     }
 
     #[test]
