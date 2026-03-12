@@ -66,10 +66,16 @@ impl CompactionScheduler for L0OnlyCompactionScheduler {
         // order so that validate() sees consecutive entries.
         let mut specs = Vec::new();
         let mut end = available.len();
+        let mut next_dst = base_dst;
 
         while active_count + specs.len() < self.max_concurrent_compactions {
             if end < self.min_compaction_sources {
                 break;
+            }
+
+            // Skip destination SR IDs already claimed by active compactions.
+            while sources_used.contains(&SourceId::SortedRun(next_dst)) {
+                next_dst += 1;
             }
 
             let take = end.min(self.max_compaction_sources);
@@ -77,12 +83,8 @@ impl CompactionScheduler for L0OnlyCompactionScheduler {
             let batch: Vec<SourceId> = available[start..end].to_vec();
             end = start;
 
-            let dst = base_dst + specs.len() as u32;
-            if sources_used.contains(&SourceId::SortedRun(dst)) {
-                break;
-            }
-
-            specs.push(CompactionSpec::new(batch, dst));
+            specs.push(CompactionSpec::new(batch, next_dst));
+            next_dst += 1;
         }
 
         eprintln!(
