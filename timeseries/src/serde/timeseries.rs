@@ -250,39 +250,81 @@ pub(crate) fn merge_batch_time_series(
         return Ok(sources[0].clone());
     }
 
-    // Decode all sources into (priority, timestamp, value) triples.
-    // Priority is the source index: higher index = newer = wins on tie.
-    let mut samples: Vec<(usize, i64, f64)> = Vec::new();
-    for (priority, source) in sources.iter().enumerate() {
-        let iter = TimeSeriesIterator::new(source.as_ref()).expect("Series should not be empty");
-        for result in iter {
-            let sample = result?;
-            samples.push((priority, sample.timestamp_ms, sample.value));
-        }
+    // K-way merge: each source is already sorted by timestamp. We maintain
+    // iterator heads and always pick the smallest timestamp, resolving ties
+    // by preferring the highest-priority (latest) source (last write wins).
+    let num_sources = sources.len();
+    let mut iters: Vec<TimeSeriesIterator<'_>> = Vec::with_capacity(num_sources);
+    let mut heads: Vec<Option<Sample>> = Vec::with_capacity(num_sources);
+    for source in &sources {
+        let mut iter =
+            TimeSeriesIterator::new(source.as_ref()).expect("Series should not be empty");
+        let head = match iter.next() {
+            Some(Ok(s)) => Some(s),
+            Some(Err(e)) => return Err(e),
+            None => None,
+        };
+        iters.push(iter);
+        heads.push(head);
     }
-    // If all iterators returned None immediately, treat as empty.
-    if samples.is_empty() {
+
+    // Find the first sample to initialize the encoder
+    let first_ts = heads
+        .iter()
+        .filter_map(|h| h.as_ref().map(|s| s.timestamp_ms))
+        .min();
+    let Some(start_time) = first_ts else {
         return Ok(Bytes::new());
-    }
+    };
 
-    // Sort by timestamp ascending, then by priority descending (newest first)
-    samples.sort_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
-    // Dedup by timestamp, keeping the first (highest priority) entry (last write wins)
-    samples.dedup_by(|a, b| a.1 == b.1);
-
-    // Encode the merged result
     let writer = BufferedWriter::new();
-    let start_time = samples[0].1 as u64;
-    let mut encoder = StdEncoder::new(start_time, writer);
+    let mut encoder = StdEncoder::new(start_time as u64, writer);
+    let mut last_ts: i64 = i64::MIN;
 
-    for &(_, timestamp, value) in &samples {
-        encoder.encode(DataPoint::new(timestamp as u64, value));
+    loop {
+        // Find the minimum timestamp among all heads
+        let mut min_ts = i64::MAX;
+        for head in &heads {
+            if let Some(s) = head {
+                if s.timestamp_ms < min_ts {
+                    min_ts = s.timestamp_ms;
+                }
+            }
+        }
+        if min_ts == i64::MAX {
+            break; // All iterators exhausted
+        }
+
+        // Among all heads with this timestamp, pick the highest-priority (last) source.
+        // Advance all heads that match this timestamp.
+        let mut best_value = 0.0f64;
+        for i in 0..num_sources {
+            if let Some(ref s) = heads[i] {
+                if s.timestamp_ms == min_ts {
+                    // Higher index = higher priority, so always overwrite
+                    best_value = s.value;
+                    // Advance this iterator
+                    heads[i] = match iters[i].next() {
+                        Some(Ok(s)) => Some(s),
+                        Some(Err(e)) => return Err(e),
+                        None => None,
+                    };
+                }
+            }
+        }
+
+        // Skip duplicate timestamps (shouldn't happen with proper dedup above,
+        // but guard against malformed input with duplicate timestamps within a source)
+        if min_ts != last_ts {
+            encoder.encode(DataPoint::new(min_ts as u64, best_value));
+            last_ts = min_ts;
+        }
+
+        // Note: if a single source has duplicate timestamps, we still advance past them
+        // but only encode once. The last_ts guard handles this.
     }
 
-    // Close encoder to get compressed data
     let compressed = encoder.close();
-
-    // Convert directly to Bytes without copying
     Ok(Bytes::from(compressed))
 }
 
