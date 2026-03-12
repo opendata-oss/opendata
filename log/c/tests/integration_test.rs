@@ -35,6 +35,8 @@ fn open_in_memory_log() -> *mut opendata_log_t {
         settings_path: ptr::null(),
         seal_interval_ms: -1,
         read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
+        compaction_mode: OPENDATA_LOG_COMPACTION_DEFAULT,
+        separate_compaction_runtime: true,
     };
     let mut log: *mut opendata_log_t = ptr::null_mut();
     assert_ok(unsafe { opendata_log_open(&config, &mut log) });
@@ -115,6 +117,8 @@ fn open_rejects_null_out_pointer() {
         settings_path: ptr::null(),
         seal_interval_ms: -1,
         read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
+        compaction_mode: OPENDATA_LOG_COMPACTION_DEFAULT,
+        separate_compaction_runtime: true,
     };
     assert_error(
         unsafe { opendata_log_open(&config, ptr::null_mut()) },
@@ -139,6 +143,8 @@ fn open_rejects_invalid_storage_type() {
         settings_path: ptr::null(),
         seal_interval_ms: -1,
         read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
+        compaction_mode: OPENDATA_LOG_COMPACTION_DEFAULT,
+        separate_compaction_runtime: true,
     };
     let mut log: *mut opendata_log_t = ptr::null_mut();
     assert_error(
@@ -452,6 +458,8 @@ fn reader_open_and_close() {
         settings_path: ptr::null(),
         seal_interval_ms: -1,
         read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
+        compaction_mode: OPENDATA_LOG_COMPACTION_DEFAULT,
+        separate_compaction_runtime: true,
     };
     let mut log: *mut opendata_log_t = ptr::null_mut();
     assert_ok(unsafe { opendata_log_open(&writer_config, &mut log) });
@@ -491,6 +499,8 @@ fn reader_scan_returns_written_data() {
         settings_path: ptr::null(),
         seal_interval_ms: -1,
         read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
+        compaction_mode: OPENDATA_LOG_COMPACTION_DEFAULT,
+        separate_compaction_runtime: true,
     };
     let mut log: *mut opendata_log_t = ptr::null_mut();
     assert_ok(unsafe { opendata_log_open(&writer_config, &mut log) });
@@ -578,6 +588,8 @@ fn reader_list_keys() {
         settings_path: ptr::null(),
         seal_interval_ms: -1,
         read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
+        compaction_mode: OPENDATA_LOG_COMPACTION_DEFAULT,
+        separate_compaction_runtime: true,
     };
     let mut log: *mut opendata_log_t = ptr::null_mut();
     assert_ok(unsafe { opendata_log_open(&writer_config, &mut log) });
@@ -645,6 +657,8 @@ fn reader_list_segments() {
         settings_path: ptr::null(),
         seal_interval_ms: -1,
         read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
+        compaction_mode: OPENDATA_LOG_COMPACTION_DEFAULT,
+        separate_compaction_runtime: true,
     };
     let mut log: *mut opendata_log_t = ptr::null_mut();
     assert_ok(unsafe { opendata_log_open(&writer_config, &mut log) });
@@ -724,6 +738,8 @@ fn open_with_local_slatedb() {
         settings_path: ptr::null(),
         seal_interval_ms: -1,
         read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
+        compaction_mode: OPENDATA_LOG_COMPACTION_DEFAULT,
+        separate_compaction_runtime: true,
     };
     let mut log: *mut opendata_log_t = ptr::null_mut();
     assert_ok(unsafe { opendata_log_open(&config, &mut log) });

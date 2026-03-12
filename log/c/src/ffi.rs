@@ -4,14 +4,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
-use log::{Config, ReadVisibility, ReaderConfig, SegmentConfig};
+use log::{
+    CompactionConfig, Config, L0OnlyCompactionConfig, ReadVisibility, ReaderConfig, SegmentConfig,
+};
 use tokio::runtime::Runtime;
 
 pub struct opendata_log_t {
     pub(crate) log: log::LogDb,
     pub(crate) runtime: Arc<Runtime>,
     // Kept alive so compaction tasks continue running; never read directly.
-    pub(crate) _compaction_runtime: Runtime,
+    pub(crate) _compaction_runtime: Option<Runtime>,
 }
 
 pub struct opendata_log_reader_t {
@@ -59,6 +61,9 @@ pub const OPENDATA_LOG_STORAGE_SLATEDB: u8 = 1;
 pub const OPENDATA_LOG_READ_VISIBILITY_MEMORY: u8 = 0;
 pub const OPENDATA_LOG_READ_VISIBILITY_REMOTE: u8 = 1;
 
+pub const OPENDATA_LOG_COMPACTION_DEFAULT: u8 = 0;
+pub const OPENDATA_LOG_COMPACTION_L0_ONLY: u8 = 1;
+
 #[repr(C)]
 pub struct opendata_log_config_t {
     pub storage_type: u8,
@@ -70,6 +75,13 @@ pub struct opendata_log_config_t {
     /// Use `OPENDATA_LOG_READ_VISIBILITY_MEMORY` (default) to include in-memory data,
     /// or `OPENDATA_LOG_READ_VISIBILITY_REMOTE` to only see data confirmed durable.
     pub read_visibility: u8,
+    /// Compaction scheduling mode.
+    /// Use `OPENDATA_LOG_COMPACTION_DEFAULT` (0) for SlateDB's built-in scheduler,
+    /// or `OPENDATA_LOG_COMPACTION_L0_ONLY` (1) for L0-only compaction.
+    pub compaction_mode: u8,
+    /// When true, compaction runs on a dedicated runtime with 2 worker threads.
+    /// When false, compaction shares the main tokio runtime.
+    pub separate_compaction_runtime: bool,
 }
 
 #[repr(C)]
@@ -298,6 +310,18 @@ pub(crate) unsafe fn build_config(
     } else {
         Some(Duration::from_millis(config.seal_interval_ms as u64))
     };
+    let compaction = match config.compaction_mode {
+        OPENDATA_LOG_COMPACTION_DEFAULT => CompactionConfig::Default,
+        OPENDATA_LOG_COMPACTION_L0_ONLY => {
+            CompactionConfig::L0Only(L0OnlyCompactionConfig::default())
+        }
+        other => {
+            return Err(error_result(
+                opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,
+                &format!("invalid compaction_mode: {other}"),
+            ));
+        }
+    };
     Ok(Config {
         storage,
         segmentation: SegmentConfig { seal_interval },
@@ -311,6 +335,7 @@ pub(crate) unsafe fn build_config(
                 ));
             }
         },
+        compaction,
     })
 }
 

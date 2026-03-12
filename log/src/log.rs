@@ -499,6 +499,28 @@ impl LogDbBuilder {
                 .await
                 .map_err(|e| Error::Storage(e.to_string()))?,
         };
+
+        let sb = match &self.config.compaction {
+            crate::config::CompactionConfig::Default => sb,
+            crate::config::CompactionConfig::L0Only(opts) => {
+                let supplier = Arc::new(crate::compaction::L0OnlyCompactionSchedulerSupplier::new(
+                    opts.clone(),
+                ));
+                if let common::StorageConfig::SlateDb(ref slate_cfg) = self.config.storage {
+                    let obj_store = common::create_object_store(&slate_cfg.object_store)
+                        .map_err(|e| Error::Storage(e.to_string()))?;
+                    sb.map_slatedb(|db| {
+                        db.with_compactor_builder(
+                            common::CompactorBuilder::new(slate_cfg.path.clone(), obj_store)
+                                .with_scheduler_supplier(supplier),
+                        )
+                    })
+                } else {
+                    sb
+                }
+            }
+        };
+
         let storage = sb
             .build()
             .await

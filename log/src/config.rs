@@ -60,6 +60,55 @@ pub struct Config {
         deserialize_with = "deserialize_read_visibility"
     )]
     pub read_visibility: ReadVisibility,
+
+    /// Compaction scheduling strategy.
+    #[serde(default)]
+    pub compaction: CompactionConfig,
+}
+
+/// Controls how LSM compaction is scheduled.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum CompactionConfig {
+    /// Use SlateDB's built-in compaction scheduler.
+    #[default]
+    Default,
+    /// Only compact L0 SSTs, never merge sorted runs.
+    L0Only(L0OnlyCompactionConfig),
+}
+
+/// Configuration for the L0-only compaction scheduler.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L0OnlyCompactionConfig {
+    /// Minimum number of L0 SSTs required to trigger a compaction.
+    #[serde(default = "default_min_l0_sources")]
+    pub min_compaction_sources: usize,
+    /// Maximum number of L0 SSTs included in a single compaction.
+    #[serde(default = "default_max_l0_sources")]
+    pub max_compaction_sources: usize,
+    /// Maximum number of compactions running concurrently.
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent_compactions: usize,
+}
+
+fn default_min_l0_sources() -> usize {
+    4
+}
+fn default_max_l0_sources() -> usize {
+    8
+}
+fn default_max_concurrent() -> usize {
+    4
+}
+
+impl Default for L0OnlyCompactionConfig {
+    fn default() -> Self {
+        Self {
+            min_compaction_sources: default_min_l0_sources(),
+            max_compaction_sources: default_max_l0_sources(),
+            max_concurrent_compactions: default_max_concurrent(),
+        }
+    }
 }
 
 /// Read visibility levels.

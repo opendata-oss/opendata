@@ -46,6 +46,7 @@
 //! # }
 //! ```
 
+pub mod compaction;
 mod config;
 mod error;
 mod listing;
@@ -61,7 +62,10 @@ mod storage;
 mod view_tracker;
 mod writer;
 
-pub use config::{Config, CountOptions, ReadVisibility, ReaderConfig, ScanOptions, SegmentConfig};
+pub use config::{
+    CompactionConfig, Config, CountOptions, L0OnlyCompactionConfig, ReadVisibility, ReaderConfig,
+    ScanOptions, SegmentConfig,
+};
 pub use error::{AppendError, AppendResult, Error, Result};
 pub use listing::{LogKey, LogKeyIterator};
 pub use log::{LogDb, LogDbBuilder};

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::storage::config::StorageConfig;
-use log::{LogDbBuilder, LogRead};
+use log::{CompactionConfig, LogDbBuilder, LogRead};
 
 use crate::ffi::*;
 
@@ -20,6 +20,7 @@ pub unsafe extern "C" fn opendata_log_open(
     }
 
     let config = &*config;
+    let separate_compaction_runtime = config.separate_compaction_runtime;
     let rust_config = match build_config(config) {
         Ok(c) => c,
         Err(e) => return e,
@@ -30,21 +31,30 @@ pub unsafe extern "C" fn opendata_log_open(
         Err(e) => return e,
     };
 
-    // Separate compaction runtime to prevent block_on deadlock
-    let compaction_runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name("od-compaction")
-        .enable_all()
-        .build()
-    {
-        Ok(r) => r,
-        Err(e) => {
-            return error_result(
-                opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INTERNAL,
-                &format!("failed to create compaction runtime: {e}"),
-            );
+    // Optionally create a dedicated compaction runtime to prevent block_on deadlock.
+    let compaction_runtime = if separate_compaction_runtime {
+        match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("od-compaction")
+            .enable_all()
+            .build()
+        {
+            Ok(r) => Some(r),
+            Err(e) => {
+                return error_result(
+                    opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INTERNAL,
+                    &format!("failed to create compaction runtime: {e}"),
+                );
+            }
         }
+    } else {
+        None
     };
+
+    let compaction_handle = compaction_runtime
+        .as_ref()
+        .map(|r| r.handle().clone())
+        .unwrap_or_else(|| runtime.handle().clone());
 
     let log = match runtime.block_on(async {
         let sb = match common::StorageBuilder::new(&rust_config.storage).await {
@@ -60,10 +70,15 @@ pub unsafe extern "C" fn opendata_log_open(
             // Called inside block_on because CompactorBuilder::new requires a Tokio runtime.
             if let StorageConfig::SlateDb(ref slate_config) = rust_config.storage {
                 let obj_store = common::create_object_store(&slate_config.object_store).unwrap();
-                db.with_compactor_builder(
+                let mut compactor =
                     common::CompactorBuilder::new(slate_config.path.clone(), obj_store)
-                        .with_runtime(compaction_runtime.handle().clone()),
-                )
+                        .with_runtime(compaction_handle.clone());
+                if let CompactionConfig::L0Only(ref opts) = rust_config.compaction {
+                    compactor = compactor.with_scheduler_supplier(Arc::new(
+                        log::compaction::L0OnlyCompactionSchedulerSupplier::new(opts.clone()),
+                    ));
+                }
+                db.with_compactor_builder(compactor)
             } else {
                 db
             }

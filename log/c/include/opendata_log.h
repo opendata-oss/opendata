@@ -13,6 +13,10 @@
 
 #define OPENDATA_LOG_READ_VISIBILITY_REMOTE 1
 
+#define OPENDATA_LOG_COMPACTION_DEFAULT 0
+
+#define OPENDATA_LOG_COMPACTION_L0_ONLY 1
+
 #define OPENDATA_LOG_BOUND_UNBOUNDED 0
 
 #define OPENDATA_LOG_BOUND_INCLUDED 1
@@ -58,6 +62,17 @@ typedef struct opendata_log_config_t {
    * or `OPENDATA_LOG_READ_VISIBILITY_REMOTE` to only see data confirmed durable.
    */
   uint8_t read_visibility;
+  /**
+   * Compaction scheduling mode.
+   * Use `OPENDATA_LOG_COMPACTION_DEFAULT` (0) for SlateDB's built-in scheduler,
+   * or `OPENDATA_LOG_COMPACTION_L0_ONLY` (1) for L0-only compaction.
+   */
+  uint8_t compaction_mode;
+  /**
+   * When true, compaction runs on a dedicated runtime with 2 worker threads.
+   * When false, compaction shares the main tokio runtime.
+   */
+  bool separate_compaction_runtime;
 } opendata_log_config_t;
 
 typedef struct opendata_log_seq_bound_t {
