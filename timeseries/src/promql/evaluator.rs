@@ -91,6 +91,7 @@ pub(crate) struct QueryReaderBucketEvalCache {
     // Map from terms (series_ids for forward, labels for inverted) to cached results
     forward_index_cache:
         HashMap<Vec<SeriesId>, Arc<dyn ForwardIndexLookup + Send + Sync + 'static>>,
+    forward_index_entries_cache: HashMap<Vec<SeriesId>, Arc<[(SeriesId, SeriesSpec)]>>,
     inverted_index_cache: HashMap<Vec<Label>, Arc<dyn InvertedIndexLookup + Send + Sync + 'static>>,
     samples: HashMap<SeriesId, Vec<Sample>>,
 }
@@ -99,6 +100,7 @@ impl QueryReaderBucketEvalCache {
     fn new() -> Self {
         Self {
             forward_index_cache: HashMap::new(),
+            forward_index_entries_cache: HashMap::new(),
             inverted_index_cache: HashMap::new(),
             samples: HashMap::new(),
         }
@@ -132,12 +134,22 @@ impl QueryReaderEvalCache {
         forward_index: Box<dyn ForwardIndexLookup + Send + Sync + 'static>,
     ) {
         let bucket_cache = self.get_bucket_cache_mut(&bucket);
-        let cached_index = CachedForwardIndex {
-            data: forward_index.all_series().into_iter().collect(),
-        };
+        let cache_key = series_ids.clone();
+        let mut data = HashMap::with_capacity(series_ids.len());
+        let mut entries = Vec::with_capacity(series_ids.len());
+        for series_id in &series_ids {
+            if let Some(spec) = forward_index.get_spec(series_id) {
+                data.insert(*series_id, spec.clone());
+                entries.push((*series_id, spec));
+            }
+        }
+        let cached_index = CachedForwardIndex { data };
         bucket_cache
             .forward_index_cache
             .insert(series_ids, Arc::new(cached_index));
+        bucket_cache
+            .forward_index_entries_cache
+            .insert(cache_key, Arc::from(entries));
     }
 
     pub(crate) fn get_forward_index(
@@ -148,6 +160,17 @@ impl QueryReaderEvalCache {
         self.cache
             .get(bucket)
             .and_then(|bucket_cache| bucket_cache.forward_index_cache.get(series_ids))
+            .cloned()
+    }
+
+    pub(crate) fn get_forward_index_entries(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Option<Arc<[(SeriesId, SeriesSpec)]>> {
+        self.cache
+            .get(bucket)
+            .and_then(|bucket_cache| bucket_cache.forward_index_entries_cache.get(series_ids))
             .cloned()
     }
 
@@ -431,6 +454,29 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
                 .get_forward_index(bucket, &series_ids)
                 .expect("unreachable"))
         }
+    }
+
+    pub(crate) async fn forward_index_entries(
+        &mut self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Arc<[(SeriesId, SeriesSpec)]>> {
+        let mut series_ids = Vec::from(series_ids);
+        series_ids.sort();
+        if self
+            .cache
+            .get_forward_index_entries(bucket, &series_ids)
+            .is_none()
+        {
+            let forward_index = self.reader.forward_index(bucket, &series_ids).await?;
+            self.cache
+                .cache_forward_index(*bucket, series_ids.clone(), forward_index);
+        }
+
+        Ok(self
+            .cache
+            .get_forward_index_entries(bucket, &series_ids)
+            .expect("forward index entries must be cached after load"))
     }
 
     pub(crate) async fn inverted_index(
@@ -1060,19 +1106,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             }
 
             let candidates_vec: Vec<_> = candidates.into_iter().collect();
-            let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
+            let forward_index_entries = self
+                .reader
+                .forward_index_entries(&bucket, &candidates_vec)
+                .await?;
 
-            for series_id in candidates_vec {
-                let series_spec = match forward_index_view.get_spec(&series_id) {
-                    Some(spec) => spec,
-                    None => {
-                        return Err(EvaluationError::InternalError(format!(
-                            "Series {} not found in bucket {:?}",
-                            series_id, bucket
-                        )));
-                    }
-                };
-
+            for (series_id, series_spec) in forward_index_entries.iter().cloned() {
                 let sample_data = self
                     .reader
                     .samples(&bucket, series_id, start_ms, end_ms)
@@ -1275,13 +1314,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             }
 
             let candidates_vec: Vec<_> = candidates.into_iter().collect();
-            let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
+            let forward_index_entries = self
+                .reader
+                .forward_index_entries(&bucket, &candidates_vec)
+                .await?;
 
-            for series_id in candidates_vec {
-                let Some(series_spec) = forward_index_view.get_spec(&series_id) else {
-                    continue;
-                };
-
+            for (series_id, series_spec) in forward_index_entries.iter().cloned() {
                 let fingerprint = series_spec.fingerprint;
 
                 let samples = self
@@ -1440,19 +1478,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
             // Batch load forward index for all candidates upfront
             let candidates_vec: Vec<_> = candidates.into_iter().collect();
-            let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
+            let forward_index_entries = self
+                .reader
+                .forward_index_entries(&bucket, &candidates_vec)
+                .await?;
 
-            for series_id in candidates_vec {
-                // Get series spec from forward index view (batched lookup)
-                let series_spec = match forward_index_view.get_spec(&series_id) {
-                    Some(spec) => spec,
-                    None => {
-                        return Err(EvaluationError::InternalError(format!(
-                            "Series {} not found in bucket {:?}",
-                            series_id, bucket
-                        )));
-                    }
-                };
+            for (series_id, series_spec) in forward_index_entries.iter().cloned() {
                 let fingerprint = series_spec.fingerprint;
 
                 // Skip if we already found a sample for this series in a newer bucket
@@ -2269,13 +2300,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             }
 
             let candidates_vec: Vec<_> = candidates.into_iter().collect();
-            let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
+            let forward_index_entries = self
+                .reader
+                .forward_index_entries(&bucket, &candidates_vec)
+                .await?;
 
-            for series_id in candidates_vec {
-                let Some(series_spec) = forward_index_view.get_spec(&series_id) else {
-                    continue;
-                };
-
+            for (series_id, series_spec) in forward_index_entries.iter().cloned() {
                 if !series_with_results.insert(series_spec.fingerprint) {
                     continue;
                 }
