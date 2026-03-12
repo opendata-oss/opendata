@@ -50,12 +50,10 @@ impl CompactionScheduler for L0OnlyCompactionScheduler {
             }
         }
 
-        // Collect available L0 SSTs not in use, oldest first.
-        // Manifest L0 list is newest-first, so reverse to get oldest-first.
-        let mut available: Vec<SourceId> = manifest
+        // Collect available L0 SSTs not in use, in manifest order (newest-first).
+        let available: Vec<SourceId> = manifest
             .l0
             .iter()
-            .rev()
             .map(|sst| SourceId::Sst(sst.id.unwrap_compacted_id()))
             .filter(|id| !sources_used.contains(id))
             .collect();
@@ -63,16 +61,21 @@ impl CompactionScheduler for L0OnlyCompactionScheduler {
         // Destination SR id: one past the highest existing SR id.
         let base_dst = manifest.compacted.first().map_or(0, |sr| sr.id + 1);
 
+        // Split available L0s into consecutive batches from the tail (oldest).
+        // Each batch is capped at max_compaction_sources and stays in manifest
+        // order so that validate() sees consecutive entries.
         let mut specs = Vec::new();
+        let mut end = available.len();
 
         while active_count + specs.len() < self.max_concurrent_compactions {
-            if available.len() < self.min_compaction_sources {
+            if end < self.min_compaction_sources {
                 break;
             }
 
-            let take = available.len().min(self.max_compaction_sources);
-            // Drain the oldest `take` items from the front.
-            let batch: Vec<SourceId> = available.drain(..take).collect();
+            let take = end.min(self.max_compaction_sources);
+            let start = end - take;
+            let batch: Vec<SourceId> = available[start..end].to_vec();
+            end = start;
 
             let dst = base_dst + specs.len() as u32;
             if sources_used.contains(&SourceId::SortedRun(dst)) {
