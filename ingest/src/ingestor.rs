@@ -291,9 +291,7 @@ impl BatchWriter {
             .send(IngestMessage::Flush { result_sender })
             .await
             .map_err(|_| Error::Storage("ingestor shut down".to_string()))?;
-        result_receiver
-            .await
-            .map_err(|_| Error::Storage("ingestor shut down".to_string()))?
+        result_receiver.await.unwrap()
     }
 
     fn conflict_rate(&self) -> f64 {
