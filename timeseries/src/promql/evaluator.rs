@@ -224,6 +224,48 @@ struct AggregationEvalContext {
     lookback_delta_ms: i64,
 }
 
+#[derive(Clone, Debug)]
+struct ReductionState {
+    sum: f64,
+    count: usize,
+    min: f64,
+    max: f64,
+}
+
+impl Default for ReductionState {
+    fn default() -> Self {
+        Self {
+            sum: 0.0,
+            count: 0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+        }
+    }
+}
+
+impl ReductionState {
+    fn record(&mut self, value: f64) {
+        self.sum += value;
+        self.count += 1;
+        self.min = self.min.min(value);
+        self.max = self.max.max(value);
+    }
+
+    fn finish(&self, op: TokenType) -> EvalResult<f64> {
+        match op.id() {
+            T_SUM => Ok(self.sum),
+            T_AVG => Ok(self.sum / self.count as f64),
+            T_MIN => Ok(self.min),
+            T_MAX => Ok(self.max),
+            T_COUNT => Ok(self.count as f64),
+            _ => Err(EvaluationError::InternalError(format!(
+                "Unsupported reduction aggregation operator: {:?}",
+                op
+            ))),
+        }
+    }
+}
+
 /// Compares values for topk/bottomk aggregation.
 /// NaN values are always considered "greater" (sorted last) regardless of order.
 /// Uses partial_cmp for IEEE 754 semantics (-0.0 == +0.0), matching Prometheus.
@@ -1912,6 +1954,27 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         }
     }
 
+    fn grouping_key_from_labels(
+        labels: &[Label],
+        modifier: Option<&LabelModifier>,
+    ) -> Vec<(String, String)> {
+        let mut key: Vec<(String, String)> = match modifier {
+            None => Vec::new(),
+            Some(LabelModifier::Include(label_list)) => labels
+                .iter()
+                .filter(|label| label_list.labels.contains(&label.name))
+                .map(|label| (label.name.clone(), label.value.clone()))
+                .collect(),
+            Some(LabelModifier::Exclude(label_list)) => labels
+                .iter()
+                .filter(|label| !label_list.labels.contains(&label.name))
+                .map(|label| (label.name.clone(), label.value.clone()))
+                .collect(),
+        };
+        key.sort();
+        key
+    }
+
     fn labels_to_grouping_key(labels: HashMap<String, String>) -> Vec<(String, String)> {
         let mut key_vec: Vec<_> = labels.into_iter().collect();
         key_vec.sort();
@@ -2123,6 +2186,88 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         key
     }
 
+    fn is_reduction_aggregate(op: TokenType) -> bool {
+        matches!(op.id(), T_SUM | T_AVG | T_MIN | T_MAX | T_COUNT)
+    }
+
+    async fn evaluate_vector_selector_reduction_aggregate(
+        &mut self,
+        aggregate: &AggregateExpr,
+        vector_selector: &VectorSelector,
+        query_start: Timestamp,
+        query_end: Timestamp,
+        evaluation_ts: Timestamp,
+        lookback_delta_ms: i64,
+    ) -> EvalResult<Vec<EvalSample>> {
+        let adjusted_eval_ts = self.apply_time_modifiers(
+            vector_selector.at.as_ref(),
+            vector_selector.offset.as_ref(),
+            query_start,
+            query_end,
+            evaluation_ts,
+        )?;
+
+        let end_ms = adjusted_eval_ts.as_millis();
+        let start_ms = end_ms - lookback_delta_ms;
+
+        let mut buckets = self.reader.list_buckets().await?;
+        buckets.sort_by(|a, b| b.start.cmp(&a.start));
+
+        let mut series_with_results: HashSet<SeriesFingerprint> = HashSet::new();
+        let mut groups: HashMap<Vec<(String, String)>, ReductionState> = HashMap::new();
+
+        for bucket in buckets {
+            let candidates =
+                evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
+                    .await
+                    .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+
+            if candidates.is_empty() {
+                continue;
+            }
+
+            let candidates_vec: Vec<_> = candidates.into_iter().collect();
+            let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
+
+            for series_id in candidates_vec {
+                let Some(series_spec) = forward_index_view.get_spec(&series_id) else {
+                    continue;
+                };
+
+                if !series_with_results.insert(series_spec.fingerprint) {
+                    continue;
+                }
+
+                let Some(sample) = self
+                    .reader
+                    .latest_sample(&bucket, series_id, start_ms, end_ms)
+                    .await?
+                else {
+                    continue;
+                };
+
+                let group_key = Self::grouping_key_from_labels(
+                    &series_spec.labels,
+                    aggregate.modifier.as_ref(),
+                );
+                groups.entry(group_key).or_default().record(sample.value);
+            }
+        }
+
+        let timestamp_ms = evaluation_ts.as_millis();
+        let mut result_samples = Vec::with_capacity(groups.len());
+        for (group_key, state) in groups {
+            result_samples.push(EvalSample {
+                timestamp_ms,
+                value: state.finish(aggregate.op)?,
+                labels: group_key.into_iter().collect(),
+                drop_name: false,
+            });
+        }
+
+        Ok(result_samples)
+    }
+
     async fn evaluate_aggregate(
         &mut self,
         aggregate: &AggregateExpr,
@@ -2132,6 +2277,22 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         interval_ms: i64,
         lookback_delta_ms: i64,
     ) -> EvalResult<ExprResult> {
+        if Self::is_reduction_aggregate(aggregate.op) {
+            if let Expr::VectorSelector(vector_selector) = &*aggregate.expr {
+                let samples = self
+                    .evaluate_vector_selector_reduction_aggregate(
+                        aggregate,
+                        vector_selector,
+                        query_start,
+                        query_end,
+                        evaluation_ts,
+                        lookback_delta_ms,
+                    )
+                    .await?;
+                return Ok(ExprResult::InstantVector(samples));
+            }
+        }
+
         // Evaluate the inner expression to get all samples
         let result = self
             .evaluate_expr(
