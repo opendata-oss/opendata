@@ -103,6 +103,7 @@ pub struct LogDb {
     epoch_watcher: EpochWatcher,
     read_subscriber_task: JoinHandle<()>,
     read_visibility: ReadVisibility,
+    metrics_poller_task: Option<JoinHandle<()>>,
 }
 
 impl LogDb {
@@ -305,6 +306,9 @@ impl LogDb {
     /// closed. For SlateDB-backed storage, this also releases the database
     /// fence.
     pub async fn close(self) -> Result<()> {
+        if let Some(ref task) = self.metrics_poller_task {
+            task.abort();
+        }
         self.flush().await?;
         // Drop the handle to signal the writer to stop
         drop(self.handle);
@@ -378,6 +382,34 @@ impl LogDb {
             spawn_written_subscriber(written_rx, Arc::clone(&read_view), initial_segment_id)
         };
 
+        let metrics_poller_task = storage.stat_registry().map(|registry| {
+            tokio::spawn(async move {
+                let metrics = [
+                    "db/l0_sst_count",
+                    "db/backpressure_count",
+                    "db/total_mem_size_bytes",
+                    "db/immutable_memtable_flushes",
+                    "db/wal_buffer_flushes",
+                    "compactor/running_compactions",
+                    "compactor/bytes_compacted",
+                    "compactor/total_throughput_bytes_per_sec",
+                ];
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let mut parts = Vec::new();
+                    for name in &metrics {
+                        if let Some(stat) = registry.lookup(name) {
+                            let short = name.rsplit('/').next().unwrap_or(name);
+                            parts.push(format!("{}={}", short, stat.get()));
+                        }
+                    }
+                    if !parts.is_empty() {
+                        eprintln!("[slatedb] {}", parts.join(" "));
+                    }
+                }
+            })
+        });
+
         Ok(Self {
             handle,
             writer_task,
@@ -387,6 +419,7 @@ impl LogDb {
             epoch_watcher,
             read_subscriber_task,
             read_visibility,
+            metrics_poller_task,
         })
     }
 }

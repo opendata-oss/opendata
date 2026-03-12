@@ -342,6 +342,10 @@ impl Storage for SlateDbStorage {
         Ok(())
     }
 
+    fn stat_registry(&self) -> Option<std::sync::Arc<slatedb::stats::StatRegistry>> {
+        Some(self.db.metrics())
+    }
+
     #[cfg(feature = "metrics")]
     fn register_metrics(&self, registry: &mut prometheus_client::registry::Registry) {
         let stat_registry = self.db.metrics();

@@ -383,6 +383,14 @@ pub trait Storage: StorageRead {
     /// "durable" so the watermark matches the latest written seqnum.
     fn subscribe_durable(&self) -> tokio::sync::watch::Receiver<u64>;
 
+    /// Returns the SlateDB stat registry if available.
+    ///
+    /// The default implementation returns `None`. The SlateDB backend overrides
+    /// this to expose the underlying database's metrics for monitoring.
+    fn stat_registry(&self) -> Option<std::sync::Arc<slatedb::stats::StatRegistry>> {
+        None
+    }
+
     /// Registers storage engine metrics into the given Prometheus registry.
     ///
     /// The default implementation is a no-op. Storage backends that expose
