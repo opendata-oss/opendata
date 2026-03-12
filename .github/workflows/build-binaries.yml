@@ -47,6 +47,11 @@ jobs:
               echo "features=remote-write" >> "$GITHUB_OUTPUT"
               echo "docker_image=timeseries" >> "$GITHUB_OUTPUT"
               ;;
+            opendata-vector)
+              echo "has_binary=true" >> "$GITHUB_OUTPUT"
+              echo "features=http-server" >> "$GITHUB_OUTPUT"
+              echo "docker_image=vector" >> "$GITHUB_OUTPUT"
+              ;;
             *)
               echo "has_binary=false" >> "$GITHUB_OUTPUT"
               echo "features=" >> "$GITHUB_OUTPUT"
