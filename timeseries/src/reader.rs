@@ -158,7 +158,7 @@ impl TimeSeriesDbReader {
     /// Returns an error if the storage backend cannot be initialized.
     pub async fn open(config: ReaderConfig) -> Result<Self> {
         let reader_options = slatedb::config::DbReaderOptions {
-            manifest_poll_interval: config.refresh_interval,
+            manifest_poll_interval: Duration::from_mins(30),
             ..Default::default()
         };
 
