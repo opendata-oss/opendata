@@ -17,7 +17,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use bencher::{Bench, Benchmark, Params, Summary};
-use common::StorageRuntime;
+use common::StorageBuilder;
 use common::storage::factory::{FoyerCache, FoyerCacheOptions};
 use vector::{Config, DistanceMetric, SearchResult, Vector, VectorDb, VectorDbRead};
 
@@ -530,16 +530,16 @@ impl Benchmark for RecallBenchmark {
                 ..Default::default()
             },
         };
-        let mut runtime = StorageRuntime::new();
+        let mut sb = StorageBuilder::new(&config.storage)?;
         if let Some(bytes) = dataset.block_cache_bytes {
             let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
                 max_capacity: bytes,
                 ..Default::default()
             });
-            runtime = runtime.with_block_cache(std::sync::Arc::new(cache));
+            sb = sb.map_slatedb(|db| db.with_db_cache(std::sync::Arc::new(cache)));
             println!("  Block cache: {} bytes", bytes);
         }
-        let db = VectorDb::open_with_runtime(config, runtime).await?;
+        let db = VectorDb::open_with_storage(config, sb).await?;
 
         // -- Ingest -----------------------------------------------------------
         let mut ingest_secs = None;

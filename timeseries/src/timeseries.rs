@@ -8,7 +8,7 @@ use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use common::{StorageRuntime, StorageSemantics, create_storage};
+use common::{StorageBuilder, StorageSemantics};
 
 use crate::config::Config;
 use crate::error::{QueryError, Result};
@@ -77,12 +77,12 @@ impl TimeSeriesDb {
     /// # }
     /// ```
     pub async fn open(config: Config) -> Result<Self> {
-        let storage = create_storage(
-            &config.storage,
-            StorageRuntime::new(),
-            StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
-        )
-        .await?;
+        let storage = StorageBuilder::new(&config.storage)?
+            .with_semantics(
+                StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
+            )
+            .build()
+            .await?;
         let tsdb = Tsdb::new(storage);
         Ok(Self { tsdb })
     }

@@ -11,10 +11,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use common::StorageBuilder;
 use common::clock::{Clock, SystemClock};
 use common::coordinator::{Durability, EpochWatcher, EpochWatermarks};
-use common::storage::factory::create_storage;
-use common::{StorageRuntime, StorageSemantics};
 use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -439,14 +438,14 @@ impl LogRead for LogDb {
 /// Builder for creating LogDb instances with custom options.
 ///
 /// This builder provides a fluent API for configuring a LogDb, including
-/// runtime options that cannot be serialized in configuration files.
+/// low-level SlateDB knobs via [`StorageBuilder::map_slatedb`].
 ///
 /// # Example
 ///
 /// ```ignore
 /// use log::LogDbBuilder;
 /// use log::Config;
-/// use common::StorageRuntime;
+/// use common::{StorageBuilder, CompactorBuilder, create_object_store};
 ///
 /// // Create a separate runtime for compaction (important for sync/JNI usage)
 /// let compaction_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -455,17 +454,23 @@ impl LogRead for LogDb {
 ///     .build()
 ///     .unwrap();
 ///
-/// let runtime = StorageRuntime::new()
-///     .with_compaction_runtime(compaction_runtime.handle().clone());
+/// let mut sb = StorageBuilder::new(&config.storage).unwrap();
+/// sb = sb.map_slatedb(|db| {
+///     let obj_store = create_object_store(&slate_config.object_store).unwrap();
+///     db.with_compactor_builder(
+///         CompactorBuilder::new(slate_config.path.clone(), obj_store)
+///             .with_runtime(compaction_runtime.handle().clone())
+///     )
+/// });
 ///
 /// let log = LogDbBuilder::new(config)
-///     .with_storage_runtime(runtime)
+///     .with_storage_builder(sb)
 ///     .build()
 ///     .await?;
 /// ```
 pub struct LogDbBuilder {
     config: crate::config::Config,
-    storage_runtime: StorageRuntime,
+    storage_builder: Option<StorageBuilder>,
 }
 
 impl LogDbBuilder {
@@ -473,27 +478,30 @@ impl LogDbBuilder {
     pub fn new(config: crate::config::Config) -> Self {
         Self {
             config,
-            storage_runtime: StorageRuntime::new(),
+            storage_builder: None,
         }
     }
 
-    /// Sets the storage runtime options.
+    /// Sets a pre-configured [`StorageBuilder`].
     ///
-    /// Use this to configure runtime options like the compaction runtime handle.
-    pub fn with_storage_runtime(mut self, runtime: StorageRuntime) -> Self {
-        self.storage_runtime = runtime;
+    /// Use this to configure low-level SlateDB knobs like compaction runtime.
+    /// If not called, a default `StorageBuilder` is created from the config.
+    pub fn with_storage_builder(mut self, builder: StorageBuilder) -> Self {
+        self.storage_builder = Some(builder);
         self
     }
 
     /// Builds the LogDb instance.
     pub async fn build(self) -> Result<LogDb> {
-        let storage = create_storage(
-            &self.config.storage,
-            self.storage_runtime,
-            StorageSemantics::new(),
-        )
-        .await
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        let sb = match self.storage_builder {
+            Some(sb) => sb,
+            None => StorageBuilder::new(&self.config.storage)
+                .map_err(|e| Error::Storage(e.to_string()))?,
+        };
+        let storage = sb
+            .build()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
 
         LogDb::from_storage(
             storage,
@@ -636,8 +644,8 @@ fn spawn_durable_subscriber(
 
 #[cfg(test)]
 mod tests {
+    use common::StorageBuilder;
     use common::StorageConfig;
-    use common::storage::factory::create_storage;
 
     use super::*;
     use crate::config::Config;
@@ -1050,13 +1058,11 @@ mod tests {
     #[tokio::test]
     async fn should_scan_entries_via_log_reader() {
         // given - create shared storage
-        let storage = create_storage(
-            &StorageConfig::InMemory,
-            StorageRuntime::new(),
-            StorageSemantics::new(),
-        )
-        .await
-        .unwrap();
+        let storage = StorageBuilder::new(&StorageConfig::InMemory)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
         let log = LogDb::new(storage.clone()).await.unwrap();
         log.try_append(vec![
             Record {
@@ -1289,13 +1295,11 @@ mod tests {
     #[tokio::test]
     async fn should_list_keys_via_log_reader() {
         // given - create shared storage
-        let storage = create_storage(
-            &StorageConfig::InMemory,
-            StorageRuntime::new(),
-            StorageSemantics::new(),
-        )
-        .await
-        .unwrap();
+        let storage = StorageBuilder::new(&StorageConfig::InMemory)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
         let log = LogDb::new(storage.clone()).await.unwrap();
         log.try_append(vec![
             Record {
@@ -1702,13 +1706,11 @@ mod tests {
     #[tokio::test]
     async fn should_list_segments_via_log_reader() {
         // given
-        let storage = create_storage(
-            &StorageConfig::InMemory,
-            StorageRuntime::new(),
-            StorageSemantics::new(),
-        )
-        .await
-        .unwrap();
+        let storage = StorageBuilder::new(&StorageConfig::InMemory)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
         let log = LogDb::new(storage.clone()).await.unwrap();
 
         log.try_append(vec![Record {

@@ -377,7 +377,7 @@ mod tests {
     use crate::db::{VectorDb, VectorDbRead};
     use crate::model::{Config, VECTOR_FIELD_NAME, Vector};
     use crate::serde::collection_meta::DistanceMetric;
-    use common::{StorageConfig, StorageRuntime};
+    use common::{StorageBuilder, StorageConfig};
 
     fn create_config(dimensions: u16, metric: DistanceMetric) -> Config {
         Config {
@@ -410,9 +410,12 @@ mod tests {
             vec![2.0, 0.0, 0.0],
             vec![5.0, 0.0, 0.0],
         ];
-        let db = VectorDb::open_with_centroids(config, centroids, StorageRuntime::new())
-            .await
-            .unwrap();
+        let db = {
+            let sb = StorageBuilder::new(&config.storage).unwrap();
+            VectorDb::open_with_centroids(config, centroids, sb)
+        }
+        .await
+        .unwrap();
 
         let query = [0.0, 0.0, 0.0];
         let all_ids: Vec<u64> = (0..4).collect();
@@ -431,9 +434,12 @@ mod tests {
         // given - no pruning configured
         let config = create_config(3, DistanceMetric::L2);
         let centroids = vec![vec![1.0, 0.0, 0.0], vec![100.0, 0.0, 0.0]];
-        let db = VectorDb::open_with_centroids(config, centroids, StorageRuntime::new())
-            .await
-            .unwrap();
+        let db = {
+            let sb = StorageBuilder::new(&config.storage).unwrap();
+            VectorDb::open_with_centroids(config, centroids, sb)
+        }
+        .await
+        .unwrap();
 
         let query = [0.0, 0.0, 0.0];
         let all_ids: Vec<u64> = (0..2).collect();
@@ -457,9 +463,12 @@ mod tests {
             vec![1.0, 0.0, 0.0], // c1: close
             vec![3.0, 0.0, 0.0], // c2: medium
         ];
-        let db = VectorDb::open_with_centroids(config, centroids, StorageRuntime::new())
-            .await
-            .unwrap();
+        let db = {
+            let sb = StorageBuilder::new(&config.storage).unwrap();
+            VectorDb::open_with_centroids(config, centroids, sb)
+        }
+        .await
+        .unwrap();
 
         let query = [0.0, 0.0, 0.0];
         // pass IDs in reverse distance order
@@ -496,9 +505,12 @@ mod tests {
         ];
 
         let centroids: Vec<Vec<f32>> = cluster_centers.to_vec();
-        let db = VectorDb::open_with_centroids(config, centroids, StorageRuntime::new())
-            .await
-            .unwrap();
+        let db = {
+            let sb = StorageBuilder::new(&config.storage).unwrap();
+            VectorDb::open_with_centroids(config, centroids, sb)
+        }
+        .await
+        .unwrap();
 
         let mut all_vectors = Vec::new();
         for (cluster_id, center) in cluster_centers.iter().enumerate() {
@@ -663,9 +675,12 @@ mod tests {
         // given - database with 3 centroids
         let config = create_config(2, DistanceMetric::L2);
         let centroids = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![-1.0, 0.0]];
-        let db = VectorDb::open_with_centroids(config, centroids, StorageRuntime::new())
-            .await
-            .unwrap();
+        let db = {
+            let sb = StorageBuilder::new(&config.storage).unwrap();
+            VectorDb::open_with_centroids(config, centroids, sb)
+        }
+        .await
+        .unwrap();
 
         let vectors = vec![
             Vector::new("c1-1", vec![0.9, 0.0]),

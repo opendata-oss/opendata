@@ -28,9 +28,8 @@ use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
 use common::SequenceAllocator;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};
-use common::storage::factory::create_storage;
 use common::storage::{Storage, StorageRead, StorageSnapshot};
-use common::{StorageRuntime, StorageSemantics};
+use common::{StorageBuilder, StorageSemantics};
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -126,27 +125,27 @@ impl VectorDb {
     /// Other configuration options (like `flush_interval`) can be changed
     /// on subsequent opens.
     pub async fn open(config: Config) -> Result<Self> {
-        Self::open_with_runtime(config, StorageRuntime::new()).await
+        let sb = StorageBuilder::new(&config.storage)
+            .map_err(|e| Error::Storage(format!("Failed to create storage: {e}")))?;
+        Self::open_with_storage(config, sb).await
     }
 
-    pub async fn open_with_runtime(config: Config, runtime: StorageRuntime) -> Result<Self> {
+    pub async fn open_with_storage(config: Config, builder: StorageBuilder) -> Result<Self> {
         let centroid1: Vec<f32> = vec![0.0f32; config.dimensions as usize];
-        Self::open_with_centroids(config, vec![centroid1], runtime).await
+        Self::open_with_centroids(config, vec![centroid1], builder).await
     }
 
     pub async fn open_with_centroids(
         config: Config,
         centroids: Vec<Vec<f32>>,
-        runtime: StorageRuntime,
+        builder: StorageBuilder,
     ) -> Result<Self> {
         let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
-        let storage = create_storage(
-            &config.storage,
-            runtime,
-            StorageSemantics::new().with_merge_operator(Arc::new(merge_op)),
-        )
-        .await
-        .map_err(|e| Error::Storage(format!("Failed to create storage: {e}")))?;
+        let storage = builder
+            .with_semantics(StorageSemantics::new().with_merge_operator(Arc::new(merge_op)))
+            .build()
+            .await
+            .map_err(|e| Error::Storage(format!("Failed to create storage: {e}")))?;
 
         Self::load_or_init_db(storage, config, centroids).await
     }
@@ -979,7 +978,8 @@ mod tests {
         let config = create_test_config();
 
         // when
-        let result = VectorDb::open_with_centroids(config, vec![], StorageRuntime::new()).await;
+        let sb = StorageBuilder::new(&config.storage).unwrap();
+        let result = VectorDb::open_with_centroids(config, vec![], sb).await;
 
         // then
         match result {

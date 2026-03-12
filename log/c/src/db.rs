@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use common::storage::config::StorageConfig;
 use log::{LogDbBuilder, LogRead};
 
 use crate::ffi::*;
@@ -45,14 +46,35 @@ pub unsafe extern "C" fn opendata_log_open(
         }
     };
 
-    let storage_runtime =
-        common::StorageRuntime::new().with_compaction_runtime(compaction_runtime.handle().clone());
+    let sb = match common::StorageBuilder::new(&rust_config.storage) {
+        Ok(sb) => sb,
+        Err(e) => {
+            return error_result(
+                opendata_log_error_kind_t::OPENDATA_LOG_ERROR_STORAGE,
+                &format!("failed to create storage builder: {e}"),
+            );
+        }
+    };
 
-    let log = match runtime.block_on(
+    let log = match runtime.block_on(async {
+        let sb = sb.map_slatedb(|db| {
+            // Re-extract SlateDB config fields for the CompactorBuilder.
+            // Called inside block_on because CompactorBuilder::new requires a Tokio runtime.
+            if let StorageConfig::SlateDb(ref slate_config) = rust_config.storage {
+                let obj_store = common::create_object_store(&slate_config.object_store).unwrap();
+                db.with_compactor_builder(
+                    common::CompactorBuilder::new(slate_config.path.clone(), obj_store)
+                        .with_runtime(compaction_runtime.handle().clone()),
+                )
+            } else {
+                db
+            }
+        });
         LogDbBuilder::new(rust_config)
-            .with_storage_runtime(storage_runtime)
-            .build(),
-    ) {
+            .with_storage_builder(sb)
+            .build()
+            .await
+    }) {
         Ok(log) => log,
         Err(e) => return error_from_log_error(&e),
     };
