@@ -397,35 +397,58 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<Sample>> {
-        // Check cache first
-        if let Some(cached_samples) = self.cache.get_samples(bucket, &series_id) {
-            // Filter cached samples by requested time range
-            let filtered: Vec<Sample> = cached_samples
-                .iter()
-                .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
-                .cloned()
-                .collect();
-            return Ok(filtered);
+        let cached_samples = self.load_full_samples(bucket, series_id).await?;
+        Ok(Self::filter_cached_samples(
+            cached_samples,
+            start_ms,
+            end_ms,
+        ))
+    }
+
+    pub(crate) async fn latest_sample(
+        &mut self,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Option<Sample>> {
+        let cached_samples = self.load_full_samples(bucket, series_id).await?;
+        let end_idx = cached_samples.partition_point(|s| s.timestamp_ms <= end_ms);
+        if end_idx == 0 {
+            return Ok(None);
         }
 
-        // Not in cache, load from underlying reader with wide bounds to cache the whole bucket
-        let samples = self
-            .reader
-            .samples(bucket, series_id, i64::MIN, i64::MAX)
-            .await?;
+        let candidate = &cached_samples[end_idx - 1];
+        if candidate.timestamp_ms > start_ms {
+            Ok(Some(candidate.clone()))
+        } else {
+            Ok(None)
+        }
+    }
 
-        // Cache the full sample set
-        self.cache
-            .cache_samples(*bucket, series_id, samples.clone());
+    async fn load_full_samples(
+        &mut self,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+    ) -> Result<&Vec<Sample>> {
+        if self.cache.get_samples(bucket, &series_id).is_none() {
+            let samples = self
+                .reader
+                .samples(bucket, series_id, i64::MIN, i64::MAX)
+                .await?;
+            self.cache.cache_samples(*bucket, series_id, samples);
+        }
 
-        // Filter by requested time range
-        let filtered: Vec<Sample> = samples
-            .iter()
-            .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
-            .cloned()
-            .collect();
+        Ok(self
+            .cache
+            .get_samples(bucket, &series_id)
+            .expect("samples must be cached after load"))
+    }
 
-        Ok(filtered)
+    fn filter_cached_samples(cached_samples: &[Sample], start_ms: i64, end_ms: i64) -> Vec<Sample> {
+        let start_idx = cached_samples.partition_point(|s| s.timestamp_ms <= start_ms);
+        let end_idx = cached_samples.partition_point(|s| s.timestamp_ms <= end_ms);
+        cached_samples[start_idx..end_idx].to_vec()
     }
 }
 
@@ -1354,13 +1377,13 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 }
 
                 // Read samples from this bucket within the lookback window
-                let sample_data = self
+                let best_sample = self
                     .reader
-                    .samples(&bucket, series_id, start_ms, end_ms)
+                    .latest_sample(&bucket, series_id, start_ms, end_ms)
                     .await?;
 
                 // Find the best (latest) point in the time range
-                if let Some(best_sample) = sample_data.last() {
+                if let Some(best_sample) = best_sample {
                     // Convert attributes to labels HashMap
                     let labels = self.labels_to_hashmap(&series_spec.labels);
 
