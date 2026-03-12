@@ -304,10 +304,10 @@ impl Storage for InMemoryStorage {
                         .get(&op.record.key)
                         .filter(|s| !s.is_expired(now))
                         .map(|s| s.value.clone());
-                    let merged_value = self.merge_operator.as_ref().unwrap().merge(
+                    let merged_value = self.merge_operator.as_ref().unwrap().merge_batch(
                         &op.record.key,
                         existing_value,
-                        op.record.value.clone(),
+                        &[op.record.value],
                     );
                     let expire_ts = compute_expire_ts(now, op.options.ttl, self.default_ttl);
                     data.insert(
@@ -397,7 +397,7 @@ impl Storage for InMemoryStorage {
                 .filter(|s| !s.is_expired(now))
                 .map(|s| s.value.clone());
             let merged_value =
-                merge_op.merge(&op.record.key, existing_value, op.record.value.clone());
+                merge_op.merge_batch(&op.record.key, existing_value, &[op.record.value]);
             let expire_ts = compute_expire_ts(now, op.options.ttl, self.default_ttl);
             data.insert(
                 op.record.key,
@@ -651,10 +651,6 @@ mod tests {
     struct AppendMergeOperator;
 
     impl MergeOperator for AppendMergeOperator {
-        fn merge(&self, key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
-            self.merge_batch(key, existing_value, &[new_value])
-        }
-
         fn merge_batch(
             &self,
             _key: &Bytes,

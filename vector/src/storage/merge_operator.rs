@@ -30,10 +30,6 @@ impl VectorDbMergeOperator {
 }
 
 impl common::storage::MergeOperator for VectorDbMergeOperator {
-    fn merge(&self, key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
-        self.merge_batch(key, existing_value, &[new_value])
-    }
-
     fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
         let prefix = KeyPrefix::from_bytes_with_validation(key, SUBSYSTEM, KEY_VERSION)
             .expect("Failed to decode key prefix");
@@ -318,7 +314,7 @@ mod tests {
             .unwrap();
 
         // when
-        let merged = operator.merge(&key, Some(existing_value), new_value);
+        let merged = operator.merge_batch(&key, Some(existing_value), &[new_value]);
 
         // then - verify the merge actually happened (union)
         let decoded = DeletionsValue::decode_from_bytes(&merged).unwrap();
@@ -346,7 +342,7 @@ mod tests {
             .unwrap();
 
         // when
-        let merged = operator.merge(&key, Some(existing_value), new_value);
+        let merged = operator.merge_batch(&key, Some(existing_value), &[new_value]);
 
         // then - verify the merge actually happened (union)
         let decoded = MetadataIndexValue::decode_from_bytes(&merged).unwrap();
@@ -370,7 +366,7 @@ mod tests {
             .encode_to_bytes();
 
         // when
-        let merged = operator.merge(&key, Some(existing_value), new_value);
+        let merged = operator.merge_batch(&key, Some(existing_value), &[new_value]);
 
         // then - verify the merge produced deduplicated result
         let decoded = PostingListValue::decode_from_bytes(&merged, 2).unwrap();
@@ -385,7 +381,7 @@ mod tests {
         let new_value = Bytes::from(b"new_value".to_vec());
 
         // when
-        let result = operator.merge(&key, None, new_value.clone());
+        let result = operator.merge_batch(&key, None, std::slice::from_ref(&new_value));
 
         // then
         assert_eq!(result, new_value);
@@ -411,7 +407,7 @@ mod tests {
         let new_value = CentroidStatsValue::new(new_count).encode_to_bytes();
 
         // when
-        let merged = operator.merge(&key, Some(existing_value), new_value);
+        let merged = operator.merge_batch(&key, Some(existing_value), &[new_value]);
 
         // then
         let decoded = CentroidStatsValue::decode_from_bytes(&merged).unwrap();
@@ -552,7 +548,8 @@ mod tests {
         let new_value = Bytes::from(b"new_value".to_vec());
 
         // when
-        let result = operator.merge(&key, Some(existing_value), new_value.clone());
+        let result =
+            operator.merge_batch(&key, Some(existing_value), std::slice::from_ref(&new_value));
 
         // then - should return new_value without merging
         assert_eq!(result, new_value);

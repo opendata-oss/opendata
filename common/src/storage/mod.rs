@@ -170,33 +170,16 @@ pub struct WriteResult {
 
 /// Trait for merging existing values with new values.
 ///
-/// Merge operators must be associative: `merge(merge(a, b), c) == merge(a, merge(b, c))`.
+/// Merge operators must be associative: `merge_batch(merge_batch(a, [b]), [c]) == merge_batch(a, merge_batch(b, [c]))`.
 /// This ensures consistent merging behavior regardless of the order of operations.
 pub trait MergeOperator: Send + Sync {
-    /// Merges an existing value with a new value to produce a merged result.
-    ///
-    /// # Arguments
-    /// * `key` - The key associated with the values being merged
-    /// * `existing_value` - The current value stored in the database (if any)
-    /// * `new_value` - The new value to merge with the existing value
-    ///
-    /// # Returns
-    /// The merged value.
-    fn merge(&self, key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes;
-
     /// Merges a batch of operands with an optional existing value.
-    ///
-    /// The default implementation applies pairwise merging. Implementations can
-    /// override this for better performance by constructing a single merge result once
-    /// for multiple input values.
     ///
     /// # Arguments
     /// * `key` - The key associated with the values being merged
     /// * `existing_value` - The current value stored in the database (if any)
     /// * `operands` - A slice of operands to merge, ordered from oldest to newest
-    fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
-        default_merge_batch(key, existing_value, operands, |k, e, v| self.merge(k, e, v))
-    }
+    fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes;
 }
 
 pub fn default_merge_batch(
