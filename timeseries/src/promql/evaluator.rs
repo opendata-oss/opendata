@@ -1468,9 +1468,19 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         // String-typed arguments are passed through as raw AST nodes for
         // string-argument functions such as label_replace/label_join.
         let mut arg_results = Vec::with_capacity(call.args.args.len());
-        let mut has_range_arg = false;
-        for arg in &call.args.args {
-            if arg.value_type() == ValueType::String {
+        for (idx, arg) in call.args.args.iter().enumerate() {
+            let expected_type = if idx < call.func.arg_types.len() {
+                call.func.arg_types[idx]
+            } else if call.func.variadic != 0 && !call.func.arg_types.is_empty() {
+                call.func.arg_types[call.func.arg_types.len() - 1]
+            } else {
+                return Err(EvaluationError::InternalError(format!(
+                    "argument {} is out of bounds for function {}",
+                    idx, call.func.name
+                )));
+            };
+
+            if expected_type == ValueType::String {
                 arg_results.push(None);
                 continue;
             }
@@ -1485,10 +1495,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     lookback_delta_ms,
                 )
                 .await?;
-
-            if matches!(arg_result, ExprResult::RangeVector(_)) {
-                has_range_arg = true;
-            }
             arg_results.push(Some(arg_result));
         }
 
@@ -1501,51 +1507,17 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         //   - Function is called with evaluation_ts = -50s (negative!)
         let eval_timestamp_ms = evaluation_ts.as_millis();
 
-        if has_range_arg {
-            if arg_results.len() != 1 {
-                return Err(EvaluationError::InternalError(format!(
-                    "range-vector functions currently require exactly one argument: {}",
-                    call.func.name
-                )));
-            }
-
-            return match arg_results.remove(0) {
-                Some(ExprResult::RangeVector(samples)) => {
-                    if let Some(func) = registry.get_range_function(call.func.name) {
-                        let result = func.apply(samples, eval_timestamp_ms)?;
-                        Ok(ExprResult::InstantVector(result))
-                    } else {
-                        Err(EvaluationError::InternalError(format!(
-                            "Unknown range vector function: {}",
-                            call.func.name
-                        )))
-                    }
-                }
-                Some(_) => Err(EvaluationError::InternalError(format!(
-                    "mixed range/non-range function arguments are not supported: {}",
-                    call.func.name
-                ))),
-                None => Err(EvaluationError::InternalError(format!(
-                    "range-vector functions do not support string arguments: {}",
-                    call.func.name
-                ))),
-            };
-        }
-
         let mut evaluated_args = Vec::with_capacity(arg_results.len());
         for arg_result in arg_results {
             match arg_result {
                 Some(ExprResult::InstantVector(samples)) => {
                     evaluated_args.push(Some(PromQLArg::InstantVector(samples)))
                 }
-                Some(ExprResult::Scalar(scalar)) => {
-                    evaluated_args.push(Some(PromQLArg::Scalar(scalar)))
+                Some(ExprResult::Scalar(value)) => {
+                    evaluated_args.push(Some(PromQLArg::Scalar(value)))
                 }
-                Some(ExprResult::RangeVector(_)) => {
-                    return Err(EvaluationError::InternalError(format!(
-                        "unexpected range-vector argument dispatch for function: {}",
-                        call.func.name
-                    )));
+                Some(ExprResult::RangeVector(samples)) => {
+                    evaluated_args.push(Some(PromQLArg::RangeVector(samples)))
                 }
                 // Preserve string-arg positions here; string-aware functions
                 // read the raw AST nodes from ctx.raw_args instead.
@@ -1559,6 +1531,16 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 raw_args: &call.args.args,
             };
             let result = func.apply_call(evaluated_args, &ctx)?;
+            if call.func.return_type == ValueType::Scalar {
+                return match result.as_slice() {
+                    [sample] => Ok(ExprResult::Scalar(sample.value)),
+                    _ => Err(EvaluationError::InternalError(format!(
+                        "scalar-returning function {} must return exactly one sample",
+                        call.func.name
+                    ))),
+                };
+            }
+
             Ok(ExprResult::InstantVector(result))
         } else {
             Err(EvaluationError::InternalError(format!(
@@ -1936,18 +1918,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             .await?
         {
             ExprResult::Scalar(value) => value,
-            // `scalar()` currently returns an instant vector in this engine.
-            // Accept a single-element vector here so k-aggregations can consume scalar params.
-            ExprResult::InstantVector(mut samples) => {
-                if samples.len() == 1 {
-                    samples.pop().map(|sample| sample.value).ok_or_else(|| {
-                        EvaluationError::InternalError(
-                            "aggregation parameter expected one sample".to_string(),
-                        )
-                    })?
-                } else {
-                    f64::NAN
-                }
+            ExprResult::InstantVector(_) => {
+                return Err(EvaluationError::InternalError(
+                    "aggregation parameter must evaluate to a scalar".to_string(),
+                ));
             }
             ExprResult::RangeVector(_) => {
                 return Err(EvaluationError::InternalError(
@@ -3281,6 +3255,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_evaluate_time_function_as_scalar() {
+        // given
+        let bucket = TimeBucket::hour(1000);
+        let reader = MockQueryReaderBuilder::new(bucket).build();
+        let mut evaluator = Evaluator::new(&reader);
+        let end_time = UNIX_EPOCH + Duration::from_millis(1);
+
+        // when
+        let stmt = EvalStmt {
+            expr: promql_parser::parser::parse("time()").unwrap(),
+            start: end_time,
+            end: end_time,
+            interval: Duration::from_secs(0),
+            lookback_delta: Duration::from_secs(300),
+        };
+        let result = evaluator.evaluate(stmt).await.unwrap();
+
+        // then
+        match result {
+            ExprResult::Scalar(value) => assert_eq!(value, 0.001),
+            ExprResult::InstantVector(_) => panic!("Expected scalar result, got vector"),
+            ExprResult::RangeVector(_) => panic!("Expected scalar result, got range vector"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_pi_function_as_scalar() {
+        // given
+        let bucket = TimeBucket::hour(1000);
+        let reader = MockQueryReaderBuilder::new(bucket).build();
+        let mut evaluator = Evaluator::new(&reader);
+        let end_time = UNIX_EPOCH + Duration::from_secs(2000);
+
+        // when
+        let stmt = EvalStmt {
+            expr: promql_parser::parser::parse("pi()").unwrap(),
+            start: end_time,
+            end: end_time,
+            interval: Duration::from_secs(0),
+            lookback_delta: Duration::from_secs(300),
+        };
+        let result = evaluator.evaluate(stmt).await.unwrap();
+
+        // then
+        match result {
+            ExprResult::Scalar(value) => assert_eq!(value, std::f64::consts::PI),
+            ExprResult::InstantVector(_) => panic!("Expected scalar result, got vector"),
+            ExprResult::RangeVector(_) => panic!("Expected scalar result, got range vector"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_scalar_function_as_scalar() {
+        // given
+        let bucket = TimeBucket::hour(1000);
+        let reader = MockQueryReaderBuilder::new(bucket).build();
+        let mut evaluator = Evaluator::new(&reader);
+        let end_time = UNIX_EPOCH + Duration::from_secs(2000);
+
+        // when
+        let stmt = EvalStmt {
+            expr: promql_parser::parser::parse("scalar(vector(42))").unwrap(),
+            start: end_time,
+            end: end_time,
+            interval: Duration::from_secs(0),
+            lookback_delta: Duration::from_secs(300),
+        };
+        let result = evaluator.evaluate(stmt).await.unwrap();
+
+        // then
+        match result {
+            ExprResult::Scalar(value) => assert_eq!(value, 42.0),
+            ExprResult::InstantVector(_) => panic!("Expected scalar result, got vector"),
+            ExprResult::RangeVector(_) => panic!("Expected scalar result, got range vector"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_allow_scalar_function_results_as_vector_arguments() {
+        // given
+        let bucket = TimeBucket::hour(1000);
+        let reader = MockQueryReaderBuilder::new(bucket).build();
+        let mut evaluator = Evaluator::new(&reader);
+        let end_time = UNIX_EPOCH + Duration::from_secs(5);
+
+        // when
+        let stmt = EvalStmt {
+            expr: promql_parser::parser::parse("vector(time())").unwrap(),
+            start: end_time,
+            end: end_time,
+            interval: Duration::from_secs(0),
+            lookback_delta: Duration::from_secs(300),
+        };
+        let result = evaluator
+            .evaluate(stmt)
+            .await
+            .unwrap()
+            .expect_instant_vector("Expected instant vector result");
+
+        // then
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 5.0);
+    }
+
+    #[tokio::test]
     async fn should_error_on_string_literal() {
         // given: create an empty mock reader
         let bucket = TimeBucket::hour(1000);
@@ -3810,7 +3889,7 @@ mod tests {
                 "vector",
                 vec![ValueType::Scalar],
                 0,
-                ValueType::Scalar,
+                ValueType::Vector,
                 false,
             ),
             args: FunctionArgs::new_args(Expr::NumberLiteral(NumberLiteral { val: 42.0 })),
@@ -3852,7 +3931,7 @@ mod tests {
                 "vector",
                 vec![ValueType::Scalar],
                 0,
-                ValueType::Scalar,
+                ValueType::Vector,
                 false,
             ),
             args: FunctionArgs::new_args(Expr::Binary(BinaryExpr {

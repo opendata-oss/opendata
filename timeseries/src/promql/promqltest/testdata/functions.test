@@ -573,7 +573,7 @@ eval instant at 10s timestamp(((metric)))
 
 eval instant at 20s timestamp(metric)
   {} 20
-
+resume
 # Tests for label_join.
 load 5m
   testmetric{src="a",src1="b",src2="c",dst="original-destination-value"} 0
@@ -601,6 +601,8 @@ eval instant at 0m label_join(testmetric, "dst", ", ")
 	  testmetric{src="a",src1="b",src2="c"} 0
 	  testmetric{src="d",src1="e",src2="f"} 1
 
+
+ignore
 # test without dst label for label_join
 load 5m
   testmetric1{src="foo",src1="bar",src2="foobar"} 0
@@ -615,7 +617,7 @@ eval instant at 0m label_join(dup, "label", "", "this")
   expect fail msg:vector cannot contain metrics with the same labelset
 
 clear
-
+resume
 # Tests for vector.
 eval instant at 0m vector(1)
   {} 1
@@ -629,7 +631,7 @@ eval instant at 5s vector(time())
 eval instant at 60m vector(time())
   {} 3600
 
-resume
+
 
 # Tests for clamp_max, clamp_min(), and clamp().
 load 5m

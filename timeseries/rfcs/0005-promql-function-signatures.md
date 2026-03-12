@@ -15,7 +15,9 @@ arguments, string arguments, and scalar return values.
 
 The proposal introduces a typed function argument model and a unified function
 execution interface that can evaluate functions across argument shapes while
-preserving PromQL semantics.
+preserving PromQL semantics. In the current incremental design, expression
+shape (`scalar`, `vector`, `matrix`) remains an evaluator concern, while
+function implementations continue to operate on `EvalSample`-based values.
 
 ## Motivation
 
@@ -66,7 +68,9 @@ Without generalization, PromQL support growth becomes brittle and repetitive.
   `experimental`) as the signature source of truth.
 - Use one runtime-dispatched `PromQLFunction` interface at the function
   boundary.
-- Keep scalar-return boundary semantics as `ExprResult::Scalar`.
+- Keep `ExprResult` as the evaluator boundary for expression shape.
+- Keep `PromQLFunction` implementations returning `Vec<EvalSample>` in the
+  current incremental design.
 - Preserve explicit special handling for series/label-oriented functions
   (`label_replace`, `label_join`, and `info` when supported).
 
@@ -149,11 +153,13 @@ Implication for this RFC:
 
 Use one unified function-call interface at the function boundary.
 
-- Use `PromQLArg` as the function-input channel.
-- Keep `ExprResult` as the expression-output channel.
-- Pass `raw_args` for handlers that must inspect AST literals (for example
-  string-argument functions).
-- Keep one `PromQLFunction` trait for runtime dispatch by function name.
+- `PromQLArg` is the function-input channel for `scalar`, `instant vector`,
+  and `range vector` arguments.
+- `FunctionCallContext` carries evaluation timestamp and raw AST arguments for
+  handlers that must inspect literals directly.
+- `PromQLFunction` remains the single runtime-dispatched function interface.
+- In the current implementation, function handlers return `Vec<EvalSample>`.
+- `ExprResult` remains the expression-output channel owned by evaluator.
 
 ```rust
 pub(crate) enum PromQLArg {
@@ -166,14 +172,6 @@ pub(crate) struct FunctionCallContext<'a> {
     pub eval_timestamp_ms: i64,
     pub raw_args: &'a [Box<Expr>],
 }
-
-pub(crate) trait PromQLFunction {
-    fn apply(
-        &self,
-        evaluated_args: Vec<Option<PromQLArg>>,
-        ctx: &FunctionCallContext<'_>,
-    ) -> EvalResult<ExprResult>;
-}
 ```
 
 Notes:
@@ -185,20 +183,22 @@ Notes:
   validation.
 - String-argument handling uses `raw_args` with `None` in evaluated argument
   slots.
-- `ExprResult` is intentionally not widened with `String` for this change:
-  function string literals are modeled as function inputs, while expression
-  outputs remain scalar/vector/matrix.
+- Function implementations stay simpler if they operate on sample vectors and
+  let evaluator own final expression-shape conversion.
 
 ### Scalar Boundary Semantics
 
 Prometheus function internals represent scalar results as vector samples. This
-engine keeps scalar results as `ExprResult::Scalar` at the function boundary.
+engine keeps scalar results as `ExprResult::Scalar` at the evaluator boundary.
 
 Boundary rule:
 
-- Function handlers may use internal scalar/vector helper representations as
-  needed, but final outputs for scalar-returning signatures must surface as
-  `ExprResult::Scalar`.
+- Scalar-returning function handlers may encode their result as a single-sample
+  `Vec<EvalSample>`.
+- Evaluator unwraps that result to `ExprResult::Scalar` using parser
+  `return_type` metadata.
+- This keeps function bodies simple while preserving correct PromQL expression
+  semantics.
 
 ### Signature Source of Truth
 
@@ -233,8 +233,8 @@ At a high level, evaluator-side function handling is responsible for:
   (`label_replace`, `label_join`, and `info` when parser support exists).
 - Passing both raw AST arguments and evaluated argument values into function
   execution.
-- Enforcing result-shape expectations at the boundary (`ExprResult` consistency
-  with the function signature).
+- Converting function outputs into the declared expression shape using parser
+  metadata (`ExprResult::Scalar` vs `ExprResult::InstantVector`).
 
 ### Registry Design
 
@@ -290,3 +290,4 @@ results.
 | 2026-03-06 | Updated alignment for `promql-parser` `v0.8.x` (`variadic: i32`, `experimental: bool`) and switched RFC variadic semantics to Prometheus-style cardinality. |
 | 2026-03-06 | Added explicit architecture decisions section and reduced implementation-detail sections to keep RFC scope high-level. |
 | 2026-03-09 | Clarified input/output separation for function execution: `PromQLArg` for function inputs, `ExprResult` for expression outputs. |
+| 2026-03-12 | Updated the RFC to match the incremental implementation: `PromQLFunction` remains `Vec<EvalSample>`-based, while evaluator keeps ownership of `ExprResult` conversion and scalar unwrapping. |
