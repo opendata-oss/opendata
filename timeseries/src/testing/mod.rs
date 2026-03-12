@@ -70,8 +70,10 @@ pub async fn create_test_tsdb_with_config(object_store: ObjectStoreConfig) -> Te
         path: "bench-data".to_string(),
         object_store,
         settings_path: None,
+        block_cache: None,
     });
     let storage = StorageBuilder::new(&config)
+        .await
         .unwrap()
         .with_semantics(
             StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),

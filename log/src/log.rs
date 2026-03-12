@@ -454,7 +454,7 @@ impl LogRead for LogDb {
 ///     .build()
 ///     .unwrap();
 ///
-/// let mut sb = StorageBuilder::new(&config.storage).unwrap();
+/// let mut sb = StorageBuilder::new(&config.storage).await.unwrap();
 /// sb = sb.map_slatedb(|db| {
 ///     let obj_store = create_object_store(&slate_config.object_store).unwrap();
 ///     db.with_compactor_builder(
@@ -496,6 +496,7 @@ impl LogDbBuilder {
         let sb = match self.storage_builder {
             Some(sb) => sb,
             None => StorageBuilder::new(&self.config.storage)
+                .await
                 .map_err(|e| Error::Storage(e.to_string()))?,
         };
         let storage = sb
@@ -1059,6 +1060,7 @@ mod tests {
     async fn should_scan_entries_via_log_reader() {
         // given - create shared storage
         let storage = StorageBuilder::new(&StorageConfig::InMemory)
+            .await
             .unwrap()
             .build()
             .await
@@ -1296,6 +1298,7 @@ mod tests {
     async fn should_list_keys_via_log_reader() {
         // given - create shared storage
         let storage = StorageBuilder::new(&StorageConfig::InMemory)
+            .await
             .unwrap()
             .build()
             .await
@@ -1707,6 +1710,7 @@ mod tests {
     async fn should_list_segments_via_log_reader() {
         // given
         let storage = StorageBuilder::new(&StorageConfig::InMemory)
+            .await
             .unwrap()
             .build()
             .await

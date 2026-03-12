@@ -4,7 +4,7 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
-use vector::{Config, DistanceMetric, Vector, VectorDb, VectorDbRead};
+use vector::{Config, DistanceMetric, Query, Vector, VectorDb, VectorDbRead};
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -136,13 +136,14 @@ async fn sift1m_recall() {
     let mut hnsw_recall = 0.0;
     let mut exact_recall = 0.0;
     for (i, query) in queries.iter().enumerate() {
+        let q = Query::new(query.clone()).with_limit(k);
         let hnsw_results = db
-            .search_with_nprobe(query, k, nprobe)
+            .search_with_nprobe(&q, nprobe)
             .await
             .expect("search failed");
         hnsw_recall += recall_at_k(&hnsw_results, &ground_truth[i], k);
         let exact_results = db
-            .search_exact_nprobe(query, k, nprobe)
+            .search_exact_nprobe(&q, nprobe)
             .await
             .expect("exact search failed");
         exact_recall += recall_at_k(&exact_results, &ground_truth[i], k);
@@ -237,14 +238,15 @@ async fn sift100k_recall() {
         if (i + 1) % 10 == 0 {
             info!("query {}", i);
         }
+        let q = Query::new(query.clone()).with_limit(k);
         let hnsw_results = db
-            .search_with_nprobe(query, k, nprobe)
+            .search_with_nprobe(&q, nprobe)
             .await
             .expect("search failed");
         hnsw_recall += recall_at_k(&hnsw_results, &ground_truth[i], k);
         if exact {
             let exact_results = db
-                .search_exact_nprobe(query, k, nprobe)
+                .search_exact_nprobe(&q, nprobe)
                 .await
                 .expect("exact search failed");
             exact_recall += recall_at_k(&exact_results, &ground_truth[i], k);

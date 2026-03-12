@@ -9,13 +9,14 @@ use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::Sample;
 use crate::model::SeriesFingerprint;
 use crate::model::{Label, SeriesId, TimeBucket};
-use crate::promql::functions::{FunctionRegistry, PromQLArg};
+use crate::promql::functions::{FunctionCallContext, FunctionRegistry, PromQLArg};
 use crate::promql::selector::evaluate_selector_with_reader;
 use crate::promql::timestamp::Timestamp;
 use crate::query::QueryReader;
 use crate::util::Result;
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::*;
+use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{
     AggregateExpr, AtModifier, BinaryExpr, Call, EvalStmt, Expr, LabelModifier, MatrixSelector,
     Offset, SubqueryExpr, VectorMatchCardinality, VectorSelector,
@@ -1464,17 +1465,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         interval_ms: i64,
         lookback_delta_ms: i64,
     ) -> EvalResult<ExprResult> {
-        // Evaluate all non-string arguments. We keep rejecting string literals
-        // here until string-argument functions are implemented.
+        // String-typed arguments are passed through as raw AST nodes for
+        // string-argument functions such as label_replace/label_join.
         let mut arg_results = Vec::with_capacity(call.args.args.len());
         let mut has_range_arg = false;
         for arg in &call.args.args {
-            if let Expr::StringLiteral(lit) = arg.as_ref() {
-                return Err(EvaluationError::InternalError(format!(
-                    "string literal \"{}\" passed as argument to function '{}': \
-                     string arguments are not yet supported",
-                    lit.val, call.func.name
-                )));
+            if arg.value_type() == ValueType::String {
+                arg_results.push(None);
+                continue;
             }
 
             let arg_result = self
@@ -1491,7 +1489,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             if matches!(arg_result, ExprResult::RangeVector(_)) {
                 has_range_arg = true;
             }
-            arg_results.push(arg_result);
+            arg_results.push(Some(arg_result));
         }
 
         let registry = FunctionRegistry::new();
@@ -1512,7 +1510,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             }
 
             return match arg_results.remove(0) {
-                ExprResult::RangeVector(samples) => {
+                Some(ExprResult::RangeVector(samples)) => {
                     if let Some(func) = registry.get_range_function(call.func.name) {
                         let result = func.apply(samples, eval_timestamp_ms)?;
                         Ok(ExprResult::InstantVector(result))
@@ -1523,8 +1521,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                         )))
                     }
                 }
-                _ => Err(EvaluationError::InternalError(format!(
+                Some(_) => Err(EvaluationError::InternalError(format!(
                     "mixed range/non-range function arguments are not supported: {}",
+                    call.func.name
+                ))),
+                None => Err(EvaluationError::InternalError(format!(
+                    "range-vector functions do not support string arguments: {}",
                     call.func.name
                 ))),
             };
@@ -1533,21 +1535,30 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let mut evaluated_args = Vec::with_capacity(arg_results.len());
         for arg_result in arg_results {
             match arg_result {
-                ExprResult::InstantVector(samples) => {
-                    evaluated_args.push(PromQLArg::InstantVector(samples))
+                Some(ExprResult::InstantVector(samples)) => {
+                    evaluated_args.push(Some(PromQLArg::InstantVector(samples)))
                 }
-                ExprResult::Scalar(scalar) => evaluated_args.push(PromQLArg::Scalar(scalar)),
-                ExprResult::RangeVector(_) => {
+                Some(ExprResult::Scalar(scalar)) => {
+                    evaluated_args.push(Some(PromQLArg::Scalar(scalar)))
+                }
+                Some(ExprResult::RangeVector(_)) => {
                     return Err(EvaluationError::InternalError(format!(
                         "unexpected range-vector argument dispatch for function: {}",
                         call.func.name
                     )));
                 }
+                // Preserve string-arg positions here; string-aware functions
+                // read the raw AST nodes from ctx.raw_args instead.
+                None => evaluated_args.push(None),
             }
         }
 
         if let Some(func) = registry.get(call.func.name) {
-            let result = func.apply_args(evaluated_args, eval_timestamp_ms)?;
+            let ctx = FunctionCallContext {
+                eval_timestamp_ms,
+                raw_args: &call.args.args,
+            };
+            let result = func.apply_call(evaluated_args, &ctx)?;
             Ok(ExprResult::InstantVector(result))
         } else {
             Err(EvaluationError::InternalError(format!(
@@ -3303,7 +3314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_error_on_string_literal_as_function_argument() {
+    async fn should_evaluate_label_replace_with_raw_string_arguments() {
         // given: create an empty mock reader
         let bucket = TimeBucket::hour(1000);
         let reader = MockQueryReaderBuilder::new(bucket).build();
@@ -3315,17 +3326,60 @@ mod tests {
             expr: promql_parser::parser::Expr::Call(promql_parser::parser::Call {
                 func: promql_parser::parser::Function {
                     name: "label_replace",
-                    arg_types: vec![ValueType::String],
+                    arg_types: vec![
+                        ValueType::Vector,
+                        ValueType::String,
+                        ValueType::String,
+                        ValueType::String,
+                        ValueType::String,
+                    ],
                     variadic: 0,
                     return_type: ValueType::Vector,
                     experimental: false,
                 },
                 args: promql_parser::parser::FunctionArgs {
-                    args: vec![Box::new(promql_parser::parser::Expr::StringLiteral(
-                        promql_parser::parser::StringLiteral {
-                            val: "replacement".to_string(),
-                        },
-                    ))],
+                    args: vec![
+                        Box::new(promql_parser::parser::Expr::Call(
+                            promql_parser::parser::Call {
+                                func: promql_parser::parser::Function::new(
+                                    "vector",
+                                    vec![ValueType::Scalar],
+                                    0,
+                                    ValueType::Vector,
+                                    false,
+                                ),
+                                args: promql_parser::parser::FunctionArgs::new_args(
+                                    promql_parser::parser::Expr::NumberLiteral(
+                                        promql_parser::parser::NumberLiteral { val: 1.0 },
+                                    ),
+                                ),
+                            },
+                        )),
+                        Box::new(promql_parser::parser::Expr::Paren(
+                            promql_parser::parser::ParenExpr {
+                                expr: Box::new(promql_parser::parser::Expr::StringLiteral(
+                                    promql_parser::parser::StringLiteral {
+                                        val: "dst".to_string(),
+                                    },
+                                )),
+                            },
+                        )),
+                        Box::new(promql_parser::parser::Expr::StringLiteral(
+                            promql_parser::parser::StringLiteral {
+                                val: "replacement".to_string(),
+                            },
+                        )),
+                        Box::new(promql_parser::parser::Expr::StringLiteral(
+                            promql_parser::parser::StringLiteral {
+                                val: "src".to_string(),
+                            },
+                        )),
+                        Box::new(promql_parser::parser::Expr::StringLiteral(
+                            promql_parser::parser::StringLiteral {
+                                val: "(.*)".to_string(),
+                            },
+                        )),
+                    ],
                 },
             }),
             start: end_time,
@@ -3336,16 +3390,22 @@ mod tests {
 
         let result = evaluator.evaluate(stmt).await;
 
-        // then: should return a context-specific error (string arg not yet supported)
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("string literal")
-                && err.to_string().contains("label_replace")
-                && err.to_string().contains("not yet supported"),
-            "Error message should mention string literal, function name, and 'not yet supported', got: {}",
-            err
-        );
+        // then: raw string args should reach label_replace and be applied
+        let result = result.expect("label_replace should succeed");
+        match result {
+            ExprResult::InstantVector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].value, 1.0);
+                assert_eq!(
+                    samples[0].labels.get("dst"),
+                    Some(&"replacement".to_string())
+                );
+            }
+            ExprResult::Scalar(_) => panic!("Expected instant vector result, got scalar"),
+            ExprResult::RangeVector(_) => {
+                panic!("Expected instant vector result, got range vector")
+            }
+        }
     }
 
     #[allow(clippy::type_complexity)]

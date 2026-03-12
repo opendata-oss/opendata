@@ -34,7 +34,7 @@ fail = "0.5"
 futures = { version = "0.3", features = ["std"] }
 moka = { version = "0.12", features = ["future"] }
 bencher = { path = "./bencher" }
-common = { path = "./common", package = "opendata-common", version = "0.1.9" }
+common = { path = "./common", package = "opendata-common", version = "0.1.10" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 roaring = "0.10"
 rstest = "0.19"
@@ -42,6 +42,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_with = { version = "3", features = ["base64"] }
 serde_yaml = "0.9"
+foyer = "0.18"
 slatedb = "0.11.1"
 slatedb-common = "0.11.1"
 thiserror = "2.0"

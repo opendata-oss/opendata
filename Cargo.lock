@@ -2486,12 +2486,13 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "opendata-common"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "arc-swap",
  "async-trait",
  "bytes",
  "criterion",
+ "foyer",
  "futures",
  "opendata-macros",
  "prometheus-client",
@@ -2500,6 +2501,7 @@ dependencies = [
  "serde_yaml",
  "slatedb",
  "slatedb-common",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2583,7 +2585,7 @@ dependencies = [
 
 [[package]]
 name = "opendata-timeseries"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "axum",

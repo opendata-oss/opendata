@@ -46,17 +46,15 @@ pub unsafe extern "C" fn opendata_log_open(
         }
     };
 
-    let sb = match common::StorageBuilder::new(&rust_config.storage) {
-        Ok(sb) => sb,
-        Err(e) => {
-            return error_result(
-                opendata_log_error_kind_t::OPENDATA_LOG_ERROR_STORAGE,
-                &format!("failed to create storage builder: {e}"),
-            );
-        }
-    };
-
     let log = match runtime.block_on(async {
+        let sb = match common::StorageBuilder::new(&rust_config.storage).await {
+            Ok(sb) => sb,
+            Err(e) => {
+                return Err(log::Error::Storage(format!(
+                    "failed to create storage builder: {e}"
+                )));
+            }
+        };
         let sb = sb.map_slatedb(|db| {
             // Re-extract SlateDB config fields for the CompactorBuilder.
             // Called inside block_on because CompactorBuilder::new requires a Tokio runtime.

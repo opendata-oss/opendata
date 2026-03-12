@@ -69,6 +69,7 @@ async fn main() {
     );
     let merge_operator = Arc::new(OpenTsdbMergeOperator);
     let storage = StorageBuilder::new(&prometheus_config.storage)
+        .await
         .unwrap_or_else(|e| {
             tracing::error!("Failed to create storage: {}", e);
             std::process::exit(1);

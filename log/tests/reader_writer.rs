@@ -18,6 +18,7 @@ fn local_storage_config(dir: &TempDir) -> StorageConfig {
             path: dir.path().to_string_lossy().to_string(),
         }),
         settings_path: None,
+        block_cache: None,
     })
 }
 

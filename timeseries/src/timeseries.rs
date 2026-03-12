@@ -77,7 +77,8 @@ impl TimeSeriesDb {
     /// # }
     /// ```
     pub async fn open(config: Config) -> Result<Self> {
-        let storage = StorageBuilder::new(&config.storage)?
+        let storage = StorageBuilder::new(&config.storage)
+            .await?
             .with_semantics(
                 StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
             )
@@ -249,6 +250,7 @@ mod tests {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            block_cache: None,
         });
 
         // Write a series and close without calling flush()

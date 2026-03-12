@@ -5,14 +5,16 @@
 
 use std::sync::Arc;
 
-use super::config::{ObjectStoreConfig, StorageConfig};
+use super::config::{BlockCacheConfig, ObjectStoreConfig, StorageConfig};
 use super::in_memory::InMemoryStorage;
 use super::slate::{SlateDbStorage, SlateDbStorageReader};
 use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
 use slatedb::DbReader;
 use slatedb::config::Settings;
+pub use slatedb::db_cache::CachedEntry;
 use slatedb::db_cache::DbCache;
 pub use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
+pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 use slatedb::object_store::{self, ObjectStore};
 pub use slatedb::{CompactorBuilder, DbBuilder};
 use tracing::info;
@@ -29,13 +31,13 @@ use tracing::info;
 /// use common::storage::factory::CompactorBuilder;
 ///
 /// // Simple usage:
-/// let storage = StorageBuilder::new(&config.storage)?
+/// let storage = StorageBuilder::new(&config.storage).await?
 ///     .with_semantics(StorageSemantics::new().with_merge_operator(Arc::new(MyOp)))
 ///     .build()
 ///     .await?;
 ///
 /// // Escape hatch for low-level SlateDB configuration:
-/// let storage = StorageBuilder::new(&config.storage)?
+/// let storage = StorageBuilder::new(&config.storage).await?
 ///     .map_slatedb(|db| {
 ///         let obj_store = create_object_store(&slate_config.object_store).unwrap();
 ///         db.with_compactor_builder(
@@ -60,9 +62,10 @@ impl StorageBuilder {
     /// Creates a new `StorageBuilder` from a [`StorageConfig`].
     ///
     /// For SlateDB configs this creates a [`DbBuilder`] with the configured
-    /// path, object store, and settings. For InMemory configs it stores a
-    /// sentinel so that `build()` returns an `InMemoryStorage`.
-    pub fn new(config: &StorageConfig) -> StorageResult<Self> {
+    /// path, object store, settings, and block cache (if configured). For
+    /// InMemory configs it stores a sentinel so that `build()` returns an
+    /// `InMemoryStorage`.
+    pub async fn new(config: &StorageConfig) -> StorageResult<Self> {
         let inner = match config {
             StorageConfig::InMemory => StorageBuilderInner::InMemory,
             StorageConfig::SlateDb(slate_config) => {
@@ -80,9 +83,14 @@ impl StorageBuilder {
                     "create slatedb storage with config: {:?}, settings: {:?}",
                     slate_config, settings
                 );
-                StorageBuilderInner::SlateDb(Box::new(
-                    DbBuilder::new(slate_config.path.clone(), object_store).with_settings(settings),
-                ))
+                let mut db_builder =
+                    DbBuilder::new(slate_config.path.clone(), object_store).with_settings(settings);
+                if let Some(cache) =
+                    create_block_cache_from_config(&slate_config.block_cache).await?
+                {
+                    db_builder = db_builder.with_db_cache(cache);
+                }
+                StorageBuilderInner::SlateDb(Box::new(db_builder))
             }
         };
         Ok(Self {
@@ -101,6 +109,8 @@ impl StorageBuilder {
     ///
     /// This is the escape hatch for any SlateDB knob not exposed by
     /// `StorageBuilder` itself (compactor builder, block cache, GC runtime, etc.).
+    /// Use `db.with_db_cache(...)` inside the closure to override the
+    /// config-driven block cache.
     ///
     /// For InMemory storage this is a no-op.
     pub fn map_slatedb(mut self, f: impl FnOnce(DbBuilder<String>) -> DbBuilder<String>) -> Self {
@@ -183,7 +193,7 @@ impl StorageReaderRuntime {
 /// // In timeseries crate:
 /// let semantics = StorageSemantics::new()
 ///     .with_merge_operator(Arc::new(TimeSeriesMergeOperator));
-/// let storage = StorageBuilder::new(&config)?
+/// let storage = StorageBuilder::new(&config).await?
 ///     .with_semantics(semantics)
 ///     .build()
 ///     .await?;
@@ -282,7 +292,12 @@ pub async fn create_storage_read(
                 let adapter = SlateDbStorage::merge_operator_adapter(op);
                 options.merge_operator = Some(Arc::new(adapter));
             }
+            // Prefer runtime-provided cache, fall back to config
             if let Some(cache) = runtime.block_cache {
+                options.block_cache = Some(cache);
+            } else if let Some(cache) =
+                create_block_cache_from_config(&slate_config.block_cache).await?
+            {
                 options.block_cache = Some(cache);
             }
             let reader = DbReader::open(
@@ -297,5 +312,324 @@ pub async fn create_storage_read(
             })?;
             Ok(Arc::new(SlateDbStorageReader::new(Arc::new(reader))))
         }
+    }
+}
+
+/// Creates a block cache from the serializable config, if present.
+async fn create_block_cache_from_config(
+    config: &Option<BlockCacheConfig>,
+) -> StorageResult<Option<Arc<dyn DbCache>>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    match config {
+        BlockCacheConfig::FoyerHybrid(foyer_config) => {
+            use foyer::{DirectFsDeviceOptions, Engine, HybridCacheBuilder};
+
+            let memory_capacity = usize::try_from(foyer_config.memory_capacity).map_err(|_| {
+                StorageError::Storage(format!(
+                    "memory_capacity {} exceeds usize::MAX on this platform",
+                    foyer_config.memory_capacity
+                ))
+            })?;
+            let disk_capacity = usize::try_from(foyer_config.disk_capacity).map_err(|_| {
+                StorageError::Storage(format!(
+                    "disk_capacity {} exceeds usize::MAX on this platform",
+                    foyer_config.disk_capacity
+                ))
+            })?;
+
+            let cache = HybridCacheBuilder::new()
+                .with_name("slatedb_block_cache")
+                .memory(memory_capacity)
+                .with_weighter(|_, v: &CachedEntry| v.size())
+                .storage(Engine::large())
+                .with_device_options(
+                    DirectFsDeviceOptions::new(&foyer_config.disk_path)
+                        .with_capacity(disk_capacity),
+                )
+                .build()
+                .await
+                .map_err(|e| {
+                    StorageError::Storage(format!("Failed to create hybrid cache: {}", e))
+                })?;
+
+            info!(
+                memory_mb = foyer_config.memory_capacity / (1024 * 1024),
+                disk_mb = foyer_config.disk_capacity / (1024 * 1024),
+                disk_path = %foyer_config.disk_path,
+                "hybrid block cache enabled"
+            );
+
+            Ok(Some(
+                Arc::new(FoyerHybridCache::new_with_cache(cache)) as Arc<dyn DbCache>
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::config::{
+        FoyerHybridCacheConfig, LocalObjectStoreConfig, SlateDbStorageConfig,
+    };
+
+    fn slatedb_config_with_local_dir(dir: &std::path::Path) -> StorageConfig {
+        StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: dir.to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn should_create_storage_with_block_cache_from_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("block-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let config = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp.path().join("obj").to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: Some(BlockCacheConfig::FoyerHybrid(FoyerHybridCacheConfig {
+                memory_capacity: 1024 * 1024,
+                disk_capacity: 4 * 1024 * 1024,
+                disk_path: cache_dir.to_str().unwrap().to_string(),
+            })),
+        });
+
+        let storage = StorageBuilder::new(&config).await.unwrap().build().await;
+
+        assert!(
+            storage.is_ok(),
+            "expected config-driven block cache to work"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_create_reader_with_block_cache_from_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("block-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let slate_config = SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp.path().join("obj").to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: Some(BlockCacheConfig::FoyerHybrid(FoyerHybridCacheConfig {
+                memory_capacity: 1024 * 1024,
+                disk_capacity: 4 * 1024 * 1024,
+                disk_path: cache_dir.to_str().unwrap().to_string(),
+            })),
+        };
+
+        // First open a writer so the reader has a manifest to read
+        let writer = StorageBuilder::new(&StorageConfig::SlateDb(slate_config.clone()))
+            .await
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        // Close writer before opening reader (SlateDB fencing)
+        drop(writer);
+
+        let reader = create_storage_read(
+            &StorageConfig::SlateDb(slate_config),
+            StorageReaderRuntime::new(),
+            StorageSemantics::new(),
+            slatedb::config::DbReaderOptions::default(),
+        )
+        .await;
+
+        assert!(
+            reader.is_ok(),
+            "expected config-driven block cache on reader to work"
+        );
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[tokio::test]
+    async fn should_error_when_capacity_exceeds_usize() {
+        // On 32-bit platforms, u64::MAX > usize::MAX triggers our overflow check.
+        // On 64-bit this is a no-op, so gate on 32-bit.
+        let config = BlockCacheConfig::FoyerHybrid(FoyerHybridCacheConfig {
+            memory_capacity: u64::MAX,
+            disk_capacity: 4 * 1024 * 1024,
+            disk_path: "/tmp/unused".to_string(),
+        });
+
+        let result = create_block_cache_from_config(&Some(config)).await;
+        assert!(result.is_err());
+    }
+
+    /// Helper: creates a SlateDb config whose block_cache disk_path is a regular file
+    /// (not a directory), which foyer deterministically rejects.
+    fn config_with_invalid_block_cache_disk_path(
+        obj_dir: &std::path::Path,
+        bad_disk_path: &str,
+    ) -> StorageConfig {
+        StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: obj_dir.to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: Some(BlockCacheConfig::FoyerHybrid(FoyerHybridCacheConfig {
+                memory_capacity: 1024 * 1024,
+                disk_capacity: 4 * 1024 * 1024,
+                disk_path: bad_disk_path.to_string(),
+            })),
+        })
+    }
+
+    // Note: foyer panics (unwrap inside DirectFsDevice) on invalid disk paths
+    // rather than returning an error. We isolate the panic to the create_storage
+    // call via tokio::spawn so setup unwrap() failures don't mask regressions.
+    #[tokio::test]
+    async fn should_fail_when_config_cache_disk_path_is_invalid() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Use a regular file as disk_path — foyer expects a directory
+        let bad_path = tmp.path().join("not-a-dir");
+        std::fs::write(&bad_path, b"").unwrap();
+
+        let config = config_with_invalid_block_cache_disk_path(
+            &tmp.path().join("obj"),
+            bad_path.to_str().unwrap(),
+        );
+
+        // Isolate the expected panic to just the build call
+        let handle = tokio::spawn(async move {
+            let _ = StorageBuilder::new(&config).await.unwrap().build().await;
+        });
+        let result = handle.await;
+        assert!(
+            result.is_err() && result.unwrap_err().is_panic(),
+            "expected foyer to panic on invalid disk_path"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_fail_reader_when_config_cache_disk_path_is_invalid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad_path = tmp.path().join("not-a-dir");
+        std::fs::write(&bad_path, b"").unwrap();
+
+        let slate_config = SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp.path().join("obj").to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: Some(BlockCacheConfig::FoyerHybrid(FoyerHybridCacheConfig {
+                memory_capacity: 1024 * 1024,
+                disk_capacity: 4 * 1024 * 1024,
+                disk_path: bad_path.to_str().unwrap().to_string(),
+            })),
+        };
+
+        // First open a writer (without cache) so the reader has a manifest
+        let writer = StorageBuilder::new(&StorageConfig::SlateDb(SlateDbStorageConfig {
+            block_cache: None,
+            ..slate_config.clone()
+        }))
+        .await
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+        drop(writer);
+
+        // Isolate the expected panic to just the create_storage_read call
+        let handle = tokio::spawn(async move {
+            let _ = create_storage_read(
+                &StorageConfig::SlateDb(slate_config),
+                StorageReaderRuntime::new(),
+                StorageSemantics::new(),
+                slatedb::config::DbReaderOptions::default(),
+            )
+            .await;
+        });
+        let result = handle.await;
+        assert!(
+            result.is_err() && result.unwrap_err().is_panic(),
+            "expected foyer to panic on invalid disk_path for reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_runtime_cache_should_take_precedence_over_config_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad_path = tmp.path().join("not-a-dir");
+        std::fs::write(&bad_path, b"").unwrap();
+
+        let slate_config = SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp.path().join("obj").to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: Some(BlockCacheConfig::FoyerHybrid(FoyerHybridCacheConfig {
+                memory_capacity: 1024 * 1024,
+                disk_capacity: 4 * 1024 * 1024,
+                disk_path: bad_path.to_str().unwrap().to_string(),
+            })),
+        };
+
+        // First open a writer (without cache) so the reader has a manifest
+        let writer = StorageBuilder::new(&StorageConfig::SlateDb(SlateDbStorageConfig {
+            block_cache: None,
+            ..slate_config.clone()
+        }))
+        .await
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+        drop(writer);
+
+        // Runtime cache should bypass the invalid config cache
+        let runtime_cache = FoyerCache::new_with_opts(FoyerCacheOptions {
+            max_capacity: 1024 * 1024,
+            shards: 1,
+        });
+        let runtime = StorageReaderRuntime::new().with_block_cache(Arc::new(runtime_cache));
+
+        let result = create_storage_read(
+            &StorageConfig::SlateDb(slate_config),
+            runtime,
+            StorageSemantics::new(),
+            slatedb::config::DbReaderOptions::default(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "reader runtime cache should take precedence, skipping invalid config cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_return_none_when_no_block_cache_configured() {
+        let result = create_block_cache_from_config(&None).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_work_without_block_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = slatedb_config_with_local_dir(tmp.path());
+
+        let storage = StorageBuilder::new(&config).await.unwrap().build().await;
+
+        assert!(storage.is_ok());
     }
 }

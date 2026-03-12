@@ -61,6 +61,7 @@ impl KeyValueDb {
     /// Returns an error if the storage backend cannot be initialized.
     pub async fn open(config: Config) -> Result<Self> {
         let storage = StorageBuilder::new(&config.storage)
+            .await
             .map_err(|e| Error::Storage(e.to_string()))?
             .build()
             .await
@@ -419,6 +420,7 @@ mod tests {
     async fn should_read_via_keyvalue_reader() {
         // given - create shared storage
         let storage = StorageBuilder::new(&StorageConfig::InMemory)
+            .await
             .unwrap()
             .build()
             .await
@@ -445,6 +447,7 @@ mod tests {
     async fn should_scan_via_keyvalue_reader() {
         // given - create shared storage
         let storage = StorageBuilder::new(&StorageConfig::InMemory)
+            .await
             .unwrap()
             .build()
             .await

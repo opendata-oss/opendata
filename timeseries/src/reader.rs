@@ -161,6 +161,7 @@ impl TimeSeriesDbReader {
             manifest_poll_interval: config.refresh_interval,
             ..Default::default()
         };
+
         let storage = create_storage_read(
             &config.storage,
             StorageReaderRuntime::new(),
@@ -510,6 +511,7 @@ mod tests {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            block_cache: None,
         });
 
         // 1. Open writer and write data
@@ -621,6 +623,7 @@ mod tests {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            block_cache: None,
         });
 
         let writer = TimeSeriesDb::open(Config {
