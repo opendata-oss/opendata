@@ -243,13 +243,14 @@ pub trait StorageRead: Send + Sync {
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>>;
 
     /// Collects all records in the range into a Vec.
-    #[tracing::instrument(level = "trace", skip_all)]
+    #[tracing::instrument(level = "debug", skip_all, fields(num_records))]
     async fn scan(&self, range: BytesRange) -> StorageResult<Vec<Record>> {
         let mut iter = self.scan_iter(range).await?;
         let mut records = Vec::new();
         while let Some(record) = iter.next().await? {
             records.push(record);
         }
+        tracing::Span::current().record("num_records", records.len());
         Ok(records)
     }
 }

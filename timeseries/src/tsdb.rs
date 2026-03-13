@@ -9,7 +9,7 @@ use futures::TryStreamExt;
 use moka::future::Cache;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 use tokio::sync::RwLock;
-use tracing::error;
+use tracing::{error, info_span, Instrument};
 
 use crate::error::QueryError;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
@@ -115,31 +115,37 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         time: Option<std::time::SystemTime>,
         opts: &QueryOptions,
     ) -> std::result::Result<QueryValue, QueryError> {
-        let expr = promql_parser::parser::parse(query)
-            .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
+        let span = info_span!("eval_query", query = query);
+        async {
+            let expr = promql_parser::parser::parse(query)
+                .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
 
-        let query_time = time.unwrap_or_else(std::time::SystemTime::now);
-        let lookback_delta = opts.lookback_delta;
-        let stmt = EvalStmt {
-            expr,
-            start: query_time,
-            end: query_time,
-            interval: Duration::from_secs(0),
-            lookback_delta,
-        };
+            let query_time = time.unwrap_or_else(std::time::SystemTime::now);
+            let lookback_delta = opts.lookback_delta;
+            let stmt = EvalStmt {
+                expr,
+                start: query_time,
+                end: query_time,
+                interval: Duration::from_secs(0),
+                lookback_delta,
+            };
 
-        let query_time_secs = query_time.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-        let lookback_start_secs = query_time
-            .checked_sub(lookback_delta)
-            .unwrap_or(UNIX_EPOCH)
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_secs() as i64;
+            let query_time_secs =
+                query_time.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+            let lookback_start_secs = query_time
+                .checked_sub(lookback_delta)
+                .unwrap_or(UNIX_EPOCH)
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::from_secs(0))
+                .as_secs() as i64;
 
-        let ranges = preload_ranges(&stmt, lookback_start_secs, query_time_secs);
-        let reader = self.make_query_reader_for_ranges(&ranges).await?;
+            let ranges = preload_ranges(&stmt, lookback_start_secs, query_time_secs);
+            let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
-        evaluate_instant(&reader, stmt, query_time).await
+            evaluate_instant(&reader, stmt, query_time).await
+        }
+        .instrument(span)
+        .await
     }
 
     /// Evaluate a range PromQL query, returning typed `RangeSample`s.
@@ -151,30 +157,35 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         step: Duration,
         opts: &QueryOptions,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-        let expr = promql_parser::parser::parse(query)
-            .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
+        let span = info_span!("eval_query_range", query = query);
+        async {
+            let expr = promql_parser::parser::parse(query)
+                .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
 
-        let lookback_delta = opts.lookback_delta;
-        let stmt = EvalStmt {
-            expr,
-            start,
-            end,
-            interval: step,
-            lookback_delta,
-        };
+            let lookback_delta = opts.lookback_delta;
+            let stmt = EvalStmt {
+                expr,
+                start,
+                end,
+                interval: step,
+                lookback_delta,
+            };
 
-        let default_start_secs = start
-            .checked_sub(lookback_delta)
-            .unwrap_or(UNIX_EPOCH)
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_secs() as i64;
-        let default_end_secs = end.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+            let default_start_secs = start
+                .checked_sub(lookback_delta)
+                .unwrap_or(UNIX_EPOCH)
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::from_secs(0))
+                .as_secs() as i64;
+            let default_end_secs = end.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
 
-        let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
-        let reader = self.make_query_reader_for_ranges(&ranges).await?;
+            let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
+            let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
-        evaluate_range(&reader, stmt).await
+            evaluate_range(&reader, stmt).await
+        }
+        .instrument(span)
+        .await
     }
 
     /// Discover series matching any of the given selectors.
@@ -562,15 +573,18 @@ impl Tsdb {
     async fn get_bucket(&self, bucket: TimeBucket) -> Result<Arc<MiniTsdb>> {
         // 1. Check ingest cache first (has freshest data)
         if let Some(mini) = self.ingest_cache.get(&bucket).await {
+            tracing::info!(bucket_start = bucket.start, cache = "ingest", "bucket cache hit");
             return Ok(mini);
         }
 
         // 2. Check query cache
         if let Some(mini) = self.query_cache.get(&bucket).await {
+            tracing::info!(bucket_start = bucket.start, cache = "query", "bucket cache hit");
             return Ok(mini);
         }
 
         // 3. Load from storage into query cache (NOT ingest cache)
+        tracing::info!(bucket_start = bucket.start, "bucket cache miss, loading from storage");
         let mini = Arc::new(MiniTsdb::load(bucket, self.storage.clone()).await?);
         self.query_cache.insert(bucket, mini.clone()).await;
         Ok(mini)
@@ -605,18 +619,21 @@ impl Tsdb {
 
     /// Create a QueryReader for a set of disjoint time ranges.
     /// Discovers all buckets overlapping any range and returns a TsdbQueryReader.
+    #[tracing::instrument(level = "info", skip_all, fields(num_ranges = ranges.len()))]
     pub(crate) async fn query_reader_for_ranges(
         &self,
         ranges: &[(i64, i64)],
     ) -> Result<TsdbQueryReader> {
         let snapshot = self.storage.snapshot().await?;
         let buckets = snapshot.get_buckets_for_ranges(ranges).await?;
+        tracing::info!(num_buckets = buckets.len(), "discovered buckets");
 
         let mut readers = Vec::new();
-        for bucket in buckets {
-            let mini = self.get_bucket(bucket).await?;
+        for bucket in &buckets {
+            let span = info_span!("load_bucket", bucket_start = bucket.start);
+            let mini = self.get_bucket(*bucket).instrument(span).await?;
             let reader = mini.query_reader();
-            readers.push((bucket, reader));
+            readers.push((*bucket, reader));
         }
 
         Ok(TsdbQueryReader::new(readers))
