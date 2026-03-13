@@ -1374,4 +1374,207 @@ mod tests {
         // then: should find exactly 3 series (excluding host-50)
         assert_eq!(result.len(), 3, "Should find 3 matching series");
     }
+
+    // ── Selector fast-path tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn selector_and_only_fast_path() {
+        use crate::model::TimeBucket;
+        use crate::query::test_utils::MockQueryReaderBuilder;
+
+        let bucket = TimeBucket::hour(1000);
+        let base_time = 1000 * 3600 * 1000;
+        let mut builder = MockQueryReaderBuilder::new(bucket);
+
+        builder.add_sample(
+            vec![
+                Label {
+                    name: METRIC_NAME.to_string(),
+                    value: "cpu_usage".to_string(),
+                },
+                Label {
+                    name: "env".to_string(),
+                    value: "prod".to_string(),
+                },
+            ],
+            MetricType::Gauge,
+            Sample {
+                timestamp_ms: base_time + 1000,
+                value: 80.0,
+            },
+        );
+        builder.add_sample(
+            vec![
+                Label {
+                    name: METRIC_NAME.to_string(),
+                    value: "cpu_usage".to_string(),
+                },
+                Label {
+                    name: "env".to_string(),
+                    value: "staging".to_string(),
+                },
+            ],
+            MetricType::Gauge,
+            Sample {
+                timestamp_ms: base_time + 1000,
+                value: 50.0,
+            },
+        );
+
+        let reader = builder.build();
+
+        // AND-only query: cpu_usage{env="prod"} — hits fast path (no OR groups)
+        let selector = VectorSelector {
+            name: Some("cpu_usage".to_string()),
+            matchers: Matchers {
+                matchers: vec![Matcher::new(MatchOp::Equal, "env", "prod")],
+                or_matchers: vec![],
+            },
+            offset: None,
+            at: None,
+        };
+        let mut cached_reader = CachedQueryReader::new(&reader);
+        let result = evaluate_selector_with_reader(&mut cached_reader, bucket, &selector)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1, "AND-only fast path should find exactly 1 series");
+    }
+
+    #[tokio::test]
+    async fn selector_and_plus_or_path() {
+        use crate::model::TimeBucket;
+        use crate::query::test_utils::MockQueryReaderBuilder;
+
+        let bucket = TimeBucket::hour(1000);
+        let base_time = 1000 * 3600 * 1000;
+        let mut builder = MockQueryReaderBuilder::new(bucket);
+
+        for env in &["prod", "staging", "dev"] {
+            builder.add_sample(
+                vec![
+                    Label {
+                        name: METRIC_NAME.to_string(),
+                        value: "cpu_usage".to_string(),
+                    },
+                    Label {
+                        name: "env".to_string(),
+                        value: env.to_string(),
+                    },
+                ],
+                MetricType::Gauge,
+                Sample {
+                    timestamp_ms: base_time + 1000,
+                    value: 42.0,
+                },
+            );
+        }
+
+        let reader = builder.build();
+
+        // AND+OR query: cpu_usage{env=~"prod|staging"} — bypasses fast path
+        let matcher = create_regex_matcher("env", "prod|staging").unwrap();
+        let selector = VectorSelector {
+            name: Some("cpu_usage".to_string()),
+            matchers: Matchers {
+                matchers: vec![matcher],
+                or_matchers: vec![],
+            },
+            offset: None,
+            at: None,
+        };
+        let mut cached_reader = CachedQueryReader::new(&reader);
+        let result = evaluate_selector_with_reader(&mut cached_reader, bucket, &selector)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.len(),
+            2,
+            "AND+OR path should find exactly 2 series (prod and staging)"
+        );
+    }
+
+    #[tokio::test]
+    async fn selector_and_only_vs_or_equivalence() {
+        use crate::model::TimeBucket;
+        use crate::query::test_utils::MockQueryReaderBuilder;
+
+        let bucket = TimeBucket::hour(1000);
+        let base_time = 1000 * 3600 * 1000;
+        let mut builder = MockQueryReaderBuilder::new(bucket);
+
+        builder.add_sample(
+            vec![
+                Label {
+                    name: METRIC_NAME.to_string(),
+                    value: "cpu_usage".to_string(),
+                },
+                Label {
+                    name: "env".to_string(),
+                    value: "prod".to_string(),
+                },
+            ],
+            MetricType::Gauge,
+            Sample {
+                timestamp_ms: base_time + 1000,
+                value: 80.0,
+            },
+        );
+        builder.add_sample(
+            vec![
+                Label {
+                    name: METRIC_NAME.to_string(),
+                    value: "cpu_usage".to_string(),
+                },
+                Label {
+                    name: "env".to_string(),
+                    value: "staging".to_string(),
+                },
+            ],
+            MetricType::Gauge,
+            Sample {
+                timestamp_ms: base_time + 1000,
+                value: 50.0,
+            },
+        );
+
+        let reader = builder.build();
+
+        // AND-only: cpu_usage{env="prod"}
+        let and_selector = VectorSelector {
+            name: Some("cpu_usage".to_string()),
+            matchers: Matchers {
+                matchers: vec![Matcher::new(MatchOp::Equal, "env", "prod")],
+                or_matchers: vec![],
+            },
+            offset: None,
+            at: None,
+        };
+        let mut cached_reader1 = CachedQueryReader::new(&reader);
+        let and_result = evaluate_selector_with_reader(&mut cached_reader1, bucket, &and_selector)
+            .await
+            .unwrap();
+
+        // OR with single value: cpu_usage{env=~"prod"} — should match same series
+        let matcher = create_regex_matcher("env", "prod").unwrap();
+        let or_selector = VectorSelector {
+            name: Some("cpu_usage".to_string()),
+            matchers: Matchers {
+                matchers: vec![matcher],
+                or_matchers: vec![],
+            },
+            offset: None,
+            at: None,
+        };
+        let mut cached_reader2 = CachedQueryReader::new(&reader);
+        let or_result = evaluate_selector_with_reader(&mut cached_reader2, bucket, &or_selector)
+            .await
+            .unwrap();
+
+        // Both should return exactly 1 series with the same ID
+        assert_eq!(and_result.len(), 1);
+        assert_eq!(or_result.len(), 1);
+        assert_eq!(and_result[0], or_result[0]);
+    }
 }

@@ -1828,4 +1828,107 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), QueryError::InvalidQuery(_)));
     }
+
+    // ── Multi-bucket query tests (parallel bucket loading) ──────────
+
+    #[tokio::test]
+    async fn multi_bucket_query_returns_all_data() {
+        let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        ))));
+
+        // Ingest samples across two different hour buckets
+        // Bucket at minute 60 (3,600,000 ms - 7,199,999 ms)
+        let series1 = vec![create_sample(
+            "http_requests",
+            vec![("env", "prod")],
+            4_000_000,
+            10.0,
+        )];
+        tsdb.ingest_samples(series1).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        // Bucket at minute 120 (7,200,000 ms - 10,799,999 ms)
+        let series2 = vec![create_sample(
+            "http_requests",
+            vec![("env", "prod")],
+            8_000_000,
+            20.0,
+        )];
+        tsdb.ingest_samples(series2).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        // Query range spanning both buckets
+        let start = UNIX_EPOCH + Duration::from_millis(3_500_000);
+        let end = UNIX_EPOCH + Duration::from_millis(8_500_000);
+        let opts = QueryOptions {
+            lookback_delta: Duration::from_secs(300),
+        };
+
+        let samples = tsdb
+            .eval_query_range(
+                "http_requests",
+                start..=end,
+                Duration::from_secs(60),
+                &opts,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(samples.len(), 1, "Should find 1 series across buckets");
+
+        // Verify both sample values appear
+        let all_values: Vec<f64> = samples[0].samples.iter().map(|(_, v)| *v).collect();
+        assert!(
+            all_values.contains(&10.0),
+            "Should contain value from first bucket"
+        );
+        assert!(
+            all_values.contains(&20.0),
+            "Should contain value from second bucket"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_bucket_instant_query_prefers_latest() {
+        let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        ))));
+
+        // Two buckets with different values for the same series
+        let series1 = vec![create_sample(
+            "cpu_usage",
+            vec![("host", "web1")],
+            4_000_000,
+            60.0,
+        )];
+        tsdb.ingest_samples(series1).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        let series2 = vec![create_sample(
+            "cpu_usage",
+            vec![("host", "web1")],
+            8_000_000,
+            90.0,
+        )];
+        tsdb.ingest_samples(series2).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        // Instant query at t=8100s (within lookback of second bucket sample)
+        let query_time = UNIX_EPOCH + Duration::from_secs(8100);
+        let opts = QueryOptions::default();
+
+        let result = tsdb
+            .eval_query("cpu_usage", Some(query_time), &opts)
+            .await
+            .unwrap();
+
+        let samples = match result {
+            QueryValue::Vector(s) => s,
+            other => panic!("expected Vector, got {:?}", other),
+        };
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].value, 90.0, "Should return the latest sample");
+    }
 }

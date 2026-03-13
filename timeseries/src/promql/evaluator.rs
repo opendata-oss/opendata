@@ -181,9 +181,12 @@ impl QueryReaderEvalCache {
         result: Box<dyn InvertedIndexLookup + Send + Sync + 'static>,
     ) {
         let bucket_cache = self.get_bucket_cache_mut(&bucket);
-        let cached_index = CachedInvertedIndex {
-            result: result.intersect(terms.clone()),
-        };
+        let mut postings = HashMap::with_capacity(terms.len());
+        for term in &terms {
+            let bitmap = result.intersect(vec![term.clone()]);
+            postings.insert(term.clone(), bitmap);
+        }
+        let cached_index = CachedInvertedIndex { postings };
         bucket_cache
             .inverted_index_cache
             .insert(terms, Arc::new(cached_index));
@@ -239,21 +242,32 @@ impl ForwardIndexLookup for CachedForwardIndex {
     }
 }
 
-/// A cached inverted index lookup that wraps cached data
+/// A cached inverted index lookup that stores per-term posting lists
 struct CachedInvertedIndex {
-    result: roaring::RoaringBitmap,
+    postings: HashMap<Label, roaring::RoaringBitmap>,
 }
 
 impl InvertedIndexLookup for CachedInvertedIndex {
-    fn intersect(&self, _terms: Vec<Label>) -> roaring::RoaringBitmap {
-        // Return the pre-computed intersection result
-        self.result.clone()
+    fn intersect(&self, terms: Vec<Label>) -> roaring::RoaringBitmap {
+        if terms.is_empty() {
+            return roaring::RoaringBitmap::new();
+        }
+        let mut result: Option<roaring::RoaringBitmap> = None;
+        for term in &terms {
+            if let Some(posting) = self.postings.get(term) {
+                result = Some(match result {
+                    Some(acc) => acc & posting,
+                    None => posting.clone(),
+                });
+            } else {
+                return roaring::RoaringBitmap::new();
+            }
+        }
+        result.unwrap_or_default()
     }
 
     fn all_keys(&self) -> Vec<Label> {
-        // This method doesn't make sense for a pre-computed intersection result
-        // but we need to implement it for the trait
-        Vec::new()
+        self.postings.keys().cloned().collect()
     }
 }
 
@@ -5994,6 +6008,496 @@ mod tests {
             assert_eq!(normalize_ranges(vec![(-5, 10)]), vec![(-5, 10)]);
             // Empty
             assert_eq!(normalize_ranges(vec![]), vec![]);
+        }
+
+        // ── CachedInvertedIndex tests ───────────────────────────────────
+
+        #[test]
+        fn cached_inverted_index_and_only() {
+            use roaring::RoaringBitmap;
+
+            let mut postings = HashMap::new();
+            let label_a = Label {
+                name: "env".to_string(),
+                value: "prod".to_string(),
+            };
+            let label_b = Label {
+                name: "__name__".to_string(),
+                value: "http_requests".to_string(),
+            };
+
+            let mut bm_a = RoaringBitmap::new();
+            bm_a.insert(1);
+            bm_a.insert(2);
+            bm_a.insert(3);
+
+            let mut bm_b = RoaringBitmap::new();
+            bm_b.insert(2);
+            bm_b.insert(3);
+            bm_b.insert(4);
+
+            postings.insert(label_a.clone(), bm_a);
+            postings.insert(label_b.clone(), bm_b);
+
+            let cached = CachedInvertedIndex { postings };
+
+            // intersect([A, B]) should return {2, 3}
+            let result = cached.intersect(vec![label_a.clone(), label_b.clone()]);
+            assert_eq!(result.len(), 2);
+            assert!(result.contains(2));
+            assert!(result.contains(3));
+        }
+
+        #[test]
+        fn cached_inverted_index_or_group_different_subsets() {
+            use roaring::RoaringBitmap;
+
+            let label_a = Label {
+                name: "method".to_string(),
+                value: "GET".to_string(),
+            };
+            let label_b = Label {
+                name: "method".to_string(),
+                value: "POST".to_string(),
+            };
+
+            let mut bm_a = RoaringBitmap::new();
+            bm_a.insert(1);
+            bm_a.insert(2);
+
+            let mut bm_b = RoaringBitmap::new();
+            bm_b.insert(3);
+            bm_b.insert(4);
+
+            let mut postings = HashMap::new();
+            postings.insert(label_a.clone(), bm_a);
+            postings.insert(label_b.clone(), bm_b);
+
+            let cached = CachedInvertedIndex { postings };
+
+            // intersect([A]) and intersect([B]) should return different results
+            let result_a = cached.intersect(vec![label_a]);
+            let result_b = cached.intersect(vec![label_b]);
+            assert_eq!(result_a.iter().collect::<Vec<_>>(), vec![1, 2]);
+            assert_eq!(result_b.iter().collect::<Vec<_>>(), vec![3, 4]);
+        }
+
+        #[test]
+        fn cached_inverted_index_missing_term() {
+            use roaring::RoaringBitmap;
+
+            let label_a = Label {
+                name: "env".to_string(),
+                value: "prod".to_string(),
+            };
+            let missing = Label {
+                name: "env".to_string(),
+                value: "nonexistent".to_string(),
+            };
+
+            let mut bm = RoaringBitmap::new();
+            bm.insert(1);
+            let mut postings = HashMap::new();
+            postings.insert(label_a.clone(), bm);
+
+            let cached = CachedInvertedIndex { postings };
+
+            // intersect with a missing term returns empty
+            let result = cached.intersect(vec![label_a, missing]);
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn cached_inverted_index_empty_terms() {
+            let cached = CachedInvertedIndex {
+                postings: HashMap::new(),
+            };
+            let result = cached.intersect(vec![]);
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn cached_inverted_index_all_keys() {
+            use roaring::RoaringBitmap;
+
+            let label_a = Label {
+                name: "env".to_string(),
+                value: "prod".to_string(),
+            };
+            let label_b = Label {
+                name: "method".to_string(),
+                value: "GET".to_string(),
+            };
+
+            let mut postings = HashMap::new();
+            postings.insert(label_a.clone(), RoaringBitmap::new());
+            postings.insert(label_b.clone(), RoaringBitmap::new());
+
+            let cached = CachedInvertedIndex { postings };
+            let mut keys = cached.all_keys();
+            keys.sort();
+            let mut expected = vec![label_a, label_b];
+            expected.sort();
+            assert_eq!(keys, expected);
+        }
+
+        // ── CachedForwardIndex tests ────────────────────────────────────
+
+        #[test]
+        fn cached_forward_index_hit() {
+            use crate::index::SeriesSpec;
+            use crate::model::MetricType;
+
+            let labels = vec![Label {
+                name: METRIC_NAME.to_string(),
+                value: "test_metric".to_string(),
+            }];
+            let spec = SeriesSpec::new(None, Some(MetricType::Gauge), labels);
+            let mut data = HashMap::new();
+            data.insert(42u32, spec.clone());
+
+            let cached = CachedForwardIndex { data };
+            let result = cached.get_spec(&42).unwrap();
+            assert_eq!(result.labels, spec.labels);
+            assert_eq!(result.metric_type, spec.metric_type);
+            assert_eq!(result.fingerprint, spec.fingerprint);
+        }
+
+        #[test]
+        fn cached_forward_index_miss() {
+            let cached = CachedForwardIndex {
+                data: HashMap::new(),
+            };
+            assert!(cached.get_spec(&999).is_none());
+        }
+
+        #[test]
+        fn cached_forward_index_all_series() {
+            use crate::index::SeriesSpec;
+            use crate::model::MetricType;
+
+            let labels1 = vec![Label {
+                name: METRIC_NAME.to_string(),
+                value: "metric_a".to_string(),
+            }];
+            let labels2 = vec![Label {
+                name: METRIC_NAME.to_string(),
+                value: "metric_b".to_string(),
+            }];
+            let spec1 = SeriesSpec::new(None, Some(MetricType::Gauge), labels1);
+            let spec2 = SeriesSpec::new(None, Some(MetricType::Gauge), labels2);
+
+            let mut data = HashMap::new();
+            data.insert(1u32, spec1.clone());
+            data.insert(2u32, spec2.clone());
+
+            let cached = CachedForwardIndex { data };
+            let mut all = cached.all_series();
+            all.sort_by_key(|(id, _)| *id);
+            assert_eq!(all.len(), 2);
+            assert_eq!(all[0].0, 1);
+            assert_eq!(all[0].1.labels, spec1.labels);
+            assert_eq!(all[0].1.fingerprint, spec1.fingerprint);
+            assert_eq!(all[1].0, 2);
+            assert_eq!(all[1].1.labels, spec2.labels);
+            assert_eq!(all[1].1.fingerprint, spec2.fingerprint);
+        }
+
+        // ── ReductionState tests ────────────────────────────────────────
+
+        #[test]
+        fn reduction_state_sum_count_avg() {
+            use promql_parser::parser::token::{T_AVG, T_COUNT, T_SUM};
+
+            let mut state = ReductionState::default();
+            state.record(1.0);
+            state.record(2.0);
+            state.record(3.0);
+
+            assert_eq!(state.finish(TokenType::new(T_SUM)).unwrap(), 6.0);
+            assert_eq!(state.finish(TokenType::new(T_COUNT)).unwrap(), 3.0);
+            assert_eq!(state.finish(TokenType::new(T_AVG)).unwrap(), 2.0);
+        }
+
+        #[test]
+        fn reduction_state_min_max() {
+            use promql_parser::parser::token::{T_MAX, T_MIN};
+
+            let mut state = ReductionState::default();
+            state.record(3.0);
+            state.record(1.0);
+            state.record(2.0);
+
+            assert_eq!(state.finish(TokenType::new(T_MIN)).unwrap(), 1.0);
+            assert_eq!(state.finish(TokenType::new(T_MAX)).unwrap(), 3.0);
+        }
+
+        #[test]
+        fn reduction_state_nan_propagation() {
+            use promql_parser::parser::token::{T_MAX, T_MIN, T_SUM};
+
+            let mut state = ReductionState::default();
+            state.record(1.0);
+            state.record(f64::NAN);
+            state.record(2.0);
+
+            // NaN propagates through sum (1.0 + NaN + 2.0 = NaN)
+            assert!(state.finish(TokenType::new(T_SUM)).unwrap().is_nan());
+            // f64::min/max return the non-NaN value per IEEE 754 minNum/maxNum
+            assert_eq!(state.finish(TokenType::new(T_MIN)).unwrap(), 1.0);
+            assert_eq!(state.finish(TokenType::new(T_MAX)).unwrap(), 2.0);
+        }
+
+        #[test]
+        fn reduction_state_single_value() {
+            use promql_parser::parser::token::{T_AVG, T_COUNT, T_MAX, T_MIN, T_SUM};
+
+            let mut state = ReductionState::default();
+            state.record(42.0);
+
+            assert_eq!(state.finish(TokenType::new(T_SUM)).unwrap(), 42.0);
+            assert_eq!(state.finish(TokenType::new(T_COUNT)).unwrap(), 1.0);
+            assert_eq!(state.finish(TokenType::new(T_AVG)).unwrap(), 42.0);
+            assert_eq!(state.finish(TokenType::new(T_MIN)).unwrap(), 42.0);
+            assert_eq!(state.finish(TokenType::new(T_MAX)).unwrap(), 42.0);
+        }
+
+        #[test]
+        fn reduction_state_empty() {
+            use promql_parser::parser::token::{T_COUNT, T_MAX, T_MIN, T_SUM};
+
+            let state = ReductionState::default();
+
+            assert_eq!(state.finish(TokenType::new(T_SUM)).unwrap(), 0.0);
+            assert_eq!(state.finish(TokenType::new(T_COUNT)).unwrap(), 0.0);
+            assert_eq!(
+                state.finish(TokenType::new(T_MIN)).unwrap(),
+                f64::INFINITY
+            );
+            assert_eq!(
+                state.finish(TokenType::new(T_MAX)).unwrap(),
+                f64::NEG_INFINITY
+            );
+        }
+
+        // ── FingerprintHasher tests ─────────────────────────────────────
+
+        #[test]
+        fn fingerprint_hasher_deterministic() {
+            use std::hash::Hash;
+
+            let value: u128 = 0xDEADBEEF_CAFEBABE_12345678_9ABCDEF0;
+            let hash1 = {
+                let mut h = FingerprintHasher::default();
+                value.hash(&mut h);
+                h.finish()
+            };
+            let hash2 = {
+                let mut h = FingerprintHasher::default();
+                value.hash(&mut h);
+                h.finish()
+            };
+            assert_eq!(hash1, hash2);
+        }
+
+        #[test]
+        fn fingerprint_hasher_different_inputs() {
+            use std::hash::Hash;
+
+            let hash1 = {
+                let mut h = FingerprintHasher::default();
+                (100u128).hash(&mut h);
+                h.finish()
+            };
+            let hash2 = {
+                let mut h = FingerprintHasher::default();
+                (200u128).hash(&mut h);
+                h.finish()
+            };
+            assert_ne!(hash1, hash2);
+        }
+
+        #[test]
+        fn fingerprint_hasher_distribution() {
+            use std::collections::HashSet;
+            use std::hash::Hash;
+
+            let mut hashes = HashSet::new();
+            for i in 0u128..1000 {
+                let mut h = FingerprintHasher::default();
+                i.hash(&mut h);
+                hashes.insert(h.finish());
+            }
+            // With 1000 sequential inputs, we should get at least 900 unique hashes
+            assert!(
+                hashes.len() > 900,
+                "Only {} unique hashes from 1000 inputs",
+                hashes.len()
+            );
+        }
+
+        // ── QueryReaderEvalCache inverted index integration test ────────
+
+        #[test]
+        fn cache_inverted_index_preserves_per_term_postings() {
+            use crate::index::InvertedIndex;
+            use roaring::RoaringBitmap;
+
+            let bucket = TimeBucket::hour(1000);
+            let label_metric = Label {
+                name: "__name__".to_string(),
+                value: "http_requests".to_string(),
+            };
+            let label_get = Label {
+                name: "method".to_string(),
+                value: "GET".to_string(),
+            };
+            let label_post = Label {
+                name: "method".to_string(),
+                value: "POST".to_string(),
+            };
+
+            // Build a real InvertedIndex
+            let index = InvertedIndex::default();
+            let mut bm_metric = RoaringBitmap::new();
+            bm_metric.insert(1);
+            bm_metric.insert(2);
+            bm_metric.insert(3);
+            index.postings.insert(label_metric.clone(), bm_metric);
+
+            let mut bm_get = RoaringBitmap::new();
+            bm_get.insert(1);
+            bm_get.insert(3);
+            index.postings.insert(label_get.clone(), bm_get);
+
+            let mut bm_post = RoaringBitmap::new();
+            bm_post.insert(2);
+            index.postings.insert(label_post.clone(), bm_post);
+
+            // Cache the index with all terms
+            let mut cache = QueryReaderEvalCache::new();
+            let all_terms = vec![
+                label_metric.clone(),
+                label_get.clone(),
+                label_post.clone(),
+            ];
+            cache.cache_inverted_index(bucket, all_terms.clone(), Box::new(index));
+
+            // Retrieve cached index
+            let cached = cache.get_inverted_index(&bucket, &all_terms).unwrap();
+
+            // Single-term lookups should return correct per-term postings
+            let metric_results: Vec<_> = cached.intersect(vec![label_metric.clone()]).iter().collect();
+            assert_eq!(metric_results, vec![1, 2, 3]);
+
+            let get_results: Vec<_> = cached.intersect(vec![label_get.clone()]).iter().collect();
+            assert_eq!(get_results, vec![1, 3]);
+
+            let post_results: Vec<_> = cached.intersect(vec![label_post.clone()]).iter().collect();
+            assert_eq!(post_results, vec![2]);
+
+            // Multi-term intersection should work correctly
+            let metric_get: Vec<_> = cached
+                .intersect(vec![label_metric.clone(), label_get.clone()])
+                .iter()
+                .collect();
+            assert_eq!(metric_get, vec![1, 3]);
+
+            let metric_post: Vec<_> = cached
+                .intersect(vec![label_metric, label_post])
+                .iter()
+                .collect();
+            assert_eq!(metric_post, vec![2]);
+        }
+
+        // ── Forward index entries cache integration test ────────────────
+
+        #[tokio::test]
+        async fn forward_index_entries_batch_matches_individual() {
+            let bucket = TimeBucket::hour(1000);
+            let base_time = 1000 * 3600 * 1000; // start of bucket in ms
+            let mut builder = MockQueryReaderBuilder::new(bucket);
+
+            // Add 3 series
+            builder.add_sample(
+                create_labels("metric_a", vec![("env", "prod")]),
+                crate::model::MetricType::Gauge,
+                Sample {
+                    timestamp_ms: base_time + 1000,
+                    value: 1.0,
+                },
+            );
+            builder.add_sample(
+                create_labels("metric_b", vec![("env", "staging")]),
+                crate::model::MetricType::Gauge,
+                Sample {
+                    timestamp_ms: base_time + 1000,
+                    value: 2.0,
+                },
+            );
+            builder.add_sample(
+                create_labels("metric_c", vec![("env", "dev")]),
+                crate::model::MetricType::Gauge,
+                Sample {
+                    timestamp_ms: base_time + 1000,
+                    value: 3.0,
+                },
+            );
+
+            let reader = builder.build();
+            let mut cached_reader = CachedQueryReader::new(&reader);
+
+            // Load batch of all 3 series
+            let all_ids = vec![0u32, 1, 2];
+            let batch_entries = cached_reader
+                .forward_index_entries(&bucket, &all_ids)
+                .await
+                .unwrap();
+
+            // Verify all 3 are returned
+            assert_eq!(batch_entries.len(), 3);
+
+            // Load forward index individually and compare
+            let forward_index = cached_reader
+                .forward_index(&bucket, &all_ids)
+                .await
+                .unwrap();
+            for (series_id, batch_spec) in batch_entries.iter() {
+                let individual_spec = forward_index.get_spec(series_id).unwrap();
+                assert_eq!(batch_spec.labels, individual_spec.labels);
+                assert_eq!(batch_spec.metric_type, individual_spec.metric_type);
+                assert_eq!(batch_spec.fingerprint, individual_spec.fingerprint);
+            }
+        }
+
+        #[tokio::test]
+        async fn forward_index_entries_partial_miss() {
+            let bucket = TimeBucket::hour(1000);
+            let base_time = 1000 * 3600 * 1000;
+            let mut builder = MockQueryReaderBuilder::new(bucket);
+
+            builder.add_sample(
+                create_labels("metric_a", vec![("env", "prod")]),
+                crate::model::MetricType::Gauge,
+                Sample {
+                    timestamp_ms: base_time + 1000,
+                    value: 1.0,
+                },
+            );
+
+            let reader = builder.build();
+            let mut cached_reader = CachedQueryReader::new(&reader);
+
+            // Request IDs 0 (exists) and 999 (doesn't exist)
+            let ids = vec![0u32, 999];
+            let entries = cached_reader
+                .forward_index_entries(&bucket, &ids)
+                .await
+                .unwrap();
+
+            // Only the existing series should be returned
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].0, 0);
         }
     }
 }
