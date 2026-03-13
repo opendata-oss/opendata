@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use common::Storage;
+use futures::stream::{self, StreamExt};
 use futures::TryStreamExt;
 use moka::future::Cache;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
@@ -576,6 +577,9 @@ impl Tsdb {
         Ok(mini)
     }
 
+    /// Maximum number of buckets to load concurrently.
+    const BUCKET_LOAD_CONCURRENCY: usize = 8;
+
     /// Create a QueryReader for a time range.
     /// This discovers all buckets covering the range and returns a TsdbQueryReader
     /// that properly handles bucket-scoped series IDs.
@@ -592,13 +596,16 @@ impl Tsdb {
             .get_buckets_in_range(Some(start_secs), Some(end_secs))
             .await?;
 
-        // Load MiniTsdbs for each bucket (from cache or storage)
-        let mut readers = Vec::new();
-        for bucket in buckets {
-            let mini = self.get_bucket(bucket).await?;
-            let reader = mini.query_reader();
-            readers.push((bucket, reader));
-        }
+        // Load MiniTsdbs for each bucket in parallel (from cache or storage)
+        let readers: Vec<Result<_>> = stream::iter(buckets)
+            .map(|bucket| async move {
+                let mini = self.get_bucket(bucket).await?;
+                Ok((bucket, mini.query_reader()))
+            })
+            .buffer_unordered(Self::BUCKET_LOAD_CONCURRENCY)
+            .collect()
+            .await;
+        let readers: Vec<_> = readers.into_iter().collect::<Result<_>>()?;
 
         Ok(TsdbQueryReader::new(readers))
     }
@@ -612,12 +619,15 @@ impl Tsdb {
         let snapshot = self.storage.snapshot().await?;
         let buckets = snapshot.get_buckets_for_ranges(ranges).await?;
 
-        let mut readers = Vec::new();
-        for bucket in buckets {
-            let mini = self.get_bucket(bucket).await?;
-            let reader = mini.query_reader();
-            readers.push((bucket, reader));
-        }
+        let readers: Vec<Result<_>> = stream::iter(buckets)
+            .map(|bucket| async move {
+                let mini = self.get_bucket(bucket).await?;
+                Ok((bucket, mini.query_reader()))
+            })
+            .buffer_unordered(Self::BUCKET_LOAD_CONCURRENCY)
+            .collect()
+            .await;
+        let readers: Vec<_> = readers.into_iter().collect::<Result<_>>()?;
 
         Ok(TsdbQueryReader::new(readers))
     }
