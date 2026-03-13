@@ -1438,7 +1438,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.len(), 1, "AND-only fast path should find exactly 1 series");
+        assert_eq!(
+            result.len(),
+            1,
+            "AND-only fast path should find exactly 1 series"
+        );
     }
 
     #[tokio::test]

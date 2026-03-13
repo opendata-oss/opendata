@@ -2363,20 +2363,20 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         interval_ms: i64,
         lookback_delta_ms: i64,
     ) -> EvalResult<ExprResult> {
-        if Self::is_reduction_aggregate(aggregate.op) {
-            if let Expr::VectorSelector(vector_selector) = &*aggregate.expr {
-                let samples = self
-                    .evaluate_vector_selector_reduction_aggregate(
-                        aggregate,
-                        vector_selector,
-                        query_start,
-                        query_end,
-                        evaluation_ts,
-                        lookback_delta_ms,
-                    )
-                    .await?;
-                return Ok(ExprResult::InstantVector(samples));
-            }
+        if Self::is_reduction_aggregate(aggregate.op)
+            && let Expr::VectorSelector(vector_selector) = &*aggregate.expr
+        {
+            let samples = self
+                .evaluate_vector_selector_reduction_aggregate(
+                    aggregate,
+                    vector_selector,
+                    query_start,
+                    query_end,
+                    evaluation_ts,
+                    lookback_delta_ms,
+                )
+                .await?;
+            return Ok(ExprResult::InstantVector(samples));
         }
 
         // Evaluate the inner expression to get all samples
@@ -6270,10 +6270,7 @@ mod tests {
 
             assert_eq!(state.finish(TokenType::new(T_SUM)).unwrap(), 0.0);
             assert_eq!(state.finish(TokenType::new(T_COUNT)).unwrap(), 0.0);
-            assert_eq!(
-                state.finish(TokenType::new(T_MIN)).unwrap(),
-                f64::INFINITY
-            );
+            assert_eq!(state.finish(TokenType::new(T_MIN)).unwrap(), f64::INFINITY);
             assert_eq!(
                 state.finish(TokenType::new(T_MAX)).unwrap(),
                 f64::NEG_INFINITY
@@ -6376,18 +6373,17 @@ mod tests {
 
             // Cache the index with all terms
             let mut cache = QueryReaderEvalCache::new();
-            let all_terms = vec![
-                label_metric.clone(),
-                label_get.clone(),
-                label_post.clone(),
-            ];
+            let all_terms = vec![label_metric.clone(), label_get.clone(), label_post.clone()];
             cache.cache_inverted_index(bucket, all_terms.clone(), Box::new(index));
 
             // Retrieve cached index
             let cached = cache.get_inverted_index(&bucket, &all_terms).unwrap();
 
             // Single-term lookups should return correct per-term postings
-            let metric_results: Vec<_> = cached.intersect(vec![label_metric.clone()]).iter().collect();
+            let metric_results: Vec<_> = cached
+                .intersect(vec![label_metric.clone()])
+                .iter()
+                .collect();
             assert_eq!(metric_results, vec![1, 2, 3]);
 
             let get_results: Vec<_> = cached.intersect(vec![label_get.clone()]).iter().collect();

@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use common::Storage;
-use futures::stream::{self, StreamExt};
 use futures::TryStreamExt;
+use futures::stream::{self, StreamExt};
 use moka::future::Cache;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 use tokio::sync::RwLock;
@@ -1866,12 +1866,7 @@ mod tests {
         };
 
         let samples = tsdb
-            .eval_query_range(
-                "http_requests",
-                start..=end,
-                Duration::from_secs(60),
-                &opts,
-            )
+            .eval_query_range("http_requests", start..=end, Duration::from_secs(60), &opts)
             .await
             .unwrap();
 
