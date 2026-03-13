@@ -431,6 +431,11 @@ impl LogDb {
                             "db/l0_flush_input_bytes_last",
                             "db/l0_flush_output_bytes_last",
                             "db/l0_flush_manifest_retries",
+                            "db/l0_flush_commit_batch_size_last",
+                            "db/l0_flush_build_inflight",
+                            "db/l0_flush_upload_inflight",
+                            "db/l0_flush_built_ready",
+                            "db/l0_flush_uploaded_ready",
                         ],
                     ),
                     (
