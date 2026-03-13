@@ -1938,7 +1938,7 @@ mod tests {
             OpenTsdbMergeOperator,
         ))));
 
-        // Bucket 1: sample at t=4_000_000ms (minute 60 bucket)
+        // Bucket 60 (3,600,000–7,199,999ms): sample at t=4_000s
         tsdb.ingest_samples(vec![create_sample(
             "rps",
             vec![("env", "prod")],
@@ -1949,7 +1949,7 @@ mod tests {
         .unwrap();
         tsdb.flush().await.unwrap();
 
-        // Bucket 2: sample at t=8_000_000ms (minute 120 bucket)
+        // Bucket 120 (7,200,000–10,799,999ms): same series, sample at t=8_000s
         tsdb.ingest_samples(vec![create_sample(
             "rps",
             vec![("env", "prod")],
@@ -1960,37 +1960,40 @@ mod tests {
         .unwrap();
         tsdb.flush().await.unwrap();
 
-        let start = UNIX_EPOCH + Duration::from_millis(3_500_000);
-        let end = UNIX_EPOCH + Duration::from_millis(8_500_000);
+        // Range query with 1000s step and 300s lookback.
+        // Eval timestamps: 4_000s, 5_000s, 6_000s, 7_000s, 8_000s.
+        // Sample at 4_000s (bucket 60) is within lookback for steps 4000s and 4000+300=4300s.
+        // Sample at 8_000s (bucket 120) is within lookback for step 8000s.
+        // Steps 5_000s, 6_000s, 7_000s: sample at 4_000s is >300s old → no match.
+        let start = UNIX_EPOCH + Duration::from_secs(4_000);
+        let end = UNIX_EPOCH + Duration::from_secs(8_000);
         let opts = QueryOptions {
             lookback_delta: Duration::from_secs(300),
         };
 
         let samples = tsdb
-            .eval_query_range("rps", start..=end, Duration::from_secs(60), &opts)
+            .eval_query_range("rps", start..=end, Duration::from_secs(1000), &opts)
             .await
             .unwrap();
 
         // Same fingerprint across buckets must merge into a single series
         assert_eq!(samples.len(), 1, "Should dedupe into 1 series");
 
-        // Sample timestamps must be non-decreasing (range queries return
-        // one (raw_ts, value) per eval step, and lookback fill-forward
-        // repeats the same sample across consecutive steps)
-        let timestamps: Vec<i64> = samples[0].samples.iter().map(|(t, _)| *t).collect();
-        for window in timestamps.windows(2) {
-            assert!(
-                window[0] <= window[1],
-                "Timestamps must be non-decreasing, got {} > {}",
-                window[0],
-                window[1]
-            );
-        }
-
-        // Both underlying values must appear across the range steps
-        let values: Vec<f64> = samples[0].samples.iter().map(|(_, v)| *v).collect();
-        assert!(values.contains(&10.0), "Missing value from first bucket");
-        assert!(values.contains(&20.0), "Missing value from second bucket");
+        // With 300s lookback and 1000s step:
+        //   step 4_000s → sample at 4_000s (age=0s ≤ 300s) → (4_000_000, 10.0)
+        //   step 5_000s → sample at 4_000s (age=1000s > 300s) → no match
+        //   step 6_000s → sample at 4_000s (age=2000s > 300s) → no match
+        //   step 7_000s → sample at 4_000s (age=3000s > 300s) → no match
+        //   step 8_000s → sample at 8_000s (age=0s ≤ 300s) → (8_000_000, 20.0)
+        let points = &samples[0].samples;
+        assert_eq!(
+            points.len(),
+            2,
+            "Expected exactly 2 output points, got {:?}",
+            points
+        );
+        assert_eq!(points[0], (4_000_000, 10.0));
+        assert_eq!(points[1], (8_000_000, 20.0));
     }
 
     #[tokio::test]
@@ -1999,34 +2002,36 @@ mod tests {
             OpenTsdbMergeOperator,
         ))));
 
-        // Bucket 1: sample at t=4_000s (minute 60 bucket, ts=4_000_000ms)
+        // Bucket 60 (3,600,000–7,199,999ms): sample at t=7_000s within lookback
         tsdb.ingest_samples(vec![create_sample(
             "cpu",
             vec![("host", "web1")],
-            4_000_000,
+            7_000_000,
             60.0,
         )])
         .await
         .unwrap();
         tsdb.flush().await.unwrap();
 
-        // Bucket 2: same series but sample at t=7_200s (minute 120 bucket, ts=7_200_000ms)
+        // Bucket 120 (7,200,000–10,799,999ms): same series, sample at t=9_000s
+        // This is AFTER query_time so the evaluator cannot use it.
         tsdb.ingest_samples(vec![create_sample(
             "cpu",
             vec![("host", "web1")],
-            7_200_000,
+            9_000_000,
             90.0,
         )])
         .await
         .unwrap();
         tsdb.flush().await.unwrap();
 
-        // Query at t=4_200s with 5m lookback.
-        // The newer bucket's sample at t=7_200s is far outside lookback.
-        // The older bucket's sample at t=4_000s is within 200s — should be returned.
-        let query_time = UNIX_EPOCH + Duration::from_secs(4200);
+        // Query at t=7_500s with 10m lookback.
+        // Preload range = [6_900s, 7_500s] → loads BOTH bucket 60 and bucket 120.
+        // Bucket 120's sample at t=9_000s > query_time → not usable.
+        // Bucket 60's sample at t=7_000s is within lookback [6_900s, 7_500s] → should be returned.
+        let query_time = UNIX_EPOCH + Duration::from_secs(7_500);
         let opts = QueryOptions {
-            lookback_delta: Duration::from_secs(300),
+            lookback_delta: Duration::from_secs(600),
         };
 
         let result = tsdb
@@ -2039,10 +2044,10 @@ mod tests {
             other => panic!("expected Vector, got {:?}", other),
         };
 
-        assert_eq!(samples.len(), 1, "Should find 1 series from older bucket");
+        assert_eq!(samples.len(), 1, "Should find 1 series");
         assert_eq!(
             samples[0].value, 60.0,
-            "Should fall back to older bucket sample within lookback"
+            "Should return older bucket's sample when newer bucket's sample is past query_time"
         );
     }
 }
