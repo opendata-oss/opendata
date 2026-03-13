@@ -436,6 +436,8 @@ impl LogDb {
                             "db/l0_flush_upload_inflight",
                             "db/l0_flush_built_ready",
                             "db/l0_flush_uploaded_ready",
+                            "db/l0_flush_upload_queue_ms_last",
+                            "db/l0_flush_commit_queue_ms_last",
                         ],
                     ),
                     (
