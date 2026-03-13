@@ -237,6 +237,7 @@ impl Dataset {
 fn distance_metric_to_str(m: DistanceMetric) -> &'static str {
     match m {
         DistanceMetric::L2 => "l2",
+        DistanceMetric::Cosine => "cosine",
         DistanceMetric::DotProduct => "dot_product",
     }
 }
@@ -244,6 +245,7 @@ fn distance_metric_to_str(m: DistanceMetric) -> &'static str {
 fn str_to_distance_metric(s: &str) -> DistanceMetric {
     match s {
         "l2" => DistanceMetric::L2,
+        "cosine" => DistanceMetric::Cosine,
         "dot_product" => DistanceMetric::DotProduct,
         _ => panic!("unknown distance metric: {}", s),
     }

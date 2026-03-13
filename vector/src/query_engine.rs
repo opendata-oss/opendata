@@ -49,6 +49,14 @@ impl QueryEngine {
         }
     }
 
+    /// Normalize the query vector if required by distance metric.
+    /// Returns a (possibly normalized) copy of the query vector.
+    fn normalize_query_if_needed(&self, query: &[f32]) -> Vec<f32> {
+        let mut v = query.to_vec();
+        self.options.distance_metric.normalize_if_needed(&mut v);
+        v
+    }
+
     pub(crate) async fn get(&self, id: &str) -> Result<Option<Vector>> {
         // 1. Lookup internal ID from IdDictionary
         let Some(internal_id) = self.storage.lookup_internal_id(id).await? else {
@@ -101,6 +109,9 @@ impl QueryEngine {
             )));
         }
 
+        // Normalize query vector if required.
+        let query_vector = self.normalize_query_if_needed(&query.vector);
+
         // Brute-force: compute distance from query to every live centroid
         let all_centroid_ids = self.centroid_graph.all_centroid_ids();
         let mut scored: Vec<(u64, distance::VectorDistance)> = all_centroid_ids
@@ -108,7 +119,7 @@ impl QueryEngine {
             .filter_map(|&cid| {
                 let cv = self.centroid_graph.get_centroid_vector(cid)?;
                 let d =
-                    distance::compute_distance(&query.vector, &cv, self.options.distance_metric);
+                    distance::compute_distance(&query_vector, &cv, self.options.distance_metric);
                 Some((cid, d))
             })
             .collect();
@@ -119,9 +130,9 @@ impl QueryEngine {
             return Ok(Vec::new());
         }
 
-        let centroid_ids = self.prune_centroids(&centroid_ids, &query.vector);
+        let centroid_ids = self.prune_centroids(&centroid_ids, &query_vector);
 
-        let mut sorted_lists = self.load_and_score(&centroid_ids, &query.vector).await?;
+        let mut sorted_lists = self.load_and_score(&centroid_ids, &query_vector).await?;
         if sorted_lists.is_empty() {
             return Ok(Vec::new());
         }
@@ -150,9 +161,12 @@ impl QueryEngine {
             )));
         }
 
-        // 2. Search HNSW for nearest centroids
+        // 2. Normalize query vector if required.
+        let query_vector = self.normalize_query_if_needed(&query.vector);
+
+        // 3. Search HNSW for nearest centroids
         let num_centroids = nprobe;
-        let centroid_ids = self.centroid_graph.search(&query.vector, num_centroids);
+        let centroid_ids = self.centroid_graph.search(&query_vector, num_centroids);
         debug!(
             "searched for {} centroids, found: {}",
             num_centroids,
@@ -163,29 +177,29 @@ impl QueryEngine {
             return Ok(Vec::new());
         }
 
-        // 3. Dynamic pruning: skip posting lists whose centroids are far from query
+        // 4. Dynamic pruning: skip posting lists whose centroids are far from query
         let original_ncentroids = centroid_ids.len();
-        let centroid_ids = self.prune_centroids(&centroid_ids, &query.vector);
+        let centroid_ids = self.prune_centroids(&centroid_ids, &query_vector);
         debug!(
             "query: {:?}, before pruning: {} centroids, after dynamic pruning: {} centroids",
-            query.vector,
+            query_vector,
             original_ncentroids,
             centroid_ids.len()
         );
 
-        // 4. Load posting lists and score candidates
-        let mut sorted_lists = self.load_and_score(&centroid_ids, &query.vector).await?;
+        // 5. Load posting lists and score candidates
+        let mut sorted_lists = self.load_and_score(&centroid_ids, &query_vector).await?;
 
         if sorted_lists.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 5. Apply metadata filter (if provided)
+        // 6. Apply metadata filter (if provided)
         if let Some(filter) = &query.filter {
             Self::apply_filter(&mut sorted_lists, filter, self.storage.as_ref()).await?;
         }
 
-        // 6. K-way merge and resolve top-k forward index lookups
+        // 7. K-way merge and resolve top-k forward index lookups
         let mut results = self.resolve_top_k(sorted_lists, query.limit).await?;
         Self::apply_field_selection(&mut results, &query.include_fields);
         Ok(results)
@@ -233,7 +247,7 @@ impl QueryEngine {
         let threshold = match metric {
             // raw_distance uses squared L2, so preserve epsilon semantics in
             // Euclidean space by squaring the multiplicative factor.
-            DistanceMetric::L2 => (1.0 + epsilon).powi(2) * closest_dist,
+            DistanceMetric::L2 | DistanceMetric::Cosine => (1.0 + epsilon).powi(2) * closest_dist,
             DistanceMetric::DotProduct => (1.0 + epsilon) * closest_dist,
         };
         scored
@@ -1123,6 +1137,134 @@ mod tests {
         match record.attribute(VECTOR_FIELD_NAME) {
             Some(AttributeValue::Vector(v)) => assert_eq!(v, &[0.0, 1.0, 0.0]),
             other => panic!("expected vector field, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_normalize_vectors_on_write_for_cosine_metric() {
+        // given - a database with Cosine metric and non-unit vectors at different angles
+        let config = create_config(3, DistanceMetric::Cosine);
+        let db = VectorDb::open(config).await.unwrap();
+
+        // Two vectors pointing in the same direction but with different magnitudes
+        // should be equidistant from a query in the same direction under cosine.
+        let vectors = vec![
+            Vector::new("small", vec![1.0, 0.0, 0.0]),
+            Vector::new("large", vec![100.0, 0.0, 0.0]),
+        ];
+        db.write(vectors).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when - search for a vector in the same direction
+        let results = db
+            .query_engine()
+            .search(&Query::new(vec![5.0, 0.0, 0.0]).with_limit(2))
+            .await
+            .unwrap();
+
+        // then - both vectors should have the same score (cosine distance = 0)
+        assert_eq!(results.len(), 2);
+        assert!(
+            (results[0].score - results[1].score).abs() < 1e-6,
+            "Cosine distances should be equal for same-direction vectors: {} vs {}",
+            results[0].score,
+            results[1].score
+        );
+
+        let record = db.get("large").await.unwrap().unwrap();
+
+        // stored "large" vector should be unchanged
+        match record.attribute(VECTOR_FIELD_NAME) {
+            Some(AttributeValue::Vector(v)) => assert_eq!(v, &[100.0, 0.0, 0.0]),
+            other => panic!("expected vector field, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_not_normalize_vectors_on_write_for_l2_metric() {
+        // given - a database with L2 metric and a non-unit vector
+        let config = create_config(3, DistanceMetric::L2);
+        let db = VectorDb::open(config).await.unwrap();
+
+        let vector = Vector::new("vec", vec![3.0, 4.0, 0.0]);
+        db.write(vec![vector]).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when
+        let record = db.get("vec").await.unwrap().unwrap();
+
+        // then - stored vector should be unchanged
+        match record.attribute(VECTOR_FIELD_NAME) {
+            Some(AttributeValue::Vector(v)) => assert_eq!(v, &[3.0, 4.0, 0.0]),
+            other => panic!("expected vector field, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_search_cosine_with_unnormalized_query() {
+        // given - Cosine database with normalized stored vectors
+        let config = create_config(3, DistanceMetric::Cosine);
+        let db = VectorDb::open(config).await.unwrap();
+
+        // Vectors pointing in different directions (will be normalized on write)
+        let vectors = vec![
+            Vector::new("along-x", vec![10.0, 0.0, 0.0]),
+            Vector::new("along-y", vec![0.0, 10.0, 0.0]),
+            Vector::new("along-z", vec![0.0, 0.0, 10.0]),
+        ];
+        db.write(vectors).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when - query with an unnormalized vector pointing mostly along x
+        let results = db
+            .query_engine()
+            .search(&Query::new(vec![100.0, 1.0, 0.0]).with_limit(3))
+            .await
+            .unwrap();
+
+        // then - "along-x" should be most similar (smallest angle)
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].vector.id, "along-x");
+        assert_eq!(results[1].vector.id, "along-y");
+        assert_eq!(results[2].vector.id, "along-z");
+    }
+
+    #[tokio::test]
+    async fn should_rank_cosine_by_angular_similarity() {
+        // given - Cosine database with vectors at different angles and magnitudes
+        let config = create_config(2, DistanceMetric::Cosine);
+        let db = VectorDb::open(config).await.unwrap();
+        let vectors = vec![
+            Vector::new("0-deg", vec![5.0, 0.0]),
+            Vector::new("below-45", vec![10.0, 9.0]),
+            Vector::new("45-deg", vec![1.0, 1.0]),
+            Vector::new("90-deg", vec![0.0, 3.0]),
+        ];
+        db.write(vectors).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when - query along the same "below-45" direction
+        let results = db
+            .query_engine()
+            .search(&Query::new(vec![50.0, 45.0]).with_limit(4))
+            .await
+            .unwrap();
+
+        // then - ranked by angle
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].vector.id, "below-45");
+        assert_eq!(results[1].vector.id, "45-deg");
+        assert_eq!(results[2].vector.id, "0-deg");
+        assert_eq!(results[3].vector.id, "90-deg");
+
+        // scores should be increasing (lower cosine distance = more similar)
+        for i in 1..results.len() {
+            assert!(
+                results[i - 1].score <= results[i].score,
+                "Cosine distances not sorted correctly: {} > {}",
+                results[i - 1].score,
+                results[i].score
+            );
         }
     }
 }

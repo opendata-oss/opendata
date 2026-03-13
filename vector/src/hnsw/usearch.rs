@@ -78,9 +78,10 @@ impl UsearchCentroidGraph {
             }
         }
 
-        // Convert distance metric to usearch MetricKind
+        // Convert distance metric to usearch MetricKind.
+        // Cosine is handled by normalizing vectors at ingest, so use L2 here.
         let metric = match distance_metric {
-            DistanceMetric::L2 => MetricKind::L2sq,
+            DistanceMetric::L2 | DistanceMetric::Cosine => MetricKind::L2sq,
             DistanceMetric::DotProduct => MetricKind::IP,
         };
 
@@ -252,7 +253,9 @@ impl UsearchCentroidGraphInner {
 
     fn compute_distance(&self, a: &[f32], b: &[f32]) -> f32 {
         match self.distance_metric {
-            DistanceMetric::L2 => a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum(),
+            DistanceMetric::L2 | DistanceMetric::Cosine => {
+                a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
+            }
             DistanceMetric::DotProduct => {
                 1.0 - a.iter().zip(b.iter()).map(|(x, y)| x * y).sum::<f32>()
             }
@@ -599,5 +602,92 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0], 1);
         assert_eq!(results[1], 99);
+    }
+
+    /// Helper to normalize a vector to unit length (simulating ingest-time normalization).
+    fn normalize(v: &[f32]) -> Vec<f32> {
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter().map(|x| x / norm).collect()
+    }
+
+    #[test]
+    fn should_build_and_search_cosine_graph() {
+        // given - 3 normalized centroids along axes
+        let centroids = vec![
+            CentroidEntry::new(1, normalize(&[1.0, 0.0, 0.0])),
+            CentroidEntry::new(2, normalize(&[0.0, 1.0, 0.0])),
+            CentroidEntry::new(3, normalize(&[0.0, 0.0, 1.0])),
+        ];
+
+        // when - query closest to centroid 1
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::Cosine).unwrap();
+        let query = normalize(&[0.9, 0.1, 0.1]);
+        let results = graph.search(&query, 1);
+
+        // then
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], 1);
+    }
+
+    #[test]
+    fn should_return_cosine_neighbors_in_similarity_order() {
+        // given - 4 normalized centroids
+        let centroids = vec![
+            CentroidEntry::new(1, normalize(&[1.0, 1.0])), // 45 degrees
+            CentroidEntry::new(2, normalize(&[1.0, 0.0])), // 0 degrees
+            CentroidEntry::new(3, normalize(&[-1.0, 0.0])), // 180 degrees
+            CentroidEntry::new(4, normalize(&[0.0, 1.0])), // 90 degrees
+        ];
+
+        // when - query along x-axis
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::Cosine).unwrap();
+        let query = normalize(&[1.0, 0.0]);
+        let results = graph.search(&query, 4);
+
+        // then - ordered by angular similarity
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0], 2);
+        assert_eq!(results[1], 1);
+        assert_eq!(results[2], 4);
+        assert_eq!(results[3], 3);
+    }
+
+    #[test]
+    fn should_add_and_find_centroid_with_cosine() {
+        // given - 2 normalized centroids
+        let centroids = vec![
+            CentroidEntry::new(1, normalize(&[1.0, 0.0, 0.0])),
+            CentroidEntry::new(2, normalize(&[0.0, 1.0, 0.0])),
+        ];
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::Cosine).unwrap();
+
+        // when - add a third centroid and search near it
+        let new_entry = CentroidEntry::new(3, normalize(&[0.0, 0.0, 1.0]));
+        graph.add_centroid(&new_entry).unwrap();
+
+        // then
+        assert_eq!(graph.len(), 3);
+        let results = graph.search(&normalize(&[0.0, 0.0, 0.9]), 1);
+        assert_eq!(results[0], 3);
+    }
+
+    #[test]
+    fn should_remove_centroid_with_cosine() {
+        // given - 3 normalized centroids
+        let centroids = vec![
+            CentroidEntry::new(1, normalize(&[1.0, 0.0, 0.0])),
+            CentroidEntry::new(2, normalize(&[0.0, 1.0, 0.0])),
+            CentroidEntry::new(3, normalize(&[0.0, 0.0, 1.0])),
+        ];
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::Cosine).unwrap();
+
+        // when - remove centroid 2
+        graph.remove_centroid(2).unwrap();
+
+        // then - centroid 2 should not appear in results
+        assert_eq!(graph.len(), 2);
+        let results = graph.search(&normalize(&[0.0, 1.0, 0.0]), 3);
+        assert_eq!(results.len(), 2);
+        assert!(!results.contains(&2));
     }
 }
