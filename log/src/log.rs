@@ -384,52 +384,84 @@ impl LogDb {
 
         let metrics_poller_task = storage.stat_registry().map(|registry| {
             tokio::spawn(async move {
-                let metrics = [
-                    "db/l0_sst_count",
-                    "db/backpressure_count",
-                    "db/total_mem_size_bytes",
-                    "db/wal_buffer_estimated_bytes",
-                    "db/immutable_memtable_flushes",
-                    "db/wal_buffer_flushes",
-                    "db/write_batch_count",
-                    "db/write_ops",
-                    "db/flush_requests",
-                    "db/active_memtable_bytes",
-                    "db/imm_memtable_count",
-                    "db/imm_memtable_bytes",
-                    "db/l0_flush_input_bytes",
-                    "db/l0_flush_output_bytes",
-                    "db/l0_flush_total_ms_last",
-                    "db/l0_flush_wal_wait_ms_last",
-                    "db/l0_flush_encode_ms_last",
-                    "db/l0_flush_iter_setup_ms_last",
-                    "db/l0_flush_row_loop_ms_last",
-                    "db/l0_flush_finish_block_ms_last",
-                    "db/l0_flush_footer_ms_last",
-                    "db/l0_flush_put_ms_last",
-                    "db/l0_flush_cache_ms_last",
-                    "db/l0_flush_write_ms_last",
-                    "db/l0_flush_publish_ms_last",
-                    "db/l0_flush_manifest_ms_last",
-                    "db/l0_flush_input_rows_last",
-                    "db/l0_flush_input_bytes_last",
-                    "db/l0_flush_output_bytes_last",
-                    "db/l0_flush_manifest_retries",
-                    "compactor/running_compactions",
-                    "compactor/bytes_compacted",
-                    "compactor/total_throughput_bytes_per_sec",
+                let metric_groups: &[(&str, &[&str])] = &[
+                    (
+                        "write",
+                        &[
+                            "db/l0_sst_count",
+                            "db/backpressure_count",
+                            "db/total_mem_size_bytes",
+                            "db/active_memtable_bytes",
+                            "db/imm_memtable_count",
+                            "db/imm_memtable_bytes",
+                            "db/wal_buffer_estimated_bytes",
+                            "db/immutable_memtable_flushes",
+                            "db/wal_buffer_flushes",
+                            "db/write_batch_count",
+                            "db/write_ops",
+                            "db/flush_requests",
+                        ],
+                    ),
+                    (
+                        "compactor",
+                        &[
+                            "compactor/running_compactions",
+                            "compactor/bytes_compacted",
+                            "compactor/total_throughput_bytes_per_sec",
+                        ],
+                    ),
+                    (
+                        "l0-flush",
+                        &[
+                            "db/l0_flush_input_bytes",
+                            "db/l0_flush_output_bytes",
+                            "db/l0_flush_total_ms_last",
+                            "db/l0_flush_wal_wait_ms_last",
+                            "db/l0_flush_encode_ms_last",
+                            "db/l0_flush_iter_setup_ms_last",
+                            "db/l0_flush_row_loop_ms_last",
+                            "db/l0_flush_finish_block_ms_last",
+                            "db/l0_flush_footer_ms_last",
+                            "db/l0_flush_put_ms_last",
+                            "db/l0_flush_cache_ms_last",
+                            "db/l0_flush_write_ms_last",
+                            "db/l0_flush_publish_ms_last",
+                            "db/l0_flush_manifest_ms_last",
+                            "db/l0_flush_input_rows_last",
+                            "db/l0_flush_input_bytes_last",
+                            "db/l0_flush_output_bytes_last",
+                            "db/l0_flush_manifest_retries",
+                        ],
+                    ),
+                    (
+                        "wal-flush",
+                        &[
+                            "db/wal_flush_total_ms_last",
+                            "db/wal_flush_row_loop_ms_last",
+                            "db/wal_flush_build_ms_last",
+                            "db/wal_flush_put_ms_last",
+                            "db/wal_flush_cache_ms_last",
+                            "db/wal_flush_input_rows_last",
+                            "db/wal_flush_input_bytes_last",
+                            "db/wal_flush_output_bytes_last",
+                            "db/wal_flush_input_bytes",
+                            "db/wal_flush_output_bytes",
+                        ],
+                    ),
                 ];
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    let mut parts = Vec::new();
-                    for name in &metrics {
-                        if let Some(stat) = registry.lookup(name) {
-                            let short = name.rsplit('/').next().unwrap_or(name);
-                            parts.push(format!("{}={}", short, stat.get()));
+                    for (group, metrics) in metric_groups {
+                        let mut parts = Vec::new();
+                        for name in *metrics {
+                            if let Some(stat) = registry.lookup(name) {
+                                let short = name.rsplit('/').next().unwrap_or(name);
+                                parts.push(format!("{}={}", short, stat.get()));
+                            }
                         }
-                    }
-                    if !parts.is_empty() {
-                        eprintln!("[slatedb] {}", parts.join(" "));
+                        if !parts.is_empty() {
+                            eprintln!("[slatedb:{}] {}", group, parts.join(" "));
+                        }
                     }
                 }
             })
