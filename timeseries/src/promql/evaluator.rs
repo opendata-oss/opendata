@@ -6471,6 +6471,61 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn forward_index_entries_different_order_reuses_cache() {
+            let bucket = TimeBucket::hour(1000);
+            let base_time = 1000 * 3600 * 1000;
+            let mut builder = MockQueryReaderBuilder::new(bucket);
+
+            builder.add_sample(
+                create_labels("metric_a", vec![("env", "prod")]),
+                crate::model::MetricType::Gauge,
+                Sample {
+                    timestamp_ms: base_time + 1000,
+                    value: 1.0,
+                },
+            );
+            builder.add_sample(
+                create_labels("metric_b", vec![("env", "staging")]),
+                crate::model::MetricType::Gauge,
+                Sample {
+                    timestamp_ms: base_time + 1000,
+                    value: 2.0,
+                },
+            );
+            builder.add_sample(
+                create_labels("metric_c", vec![("env", "dev")]),
+                crate::model::MetricType::Gauge,
+                Sample {
+                    timestamp_ms: base_time + 1000,
+                    value: 3.0,
+                },
+            );
+
+            let reader = builder.build();
+            let mut cached_reader = CachedQueryReader::new(&reader);
+
+            // First load with IDs in order [2, 0, 1]
+            let reversed_ids = vec![2u32, 0, 1];
+            let entries_rev = cached_reader
+                .forward_index_entries(&bucket, &reversed_ids)
+                .await
+                .unwrap();
+
+            // Second load with IDs in order [0, 1, 2] — should hit the same cache entry
+            let sorted_ids = vec![0u32, 1, 2];
+            let entries_sorted = cached_reader
+                .forward_index_entries(&bucket, &sorted_ids)
+                .await
+                .unwrap();
+
+            // Both should return the same Arc (same pointer = same cache entry)
+            assert!(Arc::ptr_eq(&entries_rev, &entries_sorted));
+
+            // And both should contain all 3 series
+            assert_eq!(entries_rev.len(), 3);
+        }
+
+        #[tokio::test]
         async fn forward_index_entries_partial_miss() {
             let bucket = TimeBucket::hour(1000);
             let base_time = 1000 * 3600 * 1000;

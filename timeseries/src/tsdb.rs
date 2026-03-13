@@ -1931,4 +1931,118 @@ mod tests {
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].value, 90.0, "Should return the latest sample");
     }
+
+    #[tokio::test]
+    async fn multi_bucket_range_dedupes_into_one_series() {
+        let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        ))));
+
+        // Bucket 1: sample at t=4_000_000ms (minute 60 bucket)
+        tsdb.ingest_samples(vec![create_sample(
+            "rps",
+            vec![("env", "prod")],
+            4_000_000,
+            10.0,
+        )])
+        .await
+        .unwrap();
+        tsdb.flush().await.unwrap();
+
+        // Bucket 2: sample at t=8_000_000ms (minute 120 bucket)
+        tsdb.ingest_samples(vec![create_sample(
+            "rps",
+            vec![("env", "prod")],
+            8_000_000,
+            20.0,
+        )])
+        .await
+        .unwrap();
+        tsdb.flush().await.unwrap();
+
+        let start = UNIX_EPOCH + Duration::from_millis(3_500_000);
+        let end = UNIX_EPOCH + Duration::from_millis(8_500_000);
+        let opts = QueryOptions {
+            lookback_delta: Duration::from_secs(300),
+        };
+
+        let samples = tsdb
+            .eval_query_range("rps", start..=end, Duration::from_secs(60), &opts)
+            .await
+            .unwrap();
+
+        // Same fingerprint across buckets must merge into a single series
+        assert_eq!(samples.len(), 1, "Should dedupe into 1 series");
+
+        // Sample timestamps must be non-decreasing (range queries return
+        // one (raw_ts, value) per eval step, and lookback fill-forward
+        // repeats the same sample across consecutive steps)
+        let timestamps: Vec<i64> = samples[0].samples.iter().map(|(t, _)| *t).collect();
+        for window in timestamps.windows(2) {
+            assert!(
+                window[0] <= window[1],
+                "Timestamps must be non-decreasing, got {} > {}",
+                window[0],
+                window[1]
+            );
+        }
+
+        // Both underlying values must appear across the range steps
+        let values: Vec<f64> = samples[0].samples.iter().map(|(_, v)| *v).collect();
+        assert!(values.contains(&10.0), "Missing value from first bucket");
+        assert!(values.contains(&20.0), "Missing value from second bucket");
+    }
+
+    #[tokio::test]
+    async fn multi_bucket_instant_falls_back_to_older_bucket() {
+        let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        ))));
+
+        // Bucket 1: sample at t=4_000s (minute 60 bucket, ts=4_000_000ms)
+        tsdb.ingest_samples(vec![create_sample(
+            "cpu",
+            vec![("host", "web1")],
+            4_000_000,
+            60.0,
+        )])
+        .await
+        .unwrap();
+        tsdb.flush().await.unwrap();
+
+        // Bucket 2: same series but sample at t=7_200s (minute 120 bucket, ts=7_200_000ms)
+        tsdb.ingest_samples(vec![create_sample(
+            "cpu",
+            vec![("host", "web1")],
+            7_200_000,
+            90.0,
+        )])
+        .await
+        .unwrap();
+        tsdb.flush().await.unwrap();
+
+        // Query at t=4_200s with 5m lookback.
+        // The newer bucket's sample at t=7_200s is far outside lookback.
+        // The older bucket's sample at t=4_000s is within 200s — should be returned.
+        let query_time = UNIX_EPOCH + Duration::from_secs(4200);
+        let opts = QueryOptions {
+            lookback_delta: Duration::from_secs(300),
+        };
+
+        let result = tsdb
+            .eval_query("cpu", Some(query_time), &opts)
+            .await
+            .unwrap();
+
+        let samples = match result {
+            QueryValue::Vector(s) => s,
+            other => panic!("expected Vector, got {:?}", other),
+        };
+
+        assert_eq!(samples.len(), 1, "Should find 1 series from older bucket");
+        assert_eq!(
+            samples[0].value, 60.0,
+            "Should fall back to older bucket sample within lookback"
+        );
+    }
 }
