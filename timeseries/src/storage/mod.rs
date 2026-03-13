@@ -85,7 +85,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
 
     /// Given a set of sorted, non-overlapping time ranges, return all buckets
     /// that overlap any range. Reads the bucket list once.
-    #[tracing::instrument(level = "trace", skip_all)]
+    #[tracing::instrument(level = "info", skip_all, fields(num_ranges = ranges.len()))]
     async fn get_buckets_for_ranges(&self, ranges: &[(i64, i64)]) -> Result<Vec<TimeBucket>> {
         if ranges.is_empty() {
             return Ok(Vec::new());
@@ -160,7 +160,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
     }
 
     /// Load only the specified terms from the inverted index.
-    #[tracing::instrument(level = "trace", skip_all)]
+    #[tracing::instrument(level = "info", skip_all, fields(bucket_start = bucket.start, num_terms = terms.len()))]
     async fn get_inverted_index_terms(
         &self,
         bucket: &TimeBucket,
@@ -184,7 +184,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
     }
 
     /// Load only the specified series from the forward index.
-    #[tracing::instrument(level = "trace", skip_all)]
+    #[tracing::instrument(level = "info", skip_all, fields(bucket_start = bucket.start, num_series = series_ids.len()))]
     async fn get_forward_index_series(
         &self,
         bucket: &TimeBucket,
@@ -209,7 +209,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
     /// Load the series dictionary using the provided insert function and
     /// return the maximum series ID found, which can be used to
     /// initialize counters
-    #[tracing::instrument(level = "trace", skip(self, bucket, insert))]
+    #[tracing::instrument(level = "info", skip(self, bucket, insert), fields(bucket_start = bucket.start, num_entries))]
     async fn load_series_dictionary<F>(&self, bucket: &TimeBucket, mut insert: F) -> Result<u32>
     where
         F: FnMut(SeriesFingerprint, SeriesId) + Send,
@@ -218,12 +218,15 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         let records = self.scan(range).await?;
 
         let mut max_series_id = 0;
+        let mut count = 0u64;
         for record in records {
             let key = SeriesDictionaryKey::decode(record.key.as_ref())?;
             let value = SeriesDictionaryValue::decode(record.value.as_ref())?;
             insert(key.series_fingerprint, value.series_id);
             max_series_id = std::cmp::max(max_series_id, value.series_id);
+            count += 1;
         }
+        tracing::Span::current().record("num_entries", count);
 
         Ok(max_series_id)
     }

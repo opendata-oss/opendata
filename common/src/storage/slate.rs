@@ -418,7 +418,7 @@ impl SlateDbStorageReader {
 
 #[async_trait]
 impl StorageRead for SlateDbStorageReader {
-    #[tracing::instrument(level = "trace", skip_all)]
+    #[tracing::instrument(level = "debug", skip_all, fields(key_len = key.len(), found))]
     async fn get(&self, key: Bytes) -> StorageResult<Option<Record>> {
         let value = self
             .reader
@@ -427,12 +427,18 @@ impl StorageRead for SlateDbStorageReader {
             .map_err(StorageError::from_storage)?;
 
         match value {
-            Some(v) => Ok(Some(Record::new(key, v))),
-            None => Ok(None),
+            Some(v) => {
+                tracing::Span::current().record("found", true);
+                Ok(Some(Record::new(key, v)))
+            }
+            None => {
+                tracing::Span::current().record("found", false);
+                Ok(None)
+            }
         }
     }
 
-    #[tracing::instrument(level = "trace", skip_all)]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn scan_iter(
         &self,
         range: BytesRange,

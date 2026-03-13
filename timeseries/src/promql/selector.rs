@@ -184,6 +184,7 @@ pub(crate) async fn evaluate_selector_with_reader<'reader, R: QueryReader>(
     selector: &VectorSelector,
 ) -> Result<Vec<SeriesId>> {
     let candidates = find_candidates_with_reader(reader, &bucket, selector).await?;
+    tracing::info!(bucket_start = bucket.start, metric = ?selector.name, num_candidates = candidates.len(), "selector candidates found");
 
     // If there are negative matchers or empty string matchers, we need to filter using forward index
     if candidates.is_empty()

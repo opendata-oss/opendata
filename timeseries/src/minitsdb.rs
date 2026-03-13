@@ -35,6 +35,7 @@ impl MiniQueryReader {
 
 #[async_trait]
 impl BucketQueryReader for MiniQueryReader {
+    #[tracing::instrument(level = "info", skip_all, fields(bucket_start = self.bucket.start, num_series = series_ids.len()))]
     async fn forward_index(
         &self,
         series_ids: &[SeriesId],
@@ -53,6 +54,7 @@ impl BucketQueryReader for MiniQueryReader {
         Ok(Box::new(forward_index))
     }
 
+    #[tracing::instrument(level = "info", skip_all, fields(bucket_start = self.bucket.start, num_terms = terms.len()))]
     async fn inverted_index(
         &self,
         terms: &[Label],
@@ -77,6 +79,7 @@ impl BucketQueryReader for MiniQueryReader {
             .await
     }
 
+    #[tracing::instrument(level = "info", skip_all, fields(bucket_start = self.bucket.start, series_id = series_id, num_samples))]
     async fn samples(
         &self,
         series_id: SeriesId,
@@ -102,9 +105,13 @@ impl BucketQueryReader for MiniQueryReader {
                     .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
                     .collect();
 
+                tracing::Span::current().record("num_samples", samples.len());
                 Ok(samples)
             }
-            None => Ok(Vec::new()),
+            None => {
+                tracing::Span::current().record("num_samples", 0u64);
+                Ok(Vec::new())
+            }
         }
     }
 }
@@ -129,6 +136,7 @@ impl MiniTsdb {
         }
     }
 
+    #[tracing::instrument(level = "info", skip(storage), fields(bucket_start = bucket.start, series_count))]
     pub(crate) async fn load(bucket: TimeBucket, storage: Arc<dyn Storage>) -> Result<Self> {
         let snapshot = storage.snapshot().await?;
 
@@ -138,6 +146,7 @@ impl MiniTsdb {
                 series_dict.insert(fingerprint, series_id);
             })
             .await?;
+        tracing::Span::current().record("series_count", series_dict.len());
 
         let context = TsdbContext {
             bucket,
