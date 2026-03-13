@@ -1,5 +1,9 @@
 #![allow(dead_code)]
 
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod delta;
 mod error;
 mod flusher;
