@@ -2045,4 +2045,282 @@ mod tests {
             "Should return older bucket's sample when newer bucket's sample is past query_time"
         );
     }
+
+    /// Regression test: reduction aggregates (sum, count, etc.) must return
+    /// data from ALL buckets, not just the newest one. The bug was that the
+    /// fingerprint dedup set was populated before checking if a sample existed
+    /// in the lookback window, causing the newest bucket to "claim" all its
+    /// series and shadow older buckets even for time ranges where the newest
+    /// bucket had no samples.
+    #[tokio::test]
+    async fn reduction_aggregate_returns_data_across_buckets() {
+        let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        ))));
+
+        // Bucket at minute 60 (3,600s - 7,199s): sample at t=4000s
+        let series1 = vec![create_sample(
+            "cpu_usage",
+            vec![("host", "web1")],
+            4_000_000,
+            10.0,
+        )];
+        tsdb.ingest_samples(series1).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        // Bucket at minute 120 (7,200s - 10,799s): sample at t=8000s
+        let series2 = vec![create_sample(
+            "cpu_usage",
+            vec![("host", "web1")],
+            8_000_000,
+            20.0,
+        )];
+        tsdb.ingest_samples(series2).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        // Range query with sum() spanning both buckets
+        let start = UNIX_EPOCH + Duration::from_millis(3_500_000);
+        let end = UNIX_EPOCH + Duration::from_millis(8_500_000);
+        let opts = QueryOptions {
+            lookback_delta: Duration::from_secs(1000),
+        };
+
+        let samples = tsdb
+            .eval_query_range(
+                "sum(cpu_usage)",
+                start..=end,
+                Duration::from_secs(1000),
+                &opts,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(samples.len(), 1, "Should find 1 aggregated series");
+
+        // With 1000s step and 1000s lookback over [3500s, 8500s]:
+        // Steps at: 3500, 4500, 5500, 6500, 7500, 8500
+        // t=3500: lookback [2500,3500] -> no sample
+        // t=4500: lookback [3500,4500] -> sample at 4000 (value 10.0)
+        // t=5500: lookback [4500,5500] -> no sample
+        // t=6500: lookback [5500,6500] -> no sample
+        // t=7500: lookback [6500,7500] -> no sample
+        // t=8500: lookback [7500,8500] -> sample at 8000 (value 20.0)
+        let values: Vec<f64> = samples[0].samples.iter().map(|(_, v)| *v).collect();
+        assert!(
+            values.contains(&10.0),
+            "sum() must return data from older bucket (value 10.0), got: {:?}",
+            values
+        );
+        assert!(
+            values.contains(&20.0),
+            "sum() must return data from newer bucket (value 20.0), got: {:?}",
+            values
+        );
+    }
+
+    /// All reduction aggregate ops (count, avg, min, max) must also work
+    /// across buckets, not just sum.
+    #[tokio::test]
+    async fn reduction_aggregate_all_ops_across_buckets() {
+        let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        ))));
+
+        // Bucket 60: two series at t=4000s
+        tsdb.ingest_samples(vec![
+            create_sample("mem", vec![("host", "a")], 4_000_000, 100.0),
+            create_sample("mem", vec![("host", "b")], 4_000_000, 200.0),
+        ])
+        .await
+        .unwrap();
+        tsdb.flush().await.unwrap();
+
+        // Bucket 120: same two series at t=8000s
+        tsdb.ingest_samples(vec![
+            create_sample("mem", vec![("host", "a")], 8_000_000, 300.0),
+            create_sample("mem", vec![("host", "b")], 8_000_000, 400.0),
+        ])
+        .await
+        .unwrap();
+        tsdb.flush().await.unwrap();
+
+        let opts = QueryOptions {
+            lookback_delta: Duration::from_secs(1000),
+        };
+
+        // Instant query at t=4500 (lookback covers bucket 60 only)
+        let t_old = UNIX_EPOCH + Duration::from_secs(4500);
+        // Instant query at t=8500 (lookback covers bucket 120 only)
+        let t_new = UNIX_EPOCH + Duration::from_secs(8500);
+
+        for (op, expected_old, expected_new) in [
+            ("count", 2.0, 2.0),
+            ("avg", 150.0, 350.0),
+            ("min", 100.0, 300.0),
+            ("max", 200.0, 400.0),
+        ] {
+            let query = format!("{op}(mem)");
+
+            let result_old = tsdb.eval_query(&query, Some(t_old), &opts).await.unwrap();
+            let samples_old = match result_old {
+                QueryValue::Vector(s) => s,
+                other => panic!("{op} at t_old: expected Vector, got {other:?}"),
+            };
+            assert_eq!(samples_old.len(), 1, "{op} at t_old: expected 1 group");
+            assert_eq!(
+                samples_old[0].value, expected_old,
+                "{op} at t_old: wrong value"
+            );
+
+            let result_new = tsdb.eval_query(&query, Some(t_new), &opts).await.unwrap();
+            let samples_new = match result_new {
+                QueryValue::Vector(s) => s,
+                other => panic!("{op} at t_new: expected Vector, got {other:?}"),
+            };
+            assert_eq!(samples_new.len(), 1, "{op} at t_new: expected 1 group");
+            assert_eq!(
+                samples_new[0].value, expected_new,
+                "{op} at t_new: wrong value"
+            );
+        }
+    }
+
+    /// The dedup fingerprint must NOT be inserted when latest_sample returns
+    /// None. The lookback window is positioned to span the bucket boundary
+    /// so both buckets are checked. Bucket 120 has the series (from a sample
+    /// at t=9000s) but no sample in the lookback window, so it must not
+    /// shadow bucket 60's sample.
+    #[tokio::test]
+    async fn reduction_aggregate_newer_bucket_does_not_shadow_older() {
+        let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        ))));
+
+        // Bucket 60: covers [3600s, 7200s). Sample at t=7000s (near end of bucket).
+        tsdb.ingest_samples(vec![create_sample(
+            "req",
+            vec![("svc", "api")],
+            7_000_000,
+            42.0,
+        )])
+        .await
+        .unwrap();
+        tsdb.flush().await.unwrap();
+
+        // Bucket 120: covers [7200s, 10800s). Same series, sample at t=9000s
+        // (outside our lookback window, but present in forward index).
+        tsdb.ingest_samples(vec![create_sample(
+            "req",
+            vec![("svc", "api")],
+            9_000_000,
+            99.0,
+        )])
+        .await
+        .unwrap();
+        tsdb.flush().await.unwrap();
+
+        // Instant sum() at t=7300s, lookback=1000s -> window [6300s, 7300s]
+        // This window spans the bucket boundary at 7200s:
+        //   - Bucket 120 [7200s, 10800s) overlaps [6300s, 7300s] -> checked
+        //   - Bucket 60  [3600s, 7200s) overlaps [6300s, 7300s]  -> checked
+        // Bucket 120 is checked first (newest-first). It has the series in its
+        // forward index but NO sample in [6300s, 7300s] (sample is at 9000s).
+        // The dedup fix ensures bucket 60's sample at t=7000s is still found.
+        let query_time = UNIX_EPOCH + Duration::from_secs(7300);
+        let opts = QueryOptions {
+            lookback_delta: Duration::from_secs(1000),
+        };
+
+        let result = tsdb
+            .eval_query("sum(req)", Some(query_time), &opts)
+            .await
+            .unwrap();
+        let samples = match result {
+            QueryValue::Vector(s) => s,
+            other => panic!("expected Vector, got {other:?}"),
+        };
+
+        assert_eq!(samples.len(), 1, "sum() should find data from older bucket");
+        assert_eq!(
+            samples[0].value, 42.0,
+            "sum() should return older bucket's value, not be shadowed by newer bucket"
+        );
+    }
+
+    /// Reduction aggregate with group-by must correctly aggregate across
+    /// buckets when multiple series exist per group.
+    #[tokio::test]
+    async fn reduction_aggregate_group_by_across_buckets() {
+        let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        ))));
+
+        // Bucket 60: two groups
+        tsdb.ingest_samples(vec![
+            create_sample("latency", vec![("region", "us")], 4_000_000, 10.0),
+            create_sample("latency", vec![("region", "eu")], 4_000_000, 20.0),
+        ])
+        .await
+        .unwrap();
+        tsdb.flush().await.unwrap();
+
+        // Bucket 120: same two groups, different values
+        tsdb.ingest_samples(vec![
+            create_sample("latency", vec![("region", "us")], 8_000_000, 30.0),
+            create_sample("latency", vec![("region", "eu")], 8_000_000, 40.0),
+        ])
+        .await
+        .unwrap();
+        tsdb.flush().await.unwrap();
+
+        let opts = QueryOptions {
+            lookback_delta: Duration::from_secs(1000),
+        };
+
+        // Range query: sum by (region)(latency) over both buckets
+        let start = UNIX_EPOCH + Duration::from_millis(3_500_000);
+        let end = UNIX_EPOCH + Duration::from_millis(8_500_000);
+        let samples = tsdb
+            .eval_query_range(
+                "sum by (region)(latency)",
+                start..=end,
+                Duration::from_secs(1000),
+                &opts,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(samples.len(), 2, "Should have 2 groups (us, eu)");
+
+        let us_series = samples
+            .iter()
+            .find(|s| {
+                s.labels
+                    .iter()
+                    .any(|l| l.name == "region" && l.value == "us")
+            })
+            .expect("should have 'us' group");
+        let eu_series = samples
+            .iter()
+            .find(|s| {
+                s.labels
+                    .iter()
+                    .any(|l| l.name == "region" && l.value == "eu")
+            })
+            .expect("should have 'eu' group");
+
+        let us_values: Vec<f64> = us_series.samples.iter().map(|(_, v)| *v).collect();
+        let eu_values: Vec<f64> = eu_series.samples.iter().map(|(_, v)| *v).collect();
+
+        assert!(
+            us_values.contains(&10.0) && us_values.contains(&30.0),
+            "us group must have data from both buckets, got: {:?}",
+            us_values
+        );
+        assert!(
+            eu_values.contains(&20.0) && eu_values.contains(&40.0),
+            "eu group must have data from both buckets, got: {:?}",
+            eu_values
+        );
+    }
 }

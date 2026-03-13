@@ -2297,7 +2297,19 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let end_ms = adjusted_eval_ts.as_millis();
         let start_ms = end_ms - lookback_delta_ms;
 
-        let mut buckets = self.reader.list_buckets().await?;
+        // Only check buckets whose time range overlaps the lookback window
+        // [start_ms, end_ms]. This is typically 1-2 buckets instead of all
+        // buckets in the query range.
+        let all_buckets = self.reader.list_buckets().await?;
+        let mut buckets: Vec<_> = all_buckets
+            .into_iter()
+            .filter(|b| {
+                let bucket_start_ms = b.start as i64 * 60_000;
+                let bucket_end_ms = (b.start as i64 + b.size_in_mins() as i64) * 60_000;
+                // Overlap: bucket_end > start_ms AND bucket_start <= end_ms
+                bucket_end_ms > start_ms && bucket_start_ms <= end_ms
+            })
+            .collect();
         buckets.sort_by(|a, b| b.start.cmp(&a.start));
 
         let mut series_with_results = FingerprintHashSet::default();
@@ -2320,7 +2332,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 .await?;
 
             for (series_id, series_spec) in forward_index_entries.iter().cloned() {
-                if !series_with_results.insert(series_spec.fingerprint) {
+                if series_with_results.contains(&series_spec.fingerprint) {
                     continue;
                 }
 
@@ -2331,6 +2343,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 else {
                     continue;
                 };
+
+                series_with_results.insert(series_spec.fingerprint);
 
                 let group_key = Self::grouping_key_from_labels(
                     &series_spec.labels,
@@ -2623,7 +2637,9 @@ mod tests {
     fn setup_mock_reader(
         data: TestSampleData,
     ) -> (crate::query::test_utils::MockQueryReader, SystemTime) {
-        let bucket = TimeBucket::hour(1000);
+        // Bucket must cover the sample timestamps (~300,001ms) so that
+        // bucket-scoped filtering in the reduction aggregate path works.
+        let bucket = TimeBucket::hour(0);
         let mut builder = MockQueryReaderBuilder::new(bucket);
 
         // Base timestamp: 300001ms (ensures samples are > start_ms with 5min lookback)
