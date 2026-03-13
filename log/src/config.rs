@@ -92,10 +92,10 @@ pub struct L0OnlyCompactionConfig {
 }
 
 fn default_min_l0_sources() -> usize {
-    4
+    2
 }
 fn default_max_l0_sources() -> usize {
-    8
+    4
 }
 fn default_max_concurrent() -> usize {
     4
