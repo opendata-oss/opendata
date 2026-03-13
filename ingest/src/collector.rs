@@ -116,7 +116,7 @@ impl Collector {
     /// Acks must be in order — the sequence must immediately follow the last acked
     /// sequence, otherwise an error is returned. To amortize manifest writes, the
     /// collector only calls `dequeue()` on the queue consumer every
-    /// [`DEQUEUE_INTERVAL`] acks.
+    /// 100 acks.
     pub async fn ack(&self, sequence: u64) -> Result<()> {
         if let Some(last) = self.last_acked_sequence.get()
             && sequence != last + 1
