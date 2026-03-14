@@ -8,6 +8,7 @@ repository = "https://github.com/opendata-oss/opendata"
 readme = "README.md"
 keywords = ["database", "vector", "similarity-search", "embeddings"]
 categories = ["database"]
+exclude = ["tests/data/"]
 
 [lib]
 name = "vector"
