@@ -58,6 +58,48 @@ fn parse_limited_regex(pattern: &str) -> std::result::Result<Vec<String>, String
     }
 }
 
+/// Extract the inverted index terms that a selector will look up.
+/// This mirrors the term-extraction logic in `find_candidates_with_reader`
+/// so callers can preload inverted indexes before evaluation.
+pub(crate) fn selector_inverted_terms(selector: &VectorSelector) -> Vec<Label> {
+    let mut and_terms = Vec::new();
+    let mut or_terms = Vec::new();
+
+    if let Some(ref name) = selector.name {
+        and_terms.push(Label {
+            name: METRIC_NAME.to_string(),
+            value: name.clone(),
+        });
+    }
+
+    for matcher in &selector.matchers.matchers {
+        match &matcher.op {
+            MatchOp::Equal => {
+                if !matcher.value.is_empty() {
+                    and_terms.push(Label {
+                        name: matcher.name.clone(),
+                        value: matcher.value.clone(),
+                    });
+                }
+            }
+            MatchOp::Re(_) => {
+                if let Ok(values) = parse_limited_regex(&matcher.value) {
+                    for value in values {
+                        or_terms.push(Label {
+                            name: matcher.name.clone(),
+                            value,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    or_terms.extend(and_terms);
+    or_terms
+}
+
 /// Find candidate series IDs using a QueryReader
 async fn find_candidates_with_reader<'reader, R: QueryReader>(
     reader: &mut CachedQueryReader<'reader, R>,
