@@ -1,0 +1,6 @@
+FROM python:3.12-slim
+RUN pip install --no-cache-dir fastembed flask
+COPY embedding_server.py /app/
+WORKDIR /app
+EXPOSE 9000
+CMD ["python3", "embedding_server.py"]

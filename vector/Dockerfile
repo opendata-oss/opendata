@@ -32,13 +32,16 @@ WORKDIR /app
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from builder stage
 COPY --from=builder /app/target/release/opendata-vector /app/opendata-vector
 
-# Create a non-root user
-RUN useradd -r -u 1000 opendata-vector
+# Create a non-root user and prepare the data directory for volume mounts
+RUN useradd -r -u 1000 opendata-vector \
+    && mkdir -p /data/store \
+    && chown opendata-vector:opendata-vector /data/store
 USER opendata-vector
 
 # Expose HTTP port

@@ -1,0 +1,86 @@
+services:
+  embedding-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.embedding-server
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  vector-writer:
+    build:
+      context: ../..
+      dockerfile: vector/Dockerfile
+    command: ["vector", "--config", "/config/writer.yaml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config/writer.yaml:/config/writer.yaml:ro
+      - vector-data:/data/store
+    environment:
+      - RUST_LOG=info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  ingestor:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingestor
+    environment:
+      - WRITER_URL=http://vector-writer:8080
+      - EMBEDDING_URL=http://embedding-server:9000
+    depends_on:
+      vector-writer:
+        condition: service_healthy
+      embedding-server:
+        condition: service_healthy
+
+  vector-reader:
+    build:
+      context: ../..
+      dockerfile: vector/Dockerfile
+    command: ["reader", "--config", "/config/reader.yaml"]
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./config/reader.yaml:/config/reader.yaml:ro
+      - vector-data:/data/store
+    environment:
+      - RUST_LOG=info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    depends_on:
+      ingestor:
+        condition: service_completed_successfully
+
+  embedded-reader:
+    build:
+      context: ../..
+      dockerfile: vector/quickstart/Dockerfile.embedded-reader
+    volumes:
+      - ./config/reader.yaml:/config/reader.yaml:ro
+      - vector-data:/data/store
+    depends_on:
+      ingestor:
+        condition: service_completed_successfully
+      embedding-server:
+        condition: service_healthy
+    # Default: run hardcoded demo queries
+    command: ["/config/reader.yaml", "http://embedding-server:9000"]
+
+volumes:
+  vector-data:

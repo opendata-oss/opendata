@@ -111,6 +111,7 @@ message SearchRequest {
   uint32 k = 2;
   optional uint32 nprobe = 3;
   optional FilterMessage filter = 4;
+  repeated string include_fields = 5;
 }
 
 message SearchResponse {
@@ -319,11 +320,14 @@ Request Body:
         }
       }
     ]
-  }
+  },
+  "includeFields": ["category", "department"]
 }
 ```
 
-`nprobe` and `filter` are optional.
+`nprobe`, `filter`, and `includeFields` are optional. If `includeFields` is absent, all fields
+(including the vector embedding) are returned. If present, only the named fields are included in
+each result's `attributes`. Use `"vector"` as a field name to include the embedding.
 
 **Success Response (200):**
 

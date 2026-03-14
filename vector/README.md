@@ -9,6 +9,10 @@ An objectstore-native vector database for approximate nearest neighbor (ANN) sea
 - **Incremental updates**: LIRE-style rebalancing maintains index quality without global rebuilds
 - **Roaring bitmaps**: Compressed posting lists for fast set operations
 
+## Quickstart
+
+See [quickstart/](quickstart/)
+
 ## Design
 
 See [rfcs/0001-storage.md](rfcs/0001-storage.md) for the storage design.

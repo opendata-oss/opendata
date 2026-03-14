@@ -1,0 +1,21 @@
+storage:
+  type: SlateDb
+  path: vector-data
+  object_store:
+    type: Local
+    path: /data/store
+dimensions: 384
+distance_metric: L2
+metadata_fields:
+  - name: book
+    field_type: String
+    indexed: true
+  - name: chapter
+    field_type: String
+    indexed: true
+  - name: section
+    field_type: String
+    indexed: false
+  - name: text
+    field_type: String
+    indexed: false

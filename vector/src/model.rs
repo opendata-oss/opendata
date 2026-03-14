@@ -324,6 +324,43 @@ pub struct SearchResult {
     pub vector: Vector,
 }
 
+/// Specifies which fields to include in query results.
+///
+/// Controls which attributes are returned in search results,
+/// reducing data transfer when only specific fields are needed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldSelection {
+    /// Include all fields (vector and all metadata).
+    All,
+    /// Include no fields (only IDs and scores).
+    None,
+    /// Include specific fields by name (e.g., `["category", "price"]`).
+    /// Use `"vector"` to include the embedding vector.
+    Fields(Vec<String>),
+}
+
+impl From<bool> for FieldSelection {
+    fn from(include: bool) -> Self {
+        if include {
+            FieldSelection::All
+        } else {
+            FieldSelection::None
+        }
+    }
+}
+
+impl From<Vec<&str>> for FieldSelection {
+    fn from(fields: Vec<&str>) -> Self {
+        FieldSelection::Fields(fields.into_iter().map(String::from).collect())
+    }
+}
+
+impl From<Vec<String>> for FieldSelection {
+    fn from(fields: Vec<String>) -> Self {
+        FieldSelection::Fields(fields)
+    }
+}
+
 /// Query specification for vector search.
 ///
 /// Constructed using the builder pattern:
@@ -331,7 +368,8 @@ pub struct SearchResult {
 /// ```ignore
 /// let query = Query::new(embedding)
 ///     .with_limit(10)
-///     .with_filter(Filter::eq("category", "shoes"));
+///     .with_filter(Filter::eq("category", "shoes"))
+///     .with_fields(vec!["category", "price"]);
 /// ```
 #[derive(Debug, Clone)]
 pub struct Query {
@@ -341,6 +379,8 @@ pub struct Query {
     pub limit: usize,
     /// Optional metadata filter.
     pub filter: Option<Filter>,
+    /// Which fields to include in results (default: All).
+    pub include_fields: FieldSelection,
 }
 
 impl Query {
@@ -350,6 +390,7 @@ impl Query {
             vector,
             limit: 10,
             filter: None,
+            include_fields: FieldSelection::All,
         }
     }
 
@@ -362,6 +403,14 @@ impl Query {
     /// Sets the metadata filter.
     pub fn with_filter(mut self, filter: Filter) -> Self {
         self.filter = Some(filter);
+        self
+    }
+
+    /// Controls which fields are included in results.
+    ///
+    /// Accepts `true`/`false` for all/none, or `Vec<&str>`/`Vec<String>` for specific fields.
+    pub fn with_fields(mut self, fields: impl Into<FieldSelection>) -> Self {
+        self.include_fields = fields.into();
         self
     }
 }

@@ -158,6 +158,9 @@ impl SearchRequest {
         if let Some(filter) = proto_request.filter {
             query = query.with_filter(proto_filter_to_filter(filter)?);
         }
+        if !proto_request.include_fields.is_empty() {
+            query = query.with_fields(proto_request.include_fields);
+        }
         Ok(Self {
             query,
             nprobe: proto_request.nprobe.map(|n| n as usize),
@@ -178,6 +181,9 @@ impl SearchRequest {
         let mut query = Query::new(json_request.vector).with_limit(json_request.k as usize);
         if let Some(filter) = json_request.filter {
             query = query.with_filter(json_filter_to_filter(filter, metadata_fields)?);
+        }
+        if let Some(fields) = json_request.include_fields {
+            query = query.with_fields(fields);
         }
 
         Ok(Self {
@@ -212,6 +218,8 @@ struct JsonSearchRequest {
     nprobe: Option<u32>,
     #[serde(default)]
     filter: Option<JsonFilter>,
+    #[serde(default)]
+    include_fields: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -881,6 +889,7 @@ mod tests {
                     )),
                 })),
             }),
+            include_fields: vec![],
         }
         .encode_to_vec();
 

@@ -1,0 +1,6 @@
+FROM python:3.12-slim
+RUN pip install --no-cache-dir requests
+COPY ingestor.py /app/
+COPY data/documents.json /app/
+WORKDIR /app
+CMD ["python3", "ingestor.py"]
