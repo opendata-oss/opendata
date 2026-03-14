@@ -71,6 +71,8 @@ pub(crate) struct EvalCacheStats {
     pub selector_eval_total_us: u64,
     pub merged_matrix_hits: u64,
     pub merged_matrix_misses: u64,
+    pub merged_vector_hits: u64,
+    pub merged_vector_misses: u64,
 }
 
 /// Type alias for complex HashMap used in matrix selector evaluation.
@@ -145,6 +147,11 @@ pub(crate) struct QueryReaderEvalCache {
     /// Pre-merged per-series sample data for matrix selectors. Key is the
     /// selector's Display string (stable within a query).
     merged_matrix_cache: HashMap<String, Vec<MergedSeriesEntry>>,
+    /// Pre-merged per-series sample data for vector selectors. Key is the
+    /// selector's Display string. On first call, all buckets are preloaded
+    /// and merged; subsequent steps binary-search for the latest sample
+    /// in the lookback window — O(num_series) per step.
+    merged_vector_cache: HashMap<String, Vec<MergedSeriesEntry>>,
 }
 
 impl QueryReaderEvalCache {
@@ -152,6 +159,7 @@ impl QueryReaderEvalCache {
         Self {
             cache: HashMap::new(),
             merged_matrix_cache: HashMap::new(),
+            merged_vector_cache: HashMap::new(),
         }
     }
 
@@ -1880,18 +1888,180 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let end_ms = adjusted_eval_ts.as_millis();
         let start_ms = end_ms - lookback_delta_ms;
 
-        // Get all buckets and sort by start time in reverse order (newest first)
+        let offset_ms = match vector_selector.offset.as_ref() {
+            Some(Offset::Pos(d)) => d.as_millis() as i64,
+            Some(Offset::Neg(d)) => -(d.as_millis() as i64),
+            None => 0,
+        };
+
+        // Determine if we can use the merged vector cache optimization.
+        // Valid when the full query range is known AND the current step's
+        // lookback window falls within the preloaded range.
+        let preload_range = self.reader.query_range_ms.and_then(|(q_start, q_end)| {
+            let proposed_start = (q_start - offset_ms) - lookback_delta_ms;
+            let proposed_end = q_end - offset_ms;
+            if start_ms >= proposed_start && end_ms <= proposed_end {
+                Some((proposed_start, proposed_end))
+            } else {
+                None
+            }
+        });
+
+        if let Some((preload_start_ms, preload_end_ms)) = preload_range {
+            let cache_key = format!("{vector_selector}");
+
+            // Fast path: reuse pre-merged per-series data from a previous step.
+            // Binary search for the latest sample in the lookback window per series.
+            if self
+                .reader
+                .cache
+                .merged_vector_cache
+                .contains_key(&cache_key)
+            {
+                self.reader.stats.merged_vector_hits += 1;
+
+                let merged = self
+                    .reader
+                    .cache
+                    .merged_vector_cache
+                    .get(&cache_key)
+                    .unwrap();
+                let mut samples = Vec::with_capacity(merged.len());
+                for entry in merged {
+                    let end_idx = entry.samples.partition_point(|s| s.timestamp_ms <= end_ms);
+                    if end_idx > 0 {
+                        let candidate = &entry.samples[end_idx - 1];
+                        if candidate.timestamp_ms > start_ms {
+                            let labels = self.labels_to_hashmap(&entry.labels_key);
+                            samples.push(EvalSample {
+                                timestamp_ms: candidate.timestamp_ms,
+                                value: candidate.value,
+                                labels,
+                                drop_name: false,
+                            });
+                        }
+                    }
+                }
+
+                return Ok(ExprResult::InstantVector(samples));
+            }
+
+            // Cold path: build merged per-series data for all buckets covering
+            // the full query range (not just this step's lookback window).
+            self.reader.stats.merged_vector_misses += 1;
+
+            let mut buckets = self.reader.list_buckets().await?;
+            buckets.sort_by(|a, b| a.start.cmp(&b.start));
+
+            let relevant_buckets: Vec<TimeBucket> = buckets
+                .into_iter()
+                .filter(|b| {
+                    let bs = (b.start as i64) * 60_000;
+                    let be = bs + (b.size_in_mins() as i64) * 60_000;
+                    be >= preload_start_ms && bs <= preload_end_ms
+                })
+                .collect();
+
+            // Phase 1: Preload inverted indexes for all buckets in parallel
+            let inverted_terms = selector_inverted_terms(vector_selector)
+                .map_err(|e| EvaluationError::InvalidSelector(e.to_string()))?;
+            self.reader
+                .preload_inverted_indexes(&relevant_buckets, &inverted_terms)
+                .await?;
+
+            let mut bucket_candidates: Vec<(TimeBucket, Vec<SeriesId>)> = Vec::new();
+            for &bucket in &relevant_buckets {
+                let candidates =
+                    evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
+                        .await
+                        .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+                if !candidates.is_empty() {
+                    bucket_candidates.push((bucket, candidates.into_iter().collect()));
+                }
+            }
+
+            // Phase 2: Preload forward indexes and samples in parallel
+            self.reader
+                .preload_forward_indexes(&bucket_candidates)
+                .await?;
+            self.reader.preload_all_samples(&bucket_candidates).await?;
+
+            // Phase 3: Merge per-series data across all buckets
+            let mut series_map: SeriesMap = HashMap::new();
+            for (bucket, candidates_vec) in &bucket_candidates {
+                let forward_index_entries = self
+                    .reader
+                    .forward_index_entries(bucket, candidates_vec)
+                    .await?;
+
+                for (series_id, series_spec) in forward_index_entries.iter() {
+                    if let Some(bucket_samples) = self.reader.cache.get_samples(bucket, series_id) {
+                        let mut labels_key: Vec<Label> = series_spec.labels.as_ref().to_vec();
+                        labels_key.sort();
+                        let values = series_map.entry(labels_key).or_default();
+                        values.extend(bucket_samples.iter().cloned());
+                    }
+                }
+            }
+
+            // Build and cache the merged entries (sorted, deduped by timestamp)
+            let merged: Vec<MergedSeriesEntry> = series_map
+                .into_iter()
+                .map(|(labels_key, mut samples)| {
+                    samples.sort_by_key(|s| s.timestamp_ms);
+                    samples.dedup_by_key(|s| s.timestamp_ms);
+                    MergedSeriesEntry {
+                        labels_key,
+                        samples,
+                    }
+                })
+                .collect();
+
+            self.reader
+                .cache
+                .merged_vector_cache
+                .insert(cache_key.clone(), merged);
+
+            // Filter for this step's lookback window
+            let merged = self
+                .reader
+                .cache
+                .merged_vector_cache
+                .get(&cache_key)
+                .unwrap();
+            let mut samples = Vec::with_capacity(merged.len());
+            for entry in merged {
+                let end_idx = entry.samples.partition_point(|s| s.timestamp_ms <= end_ms);
+                if end_idx > 0 {
+                    let candidate = &entry.samples[end_idx - 1];
+                    if candidate.timestamp_ms > start_ms {
+                        let labels = self.labels_to_hashmap(&entry.labels_key);
+                        samples.push(EvalSample {
+                            timestamp_ms: candidate.timestamp_ms,
+                            value: candidate.value,
+                            labels,
+                            drop_name: false,
+                        });
+                    }
+                }
+            }
+
+            return Ok(ExprResult::InstantVector(samples));
+        }
+
+        // Fallback path: per-step evaluation (used for instant queries without
+        // query_range_ms, or subquery contexts where @ modifier shifts evaluation
+        // time outside the top-level query range).
         let mut buckets = self.reader.list_buckets().await?;
         buckets.sort_by(|a, b| b.start.cmp(&a.start)); // newest first
 
-        // === Phase 1: Preload inverted indexes for all buckets in parallel ===
+        // 3-phase preload for this single step
         let inverted_terms = selector_inverted_terms(vector_selector)
             .map_err(|e| EvaluationError::InvalidSelector(e.to_string()))?;
         self.reader
             .preload_inverted_indexes(&buckets, &inverted_terms)
             .await?;
 
-        // Compute candidates per bucket (cheap in-memory bitmap intersections)
         let mut bucket_candidates: Vec<(TimeBucket, Vec<SeriesId>)> = Vec::new();
         for &bucket in &buckets {
             let candidates =
@@ -1903,17 +2073,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             }
         }
 
-        // === Phase 2: Preload forward indexes and samples for all buckets in parallel ===
-        // Note: we preload samples for all candidates even though some fingerprints
-        // may appear in multiple buckets (newest-first dedup happens in phase 3).
-        // Filtering here would require knowing which bucket actually has samples
-        // in the query's time range, which we can't determine without reading them.
         self.reader
             .preload_forward_indexes(&bucket_candidates)
             .await?;
         self.reader.preload_all_samples(&bucket_candidates).await?;
 
-        // === Phase 3: Merge results (all cache hits, cheap) ===
         let mut series_with_results = FingerprintHashSet::default();
         let mut samples = Vec::new();
 
@@ -1926,18 +2090,15 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             for (series_id, series_spec) in forward_index_entries.iter().cloned() {
                 let fingerprint = series_spec.fingerprint;
 
-                // Skip if we already found a sample for this series in a newer bucket
                 if series_with_results.contains(&fingerprint) {
                     continue;
                 }
 
-                // Read samples from this bucket within the lookback window
                 let best_sample = self
                     .reader
                     .latest_sample(bucket, series_id, start_ms, end_ms)
                     .await?;
 
-                // Find the best (latest) point in the time range
                 if let Some(best_sample) = best_sample {
                     let labels = self.labels_to_hashmap(&series_spec.labels);
 

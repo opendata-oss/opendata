@@ -411,6 +411,8 @@ pub(crate) async fn evaluate_range(
         selector_eval_total_us = cache_stats.selector_eval_total_us,
         merged_matrix_hits = cache_stats.merged_matrix_hits,
         merged_matrix_misses = cache_stats.merged_matrix_misses,
+        merged_vector_hits = cache_stats.merged_vector_hits,
+        merged_vector_misses = cache_stats.merged_vector_misses,
         "evaluate_range step loop complete"
     );
 
