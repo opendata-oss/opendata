@@ -509,9 +509,12 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             .get_forward_index_entries(bucket, &series_ids)
             .is_none()
         {
+            self.stats.forward_cache_misses += 1;
             let forward_index = self.reader.forward_index(bucket, &series_ids).await?;
             self.cache
                 .cache_forward_index(*bucket, series_ids.clone(), forward_index);
+        } else {
+            self.stats.forward_cache_hits += 1;
         }
 
         Ok(self
@@ -605,11 +608,14 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         series_id: SeriesId,
     ) -> Result<&Vec<Sample>> {
         if self.cache.get_samples(bucket, &series_id).is_none() {
+            self.stats.samples_cache_misses += 1;
             let samples = self
                 .reader
                 .samples(bucket, series_id, i64::MIN, i64::MAX)
                 .await?;
             self.cache.cache_samples(*bucket, series_id, samples);
+        } else {
+            self.stats.samples_cache_hits += 1;
         }
 
         Ok(self
