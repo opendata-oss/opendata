@@ -182,9 +182,12 @@ impl TimeSeriesDbReader {
         let bucket_list = Arc::new(RwLock::new(all_buckets));
 
         // Spawn background refresh — new buckets appear on hourly boundaries.
-        // Note: queries may miss the newest bucket for up to one refresh interval.
-        // This is acceptable because SlateDB's manifest polling has the same staleness
-        // window, so the data wouldn't be visible to reads anyway.
+        // Note: queries may miss the newest bucket for up to one refresh interval
+        // after it becomes readable through StorageRead. The two refresh loops
+        // (SlateDB manifest polling and this bucket list refresh) are independent,
+        // so there can be a window where storage can see a new bucket but the
+        // cached list hasn't picked it up yet. This is acceptable for our use case
+        // since buckets are hourly and the refresh interval is typically minutes.
         let refresh_storage = storage.clone();
         let refresh_list = Arc::downgrade(&bucket_list);
         let refresh_interval = config.refresh_interval;
@@ -302,11 +305,11 @@ fn filter_buckets_in_range(
     all_buckets: &[TimeBucket],
     start_secs: Option<i64>,
     end_secs: Option<i64>,
-) -> Vec<TimeBucket> {
+) -> Result<Vec<TimeBucket>> {
     if let (Some(start), Some(end)) = (start_secs, end_secs)
         && end < start
     {
-        return Vec::new();
+        return Err("end must be greater than or equal to start".into());
     }
     let start_min = start_secs.map(|s| (s / 60) as u32);
     let end_min = end_secs.map(|e| (e / 60) as u32);
@@ -332,7 +335,7 @@ fn filter_buckets_in_range(
         .cloned()
         .collect();
     filtered.sort_by_key(|b| b.start);
-    filtered
+    Ok(filtered)
 }
 
 /// Filter a cached bucket list by multiple disjoint time ranges (seconds).
@@ -365,7 +368,7 @@ impl TsdbReadEngine for TimeSeriesDbReader {
 
     async fn make_query_reader(&self, start: i64, end: i64) -> Result<ReaderQueryReader> {
         let buckets = if let Some(cached) = &self.bucket_list {
-            filter_buckets_in_range(&cached.read().await, Some(start), Some(end))
+            filter_buckets_in_range(&cached.read().await, Some(start), Some(end))?
         } else {
             self.storage
                 .get_buckets_in_range(Some(start), Some(end))

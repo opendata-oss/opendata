@@ -1533,7 +1533,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         buckets.sort_by(|a, b| b.start.cmp(&a.start)); // newest first
 
         // === Phase 1: Preload inverted indexes for all buckets in parallel ===
-        let inverted_terms = selector_inverted_terms(vector_selector);
+        let inverted_terms = selector_inverted_terms(vector_selector)
+            .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
         self.reader
             .preload_inverted_indexes(&buckets, &inverted_terms)
             .await?;
