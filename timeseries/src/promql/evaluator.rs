@@ -2882,16 +2882,187 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let end_ms = adjusted_eval_ts.as_millis();
         let start_ms = end_ms - lookback_delta_ms;
 
-        // Only check buckets whose time range overlaps the lookback window
-        // [start_ms, end_ms]. This is typically 1-2 buckets instead of all
-        // buckets in the query range.
+        let offset_ms = match vector_selector.offset.as_ref() {
+            Some(Offset::Pos(d)) => d.as_millis() as i64,
+            Some(Offset::Neg(d)) => -(d.as_millis() as i64),
+            None => 0,
+        };
+
+        // Check if we can use the merged vector cache optimization.
+        let preload_range = self.reader.query_range_ms.and_then(|(q_start, q_end)| {
+            let proposed_start = (q_start - offset_ms) - lookback_delta_ms;
+            let proposed_end = q_end - offset_ms;
+            if start_ms >= proposed_start && end_ms <= proposed_end {
+                Some((proposed_start, proposed_end))
+            } else {
+                None
+            }
+        });
+
+        if let Some((preload_start_ms, preload_end_ms)) = preload_range {
+            let cache_key = format!("{vector_selector}");
+
+            // Fast path: reuse pre-merged per-series data from a previous step.
+            if self
+                .reader
+                .cache
+                .merged_vector_cache
+                .contains_key(&cache_key)
+            {
+                self.reader.stats.merged_vector_hits += 1;
+
+                let merged = self
+                    .reader
+                    .cache
+                    .merged_vector_cache
+                    .get(&cache_key)
+                    .unwrap();
+                let mut groups: HashMap<Vec<(String, String)>, ReductionState> = HashMap::new();
+                for entry in merged {
+                    let end_idx = entry.samples.partition_point(|s| s.timestamp_ms <= end_ms);
+                    if end_idx > 0 {
+                        let candidate = &entry.samples[end_idx - 1];
+                        if candidate.timestamp_ms > start_ms {
+                            let group_key = Self::grouping_key_from_labels(
+                                &entry.labels_key,
+                                aggregate.modifier.as_ref(),
+                            );
+                            groups.entry(group_key).or_default().record(candidate.value);
+                        }
+                    }
+                }
+
+                let timestamp_ms = evaluation_ts.as_millis();
+                let mut result_samples = Vec::with_capacity(groups.len());
+                for (group_key, state) in groups {
+                    result_samples.push(EvalSample {
+                        timestamp_ms,
+                        value: state.finish(aggregate.op)?,
+                        labels: group_key.into_iter().collect(),
+                        drop_name: false,
+                    });
+                }
+                return Ok(result_samples);
+            }
+
+            // Cold path: build merged per-series data for all buckets covering
+            // the full query range.
+            self.reader.stats.merged_vector_misses += 1;
+
+            let mut buckets = self.reader.list_buckets().await?;
+            buckets.sort_by(|a, b| a.start.cmp(&b.start));
+
+            let relevant_buckets: Vec<TimeBucket> = buckets
+                .into_iter()
+                .filter(|b| {
+                    let bs = (b.start as i64) * 60_000;
+                    let be = bs + (b.size_in_mins() as i64) * 60_000;
+                    be >= preload_start_ms && bs <= preload_end_ms
+                })
+                .collect();
+
+            // Phase 1: Preload inverted indexes
+            let inverted_terms = selector_inverted_terms(vector_selector)
+                .map_err(|e| EvaluationError::InvalidSelector(e.to_string()))?;
+            self.reader
+                .preload_inverted_indexes(&relevant_buckets, &inverted_terms)
+                .await?;
+
+            let mut bucket_candidates: Vec<(TimeBucket, Vec<SeriesId>)> = Vec::new();
+            for &bucket in &relevant_buckets {
+                let candidates =
+                    evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
+                        .await
+                        .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+                if !candidates.is_empty() {
+                    bucket_candidates.push((bucket, candidates.into_iter().collect()));
+                }
+            }
+
+            // Phase 2: Preload forward indexes and samples in parallel
+            self.reader
+                .preload_forward_indexes(&bucket_candidates)
+                .await?;
+            self.reader.preload_all_samples(&bucket_candidates).await?;
+
+            // Phase 3: Merge per-series data across all buckets
+            let mut series_map: SeriesMap = HashMap::new();
+            for (bucket, candidates_vec) in &bucket_candidates {
+                let forward_index_entries = self
+                    .reader
+                    .forward_index_entries(bucket, candidates_vec)
+                    .await?;
+
+                for (series_id, series_spec) in forward_index_entries.iter() {
+                    if let Some(bucket_samples) = self.reader.cache.get_samples(bucket, series_id) {
+                        let mut labels_key: Vec<Label> = series_spec.labels.as_ref().to_vec();
+                        labels_key.sort();
+                        let values = series_map.entry(labels_key).or_default();
+                        values.extend(bucket_samples.iter().cloned());
+                    }
+                }
+            }
+
+            let merged: Vec<MergedSeriesEntry> = series_map
+                .into_iter()
+                .map(|(labels_key, mut samples)| {
+                    samples.sort_by_key(|s| s.timestamp_ms);
+                    samples.dedup_by_key(|s| s.timestamp_ms);
+                    MergedSeriesEntry {
+                        labels_key,
+                        samples,
+                    }
+                })
+                .collect();
+
+            self.reader
+                .cache
+                .merged_vector_cache
+                .insert(cache_key.clone(), merged);
+
+            // Filter for this step's lookback window and aggregate
+            let merged = self
+                .reader
+                .cache
+                .merged_vector_cache
+                .get(&cache_key)
+                .unwrap();
+            let mut groups: HashMap<Vec<(String, String)>, ReductionState> = HashMap::new();
+            for entry in merged {
+                let end_idx = entry.samples.partition_point(|s| s.timestamp_ms <= end_ms);
+                if end_idx > 0 {
+                    let candidate = &entry.samples[end_idx - 1];
+                    if candidate.timestamp_ms > start_ms {
+                        let group_key = Self::grouping_key_from_labels(
+                            &entry.labels_key,
+                            aggregate.modifier.as_ref(),
+                        );
+                        groups.entry(group_key).or_default().record(candidate.value);
+                    }
+                }
+            }
+
+            let timestamp_ms = evaluation_ts.as_millis();
+            let mut result_samples = Vec::with_capacity(groups.len());
+            for (group_key, state) in groups {
+                result_samples.push(EvalSample {
+                    timestamp_ms,
+                    value: state.finish(aggregate.op)?,
+                    labels: group_key.into_iter().collect(),
+                    drop_name: false,
+                });
+            }
+            return Ok(result_samples);
+        }
+
+        // Fallback path: per-step evaluation with bucket filtering.
+        // Only check buckets whose time range overlaps the lookback window.
         let all_buckets = self.reader.list_buckets().await?;
         let mut buckets: Vec<_> = all_buckets
             .into_iter()
             .filter(|b| {
                 let bucket_start_ms = b.start as i64 * 60_000;
                 let bucket_end_ms = (b.start as i64 + b.size_in_mins() as i64) * 60_000;
-                // Overlap: bucket_end > start_ms AND bucket_start <= end_ms
                 bucket_end_ms > start_ms && bucket_start_ms <= end_ms
             })
             .collect();
