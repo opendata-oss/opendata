@@ -190,7 +190,11 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         bucket: &TimeBucket,
         series_ids: &[SeriesId],
     ) -> Result<ForwardIndex> {
-        let span = tracing::debug_span!("get_forward_index_series", bucket_start = bucket.start, num_series = series_ids.len());
+        let span = tracing::debug_span!(
+            "get_forward_index_series",
+            bucket_start = bucket.start,
+            num_series = series_ids.len()
+        );
         let _enter = span.enter();
 
         let result = ForwardIndex::default();

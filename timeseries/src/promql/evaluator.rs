@@ -526,7 +526,9 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         let results: Vec<std::result::Result<_, crate::error::Error>> =
             futures::stream::iter(uncached)
                 .map(|(bucket, series_id)| async move {
-                    let samples = reader.samples(&bucket, series_id, i64::MIN, i64::MAX).await?;
+                    let samples = reader
+                        .samples(&bucket, series_id, i64::MIN, i64::MAX)
+                        .await?;
                     Ok((bucket, series_id, samples))
                 })
                 .buffer_unordered(24)
@@ -1163,7 +1165,9 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
             let candidates_vec: Vec<_> = candidates.into_iter().collect();
             let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
-            self.reader.preload_samples(&bucket, &candidates_vec).await?;
+            self.reader
+                .preload_samples(&bucket, &candidates_vec)
+                .await?;
 
             for series_id in candidates_vec {
                 let series_spec = match forward_index_view.get_spec(&series_id) {
@@ -1554,9 +1558,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         self.reader
             .preload_forward_indexes(&bucket_candidates)
             .await?;
-        self.reader
-            .preload_all_samples(&bucket_candidates)
-            .await?;
+        self.reader.preload_all_samples(&bucket_candidates).await?;
 
         // === Phase 3: Merge results (all cache hits, cheap) ===
         let mut series_with_results: HashSet<SeriesFingerprint> = HashSet::new();
