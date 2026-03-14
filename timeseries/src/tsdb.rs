@@ -330,6 +330,13 @@ pub(crate) async fn evaluate_range(
 
     let mut series_map: HashMap<Labels, Vec<(i64, f64)>> = HashMap::new();
     let mut evaluator = Evaluator::new(reader);
+
+    // Tell the evaluator the full query range so matrix selectors can
+    // preload all buckets on the first step and cache merged per-series data.
+    let q_start_ms = start.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    let q_end_ms = end.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    evaluator.set_query_range(q_start_ms, q_end_ms);
+
     let mut current_time = start;
 
     let loop_start = std::time::Instant::now();
@@ -402,6 +409,8 @@ pub(crate) async fn evaluate_range(
         matrix_selector_total_us = cache_stats.matrix_selector_total_us,
         selector_eval_calls = cache_stats.selector_eval_calls,
         selector_eval_total_us = cache_stats.selector_eval_total_us,
+        merged_matrix_hits = cache_stats.merged_matrix_hits,
+        merged_matrix_misses = cache_stats.merged_matrix_misses,
         "evaluate_range step loop complete"
     );
 

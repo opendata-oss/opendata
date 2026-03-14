@@ -69,6 +69,8 @@ pub(crate) struct EvalCacheStats {
     pub matrix_selector_total_us: u64,
     pub selector_eval_calls: u64,
     pub selector_eval_total_us: u64,
+    pub merged_matrix_hits: u64,
+    pub merged_matrix_misses: u64,
 }
 
 /// Type alias for complex HashMap used in matrix selector evaluation.
@@ -110,6 +112,14 @@ impl Hasher for FingerprintHasher {
     }
 }
 
+/// Pre-merged per-series sample data for matrix selector optimization.
+/// Samples from all relevant buckets are merged into per-series sorted lists,
+/// allowing O(num_series) per-step evaluation instead of O(buckets × series).
+struct MergedSeriesEntry {
+    labels_key: Vec<Label>,
+    samples: Vec<Sample>,
+}
+
 pub(crate) struct QueryReaderBucketEvalCache {
     // Map from terms (series_ids for forward, labels for inverted) to cached results
     forward_index_cache:
@@ -132,12 +142,16 @@ impl QueryReaderBucketEvalCache {
 
 pub(crate) struct QueryReaderEvalCache {
     cache: HashMap<TimeBucket, QueryReaderBucketEvalCache>,
+    /// Pre-merged per-series sample data for matrix selectors. Key is the
+    /// selector's Display string (stable within a query).
+    merged_matrix_cache: HashMap<String, Vec<MergedSeriesEntry>>,
 }
 
 impl QueryReaderEvalCache {
     pub(crate) fn new() -> Self {
         Self {
             cache: HashMap::new(),
+            merged_matrix_cache: HashMap::new(),
         }
     }
 
@@ -456,6 +470,10 @@ pub(crate) struct CachedQueryReader<'reader, R: QueryReader> {
     reader: &'reader R,
     cache: QueryReaderEvalCache,
     stats: EvalCacheStats,
+    /// Full query time range (start_ms, end_ms) for range query optimization.
+    /// When set, matrix selectors preload all buckets covering the full range
+    /// on the first call and cache the merged per-series data.
+    query_range_ms: Option<(i64, i64)>,
 }
 
 impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
@@ -464,7 +482,12 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             reader,
             cache: QueryReaderEvalCache::new(),
             stats: EvalCacheStats::default(),
+            query_range_ms: None,
         }
+    }
+
+    pub(crate) fn set_query_range(&mut self, start_ms: i64, end_ms: i64) {
+        self.query_range_ms = Some((start_ms, end_ms));
     }
 
     pub(crate) async fn list_buckets(&self) -> Result<Vec<TimeBucket>> {
@@ -1125,12 +1148,18 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 reader,
                 cache: QueryReaderEvalCache::new(),
                 stats: EvalCacheStats::default(),
+                query_range_ms: None,
             },
         }
     }
 
     pub(crate) fn cache_stats(&self) -> &EvalCacheStats {
         &self.reader.stats
+    }
+
+    /// Set the full query time range for range query matrix selector optimization.
+    pub(crate) fn set_query_range(&mut self, start_ms: i64, end_ms: i64) {
+        self.reader.set_query_range(start_ms, end_ms);
     }
 
     pub(crate) async fn evaluate(&mut self, stmt: EvalStmt) -> EvalResult<ExprResult> {
@@ -1299,27 +1328,185 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             evaluation_ts,
         )?;
 
-        // Example where this matters:
-        //   sum_over_time(metric[100s] @ 100 offset 50s)
-        //   → adjusted_eval_ts = 50s
-        //   → start = 50s - 100s = -50s (before UNIX_EPOCH!)
-        //
-        // NOTE: Prometheus represents timestamps internally as int64 milliseconds
-        // and allows negative timestamps (times before UNIX_EPOCH).
-        // See: https://github.com/prometheus/prometheus/blob/main/model/timestamp/timestamp.go
         let end_ms = adjusted_eval_ts.as_millis();
         let start_ms = end_ms - (range.as_millis() as i64);
 
-        // order buckets in chronological order
+        let range_ms = range.as_millis() as i64;
+        let offset_ms = match vector_selector.offset.as_ref() {
+            Some(Offset::Pos(d)) => d.as_millis() as i64,
+            Some(Offset::Neg(d)) => -(d.as_millis() as i64),
+            None => 0,
+        };
+
+        // Determine if we can use the merged matrix cache optimization.
+        // This is valid when the full query range is known AND the current
+        // step's window falls within the preloaded range. Subqueries with
+        // @ modifiers can shift the evaluation time outside the top-level
+        // range, so we verify coverage before using the cache.
+        let preload_range = self.reader.query_range_ms.and_then(|(q_start, q_end)| {
+            let proposed_start = (q_start - offset_ms) - range_ms;
+            let proposed_end = q_end - offset_ms;
+            if start_ms >= proposed_start && end_ms <= proposed_end {
+                Some((proposed_start, proposed_end))
+            } else {
+                None
+            }
+        });
+
+        if let Some((preload_start_ms, preload_end_ms)) = preload_range {
+            // Cache key: selector identity (stable across steps)
+            let cache_key = format!("{matrix_selector}");
+
+            // Fast path: reuse pre-merged per-series data from a previous step
+            if self
+                .reader
+                .cache
+                .merged_matrix_cache
+                .contains_key(&cache_key)
+            {
+                self.reader.stats.merged_matrix_hits += 1;
+
+                let merged = self
+                    .reader
+                    .cache
+                    .merged_matrix_cache
+                    .get(&cache_key)
+                    .unwrap();
+                let mut range_vector = Vec::with_capacity(merged.len());
+                for entry in merged {
+                    let filtered = CachedQueryReader::<R>::filter_cached_samples(
+                        &entry.samples,
+                        start_ms,
+                        end_ms,
+                    );
+                    if !filtered.is_empty() {
+                        let labels = self.labels_to_hashmap(&entry.labels_key);
+                        range_vector.push(EvalSamples {
+                            values: filtered,
+                            labels,
+                        });
+                    }
+                }
+
+                self.reader.stats.matrix_selector_calls += 1;
+                self.reader.stats.matrix_selector_total_us += ms_start.elapsed().as_micros() as u64;
+                return Ok(ExprResult::RangeVector(range_vector));
+            }
+
+            // Cold path: build merged per-series data for all buckets covering
+            // the full query range (not just this step's window).
+            self.reader.stats.merged_matrix_misses += 1;
+
+            let mut buckets = self.reader.list_buckets().await?;
+            buckets.sort_by(|a, b| a.start.cmp(&b.start));
+
+            let relevant_buckets: Vec<TimeBucket> = buckets
+                .into_iter()
+                .filter(|b| {
+                    let bs = (b.start as i64) * 60_000;
+                    let be = bs + (b.size_in_mins() as i64) * 60_000;
+                    be >= preload_start_ms && bs <= preload_end_ms
+                })
+                .collect();
+
+            // Phase 1: Preload inverted indexes for all buckets in parallel
+            let inverted_terms = selector_inverted_terms(vector_selector)
+                .map_err(|e| EvaluationError::InvalidSelector(e.to_string()))?;
+            self.reader
+                .preload_inverted_indexes(&relevant_buckets, &inverted_terms)
+                .await?;
+
+            let mut bucket_candidates: Vec<(TimeBucket, Vec<SeriesId>)> = Vec::new();
+            for &bucket in &relevant_buckets {
+                let sel_start = std::time::Instant::now();
+                let candidates =
+                    evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
+                        .await
+                        .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+                self.reader.stats.selector_eval_calls += 1;
+                self.reader.stats.selector_eval_total_us += sel_start.elapsed().as_micros() as u64;
+                if !candidates.is_empty() {
+                    bucket_candidates.push((bucket, candidates.into_iter().collect()));
+                }
+            }
+
+            // Phase 2: Preload forward indexes and samples in parallel
+            self.reader
+                .preload_forward_indexes(&bucket_candidates)
+                .await?;
+            self.reader.preload_all_samples(&bucket_candidates).await?;
+
+            // Phase 3: Merge per-series data across all buckets
+            let mut series_map: SeriesMap = HashMap::new();
+            for (bucket, candidates_vec) in &bucket_candidates {
+                let forward_index_entries = self
+                    .reader
+                    .forward_index_entries(bucket, candidates_vec)
+                    .await?;
+
+                for (series_id, series_spec) in forward_index_entries.iter() {
+                    if let Some(bucket_samples) = self.reader.cache.get_samples(bucket, series_id) {
+                        let mut labels_key: Vec<Label> = series_spec.labels.as_ref().to_vec();
+                        labels_key.sort();
+                        let values = series_map.entry(labels_key).or_default();
+                        values.extend(bucket_samples.iter().cloned());
+                    }
+                }
+            }
+
+            // Build and cache the merged entries (sorted, deduped by timestamp)
+            let merged: Vec<MergedSeriesEntry> = series_map
+                .into_iter()
+                .map(|(labels_key, mut samples)| {
+                    samples.sort_by_key(|s| s.timestamp_ms);
+                    samples.dedup_by_key(|s| s.timestamp_ms);
+                    MergedSeriesEntry {
+                        labels_key,
+                        samples,
+                    }
+                })
+                .collect();
+
+            self.reader
+                .cache
+                .merged_matrix_cache
+                .insert(cache_key.clone(), merged);
+
+            // Filter for this step's time window
+            let merged = self
+                .reader
+                .cache
+                .merged_matrix_cache
+                .get(&cache_key)
+                .unwrap();
+            let mut range_vector = Vec::with_capacity(merged.len());
+            for entry in merged {
+                let filtered =
+                    CachedQueryReader::<R>::filter_cached_samples(&entry.samples, start_ms, end_ms);
+                if !filtered.is_empty() {
+                    let labels = self.labels_to_hashmap(&entry.labels_key);
+                    range_vector.push(EvalSamples {
+                        values: filtered,
+                        labels,
+                    });
+                }
+            }
+
+            self.reader.stats.matrix_selector_calls += 1;
+            self.reader.stats.matrix_selector_total_us += ms_start.elapsed().as_micros() as u64;
+            return Ok(ExprResult::RangeVector(range_vector));
+        }
+
+        // Fallback path: per-step evaluation (used for instant queries and
+        // subquery contexts where the evaluation time is outside the
+        // top-level query range).
         let mut buckets = self.reader.list_buckets().await?;
         buckets.sort_by(|a, b| a.start.cmp(&b.start));
 
-        // Group samples by series (using sorted label vector as key since HashMap doesn't impl Hash)
         let mut series_map: SeriesMap = HashMap::new();
 
         for bucket in buckets {
-            // Check if bucket overlaps with our time range
-            let bucket_start_ms = (bucket.start as i64) * 60 * 1000; // Convert minutes to milliseconds
+            let bucket_start_ms = (bucket.start as i64) * 60 * 1000;
             let bucket_end_ms = bucket_start_ms + (bucket.size_in_mins() as i64) * 60 * 1000;
             if bucket_end_ms < start_ms || bucket_start_ms > end_ms {
                 continue;
@@ -1353,7 +1540,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     .await?;
 
                 let mut labels_key: Vec<Label> = series_spec.labels.as_ref().to_vec();
-                // Sort by canonical Label ordering (name, then value) for series grouping
                 labels_key.sort();
 
                 let values = series_map.entry(labels_key).or_default();
