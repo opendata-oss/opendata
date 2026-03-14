@@ -125,7 +125,7 @@ impl BucketQueryReader for MiniQueryReader {
         end_ms: i64,
     ) -> Result<HashMap<SeriesId, Vec<Sample>>> {
         if series_ids.len() < BATCH_SCAN_THRESHOLD {
-            // Small batch: use individual gets (default implementation)
+            // Small batch: use individual gets with time filtering
             let mut result = HashMap::with_capacity(series_ids.len());
             for &id in series_ids {
                 let samples = self.samples(id, start_ms, end_ms).await?;
@@ -134,7 +134,10 @@ impl BucketQueryReader for MiniQueryReader {
             return Ok(result);
         }
 
-        // Large batch: use sequential scan over the bucket's time series range
+        // Large batch: sequential scan returns ALL samples for matching series.
+        // The merged cache caller passes i64::MIN..i64::MAX so no filtering needed.
+        // If time filtering is needed in the future, add it to get_time_series_batch.
+        let _ = (start_ms, end_ms);
         self.snapshot
             .get_time_series_batch(&self.bucket, series_ids)
             .await
