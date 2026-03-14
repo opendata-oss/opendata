@@ -116,7 +116,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         time: Option<std::time::SystemTime>,
         opts: &QueryOptions,
     ) -> std::result::Result<QueryValue, QueryError> {
-        let span = info_span!("eval_query", query = query);
+        let span = info_span!("eval_query");
         async {
             let expr = promql_parser::parser::parse(query)
                 .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
@@ -158,7 +158,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         step: Duration,
         opts: &QueryOptions,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-        let span = info_span!("eval_query_range", query = query);
+        let span = info_span!("eval_query_range");
         async {
             let expr = promql_parser::parser::parse(query)
                 .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;

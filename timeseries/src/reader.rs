@@ -185,6 +185,9 @@ impl TimeSeriesDbReader {
         let bucket_list = Arc::new(RwLock::new(all_buckets));
 
         // Spawn background refresh — new buckets appear on hourly boundaries.
+        // Note: queries may miss the newest bucket for up to one refresh interval.
+        // This is acceptable because SlateDB's manifest polling has the same staleness
+        // window, so the data wouldn't be visible to reads anyway.
         let refresh_storage = storage.clone();
         let refresh_list = Arc::downgrade(&bucket_list);
         let refresh_interval = config.refresh_interval;
@@ -303,6 +306,11 @@ fn filter_buckets_in_range(
     start_secs: Option<i64>,
     end_secs: Option<i64>,
 ) -> Vec<TimeBucket> {
+    if let (Some(start), Some(end)) = (start_secs, end_secs) {
+        if end < start {
+            return Vec::new();
+        }
+    }
     let start_min = start_secs.map(|s| (s / 60) as u32);
     let end_min = end_secs.map(|e| (e / 60) as u32);
 

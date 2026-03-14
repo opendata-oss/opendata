@@ -161,7 +161,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
     }
 
     /// Load only the specified terms from the inverted index.
-    #[tracing::instrument(level = "info", skip_all, fields(bucket_start = bucket.start, num_terms = terms.len()))]
+    #[tracing::instrument(level = "debug", skip_all, fields(bucket_start = bucket.start, num_terms = terms.len()))]
     async fn get_inverted_index_terms(
         &self,
         bucket: &TimeBucket,
@@ -190,7 +190,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         bucket: &TimeBucket,
         series_ids: &[SeriesId],
     ) -> Result<ForwardIndex> {
-        let span = tracing::info_span!("get_forward_index_series", bucket_start = bucket.start, num_series = series_ids.len());
+        let span = tracing::debug_span!("get_forward_index_series", bucket_start = bucket.start, num_series = series_ids.len());
         let _enter = span.enter();
 
         let result = ForwardIndex::default();
