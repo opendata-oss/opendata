@@ -1547,6 +1547,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         }
 
         // === Phase 2: Preload forward indexes and samples for all buckets in parallel ===
+        // Note: we preload samples for all candidates even though some fingerprints
+        // may appear in multiple buckets (newest-first dedup happens in phase 3).
+        // Filtering here would require knowing which bucket actually has samples
+        // in the query's time range, which we can't determine without reading them.
         self.reader
             .preload_forward_indexes(&bucket_candidates)
             .await?;
