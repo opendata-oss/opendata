@@ -13,7 +13,7 @@ use crate::model::Sample;
 use crate::model::SeriesFingerprint;
 use crate::model::{Label, SeriesId, TimeBucket};
 use crate::promql::functions::{FunctionCallContext, FunctionRegistry, PromQLArg};
-use crate::promql::selector::evaluate_selector_with_reader;
+use crate::promql::selector::{evaluate_selector_with_reader, selector_inverted_terms};
 use crate::promql::timestamp::Timestamp;
 use crate::query::QueryReader;
 use crate::util::Result;
@@ -650,7 +650,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
                         Ok((series_id, samples))
                     }
                 })
-                .buffer_unordered(32)
+                .buffer_unordered(24)
                 .collect()
                 .await;
 
@@ -659,6 +659,133 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         for result in results {
             let (series_id, samples) = result?;
             self.cache.cache_samples(*bucket, series_id, samples);
+        }
+
+        Ok(())
+    }
+
+    /// Preload samples for all (bucket, series_ids) pairs concurrently across
+    /// all buckets in a single parallel batch.
+    pub(crate) async fn preload_all_samples(
+        &mut self,
+        bucket_candidates: &[(TimeBucket, Vec<SeriesId>)],
+    ) -> Result<()> {
+        // Collect all uncached (bucket, series_id) pairs across all buckets.
+        let uncached: Vec<(TimeBucket, SeriesId)> = bucket_candidates
+            .iter()
+            .flat_map(|(bucket, series_ids)| {
+                series_ids
+                    .iter()
+                    .filter(|id| self.cache.get_samples(bucket, id).is_none())
+                    .map(move |&id| (*bucket, id))
+            })
+            .collect();
+
+        if uncached.is_empty() {
+            return Ok(());
+        }
+
+        let reader = self.reader;
+        let results: Vec<std::result::Result<_, crate::error::Error>> =
+            futures::stream::iter(uncached)
+                .map(|(bucket, series_id)| async move {
+                    let samples = reader.samples(&bucket, series_id, i64::MIN, i64::MAX).await?;
+                    Ok((bucket, series_id, samples))
+                })
+                .buffer_unordered(24)
+                .collect()
+                .await;
+
+        self.stats.samples_cache_misses += results.len() as u64;
+
+        for result in results {
+            let (bucket, series_id, samples) = result?;
+            self.cache.cache_samples(bucket, series_id, samples);
+        }
+
+        Ok(())
+    }
+
+    /// Preload inverted indexes for multiple buckets concurrently.
+    /// After this call, `inverted_index()` calls for these (bucket, terms)
+    /// pairs will be served from cache.
+    pub(crate) async fn preload_inverted_indexes(
+        &mut self,
+        buckets: &[TimeBucket],
+        terms: &[Label],
+    ) -> Result<()> {
+        let mut sorted_terms = terms.to_vec();
+        sorted_terms.sort();
+
+        let uncached: Vec<TimeBucket> = buckets
+            .iter()
+            .filter(|b| self.cache.get_inverted_index(b, &sorted_terms).is_none())
+            .copied()
+            .collect();
+
+        if uncached.is_empty() {
+            return Ok(());
+        }
+
+        let reader = self.reader;
+        let results: Vec<std::result::Result<_, crate::error::Error>> =
+            futures::stream::iter(uncached)
+                .map(|bucket| {
+                    let t = sorted_terms.clone();
+                    async move {
+                        let idx = reader.inverted_index(&bucket, &t).await?;
+                        Ok((bucket, idx))
+                    }
+                })
+                .buffer_unordered(24)
+                .collect()
+                .await;
+
+        for result in results {
+            let (bucket, idx) = result?;
+            self.stats.inverted_cache_misses += 1;
+            self.cache
+                .cache_inverted_index(bucket, sorted_terms.clone(), idx);
+        }
+
+        Ok(())
+    }
+
+    /// Preload forward indexes for multiple (bucket, series_ids) pairs concurrently.
+    pub(crate) async fn preload_forward_indexes(
+        &mut self,
+        bucket_candidates: &[(TimeBucket, Vec<SeriesId>)],
+    ) -> Result<()> {
+        let uncached: Vec<(TimeBucket, Vec<SeriesId>)> = bucket_candidates
+            .iter()
+            .filter(|(b, ids)| {
+                let mut sorted = ids.clone();
+                sorted.sort();
+                self.cache.get_forward_index(b, &sorted).is_none()
+            })
+            .cloned()
+            .collect();
+
+        if uncached.is_empty() {
+            return Ok(());
+        }
+
+        let reader = self.reader;
+        let results: Vec<std::result::Result<_, crate::error::Error>> =
+            futures::stream::iter(uncached)
+                .map(|(bucket, series_ids)| async move {
+                    let idx = reader.forward_index(&bucket, &series_ids).await?;
+                    Ok((bucket, series_ids, idx))
+                })
+                .buffer_unordered(24)
+                .collect()
+                .await;
+
+        for result in results {
+            let (bucket, mut series_ids, idx) = result?;
+            self.stats.forward_cache_misses += 1;
+            series_ids.sort();
+            self.cache.cache_forward_index(bucket, series_ids, idx);
         }
 
         Ok(())
@@ -1558,29 +1685,40 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let mut buckets = self.reader.list_buckets().await?;
         buckets.sort_by(|a, b| b.start.cmp(&a.start)); // newest first
 
-        let mut series_with_results = FingerprintHashSet::default();
-        let mut samples = Vec::new();
+        // === Phase 1: Preload inverted indexes for all buckets in parallel ===
+        let inverted_terms = selector_inverted_terms(vector_selector);
+        self.reader
+            .preload_inverted_indexes(&buckets, &inverted_terms)
+            .await?;
 
-        // Iterate through buckets in reverse time order (newest first)
-        for bucket in buckets {
-            // Find matching series in this bucket
+        // Compute candidates per bucket (cheap in-memory bitmap intersections)
+        let mut bucket_candidates: Vec<(TimeBucket, Vec<SeriesId>)> = Vec::new();
+        for &bucket in &buckets {
             let candidates =
                 evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
                     .await
                     .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
-
-            if candidates.is_empty() {
-                continue;
+            if !candidates.is_empty() {
+                bucket_candidates.push((bucket, candidates.into_iter().collect()));
             }
+        }
 
-            // Batch load forward index and samples for all candidates upfront
-            let candidates_vec: Vec<_> = candidates.into_iter().collect();
+        // === Phase 2: Preload forward indexes and samples for all buckets in parallel ===
+        self.reader
+            .preload_forward_indexes(&bucket_candidates)
+            .await?;
+        self.reader
+            .preload_all_samples(&bucket_candidates)
+            .await?;
+
+        // === Phase 3: Merge results (all cache hits, cheap) ===
+        let mut series_with_results = FingerprintHashSet::default();
+        let mut samples = Vec::new();
+
+        for (bucket, candidates_vec) in &bucket_candidates {
             let forward_index_entries = self
                 .reader
-                .forward_index_entries(&bucket, &candidates_vec)
-                .await?;
-            self.reader
-                .preload_samples(&bucket, &candidates_vec)
+                .forward_index_entries(bucket, candidates_vec)
                 .await?;
 
             for (series_id, series_spec) in forward_index_entries.iter().cloned() {
@@ -1594,12 +1732,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 // Read samples from this bucket within the lookback window
                 let best_sample = self
                     .reader
-                    .latest_sample(&bucket, series_id, start_ms, end_ms)
+                    .latest_sample(bucket, series_id, start_ms, end_ms)
                     .await?;
 
                 // Find the best (latest) point in the time range
                 if let Some(best_sample) = best_sample {
-                    // Convert attributes to labels HashMap
                     let labels = self.labels_to_hashmap(&series_spec.labels);
 
                     samples.push(EvalSample {
@@ -1609,7 +1746,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                         drop_name: false,
                     });
 
-                    // Mark this series fingerprint as found so we don't add it again from older buckets
                     series_with_results.insert(fingerprint);
                 }
             }

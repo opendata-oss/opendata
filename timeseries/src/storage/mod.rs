@@ -213,7 +213,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
                         None => Ok(None),
                     }
                 })
-                .buffer_unordered(32)
+                .buffer_unordered(24)
                 .collect()
                 .await;
         for entry in entries {
