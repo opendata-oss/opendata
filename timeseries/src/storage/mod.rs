@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use common::storage::RecordOp;
 use common::{Record, Storage, StorageRead};
+use futures::stream::{self, StreamExt};
 use roaring::RoaringBitmap;
 
 use crate::index::{InvertedIndex, SeriesSpec};
@@ -184,22 +185,39 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
     }
 
     /// Load only the specified series from the forward index.
-    #[tracing::instrument(level = "info", skip_all, fields(bucket_start = bucket.start, num_series = series_ids.len()))]
     async fn get_forward_index_series(
         &self,
         bucket: &TimeBucket,
         series_ids: &[SeriesId],
     ) -> Result<ForwardIndex> {
+        let span = tracing::info_span!("get_forward_index_series", bucket_start = bucket.start, num_series = series_ids.len());
+        let _enter = span.enter();
+
         let result = ForwardIndex::default();
-        for &series_id in series_ids {
-            let key = ForwardIndexKey {
-                time_bucket: bucket.start,
-                bucket_size: bucket.size,
-                series_id,
-            }
-            .encode();
-            if let Some(record) = self.get(key).await? {
-                let value = ForwardIndexValue::decode(record.value.as_ref())?;
+        let bucket_start = bucket.start;
+        let bucket_size = bucket.size;
+        let entries: Vec<std::result::Result<_, crate::error::Error>> =
+            stream::iter(series_ids.iter().copied())
+                .map(|series_id| async move {
+                    let key = ForwardIndexKey {
+                        time_bucket: bucket_start,
+                        bucket_size,
+                        series_id,
+                    }
+                    .encode();
+                    match self.get(key).await? {
+                        Some(record) => {
+                            let value = ForwardIndexValue::decode(record.value.as_ref())?;
+                            Ok(Some((series_id, value)))
+                        }
+                        None => Ok(None),
+                    }
+                })
+                .buffer_unordered(32)
+                .collect()
+                .await;
+        for entry in entries {
+            if let Some((series_id, value)) = entry? {
                 result.series.insert(series_id, value.into());
             }
         }

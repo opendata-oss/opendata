@@ -16,6 +16,7 @@ use common::storage::factory::create_storage_read;
 use common::{StorageReaderRuntime, StorageSemantics};
 use futures::stream::{self, StreamExt};
 use moka::future::Cache;
+use tokio::sync::RwLock;
 
 use crate::config::ReaderConfig;
 use crate::error::{QueryError, Result};
@@ -145,6 +146,9 @@ pub struct TimeSeriesDbReader {
     storage: Arc<dyn StorageRead>,
     /// LRU cache for read-only query buckets.
     query_cache: Cache<TimeBucket, Arc<MiniQueryReader>>,
+    /// Cached bucket list, loaded eagerly on open and refreshed periodically.
+    /// `None` in the test path (from_storage) — falls back to storage reads.
+    bucket_list: Option<Arc<RwLock<Vec<TimeBucket>>>>,
 }
 
 impl TimeSeriesDbReader {
@@ -170,10 +174,45 @@ impl TimeSeriesDbReader {
             reader_options,
         )
         .await?;
-        Ok(Self::from_storage_with_capacity(
+
+        let query_cache = Cache::builder()
+            .max_capacity(config.cache_capacity)
+            .build();
+
+        // Eagerly load the bucket list so we're ready to serve queries.
+        let all_buckets = storage.get_buckets_in_range(None, None).await?;
+        tracing::info!(num_buckets = all_buckets.len(), "bucket list loaded");
+        let bucket_list = Arc::new(RwLock::new(all_buckets));
+
+        // Spawn background refresh — new buckets appear on hourly boundaries.
+        let refresh_storage = storage.clone();
+        let refresh_list = Arc::downgrade(&bucket_list);
+        let refresh_interval = config.refresh_interval;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(refresh_interval).await;
+                // Stop if the reader has been dropped.
+                let list = match refresh_list.upgrade() {
+                    Some(l) => l,
+                    None => break,
+                };
+                match refresh_storage.get_buckets_in_range(None, None).await {
+                    Ok(buckets) => {
+                        tracing::debug!(num_buckets = buckets.len(), "bucket list refreshed");
+                        *list.write().await = buckets;
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to refresh bucket list: {}", e);
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
             storage,
-            config.cache_capacity,
-        ))
+            query_cache,
+            bucket_list: Some(bucket_list),
+        })
     }
 
     /// Creates a TimeSeriesDbReader from an existing storage implementation.
@@ -186,6 +225,7 @@ impl TimeSeriesDbReader {
         Self {
             storage,
             query_cache,
+            bucket_list: None,
         }
     }
 
@@ -256,15 +296,76 @@ impl TimeSeriesDbReader {
 /// Maximum number of buckets to load concurrently.
 const BUCKET_LOAD_CONCURRENCY: usize = 8;
 
+/// Filter a cached bucket list by a single time range (seconds).
+/// Mirrors the logic in `OpenTsdbStorageReadExt::get_buckets_in_range`.
+fn filter_buckets_in_range(
+    all_buckets: &[TimeBucket],
+    start_secs: Option<i64>,
+    end_secs: Option<i64>,
+) -> Vec<TimeBucket> {
+    let start_min = start_secs.map(|s| (s / 60) as u32);
+    let end_min = end_secs.map(|e| (e / 60) as u32);
+
+    let mut filtered: Vec<TimeBucket> = all_buckets
+        .iter()
+        .filter(|bucket| match (start_min, end_min) {
+            (None, None) => true,
+            (Some(start), None) => {
+                let start_bucket_min = start - start % bucket.size_in_mins();
+                bucket.start >= start_bucket_min
+            }
+            (None, Some(end)) => {
+                let end_bucket_min = end - end % bucket.size_in_mins();
+                bucket.start <= end_bucket_min
+            }
+            (Some(start), Some(end)) => {
+                let start_bucket_min = start - start % bucket.size_in_mins();
+                let end_bucket_min = end - end % bucket.size_in_mins();
+                bucket.start >= start_bucket_min && bucket.start <= end_bucket_min
+            }
+        })
+        .cloned()
+        .collect();
+    filtered.sort_by_key(|b| b.start);
+    filtered
+}
+
+/// Filter a cached bucket list by multiple disjoint time ranges (seconds).
+/// Mirrors the logic in `OpenTsdbStorageReadExt::get_buckets_for_ranges`.
+fn filter_buckets_for_ranges(all_buckets: &[TimeBucket], ranges: &[(i64, i64)]) -> Vec<TimeBucket> {
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+
+    let mut filtered: Vec<TimeBucket> = all_buckets
+        .iter()
+        .filter(|bucket| {
+            let bucket_start_min = bucket.start as i64;
+            let bucket_end_min = bucket_start_min + bucket.size_in_mins() as i64;
+            let bucket_start_secs = bucket_start_min * 60;
+            let bucket_end_secs = bucket_end_min * 60;
+            ranges
+                .iter()
+                .any(|&(r_start, r_end)| bucket_end_secs > r_start && bucket_start_secs <= r_end)
+        })
+        .cloned()
+        .collect();
+    filtered.sort_by_key(|b| b.start);
+    filtered
+}
+
 #[async_trait]
 impl TsdbReadEngine for TimeSeriesDbReader {
     type QR = ReaderQueryReader;
 
     async fn make_query_reader(&self, start: i64, end: i64) -> Result<ReaderQueryReader> {
-        let buckets = self
-            .storage
-            .get_buckets_in_range(Some(start), Some(end))
-            .await?;
+        let buckets = if let Some(cached) = &self.bucket_list {
+            filter_buckets_in_range(&cached.read().await, Some(start), Some(end))
+        } else {
+            self.storage
+                .get_buckets_in_range(Some(start), Some(end))
+                .await?
+        };
 
         let readers: Vec<_> = stream::iter(buckets)
             .map(|bucket| async move {
@@ -282,7 +383,11 @@ impl TsdbReadEngine for TimeSeriesDbReader {
         &self,
         ranges: &[(i64, i64)],
     ) -> Result<ReaderQueryReader> {
-        let buckets = self.storage.get_buckets_for_ranges(ranges).await?;
+        let buckets = if let Some(cached) = &self.bucket_list {
+            filter_buckets_for_ranges(&cached.read().await, ranges)
+        } else {
+            self.storage.get_buckets_for_ranges(ranges).await?
+        };
 
         let readers: Vec<_> = stream::iter(buckets)
             .map(|bucket| async move {
