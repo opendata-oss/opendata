@@ -332,7 +332,12 @@ pub(crate) async fn evaluate_range(
     let mut evaluator = Evaluator::new(reader);
     let mut current_time = start;
 
+    let loop_start = std::time::Instant::now();
+    let mut step_count: u64 = 0;
+    let mut first_step_ms: u64 = 0;
+
     while current_time <= end {
+        let step_start = std::time::Instant::now();
         let instant_stmt = EvalStmt {
             expr: stmt.expr.clone(),
             start: current_time,
@@ -368,8 +373,33 @@ pub(crate) async fn evaluate_range(
             }
         }
 
+        step_count += 1;
+        if step_count == 1 {
+            first_step_ms = step_start.elapsed().as_millis() as u64;
+        }
         current_time += step;
     }
+
+    let loop_elapsed_ms = loop_start.elapsed().as_millis() as u64;
+    let cache_stats = evaluator.cache_stats();
+    tracing::info!(
+        steps = step_count,
+        first_step_ms = first_step_ms,
+        loop_elapsed_ms = loop_elapsed_ms,
+        avg_step_ms = if step_count > 0 { loop_elapsed_ms / step_count } else { 0 },
+        samples_cache_hits = cache_stats.samples_cache_hits,
+        samples_cache_misses = cache_stats.samples_cache_misses,
+        samples_filter_total_us = cache_stats.samples_filter_total_us,
+        inverted_cache_hits = cache_stats.inverted_cache_hits,
+        inverted_cache_misses = cache_stats.inverted_cache_misses,
+        forward_cache_hits = cache_stats.forward_cache_hits,
+        forward_cache_misses = cache_stats.forward_cache_misses,
+        matrix_selector_calls = cache_stats.matrix_selector_calls,
+        matrix_selector_total_us = cache_stats.matrix_selector_total_us,
+        selector_eval_calls = cache_stats.selector_eval_calls,
+        selector_eval_total_us = cache_stats.selector_eval_total_us,
+        "evaluate_range step loop complete"
+    );
 
     Ok(series_map
         .into_iter()

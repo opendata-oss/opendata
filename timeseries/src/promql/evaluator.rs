@@ -5,6 +5,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::stream::StreamExt;
+
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::Sample;
 use crate::model::SeriesFingerprint;
@@ -46,6 +48,22 @@ impl From<crate::error::Error> for EvaluationError {
 }
 
 pub(crate) type EvalResult<T> = std::result::Result<T, EvaluationError>;
+
+/// Aggregate statistics for cache and evaluator performance tracking.
+#[derive(Debug, Default)]
+pub(crate) struct EvalCacheStats {
+    pub samples_cache_hits: u64,
+    pub samples_cache_misses: u64,
+    pub samples_filter_total_us: u64,
+    pub inverted_cache_hits: u64,
+    pub inverted_cache_misses: u64,
+    pub forward_cache_hits: u64,
+    pub forward_cache_misses: u64,
+    pub matrix_selector_calls: u64,
+    pub matrix_selector_total_us: u64,
+    pub selector_eval_calls: u64,
+    pub selector_eval_total_us: u64,
+}
 
 /// Type alias for complex HashMap used in matrix selector evaluation.
 /// Maps from label key (sorted vector of label pairs) to samples vector
@@ -311,6 +329,7 @@ pub(crate) struct Evaluator<'reader, R: QueryReader> {
 pub(crate) struct CachedQueryReader<'reader, R: QueryReader> {
     reader: &'reader R,
     cache: QueryReaderEvalCache,
+    stats: EvalCacheStats,
 }
 
 impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
@@ -318,6 +337,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         Self {
             reader,
             cache: QueryReaderEvalCache::new(),
+            stats: EvalCacheStats::default(),
         }
     }
 
@@ -334,8 +354,10 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         series_ids.sort();
         // Check cache first
         if let Some(cached_data) = self.cache.get_forward_index(bucket, &series_ids) {
+            self.stats.forward_cache_hits += 1;
             Ok(cached_data)
         } else {
+            self.stats.forward_cache_misses += 1;
             // Load from underlying reader
             let forward_index = self.reader.forward_index(bucket, &series_ids).await?;
 
@@ -359,8 +381,10 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         terms.sort();
         // Check cache first
         if let Some(cached_result) = self.cache.get_inverted_index(bucket, &terms) {
+            self.stats.inverted_cache_hits += 1;
             return Ok(cached_result);
         }
+        self.stats.inverted_cache_misses += 1;
 
         // Load from underlying reader
         let inverted_index = self.reader.inverted_index(bucket, &terms).await?;
@@ -399,14 +423,18 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
     ) -> Result<Vec<Sample>> {
         // Check cache first
         if let Some(cached_samples) = self.cache.get_samples(bucket, &series_id) {
+            self.stats.samples_cache_hits += 1;
+            let filter_start = std::time::Instant::now();
             // Filter cached samples by requested time range
             let filtered: Vec<Sample> = cached_samples
                 .iter()
                 .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
                 .cloned()
                 .collect();
+            self.stats.samples_filter_total_us += filter_start.elapsed().as_micros() as u64;
             return Ok(filtered);
         }
+        self.stats.samples_cache_misses += 1;
 
         // Not in cache, load from underlying reader with wide bounds to cache the whole bucket
         let samples = self
@@ -426,6 +454,51 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             .collect();
 
         Ok(filtered)
+    }
+
+    /// Preload samples for multiple series in a bucket concurrently.
+    /// After this call, individual `samples()` calls for these series will
+    /// be served from cache.
+    pub(crate) async fn preload_samples(
+        &mut self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<()> {
+        // Find which series are not yet cached.
+        let uncached: Vec<SeriesId> = series_ids
+            .iter()
+            .filter(|id| self.cache.get_samples(bucket, id).is_none())
+            .copied()
+            .collect();
+
+        if uncached.is_empty() {
+            return Ok(());
+        }
+
+        // Load all uncached series in parallel from the underlying reader.
+        // self.reader is &R (Copy), so concurrent reads are safe.
+        let reader = self.reader;
+        let results: Vec<std::result::Result<_, crate::error::Error>> =
+            futures::stream::iter(uncached)
+                .map(|series_id| {
+                    let b = *bucket;
+                    async move {
+                        let samples = reader.samples(&b, series_id, i64::MIN, i64::MAX).await?;
+                        Ok((series_id, samples))
+                    }
+                })
+                .buffer_unordered(32)
+                .collect()
+                .await;
+
+        self.stats.samples_cache_misses += results.len() as u64;
+
+        for result in results {
+            let (series_id, samples) = result?;
+            self.cache.cache_samples(*bucket, series_id, samples);
+        }
+
+        Ok(())
     }
 }
 
@@ -748,8 +821,13 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             reader: CachedQueryReader {
                 reader,
                 cache: QueryReaderEvalCache::new(),
+                stats: EvalCacheStats::default(),
             },
         }
+    }
+
+    pub(crate) fn cache_stats(&self) -> &EvalCacheStats {
+        &self.reader.stats
     }
 
     pub(crate) async fn evaluate(&mut self, stmt: EvalStmt) -> EvalResult<ExprResult> {
@@ -905,6 +983,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         query_end: Timestamp,
         evaluation_ts: Timestamp,
     ) -> EvalResult<ExprResult> {
+        let ms_start = std::time::Instant::now();
         let vector_selector = &matrix_selector.vs;
         let range = matrix_selector.range;
 
@@ -943,10 +1022,13 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 continue;
             }
 
+            let sel_start = std::time::Instant::now();
             let candidates =
                 evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
                     .await
                     .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+            self.reader.stats.selector_eval_calls += 1;
+            self.reader.stats.selector_eval_total_us += sel_start.elapsed().as_micros() as u64;
 
             if candidates.is_empty() {
                 continue;
@@ -954,6 +1036,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
             let candidates_vec: Vec<_> = candidates.into_iter().collect();
             let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
+            self.reader.preload_samples(&bucket, &candidates_vec).await?;
 
             for series_id in candidates_vec {
                 let series_spec = match forward_index_view.get_spec(&series_id) {
@@ -981,6 +1064,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 }
             }
         }
+        self.reader.stats.matrix_selector_calls += 1;
+        self.reader.stats.matrix_selector_total_us += ms_start.elapsed().as_micros() as u64;
 
         let mut range_vector = Vec::new();
         for (labels, values) in series_map {
@@ -1331,9 +1416,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 continue;
             }
 
-            // Batch load forward index for all candidates upfront
+            // Batch load forward index and samples for all candidates upfront
             let candidates_vec: Vec<_> = candidates.into_iter().collect();
             let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
+            self.reader.preload_samples(&bucket, &candidates_vec).await?;
 
             for series_id in candidates_vec {
                 // Get series spec from forward index view (batched lookup)
