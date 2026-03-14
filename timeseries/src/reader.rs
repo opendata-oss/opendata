@@ -175,9 +175,7 @@ impl TimeSeriesDbReader {
         )
         .await?;
 
-        let query_cache = Cache::builder()
-            .max_capacity(config.cache_capacity)
-            .build();
+        let query_cache = Cache::builder().max_capacity(config.cache_capacity).build();
 
         // Eagerly load the bucket list so we're ready to serve queries.
         let all_buckets = storage.get_buckets_in_range(None, None).await?;
@@ -306,10 +304,10 @@ fn filter_buckets_in_range(
     start_secs: Option<i64>,
     end_secs: Option<i64>,
 ) -> Vec<TimeBucket> {
-    if let (Some(start), Some(end)) = (start_secs, end_secs) {
-        if end < start {
-            return Vec::new();
-        }
+    if let (Some(start), Some(end)) = (start_secs, end_secs)
+        && end < start
+    {
+        return Vec::new();
     }
     let start_min = start_secs.map(|s| (s / 60) as u32);
     let end_min = end_secs.map(|e| (e / 60) as u32);

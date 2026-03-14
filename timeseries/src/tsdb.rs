@@ -10,7 +10,7 @@ use futures::stream::{self, StreamExt};
 use moka::future::Cache;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 use tokio::sync::RwLock;
-use tracing::{error, info_span, Instrument};
+use tracing::{Instrument, error, info_span};
 
 use crate::error::QueryError;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
@@ -131,8 +131,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
                 lookback_delta,
             };
 
-            let query_time_secs =
-                query_time.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+            let query_time_secs = query_time.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
             let lookback_start_secs = query_time
                 .checked_sub(lookback_delta)
                 .unwrap_or(UNIX_EPOCH)
@@ -387,7 +386,11 @@ pub(crate) async fn evaluate_range(
         steps = step_count,
         first_step_ms = first_step_ms,
         loop_elapsed_ms = loop_elapsed_ms,
-        avg_step_ms = if step_count > 0 { loop_elapsed_ms / step_count } else { 0 },
+        avg_step_ms = if step_count > 0 {
+            loop_elapsed_ms / step_count
+        } else {
+            0
+        },
         samples_cache_hits = cache_stats.samples_cache_hits,
         samples_cache_misses = cache_stats.samples_cache_misses,
         samples_filter_total_us = cache_stats.samples_filter_total_us,
@@ -604,18 +607,29 @@ impl Tsdb {
     async fn get_bucket(&self, bucket: TimeBucket) -> Result<Arc<MiniTsdb>> {
         // 1. Check ingest cache first (has freshest data)
         if let Some(mini) = self.ingest_cache.get(&bucket).await {
-            tracing::info!(bucket_start = bucket.start, cache = "ingest", "bucket cache hit");
+            tracing::info!(
+                bucket_start = bucket.start,
+                cache = "ingest",
+                "bucket cache hit"
+            );
             return Ok(mini);
         }
 
         // 2. Check query cache
         if let Some(mini) = self.query_cache.get(&bucket).await {
-            tracing::info!(bucket_start = bucket.start, cache = "query", "bucket cache hit");
+            tracing::info!(
+                bucket_start = bucket.start,
+                cache = "query",
+                "bucket cache hit"
+            );
             return Ok(mini);
         }
 
         // 3. Load from storage into query cache (NOT ingest cache)
-        tracing::info!(bucket_start = bucket.start, "bucket cache miss, loading from storage");
+        tracing::info!(
+            bucket_start = bucket.start,
+            "bucket cache miss, loading from storage"
+        );
         let mini = Arc::new(MiniTsdb::load(bucket, self.storage.clone()).await?);
         self.query_cache.insert(bucket, mini.clone()).await;
         Ok(mini)
