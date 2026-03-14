@@ -7,6 +7,9 @@ use common::storage::StorageSnapshot;
 use common::{Storage, StorageRead};
 
 const WRITE_CHANNEL: &str = "write";
+/// When the number of series to load exceeds this threshold per bucket,
+/// use a sequential scan instead of individual point reads.
+const BATCH_SCAN_THRESHOLD: usize = 50;
 
 use crate::delta::{TsdbContext, TsdbWriteDelta};
 use crate::error::Error;
@@ -113,6 +116,44 @@ impl BucketQueryReader for MiniQueryReader {
                 Ok(Vec::new())
             }
         }
+    }
+
+    async fn samples_batch(
+        &self,
+        series_ids: &[SeriesId],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<HashMap<SeriesId, Vec<Sample>>> {
+        if series_ids.len() < BATCH_SCAN_THRESHOLD {
+            // Small batch: use individual gets (default implementation)
+            let mut result = HashMap::with_capacity(series_ids.len());
+            for &id in series_ids {
+                let samples = self.samples(id, start_ms, end_ms).await?;
+                result.insert(id, samples);
+            }
+            return Ok(result);
+        }
+
+        // Large batch: use sequential scan over the bucket's time series range
+        self.snapshot
+            .get_time_series_batch(&self.bucket, series_ids)
+            .await
+    }
+
+    async fn forward_index_batch(
+        &self,
+        series_ids: &[SeriesId],
+    ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
+        if series_ids.len() < BATCH_SCAN_THRESHOLD {
+            return self.forward_index(series_ids).await;
+        }
+
+        // Large batch: use sequential scan over the bucket's forward index range
+        let forward_index = self
+            .snapshot
+            .get_forward_index_batch(&self.bucket, series_ids)
+            .await?;
+        Ok(Box::new(forward_index))
     }
 }
 

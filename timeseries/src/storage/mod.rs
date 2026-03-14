@@ -4,10 +4,12 @@ use common::{Record, Storage, StorageRead};
 use futures::stream::{self, StreamExt};
 use roaring::RoaringBitmap;
 
+use std::collections::{HashMap, HashSet};
+
 use crate::index::{InvertedIndex, SeriesSpec};
 use crate::model::{Sample, SeriesFingerprint, SeriesId, TimeBucket};
 use crate::serde::key::TimeSeriesKey;
-use crate::serde::timeseries::TimeSeriesValue;
+use crate::serde::timeseries::{TimeSeriesIterator, TimeSeriesValue};
 use crate::{
     index::ForwardIndex,
     model::Label,
@@ -251,6 +253,66 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         tracing::Span::current().record("num_entries", count);
 
         Ok(max_series_id)
+    }
+
+    /// Load samples for a batch of series using a single sequential scan.
+    ///
+    /// Instead of N individual `get()` calls, this scans the entire time series
+    /// key range for the bucket and filters to the requested series IDs. For
+    /// large candidate sets (e.g. 3796 series), a single sequential scan is
+    /// dramatically faster than thousands of random point reads because SST
+    /// blocks are read linearly with good cache locality.
+    #[tracing::instrument(level = "info", skip(self, bucket, series_ids), fields(bucket_start = bucket.start, wanted = series_ids.len(), scanned))]
+    async fn get_time_series_batch(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<HashMap<SeriesId, Vec<Sample>>> {
+        let wanted: HashSet<SeriesId> = series_ids.iter().copied().collect();
+        let range = TimeSeriesKey::bucket_range(bucket);
+        let mut iter = self.scan_iter(range).await?;
+        let mut result = HashMap::with_capacity(series_ids.len());
+        let mut scanned = 0u64;
+        while let Some(record) = iter.next().await? {
+            scanned += 1;
+            let key = TimeSeriesKey::decode(record.key.as_ref())?;
+            if wanted.contains(&key.series_id) {
+                let samples: Vec<Sample> = match TimeSeriesIterator::new(record.value.as_ref()) {
+                    Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+                    None => Vec::new(),
+                };
+                result.insert(key.series_id, samples);
+            }
+        }
+        tracing::Span::current().record("scanned", scanned);
+        Ok(result)
+    }
+
+    /// Load forward index entries for a batch of series using a single scan.
+    ///
+    /// Similar to `get_time_series_batch`, this uses a sequential scan instead
+    /// of individual gets when the candidate set is large.
+    #[tracing::instrument(level = "info", skip(self, bucket, series_ids), fields(bucket_start = bucket.start, wanted = series_ids.len(), scanned))]
+    async fn get_forward_index_batch(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<ForwardIndex> {
+        let wanted: HashSet<SeriesId> = series_ids.iter().copied().collect();
+        let range = ForwardIndexKey::bucket_range(bucket);
+        let mut iter = self.scan_iter(range).await?;
+        let result = ForwardIndex::default();
+        let mut scanned = 0u64;
+        while let Some(record) = iter.next().await? {
+            scanned += 1;
+            let key = ForwardIndexKey::decode(record.key.as_ref())?;
+            if wanted.contains(&key.series_id) {
+                let value = ForwardIndexValue::decode(record.value.as_ref())?;
+                result.series.insert(key.series_id, value.into());
+            }
+        }
+        tracing::Span::current().record("scanned", scanned);
+        Ok(result)
     }
 
     /// Get all unique values for a specific label name within a bucket.

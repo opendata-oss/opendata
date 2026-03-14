@@ -708,43 +708,51 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
 
     /// Preload samples for all (bucket, series_ids) pairs concurrently across
     /// all buckets in a single parallel batch.
+    ///
+    /// Uses a sequential scan per bucket (via `samples_batch`) when the number
+    /// of uncached series is large, which is dramatically faster than thousands
+    /// of individual point reads.
     pub(crate) async fn preload_all_samples(
         &mut self,
         bucket_candidates: &[(TimeBucket, Vec<SeriesId>)],
     ) -> Result<()> {
-        // Collect all uncached (bucket, series_id) pairs across all buckets.
-        let uncached: Vec<(TimeBucket, SeriesId)> = bucket_candidates
-            .iter()
-            .flat_map(|(bucket, series_ids)| {
-                series_ids
-                    .iter()
-                    .filter(|id| self.cache.get_samples(bucket, id).is_none())
-                    .map(move |&id| (*bucket, id))
-            })
-            .collect();
+        // Group uncached series by bucket.
+        let mut uncached_by_bucket: Vec<(TimeBucket, Vec<SeriesId>)> = Vec::new();
+        for (bucket, series_ids) in bucket_candidates {
+            let uncached_ids: Vec<SeriesId> = series_ids
+                .iter()
+                .filter(|id| self.cache.get_samples(bucket, id).is_none())
+                .copied()
+                .collect();
+            if !uncached_ids.is_empty() {
+                uncached_by_bucket.push((*bucket, uncached_ids));
+            }
+        }
 
-        if uncached.is_empty() {
+        if uncached_by_bucket.is_empty() {
             return Ok(());
         }
 
+        // Use batch scan per bucket (scan vs individual gets decided by the reader)
         let reader = self.reader;
         let results: Vec<std::result::Result<_, crate::error::Error>> =
-            futures::stream::iter(uncached)
-                .map(|(bucket, series_id)| async move {
-                    let samples = reader
-                        .samples(&bucket, series_id, i64::MIN, i64::MAX)
+            futures::stream::iter(uncached_by_bucket)
+                .map(|(bucket, series_ids)| async move {
+                    let batch = reader
+                        .samples_batch(&bucket, &series_ids, i64::MIN, i64::MAX)
                         .await?;
-                    Ok((bucket, series_id, samples))
+                    Ok((bucket, batch))
                 })
-                .buffer_unordered(24)
+                .buffer_unordered(8)
                 .collect()
                 .await;
 
-        self.stats.samples_cache_misses += results.len() as u64;
-
         for result in results {
-            let (bucket, series_id, samples) = result?;
-            self.cache.cache_samples(bucket, series_id, samples);
+            let (bucket, batch) = result?;
+            self.stats.samples_cache_misses += batch.len() as u64;
+            for (series_id, samples) in batch {
+                self.cache.cache_samples(bucket, series_id, samples);
+            }
         }
 
         Ok(())
@@ -796,6 +804,9 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
     }
 
     /// Preload forward indexes for multiple (bucket, series_ids) pairs concurrently.
+    ///
+    /// Uses a sequential scan per bucket (via `forward_index_batch`) when the
+    /// candidate set is large.
     pub(crate) async fn preload_forward_indexes(
         &mut self,
         bucket_candidates: &[(TimeBucket, Vec<SeriesId>)],
@@ -818,10 +829,10 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         let results: Vec<std::result::Result<_, crate::error::Error>> =
             futures::stream::iter(uncached)
                 .map(|(bucket, series_ids)| async move {
-                    let idx = reader.forward_index(&bucket, &series_ids).await?;
+                    let idx = reader.forward_index_batch(&bucket, &series_ids).await?;
                     Ok((bucket, series_ids, idx))
                 })
-                .buffer_unordered(24)
+                .buffer_unordered(8)
                 .collect()
                 .await;
 

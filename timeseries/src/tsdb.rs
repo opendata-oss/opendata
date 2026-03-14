@@ -953,6 +953,30 @@ impl QueryReader for TsdbQueryReader {
         })?;
         mini.samples(series_id, start_ms, end_ms).await
     }
+
+    async fn samples_batch(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<HashMap<SeriesId, Vec<Sample>>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.samples_batch(series_ids, start_ms, end_ms).await
+    }
+
+    async fn forward_index_batch(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.forward_index_batch(series_ids).await
+    }
 }
 
 #[cfg(test)]

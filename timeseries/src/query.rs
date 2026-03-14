@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
@@ -44,6 +46,32 @@ pub(crate) trait BucketQueryReader: Send + Sync {
     /// Returns samples sorted by timestamp with duplicates removed (head takes priority).
     async fn samples(&self, series_id: SeriesId, start_ms: i64, end_ms: i64)
     -> Result<Vec<Sample>>;
+
+    /// Load samples for many series at once using a sequential scan.
+    /// Returns a map from series_id to its samples.
+    /// Default implementation falls back to individual reads.
+    async fn samples_batch(
+        &self,
+        series_ids: &[SeriesId],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<HashMap<SeriesId, Vec<Sample>>> {
+        let mut result = HashMap::with_capacity(series_ids.len());
+        for &id in series_ids {
+            let samples = self.samples(id, start_ms, end_ms).await?;
+            result.insert(id, samples);
+        }
+        Ok(result)
+    }
+
+    /// Load forward index for many series at once using a sequential scan.
+    /// Default implementation falls back to the standard forward_index method.
+    async fn forward_index_batch(
+        &self,
+        series_ids: &[SeriesId],
+    ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
+        self.forward_index(series_ids).await
+    }
 }
 
 /// Trait for read-only queries that may span multiple time buckets.
@@ -84,6 +112,22 @@ pub(crate) trait QueryReader: Send + Sync {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<Sample>>;
+
+    /// Load samples for many series at once from a specific bucket using a scan.
+    async fn samples_batch(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<HashMap<SeriesId, Vec<Sample>>>;
+
+    /// Load forward index for many series at once from a specific bucket using a scan.
+    async fn forward_index_batch(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>>;
 }
 
 #[cfg(any(test, feature = "bench-internals"))]
@@ -198,6 +242,29 @@ pub(crate) mod test_utils {
                     bucket
                 )))
             }
+        }
+
+        async fn samples_batch(
+            &self,
+            bucket: &TimeBucket,
+            series_ids: &[SeriesId],
+            start_ms: i64,
+            end_ms: i64,
+        ) -> Result<HashMap<SeriesId, Vec<Sample>>> {
+            let mut result = HashMap::new();
+            for &id in series_ids {
+                let samples = self.samples(bucket, id, start_ms, end_ms).await?;
+                result.insert(id, samples);
+            }
+            Ok(result)
+        }
+
+        async fn forward_index_batch(
+            &self,
+            bucket: &TimeBucket,
+            series_ids: &[SeriesId],
+        ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
+            self.forward_index(bucket, series_ids).await
         }
     }
 
