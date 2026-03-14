@@ -29,6 +29,8 @@ use promql_parser::parser::{
 pub enum EvaluationError {
     StorageError(String),
     InternalError(String),
+    /// Invalid user input (e.g. unsupported regex in selector).
+    InvalidSelector(String),
 }
 
 impl Display for EvaluationError {
@@ -36,6 +38,9 @@ impl Display for EvaluationError {
         match self {
             EvaluationError::StorageError(err) => write!(f, "PromQL evaluation error: {err}"),
             EvaluationError::InternalError(err) => write!(f, "PromQL internal error: {err}"),
+            EvaluationError::InvalidSelector(err) => {
+                write!(f, "invalid selector: {err}")
+            }
         }
     }
 }
@@ -1689,7 +1694,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         // === Phase 1: Preload inverted indexes for all buckets in parallel ===
         let inverted_terms = selector_inverted_terms(vector_selector)
-            .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+            .map_err(|e| EvaluationError::InvalidSelector(e.to_string()))?;
         self.reader
             .preload_inverted_indexes(&buckets, &inverted_terms)
             .await?;
