@@ -43,8 +43,8 @@ serde_json = "1.0"
 serde_with = { version = "3", features = ["base64"] }
 serde_yaml = "0.9"
 foyer = "0.18"
-slatedb = "0.11.1"
-slatedb-common = "0.11.1"
+slatedb = { git = "https://github.com/apurvam/slatedb", branch = "multi-get-prototype" }
+slatedb-common = { git = "https://github.com/apurvam/slatedb", branch = "multi-get-prototype" }
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["full"] }
 tokio-util = "0.7"

@@ -450,6 +450,25 @@ impl StorageRead for SlateDbStorageReader {
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
     }
+
+    #[tracing::instrument(level = "debug", skip_all, fields(num_keys = keys.len(), num_found, num_scanned))]
+    async fn multi_get(
+        &self,
+        keys: &[Bytes],
+    ) -> StorageResult<std::collections::HashMap<Bytes, Record>> {
+        let result = self
+            .reader
+            .multi_get(keys)
+            .await
+            .map_err(StorageError::from_storage)?;
+
+        tracing::Span::current().record("num_found", result.len());
+
+        Ok(result
+            .into_iter()
+            .map(|(k, v)| (k.clone(), Record::new(k, v)))
+            .collect())
+    }
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ use common::{Record, Storage, StorageRead};
 use futures::stream::{self, StreamExt};
 use roaring::RoaringBitmap;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::index::{InvertedIndex, SeriesSpec};
 use crate::model::{Sample, SeriesFingerprint, SeriesId, TimeBucket};
@@ -255,114 +255,73 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         Ok(max_series_id)
     }
 
-    /// Load samples for a batch of series using a narrowed sequential scan.
+    /// Load samples for a batch of series using multi_get.
     ///
-    /// Scans from the minimum to maximum series_id key, filtering to only
-    /// the requested IDs via HashSet lookup. This is faster than N individual
-    /// `get()` calls because sequential scan has much lower per-record overhead
-    /// (~0.35ms vs ~6ms for point reads due to LSM tree traversal).
-    ///
-    /// Stops early once all requested series have been found.
-    #[tracing::instrument(level = "info", skip(self, bucket, series_ids), fields(bucket_start = bucket.start, wanted = series_ids.len(), scanned, range_size))]
+    /// Uses the storage layer's multi_get which internally performs a
+    /// sequential scan from min to max key. This is much faster than
+    /// individual get() calls because it amortizes SST index reads and
+    /// data block reads across all requested keys.
+    #[tracing::instrument(level = "info", skip(self, bucket, series_ids), fields(bucket_start = bucket.start, wanted = series_ids.len(), found))]
     async fn get_time_series_batch(
         &self,
         bucket: &TimeBucket,
         series_ids: &[SeriesId],
     ) -> Result<HashMap<SeriesId, Vec<Sample>>> {
-        let wanted: HashSet<SeriesId> = series_ids.iter().copied().collect();
-        let min_id = *series_ids.iter().min().unwrap();
-        let max_id = *series_ids.iter().max().unwrap();
-        let range_size = (max_id - min_id + 1) as u64;
-        tracing::Span::current().record("range_size", range_size);
-
-        // Narrow scan from min to max+1 series_id key
-        let start_key = TimeSeriesKey {
-            time_bucket: bucket.start,
-            bucket_size: bucket.size,
-            series_id: min_id,
-        }
-        .encode();
-        let end_key = TimeSeriesKey {
-            time_bucket: bucket.start,
-            bucket_size: bucket.size,
-            series_id: max_id.wrapping_add(1),
-        }
-        .encode();
-        let range = common::BytesRange::new(
-            std::ops::Bound::Included(start_key),
-            std::ops::Bound::Excluded(end_key),
-        );
-
-        let mut iter = self.scan_iter(range).await?;
-        let mut result = HashMap::with_capacity(series_ids.len());
-        let mut scanned = 0u64;
-        let mut found = 0usize;
-        while let Some(record) = iter.next().await? {
-            scanned += 1;
-            let key = TimeSeriesKey::decode(record.key.as_ref())?;
-            if wanted.contains(&key.series_id) {
-                let samples: Vec<Sample> = match TimeSeriesIterator::new(record.value.as_ref()) {
-                    Some(iter) => iter.filter_map(|r| r.ok()).collect(),
-                    None => Vec::new(),
-                };
-                result.insert(key.series_id, samples);
-                found += 1;
-                if found == wanted.len() {
-                    break; // All requested series found
+        let keys: Vec<bytes::Bytes> = series_ids
+            .iter()
+            .map(|&series_id| {
+                TimeSeriesKey {
+                    time_bucket: bucket.start,
+                    bucket_size: bucket.size,
+                    series_id,
                 }
-            }
+                .encode()
+            })
+            .collect();
+
+        let records = self.multi_get(&keys).await?;
+        let mut result = HashMap::with_capacity(records.len());
+
+        for (key_bytes, record) in records {
+            let key = TimeSeriesKey::decode(key_bytes.as_ref())?;
+            let samples: Vec<Sample> = match TimeSeriesIterator::new(record.value.as_ref()) {
+                Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+                None => Vec::new(),
+            };
+            result.insert(key.series_id, samples);
         }
-        tracing::Span::current().record("scanned", scanned);
+        tracing::Span::current().record("found", result.len());
         Ok(result)
     }
 
-    /// Load forward index entries for a batch of series using a narrowed scan.
-    #[tracing::instrument(level = "info", skip(self, bucket, series_ids), fields(bucket_start = bucket.start, wanted = series_ids.len(), scanned, range_size))]
+    /// Load forward index entries for a batch of series using multi_get.
+    #[tracing::instrument(level = "info", skip(self, bucket, series_ids), fields(bucket_start = bucket.start, wanted = series_ids.len(), found))]
     async fn get_forward_index_batch(
         &self,
         bucket: &TimeBucket,
         series_ids: &[SeriesId],
     ) -> Result<ForwardIndex> {
-        let wanted: HashSet<SeriesId> = series_ids.iter().copied().collect();
-        let min_id = *series_ids.iter().min().unwrap();
-        let max_id = *series_ids.iter().max().unwrap();
-        let range_size = (max_id - min_id + 1) as u64;
-        tracing::Span::current().record("range_size", range_size);
-
-        let start_key = ForwardIndexKey {
-            time_bucket: bucket.start,
-            bucket_size: bucket.size,
-            series_id: min_id,
-        }
-        .encode();
-        let end_key = ForwardIndexKey {
-            time_bucket: bucket.start,
-            bucket_size: bucket.size,
-            series_id: max_id.wrapping_add(1),
-        }
-        .encode();
-        let range = common::BytesRange::new(
-            std::ops::Bound::Included(start_key),
-            std::ops::Bound::Excluded(end_key),
-        );
-
-        let mut iter = self.scan_iter(range).await?;
-        let result = ForwardIndex::default();
-        let mut scanned = 0u64;
-        let mut found = 0usize;
-        while let Some(record) = iter.next().await? {
-            scanned += 1;
-            let key = ForwardIndexKey::decode(record.key.as_ref())?;
-            if wanted.contains(&key.series_id) {
-                let value = ForwardIndexValue::decode(record.value.as_ref())?;
-                result.series.insert(key.series_id, value.into());
-                found += 1;
-                if found == wanted.len() {
-                    break;
+        let keys: Vec<bytes::Bytes> = series_ids
+            .iter()
+            .map(|&series_id| {
+                ForwardIndexKey {
+                    time_bucket: bucket.start,
+                    bucket_size: bucket.size,
+                    series_id,
                 }
-            }
+                .encode()
+            })
+            .collect();
+
+        let records = self.multi_get(&keys).await?;
+        let result = ForwardIndex::default();
+
+        for (key_bytes, record) in records {
+            let key = ForwardIndexKey::decode(key_bytes.as_ref())?;
+            let value = ForwardIndexValue::decode(record.value.as_ref())?;
+            result.series.insert(key.series_id, value.into());
         }
-        tracing::Span::current().record("scanned", scanned);
+        tracing::Span::current().record("found", result.series.len());
         Ok(result)
     }
 

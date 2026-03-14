@@ -709,48 +709,54 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
     /// Preload samples for all (bucket, series_ids) pairs concurrently across
     /// all buckets in a single parallel batch.
     ///
-    /// Uses a sequential scan per bucket (via `samples_batch`) when the number
-    /// of uncached series is large, which is dramatically faster than thousands
-    /// of individual point reads.
+    /// Uses high concurrency (128) for individual gets, flattened across all
+    /// buckets into a single stream for maximum parallelism.
     pub(crate) async fn preload_all_samples(
         &mut self,
         bucket_candidates: &[(TimeBucket, Vec<SeriesId>)],
     ) -> Result<()> {
-        // Group uncached series by bucket.
-        let mut uncached_by_bucket: Vec<(TimeBucket, Vec<SeriesId>)> = Vec::new();
-        for (bucket, series_ids) in bucket_candidates {
-            let uncached_ids: Vec<SeriesId> = series_ids
-                .iter()
-                .filter(|id| self.cache.get_samples(bucket, id).is_none())
-                .copied()
-                .collect();
-            if !uncached_ids.is_empty() {
-                uncached_by_bucket.push((*bucket, uncached_ids));
-            }
-        }
+        // Group uncached series by bucket for batch loading.
+        let uncached_by_bucket: Vec<(TimeBucket, Vec<SeriesId>)> = bucket_candidates
+            .iter()
+            .filter_map(|(bucket, series_ids)| {
+                let uncached: Vec<SeriesId> = series_ids
+                    .iter()
+                    .filter(|id| self.cache.get_samples(bucket, id).is_none())
+                    .copied()
+                    .collect();
+                if uncached.is_empty() {
+                    None
+                } else {
+                    Some((*bucket, uncached))
+                }
+            })
+            .collect();
 
         if uncached_by_bucket.is_empty() {
             return Ok(());
         }
 
-        // Use batch scan per bucket (scan vs individual gets decided by the reader)
+        let total_uncached: usize = uncached_by_bucket.iter().map(|(_, ids)| ids.len()).sum();
+
+        // Load all buckets concurrently using samples_batch (which uses multi_get internally).
         let reader = self.reader;
         let results: Vec<std::result::Result<_, crate::error::Error>> =
             futures::stream::iter(uncached_by_bucket)
                 .map(|(bucket, series_ids)| async move {
-                    let batch = reader
+                    let samples_map = reader
                         .samples_batch(&bucket, &series_ids, i64::MIN, i64::MAX)
                         .await?;
-                    Ok((bucket, batch))
+                    Ok((bucket, samples_map))
                 })
-                .buffer_unordered(8)
+                .buffer_unordered(4) // one per bucket, not per series
                 .collect()
                 .await;
 
+        self.stats.samples_cache_misses += total_uncached as u64;
+
         for result in results {
-            let (bucket, batch) = result?;
-            self.stats.samples_cache_misses += batch.len() as u64;
-            for (series_id, samples) in batch {
+            let (bucket, samples_map) = result?;
+            for (series_id, samples) in samples_map {
                 self.cache.cache_samples(bucket, series_id, samples);
             }
         }

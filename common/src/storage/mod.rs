@@ -5,6 +5,7 @@ pub mod loader;
 pub mod slate;
 pub mod util;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -252,6 +253,24 @@ pub trait StorageRead: Send + Sync {
         }
         tracing::Span::current().record("num_records", records.len());
         Ok(records)
+    }
+
+    /// Retrieves multiple records by their keys in a single batch operation.
+    ///
+    /// Returns a map of key to record for all keys that were found.
+    /// Keys not present in storage are omitted from the result.
+    ///
+    /// The default implementation falls back to individual `get()` calls.
+    /// Implementations may override this for better performance (e.g., using
+    /// a scan from min to max key with a filter).
+    async fn multi_get(&self, keys: &[Bytes]) -> StorageResult<HashMap<Bytes, Record>> {
+        let mut results = HashMap::with_capacity(keys.len());
+        for key in keys {
+            if let Some(record) = self.get(key.clone()).await? {
+                results.insert(key.clone(), record);
+            }
+        }
+        Ok(results)
     }
 }
 
