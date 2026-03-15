@@ -3,9 +3,6 @@
 //! Demonstrates using `VectorDbReader` directly from Rust code to perform
 //! similarity searches. Embeds query text via the embedding HTTP server
 //! and searches the vector database without going through the HTTP API.
-//!
-//! Usage:
-//!   embedded-reader <config.yaml> <embedding-server-url> [query]
 
 use std::env;
 use std::process;
