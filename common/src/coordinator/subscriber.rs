@@ -25,9 +25,22 @@
 //!     let initial_view = subscriber.initialize();
 //!     // Bootstrap read state from initial_view ...
 //!
-//!     while let Ok(view) = subscriber.recv().await {
-//!         // Process the view (update read state)...
-//!         subscriber.update_durable(epoch);
+//!     loop {
+//!         match subscriber.recv().await {
+//!             Ok(view) => {
+//!                 // Process the view (update read state)...
+//!                 subscriber.update_durable(epoch);
+//!             }
+//!             Err(SubscribeError::Lagged) => {
+//!                 // Re-subscribe to get a consistent initial view, then
+//!                 // recover db-specific state from the snapshot.
+//!                 (subscriber, _monitor) = handle.resubscribe();
+//!                 let view = subscriber.initialize();
+//!                 // db.recover_from_view(&view).await?;
+//!             }
+//!             Err(SubscribeError::Shutdown) => break,
+//!             Err(SubscribeError::NotInitialized) => unreachable!(),
+//!         }
 //!     }
 //! });
 //!
@@ -49,6 +62,8 @@ pub enum SubscribeError {
     Shutdown,
     /// [`ViewSubscriber::recv()`] was called before [`ViewSubscriber::initialize()`].
     NotInitialized,
+    /// The subscriber is lagging behind the coordinator's progress.
+    Lagged,
 }
 
 impl std::fmt::Display for SubscribeError {
@@ -58,6 +73,7 @@ impl std::fmt::Display for SubscribeError {
             SubscribeError::NotInitialized => {
                 write!(f, "initialize() must be called before recv()")
             }
+            SubscribeError::Lagged => write!(f, "subscriber is lagging behind"),
         }
     }
 }
@@ -113,23 +129,13 @@ impl<D: Delta> ViewSubscriber<D> {
         if self.initial_view.is_some() {
             return Err(SubscribeError::NotInitialized);
         }
-        loop {
-            match self.view_rx.recv().await {
-                Ok(view) => {
-                    return Ok(view);
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // TODO: Skipping missed views is not safe in general.
-                    // Consumers may depend on processing every view (e.g. to
-                    // apply new segments from each flush). Recovery likely
-                    // requires killing this subscriber and resubscribing to
-                    // get a fresh initial view to reset state from.
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    return Err(SubscribeError::Shutdown);
-                }
+        match self.view_rx.recv().await {
+            Ok(view) => Ok(view),
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                // the subscriber is lagging behind the coordinator's progress.
+                Err(SubscribeError::Lagged)
             }
+            Err(broadcast::error::RecvError::Closed) => Err(SubscribeError::Shutdown),
         }
     }
 

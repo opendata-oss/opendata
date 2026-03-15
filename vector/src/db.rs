@@ -582,6 +582,23 @@ impl VectorDb {
         self.centroid_graph.len()
     }
 
+    /// Recover subscriber state from a view's storage snapshot.
+    ///
+    /// When a view subscriber lags and misses broadcasts, it should call
+    /// `handle.resubscribe()` to get a fresh view, then call this method
+    /// to restore its in-memory state from the snapshot.
+    ///
+    /// The returned snapshot contains the durable centroid state (centroids,
+    /// posting lists, deleted vectors, and metadata). A subscriber can use this
+    /// to re-initialize its in-memory tracking (e.g., centroid counts for the
+    /// LIRE rebalancer).
+    pub fn recover_from_view<D: common::coordinator::Delta>(
+        &self,
+        view: &Arc<common::coordinator::View<D>>,
+    ) -> Arc<dyn StorageRead> {
+        view.snapshot.clone()
+    }
+
     /// Search for k-nearest neighbors to a query vector.
     ///
     /// This implements the SPANN-style query algorithm:

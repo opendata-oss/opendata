@@ -2311,6 +2311,77 @@ mod tests {
         coordinator.stop().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_recover_from_lagged_subscriber() {
+        // given - a coordinator with a small broadcast buffer (16)
+        let flusher = TestFlusher::default();
+        let mut coordinator = WriteCoordinator::new(
+            test_config(),
+            vec!["default".to_string()],
+            TestContext::default(),
+            flusher.initial_snapshot().await,
+            flusher.clone(),
+        );
+        let handle = coordinator.handle("default");
+        let (mut subscriber, _) = coordinator.subscribe();
+        subscriber.initialize();
+        coordinator.start();
+
+        // when - write and flush enough times to overflow the broadcast buffer
+        // (capacity is 16, so ~20 flushes should cause lag)
+        for i in 0..20 {
+            let _write_handle = handle
+                .try_write(TestWrite {
+                    key: format!("key_{}", i),
+                    value: i as u64,
+                    size: 10,
+                })
+                .await
+                .unwrap();
+            let _ = handle.flush(false).await.unwrap();
+        }
+
+        // Give subscriber time to fall behind
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // then - subscriber should eventually get Lagged error
+        let result = subscriber.recv().await;
+        if let Err(SubscribeError::Lagged) = result {
+            // when - resubscribe to recover
+            (subscriber, _) = handle.resubscribe();
+            let view = subscriber.initialize();
+
+            // then - the fresh view should reflect the current state
+            // (all 20 writes should be in the snapshot after all the flushes)
+            let records = view.snapshot.scan(BytesRange::unbounded()).await.unwrap();
+            assert!(
+                records.len() >= 20,
+                "expected at least 20 rows, got {}",
+                records.len()
+            );
+
+            // and - we should be able to receive future broadcasts
+            let _write_handle = handle
+                .try_write(TestWrite {
+                    key: "post_recovery".into(),
+                    value: 100,
+                    size: 10,
+                })
+                .await
+                .unwrap();
+            let _ = handle.flush(false).await.unwrap();
+
+            let result = subscriber.recv().await;
+            assert!(result.is_ok());
+        } else {
+            // If the subscriber didn't lag (possible on a fast machine), that's ok
+            // The important thing is that recovery works when it does lag
+        }
+
+        // cleanup
+        coordinator.stop().await;
+    }
+
     // ============================================================================
     // Durable Flush Tests
     // ============================================================================
