@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "bencher",
     "common",
+    "ingest",
     "keyvalue",
     "log",
     "log/bench",
@@ -11,6 +12,7 @@ members = [
     "timeseries/bench",
     "vector",
     "vector/bench",
+    "macros",
 ]
 
 [workspace.package]
@@ -32,7 +34,7 @@ fail = "0.5"
 futures = { version = "0.3", features = ["std"] }
 moka = { version = "0.12", features = ["future"] }
 bencher = { path = "./bencher" }
-common = { path = "./common", package = "opendata-common", version = "0.1.8" }
+common = { path = "./common", package = "opendata-common", version = "0.1.11" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 roaring = "0.10"
 rstest = "0.19"
@@ -40,7 +42,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_with = { version = "3", features = ["base64"] }
 serde_yaml = "0.9"
-slatedb = "0.10.1"
+foyer = "0.18"
+slatedb = "0.11.1"
+slatedb-common = "0.11.1"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["full"] }
 tokio-util = "0.7"
@@ -50,11 +54,14 @@ tower-http = { version = "0.5", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = "1.14.0"
+opentelemetry-proto = { version = "0.28", default-features = false, features = ["metrics", "gen-tonic-messages"] }
 prost = "0.13"
 proptest = "1"
 dashu-float = "0.4"
 snap = "1"
 criterion = "0.5"
+tempfile = "3"
+opendata-macros = { path = "./macros" }
 
 [profile.release]
 debug = true

@@ -1,19 +1,21 @@
-//! Testing utilities for the timeseries HTTP server.
+//! Testing utilities for the timeseries database.
 //!
-//! Provides helpers for integration tests that exercise HTTP endpoints
-//! using Axum's `oneshot()` infrastructure with a real SlateDB-backed TSDB.
+//! Provides helpers for integration tests and benchmarks with a real
+//! SlateDB-backed TSDB. HTTP-specific helpers live in the [`http`]
+//! submodule, which is only available when the `http-server` feature
+//! is enabled.
+
+#[cfg(feature = "http-server")]
+pub mod http;
 
 use std::sync::Arc;
 
-use axum::Router;
 use common::storage::config::SlateDbStorageConfig;
-use common::{StorageConfig, StorageRuntime, StorageSemantics, create_storage};
+use common::{StorageBuilder, StorageConfig, StorageSemantics};
 
 use common::Storage;
 
 use crate::model::Series;
-use crate::promql::metrics::Metrics;
-use crate::promql::server::build_router;
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::Tsdb;
 
@@ -23,17 +25,21 @@ pub use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig};
 
 // Re-export production types so integration tests use the real types.
 pub use crate::promql::response::{
-    ErrorResponse, LabelValuesResponse, LabelsResponse, MatrixSeries, QueryRangeResponse,
-    QueryRangeResult, QueryResponse, QueryResult, SeriesResponse, VectorSeries,
+    ErrorResponse, LabelValuesResponse, LabelsResponse, MatrixSeries, MetadataResponse,
+    QueryRangeResponse, QueryRangeResult, QueryResponse, QueryResult, QueryResultValue,
+    SeriesResponse, VectorSeries,
 };
+
+// Re-export conversion functions for benchmarks.
+pub use crate::promql::response::{query_value_to_response, range_result_to_response};
 
 /// Opaque handle to a test TSDB instance.
 ///
 /// Wraps the internal `Tsdb` so that integration tests can ingest data
 /// without the crate needing to expose `Tsdb` as a public type.
 pub struct TestTsdb {
-    inner: Arc<Tsdb>,
-    storage: Arc<dyn Storage>,
+    pub(crate) inner: Arc<Tsdb>,
+    pub(crate) storage: Arc<dyn Storage>,
 }
 
 impl TestTsdb {
@@ -64,25 +70,19 @@ pub async fn create_test_tsdb_with_config(object_store: ObjectStoreConfig) -> Te
         path: "bench-data".to_string(),
         object_store,
         settings_path: None,
+        block_cache: None,
     });
-    let storage = create_storage(
-        &config,
-        StorageRuntime::new(),
-        StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
-    )
-    .await
-    .unwrap();
+    let storage = StorageBuilder::new(&config)
+        .await
+        .unwrap()
+        .with_semantics(
+            StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
+        )
+        .build()
+        .await
+        .unwrap();
     TestTsdb {
         inner: Arc::new(Tsdb::new(storage.clone())),
         storage,
     }
-}
-
-/// Build the production Axum router — same routes, middleware, and state
-/// as [`crate::promql::server::PromqlServer::run()`] but without binding
-/// to a TCP port.
-pub fn build_app(tsdb: &TestTsdb) -> Router {
-    let mut metrics = Metrics::new();
-    tsdb.storage.register_metrics(metrics.registry_mut());
-    build_router(tsdb.inner.clone(), Arc::new(metrics))
 }

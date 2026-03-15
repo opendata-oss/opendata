@@ -8,8 +8,8 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use timeseries::testing::{
-    self, LabelValuesResponse, LabelsResponse, QueryRangeResponse, QueryResponse, SeriesResponse,
-    TestTsdb, VectorSeries,
+    self, LabelValuesResponse, LabelsResponse, MetadataResponse, QueryRangeResponse, QueryResponse,
+    QueryResultValue, SeriesResponse, TestTsdb,
 };
 use timeseries::{Label, MetricType, Sample, Series};
 use tower::ServiceExt;
@@ -25,19 +25,32 @@ const SAMPLE_TS_MS: i64 = 3_900_000;
 /// Same instant expressed in seconds (for query params).
 const SAMPLE_TS_SECS: i64 = 3900;
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
 async fn setup() -> (Router, TestTsdb) {
     let tsdb = testing::create_test_tsdb().await;
-    let app = testing::build_app(&tsdb);
+    let app = testing::http::build_app(&tsdb);
     (app, tsdb)
 }
 
 async fn setup_with_data() -> (Router, TestTsdb) {
     let (app, tsdb) = setup().await;
-    ingest_test_data(&tsdb).await;
+    ingest_test_data(&tsdb, SAMPLE_TS_MS).await;
     (app, tsdb)
 }
 
-async fn ingest_test_data(tsdb: &TestTsdb) {
+async fn setup_with_recent_data() -> (Router, TestTsdb) {
+    let (app, tsdb) = setup().await;
+    ingest_test_data(&tsdb, now_ms()).await;
+    (app, tsdb)
+}
+
+async fn ingest_test_data(tsdb: &TestTsdb, base_ts_ms: i64) {
     let series = vec![
         Series {
             labels: vec![
@@ -48,7 +61,7 @@ async fn ingest_test_data(tsdb: &TestTsdb) {
             metric_type: Some(MetricType::Gauge),
             unit: None,
             description: None,
-            samples: vec![Sample::new(SAMPLE_TS_MS, 42.0)],
+            samples: vec![Sample::new(base_ts_ms, 42.0)],
         },
         Series {
             labels: vec![
@@ -59,7 +72,7 @@ async fn ingest_test_data(tsdb: &TestTsdb) {
             metric_type: Some(MetricType::Gauge),
             unit: None,
             description: None,
-            samples: vec![Sample::new(SAMPLE_TS_MS + 1, 7.0)],
+            samples: vec![Sample::new(base_ts_ms + 1, 7.0)],
         },
     ];
 
@@ -389,16 +402,253 @@ async fn test_roundtrip() {
     let data = parsed.data.unwrap();
     assert_eq!(data.result_type, "vector");
 
-    // Deserialize the result as a vector of VectorSeries
-    let results: Vec<VectorSeries> = serde_json::from_value(data.result).unwrap();
+    let results = match data.result {
+        QueryResultValue::Vector(v) => v,
+        _ => panic!("expected Vector variant"),
+    };
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].metric.get("__name__").unwrap(),
+        results[0].0.labels.get("__name__").unwrap(),
         "http_requests_total"
     );
-    assert_eq!(results[0].metric.get("method").unwrap(), "GET");
-    // Value should be "42" (string representation)
-    assert_eq!(results[0].value.1, "42");
+    assert_eq!(results[0].0.labels.get("method").unwrap(), "GET");
+    // Value should be 42.0
+    assert_eq!(results[0].0.value, 42.0);
+}
+
+// ---------------------------------------------------------------------------
+// /api/v1/metadata
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_metadata() {
+    let (app, tsdb) = setup().await;
+
+    // Ingest data with metadata
+    let series = vec![Series {
+        labels: vec![
+            Label::metric_name("http_requests_total"),
+            Label::new("method", "GET"),
+        ],
+        metric_type: Some(MetricType::Gauge),
+        unit: Some("requests".to_string()),
+        description: Some("Total HTTP requests".to_string()),
+        samples: vec![Sample::new(SAMPLE_TS_MS, 42.0)],
+    }];
+    tsdb.ingest_samples(series).await;
+    tsdb.flush().await;
+
+    let req = Request::get("/api/v1/metadata")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let parsed: MetadataResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(parsed.status, "success");
+    let data = parsed.data.unwrap();
+    assert!(
+        data.contains_key("http_requests_total"),
+        "metadata should contain ingested metric"
+    );
+    let entries = &data["http_requests_total"];
+    assert!(!entries.is_empty());
+    assert_eq!(entries[0].0.metric_type.as_ref().unwrap().as_str(), "gauge");
+    assert_eq!(
+        entries[0].0.description.as_deref().unwrap(),
+        "Total HTTP requests"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// /federate
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_federate_no_match_returns_error() {
+    let (app, _) = setup().await;
+    let req = Request::get("/federate").body(Body::empty()).unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_federate_single_selector() {
+    let (app, _) = setup_with_recent_data().await;
+    let req = Request::get("/federate?match[]=http_requests_total")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        content_type.contains("text/plain"),
+        "expected text/plain content type, got: {content_type}"
+    );
+    let body = body_string(resp).await;
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(lines.len(), 2, "expected 2 series, got: {body}");
+    assert!(
+        lines.iter().all(|l| l.starts_with("http_requests_total{")),
+        "all lines should start with metric name, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_federate_multiple_selectors_dedup() {
+    let (app, _) = setup_with_recent_data().await;
+    // Both selectors match the same 2 series — should still return only 2 lines
+    let req = Request::get(
+        "/federate?match[]=http_requests_total&match[]=%7B__name__%3D%22http_requests_total%22%7D",
+    )
+    .body(Body::empty())
+    .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "dedup should prevent duplicates, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_federate_label_value_escaping() {
+    let (app, tsdb) = setup().await;
+
+    // Ingest a series with a label value that needs escaping
+    let series = vec![Series {
+        labels: vec![
+            Label::metric_name("test_metric"),
+            Label::new("path", "/api/v1\"weird\\path\nhere"),
+        ],
+        metric_type: Some(MetricType::Gauge),
+        unit: None,
+        description: None,
+        samples: vec![Sample::new(now_ms(), 1.0)],
+    }];
+    tsdb.ingest_samples(series).await;
+    tsdb.flush().await;
+
+    let req = Request::get("/federate?match[]=test_metric")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(
+        body.contains(r#"path="/api/v1\"weird\\path\nhere""#),
+        "label value should be escaped, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_federate_nonexistent_metric() {
+    let (app, _) = setup_with_data().await;
+    let req = Request::get("/federate?match[]=nonexistent_metric")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(
+        body.is_empty(),
+        "no matching series should return empty body, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_federate_dedup_with_unsorted_labels() {
+    let (app, tsdb) = setup().await;
+    let now_ms = now_ms();
+
+    // Ingest the same logical series twice with labels in different order.
+    // The TSDB may normalise order, but the dedup key must handle both cases.
+    let series = vec![
+        Series {
+            labels: vec![
+                Label::metric_name("order_test"),
+                Label::new("a", "1"),
+                Label::new("b", "2"),
+            ],
+            metric_type: Some(MetricType::Gauge),
+            unit: None,
+            description: None,
+            samples: vec![Sample::new(now_ms, 10.0)],
+        },
+        Series {
+            labels: vec![
+                Label::metric_name("order_test"),
+                Label::new("b", "2"),
+                Label::new("a", "1"),
+            ],
+            metric_type: Some(MetricType::Gauge),
+            unit: None,
+            description: None,
+            samples: vec![Sample::new(now_ms + 1, 20.0)],
+        },
+    ];
+    tsdb.ingest_samples(series).await;
+    tsdb.flush().await;
+
+    let req = Request::get("/federate?match[]=order_test")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "same series with different label order should dedup to 1 line, got: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Limit parameter
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_series_with_limit() {
+    let (app, _) = setup_with_data().await;
+    // There are 2 http_requests_total series; limit=1 should return only 1.
+    let form_body = format!(
+        "match[]=http_requests_total&start={}&end={}&limit=1",
+        SAMPLE_TS_SECS - 300,
+        SAMPLE_TS_SECS + 300,
+    );
+    let req = Request::post("/api/v1/series")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(form_body))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let parsed: SeriesResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(parsed.status, "success");
+    let data = parsed.data.unwrap();
+    assert_eq!(data.len(), 1, "limit=1 should return only 1 series");
 }
 
 // ---------------------------------------------------------------------------
@@ -446,7 +696,7 @@ async fn test_slatedb_metrics_reflect_writes() {
     let baseline_write_ops = parse_metric_value(&baseline_text, "slatedb_db_write_ops");
 
     // Ingest data and flush to trigger SlateDB writes
-    ingest_test_data(&tsdb).await;
+    ingest_test_data(&tsdb, SAMPLE_TS_MS).await;
 
     // Check that write_ops increased
     let req = Request::get("/metrics").body(Body::empty()).unwrap();

@@ -5,12 +5,9 @@
 //! listing) to any [`StorageRead`] implementation, and test helpers for
 //! writing log domain types to storage.
 
+use async_trait::async_trait;
 use std::collections::BTreeSet;
 use std::ops::Range;
-#[cfg(test)]
-use std::sync::Arc;
-
-use async_trait::async_trait;
 
 use crate::error::{Error, Result};
 use crate::model::{LogEntry, SegmentId};
@@ -192,22 +189,15 @@ pub(crate) trait LogStorageWrite: Storage {
 #[cfg(test)]
 impl<T: Storage + ?Sized> LogStorageWrite for T {}
 
-/// Creates an in-memory storage for testing.
-#[cfg(test)]
-pub(crate) fn in_memory_storage() -> Arc<dyn Storage> {
-    use common::storage::in_memory::InMemoryStorage;
-    Arc::new(InMemoryStorage::new())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::serde::SegmentMeta;
+    use opendata_macros::storage_test;
 
-    #[tokio::test]
-    async fn should_get_record_when_present() {
+    #[storage_test]
+    async fn should_get_record_when_present(storage: Arc<dyn Storage>) {
         // given
-        let storage = in_memory_storage();
         let key = Bytes::from("test-key");
         let value = Bytes::from("test-value");
         storage
@@ -223,11 +213,8 @@ mod tests {
         assert_eq!(result.unwrap().value, value);
     }
 
-    #[tokio::test]
-    async fn should_return_none_when_record_absent() {
-        // given
-        let storage = in_memory_storage();
-
+    #[storage_test]
+    async fn should_return_none_when_record_absent(storage: Arc<dyn Storage>) {
         // when
         let result = storage.get(Bytes::from("missing")).await.unwrap();
 
@@ -235,10 +222,9 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[tokio::test]
-    async fn should_scan_segments_in_order() {
+    #[storage_test]
+    async fn should_scan_segments_in_order(storage: Arc<dyn Storage>) {
         // given
-        let storage = in_memory_storage();
         let seg0 = LogSegment::new(0, SegmentMeta::new(0, 100));
         let seg1 = LogSegment::new(1, SegmentMeta::new(100, 200));
         let seg2 = LogSegment::new(2, SegmentMeta::new(200, 300));
@@ -256,10 +242,9 @@ mod tests {
         assert_eq!(segments[2].id(), 2);
     }
 
-    #[tokio::test]
-    async fn should_scan_segments_with_range() {
+    #[storage_test]
+    async fn should_scan_segments_with_range(storage: Arc<dyn Storage>) {
         // given
-        let storage = in_memory_storage();
         for i in 0u32..5 {
             let seg = LogSegment::new(i, SegmentMeta::new(i as u64 * 100, i as i64 * 100));
             storage.write_segment(&seg).await.unwrap();
@@ -275,10 +260,9 @@ mod tests {
         assert_eq!(segments[2].id(), 3);
     }
 
-    #[tokio::test]
-    async fn should_scan_entries_for_key() {
+    #[storage_test]
+    async fn should_scan_entries_for_key(storage: Arc<dyn Storage>) {
         // given
-        let storage = in_memory_storage();
         let segment = LogSegment::new(0, SegmentMeta::new(0, 100));
         storage.write_segment(&segment).await.unwrap();
 
@@ -309,10 +293,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn should_filter_entries_by_sequence_range() {
+    #[storage_test]
+    async fn should_filter_entries_by_sequence_range(storage: Arc<dyn Storage>) {
         // given
-        let storage = in_memory_storage();
         let segment = LogSegment::new(0, SegmentMeta::new(0, 100));
         storage.write_segment(&segment).await.unwrap();
 
@@ -339,10 +322,9 @@ mod tests {
         assert_eq!(entries[3].sequence, 6);
     }
 
-    #[tokio::test]
-    async fn should_return_empty_iterator_for_unknown_key() {
+    #[storage_test]
+    async fn should_return_empty_iterator_for_unknown_key(storage: Arc<dyn Storage>) {
         // given
-        let storage = in_memory_storage();
         let segment = LogSegment::new(0, SegmentMeta::new(0, 100));
         storage.write_segment(&segment).await.unwrap();
 
@@ -356,10 +338,9 @@ mod tests {
         assert!(iter.next().await.unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn should_write_and_read_seq_block() {
+    #[storage_test]
+    async fn should_write_and_read_seq_block(storage: Arc<dyn Storage>) {
         // given
-        let storage = in_memory_storage();
         let block = common::SeqBlock::new(1000, 500);
 
         // when
@@ -374,10 +355,9 @@ mod tests {
         assert_eq!(read_block.block_size, 500);
     }
 
-    #[tokio::test]
-    async fn should_put_with_options() {
+    #[storage_test]
+    async fn should_put_with_options(storage: Arc<dyn Storage>) {
         // given
-        let storage = in_memory_storage();
         let records = vec![
             common::Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
             common::Record::new(Bytes::from("k2"), Bytes::from("v2")).into(),

@@ -5,6 +5,7 @@
 **Authors**:
 
 - [Almog Gavra](https://github.com/agavra)
+- [Rohan Desai](https://github.com/rodesai)
 
 ## Summary
 
@@ -63,7 +64,7 @@ This RFC uses the `AttributeValue` enum defined in RFC 0002, which includes a `V
 
 ```rust
 pub enum AttributeValue {
-    Vector(Vec<f32>),  // API-level only; stored in VectorData
+    Vector(Vec<f32>),
     String(String),
     Int64(i64),
     Float64(f64),
@@ -71,11 +72,9 @@ pub enum AttributeValue {
 }
 ```
 
-The vector embedding is stored under the reserved field name `"vector"` in the fields HashMap,
+The vector embedding is stored under the reserved field name `"vector"` in the fields collection,
 enabling a unified data model where all attributes (including the vector) can be queried and
-retrieved consistently. The Vector variant is first as it is the primary data in a vector
-database. At the storage layer, vectors are stored in VectorData records while other attributes
-are stored in VectorMeta records.
+retrieved consistently.
 
 ### VectorDbRead Trait
 
@@ -107,7 +106,7 @@ use async_trait::async_trait;
 ///
 ///     let results = reader.search(query).await?;
 ///     for result in results {
-///         println!("{}: score={}", result.external_id, result.score);
+///         println!("{}: score={}", result.vector.id, result.score);
 ///     }
 ///     Ok(())
 /// }
@@ -167,7 +166,7 @@ pub trait VectorDbRead {
     ///
     /// # Returns
     ///
-    /// `Some(VectorRecord)` if found, `None` if not found or deleted.
+    /// `Some(Vector)` if found, `None` if not found or deleted.
     ///
     /// # Example
     ///
@@ -179,7 +178,7 @@ pub trait VectorDbRead {
     ///     println!("Category: {:?}", record.fields.get("category"));
     /// }
     /// ```
-    async fn get(&self, id: &str) -> Result<Option<VectorRecord>>;
+    async fn get(&self, id: &str) -> Result<Option<Vector>>;
 }
 ```
 
@@ -201,30 +200,39 @@ use common::StorageRead;
 ///
 /// # Obtaining a VectorDbReader
 ///
-/// A `VectorDbReader` can be created in two ways:
+/// A `VectorDbReader` can be created in a few ways:
 ///
-/// 1. From an existing `VectorDb`:
+/// 1. From an existing `VectorDb`, to read the state of the db at the time of creating the reader:
+/// ```ignore
+/// let reader = db.snapshot();
+/// ```
+///
+/// 2. From an existing `VectorDb` to see the latest updates to the db:
 /// ```ignore
 /// let reader = db.reader();
 /// ```
 ///
-/// 2. Opened directly:
+/// 3. Opened directly. In this case th reader will observe a fixed snapshot or the latest writes
+///    depending on config:
 /// ```ignore
 /// let reader = VectorDbReader::open(config).await?;
 /// ```
 ///
 /// # Thread Safety
 ///
-/// `VectorDbReader` is designed to be cloned and shared across threads.
-/// All methods take `&self` and are safe to call concurrently.
+/// `VectorDbReader` is designed to be shareable across threads.  All methods take `&self` and are
+/// safe to call concurrently.
 ///
 /// # Snapshot Semantics
 ///
 /// When opened directly via `open()`, a `VectorDbReader` operates on a storage snapshot taken
-/// at open time. It will not see writes that occur after opening.
+/// at open time, or periodically refreshes to see the latest writes, depending on config.
 ///
 /// When obtained from `VectorDb::reader()`, the reader shares the database's snapshot, which is
 /// updated after each flush operation.
+///
+/// When obtained from `VectorDb::snapshot()`, the reader sees a fixed snapshot taken at the time
+/// snapshot was called.
 ///
 /// # Example
 ///
@@ -256,21 +264,18 @@ use common::StorageRead;
 /// }
 /// ```
 pub struct VectorDbReader {
-    config: Config,
-    storage: Arc<dyn StorageRead>,
-    /// In-memory HNSW graph for centroid search (loaded lazily on first query).
-    centroid_graph: RwLock<Option<CentroidGraph>>,
+    // ...
 }
 
 impl VectorDbReader {
     /// Opens a read-only view of the vector database with the given configuration.
     ///
-    /// This creates a `VectorDbReader` that can query vectors but cannot write. The reader
-    /// operates on a storage snapshot taken at open time.
+    /// This creates a `VectorDbReader` that can query vectors but cannot write.
     ///
     /// # Arguments
     ///
-    /// * `config` - Configuration specifying storage backend and settings.
+    /// * `config` - Configuration specifying storage backend and settings, and optionally
+    ///              a checkpoint to fix reads to.
     ///
     /// # Errors
     ///
@@ -295,21 +300,6 @@ impl VectorDbReader {
             storage,
             centroid_graph: RwLock::new(None),
         })
-    }
-
-    /// Creates a VectorDbReader from an existing storage snapshot.
-    ///
-    /// This is used internally by `VectorDb::reader()` to create readers that share the
-    /// database's snapshot.
-    pub(crate) fn from_snapshot(
-        config: Config,
-        storage: Arc<dyn StorageRead>,
-    ) -> Self {
-        Self {
-            config,
-            storage,
-            centroid_graph: RwLock::new(None),
-        }
     }
 }
 ```
@@ -597,9 +587,9 @@ use std::collections::HashMap;
 ///
 /// Returned by `get()` operations.
 #[derive(Debug, Clone)]
-pub struct VectorRecord {
-    /// External vector ID (user-provided)
-    pub external_id: String,
+pub struct Vector {
+    /// vector ID that the vector was inserted with
+    pub id: String,
 
     /// All fields including vector and metadata
     ///
@@ -618,12 +608,6 @@ pub struct VectorRecord {
 /// Returned by `search()` operations.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
-    /// Internal vector ID (system-assigned)
-    pub internal_id: u64,
-
-    /// External vector ID (user-provided)
-    pub external_id: String,
-
     /// Similarity score (interpretation depends on distance metric)
     ///
     /// - L2: Lower scores = more similar
@@ -631,16 +615,8 @@ pub struct SearchResult {
     /// - DotProduct: Higher scores = more similar
     pub score: f32,
 
-    /// All fields including vector and metadata
-    ///
-    /// The vector embedding is stored under the key `"vector"` as
-    /// `AttributeValue::Vector(Vec<f32>)`.
-    ///
-    /// Contents depend on the `include_fields` query parameter:
-    /// - `FieldSelection::All`: All fields including vector
-    /// - `FieldSelection::None`: Empty map
-    /// - `FieldSelection::Fields(names)`: Only specified fields
-    pub fields: HashMap<String, AttributeValue>,
+    /// The vector found by the search
+    pub vector: Vector
 }
 ```
 
@@ -664,8 +640,20 @@ impl VectorDb {
     /// let results = reader.search(query).await?;
     /// ```
     pub fn reader(&self) -> VectorDbReader {
-        let snapshot = self.snapshot.blocking_read().clone();
-        VectorDbReader::from_snapshot(self.config.clone(), snapshot)
+        ...
+    }
+
+    /// Get a read-only view of the vector database at a fixed snapshot.
+    /// # Example
+    ///
+    /// ```ignore
+    /// let db = VectorDb::open(config).await?;
+    /// let reader = db.snapshot();
+    ///
+    /// let results = reader.search(query).await?;
+    /// ```
+    pub fn snapshot(&self) -> VectorDbReader {
+        ...
     }
 }
 ```
@@ -674,31 +662,27 @@ impl VectorDb {
 
 ### Search Query Execution
 
-The `search()` operation implements the SPANN algorithm with metadata filtering:
+The `search()` operation implements the SPANN algorithm with metadata filtering. Internally,
+it does something similar to the following procedure:
 
 1. **Validate query dimensions** against configured dimensions
-2. **Load centroids** (lazily on first query) and build HNSW graph if needed
-3. **Search HNSW** for nearest centroids
+2. **Search centroids** for nearest centroids
    - Expands search by 10-100x (at least 10, at most 100 centroids)
    - This expansion improves recall for approximate nearest neighbor search
-4. **Load posting lists** for identified centroids to get candidate vector IDs
-5. **Apply metadata filter** (if provided):
+3. **Load posting lists** for identified centroids to get candidate vector IDs
+4. **Apply metadata filter** (if provided):
    - For each filter predicate, load metadata index entries
    - Compute intersection/union/difference of vector ID sets using RoaringTreemap operations
-   - Intersect filtered IDs with posting list candidates
-6. **Filter deleted vectors** using the deleted bitmap (centroid_id=0)
-7. **Load fields** for remaining candidates based on `include_fields`:
+   - Intersect filtered IDs with posting list candidates.
+5. **Score candidates** using configured distance metric (L2, Cosine, or DotProduct)
+6. **Sort results**:
+    - L2: Ascending (lower distances first)
+    - Cosine/DotProduct: Descending (higher scores first)
+7. **Truncate to limit results**
+8. **Load fields** for remaining candidates based on `include_fields`:
    - `FieldSelection::All`: Load all fields from VectorData and VectorMeta
    - `FieldSelection::None`: Skip loading fields entirely
    - `FieldSelection::Fields(names)`: Load only specified fields
-8. **Score candidates** using configured distance metric (L2, Cosine, or DotProduct)
-9. **Sort results**:
-   - L2: Ascending (lower distances first)
-   - Cosine/DotProduct: Descending (higher scores first)
-10. **Truncate to limit results**
-11. **Apply distance threshold** (if provided):
-    - L2: Exclude results where distance > threshold
-    - Cosine/DotProduct: Exclude results where score < threshold
 
 ### Filter Evaluation
 
@@ -724,21 +708,18 @@ need filtering. This is efficient when filters are selective.
 The `get()` operation retrieves a single vector record by external ID:
 
 1. **Lookup internal ID** from `IdDictionary[external_id]`
-2. **Check deleted bitmap**: Return `None` if internal ID is in deleted set (centroid_id=0)
 3. **Load vector data** from `VectorData[internal_id]`
-4. **Load metadata** from `VectorMeta[internal_id]`
-5. **Construct VectorRecord** with external_id and fields (including "vector" field)
+5. **Construct Vector** with id and fields (including "vector" field)
 
 ## Thread Safety
 
 Following the `LogReader` pattern from the log module:
 
 - All methods take `&self` for concurrent access
-- Internal state (`centroid_graph`) uses `RwLock` for safe lazy initialization
 - Storage snapshots are immutable and thread-safe (`Arc<dyn StorageRead>`)
 - Multiple readers can query concurrently without contention
-- Readers obtained from `VectorDb::reader()` share the database's snapshot but are independent
-  objects
+- Readers obtained from `VectorDb::reader()` and `VectorDb::snapshot()` share the database's
+  snapshot but are independent objects
 
 ## Performance Considerations
 

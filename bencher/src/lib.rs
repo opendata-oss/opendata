@@ -13,7 +13,7 @@
 //!    Updated during the benchmark and automatically snapshotted at regular intervals.
 //!    Use for measurements like request counts, latencies, or queue depths.
 //!
-//! 2. **Summary metrics** via [`Bench::summary()`]:
+//! 2. **Summary metrics** via `Bench::summary()`:
 //!    One-off samples recorded immediately. Use for final results or computed
 //!    aggregates at the end of a benchmark run.
 //!

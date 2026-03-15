@@ -3,8 +3,9 @@ use bytes::Bytes;
 use crate::model::RecordTag;
 use crate::serde::bucket_list::BucketListValue;
 use crate::serde::inverted_index::InvertedIndexValue;
-use crate::serde::timeseries::merge_time_series;
+use crate::serde::timeseries::merge_batch_time_series;
 use crate::serde::{EncodingError, RecordType, record_type_from_tag};
+use common::storage::default_merge_batch;
 
 /// Merge operator for OpenTSDB that handles merging of different record types.
 ///
@@ -14,11 +15,10 @@ pub(crate) struct OpenTsdbMergeOperator;
 
 impl common::storage::MergeOperator for OpenTsdbMergeOperator {
     fn merge(&self, key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
-        // If no existing value, just return the new value
-        let Some(existing) = existing_value else {
-            return new_value;
-        };
+        self.merge_batch(key, existing_value, &[new_value])
+    }
 
+    fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
         // Decode record type from key
         if key.len() < 2 {
             panic!("Invalid key: key length is less than 2 bytes");
@@ -31,53 +31,70 @@ impl common::storage::MergeOperator for OpenTsdbMergeOperator {
             record_type_from_tag(record_tag).expect("Failed to get record type from record tag");
 
         match record_type {
-            RecordType::InvertedIndex => {
-                merge_inverted_index(existing, new_value).expect("Failed to merge inverted index")
-            }
-            RecordType::TimeSeries => {
-                merge_time_series(existing, new_value).expect("Failed to merge time series")
-            }
-            RecordType::BucketList => {
-                merge_bucket_list(existing, new_value).expect("Failed to merge bucket list")
-            }
+            RecordType::InvertedIndex => merge_batch_inverted_index(existing_value, operands)
+                .expect("Failed to batch merge inverted index"),
+            RecordType::TimeSeries => merge_batch_time_series(existing_value, operands)
+                .expect("Failed to batch merge time series"),
+            RecordType::BucketList => merge_batch_bucket_list(existing_value, operands)
+                .expect("Failed to batch merge bucket list"),
             _ => {
-                // For other record types (SeriesDictionary, ForwardIndex), just use new value
+                // For other record types (SeriesDictionary, ForwardIndex), just use new value for each pairwise merge.
                 // These should use Put, not Merge, but handle gracefully
-                new_value
+                default_merge_batch(key, existing_value, operands, |_k, _e, v| v)
             }
         }
     }
 }
 
-/// Merge inverted index posting lists by unioning RoaringBitmaps.
-fn merge_inverted_index(existing: Bytes, new_value: Bytes) -> Result<Bytes, EncodingError> {
-    let existing_bitmap = InvertedIndexValue::decode(existing.as_ref())?.postings;
-    let new_bitmap = InvertedIndexValue::decode(new_value.as_ref())?.postings;
+/// Batch merge inverted index posting lists by unioning all RoaringBitmaps at once.
+///
+/// Decodes every bitmap once and unions them into a single result, avoiding
+/// repeated serialize/deserialize cycles of the default pairwise merge.
+fn merge_batch_inverted_index(
+    existing: Option<Bytes>,
+    operands: &[Bytes],
+) -> Result<Bytes, EncodingError> {
+    let mut merged = if let Some(existing) = existing {
+        InvertedIndexValue::decode(existing.as_ref())?.postings
+    } else {
+        roaring::RoaringBitmap::new()
+    };
 
-    let merged = existing_bitmap | new_bitmap;
+    for operand in operands {
+        let bitmap = InvertedIndexValue::decode(operand.as_ref())?.postings;
+        merged |= bitmap;
+    }
+
     (InvertedIndexValue { postings: merged }).encode()
 }
 
-/// Merge bucket lists by taking the union of buckets and sorting.
-/// Used by the merge operator to handle concurrent updates to the BucketsList.
-fn merge_bucket_list(existing: Bytes, new_value: Bytes) -> Result<Bytes, EncodingError> {
-    let mut base_buckets = BucketListValue::decode(existing.as_ref())?.buckets;
-    let other_buckets = BucketListValue::decode(new_value.as_ref())?.buckets;
+/// Batch merge bucket lists by collecting all unique buckets and sorting once.
+///
+/// Decodes every bucket list once, collects unique buckets, and produces a single
+/// sorted result, avoiding repeated decode/encode cycles.
+fn merge_batch_bucket_list(
+    existing: Option<Bytes>,
+    operands: &[Bytes],
+) -> Result<Bytes, EncodingError> {
+    let mut buckets = if let Some(existing) = existing {
+        BucketListValue::decode(existing.as_ref())?.buckets
+    } else {
+        Vec::new()
+    };
 
-    // Add buckets from other that aren't in base
-    for bucket in other_buckets {
-        if !base_buckets.contains(&bucket) {
-            base_buckets.push(bucket);
+    for operand in operands {
+        let other_buckets = BucketListValue::decode(operand.as_ref())?.buckets;
+        for bucket in other_buckets {
+            if !buckets.contains(&bucket) {
+                buckets.push(bucket);
+            }
         }
     }
 
     // Sort by start time
-    base_buckets.sort_by_key(|b| b.1);
+    buckets.sort_by_key(|b| b.1);
 
-    Ok(BucketListValue {
-        buckets: base_buckets,
-    }
-    .encode())
+    Ok(BucketListValue { buckets }.encode())
 }
 
 #[cfg(test)]
@@ -187,7 +204,7 @@ mod tests {
         .unwrap();
 
         // when
-        let merged = merge_inverted_index(existing_value, new_value).unwrap();
+        let merged = merge_batch_inverted_index(Some(existing_value), &[new_value]).unwrap();
         let decoded = InvertedIndexValue::decode(merged.as_ref()).unwrap();
 
         // then
@@ -257,7 +274,7 @@ mod tests {
         .encode();
 
         // when
-        let merged = merge_bucket_list(existing_value, new_value).unwrap();
+        let merged = merge_batch_bucket_list(Some(existing_value), &[new_value]).unwrap();
         let decoded = BucketListValue::decode(merged.as_ref()).unwrap();
 
         // then
@@ -329,7 +346,7 @@ mod tests {
         let new_value = TimeSeriesValue { points: new_points }.encode().unwrap();
 
         // when
-        let merged = merge_time_series(existing_value, new_value).unwrap();
+        let merged = merge_batch_time_series(Some(existing_value), &[new_value]).unwrap();
         let decoded = TimeSeriesValue::decode(merged.as_ref()).unwrap();
 
         // then
@@ -471,13 +488,21 @@ mod tests {
         // given
         let operator = OpenTsdbMergeOperator;
         let key = create_inverted_index_key();
-        let new_value = Bytes::from(b"new_value".to_vec());
+        let mut bm = RoaringBitmap::new();
+        bm.insert(1);
+        bm.insert(2);
+        let new_value = InvertedIndexValue {
+            postings: bm.clone(),
+        }
+        .encode()
+        .unwrap();
 
         // when
-        let result = operator.merge(&key, None, new_value.clone());
+        let result = operator.merge(&key, None, new_value);
 
         // then
-        assert_eq!(result, new_value);
+        let decoded = InvertedIndexValue::decode(result.as_ref()).unwrap();
+        assert_eq!(decoded.postings, bm);
     }
 
     #[test]
@@ -493,5 +518,401 @@ mod tests {
 
         // then - should return new_value without merging
         assert_eq!(result, new_value);
+    }
+
+    #[test]
+    fn should_batch_merge_inverted_index() {
+        // given
+        let op0 = InvertedIndexValue {
+            postings: {
+                let mut bm = RoaringBitmap::new();
+                bm.insert(1);
+                bm.insert(2);
+                bm
+            },
+        }
+        .encode()
+        .unwrap();
+        let op1 = InvertedIndexValue {
+            postings: {
+                let mut bm = RoaringBitmap::new();
+                bm.insert(2);
+                bm.insert(3);
+                bm
+            },
+        }
+        .encode()
+        .unwrap();
+        let op2 = InvertedIndexValue {
+            postings: {
+                let mut bm = RoaringBitmap::new();
+                bm.insert(4);
+                bm.insert(5);
+                bm
+            },
+        }
+        .encode()
+        .unwrap();
+
+        // when - no existing value
+        let merged =
+            merge_batch_inverted_index(None, &[op0.clone(), op1.clone(), op2.clone()]).unwrap();
+        let decoded = InvertedIndexValue::decode(merged.as_ref()).unwrap();
+
+        // then - union of all bitmaps
+        let mut expected = RoaringBitmap::new();
+        for id in [1, 2, 3, 4, 5] {
+            expected.insert(id);
+        }
+        assert_eq!(decoded.postings, expected);
+    }
+
+    #[test]
+    fn should_batch_merge_inverted_index_with_existing() {
+        // given
+        let existing = InvertedIndexValue {
+            postings: {
+                let mut bm = RoaringBitmap::new();
+                bm.insert(10);
+                bm
+            },
+        }
+        .encode()
+        .unwrap();
+        let op0 = InvertedIndexValue {
+            postings: {
+                let mut bm = RoaringBitmap::new();
+                bm.insert(1);
+                bm.insert(10);
+                bm
+            },
+        }
+        .encode()
+        .unwrap();
+
+        // when
+        let merged = merge_batch_inverted_index(Some(existing), &[op0]).unwrap();
+        let decoded = InvertedIndexValue::decode(merged.as_ref()).unwrap();
+
+        // then
+        let mut expected = RoaringBitmap::new();
+        for id in [1, 10] {
+            expected.insert(id);
+        }
+        assert_eq!(decoded.postings, expected);
+    }
+
+    #[test]
+    fn should_batch_merge_bucket_list() {
+        // given
+        let op0 = BucketListValue {
+            buckets: vec![(1, 100), (2, 200)],
+        }
+        .encode();
+        let op1 = BucketListValue {
+            buckets: vec![(2, 200), (3, 300)],
+        }
+        .encode();
+        let op2 = BucketListValue {
+            buckets: vec![(4, 400)],
+        }
+        .encode();
+
+        // when - no existing value
+        let merged = merge_batch_bucket_list(None, &[op0, op1, op2]).unwrap();
+        let decoded = BucketListValue::decode(merged.as_ref()).unwrap();
+
+        // then - unique buckets sorted by start time
+        assert_eq!(
+            decoded.buckets,
+            vec![(1, 100), (2, 200), (3, 300), (4, 400)]
+        );
+    }
+
+    #[test]
+    fn should_batch_merge_bucket_list_with_existing() {
+        // given
+        let existing = BucketListValue {
+            buckets: vec![(1, 100)],
+        }
+        .encode();
+        let op0 = BucketListValue {
+            buckets: vec![(2, 200)],
+        }
+        .encode();
+        let op1 = BucketListValue {
+            buckets: vec![(1, 100), (3, 300)],
+        }
+        .encode();
+
+        // when
+        let merged = merge_batch_bucket_list(Some(existing), &[op0, op1]).unwrap();
+        let decoded = BucketListValue::decode(merged.as_ref()).unwrap();
+
+        // then
+        assert_eq!(decoded.buckets, vec![(1, 100), (2, 200), (3, 300)]);
+    }
+
+    #[test]
+    fn should_batch_merge_time_series() {
+        // given
+        let op0 = TimeSeriesValue {
+            points: vec![
+                Sample {
+                    timestamp_ms: 1000,
+                    value: 10.0,
+                },
+                Sample {
+                    timestamp_ms: 2000,
+                    value: 20.0,
+                },
+            ],
+        }
+        .encode()
+        .unwrap();
+        let op1 = TimeSeriesValue {
+            points: vec![
+                Sample {
+                    timestamp_ms: 2000,
+                    value: 200.0,
+                },
+                Sample {
+                    timestamp_ms: 3000,
+                    value: 30.0,
+                },
+            ],
+        }
+        .encode()
+        .unwrap();
+        let op2 = TimeSeriesValue {
+            points: vec![Sample {
+                timestamp_ms: 4000,
+                value: 40.0,
+            }],
+        }
+        .encode()
+        .unwrap();
+
+        // when - no existing value
+        let merged =
+            crate::serde::timeseries::merge_batch_time_series(None, &[op0, op1, op2]).unwrap();
+        let decoded = TimeSeriesValue::decode(merged.as_ref()).unwrap();
+
+        // then - merged with last write wins on timestamp 2000
+        let expected = vec![
+            Sample {
+                timestamp_ms: 1000,
+                value: 10.0,
+            },
+            Sample {
+                timestamp_ms: 2000,
+                value: 200.0,
+            },
+            Sample {
+                timestamp_ms: 3000,
+                value: 30.0,
+            },
+            Sample {
+                timestamp_ms: 4000,
+                value: 40.0,
+            },
+        ];
+        assert_eq!(decoded.points, expected);
+    }
+
+    #[test]
+    fn should_batch_merge_time_series_with_existing() {
+        // given
+        let existing = TimeSeriesValue {
+            points: vec![
+                Sample {
+                    timestamp_ms: 1000,
+                    value: 1.0,
+                },
+                Sample {
+                    timestamp_ms: 3000,
+                    value: 3.0,
+                },
+            ],
+        }
+        .encode()
+        .unwrap();
+        let op0 = TimeSeriesValue {
+            points: vec![
+                Sample {
+                    timestamp_ms: 2000,
+                    value: 2.0,
+                },
+                Sample {
+                    timestamp_ms: 3000,
+                    value: 300.0,
+                },
+            ],
+        }
+        .encode()
+        .unwrap();
+
+        // when
+        let merged =
+            crate::serde::timeseries::merge_batch_time_series(Some(existing), &[op0]).unwrap();
+        let decoded = TimeSeriesValue::decode(merged.as_ref()).unwrap();
+
+        // then - timestamp 3000 takes operand value (newer)
+        let expected = vec![
+            Sample {
+                timestamp_ms: 1000,
+                value: 1.0,
+            },
+            Sample {
+                timestamp_ms: 2000,
+                value: 2.0,
+            },
+            Sample {
+                timestamp_ms: 3000,
+                value: 300.0,
+            },
+        ];
+        assert_eq!(decoded.points, expected);
+    }
+
+    #[rstest]
+    #[case(RecordType::InvertedIndex, create_inverted_index_key, "InvertedIndex")]
+    #[case(RecordType::TimeSeries, create_time_series_key, "TimeSeries")]
+    #[case(RecordType::BucketList, create_bucket_list_key, "BucketList")]
+    fn should_route_merge_batch_to_correct_function(
+        #[case] record_type: RecordType,
+        #[case] key_fn: fn() -> Bytes,
+        #[case] description: &str,
+    ) {
+        // given
+        let operator = OpenTsdbMergeOperator;
+        let key = key_fn();
+
+        let (existing_value, op0, op1) = match record_type {
+            RecordType::InvertedIndex => {
+                let existing = InvertedIndexValue {
+                    postings: {
+                        let mut bm = RoaringBitmap::new();
+                        bm.insert(1);
+                        bm
+                    },
+                }
+                .encode()
+                .unwrap();
+                let o0 = InvertedIndexValue {
+                    postings: {
+                        let mut bm = RoaringBitmap::new();
+                        bm.insert(2);
+                        bm
+                    },
+                }
+                .encode()
+                .unwrap();
+                let o1 = InvertedIndexValue {
+                    postings: {
+                        let mut bm = RoaringBitmap::new();
+                        bm.insert(3);
+                        bm
+                    },
+                }
+                .encode()
+                .unwrap();
+                (existing, o0, o1)
+            }
+            RecordType::TimeSeries => {
+                let existing = TimeSeriesValue {
+                    points: vec![Sample {
+                        timestamp_ms: 1000,
+                        value: 10.0,
+                    }],
+                }
+                .encode()
+                .unwrap();
+                let o0 = TimeSeriesValue {
+                    points: vec![Sample {
+                        timestamp_ms: 2000,
+                        value: 20.0,
+                    }],
+                }
+                .encode()
+                .unwrap();
+                let o1 = TimeSeriesValue {
+                    points: vec![Sample {
+                        timestamp_ms: 3000,
+                        value: 30.0,
+                    }],
+                }
+                .encode()
+                .unwrap();
+                (existing, o0, o1)
+            }
+            RecordType::BucketList => {
+                let existing = BucketListValue {
+                    buckets: vec![(1, 100)],
+                }
+                .encode();
+                let o0 = BucketListValue {
+                    buckets: vec![(2, 200)],
+                }
+                .encode();
+                let o1 = BucketListValue {
+                    buckets: vec![(3, 300)],
+                }
+                .encode();
+                (existing, o0, o1)
+            }
+            _ => unreachable!(),
+        };
+
+        // when
+        let merged = operator.merge_batch(&key, Some(existing_value), &[op0, op1]);
+
+        // then - verify all three sources were merged
+        match record_type {
+            RecordType::InvertedIndex => {
+                let decoded = InvertedIndexValue::decode(merged.as_ref()).unwrap();
+                assert_eq!(
+                    decoded.postings.len(),
+                    3,
+                    "{} batch merge should union all values",
+                    description
+                );
+            }
+            RecordType::TimeSeries => {
+                let decoded = TimeSeriesValue::decode(merged.as_ref()).unwrap();
+                assert_eq!(
+                    decoded.points.len(),
+                    3,
+                    "{} batch merge should combine all samples",
+                    description
+                );
+            }
+            RecordType::BucketList => {
+                let decoded = BucketListValue::decode(merged.as_ref()).unwrap();
+                assert_eq!(
+                    decoded.buckets.len(),
+                    3,
+                    "{} batch merge should union all buckets",
+                    description
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn should_merge_batch_return_new_value_for_other_record_types() {
+        // given
+        let operator = OpenTsdbMergeOperator;
+        let key = create_other_record_type_key();
+        let existing_value = Bytes::from(b"existing".to_vec());
+        let op0 = Bytes::from(b"op0".to_vec());
+        let op1 = Bytes::from(b"final".to_vec());
+
+        // when
+        let result = operator.merge_batch(&key, Some(existing_value), &[op0, op1.clone()]);
+
+        // then - falls back to pairwise merge; last operand wins for non-mergeable types
+        assert_eq!(result, op1);
     }
 }

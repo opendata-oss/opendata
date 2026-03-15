@@ -71,15 +71,13 @@
     }
     if (params.has("eval")) {
       evalTimeInput.value = params.get("eval");
+    } else {
+      evalTimeInput.value = "";
     }
     if (params.has("end")) {
       endTimeInput.value = params.get("end");
-    }
-    if (!params.has("eval") && !params.has("end")) {
-      initEndTimeToNow();
     } else {
-      if (!params.has("eval")) evalTimeInput.value = formatLocalDatetime(new Date());
-      if (!params.has("end")) endTimeInput.value = formatLocalDatetime(new Date());
+      endTimeInput.value = "";
     }
 
     // Apply active tab
@@ -103,12 +101,6 @@
     var mi = String(date.getMinutes()).padStart(2, "0");
     var s = String(date.getSeconds()).padStart(2, "0");
     return y + "-" + mo + "-" + d + "T" + h + ":" + mi + ":" + s;
-  }
-
-  function initEndTimeToNow() {
-    var now = formatLocalDatetime(new Date());
-    endTimeInput.value = now;
-    evalTimeInput.value = now;
   }
 
   // Tab switching

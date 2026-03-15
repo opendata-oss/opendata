@@ -1007,6 +1007,7 @@ mod tests {
                     max_pending_and_running_rebalance_tasks: usize::MAX,
                     split_threshold_vectors: usize::MAX / 2,
                     rebalance_backpressure_resume_threshold: 0,
+                    indexed_fields: std::collections::HashSet::new(),
                 },
                 dictionary: Arc::new(DashMap::new()),
                 centroid_graph: centroid_graph.clone(),
@@ -1412,11 +1413,11 @@ mod tests {
             self.centroids.iter().map(|(id, _)| *id).collect()
         }
 
-        fn add_centroid(&self, _entry: &CentroidEntry) -> anyhow::Result<()> {
+        fn add_centroid(&self, _entry: &CentroidEntry) -> crate::error::Result<()> {
             Ok(())
         }
 
-        fn remove_centroid(&self, _centroid_id: u64) -> anyhow::Result<()> {
+        fn remove_centroid(&self, _centroid_id: u64) -> crate::error::Result<()> {
             Ok(())
         }
 

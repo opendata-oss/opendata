@@ -1,0 +1,16 @@
+[package]
+name = "opendata-macros"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro-crate = "3.4.0"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+
+[dev-dependencies]
+opendata-common = { path = "../common" }

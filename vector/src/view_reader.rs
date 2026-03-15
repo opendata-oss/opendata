@@ -1,7 +1,7 @@
 use crate::delta::VectorDbWriteDelta;
+use crate::error::Result;
 use crate::serde::posting_list::{PostingList, PostingListValue, merge_decoded_posting_lists};
 use crate::storage::VectorDbStorageReadExt;
-use anyhow::Result;
 use common::coordinator::View;
 use std::sync::Arc;
 
@@ -61,6 +61,7 @@ mod tests {
         VectorDbDeltaView {
             posting_updates,
             deleted_centroids: RoaringTreemap::new(),
+            metadata_index_updates: HashMap::new(),
         }
     }
 
@@ -131,6 +132,7 @@ mod tests {
             current: Arc::new(std::sync::RwLock::new(VectorDbDeltaView {
                 posting_updates: HashMap::new(),
                 deleted_centroids: RoaringTreemap::new(),
+                metadata_index_updates: HashMap::new(),
             })),
             frozen: vec![EpochStamped {
                 val: frozen_view,
@@ -170,6 +172,7 @@ mod tests {
             current: Arc::new(std::sync::RwLock::new(VectorDbDeltaView {
                 posting_updates: HashMap::new(),
                 deleted_centroids: RoaringTreemap::new(),
+                metadata_index_updates: HashMap::new(),
             })),
             frozen: vec![],
             snapshot,
@@ -284,6 +287,7 @@ mod tests {
             current: Arc::new(std::sync::RwLock::new(VectorDbDeltaView {
                 posting_updates: HashMap::new(),
                 deleted_centroids: RoaringTreemap::new(),
+                metadata_index_updates: HashMap::new(),
             })),
             frozen: vec![EpochStamped {
                 val: frozen_view,
@@ -398,6 +402,7 @@ mod tests {
             current: Arc::new(std::sync::RwLock::new(VectorDbDeltaView {
                 posting_updates: HashMap::new(),
                 deleted_centroids: RoaringTreemap::new(),
+                metadata_index_updates: HashMap::new(),
             })),
             frozen: vec![
                 EpochStamped {

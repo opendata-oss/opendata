@@ -1,7 +1,7 @@
 //! Prometheus Remote Write 1.0 protocol handler.
 //!
 //! Implements the Prometheus Remote Write 1.0 specification:
-//! https://prometheus.io/docs/specs/prw/remote_write_spec/
+//! <https://prometheus.io/docs/specs/prw/remote_write_spec/>
 
 use std::sync::Arc;
 
@@ -60,7 +60,7 @@ pub struct ProtobufSample {
 // Conversion logic
 // ============================================================================
 
-/// Convert a WriteRequest into a Vec<Series>.
+/// Convert a WriteRequest into a `Vec<Series>`.
 ///
 /// Each TimeSeries in the WriteRequest produces one Series containing all its samples.
 /// TimeSeries with no samples are filtered out - this is intentional because:
@@ -186,7 +186,7 @@ impl From<Error> for RemoteWriteError {
     )
 )]
 pub async fn handle_remote_write(
-    State(state): State<super::server::AppState>,
+    State(state): State<super::http::AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> std::result::Result<StatusCode, RemoteWriteError> {

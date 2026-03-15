@@ -1,6 +1,6 @@
 [package]
 name = "opendata-vector"
-version = "0.1.0"
+version = "0.1.2"
 edition.workspace = true
 description = "Vector similarity search database built on SlateDB"
 license = "MIT"
@@ -8,10 +8,20 @@ repository = "https://github.com/opendata-oss/opendata"
 readme = "README.md"
 keywords = ["database", "vector", "similarity-search", "embeddings"]
 categories = ["database"]
+exclude = ["tests/data/"]
 
 [lib]
 name = "vector"
 path = "src/lib.rs"
+
+[[bin]]
+name = "opendata-vector"
+path = "src/bin/server.rs"
+required-features = ["http-server"]
+
+[features]
+default = []
+http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prost", "dep:serde_json", "dep:serde_with"]
 
 [dependencies]
 anyhow.workspace = true
@@ -27,10 +37,20 @@ rstest.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
+slatedb.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 log = "0.4.29"
 rand = "0.8"
+
+# HTTP server dependencies (optional, enabled by http-server feature)
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+serde_with = { workspace = true, optional = true }
 
 [[bin]]
 name = "gen_sift100k_groundtruth"
@@ -38,4 +58,6 @@ path = "src/bin/gen_sift100k_groundtruth.rs"
 
 [dev-dependencies]
 common = { workspace = true, features = ["test-utils"] }
-tracing-subscriber.workspace = true
+opendata-macros.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true

@@ -5,6 +5,7 @@
 **Authors**:
 
 - [Almog Gavra](https://github.com/agavra)
+- [Rohan Desai](https://github.com/rodesai)
 
 ## Summary
 
@@ -60,23 +61,19 @@ A vector is the primary unit of ingestion, combining an ID, embedding values, an
 ///
 /// Writing a vector with an existing ID replaces the previous vector. The old
 /// vector is marked as deleted and a new internal ID is allocated. This ensures
-/// posting lists and metadata indexes are updated correctly without expensive
-/// read-modify-write cycles.
+/// posting lists and metadata indexes are updated correctly.
 ///
 /// # Embedding Values
 ///
-/// The `values` field contains the embedding vector as f32 values. The length
-/// must match the `dimensions` specified in the `Config` when the database
-/// was created.
+/// Vectors are expected to have an attribute named "vector" that contains the
+/// embedding vector as f32 values. The length  must match the `dimensions` specified
+/// in the `Config` when the database was created.
 #[derive(Debug, Clone)]
 pub struct Vector {
     /// User-provided unique identifier (max 64 bytes UTF-8).
     pub id: String,
 
-    /// The embedding vector (f32 values).
-    pub values: Vec<f32>,
-
-    /// Metadata attributes for filtering.
+    /// Vector along with metadata attributes for filtering.
     pub attributes: Vec<Attribute>,
 }
 
@@ -89,7 +86,7 @@ impl Vector {
 }
 
 pub struct VectorBuilder {
-    ...
+    // ...
 }
 
 impl VectorBuilder {
@@ -253,11 +250,6 @@ pub enum DistanceMetric {
     /// Lower is more similar.
     L2,
 
-    /// Cosine distance: 1 - cosine_similarity
-    /// Range [0, 2]. Lower is more similar.
-    #[default]
-    Cosine,
-
     /// Dot product distance: -dot(x, y)
     /// More negative is more similar (vectors should be normalized).
     DotProduct,
@@ -278,7 +270,7 @@ pub struct MetadataFieldSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MetadataFieldType {
+pub enum FieldType {
     /// Vector embedding type. Use the reserved field name "vector" to define
     /// the embedding field in the schema. API-level only; stored in VectorData.
     Vector,
@@ -408,25 +400,6 @@ impl VectorDb {
 }
 ```
 
-#### Reader Access (Placeholder)
-
-```rust
-impl VectorDb {
-    /// Get a read-only view of the vector database.
-    ///
-    /// The reader provides query access without write capabilities.
-    /// See RFC-XXXX for the VectorDbReader API.
-    pub fn reader(&self) -> VectorDbReader;
-}
-
-/// Read-only view of a vector database.
-///
-/// API to be defined in a future RFC.
-pub struct VectorDbReader {
-    // ...
-}
-```
-
 ### Write Path
 
 When `write()` is called, the following operations occur:
@@ -435,11 +408,9 @@ When `write()` is called, the following operations occur:
 2. **For each vector**:
     - Look up the external ID in `IdDictionary`
     - If found (upsert case):
-        - Delete the old vector: add old internal ID to deleted bitmap (centroid_id=0)
-        - Tombstone old `VectorData` and `VectorMeta` records
+        - Tombstone old `VectorData` records
     - Allocate a new internal ID using block-based sequence allocation (see `SeqBlock` in storage RFC)
-    - Write `VectorData` record with the embedding values (keyed by new internal ID)
-    - Write `VectorMeta` record with the external ID and attributes (keyed by new internal ID)
+    - Write `VectorData` record with the embedding values (keyed by new internal ID) and attributes
     - Update or create `IdDictionary` entry mapping external ID → new internal ID
     - Update `MetadataIndex` entries via merge operators for indexed fields
     - Assign to nearest centroid(s) and update `PostingList` via merge operators
@@ -450,25 +421,7 @@ When `write()` is called, the following operations occur:
 When `delete()` is called:
 
 1. **Look up internal IDs**: For each external ID, look up the internal ID in `IdDictionary`
-2. **Add to deleted bitmap**: Internal IDs are added to the special posting list at `centroid_id=0`
-3. **Tombstone records**: `VectorData`, `VectorMeta`, and `IdDictionary` records are tombstoned
-4. **Deferred cleanup**: Metadata index entries and posting list entries are cleaned up during LIRE
-   maintenance
-
-### Comparison with TimeSeries API
-
-| Aspect               | TimeSeries                           | VectorDb                            |
-|----------------------|--------------------------------------|-------------------------------------|
-| Configuration        | `Config`                             | `Config`                            |
-| Primary write method | `write(Vec<Series>)`                 | `write(Vec<Vector>)`                |
-| Options variant      | `write_with_options()`               | `write_with_options()`              |
-| Data unit            | `Series` (labels + samples)          | `Vector` (id + values + attributes) |
-| Identification       | Labels (including `__name__`)        | `id: String` (external ID)          |
-| Metadata             | `metric_type`, `unit`, `description` | `attributes: Vec<Attribute>`        |
-| Write semantics      | Append samples                       | Upsert (replace existing)           |
-| Delete method        | N/A                                  | `delete(Vec<String>)`               |
-| Durability control   | `WriteOptions::await_durable`        | `WriteOptions::await_durable`       |
-| Reader access        | `fn reader() -> TimeSeriesReader`    | `fn reader() -> VectorDbReader`     |
+2. **Tombstone records**: `VectorData`, and `IdDictionary` records are tombstoned
 
 ## Alternatives
 

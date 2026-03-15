@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 
 use crate::error::AppendError;
 use crate::listing::ListingCache;
-use crate::model::{AppendOutput, Record as UserRecord};
+use crate::model::{AppendOutput, Record as UserRecord, SegmentId};
 use crate::segment::{LogSegment, SegmentAssignment, SegmentCache};
 use crate::serde::LogEntryKey;
 
@@ -36,7 +36,13 @@ use crate::serde::LogEntryKey;
 pub(crate) struct WrittenView {
     pub epoch: u64,
     pub snapshot: Arc<dyn common::storage::StorageSnapshot>,
-    pub segments: Arc<[LogSegment]>,
+    /// Storage engine sequence number for this write.
+    pub seqnum: u64,
+    /// ID of the most recently created segment, if any.
+    /// Subscribers compare this against their local state to detect new segments
+    /// and reload them from the snapshot. This is safe under watch coalescing
+    /// because it is a monotonic watermark, not an incremental delta.
+    pub last_segment_id: Option<SegmentId>,
 }
 
 /// The write type for the log writer.
@@ -59,7 +65,7 @@ pub(crate) enum WriterCommand {
         result_tx: oneshot::Sender<Result<(), String>>,
     },
     Flush {
-        result_tx: oneshot::Sender<Result<(), String>>,
+        result_tx: oneshot::Sender<Result<u64, String>>,
     },
 }
 
@@ -84,8 +90,8 @@ pub(crate) struct LogWriter {
     listing_cache: ListingCache,
     epoch: u64,
     written_tx: watch::Sender<WrittenView>,
-    segments_snapshot: Arc<[LogSegment]>,
     watermarks: EpochWatermarks,
+    last_segment_id: Option<SegmentId>,
 }
 
 impl LogWriter {
@@ -100,11 +106,12 @@ impl LogWriter {
         let (cmd_tx, cmd_rx) = mpsc::channel(config.queue_capacity);
 
         let initial_snapshot = storage.snapshot().await.map_err(|e| e.to_string())?;
-        let segments_snapshot: Arc<[LogSegment]> = segment_cache.all().into();
+        let last_segment_id = segment_cache.latest().map(|s| s.id());
         let initial_view = WrittenView {
             epoch: 0,
             snapshot: initial_snapshot,
-            segments: Arc::clone(&segments_snapshot),
+            seqnum: 0,
+            last_segment_id,
         };
         let (written_tx, written_rx) = watch::channel(initial_view);
         let (watermarks, watcher) = EpochWatermarks::new();
@@ -116,8 +123,8 @@ impl LogWriter {
             listing_cache,
             epoch: 0,
             written_tx,
-            segments_snapshot,
             watermarks,
+            last_segment_id,
         };
 
         let handle = LogWriteHandle {
@@ -220,31 +227,32 @@ impl LogWriter {
         let options = WriteOptions {
             await_durable: false,
         };
-        self.storage
+        let write_result = self
+            .storage
             .put_with_options(records, options)
             .await
             .map_err(|e| e.to_string())?;
 
-        if assignment.is_new {
-            self.segments_snapshot = self.segment_cache.all().into();
-        }
-
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
         self.epoch += 1;
+        if assignment.is_new {
+            self.last_segment_id = Some(assignment.segment.id());
+        }
         self.written_tx.send_replace(WrittenView {
             epoch: self.epoch,
             snapshot,
-            segments: Arc::clone(&self.segments_snapshot),
+            seqnum: write_result.seqnum,
+            last_segment_id: self.last_segment_id,
         });
         self.watermarks.update_written(self.epoch);
         Ok(())
     }
 
     /// Flushes all pending writes to durable storage.
-    async fn handle_flush(&mut self) -> Result<(), String> {
+    async fn handle_flush(&mut self) -> Result<u64, String> {
         self.storage.flush().await.map_err(|e| e.to_string())?;
         self.watermarks.update_durable(self.epoch);
-        Ok(())
+        Ok(self.epoch)
     }
 
     /// Builds log entry storage records from user records and appends them.
@@ -291,9 +299,19 @@ impl LogWriteHandle {
     }
 
     /// Receives a unit result from the writer task.
+    #[cfg(test)]
     async fn recv_cmd(
         rx: oneshot::Receiver<Result<(), String>>,
     ) -> Result<(), crate::error::Error> {
+        rx.await
+            .map_err(|_| crate::error::Error::Internal("writer shut down".into()))?
+            .map_err(crate::error::Error::Storage)
+    }
+
+    /// Receives an epoch result from the writer task.
+    async fn recv_epoch(
+        rx: oneshot::Receiver<Result<u64, String>>,
+    ) -> Result<u64, crate::error::Error> {
         rx.await
             .map_err(|_| crate::error::Error::Internal("writer shut down".into()))?
             .map_err(crate::error::Error::Storage)
@@ -358,17 +376,17 @@ impl LogWriteHandle {
     }
 
     /// Flush all pending writes to durable storage.
-    pub(crate) async fn flush(&self) -> Result<(), crate::error::Error> {
+    pub(crate) async fn flush(&self) -> Result<u64, crate::error::Error> {
         let (result_tx, result_rx) = oneshot::channel();
         self.cmd_tx
             .send(WriterCommand::Flush { result_tx })
             .await
             .map_err(|_| crate::error::Error::Internal("writer shut down".into()))?;
-        Self::recv_cmd(result_rx).await
+        Self::recv_epoch(result_rx).await
     }
 
-    /// The highest epoch flushed to storage (but not necessarily durable).
-    pub(crate) fn flushed_epoch(&self) -> u64 {
+    /// The highest epoch that has reached written visibility.
+    pub(crate) fn written_epoch(&self) -> u64 {
         *self.watcher.written_rx.borrow()
     }
 
@@ -378,7 +396,6 @@ impl LogWriteHandle {
     }
 
     /// Returns the durable epoch (highest epoch that has been flushed to disk).
-    #[cfg(test)]
     pub(crate) fn durable_epoch(&self) -> u64 {
         *self.watcher.durable_rx.borrow()
     }
@@ -389,8 +406,11 @@ mod tests {
     use super::*;
     use crate::config::SegmentConfig;
     use crate::serde::SEQ_BLOCK_KEY;
-    use crate::storage::in_memory_storage;
-    use common::storage::in_memory::FailingStorage;
+    use common::{
+        Storage,
+        storage::in_memory::{FailingStorage, InMemoryStorage},
+    };
+    use opendata_macros::storage_test;
 
     async fn create_writer() -> (LogWriter, LogWriteHandle, Arc<dyn common::Storage>) {
         create_writer_with_config(LogWriterConfig::default()).await
@@ -399,7 +419,7 @@ mod tests {
     async fn create_writer_with_config(
         config: LogWriterConfig,
     ) -> (LogWriter, LogWriteHandle, Arc<dyn common::Storage>) {
-        let storage = in_memory_storage();
+        let storage = std::sync::Arc::new(InMemoryStorage::default());
         create_writer_with_storage(storage, config).await
     }
 
@@ -453,8 +473,8 @@ mod tests {
             .unwrap();
         assert_eq!(result.unwrap().start_sequence, 0);
 
-        // Verify flushed epoch advanced
-        assert_eq!(handle.flushed_epoch(), 1);
+        // Verify written epoch advanced
+        assert_eq!(handle.written_epoch(), 1);
 
         // Verify data is in storage
         handle.flush().await.unwrap();
@@ -482,7 +502,7 @@ mod tests {
             .unwrap();
         assert_eq!(r2.start_sequence, 2);
 
-        assert_eq!(handle.flushed_epoch(), 2);
+        assert_eq!(handle.written_epoch(), 2);
     }
 
     #[tokio::test]
@@ -493,7 +513,7 @@ mod tests {
         let result = handle.try_append(make_write(&[], 1000)).await.unwrap();
         assert!(result.is_none());
         // Epoch should not advance for empty writes
-        assert_eq!(handle.flushed_epoch(), 0);
+        assert_eq!(handle.written_epoch(), 0);
     }
 
     #[tokio::test]
@@ -506,11 +526,11 @@ mod tests {
             .try_append(make_write(&["key1"], 1000))
             .await
             .unwrap();
-        assert_eq!(handle.flushed_epoch(), 1);
+        assert_eq!(handle.written_epoch(), 1);
 
         // Force seal — should create segment 1
         handle.force_seal(2000).await.unwrap();
-        assert_eq!(handle.flushed_epoch(), 2);
+        assert_eq!(handle.written_epoch(), 2);
 
         // Verify two segments exist in storage
         handle.flush().await.unwrap();
@@ -574,21 +594,21 @@ mod tests {
         written_rx.changed().await.unwrap();
         let view = written_rx.borrow_and_update().clone();
         assert_eq!(view.epoch, 1);
-        assert_eq!(view.segments.len(), 1);
+        assert!(view.last_segment_id.is_some());
     }
 
     #[tokio::test]
-    async fn should_advance_flushed_watermark_on_append() {
+    async fn should_advance_written_watermark_on_append() {
         let (writer, mut handle, _storage) = create_writer().await;
         let _task = handle.spawn(writer);
 
-        assert_eq!(handle.flushed_epoch(), 0);
+        assert_eq!(handle.written_epoch(), 0);
         assert_eq!(handle.durable_epoch(), 0);
 
         handle.try_append(make_write(&["k1"], 1000)).await.unwrap();
 
         // Written watermark should advance, durable should not
-        assert_eq!(handle.flushed_epoch(), 1);
+        assert_eq!(handle.written_epoch(), 1);
         assert_eq!(handle.durable_epoch(), 0);
     }
 
@@ -598,20 +618,19 @@ mod tests {
         let _task = handle.spawn(writer);
 
         handle.try_append(make_write(&["k1"], 1000)).await.unwrap();
-        assert_eq!(handle.flushed_epoch(), 1);
+        assert_eq!(handle.written_epoch(), 1);
         assert_eq!(handle.durable_epoch(), 0);
 
         handle.flush().await.unwrap();
 
         // Both watermarks should now be at epoch 1
-        assert_eq!(handle.flushed_epoch(), 1);
+        assert_eq!(handle.written_epoch(), 1);
         assert_eq!(handle.durable_epoch(), 1);
     }
 
-    #[tokio::test]
-    async fn should_propagate_put_error_on_append() {
-        let inner = in_memory_storage();
-        let failing = FailingStorage::wrap(inner);
+    #[storage_test]
+    async fn should_propagate_put_error_on_append(storage: Arc<dyn Storage>) {
+        let failing = FailingStorage::wrap(storage);
         let (writer, mut handle, _) =
             create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
         let _task = handle.spawn(writer);
@@ -627,13 +646,12 @@ mod tests {
         );
 
         // Epoch should not have advanced
-        assert_eq!(handle.flushed_epoch(), 0);
+        assert_eq!(handle.written_epoch(), 0);
     }
 
-    #[tokio::test]
-    async fn should_propagate_snapshot_error_on_append() {
-        let inner = in_memory_storage();
-        let failing = FailingStorage::wrap(inner);
+    #[storage_test]
+    async fn should_propagate_snapshot_error_on_append(storage: Arc<dyn Storage>) {
+        let failing = FailingStorage::wrap(storage);
         let (writer, mut handle, _) =
             create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
         let _task = handle.spawn(writer);
@@ -650,10 +668,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn should_propagate_flush_error() {
-        let inner = in_memory_storage();
-        let failing = FailingStorage::wrap(inner);
+    #[storage_test]
+    async fn should_propagate_flush_error(storage: Arc<dyn Storage>) {
+        let failing = FailingStorage::wrap(storage);
         let (writer, mut handle, _) =
             create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
         let _task = handle.spawn(writer);
@@ -677,10 +694,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn should_enter_fatal_state_after_put_error() {
-        let inner = in_memory_storage();
-        let failing = FailingStorage::wrap(inner);
+    #[storage_test]
+    async fn should_enter_fatal_state_after_put_error(storage: Arc<dyn Storage>) {
+        let failing = FailingStorage::wrap(storage);
         let (writer, mut handle, _) =
             create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
         let _task = handle.spawn(writer);

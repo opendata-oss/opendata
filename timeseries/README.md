@@ -13,6 +13,31 @@ Grafana so that you can visualize the collected metrics.
 ### Prerequisites
 
 - Docker and Docker Compose installed
+- `curl` and `jq` for API examples
+
+### Local binary (no Docker)
+
+Run the HTTP server directly from source:
+
+```bash
+cargo run -p opendata-timeseries --features remote-write -- --port 9090
+```
+
+### OTLP ingest config
+
+To enable OTLP/HTTP metrics ingest (`POST /v1/metrics`), include the `otel`
+feature when starting the server and configure OTEL label behavior in
+`prometheus.yaml`:
+
+```bash
+cargo run -p opendata-timeseries --features "http-server,otel" -- --config ./prometheus.yaml --port 9090
+```
+
+```yaml
+otel:
+  include_resource_attrs: true  # default: true
+  include_scope_attrs: true     # default: true
+```
 
 ### 1. Start the quickstart stack
 
@@ -52,7 +77,9 @@ curl 'http://localhost:9090/api/v1/query?query=mock_uptime_seconds' | jq .
 **Range query (values over the last 5 minutes):**
 
 ```bash
-curl "http://localhost:9090/api/v1/query_range?query=node_cpu_seconds&start=$(date -v-5M +%s)&end=$(date +%s)&step=15s" | jq .
+START=$(($(date +%s) - 300))
+END=$(date +%s)
+curl "http://localhost:9090/api/v1/query_range?query=node_cpu_seconds&start=${START}&end=${END}&step=15s" | jq .
 ```
 
 ### 3. Open Grafana and Explore Metrics

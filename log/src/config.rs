@@ -6,25 +6,30 @@
 use std::time::Duration;
 
 use common::StorageConfig;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_with::{DurationMilliSeconds, serde_as};
 
-/// Configuration for opening a [`Log`](crate::Log).
+/// Configuration for opening a [`LogDb`](crate::LogDb).
 ///
 /// This struct holds all the settings needed to initialize a log instance,
 /// including storage backend configuration.
 ///
 /// # Example
 ///
-/// ```ignore
-/// use log::Config;
+/// ```no_run
+/// use log::{Config, SegmentConfig};
 /// use common::StorageConfig;
 ///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = Config {
 ///     storage: StorageConfig::default(),
 ///     segmentation: SegmentConfig::default(),
+///     ..Default::default()
 /// };
-/// let log = LogDb::open(config).await?;
+/// let log = log::LogDb::open(config).await?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -40,6 +45,58 @@ pub struct Config {
     /// time-based queries and retention management.
     #[serde(default)]
     pub segmentation: SegmentConfig,
+
+    /// Read visibility level.
+    ///
+    /// `Memory` (default) exposes writes as soon as they are visible in memory.
+    /// `Remote` only exposes writes after remote/object-store durability is
+    /// confirmed by the storage engine.
+    ///
+    /// Backward-compatibility: legacy boolean `read_durable` values are accepted
+    /// and mapped as `false => Memory`, `true => Remote`.
+    #[serde(
+        default,
+        alias = "read_durable",
+        deserialize_with = "deserialize_read_visibility"
+    )]
+    pub read_visibility: ReadVisibility,
+}
+
+/// Read visibility levels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadVisibility {
+    /// Return reads once data is visible in memory (fast, not crash-safe).
+    #[default]
+    Memory,
+    /// Return reads only after remote/object-store durability is confirmed.
+    Remote,
+}
+
+impl ReadVisibility {
+    pub fn is_remote(self) -> bool {
+        matches!(self, Self::Remote)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ReadVisibilityCompat {
+    Bool(bool),
+    Level(ReadVisibility),
+}
+
+fn deserialize_read_visibility<'de, D>(deserializer: D) -> Result<ReadVisibility, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<ReadVisibilityCompat>::deserialize(deserializer)?;
+    Ok(match value {
+        None => ReadVisibility::default(),
+        Some(ReadVisibilityCompat::Bool(false)) => ReadVisibility::Memory,
+        Some(ReadVisibilityCompat::Bool(true)) => ReadVisibility::Remote,
+        Some(ReadVisibilityCompat::Level(level)) => level,
+    })
 }
 
 /// Configuration for log segmentation.
@@ -60,7 +117,7 @@ pub struct SegmentConfig {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
     /// use std::time::Duration;
     /// use log::SegmentConfig;
     ///
@@ -110,16 +167,20 @@ pub struct CountOptions {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
 /// use log::ReaderConfig;
 /// use common::StorageConfig;
 /// use std::time::Duration;
 ///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = ReaderConfig {
 ///     storage: StorageConfig::default(),
 ///     refresh_interval: Duration::from_secs(1),
 /// };
-/// let reader = LogDbReader::open(config).await?;
+/// let reader = log::LogDbReader::open(config).await?;
+/// # Ok(())
+/// # }
 /// ```
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,5 +213,56 @@ impl Default for ReaderConfig {
             storage: StorageConfig::default(),
             refresh_interval: default_refresh_interval(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct DurabilityOnly {
+        #[serde(
+            default,
+            alias = "read_durable",
+            deserialize_with = "deserialize_read_visibility"
+        )]
+        read_visibility: ReadVisibility,
+    }
+
+    #[test]
+    fn should_default_read_visibility_to_memory_when_missing() {
+        // given
+        let json = "{}";
+
+        // when
+        let cfg: DurabilityOnly = serde_json::from_str(json).unwrap();
+
+        // then
+        assert_eq!(cfg.read_visibility, ReadVisibility::Memory);
+    }
+
+    #[test]
+    fn should_deserialize_legacy_bool_true_as_remote() {
+        // given
+        let json = r#"{"read_durable": true}"#;
+
+        // when
+        let cfg: DurabilityOnly = serde_json::from_str(json).unwrap();
+
+        // then
+        assert_eq!(cfg.read_visibility, ReadVisibility::Remote);
+    }
+
+    #[test]
+    fn should_deserialize_enum_remote() {
+        // given
+        let json = r#"{"read_visibility": "remote"}"#;
+
+        // when
+        let cfg: DurabilityOnly = serde_json::from_str(json).unwrap();
+
+        // then
+        assert_eq!(cfg.read_visibility, ReadVisibility::Remote);
     }
 }

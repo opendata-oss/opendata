@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
@@ -8,13 +9,14 @@ use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::Sample;
 use crate::model::SeriesFingerprint;
 use crate::model::{Label, SeriesId, TimeBucket};
-use crate::promql::functions::{FunctionRegistry, PromQLArg};
+use crate::promql::functions::{FunctionCallContext, FunctionRegistry, PromQLArg};
 use crate::promql::selector::evaluate_selector_with_reader;
 use crate::promql::timestamp::Timestamp;
 use crate::query::QueryReader;
 use crate::util::Result;
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::*;
+use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{
     AggregateExpr, AtModifier, BinaryExpr, Call, EvalStmt, Expr, LabelModifier, MatrixSelector,
     Offset, SubqueryExpr, VectorMatchCardinality, VectorSelector,
@@ -203,6 +205,102 @@ pub struct EvalSample {
 pub struct EvalSamples {
     pub(crate) values: Vec<Sample>,
     pub(crate) labels: HashMap<String, String>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum KAggregationOrder {
+    Top,
+    Bottom,
+}
+
+#[derive(Clone, Copy)]
+struct AggregationEvalContext {
+    // Keep timing inputs bundled so k-aggregation helpers stay small and
+    // always use a consistent eval context.
+    query_start: Timestamp,
+    query_end: Timestamp,
+    evaluation_ts: Timestamp,
+    interval_ms: i64,
+    lookback_delta_ms: i64,
+}
+
+/// Compares values for topk/bottomk aggregation.
+/// NaN values are always considered "greater" (sorted last) regardless of order.
+/// Uses partial_cmp for IEEE 754 semantics (-0.0 == +0.0), matching Prometheus.
+fn compare_k_values(left: f64, right: f64, order: KAggregationOrder) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => match order {
+            KAggregationOrder::Top => right.partial_cmp(&left).unwrap_or(Ordering::Equal),
+            KAggregationOrder::Bottom => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+struct KHeapEntry {
+    value: f64,
+    index: usize,
+    order: KAggregationOrder,
+}
+
+impl PartialEq for KHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index
+            && self.order == other.order
+            && self.value.to_bits() == other.value.to_bits()
+    }
+}
+
+impl Eq for KHeapEntry {}
+
+impl PartialOrd for KHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for KHeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap is a max-heap. Define "greater" as "worse" so heap.peek()
+        // returns the least desirable currently selected sample.
+        compare_k_values(self.value, other.value, self.order)
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
+fn select_k_indices_with_heap(
+    samples: &[EvalSample],
+    keep: usize,
+    order: KAggregationOrder,
+) -> Vec<usize> {
+    if keep == 0 || samples.is_empty() {
+        return Vec::new();
+    }
+    let mut heap = BinaryHeap::with_capacity(keep);
+    for (idx, sample) in samples.iter().enumerate() {
+        let entry = KHeapEntry {
+            value: sample.value,
+            index: idx,
+            order,
+        };
+        if heap.len() < keep {
+            heap.push(entry);
+            continue;
+        }
+
+        if let Some(worst) = heap.peek()
+            && compare_k_values(sample.value, worst.value, order).is_lt()
+        {
+            // Replace only when the candidate outranks the current worst,
+            // preserving the "peek is worst-kept" invariant.
+            heap.pop();
+            heap.push(entry);
+        }
+    }
+    heap.into_iter().map(|entry| entry.index).collect()
 }
 
 pub(crate) struct Evaluator<'reader, R: QueryReader> {
@@ -1367,36 +1465,38 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         interval_ms: i64,
         lookback_delta_ms: i64,
     ) -> EvalResult<ExprResult> {
-        if call.args.args.len() != 1 {
-            return Err(EvaluationError::InternalError(format!(
-                "{} function requires exactly one argument",
-                call.func.name
-            )));
-        }
+        // String-typed arguments are passed through as raw AST nodes for
+        // string-argument functions such as label_replace/label_join.
+        let mut arg_results = Vec::with_capacity(call.args.args.len());
+        for (idx, arg) in call.args.args.iter().enumerate() {
+            let expected_type = if idx < call.func.arg_types.len() {
+                call.func.arg_types[idx]
+            } else if call.func.variadic != 0 && !call.func.arg_types.is_empty() {
+                call.func.arg_types[call.func.arg_types.len() - 1]
+            } else {
+                return Err(EvaluationError::InternalError(format!(
+                    "argument {} is out of bounds for function {}",
+                    idx, call.func.name
+                )));
+            };
 
-        // Check for string literal arguments before evaluation.
-        // String literals are valid as function arguments in PromQL (e.g., label_replace),
-        // but we don't yet support evaluating them as function arguments.
-        let arg = call.args.args[0].as_ref();
-        if let Expr::StringLiteral(lit) = arg {
-            return Err(EvaluationError::InternalError(format!(
-                "string literal \"{}\" passed as argument to function '{}': \
-                 string arguments are not yet supported",
-                lit.val, call.func.name
-            )));
-        }
+            if expected_type == ValueType::String {
+                arg_results.push(None);
+                continue;
+            }
 
-        // Evaluate the argument
-        let arg_result = self
-            .evaluate_expr(
-                arg,
-                query_start,
-                query_end,
-                evaluation_ts,
-                interval_ms,
-                lookback_delta_ms,
-            )
-            .await?;
+            let arg_result = self
+                .evaluate_expr(
+                    arg,
+                    query_start,
+                    query_end,
+                    evaluation_ts,
+                    interval_ms,
+                    lookback_delta_ms,
+                )
+                .await?;
+            arg_results.push(Some(arg_result));
+        }
 
         let registry = FunctionRegistry::new();
 
@@ -1407,43 +1507,46 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         //   - Function is called with evaluation_ts = -50s (negative!)
         let eval_timestamp_ms = evaluation_ts.as_millis();
 
-        match arg_result {
-            ExprResult::InstantVector(samples) => {
-                // Try instant vector function first
-                if let Some(func) = registry.get(call.func.name) {
-                    let result =
-                        func.apply(PromQLArg::InstantVector(samples), eval_timestamp_ms)?;
-                    Ok(ExprResult::InstantVector(result))
-                } else {
-                    Err(EvaluationError::InternalError(format!(
-                        "Unknown instant vector function: {}",
-                        call.func.name
-                    )))
+        let mut evaluated_args = Vec::with_capacity(arg_results.len());
+        for arg_result in arg_results {
+            match arg_result {
+                Some(ExprResult::InstantVector(samples)) => {
+                    evaluated_args.push(Some(PromQLArg::InstantVector(samples)))
                 }
-            }
-            ExprResult::RangeVector(samples) => {
-                // Try range vector function
-                if let Some(func) = registry.get_range_function(call.func.name) {
-                    let result = func.apply(samples, eval_timestamp_ms)?;
-                    Ok(ExprResult::InstantVector(result))
-                } else {
-                    Err(EvaluationError::InternalError(format!(
-                        "Unknown range vector function: {}",
-                        call.func.name
-                    )))
+                Some(ExprResult::Scalar(value)) => {
+                    evaluated_args.push(Some(PromQLArg::Scalar(value)))
                 }
-            }
-            ExprResult::Scalar(scalar) => {
-                if let Some(func) = registry.get(call.func.name) {
-                    let result = func.apply(PromQLArg::Scalar(scalar), eval_timestamp_ms)?;
-                    Ok(ExprResult::InstantVector(result))
-                } else {
-                    Err(EvaluationError::InternalError(format!(
-                        "Unknown scalar function: {}",
-                        call.func.name
-                    )))
+                Some(ExprResult::RangeVector(samples)) => {
+                    evaluated_args.push(Some(PromQLArg::RangeVector(samples)))
                 }
+                // Preserve string-arg positions here; string-aware functions
+                // read the raw AST nodes from ctx.raw_args instead.
+                None => evaluated_args.push(None),
             }
+        }
+
+        if let Some(func) = registry.get(call.func.name) {
+            let ctx = FunctionCallContext {
+                eval_timestamp_ms,
+                raw_args: &call.args.args,
+            };
+            let result = func.apply_call(evaluated_args, &ctx)?;
+            if call.func.return_type == ValueType::Scalar {
+                return match result.as_slice() {
+                    [sample] => Ok(ExprResult::Scalar(sample.value)),
+                    _ => Err(EvaluationError::InternalError(format!(
+                        "scalar-returning function {} must return exactly one sample",
+                        call.func.name
+                    ))),
+                };
+            }
+
+            Ok(ExprResult::InstantVector(result))
+        } else {
+            Err(EvaluationError::InternalError(format!(
+                "Unknown instant/scalar function: {}",
+                call.func.name
+            )))
         }
     }
 
@@ -1533,19 +1636,20 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     .collect();
                 Ok(ExprResult::InstantVector(result))
             }
-            // Vector-Vector operations: one-to-one matching only
+            // Vector-Vector operations: many-to-many not supported
             (
                 ExprResult::InstantVector(mut left_vector),
                 ExprResult::InstantVector(mut right_vector),
             ) => {
-                if let Some(modifier) = &expr.modifier
-                    && !matches!(modifier.card, VectorMatchCardinality::OneToOne)
-                {
-                    return Err(EvaluationError::InternalError(
-                        "only one-to-one cardinality supported".to_string(),
-                    ));
-                    // TODO: support many-to-one/one-to-many cardinality (group_left/group_right)
-                }
+                let card = match expr.modifier.as_ref().map(|m| &m.card) {
+                    Some(VectorMatchCardinality::ManyToMany) => {
+                        return Err(EvaluationError::InternalError(
+                            "many-to-many cardinality not supported".to_string(),
+                        ));
+                    }
+                    Some(c) => c,
+                    None => &VectorMatchCardinality::OneToOne,
+                };
 
                 let matching = expr.modifier.as_ref().and_then(|m| m.matching.as_ref());
 
@@ -1562,49 +1666,127 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     }
                 }
 
-                // Build right-side index keyed by match signature
-                let mut right_map: HashMap<Vec<(String, String)>, EvalSample> = HashMap::new();
-                for sample in right_vector {
+                let is_group_right = matches!(card, VectorMatchCardinality::OneToMany(_));
+                let is_one_to_one = matches!(card, VectorMatchCardinality::OneToOne);
+                let group_labels = card.labels().map(|l| &l.labels);
+
+                // Determine which side is "one" vs "many" for matching purposes.
+                // For one-to-one mappings, we treat the right-hand side as the "one" side.
+                let (one_vec, many_vec) = if is_group_right {
+                    (left_vector, right_vector)
+                } else {
+                    (right_vector, left_vector)
+                };
+
+                // Build "one" side index keyed by match signature
+                let mut one_map: HashMap<Vec<(String, String)>, EvalSample> = HashMap::new();
+                for sample in one_vec {
                     let key = Self::compute_binary_match_key(&sample.labels, matching);
-                    if right_map.insert(key.clone(), sample).is_some() {
-                        return Err(EvaluationError::InternalError(
-                            "many-to-many matching not allowed: found duplicate series on the right side of the operation".to_string(),
-                        ));
+                    if one_map.insert(key, sample).is_some() {
+                        return Err(EvaluationError::InternalError(format!(
+                            "many-to-many matching not allowed: found duplicate series on the {} side of the operation",
+                            if is_group_right { "left" } else { "right" }
+                        )));
                     }
                 }
 
                 let mut result = Vec::new();
-                let mut left_seen: HashSet<Vec<(String, String)>> = HashSet::new();
+                let mut one_to_one_seen: HashSet<Vec<(String, String)>> = HashSet::new();
+                // PromQL grouped matching (`group_left` / `group_right`) requires every
+                // output time series to remain uniquely identifiable. Two different matches
+                // are not allowed to collapse to the same final output labels.
+                // Keep a set of final output label keys and fail on duplicates.
+                let mut grouped_result_seen: HashSet<Vec<(String, String)>> = HashSet::new();
 
-                for left_sample in left_vector {
-                    let key = Self::compute_binary_match_key(&left_sample.labels, matching);
+                for many_sample in many_vec {
+                    let key = Self::compute_binary_match_key(&many_sample.labels, matching);
 
-                    // Look up matching right sample
-                    let right_sample = match right_map.get(&key) {
-                        Some(rs) => rs,
-                        None => continue, // Unmatched left samples silently dropped
+                    // Look up matching "one" sample
+                    let one_sample = match one_map.get(&key) {
+                        Some(s) => s,
+                        None => continue, // silently dropped if unmatched on "one" side
                     };
 
-                    // One-to-one check: only error on duplicate left keys that have a right match
-                    if !left_seen.insert(key) {
+                    // One-to-one vector matching must be unique on both sides. We already
+                    // validated uniqueness on the "one" map build; this guards the "many"
+                    // iteration path when card=OneToOne.
+                    if is_one_to_one && !one_to_one_seen.insert(key) {
                         return Err(EvaluationError::InternalError(
                             "many-to-many matching not allowed: found duplicate series on the left side of the operation".to_string(),
                         ));
                     }
 
-                    match self.apply_binary_op(op, left_sample.value, right_sample.value) {
+                    // Preserve original lhs/rhs ordering for the operator.
+                    let (lhs, rhs) = if is_group_right {
+                        (one_sample.value, many_sample.value)
+                    } else {
+                        (many_sample.value, one_sample.value)
+                    };
+
+                    match self.apply_binary_op(op, lhs, rhs) {
                         Ok(value) => {
-                            // For comparison ops without bool, filter out false results
+                            let mut result_labels = Self::result_metric(
+                                many_sample.labels,
+                                op,
+                                if is_one_to_one { matching } else { None }, // should only be filtered for one-to-one case
+                            );
+                            // For `group_left(<labels>)` / `group_right(<labels>)`, each listed
+                            // label must come from the "one" side. Use set-or-remove semantics:
+                            // - if present on "one" side, copy/overwrite it in output
+                            // - if absent on "one" side, remove it from output
+                            // This avoids leaking stale values from the "many" side.
+                            if let Some(extra) = group_labels {
+                                for name in extra {
+                                    match one_sample.labels.get(name) {
+                                        Some(v) => {
+                                            result_labels.insert(name.clone(), v.clone());
+                                        }
+                                        None => {
+                                            result_labels.remove(name);
+                                        }
+                                    }
+                                }
+                            }
+
+                            let drop_name = many_sample.drop_name || return_bool;
+                            if !is_one_to_one {
+                                // Duplicate detection must use the final output labelset.
+                                // `__name__` may be removed later (arithmetic, or comparison
+                                // with `bool`), so mirror that here before computing the key.
+                                // This intentionally runs before non-bool comparison filtering
+                                // so invalid grouped cardinality still errors even when the
+                                // comparison result would be filtered out.
+                                let mut result_label_key = result_labels.clone();
+                                if drop_name {
+                                    result_label_key.remove(METRIC_NAME);
+                                }
+                                let key = Self::labels_to_grouping_key(result_label_key);
+                                if !grouped_result_seen.insert(key) {
+                                    return Err(EvaluationError::InternalError(
+                                        "multiple matches for labels: grouping labels must ensure unique matches"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+
+                            // For comparison ops without bool, filter out false results.
                             if is_comparison && !return_bool && value == 0.0 {
                                 continue;
                             }
-                            let result_labels =
-                                Self::result_metric(left_sample.labels, op, matching);
+                            // PromQL comparison operators without `bool` are filters.
+                            // For vector-vector comparisons (one-to-one and grouped), keep
+                            // matched true pairs and propagate the original LHS sample value
+                            // instead of the computed predicate value (1/0).
+                            let output_value = if is_comparison && !return_bool {
+                                lhs
+                            } else {
+                                value
+                            };
                             result.push(EvalSample {
-                                timestamp_ms: left_sample.timestamp_ms,
-                                value,
+                                timestamp_ms: many_sample.timestamp_ms,
+                                value: output_value,
                                 labels: result_labels,
-                                drop_name: left_sample.drop_name || return_bool,
+                                drop_name,
                             });
                         }
                         Err(e) => return Err(e),
@@ -1709,6 +1891,170 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         key_vec
     }
 
+    async fn evaluate_aggregation_param_as_scalar(
+        &mut self,
+        param: Option<&Expr>,
+        query_start: Timestamp,
+        query_end: Timestamp,
+        evaluation_ts: Timestamp,
+        interval_ms: i64,
+        lookback_delta_ms: i64,
+    ) -> EvalResult<f64> {
+        let Some(param_expr) = param else {
+            return Err(EvaluationError::InternalError(
+                "aggregation requires a scalar parameter".to_string(),
+            ));
+        };
+
+        let param_value = match self
+            .evaluate_expr(
+                param_expr,
+                query_start,
+                query_end,
+                evaluation_ts,
+                interval_ms,
+                lookback_delta_ms,
+            )
+            .await?
+        {
+            ExprResult::Scalar(value) => value,
+            ExprResult::InstantVector(_) => {
+                return Err(EvaluationError::InternalError(
+                    "aggregation parameter must evaluate to a scalar".to_string(),
+                ));
+            }
+            ExprResult::RangeVector(_) => {
+                return Err(EvaluationError::InternalError(
+                    "aggregation parameter cannot be a range vector".to_string(),
+                ));
+            }
+        };
+
+        Ok(param_value)
+    }
+
+    // topk/bottomk params are scalar floats, but selection needs a bounded count.
+    // Coerce once to match PromQL-like behavior: clamp to input size and treat
+    // k < 1 as empty output.
+    fn coerce_k_size(k_param: f64, input_len: usize) -> usize {
+        let max_k = input_len as i64;
+        let coerced = (k_param as i64).min(max_k);
+        if coerced < 1 { 0 } else { coerced as usize }
+    }
+
+    // Group key construction clones label strings. This is acceptable since
+    // topk's dominant cost is sorting/selection. If profiling shows this is hot,
+    // consider using series fingerprints as group keys instead.
+    fn group_samples_for_k_aggregation(
+        samples: Vec<EvalSample>,
+        modifier: Option<&LabelModifier>,
+    ) -> HashMap<Vec<(String, String)>, Vec<EvalSample>> {
+        let mut groups: HashMap<Vec<(String, String)>, Vec<EvalSample>> = HashMap::new();
+        for mut sample in samples {
+            // Materialize pending metric-name drops before grouping so __name__
+            // doesn't incorrectly affect bucket assignment.
+            if sample.drop_name {
+                sample.labels.remove(METRIC_NAME);
+                sample.drop_name = false;
+            }
+
+            let mut group_key: Vec<(String, String)> = match modifier {
+                None => Vec::new(),
+                Some(LabelModifier::Include(label_list)) => sample
+                    .labels
+                    .iter()
+                    .filter(|(name, _)| label_list.labels.contains(name))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+                Some(LabelModifier::Exclude(label_list)) => sample
+                    .labels
+                    .iter()
+                    .filter(|(name, _)| !label_list.labels.contains(name))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+            };
+            group_key.sort();
+            groups.entry(group_key).or_default().push(sample);
+        }
+        groups
+    }
+
+    fn select_k_from_group(
+        mut samples: Vec<EvalSample>,
+        k: usize,
+        order: KAggregationOrder,
+    ) -> Vec<EvalSample> {
+        let keep = k.min(samples.len());
+        let mut selected_indices = select_k_indices_with_heap(&samples, keep, order);
+        // Remove from highest index first so swap_remove cannot invalidate
+        // indices we still need to read.
+        selected_indices.sort_unstable_by(|left, right| right.cmp(left));
+
+        let mut result = Vec::with_capacity(selected_indices.len());
+        for idx in selected_indices {
+            result.push(samples.swap_remove(idx));
+        }
+        result.sort_by(|left, right| compare_k_values(left.value, right.value, order));
+        result
+    }
+
+    async fn evaluate_k_aggregate(
+        &mut self,
+        aggregate: &AggregateExpr,
+        mut samples: Vec<EvalSample>,
+        eval_ctx: AggregationEvalContext,
+    ) -> EvalResult<Vec<EvalSample>> {
+        let order = match aggregate.op.id() {
+            T_TOPK => KAggregationOrder::Top,
+            T_BOTTOMK => KAggregationOrder::Bottom,
+            _ => {
+                return Err(EvaluationError::InternalError(format!(
+                    "evaluate_k_aggregate called for non-k aggregation operator: {:?}",
+                    aggregate.op
+                )));
+            }
+        };
+
+        let k_param = self
+            .evaluate_aggregation_param_as_scalar(
+                aggregate.param.as_deref(),
+                eval_ctx.query_start,
+                eval_ctx.query_end,
+                eval_ctx.evaluation_ts,
+                eval_ctx.interval_ms,
+                eval_ctx.lookback_delta_ms,
+            )
+            .await?;
+        let k = Self::coerce_k_size(k_param, samples.len());
+        if k == 0 {
+            return Ok(vec![]);
+        }
+
+        // k-aggregation without `by` / `without`: all samples belong to one
+        // implicit group, so skip hashmap bucketing overhead.
+        if aggregate.modifier.is_none() {
+            if samples.iter().any(|sample| sample.drop_name) {
+                for sample in &mut samples {
+                    if sample.drop_name {
+                        sample.labels.remove(METRIC_NAME);
+                        sample.drop_name = false;
+                    }
+                }
+            }
+            return Ok(Self::select_k_from_group(samples, k, order));
+        }
+
+        // Histogram samples are not yet represented in EvalSample.
+        // This path is isolated so histogram handling can be added later
+        // without changing k-aggregation grouping/selection flow.
+        let grouped = Self::group_samples_for_k_aggregation(samples, aggregate.modifier.as_ref());
+        let mut result = Vec::new();
+        for group_samples in grouped.into_values() {
+            result.extend(Self::select_k_from_group(group_samples, k, order));
+        }
+        Ok(result)
+    }
+
     /// Compute a match signature for a sample's labels per Prometheus binary op semantics.
     /// - No modifier: match on ALL labels except `__name__`
     /// - `on(l1, l2)` (Include): match only on listed labels
@@ -1782,6 +2128,25 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         // If there are no samples, return empty result
         if samples.is_empty() {
             return Ok(ExprResult::InstantVector(vec![]));
+        }
+
+        // `topk`/`bottomk` are selection aggregations, not reduction aggregations.
+        // They must keep full EvalSample records so the selected output series
+        // retain their original labels/timestamps. The generic path below is a
+        // reducer: it collapses each group to Vec<f64> and emits one value per
+        // group, which discards per-series identity and cannot express k-selection.
+        if matches!(aggregate.op.id(), T_TOPK | T_BOTTOMK) {
+            let eval_ctx = AggregationEvalContext {
+                query_start,
+                query_end,
+                evaluation_ts,
+                interval_ms,
+                lookback_delta_ms,
+            };
+            let k_samples = self
+                .evaluate_k_aggregate(aggregate, samples, eval_ctx)
+                .await?;
+            return Ok(ExprResult::InstantVector(k_samples));
         }
 
         // Group samples by their grouping key (which consumes the filtered labels)
@@ -2400,8 +2765,8 @@ mod tests {
             ("memory_bytes", vec![("env", "staging")], 3, 100.0),
         ],
         vec![
-            // 150 > 100 = true; __name__ preserved for comparison ops
-            (1.0, vec![("__name__", "cpu_usage"), ("env", "prod")]),
+            // 150 > 100 = true; non-bool comparison propagates lhs value
+            (150.0, vec![("__name__", "cpu_usage"), ("env", "prod")]),
             // 50 > 100 = false, filtered out
         ]
     )]
@@ -2439,8 +2804,8 @@ mod tests {
             ("memory_bytes", vec![("env", "staging")], 3, 100.0),
         ],
         vec![
-            // 150 > 100 = true; on(env) keeps only env label
-            (1.0, vec![("env", "prod")]),
+            // 150 > 100 = true; on(env) keeps only env label, value stays from lhs
+            (150.0, vec![("env", "prod")]),
             // 50 > 100 = false, filtered out
         ]
     )]
@@ -2453,7 +2818,7 @@ mod tests {
         ],
         vec![
             // ignoring(instance) comparison preserves __name__ but removes instance
-            (1.0, vec![("__name__", "cpu_usage"), ("env", "prod")]),
+            (150.0, vec![("__name__", "cpu_usage"), ("env", "prod")]),
         ]
     )]
     #[case(
@@ -2464,8 +2829,8 @@ mod tests {
         ],
         vec![
             // on(__name__) comparison without bool: Prometheus preserves __name__
-            // (shouldDropMetricName only returns true for comparisons when ReturnBool is set)
-            (1.0, vec![("__name__", "cpu_usage")]),
+            // and propagates lhs value.
+            (150.0, vec![("__name__", "cpu_usage")]),
         ]
     )]
     #[case(
@@ -2650,6 +3015,54 @@ mod tests {
         vec![
             (4.0, vec![]), // 4 series
         ]
+    )]
+    #[case(
+        "aggregation_topk",
+        "topk(2, http_requests_total)",
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+            ("http_requests_total", vec![("env", "staging"), ("method", "GET")], 2, 30.0),
+            ("http_requests_total", vec![("env", "staging"), ("method", "POST")], 3, 40.0),
+        ],
+        vec![
+            (30.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "GET")]),
+            (40.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "POST")]),
+        ]
+    )]
+    #[case(
+        "aggregation_topk_by_env",
+        r#"topk by (env) (1, http_requests_total)"#,
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+            ("http_requests_total", vec![("env", "staging"), ("method", "GET")], 2, 30.0),
+            ("http_requests_total", vec![("env", "staging"), ("method", "POST")], 3, 40.0),
+        ],
+        vec![
+            (20.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "POST")]),
+            (40.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "POST")]),
+        ]
+    )]
+    #[case(
+        "aggregation_topk_materializes_drop_name",
+        "topk(1, http_requests_total + 1)",
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+        ],
+        vec![
+            (21.0, vec![("env", "prod"), ("method", "POST")]),
+        ]
+    )]
+    #[case(
+        "aggregation_topk_zero_k_returns_empty",
+        "topk(0, http_requests_total)",
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+        ],
+        vec![]
     )]
     // Aggregations with grouping
     #[case(
@@ -2842,6 +3255,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_evaluate_time_function_as_scalar() {
+        // given
+        let bucket = TimeBucket::hour(1000);
+        let reader = MockQueryReaderBuilder::new(bucket).build();
+        let mut evaluator = Evaluator::new(&reader);
+        let end_time = UNIX_EPOCH + Duration::from_millis(1);
+
+        // when
+        let stmt = EvalStmt {
+            expr: promql_parser::parser::parse("time()").unwrap(),
+            start: end_time,
+            end: end_time,
+            interval: Duration::from_secs(0),
+            lookback_delta: Duration::from_secs(300),
+        };
+        let result = evaluator.evaluate(stmt).await.unwrap();
+
+        // then
+        match result {
+            ExprResult::Scalar(value) => assert_eq!(value, 0.001),
+            ExprResult::InstantVector(_) => panic!("Expected scalar result, got vector"),
+            ExprResult::RangeVector(_) => panic!("Expected scalar result, got range vector"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_pi_function_as_scalar() {
+        // given
+        let bucket = TimeBucket::hour(1000);
+        let reader = MockQueryReaderBuilder::new(bucket).build();
+        let mut evaluator = Evaluator::new(&reader);
+        let end_time = UNIX_EPOCH + Duration::from_secs(2000);
+
+        // when
+        let stmt = EvalStmt {
+            expr: promql_parser::parser::parse("pi()").unwrap(),
+            start: end_time,
+            end: end_time,
+            interval: Duration::from_secs(0),
+            lookback_delta: Duration::from_secs(300),
+        };
+        let result = evaluator.evaluate(stmt).await.unwrap();
+
+        // then
+        match result {
+            ExprResult::Scalar(value) => assert_eq!(value, std::f64::consts::PI),
+            ExprResult::InstantVector(_) => panic!("Expected scalar result, got vector"),
+            ExprResult::RangeVector(_) => panic!("Expected scalar result, got range vector"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_scalar_function_as_scalar() {
+        // given
+        let bucket = TimeBucket::hour(1000);
+        let reader = MockQueryReaderBuilder::new(bucket).build();
+        let mut evaluator = Evaluator::new(&reader);
+        let end_time = UNIX_EPOCH + Duration::from_secs(2000);
+
+        // when
+        let stmt = EvalStmt {
+            expr: promql_parser::parser::parse("scalar(vector(42))").unwrap(),
+            start: end_time,
+            end: end_time,
+            interval: Duration::from_secs(0),
+            lookback_delta: Duration::from_secs(300),
+        };
+        let result = evaluator.evaluate(stmt).await.unwrap();
+
+        // then
+        match result {
+            ExprResult::Scalar(value) => assert_eq!(value, 42.0),
+            ExprResult::InstantVector(_) => panic!("Expected scalar result, got vector"),
+            ExprResult::RangeVector(_) => panic!("Expected scalar result, got range vector"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_allow_scalar_function_results_as_vector_arguments() {
+        // given
+        let bucket = TimeBucket::hour(1000);
+        let reader = MockQueryReaderBuilder::new(bucket).build();
+        let mut evaluator = Evaluator::new(&reader);
+        let end_time = UNIX_EPOCH + Duration::from_secs(5);
+
+        // when
+        let stmt = EvalStmt {
+            expr: promql_parser::parser::parse("vector(time())").unwrap(),
+            start: end_time,
+            end: end_time,
+            interval: Duration::from_secs(0),
+            lookback_delta: Duration::from_secs(300),
+        };
+        let result = evaluator
+            .evaluate(stmt)
+            .await
+            .unwrap()
+            .expect_instant_vector("Expected instant vector result");
+
+        // then
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 5.0);
+    }
+
+    #[tokio::test]
     async fn should_error_on_string_literal() {
         // given: create an empty mock reader
         let bucket = TimeBucket::hour(1000);
@@ -2875,7 +3393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_error_on_string_literal_as_function_argument() {
+    async fn should_evaluate_label_replace_with_raw_string_arguments() {
         // given: create an empty mock reader
         let bucket = TimeBucket::hour(1000);
         let reader = MockQueryReaderBuilder::new(bucket).build();
@@ -2887,16 +3405,60 @@ mod tests {
             expr: promql_parser::parser::Expr::Call(promql_parser::parser::Call {
                 func: promql_parser::parser::Function {
                     name: "label_replace",
-                    arg_types: vec![],
-                    variadic: false,
+                    arg_types: vec![
+                        ValueType::Vector,
+                        ValueType::String,
+                        ValueType::String,
+                        ValueType::String,
+                        ValueType::String,
+                    ],
+                    variadic: 0,
                     return_type: ValueType::Vector,
+                    experimental: false,
                 },
                 args: promql_parser::parser::FunctionArgs {
-                    args: vec![Box::new(promql_parser::parser::Expr::StringLiteral(
-                        promql_parser::parser::StringLiteral {
-                            val: "replacement".to_string(),
-                        },
-                    ))],
+                    args: vec![
+                        Box::new(promql_parser::parser::Expr::Call(
+                            promql_parser::parser::Call {
+                                func: promql_parser::parser::Function::new(
+                                    "vector",
+                                    vec![ValueType::Scalar],
+                                    0,
+                                    ValueType::Vector,
+                                    false,
+                                ),
+                                args: promql_parser::parser::FunctionArgs::new_args(
+                                    promql_parser::parser::Expr::NumberLiteral(
+                                        promql_parser::parser::NumberLiteral { val: 1.0 },
+                                    ),
+                                ),
+                            },
+                        )),
+                        Box::new(promql_parser::parser::Expr::Paren(
+                            promql_parser::parser::ParenExpr {
+                                expr: Box::new(promql_parser::parser::Expr::StringLiteral(
+                                    promql_parser::parser::StringLiteral {
+                                        val: "dst".to_string(),
+                                    },
+                                )),
+                            },
+                        )),
+                        Box::new(promql_parser::parser::Expr::StringLiteral(
+                            promql_parser::parser::StringLiteral {
+                                val: "replacement".to_string(),
+                            },
+                        )),
+                        Box::new(promql_parser::parser::Expr::StringLiteral(
+                            promql_parser::parser::StringLiteral {
+                                val: "src".to_string(),
+                            },
+                        )),
+                        Box::new(promql_parser::parser::Expr::StringLiteral(
+                            promql_parser::parser::StringLiteral {
+                                val: "(.*)".to_string(),
+                            },
+                        )),
+                    ],
                 },
             }),
             start: end_time,
@@ -2907,16 +3469,22 @@ mod tests {
 
         let result = evaluator.evaluate(stmt).await;
 
-        // then: should return a context-specific error (string arg not yet supported)
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("string literal")
-                && err.to_string().contains("label_replace")
-                && err.to_string().contains("not yet supported"),
-            "Error message should mention string literal, function name, and 'not yet supported', got: {}",
-            err
-        );
+        // then: raw string args should reach label_replace and be applied
+        let result = result.expect("label_replace should succeed");
+        match result {
+            ExprResult::InstantVector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].value, 1.0);
+                assert_eq!(
+                    samples[0].labels.get("dst"),
+                    Some(&"replacement".to_string())
+                );
+            }
+            ExprResult::Scalar(_) => panic!("Expected instant vector result, got scalar"),
+            ExprResult::RangeVector(_) => {
+                panic!("Expected instant vector result, got range vector")
+            }
+        }
     }
 
     #[allow(clippy::type_complexity)]
@@ -3317,7 +3885,13 @@ mod tests {
         let mut evaluator = Evaluator::new(&reader);
 
         let call = Call {
-            func: Function::new("vector", vec![ValueType::Scalar], false, ValueType::Scalar),
+            func: Function::new(
+                "vector",
+                vec![ValueType::Scalar],
+                0,
+                ValueType::Vector,
+                false,
+            ),
             args: FunctionArgs::new_args(Expr::NumberLiteral(NumberLiteral { val: 42.0 })),
         };
 
@@ -3353,7 +3927,13 @@ mod tests {
         let (reader, end_time) = setup_mock_reader(vec![]);
         let mut evaluator = Evaluator::new(&reader);
         let call = Call {
-            func: Function::new("vector", vec![ValueType::Scalar], false, ValueType::Scalar),
+            func: Function::new(
+                "vector",
+                vec![ValueType::Scalar],
+                0,
+                ValueType::Vector,
+                false,
+            ),
             args: FunctionArgs::new_args(Expr::Binary(BinaryExpr {
                 lhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 1.0 })),
                 rhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 1.0 })),
@@ -3380,6 +3960,92 @@ mod tests {
             }
             other => panic!("Expected Instant Vector, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_clamp_family_queries() {
+        let test_data = vec![
+            ("test_clamp", vec![("src", "clamp-a")], 0, -50.0),
+            ("test_clamp", vec![("src", "clamp-b")], 1, 0.0),
+            ("test_clamp", vec![("src", "clamp-c")], 2, 100.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        let clamp_result = parse_and_evaluate(
+            &mut evaluator,
+            "clamp(test_clamp, -25, 75)",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .unwrap();
+        assert_results_match(
+            &clamp_result,
+            &[
+                (-25.0, vec![("__name__", "test_clamp"), ("src", "clamp-a")]),
+                (0.0, vec![("__name__", "test_clamp"), ("src", "clamp-b")]),
+                (75.0, vec![("__name__", "test_clamp"), ("src", "clamp-c")]),
+            ],
+        );
+
+        let clamp_min_result = parse_and_evaluate(
+            &mut evaluator,
+            "clamp_min(test_clamp, -25)",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .unwrap();
+        assert_results_match(
+            &clamp_min_result,
+            &[
+                (-25.0, vec![("__name__", "test_clamp"), ("src", "clamp-a")]),
+                (0.0, vec![("__name__", "test_clamp"), ("src", "clamp-b")]),
+                (100.0, vec![("__name__", "test_clamp"), ("src", "clamp-c")]),
+            ],
+        );
+
+        let clamp_max_result = parse_and_evaluate(
+            &mut evaluator,
+            "clamp_max(test_clamp, 75)",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .unwrap();
+        assert_results_match(
+            &clamp_max_result,
+            &[
+                (-50.0, vec![("__name__", "test_clamp"), ("src", "clamp-a")]),
+                (0.0, vec![("__name__", "test_clamp"), ("src", "clamp-b")]),
+                (75.0, vec![("__name__", "test_clamp"), ("src", "clamp-c")]),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn should_return_empty_vector_for_clamp_when_min_exceeds_max() {
+        let test_data = vec![
+            ("test_clamp", vec![("src", "clamp-a")], 0, -50.0),
+            ("test_clamp", vec![("src", "clamp-b")], 1, 0.0),
+            ("test_clamp", vec![("src", "clamp-c")], 2, 100.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "clamp(test_clamp, 5, -5)",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_empty());
     }
 
     #[tokio::test]
@@ -4133,6 +4799,691 @@ mod tests {
             samples.is_empty(),
             "No matches expected, got {} samples",
             samples.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_group_left_add() {
+        // given: many left-side series matched to one right-side series via on(env)
+        // cpu_usage has two series per env (different instance), memory_bytes has one per env.
+        let test_data: TestSampleData = vec![
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i1")],
+                0,
+                50.0,
+            ),
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i2")],
+                1,
+                60.0,
+            ),
+            (
+                "cpu_usage",
+                vec![("env", "staging"), ("instance", "i3")],
+                2,
+                70.0,
+            ),
+            ("memory_bytes", vec![("env", "prod")], 3, 100.0),
+            ("memory_bytes", vec![("env", "staging")], 4, 200.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "cpu_usage + on(env) group_left memory_bytes",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .expect("group_left query should evaluate successfully");
+
+        // then: result labels come from the many (left) side, __name__ dropped by arithmetic
+        assert_results_match(
+            &result,
+            &[
+                (150.0, vec![("env", "prod"), ("instance", "i1")]),
+                (160.0, vec![("env", "prod"), ("instance", "i2")]),
+                (270.0, vec![("env", "staging"), ("instance", "i3")]),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_group_left_with_extra_labels() {
+        // given: group_left(region) copies the "region" label from the one (right) side
+        let test_data: TestSampleData = vec![
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i1")],
+                0,
+                50.0,
+            ),
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i2")],
+                1,
+                60.0,
+            ),
+            (
+                "memory_bytes",
+                vec![("env", "prod"), ("region", "us-east")],
+                2,
+                100.0,
+            ),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "cpu_usage + on(env) group_left(region) memory_bytes",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .expect("group_left with extra labels should evaluate successfully");
+
+        // then: result has many-side labels plus the extra "region" from one side
+        assert_results_match(
+            &result,
+            &[
+                (
+                    150.0,
+                    vec![("env", "prod"), ("instance", "i1"), ("region", "us-east")],
+                ),
+                (
+                    160.0,
+                    vec![("env", "prod"), ("instance", "i2"), ("region", "us-east")],
+                ),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_group_left_comparison() {
+        // given: comparison with group_left filters out false results
+        let test_data: TestSampleData = vec![
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i1")],
+                0,
+                150.0,
+            ),
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i2")],
+                1,
+                50.0,
+            ),
+            ("memory_bytes", vec![("env", "prod")], 2, 100.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "cpu_usage > on(env) group_left memory_bytes",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .expect("group_left comparison should evaluate successfully");
+
+        // then: only the 150 > 100 result survives; non-bool comparison propagates lhs sample value
+        assert_results_match(
+            &result,
+            &[(
+                150.0,
+                vec![
+                    ("__name__", "cpu_usage"),
+                    ("env", "prod"),
+                    ("instance", "i1"),
+                ],
+            )],
+        );
+    }
+
+    #[tokio::test]
+    async fn should_error_group_left_duplicate_on_right_side() {
+        // given: group_left but the right (one) side has duplicates after matching
+        let test_data: TestSampleData = vec![
+            ("cpu_usage", vec![("env", "prod")], 0, 50.0),
+            (
+                "memory_bytes",
+                vec![("env", "prod"), ("instance", "i1")],
+                1,
+                100.0,
+            ),
+            (
+                "memory_bytes",
+                vec![("env", "prod"), ("instance", "i2")],
+                2,
+                200.0,
+            ),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "cpu_usage + on(env) group_left memory_bytes",
+            end_time,
+            lookback_delta,
+        )
+        .await;
+
+        // then: error - the one side has duplicates
+        assert!(
+            result.is_err(),
+            "Expected error for duplicate series on the one (right) side"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate series on the right side"),
+            "Error should mention right side: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_group_left_no_match() {
+        // given: no matching env between lhs and rhs
+        let test_data: TestSampleData = vec![
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i1")],
+                0,
+                50.0,
+            ),
+            ("memory_bytes", vec![("env", "staging")], 1, 100.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "cpu_usage + on(env) group_left memory_bytes",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .expect("group_left with no match should return empty");
+
+        // then: empty - no env matches
+        assert!(
+            result.is_empty(),
+            "Expected empty result, got {} samples",
+            result.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_group_right_add() {
+        // given: one left-side series matched to many right-side series via on(env)
+        // cpu_usage has one per env, memory_bytes has two per env (different instance).
+        let test_data: TestSampleData = vec![
+            ("cpu_usage", vec![("env", "prod")], 0, 50.0),
+            ("cpu_usage", vec![("env", "staging")], 1, 70.0),
+            (
+                "memory_bytes",
+                vec![("env", "prod"), ("instance", "i1")],
+                2,
+                100.0,
+            ),
+            (
+                "memory_bytes",
+                vec![("env", "prod"), ("instance", "i2")],
+                3,
+                200.0,
+            ),
+            (
+                "memory_bytes",
+                vec![("env", "staging"), ("instance", "i3")],
+                4,
+                300.0,
+            ),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "cpu_usage + on(env) group_right memory_bytes",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .expect("group_right query should evaluate successfully");
+
+        // then: result labels come from the many (right) side, __name__ dropped by arithmetic
+        assert_results_match(
+            &result,
+            &[
+                (150.0, vec![("env", "prod"), ("instance", "i1")]),
+                (250.0, vec![("env", "prod"), ("instance", "i2")]),
+                (370.0, vec![("env", "staging"), ("instance", "i3")]),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_group_right_with_extra_labels() {
+        // given: group_right(region) copies "region" label from the one (left) side
+        let test_data: TestSampleData = vec![
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("region", "us-east")],
+                0,
+                50.0,
+            ),
+            (
+                "memory_bytes",
+                vec![("env", "prod"), ("instance", "i1")],
+                1,
+                100.0,
+            ),
+            (
+                "memory_bytes",
+                vec![("env", "prod"), ("instance", "i2")],
+                2,
+                200.0,
+            ),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "cpu_usage + on(env) group_right(region) memory_bytes",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .expect("group_right with extra labels should evaluate successfully");
+
+        // then: result has many-side labels plus the extra "region" from one (left) side
+        assert_results_match(
+            &result,
+            &[
+                (
+                    150.0,
+                    vec![("env", "prod"), ("instance", "i1"), ("region", "us-east")],
+                ),
+                (
+                    250.0,
+                    vec![("env", "prod"), ("instance", "i2"), ("region", "us-east")],
+                ),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_group_right_comparison() {
+        // given: comparison with group_right filters out false results
+        let test_data: TestSampleData = vec![
+            ("cpu_usage", vec![("env", "prod")], 0, 150.0),
+            (
+                "memory_bytes",
+                vec![("env", "prod"), ("instance", "i1")],
+                1,
+                100.0,
+            ),
+            (
+                "memory_bytes",
+                vec![("env", "prod"), ("instance", "i2")],
+                2,
+                200.0,
+            ),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "cpu_usage > on(env) group_right memory_bytes",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .expect("group_right comparison should evaluate successfully");
+
+        // then: only 150 > 100 survives; non-bool comparison propagates lhs sample value
+        assert_results_match(
+            &result,
+            &[(
+                150.0,
+                vec![
+                    ("__name__", "memory_bytes"),
+                    ("env", "prod"),
+                    ("instance", "i1"),
+                ],
+            )],
+        );
+    }
+
+    #[tokio::test]
+    async fn should_error_group_right_duplicate_on_left_side() {
+        // given: group_right but the left (one) side has duplicates after matching
+        let test_data: TestSampleData = vec![
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i1")],
+                0,
+                50.0,
+            ),
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i2")],
+                1,
+                60.0,
+            ),
+            ("memory_bytes", vec![("env", "prod")], 2, 100.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "cpu_usage + on(env) group_right memory_bytes",
+            end_time,
+            lookback_delta,
+        )
+        .await;
+
+        // then: error - the one (left) side has duplicates
+        assert!(
+            result.is_err(),
+            "Expected error for duplicate series on the one (left) side"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate series on the left side"),
+            "Error should mention left side: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_group_right_no_match() {
+        // given: no matching env between lhs and rhs
+        let test_data: TestSampleData = vec![
+            ("cpu_usage", vec![("env", "prod")], 0, 50.0),
+            (
+                "memory_bytes",
+                vec![("env", "staging"), ("instance", "i1")],
+                1,
+                100.0,
+            ),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "cpu_usage + on(env) group_right memory_bytes",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .expect("group_right with no match should return empty");
+
+        // then: empty - no env matches
+        assert!(
+            result.is_empty(),
+            "Expected empty result, got {} samples",
+            result.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_group_left_with_ignoring() {
+        // given: group_left with ignoring() instead of on()
+        let test_data: TestSampleData = vec![
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i1"), ("region", "us-east")],
+                0,
+                50.0,
+            ),
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i2"), ("region", "us-east")],
+                1,
+                60.0,
+            ),
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i3"), ("region", "eu-west")],
+                2,
+                70.0,
+            ),
+            (
+                "memory_bytes",
+                vec![("env", "prod"), ("instance", "i99"), ("region", "us-east")],
+                3,
+                100.0,
+            ),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when: ignoring(instance) removes instance from key, so key = {env, region}
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "cpu_usage + ignoring(instance) group_left memory_bytes",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .expect("group_left with ignoring should evaluate successfully");
+
+        // then: only region="us-east" matches; region="eu-west" is dropped (no one-side match)
+        assert_results_match(
+            &result,
+            &[
+                (
+                    150.0,
+                    vec![("env", "prod"), ("instance", "i1"), ("region", "us-east")],
+                ),
+                (
+                    160.0,
+                    vec![("env", "prod"), ("instance", "i2"), ("region", "us-east")],
+                ),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn should_evaluate_group_right_with_ignoring() {
+        // given: group_right with ignoring() instead of on()
+        let test_data: TestSampleData = vec![
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i99"), ("region", "us-east")],
+                0,
+                50.0,
+            ),
+            (
+                "memory_bytes",
+                vec![("env", "prod"), ("instance", "i1"), ("region", "us-east")],
+                1,
+                100.0,
+            ),
+            (
+                "memory_bytes",
+                vec![("env", "prod"), ("instance", "i2"), ("region", "us-east")],
+                2,
+                200.0,
+            ),
+            (
+                "memory_bytes",
+                vec![("env", "prod"), ("instance", "i3"), ("region", "eu-west")],
+                3,
+                300.0,
+            ),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when: ignoring(instance) removes instance from key, so key = {env, region}
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "cpu_usage + ignoring(instance) group_right memory_bytes",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .expect("group_right with ignoring should evaluate successfully");
+
+        // then: only region="us-east" matches; region="eu-west" is dropped (no one-side match)
+        assert_results_match(
+            &result,
+            &[
+                (
+                    150.0,
+                    vec![("env", "prod"), ("instance", "i1"), ("region", "us-east")],
+                ),
+                (
+                    250.0,
+                    vec![("env", "prod"), ("instance", "i2"), ("region", "us-east")],
+                ),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn should_error_when_group_left_produces_duplicate_output_labelsets() {
+        // given: two many-side series differ only by metric name. Arithmetic drops __name__,
+        // so both outputs collapse to the same label set and must be rejected.
+        let test_data: TestSampleData = vec![
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i1")],
+                0,
+                50.0,
+            ),
+            (
+                "cpu_usage_alt",
+                vec![("env", "prod"), ("instance", "i1")],
+                1,
+                60.0,
+            ),
+            ("memory_bytes", vec![("env", "prod")], 2, 100.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            r#"{__name__=~"cpu_usage|cpu_usage_alt"} + on(env) group_left memory_bytes"#,
+            end_time,
+            lookback_delta,
+        )
+        .await;
+
+        // then: Prometheus requires output series to remain uniquely identifiable
+        assert!(
+            result.is_err(),
+            "Expected error for duplicate output label sets in group_left result"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_remove_group_left_extra_label_when_one_side_lacks_it() {
+        // given: many-side sample already has region label, but one-side match has no region.
+        // group_left(region) should remove region from output, not preserve stale value.
+        let test_data: TestSampleData = vec![
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i1"), ("region", "stale")],
+                0,
+                50.0,
+            ),
+            ("memory_bytes", vec![("env", "prod")], 1, 100.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            "cpu_usage + on(env) group_left(region) memory_bytes",
+            end_time,
+            lookback_delta,
+        )
+        .await
+        .expect("group_left(region) query should evaluate successfully");
+
+        // then: region must not be present because one-side series has no region label
+        assert_results_match(
+            &result,
+            &[(150.0, vec![("env", "prod"), ("instance", "i1")])],
+        );
+    }
+
+    #[tokio::test]
+    async fn should_error_grouped_comparison_duplicates_before_false_filter() {
+        // given: two many-side series collapse to identical output labels after inner arithmetic
+        // drops __name__. Both comparisons are false, but grouped duplicate validation should
+        // still run before non-bool filter drop.
+        let test_data: TestSampleData = vec![
+            (
+                "cpu_usage",
+                vec![("env", "prod"), ("instance", "i1")],
+                0,
+                10.0,
+            ),
+            (
+                "cpu_usage_alt",
+                vec![("env", "prod"), ("instance", "i1")],
+                1,
+                20.0,
+            ),
+            ("memory_bytes", vec![("env", "prod")], 2, 100.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let mut evaluator = Evaluator::new(&reader);
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &mut evaluator,
+            r#"({__name__=~"cpu_usage|cpu_usage_alt"} + 0) > on(env) group_left memory_bytes"#,
+            end_time,
+            lookback_delta,
+        )
+        .await;
+
+        // then: duplicate output labels must error even though both comparisons are false
+        assert!(
+            result.is_err(),
+            "Expected duplicate-match error before comparison false filtering"
         );
     }
 

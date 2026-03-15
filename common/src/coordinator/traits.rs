@@ -69,7 +69,7 @@ pub trait Delta: Sized + Send + Sync + 'static {
     /// Returns the frozen delta and the context (which was owned by the delta).
     /// Implementations should ensure this operation is efficient (e.g., via
     /// copy-on-write or reference counting) since it blocks writes. After this
-    /// is complete, the [`Flusher::flush`] happens on a background thread.
+    /// is complete, the [`Flusher::flush_delta`] happens on a background thread.
     fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context);
 
     fn reader(&self) -> Self::DeltaView;

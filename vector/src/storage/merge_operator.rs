@@ -3,15 +3,15 @@
 //! Routes merge operations to the appropriate merge function based on the
 //! record type encoded in the key.
 
-use bytes::Bytes;
-use common::serde::key_prefix::KeyPrefix;
-use roaring::RoaringTreemap;
-use std::io::Cursor;
-
 use crate::serde::centroid_chunk::CentroidChunkValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
-use crate::serde::posting_list::merge_posting_list;
+use crate::serde::posting_list::{merge_batch_posting_list, merge_posting_list};
 use crate::serde::{EncodingError, KEY_VERSION, RecordType};
+use bytes::Bytes;
+use common::serde::key_prefix::KeyPrefix;
+use common::storage::default_merge_batch;
+use roaring::RoaringTreemap;
+use std::io::Cursor;
 
 /// Merge operator for vector database that handles merging of different record types.
 ///
@@ -69,6 +69,20 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
             }
         }
     }
+
+    fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
+        let prefix =
+            KeyPrefix::from_bytes_versioned(key, KEY_VERSION).expect("Failed to decode key prefix");
+        let record_type = RecordType::from_id(prefix.tag().record_type())
+            .expect("Failed to get record type from record tag");
+
+        match record_type {
+            RecordType::PostingList => {
+                merge_batch_posting_list(existing_value, operands, self.dimensions)
+            }
+            _ => default_merge_batch(key, existing_value, operands, |k, e, v| self.merge(k, e, v)),
+        }
+    }
 }
 
 /// Merge two RoaringTreemap values by unioning them.
@@ -76,7 +90,6 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
 /// Used for:
 /// - Deletions: Union deleted vector IDs
 /// - MetadataIndex: Union vector IDs matching a metadata filter
-#[allow(dead_code)]
 fn merge_roaring_treemap(existing: Bytes, new_value: Bytes) -> Result<Bytes, EncodingError> {
     // Deserialize both bitmaps
     let existing_bitmap = RoaringTreemap::deserialize_from(Cursor::new(existing.as_ref()))

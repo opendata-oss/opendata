@@ -98,6 +98,36 @@ impl From<crate::serde::EncodingError> for Error {
     }
 }
 
+/// Error type for PromQL query and discovery operations.
+///
+/// This is returned by the read/query methods on `TimeSeriesDb`.
+#[derive(Debug, thiserror::Error)]
+pub enum QueryError {
+    /// The query string could not be parsed or is otherwise invalid.
+    #[error("invalid query: {0}")]
+    InvalidQuery(String),
+
+    /// The query exceeded the configured timeout.
+    #[error("query timed out")]
+    Timeout,
+
+    /// An error occurred during query execution.
+    #[error("execution error: {0}")]
+    Execution(String),
+}
+
+impl From<crate::promql::evaluator::EvaluationError> for QueryError {
+    fn from(err: crate::promql::evaluator::EvaluationError) -> Self {
+        QueryError::Execution(err.to_string())
+    }
+}
+
+impl From<Error> for QueryError {
+    fn from(err: Error) -> Self {
+        QueryError::Execution(err.to_string())
+    }
+}
+
 /// Result type alias for OpenData TimeSeries operations.
 ///
 /// This is a convenience alias for `std::result::Result<T, Error>`.

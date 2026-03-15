@@ -1,0 +1,163 @@
+# Vector matching tests for one-to-many and many-to-one binary operations.
+# Tests group_left (many-to-one) and group_right (one-to-many) semantics.
+
+# Setup: a "many" side with per-instance metrics and a "one" side aggregated by group.
+load 5m
+  requests_total{job="api", instance="0", group="production"} 100
+  requests_total{job="api", instance="1", group="production"} 200
+  requests_total{job="api", instance="0", group="canary"} 300
+  requests_total{job="api", instance="1", group="canary"} 400
+  group_size{group="production"} 2
+  group_size{group="canary"} 3
+
+# ── many-to-one (group_left) ────────────────────────────────────────────────
+
+# Basic group_left: multiply each instance's requests by the group size.
+# Many side (requests_total) has multiple series per group; one side (group_size)
+# has one series per group. Result keeps the many side's labels.
+eval instant at 0s requests_total * on(group) group_left group_size
+  {job="api", instance="0", group="production"} 200
+  {job="api", instance="1", group="production"} 400
+  {job="api", instance="0", group="canary"} 900
+  {job="api", instance="1", group="canary"} 1200
+
+# group_left division
+eval instant at 0s requests_total / on(group) group_left group_size
+  {job="api", instance="0", group="production"} 50
+  {job="api", instance="1", group="production"} 100
+  {job="api", instance="0", group="canary"} 100
+  {job="api", instance="1", group="canary"} 133.33333333333334
+
+# group_left addition
+eval instant at 0s requests_total + on(group) group_left group_size
+  {job="api", instance="0", group="production"} 102
+  {job="api", instance="1", group="production"} 202
+  {job="api", instance="0", group="canary"} 303
+  {job="api", instance="1", group="canary"} 403
+
+# group_left subtraction
+eval instant at 0s requests_total - on(group) group_left group_size
+  {job="api", instance="0", group="production"} 98
+  {job="api", instance="1", group="production"} 198
+  {job="api", instance="0", group="canary"} 297
+  {job="api", instance="1", group="canary"} 397
+
+# ── one-to-many (group_right) ───────────────────────────────────────────────
+
+# Basic group_right: multiply group size by each instance's requests.
+# One side (group_size) has one series per group; many side (requests_total)
+# has multiple series per group. Result keeps the many side's labels.
+eval instant at 0s group_size * on(group) group_right requests_total
+  {job="api", instance="0", group="production"} 200
+  {job="api", instance="1", group="production"} 400
+  {job="api", instance="0", group="canary"} 900
+  {job="api", instance="1", group="canary"} 1200
+
+# group_right addition
+eval instant at 0s group_size + on(group) group_right requests_total
+  {job="api", instance="0", group="production"} 102
+  {job="api", instance="1", group="production"} 202
+  {job="api", instance="0", group="canary"} 303
+  {job="api", instance="1", group="canary"} 403
+
+# group_right subtraction: one_value - many_value
+eval instant at 0s group_size - on(group) group_right requests_total
+  {job="api", instance="0", group="production"} -98
+  {job="api", instance="1", group="production"} -198
+  {job="api", instance="0", group="canary"} -297
+  {job="api", instance="1", group="canary"} -397
+
+# ── group_left / group_right with extra label copying ────────────────────────
+
+clear
+
+load 5m
+  cpu_seconds{job="app", instance="0", group="web"} 10
+  cpu_seconds{job="app", instance="1", group="web"} 20
+  cpu_seconds{job="app", instance="0", group="db"} 30
+  cluster_info{group="web", region="us-east", owner="team-a"} 1
+  cluster_info{group="db", region="eu-west", owner="team-b"} 2
+
+# group_left copying "region" from the one side into the result
+eval instant at 0s cpu_seconds * on(group) group_left(region) cluster_info
+  {job="app", instance="0", group="web", region="us-east"} 10
+  {job="app", instance="1", group="web", region="us-east"} 20
+  {job="app", instance="0", group="db", region="eu-west"} 60
+
+# group_left copying multiple labels from the one side
+eval instant at 0s cpu_seconds * on(group) group_left(region, owner) cluster_info
+  {job="app", instance="0", group="web", region="us-east", owner="team-a"} 10
+  {job="app", instance="1", group="web", region="us-east", owner="team-a"} 20
+  {job="app", instance="0", group="db", region="eu-west", owner="team-b"} 60
+
+# group_right copying "region" and "owner" from the one side (cluster_info)
+# into the many side's (cpu_seconds) result labels.
+eval instant at 0s cluster_info * on(group) group_right(region, owner) cpu_seconds
+  {job="app", instance="0", group="web", region="us-east", owner="team-a"} 10
+  {job="app", instance="1", group="web", region="us-east", owner="team-a"} 20
+  {job="app", instance="0", group="db", region="eu-west", owner="team-b"} 60
+
+# ── ignoring() with group_left / group_right ─────────────────────────────────
+#
+# ignoring(labels) matches on all labels except the listed ones.
+# Result retains all labels from the many side.
+
+clear
+
+load 5m
+  errors{job="api", instance="0", env="prod"} 5
+  errors{job="api", instance="1", env="prod"} 10
+  total{job="api", instance="2", env="prod"} 100
+
+# many-to-one: ignoring(instance) means match on {job, env}.
+# Result keeps all labels from the many side including "instance".
+eval instant at 0s errors / ignoring(instance) group_left total
+  {job="api", instance="0", env="prod"} 0.05
+  {job="api", instance="1", env="prod"} 0.1
+
+# one-to-many: ignoring(instance) with group_right, reversed operand order.
+eval instant at 0s total / ignoring(instance) group_right errors
+  {job="api", instance="0", env="prod"} 20
+  {job="api", instance="1", env="prod"} 10
+
+# ignoring multiple labels at once
+clear
+
+load 5m
+  req{job="web", method="GET", path="/a"} 100
+  req{job="web", method="POST", path="/b"} 200
+  limit{job="web"} 500
+
+# ignoring(method, path) matches on {job}.
+# Result retains method and path from the many side.
+eval instant at 0s req / ignoring(method, path) group_left limit
+  {job="web", method="GET", path="/a"} 0.2
+  {job="web", method="POST", path="/b"} 0.4
+
+# ── unmatched series are silently dropped ────────────────────────────────────
+
+clear
+
+load 5m
+  metric_a{group="x"} 10
+  metric_a{group="y"} 20
+  metric_b{group="x"} 3
+
+# group "y" from metric_a has no match in metric_b -> silently dropped
+eval instant at 0s metric_a * on(group) group_left metric_b
+  {group="x"} 30
+
+# ── one-to-one (no group modifier) with on() ────────────────────────────────
+
+clear
+
+load 5m
+  foo{env="prod", "instance"="0"} 10
+  foo{env="dev", "instance"="1"} 20
+  bar{env="prod", "instance"="2"} 3
+  bar{env="dev", "instance"="3"} 7
+
+# Only "on" labels are kept
+eval instant at 0s foo + on(env) bar
+  {env="prod"} 13
+  {env="dev"} 27

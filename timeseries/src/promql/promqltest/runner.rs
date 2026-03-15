@@ -117,6 +117,7 @@ where
                     assert_results(
                         &result,
                         &eval_cmd.expected,
+                        eval_cmd.expect_ordered,
                         name,
                         eval_count,
                         &eval_cmd.query,
@@ -167,7 +168,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].value, 2.0);
+        assert_eq!(result[0].samples[0].1, 2.0);
     }
 
     #[tokio::test]
@@ -189,7 +190,7 @@ mod tests {
 
         // then
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].value, 30.0);
+        assert_eq!(result[0].samples[0].1, 30.0);
     }
 
     #[tokio::test]

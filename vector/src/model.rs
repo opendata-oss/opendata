@@ -73,6 +73,14 @@ impl Vector {
             )],
         }
     }
+
+    pub fn attribute(&self, name: &str) -> Option<&AttributeValue> {
+        self.attributes
+            .iter()
+            .filter(|a| a.name == name)
+            .map(|a| &a.value)
+            .next()
+    }
 }
 
 /// Builder for constructing `Vector` instances with attributes.
@@ -259,6 +267,27 @@ impl Default for Config {
     }
 }
 
+/// Configuration for a read-only vector database client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReaderConfig {
+    /// Storage backend configuration.
+    pub storage: StorageConfig,
+
+    /// Vector dimensionality.
+    pub dimensions: u16,
+
+    /// Distance metric for similarity computation.
+    pub distance_metric: DistanceMetric,
+
+    /// Query-aware dynamic pruning epsilon (SPANN §3.2).
+    ///
+    /// See [`Config::query_pruning_factor`] for details.
+    pub query_pruning_factor: Option<f32>,
+
+    /// Metadata field schema.
+    pub metadata_fields: Vec<MetadataFieldSpec>,
+}
+
 /// Metadata field specification for schema definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataFieldSpec {
@@ -286,18 +315,100 @@ impl MetadataFieldSpec {
 /// A search result with vector, score, and metadata.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
-    /// Internal vector ID
-    pub internal_id: u64,
-    /// External vector ID (user-provided)
-    pub external_id: String,
     /// Similarity score (interpretation depends on distance metric)
     ///
     /// - L2: Lower scores = more similar
-    /// - Cosine: Higher scores = more similar (range: -1 to 1)
     /// - DotProduct: Higher scores = more similar
     pub score: f32,
-    /// Attribute key-value pairs
-    pub attributes: HashMap<String, AttributeValue>,
+    /// The vector found by search
+    pub vector: Vector,
+}
+
+/// Query specification for vector search.
+///
+/// Constructed using the builder pattern:
+///
+/// ```ignore
+/// let query = Query::new(embedding)
+///     .with_limit(10)
+///     .with_filter(Filter::eq("category", "shoes"));
+/// ```
+#[derive(Debug, Clone)]
+pub struct Query {
+    /// Query vector (required).
+    pub vector: Vec<f32>,
+    /// Maximum number of results to return (default: 10).
+    pub limit: usize,
+    /// Optional metadata filter.
+    pub filter: Option<Filter>,
+}
+
+impl Query {
+    /// Creates a new query with the given vector.
+    pub fn new(vector: Vec<f32>) -> Self {
+        Self {
+            vector,
+            limit: 10,
+            filter: None,
+        }
+    }
+
+    /// Sets the maximum number of results to return.
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Sets the metadata filter.
+    pub fn with_filter(mut self, filter: Filter) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+}
+
+/// Metadata filter for search queries.
+///
+/// Filters are composed using simple predicates and logical operators.
+/// All filters are evaluated against the metadata inverted indexes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Filter {
+    /// Field equals value.
+    Eq(String, AttributeValue),
+    /// Field not equals value.
+    Neq(String, AttributeValue),
+    /// Field is in set of values.
+    In(String, Vec<AttributeValue>),
+    /// All filters must match (logical AND).
+    And(Vec<Filter>),
+    /// Any filter must match (logical OR).
+    Or(Vec<Filter>),
+}
+
+impl Filter {
+    /// Creates an equality filter.
+    pub fn eq(field: impl Into<String>, value: impl Into<AttributeValue>) -> Self {
+        Filter::Eq(field.into(), value.into())
+    }
+
+    /// Creates a not-equals filter.
+    pub fn neq(field: impl Into<String>, value: impl Into<AttributeValue>) -> Self {
+        Filter::Neq(field.into(), value.into())
+    }
+
+    /// Creates an in-set filter.
+    pub fn in_set(field: impl Into<String>, values: Vec<AttributeValue>) -> Self {
+        Filter::In(field.into(), values)
+    }
+
+    /// Combines filters with logical AND.
+    pub fn and(filters: Vec<Filter>) -> Self {
+        Filter::And(filters)
+    }
+
+    /// Combines filters with logical OR.
+    pub fn or(filters: Vec<Filter>) -> Self {
+        Filter::Or(filters)
+    }
 }
 
 /// Helper to build a metadata map from attributes.

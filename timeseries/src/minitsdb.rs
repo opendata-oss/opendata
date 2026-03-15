@@ -24,6 +24,15 @@ pub(crate) struct MiniQueryReader {
     snapshot: Arc<dyn StorageRead>,
 }
 
+impl MiniQueryReader {
+    pub(crate) fn new(bucket: TimeBucket, storage: Arc<dyn StorageRead>) -> Self {
+        Self {
+            bucket,
+            snapshot: storage,
+        }
+    }
+}
+
 #[async_trait]
 impl BucketQueryReader for MiniQueryReader {
     async fn forward_index(
@@ -206,8 +215,12 @@ impl MiniTsdb {
         self.ingest_batch(std::slice::from_ref(series)).await
     }
 
-    /// Flush pending data to storage, making it durable and visible to queries.
-    pub(crate) async fn flush(&self) -> Result<()> {
+    /// Flush pending data to the storage memtable (not yet durable).
+    ///
+    /// After this returns, the data is visible to snapshot reads but has not
+    /// been persisted to durable storage. Call [`Storage::flush`] afterwards
+    /// to make the data durable.
+    pub(crate) async fn flush_written(&self) -> Result<()> {
         let handle = self.write_coordinator.handle(WRITE_CHANNEL);
         let mut flush_handle = handle.flush(false).await.map_err(map_write_error)?;
 

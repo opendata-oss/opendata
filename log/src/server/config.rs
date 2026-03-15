@@ -48,6 +48,7 @@ impl CliArgs {
                     bucket: bucket.clone(),
                 }),
                 settings_path: None,
+                block_cache: None,
             })
         } else {
             // Local filesystem storage
@@ -57,6 +58,7 @@ impl CliArgs {
                     path: self.data_dir.clone(),
                 }),
                 settings_path: None,
+                block_cache: None,
             })
         };
 

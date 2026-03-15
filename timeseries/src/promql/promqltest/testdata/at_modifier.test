@@ -100,15 +100,15 @@ eval instant at 25s metric{job="1"} @ 50 + metric{job="1"} @ 100
   {job="1"} 15
 
 # ignoring label_replace function
-ignore
+
 
 eval instant at 25s rate(metric{job="1"}[100s] @ 100) + label_replace(rate(metric{job="2"}[123s] @ 200), "job", "1", "", "")
   {job="1"} 0.3
   
-resume
+
 
 # ignoring aggregator functions
-ignore
+
 
 eval instant at 25s sum_over_time(metric{job="1"}[100s] @ 100) + label_replace(sum_over_time(metric{job="2"}[100s] @ 100), "job", "1", "", "")
   {job="1"} 165
@@ -116,7 +116,7 @@ eval instant at 25s sum_over_time(metric{job="1"}[100s] @ 100) + label_replace(s
 eval instant at 25s sum_over_time(metric{job="1"}[100] @ 100) + label_replace(sum_over_time(metric{job="2"}[100] @ 100), "job", "1", "", "")
   {job="1"} 165
 
-resume
+
 
 
 # Subqueries.
@@ -189,8 +189,6 @@ eval instant at 10s minute(metric @ 1500)
   {job="2"} 5
 resume
 
-# ignoring timestamp function
-ignore
 # timestamp() takes the time of the sample and not the evaluation time.
 eval instant at 10m timestamp(metric{job="1"} @ 10)
   {job="1"} 10
@@ -202,10 +200,8 @@ eval instant at 10m timestamp(timestamp(metric{job="1"} @ 10))
 
 eval instant at 15m timestamp(timestamp(metric{job="1"} @ 10))
   {job="1"} 900
-resume
 
-# ignoring sum_over_time aggregator functions
-ignore
+
 
 # Time functions inside a subquery.
 
@@ -244,7 +240,7 @@ eval instant at 0s sum_over_time(timestamp(metric{job="1"} @ 10)[100s:10s] @ 300
 eval instant at 0s sum_over_time(timestamp(timestamp(metric{job="1"} @ 999))[10s:1s] @ 10)
   {job="1"} 55
 
-resume
+
 
 clear
 

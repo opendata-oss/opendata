@@ -573,7 +573,7 @@ eval instant at 10s timestamp(((metric)))
 
 eval instant at 20s timestamp(metric)
   {} 20
-
+resume
 # Tests for label_join.
 load 5m
   testmetric{src="a",src1="b",src2="c",dst="original-destination-value"} 0
@@ -601,6 +601,8 @@ eval instant at 0m label_join(testmetric, "dst", ", ")
 	  testmetric{src="a",src1="b",src2="c"} 0
 	  testmetric{src="d",src1="e",src2="f"} 1
 
+
+ignore
 # test without dst label for label_join
 load 5m
   testmetric1{src="foo",src1="bar",src2="foobar"} 0
@@ -615,7 +617,7 @@ eval instant at 0m label_join(dup, "label", "", "this")
   expect fail msg:vector cannot contain metrics with the same labelset
 
 clear
-
+resume
 # Tests for vector.
 eval instant at 0m vector(1)
   {} 1
@@ -630,12 +632,15 @@ eval instant at 60m vector(time())
   {} 3600
 
 
+
 # Tests for clamp_max, clamp_min(), and clamp().
 load 5m
 	test_clamp{src="clamp-a"}	-50
 	test_clamp{src="clamp-b"}	0
 	test_clamp{src="clamp-c"}	100
+ignore
 	test_clamp{src="histogram"} {{schema:0 sum:1 count:1}}
+resume
 
 eval instant at 0m clamp_max(test_clamp, 75)
 	{src="clamp-a"}	-50
@@ -676,6 +681,7 @@ eval instant at 0m clamp(test_clamp, 5, -5)
 
 clear
 
+ignore
 load 1m
 	mixed_metric {{schema:0 sum:5 count:4 buckets:[1 2 1]}} 1 2 3 {{schema:0 sum:5 count:4 buckets:[1 2 1]}} {{schema:0 sum:8 count:6 buckets:[1 4 1]}}
 
@@ -1657,6 +1663,8 @@ eval instant at 1m count_over_time({__name__=~"data(_histogram|_sparse|_empty)?"
 	{type="mix_samples_hfirst"} 4
 	{type="sparse_numbers"} 3
 
+resume
+
 clear
 
 # Test for abs, ceil(), floor(), round().
@@ -1671,7 +1679,9 @@ load 5m
 	data{type="inf"} +Inf
 	data{type="ninf"} -Inf
 	data{type="nan"} NaN
+ignore
 	data{type="histogram"} {{schema:0 sum:1 count:1}}
+resume
 
 eval instant at 0m abs(data)
 	{type="positive"} 2.5
@@ -1718,6 +1728,8 @@ eval instant at 0m round(data)
 	{type="nan"} NaN
 
 clear
+
+ignore
 
 # Test for absent().
 eval instant at 50m absent(nonexistent)

@@ -1,14 +1,17 @@
-use anyhow::{Context, Result};
 use async_trait::async_trait;
-use common::StorageRead;
+use common::{BytesRange, StorageRead};
+
+use crate::error::{Error, Result};
+use std::ops::Bound::Included;
 
 use crate::serde::centroid_chunk::CentroidChunkValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::deletions::DeletionsValue;
 use crate::serde::key::{
-    CentroidChunkKey, CentroidStatsKey, DeletionsKey, IdDictionaryKey, PostingListKey,
-    VectorDataKey,
+    CentroidChunkKey, CentroidStatsKey, DeletionsKey, IdDictionaryKey, MetadataIndexKey,
+    PostingListKey, VectorDataKey,
 };
+use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::PostingListValue;
 use crate::serde::vector_data::VectorDataValue;
 
@@ -41,8 +44,11 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         match record {
             Some(record) => {
                 let mut slice = record.value.as_ref();
-                let internal_id = common::serde::encoding::decode_u64(&mut slice)
-                    .context("failed to decode internal ID from ID dictionary")?;
+                let internal_id = common::serde::encoding::decode_u64(&mut slice).map_err(|e| {
+                    Error::Encoding(format!(
+                        "failed to decode internal ID from ID dictionary: {e}"
+                    ))
+                })?;
                 Ok(Some(internal_id))
             }
             None => Ok(None),
@@ -79,9 +85,15 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         dimensions: usize,
     ) -> Result<PostingListValue> {
         let key = PostingListKey::new(centroid_id).encode();
-        let record = self.get(key).await?;
-        match record {
+        let key_next = PostingListKey::new(centroid_id + 1).encode();
+        let record = self
+            .scan(BytesRange::new(Included(key.clone()), Included(key_next)))
+            .await?;
+        match record.first() {
             Some(record) => {
+                if record.key != key {
+                    return Ok(PostingListValue::new());
+                }
                 let value = PostingListValue::decode_from_bytes(&record.value, dimensions)?;
                 Ok(value)
             }
@@ -130,8 +142,9 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         let record = self.get(key).await?;
         match record {
             Some(record) => {
-                let value = CentroidStatsValue::decode_from_bytes(&record.value)
-                    .context("failed to decode CentroidStatsValue")?;
+                let value = CentroidStatsValue::decode_from_bytes(&record.value).map_err(|e| {
+                    Error::Encoding(format!("failed to decode CentroidStatsValue: {e}"))
+                })?;
                 Ok(value)
             }
             None => Ok(CentroidStatsValue::new(0)),
@@ -155,12 +168,34 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         let mut stats = Vec::new();
         for record in records {
             let key = CentroidStatsKey::decode(&record.key)?;
-            let value = CentroidStatsValue::decode_from_bytes(&record.value)
-                .context("failed to decode CentroidStatsValue")?;
+            let value = CentroidStatsValue::decode_from_bytes(&record.value).map_err(|e| {
+                Error::Encoding(format!("failed to decode CentroidStatsValue: {e}"))
+            })?;
             stats.push((key.centroid_id, value));
         }
 
         Ok(stats)
+    }
+
+    /// Load a metadata index entry for a specific field/value pair.
+    ///
+    /// Returns a bitmap of vector IDs that have the given value for the field.
+    /// Returns an empty bitmap if no entry exists.
+    #[allow(dead_code)]
+    async fn get_metadata_index(
+        &self,
+        field: &str,
+        value: crate::serde::FieldValue,
+    ) -> Result<MetadataIndexValue> {
+        let key = MetadataIndexKey::new(field, value).encode();
+        let record = self.get(key).await?;
+        match record {
+            Some(record) => {
+                let value = MetadataIndexValue::decode_from_bytes(&record.value)?;
+                Ok(value)
+            }
+            None => Ok(MetadataIndexValue::new()),
+        }
     }
 
     /// Scan all centroid chunks to load centroids.

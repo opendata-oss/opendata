@@ -4,8 +4,7 @@ use std::ops::RangeBounds;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use common::storage::factory::create_storage;
-use common::{StorageRuntime, StorageSemantics};
+use common::StorageBuilder;
 
 use crate::config::{Config, WriteOptions};
 use crate::error::{Error, Result};
@@ -61,13 +60,12 @@ impl KeyValueDb {
     ///
     /// Returns an error if the storage backend cannot be initialized.
     pub async fn open(config: Config) -> Result<Self> {
-        let storage = create_storage(
-            &config.storage,
-            StorageRuntime::new(),
-            StorageSemantics::new(),
-        )
-        .await
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        let storage = StorageBuilder::new(&config.storage)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .build()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
 
         let kv_storage = KeyValueStorage::new(storage);
         Ok(Self {
@@ -187,8 +185,8 @@ impl KeyValueRead for KeyValueDb {
 mod tests {
     use std::sync::Arc;
 
+    use common::StorageBuilder;
     use common::StorageConfig;
-    use common::storage::factory::create_storage;
 
     use super::*;
     use crate::reader::KeyValueDbReader;
@@ -421,13 +419,12 @@ mod tests {
     #[tokio::test]
     async fn should_read_via_keyvalue_reader() {
         // given - create shared storage
-        let storage = create_storage(
-            &StorageConfig::InMemory,
-            StorageRuntime::new(),
-            StorageSemantics::new(),
-        )
-        .await
-        .unwrap();
+        let storage = StorageBuilder::new(&StorageConfig::InMemory)
+            .await
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
         let kv = KeyValueDb::new(storage.clone());
         kv.put(Bytes::from("key1"), Bytes::from("value1"))
             .await
@@ -449,13 +446,12 @@ mod tests {
     #[tokio::test]
     async fn should_scan_via_keyvalue_reader() {
         // given - create shared storage
-        let storage = create_storage(
-            &StorageConfig::InMemory,
-            StorageRuntime::new(),
-            StorageSemantics::new(),
-        )
-        .await
-        .unwrap();
+        let storage = StorageBuilder::new(&StorageConfig::InMemory)
+            .await
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
         let kv = KeyValueDb::new(storage.clone());
         kv.put(Bytes::from("a"), Bytes::from("1")).await.unwrap();
         kv.put(Bytes::from("b"), Bytes::from("2")).await.unwrap();

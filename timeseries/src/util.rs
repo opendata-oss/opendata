@@ -1,4 +1,5 @@
 use blake3::Hasher;
+use std::ops::{Bound, RangeBounds};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::Error;
@@ -134,6 +135,51 @@ pub fn time_bucket_size_hours(size: BucketSize) -> u32 {
         return 0;
     }
     2u32.pow((size - 1) as u32)
+}
+
+/// Convert a `RangeBounds<SystemTime>` into `(start: SystemTime, end: SystemTime)`.
+///
+/// `Excluded` bounds are adjusted by 1 ms — the smallest sample timestamp
+/// granularity — so that `start..end` excludes the exact boundary timestamps.
+pub(crate) fn range_bounds_to_system_time(
+    range: impl RangeBounds<SystemTime>,
+) -> (SystemTime, SystemTime) {
+    let start = match range.start_bound() {
+        Bound::Included(t) => *t,
+        Bound::Excluded(t) => *t + Duration::from_millis(1),
+        Bound::Unbounded => UNIX_EPOCH,
+    };
+    let end = match range.end_bound() {
+        Bound::Included(t) => *t,
+        Bound::Excluded(t) => t
+            .checked_sub(Duration::from_millis(1))
+            .unwrap_or(UNIX_EPOCH),
+        Bound::Unbounded => UNIX_EPOCH + Duration::from_secs(i64::MAX as u64),
+    };
+    (start, end)
+}
+
+/// Convert a `RangeBounds<SystemTime>` into `(start_secs, end_secs)` as `i64`.
+///
+/// Returns an error if either bound resolves to a time before the Unix epoch.
+/// Unbounded starts resolve to 0, unbounded ends resolve to `i64::MAX`.
+pub(crate) fn range_bounds_to_secs(
+    range: impl RangeBounds<SystemTime>,
+) -> std::result::Result<(i64, i64), crate::error::QueryError> {
+    let (start, end) = range_bounds_to_system_time(range);
+    let start_secs = start
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .map_err(|_| {
+            crate::error::QueryError::InvalidQuery("start time is before Unix epoch".to_string())
+        })?;
+    let end_secs = end
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .map_err(|_| {
+            crate::error::QueryError::InvalidQuery("end time is before Unix epoch".to_string())
+        })?;
+    Ok((start_secs, end_secs))
 }
 
 #[cfg(test)]
@@ -405,5 +451,40 @@ mod tests {
         assert_eq!(time_bucket_size_hours(3), 4);
         assert_eq!(time_bucket_size_hours(4), 8);
         assert_eq!(time_bucket_size_hours(5), 16);
+    }
+
+    #[test]
+    fn range_bounds_to_secs_rejects_pre_epoch_start() {
+        use super::range_bounds_to_secs;
+        use std::time::UNIX_EPOCH;
+
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(1);
+        let after_epoch = UNIX_EPOCH + Duration::from_secs(100);
+        let result = range_bounds_to_secs(pre_epoch..=after_epoch);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("before Unix epoch"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn range_bounds_to_secs_rejects_pre_epoch_end() {
+        use super::range_bounds_to_secs;
+        use std::time::UNIX_EPOCH;
+
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(1);
+        let result = range_bounds_to_secs(UNIX_EPOCH..=pre_epoch);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("before Unix epoch"),
+            "unexpected error: {}",
+            err
+        );
     }
 }

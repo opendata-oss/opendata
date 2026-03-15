@@ -3,7 +3,7 @@
 //! These functions build RecordOp instances for common write patterns without
 //! requiring a storage reference, since they only encode keys and values.
 
-use anyhow::Result;
+use crate::error::Result;
 use bytes::BytesMut;
 use common::Record;
 use common::storage::RecordOp;
@@ -18,6 +18,7 @@ use crate::serde::key::{
     CentroidChunkKey, CentroidStatsKey, DeletionsKey, IdDictionaryKey, PostingListKey,
     VectorDataKey,
 };
+use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_data::{Field, VectorDataValue};
 
@@ -97,6 +98,22 @@ pub fn merge_centroid_stats(centroid_id: u64, delta: i32) -> RecordOp {
     let key = CentroidStatsKey::new(centroid_id).encode();
     let value = CentroidStatsValue::new(delta).encode_to_bytes();
     RecordOp::Merge(Record::new(key, value).into())
+}
+
+/// Create a RecordOp to merge a batch of vector IDs into a metadata index entry.
+///
+/// The metadata index maps (field_name, field_value) → set of vector IDs.
+/// The merge operator unions RoaringTreemap bitmaps, so this adds all the
+/// vector IDs to the existing set for that field/value pair.
+///
+/// `encoded_key` is the pre-encoded MetadataIndexKey bytes.
+pub fn merge_metadata_index_bitmap(
+    encoded_key: bytes::Bytes,
+    vector_ids: &RoaringTreemap,
+) -> Result<RecordOp> {
+    let bitmap = MetadataIndexValue::from_treemap(vector_ids.clone());
+    let encoded = bitmap.encode_to_bytes()?;
+    Ok(RecordOp::Merge(Record::new(encoded_key, encoded).into()))
 }
 
 /// Create a RecordOp to merge new centroid entries into an existing centroid chunk.

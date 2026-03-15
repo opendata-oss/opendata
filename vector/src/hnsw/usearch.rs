@@ -4,8 +4,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::RwLock;
 
-use anyhow::Result;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
+
+use crate::error::{Error, Result};
 
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::collection_meta::DistanceMetric;
@@ -58,25 +59,26 @@ impl UsearchCentroidGraph {
     /// A UsearchCentroidGraph ready for searching
     pub fn build(centroids: Vec<CentroidEntry>, distance_metric: DistanceMetric) -> Result<Self> {
         if centroids.is_empty() {
-            return Err(anyhow::anyhow!("Cannot build HNSW graph with no centroids"));
+            return Err(Error::InvalidInput(
+                "Cannot build HNSW graph with no centroids".to_string(),
+            ));
         }
 
         // Validate all centroids have the same dimensionality
         let dimensions = centroids[0].dimensions();
         for centroid in &centroids {
             if centroid.dimensions() != dimensions {
-                return Err(anyhow::anyhow!(
+                return Err(Error::InvalidInput(format!(
                     "Centroid dimension mismatch: expected {}, got {}",
                     dimensions,
                     centroid.dimensions()
-                ));
+                )));
             }
         }
 
         // Convert distance metric to usearch MetricKind
         let metric = match distance_metric {
             DistanceMetric::L2 => MetricKind::L2sq,
-            DistanceMetric::Cosine => MetricKind::Cos,
             DistanceMetric::DotProduct => MetricKind::IP,
         };
 
@@ -92,10 +94,12 @@ impl UsearchCentroidGraph {
         };
 
         // Create index
-        let index = Index::new(&options)?;
+        let index = Index::new(&options).map_err(|e| Error::Internal(e.to_string()))?;
 
         // Reserve 200K capacity upfront
-        index.reserve(INITIAL_CAPACITY)?;
+        index
+            .reserve(INITIAL_CAPACITY)
+            .map_err(|e| Error::Internal(e.to_string()))?;
 
         // Build mappings and insert
         let mut key_to_centroid = HashMap::with_capacity(centroids.len());
@@ -104,7 +108,9 @@ impl UsearchCentroidGraph {
 
         for (key, centroid) in centroids.iter().enumerate() {
             let key = key as u64;
-            index.add(key, &centroid.vector)?;
+            index
+                .add(key, &centroid.vector)
+                .map_err(|e| Error::Internal(e.to_string()))?;
             key_to_centroid.insert(key, centroid.centroid_id);
             centroid_to_key.insert(centroid.centroid_id, key);
             centroid_vectors.insert(centroid.centroid_id, centroid.vector.clone());
@@ -182,7 +188,9 @@ impl UsearchCentroidGraphInner {
         let key = self.next_key;
         self.next_key += 1;
 
-        self.index.add(key, &entry.vector)?;
+        self.index
+            .add(key, &entry.vector)
+            .map_err(|e| Error::Internal(e.to_string()))?;
 
         self.key_to_centroid.insert(key, entry.centroid_id);
         self.centroid_to_key.insert(entry.centroid_id, key);
@@ -193,14 +201,15 @@ impl UsearchCentroidGraphInner {
     }
 
     fn remove_centroid(&mut self, centroid_id: u64) -> Result<()> {
-        let key = self
-            .centroid_to_key
-            .remove(&centroid_id)
-            .ok_or_else(|| anyhow::anyhow!("Centroid {} not found in graph", centroid_id))?;
+        let key = self.centroid_to_key.remove(&centroid_id).ok_or_else(|| {
+            Error::Internal(format!("Centroid {} not found in graph", centroid_id))
+        })?;
 
         self.key_to_centroid.remove(&key);
         self.centroid_vectors.remove(&centroid_id);
-        self.index.remove(key)?;
+        self.index
+            .remove(key)
+            .map_err(|e| Error::Internal(e.to_string()))?;
 
         Ok(())
     }
@@ -235,25 +244,6 @@ mod tests {
         // then
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], 1);
-    }
-
-    #[test]
-    fn should_build_and_search_cosine_graph() {
-        // given - 3 centroids
-        let centroids = vec![
-            CentroidEntry::new(10, vec![1.0, 0.0]),
-            CentroidEntry::new(20, vec![0.0, 1.0]),
-            CentroidEntry::new(30, vec![1.0, 1.0]),
-        ];
-
-        // when
-        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::Cosine).unwrap();
-        let query = vec![0.9, 0.1];
-        let results = graph.search(&query, 1);
-
-        // then
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0], 10);
     }
 
     #[test]

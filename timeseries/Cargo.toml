@@ -1,6 +1,6 @@
 [package]
 name = "opendata-timeseries"
-version = "0.1.7"
+version = "0.1.9"
 edition.workspace = true
 description = "Prometheus-compatible time series database built on SlateDB"
 license = "MIT"
@@ -16,64 +16,99 @@ path = "src/lib.rs"
 [[bin]]
 name = "opendata-timeseries"
 path = "src/main.rs"
+required-features = ["http-server"]
 
 [features]
 default = []
+http-server = [
+    "dep:axum",
+    "dep:axum-extra",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:clap",
+    "dep:prometheus-client",
+]
 testing = []
-remote-write = ["dep:prost", "dep:snap"]
+remote-write = ["http-server", "dep:prost", "dep:snap"]
+otel = ["dep:opentelemetry-proto", "dep:prost"]
 bench-internals = []
 
 [dependencies]
 async-trait.workspace = true
-axum.workspace = true
-axum-extra.workspace = true
+axum = { workspace = true, optional = true }
+axum-extra = { workspace = true, optional = true }
 bytes.workspace = true
 chrono.workspace = true
-clap.workspace = true
+clap = { workspace = true, optional = true }
 config.workspace = true
 dashmap.workspace = true
+futures.workspace = true
 moka.workspace = true
 common = { workspace = true, features = ["metrics"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_with.workspace = true
 serde_yaml.workspace = true
 slatedb.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tower.workspace = true
-tower-http.workspace = true
+tower = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 
 blake3 = "1.8.2"
 mime_guess = "2"
-prometheus-client = "0.22"
-promql-parser = "0.6"
+prometheus-client = { version = "0.22", optional = true }
+promql-parser = "0.8"
 regex = "1.0"
+ryu = "1"
 regex-syntax = "0.8"
 roaring = "0.7"
 rust-embed = { version = "8", features = ["mime-guess"] }
 tsz = "0.1"
 
-# Optional dependencies for remote-write feature
+# Optional dependencies for remote-write and otel features
+opentelemetry-proto = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
 
 [dev-dependencies]
 common = { workspace = true, features = ["test-utils"] }
+criterion.workspace = true
 fail.workspace = true
 proptest.workspace = true
 rstest.workspace = true
 dashu-float.workspace = true
-criterion.workspace = true
+tempfile.workspace = true
+opendata-macros.workspace = true
+
 
 [[test]]
 name = "http_server"
-required-features = ["testing"]
+required-features = ["testing", "http-server"]
+
+[[test]]
+name = "otel_ingest"
+required-features = ["testing", "otel", "http-server"]
 
 [[bench]]
 name = "evaluator_micorbench"
 harness = false
 required-features = ["bench-internals"]
+
+[[bench]]
+name = "response_serialization"
+harness = false
+required-features = ["testing"]
+
+[[bench]]
+name = "otel_conversion"
+harness = false
+required-features = ["otel"]
+
+[[example]]
+name = "query_bench"
+required-features = ["http-server"]

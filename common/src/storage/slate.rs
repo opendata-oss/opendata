@@ -4,7 +4,8 @@ use crate::storage::{MergeOptions, PutOptions};
 use crate::{
     BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult, Ttl,
     storage::{
-        MergeOperator, MergeRecordOp, PutRecordOp, RecordOp, Storage, StorageSnapshot, WriteOptions,
+        MergeOperator, MergeRecordOp, PutRecordOp, RecordOp, Storage, StorageSnapshot,
+        WriteOptions, WriteResult,
     },
 };
 use async_trait::async_trait;
@@ -14,6 +15,7 @@ use slatedb::{
     Db, DbIterator, DbReader, DbSnapshot, MergeOperator as SlateDbMergeOperator,
     MergeOperatorError, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
 };
+use tokio::sync::watch;
 
 /// Thin wrapper that exposes a SlateDB [`ReadableStat`] as a Prometheus gauge.
 ///
@@ -33,7 +35,10 @@ impl prometheus_client::encoding::EncodeMetric for ReadableStatGauge {
     }
 
     fn metric_type(&self) -> prometheus_client::metrics::MetricType {
-        prometheus_client::metrics::MetricType::Gauge
+        match self.0.metric_type() {
+            slatedb::stats::MetricType::Counter => prometheus_client::metrics::MetricType::Counter,
+            slatedb::stats::MetricType::Gauge => prometheus_client::metrics::MetricType::Gauge,
+        }
     }
 }
 
@@ -59,6 +64,18 @@ impl SlateDbMergeOperator for SlateDbMergeOperatorAdapter {
     ) -> Result<Bytes, MergeOperatorError> {
         Ok(self.operator.merge(key, existing_value, value))
     }
+
+    fn merge_batch(
+        &self,
+        key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<Bytes, MergeOperatorError> {
+        if operands.is_empty() && existing_value.is_none() {
+            return Err(MergeOperatorError::EmptyBatch);
+        }
+        Ok(self.operator.merge_batch(key, existing_value, operands))
+    }
 }
 
 /// Returns the default scan options used for storage scans.
@@ -78,12 +95,33 @@ fn default_scan_options() -> ScanOptions {
 /// LSM-tree semantics with cloud-native durability.
 pub struct SlateDbStorage {
     pub(super) db: Arc<Db>,
+    durable_tx: watch::Sender<u64>,
+    durable_bridge_abort: tokio::task::AbortHandle,
 }
 
 impl SlateDbStorage {
     /// Creates a new SlateDbStorage instance wrapping the given SlateDB database.
     pub fn new(db: Arc<Db>) -> Self {
-        Self { db }
+        let slate_rx = db.subscribe();
+        let (durable_tx, _) = watch::channel(slate_rx.borrow().durable_seq);
+        let task = tokio::spawn({
+            let tx = durable_tx.clone();
+            async move {
+                let mut slate_rx = slate_rx;
+                while slate_rx.changed().await.is_ok() {
+                    let durable_seq = slate_rx.borrow_and_update().durable_seq;
+                    if tx.send(durable_seq).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Self {
+            db,
+            durable_tx,
+            durable_bridge_abort: task.abort_handle(),
+        }
     }
 
     /// Creates a SlateDB `MergeOperator` from our common `MergeOperator` trait.
@@ -196,7 +234,11 @@ impl StorageSnapshot for SlateDbStorageSnapshot {}
 
 #[async_trait]
 impl Storage for SlateDbStorage {
-    async fn apply(&self, records: Vec<RecordOp>) -> StorageResult<()> {
+    async fn apply_with_options(
+        &self,
+        records: Vec<RecordOp>,
+        options: WriteOptions,
+    ) -> StorageResult<WriteResult> {
         let mut batch = WriteBatch::new();
         for op in records {
             match op {
@@ -209,23 +251,24 @@ impl Storage for SlateDbStorage {
                 RecordOp::Delete(key) => batch.delete(key),
             }
         }
-        self.db
-            .write(batch)
+        let slate_options = SlateDbWriteOptions {
+            await_durable: options.await_durable,
+        };
+        let write_handle = self
+            .db
+            .write_with_options(batch, &slate_options)
             .await
             .map_err(StorageError::from_storage)?;
-        Ok(())
-    }
-
-    async fn put(&self, records: Vec<PutRecordOp>) -> StorageResult<()> {
-        self.put_with_options(records, WriteOptions::default())
-            .await
+        Ok(WriteResult {
+            seqnum: write_handle.seqnum(),
+        })
     }
 
     async fn put_with_options(
         &self,
         records: Vec<PutRecordOp>,
         options: WriteOptions,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<WriteResult> {
         let mut batch = WriteBatch::new();
         for op in records {
             batch.put_with_options(op.record.key, op.record.value, &op.options.into());
@@ -233,33 +276,49 @@ impl Storage for SlateDbStorage {
         let slate_options = SlateDbWriteOptions {
             await_durable: options.await_durable,
         };
-        self.db
+        let write_handle = self
+            .db
             .write_with_options(batch, &slate_options)
             .await
             .map_err(StorageError::from_storage)?;
-        Ok(())
+        Ok(WriteResult {
+            seqnum: write_handle.seqnum(),
+        })
     }
 
-    /// Merges values for the given keys using SlateDB's merge operator.
-    ///
-    /// This method requires the database to be configured with a merge operator
-    /// during construction. If no merge operator is configured, this will return
-    /// a `StorageError::Storage` error.
-    async fn merge(&self, records: Vec<MergeRecordOp>) -> StorageResult<()> {
+    async fn merge_with_options(
+        &self,
+        records: Vec<MergeRecordOp>,
+        options: WriteOptions,
+    ) -> StorageResult<WriteResult> {
         let mut batch = WriteBatch::new();
         for op in records {
             batch.merge_with_options(op.record.key, op.record.value, &op.options.into());
         }
-        self.db.write(batch).await.map_err(|e| {
-            let error_msg = e.to_string();
-            // Check if the error indicates merge operator is not configured
-            if error_msg.contains("merge operator") || error_msg.contains("not configured") {
-                StorageError::Storage("Merge operator not configured for this database".to_string())
-            } else {
-                StorageError::from_storage(e)
-            }
-        })?;
-        Ok(())
+        let slate_options = SlateDbWriteOptions {
+            await_durable: options.await_durable,
+        };
+        let write_handle = self
+            .db
+            .write_with_options(batch, &slate_options)
+            .await
+            .map_err(|e| {
+                let error_msg = e.to_string();
+                if error_msg.contains("merge operator") || error_msg.contains("not configured") {
+                    StorageError::Storage(
+                        "Merge operator not configured for this database".to_string(),
+                    )
+                } else {
+                    StorageError::from_storage(e)
+                }
+            })?;
+        Ok(WriteResult {
+            seqnum: write_handle.seqnum(),
+        })
+    }
+
+    fn subscribe_durable(&self) -> watch::Receiver<u64> {
+        self.durable_tx.subscribe()
     }
 
     async fn snapshot(&self) -> StorageResult<Arc<dyn StorageSnapshot>> {
@@ -277,6 +336,8 @@ impl Storage for SlateDbStorage {
     }
 
     async fn close(&self) -> StorageResult<()> {
+        // Stop durable bridge first so no status subscriber outlives DB close.
+        self.durable_bridge_abort.abort();
         self.db.close().await.map_err(StorageError::from_storage)?;
         Ok(())
     }
@@ -390,24 +451,9 @@ mod tests {
     use super::*;
     use crate::BytesRange;
     use slatedb::DbBuilder;
-    use slatedb::clock::{LogicalClock, MockSystemClock, SystemClock};
-    use slatedb::config::Settings;
+    use slatedb::config::{DbReaderOptions, Settings};
     use slatedb::object_store::memory::InMemory;
-
-    /// Adapter that bridges [`MockSystemClock`] to [`LogicalClock`].
-    ///
-    /// SlateDB uses `LogicalClock` (not `SystemClock`) for TTL expiration.
-    /// This wrapper lets us control TTL time via `MockSystemClock::set()`.
-    #[derive(Debug)]
-    struct MockLogicalClockAdapter {
-        system_clock: Arc<MockSystemClock>,
-    }
-
-    impl LogicalClock for MockLogicalClockAdapter {
-        fn now(&self) -> i64 {
-            self.system_clock.now().timestamp_millis()
-        }
-    }
+    use slatedb_common::clock::MockSystemClock;
 
     #[tokio::test]
     async fn should_read_data_written_by_storage_via_reader() {
@@ -545,16 +591,13 @@ mod tests {
         let object_store = Arc::new(InMemory::new());
         let path = "/test/ttl_db";
         let clock = Arc::new(MockSystemClock::new());
-        let logical_clock = Arc::new(MockLogicalClockAdapter {
-            system_clock: clock.clone(),
-        });
 
         let db = DbBuilder::new(path, object_store)
             .with_settings(Settings {
                 default_ttl: Some(30_000),
                 ..Default::default()
             })
-            .with_logical_clock(logical_clock)
+            .with_system_clock(clock.clone())
             .build()
             .await
             .unwrap();
@@ -633,9 +676,6 @@ mod tests {
         let object_store = Arc::new(InMemory::new());
         let path = "/test/merge_ttl_db";
         let clock = Arc::new(MockSystemClock::new());
-        let logical_clock = Arc::new(MockLogicalClockAdapter {
-            system_clock: clock.clone(),
-        });
 
         let merge_op: Arc<dyn MergeOperator> = Arc::new(ConcatMergeOperator);
         let slate_merge_op = SlateDbStorage::merge_operator_adapter(merge_op);
@@ -644,7 +684,7 @@ mod tests {
                 default_ttl: Some(30_000),
                 ..Default::default()
             })
-            .with_logical_clock(logical_clock)
+            .with_system_clock(clock.clone())
             .with_merge_operator(Arc::new(slate_merge_op))
             .build()
             .await
@@ -723,5 +763,280 @@ mod tests {
         assert_eq!(record.unwrap().value, Bytes::from("v3"));
 
         storage.close().await.unwrap();
+    }
+
+    /// Helper: open a DbReader against the same path/object_store and try to
+    /// read a key. Returns `true` if the key is present.
+    async fn reader_can_see(path: &str, object_store: Arc<InMemory>, key: &str) -> bool {
+        reader_can_see_with_merge_op(path, object_store, key, None).await
+    }
+
+    async fn reader_can_see_with_merge_op(
+        path: &str,
+        object_store: Arc<InMemory>,
+        key: &str,
+        merge_op: Option<Arc<dyn SlateDbMergeOperator + Send + Sync>>,
+    ) -> bool {
+        let options = DbReaderOptions {
+            merge_operator: merge_op,
+            ..Default::default()
+        };
+        let reader = DbReader::open(path, object_store, None, options)
+            .await
+            .unwrap();
+        let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
+        storage_reader
+            .get(Bytes::from(key.to_owned()))
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn put_defaults_to_not_await_durable() {
+        let object_store = Arc::new(InMemory::new());
+        let path = "/test/put_default_durability";
+
+        let db = DbBuilder::new(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        let storage = SlateDbStorage::new(Arc::new(db));
+
+        // put() uses WriteOptions::default() which is await_durable: false
+        storage
+            .put(vec![
+                Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+            ])
+            .await
+            .unwrap();
+
+        // Data is in memtable only — a reader (which reads from durable state) should NOT see it
+        assert!(!reader_can_see(path, object_store.clone(), "k1").await);
+
+        // After explicit flush, reader can see it
+        storage.flush().await.unwrap();
+        assert!(reader_can_see(path, object_store.clone(), "k1").await);
+
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_with_await_durable_true_is_visible_to_reader() {
+        let object_store = Arc::new(InMemory::new());
+        let path = "/test/put_durable";
+
+        let db = DbBuilder::new(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        let storage = SlateDbStorage::new(Arc::new(db));
+
+        // Write with await_durable: true — should be flushed before returning
+        storage
+            .put_with_options(
+                vec![Record::new(Bytes::from("k1"), Bytes::from("v1")).into()],
+                WriteOptions {
+                    await_durable: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Reader should see it immediately without explicit flush
+        assert!(reader_can_see(path, object_store.clone(), "k1").await);
+
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_defaults_to_not_await_durable() {
+        let object_store = Arc::new(InMemory::new());
+        let path = "/test/apply_default_durability";
+
+        let db = DbBuilder::new(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        let storage = SlateDbStorage::new(Arc::new(db));
+
+        // apply() delegates with WriteOptions::default() (await_durable: false)
+        storage
+            .apply(vec![RecordOp::Put(
+                Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+            )])
+            .await
+            .unwrap();
+
+        assert!(!reader_can_see(path, object_store.clone(), "k1").await);
+
+        storage.flush().await.unwrap();
+        assert!(reader_can_see(path, object_store.clone(), "k1").await);
+
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_with_await_durable_true_is_visible_to_reader() {
+        let object_store = Arc::new(InMemory::new());
+        let path = "/test/apply_durable";
+
+        let db = DbBuilder::new(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        let storage = SlateDbStorage::new(Arc::new(db));
+
+        storage
+            .apply_with_options(
+                vec![RecordOp::Put(
+                    Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+                )],
+                WriteOptions {
+                    await_durable: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(reader_can_see(path, object_store.clone(), "k1").await);
+
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn merge_defaults_to_not_await_durable() {
+        let object_store = Arc::new(InMemory::new());
+        let path = "/test/merge_default_durability";
+
+        let merge_op: Arc<dyn MergeOperator> = Arc::new(ConcatMergeOperator);
+        let slate_merge_op = Arc::new(SlateDbStorage::merge_operator_adapter(merge_op.clone()));
+        let db = DbBuilder::new(path, object_store.clone())
+            .with_merge_operator(slate_merge_op.clone())
+            .build()
+            .await
+            .unwrap();
+        let storage = SlateDbStorage::new(Arc::new(db));
+
+        // merge() delegates with WriteOptions::default() (await_durable: false)
+        storage
+            .merge(vec![
+                Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+            ])
+            .await
+            .unwrap();
+
+        let reader_merge_op: Arc<dyn SlateDbMergeOperator + Send + Sync> =
+            Arc::new(SlateDbStorage::merge_operator_adapter(merge_op.clone()));
+        assert!(
+            !reader_can_see_with_merge_op(
+                path,
+                object_store.clone(),
+                "k1",
+                Some(reader_merge_op.clone()),
+            )
+            .await
+        );
+
+        storage.flush().await.unwrap();
+        assert!(
+            reader_can_see_with_merge_op(path, object_store.clone(), "k1", Some(reader_merge_op),)
+                .await
+        );
+
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn merge_with_await_durable_true_is_visible_to_reader() {
+        let object_store = Arc::new(InMemory::new());
+        let path = "/test/merge_durable";
+
+        let merge_op: Arc<dyn MergeOperator> = Arc::new(ConcatMergeOperator);
+        let slate_merge_op = Arc::new(SlateDbStorage::merge_operator_adapter(merge_op.clone()));
+        let db = DbBuilder::new(path, object_store.clone())
+            .with_merge_operator(slate_merge_op.clone())
+            .build()
+            .await
+            .unwrap();
+        let storage = SlateDbStorage::new(Arc::new(db));
+
+        storage
+            .merge_with_options(
+                vec![Record::new(Bytes::from("k1"), Bytes::from("v1")).into()],
+                WriteOptions {
+                    await_durable: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        let reader_merge_op: Arc<dyn SlateDbMergeOperator + Send + Sync> =
+            Arc::new(SlateDbStorage::merge_operator_adapter(merge_op));
+        assert!(
+            reader_can_see_with_merge_op(path, object_store.clone(), "k1", Some(reader_merge_op),)
+                .await
+        );
+
+        storage.close().await.unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "metrics"))]
+mod metrics_tests {
+    use super::ReadableStatGauge;
+    use prometheus_client::encoding::EncodeMetric;
+    use slatedb::stats::{MetricType as SlateMetricType, ReadableStat};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct MockStat {
+        metric_type: SlateMetricType,
+    }
+
+    impl ReadableStat for MockStat {
+        fn get(&self) -> i64 {
+            0
+        }
+
+        fn metric_type(&self) -> SlateMetricType {
+            self.metric_type
+        }
+    }
+
+    #[test]
+    fn should_return_counter_when_slate_metric_type_is_counter() {
+        // given
+        let stat = Arc::new(MockStat {
+            metric_type: SlateMetricType::Counter,
+        });
+        let gauge = ReadableStatGauge(stat);
+
+        // when
+        let result = gauge.metric_type();
+
+        // then
+        assert!(matches!(
+            result,
+            prometheus_client::metrics::MetricType::Counter,
+        ));
+    }
+
+    #[test]
+    fn should_return_gauge_when_slate_metric_type_is_gauge() {
+        // given
+        let stat = Arc::new(MockStat {
+            metric_type: SlateMetricType::Gauge,
+        });
+        let gauge = ReadableStatGauge(stat);
+
+        // when
+        let result = gauge.metric_type();
+
+        // then
+        assert!(matches!(
+            result,
+            prometheus_client::metrics::MetricType::Gauge,
+        ));
     }
 }

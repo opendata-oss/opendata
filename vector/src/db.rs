@@ -11,36 +11,74 @@
 //! - Delta handles dictionary lookup, centroid assignment, and builds RecordOps
 //! - Flusher applies ops atomically to storage
 
+use crate::VectorDbReader;
 use crate::delta::{
     VectorDbDeltaContext, VectorDbDeltaOpts, VectorDbWrite, VectorDbWriteDelta, VectorWrite,
 };
-use crate::distance;
+use crate::error::{Error, Result};
 use crate::flusher::VectorDbFlusher;
 use crate::hnsw::{CentroidGraph, build_centroid_graph};
 use crate::lire::rebalancer::{IndexRebalancer, IndexRebalancerOpts};
 use crate::model::{
-    AttributeValue, Config, SearchResult, VECTOR_FIELD_NAME, Vector, attributes_to_map,
+    AttributeValue, Config, Query, SearchResult, VECTOR_FIELD_NAME, Vector, attributes_to_map,
 };
+use crate::query_engine::{QueryEngine, QueryEngineOptions};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::key::SeqBlockKey;
-use crate::serde::posting_list::PostingList;
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
-use anyhow::{Context, Result};
+use async_trait::async_trait;
 use common::SequenceAllocator;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};
-use common::storage::factory::create_storage;
 use common::storage::{Storage, StorageRead, StorageSnapshot};
-use common::{StorageRuntime, StorageSemantics};
+use common::{StorageBuilder, StorageSemantics};
 use dashmap::DashMap;
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tracing::debug;
 
 pub(crate) const WRITE_CHANNEL: &str = "write";
 pub(crate) const REBALANCE_CHANNEL: &str = "rebalance";
+
+/// Trait for querying the vector db
+#[async_trait]
+pub trait VectorDbRead {
+    /// Search for k-nearest neighbors to a query vector.
+    ///
+    /// This implements the SPANN-style query algorithm:
+    /// 1. Search HNSW for nearest centroids
+    /// 2. Load posting lists for those centroids
+    /// 3. Filter deleted vectors
+    /// 4. Score candidates and return top-k
+    ///
+    /// # Arguments
+    /// * `query` - search query
+    ///
+    /// # Returns
+    /// Vector of SearchResults sorted by similarity (best first)
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - Query dimensions don't match collection dimensions
+    /// - Storage read fails
+    async fn search(&self, query: &Query) -> Result<Vec<SearchResult>>;
+
+    async fn search_with_nprobe(&self, query: &Query, nprobe: usize) -> Result<Vec<SearchResult>>;
+
+    /// Retrieve a vector record by its external ID.
+    ///
+    /// This is a point lookup operation that retrieves a single record with all its fields.
+    /// Returns `None` if the record doesn't exist or has been deleted.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - External ID of the record to retrieve
+    ///
+    /// # Returns
+    ///
+    /// `Some(VectorRecord)` if found, `None` if not found or deleted.
+    async fn get(&self, id: &str) -> Result<Option<Vector>>;
+}
 
 /// Vector database for storing and querying embedding vectors.
 ///
@@ -80,27 +118,28 @@ impl VectorDb {
     /// Other configuration options (like `flush_interval`) can be changed
     /// on subsequent opens.
     pub async fn open(config: Config) -> Result<Self> {
-        Self::open_with_runtime(config, StorageRuntime::new()).await
+        let sb = StorageBuilder::new(&config.storage)
+            .await
+            .map_err(|e| Error::Storage(format!("Failed to create storage: {e}")))?;
+        Self::open_with_storage(config, sb).await
     }
 
-    pub async fn open_with_runtime(config: Config, runtime: StorageRuntime) -> Result<Self> {
+    pub async fn open_with_storage(config: Config, builder: StorageBuilder) -> Result<Self> {
         let centroid1: Vec<f32> = vec![0.0f32; config.dimensions as usize];
-        Self::open_with_centroids(config, vec![centroid1], runtime).await
+        Self::open_with_centroids(config, vec![centroid1], builder).await
     }
 
     pub async fn open_with_centroids(
         config: Config,
         centroids: Vec<Vec<f32>>,
-        runtime: StorageRuntime,
+        builder: StorageBuilder,
     ) -> Result<Self> {
         let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
-        let storage = create_storage(
-            &config.storage,
-            runtime,
-            StorageSemantics::new().with_merge_operator(Arc::new(merge_op)),
-        )
-        .await
-        .context("Failed to create storage")?;
+        let storage = builder
+            .with_semantics(StorageSemantics::new().with_merge_operator(Arc::new(merge_op)))
+            .build()
+            .await
+            .map_err(|e| Error::Storage(format!("Failed to create storage: {e}")))?;
 
         Self::load_or_init_db(storage, config, centroids).await
     }
@@ -176,6 +215,7 @@ impl VectorDb {
                 rebalance_backpressure_resume_threshold: config
                     .rebalance_backpressure_resume_threshold,
                 split_threshold_vectors: config.split_threshold_vectors,
+                indexed_fields: VectorDbDeltaOpts::indexed_fields_from(&config.metadata_fields),
             },
             dictionary: Arc::clone(&dictionary),
             centroid_graph: Arc::clone(&centroid_graph),
@@ -248,19 +288,19 @@ impl VectorDb {
 
         // No existing centroids - validate and write the provided ones
         if centroids.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Centroids must be provided when creating a new database"
+            return Err(Error::InvalidInput(
+                "Centroids must be provided when creating a new database".to_string(),
             ));
         }
 
         // Validate centroid dimensions
         for centroid in &centroids {
             if centroid.len() != config.dimensions as usize {
-                return Err(anyhow::anyhow!(
+                return Err(Error::InvalidInput(format!(
                     "Centroid dimension mismatch: expected {}, got {}",
                     config.dimensions,
                     centroid.len()
-                ));
+                )));
             }
         }
 
@@ -327,8 +367,11 @@ impl VectorDb {
 
             // Decode the value to get internal_id
             let mut slice = record.value.as_ref();
-            let internal_id = common::serde::encoding::decode_u64(&mut slice)
-                .context("failed to decode internal ID from ID dictionary")?;
+            let internal_id = common::serde::encoding::decode_u64(&mut slice).map_err(|e| {
+                Error::Encoding(format!(
+                    "failed to decode internal ID from ID dictionary: {e}"
+                ))
+            })?;
 
             dictionary.insert(external_id, internal_id);
         }
@@ -388,11 +431,12 @@ impl VectorDb {
             .write_coordinator
             .handle(WRITE_CHANNEL)
             .write(VectorDbWrite::Write(writes))
-            .await?;
+            .await
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
         write_handle
             .wait(Durability::Applied)
             .await
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
 
         Ok(())
     }
@@ -436,11 +480,12 @@ impl VectorDb {
             .write_coordinator
             .handle(WRITE_CHANNEL)
             .write_timeout(VectorDbWrite::Write(writes), timeout)
-            .await?;
+            .await
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
         write_handle
             .wait(Durability::Applied)
             .await
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
 
         Ok(())
     }
@@ -452,10 +497,10 @@ impl VectorDb {
     fn prepare_vector_write(&self, vector: Vector) -> Result<VectorWrite> {
         // Validate external ID length
         if vector.id.len() > 64 {
-            return Err(anyhow::anyhow!(
+            return Err(Error::InvalidInput(format!(
                 "External ID too long: {} bytes (max 64)",
                 vector.id.len()
-            ));
+            )));
         }
 
         // Convert attributes to map for validation
@@ -465,26 +510,26 @@ impl VectorDb {
         let values = match attributes.get(VECTOR_FIELD_NAME) {
             Some(AttributeValue::Vector(v)) => v.clone(),
             Some(_) => {
-                return Err(anyhow::anyhow!(
+                return Err(Error::InvalidInput(format!(
                     "Field '{}' must have type Vector",
                     VECTOR_FIELD_NAME
-                ));
+                )));
             }
             None => {
-                return Err(anyhow::anyhow!(
+                return Err(Error::InvalidInput(format!(
                     "Missing required field '{}'",
                     VECTOR_FIELD_NAME
-                ));
+                )));
             }
         };
 
         // Validate dimensions
         if values.len() != self.config.dimensions as usize {
-            return Err(anyhow::anyhow!(
+            return Err(Error::InvalidInput(format!(
                 "Vector dimension mismatch: expected {}, got {}",
                 self.config.dimensions,
                 values.len()
-            ));
+            )));
         }
 
         // Validate attributes against schema (if schema is defined)
@@ -531,20 +576,18 @@ impl VectorDb {
                     };
 
                     if actual_type != *expected_type {
-                        return Err(anyhow::anyhow!(
+                        return Err(Error::InvalidInput(format!(
                             "Type mismatch for field '{}': expected {:?}, got {:?}",
-                            field_name,
-                            expected_type,
-                            actual_type
-                        ));
+                            field_name, expected_type, actual_type
+                        )));
                     }
                 }
                 None => {
-                    return Err(anyhow::anyhow!(
+                    return Err(Error::InvalidInput(format!(
                         "Unknown metadata field: '{}'. Valid fields: {:?}",
                         field_name,
                         schema.keys().collect::<Vec<_>>()
-                    ));
+                    )));
                 }
             }
         }
@@ -552,12 +595,11 @@ impl VectorDb {
         Ok(())
     }
 
-    /// Force flush all pending data to storage.
+    /// Force flush all pending data to durable storage.
     ///
-    /// Normally data is flushed according to `flush_interval`, and is then
-    /// readable. This method can be used to make writes readable immediately.
-    /// TODO: extend with an option to make durable, or support reading unflushed
-    ///       and change the meaning here to mean flushed durably
+    /// Flushes the in-memory delta to the storage memtable, then persists
+    /// to durable storage. After this returns, data is both readable and
+    /// durable.
     ///
     /// # Atomic Flush
     ///
@@ -565,6 +607,7 @@ impl VectorDb {
     /// 1. All pending writes are frozen into an immutable delta
     /// 2. RecordOps are applied in one batch via `storage.apply()`
     /// 3. The snapshot is updated for queries
+    /// 4. Data is flushed to durable storage
     ///
     /// This ensures ID dictionary updates, deletes, and new records are all
     /// applied together, maintaining consistency.
@@ -572,9 +615,28 @@ impl VectorDb {
         let mut handle = self
             .write_coordinator
             .handle(WRITE_CHANNEL)
-            .flush(false)
-            .await?;
-        handle.wait(Durability::Written).await?;
+            .flush(true)
+            .await
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
+        handle
+            .wait(Durability::Durable)
+            .await
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
+        Ok(())
+    }
+
+    /// Closes the vector database, flushing any pending data and releasing resources.
+    ///
+    /// All written data is flushed to durable storage before the database is
+    /// closed. For SlateDB-backed storage, this also releases the database
+    /// fence.
+    pub async fn close(self) -> Result<()> {
+        self.flush().await?;
+        self.write_coordinator
+            .stop()
+            .await
+            .map_err(Error::Internal)?;
+        self.storage.close().await?;
         Ok(())
     }
 
@@ -625,302 +687,43 @@ impl VectorDb {
         self.search_with_nprobe(query, k, nprobe).await
     }
 
+    /// Create a QueryEngine from the current snapshot for executing queries.
+    pub(crate) fn query_engine(&self) -> QueryEngine {
+        let snapshot = self.write_coordinator.view().snapshot.clone();
+        let options = QueryEngineOptions {
+            dimensions: self.config.dimensions,
+            distance_metric: self.config.distance_metric,
+            query_pruning_factor: self.config.query_pruning_factor,
+        };
+        QueryEngine::new(options, self.centroid_graph.clone(), snapshot)
+    }
+
     /// Search using brute-force centroid lookup (for diagnostics).
-    /// Compares all centroids to the query to find the true nearest ones,
-    /// bypassing HNSW entirely.
     pub async fn search_exact_nprobe(
         &self,
-        query: &[f32],
-        k: usize,
+        query: &Query,
         nprobe: usize,
     ) -> Result<Vec<SearchResult>> {
-        if query.len() != self.config.dimensions as usize {
-            return Err(anyhow::anyhow!(
-                "Query dimension mismatch: expected {}, got {}",
-                self.config.dimensions,
-                query.len()
-            ));
-        }
-
-        // Brute-force: compute distance from query to every centroid
-        let num_centroids = self.centroid_graph.len();
-        let all_centroid_ids = self.centroid_graph.search(query, num_centroids);
-        let mut scored: Vec<(u64, distance::VectorDistance)> = all_centroid_ids
-            .iter()
-            .filter_map(|&cid| {
-                let cv = self.centroid_graph.get_centroid_vector(cid)?;
-                let d = distance::compute_distance(query, &cv, self.config.distance_metric);
-                Some((cid, d))
-            })
-            .collect();
-        scored.sort_by(|a, b| a.1.cmp(&b.1));
-        let centroid_ids: Vec<u64> = scored.iter().take(nprobe).map(|(id, _)| *id).collect();
-
-        if centroid_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Dynamic pruning: skip posting lists whose centroids are far from query
-        let centroid_ids = self.prune_centroids(&centroid_ids, query);
-
-        let snapshot = self.write_coordinator.view().snapshot.clone();
-        let sorted_lists = self
-            .load_and_score(&centroid_ids, query, snapshot.clone())
-            .await?;
-        if sorted_lists.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.resolve_top_k(sorted_lists, k, snapshot.as_ref()).await
+        self.query_engine().search_exact_nprobe(query, nprobe).await
     }
 
-    pub async fn search_with_nprobe(
-        &self,
-        query: &[f32],
-        k: usize,
-        nprobe: usize,
-    ) -> Result<Vec<SearchResult>> {
-        // 1. Validate query dimensions
-        if query.len() != self.config.dimensions as usize {
-            return Err(anyhow::anyhow!(
-                "Query dimension mismatch: expected {}, got {}",
-                self.config.dimensions,
-                query.len()
-            ));
-        }
-
-        // 2. Search HNSW for nearest centroids
-        let num_centroids = nprobe;
-        let centroid_ids = self.centroid_graph.search(query, num_centroids);
-        debug!(
-            "searched for {} centroids, found: {}",
-            num_centroids,
-            centroid_ids.len()
-        );
-
-        if centroid_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // 3. Dynamic pruning: skip posting lists whose centroids are far from query
-        let original_ncentroids = centroid_ids.len();
-        let centroid_ids = self.prune_centroids(&centroid_ids, query);
-        debug!(
-            "query: {:?}, before pruning: {} centroids, after dynamic pruning: {} centroids",
-            query,
-            original_ncentroids,
-            centroid_ids.len()
-        );
-
-        // 4. Load posting lists and score candidates
-        let snapshot = self.write_coordinator.view().snapshot.clone();
-        let sorted_lists = self
-            .load_and_score(&centroid_ids, query, snapshot.clone())
-            .await?;
-
-        if sorted_lists.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // 5. K-way merge and resolve top-k forward index lookups
-        self.resolve_top_k(sorted_lists, k, snapshot.as_ref()).await
-    }
-
-    /// Apply query-aware dynamic pruning
-    /// (SPANN §3.2: https://arxiv.org/pdf/2111.08566).
-    ///
-    /// Given candidate centroid IDs (already sorted closest-first), computes
-    /// the raw distance from the query to each centroid and keeps only those
-    /// satisfying `dist(q, c) <= (1 + epsilon) * dist(q, closest)`.
-    ///
-    /// Returns the pruned centroid IDs. If pruning is disabled (`None`), returns
-    /// the input unchanged.
-    fn prune_centroids(&self, centroid_ids: &[u64], query: &[f32]) -> Vec<u64> {
-        let epsilon = match self.config.query_pruning_factor {
-            Some(e) => e,
-            None => return centroid_ids.to_vec(),
-        };
-
-        let metric = self.config.distance_metric;
-
-        // Compute raw distance (lower = closer) from query to each centroid.
-        let mut scored: Vec<(u64, f32)> = centroid_ids
-            .iter()
-            .filter_map(|&cid| {
-                let cv = self.centroid_graph.get_centroid_vector(cid)?;
-                let d = distance::raw_distance(query, &cv, metric);
-                Some((cid, d))
-            })
-            .collect();
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        if scored.is_empty() {
-            return Vec::new();
-        }
-
-        let closest_dist = scored[0].1;
-        // Skip pruning when closest distance is non-positive (can happen with
-        // DotProduct metric) since the multiplicative threshold is meaningless.
-        if closest_dist < 0.0 {
-            return scored.into_iter().map(|(id, _)| id).collect();
-        }
-
-        let threshold = (1.0 + epsilon) * closest_dist;
-        scored
-            .into_iter()
-            .take_while(|&(_, d)| d <= threshold)
-            .map(|(id, _)| id)
-            .collect()
-    }
-
-    /// Spawn a task per centroid to load its posting list and score all candidates
-    /// against the query vector. Returns per-centroid sorted candidate lists.
-    async fn load_and_score(
-        &self,
-        centroid_ids: &[u64],
-        query: &[f32],
-        snapshot: Arc<dyn StorageSnapshot>,
-    ) -> Result<Vec<Vec<ScoredCandidate>>> {
-        let dimensions = self.config.dimensions as usize;
-        let metric = self.config.distance_metric;
-        let query_vec: Vec<f32> = query.to_vec();
-
-        let mut handles = Vec::with_capacity(centroid_ids.len());
-        for &cid in centroid_ids {
-            let snap = snapshot.clone();
-            let q = query_vec.clone();
-            handles.push(tokio::spawn(async move {
-                let posting_list: PostingList =
-                    snap.get_posting_list(cid, dimensions).await?.into();
-                let mut scored: Vec<ScoredCandidate> = posting_list
-                    .iter()
-                    .map(|posting| {
-                        let d = distance::compute_distance(&q, posting.vector(), metric);
-                        ScoredCandidate {
-                            internal_id: posting.id(),
-                            distance: d,
-                        }
-                    })
-                    .collect();
-                scored.sort_unstable_by(|a, b| a.distance.cmp(&b.distance));
-                Ok::<_, anyhow::Error>(scored)
-            }));
-        }
-
-        let results = futures::future::join_all(handles).await;
-        let mut sorted_lists: Vec<Vec<ScoredCandidate>> = Vec::with_capacity(results.len());
-        for result in results {
-            let scored = result??;
-            if !scored.is_empty() {
-                sorted_lists.push(scored);
-            }
-        }
-
-        Ok(sorted_lists)
-    }
-
-    /// K-way merge the per-centroid sorted lists and resolve top-k forward
-    /// index lookups. Only merges as far into the lists as needed to produce
-    /// k results, deduplicating by `internal_id` along the way.
-    async fn resolve_top_k(
-        &self,
-        sorted_lists: Vec<Vec<ScoredCandidate>>,
-        k: usize,
-        snapshot: &dyn StorageRead,
-    ) -> Result<Vec<SearchResult>> {
-        let dimensions = self.config.dimensions as usize;
-
-        // Seed the min-heap with the first element of each sorted list.
-        let mut heap = BinaryHeap::new();
-        for list in sorted_lists {
-            let mut iter = list.into_iter();
-            if let Some(first) = iter.next() {
-                heap.push(Reverse(MergeEntry(first, iter)));
-            }
-        }
-
-        let mut results = Vec::with_capacity(k);
-        let mut seen = HashSet::new();
-
-        // Pop candidates from the heap in score order, batch-resolve k at a
-        // time, and stop as soon as we have k results.
-        loop {
-            // Drain up to k unique candidates from the merge heap.
-            let mut batch = Vec::with_capacity(k - results.len());
-            while batch.len() < k - results.len() {
-                let Some(Reverse(MergeEntry(candidate, mut iter))) = heap.pop() else {
-                    break;
-                };
-                if let Some(next) = iter.next() {
-                    heap.push(Reverse(MergeEntry(next, iter)));
-                }
-                if seen.insert(candidate.internal_id) {
-                    batch.push(candidate);
-                }
-            }
-
-            if batch.is_empty() {
-                break;
-            }
-
-            // Resolve forward index lookups for the batch concurrently.
-            let futures: Vec<_> = batch
-                .iter()
-                .map(|sr| snapshot.get_vector_data(sr.internal_id, dimensions))
-                .collect();
-            let loaded = futures::future::join_all(futures).await;
-
-            for (sr, vector_data) in batch.iter().zip(loaded) {
-                let Some(vector_data) = vector_data? else {
-                    continue;
-                };
-
-                let metadata: HashMap<String, AttributeValue> = vector_data
-                    .fields()
-                    .map(|field| (field.field_name.clone(), field.value.clone().into()))
-                    .collect();
-
-                results.push(SearchResult {
-                    internal_id: sr.internal_id,
-                    external_id: vector_data.external_id().to_string(),
-                    score: sr.distance.score(),
-                    attributes: metadata,
-                });
-
-                if results.len() == k {
-                    return Ok(results);
-                }
-            }
-        }
-
-        Ok(results)
+    pub async fn snapshot(&self) -> Box<dyn VectorDbRead> {
+        Box::new(VectorDbReader::new(self.query_engine())) as Box<dyn VectorDbRead>
     }
 }
 
-struct ScoredCandidate {
-    internal_id: u64,
-    distance: distance::VectorDistance,
-}
-
-/// Entry for k-way merge of sorted scored candidate lists.
-struct MergeEntry(ScoredCandidate, std::vec::IntoIter<ScoredCandidate>);
-
-impl PartialEq for MergeEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.distance == other.0.distance
+#[async_trait]
+impl VectorDbRead for VectorDb {
+    async fn search(&self, query: &Query) -> Result<Vec<SearchResult>> {
+        self.query_engine().search(query).await
     }
-}
 
-impl Eq for MergeEntry {}
-
-impl PartialOrd for MergeEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+    async fn search_with_nprobe(&self, query: &Query, nprobe: usize) -> Result<Vec<SearchResult>> {
+        self.query_engine().search_with_nprobe(query, nprobe).await
     }
-}
 
-impl Ord for MergeEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.distance.cmp(&other.0.distance)
+    async fn get(&self, id: &str) -> Result<Option<Vector>> {
+        self.query_engine().get(id).await
     }
 }
 
@@ -933,14 +736,14 @@ mod tests {
     use crate::serde::key::{IdDictionaryKey, VectorDataKey};
     use crate::serde::vector_data::VectorDataValue;
     use common::StorageConfig;
-    use common::storage::in_memory::InMemoryStorage;
+    use opendata_macros::storage_test;
     use std::time::Duration;
 
     fn create_test_config() -> Config {
         Config {
             storage: StorageConfig::InMemory,
             dimensions: 3,
-            distance_metric: DistanceMetric::Cosine,
+            distance_metric: DistanceMetric::L2,
             flush_interval: Duration::from_secs(60),
             split_threshold_vectors: 10_000,
             merge_threshold_vectors: 200,
@@ -958,12 +761,6 @@ mod tests {
         vec![vec![1.0; dimensions]]
     }
 
-    fn create_test_storage() -> Arc<dyn Storage> {
-        Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            VectorDbMergeOperator::new(3),
-        )))
-    }
-
     #[tokio::test]
     async fn should_open_vector_db() {
         // given
@@ -976,10 +773,9 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn should_write_and_flush_vectors() {
+    #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
+    async fn should_write_and_flush_vectors(storage: Arc<dyn Storage>) {
         // given
-        let storage = create_test_storage();
         let config = create_test_config();
         let centroids = create_test_centroids(3);
         let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
@@ -1019,10 +815,9 @@ mod tests {
         assert!(dict_entry1.is_some());
     }
 
-    #[tokio::test]
-    async fn should_upsert_existing_vector() {
+    #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
+    async fn should_upsert_existing_vector(storage: Arc<dyn Storage>) {
         // given
-        let storage = create_test_storage();
         let config = create_test_config();
         let centroids = create_test_centroids(3);
         let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
@@ -1093,256 +888,9 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // End-to-end search tests
-
-    fn create_test_config_with_dimensions(dimensions: u16) -> Config {
-        Config {
-            storage: StorageConfig::InMemory,
-            dimensions,
-            distance_metric: DistanceMetric::Cosine,
-            flush_interval: Duration::from_secs(60),
-            split_threshold_vectors: 10_000,
-            merge_threshold_vectors: 200,
-            split_search_neighbourhood: 8,
-            chunk_target: 4096,
-            metadata_fields: vec![],
-            ..Default::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn should_query_vectors() {
-        // given - create test database with 128 dimensions
-        let config = create_test_config_with_dimensions(128);
-
-        // Create 4 centroids for the clusters
-        let cluster_centers = [
-            vec![1.0; 128],  // Cluster 1: all ones
-            vec![-1.0; 128], // Cluster 2: all negative ones
-            {
-                let mut v = vec![0.0; 128];
-                v[0] = 10.0;
-                v
-            }, // Cluster 3: sparse
-            {
-                let mut v = vec![0.0; 128];
-                for i in (0..128).step_by(2) {
-                    v[i] = 1.0;
-                }
-                v
-            }, // Cluster 4: alternating
-        ];
-
-        let centroids: Vec<Vec<f32>> = cluster_centers.to_vec();
-
-        let db = VectorDb::open_with_centroids(config, centroids, StorageRuntime::new())
-            .await
-            .unwrap();
-
-        // Create 4 clusters of 25 vectors each
-        let mut all_vectors = Vec::new();
-        for (cluster_id, center) in cluster_centers.iter().enumerate() {
-            for i in 0..25 {
-                let mut v = center.clone();
-                // Add small noise
-                v[0] += (i as f32) * 0.01;
-
-                let vector = Vector::new(format!("vec-{}-{}", cluster_id, i), v);
-                all_vectors.push(vector);
-            }
-        }
-
-        // Write vectors and flush
-        db.write(all_vectors.clone()).await.unwrap();
-        db.flush().await.unwrap();
-
-        // Search for vector similar to cluster 0
-        let query = vec![1.0; 128];
-        let results = db.search(&query, 10).await.unwrap();
-
-        // then - should find vectors from cluster 0
-        assert_eq!(results.len(), 10);
-
-        // Verify all results are from cluster 0 (external_id starts with "vec-0-")
-        for result in &results {
-            assert!(
-                result.external_id.starts_with("vec-0-"),
-                "Expected cluster 0 vector, got: {}",
-                result.external_id
-            );
-        }
-
-        // Verify results are sorted by score (cosine similarity, higher = better)
-        for i in 1..results.len() {
-            assert!(
-                results[i - 1].score >= results[i].score,
-                "Results not sorted by score"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn should_handle_deleted_vectors_in_search() {
-        // given - create database with centroids
-        let config = create_test_config_with_dimensions(3);
-        let db = VectorDb::open(config).await.unwrap();
-
-        // Write initial vector
-        let vector1 = Vector::new("vec-1", vec![1.0, 0.0, 0.0]);
-        db.write(vec![vector1]).await.unwrap();
-        db.flush().await.unwrap();
-
-        // when - upsert the same vector (old version should be marked as deleted)
-        let vector2 = Vector::new("vec-1", vec![0.9, 0.1, 0.0]);
-        db.write(vec![vector2]).await.unwrap();
-        db.flush().await.unwrap();
-
-        // when - search
-        let results = db.search(&[1.0, 0.0, 0.0], 10).await.unwrap();
-
-        // then - should only return the new version (not the deleted one)
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].external_id, "vec-1");
-        let vector = results[0]
-            .attributes
-            .iter()
-            .find(|f| f.0 == "vector")
-            .unwrap()
-            .1;
-        let AttributeValue::Vector(vector) = vector.clone() else {
-            panic!("unexpected attr type");
-        };
-        assert_eq!(vector, vec![0.9, 0.1, 0.0]);
-    }
-
-    #[tokio::test]
-    async fn should_search_with_l2_distance_metric() {
-        // given - create database with L2 metric
-        let config = Config {
-            storage: StorageConfig::InMemory,
-            dimensions: 3,
-            distance_metric: DistanceMetric::L2,
-            flush_interval: Duration::from_secs(60),
-            split_threshold_vectors: 10_000,
-            merge_threshold_vectors: 200,
-            split_search_neighbourhood: 8,
-            chunk_target: 4096,
-            metadata_fields: vec![],
-            ..Default::default()
-        };
-        let db = VectorDb::open(config).await.unwrap();
-
-        // Write vectors at different distances from origin
-        let vectors = vec![
-            Vector::new("close", vec![0.1, 0.1, 0.1]), // Close to origin
-            Vector::new("medium", vec![1.0, 1.0, 1.0]), // Medium distance
-            Vector::new("far", vec![5.0, 5.0, 5.0]),   // Far from origin
-        ];
-        db.write(vectors).await.unwrap();
-        db.flush().await.unwrap();
-
-        // when - search for vectors near origin
-        let results = db.search(&[0.0, 0.0, 0.0], 3).await.unwrap();
-
-        // then - should be sorted by L2 distance (lower = better)
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0].external_id, "close");
-        assert_eq!(results[1].external_id, "medium");
-        assert_eq!(results[2].external_id, "far");
-
-        // Verify scores are increasing (L2 distance)
-        for i in 1..results.len() {
-            assert!(
-                results[i - 1].score <= results[i].score,
-                "L2 distances not sorted correctly"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn should_reject_query_with_wrong_dimensions() {
-        // given - database with 3 dimensions
-        let config = create_test_config_with_dimensions(3);
-        let db = VectorDb::open(config).await.unwrap();
-
-        // when - query with wrong dimensions
-        let result = db.search(&[1.0, 2.0], 10).await;
-
-        // then - should fail
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Query dimension mismatch")
-        );
-    }
-
-    #[tokio::test]
-    async fn should_return_empty_results_when_no_vectors() {
-        // given - database with centroids but no vectors
-        let config = create_test_config_with_dimensions(3);
-        let db = VectorDb::open(config).await.unwrap();
-
-        // when - search
-        let results = db.search(&[1.0, 0.0, 0.0], 10).await.unwrap();
-
-        // then - should return empty results
-        assert_eq!(results.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn should_limit_results_to_k() {
-        // given - database with many vectors
-        let config = create_test_config_with_dimensions(2);
-        let db = VectorDb::open(config).await.unwrap();
-
-        // Insert 20 vectors
-        let vectors: Vec<Vector> = (0..20)
-            .map(|i| Vector::new(format!("vec-{}", i), vec![1.0 + (i as f32) * 0.01, 0.0]))
-            .collect();
-        db.write(vectors).await.unwrap();
-        db.flush().await.unwrap();
-
-        // when - search for k=5
-        let results = db.search(&[1.0, 0.0], 5).await.unwrap();
-
-        // then - should return exactly 5 results
-        assert_eq!(results.len(), 5);
-    }
-
-    #[tokio::test]
-    async fn should_search_across_multiple_centroids() {
-        // given - database with 3 centroids
-        let config = create_test_config_with_dimensions(2);
-        let centroids = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![-1.0, 0.0]];
-        let db = VectorDb::open_with_centroids(config, centroids, StorageRuntime::new())
-            .await
-            .unwrap();
-
-        // Insert vectors in each cluster
-        let vectors = vec![
-            Vector::new("c1-1", vec![0.9, 0.0]),
-            Vector::new("c1-2", vec![1.1, 0.0]),
-            Vector::new("c2-1", vec![0.0, 0.9]),
-            Vector::new("c2-2", vec![0.0, 1.1]),
-            Vector::new("c3-1", vec![-0.9, 0.0]),
-            Vector::new("c3-2", vec![-1.1, 0.0]),
-        ];
-        db.write(vectors).await.unwrap();
-        db.flush().await.unwrap();
-
-        // when - search in between centroids 1 and 2
-        let results = db.search(&[0.7, 0.7], 10).await.unwrap();
-
-        // then - should find vectors from multiple centroids
-        assert!(!results.is_empty());
-    }
-
-    #[tokio::test]
-    async fn should_load_dictionary_on_reopen() {
+    #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
+    async fn should_load_dictionary_on_reopen(storage: Arc<dyn Storage>) {
         // given - create database and write vectors
-        let storage = create_test_storage();
         let config = create_test_config();
         let centroids = create_test_centroids(3);
 
@@ -1371,101 +919,100 @@ mod tests {
             .unwrap();
 
         // then - should be able to search (dictionary and centroids loaded from storage)
-        let results = db2.search(&[1.0, 0.0, 0.0], 10).await.unwrap();
+        let results = db2
+            .search(&Query::new(vec![1.0, 0.0, 0.0]).with_limit(10))
+            .await
+            .unwrap();
         assert!(!results.is_empty());
     }
 
     #[tokio::test]
-    async fn should_prune_centroids_beyond_epsilon_threshold() {
-        // given - 4 centroids at known L2 distances from query [0,0,0]:
-        //   c0 = [1,0,0]  -> dist = 1.0
-        //   c1 = [1.4,0,0] -> dist = 1.4
-        //   c2 = [2,0,0]  -> dist = 2.0
-        //   c3 = [5,0,0]  -> dist = 5.0
-        // epsilon = 0.5 => threshold = 1.5 * 1.0 = 1.5
-        // Expected: c0 (1.0) and c1 (1.4) survive; c2 (2.0) and c3 (5.0) pruned.
+    async fn flush_should_be_durable_across_reopen() {
+        use common::storage::config::{
+            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+        };
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage_config = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp_dir.path().to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: None,
+        });
+
         let config = Config {
-            storage: StorageConfig::InMemory,
+            storage: storage_config.clone(),
             dimensions: 3,
             distance_metric: DistanceMetric::L2,
-            query_pruning_factor: Some(0.5),
             ..Default::default()
         };
-        let centroids = vec![
-            vec![1.0, 0.0, 0.0],
-            vec![1.4, 0.0, 0.0],
-            vec![2.0, 0.0, 0.0],
-            vec![5.0, 0.0, 0.0],
-        ];
-        let db = VectorDb::open_with_centroids(config, centroids, StorageRuntime::new())
+
+        // Write vectors and flush
+        let db = VectorDb::open(config.clone()).await.unwrap();
+        db.write(vec![
+            Vector::new("vec-1", vec![1.0, 0.0, 0.0]),
+            Vector::new("vec-2", vec![0.0, 1.0, 0.0]),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+        drop(db);
+
+        // Reopen from durable state — data should be visible
+        let db2 = VectorDb::open(config).await.unwrap();
+        let results = db2
+            .search(&Query::new(vec![1.0, 0.0, 0.0]).with_limit(10))
             .await
             .unwrap();
-
-        let query = [0.0, 0.0, 0.0];
-        let all_ids: Vec<u64> = (0..4).collect();
-
-        // when
-        let pruned = db.prune_centroids(&all_ids, &query);
-
-        // then
-        assert_eq!(pruned.len(), 2);
-        assert_eq!(pruned[0], 0); // closest
-        assert_eq!(pruned[1], 1); // within threshold
+        assert!(
+            !results.is_empty(),
+            "expected data to be durable after flush, but search returned no results"
+        );
     }
 
     #[tokio::test]
-    async fn should_skip_pruning_when_epsilon_is_none() {
-        // given - no pruning configured
+    #[allow(clippy::needless_return)]
+    async fn close_without_explicit_flush_guarantees_durability() {
+        use common::storage::config::{
+            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+        };
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage_config = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp_dir.path().to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: None,
+        });
+
         let config = Config {
-            storage: StorageConfig::InMemory,
+            storage: storage_config.clone(),
             dimensions: 3,
             distance_metric: DistanceMetric::L2,
-            query_pruning_factor: None,
             ..Default::default()
         };
-        let centroids = vec![vec![1.0, 0.0, 0.0], vec![100.0, 0.0, 0.0]];
-        let db = VectorDb::open_with_centroids(config, centroids, StorageRuntime::new())
+
+        // Write a vector and close without calling flush()
+        {
+            let db = VectorDb::open(config.clone()).await.unwrap();
+            db.write(vec![Vector::new("vec-1", vec![1.0, 0.0, 0.0])])
+                .await
+                .unwrap();
+            db.close().await.unwrap();
+        }
+
+        // Reopen and verify the vector survived
+        let db2 = VectorDb::open(config).await.unwrap();
+        let results = db2
+            .search(&Query::new(vec![1.0, 0.0, 0.0]).with_limit(1))
             .await
             .unwrap();
-
-        let query = [0.0, 0.0, 0.0];
-        let all_ids: Vec<u64> = (0..2).collect();
-
-        // when
-        let result = db.prune_centroids(&all_ids, &query);
-
-        // then - all centroids returned regardless of distance
-        assert_eq!(result.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn should_prune_centroids_returns_sorted_by_distance() {
-        // given - pass centroid IDs in non-distance order
-        let config = Config {
-            storage: StorageConfig::InMemory,
-            dimensions: 3,
-            distance_metric: DistanceMetric::L2,
-            query_pruning_factor: Some(10.0), // large epsilon, keeps all
-            ..Default::default()
-        };
-        let centroids = vec![
-            vec![5.0, 0.0, 0.0], // c0: far
-            vec![1.0, 0.0, 0.0], // c1: close
-            vec![3.0, 0.0, 0.0], // c2: medium
-        ];
-        let db = VectorDb::open_with_centroids(config, centroids, StorageRuntime::new())
-            .await
-            .unwrap();
-
-        let query = [0.0, 0.0, 0.0];
-        // pass IDs in reverse distance order
-        let ids: Vec<u64> = vec![0, 2, 1];
-
-        // when
-        let result = db.prune_centroids(&ids, &query);
-
-        // then - sorted by ascending distance: c1 (1.0), c2 (3.0), c0 (5.0)
-        assert_eq!(result, vec![1, 2, 0]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].vector.id, "vec-1");
     }
 
     #[tokio::test]
@@ -1474,7 +1021,8 @@ mod tests {
         let config = create_test_config();
 
         // when
-        let result = VectorDb::open_with_centroids(config, vec![], StorageRuntime::new()).await;
+        let sb = StorageBuilder::new(&config.storage).await.unwrap();
+        let result = VectorDb::open_with_centroids(config, vec![], sb).await;
 
         // then
         match result {

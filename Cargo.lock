@@ -2486,21 +2486,40 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "opendata-common"
-version = "0.1.8"
+version = "0.1.11"
 dependencies = [
  "arc-swap",
  "async-trait",
  "bytes",
  "criterion",
+ "foyer",
  "futures",
+ "opendata-macros",
  "prometheus-client",
  "proptest",
  "serde",
  "serde_yaml",
  "slatedb",
+ "slatedb-common",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "opendata-ingest"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "opendata-common",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "slatedb",
+ "tokio",
+ "tokio-util",
  "uuid",
 ]
 
@@ -2517,7 +2536,7 @@ dependencies = [
 
 [[package]]
 name = "opendata-log"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2525,6 +2544,7 @@ dependencies = [
  "bytes",
  "clap",
  "opendata-common",
+ "opendata-macros",
  "prometheus-client",
  "proptest",
  "prost",
@@ -2553,8 +2573,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "opendata-macros"
+version = "0.1.0"
+dependencies = [
+ "opendata-common",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
+]
+
+[[package]]
 name = "opendata-timeseries"
-version = "0.1.7"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "axum",
@@ -2568,9 +2599,12 @@ dependencies = [
  "dashmap",
  "dashu-float",
  "fail",
+ "futures",
  "mime_guess",
  "moka",
  "opendata-common",
+ "opendata-macros",
+ "opentelemetry-proto",
  "prometheus-client",
  "promql-parser",
  "proptest",
@@ -2581,11 +2615,14 @@ dependencies = [
  "roaring 0.7.0",
  "rstest",
  "rust-embed",
+ "ryu",
  "serde",
  "serde_json",
+ "serde_with",
  "serde_yaml",
  "slatedb",
  "snap",
+ "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "tower",
@@ -2598,23 +2635,33 @@ dependencies = [
 
 [[package]]
 name = "opendata-vector"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "bytes",
+ "clap",
  "dashmap",
  "fail",
  "futures",
  "log",
  "opendata-common",
+ "opendata-macros",
+ "prost",
  "rand 0.8.5",
+ "reqwest",
  "roaring 0.10.12",
  "rstest",
  "serde",
+ "serde_json",
+ "serde_with",
  "serde_yaml",
+ "slatedb",
+ "tempfile",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "usearch",
@@ -2625,6 +2672,47 @@ name = "openssl-probe"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
+
+[[package]]
+name = "opentelemetry"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "236e667b670a5cdf90c258f5a55794ec5ac5027e960c224bff8367a59e1e6426"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror 2.0.17",
+ "tracing",
+]
+
+[[package]]
+name = "opentelemetry-proto"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56f8870d3024727e99212eb3bb1762ec16e255e3e6f58eeb3dc8db1aa226746d"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost",
+ "tonic",
+]
+
+[[package]]
+name = "opentelemetry_sdk"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84dfad6042089c7fc1f6118b7040dc2eb4ab520abbf410b79dc481032af39570"
+dependencies = [
+ "async-trait",
+ "futures-channel",
+ "futures-executor",
+ "futures-util",
+ "glob",
+ "opentelemetry",
+ "thiserror 2.0.17",
+]
 
 [[package]]
 name = "ordered-float"
@@ -2904,6 +2992,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "proc-macro-crate"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "219cb19e96be00ab2e37d6e299658a0cfa83e52429179969b0f0121b4ac46983"
+dependencies = [
+ "toml_edit 0.23.10+spec-1.0.0",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2950,9 +3047,9 @@ dependencies = [
 
 [[package]]
 name = "promql-parser"
-version = "0.6.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "328fe69c2443ec4f8e6c33ea925dde04a1026e6c95928e89ed02343944cac9bf"
+checksum = "df2791a28f8ea7e48f2838999c06d089184d44adb860feab682d45dd190ef718"
 dependencies = [
  "cfgrammar",
  "chrono",
@@ -2960,7 +3057,6 @@ dependencies = [
  "lrlex",
  "lrpar",
  "regex",
- "unescaper",
 ]
 
 [[package]]
@@ -3853,9 +3949,9 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 
 [[package]]
 name = "slatedb"
-version = "0.10.1"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "588e9ae32019696205a05e54e4456486e8d11b69c72662739be853736833b3dd"
+checksum = "dc33982c2d4f2f66fddb6e4bd050c6fcc415944221c0c2775a407b5af0af3388"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3884,6 +3980,8 @@ dependencies = [
  "serde",
  "serde_json",
  "siphasher",
+ "slatedb-common",
+ "slatedb-txn-obj",
  "sysinfo",
  "thiserror 1.0.69",
  "thread_local",
@@ -3894,6 +3992,32 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "slatedb-common"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30f25d1e125ea2f5dcf315e7cc40bc4adce655b382d2350ec37b66d7e97802ff"
+dependencies = [
+ "chrono",
+ "tokio",
+]
+
+[[package]]
+name = "slatedb-txn-obj"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc5f20e6b8c7d01cb6a4050a495d3a2e8c435bc8ce439c9b0b72fa2d3096bed8"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "log",
+ "object_store",
+ "slatedb-common",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -4230,6 +4354,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-stream"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4253,7 +4388,7 @@ dependencies = [
  "serde",
  "serde_spanned 0.6.9",
  "toml_datetime 0.6.11",
- "toml_edit",
+ "toml_edit 0.22.27",
 ]
 
 [[package]]
@@ -4265,7 +4400,7 @@ dependencies = [
  "indexmap 2.12.1",
  "serde_core",
  "serde_spanned 1.0.3",
- "toml_datetime 0.7.3",
+ "toml_datetime 0.7.5+spec-1.1.0",
  "toml_parser",
  "toml_writer",
  "winnow 0.7.14",
@@ -4282,9 +4417,9 @@ dependencies = [
 
 [[package]]
 name = "toml_datetime"
-version = "0.7.3"
+version = "0.7.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2cdb639ebbc97961c51720f858597f7f24c4fc295327923af55b74c3c724533"
+checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
 dependencies = [
  "serde_core",
 ]
@@ -4304,10 +4439,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "toml_parser"
-version = "1.0.4"
+name = "toml_edit"
+version = "0.23.10+spec-1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0cbe268d35bdb4bb5a56a2de88d0ad0eb70af5384a99d648cd4b3d04039800e"
+checksum = "84c8b9f757e028cee9fa244aea147aab2a9ec09d5325a9b01e0a49730c2b5269"
+dependencies = [
+ "indexmap 2.12.1",
+ "toml_datetime 0.7.5+spec-1.1.0",
+ "toml_parser",
+ "winnow 0.7.14",
+]
+
+[[package]]
+name = "toml_parser"
+version = "1.0.9+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "702d4415e08923e7e1ef96cd5727c0dfed80b4d2fa25db9647fe5eb6f7c5a4c4"
 dependencies = [
  "winnow 0.7.14",
 ]
@@ -4323,6 +4470,27 @@ name = "toml_writer"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df8b2b54733674ad286d16267dcfc7a71ed5c776e4ac7aa3c3e2561f7c637bf2"
+
+[[package]]
+name = "tonic"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "877c5b330756d856ffcc4553ab34a5684481ade925ecc54bcd1bf02b1d0d4d52"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "http",
+ "http-body",
+ "http-body-util",
+ "percent-encoding",
+ "pin-project",
+ "prost",
+ "tokio-stream",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
 
 [[package]]
 name = "tower"
@@ -4508,15 +4676,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1b88fcfe09e89d3866a5c11019378088af2d24c3fbd4f0543f96b479ec90697"
 dependencies = [
  "version_check",
-]
-
-[[package]]
-name = "unescaper"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4064ed685c487dbc25bd3f0e9548f2e34bab9d18cefc700f9ec2dba74ba1138e"
-dependencies = [
- "thiserror 2.0.17",
 ]
 
 [[package]]

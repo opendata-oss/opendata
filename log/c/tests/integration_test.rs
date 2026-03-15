@@ -34,6 +34,7 @@ fn open_in_memory_log() -> *mut opendata_log_t {
         object_store: ptr::null(),
         settings_path: ptr::null(),
         seal_interval_ms: -1,
+        read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
     };
     let mut log: *mut opendata_log_t = ptr::null_mut();
     assert_ok(unsafe { opendata_log_open(&config, &mut log) });
@@ -113,6 +114,7 @@ fn open_rejects_null_out_pointer() {
         object_store: ptr::null(),
         settings_path: ptr::null(),
         seal_interval_ms: -1,
+        read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
     };
     assert_error(
         unsafe { opendata_log_open(&config, ptr::null_mut()) },
@@ -136,6 +138,7 @@ fn open_rejects_invalid_storage_type() {
         object_store: ptr::null(),
         settings_path: ptr::null(),
         seal_interval_ms: -1,
+        read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
     };
     let mut log: *mut opendata_log_t = ptr::null_mut();
     assert_error(
@@ -448,6 +451,7 @@ fn reader_open_and_close() {
         object_store: store,
         settings_path: ptr::null(),
         seal_interval_ms: -1,
+        read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
     };
     let mut log: *mut opendata_log_t = ptr::null_mut();
     assert_ok(unsafe { opendata_log_open(&writer_config, &mut log) });
@@ -486,6 +490,7 @@ fn reader_scan_returns_written_data() {
         object_store: store,
         settings_path: ptr::null(),
         seal_interval_ms: -1,
+        read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
     };
     let mut log: *mut opendata_log_t = ptr::null_mut();
     assert_ok(unsafe { opendata_log_open(&writer_config, &mut log) });
@@ -572,6 +577,7 @@ fn reader_list_keys() {
         object_store: store,
         settings_path: ptr::null(),
         seal_interval_ms: -1,
+        read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
     };
     let mut log: *mut opendata_log_t = ptr::null_mut();
     assert_ok(unsafe { opendata_log_open(&writer_config, &mut log) });
@@ -638,6 +644,7 @@ fn reader_list_segments() {
         object_store: store,
         settings_path: ptr::null(),
         seal_interval_ms: -1,
+        read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
     };
     let mut log: *mut opendata_log_t = ptr::null_mut();
     assert_ok(unsafe { opendata_log_open(&writer_config, &mut log) });
@@ -716,6 +723,7 @@ fn open_with_local_slatedb() {
         object_store: store,
         settings_path: ptr::null(),
         seal_interval_ms: -1,
+        read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
     };
     let mut log: *mut opendata_log_t = ptr::null_mut();
     assert_ok(unsafe { opendata_log_open(&config, &mut log) });
