@@ -2,7 +2,6 @@ use super::{BroadcastedView, WriteCommand};
 use super::{Delta, Durability, WriteError, WriteResult};
 use crate::StorageRead;
 use crate::coordinator::traits::EpochStamped;
-use crate::coordinator::{ViewMonitor, ViewSubscriber};
 use crate::storage::StorageSnapshot;
 use futures::FutureExt;
 use futures::future::Shared;
@@ -294,25 +293,6 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
 
     pub fn subscribe(&self) -> (broadcast::Receiver<Arc<View<D>>>, Arc<View<D>>) {
         self.view.subscribe()
-    }
-
-    /// Re-subscribes to the coordinator, returning a fresh pair of subscriber
-    /// and monitor with an atomically-captured initial view.
-    ///
-    /// This is typically used to recover from a lagged subscription:
-    /// ```ignore
-    /// match subscriber.recv().await {
-    ///     Err(SubscribeError::Lagged) => {
-    ///         (subscriber, _monitor) = handle.resubscribe();
-    ///         let view = subscriber.initialize();
-    ///         // recover db state from view...
-    ///     }
-    ///     // ...
-    /// }
-    /// ```
-    pub fn resubscribe(&self) -> (ViewSubscriber<D>, ViewMonitor) {
-        let (rx, view) = self.view.subscribe();
-        ViewSubscriber::new(rx, view)
     }
 }
 

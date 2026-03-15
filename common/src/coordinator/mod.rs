@@ -2348,7 +2348,8 @@ mod tests {
         let result = subscriber.recv().await;
         if let Err(SubscribeError::Lagged) = result {
             // when - resubscribe to recover
-            (subscriber, _) = handle.resubscribe();
+            let (rx, initial_view) = handle.subscribe();
+            (subscriber, _) = ViewSubscriber::new(rx, initial_view);
             let view = subscriber.initialize();
 
             // then - the fresh view should reflect the current state

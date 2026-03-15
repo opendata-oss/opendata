@@ -34,7 +34,8 @@
 //!             Err(SubscribeError::Lagged) => {
 //!                 // Re-subscribe to get a consistent initial view, then
 //!                 // recover db-specific state from the snapshot.
-//!                 (subscriber, _monitor) = handle.resubscribe();
+//!                 let (rx, view) = handle.subscribe();
+//!                 (subscriber, _) = ViewSubscriber::new(rx, view);
 //!                 let view = subscriber.initialize();
 //!                 // db.recover_from_view(&view).await?;
 //!             }
