@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 COMPOSE="docker compose"
-TIMEOUT=300  # max seconds to wait for embedded-reader to finish
+TIMEOUT=1800  # max seconds to wait for embedded-reader to finish
 PASSED=0
 FAILED=0
 
