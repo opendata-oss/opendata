@@ -240,21 +240,6 @@ impl MiniTsdb {
             .map_err(Error::Internal)?;
         Ok(())
     }
-
-    /// Recover subscriber state from a view's storage snapshot.
-    ///
-    /// When a view subscriber lags and misses broadcasts, it should call
-    /// `handle.resubscribe()` to get a fresh view, then call this method
-    /// to restore its read snapshot.
-    ///
-    /// For timeseries, the only relevant snapshot state is the storage
-    /// snapshot itself, since `TsdbWriteDelta` carries no readable delta.
-    pub fn recover_from_view(
-        &self,
-        view: &Arc<common::coordinator::View<TsdbWriteDelta>>,
-    ) -> Arc<dyn common::StorageRead> {
-        view.snapshot.clone()
-    }
 }
 
 fn map_write_error(e: WriteError) -> Error {
