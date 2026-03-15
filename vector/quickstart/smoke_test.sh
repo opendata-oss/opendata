@@ -42,22 +42,72 @@ assert_contains() {
     fi
 }
 
+# Check if a container has exited (handles different docker compose versions).
+# Returns 0 if exited, 1 otherwise. Sets CONTAINER_EXIT_CODE.
+check_exited() {
+    local service="$1"
+    CONTAINER_EXIT_CODE=""
+
+    # Try JSON format first (works on Docker Compose V2.21+)
+    local json
+    json=$($COMPOSE ps "$service" --format json 2>/dev/null || true)
+    if [ -n "$json" ]; then
+        local state
+        state=$(echo "$json" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    obj = json.loads(line)
+    print(obj.get('State', '').lower())
+    break
+" 2>/dev/null || true)
+        if [ "$state" = "exited" ]; then
+            CONTAINER_EXIT_CODE=$(echo "$json" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    obj = json.loads(line)
+    print(obj.get('ExitCode', 1))
+    break
+" 2>/dev/null || echo "1")
+            return 0
+        fi
+        return 1
+    fi
+
+    # Fallback: parse docker compose ps text output
+    local ps_output
+    ps_output=$($COMPOSE ps "$service" 2>/dev/null || true)
+    if echo "$ps_output" | grep -iq "exited"; then
+        # Extract exit code from output like "Exited (0)" or "exited (1)"
+        CONTAINER_EXIT_CODE=$(echo "$ps_output" | grep -oP 'xited \(\K[0-9]+' | head -1)
+        CONTAINER_EXIT_CODE="${CONTAINER_EXIT_CODE:-1}"
+        return 0
+    fi
+
+    return 1
+}
+
 # ---------------------------------------------------------------
 # 1. Start everything and wait for embedded-reader to complete
 # ---------------------------------------------------------------
 echo "=== Starting quickstart ==="
+echo "Docker Compose version:"
+$COMPOSE version
+echo ""
+
 $COMPOSE up --build -d
 
 echo "=== Waiting for embedded-reader to finish (timeout: ${TIMEOUT}s) ==="
 elapsed=0
 while [ $elapsed -lt $TIMEOUT ]; do
-    status=$($COMPOSE ps embedded-reader --format '{{.State}}' 2>/dev/null || echo "unknown")
-    if [ "$status" = "exited" ]; then
-        exit_code=$($COMPOSE ps embedded-reader --format '{{.ExitCode}}' 2>/dev/null || echo "1")
-        if [ "$exit_code" = "0" ]; then
+    if check_exited "embedded-reader"; then
+        if [ "$CONTAINER_EXIT_CODE" = "0" ]; then
             pass "embedded-reader exited successfully"
         else
-            fail "embedded-reader exited with code $exit_code"
+            fail "embedded-reader exited with code $CONTAINER_EXIT_CODE"
             echo "--- embedded-reader logs ---"
             $COMPOSE logs embedded-reader
             exit 1
@@ -66,15 +116,20 @@ while [ $elapsed -lt $TIMEOUT ]; do
     fi
     sleep 5
     elapsed=$((elapsed + 5))
-    if [ $((elapsed % 30)) -eq 0 ]; then
-        echo "  ...still waiting (${elapsed}s)"
+    if [ $((elapsed % 60)) -eq 0 ]; then
+        echo "  ...still waiting (${elapsed}s). Container states:"
+        $COMPOSE ps --format 'table {{.Name}}\t{{.State}}\t{{.Status}}' 2>/dev/null \
+            || $COMPOSE ps 2>/dev/null \
+            || true
     fi
 done
 
 if [ $elapsed -ge $TIMEOUT ]; then
-    fail "Timed out waiting for embedded-reader"
-    echo "--- docker compose logs ---"
-    $COMPOSE logs --tail=50
+    fail "Timed out waiting for embedded-reader after ${TIMEOUT}s"
+    echo "--- container states ---"
+    $COMPOSE ps 2>/dev/null || true
+    echo "--- last 100 lines of all logs ---"
+    $COMPOSE logs --tail=100
     exit 1
 fi
 
