@@ -1,8 +1,5 @@
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::clock::Clock;
@@ -13,33 +10,36 @@ use slatedb::object_store::{
 
 use crate::error::{Error, Result};
 
-fn millis(time: SystemTime) -> i64 {
-    time.duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_millis() as i64
-}
-
 const MANIFEST_VERSION: u16 = 1;
 const UNINITIALIZED_EPOCH: u64 = u64::MAX;
 const ENTRY_LEN_SIZE: usize = 4;
 const LOCATION_LEN_SIZE: usize = 2;
 const INGESTION_TIME_MS_SIZE: usize = 8;
+const METADATA_LEN_SIZE: usize = 4;
+const START_INDEX_SIZE: usize = 4;
+const METADATA_COUNT_SIZE: usize = 4;
 const ENTRIES_COUNT_SIZE: usize = 4;
 const SEQUENCE_SIZE: usize = 8;
 const EPOCH_SIZE: usize = 8;
 const VERSION_SIZE: usize = 2;
 const FOOTER_SIZE: usize = ENTRIES_COUNT_SIZE + SEQUENCE_SIZE + EPOCH_SIZE + VERSION_SIZE;
 
-#[derive(Debug, Clone)]
-struct QueueEntry {
-    sequence: u64,
-    location: String,
-    ingestion_time_ms: i64,
-    metadata: Bytes,
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Metadata {
+    pub(crate) start_index: u32,
+    pub(crate) ingestion_time_ms: i64,
+    pub(crate) payload: Bytes,
 }
 
 #[derive(Debug, Clone)]
-struct Manifest {
+pub(crate) struct QueueEntry {
+    pub(crate) sequence: u64,
+    pub(crate) location: String,
+    pub(crate) metadata: Vec<Metadata>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Manifest {
     data: Bytes,
     appended: BytesMut,
     appended_count: usize,
@@ -65,7 +65,7 @@ impl Manifest {
     }
 
     /// Wrap raw binary data as a queue manifest, validating the footer.
-    fn from_bytes(data: Bytes) -> Result<Self> {
+    pub(crate) fn from_bytes(data: Bytes) -> Result<Self> {
         if data.is_empty() {
             return Err(Error::Serialization(
                 "queue manifest data must not be empty".to_string(),
@@ -127,18 +127,21 @@ impl Manifest {
     }
 
     /// Number of entries (read from the footer, O(1)).
+    #[allow(dead_code)]
     fn entries_count(&self) -> usize {
         let base = self.existing_entries_count();
         base + self.appended_count
     }
 
     /// Whether the manifest contains no entries.
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.entries_count() == 0
     }
 
     /// Return a borrowing iterator that lazily deserializes entries.
-    fn iter(&self) -> ManifestIter<'_> {
+    #[allow(dead_code)]
+    pub(crate) fn iter(&self) -> ManifestIter<'_> {
         let base_count = self.existing_entries_count();
         let entries_end = if self.data.is_empty() {
             0
@@ -186,7 +189,8 @@ impl Manifest {
     ///
     /// Optimized to avoid deserializing/re-serializing remaining entries: only the
     /// removed entries are fully decoded, while remaining entries are byte-copied.
-    fn dequeue(&mut self, through_sequence: u64) -> Vec<QueueEntry> {
+    #[allow(dead_code)]
+    fn dequeue(&mut self, through_sequence: u64) -> Result<Vec<QueueEntry>> {
         let next_seq = self.next_sequence;
         let epoch = self.epoch;
 
@@ -198,7 +202,7 @@ impl Manifest {
         };
 
         let (mut removed, remaining_base_start, remaining_base_count) =
-            split_entries(&self.data, base_count, entries_end, through_sequence);
+            split_entries(&self.data, base_count, entries_end, through_sequence)?;
 
         let appended_end = self.appended.len();
         let (appended_removed, remaining_appended_start, remaining_appended_count) = split_entries(
@@ -206,7 +210,7 @@ impl Manifest {
             self.appended_count,
             appended_end,
             through_sequence,
-        );
+        )?;
         removed.extend(appended_removed);
 
         let remaining_base_bytes = &self.data[remaining_base_start..entries_end];
@@ -229,10 +233,11 @@ impl Manifest {
         self.next_sequence = next_seq;
         self.epoch = epoch;
 
-        removed
+        Ok(removed)
     }
 
     /// Set the epoch and patch the data bytes in place.
+    #[allow(dead_code)]
     fn set_epoch(&mut self, epoch: u64) {
         self.epoch = epoch;
         let mut buf = BytesMut::from(self.data.as_ref());
@@ -270,13 +275,26 @@ impl Manifest {
     }
 
     fn encode_entry(buf: &mut BytesMut, entry: &QueueEntry) {
-        let entry_len = 8 + 2 + entry.location.len() + 8 + entry.metadata.len();
+        let metadata_size: usize = METADATA_COUNT_SIZE
+            + entry
+                .metadata
+                .iter()
+                .map(|m| {
+                    START_INDEX_SIZE + INGESTION_TIME_MS_SIZE + METADATA_LEN_SIZE + m.payload.len()
+                })
+                .sum::<usize>();
+        let entry_len = SEQUENCE_SIZE + LOCATION_LEN_SIZE + entry.location.len() + metadata_size;
         buf.put_u32_le(entry_len as u32);
         buf.put_u64_le(entry.sequence);
         buf.put_u16_le(entry.location.len() as u16);
         buf.extend_from_slice(entry.location.as_bytes());
-        buf.put_i64_le(entry.ingestion_time_ms);
-        buf.extend_from_slice(&entry.metadata);
+        buf.put_u32_le(entry.metadata.len() as u32);
+        for m in &entry.metadata {
+            buf.put_u32_le(m.start_index);
+            buf.put_i64_le(m.ingestion_time_ms);
+            buf.put_u32_le(m.payload.len() as u32);
+            buf.extend_from_slice(&m.payload);
+        }
     }
 }
 
@@ -288,39 +306,29 @@ fn split_entries(
     count: usize,
     end: usize,
     through_sequence: u64,
-) -> (Vec<QueueEntry>, usize, u32) {
+) -> Result<(Vec<QueueEntry>, usize, u32)> {
     let mut removed = Vec::new();
     let mut offset = 0usize;
 
     for i in 0..count {
-        if offset + ENTRY_LEN_SIZE + SEQUENCE_SIZE > end {
-            break;
-        }
-        let entry_len =
-            u32::from_le_bytes(data[offset..offset + ENTRY_LEN_SIZE].try_into().unwrap()) as usize;
-        let sequence = u64::from_le_bytes(
-            data[offset + ENTRY_LEN_SIZE..offset + ENTRY_LEN_SIZE + SEQUENCE_SIZE]
-                .try_into()
-                .unwrap(),
-        );
+        let entry_start = offset;
+        let entry = decode_entry(data, &mut offset, end)?;
 
-        if sequence <= through_sequence {
-            let mut off = offset;
-            removed.push(decode_entry(data, &mut off, end).unwrap());
-            offset += ENTRY_LEN_SIZE + entry_len;
+        if entry.sequence <= through_sequence {
+            removed.push(entry);
         } else {
-            return (removed, offset, (count - i) as u32);
+            return Ok((removed, entry_start, (count - i) as u32));
         }
     }
 
-    (removed, end, 0)
+    Ok((removed, end, 0))
 }
 
 /// Decode a single entry from binary data at the given offset.
 fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntry> {
     if *offset + ENTRY_LEN_SIZE > end {
         return Err(Error::Serialization(
-            "manifest truncated: not enough bytes for entry_len".to_string(),
+            "queue entry corrupt: size of entry length field does not fit in entry".to_string(),
         ));
     }
 
@@ -330,9 +338,11 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntr
 
     if *offset + entry_len > end {
         return Err(Error::Serialization(
-            "manifest truncated: entry extends beyond data".to_string(),
+            "queue entry corrupt: entry has less bytes than set in the entry length".to_string(),
         ));
     }
+
+    let entry_end = *offset + entry_len;
 
     let sequence = u64::from_le_bytes(data[*offset..*offset + SEQUENCE_SIZE].try_into().unwrap());
     *offset += SEQUENCE_SIZE;
@@ -344,10 +354,10 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntr
     ) as usize;
     *offset += LOCATION_LEN_SIZE;
 
-    let min_entry_len = SEQUENCE_SIZE + LOCATION_LEN_SIZE + INGESTION_TIME_MS_SIZE + location_len;
+    let min_entry_len = SEQUENCE_SIZE + LOCATION_LEN_SIZE + location_len + METADATA_COUNT_SIZE;
     if entry_len < min_entry_len {
         return Err(Error::Serialization(format!(
-            "entry_len {} is less than minimum {} for location_len {}",
+            "queue entry corrupt: entry length {} is less than minimum entry length {} for the length of the location {}",
             entry_len, min_entry_len, location_len
         )));
     }
@@ -356,28 +366,78 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntr
         .map_err(|e| Error::Serialization(e.to_string()))?;
     *offset += location_len;
 
-    let ingestion_time_ms = i64::from_le_bytes(
-        data[*offset..*offset + INGESTION_TIME_MS_SIZE]
+    let metadata_count = u32::from_le_bytes(
+        data[*offset..*offset + METADATA_COUNT_SIZE]
             .try_into()
             .unwrap(),
-    );
-    *offset += INGESTION_TIME_MS_SIZE;
+    ) as usize;
+    *offset += METADATA_COUNT_SIZE;
 
-    let metadata_len =
-        entry_len - SEQUENCE_SIZE - LOCATION_LEN_SIZE - location_len - INGESTION_TIME_MS_SIZE;
-    let metadata = Bytes::copy_from_slice(&data[*offset..*offset + metadata_len]);
-    *offset += metadata_len;
+    let mut metadata = Vec::with_capacity(metadata_count);
+    for _ in 0..metadata_count {
+        if *offset + START_INDEX_SIZE > end {
+            return Err(Error::Serialization(
+                "queue entry corrupt: size of start index field does not fit in entry".to_string(),
+            ));
+        }
+        let start_index = u32::from_le_bytes(
+            data[*offset..*offset + START_INDEX_SIZE]
+                .try_into()
+                .unwrap(),
+        );
+        *offset += START_INDEX_SIZE;
+
+        if *offset + INGESTION_TIME_MS_SIZE > end {
+            return Err(Error::Serialization(
+                "queue entry corrupt: size of ingestion time field does not fit in entry"
+                    .to_string(),
+            ));
+        }
+        let ingestion_time_ms = i64::from_le_bytes(
+            data[*offset..*offset + INGESTION_TIME_MS_SIZE]
+                .try_into()
+                .unwrap(),
+        );
+        *offset += INGESTION_TIME_MS_SIZE;
+
+        if *offset + METADATA_LEN_SIZE > end {
+            return Err(Error::Serialization(
+                "queue entry corrupt: size of metadata length field does not fit in entry"
+                    .to_string(),
+            ));
+        }
+        let m_len = u32::from_le_bytes(
+            data[*offset..*offset + METADATA_LEN_SIZE]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        *offset += METADATA_LEN_SIZE;
+
+        if *offset + m_len > end {
+            return Err(Error::Serialization(
+                "queue entry corrupt: metadata has less bytes than set in the metadata length"
+                    .to_string(),
+            ));
+        }
+        metadata.push(Metadata {
+            start_index,
+            ingestion_time_ms,
+            payload: Bytes::copy_from_slice(&data[*offset..*offset + m_len]),
+        });
+        *offset += m_len;
+    }
+
+    *offset = entry_end;
 
     Ok(QueueEntry {
         sequence,
         location,
-        ingestion_time_ms,
         metadata,
     })
 }
 
 /// Borrowing iterator over manifest entries. Lazily deserializes each entry.
-struct ManifestIter<'a> {
+pub(crate) struct ManifestIter<'a> {
     data: &'a [u8],
     offset: usize,
     remaining: usize,
@@ -498,7 +558,8 @@ impl ConflictCounter {
             return 0.0;
         }
         let conflicts = self.conflict_count.load(Ordering::Relaxed);
-        (conflicts as f64 / writes as f64) * 100.0
+        let rate = (conflicts as f64 / writes as f64) * 100.0;
+        rate.min(100.0)
     }
 }
 
@@ -509,23 +570,17 @@ impl ConflictCounter {
 /// retried automatically until it succeeds.
 pub struct QueueProducer {
     manifest_store: ManifestStore,
-    clock: Arc<dyn Clock>,
     counter: ConflictCounter,
 }
 
 impl QueueProducer {
     /// Create a new producer backed by the given [`ObjectStore`].
-    pub fn with_object_store(
-        manifest_path: String,
-        object_store: Arc<dyn ObjectStore>,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
+    pub fn with_object_store(manifest_path: String, object_store: Arc<dyn ObjectStore>) -> Self {
         Self {
             manifest_store: ManifestStore {
                 object_store,
                 manifest_path,
             },
-            clock,
             counter: ConflictCounter::new(),
         }
     }
@@ -533,11 +588,10 @@ impl QueueProducer {
     /// Append an entry to the queue with the given `location` and `metadata`.
     ///
     /// The write is retried automatically on optimistic-concurrency conflicts.
-    pub async fn enqueue(&self, location: String, metadata: Bytes) -> Result<()> {
+    pub async fn enqueue(&self, location: String, metadata: Vec<Metadata>) -> Result<()> {
         let entry = QueueEntry {
             sequence: 0,
             location,
-            ingestion_time_ms: millis(self.clock.now()),
             metadata,
         };
         loop {
@@ -569,6 +623,7 @@ impl QueueProducer {
 /// fencing any previous consumer instance. Every subsequent read or dequeue
 /// checks that the local epoch still matches the manifest, returning
 /// [`Error::Fenced`] if another consumer has taken over.
+#[allow(dead_code)]
 pub struct QueueConsumer {
     manifest_store: ManifestStore,
     epoch: AtomicU64,
@@ -577,6 +632,7 @@ pub struct QueueConsumer {
     queue_len: AtomicU64,
 }
 
+#[allow(dead_code)]
 impl QueueConsumer {
     /// Create a new consumer backed by the given [`ObjectStore`].
     ///
@@ -653,7 +709,7 @@ impl QueueConsumer {
             if manifest.epoch != self.epoch.load(Ordering::Relaxed) {
                 return Err(Error::Fenced);
             }
-            let removed = manifest.dequeue(through_sequence);
+            let removed = manifest.dequeue(through_sequence)?;
             match self.write_manifest(&manifest, version).await {
                 Ok(()) => return Ok(removed),
                 Err(ManifestWriteError::Conflict) => {
@@ -713,60 +769,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_enqueue_locations_to_manifest() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
-
-        producer
-            .enqueue("path/to/file1.json".to_string(), Bytes::new())
-            .await
-            .unwrap();
-        producer
-            .enqueue("path/to/file2.json".to_string(), Bytes::new())
-            .await
-            .unwrap();
-
-        let manifest = read_producer_manifest(&store, "test/manifest").await;
-        let locations: Vec<String> = manifest.iter().map(|e| e.unwrap().location).collect();
-        assert_eq!(locations, vec!["path/to/file1.json", "path/to/file2.json"]);
-    }
-
-    #[tokio::test]
-    async fn should_merge_with_existing_manifest() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-
-        let existing = Manifest::from_entries(&[QueueEntry {
-            sequence: 0,
-            location: "existing/file.json".to_string(),
-            ingestion_time_ms: 1000,
-            metadata: Bytes::new(),
-        }]);
-        let path = Path::from("test/manifest");
-        store
-            .put(&path, PutPayload::from(existing.to_bytes().to_vec()))
-            .await
-            .unwrap();
-
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
-        producer
-            .enqueue("new/file.json".to_string(), Bytes::new())
-            .await
-            .unwrap();
-
-        let manifest = read_producer_manifest(&store, "test/manifest").await;
-        let locations: Vec<String> = manifest.iter().map(|e| e.unwrap().location).collect();
-        assert_eq!(locations, vec!["existing/file.json", "new/file.json"]);
-    }
-
-    #[tokio::test]
     async fn should_initialize_consumer_and_increment_epoch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let consumer = QueueConsumer::with_object_store(
@@ -798,22 +800,19 @@ mod tests {
     #[tokio::test]
     async fn should_read_entry_by_sequence() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new())
+            .enqueue("a.batch".to_string(), vec![])
             .await
             .unwrap();
         producer
-            .enqueue("b.json".to_string(), Bytes::new())
+            .enqueue("b.batch".to_string(), vec![])
             .await
             .unwrap();
         producer
-            .enqueue("c.json".to_string(), Bytes::new())
+            .enqueue("c.batch".to_string(), vec![])
             .await
             .unwrap();
 
@@ -825,21 +824,18 @@ mod tests {
         consumer.initialize().await.unwrap();
 
         let entry = consumer.read(1).await.unwrap().unwrap();
-        assert_eq!(entry.location, "b.json");
+        assert_eq!(entry.location, "b.batch");
         assert_eq!(entry.sequence, 1);
     }
 
     #[tokio::test]
     async fn should_read_none_for_missing_sequence() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new())
+            .enqueue("a.batch".to_string(), vec![])
             .await
             .unwrap();
 
@@ -899,14 +895,11 @@ mod tests {
     #[tokio::test]
     async fn should_fence_uninitialized_consumer() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.batch".to_string(), Bytes::new())
+            .enqueue("a.batch".to_string(), vec![])
             .await
             .unwrap();
 
@@ -946,18 +939,15 @@ mod tests {
     #[tokio::test]
     async fn should_peek_first_entry_with_valid_epoch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new())
+            .enqueue("a.batch".to_string(), vec![])
             .await
             .unwrap();
         producer
-            .enqueue("b.json".to_string(), Bytes::new())
+            .enqueue("b.batch".to_string(), vec![])
             .await
             .unwrap();
 
@@ -969,28 +959,25 @@ mod tests {
         consumer.initialize().await.unwrap();
 
         let entry = consumer.peek().await.unwrap().unwrap();
-        assert_eq!(entry.location, "a.json");
+        assert_eq!(entry.location, "a.batch");
     }
 
     #[tokio::test]
     async fn should_dequeue_entries_with_valid_epoch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new())
+            .enqueue("a.batch".to_string(), vec![])
             .await
             .unwrap();
         producer
-            .enqueue("b.json".to_string(), Bytes::new())
+            .enqueue("b.batch".to_string(), vec![])
             .await
             .unwrap();
         producer
-            .enqueue("c.json".to_string(), Bytes::new())
+            .enqueue("c.batch".to_string(), vec![])
             .await
             .unwrap();
 
@@ -1003,28 +990,25 @@ mod tests {
 
         let removed = consumer.dequeue(1).await.unwrap();
         assert_eq!(removed.len(), 2);
-        assert_eq!(removed[0].location, "a.json");
-        assert_eq!(removed[1].location, "b.json");
+        assert_eq!(removed[0].location, "a.batch");
+        assert_eq!(removed[1].location, "b.batch");
 
         let next = consumer.peek().await.unwrap().unwrap();
-        assert_eq!(next.location, "c.json");
+        assert_eq!(next.location, "c.batch");
     }
 
     #[tokio::test]
     async fn should_enqueue_after_consumer_dequeue() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer = QueueProducer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         producer
-            .enqueue("a.json".to_string(), Bytes::new())
+            .enqueue("a.batch".to_string(), vec![])
             .await
             .unwrap();
         producer
-            .enqueue("b.json".to_string(), Bytes::new())
+            .enqueue("b.batch".to_string(), vec![])
             .await
             .unwrap();
 
@@ -1038,30 +1022,86 @@ mod tests {
         consumer.dequeue(1).await.unwrap();
 
         producer
-            .enqueue("c.json".to_string(), Bytes::new())
+            .enqueue("c.batch".to_string(), vec![])
             .await
             .unwrap();
 
         let next = consumer.peek().await.unwrap().unwrap();
-        assert_eq!(next.location, "c.json");
+        assert_eq!(next.location, "c.batch");
         assert_eq!(next.sequence, 2);
     }
 
-    fn entry(location: &str, time_ms: i64, metadata: &[u8]) -> QueueEntry {
+    #[tokio::test]
+    async fn should_enqueue_locations_to_manifest() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+
+        producer
+            .enqueue("path/to/file1.batch".to_string(), vec![])
+            .await
+            .unwrap();
+        producer
+            .enqueue("path/to/file2.batch".to_string(), vec![])
+            .await
+            .unwrap();
+
+        let manifest = read_producer_manifest(&store, TEST_MANIFEST_PATH).await;
+        let locations: Vec<String> = manifest.iter().map(|e| e.unwrap().location).collect();
+        assert_eq!(
+            locations,
+            vec!["path/to/file1.batch", "path/to/file2.batch"]
+        );
+    }
+
+    #[tokio::test]
+    async fn should_merge_with_existing_manifest() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let existing = Manifest::from_entries(&[QueueEntry {
+            sequence: 0,
+            location: "existing/file.batch".to_string(),
+            metadata: vec![],
+        }]);
+        let path = Path::from(TEST_MANIFEST_PATH);
+        store
+            .put(&path, PutPayload::from(existing.to_bytes().to_vec()))
+            .await
+            .unwrap();
+
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+        producer
+            .enqueue("new/file.batch".to_string(), vec![])
+            .await
+            .unwrap();
+
+        let manifest = read_producer_manifest(&store, "test/manifest").await;
+        let locations: Vec<String> = manifest.iter().map(|e| e.unwrap().location).collect();
+        assert_eq!(locations, vec!["existing/file.batch", "new/file.batch"]);
+    }
+
+    fn entry(location: &str, metadata: Vec<Metadata>) -> QueueEntry {
         QueueEntry {
             sequence: 0,
             location: location.to_string(),
-            ingestion_time_ms: time_ms,
-            metadata: Bytes::from(metadata.to_vec()),
+            metadata,
         }
     }
 
-    fn entry_seq(seq: u64, location: &str, time_ms: i64, metadata: &[u8]) -> QueueEntry {
+    fn entry_seq(seq: u64, location: &str, metadata: Vec<Metadata>) -> QueueEntry {
         QueueEntry {
             sequence: seq,
             location: location.to_string(),
+            metadata,
+        }
+    }
+
+    fn meta(start_index: u32, time_ms: i64, data: &str) -> Metadata {
+        Metadata {
+            start_index,
             ingestion_time_ms: time_ms,
-            metadata: Bytes::from(metadata.to_vec()),
+            payload: Bytes::from(data.to_string()),
         }
     }
 
@@ -1090,7 +1130,10 @@ mod tests {
 
     #[test]
     fn should_parse_valid_manifest_bytes() {
-        let entries = vec![entry_seq(0, "a", 1, b"x"), entry_seq(1, "b", 2, b"y")];
+        let entries = vec![
+            entry_seq(0, "a", vec![meta(0, 1, "x")]),
+            entry_seq(1, "b", vec![meta(0, 2, "y")]),
+        ];
         let data = Manifest::from_entries(&entries).to_bytes();
 
         let m = Manifest::from_bytes(data).unwrap();
@@ -1112,7 +1155,7 @@ mod tests {
         assert_eq!(m.epoch, 0);
 
         let mut m = m;
-        m.append(&entry("loc", 1, b""));
+        m.append(&entry("loc", vec![]));
         let entries: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(entries[0].sequence, 42);
     }
@@ -1159,105 +1202,25 @@ mod tests {
     }
 
     #[test]
-    fn should_reject_trailing_bytes_before_footer() {
-        // Build a valid entry manually, then add garbage bytes before the footer.
-        let mut buf = BytesMut::new();
-        let location = "loc";
-        let entry_len = SEQUENCE_SIZE + LOCATION_LEN_SIZE + location.len() + INGESTION_TIME_MS_SIZE;
-        buf.put_u32_le(entry_len as u32); // entry_len prefix
-        buf.put_u64_le(0); // sequence
-        buf.put_u16_le(location.len() as u16);
-        buf.extend_from_slice(location.as_bytes());
-        buf.put_i64_le(1000); // ingestion_time_ms
-        // trailing garbage before footer
-        buf.extend_from_slice(&[0xFFu8; 5]);
-        // footer: entry_count=1
-        buf.put_u32_le(1);
-        buf.put_u64_le(1);
-        buf.put_u64_le(0);
-        buf.put_u16_le(MANIFEST_VERSION);
-
-        let manifest = Manifest::from_bytes(buf.freeze()).unwrap();
-        let items: Vec<Result<QueueEntry>> = manifest.iter().collect();
-        assert_eq!(items.len(), 2);
-        assert!(items[0].is_ok());
-        let err = items[1].as_ref().unwrap_err();
-        assert!(
-            err.to_string().contains("did not consume all bytes"),
-            "got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn should_reject_entry_with_entry_len_below_minimum() {
-        let mut buf = BytesMut::new();
-        // entry_len too small: less than SEQUENCE_SIZE + LOCATION_LEN_SIZE + INGESTION_TIME_MS_SIZE (18)
-        let bad_entry_len = (SEQUENCE_SIZE + LOCATION_LEN_SIZE + INGESTION_TIME_MS_SIZE - 1) as u32;
-        buf.put_u32_le(bad_entry_len);
-        buf.extend_from_slice(&[0u8; 17]); // enough raw bytes to not truncate
-        // footer
-        buf.put_u32_le(1);
-        buf.put_u64_le(1);
-        buf.put_u64_le(0);
-        buf.put_u16_le(MANIFEST_VERSION);
-
-        let manifest = Manifest::from_bytes(buf.freeze()).unwrap();
-        let err = manifest.iter().next().unwrap().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("entry_len 17 is less than minimum 18 for location_len 0")
-        );
-    }
-
-    #[test]
-    fn should_reject_entry_with_entry_len_below_minimum_for_location() {
-        let mut buf = BytesMut::new();
-        let location = "abc";
-        // entry_len covers fixed fields but not the full location
-        let bad_entry_len =
-            SEQUENCE_SIZE + LOCATION_LEN_SIZE + INGESTION_TIME_MS_SIZE + location.len() - 1;
-        buf.put_u32_le(bad_entry_len as u32);
-        buf.put_u64_le(0); // sequence
-        buf.put_u16_le(location.len() as u16); // location_len
-        buf.extend_from_slice(&[0u8; 20]); // padding so entry doesn't extend beyond data
-        // footer
-        buf.put_u32_le(1);
-        buf.put_u64_le(1);
-        buf.put_u64_le(0);
-        buf.put_u16_le(MANIFEST_VERSION);
-
-        let manifest = Manifest::from_bytes(buf.freeze()).unwrap();
-        let err = manifest.iter().next().unwrap().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("entry_len 20 is less than minimum 21"),
-            "got: {}",
-            err
-        );
-    }
-
-    #[test]
     fn should_make_appended_entry_accessible_via_iter() {
         let mut m = Manifest::empty();
 
-        m.append(&entry("loc", 42, b"meta"));
+        m.append(&entry("loc", vec![meta(0, 42, "meta")]));
 
         let entries: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].sequence, 0);
         assert_eq!(entries[0].location, "loc");
-        assert_eq!(entries[0].ingestion_time_ms, 42);
-        assert_eq!(entries[0].metadata, &b"meta"[..]);
+        assert_eq!(entries[0].metadata, vec![meta(0, 42, "meta")]);
     }
 
     #[test]
     fn should_append_to_existing_base_entries() {
-        let base = Manifest::from_entries(&[entry_seq(0, "base", 1, b"")]);
+        let base = Manifest::from_entries(&[entry_seq(0, "base", vec![])]);
         let data = base.to_bytes();
         let mut m = Manifest::from_bytes(data).unwrap();
 
-        m.append(&entry("appended", 2, b""));
+        m.append(&entry("appended", vec![]));
 
         assert_eq!(m.entries_count(), 2);
         assert_eq!(collect_locations(&m), vec!["base", "appended"]);
@@ -1270,9 +1233,9 @@ mod tests {
     fn should_preserve_append_order() {
         let mut m = Manifest::empty();
 
-        m.append(&entry("a", 1, b""));
-        m.append(&entry("b", 2, b""));
-        m.append(&entry("c", 3, b""));
+        m.append(&entry("a", vec![]));
+        m.append(&entry("b", vec![]));
+        m.append(&entry("c", vec![]));
 
         assert_eq!(collect_locations(&m), vec!["a", "b", "c"]);
         let entries: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
@@ -1282,71 +1245,39 @@ mod tests {
     }
 
     #[test]
-    fn should_create_empty_manifest_from_empty_slice() {
-        let mut m = Manifest::from_entries(&[]);
-
-        assert_eq!(m.entries_count(), 0);
-        assert!(m.is_empty());
-
-        m.append(&entry("loc", 1, b""));
-        let entries: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
-        assert_eq!(entries[0].sequence, 0);
-    }
-
-    #[test]
-    fn should_create_manifest_from_multiple_entries() {
-        let entries = vec![
-            entry_seq(0, "x", 10, b"m1"),
-            entry_seq(1, "y", 20, b"m2"),
-            entry_seq(2, "z", 30, b"m3"),
-        ];
-
-        let m = Manifest::from_entries(&entries);
-
-        assert_eq!(m.entries_count(), 3);
-        assert_eq!(m.next_sequence, 3);
-        let decoded: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
-        assert_eq!(decoded[0].sequence, 0);
-        assert_eq!(decoded[0].location, "x");
-        assert_eq!(decoded[0].ingestion_time_ms, 10);
-        assert_eq!(decoded[0].metadata, &b"m1"[..]);
-        assert_eq!(decoded[1].sequence, 1);
-        assert_eq!(decoded[1].location, "y");
-        assert_eq!(decoded[1].ingestion_time_ms, 20);
-        assert_eq!(decoded[1].metadata, &b"m2"[..]);
-        assert_eq!(decoded[2].sequence, 2);
-        assert_eq!(decoded[2].location, "z");
-        assert_eq!(decoded[2].ingestion_time_ms, 30);
-        assert_eq!(decoded[2].metadata, &b"m3"[..]);
-    }
-
-    #[test]
     fn should_handle_entry_with_empty_location() {
-        let m = Manifest::from_entries(&[entry_seq(0, "", 0, b"")]);
+        let m = Manifest::from_entries(&[entry_seq(0, "", vec![])]);
 
         let decoded: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(decoded[0].location, "");
-        assert_eq!(decoded[0].ingestion_time_ms, 0);
         assert!(decoded[0].metadata.is_empty());
     }
 
     #[test]
     fn should_handle_entry_with_large_metadata() {
-        let big_meta = vec![0xAB_u8; 1024];
+        let big_meta = Bytes::from(vec![0xAB_u8; 1024]);
 
-        let m = Manifest::from_entries(&[entry_seq(0, "loc", 1, &big_meta)]);
+        let m = Manifest::from_entries(&[entry_seq(
+            0,
+            "loc",
+            vec![Metadata {
+                start_index: 0,
+                ingestion_time_ms: 1,
+                payload: big_meta.clone(),
+            }],
+        )]);
 
         let decoded: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
-        assert_eq!(decoded[0].metadata.len(), 1024);
-        assert_eq!(&decoded[0].metadata[..], &big_meta[..]);
+        assert_eq!(decoded[0].metadata.len(), 1);
+        assert_eq!(decoded[0].metadata[0].payload, big_meta);
     }
 
     #[test]
     fn should_handle_negative_ingestion_time() {
-        let m = Manifest::from_entries(&[entry_seq(0, "loc", -1000, b"")]);
+        let m = Manifest::from_entries(&[entry_seq(0, "loc", vec![meta(0, -1000, "")])]);
 
         let decoded: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
-        assert_eq!(decoded[0].ingestion_time_ms, -1000);
+        assert_eq!(decoded[0].metadata[0].ingestion_time_ms, -1000);
     }
 
     #[test]
@@ -1367,9 +1298,9 @@ mod tests {
 
     #[test]
     fn should_merge_base_and_appended() {
-        let base = Manifest::from_entries(&[entry_seq(0, "base", 1, b"")]);
+        let base = Manifest::from_entries(&[entry_seq(0, "base", vec![])]);
         let mut m = Manifest::from_bytes(base.to_bytes()).unwrap();
-        m.append(&entry("appended", 2, b""));
+        m.append(&entry("appended", vec![]));
 
         let serialized = m.to_bytes();
         let reparsed = Manifest::from_bytes(serialized).unwrap();
@@ -1383,11 +1314,11 @@ mod tests {
 
     #[test]
     fn should_write_correct_footer_count() {
-        let base = Manifest::from_entries(&[entry_seq(0, "a", 1, b""), entry_seq(1, "b", 2, b"")]);
+        let base = Manifest::from_entries(&[entry_seq(0, "a", vec![]), entry_seq(1, "b", vec![])]);
         let mut m = Manifest::from_bytes(base.to_bytes()).unwrap();
-        m.append(&entry("c", 3, b""));
-        m.append(&entry("d", 4, b""));
-        m.append(&entry("e", 5, b""));
+        m.append(&entry("c", vec![]));
+        m.append(&entry("d", vec![]));
+        m.append(&entry("e", vec![]));
 
         let bytes = m.to_bytes();
 
@@ -1412,7 +1343,10 @@ mod tests {
 
     #[test]
     fn should_round_trip_from_entries_to_bytes_from_bytes() {
-        let entries = vec![entry_seq(0, "a", 10, b"m1"), entry_seq(1, "b", 20, b"m2")];
+        let entries = vec![
+            entry_seq(0, "a", vec![meta(0, 10, "m1")]),
+            entry_seq(1, "b", vec![meta(0, 20, "m2")]),
+        ];
         let original = Manifest::from_entries(&entries);
 
         let reparsed = Manifest::from_bytes(original.to_bytes()).unwrap();
@@ -1421,19 +1355,17 @@ mod tests {
         let decoded: Vec<QueueEntry> = reparsed.iter().map(|e| e.unwrap()).collect();
         assert_eq!(decoded[0].sequence, 0);
         assert_eq!(decoded[0].location, "a");
-        assert_eq!(decoded[0].ingestion_time_ms, 10);
-        assert_eq!(decoded[0].metadata, &b"m1"[..]);
+        assert_eq!(decoded[0].metadata, vec![meta(0, 10, "m1")]);
         assert_eq!(decoded[1].sequence, 1);
         assert_eq!(decoded[1].location, "b");
-        assert_eq!(decoded[1].ingestion_time_ms, 20);
-        assert_eq!(decoded[1].metadata, &b"m2"[..]);
+        assert_eq!(decoded[1].metadata, vec![meta(0, 20, "m2")]);
     }
 
     #[test]
     fn should_round_trip_append_serialize_reparse() {
         let mut m = Manifest::empty();
-        m.append(&entry("x", 100, b"data"));
-        m.append(&entry("y", 200, b"more"));
+        m.append(&entry("x", vec![meta(0, 100, "data")]));
+        m.append(&entry("y", vec![meta(0, 200, "more")]));
 
         let reparsed = Manifest::from_bytes(m.to_bytes()).unwrap();
 
@@ -1443,12 +1375,12 @@ mod tests {
 
     #[test]
     fn should_chain_serialize_reparse_append() {
-        let original = Manifest::from_entries(&[entry_seq(0, "a", 1, b"")]);
+        let original = Manifest::from_entries(&[entry_seq(0, "a", vec![])]);
         let mut m = Manifest::from_bytes(original.to_bytes()).unwrap();
-        m.append(&entry("b", 2, b""));
+        m.append(&entry("b", vec![]));
 
         let mut m2 = Manifest::from_bytes(m.to_bytes()).unwrap();
-        m2.append(&entry("c", 3, b""));
+        m2.append(&entry("c", vec![]));
 
         let final_m = Manifest::from_bytes(m2.to_bytes()).unwrap();
 
@@ -1462,10 +1394,10 @@ mod tests {
     fn should_dequeue_entries_through_sequence() {
         let mut m = Manifest::empty();
         for _ in 0..5 {
-            m.append(&entry("loc", 1, b""));
+            m.append(&entry("loc", vec![]));
         }
 
-        let removed = m.dequeue(2);
+        let removed = m.dequeue(2).unwrap();
 
         assert_eq!(removed.len(), 3);
         assert_eq!(removed[0].sequence, 0);
@@ -1482,10 +1414,10 @@ mod tests {
     fn should_dequeue_all_entries() {
         let mut m = Manifest::empty();
         for _ in 0..3 {
-            m.append(&entry("loc", 1, b""));
+            m.append(&entry("loc", vec![]));
         }
 
-        let removed = m.dequeue(2);
+        let removed = m.dequeue(2).unwrap();
 
         assert_eq!(removed.len(), 3);
         assert!(m.is_empty());
@@ -1495,13 +1427,13 @@ mod tests {
     #[test]
     fn should_dequeue_nothing_when_sequence_below_first() {
         let entries = vec![
-            entry_seq(5, "a", 1, b""),
-            entry_seq(6, "b", 2, b""),
-            entry_seq(7, "c", 3, b""),
+            entry_seq(5, "a", vec![]),
+            entry_seq(6, "b", vec![]),
+            entry_seq(7, "c", vec![]),
         ];
         let mut m = Manifest::from_entries(&entries);
 
-        let removed = m.dequeue(3);
+        let removed = m.dequeue(3).unwrap();
 
         assert!(removed.is_empty());
         assert_eq!(m.entries_count(), 3);
@@ -1511,19 +1443,180 @@ mod tests {
     fn should_append_after_dequeue() {
         let mut m = Manifest::empty();
         for _ in 0..3 {
-            m.append(&entry("loc", 1, b""));
+            m.append(&entry("loc", vec![]));
         }
 
-        m.dequeue(0);
+        m.dequeue(0).unwrap();
 
         assert_eq!(m.entries_count(), 2);
         let remaining: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(remaining[0].sequence, 1);
         assert_eq!(remaining[1].sequence, 2);
 
-        m.append(&entry("new", 4, b""));
+        m.append(&entry("new", vec![]));
         let all: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(all.len(), 3);
         assert_eq!(all[2].sequence, 3);
+    }
+
+    /// Serialize a single entry into raw bytes (without footer).
+    fn encode_entry_bytes(entry: &QueueEntry) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        Manifest::encode_entry(&mut buf, entry);
+        buf.to_vec()
+    }
+
+    /// Wrap raw entry bytes with a manifest footer (entry_count=1) so that
+    /// `Manifest::from_bytes` + `.iter()` exercises `decode_entry`.
+    fn manifest_from_raw_entry(entry_bytes: &[u8]) -> Manifest {
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(entry_bytes);
+        buf.put_u32_le(1); // entry_count
+        buf.put_u64_le(1); // next_sequence
+        buf.put_u64_le(0); // epoch
+        buf.put_u16_le(MANIFEST_VERSION);
+        Manifest::from_bytes(buf.freeze()).unwrap()
+    }
+
+    /// Offset of metadata_count inside the encoded entry (for location "a").
+    /// Layout: entry_len(4) + sequence(8) + location_len(2) + location(1)
+    const METADATA_COUNT_OFFSET: usize = ENTRY_LEN_SIZE + SEQUENCE_SIZE + LOCATION_LEN_SIZE + 1;
+
+    /// Build an entry with no metadata, then corrupt metadata_count to `count`
+    /// and extend the buffer with `extra_bytes` after metadata_count to simulate
+    /// partial metadata. Also patches entry_len to match the new total size.
+    fn corrupt_metadata_entry(count: u32, extra_bytes: &[u8]) -> Vec<u8> {
+        let e = QueueEntry {
+            sequence: 1,
+            location: "a".to_string(),
+            metadata: vec![],
+        };
+        let mut raw = encode_entry_bytes(&e);
+        // Overwrite metadata_count
+        raw[METADATA_COUNT_OFFSET..METADATA_COUNT_OFFSET + 4].copy_from_slice(&count.to_le_bytes());
+        // Append extra bytes (partial metadata fields)
+        raw.extend_from_slice(extra_bytes);
+        // Patch entry_len to cover the full buffer after the 4-byte prefix
+        let new_entry_len = (raw.len() - ENTRY_LEN_SIZE) as u32;
+        raw[..ENTRY_LEN_SIZE].copy_from_slice(&new_entry_len.to_le_bytes());
+        raw
+    }
+
+    #[test]
+    fn should_reject_trailing_bytes_before_footer() {
+        // Build a valid entry, then add garbage bytes before the footer.
+        let mut raw = encode_entry_bytes(&entry_seq(0, "loc", vec![]));
+        raw.extend_from_slice(&[0xFFu8; 5]); // trailing garbage
+
+        let manifest = manifest_from_raw_entry(&raw);
+        let items: Vec<Result<QueueEntry>> = manifest.iter().collect();
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_ok());
+        let err = items[1].as_ref().unwrap_err();
+        assert!(
+            err.to_string().contains("did not consume all bytes"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn should_reject_entry_with_entry_len_below_minimum() {
+        // entry_len too small: less than SEQUENCE_SIZE + LOCATION_LEN_SIZE + METADATA_COUNT_SIZE (14)
+        let bad_entry_len = (SEQUENCE_SIZE + LOCATION_LEN_SIZE + METADATA_COUNT_SIZE - 1) as u32;
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&bad_entry_len.to_le_bytes());
+        raw.extend_from_slice(&[0u8; 13]); // enough raw bytes to not truncate
+
+        let manifest = manifest_from_raw_entry(&raw);
+        let err = manifest.iter().next().unwrap().unwrap_err();
+        assert!(err.to_string().contains(
+            "entry length 13 is less than minimum entry length 14 for the length of the location 0"
+        ));
+    }
+
+    #[test]
+    fn should_reject_entry_with_entry_len_below_minimum_for_location() {
+        let location = "abc";
+        // entry_len covers fixed fields but not the full location
+        let bad_entry_len =
+            (SEQUENCE_SIZE + LOCATION_LEN_SIZE + METADATA_COUNT_SIZE + location.len() - 1) as u32;
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&bad_entry_len.to_le_bytes());
+        raw.extend_from_slice(&0u64.to_le_bytes()); // sequence
+        raw.extend_from_slice(&(location.len() as u16).to_le_bytes()); // location_len
+        raw.extend_from_slice(&[0u8; 20]); // padding so entry doesn't extend beyond data
+
+        let manifest = manifest_from_raw_entry(&raw);
+        let err = manifest.iter().next().unwrap().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("entry length 16 is less than minimum entry length 17"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn should_reject_entry_truncated_before_entry_len() {
+        // Data too short to even read entry_len (need 4 bytes, provide 2)
+        let manifest = manifest_from_raw_entry(&[0u8; 2]);
+        let err = manifest.iter().next().unwrap().unwrap_err();
+        assert!(
+            matches!(&err, Error::Serialization(msg) if msg.contains("entry length field does not fit")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_entry_truncated_before_metadata_start_index() {
+        // metadata_count = 1 but no metadata bytes at all
+        let manifest = manifest_from_raw_entry(&corrupt_metadata_entry(1, &[]));
+        let err = manifest.iter().next().unwrap().unwrap_err();
+        assert!(
+            matches!(&err, Error::Serialization(msg) if msg.contains("start index field does not fit")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_entry_truncated_before_metadata_ingestion_time() {
+        // metadata_count = 1, only start_index present (4 bytes)
+        let manifest = manifest_from_raw_entry(&corrupt_metadata_entry(1, &0u32.to_le_bytes()));
+        let err = manifest.iter().next().unwrap().unwrap_err();
+        assert!(
+            matches!(&err, Error::Serialization(msg) if msg.contains("ingestion time field does not fit")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_entry_truncated_before_metadata_length() {
+        // metadata_count = 1, start_index + ingestion_time present, but no m_len
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&0u32.to_le_bytes()); // start_index
+        extra.extend_from_slice(&0i64.to_le_bytes()); // ingestion_time_ms
+        let manifest = manifest_from_raw_entry(&corrupt_metadata_entry(1, &extra));
+        let err = manifest.iter().next().unwrap().unwrap_err();
+        assert!(
+            matches!(&err, Error::Serialization(msg) if msg.contains("metadata length field does not fit")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_entry_truncated_before_metadata_payload() {
+        // metadata_count = 1, all fixed fields present, m_len says 10 but only 2 bytes follow
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&0u32.to_le_bytes()); // start_index
+        extra.extend_from_slice(&0i64.to_le_bytes()); // ingestion_time_ms
+        extra.extend_from_slice(&10u32.to_le_bytes()); // m_len = 10
+        extra.extend_from_slice(&[0xAB, 0xCD]); // only 2 payload bytes
+        let manifest = manifest_from_raw_entry(&corrupt_metadata_entry(1, &extra));
+        let err = manifest.iter().next().unwrap().unwrap_err();
+        assert!(
+            matches!(&err, Error::Serialization(msg) if msg.contains("metadata has less bytes than set")),
+            "unexpected error: {err}"
+        );
     }
 }

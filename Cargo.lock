@@ -2515,12 +2515,11 @@ dependencies = [
  "bytes",
  "opendata-common",
  "serde",
- "serde_json",
  "serde_with",
  "slatedb",
  "tokio",
  "tokio-util",
- "uuid",
+ "ulid",
 ]
 
 [[package]]
@@ -2644,6 +2643,7 @@ dependencies = [
  "clap",
  "dashmap",
  "fail",
+ "figment",
  "futures",
  "log",
  "opendata-common",
