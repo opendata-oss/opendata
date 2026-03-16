@@ -1,0 +1,39 @@
+# Use cargo-chef for dependency caching
+FROM lukemathwalker/cargo-chef:latest-rust-1.89@sha256:abbe80c8000f4e1b6969b4d84d5ec7ad86616be7e6322ba0e3b451c2eee6f280 AS chef
+WORKDIR /app
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+
+# Build dependencies
+RUN cargo chef cook --release --recipe-path recipe.json
+
+# Copy source code
+COPY . .
+
+# Build the embedded-reader binary
+RUN cargo build --release --locked --manifest-path vector/Cargo.toml --features embedded-reader
+
+# Runtime stage
+FROM debian:bookworm-slim@sha256:56ff6d36d4eb3db13a741b342ec466f121480b5edded42e4b7ee850ce7a418ee
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/embedded-reader /app/embedded-reader
+
+RUN useradd -r -u 1000 embedded-reader \
+    && mkdir -p /data/store \
+    && chown embedded-reader:embedded-reader /data/store
+USER embedded-reader
+
+ENV RUST_LOG=info
+
+ENTRYPOINT ["/app/embedded-reader"]

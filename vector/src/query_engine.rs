@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::hnsw::CentroidGraph;
-use crate::model::{Filter, Query, SearchResult};
+use crate::model::{FieldSelection, Filter, Query, SearchResult};
 use crate::serde::collection_meta::DistanceMetric;
 use crate::serde::posting_list::PostingList;
 use crate::serde::vector_data::VectorDataValue;
@@ -131,7 +131,9 @@ impl QueryEngine {
             Self::apply_filter(&mut sorted_lists, filter, self.storage.as_ref()).await?;
         }
 
-        self.resolve_top_k(sorted_lists, query.limit).await
+        let mut results = self.resolve_top_k(sorted_lists, query.limit).await?;
+        Self::apply_field_selection(&mut results, &query.include_fields);
+        Ok(results)
     }
 
     pub(crate) async fn search_with_nprobe(
@@ -184,7 +186,9 @@ impl QueryEngine {
         }
 
         // 6. K-way merge and resolve top-k forward index lookups
-        self.resolve_top_k(sorted_lists, query.limit).await
+        let mut results = self.resolve_top_k(sorted_lists, query.limit).await?;
+        Self::apply_field_selection(&mut results, &query.include_fields);
+        Ok(results)
     }
 
     /// Apply query-aware dynamic pruning
@@ -346,6 +350,26 @@ impl QueryEngine {
         }
 
         Ok(results)
+    }
+
+    /// Apply field projection to search results.
+    fn apply_field_selection(results: &mut [SearchResult], selection: &FieldSelection) {
+        match selection {
+            FieldSelection::All => {}
+            FieldSelection::None => {
+                for result in results.iter_mut() {
+                    result.vector.attributes.clear();
+                }
+            }
+            FieldSelection::Fields(names) => {
+                for result in results.iter_mut() {
+                    result
+                        .vector
+                        .attributes
+                        .retain(|attr| names.contains(&attr.name));
+                }
+            }
+        }
     }
 
     /// Apply a metadata filter to scored candidate lists.

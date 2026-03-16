@@ -151,6 +151,8 @@ pub(crate) struct SearchRequest {
     pub(crate) nprobe: Option<u32>,
     #[prost(message, optional, tag = "4")]
     pub(crate) filter: Option<FilterMessage>,
+    #[prost(string, repeated, tag = "5")]
+    pub(crate) include_fields: Vec<String>,
 }
 
 /// SearchResponse is the response for POST /api/v1/vector/search.
@@ -282,6 +284,7 @@ mod tests {
                     )),
                 })),
             }),
+            include_fields: vec![],
         };
 
         // when

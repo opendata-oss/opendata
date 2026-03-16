@@ -1,0 +1,29 @@
+storage:
+  type: SlateDb
+  path: vector-data
+  object_store:
+    type: Local
+    path: /data/store
+dimensions: 384
+distance_metric: L2
+flush_interval: 5
+split_threshold_vectors: 2000
+merge_threshold_vectors: 500
+split_search_neighbourhood: 16
+max_pending_and_running_rebalance_tasks: 4
+rebalance_backpressure_resume_threshold: 2
+max_rebalance_tasks: 4
+chunk_target: 4096
+metadata_fields:
+  - name: book
+    field_type: String
+    indexed: true
+  - name: chapter
+    field_type: String
+    indexed: true
+  - name: section
+    field_type: String
+    indexed: false
+  - name: text
+    field_type: String
+    indexed: false

@@ -22,6 +22,7 @@ required-features = ["http-server"]
 [features]
 default = []
 http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prost", "dep:serde_json", "dep:serde_with"]
+embedded-reader = ["dep:reqwest", "dep:serde_json"]
 
 [dependencies]
 anyhow.workspace = true
@@ -52,9 +53,17 @@ prost = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 serde_with = { workspace = true, optional = true }
 
+# Embedded reader dependencies (optional, enabled by embedded-reader feature)
+reqwest = { workspace = true, optional = true, features = ["json"] }
+
 [[bin]]
 name = "gen_sift100k_groundtruth"
 path = "src/bin/gen_sift100k_groundtruth.rs"
+
+[[bin]]
+name = "embedded-reader"
+path = "src/bin/embedded_reader.rs"
+required-features = ["embedded-reader"]
 
 [dev-dependencies]
 common = { workspace = true, features = ["test-utils"] }

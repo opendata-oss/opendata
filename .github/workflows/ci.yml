@@ -60,3 +60,23 @@ jobs:
 
       - name: Run doc tests
         run: cargo test --doc --all
+
+  quickstart-vector-smoke-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+
+      - name: Run vector quickstart smoke test
+        run: ./vector/quickstart/smoke_test.sh
