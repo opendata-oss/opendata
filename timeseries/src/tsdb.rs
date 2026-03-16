@@ -369,11 +369,13 @@ pub(crate) async fn evaluate_range(
         total_ms = loop_start.elapsed().as_millis() as u64,
         list_buckets_calls = stats.list_buckets_calls,
         selector_calls = stats.selector_calls,
+        selector_cache_hits = stats.selector_cache_hits,
         forward_index_calls = stats.forward_index_calls,
         forward_index_cache_hits = stats.forward_index_cache_hits,
         sample_loads = stats.sample_loads,
         sample_cache_hits = stats.sample_cache_hits,
         samples_loaded = stats.samples_loaded,
+        series_meta_cache_hits = stats.series_meta_cache_hits,
         unique_series = series_map.len(),
         "evaluate_range complete"
     );

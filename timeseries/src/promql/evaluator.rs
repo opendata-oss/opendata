@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -58,6 +59,33 @@ pub(crate) struct EvalStats {
     pub(crate) sample_loads: u64,
     pub(crate) sample_cache_hits: u64,
     pub(crate) samples_loaded: u64,
+    pub(crate) selector_cache_hits: u64,
+    pub(crate) series_meta_cache_hits: u64,
+}
+
+/// Canonical key for caching selector results across steps.
+/// Derived from VectorSelector's matchers (which determine which series match).
+/// Offset and @ modifiers are excluded — they affect time windows, not series selection.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SelectorKey(u64);
+
+impl SelectorKey {
+    pub(crate) fn from_selector(selector: &VectorSelector) -> Self {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        selector.name.hash(&mut hasher);
+        selector.matchers.matchers.hash(&mut hasher);
+        selector.matchers.or_matchers.hash(&mut hasher);
+        Self(hasher.finish())
+    }
+}
+
+/// Cached per-series metadata: fingerprint, label map, and canonical sorted labels.
+/// Computed once per (bucket, series_id), reused across all steps.
+#[derive(Clone)]
+pub(crate) struct SeriesMeta {
+    pub(crate) fingerprint: SeriesFingerprint,
+    pub(crate) label_map: HashMap<String, String>,
+    pub(crate) sorted_labels: Vec<Label>,
 }
 
 /// Type alias for complex HashMap used in matrix selector evaluation.
@@ -325,6 +353,12 @@ pub(crate) struct CachedQueryReader<'reader, R: QueryReader> {
     reader: &'reader R,
     cache: QueryReaderEvalCache,
     pub(crate) stats: EvalStats,
+    /// Cached bucket list — populated on first call, reused for all subsequent steps.
+    cached_buckets: Option<Vec<TimeBucket>>,
+    /// Cached selector results: (bucket, selector_key) → matching series IDs.
+    selector_cache: HashMap<(TimeBucket, SelectorKey), HashSet<SeriesId>>,
+    /// Cached per-series metadata: (bucket, series_id) → fingerprint + labels.
+    series_meta_cache: HashMap<(TimeBucket, SeriesId), SeriesMeta>,
 }
 
 impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
@@ -333,12 +367,20 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             reader,
             cache: QueryReaderEvalCache::new(),
             stats: EvalStats::default(),
+            cached_buckets: None,
+            selector_cache: HashMap::new(),
+            series_meta_cache: HashMap::new(),
         }
     }
 
     pub(crate) async fn list_buckets(&mut self) -> Result<Vec<TimeBucket>> {
         self.stats.list_buckets_calls += 1;
-        self.reader.list_buckets().await
+        if let Some(ref buckets) = self.cached_buckets {
+            return Ok(buckets.clone());
+        }
+        let buckets = self.reader.list_buckets().await?;
+        self.cached_buckets = Some(buckets.clone());
+        Ok(buckets)
     }
 
     pub(crate) async fn forward_index(
@@ -420,13 +462,11 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         // Check cache first
         if let Some(cached_samples) = self.cache.get_samples(bucket, &series_id) {
             self.stats.sample_cache_hits += 1;
-            // Filter cached samples by requested time range
-            let filtered: Vec<Sample> = cached_samples
-                .iter()
-                .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
-                .cloned()
-                .collect();
-            return Ok(filtered);
+            return Ok(Self::filter_samples_binary_search(
+                cached_samples,
+                start_ms,
+                end_ms,
+            ));
         }
 
         // Not in cache, load from underlying reader with wide bounds to cache the whole bucket
@@ -441,14 +481,95 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         self.cache
             .cache_samples(*bucket, series_id, samples.clone());
 
-        // Filter by requested time range
-        let filtered: Vec<Sample> = samples
-            .iter()
-            .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
-            .cloned()
-            .collect();
+        // Filter by requested time range using binary search
+        Ok(Self::filter_samples_binary_search(
+            &samples, start_ms, end_ms,
+        ))
+    }
 
-        Ok(filtered)
+    /// Filter samples to (start_ms, end_ms] using binary search on sorted timestamps.
+    /// Samples are sorted by timestamp_ms (storage invariant), so we use partition_point
+    /// to find bounds in O(log n) instead of scanning the full vector.
+    fn filter_samples_binary_search(
+        samples: &[Sample],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Vec<Sample> {
+        // Find first index where timestamp_ms > start_ms
+        let lo = samples.partition_point(|s| s.timestamp_ms <= start_ms);
+        // Find first index where timestamp_ms > end_ms
+        let hi = samples.partition_point(|s| s.timestamp_ms <= end_ms);
+        samples[lo..hi].to_vec()
+    }
+
+    /// Look up cached selector results for (bucket, selector_key).
+    /// Returns a clone of the cached set (if present) and increments the cache hit counter.
+    pub(crate) fn get_cached_selector_cloned(
+        &mut self,
+        bucket: &TimeBucket,
+        key: &SelectorKey,
+    ) -> Option<HashSet<SeriesId>> {
+        let result = self.selector_cache.get(&(*bucket, key.clone())).cloned();
+        if result.is_some() {
+            self.stats.selector_cache_hits += 1;
+        }
+        result
+    }
+
+    /// Cache selector results for (bucket, selector_key).
+    pub(crate) fn cache_selector(
+        &mut self,
+        bucket: TimeBucket,
+        key: SelectorKey,
+        candidates: HashSet<SeriesId>,
+    ) {
+        self.selector_cache.insert((bucket, key), candidates);
+    }
+
+    /// Look up or compute series metadata (fingerprint + label map + sorted labels).
+    /// On first call for a (bucket, series_id), computes from the forward index view
+    /// and caches. Subsequent calls return the cached copy.
+    pub(crate) fn get_or_insert_series_meta(
+        &mut self,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+        forward_index_view: &dyn ForwardIndexLookup,
+    ) -> Option<&SeriesMeta> {
+        let cache_key = (*bucket, series_id);
+        match self.series_meta_cache.entry(cache_key) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                self.stats.series_meta_cache_hits += 1;
+                Some(entry.into_mut())
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let spec = forward_index_view.get_spec(&series_id)?;
+                let fingerprint = Self::compute_fingerprint_static(&spec.labels);
+                let label_map: HashMap<String, String> = spec
+                    .labels
+                    .iter()
+                    .map(|l| (l.name.clone(), l.value.clone()))
+                    .collect();
+                let mut sorted_labels = spec.labels;
+                sorted_labels.sort();
+                Some(entry.insert(SeriesMeta {
+                    fingerprint,
+                    label_map,
+                    sorted_labels,
+                }))
+            }
+        }
+    }
+
+    /// Compute fingerprint from labels — static version for use in cache population.
+    fn compute_fingerprint_static(labels: &[Label]) -> SeriesFingerprint {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut sorted_labels: Vec<_> = labels.iter().collect();
+        sorted_labels.sort_by(|a, b| a.name.cmp(&b.name));
+        for label in sorted_labels {
+            label.name.hash(&mut hasher);
+            label.value.hash(&mut hasher);
+        }
+        hasher.finish() as SeriesFingerprint
     }
 }
 
@@ -960,6 +1081,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         // Group samples by series (using sorted label vector as key since HashMap doesn't impl Hash)
         let mut series_map: SeriesMap = HashMap::new();
 
+        let selector_key = SelectorKey::from_selector(vector_selector);
+
         for bucket in buckets {
             // Check if bucket overlaps with our time range
             let bucket_start_ms = (bucket.start as i64) * 60 * 1000; // Convert minutes to milliseconds
@@ -968,10 +1091,20 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 continue;
             }
 
+            // Check selector cache first, fall back to full evaluation
             let candidates =
-                evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
-                    .await
-                    .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+                if let Some(cached) = self.reader.get_cached_selector_cloned(&bucket, &selector_key)
+                {
+                    cached
+                } else {
+                    let result =
+                        evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
+                            .await
+                            .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+                    self.reader
+                        .cache_selector(bucket, selector_key.clone(), result.clone());
+                    result
+                };
 
             if candidates.is_empty() {
                 continue;
@@ -981,8 +1114,13 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
 
             for series_id in candidates_vec {
-                let series_spec = match forward_index_view.get_spec(&series_id) {
-                    Some(spec) => spec,
+                // Get series metadata from cache, computing on first access
+                let meta = match self.reader.get_or_insert_series_meta(
+                    &bucket,
+                    series_id,
+                    forward_index_view.as_ref(),
+                ) {
+                    Some(m) => m.clone(),
                     None => {
                         return Err(EvaluationError::InternalError(format!(
                             "Series {} not found in bucket {:?}",
@@ -996,11 +1134,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     .samples(&bucket, series_id, start_ms, end_ms)
                     .await?;
 
-                let mut labels_key: Vec<Label> = series_spec.labels.clone();
-                // Sort by canonical Label ordering (name, then value) for series grouping
-                labels_key.sort();
-
-                let values = series_map.entry(labels_key).or_default();
+                let values = series_map.entry(meta.sorted_labels).or_default();
                 for sample in sample_data {
                     values.push(sample);
                 }
@@ -1009,8 +1143,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         let mut range_vector = Vec::new();
         for (labels, values) in series_map {
-            let labels = self.labels_to_hashmap(&labels);
-            range_vector.push(EvalSamples { values, labels });
+            let labels_map: HashMap<String, String> = labels
+                .iter()
+                .map(|l| (l.name.clone(), l.value.clone()))
+                .collect();
+            range_vector.push(EvalSamples {
+                values,
+                labels: labels_map,
+            });
         }
 
         Ok(ExprResult::RangeVector(range_vector))
@@ -1180,13 +1320,24 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let mut buckets = self.reader.list_buckets().await?;
         buckets.sort_by(|a, b| b.start.cmp(&a.start));
 
+        let selector_key = SelectorKey::from_selector(vector_selector);
         let mut series_samples = HashMap::new();
 
         for bucket in buckets {
+            // Check selector cache first, fall back to full evaluation
             let candidates =
-                evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
-                    .await
-                    .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+                if let Some(cached) = self.reader.get_cached_selector_cloned(&bucket, &selector_key)
+                {
+                    cached
+                } else {
+                    let result =
+                        evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
+                            .await
+                            .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+                    self.reader
+                        .cache_selector(bucket, selector_key.clone(), result.clone());
+                    result
+                };
 
             if candidates.is_empty() {
                 continue;
@@ -1196,11 +1347,15 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
 
             for series_id in candidates_vec {
-                let Some(series_spec) = forward_index_view.get_spec(&series_id) else {
-                    continue;
+                // Get series metadata from cache, computing on first access
+                let meta = match self.reader.get_or_insert_series_meta(
+                    &bucket,
+                    series_id,
+                    forward_index_view.as_ref(),
+                ) {
+                    Some(m) => m.clone(),
+                    None => continue,
                 };
-
-                let fingerprint = self.compute_fingerprint(&series_spec.labels);
 
                 let samples = self
                     .reader
@@ -1211,9 +1366,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     continue;
                 }
 
-                let entry = series_samples.entry(fingerprint).or_insert_with(|| {
-                    let labels = self.labels_to_hashmap(&series_spec.labels);
-                    (labels, Vec::new())
+                let entry = series_samples.entry(meta.fingerprint).or_insert_with(|| {
+                    (meta.label_map, Vec::new())
                 });
 
                 entry.1.extend(samples);
@@ -1341,16 +1495,26 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let mut buckets = self.reader.list_buckets().await?;
         buckets.sort_by(|a, b| b.start.cmp(&a.start)); // newest first
 
+        let selector_key = SelectorKey::from_selector(vector_selector);
         let mut series_with_results: HashSet<SeriesFingerprint> = HashSet::new();
         let mut samples = Vec::new();
 
         // Iterate through buckets in reverse time order (newest first)
         for bucket in buckets {
-            // Find matching series in this bucket
+            // Check selector cache first, fall back to full evaluation
             let candidates =
-                evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
-                    .await
-                    .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+                if let Some(cached) = self.reader.get_cached_selector_cloned(&bucket, &selector_key)
+                {
+                    cached
+                } else {
+                    let result =
+                        evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
+                            .await
+                            .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+                    self.reader
+                        .cache_selector(bucket, selector_key.clone(), result.clone());
+                    result
+                };
 
             if candidates.is_empty() {
                 continue;
@@ -1361,9 +1525,13 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
 
             for series_id in candidates_vec {
-                // Get series spec from forward index view (batched lookup)
-                let series_spec = match forward_index_view.get_spec(&series_id) {
-                    Some(spec) => spec,
+                // Get series metadata from cache (fingerprint + labels), computing on first access
+                let meta = match self.reader.get_or_insert_series_meta(
+                    &bucket,
+                    series_id,
+                    forward_index_view.as_ref(),
+                ) {
+                    Some(m) => m.clone(),
                     None => {
                         return Err(EvaluationError::InternalError(format!(
                             "Series {} not found in bucket {:?}",
@@ -1371,10 +1539,9 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                         )));
                     }
                 };
-                let fingerprint = self.compute_fingerprint(&series_spec.labels);
 
                 // Skip if we already found a sample for this series in a newer bucket
-                if series_with_results.contains(&fingerprint) {
+                if series_with_results.contains(&meta.fingerprint) {
                     continue;
                 }
 
@@ -1386,18 +1553,15 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
                 // Find the best (latest) point in the time range
                 if let Some(best_sample) = sample_data.last() {
-                    // Convert attributes to labels HashMap
-                    let labels = self.labels_to_hashmap(&series_spec.labels);
-
                     samples.push(EvalSample {
                         timestamp_ms: best_sample.timestamp_ms,
                         value: best_sample.value,
-                        labels,
+                        labels: meta.label_map,
                         drop_name: false,
                     });
 
                     // Mark this series fingerprint as found so we don't add it again from older buckets
-                    series_with_results.insert(fingerprint);
+                    series_with_results.insert(meta.fingerprint);
                 }
             }
         }
@@ -1467,19 +1631,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             .collect()
     }
 
-    /// Compute fingerprint from labels (simple hash for deduplication)
-    fn compute_fingerprint(&self, labels: &[Label]) -> SeriesFingerprint {
-        // Use a simple hash of sorted labels
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        let mut sorted_labels: Vec<_> = labels.iter().collect();
-        sorted_labels.sort_by(|a, b| a.name.cmp(&b.name));
-        for label in sorted_labels {
-            label.name.hash(&mut hasher);
-            label.value.hash(&mut hasher);
-        }
-        hasher.finish() as SeriesFingerprint
-    }
+
 
     async fn evaluate_call(
         &mut self,
