@@ -37,6 +37,35 @@ pub(crate) struct QueueEntry {
     pub(crate) metadata: Vec<Metadata>,
 }
 
+impl QueueEntry {
+    fn new(location: String, metadata: Vec<Metadata>) -> Result<Self> {
+        if location.len() > u16::MAX as usize {
+            return Err(Error::InvalidInput(format!(
+                "location length {} exceeds u16::MAX",
+                location.len()
+            )));
+        }
+        if metadata.len() > u32::MAX as usize {
+            return Err(Error::InvalidInput(format!(
+                "metadata count {} exceeds u32::MAX",
+                metadata.len()
+            )));
+        }
+        Ok(Self {
+            sequence: 0,
+            location,
+            metadata,
+        })
+    }
+
+    fn clone_with_sequence(&self, sequence: u64) -> Self {
+        Self {
+            sequence,
+            ..self.clone()
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Manifest {
     data: Bytes,
@@ -173,10 +202,7 @@ impl Manifest {
     /// The entry is encoded and stored internally; bytes are merged in `to_bytes()`.
     /// The entry's sequence number is overwritten with the manifest's next sequence.
     fn append(&mut self, entry: &QueueEntry) -> Result<()> {
-        let sequenced = QueueEntry {
-            sequence: self.next_sequence,
-            ..entry.clone()
-        };
+        let sequenced = entry.clone_with_sequence(self.next_sequence);
         Self::encode_entry(&mut self.appended, &sequenced)?;
         self.next_sequence += 1;
         self.appended_count += 1;
@@ -279,12 +305,7 @@ impl Manifest {
     }
 
     fn encode_entry(buf: &mut BytesMut, entry: &QueueEntry) -> Result<()> {
-        let location_len: u16 = entry.location.len().try_into().map_err(|_| {
-            Error::Serialization(format!(
-                "location length {} exceeds u16::MAX",
-                entry.location.len()
-            ))
-        })?;
+        debug_assert!(entry.location.len() <= u16::MAX as usize);
         let metadata_size: usize = METADATA_COUNT_SIZE
             + entry
                 .metadata
@@ -293,21 +314,22 @@ impl Manifest {
                     START_INDEX_SIZE + INGESTION_TIME_MS_SIZE + METADATA_LEN_SIZE + m.payload.len()
                 })
                 .sum::<usize>();
-        let entry_len: u32 =
-            (SEQUENCE_SIZE + LOCATION_LEN_SIZE + entry.location.len() + metadata_size)
-                .try_into()
-                .map_err(|_| {
-                    Error::Serialization(format!(
-                        "entry size {} exceeds u32::MAX",
-                        SEQUENCE_SIZE + LOCATION_LEN_SIZE + entry.location.len() + metadata_size
-                    ))
-                })?;
-        buf.put_u32_le(entry_len);
+        let entry_body_len =
+            SEQUENCE_SIZE + LOCATION_LEN_SIZE + entry.location.len() + metadata_size;
+        debug_assert!(entry_body_len <= u32::MAX as usize);
+        buf.put_u32_le(entry_body_len as u32);
         buf.put_u64_le(entry.sequence);
-        buf.put_u16_le(location_len);
+        buf.put_u16_le(entry.location.len() as u16);
         buf.extend_from_slice(entry.location.as_bytes());
+        debug_assert!(entry.metadata.len() <= u32::MAX as usize);
         buf.put_u32_le(entry.metadata.len() as u32);
         for m in &entry.metadata {
+            if m.payload.len() > u32::MAX as usize {
+                return Err(Error::InvalidInput(format!(
+                    "metadata payload size {} exceeds u32::MAX",
+                    m.payload.len()
+                )));
+            }
             buf.put_u32_le(m.start_index);
             buf.put_i64_le(m.ingestion_time_ms);
             buf.put_u32_le(m.payload.len() as u32);
@@ -606,13 +628,11 @@ impl QueueProducer {
 
     /// Append an entry to the queue with the given `location` and `metadata`.
     ///
-    /// The write is retried automatically on optimistic-concurrency conflicts.
+    /// Returns [`Error::InvalidInput`] if `location` exceeds 65 535 bytes or
+    /// `metadata` exceeds 2³²−1 items. The write is retried automatically on
+    /// optimistic-concurrency conflicts.
     pub async fn enqueue(&self, location: String, metadata: Vec<Metadata>) -> Result<()> {
-        let entry = QueueEntry {
-            sequence: 0,
-            location,
-            metadata,
-        };
+        let entry = QueueEntry::new(location, metadata)?;
         loop {
             let (mut manifest, version) = self.manifest_store.read().await?;
             manifest.append(&entry)?;
@@ -1059,11 +1079,7 @@ mod tests {
     }
 
     fn entry(location: &str, metadata: Vec<Metadata>) -> QueueEntry {
-        QueueEntry {
-            sequence: 0,
-            location: location.to_string(),
-            metadata,
-        }
+        QueueEntry::new(location.to_string(), metadata).unwrap()
     }
 
     fn entry_seq(seq: u64, location: &str, metadata: Vec<Metadata>) -> QueueEntry {
@@ -1595,5 +1611,16 @@ mod tests {
             matches!(&err, Error::Serialization(msg) if msg.contains("metadata has less bytes than set")),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn should_reject_location_exceeding_u16_max() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+
+        let long_location = "x".repeat(u16::MAX as usize + 1);
+        let result = producer.enqueue(long_location, vec![]).await;
+        assert!(matches!(result, Err(Error::InvalidInput(msg)) if msg.contains("location length")));
     }
 }
