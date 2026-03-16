@@ -31,6 +31,7 @@ http-server = [
 testing = []
 remote-write = ["http-server", "dep:prost", "dep:snap"]
 otel = ["dep:opentelemetry-proto", "dep:prost"]
+profiling = ["http-server", "dep:pprof"]
 bench-internals = []
 
 [dependencies]
@@ -74,6 +75,9 @@ tsz = "0.1"
 opentelemetry-proto = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
+
+# Optional dependency for profiling feature
+pprof = { workspace = true, optional = true }
 
 [dev-dependencies]
 common = { workspace = true, features = ["test-utils"] }

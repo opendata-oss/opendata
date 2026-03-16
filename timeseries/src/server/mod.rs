@@ -3,6 +3,8 @@ pub(crate) mod metrics;
 mod middleware;
 #[cfg(feature = "otel")]
 pub(crate) mod otel;
+#[cfg(feature = "profiling")]
+pub(crate) mod pprof;
 #[cfg(feature = "remote-write")]
 pub(crate) mod remote_write;
 

@@ -64,6 +64,7 @@ snap = "1"
 criterion = "0.5"
 tempfile = "3"
 opendata-macros = { path = "./macros" }
+pprof = { version = "0.14", features = ["flamegraph"] }
 
 [profile.release]
 debug = true

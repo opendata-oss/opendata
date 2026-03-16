@@ -103,6 +103,12 @@ pub(crate) fn build_router(
     #[cfg(feature = "otel")]
     let app = app.route("/v1/metrics", post(super::otel::handle_otel_metrics));
 
+    #[cfg(feature = "profiling")]
+    let app = app.route(
+        "/debug/pprof/profile",
+        get(super::pprof::handle_pprof_profile),
+    );
+
     app.route("/", get(handle_ui_redirect))
         .route("/query", get(handle_ui_index))
         .route("/{*path}", get(handle_ui))
