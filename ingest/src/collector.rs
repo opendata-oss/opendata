@@ -190,7 +190,7 @@ mod tests {
     }
 
     async fn write_batch(store: &Arc<dyn ObjectStore>, location: &str, entries: &[Bytes]) {
-        let payload = encode_batch(entries);
+        let payload = encode_batch(entries).unwrap();
         let path = Path::from(location);
         store.put(&path, PutPayload::from(payload)).await.unwrap();
     }
