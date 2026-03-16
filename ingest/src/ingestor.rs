@@ -69,8 +69,13 @@ impl DataAndNotifiers {
         metadata: Bytes,
         ingestion_time_ms: i64,
         notifier: Notifier,
-    ) {
-        let start_index = self.entries.len() as u32;
+    ) -> Result<()> {
+        let start_index: u32 = self.entries.len().try_into().map_err(|_| {
+            Error::InvalidInput(format!(
+                "batch entry count {} exceeds u32::MAX",
+                self.entries.len()
+            ))
+        })?;
         self.entries.extend(entries);
         self.metadata.push(Metadata {
             start_index,
@@ -78,6 +83,7 @@ impl DataAndNotifiers {
             payload: metadata,
         });
         self.notifiers.push(notifier);
+        Ok(())
     }
 
     fn is_empty(&self) -> bool {
@@ -107,13 +113,14 @@ impl Batch {
         ingestion_time_ms: i64,
         notifier: Notifier,
         now: SystemTime,
-    ) {
+    ) -> Result<()> {
         self.size_bytes += entries.iter().map(|e| e.len()).sum::<usize>() + metadata.len();
         self.data_and_notifiers
-            .add(entries, metadata, ingestion_time_ms, notifier);
+            .add(entries, metadata, ingestion_time_ms, notifier)?;
         if self.started_at.is_none() {
             self.started_at = Some(now);
         }
+        Ok(())
     }
 
     fn take(&mut self) -> DataAndNotifiers {
@@ -174,8 +181,9 @@ impl BatchWriterTask {
                 msg = rx.recv() => {
                     match msg {
                         Some(IngestMessage::Add { entries, metadata, ingestion_time_ms, notifier }) => {
-                            self.batch.add(entries, metadata, ingestion_time_ms, notifier, self.clock.now());
-                            if self.batch.size_bytes >= self.flush_size_bytes {
+                            if let Err(e) = self.batch.add(entries, metadata, ingestion_time_ms, notifier.clone(), self.clock.now()) {
+                                let _ = notifier.send(Some(Err(e)));
+                            } else if self.batch.size_bytes >= self.flush_size_bytes {
                                 let _ = self.write_batch().await;
                             }
                         }

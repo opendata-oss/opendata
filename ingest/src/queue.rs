@@ -558,7 +558,8 @@ impl ConflictCounter {
             return 0.0;
         }
         let conflicts = self.conflict_count.load(Ordering::Relaxed);
-        (conflicts as f64 / writes as f64) * 100.0
+        let rate = (conflicts as f64 / writes as f64) * 100.0;
+        rate.min(100.0)
     }
 }
 
