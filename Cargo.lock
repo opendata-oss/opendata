@@ -2644,6 +2644,7 @@ dependencies = [
  "clap",
  "dashmap",
  "fail",
+ "figment",
  "futures",
  "log",
  "opendata-common",

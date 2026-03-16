@@ -31,6 +31,7 @@ common.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
 fail.workspace = true
+figment.workspace = true
 futures.workspace = true
 usearch = "2"
 roaring.workspace = true
