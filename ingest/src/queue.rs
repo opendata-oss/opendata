@@ -311,25 +311,13 @@ fn split_entries(
     let mut offset = 0usize;
 
     for i in 0..count {
-        if offset + ENTRY_LEN_SIZE + SEQUENCE_SIZE > end {
-            return Err(Error::Serialization(
-                "queue entry corrupt: not enough bytes for entry header during dequeue".to_string(),
-            ));
-        }
-        let entry_len =
-            u32::from_le_bytes(data[offset..offset + ENTRY_LEN_SIZE].try_into().unwrap()) as usize;
-        let sequence = u64::from_le_bytes(
-            data[offset + ENTRY_LEN_SIZE..offset + ENTRY_LEN_SIZE + SEQUENCE_SIZE]
-                .try_into()
-                .unwrap(),
-        );
+        let entry_start = offset;
+        let entry = decode_entry(data, &mut offset, end)?;
 
-        if sequence <= through_sequence {
-            let mut off = offset;
-            removed.push(decode_entry(data, &mut off, end)?);
-            offset += ENTRY_LEN_SIZE + entry_len;
+        if entry.sequence <= through_sequence {
+            removed.push(entry);
         } else {
-            return Ok((removed, offset, (count - i) as u32));
+            return Ok((removed, entry_start, (count - i) as u32));
         }
     }
 
