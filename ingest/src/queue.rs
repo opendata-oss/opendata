@@ -347,7 +347,7 @@ fn split_entries(
 fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntry> {
     if *offset + ENTRY_LEN_SIZE > end {
         return Err(Error::Serialization(
-            "manifest truncated: not enough bytes for entry_len".to_string(),
+            "queue entry corrupt: size of entry length field does not fit in entry".to_string(),
         ));
     }
 
@@ -357,7 +357,7 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntr
 
     if *offset + entry_len > end {
         return Err(Error::Serialization(
-            "manifest truncated: entry extends beyond data".to_string(),
+            "queue entry corrupt: entry has less bytes than set in the entry length".to_string(),
         ));
     }
 
@@ -374,7 +374,7 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntr
     let min_entry_len = SEQUENCE_SIZE + LOCATION_LEN_SIZE + location_len + METADATA_COUNT_SIZE;
     if entry_len < min_entry_len {
         return Err(Error::Serialization(format!(
-            "entry_len {} is less than minimum {} for location_len {}",
+            "queue entry corrupt: entry length {} is less than minimum entry length {} for the length of the location {}",
             entry_len, min_entry_len, location_len
         )));
     }
@@ -392,6 +392,11 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntr
 
     let mut metadata = Vec::with_capacity(metadata_count);
     for _ in 0..metadata_count {
+        if *offset + START_INDEX_SIZE > end {
+            return Err(Error::Serialization(
+                "queue entry corrupt: size of start index field does not fit in entry".to_string(),
+            ));
+        }
         let start_index = u32::from_le_bytes(
             data[*offset..*offset + START_INDEX_SIZE]
                 .try_into()
@@ -399,6 +404,12 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntr
         );
         *offset += START_INDEX_SIZE;
 
+        if *offset + INGESTION_TIME_MS_SIZE > end {
+            return Err(Error::Serialization(
+                "queue entry corrupt: size of ingestion time field does not fit in entry"
+                    .to_string(),
+            ));
+        }
         let ingestion_time_ms = i64::from_le_bytes(
             data[*offset..*offset + INGESTION_TIME_MS_SIZE]
                 .try_into()
@@ -406,6 +417,12 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntr
         );
         *offset += INGESTION_TIME_MS_SIZE;
 
+        if *offset + METADATA_LEN_SIZE > end {
+            return Err(Error::Serialization(
+                "queue entry corrupt: size of metadata length field does not fit in entry"
+                    .to_string(),
+            ));
+        }
         let m_len = u32::from_le_bytes(
             data[*offset..*offset + METADATA_LEN_SIZE]
                 .try_into()
@@ -413,6 +430,12 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntr
         ) as usize;
         *offset += METADATA_LEN_SIZE;
 
+        if *offset + m_len > end {
+            return Err(Error::Serialization(
+                "queue entry corrupt: metadata has less bytes than set in the metadata length"
+                    .to_string(),
+            ));
+        }
         metadata.push(Metadata {
             start_index,
             ingestion_time_ms,
@@ -761,56 +784,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_enqueue_locations_to_manifest() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
-
-        producer
-            .enqueue("path/to/file1.batch".to_string(), vec![])
-            .await
-            .unwrap();
-        producer
-            .enqueue("path/to/file2.batch".to_string(), vec![])
-            .await
-            .unwrap();
-
-        let manifest = read_producer_manifest(&store, "test/manifest").await;
-        let locations: Vec<String> = manifest.iter().map(|e| e.unwrap().location).collect();
-        assert_eq!(
-            locations,
-            vec!["path/to/file1.batch", "path/to/file2.batch"]
-        );
-    }
-
-    #[tokio::test]
-    async fn should_merge_with_existing_manifest() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-
-        let existing = Manifest::from_entries(&[QueueEntry {
-            sequence: 0,
-            location: "existing/file.batch".to_string(),
-            metadata: vec![],
-        }]);
-        let path = Path::from("test/manifest");
-        store
-            .put(&path, PutPayload::from(existing.to_bytes().to_vec()))
-            .await
-            .unwrap();
-
-        let producer =
-            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
-        producer
-            .enqueue("new/file.batch".to_string(), vec![])
-            .await
-            .unwrap();
-
-        let manifest = read_producer_manifest(&store, "test/manifest").await;
-        let locations: Vec<String> = manifest.iter().map(|e| e.unwrap().location).collect();
-        assert_eq!(locations, vec!["existing/file.batch", "new/file.batch"]);
-    }
-
-    #[tokio::test]
     async fn should_initialize_consumer_and_increment_epoch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let consumer = QueueConsumer::with_object_store(
@@ -1073,6 +1046,56 @@ mod tests {
         assert_eq!(next.sequence, 2);
     }
 
+    #[tokio::test]
+    async fn should_enqueue_locations_to_manifest() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+
+        producer
+            .enqueue("path/to/file1.batch".to_string(), vec![])
+            .await
+            .unwrap();
+        producer
+            .enqueue("path/to/file2.batch".to_string(), vec![])
+            .await
+            .unwrap();
+
+        let manifest = read_producer_manifest(&store, TEST_MANIFEST_PATH).await;
+        let locations: Vec<String> = manifest.iter().map(|e| e.unwrap().location).collect();
+        assert_eq!(
+            locations,
+            vec!["path/to/file1.batch", "path/to/file2.batch"]
+        );
+    }
+
+    #[tokio::test]
+    async fn should_merge_with_existing_manifest() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let existing = Manifest::from_entries(&[QueueEntry {
+            sequence: 0,
+            location: "existing/file.batch".to_string(),
+            metadata: vec![],
+        }]);
+        let path = Path::from(TEST_MANIFEST_PATH);
+        store
+            .put(&path, PutPayload::from(existing.to_bytes().to_vec()))
+            .await
+            .unwrap();
+
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+        producer
+            .enqueue("new/file.batch".to_string(), vec![])
+            .await
+            .unwrap();
+
+        let manifest = read_producer_manifest(&store, "test/manifest").await;
+        let locations: Vec<String> = manifest.iter().map(|e| e.unwrap().location).collect();
+        assert_eq!(locations, vec!["existing/file.batch", "new/file.batch"]);
+    }
+
     fn entry(location: &str, metadata: Vec<Metadata>) -> QueueEntry {
         QueueEntry {
             sequence: 0,
@@ -1194,85 +1217,6 @@ mod tests {
     }
 
     #[test]
-    fn should_reject_trailing_bytes_before_footer() {
-        // Build a valid entry manually, then add garbage bytes before the footer.
-        let mut buf = BytesMut::new();
-        let location = "loc";
-        let entry_len = SEQUENCE_SIZE + LOCATION_LEN_SIZE + location.len() + METADATA_COUNT_SIZE;
-        buf.put_u32_le(entry_len as u32); // entry_len prefix
-        buf.put_u64_le(0); // sequence
-        buf.put_u16_le(location.len() as u16);
-        buf.extend_from_slice(location.as_bytes());
-        buf.put_u32_le(0); // metadata_count
-        // trailing garbage before footer
-        buf.extend_from_slice(&[0xFFu8; 5]);
-        // footer: entry_count=1
-        buf.put_u32_le(1);
-        buf.put_u64_le(1);
-        buf.put_u64_le(0);
-        buf.put_u16_le(MANIFEST_VERSION);
-
-        let manifest = Manifest::from_bytes(buf.freeze()).unwrap();
-        let items: Vec<Result<QueueEntry>> = manifest.iter().collect();
-        assert_eq!(items.len(), 2);
-        assert!(items[0].is_ok());
-        let err = items[1].as_ref().unwrap_err();
-        assert!(
-            err.to_string().contains("did not consume all bytes"),
-            "got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn should_reject_entry_with_entry_len_below_minimum() {
-        let mut buf = BytesMut::new();
-        // entry_len too small: less than SEQUENCE_SIZE + LOCATION_LEN_SIZE + METADATA_COUNT_SIZE (14)
-        let bad_entry_len = (SEQUENCE_SIZE + LOCATION_LEN_SIZE + METADATA_COUNT_SIZE - 1) as u32;
-        buf.put_u32_le(bad_entry_len);
-        buf.extend_from_slice(&[0u8; 13]); // enough raw bytes to not truncate
-        // footer
-        buf.put_u32_le(1);
-        buf.put_u64_le(1);
-        buf.put_u64_le(0);
-        buf.put_u16_le(MANIFEST_VERSION);
-
-        let manifest = Manifest::from_bytes(buf.freeze()).unwrap();
-        let err = manifest.iter().next().unwrap().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("entry_len 13 is less than minimum 14 for location_len 0")
-        );
-    }
-
-    #[test]
-    fn should_reject_entry_with_entry_len_below_minimum_for_location() {
-        let mut buf = BytesMut::new();
-        let location = "abc";
-        // entry_len covers fixed fields but not the full location
-        let bad_entry_len =
-            SEQUENCE_SIZE + LOCATION_LEN_SIZE + METADATA_COUNT_SIZE + location.len() - 1;
-        buf.put_u32_le(bad_entry_len as u32);
-        buf.put_u64_le(0); // sequence
-        buf.put_u16_le(location.len() as u16); // location_len
-        buf.extend_from_slice(&[0u8; 20]); // padding so entry doesn't extend beyond data
-        // footer
-        buf.put_u32_le(1);
-        buf.put_u64_le(1);
-        buf.put_u64_le(0);
-        buf.put_u16_le(MANIFEST_VERSION);
-
-        let manifest = Manifest::from_bytes(buf.freeze()).unwrap();
-        let err = manifest.iter().next().unwrap().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("entry_len 16 is less than minimum 17"),
-            "got: {}",
-            err
-        );
-    }
-
-    #[test]
     fn should_make_appended_entry_accessible_via_iter() {
         let mut m = Manifest::empty();
 
@@ -1313,42 +1257,6 @@ mod tests {
         assert_eq!(entries[0].sequence, 0);
         assert_eq!(entries[1].sequence, 1);
         assert_eq!(entries[2].sequence, 2);
-    }
-
-    #[test]
-    fn should_create_empty_manifest_from_empty_slice() {
-        let mut m = Manifest::from_entries(&[]);
-
-        assert_eq!(m.entries_count(), 0);
-        assert!(m.is_empty());
-
-        m.append(&entry("loc", vec![]));
-        let entries: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
-        assert_eq!(entries[0].sequence, 0);
-    }
-
-    #[test]
-    fn should_create_manifest_from_multiple_entries() {
-        let entries = vec![
-            entry_seq(0, "x", vec![meta(0, 10, "m1")]),
-            entry_seq(1, "y", vec![meta(0, 20, "m2")]),
-            entry_seq(2, "z", vec![meta(0, 30, "m3")]),
-        ];
-
-        let m = Manifest::from_entries(&entries);
-
-        assert_eq!(m.entries_count(), 3);
-        assert_eq!(m.next_sequence, 3);
-        let decoded: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
-        assert_eq!(decoded[0].sequence, 0);
-        assert_eq!(decoded[0].location, "x");
-        assert_eq!(decoded[0].metadata, vec![meta(0, 10, "m1")]);
-        assert_eq!(decoded[1].sequence, 1);
-        assert_eq!(decoded[1].location, "y");
-        assert_eq!(decoded[1].metadata, vec![meta(0, 20, "m2")]);
-        assert_eq!(decoded[2].sequence, 2);
-        assert_eq!(decoded[2].location, "z");
-        assert_eq!(decoded[2].metadata, vec![meta(0, 30, "m3")]);
     }
 
     #[test]
@@ -1564,5 +1472,166 @@ mod tests {
         let all: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(all.len(), 3);
         assert_eq!(all[2].sequence, 3);
+    }
+
+    /// Serialize a single entry into raw bytes (without footer).
+    fn encode_entry_bytes(entry: &QueueEntry) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        Manifest::encode_entry(&mut buf, entry);
+        buf.to_vec()
+    }
+
+    /// Wrap raw entry bytes with a manifest footer (entry_count=1) so that
+    /// `Manifest::from_bytes` + `.iter()` exercises `decode_entry`.
+    fn manifest_from_raw_entry(entry_bytes: &[u8]) -> Manifest {
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(entry_bytes);
+        buf.put_u32_le(1); // entry_count
+        buf.put_u64_le(1); // next_sequence
+        buf.put_u64_le(0); // epoch
+        buf.put_u16_le(MANIFEST_VERSION);
+        Manifest::from_bytes(buf.freeze()).unwrap()
+    }
+
+    /// Offset of metadata_count inside the encoded entry (for location "a").
+    /// Layout: entry_len(4) + sequence(8) + location_len(2) + location(1)
+    const METADATA_COUNT_OFFSET: usize = ENTRY_LEN_SIZE + SEQUENCE_SIZE + LOCATION_LEN_SIZE + 1;
+
+    /// Build an entry with no metadata, then corrupt metadata_count to `count`
+    /// and extend the buffer with `extra_bytes` after metadata_count to simulate
+    /// partial metadata. Also patches entry_len to match the new total size.
+    fn corrupt_metadata_entry(count: u32, extra_bytes: &[u8]) -> Vec<u8> {
+        let e = QueueEntry {
+            sequence: 1,
+            location: "a".to_string(),
+            metadata: vec![],
+        };
+        let mut raw = encode_entry_bytes(&e);
+        // Overwrite metadata_count
+        raw[METADATA_COUNT_OFFSET..METADATA_COUNT_OFFSET + 4].copy_from_slice(&count.to_le_bytes());
+        // Append extra bytes (partial metadata fields)
+        raw.extend_from_slice(extra_bytes);
+        // Patch entry_len to cover the full buffer after the 4-byte prefix
+        let new_entry_len = (raw.len() - ENTRY_LEN_SIZE) as u32;
+        raw[..ENTRY_LEN_SIZE].copy_from_slice(&new_entry_len.to_le_bytes());
+        raw
+    }
+
+    #[test]
+    fn should_reject_trailing_bytes_before_footer() {
+        // Build a valid entry, then add garbage bytes before the footer.
+        let mut raw = encode_entry_bytes(&entry_seq(0, "loc", vec![]));
+        raw.extend_from_slice(&[0xFFu8; 5]); // trailing garbage
+
+        let manifest = manifest_from_raw_entry(&raw);
+        let items: Vec<Result<QueueEntry>> = manifest.iter().collect();
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_ok());
+        let err = items[1].as_ref().unwrap_err();
+        assert!(
+            err.to_string().contains("did not consume all bytes"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn should_reject_entry_with_entry_len_below_minimum() {
+        // entry_len too small: less than SEQUENCE_SIZE + LOCATION_LEN_SIZE + METADATA_COUNT_SIZE (14)
+        let bad_entry_len = (SEQUENCE_SIZE + LOCATION_LEN_SIZE + METADATA_COUNT_SIZE - 1) as u32;
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&bad_entry_len.to_le_bytes());
+        raw.extend_from_slice(&[0u8; 13]); // enough raw bytes to not truncate
+
+        let manifest = manifest_from_raw_entry(&raw);
+        let err = manifest.iter().next().unwrap().unwrap_err();
+        assert!(err.to_string().contains(
+            "entry length 13 is less than minimum entry length 14 for the length of the location 0"
+        ));
+    }
+
+    #[test]
+    fn should_reject_entry_with_entry_len_below_minimum_for_location() {
+        let location = "abc";
+        // entry_len covers fixed fields but not the full location
+        let bad_entry_len =
+            (SEQUENCE_SIZE + LOCATION_LEN_SIZE + METADATA_COUNT_SIZE + location.len() - 1) as u32;
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&bad_entry_len.to_le_bytes());
+        raw.extend_from_slice(&0u64.to_le_bytes()); // sequence
+        raw.extend_from_slice(&(location.len() as u16).to_le_bytes()); // location_len
+        raw.extend_from_slice(&[0u8; 20]); // padding so entry doesn't extend beyond data
+
+        let manifest = manifest_from_raw_entry(&raw);
+        let err = manifest.iter().next().unwrap().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("entry length 16 is less than minimum entry length 17"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn should_reject_entry_truncated_before_entry_len() {
+        // Data too short to even read entry_len (need 4 bytes, provide 2)
+        let manifest = manifest_from_raw_entry(&[0u8; 2]);
+        let err = manifest.iter().next().unwrap().unwrap_err();
+        assert!(
+            matches!(&err, Error::Serialization(msg) if msg.contains("entry length field does not fit")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_entry_truncated_before_metadata_start_index() {
+        // metadata_count = 1 but no metadata bytes at all
+        let manifest = manifest_from_raw_entry(&corrupt_metadata_entry(1, &[]));
+        let err = manifest.iter().next().unwrap().unwrap_err();
+        assert!(
+            matches!(&err, Error::Serialization(msg) if msg.contains("start index field does not fit")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_entry_truncated_before_metadata_ingestion_time() {
+        // metadata_count = 1, only start_index present (4 bytes)
+        let manifest = manifest_from_raw_entry(&corrupt_metadata_entry(1, &0u32.to_le_bytes()));
+        let err = manifest.iter().next().unwrap().unwrap_err();
+        assert!(
+            matches!(&err, Error::Serialization(msg) if msg.contains("ingestion time field does not fit")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_entry_truncated_before_metadata_length() {
+        // metadata_count = 1, start_index + ingestion_time present, but no m_len
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&0u32.to_le_bytes()); // start_index
+        extra.extend_from_slice(&0i64.to_le_bytes()); // ingestion_time_ms
+        let manifest = manifest_from_raw_entry(&corrupt_metadata_entry(1, &extra));
+        let err = manifest.iter().next().unwrap().unwrap_err();
+        assert!(
+            matches!(&err, Error::Serialization(msg) if msg.contains("metadata length field does not fit")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_entry_truncated_before_metadata_payload() {
+        // metadata_count = 1, all fixed fields present, m_len says 10 but only 2 bytes follow
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&0u32.to_le_bytes()); // start_index
+        extra.extend_from_slice(&0i64.to_le_bytes()); // ingestion_time_ms
+        extra.extend_from_slice(&10u32.to_le_bytes()); // m_len = 10
+        extra.extend_from_slice(&[0xAB, 0xCD]); // only 2 payload bytes
+        let manifest = manifest_from_raw_entry(&corrupt_metadata_entry(1, &extra));
+        let err = manifest.iter().next().unwrap().unwrap_err();
+        assert!(
+            matches!(&err, Error::Serialization(msg) if msg.contains("metadata has less bytes than set")),
+            "unexpected error: {err}"
+        );
     }
 }
