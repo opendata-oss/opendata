@@ -306,6 +306,7 @@ pub(crate) async fn evaluate_range(
     reader: &impl QueryReader,
     stmt: EvalStmt,
 ) -> std::result::Result<Vec<RangeSample>, QueryError> {
+    let loop_start = std::time::Instant::now();
     let start = stmt.start;
     let end = stmt.end;
     let step = stmt.interval;
@@ -320,6 +321,7 @@ pub(crate) async fn evaluate_range(
     let mut series_map: HashMap<Labels, Vec<(i64, f64)>> = HashMap::new();
     let mut evaluator = Evaluator::new(reader);
     let mut current_time = start;
+    let mut step_count: u64 = 0;
 
     while current_time <= end {
         let instant_stmt = EvalStmt {
@@ -357,8 +359,24 @@ pub(crate) async fn evaluate_range(
             }
         }
 
+        step_count += 1;
         current_time += step;
     }
+
+    let stats = evaluator.stats();
+    tracing::info!(
+        step_count,
+        total_ms = loop_start.elapsed().as_millis() as u64,
+        list_buckets_calls = stats.list_buckets_calls,
+        selector_calls = stats.selector_calls,
+        forward_index_calls = stats.forward_index_calls,
+        forward_index_cache_hits = stats.forward_index_cache_hits,
+        sample_loads = stats.sample_loads,
+        sample_cache_hits = stats.sample_cache_hits,
+        samples_loaded = stats.samples_loaded,
+        unique_series = series_map.len(),
+        "evaluate_range complete"
+    );
 
     Ok(series_map
         .into_iter()

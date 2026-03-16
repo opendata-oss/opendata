@@ -12,6 +12,7 @@ use axum::{Json, Router};
 use axum_extra::extract::{Form, Query};
 use rust_embed::Embed;
 use tokio::signal;
+use tracing::Instrument;
 
 use super::metrics::Metrics;
 use super::middleware::{MetricsLayer, TracingLayer};
@@ -272,10 +273,42 @@ async fn handle_query_range(
     let start = parse_timestamp(&params.start)?;
     let end = parse_timestamp(&params.end)?;
     let step = parse_duration(&params.step)?;
-    let result = state
-        .tsdb
-        .eval_query_range(&params.query, start..=end, step, &QueryOptions::default())
-        .await;
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let query_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        params.query.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    };
+    let step_count = {
+        let start_ms = start.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let end_ms = end.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let step_ms = step.as_millis() as i64;
+        if step_ms > 0 {
+            (end_ms - start_ms) / step_ms + 1
+        } else {
+            0
+        }
+    };
+
+    let span = tracing::info_span!(
+        "query_range",
+        request_id = %request_id,
+        query_hash = %query_hash,
+        step_count = step_count,
+    );
+    tracing::debug!(parent: &span, query = %params.query, "query_range request");
+
+    let result = async {
+        state
+            .tsdb
+            .eval_query_range(&params.query, start..=end, step, &QueryOptions::default())
+            .await
+    }
+    .instrument(span)
+    .await;
+
     Ok(Json(response::range_result_to_response(result)))
 }
 

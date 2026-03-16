@@ -33,14 +33,27 @@ use tsdb::Tsdb;
 async fn main() {
     // Initialize tracing with configurable log level via RUST_LOG environment variable
     // Default to "info" if RUST_LOG is not set
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE) // Only exit events with timing
-        .with_target(true)
-        .with_line_number(true)
-        .init();
+    // LOG_FORMAT=json enables structured JSON output for analysis scripts
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let log_format = std::env::var("LOG_FORMAT").unwrap_or_default();
+
+    if log_format.eq_ignore_ascii_case("json") {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_target(true)
+            .with_line_number(true)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_target(true)
+            .with_line_number(true)
+            .init();
+    }
 
     // Parse CLI arguments
     let args = CliArgs::parse();

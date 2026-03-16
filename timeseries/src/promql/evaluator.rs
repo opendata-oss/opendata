@@ -47,6 +47,19 @@ impl From<crate::error::Error> for EvaluationError {
 
 pub(crate) type EvalResult<T> = std::result::Result<T, EvaluationError>;
 
+/// Aggregated counters for evaluator operations.
+/// Incremented inside hot methods, read once after the step loop completes.
+#[derive(Debug, Default)]
+pub(crate) struct EvalStats {
+    pub(crate) list_buckets_calls: u64,
+    pub(crate) selector_calls: u64,
+    pub(crate) forward_index_calls: u64,
+    pub(crate) forward_index_cache_hits: u64,
+    pub(crate) sample_loads: u64,
+    pub(crate) sample_cache_hits: u64,
+    pub(crate) samples_loaded: u64,
+}
+
 /// Type alias for complex HashMap used in matrix selector evaluation.
 /// Maps from label key (sorted vector of label pairs) to samples vector
 type SeriesMap = HashMap<Vec<Label>, Vec<Sample>>;
@@ -311,6 +324,7 @@ pub(crate) struct Evaluator<'reader, R: QueryReader> {
 pub(crate) struct CachedQueryReader<'reader, R: QueryReader> {
     reader: &'reader R,
     cache: QueryReaderEvalCache,
+    pub(crate) stats: EvalStats,
 }
 
 impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
@@ -318,10 +332,12 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         Self {
             reader,
             cache: QueryReaderEvalCache::new(),
+            stats: EvalStats::default(),
         }
     }
 
-    pub(crate) async fn list_buckets(&self) -> Result<Vec<TimeBucket>> {
+    pub(crate) async fn list_buckets(&mut self) -> Result<Vec<TimeBucket>> {
+        self.stats.list_buckets_calls += 1;
         self.reader.list_buckets().await
     }
 
@@ -330,10 +346,12 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         bucket: &TimeBucket,
         series_ids: &[SeriesId],
     ) -> Result<Arc<dyn ForwardIndexLookup + Send + Sync + 'static>> {
+        self.stats.forward_index_calls += 1;
         let mut series_ids = Vec::from(series_ids);
         series_ids.sort();
         // Check cache first
         if let Some(cached_data) = self.cache.get_forward_index(bucket, &series_ids) {
+            self.stats.forward_index_cache_hits += 1;
             Ok(cached_data)
         } else {
             // Load from underlying reader
@@ -354,6 +372,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         bucket: &TimeBucket,
         terms: &[Label],
     ) -> Result<Arc<dyn InvertedIndexLookup + Send + Sync + 'static>> {
+        self.stats.selector_calls += 1;
         let mut terms = terms.to_vec();
         // Sort by canonical Label ordering (name, then value) for cache key consistency
         terms.sort();
@@ -397,8 +416,10 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<Sample>> {
+        self.stats.sample_loads += 1;
         // Check cache first
         if let Some(cached_samples) = self.cache.get_samples(bucket, &series_id) {
+            self.stats.sample_cache_hits += 1;
             // Filter cached samples by requested time range
             let filtered: Vec<Sample> = cached_samples
                 .iter()
@@ -413,6 +434,8 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             .reader
             .samples(bucket, series_id, i64::MIN, i64::MAX)
             .await?;
+
+        self.stats.samples_loaded += samples.len() as u64;
 
         // Cache the full sample set
         self.cache
@@ -745,11 +768,13 @@ fn preload_ranges_inner(
 impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     pub(crate) fn new(reader: &'reader R) -> Self {
         Self {
-            reader: CachedQueryReader {
-                reader,
-                cache: QueryReaderEvalCache::new(),
-            },
+            reader: CachedQueryReader::new(reader),
         }
+    }
+
+    /// Access aggregated evaluation statistics.
+    pub(crate) fn stats(&self) -> &EvalStats {
+        &self.reader.stats
     }
 
     pub(crate) async fn evaluate(&mut self, stmt: EvalStmt) -> EvalResult<ExprResult> {
