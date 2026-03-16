@@ -12,17 +12,11 @@ use crate::error::{Error, Result};
 
 const MANIFEST_VERSION: u16 = 1;
 const UNINITIALIZED_EPOCH: u64 = u64::MAX;
-#[allow(dead_code)]
 const ENTRY_LEN_SIZE: usize = 4;
-#[allow(dead_code)]
 const LOCATION_LEN_SIZE: usize = 2;
-#[allow(dead_code)]
 const INGESTION_TIME_MS_SIZE: usize = 8;
-#[allow(dead_code)]
 const METADATA_LEN_SIZE: usize = 4;
-#[allow(dead_code)]
 const START_INDEX_SIZE: usize = 4;
-#[allow(dead_code)]
 const METADATA_COUNT_SIZE: usize = 4;
 const ENTRIES_COUNT_SIZE: usize = 4;
 const SEQUENCE_SIZE: usize = 8;
@@ -165,7 +159,6 @@ impl Manifest {
         }
     }
 
-    #[allow(dead_code)]
     fn existing_entries_count(&self) -> usize {
         if self.data.is_empty() {
             0
@@ -305,7 +298,6 @@ impl Manifest {
     }
 }
 
-#[allow(dead_code)]
 /// Walk entries in `data[0..end]`, splitting at `through_sequence`.
 /// Entries with sequence <= through_sequence are fully decoded and returned.
 /// Returns (removed_entries, remaining_start_offset, remaining_count).
@@ -342,7 +334,6 @@ fn split_entries(
     (removed, end, 0)
 }
 
-#[allow(dead_code)]
 /// Decode a single entry from binary data at the given offset.
 fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntry> {
     if *offset + ENTRY_LEN_SIZE > end {
@@ -451,7 +442,6 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntr
     })
 }
 
-#[allow(dead_code)]
 /// Borrowing iterator over manifest entries. Lazily deserializes each entry.
 pub(crate) struct ManifestIter<'a> {
     data: &'a [u8],
