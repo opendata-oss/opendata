@@ -190,7 +190,7 @@ impl Manifest {
     /// Optimized to avoid deserializing/re-serializing remaining entries: only the
     /// removed entries are fully decoded, while remaining entries are byte-copied.
     #[allow(dead_code)]
-    fn dequeue(&mut self, through_sequence: u64) -> Vec<QueueEntry> {
+    fn dequeue(&mut self, through_sequence: u64) -> Result<Vec<QueueEntry>> {
         let next_seq = self.next_sequence;
         let epoch = self.epoch;
 
@@ -202,7 +202,7 @@ impl Manifest {
         };
 
         let (mut removed, remaining_base_start, remaining_base_count) =
-            split_entries(&self.data, base_count, entries_end, through_sequence);
+            split_entries(&self.data, base_count, entries_end, through_sequence)?;
 
         let appended_end = self.appended.len();
         let (appended_removed, remaining_appended_start, remaining_appended_count) = split_entries(
@@ -210,7 +210,7 @@ impl Manifest {
             self.appended_count,
             appended_end,
             through_sequence,
-        );
+        )?;
         removed.extend(appended_removed);
 
         let remaining_base_bytes = &self.data[remaining_base_start..entries_end];
@@ -233,7 +233,7 @@ impl Manifest {
         self.next_sequence = next_seq;
         self.epoch = epoch;
 
-        removed
+        Ok(removed)
     }
 
     /// Set the epoch and patch the data bytes in place.
@@ -306,13 +306,15 @@ fn split_entries(
     count: usize,
     end: usize,
     through_sequence: u64,
-) -> (Vec<QueueEntry>, usize, u32) {
+) -> Result<(Vec<QueueEntry>, usize, u32)> {
     let mut removed = Vec::new();
     let mut offset = 0usize;
 
     for i in 0..count {
         if offset + ENTRY_LEN_SIZE + SEQUENCE_SIZE > end {
-            break;
+            return Err(Error::Serialization(
+                "queue entry corrupt: not enough bytes for entry header during dequeue".to_string(),
+            ));
         }
         let entry_len =
             u32::from_le_bytes(data[offset..offset + ENTRY_LEN_SIZE].try_into().unwrap()) as usize;
@@ -324,14 +326,14 @@ fn split_entries(
 
         if sequence <= through_sequence {
             let mut off = offset;
-            removed.push(decode_entry(data, &mut off, end).unwrap());
+            removed.push(decode_entry(data, &mut off, end)?);
             offset += ENTRY_LEN_SIZE + entry_len;
         } else {
-            return (removed, offset, (count - i) as u32);
+            return Ok((removed, offset, (count - i) as u32));
         }
     }
 
-    (removed, end, 0)
+    Ok((removed, end, 0))
 }
 
 /// Decode a single entry from binary data at the given offset.
@@ -714,7 +716,7 @@ impl QueueConsumer {
             if manifest.epoch != self.epoch.load(Ordering::Relaxed) {
                 return Err(Error::Fenced);
             }
-            let removed = manifest.dequeue(through_sequence);
+            let removed = manifest.dequeue(through_sequence)?;
             match self.write_manifest(&manifest, version).await {
                 Ok(()) => return Ok(removed),
                 Err(ManifestWriteError::Conflict) => {
@@ -1402,7 +1404,7 @@ mod tests {
             m.append(&entry("loc", vec![]));
         }
 
-        let removed = m.dequeue(2);
+        let removed = m.dequeue(2).unwrap();
 
         assert_eq!(removed.len(), 3);
         assert_eq!(removed[0].sequence, 0);
@@ -1422,7 +1424,7 @@ mod tests {
             m.append(&entry("loc", vec![]));
         }
 
-        let removed = m.dequeue(2);
+        let removed = m.dequeue(2).unwrap();
 
         assert_eq!(removed.len(), 3);
         assert!(m.is_empty());
@@ -1438,7 +1440,7 @@ mod tests {
         ];
         let mut m = Manifest::from_entries(&entries);
 
-        let removed = m.dequeue(3);
+        let removed = m.dequeue(3).unwrap();
 
         assert!(removed.is_empty());
         assert_eq!(m.entries_count(), 3);
@@ -1451,7 +1453,7 @@ mod tests {
             m.append(&entry("loc", vec![]));
         }
 
-        m.dequeue(0);
+        m.dequeue(0).unwrap();
 
         assert_eq!(m.entries_count(), 2);
         let remaining: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
