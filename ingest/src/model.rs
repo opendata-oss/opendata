@@ -8,19 +8,25 @@ const ENTRIES_COUNT_SIZE: usize = 4;
 const VERSION_SIZE: usize = 2;
 const FOOTER_SIZE: usize = ENTRIES_COUNT_SIZE + VERSION_SIZE;
 
-pub(crate) fn encode_batch(entries: &[Bytes]) -> Bytes {
+pub(crate) fn encode_batch(entries: &[Bytes]) -> Result<Bytes> {
     let data_size: usize = entries.iter().map(|e| ENTRY_LEN_SIZE + e.len()).sum();
     let mut buf = BytesMut::with_capacity(data_size + FOOTER_SIZE);
 
     for entry in entries {
-        buf.put_u32_le(entry.len() as u32);
+        let len: u32 = entry.len().try_into().map_err(|_| {
+            Error::InvalidInput(format!("entry size {} exceeds u32::MAX", entry.len()))
+        })?;
+        buf.put_u32_le(len);
         buf.put_slice(entry);
     }
 
-    buf.put_u32_le(entries.len() as u32);
+    let count: u32 = entries.len().try_into().map_err(|_| {
+        Error::InvalidInput(format!("entry count {} exceeds u32::MAX", entries.len()))
+    })?;
+    buf.put_u32_le(count);
     buf.put_u16_le(FORMAT_VERSION);
 
-    buf.freeze()
+    Ok(buf.freeze())
 }
 
 #[allow(dead_code)]
@@ -70,7 +76,7 @@ mod tests {
             Bytes::from("world"),
             Bytes::from("foo"),
         ];
-        let encoded = encode_batch(&entries);
+        let encoded = encode_batch(&entries).unwrap();
         let decoded = decode_batch(encoded).unwrap();
         assert_eq!(decoded, entries);
     }
@@ -78,7 +84,7 @@ mod tests {
     #[test]
     fn should_roundtrip_empty_batch() {
         let entries: Vec<Bytes> = vec![];
-        let encoded = encode_batch(&entries);
+        let encoded = encode_batch(&entries).unwrap();
         assert_eq!(encoded.len(), FOOTER_SIZE);
         let decoded = decode_batch(encoded).unwrap();
         assert!(decoded.is_empty());
@@ -87,7 +93,7 @@ mod tests {
     #[test]
     fn should_roundtrip_empty_record() {
         let entries = vec![Bytes::new()];
-        let encoded = encode_batch(&entries);
+        let encoded = encode_batch(&entries).unwrap();
         let decoded = decode_batch(encoded).unwrap();
         assert_eq!(decoded, entries);
     }
@@ -95,7 +101,7 @@ mod tests {
     #[test]
     fn should_reject_truncated_data() {
         let entries = vec![Bytes::from("hello")];
-        let mut encoded = BytesMut::from(encode_batch(&entries).as_ref());
+        let mut encoded = BytesMut::from(encode_batch(&entries).unwrap().as_ref());
         encoded.truncate(encoded.len() - FOOTER_SIZE - 1);
         encoded.put_u32_le(1);
         encoded.put_u16_le(FORMAT_VERSION);

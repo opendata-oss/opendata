@@ -209,7 +209,7 @@ impl BatchWriterTask {
     }
 
     async fn write_and_enqueue(&self, entries: Vec<Bytes>, metadata: Vec<Metadata>) -> Result<()> {
-        let payload = encode_batch(&entries);
+        let payload = encode_batch(&entries)?;
         let id = ulid::Ulid::new();
         let path = Path::from(format!("{}/{}.batch", self.data_path_prefix, id));
         self.object_store

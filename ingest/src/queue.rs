@@ -342,6 +342,8 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntr
         ));
     }
 
+    let entry_end = *offset + entry_len;
+
     let sequence = u64::from_le_bytes(data[*offset..*offset + SEQUENCE_SIZE].try_into().unwrap());
     *offset += SEQUENCE_SIZE;
 
@@ -424,6 +426,8 @@ fn decode_entry(data: &[u8], offset: &mut usize, end: usize) -> Result<QueueEntr
         });
         *offset += m_len;
     }
+
+    *offset = entry_end;
 
     Ok(QueueEntry {
         sequence,
