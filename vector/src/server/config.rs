@@ -1,24 +1,27 @@
 //! Configuration for the vector HTTP server.
 
-use std::path::Path;
+use figment::Figment;
+use figment::providers::{Format, Serialized, Yaml};
 
 use crate::Config;
 use crate::model::ReaderConfig;
 
 /// Load a vector database configuration from a YAML file.
+///
+/// Fields present in the file override the defaults from [`Config::default()`].
+/// Fields omitted from the file retain their default values.
 pub fn load_vector_config(path: &str) -> Config {
-    let contents = std::fs::read_to_string(Path::new(path))
-        .unwrap_or_else(|e| panic!("Failed to read config file '{}': {}", path, e));
-    serde_yaml::from_str(&contents)
-        .unwrap_or_else(|e| panic!("Failed to parse config file '{}': {}", path, e))
+    Figment::from(Serialized::defaults(Config::default()))
+        .merge(Yaml::file(path))
+        .extract()
+        .unwrap_or_else(|e| panic!("Failed to load config file '{}': {}", path, e))
 }
 
 /// Load a reader configuration from a YAML file.
 pub fn load_reader_config(path: &str) -> ReaderConfig {
-    let contents = std::fs::read_to_string(Path::new(path))
-        .unwrap_or_else(|e| panic!("Failed to read config file '{}': {}", path, e));
-    serde_yaml::from_str(&contents)
-        .unwrap_or_else(|e| panic!("Failed to parse config file '{}': {}", path, e))
+    Figment::from(Yaml::file(path))
+        .extract()
+        .unwrap_or_else(|e| panic!("Failed to load config file '{}': {}", path, e))
 }
 
 /// Configuration for the vector HTTP server.
@@ -70,6 +73,38 @@ metadata_fields: []
         // then
         assert!(matches!(config.storage, StorageConfig::InMemory));
         assert_eq!(config.dimensions, 384);
+    }
+
+    #[test]
+    fn should_load_vector_config_with_defaults() {
+        // given
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+storage:
+  type: InMemory
+dimensions: 2
+distance_metric: L2
+metadata_fields:
+  - name: label
+    field_type: String
+    indexed: true
+"#,
+        )
+        .unwrap();
+
+        // when
+        let config = load_vector_config(config_path.to_str().unwrap());
+
+        // then
+        assert!(matches!(config.storage, StorageConfig::InMemory));
+        assert_eq!(config.dimensions, 2);
+        assert_eq!(config.flush_interval, std::time::Duration::from_secs(60));
+        assert_eq!(config.split_threshold_vectors, 2_000);
+        assert_eq!(config.merge_threshold_vectors, 500);
+        assert_eq!(config.chunk_target, 4096);
     }
 
     #[test]
