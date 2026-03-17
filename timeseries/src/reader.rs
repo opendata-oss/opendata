@@ -20,6 +20,7 @@ use moka::future::Cache;
 use crate::config::ReaderConfig;
 use crate::error::{QueryError, Result};
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
+use crate::load_coordinator::ReadLoadCoordinator;
 use crate::minitsdb::MiniQueryReader;
 use crate::model::{
     Label, Labels, QueryOptions, QueryValue, RangeSample, Sample, SeriesId, TimeBucket,
@@ -145,6 +146,7 @@ pub struct TimeSeriesDbReader {
     storage: Arc<dyn StorageRead>,
     /// LRU cache for read-only query buckets.
     query_cache: Cache<TimeBucket, Arc<MiniQueryReader>>,
+    load_coordinator: ReadLoadCoordinator,
 }
 
 impl TimeSeriesDbReader {
@@ -186,6 +188,7 @@ impl TimeSeriesDbReader {
         Self {
             storage,
             query_cache,
+            load_coordinator: ReadLoadCoordinator::from_env(),
         }
     }
 
@@ -294,6 +297,10 @@ impl TsdbReadEngine for TimeSeriesDbReader {
             .await;
 
         Ok(ReaderQueryReader::new(readers))
+    }
+
+    fn load_coordinator(&self) -> Option<&ReadLoadCoordinator> {
+        Some(&self.load_coordinator)
     }
 }
 

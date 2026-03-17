@@ -6,7 +6,10 @@ use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::stream::StreamExt;
+
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
+use crate::load_coordinator::ReadLoadCoordinator;
 use crate::model::Sample;
 use crate::model::SeriesFingerprint;
 use crate::model::{Label, SeriesId, TimeBucket};
@@ -80,6 +83,17 @@ pub(crate) struct EvalStats {
     // Per-bucket preload aggregates
     pub(crate) preload_bucket_ms_max: u64,
     pub(crate) preload_bucket_ms_sum: u64,
+    // Queue wait time (ms waiting for semaphore permits)
+    pub(crate) sample_queue_wait_ms: u64,
+    pub(crate) metadata_queue_wait_ms: u64,
+    // Pure I/O load time (ms doing actual storage reads, excludes queue wait)
+    pub(crate) sample_load_ms: u64,
+    pub(crate) metadata_load_ms: u64,
+    // Permit acquisition counters
+    pub(crate) sample_permit_acquires: u64,
+    pub(crate) metadata_permit_acquires: u64,
+    // Parallel path counters
+    pub(crate) parallel_sample_loads: u64,
 }
 
 /// Canonical key for caching selector results across steps.
@@ -560,6 +574,8 @@ pub(crate) struct CachedQueryReader<'reader, R: QueryReader> {
     /// Cached per-series metadata: (bucket, series_id) → fingerprint + labels.
     /// Arc-wrapped so callers can share metadata without cloning strings.
     series_meta_cache: HashMap<(TimeBucket, SeriesId), Arc<SeriesMeta>>,
+    /// Optional load coordinator for semaphore-based I/O budgeting.
+    load_coordinator: Option<ReadLoadCoordinator>,
 }
 
 impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
@@ -571,6 +587,14 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             cached_buckets: None,
             selector_cache: HashMap::new(),
             series_meta_cache: HashMap::new(),
+            load_coordinator: None,
+        }
+    }
+
+    pub(crate) fn with_coordinator(reader: &'reader R, coordinator: ReadLoadCoordinator) -> Self {
+        Self {
+            load_coordinator: Some(coordinator),
+            ..Self::new(reader)
         }
     }
 
@@ -601,9 +625,26 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             Ok(cached_data)
         } else {
             self.stats.forward_index_misses += 1;
-            let t0 = std::time::Instant::now();
-            let forward_index = self.reader.forward_index(bucket, &series_ids).await?;
-            self.stats.forward_index_miss_ms += t0.elapsed().as_millis() as u64;
+            let (wait_ms, load_ms);
+            let forward_index = if let Some(ref coord) = self.load_coordinator {
+                let (permit, wait) = coord.acquire_metadata().await;
+                self.stats.metadata_permit_acquires += 1;
+                wait_ms = wait.as_millis() as u64;
+                let t0 = std::time::Instant::now();
+                let fi = self.reader.forward_index(bucket, &series_ids).await?;
+                load_ms = t0.elapsed().as_millis() as u64;
+                drop(permit);
+                fi
+            } else {
+                wait_ms = 0;
+                let t0 = std::time::Instant::now();
+                let fi = self.reader.forward_index(bucket, &series_ids).await?;
+                load_ms = t0.elapsed().as_millis() as u64;
+                fi
+            };
+            self.stats.metadata_queue_wait_ms += wait_ms;
+            self.stats.metadata_load_ms += load_ms;
+            self.stats.forward_index_miss_ms += wait_ms + load_ms;
 
             self.cache
                 .cache_forward_index(*bucket, series_ids.clone(), forward_index);
@@ -630,7 +671,26 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         }
 
         // Load from underlying reader
-        let inverted_index = self.reader.inverted_index(bucket, &terms).await?;
+        let (wait_ms, load_ms);
+        let inverted_index = if let Some(ref coord) = self.load_coordinator {
+            let (permit, wait) = coord.acquire_metadata().await;
+            self.stats.metadata_permit_acquires += 1;
+            wait_ms = wait.as_millis() as u64;
+            let t0 = std::time::Instant::now();
+            let ii = self.reader.inverted_index(bucket, &terms).await?;
+            load_ms = t0.elapsed().as_millis() as u64;
+            drop(permit);
+            ii
+        } else {
+            wait_ms = 0;
+            let t0 = std::time::Instant::now();
+            let ii = self.reader.inverted_index(bucket, &terms).await?;
+            load_ms = t0.elapsed().as_millis() as u64;
+            ii
+        };
+        self.stats.metadata_queue_wait_ms += wait_ms;
+        self.stats.metadata_load_ms += load_ms;
+        self.stats.selector_miss_ms += wait_ms + load_ms;
 
         // Cache the result
         self.cache
@@ -677,12 +737,32 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
 
         // Not in cache, load from underlying reader with wide bounds to cache the whole bucket
         self.stats.sample_misses += 1;
-        let t0 = std::time::Instant::now();
-        let samples = self
-            .reader
-            .samples(bucket, series_id, i64::MIN, i64::MAX)
-            .await?;
-        self.stats.sample_miss_ms += t0.elapsed().as_millis() as u64;
+        let (wait_ms, load_ms);
+        let samples = if let Some(ref coord) = self.load_coordinator {
+            let (permit, wait) = coord.acquire_sample().await;
+            self.stats.sample_permit_acquires += 1;
+            wait_ms = wait.as_millis() as u64;
+            let t0 = std::time::Instant::now();
+            let s = self
+                .reader
+                .samples(bucket, series_id, i64::MIN, i64::MAX)
+                .await?;
+            load_ms = t0.elapsed().as_millis() as u64;
+            drop(permit);
+            s
+        } else {
+            wait_ms = 0;
+            let t0 = std::time::Instant::now();
+            let s = self
+                .reader
+                .samples(bucket, series_id, i64::MIN, i64::MAX)
+                .await?;
+            load_ms = t0.elapsed().as_millis() as u64;
+            s
+        };
+        self.stats.sample_queue_wait_ms += wait_ms;
+        self.stats.sample_load_ms += load_ms;
+        self.stats.sample_miss_ms += wait_ms + load_ms;
 
         self.stats.samples_loaded += samples.len() as u64;
 
@@ -699,11 +779,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
     /// Filter samples to (start_ms, end_ms] using binary search on sorted timestamps.
     /// Samples are sorted by timestamp_ms (storage invariant), so we use partition_point
     /// to find bounds in O(log n) instead of scanning the full vector.
-    fn filter_samples_binary_search(
-        samples: &[Sample],
-        start_ms: i64,
-        end_ms: i64,
-    ) -> Vec<Sample> {
+    fn filter_samples_binary_search(samples: &[Sample], start_ms: i64, end_ms: i64) -> Vec<Sample> {
         // Find first index where timestamp_ms > start_ms
         let lo = samples.partition_point(|s| s.timestamp_ms <= start_ms);
         // Find first index where timestamp_ms > end_ms
@@ -732,7 +808,8 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         key: SelectorKey,
         candidates: HashSet<SeriesId>,
     ) {
-        self.selector_cache.insert((bucket, key), Arc::new(candidates));
+        self.selector_cache
+            .insert((bucket, key), Arc::new(candidates));
     }
 
     /// Look up or compute series metadata (fingerprint + label map + sorted labels).
@@ -1168,6 +1245,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         }
     }
 
+    pub(crate) fn with_coordinator(reader: &'reader R, coordinator: ReadLoadCoordinator) -> Self {
+        Self {
+            reader: CachedQueryReader::with_coordinator(reader, coordinator),
+            preloaded_instant: HashMap::new(),
+            preload_eligible: true,
+        }
+    }
+
     /// Access aggregated evaluation statistics.
     pub(crate) fn stats(&self) -> &EvalStats {
         &self.reader.stats
@@ -1226,7 +1311,9 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         );
 
         // Fetch all series + samples for the full time range
-        let series_samples = self.fetch_series_samples(vs, earliest_ms, latest_ms).await?;
+        let series_samples = self
+            .fetch_series_samples(vs, earliest_ms, latest_ms)
+            .await?;
 
         let num_steps = ((eval_end_ms - eval_start_ms) / step_ms) as usize + 1;
         let mut preloaded_series = Vec::with_capacity(series_samples.len());
@@ -1741,8 +1828,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             let forward_index_view = self.reader.forward_index(bucket, &candidates_vec).await?;
 
             let mut bucket_sample_count: u64 = 0;
+
+            // Pass 1: Check sample cache, collect misses for parallel loading
+            let mut to_load: Vec<(SeriesId, Arc<SeriesMeta>)> = Vec::new();
             for series_id in &candidates_vec {
-                // Get series metadata from cache (Arc — cheap refcount bump)
                 let meta = match self.reader.get_or_insert_series_meta(
                     bucket,
                     *series_id,
@@ -1752,21 +1841,92 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     None => continue,
                 };
 
-                let samples = self
-                    .reader
-                    .samples(bucket, *series_id, range_start_ms, range_end_ms)
-                    .await?;
-
-                if samples.is_empty() {
-                    continue;
+                if let Some(cached_samples) = self.reader.cache.get_samples(bucket, series_id) {
+                    self.reader.stats.sample_loads += 1;
+                    self.reader.stats.sample_cache_hits += 1;
+                    let samples = CachedQueryReader::<R>::filter_samples_binary_search(
+                        cached_samples,
+                        range_start_ms,
+                        range_end_ms,
+                    );
+                    if !samples.is_empty() {
+                        bucket_sample_count += samples.len() as u64;
+                        let entry = series_samples
+                            .entry(meta.fingerprint)
+                            .or_insert_with(|| (Arc::clone(&meta.sorted_labels), Vec::new()));
+                        entry.1.extend(samples);
+                    }
+                } else {
+                    to_load.push((*series_id, meta));
                 }
+            }
 
-                bucket_sample_count += samples.len() as u64;
-                let entry = series_samples.entry(meta.fingerprint).or_insert_with(|| {
-                    (Arc::clone(&meta.sorted_labels), Vec::new())
-                });
+            // Pass 2: Parallel loading of cache misses
+            if !to_load.is_empty() {
+                const PER_QUERY_SAMPLE_CONCURRENCY: usize = 8;
 
-                entry.1.extend(samples);
+                let underlying_reader = self.reader.reader;
+                let coordinator = self.reader.load_coordinator.clone();
+
+                let load_results: Vec<_> = futures::stream::iter(to_load.into_iter())
+                    .map(|(series_id, meta)| {
+                        let coord = coordinator.clone();
+                        async move {
+                            let (wait_ms, _permit) = if let Some(ref c) = coord {
+                                let (permit, wait) = c.acquire_sample().await;
+                                (wait.as_millis() as u64, Some(permit))
+                            } else {
+                                (0, None)
+                            };
+                            let t0 = std::time::Instant::now();
+                            let result = underlying_reader
+                                .samples(bucket, series_id, i64::MIN, i64::MAX)
+                                .await;
+                            let load_ms = t0.elapsed().as_millis() as u64;
+                            drop(_permit);
+                            (series_id, meta, result, wait_ms, load_ms)
+                        }
+                    })
+                    .buffer_unordered(PER_QUERY_SAMPLE_CONCURRENCY)
+                    .collect()
+                    .await;
+
+                // Sequential post-processing: update cache, stats, and series_samples
+                for (series_id, meta, result, wait_ms, load_ms) in load_results {
+                    let all_samples =
+                        result.map_err(|e| EvaluationError::StorageError(e.to_string()))?;
+
+                    self.reader.stats.sample_misses += 1;
+                    self.reader.stats.sample_loads += 1;
+                    self.reader.stats.samples_loaded += all_samples.len() as u64;
+                    self.reader.stats.sample_queue_wait_ms += wait_ms;
+                    self.reader.stats.sample_load_ms += load_ms;
+                    self.reader.stats.sample_miss_ms += wait_ms + load_ms;
+                    if self.reader.load_coordinator.is_some() {
+                        self.reader.stats.sample_permit_acquires += 1;
+                    }
+                    self.reader.stats.parallel_sample_loads += 1;
+
+                    // Cache the full sample set
+                    self.reader
+                        .cache
+                        .cache_samples(*bucket, series_id, all_samples.clone());
+
+                    // Filter by requested time range
+                    let samples = CachedQueryReader::<R>::filter_samples_binary_search(
+                        &all_samples,
+                        range_start_ms,
+                        range_end_ms,
+                    );
+
+                    if !samples.is_empty() {
+                        bucket_sample_count += samples.len() as u64;
+                        let entry = series_samples
+                            .entry(meta.fingerprint)
+                            .or_insert_with(|| (Arc::clone(&meta.sorted_labels), Vec::new()));
+                        entry.1.extend(samples);
+                    }
+                }
             }
 
             let bucket_ms = bucket_start.elapsed().as_millis() as u64;
@@ -2026,8 +2186,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         );
         Ok(Timestamp::from_millis(ms))
     }
-
-
 
     async fn evaluate_call(
         &mut self,
@@ -2520,8 +2678,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     ) -> HashMap<Vec<(String, String)>, Vec<EvalSample>> {
         let mut groups: HashMap<Vec<(String, String)>, Vec<EvalSample>> = HashMap::new();
         for mut sample in samples {
-            let group_key =
-                Self::compute_grouping_key(&sample.labels, modifier, sample.drop_name);
+            let group_key = Self::compute_grouping_key(&sample.labels, modifier, sample.drop_name);
             // Materialize pending metric-name drops so __name__
             // doesn't incorrectly affect downstream label output.
             if sample.drop_name {
@@ -6367,6 +6524,214 @@ mod tests {
             assert_eq!(normalize_ranges(vec![(-5, 10)]), vec![(-5, 10)]);
             // Empty
             assert_eq!(normalize_ranges(vec![]), vec![]);
+        }
+    }
+
+    /// Tests that exercise the ReadLoadCoordinator integration with the evaluator.
+    mod load_coordinator_integration {
+        use super::*;
+        use crate::load_coordinator::ReadLoadCoordinator;
+        use crate::query::test_utils::MockMultiBucketQueryReaderBuilder;
+
+        /// Range query through Evaluator::with_coordinator produces correct results
+        /// and populates the new stats fields.
+        #[tokio::test]
+        async fn range_query_with_coordinator_populates_stats() {
+            let mut builder = MockMultiBucketQueryReaderBuilder::new();
+            let bucket = TimeBucket::hour(100);
+
+            // 3 series × 3 samples each → enough to exercise parallel loading
+            for env in ["prod", "staging", "dev"] {
+                for (ts, val) in [(5_700_000, 10.0), (6_000_000, 20.0), (6_300_000, 30.0)] {
+                    builder.add_sample(
+                        bucket,
+                        vec![
+                            Label {
+                                name: METRIC_NAME.to_string(),
+                                value: "http_requests".to_string(),
+                            },
+                            Label {
+                                name: "env".to_string(),
+                                value: env.to_string(),
+                            },
+                        ],
+                        MetricType::Gauge,
+                        Sample {
+                            timestamp_ms: ts,
+                            value: val,
+                        },
+                    );
+                }
+            }
+
+            let reader = builder.build();
+            let coordinator = ReadLoadCoordinator::new(4, 2);
+            let mut evaluator = Evaluator::with_coordinator(&reader, coordinator);
+
+            // Preload triggers fetch_series_samples → the parallel path
+            let eval_start_ms = 5_700_000i64;
+            let eval_end_ms = 6_300_000i64;
+            let step_ms = 300_000i64;
+            let lookback_delta_ms = 300_000i64;
+
+            let expr = promql_parser::parser::parse("http_requests").unwrap();
+            evaluator
+                .preload_for_range(
+                    &expr,
+                    eval_start_ms,
+                    eval_end_ms,
+                    step_ms,
+                    lookback_delta_ms,
+                )
+                .await
+                .unwrap();
+
+            let stats = evaluator.stats();
+
+            // Parallel path was used (samples weren't cached, so all are misses)
+            assert!(
+                stats.parallel_sample_loads > 0,
+                "expected parallel_sample_loads > 0, got {}",
+                stats.parallel_sample_loads
+            );
+
+            // Permit acquires should match parallel loads (coordinator was present)
+            assert_eq!(
+                stats.sample_permit_acquires, stats.parallel_sample_loads,
+                "permit acquires ({}) should equal parallel loads ({})",
+                stats.sample_permit_acquires, stats.parallel_sample_loads
+            );
+
+            // Load time decomposition is consistent
+            assert!(
+                stats.sample_load_ms + stats.sample_queue_wait_ms >= stats.sample_miss_ms
+                    || stats.sample_miss_ms
+                        <= stats.sample_load_ms + stats.sample_queue_wait_ms + 1,
+                "sample_load_ms ({}) + sample_queue_wait_ms ({}) should ≈ sample_miss_ms ({})",
+                stats.sample_load_ms,
+                stats.sample_queue_wait_ms,
+                stats.sample_miss_ms
+            );
+
+            // Metadata permits were acquired for forward_index loads
+            assert!(
+                stats.metadata_permit_acquires > 0,
+                "expected metadata_permit_acquires > 0, got {}",
+                stats.metadata_permit_acquires
+            );
+
+            // Now verify the results are still correct by evaluating a step
+            let query_time = UNIX_EPOCH + Duration::from_millis(6_300_000);
+            let stmt = EvalStmt {
+                expr,
+                start: query_time,
+                end: query_time,
+                interval: Duration::from_secs(0),
+                lookback_delta: Duration::from_millis(lookback_delta_ms as u64),
+            };
+            let result = evaluator.evaluate(stmt).await.unwrap();
+            if let ExprResult::InstantVector(samples) = result {
+                assert_eq!(samples.len(), 3, "expected 3 series");
+                for s in &samples {
+                    assert_eq!(s.value, 30.0, "expected latest sample value");
+                }
+            } else {
+                panic!("expected InstantVector");
+            }
+        }
+
+        /// Evaluator::new (no coordinator) still works and leaves coordinator stats at zero.
+        #[tokio::test]
+        async fn range_query_without_coordinator_leaves_stats_zeroed() {
+            let mut builder = MockMultiBucketQueryReaderBuilder::new();
+            let bucket = TimeBucket::hour(100);
+
+            builder.add_sample(
+                bucket,
+                vec![
+                    Label {
+                        name: METRIC_NAME.to_string(),
+                        value: "metric".to_string(),
+                    },
+                    Label {
+                        name: "k".to_string(),
+                        value: "v".to_string(),
+                    },
+                ],
+                MetricType::Gauge,
+                Sample {
+                    timestamp_ms: 6_000_000,
+                    value: 42.0,
+                },
+            );
+
+            let reader = builder.build();
+            let mut evaluator = Evaluator::new(&reader);
+
+            let expr = promql_parser::parser::parse("metric").unwrap();
+            evaluator
+                .preload_for_range(&expr, 5_700_000, 6_300_000, 300_000, 300_000)
+                .await
+                .unwrap();
+
+            let stats = evaluator.stats();
+            assert_eq!(stats.sample_permit_acquires, 0);
+            assert_eq!(stats.metadata_permit_acquires, 0);
+            // parallel_sample_loads is still populated (the buffer_unordered path
+            // runs regardless of coordinator presence)
+            assert!(stats.parallel_sample_loads > 0);
+        }
+
+        /// Cache hits bypass the parallel path — second preload for the same selector
+        /// should not increment parallel_sample_loads further.
+        #[tokio::test]
+        async fn cached_samples_skip_parallel_path() {
+            let mut builder = MockMultiBucketQueryReaderBuilder::new();
+            let bucket = TimeBucket::hour(100);
+
+            builder.add_sample(
+                bucket,
+                vec![
+                    Label {
+                        name: METRIC_NAME.to_string(),
+                        value: "metric".to_string(),
+                    },
+                    Label {
+                        name: "k".to_string(),
+                        value: "v".to_string(),
+                    },
+                ],
+                MetricType::Gauge,
+                Sample {
+                    timestamp_ms: 6_000_000,
+                    value: 1.0,
+                },
+            );
+
+            let reader = builder.build();
+            let coordinator = ReadLoadCoordinator::new(4, 2);
+            let mut evaluator = Evaluator::with_coordinator(&reader, coordinator);
+
+            let expr = promql_parser::parser::parse("metric").unwrap();
+
+            // First preload — cold
+            evaluator
+                .preload_for_range(&expr, 5_700_000, 6_300_000, 300_000, 300_000)
+                .await
+                .unwrap();
+            let after_first = evaluator.stats().parallel_sample_loads;
+            assert!(after_first > 0);
+
+            // Second preload — samples should be cached
+            evaluator
+                .preload_for_range(&expr, 5_700_000, 6_300_000, 300_000, 300_000)
+                .await
+                .unwrap();
+            let after_second = evaluator.stats().parallel_sample_loads;
+            assert_eq!(
+                after_first, after_second,
+                "parallel_sample_loads should not increase on cache hit"
+            );
         }
     }
 }

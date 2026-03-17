@@ -46,6 +46,7 @@
 mod delta;
 mod flusher;
 mod index;
+mod load_coordinator;
 mod minitsdb;
 mod promql;
 mod query;

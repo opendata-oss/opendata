@@ -13,6 +13,7 @@ use tracing::{Instrument, error};
 
 use crate::error::QueryError;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
+use crate::load_coordinator::ReadLoadCoordinator;
 use crate::minitsdb::{MiniQueryReader, MiniTsdb};
 use crate::model::{
     InstantSample, Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Sample,
@@ -106,6 +107,11 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
     /// Build a query reader spanning a set of disjoint ranges (seconds).
     async fn make_query_reader_for_ranges(&self, ranges: &[(i64, i64)]) -> Result<Self::QR>;
 
+    /// Optional load coordinator for I/O budgeting.
+    fn load_coordinator(&self) -> Option<&ReadLoadCoordinator> {
+        None
+    }
+
     // ── Provided: 5 default methods written once ──
 
     /// Evaluate an instant PromQL query, returning typed `InstantSample`s.
@@ -139,7 +145,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         let ranges = preload_ranges(&stmt, lookback_start_secs, query_time_secs);
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
-        evaluate_instant(&reader, stmt, query_time).await
+        evaluate_instant(&reader, stmt, query_time, self.load_coordinator()).await
     }
 
     /// Evaluate a range PromQL query, returning typed `RangeSample`s.
@@ -174,7 +180,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
-        evaluate_range(&reader, stmt).await
+        evaluate_range(&reader, stmt, self.load_coordinator()).await
     }
 
     /// Discover series matching any of the given selectors.
@@ -263,8 +269,13 @@ pub(crate) async fn evaluate_instant(
     reader: &impl QueryReader,
     stmt: EvalStmt,
     query_time: std::time::SystemTime,
+    coordinator: Option<&ReadLoadCoordinator>,
 ) -> std::result::Result<QueryValue, QueryError> {
-    let mut evaluator = Evaluator::new(reader);
+    let mut evaluator = if let Some(coord) = coordinator {
+        Evaluator::with_coordinator(reader, coord.clone())
+    } else {
+        Evaluator::new(reader)
+    };
     let result = evaluator.evaluate(stmt).await?;
 
     match result {
@@ -305,6 +316,7 @@ pub(crate) async fn evaluate_instant(
 pub(crate) async fn evaluate_range(
     reader: &impl QueryReader,
     stmt: EvalStmt,
+    coordinator: Option<&ReadLoadCoordinator>,
 ) -> std::result::Result<Vec<RangeSample>, QueryError> {
     let total_start = std::time::Instant::now();
     let start = stmt.start;
@@ -319,7 +331,11 @@ pub(crate) async fn evaluate_range(
     }
 
     let mut series_map: HashMap<Labels, Vec<(i64, f64)>> = HashMap::new();
-    let mut evaluator = Evaluator::new(reader);
+    let mut evaluator = if let Some(coord) = coordinator {
+        Evaluator::with_coordinator(reader, coord.clone())
+    } else {
+        Evaluator::new(reader)
+    };
 
     // Preload VectorSelector data for all steps
     let start_ms = start.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
@@ -410,6 +426,14 @@ pub(crate) async fn evaluate_range(
         // Per-bucket preload aggregates
         preload_bucket_ms_max = stats.preload_bucket_ms_max,
         preload_bucket_ms_sum = stats.preload_bucket_ms_sum,
+        // Load coordinator stats
+        sample_queue_wait_ms = stats.sample_queue_wait_ms,
+        sample_load_ms = stats.sample_load_ms,
+        sample_permit_acquires = stats.sample_permit_acquires,
+        metadata_queue_wait_ms = stats.metadata_queue_wait_ms,
+        metadata_load_ms = stats.metadata_load_ms,
+        metadata_permit_acquires = stats.metadata_permit_acquires,
+        parallel_sample_loads = stats.parallel_sample_loads,
         "evaluate_range complete"
     );
 
@@ -574,6 +598,8 @@ pub(crate) struct Tsdb {
 
     // Metadata catalog (keyed by metric name)
     pub(crate) metadata_catalog: RwLock<HashMap<String, Vec<MetricMetadata>>>,
+
+    load_coordinator: ReadLoadCoordinator,
 }
 
 impl Tsdb {
@@ -591,6 +617,7 @@ impl Tsdb {
             ingest_cache,
             query_cache,
             metadata_catalog: RwLock::new(HashMap::new()),
+            load_coordinator: ReadLoadCoordinator::from_env(),
         }
     }
 
@@ -849,6 +876,10 @@ impl TsdbReadEngine for Tsdb {
 
     async fn make_query_reader_for_ranges(&self, ranges: &[(i64, i64)]) -> Result<TsdbQueryReader> {
         self.query_reader_for_ranges(ranges).await
+    }
+
+    fn load_coordinator(&self) -> Option<&ReadLoadCoordinator> {
+        Some(&self.load_coordinator)
     }
 }
 

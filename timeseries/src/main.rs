@@ -4,6 +4,7 @@ mod delta;
 mod error;
 mod flusher;
 mod index;
+mod load_coordinator;
 mod minitsdb;
 mod model;
 #[cfg(feature = "otel")]
@@ -34,8 +35,7 @@ async fn main() {
     // Initialize tracing with configurable log level via RUST_LOG environment variable
     // Default to "info" if RUST_LOG is not set
     // LOG_FORMAT=json enables structured JSON output for analysis scripts
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let log_format = std::env::var("LOG_FORMAT").unwrap_or_default();
 
     if log_format.eq_ignore_ascii_case("json") {
