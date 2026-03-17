@@ -53,14 +53,22 @@ pub(crate) type EvalResult<T> = std::result::Result<T, EvaluationError>;
 #[derive(Debug, Default)]
 pub(crate) struct EvalStats {
     pub(crate) list_buckets_calls: u64,
+    pub(crate) list_buckets_misses: u64,
     pub(crate) selector_calls: u64,
+    pub(crate) selector_cache_hits: u64,
+    pub(crate) selector_misses: u64,
     pub(crate) forward_index_calls: u64,
     pub(crate) forward_index_cache_hits: u64,
+    pub(crate) forward_index_misses: u64,
     pub(crate) sample_loads: u64,
     pub(crate) sample_cache_hits: u64,
+    pub(crate) sample_misses: u64,
     pub(crate) samples_loaded: u64,
-    pub(crate) selector_cache_hits: u64,
     pub(crate) series_meta_cache_hits: u64,
+    pub(crate) series_meta_misses: u64,
+    pub(crate) preload_selectors: u64,
+    pub(crate) preload_series: u64,
+    pub(crate) preload_hits: u64,
 }
 
 /// Canonical key for caching selector results across steps.
@@ -381,6 +389,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         if let Some(ref buckets) = self.cached_buckets {
             return Ok(buckets.clone());
         }
+        self.stats.list_buckets_misses += 1;
         let buckets = self.reader.list_buckets().await?;
         self.cached_buckets = Some(buckets.clone());
         Ok(buckets)
@@ -399,6 +408,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             self.stats.forward_index_cache_hits += 1;
             Ok(cached_data)
         } else {
+            self.stats.forward_index_misses += 1;
             // Load from underlying reader
             let forward_index = self.reader.forward_index(bucket, &series_ids).await?;
 
@@ -473,6 +483,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         }
 
         // Not in cache, load from underlying reader with wide bounds to cache the whole bucket
+        self.stats.sample_misses += 1;
         let samples = self
             .reader
             .samples(bucket, series_id, i64::MIN, i64::MAX)
@@ -545,6 +556,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
                 Some(Arc::clone(entry.get()))
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
+                self.stats.series_meta_misses += 1;
                 let spec = forward_index_view.get_spec(&series_id)?;
                 let fingerprint = Self::compute_fingerprint_static(&spec.labels);
                 let mut sorted_labels = spec.labels;
@@ -1095,6 +1107,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 if let Some(cached) = self.reader.get_cached_selector(&bucket, &selector_key) {
                     cached
                 } else {
+                    self.reader.stats.selector_misses += 1;
                     let result =
                         evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
                             .await
@@ -1330,6 +1343,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 if let Some(cached) = self.reader.get_cached_selector(&bucket, &selector_key) {
                     cached
                 } else {
+                    self.reader.stats.selector_misses += 1;
                     let result =
                         evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
                             .await
@@ -1512,6 +1526,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 if let Some(cached) = self.reader.get_cached_selector(&bucket, &selector_key) {
                     cached
                 } else {
+                    self.reader.stats.selector_misses += 1;
                     let result =
                         evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
                             .await
