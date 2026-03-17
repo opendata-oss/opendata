@@ -87,6 +87,73 @@ impl SelectorKey {
     }
 }
 
+/// Structural key for preloaded instant vector data.
+/// Captures selector identity + time modifiers that affect which samples map to which steps.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PreloadKey {
+    selector: SelectorKey,
+    offset: Option<OffsetKey>,
+    at: Option<AtKey>,
+}
+
+impl PreloadKey {
+    fn from_selector(vs: &VectorSelector) -> Self {
+        Self {
+            selector: SelectorKey::from_selector(vs),
+            offset: vs.offset.as_ref().map(OffsetKey::from),
+            at: vs.at.as_ref().map(AtKey::from),
+        }
+    }
+}
+
+/// Hashable representation of Offset
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum OffsetKey {
+    Pos(i64),
+    Neg(i64),
+}
+
+impl From<&Offset> for OffsetKey {
+    fn from(offset: &Offset) -> Self {
+        match offset {
+            Offset::Pos(d) => OffsetKey::Pos(d.as_millis() as i64),
+            Offset::Neg(d) => OffsetKey::Neg(d.as_millis() as i64),
+        }
+    }
+}
+
+/// Hashable representation of AtModifier
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum AtKey {
+    At(i64),
+    Start,
+    End,
+}
+
+impl From<&AtModifier> for AtKey {
+    fn from(at: &AtModifier) -> Self {
+        match at {
+            AtModifier::At(t) => AtKey::At(Timestamp::from(*t).as_millis()),
+            AtModifier::Start => AtKey::Start,
+            AtModifier::End => AtKey::End,
+        }
+    }
+}
+
+/// Preloaded per-step evaluation data for a VectorSelector across a range query.
+struct PreloadedInstantData {
+    eval_start_ms: i64,
+    step_ms: i64,
+    series: Vec<PreloadedInstantSeries>,
+}
+
+struct PreloadedInstantSeries {
+    labels: HashMap<String, String>,
+    /// Dense array indexed by outer step number. values[i] = Some(Sample) if a
+    /// sample exists in the lookback window for that step, None otherwise.
+    values: Vec<Option<Sample>>,
+}
+
 /// Cached per-series metadata: fingerprint and canonical sorted labels.
 /// Computed once per (bucket, series_id), reused across all steps via Arc sharing.
 /// Label maps (HashMap<String, String>) are built on demand at output time, not cached,
@@ -355,6 +422,9 @@ fn select_k_indices_with_heap(
 
 pub(crate) struct Evaluator<'reader, R: QueryReader> {
     reader: CachedQueryReader<'reader, R>,
+    /// Preloaded per-step instant vector data for range queries.
+    /// Populated by preload_for_range() before the step loop.
+    preloaded_instant: HashMap<PreloadKey, PreloadedInstantData>,
 }
 
 /// A wrapper around QueryReader that uses QueryReaderEvalCache for caching
@@ -926,16 +996,167 @@ fn apply_time_modifiers_ms(
     adjusted
 }
 
+/// Walk the AST and collect references to all VectorSelectors.
+/// MatrixSelectors and Subqueries are skipped (not preloaded).
+fn collect_vector_selectors(expr: &Expr) -> Vec<&VectorSelector> {
+    let mut out = Vec::new();
+    collect_vector_selectors_inner(expr, &mut out);
+    out
+}
+
+fn collect_vector_selectors_inner<'a>(expr: &'a Expr, out: &mut Vec<&'a VectorSelector>) {
+    match expr {
+        Expr::VectorSelector(vs) => out.push(vs),
+        Expr::Aggregate(agg) => {
+            collect_vector_selectors_inner(&agg.expr, out);
+            if let Some(ref param) = agg.param {
+                collect_vector_selectors_inner(param, out);
+            }
+        }
+        Expr::Binary(b) => {
+            collect_vector_selectors_inner(&b.lhs, out);
+            collect_vector_selectors_inner(&b.rhs, out);
+        }
+        Expr::Paren(p) => collect_vector_selectors_inner(&p.expr, out),
+        Expr::Call(call) => {
+            for arg in &call.args.args {
+                collect_vector_selectors_inner(arg, out);
+            }
+        }
+        Expr::Unary(u) => collect_vector_selectors_inner(&u.expr, out),
+        // MatrixSelector: needs sample slices, not latest-value — not preloaded
+        // Subquery: has own step loop with different step params — not preloaded
+        Expr::MatrixSelector(_)
+        | Expr::Subquery(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::Extension(_) => {}
+    }
+}
+
 impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     pub(crate) fn new(reader: &'reader R) -> Self {
         Self {
             reader: CachedQueryReader::new(reader),
+            preloaded_instant: HashMap::new(),
         }
     }
 
     /// Access aggregated evaluation statistics.
     pub(crate) fn stats(&self) -> &EvalStats {
         &self.reader.stats
+    }
+
+    /// Preload VectorSelector data for all steps of a range query.
+    /// Must be called before the step loop. Walks the AST, deduplicates selectors,
+    /// and builds dense per-step sample arrays for O(1) per-step lookup.
+    pub(crate) async fn preload_for_range(
+        &mut self,
+        expr: &Expr,
+        eval_start_ms: i64,
+        eval_end_ms: i64,
+        step_ms: i64,
+        lookback_delta_ms: i64,
+    ) -> EvalResult<()> {
+        let selectors = collect_vector_selectors(expr);
+        // Deduplicate by PreloadKey
+        let mut seen = HashSet::new();
+        for vs in &selectors {
+            let key = PreloadKey::from_selector(vs);
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            self.preload_vector_selector(
+                vs,
+                eval_start_ms,
+                eval_end_ms,
+                step_ms,
+                lookback_delta_ms,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn preload_vector_selector(
+        &mut self,
+        vs: &VectorSelector,
+        eval_start_ms: i64,
+        eval_end_ms: i64,
+        step_ms: i64,
+        lookback_delta_ms: i64,
+    ) -> EvalResult<()> {
+        // Compute fetch range via selector_bounds
+        let (earliest_ms, latest_ms) = selector_bounds(
+            vs.at.as_ref(),
+            vs.offset.as_ref(),
+            eval_start_ms,
+            eval_end_ms,
+            eval_start_ms,
+            eval_end_ms,
+            lookback_delta_ms,
+        );
+
+        // Fetch all series + samples for the full time range
+        let series_samples = self.fetch_series_samples(vs, earliest_ms, latest_ms).await?;
+
+        let num_steps = ((eval_end_ms - eval_start_ms) / step_ms) as usize + 1;
+        let mut preloaded_series = Vec::with_capacity(series_samples.len());
+
+        for (_fp, (labels, samples)) in series_samples {
+            let mut values = Vec::with_capacity(num_steps);
+            let mut i = 0usize;
+            let mut last_valid: Option<&Sample> = None;
+
+            for step_idx in 0..num_steps {
+                let eval_ts_i = eval_start_ms + (step_idx as i64) * step_ms;
+
+                // Per-step instant stmt sets query_start = query_end = eval_ts
+                let adjusted_ts = apply_time_modifiers_ms(
+                    vs.at.as_ref(),
+                    vs.offset.as_ref(),
+                    eval_ts_i,
+                    eval_ts_i,
+                    eval_ts_i,
+                );
+                let lookback_start = adjusted_ts - lookback_delta_ms;
+
+                while i < samples.len() && samples[i].timestamp_ms <= adjusted_ts {
+                    last_valid = Some(&samples[i]);
+                    i += 1;
+                }
+
+                if let Some(sample) = last_valid {
+                    if sample.timestamp_ms > lookback_start {
+                        values.push(Some(Sample {
+                            timestamp_ms: sample.timestamp_ms,
+                            value: sample.value,
+                        }));
+                    } else {
+                        values.push(None);
+                    }
+                } else {
+                    values.push(None);
+                }
+            }
+
+            preloaded_series.push(PreloadedInstantSeries { labels, values });
+        }
+
+        self.reader.stats.preload_selectors += 1;
+        self.reader.stats.preload_series += preloaded_series.len() as u64;
+
+        let key = PreloadKey::from_selector(vs);
+        self.preloaded_instant.insert(
+            key,
+            PreloadedInstantData {
+                eval_start_ms,
+                step_ms,
+                series: preloaded_series,
+            },
+        );
+
+        Ok(())
     }
 
     pub(crate) async fn evaluate(&mut self, stmt: EvalStmt) -> EvalResult<ExprResult> {
