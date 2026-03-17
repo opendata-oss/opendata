@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 
-use super::evaluator::{EvalResult, EvalSample, EvalSamples};
+use super::evaluator::{EvalLabels, EvalResult, EvalSample, EvalSamples};
 use crate::{model::Sample, promql::evaluator::EvaluationError};
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::Expr;
@@ -315,14 +315,13 @@ fn is_valid_label_name(label: &str) -> bool {
     !label.is_empty()
 }
 
-fn output_labelset_key(labels: &HashMap<String, String>, drop_name: bool) -> Vec<(String, String)> {
-    let mut key: Vec<(String, String)> = labels
+fn output_labelset_key(labels: &EvalLabels, drop_name: bool) -> Vec<(String, String)> {
+    // Labels are already sorted, so output is sorted — no sort step needed.
+    labels
         .iter()
-        .filter(|(name, _)| !drop_name || name.as_str() != METRIC_NAME)
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect();
-    key.sort_unstable();
-    key
+        .filter(|l| !drop_name || l.name != METRIC_NAME)
+        .map(|l| (l.name.clone(), l.value.clone()))
+        .collect()
 }
 
 fn extract_string_arg(expr: &Expr, function_name: &str, arg_index: usize) -> EvalResult<String> {
@@ -486,7 +485,11 @@ impl PromQLFunction for LabelReplaceFunction {
             .map_err(|err| EvaluationError::InternalError(err.to_string()))?;
 
         for sample in &mut samples {
-            let src_value = sample.labels.get(&src_label).cloned().unwrap_or_default();
+            let src_value = sample
+                .labels
+                .get(&src_label)
+                .unwrap_or("")
+                .to_string();
 
             if let Some(captures) = regex.captures(&src_value) {
                 let mut replaced = String::new();
@@ -557,7 +560,7 @@ impl PromQLFunction for LabelJoinFunction {
                 if index > 0 {
                     joined.push_str(&separator);
                 }
-                if let Some(value) = sample.labels.get(src_label) {
+                if let Some(value) = sample.labels.get(src_label.as_str()) {
                     joined.push_str(value);
                 }
             }
@@ -783,7 +786,7 @@ impl PromQLFunction for AbsentFunction {
             Ok(vec![EvalSample {
                 timestamp_ms: eval_timestamp_ms,
                 value: 1.0,
-                labels: HashMap::new(),
+                labels: EvalLabels::Owned(Vec::new()),
                 drop_name: false,
             }])
         } else {
@@ -813,7 +816,7 @@ impl PromQLFunction for PiFunction {
         Ok(vec![EvalSample {
             timestamp_ms: eval_timestamp_ms,
             value: std::f64::consts::PI,
-            labels: HashMap::new(),
+            labels: EvalLabels::Owned(Vec::new()),
             drop_name: false,
         }])
     }
@@ -834,7 +837,7 @@ impl PromQLFunction for ScalarFunction {
         Ok(vec![EvalSample {
             timestamp_ms: eval_timestamp_ms,
             value,
-            labels: HashMap::new(),
+            labels: EvalLabels::Owned(Vec::new()),
             drop_name: false,
         }])
     }
@@ -859,7 +862,7 @@ impl PromQLFunction for TimeFunction {
         Ok(vec![EvalSample {
             timestamp_ms: eval_timestamp_ms,
             value: eval_timestamp_ms as f64 / 1000.0,
-            labels: HashMap::new(),
+            labels: EvalLabels::Owned(Vec::new()),
             drop_name: false,
         }])
     }
@@ -977,7 +980,7 @@ impl PromQLFunction for DateTimeFunction {
                 value: datetime_from_millis(eval_timestamp_ms)
                     .map(|dt| self.sample_value(dt))
                     .unwrap_or(f64::NAN),
-                labels: HashMap::new(),
+                labels: EvalLabels::Owned(Vec::new()),
                 drop_name: false,
             }]),
             1 => self.apply(
@@ -1228,7 +1231,7 @@ impl PromQLFunction for VectorFunction {
         Ok(vec![EvalSample {
             timestamp_ms: eval_timestamp_ms,
             value: arg.into_scalar()?,
-            labels: HashMap::new(),
+            labels: EvalLabels::Owned(Vec::new()),
             drop_name: false,
         }])
     }
@@ -1241,7 +1244,6 @@ mod tests {
     use promql_parser::label::METRIC_NAME;
     use promql_parser::parser::{Expr, ParenExpr, StringLiteral};
     use rstest::rstest;
-    use std::collections::HashMap;
 
     // ========================================================================
     // Test helpers
@@ -1299,7 +1301,7 @@ mod tests {
         EvalSample {
             timestamp_ms: 1000,
             value,
-            labels: HashMap::new(),
+            labels: EvalLabels::Owned(Vec::new()),
             drop_name: false,
         }
     }
@@ -1308,10 +1310,7 @@ mod tests {
         EvalSample {
             timestamp_ms: 1000,
             value,
-            labels: labels
-                .iter()
-                .map(|(name, value)| (name.to_string(), value.to_string()))
-                .collect(),
+            labels: EvalLabels::from_pairs(labels),
             drop_name: false,
         }
     }
@@ -1509,11 +1508,11 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(
             result[0].labels.get("dst"),
-            Some(&"destination-value-10".to_string())
+            Some("destination-value-10")
         );
         assert_eq!(
             result[1].labels.get("dst"),
-            Some(&"destination-value-20".to_string())
+            Some("destination-value-20")
         );
     }
 
@@ -1548,7 +1547,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(result[0].labels.get("dst"), Some(&"matched".to_string()));
+        assert_eq!(result[0].labels.get("dst"), Some("matched"));
     }
 
     #[test]
@@ -1588,7 +1587,7 @@ mod tests {
 
         assert_eq!(
             result[0].labels.get("dst"),
-            Some(&"original-destination-value".to_string())
+            Some("original-destination-value")
         );
     }
 
@@ -1622,7 +1621,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(!result[0].labels.contains_key("dst"));
+        assert!(result[0].labels.get("dst").is_none());
     }
 
     #[test]
@@ -1658,7 +1657,7 @@ mod tests {
 
         assert_eq!(
             result[0].labels.get("\u{00ff}"),
-            Some(&"value-10".to_string())
+            Some("value-10")
         );
     }
 
@@ -1778,8 +1777,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(result[0].labels.get("dst"), Some(&"a-b-c".to_string()));
-        assert_eq!(result[1].labels.get("dst"), Some(&"d-e-f".to_string()));
+        assert_eq!(result[0].labels.get("dst"), Some("a-b-c"));
+        assert_eq!(result[1].labels.get("dst"), Some("d-e-f"));
     }
 
     #[test]
@@ -1811,7 +1810,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(!result[0].labels.contains_key("dst"));
+        assert!(result[0].labels.get("dst").is_none());
     }
 
     #[test]
@@ -1915,7 +1914,7 @@ mod tests {
 
         assert_eq!(
             result[0].labels.get(METRIC_NAME),
-            Some(&"rate_metric_total".to_string())
+            Some("rate_metric_total")
         );
         assert!(!result[0].drop_name);
     }
@@ -1948,7 +1947,7 @@ mod tests {
 
         assert_eq!(
             result[0].labels.get(METRIC_NAME),
-            Some(&"metric_total_1".to_string())
+            Some("metric_total_1")
         );
         assert!(!result[0].drop_name);
     }
@@ -2338,10 +2337,7 @@ mod tests {
         let samples = vec![EvalSample {
             timestamp_ms: 10_000,
             value: 123.0,
-            labels: HashMap::from([
-                (METRIC_NAME.to_string(), "metric".to_string()),
-                ("job".to_string(), "api".to_string()),
-            ]),
+            labels: EvalLabels::from_pairs(&[(METRIC_NAME, "metric"), ("job", "api")]),
             drop_name: false,
         }];
 
@@ -2354,9 +2350,9 @@ mod tests {
         assert_eq!(result[0].timestamp_ms, 600_000);
         assert_eq!(
             result[0].labels.get(METRIC_NAME),
-            Some(&"metric".to_string())
+            Some("metric")
         );
-        assert_eq!(result[0].labels.get("job"), Some(&"api".to_string()));
+        assert_eq!(result[0].labels.get("job"), Some("api"));
         assert!(result[0].drop_name);
     }
 
@@ -2380,9 +2376,9 @@ mod tests {
         assert_eq!(result[0].timestamp_ms, 600_000);
         assert_eq!(
             result[0].labels.get(METRIC_NAME),
-            Some(&"metric".to_string())
+            Some("metric")
         );
-        assert_eq!(result[0].labels.get("job"), Some(&"api".to_string()));
+        assert_eq!(result[0].labels.get("job"), Some("api"));
         assert!(result[0].drop_name);
     }
 
@@ -2396,7 +2392,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].value, 1970.0);
         assert_eq!(result[0].timestamp_ms, 0);
-        assert_eq!(result[0].labels, HashMap::new());
+        assert_eq!(result[0].labels, EvalLabels::Owned(Vec::new()));
         assert!(!result[0].drop_name);
     }
 
@@ -2448,7 +2444,7 @@ mod tests {
 
     fn create_eval_samples(
         values: Vec<(i64, f64)>,
-        labels: HashMap<String, String>,
+        labels: EvalLabels,
     ) -> EvalSamples {
         let values = values
             .into_iter()
@@ -2462,8 +2458,7 @@ mod tests {
         let registry = FunctionRegistry::new();
         let func = registry.get_range_function("rate").unwrap();
 
-        let mut labels = HashMap::new();
-        labels.insert("job".to_string(), "test".to_string());
+        let labels = EvalLabels::from_pairs(&[("job", "test")]);
 
         // Create sample series with increasing counter values
         let samples = vec![create_eval_samples(
@@ -2492,7 +2487,7 @@ mod tests {
 
         let samples = vec![create_eval_samples(
             vec![(1000, 1.0), (2000, 2.0), (3000, 3.0)],
-            HashMap::new(),
+            EvalLabels::Owned(Vec::new()),
         )];
 
         // when
@@ -2511,7 +2506,7 @@ mod tests {
 
         let samples = vec![create_eval_samples(
             vec![(1000, 10.0), (2000, 20.0), (3000, 30.0)],
-            HashMap::new(),
+            EvalLabels::Owned(Vec::new()),
         )];
 
         // when
@@ -2530,7 +2525,7 @@ mod tests {
 
         let samples = vec![create_eval_samples(
             vec![(1000, 10.0), (2000, 5.0), (3000, 30.0)],
-            HashMap::new(),
+            EvalLabels::Owned(Vec::new()),
         )];
 
         // when
@@ -2549,7 +2544,7 @@ mod tests {
 
         let samples = vec![create_eval_samples(
             vec![(1000, 10.0), (2000, 50.0), (3000, 30.0)],
-            HashMap::new(),
+            EvalLabels::Owned(Vec::new()),
         )];
 
         // when
@@ -2568,7 +2563,7 @@ mod tests {
 
         let samples = vec![create_eval_samples(
             vec![(1000, 10.0), (2000, 20.0), (3000, 30.0), (4000, 40.0)],
-            HashMap::new(),
+            EvalLabels::Owned(Vec::new()),
         )];
 
         // when
@@ -2591,7 +2586,7 @@ mod tests {
         // Stddev: sqrt(125) ≈ 11.180339887498949
         let samples = vec![create_eval_samples(
             vec![(1000, 10.0), (2000, 20.0), (3000, 30.0), (4000, 40.0)],
-            HashMap::new(),
+            EvalLabels::Owned(Vec::new()),
         )];
 
         // when
@@ -2613,7 +2608,7 @@ mod tests {
         // Variance: 125
         let samples = vec![create_eval_samples(
             vec![(1000, 10.0), (2000, 20.0), (3000, 30.0), (4000, 40.0)],
-            HashMap::new(),
+            EvalLabels::Owned(Vec::new()),
         )];
 
         // when
@@ -2630,7 +2625,7 @@ mod tests {
         let registry = FunctionRegistry::new();
         let func = registry.get_range_function("stddev_over_time").unwrap();
 
-        let samples = vec![create_eval_samples(vec![(1000, 42.0)], HashMap::new())];
+        let samples = vec![create_eval_samples(vec![(1000, 42.0)], EvalLabels::Owned(Vec::new()))];
 
         // when
         let result = func.apply(samples, 1000).unwrap();
@@ -2647,7 +2642,7 @@ mod tests {
         let registry = FunctionRegistry::new();
         let func = registry.get_range_function("stddev_over_time").unwrap();
 
-        let samples = vec![create_eval_samples(vec![], HashMap::new())];
+        let samples = vec![create_eval_samples(vec![], EvalLabels::Owned(Vec::new()))];
 
         // when
         let result = func.apply(samples, 1000).unwrap();
@@ -2663,7 +2658,7 @@ mod tests {
         let registry = FunctionRegistry::new();
         let func = registry.get_range_function("stdvar_over_time").unwrap();
 
-        let samples = vec![create_eval_samples(vec![], HashMap::new())];
+        let samples = vec![create_eval_samples(vec![], EvalLabels::Owned(Vec::new()))];
 
         // when
         let result = func.apply(samples, 1000).unwrap();
@@ -2749,7 +2744,7 @@ mod tests {
 
         let samples = vec![create_eval_samples(
             vec![(1000, 5.0), (2000, 5.0), (3000, 5.0), (4000, 5.0)],
-            HashMap::new(),
+            EvalLabels::Owned(Vec::new()),
         )];
 
         // when
@@ -2780,7 +2775,7 @@ mod tests {
                 (3000, base + 2.0),
                 (4000, base + 3.0),
             ],
-            HashMap::new(),
+            EvalLabels::Owned(Vec::new()),
         )];
 
         // when
@@ -2808,7 +2803,7 @@ mod tests {
 
         let samples = vec![create_eval_samples(
             vec![(1000, 10.0), (2000, f64::NAN), (3000, 30.0)],
-            HashMap::new(),
+            EvalLabels::Owned(Vec::new()),
         )];
 
         // when
@@ -2830,7 +2825,7 @@ mod tests {
 
         let samples = vec![create_eval_samples(
             vec![(1000, 10.0), (2000, f64::NAN), (3000, 30.0)],
-            HashMap::new(),
+            EvalLabels::Owned(Vec::new()),
         )];
 
         // when
@@ -2849,7 +2844,7 @@ mod tests {
         let registry = FunctionRegistry::new();
         let func = registry.get_range_function("rate").unwrap();
 
-        let labels = HashMap::new();
+        let labels = EvalLabels::Owned(Vec::new());
 
         // Create sample series with counter reset (value goes down)
         let samples = vec![create_eval_samples(
@@ -2873,7 +2868,7 @@ mod tests {
         let func = registry.get_range_function("rate").unwrap();
 
         // Create sample series with only one point
-        let samples = vec![create_eval_samples(vec![(1000, 100.0)], HashMap::new())];
+        let samples = vec![create_eval_samples(vec![(1000, 100.0)], EvalLabels::Owned(Vec::new()))];
 
         let result = func.apply(samples, 1000).unwrap();
 
@@ -3032,7 +3027,7 @@ mod tests {
 
         let samples = vec![create_eval_samples(
             vec![(1000, f64::NAN), (2000, 5.0)],
-            HashMap::new(),
+            EvalLabels::Owned(Vec::new()),
         )];
 
         let result = func.apply(samples, 2000).unwrap();
@@ -3049,7 +3044,7 @@ mod tests {
 
         let samples = vec![create_eval_samples(
             vec![(1000, f64::NAN), (2000, 5.0)],
-            HashMap::new(),
+            EvalLabels::Owned(Vec::new()),
         )];
 
         let result = func.apply(samples, 2000).unwrap();
@@ -3066,7 +3061,7 @@ mod tests {
 
         let samples = vec![create_eval_samples(
             vec![(1000, f64::NAN), (2000, f64::NAN)],
-            HashMap::new(),
+            EvalLabels::Owned(Vec::new()),
         )];
 
         let result = func.apply(samples, 2000).unwrap();
@@ -3087,7 +3082,7 @@ mod tests {
 
         let samples = vec![create_eval_samples(
             vec![(1000, f64::NAN), (2000, f64::NAN)],
-            HashMap::new(),
+            EvalLabels::Owned(Vec::new()),
         )];
 
         let result = func.apply(samples, 2000).unwrap();
@@ -3144,7 +3139,7 @@ mod tests {
 
                 let samples = vec![create_eval_samples(
                     values.iter().enumerate().map(|(i, &v)| ((i as i64) * 1000, v)).collect(),
-                    HashMap::new(),
+                    EvalLabels::Owned(Vec::new()),
                 )];
 
                 let result = func.apply(samples, 0).unwrap();
@@ -3182,7 +3177,7 @@ mod tests {
 
                 let samples = vec![create_eval_samples(
                     values.iter().enumerate().map(|(i, &v)| ((i as i64) * 1000, v)).collect(),
-                    HashMap::new(),
+                    EvalLabels::Owned(Vec::new()),
                 )];
 
                 let result = func.apply(samples, 0).unwrap();
@@ -3220,7 +3215,7 @@ mod tests {
 
                 let samples = vec![create_eval_samples(
                     values.iter().enumerate().map(|(i, &v)| ((i as i64) * 1000, v)).collect(),
-                    HashMap::new(),
+                    EvalLabels::Owned(Vec::new()),
                 )];
 
                 let result = func.apply(samples, 0).unwrap();
@@ -3240,7 +3235,7 @@ mod tests {
 
                 let samples = vec![create_eval_samples(
                     values.iter().enumerate().map(|(i, &v)| ((i as i64) * 1000, v)).collect(),
-                    HashMap::new(),
+                    EvalLabels::Owned(Vec::new()),
                 )];
 
                 let result = func.apply(samples, 0).unwrap();
@@ -3260,7 +3255,7 @@ mod tests {
 
                 let samples = vec![create_eval_samples(
                     values.iter().enumerate().map(|(i, &v)| ((i as i64) * 1000, v)).collect(),
-                    HashMap::new(),
+                    EvalLabels::Owned(Vec::new()),
                 )];
 
                 let result = func.apply(samples, 0).unwrap();
@@ -3280,7 +3275,7 @@ mod tests {
 
                 let eval_samples = vec![create_eval_samples(
                     values.iter().enumerate().map(|(i, &v)| ((i as i64) * 1000, v)).collect(),
-                    HashMap::new(),
+                    EvalLabels::Owned(Vec::new()),
                 )];
 
                 let result = func.apply(eval_samples, 0).unwrap();
@@ -3315,7 +3310,7 @@ mod tests {
 
                 let eval_samples = vec![create_eval_samples(
                     values.iter().enumerate().map(|(i, &v)| ((i as i64) * 1000, v)).collect(),
-                    HashMap::new(),
+                    EvalLabels::Owned(Vec::new()),
                 )];
 
                 let result = func.apply(eval_samples, 0).unwrap();
@@ -3354,7 +3349,7 @@ mod tests {
 
                 let samples = vec![create_eval_samples(
                     values.iter().enumerate().map(|(i, &v)| ((i as i64) * 1000, v)).collect(),
-                    HashMap::new(),
+                    EvalLabels::Owned(Vec::new()),
                 )];
 
                 let result = func.apply(samples, 0).unwrap();

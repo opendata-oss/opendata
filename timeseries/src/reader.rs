@@ -159,6 +159,7 @@ impl TimeSeriesDbReader {
     pub async fn open(config: ReaderConfig) -> Result<Self> {
         let reader_options = slatedb::config::DbReaderOptions {
             manifest_poll_interval: config.refresh_interval,
+            checkpoint_lifetime: config.refresh_interval * 3,
             ..Default::default()
         };
 
@@ -537,7 +538,7 @@ mod tests {
         // 2. Open reader via the public API (exercises create_storage_read + DbReader)
         let reader = TimeSeriesDbReader::open(ReaderConfig {
             storage: storage_config.clone(),
-            refresh_interval: Duration::from_millis(100),
+            refresh_interval: Duration::from_secs(1),
             ..Default::default()
         })
         .await

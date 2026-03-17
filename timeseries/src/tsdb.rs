@@ -279,7 +279,7 @@ pub(crate) async fn evaluate_instant(
             samples
                 .into_iter()
                 .map(|s| InstantSample {
-                    labels: Labels::from(s.labels),
+                    labels: s.labels.into_labels(),
                     timestamp_ms: s.timestamp_ms,
                     value: s.value,
                 })
@@ -289,7 +289,7 @@ pub(crate) async fn evaluate_instant(
             samples
                 .into_iter()
                 .map(|s| RangeSample {
-                    labels: Labels::from(s.labels),
+                    labels: s.labels.into_labels(),
                     samples: s
                         .values
                         .into_iter()
@@ -348,7 +348,7 @@ pub(crate) async fn evaluate_range(
         match result {
             ExprResult::InstantVector(samples) => {
                 for sample in samples {
-                    let labels = Labels::from(sample.labels);
+                    let labels = sample.labels.into_labels();
                     series_map
                         .entry(labels)
                         .or_default()
@@ -913,7 +913,7 @@ impl QueryReader for TsdbQueryReader {
 mod tests {
     use super::*;
     use crate::model::MetricType;
-    use crate::promql::evaluator::EvalSample;
+    use crate::promql::evaluator::{EvalLabels, EvalSample};
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
     use common::storage::in_memory::InMemoryStorage;
     use opendata_macros::storage_test;
@@ -1223,11 +1223,11 @@ mod tests {
             );
 
             // env=prod
-            assert_eq!(results[0].labels.get("env"), Some(&"prod".to_string()));
+            assert_eq!(results[0].labels.get("env"), Some("prod"));
             assert_approx_eq(results[0].value, expected_prod_values[i]);
 
             // env=staging
-            assert_eq!(results[1].labels.get("env"), Some(&"staging".to_string()));
+            assert_eq!(results[1].labels.get("env"), Some("staging"));
             assert_approx_eq(results[1].value, expected_staging_values[i]);
         }
     }
@@ -1314,10 +1314,7 @@ mod tests {
         let expected = vec![EvalSample {
             timestamp_ms: 7_900_000,
             value: 3.0,
-            labels: [("a", "c"), ("x", "z"), ("__name__", "foo")]
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
+            labels: EvalLabels::from_pairs(&[("a", "c"), ("x", "z"), ("__name__", "foo")]),
             drop_name: false,
         }];
         assert_eq!(results, expected);

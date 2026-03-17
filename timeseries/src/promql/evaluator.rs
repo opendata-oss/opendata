@@ -148,7 +148,7 @@ struct PreloadedInstantData {
 }
 
 struct PreloadedInstantSeries {
-    labels: HashMap<String, String>,
+    labels: Arc<[Label]>,
     /// Dense array indexed by outer step number. values[i] = Some(Sample) if a
     /// sample exists in the lookback window for that step, None otherwise.
     values: Vec<Option<Sample>>,
@@ -156,17 +156,17 @@ struct PreloadedInstantSeries {
 
 /// Cached per-series metadata: fingerprint and canonical sorted labels.
 /// Computed once per (bucket, series_id), reused across all steps via Arc sharing.
-/// Label maps (HashMap<String, String>) are built on demand at output time, not cached,
-/// because most steps don't emit output for most series.
+/// Labels are shared via Arc and wrapped in EvalLabels at output time — no string cloning.
+/// Most steps don't emit output for most series.
 pub(crate) struct SeriesMeta {
     pub(crate) fingerprint: SeriesFingerprint,
-    pub(crate) sorted_labels: Arc<Vec<Label>>,
+    pub(crate) sorted_labels: Arc<[Label]>,
 }
 
 /// Type alias for complex HashMap used in matrix selector evaluation.
-/// Maps from label key (Arc-wrapped sorted vector of label pairs) to samples vector.
+/// Maps from label key (Arc-wrapped sorted slice of label pairs) to samples vector.
 /// Arc key enables cheap insertion from cached SeriesMeta without cloning the label vec.
-type SeriesMap = HashMap<Arc<Vec<Label>>, Vec<Sample>>;
+type SeriesMap = HashMap<Arc<[Label]>, Vec<Sample>>;
 
 pub(crate) struct QueryReaderBucketEvalCache {
     // Map from terms (series_ids for forward, labels for inverted) to cached results
@@ -309,19 +309,124 @@ impl InvertedIndexLookup for CachedInvertedIndex {
     }
 }
 
+/// Cheap-to-clone label container for evaluator internals.
+///
+/// Storage provides labels as `Arc<[Label]>` (sorted). The `Shared` variant
+/// wraps that Arc directly — cloning is an atomic refcount bump. Mutation
+/// (remove/insert/retain) promotes to `Owned`, which copies the vec once.
+#[derive(Debug, Clone)]
+pub(crate) enum EvalLabels {
+    /// Shared immutable labels from storage. Clone = O(1) refcount bump.
+    Shared(Arc<[Label]>),
+    /// Owned mutable sorted labels, materialized on first mutation.
+    Owned(Vec<Label>),
+}
+
+impl EvalLabels {
+    /// Binary search on the sorted label slice.
+    pub(crate) fn get(&self, key: &str) -> Option<&str> {
+        let slice = self.as_slice();
+        slice
+            .binary_search_by(|l| l.name.as_str().cmp(key))
+            .ok()
+            .map(|i| slice[i].value.as_str())
+    }
+
+    /// Remove a label by name. Promotes Shared→Owned if needed.
+    pub(crate) fn remove(&mut self, key: &str) {
+        self.make_owned();
+        if let EvalLabels::Owned(vec) = self {
+            if let Ok(i) = vec.binary_search_by(|l| l.name.as_str().cmp(key)) {
+                vec.remove(i);
+            }
+        }
+    }
+
+    /// Insert or update a label. Maintains sort order. Promotes Shared→Owned.
+    pub(crate) fn insert(&mut self, key: String, value: String) {
+        self.make_owned();
+        if let EvalLabels::Owned(vec) = self {
+            match vec.binary_search_by(|l| l.name.as_str().cmp(key.as_str())) {
+                Ok(i) => vec[i].value = value,
+                Err(i) => vec.insert(i, Label { name: key, value }),
+            }
+        }
+    }
+
+    /// Retain only labels matching the predicate. Promotes Shared→Owned.
+    pub(crate) fn retain(&mut self, f: impl FnMut(&Label) -> bool) {
+        self.make_owned();
+        if let EvalLabels::Owned(vec) = self {
+            vec.retain(f);
+        }
+    }
+
+    /// Returns true if there are no labels.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
+    /// Iterate over labels (sorted order in both variants).
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Label> {
+        self.as_slice().iter()
+    }
+
+    /// Convert into `Labels` for the output boundary. Both variants are
+    /// already sorted, so `Labels::new()` does no extra work.
+    pub(crate) fn into_labels(self) -> crate::model::Labels {
+        match self {
+            EvalLabels::Shared(arc) => crate::model::Labels::new(arc.to_vec()),
+            EvalLabels::Owned(vec) => crate::model::Labels::new(vec),
+        }
+    }
+
+    /// Construct from pairs (for tests). Sorts on construction.
+    #[cfg(test)]
+    pub(crate) fn from_pairs(pairs: &[(&str, &str)]) -> Self {
+        let mut vec: Vec<Label> = pairs
+            .iter()
+            .map(|(k, v)| Label {
+                name: k.to_string(),
+                value: v.to_string(),
+            })
+            .collect();
+        vec.sort();
+        EvalLabels::Owned(vec)
+    }
+
+    fn as_slice(&self) -> &[Label] {
+        match self {
+            EvalLabels::Shared(arc) => arc,
+            EvalLabels::Owned(vec) => vec,
+        }
+    }
+
+    fn make_owned(&mut self) {
+        if let EvalLabels::Shared(arc) = self {
+            *self = EvalLabels::Owned(arc.to_vec());
+        }
+    }
+}
+
+impl PartialEq for EvalLabels {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
 // ToDo(cadonna): Add histogram samples
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvalSample {
     pub(crate) timestamp_ms: i64,
     pub(crate) value: f64,
-    pub(crate) labels: HashMap<String, String>,
+    pub(crate) labels: EvalLabels,
     pub(crate) drop_name: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvalSamples {
     pub(crate) values: Vec<Sample>,
-    pub(crate) labels: HashMap<String, String>,
+    pub(crate) labels: EvalLabels,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -637,7 +742,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
                 sorted_labels.sort();
                 let meta = Arc::new(SeriesMeta {
                     fingerprint,
-                    sorted_labels: Arc::new(sorted_labels),
+                    sorted_labels: Arc::from(sorted_labels),
                 });
                 entry.insert(Arc::clone(&meta));
                 Some(meta)
@@ -1412,13 +1517,9 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         let mut range_vector = Vec::new();
         for (labels, values) in series_map {
-            let labels_map: HashMap<String, String> = labels
-                .iter()
-                .map(|l| (l.name.clone(), l.value.clone()))
-                .collect();
             range_vector.push(EvalSamples {
                 values,
-                labels: labels_map,
+                labels: EvalLabels::Shared(labels),
             });
         }
 
@@ -1524,16 +1625,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             };
 
             for sample in samples {
-                let mut labels_key: Vec<Label> = sample
-                    .labels
-                    .iter()
-                    .map(|(k, v)| Label {
-                        name: k.clone(),
-                        value: v.clone(),
-                    })
-                    .collect();
-                labels_key.sort();
-
+                // Labels are already sorted in EvalLabels — clone into key directly.
+                let labels_key: Vec<Label> = sample.labels.iter().cloned().collect();
                 let values = series_map.entry(labels_key).or_default();
                 values.push(Sample {
                     timestamp_ms: current_time_ms,
@@ -1546,8 +1639,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         let mut range_vector = Vec::new();
         for (labels, values) in series_map {
-            let labels = self.labels_to_hashmap(&labels);
-            range_vector.push(EvalSamples { values, labels });
+            range_vector.push(EvalSamples {
+                values,
+                labels: EvalLabels::Owned(labels),
+            });
         }
 
         Ok(ExprResult::RangeVector(range_vector))
@@ -1592,7 +1687,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         vector_selector: &VectorSelector,
         range_start_ms: i64,
         range_end_ms: i64,
-    ) -> EvalResult<HashMap<SeriesFingerprint, (HashMap<String, String>, Vec<Sample>)>> {
+    ) -> EvalResult<HashMap<SeriesFingerprint, (Arc<[Label]>, Vec<Sample>)>> {
         let mut buckets = self.reader.list_buckets().await?;
         buckets.sort_by(|a, b| b.start.cmp(&a.start));
 
@@ -1643,13 +1738,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 }
 
                 let entry = series_samples.entry(meta.fingerprint).or_insert_with(|| {
-                    // Build label_map only once per series, at insertion time
-                    let label_map: HashMap<String, String> = meta
-                        .sorted_labels
-                        .iter()
-                        .map(|l| (l.name.clone(), l.value.clone()))
-                        .collect();
-                    (label_map, Vec::new())
+                    (Arc::clone(&meta.sorted_labels), Vec::new())
                 });
 
                 entry.1.extend(samples);
@@ -1671,7 +1760,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     /// sample within the lookback window. Uses > (not >=) for start boundary to match
     /// Prometheus staleness semantics.
     fn bucket_series_samples(
-        series_samples: HashMap<SeriesFingerprint, (HashMap<String, String>, Vec<Sample>)>,
+        series_samples: HashMap<SeriesFingerprint, (Arc<[Label]>, Vec<Sample>)>,
         aligned_start_ms: i64,
         subquery_end_ms: i64,
         step_ms: i64,
@@ -1706,7 +1795,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             if !step_samples.is_empty() {
                 range_vector.push(EvalSamples {
                     values: step_samples,
-                    labels,
+                    labels: EvalLabels::Shared(labels),
                 });
             }
         }
@@ -1779,7 +1868,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     samples.push(EvalSample {
                         timestamp_ms: sample.timestamp_ms,
                         value: sample.value,
-                        labels: series.labels.clone(),
+                        labels: EvalLabels::Shared(Arc::clone(&series.labels)),
                         drop_name: false,
                     });
                 }
@@ -1862,16 +1951,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
                 // Find the best (latest) point in the time range
                 if let Some(best_sample) = sample_data.last() {
-                    // Build label_map only when we actually emit a result (not on every cache hit)
-                    let label_map: HashMap<String, String> = meta
-                        .sorted_labels
-                        .iter()
-                        .map(|l| (l.name.clone(), l.value.clone()))
-                        .collect();
                     samples.push(EvalSample {
                         timestamp_ms: best_sample.timestamp_ms,
                         value: best_sample.value,
-                        labels: label_map,
+                        labels: EvalLabels::Shared(Arc::clone(&meta.sorted_labels)),
                         drop_name: false,
                     });
 
@@ -1902,14 +1985,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             evaluation_ts.as_millis(),
         );
         Ok(Timestamp::from_millis(ms))
-    }
-
-    /// Convert labels to HashMap
-    fn labels_to_hashmap(&self, labels: &[Label]) -> HashMap<String, String> {
-        labels
-            .iter()
-            .map(|label| (label.name.clone(), label.value.clone()))
-            .collect()
     }
 
 
@@ -2197,7 +2272,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                                 for name in extra {
                                     match one_sample.labels.get(name) {
                                         Some(v) => {
-                                            result_labels.insert(name.clone(), v.clone());
+                                            result_labels.insert(name.clone(), v.to_string());
                                         }
                                         None => {
                                             result_labels.remove(name);
@@ -2208,17 +2283,13 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
                             let drop_name = many_sample.drop_name || return_bool;
                             if !is_one_to_one {
-                                // Duplicate detection must use the final output labelset.
-                                // `__name__` may be removed later (arithmetic, or comparison
-                                // with `bool`), so mirror that here before computing the key.
-                                // This intentionally runs before non-bool comparison filtering
-                                // so invalid grouped cardinality still errors even when the
-                                // comparison result would be filtered out.
-                                let mut result_label_key = result_labels.clone();
-                                if drop_name {
-                                    result_label_key.remove(METRIC_NAME);
-                                }
-                                let key = Self::labels_to_grouping_key(result_label_key);
+                                // Duplicate detection: compute key by borrowing and filtering,
+                                // avoiding a clone of result_labels.
+                                let key: Vec<(String, String)> = result_labels
+                                    .iter()
+                                    .filter(|l| !drop_name || l.name != METRIC_NAME)
+                                    .map(|l| (l.name.clone(), l.value.clone()))
+                                    .collect();
                                 if !grouped_result_seen.insert(key) {
                                     return Err(EvaluationError::InternalError(
                                         "multiple matches for labels: grouping labels must ensure unique matches"
@@ -2279,19 +2350,19 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     /// 1. Arithmetic ops always drop `__name__`
     /// 2. `on()` keeps only listed labels; `ignoring()` removes listed labels
     fn result_metric(
-        mut labels: HashMap<String, String>,
+        mut labels: EvalLabels,
         op: TokenType,
         matching: Option<&LabelModifier>,
-    ) -> HashMap<String, String> {
+    ) -> EvalLabels {
         if Self::changes_metric_schema(op) {
             labels.remove(METRIC_NAME);
         }
         match matching {
             Some(LabelModifier::Include(label_list)) => {
-                labels.retain(|k, _| label_list.labels.contains(k));
+                labels.retain(|l| label_list.labels.contains(&l.name));
             }
             Some(LabelModifier::Exclude(label_list)) => {
-                labels.retain(|k, _| !label_list.labels.contains(k));
+                labels.retain(|l| !label_list.labels.contains(&l.name));
             }
             None => {}
         }
@@ -2324,29 +2395,29 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         }
     }
 
-    fn compute_grouping_labels(
-        mut labels: HashMap<String, String>,
+    /// Compute a grouping key from sorted labels. Because input is sorted,
+    /// output is sorted — no extra sort step needed.
+    fn compute_grouping_key(
+        labels: &EvalLabels,
         modifier: Option<&LabelModifier>,
-    ) -> HashMap<String, String> {
+        drop_name: bool,
+    ) -> Vec<(String, String)> {
+        let filter_name = |l: &&Label| !drop_name || l.name != METRIC_NAME;
         match modifier {
-            None => HashMap::new(), // No grouping, return empty labels
-            Some(LabelModifier::Include(label_list)) => {
-                // Keep only specified labels
-                labels.retain(|k, _| label_list.labels.contains(k));
-                labels
-            }
-            Some(LabelModifier::Exclude(label_list)) => {
-                // Remove specified labels
-                labels.retain(|k, _| !label_list.labels.contains(k));
-                labels
-            }
+            None => Vec::new(),
+            Some(LabelModifier::Include(label_list)) => labels
+                .iter()
+                .filter(filter_name)
+                .filter(|l| label_list.labels.contains(&l.name))
+                .map(|l| (l.name.clone(), l.value.clone()))
+                .collect(),
+            Some(LabelModifier::Exclude(label_list)) => labels
+                .iter()
+                .filter(filter_name)
+                .filter(|l| !label_list.labels.contains(&l.name))
+                .map(|l| (l.name.clone(), l.value.clone()))
+                .collect(),
         }
-    }
-
-    fn labels_to_grouping_key(labels: HashMap<String, String>) -> Vec<(String, String)> {
-        let mut key_vec: Vec<_> = labels.into_iter().collect();
-        key_vec.sort();
-        key_vec
     }
 
     async fn evaluate_aggregation_param_as_scalar(
@@ -2409,29 +2480,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     ) -> HashMap<Vec<(String, String)>, Vec<EvalSample>> {
         let mut groups: HashMap<Vec<(String, String)>, Vec<EvalSample>> = HashMap::new();
         for mut sample in samples {
-            // Materialize pending metric-name drops before grouping so __name__
-            // doesn't incorrectly affect bucket assignment.
+            let group_key =
+                Self::compute_grouping_key(&sample.labels, modifier, sample.drop_name);
+            // Materialize pending metric-name drops so __name__
+            // doesn't incorrectly affect downstream label output.
             if sample.drop_name {
                 sample.labels.remove(METRIC_NAME);
                 sample.drop_name = false;
             }
-
-            let mut group_key: Vec<(String, String)> = match modifier {
-                None => Vec::new(),
-                Some(LabelModifier::Include(label_list)) => sample
-                    .labels
-                    .iter()
-                    .filter(|(name, _)| label_list.labels.contains(name))
-                    .map(|(name, value)| (name.clone(), value.clone()))
-                    .collect(),
-                Some(LabelModifier::Exclude(label_list)) => sample
-                    .labels
-                    .iter()
-                    .filter(|(name, _)| !label_list.labels.contains(name))
-                    .map(|(name, value)| (name.clone(), value.clone()))
-                    .collect(),
-            };
-            group_key.sort();
             groups.entry(group_key).or_default().push(sample);
         }
         groups
@@ -2522,28 +2578,27 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     /// cases have opposite semantics (aggregation groups everything together; binary ops
     /// match on all labels).
     fn compute_binary_match_key(
-        labels: &HashMap<String, String>,
+        labels: &EvalLabels,
         matching: Option<&LabelModifier>,
     ) -> Vec<(String, String)> {
-        let mut key: Vec<(String, String)> = match matching {
+        // Input is sorted, so output is sorted — no sort step needed.
+        match matching {
             None => labels
                 .iter()
-                .filter(|(k, _)| k.as_str() != METRIC_NAME)
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .filter(|l| l.name != METRIC_NAME)
+                .map(|l| (l.name.clone(), l.value.clone()))
                 .collect(),
             Some(LabelModifier::Include(label_list)) => labels
                 .iter()
-                .filter(|(k, _)| label_list.labels.contains(k))
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .filter(|l| label_list.labels.contains(&l.name))
+                .map(|l| (l.name.clone(), l.value.clone()))
                 .collect(),
             Some(LabelModifier::Exclude(label_list)) => labels
                 .iter()
-                .filter(|(k, _)| k.as_str() != METRIC_NAME && !label_list.labels.contains(k))
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .filter(|l| l.name != METRIC_NAME && !label_list.labels.contains(&l.name))
+                .map(|l| (l.name.clone(), l.value.clone()))
                 .collect(),
-        };
-        key.sort();
-        key
+        }
     }
 
     async fn evaluate_aggregate(
@@ -2607,20 +2662,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             return Ok(ExprResult::InstantVector(k_samples));
         }
 
-        // Group samples by their grouping key (which consumes the filtered labels)
+        // Group samples by their grouping key
         let mut groups: HashMap<Vec<(String, String)>, Vec<f64>> = HashMap::new();
-        for mut sample in samples {
-            // Materialize pending __name__ drops before grouping
-            if sample.drop_name {
-                sample.labels.remove(METRIC_NAME);
-            }
-            // Compute the grouping labels by taking ownership and filtering
-            let group_labels =
-                Self::compute_grouping_labels(sample.labels, aggregate.modifier.as_ref());
-
-            // Convert labels to sorted key, consuming the labels
-            let group_key = Self::labels_to_grouping_key(group_labels);
-
+        for sample in samples {
+            let group_key = Self::compute_grouping_key(
+                &sample.labels,
+                aggregate.modifier.as_ref(),
+                sample.drop_name,
+            );
             groups.entry(group_key).or_default().push(sample.value);
         }
 
@@ -2647,8 +2696,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 }
             };
 
-            // Reconstruct the labels HashMap from the group key
-            let result_labels: HashMap<String, String> = group_key.into_iter().collect();
+            let result_labels = EvalLabels::Owned(
+                group_key
+                    .into_iter()
+                    .map(|(n, v)| Label { name: n, value: v })
+                    .collect(),
+            );
 
             result_samples.push(EvalSample {
                 timestamp_ms,
@@ -2715,21 +2768,16 @@ mod tests {
             .map(|result| result.expect_instant_vector("Expected instant vector result"))
     }
 
-    /// Helper to convert label vec to HashMap for comparison
-    fn labels_to_map(labels: &[(&str, &str)]) -> HashMap<String, String> {
-        labels
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
+    /// Helper to convert label vec to EvalLabels for comparison
+    fn labels_to_eval(labels: &[(&str, &str)]) -> EvalLabels {
+        EvalLabels::from_pairs(labels)
     }
 
     /// Sort samples by labels (for deterministic comparison)
     fn sort_samples_by_labels(samples: &mut [EvalSample]) {
         samples.sort_by(|a, b| {
-            let mut a_labels: Vec<_> = a.labels.iter().collect();
-            let mut b_labels: Vec<_> = b.labels.iter().collect();
-            a_labels.sort();
-            b_labels.sort();
+            let a_labels: Vec<_> = a.labels.iter().collect();
+            let b_labels: Vec<_> = b.labels.iter().collect();
             a_labels.cmp(&b_labels)
         });
     }
@@ -2749,13 +2797,9 @@ mod tests {
 
         let mut expected_sorted: Vec<_> = expected.to_vec();
         expected_sorted.sort_by(|a, b| {
-            let a_labels = labels_to_map(&a.1);
-            let b_labels = labels_to_map(&b.1);
-            let mut a_vec: Vec<_> = a_labels.iter().collect();
-            let mut b_vec: Vec<_> = b_labels.iter().collect();
-            a_vec.sort();
-            b_vec.sort();
-            a_vec.cmp(&b_vec)
+            let a_labels: Vec<_> = a.1.iter().collect();
+            let b_labels: Vec<_> = b.1.iter().collect();
+            a_labels.cmp(&b_labels)
         });
 
         for (i, (actual_sample, (expected_value, expected_labels))) in
@@ -2769,11 +2813,11 @@ mod tests {
                 expected_value
             );
 
-            let expected_labels_map = labels_to_map(expected_labels);
+            let expected_eval = labels_to_eval(expected_labels);
             assert_eq!(
-                actual_sample.labels, expected_labels_map,
+                actual_sample.labels, expected_eval,
                 "Sample {} labels mismatch: got {:?}, expected {:?}",
-                i, actual_sample.labels, expected_labels_map
+                i, actual_sample.labels, expected_eval
             );
         }
     }
@@ -3933,10 +3977,7 @@ mod tests {
             ExprResult::InstantVector(samples) => {
                 assert_eq!(samples.len(), 1);
                 assert_eq!(samples[0].value, 1.0);
-                assert_eq!(
-                    samples[0].labels.get("dst"),
-                    Some(&"replacement".to_string())
-                );
+                assert_eq!(samples[0].labels.get("dst"), Some("replacement"));
             }
             ExprResult::Scalar(_) => panic!("Expected instant vector result, got scalar"),
             ExprResult::RangeVector(_) => {
@@ -4102,8 +4143,8 @@ mod tests {
 
                 for (key, value) in expected_labels {
                     assert_eq!(
-                        actual.labels.get(*key),
-                        Some(&value.to_string()),
+                        actual.labels.get(key),
+                        Some(*value),
                         "Sample {} missing label {}={}",
                         i,
                         key,
@@ -4294,8 +4335,8 @@ mod tests {
                 // Check that the series has the expected labels
                 for (key, expected_value) in &expected.0 {
                     assert_eq!(
-                        actual.labels.get(*key),
-                        Some(&expected_value.to_string()),
+                        actual.labels.get(key),
+                        Some(*expected_value),
                         "Test '{}': Series {} missing label {}={}",
                         test_name,
                         i,
@@ -4578,10 +4619,7 @@ mod tests {
             assert_eq!(instant_samples.len(), 1, "Expected 1 result from pipeline");
             // The pipeline should give the same rate as the direct function call
             assert!(instant_samples[0].value > 0.0, "Rate should be positive");
-            assert_eq!(
-                instant_samples[0].labels.get("job"),
-                Some(&"webapp".to_string())
-            );
+            assert_eq!(instant_samples[0].labels.get("job"), Some("webapp"));
         } else {
             panic!(
                 "Expected InstantVector result from rate function pipeline, got {:?}",
