@@ -353,7 +353,7 @@ mod tests {
 
         // Acking sequence 5 when last acked was 0 should fail
         let result = collector.ack(5).await;
-        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::Storage(msg)) if msg.contains("out-of-order ack")));
     }
 
     #[tokio::test]
