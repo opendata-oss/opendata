@@ -69,6 +69,17 @@ pub(crate) struct EvalStats {
     pub(crate) preload_selectors: u64,
     pub(crate) preload_series: u64,
     pub(crate) preload_hits: u64,
+    // Phase timing (milliseconds)
+    pub(crate) preload_ms: u64,
+    pub(crate) step_loop_ms: u64,
+    // Miss latency totals (milliseconds)
+    pub(crate) list_buckets_miss_ms: u64,
+    pub(crate) forward_index_miss_ms: u64,
+    pub(crate) sample_miss_ms: u64,
+    pub(crate) selector_miss_ms: u64,
+    // Per-bucket preload aggregates
+    pub(crate) preload_bucket_ms_max: u64,
+    pub(crate) preload_bucket_ms_sum: u64,
 }
 
 /// Canonical key for caching selector results across steps.
@@ -569,7 +580,9 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             return Ok(buckets.clone());
         }
         self.stats.list_buckets_misses += 1;
+        let t0 = std::time::Instant::now();
         let buckets = self.reader.list_buckets().await?;
+        self.stats.list_buckets_miss_ms += t0.elapsed().as_millis() as u64;
         self.cached_buckets = Some(buckets.clone());
         Ok(buckets)
     }
@@ -588,8 +601,9 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             Ok(cached_data)
         } else {
             self.stats.forward_index_misses += 1;
-            // Load from underlying reader
+            let t0 = std::time::Instant::now();
             let forward_index = self.reader.forward_index(bucket, &series_ids).await?;
+            self.stats.forward_index_miss_ms += t0.elapsed().as_millis() as u64;
 
             self.cache
                 .cache_forward_index(*bucket, series_ids.clone(), forward_index);
@@ -663,10 +677,12 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
 
         // Not in cache, load from underlying reader with wide bounds to cache the whole bucket
         self.stats.sample_misses += 1;
+        let t0 = std::time::Instant::now();
         let samples = self
             .reader
             .samples(bucket, series_id, i64::MIN, i64::MAX)
             .await?;
+        self.stats.sample_miss_ms += t0.elapsed().as_millis() as u64;
 
         self.stats.samples_loaded += samples.len() as u64;
 
@@ -1168,6 +1184,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         step_ms: i64,
         lookback_delta_ms: i64,
     ) -> EvalResult<()> {
+        let preload_start = std::time::Instant::now();
         let selectors = collect_vector_selectors(expr);
         // Deduplicate by PreloadKey
         let mut seen = HashSet::new();
@@ -1185,6 +1202,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             )
             .await?;
         }
+        self.reader.stats.preload_ms = preload_start.elapsed().as_millis() as u64;
         Ok(())
     }
 
@@ -1468,10 +1486,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     cached
                 } else {
                     self.reader.stats.selector_misses += 1;
+                    let t0 = std::time::Instant::now();
                     let result =
                         evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
                             .await
                             .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+                    self.reader.stats.selector_miss_ms += t0.elapsed().as_millis() as u64;
                     self.reader
                         .cache_selector(bucket, selector_key.clone(), result.clone());
                     Arc::new(result)
@@ -1694,19 +1714,22 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let selector_key = SelectorKey::from_selector(vector_selector);
         let mut series_samples = HashMap::new();
 
-        for bucket in buckets {
+        for bucket in &buckets {
+            let bucket_start = std::time::Instant::now();
             // Check selector cache first, fall back to full evaluation
             let candidates =
-                if let Some(cached) = self.reader.get_cached_selector(&bucket, &selector_key) {
+                if let Some(cached) = self.reader.get_cached_selector(bucket, &selector_key) {
                     cached
                 } else {
                     self.reader.stats.selector_misses += 1;
+                    let t0 = std::time::Instant::now();
                     let result =
-                        evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
+                        evaluate_selector_with_reader(&mut self.reader, *bucket, vector_selector)
                             .await
                             .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+                    self.reader.stats.selector_miss_ms += t0.elapsed().as_millis() as u64;
                     self.reader
-                        .cache_selector(bucket, selector_key.clone(), result.clone());
+                        .cache_selector(*bucket, selector_key.clone(), result.clone());
                     Arc::new(result)
                 };
 
@@ -1715,13 +1738,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             }
 
             let candidates_vec: Vec<_> = candidates.iter().copied().collect();
-            let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
+            let forward_index_view = self.reader.forward_index(bucket, &candidates_vec).await?;
 
-            for series_id in candidates_vec {
+            let mut bucket_sample_count: u64 = 0;
+            for series_id in &candidates_vec {
                 // Get series metadata from cache (Arc — cheap refcount bump)
                 let meta = match self.reader.get_or_insert_series_meta(
-                    &bucket,
-                    series_id,
+                    bucket,
+                    *series_id,
                     forward_index_view.as_ref(),
                 ) {
                     Some(m) => m,
@@ -1730,19 +1754,33 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
                 let samples = self
                     .reader
-                    .samples(&bucket, series_id, range_start_ms, range_end_ms)
+                    .samples(bucket, *series_id, range_start_ms, range_end_ms)
                     .await?;
 
                 if samples.is_empty() {
                     continue;
                 }
 
+                bucket_sample_count += samples.len() as u64;
                 let entry = series_samples.entry(meta.fingerprint).or_insert_with(|| {
                     (Arc::clone(&meta.sorted_labels), Vec::new())
                 });
 
                 entry.1.extend(samples);
             }
+
+            let bucket_ms = bucket_start.elapsed().as_millis() as u64;
+            self.reader.stats.preload_bucket_ms_sum += bucket_ms;
+            if bucket_ms > self.reader.stats.preload_bucket_ms_max {
+                self.reader.stats.preload_bucket_ms_max = bucket_ms;
+            }
+            tracing::debug!(
+                bucket_id = ?bucket,
+                series_count = candidates_vec.len(),
+                sample_count = bucket_sample_count,
+                elapsed_ms = bucket_ms,
+                "preload_bucket"
+            );
         }
 
         for (_fp, (_labels, samples)) in series_samples.iter_mut() {
@@ -1905,10 +1943,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     cached
                 } else {
                     self.reader.stats.selector_misses += 1;
+                    let t0 = std::time::Instant::now();
                     let result =
                         evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
                             .await
                             .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+                    self.reader.stats.selector_miss_ms += t0.elapsed().as_millis() as u64;
                     self.reader
                         .cache_selector(bucket, selector_key.clone(), result.clone());
                     Arc::new(result)

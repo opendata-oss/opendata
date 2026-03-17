@@ -9,7 +9,7 @@ use futures::TryStreamExt;
 use moka::future::Cache;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 use tokio::sync::RwLock;
-use tracing::error;
+use tracing::{Instrument, error};
 
 use crate::error::QueryError;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
@@ -306,7 +306,7 @@ pub(crate) async fn evaluate_range(
     reader: &impl QueryReader,
     stmt: EvalStmt,
 ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-    let loop_start = std::time::Instant::now();
+    let total_start = std::time::Instant::now();
     let start = stmt.start;
     let end = stmt.end;
     let step = stmt.interval;
@@ -326,10 +326,14 @@ pub(crate) async fn evaluate_range(
     let end_ms = end.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
     let step_ms = step.as_millis() as i64;
     let lookback_delta_ms = lookback_delta.as_millis() as i64;
+
+    let preload_span = tracing::info_span!("preload_for_range");
     evaluator
         .preload_for_range(&stmt.expr, start_ms, end_ms, step_ms, lookback_delta_ms)
+        .instrument(preload_span)
         .await?;
 
+    let step_loop_start = std::time::Instant::now();
     let mut current_time = start;
     let mut step_count: u64 = 0;
 
@@ -373,10 +377,16 @@ pub(crate) async fn evaluate_range(
         current_time += step;
     }
 
+    let step_loop_ms = step_loop_start.elapsed().as_millis() as u64;
+
     let stats = evaluator.stats();
     tracing::info!(
         step_count,
-        total_ms = loop_start.elapsed().as_millis() as u64,
+        total_ms = total_start.elapsed().as_millis() as u64,
+        // Phase timing
+        preload_ms = stats.preload_ms,
+        step_loop_ms,
+        // Existing counters
         list_buckets_calls = stats.list_buckets_calls,
         list_buckets_misses = stats.list_buckets_misses,
         selector_hits = stats.selector_cache_hits,
@@ -392,6 +402,14 @@ pub(crate) async fn evaluate_range(
         preload_series = stats.preload_series,
         preload_hits = stats.preload_hits,
         unique_series = series_map.len(),
+        // Miss latency totals
+        list_buckets_miss_ms = stats.list_buckets_miss_ms,
+        forward_index_miss_ms = stats.forward_index_miss_ms,
+        sample_miss_ms = stats.sample_miss_ms,
+        selector_miss_ms = stats.selector_miss_ms,
+        // Per-bucket preload aggregates
+        preload_bucket_ms_max = stats.preload_bucket_ms_max,
+        preload_bucket_ms_sum = stats.preload_bucket_ms_sum,
         "evaluate_range complete"
     );
 
