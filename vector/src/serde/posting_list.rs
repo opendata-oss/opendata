@@ -396,91 +396,6 @@ pub(crate) fn merge_decoded_posting_lists(postings: Vec<PostingListValue>) -> Po
     PostingListValue::from_posting_updates(merged).expect("unexpected error")
 }
 
-/// Merge two PostingList values using sort-merge.
-///
-/// Both input PostingList values are assumed to be sorted by id. The merge
-/// performs a sort-merge operation:
-/// - When ids match, the entry from new_value takes precedence
-/// - Output remains sorted by id
-///
-/// This implementation works directly with raw bytes for efficiency,
-/// only parsing the type byte and id to determine merge decisions.
-pub(crate) fn merge_posting_list(
-    mut existing: Bytes,
-    mut new_value: Bytes,
-    dimensions: usize,
-) -> Bytes {
-    let vector_size = dimensions * 4;
-    let append_size = 1 + 8 + vector_size; // type + id + vector
-    let delete_size = 1 + 8; // type + id
-
-    let peek_entry = |buf: &[u8]| -> Option<(u64, usize)> {
-        if buf.is_empty() {
-            return None;
-        }
-        assert!(buf.len() >= delete_size);
-        let entry_type = buf[0];
-        let id = u64::from_le_bytes([
-            buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
-        ]);
-        let entry_size = if entry_type == POSTING_UPDATE_TYPE_APPEND_BYTE {
-            append_size
-        } else {
-            delete_size
-        };
-        Some((id, entry_size))
-    };
-
-    // Estimate capacity
-    let total_size = existing.len() + new_value.len();
-    let mut result = BytesMut::with_capacity(total_size);
-    let mut last_id = None;
-
-    loop {
-        let existing_entry = peek_entry(&existing);
-        let new_entry = peek_entry(&new_value);
-
-        let id = match (existing_entry, new_entry) {
-            (None, None) => break,
-            (Some((id, size)), None) => {
-                // Only existing has entries left
-                result.put_slice(&existing[..size]);
-                existing.advance(size);
-                id
-            }
-            (None, Some((id, size))) => {
-                // Only new has entries left
-                result.put_slice(&new_value[..size]);
-                new_value.advance(size);
-                id
-            }
-            (Some((existing_id, existing_size)), Some((new_id, new_size))) => {
-                if existing_id < new_id {
-                    // Take from existing
-                    result.put_slice(&existing[..existing_size]);
-                    existing.advance(existing_size);
-                    existing_id
-                } else if new_id < existing_id {
-                    // Take from new
-                    result.put_slice(&new_value[..new_size]);
-                    new_value.advance(new_size);
-                    new_id
-                } else {
-                    // Same id - new wins, skip existing
-                    result.put_slice(&new_value[..new_size]);
-                    new_value.advance(new_size);
-                    existing.advance(existing_size);
-                    new_id
-                }
-            }
-        };
-        assert!(last_id.is_none_or(|last_id| last_id < id));
-        last_id = Some(id);
-    }
-
-    result.freeze()
-}
-
 /// K-way byte-level merge for posting lists across multiple operands.
 ///
 /// Merges `existing` (oldest, priority 0) with `operands` (priority 1..N, newest last)
@@ -836,7 +751,7 @@ mod tests {
             .encode_to_bytes();
 
         // when
-        let merged = merge_posting_list(existing_value, new_value, 3);
+        let merged = merge_batch_posting_list(Some(existing_value), &[new_value], 3);
         let decoded = PostingListValue::decode_from_bytes(&merged, 3).unwrap();
 
         // then - all 3 unique ids preserved in sorted order
@@ -863,7 +778,7 @@ mod tests {
             .encode_to_bytes();
 
         // when
-        let merged = merge_posting_list(existing_value, new_value, 2);
+        let merged = merge_batch_posting_list(Some(existing_value), &[new_value], 2);
         let decoded = PostingListValue::decode_from_bytes(&merged, 2).unwrap();
 
         // then - id 1 is now a delete, id 2 unchanged, sorted order
@@ -891,7 +806,7 @@ mod tests {
             .encode_to_bytes();
 
         // when
-        let merged = merge_posting_list(existing_value, new_value, 2);
+        let merged = merge_batch_posting_list(Some(existing_value), &[new_value], 2);
         let decoded = PostingListValue::decode_from_bytes(&merged, 2).unwrap();
 
         // then - id 1 has new vector, id 2 unchanged, sorted order
@@ -916,7 +831,7 @@ mod tests {
             .encode_to_bytes();
 
         // when
-        let merged = merge_posting_list(existing_value, new_value, 2);
+        let merged = merge_batch_posting_list(Some(existing_value), &[new_value], 2);
         let decoded = PostingListValue::decode_from_bytes(&merged, 2).unwrap();
 
         // then - new entries are preserved in sorted order
@@ -939,7 +854,7 @@ mod tests {
         let new_value = PostingListValue::new().encode_to_bytes();
 
         // when
-        let merged = merge_posting_list(existing_value, new_value, 2);
+        let merged = merge_batch_posting_list(Some(existing_value), &[new_value], 2);
         let decoded = PostingListValue::decode_from_bytes(&merged, 2).unwrap();
 
         // then - existing entries are preserved in sorted order
@@ -955,7 +870,7 @@ mod tests {
         let new_value = PostingListValue::new().encode_to_bytes();
 
         // when
-        let merged = merge_posting_list(existing_value, new_value, 2);
+        let merged = merge_batch_posting_list(Some(existing_value), &[new_value], 2);
         let decoded = PostingListValue::decode_from_bytes(&merged, 2).unwrap();
 
         // then - result is empty
@@ -983,7 +898,7 @@ mod tests {
             .encode_to_bytes();
 
         // when
-        let merged = merge_posting_list(existing_value, new_value, 1);
+        let merged = merge_batch_posting_list(Some(existing_value), &[new_value], 1);
         let decoded = PostingListValue::decode_from_bytes(&merged, 1).unwrap();
 
         // then - all entries in sorted order: 1, 2, 3, 4, 5
@@ -1063,7 +978,7 @@ mod tests {
             .encode_to_bytes();
 
         // when
-        let merged = merge_posting_list(existing_value, new_value, 1);
+        let merged = merge_batch_posting_list(Some(existing_value), &[new_value], 1);
         let decoded = PostingListValue::decode_from_bytes(&merged, 1).unwrap();
 
         // then - result is in sorted order

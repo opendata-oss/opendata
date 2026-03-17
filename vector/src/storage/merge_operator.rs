@@ -5,7 +5,7 @@
 
 use crate::serde::centroid_chunk::CentroidChunkValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
-use crate::serde::posting_list::{merge_batch_posting_list, merge_posting_list};
+use crate::serde::posting_list::merge_batch_posting_list;
 use crate::serde::{EncodingError, KEY_VERSION, RecordType};
 use bytes::Bytes;
 use common::serde::key_prefix::KeyPrefix;
@@ -31,43 +31,7 @@ impl VectorDbMergeOperator {
 
 impl common::storage::MergeOperator for VectorDbMergeOperator {
     fn merge(&self, key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
-        // If no existing value, just return the new value
-        let Some(existing) = existing_value else {
-            return new_value;
-        };
-
-        let prefix =
-            KeyPrefix::from_bytes_versioned(key, KEY_VERSION).expect("Failed to decode key prefix");
-
-        let record_tag = prefix.tag();
-
-        let record_type_id = record_tag.record_type();
-        let record_type =
-            RecordType::from_id(record_type_id).expect("Failed to get record type from record tag");
-
-        match record_type {
-            RecordType::Deletions | RecordType::MetadataIndex => {
-                // Deletions and MetadataIndex use RoaringTreemap and merge via union
-                merge_roaring_treemap(existing, new_value).expect("Failed to merge RoaringTreemap")
-            }
-            RecordType::PostingList => {
-                // PostingList deduplicates by id, keeping only the last update per id
-                merge_posting_list(existing, new_value, self.dimensions)
-            }
-            RecordType::CentroidStats => {
-                // CentroidStats sums i32 deltas
-                merge_centroid_stats(existing, new_value)
-            }
-            RecordType::CentroidChunk => {
-                // CentroidChunk appends new entries to existing chunk
-                merge_centroid_chunk(existing, new_value, self.dimensions)
-            }
-            _ => {
-                // For other record types (IdDictionary, VectorData, VectorMeta, etc.),
-                // just use new value. These should use Put, not Merge, but handle gracefully
-                new_value
-            }
-        }
+        self.merge_batch(key, existing_value, &[new_value])
     }
 
     fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
@@ -77,37 +41,56 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
             .expect("Failed to get record type from record tag");
 
         match record_type {
+            RecordType::Deletions | RecordType::MetadataIndex => {
+                // Deletions and MetadataIndex use RoaringTreemap and merge via union
+                merge_batch_roaring_treemap(existing_value, operands)
+                    .expect("Failed to batch merge RoaringTreemap")
+            }
             RecordType::PostingList => {
                 merge_batch_posting_list(existing_value, operands, self.dimensions)
             }
-            _ => default_merge_batch(key, existing_value, operands, |k, e, v| self.merge(k, e, v)),
+            RecordType::CentroidStats => merge_batch_centroid_stats(existing_value, operands),
+            RecordType::CentroidChunk => {
+                merge_batch_centroid_chunk(existing_value, operands, self.dimensions)
+            }
+            _ => {
+                // For other record types (IdDictionary, VectorData, VectorMeta, etc.), just use new value
+                // for each pairwise merge. These should use Put, not Merge, but handle gracefully
+                default_merge_batch(key, existing_value, operands, |_k, _e, v| v)
+            }
         }
     }
 }
 
-/// Merge two RoaringTreemap values by unioning them.
+/// Batch merge RoaringTreemap values by unioning all treemaps at once.
 ///
 /// Used for:
 /// - Deletions: Union deleted vector IDs
 /// - MetadataIndex: Union vector IDs matching a metadata filter
-fn merge_roaring_treemap(existing: Bytes, new_value: Bytes) -> Result<Bytes, EncodingError> {
-    // Deserialize both bitmaps
-    let existing_bitmap = RoaringTreemap::deserialize_from(Cursor::new(existing.as_ref()))
-        .map_err(|e| EncodingError {
-            message: format!("Failed to deserialize existing RoaringTreemap: {}", e),
-        })?;
-
-    let new_bitmap =
-        RoaringTreemap::deserialize_from(Cursor::new(new_value.as_ref())).map_err(|e| {
+fn merge_batch_roaring_treemap(
+    existing: Option<Bytes>,
+    operands: &[Bytes],
+) -> Result<Bytes, EncodingError> {
+    let mut merged = if let Some(existing) = existing {
+        RoaringTreemap::deserialize_from(Cursor::new(existing.as_ref())).map_err(|e| {
             EncodingError {
-                message: format!("Failed to deserialize new RoaringTreemap: {}", e),
+                message: format!("Failed to deserialize existing RoaringTreemap: {}", e),
             }
-        })?;
+        })?
+    } else {
+        RoaringTreemap::new()
+    };
 
-    // Union the bitmaps
-    let merged = existing_bitmap | new_bitmap;
+    for operand in operands {
+        let bitmap =
+            RoaringTreemap::deserialize_from(Cursor::new(operand.as_ref())).map_err(|e| {
+                EncodingError {
+                    message: format!("Failed to deserialize operand RoaringTreemap: {}", e),
+                }
+            })?;
+        merged |= bitmap;
+    }
 
-    // Serialize result
     let mut buf = Vec::new();
     merged.serialize_into(&mut buf).map_err(|e| EncodingError {
         message: format!("Failed to serialize merged RoaringTreemap: {}", e),
@@ -115,34 +98,57 @@ fn merge_roaring_treemap(existing: Bytes, new_value: Bytes) -> Result<Bytes, Enc
     Ok(Bytes::from(buf))
 }
 
-/// Merge two CentroidChunk values by appending entries from new to existing.
-fn merge_centroid_chunk(existing: Bytes, new_value: Bytes, dimensions: usize) -> Bytes {
-    let existing_chunk = CentroidChunkValue::decode_from_bytes(&existing, dimensions)
-        .expect("Failed to decode existing CentroidChunkValue");
-    let new_chunk = CentroidChunkValue::decode_from_bytes(&new_value, dimensions)
-        .expect("Failed to decode new CentroidChunkValue");
-    let mut combined_entries = existing_chunk.entries;
-    combined_entries.extend(new_chunk.entries);
-    CentroidChunkValue::new(combined_entries).encode_to_bytes(dimensions)
+/// Batch merge CentroidStats values by summing all i32 deltas at once.
+fn merge_batch_centroid_stats(existing: Option<Bytes>, operands: &[Bytes]) -> Bytes {
+    let mut total = if let Some(existing) = existing {
+        CentroidStatsValue::decode_from_bytes(&existing)
+            .expect("Failed to decode existing CentroidStatsValue")
+            .num_vectors
+    } else {
+        0
+    };
+
+    for operand in operands {
+        total += CentroidStatsValue::decode_from_bytes(operand)
+            .expect("Failed to decode operand CentroidStatsValue")
+            .num_vectors;
+    }
+
+    CentroidStatsValue::new(total).encode_to_bytes()
 }
 
-/// Merge two CentroidStats values by summing their i32 deltas.
-fn merge_centroid_stats(existing: Bytes, new_value: Bytes) -> Bytes {
-    let existing_stats = CentroidStatsValue::decode_from_bytes(&existing)
-        .expect("Failed to decode existing CentroidStatsValue");
-    let new_stats = CentroidStatsValue::decode_from_bytes(&new_value)
-        .expect("Failed to decode new CentroidStatsValue");
-    let merged = CentroidStatsValue::new(existing_stats.num_vectors + new_stats.num_vectors);
-    merged.encode_to_bytes()
+/// Batch merge CentroidChunk values by appending entries from all operands.
+fn merge_batch_centroid_chunk(
+    existing: Option<Bytes>,
+    operands: &[Bytes],
+    dimensions: usize,
+) -> Bytes {
+    let mut entries = if let Some(existing) = existing {
+        CentroidChunkValue::decode_from_bytes(&existing, dimensions)
+            .expect("Failed to decode existing CentroidChunkValue")
+            .entries
+    } else {
+        Vec::new()
+    };
+
+    for operand in operands {
+        let chunk = CentroidChunkValue::decode_from_bytes(operand, dimensions)
+            .expect("Failed to decode operand CentroidChunkValue");
+        entries.extend(chunk.entries);
+    }
+
+    CentroidChunkValue::new(entries).encode_to_bytes(dimensions)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::serde::FieldValue;
+    use crate::serde::centroid_chunk::CentroidEntry;
     use crate::serde::deletions::DeletionsValue;
     use crate::serde::key::{
-        CentroidStatsKey, DeletionsKey, IdDictionaryKey, MetadataIndexKey, PostingListKey,
+        CentroidChunkKey, CentroidStatsKey, DeletionsKey, IdDictionaryKey, MetadataIndexKey,
+        PostingListKey,
     };
     use crate::serde::metadata_index::MetadataIndexValue;
     use crate::serde::posting_list::{PostingListValue, PostingUpdate};
@@ -224,7 +230,7 @@ mod tests {
             .unwrap();
 
         // when
-        let merged = merge_roaring_treemap(existing_value, new_value).unwrap();
+        let merged = merge_batch_roaring_treemap(Some(existing_value), &[new_value]).unwrap();
         let decoded = DeletionsValue::decode_from_bytes(&merged).unwrap();
 
         // then
@@ -276,7 +282,7 @@ mod tests {
             .unwrap();
 
         // when
-        let merged = merge_roaring_treemap(existing_value, new_value).unwrap();
+        let merged = merge_batch_roaring_treemap(Some(existing_value), &[new_value]).unwrap();
         let decoded = MetadataIndexValue::decode_from_bytes(&merged).unwrap();
 
         // then
@@ -417,6 +423,127 @@ mod tests {
     }
 
     #[test]
+    fn should_batch_merge_centroid_stats_no_existing() {
+        // given
+        let op0 = CentroidStatsValue::new(3).encode_to_bytes();
+        let op1 = CentroidStatsValue::new(5).encode_to_bytes();
+        let op2 = CentroidStatsValue::new(-2).encode_to_bytes();
+
+        // when
+        let merged = merge_batch_centroid_stats(None, &[op0, op1, op2]);
+
+        // then
+        let decoded = CentroidStatsValue::decode_from_bytes(&merged).unwrap();
+        assert_eq!(decoded.num_vectors, 6);
+    }
+
+    #[test]
+    fn should_batch_merge_centroid_stats_with_existing() {
+        // given
+        let existing = CentroidStatsValue::new(10).encode_to_bytes();
+        let op0 = CentroidStatsValue::new(3).encode_to_bytes();
+        let op1 = CentroidStatsValue::new(-7).encode_to_bytes();
+
+        // when
+        let merged = merge_batch_centroid_stats(Some(existing), &[op0, op1]);
+
+        // then
+        let decoded = CentroidStatsValue::decode_from_bytes(&merged).unwrap();
+        assert_eq!(decoded.num_vectors, 6);
+    }
+
+    #[test]
+    fn should_route_merge_batch_centroid_stats() {
+        // given
+        let operator = VectorDbMergeOperator::new(3);
+        let key = CentroidStatsKey::new(1).encode();
+        let existing = CentroidStatsValue::new(10).encode_to_bytes();
+        let op0 = CentroidStatsValue::new(5).encode_to_bytes();
+        let op1 = CentroidStatsValue::new(-3).encode_to_bytes();
+
+        // when
+        let merged = operator.merge_batch(&key, Some(existing), &[op0, op1]);
+
+        // then
+        let decoded = CentroidStatsValue::decode_from_bytes(&merged).unwrap();
+        assert_eq!(decoded.num_vectors, 12);
+    }
+
+    #[test]
+    fn should_batch_merge_centroid_chunk_no_existing() {
+        // given
+        let dimensions = 2;
+        let op0 = CentroidChunkValue::new(vec![CentroidEntry::new(1, vec![1.0, 2.0])])
+            .encode_to_bytes(dimensions);
+        let op1 = CentroidChunkValue::new(vec![
+            CentroidEntry::new(2, vec![3.0, 4.0]),
+            CentroidEntry::new(3, vec![5.0, 6.0]),
+        ])
+        .encode_to_bytes(dimensions);
+
+        // when
+        let merged = merge_batch_centroid_chunk(None, &[op0, op1], dimensions);
+
+        // then
+        let decoded = CentroidChunkValue::decode_from_bytes(&merged, dimensions).unwrap();
+        assert_eq!(decoded.entries.len(), 3);
+        assert_eq!(decoded.entries[0].centroid_id, 1);
+        assert_eq!(decoded.entries[1].centroid_id, 2);
+        assert_eq!(decoded.entries[2].centroid_id, 3);
+        assert_eq!(decoded.entries[0].vector, vec![1.0, 2.0]);
+        assert_eq!(decoded.entries[1].vector, vec![3.0, 4.0]);
+        assert_eq!(decoded.entries[2].vector, vec![5.0, 6.0]);
+    }
+
+    #[test]
+    fn should_batch_merge_centroid_chunk_with_existing() {
+        // given
+        let dimensions = 2;
+        let existing = CentroidChunkValue::new(vec![CentroidEntry::new(1, vec![1.0, 2.0])])
+            .encode_to_bytes(dimensions);
+        let op0 = CentroidChunkValue::new(vec![CentroidEntry::new(2, vec![3.0, 4.0])])
+            .encode_to_bytes(dimensions);
+        let op1 = CentroidChunkValue::new(vec![CentroidEntry::new(3, vec![5.0, 6.0])])
+            .encode_to_bytes(dimensions);
+
+        // when
+        let merged = merge_batch_centroid_chunk(Some(existing), &[op0, op1], dimensions);
+
+        // then
+        let decoded = CentroidChunkValue::decode_from_bytes(&merged, dimensions).unwrap();
+        assert_eq!(decoded.entries.len(), 3);
+        assert_eq!(decoded.entries[0].centroid_id, 1);
+        assert_eq!(decoded.entries[1].centroid_id, 2);
+        assert_eq!(decoded.entries[2].centroid_id, 3);
+        assert_eq!(decoded.entries[0].vector, vec![1.0, 2.0]);
+        assert_eq!(decoded.entries[1].vector, vec![3.0, 4.0]);
+        assert_eq!(decoded.entries[2].vector, vec![5.0, 6.0]);
+    }
+
+    #[test]
+    fn should_route_merge_batch_centroid_chunk() {
+        // given
+        let dimensions = 2;
+        let operator = VectorDbMergeOperator::new(dimensions);
+        let key = CentroidChunkKey::new(1).encode();
+        let existing = CentroidChunkValue::new(vec![CentroidEntry::new(1, vec![1.0, 2.0])])
+            .encode_to_bytes(dimensions);
+        let op0 = CentroidChunkValue::new(vec![CentroidEntry::new(2, vec![3.0, 4.0])])
+            .encode_to_bytes(dimensions);
+
+        // when
+        let merged = operator.merge_batch(&key, Some(existing), &[op0]);
+
+        // then
+        let decoded = CentroidChunkValue::decode_from_bytes(&merged, dimensions).unwrap();
+        assert_eq!(decoded.entries.len(), 2);
+        assert_eq!(decoded.entries[0].centroid_id, 1);
+        assert_eq!(decoded.entries[1].centroid_id, 2);
+        assert_eq!(decoded.entries[0].vector, vec![1.0, 2.0]);
+        assert_eq!(decoded.entries[1].vector, vec![3.0, 4.0]);
+    }
+
+    #[test]
     fn should_return_new_value_for_other_record_types() {
         // given
         let operator = VectorDbMergeOperator::new(3);
@@ -429,5 +556,156 @@ mod tests {
 
         // then - should return new_value without merging
         assert_eq!(result, new_value);
+    }
+
+    #[test]
+    fn should_batch_merge_deletions() {
+        // given
+        let op0 = DeletionsValue::from_treemap({
+            let mut bm = RoaringTreemap::new();
+            bm.insert(1);
+            bm.insert(2);
+            bm
+        })
+        .encode_to_bytes()
+        .unwrap();
+        let op1 = DeletionsValue::from_treemap({
+            let mut bm = RoaringTreemap::new();
+            bm.insert(2);
+            bm.insert(3);
+            bm
+        })
+        .encode_to_bytes()
+        .unwrap();
+        let op2 = DeletionsValue::from_treemap({
+            let mut bm = RoaringTreemap::new();
+            bm.insert(4);
+            bm.insert(5);
+            bm
+        })
+        .encode_to_bytes()
+        .unwrap();
+
+        // when - no existing value
+        let merged = merge_batch_roaring_treemap(None, &[op0, op1, op2]).unwrap();
+        let decoded = DeletionsValue::decode_from_bytes(&merged).unwrap();
+
+        // then - union of all bitmaps
+        let mut expected = RoaringTreemap::new();
+        for id in [1, 2, 3, 4, 5] {
+            expected.insert(id);
+        }
+        assert_eq!(decoded.vector_ids, expected);
+    }
+
+    #[test]
+    fn should_batch_merge_deletions_with_existing() {
+        // given
+        let existing = DeletionsValue::from_treemap({
+            let mut bm = RoaringTreemap::new();
+            bm.insert(10);
+            bm
+        })
+        .encode_to_bytes()
+        .unwrap();
+        let op0 = DeletionsValue::from_treemap({
+            let mut bm = RoaringTreemap::new();
+            bm.insert(1);
+            bm.insert(10);
+            bm
+        })
+        .encode_to_bytes()
+        .unwrap();
+
+        // when
+        let merged = merge_batch_roaring_treemap(Some(existing), &[op0]).unwrap();
+        let decoded = DeletionsValue::decode_from_bytes(&merged).unwrap();
+
+        // then
+        let mut expected = RoaringTreemap::new();
+        for id in [1, 10] {
+            expected.insert(id);
+        }
+        assert_eq!(decoded.vector_ids, expected);
+    }
+
+    #[test]
+    fn should_route_merge_batch_deletions_to_batch_treemap() {
+        // given
+        let operator = VectorDbMergeOperator::new(3);
+        let key = create_deletions_key();
+
+        let existing = DeletionsValue::from_treemap({
+            let mut bm = RoaringTreemap::new();
+            bm.insert(1);
+            bm
+        })
+        .encode_to_bytes()
+        .unwrap();
+        let op0 = DeletionsValue::from_treemap({
+            let mut bm = RoaringTreemap::new();
+            bm.insert(2);
+            bm
+        })
+        .encode_to_bytes()
+        .unwrap();
+        let op1 = DeletionsValue::from_treemap({
+            let mut bm = RoaringTreemap::new();
+            bm.insert(3);
+            bm
+        })
+        .encode_to_bytes()
+        .unwrap();
+
+        // when
+        let merged = operator.merge_batch(&key, Some(existing), &[op0, op1]);
+
+        // then
+        let mut expected = RoaringTreemap::new();
+        for id in [1, 2, 3] {
+            expected.insert(id);
+        }
+        let decoded = DeletionsValue::decode_from_bytes(&merged).unwrap();
+        assert_eq!(decoded.vector_ids, expected);
+    }
+
+    #[test]
+    fn should_route_merge_batch_metadata_index_to_batch_treemap() {
+        // given
+        let operator = VectorDbMergeOperator::new(3);
+        let key = create_metadata_index_key();
+
+        let existing = MetadataIndexValue::from_treemap({
+            let mut bm = RoaringTreemap::new();
+            bm.insert(1);
+            bm
+        })
+        .encode_to_bytes()
+        .unwrap();
+        let op0 = MetadataIndexValue::from_treemap({
+            let mut bm = RoaringTreemap::new();
+            bm.insert(2);
+            bm
+        })
+        .encode_to_bytes()
+        .unwrap();
+        let op1 = MetadataIndexValue::from_treemap({
+            let mut bm = RoaringTreemap::new();
+            bm.insert(3);
+            bm
+        })
+        .encode_to_bytes()
+        .unwrap();
+
+        // when
+        let merged = operator.merge_batch(&key, Some(existing), &[op0, op1]);
+
+        // then
+        let mut expected = RoaringTreemap::new();
+        for id in [1, 2, 3] {
+            expected.insert(id);
+        }
+        let decoded = MetadataIndexValue::decode_from_bytes(&merged).unwrap();
+        assert_eq!(decoded.vector_ids, expected);
     }
 }
