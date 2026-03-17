@@ -1749,6 +1749,30 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         evaluation_ts: Timestamp,
         lookback_delta_ms: i64,
     ) -> EvalResult<ExprResult> {
+        // Fast path: use preloaded data if available
+        let preload_key = PreloadKey::from_selector(vector_selector);
+        if let Some(preloaded) = self.preloaded_instant.get(&preload_key) {
+            self.reader.stats.preload_hits += 1;
+
+            // Step index from raw evaluation_ts (before modifiers) — matches outer step loop
+            let step_idx = ((evaluation_ts.as_millis() - preloaded.eval_start_ms)
+                / preloaded.step_ms) as usize;
+
+            let mut samples = Vec::new();
+            for series in &preloaded.series {
+                if let Some(Some(sample)) = series.values.get(step_idx) {
+                    samples.push(EvalSample {
+                        timestamp_ms: sample.timestamp_ms,
+                        value: sample.value,
+                        labels: series.labels.clone(),
+                        drop_name: false,
+                    });
+                }
+            }
+            return Ok(ExprResult::InstantVector(samples));
+        }
+
+        // Slow path: per-step evaluation
         // Apply time modifiers (offset and @)
         let adjusted_eval_ts = self.apply_time_modifiers(
             vector_selector.at.as_ref(),

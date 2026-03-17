@@ -320,6 +320,16 @@ pub(crate) async fn evaluate_range(
 
     let mut series_map: HashMap<Labels, Vec<(i64, f64)>> = HashMap::new();
     let mut evaluator = Evaluator::new(reader);
+
+    // Preload VectorSelector data for all steps
+    let start_ms = start.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    let end_ms = end.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    let step_ms = step.as_millis() as i64;
+    let lookback_delta_ms = lookback_delta.as_millis() as i64;
+    evaluator
+        .preload_for_range(&stmt.expr, start_ms, end_ms, step_ms, lookback_delta_ms)
+        .await?;
+
     let mut current_time = start;
     let mut step_count: u64 = 0;
 
