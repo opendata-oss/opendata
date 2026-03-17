@@ -79,18 +79,19 @@ impl SelectorKey {
     }
 }
 
-/// Cached per-series metadata: fingerprint, label map, and canonical sorted labels.
-/// Computed once per (bucket, series_id), reused across all steps.
-#[derive(Clone)]
+/// Cached per-series metadata: fingerprint and canonical sorted labels.
+/// Computed once per (bucket, series_id), reused across all steps via Arc sharing.
+/// Label maps (HashMap<String, String>) are built on demand at output time, not cached,
+/// because most steps don't emit output for most series.
 pub(crate) struct SeriesMeta {
     pub(crate) fingerprint: SeriesFingerprint,
-    pub(crate) label_map: HashMap<String, String>,
-    pub(crate) sorted_labels: Vec<Label>,
+    pub(crate) sorted_labels: Arc<Vec<Label>>,
 }
 
 /// Type alias for complex HashMap used in matrix selector evaluation.
-/// Maps from label key (sorted vector of label pairs) to samples vector
-type SeriesMap = HashMap<Vec<Label>, Vec<Sample>>;
+/// Maps from label key (Arc-wrapped sorted vector of label pairs) to samples vector.
+/// Arc key enables cheap insertion from cached SeriesMeta without cloning the label vec.
+type SeriesMap = HashMap<Arc<Vec<Label>>, Vec<Sample>>;
 
 pub(crate) struct QueryReaderBucketEvalCache {
     // Map from terms (series_ids for forward, labels for inverted) to cached results
@@ -356,9 +357,11 @@ pub(crate) struct CachedQueryReader<'reader, R: QueryReader> {
     /// Cached bucket list — populated on first call, reused for all subsequent steps.
     cached_buckets: Option<Vec<TimeBucket>>,
     /// Cached selector results: (bucket, selector_key) → matching series IDs.
-    selector_cache: HashMap<(TimeBucket, SelectorKey), HashSet<SeriesId>>,
+    /// Arc-wrapped so cache hits return a cheap refcount bump instead of cloning the set.
+    selector_cache: HashMap<(TimeBucket, SelectorKey), Arc<HashSet<SeriesId>>>,
     /// Cached per-series metadata: (bucket, series_id) → fingerprint + labels.
-    series_meta_cache: HashMap<(TimeBucket, SeriesId), SeriesMeta>,
+    /// Arc-wrapped so callers can share metadata without cloning strings.
+    series_meta_cache: HashMap<(TimeBucket, SeriesId), Arc<SeriesMeta>>,
 }
 
 impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
@@ -503,12 +506,12 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
     }
 
     /// Look up cached selector results for (bucket, selector_key).
-    /// Returns a clone of the cached set (if present) and increments the cache hit counter.
-    pub(crate) fn get_cached_selector_cloned(
+    /// Returns an Arc (cheap refcount bump) and increments the cache hit counter.
+    pub(crate) fn get_cached_selector(
         &mut self,
         bucket: &TimeBucket,
         key: &SelectorKey,
-    ) -> Option<HashSet<SeriesId>> {
+    ) -> Option<Arc<HashSet<SeriesId>>> {
         let result = self.selector_cache.get(&(*bucket, key.clone())).cloned();
         if result.is_some() {
             self.stats.selector_cache_hits += 1;
@@ -523,39 +526,35 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         key: SelectorKey,
         candidates: HashSet<SeriesId>,
     ) {
-        self.selector_cache.insert((bucket, key), candidates);
+        self.selector_cache.insert((bucket, key), Arc::new(candidates));
     }
 
     /// Look up or compute series metadata (fingerprint + label map + sorted labels).
     /// On first call for a (bucket, series_id), computes from the forward index view
-    /// and caches. Subsequent calls return the cached copy.
+    /// and caches. Returns Arc for cheap sharing — callers never clone the inner data.
     pub(crate) fn get_or_insert_series_meta(
         &mut self,
         bucket: &TimeBucket,
         series_id: SeriesId,
         forward_index_view: &dyn ForwardIndexLookup,
-    ) -> Option<&SeriesMeta> {
+    ) -> Option<Arc<SeriesMeta>> {
         let cache_key = (*bucket, series_id);
         match self.series_meta_cache.entry(cache_key) {
             std::collections::hash_map::Entry::Occupied(entry) => {
                 self.stats.series_meta_cache_hits += 1;
-                Some(entry.into_mut())
+                Some(Arc::clone(entry.get()))
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let spec = forward_index_view.get_spec(&series_id)?;
                 let fingerprint = Self::compute_fingerprint_static(&spec.labels);
-                let label_map: HashMap<String, String> = spec
-                    .labels
-                    .iter()
-                    .map(|l| (l.name.clone(), l.value.clone()))
-                    .collect();
                 let mut sorted_labels = spec.labels;
                 sorted_labels.sort();
-                Some(entry.insert(SeriesMeta {
+                let meta = Arc::new(SeriesMeta {
                     fingerprint,
-                    label_map,
-                    sorted_labels,
-                }))
+                    sorted_labels: Arc::new(sorted_labels),
+                });
+                entry.insert(Arc::clone(&meta));
+                Some(meta)
             }
         }
     }
@@ -1093,8 +1092,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
             // Check selector cache first, fall back to full evaluation
             let candidates =
-                if let Some(cached) = self.reader.get_cached_selector_cloned(&bucket, &selector_key)
-                {
+                if let Some(cached) = self.reader.get_cached_selector(&bucket, &selector_key) {
                     cached
                 } else {
                     let result =
@@ -1103,24 +1101,24 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                             .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
                     self.reader
                         .cache_selector(bucket, selector_key.clone(), result.clone());
-                    result
+                    Arc::new(result)
                 };
 
             if candidates.is_empty() {
                 continue;
             }
 
-            let candidates_vec: Vec<_> = candidates.into_iter().collect();
+            let candidates_vec: Vec<_> = candidates.iter().copied().collect();
             let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
 
             for series_id in candidates_vec {
-                // Get series metadata from cache, computing on first access
+                // Get series metadata from cache (Arc — cheap refcount bump)
                 let meta = match self.reader.get_or_insert_series_meta(
                     &bucket,
                     series_id,
                     forward_index_view.as_ref(),
                 ) {
-                    Some(m) => m.clone(),
+                    Some(m) => m,
                     None => {
                         return Err(EvaluationError::InternalError(format!(
                             "Series {} not found in bucket {:?}",
@@ -1134,7 +1132,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     .samples(&bucket, series_id, start_ms, end_ms)
                     .await?;
 
-                let values = series_map.entry(meta.sorted_labels).or_default();
+                // Use sorted_labels as map key via Arc to avoid cloning the Vec<Label>
+                let values = series_map
+                    .entry(Arc::clone(&meta.sorted_labels))
+                    .or_default();
                 for sample in sample_data {
                     values.push(sample);
                 }
@@ -1326,8 +1327,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         for bucket in buckets {
             // Check selector cache first, fall back to full evaluation
             let candidates =
-                if let Some(cached) = self.reader.get_cached_selector_cloned(&bucket, &selector_key)
-                {
+                if let Some(cached) = self.reader.get_cached_selector(&bucket, &selector_key) {
                     cached
                 } else {
                     let result =
@@ -1336,24 +1336,24 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                             .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
                     self.reader
                         .cache_selector(bucket, selector_key.clone(), result.clone());
-                    result
+                    Arc::new(result)
                 };
 
             if candidates.is_empty() {
                 continue;
             }
 
-            let candidates_vec: Vec<_> = candidates.into_iter().collect();
+            let candidates_vec: Vec<_> = candidates.iter().copied().collect();
             let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
 
             for series_id in candidates_vec {
-                // Get series metadata from cache, computing on first access
+                // Get series metadata from cache (Arc — cheap refcount bump)
                 let meta = match self.reader.get_or_insert_series_meta(
                     &bucket,
                     series_id,
                     forward_index_view.as_ref(),
                 ) {
-                    Some(m) => m.clone(),
+                    Some(m) => m,
                     None => continue,
                 };
 
@@ -1367,7 +1367,13 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 }
 
                 let entry = series_samples.entry(meta.fingerprint).or_insert_with(|| {
-                    (meta.label_map, Vec::new())
+                    // Build label_map only once per series, at insertion time
+                    let label_map: HashMap<String, String> = meta
+                        .sorted_labels
+                        .iter()
+                        .map(|l| (l.name.clone(), l.value.clone()))
+                        .collect();
+                    (label_map, Vec::new())
                 });
 
                 entry.1.extend(samples);
@@ -1503,8 +1509,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         for bucket in buckets {
             // Check selector cache first, fall back to full evaluation
             let candidates =
-                if let Some(cached) = self.reader.get_cached_selector_cloned(&bucket, &selector_key)
-                {
+                if let Some(cached) = self.reader.get_cached_selector(&bucket, &selector_key) {
                     cached
                 } else {
                     let result =
@@ -1513,7 +1518,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                             .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
                     self.reader
                         .cache_selector(bucket, selector_key.clone(), result.clone());
-                    result
+                    Arc::new(result)
                 };
 
             if candidates.is_empty() {
@@ -1521,17 +1526,17 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             }
 
             // Batch load forward index for all candidates upfront
-            let candidates_vec: Vec<_> = candidates.into_iter().collect();
+            let candidates_vec: Vec<_> = candidates.iter().copied().collect();
             let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
 
             for series_id in candidates_vec {
-                // Get series metadata from cache (fingerprint + labels), computing on first access
+                // Get series metadata from cache (Arc — cheap refcount bump)
                 let meta = match self.reader.get_or_insert_series_meta(
                     &bucket,
                     series_id,
                     forward_index_view.as_ref(),
                 ) {
-                    Some(m) => m.clone(),
+                    Some(m) => m,
                     None => {
                         return Err(EvaluationError::InternalError(format!(
                             "Series {} not found in bucket {:?}",
@@ -1553,10 +1558,16 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
                 // Find the best (latest) point in the time range
                 if let Some(best_sample) = sample_data.last() {
+                    // Build label_map only when we actually emit a result (not on every cache hit)
+                    let label_map: HashMap<String, String> = meta
+                        .sorted_labels
+                        .iter()
+                        .map(|l| (l.name.clone(), l.value.clone()))
+                        .collect();
                     samples.push(EvalSample {
                         timestamp_ms: best_sample.timestamp_ms,
                         value: best_sample.value,
-                        labels: meta.label_map,
+                        labels: label_map,
                         drop_name: false,
                     });
 
