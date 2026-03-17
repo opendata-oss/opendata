@@ -425,6 +425,10 @@ pub(crate) struct Evaluator<'reader, R: QueryReader> {
     /// Preloaded per-step instant vector data for range queries.
     /// Populated by preload_for_range() before the step loop.
     preloaded_instant: HashMap<PreloadKey, PreloadedInstantData>,
+    /// True when executing in the outer range-query step loop context.
+    /// Set to false inside subquery evaluation to prevent cross-context
+    /// reuse of preloaded data (subqueries have different step grids).
+    preload_eligible: bool,
 }
 
 /// A wrapper around QueryReader that uses QueryReaderEvalCache for caching
@@ -1039,6 +1043,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         Self {
             reader: CachedQueryReader::new(reader),
             preloaded_instant: HashMap::new(),
+            preload_eligible: true,
         }
     }
 
@@ -1488,7 +1493,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             aligned_start_ms += step_ms;
         }
 
-        // Evaluate the inner expression at each step within the subquery range
+        // Evaluate the inner expression at each step within the subquery range.
+        // Disable preload fast path — subquery has its own step grid/lookback context.
+        let outer_preload_eligible = self.preload_eligible;
+        self.preload_eligible = false;
+
         let mut series_map: HashMap<Vec<Label>, Vec<Sample>> = HashMap::new();
 
         for current_time_ms in (aligned_start_ms..=subquery_end_ms).step_by(step_ms as usize) {
@@ -1508,6 +1517,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             // PromQL requires subquery inner expression to evaluate to an instant vector.
             // Enforce this invariant at runtime.
             let ExprResult::InstantVector(samples) = result else {
+                self.preload_eligible = outer_preload_eligible;
                 return Err(EvaluationError::InternalError(
                     "subquery inner expression must return instant vector".to_string(),
                 ));
@@ -1531,6 +1541,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 });
             }
         }
+
+        self.preload_eligible = outer_preload_eligible;
 
         let mut range_vector = Vec::new();
         for (labels, values) in series_map {
@@ -1749,9 +1761,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         evaluation_ts: Timestamp,
         lookback_delta_ms: i64,
     ) -> EvalResult<ExprResult> {
-        // Fast path: use preloaded data if available
+        // Fast path: use preloaded data if available (outer range-query context only).
+        // Disabled inside subqueries which have their own step grid/lookback context.
         let preload_key = PreloadKey::from_selector(vector_selector);
-        if let Some(preloaded) = self.preloaded_instant.get(&preload_key) {
+        if self.preload_eligible
+            && let Some(preloaded) = self.preloaded_instant.get(&preload_key)
+        {
             self.reader.stats.preload_hits += 1;
 
             // Step index from raw evaluation_ts (before modifiers) — matches outer step loop
