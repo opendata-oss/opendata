@@ -897,6 +897,35 @@ fn preload_ranges_inner(
     }
 }
 
+/// Single source of truth for offset / @ time-modifier arithmetic (in milliseconds).
+/// Both evaluate_vector_selector (per-step) and preload_vector_selector call this.
+fn apply_time_modifiers_ms(
+    at: Option<&AtModifier>,
+    offset: Option<&Offset>,
+    query_start_ms: i64,
+    query_end_ms: i64,
+    evaluation_ts_ms: i64,
+) -> i64 {
+    let mut adjusted = if let Some(at_modifier) = at {
+        match at_modifier {
+            AtModifier::At(timestamp) => Timestamp::from(*timestamp).as_millis(),
+            AtModifier::Start => query_start_ms,
+            AtModifier::End => query_end_ms,
+        }
+    } else {
+        evaluation_ts_ms
+    };
+
+    if let Some(offset) = offset {
+        adjusted = match offset {
+            Offset::Pos(duration) => adjusted - (duration.as_millis() as i64),
+            Offset::Neg(duration) => adjusted + (duration.as_millis() as i64),
+        };
+    }
+
+    adjusted
+}
+
 impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     pub(crate) fn new(reader: &'reader R) -> Self {
         Self {
@@ -1596,20 +1625,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     }
 
     /// Apply offset and @ modifiers to adjust the evaluation time.
-    ///
-    /// Implements PromQL time modifier semantics per the Prometheus specification:
-    /// - `offset <duration>`: Shifts evaluation time backward (positive) or forward (negative)
-    /// - `@ <timestamp>`: Sets absolute evaluation time
-    /// - `@ start()`: Uses query start time
-    /// - `@ end()`: Uses query end time
-    ///
-    /// When both modifiers are present, `offset` is applied relative to the `@`
-    /// modifier time. Although PromQL defines the result as order-independent
-    /// (e.g. `@ t offset d` == `offset d @ t`), we normalize the implementation
-    /// by applying `@` first and then applying `offset`. This keeps the logic
-    /// simple and matches Prometheus semantics.
-    ///
-    /// See: <https://prometheus.io/docs/prometheus/latest/querying/basics/#offset-modifier>
+    /// Thin wrapper around the free function `apply_time_modifiers_ms`.
     fn apply_time_modifiers(
         &self,
         at: Option<&AtModifier>,
@@ -1618,35 +1634,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         query_end: Timestamp,
         evaluation_ts: Timestamp,
     ) -> EvalResult<Timestamp> {
-        let mut adjusted_time_ms = if let Some(at_modifier) = at {
-            match at_modifier {
-                AtModifier::At(timestamp) => Timestamp::from(*timestamp).as_millis(),
-                AtModifier::Start => query_start.as_millis(),
-                AtModifier::End => query_end.as_millis(),
-            }
-        } else {
-            evaluation_ts.as_millis()
-        };
-
-        // Apply offset modifier (relative adjustment)
-        if let Some(offset) = offset {
-            adjusted_time_ms = match offset {
-                Offset::Pos(duration) => {
-                    // Positive offset: look back in time (subtract duration).
-                    // This matches Prometheus semantics: `http_requests_total offset 5m`
-                    // queries data from 5 minutes ago.
-                    adjusted_time_ms - (duration.as_millis() as i64)
-                }
-                Offset::Neg(duration) => {
-                    // Negative offset: look forward in time (add duration).
-                    // This matches Prometheus semantics: `http_requests_total offset -1w`
-                    // queries data from 1 week in the future.
-                    adjusted_time_ms + (duration.as_millis() as i64)
-                }
-            };
-        }
-
-        Ok(Timestamp::from_millis(adjusted_time_ms))
+        let ms = apply_time_modifiers_ms(
+            at,
+            offset,
+            query_start.as_millis(),
+            query_end.as_millis(),
+            evaluation_ts.as_millis(),
+        );
+        Ok(Timestamp::from_millis(ms))
     }
 
     /// Convert labels to HashMap
