@@ -151,6 +151,44 @@ impl ForwardIndexKey {
             bucket_size,
         })
     }
+
+    /// Create a BytesRange covering forward index keys for a contiguous range of series IDs
+    /// within a bucket. Used for batched forward index loading.
+    pub fn series_range(
+        bucket: &crate::model::TimeBucket,
+        start_id: SeriesId,
+        end_id_inclusive: SeriesId,
+    ) -> BytesRange {
+        use std::ops::Bound::{Excluded, Included};
+
+        let start_key = ForwardIndexKey {
+            time_bucket: bucket.start,
+            bucket_size: bucket.size,
+            series_id: start_id,
+        }
+        .encode();
+        match end_id_inclusive.checked_add(1) {
+            Some(end_exclusive) => {
+                let end_key = ForwardIndexKey {
+                    time_bucket: bucket.start,
+                    bucket_size: bucket.size,
+                    series_id: end_exclusive,
+                }
+                .encode();
+                BytesRange::new(Included(start_key), Excluded(end_key))
+            }
+            None => {
+                // end_id_inclusive is u32::MAX, can't compute exclusive end
+                let end_key = ForwardIndexKey {
+                    time_bucket: bucket.start,
+                    bucket_size: bucket.size,
+                    series_id: end_id_inclusive,
+                }
+                .encode();
+                BytesRange::new(Included(start_key), Included(end_key))
+            }
+        }
+    }
 }
 
 impl RecordKey for ForwardIndexKey {
@@ -498,6 +536,113 @@ mod tests {
             !range.contains(&short_attr_key.encode()),
             "attribute_range for 'abcdef' should not match key with attribute='ab' value='cdef'"
         );
+    }
+
+    #[test]
+    fn series_range_single_id() {
+        let bucket = crate::model::TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let range = ForwardIndexKey::series_range(&bucket, 5, 5);
+        let key5 = ForwardIndexKey {
+            time_bucket: 100,
+            bucket_size: 1,
+            series_id: 5,
+        }
+        .encode();
+        let key4 = ForwardIndexKey {
+            time_bucket: 100,
+            bucket_size: 1,
+            series_id: 4,
+        }
+        .encode();
+        let key6 = ForwardIndexKey {
+            time_bucket: 100,
+            bucket_size: 1,
+            series_id: 6,
+        }
+        .encode();
+        assert!(range.contains(&key5));
+        assert!(!range.contains(&key4));
+        assert!(!range.contains(&key6));
+    }
+
+    #[test]
+    fn series_range_contiguous_ids() {
+        let bucket = crate::model::TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let range = ForwardIndexKey::series_range(&bucket, 10, 12);
+        for id in 10..=12 {
+            let key = ForwardIndexKey {
+                time_bucket: 100,
+                bucket_size: 1,
+                series_id: id,
+            }
+            .encode();
+            assert!(range.contains(&key), "should contain series_id={}", id);
+        }
+        for id in [9, 13] {
+            let key = ForwardIndexKey {
+                time_bucket: 100,
+                bucket_size: 1,
+                series_id: id,
+            }
+            .encode();
+            assert!(!range.contains(&key), "should not contain series_id={}", id);
+        }
+    }
+
+    #[test]
+    fn series_range_u32_max_boundary() {
+        let bucket = crate::model::TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let range = ForwardIndexKey::series_range(&bucket, u32::MAX - 1, u32::MAX);
+        let key_max = ForwardIndexKey {
+            time_bucket: 100,
+            bucket_size: 1,
+            series_id: u32::MAX,
+        }
+        .encode();
+        let key_max_minus_1 = ForwardIndexKey {
+            time_bucket: 100,
+            bucket_size: 1,
+            series_id: u32::MAX - 1,
+        }
+        .encode();
+        let key_max_minus_2 = ForwardIndexKey {
+            time_bucket: 100,
+            bucket_size: 1,
+            series_id: u32::MAX - 2,
+        }
+        .encode();
+        assert!(range.contains(&key_max));
+        assert!(range.contains(&key_max_minus_1));
+        assert!(!range.contains(&key_max_minus_2));
+    }
+
+    #[test]
+    fn series_range_does_not_cross_buckets() {
+        let bucket1 = crate::model::TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let bucket2 = crate::model::TimeBucket {
+            start: 200,
+            size: 1,
+        };
+        let range = ForwardIndexKey::series_range(&bucket1, 10, 12);
+        let key_other_bucket = ForwardIndexKey {
+            time_bucket: 200,
+            bucket_size: 1,
+            series_id: 11,
+        }
+        .encode();
+        assert!(!range.contains(&key_other_bucket));
     }
 
     #[test]

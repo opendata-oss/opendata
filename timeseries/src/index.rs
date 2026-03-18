@@ -11,6 +11,16 @@ pub(crate) struct SeriesSpec {
     pub(crate) labels: Vec<Label>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ForwardIndexBatchStats {
+    pub(crate) total_series_requested: u32,
+    pub(crate) unique_series: u32,
+    pub(crate) batch_ops: u32,
+    pub(crate) point_lookups: u32,
+    pub(crate) range_scans: u32,
+    pub(crate) range_scan_series: u32,
+}
+
 /// Trait for looking up series specs by ID.
 /// This allows both ForwardIndex and view types to be used interchangeably.
 pub(crate) trait ForwardIndexLookup {
@@ -21,6 +31,11 @@ pub(crate) trait ForwardIndexLookup {
     /// Get all series specs in the forward index.
     /// Returns a vector of (series_id, spec) pairs.
     fn all_series(&self) -> Vec<(SeriesId, SeriesSpec)>;
+
+    /// Return batch loading statistics. Default returns zeros (for mocks, cached views, etc.).
+    fn batch_stats(&self) -> ForwardIndexBatchStats {
+        ForwardIndexBatchStats::default()
+    }
 }
 
 impl<T: ForwardIndexLookup + ?Sized> ForwardIndexLookup for Box<T> {
@@ -30,6 +45,10 @@ impl<T: ForwardIndexLookup + ?Sized> ForwardIndexLookup for Box<T> {
 
     fn all_series(&self) -> Vec<(SeriesId, SeriesSpec)> {
         (**self).all_series()
+    }
+
+    fn batch_stats(&self) -> ForwardIndexBatchStats {
+        (**self).batch_stats()
     }
 }
 

@@ -3,7 +3,7 @@ use common::storage::RecordOp;
 use common::{Record, Storage, StorageRead};
 use roaring::RoaringBitmap;
 
-use crate::index::{InvertedIndex, SeriesSpec};
+use crate::index::{ForwardIndexBatchStats, ForwardIndexLookup, InvertedIndex, SeriesSpec};
 use crate::model::{Sample, SeriesFingerprint, SeriesId, TimeBucket};
 use crate::serde::key::TimeSeriesKey;
 use crate::serde::timeseries::TimeSeriesValue;
@@ -22,6 +22,71 @@ use crate::{
 };
 
 pub(crate) mod merge_operator;
+
+// ── Batched forward index loading ──────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ForwardIndexBatchOp {
+    Point(SeriesId),
+    Range {
+        start: SeriesId,
+        end_inclusive: SeriesId,
+        count: u32,
+    },
+}
+
+fn plan_forward_index_batches(sorted_ids: &[SeriesId]) -> Vec<ForwardIndexBatchOp> {
+    if sorted_ids.is_empty() {
+        return Vec::new();
+    }
+    let mut ops = Vec::new();
+    let mut run_start = sorted_ids[0];
+    let mut run_end = sorted_ids[0];
+    for &id in &sorted_ids[1..] {
+        if run_end.checked_add(1) == Some(id) {
+            run_end = id;
+        } else {
+            emit_batch_op(&mut ops, run_start, run_end);
+            run_start = id;
+            run_end = id;
+        }
+    }
+    emit_batch_op(&mut ops, run_start, run_end);
+    ops
+}
+
+fn emit_batch_op(ops: &mut Vec<ForwardIndexBatchOp>, start: SeriesId, end: SeriesId) {
+    if start == end {
+        ops.push(ForwardIndexBatchOp::Point(start));
+    } else {
+        ops.push(ForwardIndexBatchOp::Range {
+            start,
+            end_inclusive: end,
+            count: end - start + 1,
+        });
+    }
+}
+
+/// Forward index loaded from storage, carrying batch loading statistics.
+/// Wraps ForwardIndex to keep telemetry out of the logical data structure.
+pub(crate) struct LoadedForwardIndex {
+    pub(crate) inner: ForwardIndex,
+    pub(crate) batch_stats: ForwardIndexBatchStats,
+}
+
+impl ForwardIndexLookup for LoadedForwardIndex {
+    fn get_spec(&self, series_id: &SeriesId) -> Option<SeriesSpec> {
+        self.inner.get_spec(series_id)
+    }
+
+    fn all_series(&self) -> Vec<(SeriesId, SeriesSpec)> {
+        self.inner.all_series()
+    }
+
+    fn batch_stats(&self) -> ForwardIndexBatchStats {
+        self.batch_stats.clone()
+    }
+}
 
 /// Extension trait for StorageRead that provides OpenTSDB-specific loading methods
 #[async_trait]
@@ -183,27 +248,78 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         Ok(result)
     }
 
-    /// Load only the specified series from the forward index.
+    /// Load only the specified series from the forward index using batched operations.
+    /// Contiguous runs of series IDs are loaded with a single scan() instead of N get() calls.
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get_forward_index_series(
         &self,
         bucket: &TimeBucket,
         series_ids: &[SeriesId],
-    ) -> Result<ForwardIndex> {
+    ) -> Result<LoadedForwardIndex> {
+        let total_requested = series_ids.len() as u32;
+
+        // Sort and dedup
+        let mut sorted_ids: Vec<SeriesId> = series_ids.to_vec();
+        sorted_ids.sort();
+        sorted_ids.dedup();
+        let unique_count = sorted_ids.len() as u32;
+
+        let ops = plan_forward_index_batches(&sorted_ids);
         let result = ForwardIndex::default();
-        for &series_id in series_ids {
-            let key = ForwardIndexKey {
-                time_bucket: bucket.start,
-                bucket_size: bucket.size,
-                series_id,
-            }
-            .encode();
-            if let Some(record) = self.get(key).await? {
-                let value = ForwardIndexValue::decode(record.value.as_ref())?;
-                result.series.insert(series_id, value.into());
+        let mut stats = ForwardIndexBatchStats {
+            total_series_requested: total_requested,
+            unique_series: unique_count,
+            batch_ops: ops.len() as u32,
+            ..Default::default()
+        };
+
+        for op in &ops {
+            match op {
+                ForwardIndexBatchOp::Point(series_id) => {
+                    stats.point_lookups += 1;
+                    let key = ForwardIndexKey {
+                        time_bucket: bucket.start,
+                        bucket_size: bucket.size,
+                        series_id: *series_id,
+                    }
+                    .encode();
+                    if let Some(record) = self.get(key).await? {
+                        let value = ForwardIndexValue::decode(record.value.as_ref())?;
+                        result.series.insert(*series_id, value.into());
+                    }
+                }
+                ForwardIndexBatchOp::Range {
+                    start,
+                    end_inclusive,
+                    count,
+                } => {
+                    stats.range_scans += 1;
+                    stats.range_scan_series += count;
+                    let range = ForwardIndexKey::series_range(bucket, *start, *end_inclusive);
+                    let records = self.scan(range).await?;
+                    for record in records {
+                        let key = ForwardIndexKey::decode(record.key.as_ref())?;
+                        let value = ForwardIndexValue::decode(record.value.as_ref())?;
+                        result.series.insert(key.series_id, value.into());
+                    }
+                }
             }
         }
-        Ok(result)
+
+        tracing::trace!(
+            total_requested,
+            unique_series = unique_count,
+            batch_ops = stats.batch_ops,
+            point_lookups = stats.point_lookups,
+            range_scans = stats.range_scans,
+            range_scan_series = stats.range_scan_series,
+            "forward index batch load"
+        );
+
+        Ok(LoadedForwardIndex {
+            inner: result,
+            batch_stats: stats,
+        })
     }
 
     /// Load the series dictionary using the provided insert function and
@@ -427,5 +543,291 @@ mod tests {
         let s = storage_with_buckets(&[0, 60]).await;
         let buckets = s.get_buckets_for_ranges(&[(3600, 7200)]).await.unwrap();
         assert_eq!(starts(&buckets), vec![60]);
+    }
+
+    // ── plan_forward_index_batches tests ───────────────────────────────
+
+    #[test]
+    fn batch_plan_empty() {
+        assert!(plan_forward_index_batches(&[]).is_empty());
+    }
+
+    #[test]
+    fn batch_plan_single() {
+        assert_eq!(
+            plan_forward_index_batches(&[42]),
+            vec![ForwardIndexBatchOp::Point(42)]
+        );
+    }
+
+    #[test]
+    fn batch_plan_two_contiguous() {
+        assert_eq!(
+            plan_forward_index_batches(&[10, 11]),
+            vec![ForwardIndexBatchOp::Range {
+                start: 10,
+                end_inclusive: 11,
+                count: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn batch_plan_three_contiguous() {
+        assert_eq!(
+            plan_forward_index_batches(&[10, 11, 12]),
+            vec![ForwardIndexBatchOp::Range {
+                start: 10,
+                end_inclusive: 12,
+                count: 3
+            }]
+        );
+    }
+
+    #[test]
+    fn batch_plan_gap() {
+        assert_eq!(
+            plan_forward_index_batches(&[10, 12, 13]),
+            vec![
+                ForwardIndexBatchOp::Point(10),
+                ForwardIndexBatchOp::Range {
+                    start: 12,
+                    end_inclusive: 13,
+                    count: 2
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn batch_plan_all_isolated() {
+        assert_eq!(
+            plan_forward_index_batches(&[1, 5, 100]),
+            vec![
+                ForwardIndexBatchOp::Point(1),
+                ForwardIndexBatchOp::Point(5),
+                ForwardIndexBatchOp::Point(100),
+            ]
+        );
+    }
+
+    #[test]
+    fn batch_plan_mixed() {
+        assert_eq!(
+            plan_forward_index_batches(&[1, 2, 3, 10, 20, 21, 22, 23, 50]),
+            vec![
+                ForwardIndexBatchOp::Range {
+                    start: 1,
+                    end_inclusive: 3,
+                    count: 3
+                },
+                ForwardIndexBatchOp::Point(10),
+                ForwardIndexBatchOp::Range {
+                    start: 20,
+                    end_inclusive: 23,
+                    count: 4
+                },
+                ForwardIndexBatchOp::Point(50),
+            ]
+        );
+    }
+
+    #[test]
+    fn batch_plan_u32_max_contiguous() {
+        assert_eq!(
+            plan_forward_index_batches(&[u32::MAX - 1, u32::MAX]),
+            vec![ForwardIndexBatchOp::Range {
+                start: u32::MAX - 1,
+                end_inclusive: u32::MAX,
+                count: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn batch_plan_u32_max_isolated() {
+        // Gap of 1 between MAX-2 and MAX
+        assert_eq!(
+            plan_forward_index_batches(&[u32::MAX - 2, u32::MAX]),
+            vec![
+                ForwardIndexBatchOp::Point(u32::MAX - 2),
+                ForwardIndexBatchOp::Point(u32::MAX),
+            ]
+        );
+    }
+
+    // ── Integration tests for batched get_forward_index_series ─────────
+
+    fn make_series_spec(label_value: &str) -> SeriesSpec {
+        SeriesSpec {
+            unit: None,
+            metric_type: None,
+            labels: vec![crate::model::Label {
+                name: "test".to_string(),
+                value: label_value.to_string(),
+            }],
+        }
+    }
+
+    async fn storage_with_forward_index(
+        series: &[(SeriesId, &str)],
+        bucket: &TimeBucket,
+    ) -> Arc<InMemoryStorage> {
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let ops: Vec<_> = series
+            .iter()
+            .map(|&(sid, label)| {
+                let spec = make_series_spec(label);
+                storage.insert_forward_index(*bucket, sid, spec).unwrap()
+            })
+            .collect();
+        let put_ops: Vec<_> = ops
+            .into_iter()
+            .map(|op| match op {
+                RecordOp::Put(p) => p,
+                _ => panic!("expected Put"),
+            })
+            .collect();
+        storage.put(put_ops).await.unwrap();
+        storage
+    }
+
+    #[tokio::test]
+    async fn batched_fi_mixed_ops() {
+        let bucket = TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let s = storage_with_forward_index(
+            &[(1, "a"), (2, "b"), (3, "c"), (5, "e"), (10, "j")],
+            &bucket,
+        )
+        .await;
+        let snapshot = s.snapshot().await.unwrap();
+        let result = snapshot
+            .get_forward_index_series(&bucket, &[1, 2, 3, 5, 10])
+            .await
+            .unwrap();
+        // All 5 should be present
+        assert_eq!(result.inner.series.len(), 5);
+        // batch_stats: [1,2,3] = 1 range scan, [5] = 1 point, [10] = 1 point
+        assert_eq!(result.batch_stats.range_scans, 1);
+        assert_eq!(result.batch_stats.point_lookups, 2);
+        assert_eq!(result.batch_stats.batch_ops, 3);
+    }
+
+    #[tokio::test]
+    async fn batched_fi_missing_ids() {
+        let bucket = TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let s = storage_with_forward_index(&[(2, "b")], &bucket).await;
+        let snapshot = s.snapshot().await.unwrap();
+        let result = snapshot
+            .get_forward_index_series(&bucket, &[1, 2, 3])
+            .await
+            .unwrap();
+        // Only series 2 exists
+        assert_eq!(result.inner.series.len(), 1);
+        assert!(result.inner.series.get(&2).is_some());
+    }
+
+    #[tokio::test]
+    async fn batched_fi_dedup() {
+        let bucket = TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let s = storage_with_forward_index(&[(1, "a")], &bucket).await;
+        let snapshot = s.snapshot().await.unwrap();
+        let result = snapshot
+            .get_forward_index_series(&bucket, &[1, 1, 1])
+            .await
+            .unwrap();
+        assert_eq!(result.inner.series.len(), 1);
+        assert_eq!(result.batch_stats.unique_series, 1);
+        assert_eq!(result.batch_stats.total_series_requested, 3);
+        assert_eq!(result.batch_stats.point_lookups, 1);
+    }
+
+    #[tokio::test]
+    async fn batched_fi_empty_input() {
+        let bucket = TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let s = storage_with_forward_index(&[], &bucket).await;
+        let snapshot = s.snapshot().await.unwrap();
+        let result = snapshot
+            .get_forward_index_series(&bucket, &[])
+            .await
+            .unwrap();
+        assert_eq!(result.inner.series.len(), 0);
+        assert_eq!(result.batch_stats.batch_ops, 0);
+    }
+
+    #[tokio::test]
+    async fn batched_fi_dense_run_stats() {
+        let bucket = TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let s = storage_with_forward_index(
+            &[(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")],
+            &bucket,
+        )
+        .await;
+        let snapshot = s.snapshot().await.unwrap();
+        let result = snapshot
+            .get_forward_index_series(&bucket, &[1, 2, 3, 4, 5])
+            .await
+            .unwrap();
+        assert_eq!(result.inner.series.len(), 5);
+        assert_eq!(result.batch_stats.range_scans, 1);
+        assert_eq!(result.batch_stats.point_lookups, 0);
+        assert_eq!(result.batch_stats.unique_series, 5);
+        assert_eq!(result.batch_stats.batch_ops, 1);
+        assert_eq!(result.batch_stats.range_scan_series, 5);
+    }
+
+    #[tokio::test]
+    async fn batched_fi_equivalence_with_individual_gets() {
+        // Verify batched results match N individual lookups
+        let bucket = TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let s = storage_with_forward_index(
+            &[(1, "a"), (2, "b"), (5, "e"), (6, "f"), (10, "j")],
+            &bucket,
+        )
+        .await;
+        let snapshot = s.snapshot().await.unwrap();
+        let batched = snapshot
+            .get_forward_index_series(&bucket, &[1, 2, 5, 6, 10])
+            .await
+            .unwrap();
+
+        // Individual lookups
+        for &sid in &[1u32, 2, 5, 6, 10] {
+            let individual = snapshot
+                .get_forward_index_series(&bucket, &[sid])
+                .await
+                .unwrap();
+            let batched_spec = batched.inner.get_spec(&sid);
+            let individual_spec = individual.inner.get_spec(&sid);
+            assert_eq!(
+                batched_spec.is_some(),
+                individual_spec.is_some(),
+                "mismatch for sid={}",
+                sid
+            );
+            if let (Some(b), Some(i)) = (batched_spec, individual_spec) {
+                assert_eq!(b.labels, i.labels, "label mismatch for sid={}", sid);
+            }
+        }
     }
 }

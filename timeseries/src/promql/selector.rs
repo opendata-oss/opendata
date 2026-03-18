@@ -227,6 +227,12 @@ pub(crate) struct SelectorRawStats {
     pub(crate) metadata_queue_wait_ms: u64,
     pub(crate) metadata_load_ms: u64,
     pub(crate) metadata_permit_acquires: u64,
+    // Batched forward index stats (from negative/empty-string matcher filtering)
+    pub(crate) fi_unique_series: u64,
+    pub(crate) fi_batch_ops: u64,
+    pub(crate) fi_point_lookups: u64,
+    pub(crate) fi_range_scans: u64,
+    pub(crate) fi_range_scan_series: u64,
 }
 
 /// Selector evaluation using raw QueryReader — no caching layer.
@@ -342,7 +348,7 @@ async fn acquire_and_load_forward_index<R: QueryReader>(
     coordinator: &Option<ReadLoadCoordinator>,
     stats: &mut SelectorRawStats,
 ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
-    if let Some(coord) = coordinator {
+    let result = if let Some(coord) = coordinator {
         let (permit, wait) = coord.acquire_metadata().await;
         stats.metadata_permit_acquires += 1;
         stats.metadata_queue_wait_ms += wait.as_millis() as u64;
@@ -350,13 +356,20 @@ async fn acquire_and_load_forward_index<R: QueryReader>(
         let result = reader.forward_index(bucket, series_ids).await?;
         stats.metadata_load_ms += t0.elapsed().as_millis() as u64;
         drop(permit);
-        Ok(result)
+        result
     } else {
         let t0 = std::time::Instant::now();
         let result = reader.forward_index(bucket, series_ids).await?;
         stats.metadata_load_ms += t0.elapsed().as_millis() as u64;
-        Ok(result)
-    }
+        result
+    };
+    let bs = result.batch_stats();
+    stats.fi_unique_series += bs.unique_series as u64;
+    stats.fi_batch_ops += bs.batch_ops as u64;
+    stats.fi_point_lookups += bs.point_lookups as u64;
+    stats.fi_range_scans += bs.range_scans as u64;
+    stats.fi_range_scan_series += bs.range_scan_series as u64;
+    Ok(result)
 }
 
 /// Evaluate selector on in-memory indexes.
