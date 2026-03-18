@@ -113,6 +113,10 @@ pub(crate) struct EvalStats {
     pub(crate) fi_run_len_2_3: u64,
     pub(crate) fi_run_len_4_7: u64,
     pub(crate) fi_run_len_8_plus: u64,
+    // Merge decision counters
+    pub(crate) fi_merge_accepted: u64,
+    pub(crate) fi_merge_rejected_gap: u64,
+    pub(crate) fi_merge_rejected_density: u64,
 }
 
 /// Canonical key for caching selector results across steps.
@@ -239,6 +243,10 @@ struct BucketResolutionStats {
     fi_run_len_2_3: u64,
     fi_run_len_4_7: u64,
     fi_run_len_8_plus: u64,
+    // Merge decision counters
+    fi_merge_accepted: u64,
+    fi_merge_rejected_gap: u64,
+    fi_merge_rejected_density: u64,
 }
 
 /// Work item for parallel sample loading (Phase B3).
@@ -743,6 +751,9 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             self.stats.fi_run_len_2_3 += bs.run_len_2_3 as u64;
             self.stats.fi_run_len_4_7 += bs.run_len_4_7 as u64;
             self.stats.fi_run_len_8_plus += (bs.run_len_8_15 + bs.run_len_16_plus) as u64;
+            self.stats.fi_merge_accepted += bs.merge_accepted as u64;
+            self.stats.fi_merge_rejected_gap += bs.merge_rejected_gap as u64;
+            self.stats.fi_merge_rejected_density += bs.merge_rejected_density as u64;
 
             self.cache
                 .cache_forward_index(*bucket, series_ids.clone(), forward_index);
@@ -1363,6 +1374,9 @@ async fn resolve_bucket_raw<R: QueryReader>(
     stats.fi_run_len_2_3 += sel_stats.fi_run_len_2_3;
     stats.fi_run_len_4_7 += sel_stats.fi_run_len_4_7;
     stats.fi_run_len_8_plus += sel_stats.fi_run_len_8_plus;
+    stats.fi_merge_accepted += sel_stats.fi_merge_accepted;
+    stats.fi_merge_rejected_gap += sel_stats.fi_merge_rejected_gap;
+    stats.fi_merge_rejected_density += sel_stats.fi_merge_rejected_density;
 
     if candidates.is_empty() {
         stats.total_ms = total_start.elapsed().as_millis() as u64;
@@ -1418,6 +1432,9 @@ async fn resolve_bucket_raw<R: QueryReader>(
     stats.fi_run_len_2_3 += fi_bs.run_len_2_3 as u64;
     stats.fi_run_len_4_7 += fi_bs.run_len_4_7 as u64;
     stats.fi_run_len_8_plus += (fi_bs.run_len_8_15 + fi_bs.run_len_16_plus) as u64;
+    stats.fi_merge_accepted += fi_bs.merge_accepted as u64;
+    stats.fi_merge_rejected_gap += fi_bs.merge_rejected_gap as u64;
+    stats.fi_merge_rejected_density += fi_bs.merge_rejected_density as u64;
 
     // Step 3: Series meta computation (pure CPU)
     let mut series_meta = Vec::with_capacity(candidates.len());
@@ -2240,6 +2257,9 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 self.reader.stats.fi_run_len_2_3 += bs.fi_run_len_2_3;
                 self.reader.stats.fi_run_len_4_7 += bs.fi_run_len_4_7;
                 self.reader.stats.fi_run_len_8_plus += bs.fi_run_len_8_plus;
+                self.reader.stats.fi_merge_accepted += bs.fi_merge_accepted;
+                self.reader.stats.fi_merge_rejected_gap += bs.fi_merge_rejected_gap;
+                self.reader.stats.fi_merge_rejected_density += bs.fi_merge_rejected_density;
                 self.reader.stats.parallel_selector_count += 1;
                 self.reader.stats.parallel_selector_sum_ms += bs.total_ms;
 

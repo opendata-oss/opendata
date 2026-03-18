@@ -238,6 +238,10 @@ pub(crate) struct SelectorRawStats {
     pub(crate) fi_run_len_2_3: u64,
     pub(crate) fi_run_len_4_7: u64,
     pub(crate) fi_run_len_8_plus: u64,
+    // Merge decision counters
+    pub(crate) fi_merge_accepted: u64,
+    pub(crate) fi_merge_rejected_gap: u64,
+    pub(crate) fi_merge_rejected_density: u64,
 }
 
 /// Selector evaluation using raw QueryReader — no caching layer.
@@ -379,6 +383,9 @@ async fn acquire_and_load_forward_index<R: QueryReader>(
     stats.fi_run_len_2_3 += bs.run_len_2_3 as u64;
     stats.fi_run_len_4_7 += bs.run_len_4_7 as u64;
     stats.fi_run_len_8_plus += (bs.run_len_8_15 + bs.run_len_16_plus) as u64;
+    stats.fi_merge_accepted += bs.merge_accepted as u64;
+    stats.fi_merge_rejected_gap += bs.merge_rejected_gap as u64;
+    stats.fi_merge_rejected_density += bs.merge_rejected_density as u64;
     Ok(result)
 }
 

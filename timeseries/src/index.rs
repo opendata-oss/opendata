@@ -33,6 +33,12 @@ pub(crate) struct ForwardIndexBatchStats {
     pub(crate) gap_4_7: u32,
     pub(crate) gap_8_15: u32,
     pub(crate) gap_16_plus: u32,
+    // Merge decision counters (gap-aware merging)
+    pub(crate) merge_accepted: u32,
+    pub(crate) merge_gap_accepted_1: u32,
+    pub(crate) merge_gap_accepted_2_3: u32,
+    pub(crate) merge_rejected_gap: u32,
+    pub(crate) merge_rejected_density: u32,
 }
 
 /// Trait for looking up series specs by ID.

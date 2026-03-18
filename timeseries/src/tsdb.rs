@@ -453,6 +453,9 @@ pub(crate) async fn evaluate_range(
         fi_run_len_2_3 = stats.fi_run_len_2_3,
         fi_run_len_4_7 = stats.fi_run_len_4_7,
         fi_run_len_8_plus = stats.fi_run_len_8_plus,
+        fi_merge_accepted = stats.fi_merge_accepted,
+        fi_merge_rejected_gap = stats.fi_merge_rejected_gap,
+        fi_merge_rejected_density = stats.fi_merge_rejected_density,
         "evaluate_range complete"
     );
 

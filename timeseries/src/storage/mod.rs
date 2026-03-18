@@ -27,6 +27,10 @@ pub(crate) mod merge_operator;
 
 /// Minimum contiguous run length to use a range scan instead of individual gets.
 const MIN_SCAN_RUN_LEN: u32 = 8;
+/// Maximum gap (in series IDs) between runs that can be merged into a single group.
+const MAX_MERGE_GAP: u32 = 3;
+/// Maximum scan amplification * 100: span*100 <= count * MAX_SCAN_AMPLIFICATION_X100.
+const MAX_SCAN_AMPLIFICATION_X100: u32 = 150;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ForwardIndexBatchOp {
@@ -35,6 +39,7 @@ enum ForwardIndexBatchOp {
         start: SeriesId,
         end_inclusive: SeriesId,
         count: u32,
+        runs: Vec<ForwardIndexRun>,
     },
 }
 
@@ -44,6 +49,29 @@ struct ForwardIndexRun {
     start: SeriesId,
     end_inclusive: SeriesId,
     count: u32,
+}
+
+impl ForwardIndexRun {
+    fn gap_to(&self, next: &Self) -> u32 {
+        next.start
+            .saturating_sub(self.end_inclusive)
+            .saturating_sub(1)
+    }
+}
+
+/// A possibly-gapped group of contiguous runs, formed by merging nearby runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForwardIndexGroup {
+    start: SeriesId,
+    end_inclusive: SeriesId,
+    count: u32,
+    runs: Vec<ForwardIndexRun>,
+}
+
+impl ForwardIndexGroup {
+    fn span(&self) -> u32 {
+        self.end_inclusive - self.start + 1
+    }
 }
 
 /// Build contiguous runs from sorted, deduped series IDs.
@@ -104,19 +132,86 @@ fn record_run_and_gap_stats(runs: &[ForwardIndexRun], stats: &mut ForwardIndexBa
     }
 }
 
-/// Convert runs to batch ops, using range scans only for runs >= min_scan_run_len.
-fn plan_ops_from_runs(runs: &[ForwardIndexRun], min_scan_run_len: u32) -> Vec<ForwardIndexBatchOp> {
+/// Greedy left-to-right merge of nearby runs into groups.
+/// Merges across gaps <= max_gap when the resulting scan amplification stays within bounds.
+fn merge_dense_runs(
+    runs: &[ForwardIndexRun],
+    max_gap: u32,
+    max_amplification_x100: u32,
+    stats: &mut ForwardIndexBatchStats,
+) -> Vec<ForwardIndexGroup> {
+    if runs.is_empty() {
+        return Vec::new();
+    }
+    let mut groups = Vec::new();
+    let mut current = ForwardIndexGroup {
+        start: runs[0].start,
+        end_inclusive: runs[0].end_inclusive,
+        count: runs[0].count,
+        runs: vec![runs[0].clone()],
+    };
+    for next in &runs[1..] {
+        let gap = current.runs.last().unwrap().gap_to(next);
+        if gap > max_gap {
+            stats.merge_rejected_gap += 1;
+            groups.push(current);
+            current = ForwardIndexGroup {
+                start: next.start,
+                end_inclusive: next.end_inclusive,
+                count: next.count,
+                runs: vec![next.clone()],
+            };
+            continue;
+        }
+        let merged_span = next.end_inclusive - current.start + 1;
+        let merged_count = current.count + next.count;
+        if (merged_span as u64) * 100 > (merged_count as u64) * (max_amplification_x100 as u64) {
+            stats.merge_rejected_density += 1;
+            groups.push(current);
+            current = ForwardIndexGroup {
+                start: next.start,
+                end_inclusive: next.end_inclusive,
+                count: next.count,
+                runs: vec![next.clone()],
+            };
+            continue;
+        }
+        // Accept merge
+        stats.merge_accepted += 1;
+        match gap {
+            1 => stats.merge_gap_accepted_1 += 1,
+            2..=3 => stats.merge_gap_accepted_2_3 += 1,
+            _ => {} // gap=0 shouldn't happen between distinct runs
+        }
+        current.end_inclusive = next.end_inclusive;
+        current.count = merged_count;
+        current.runs.push(next.clone());
+    }
+    groups.push(current);
+    groups
+}
+
+/// Convert groups to batch ops, using range scans for groups with count >= min_scan_run_len.
+/// For sub-threshold groups, expands constituent runs back to exact Point ops (never gap IDs).
+fn plan_ops_from_groups(
+    groups: &[ForwardIndexGroup],
+    min_scan_run_len: u32,
+) -> Vec<ForwardIndexBatchOp> {
     let mut ops = Vec::new();
-    for run in runs {
-        if run.count >= min_scan_run_len {
+    for group in groups {
+        if group.count >= min_scan_run_len {
             ops.push(ForwardIndexBatchOp::Range {
-                start: run.start,
-                end_inclusive: run.end_inclusive,
-                count: run.count,
+                start: group.start,
+                end_inclusive: group.end_inclusive,
+                count: group.count,
+                runs: group.runs.clone(),
             });
         } else {
-            for id in run.start..=run.end_inclusive {
-                ops.push(ForwardIndexBatchOp::Point(id));
+            // Expand constituent runs to exact points — never emit gap IDs
+            for run in &group.runs {
+                for id in run.start..=run.end_inclusive {
+                    ops.push(ForwardIndexBatchOp::Point(id));
+                }
             }
         }
     }
@@ -328,7 +423,13 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
             ..Default::default()
         };
         record_run_and_gap_stats(&runs, &mut stats);
-        let ops = plan_ops_from_runs(&runs, MIN_SCAN_RUN_LEN);
+        let groups = merge_dense_runs(
+            &runs,
+            MAX_MERGE_GAP,
+            MAX_SCAN_AMPLIFICATION_X100,
+            &mut stats,
+        );
+        let ops = plan_ops_from_groups(&groups, MIN_SCAN_RUN_LEN);
         stats.batch_ops = ops.len() as u32;
 
         for op in &ops {
@@ -350,6 +451,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
                     start,
                     end_inclusive,
                     count,
+                    runs,
                 } => {
                     stats.range_scans += 1;
                     stats.range_scan_series += count;
@@ -358,8 +460,15 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
                     let records = self.scan(range).await?;
                     for record in records {
                         let key = ForwardIndexKey::decode(record.key.as_ref())?;
-                        let value = ForwardIndexValue::decode(record.value.as_ref())?;
-                        result.series.insert(key.series_id, value.into());
+                        // Filter: only insert if this series was actually requested.
+                        // Scans over merged groups may return gap IDs that exist in storage.
+                        if runs
+                            .iter()
+                            .any(|r| key.series_id >= r.start && key.series_id <= r.end_inclusive)
+                        {
+                            let value = ForwardIndexValue::decode(record.value.as_ref())?;
+                            result.series.insert(key.series_id, value.into());
+                        }
                     }
                 }
             }
@@ -383,6 +492,11 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
             gap_4_7 = stats.gap_4_7,
             gap_8_15 = stats.gap_8_15,
             gap_16_plus = stats.gap_16_plus,
+            merge_accepted = stats.merge_accepted,
+            merge_gap_accepted_1 = stats.merge_gap_accepted_1,
+            merge_gap_accepted_2_3 = stats.merge_gap_accepted_2_3,
+            merge_rejected_gap = stats.merge_rejected_gap,
+            merge_rejected_density = stats.merge_rejected_density,
             "forward index batch load"
         );
 
@@ -677,11 +791,18 @@ mod tests {
         );
     }
 
-    // ── plan_ops_from_runs tests (with MIN_SCAN_RUN_LEN threshold) ───
+    // ── plan_ops_from_groups tests (with MIN_SCAN_RUN_LEN threshold) ───
 
     fn plan(sorted_ids: &[SeriesId]) -> Vec<ForwardIndexBatchOp> {
         let runs = build_forward_index_runs(sorted_ids);
-        plan_ops_from_runs(&runs, MIN_SCAN_RUN_LEN)
+        let mut stats = ForwardIndexBatchStats::default();
+        let groups = merge_dense_runs(
+            &runs,
+            MAX_MERGE_GAP,
+            MAX_SCAN_AMPLIFICATION_X100,
+            &mut stats,
+        );
+        plan_ops_from_groups(&groups, MIN_SCAN_RUN_LEN)
     }
 
     #[test]
@@ -722,7 +843,12 @@ mod tests {
             vec![ForwardIndexBatchOp::Range {
                 start: 1,
                 end_inclusive: 8,
-                count: 8
+                count: 8,
+                runs: vec![ForwardIndexRun {
+                    start: 1,
+                    end_inclusive: 8,
+                    count: 8
+                }],
             }]
         );
     }
@@ -731,6 +857,7 @@ mod tests {
     fn plan_mixed_short_and_long() {
         // [1,2,3] = run of 3 (< 8) -> 3 Points
         // [10..=17] = run of 8 (>= 8) -> 1 Range
+        // Gap between [1..3] and [10..17] is 6 > MAX_MERGE_GAP=3, so no merge
         let mut ids: Vec<u32> = vec![1, 2, 3];
         ids.extend(10..=17);
         let ops = plan(&ids);
@@ -743,7 +870,12 @@ mod tests {
                 ForwardIndexBatchOp::Range {
                     start: 10,
                     end_inclusive: 17,
-                    count: 8
+                    count: 8,
+                    runs: vec![ForwardIndexRun {
+                        start: 10,
+                        end_inclusive: 17,
+                        count: 8
+                    }],
                 },
             ]
         );
@@ -752,6 +884,7 @@ mod tests {
     #[test]
     fn plan_mixed_long_point_short() {
         // [1..=10] = range, [20] = point, [30,31,32] = 3 points
+        // Gaps 9 and 9 both > MAX_MERGE_GAP=3, so no merging
         let mut ids: Vec<u32> = (1..=10).collect();
         ids.push(20);
         ids.extend(30..=32);
@@ -762,7 +895,12 @@ mod tests {
                 ForwardIndexBatchOp::Range {
                     start: 1,
                     end_inclusive: 10,
-                    count: 10
+                    count: 10,
+                    runs: vec![ForwardIndexRun {
+                        start: 1,
+                        end_inclusive: 10,
+                        count: 10
+                    }],
                 },
                 ForwardIndexBatchOp::Point(20),
                 ForwardIndexBatchOp::Point(30),
@@ -891,10 +1029,14 @@ mod tests {
             .unwrap();
         // All 5 should be present
         assert_eq!(result.inner.series.len(), 5);
-        // With MIN_SCAN_RUN_LEN=8: [1,2,3] run of 3 < 8 -> 3 points, [5] point, [10] point = 5 points total
+        // Runs: [1..3](count=3), [5](count=1), [10](count=1)
+        // Merge: [1..3]+[5] gap=1 <=3, span=5, count=4, amp=1.25 <=1.5 -> merge accepted
+        //        merged group count=4 < 8 -> expand to 4 points: [1,2,3,5]
+        //        [10] gap=4 > MAX_MERGE_GAP=3 -> separate group, count=1 -> 1 point
         assert_eq!(result.batch_stats.range_scans, 0);
         assert_eq!(result.batch_stats.point_lookups, 5);
         assert_eq!(result.batch_stats.batch_ops, 5);
+        assert_eq!(result.batch_stats.merge_accepted, 1);
     }
 
     #[tokio::test]
@@ -1034,6 +1176,307 @@ mod tests {
             if let (Some(b), Some(i)) = (batched_spec, individual_spec) {
                 assert_eq!(b.labels, i.labels, "label mismatch for sid={}", sid);
             }
+        }
+    }
+
+    // ── merge_dense_runs unit tests ──────────────────────────────────────
+
+    #[test]
+    fn merge_gap1_good_density() {
+        // [1..3] + [5..9]: gap=1, merged span=9, count=8, amp=1.125 <= 1.5
+        let runs = build_forward_index_runs(&[1, 2, 3, 5, 6, 7, 8, 9]);
+        let mut stats = ForwardIndexBatchStats::default();
+        let groups = merge_dense_runs(
+            &runs,
+            MAX_MERGE_GAP,
+            MAX_SCAN_AMPLIFICATION_X100,
+            &mut stats,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].start, 1);
+        assert_eq!(groups[0].end_inclusive, 9);
+        assert_eq!(groups[0].count, 8);
+        assert_eq!(groups[0].span(), 9);
+        assert_eq!(groups[0].runs.len(), 2);
+        assert_eq!(stats.merge_accepted, 1);
+        assert_eq!(stats.merge_gap_accepted_1, 1);
+    }
+
+    #[test]
+    fn merge_reject_poor_density() {
+        // [1] + [5]: gap=3, merged span=5, count=2, amp=2.5 > 1.5
+        let runs = build_forward_index_runs(&[1, 5]);
+        let mut stats = ForwardIndexBatchStats::default();
+        let groups = merge_dense_runs(
+            &runs,
+            MAX_MERGE_GAP,
+            MAX_SCAN_AMPLIFICATION_X100,
+            &mut stats,
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(stats.merge_rejected_density, 1);
+        assert_eq!(stats.merge_accepted, 0);
+    }
+
+    #[test]
+    fn merge_greedy_chain() {
+        // [1..3], [5..7], [9..11]: gap=1 each
+        // After first merge: span=7, count=6, amp=1.17 OK
+        // After second merge: span=11, count=9, amp=1.22 OK
+        let runs = build_forward_index_runs(&[1, 2, 3, 5, 6, 7, 9, 10, 11]);
+        let mut stats = ForwardIndexBatchStats::default();
+        let groups = merge_dense_runs(
+            &runs,
+            MAX_MERGE_GAP,
+            MAX_SCAN_AMPLIFICATION_X100,
+            &mut stats,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].start, 1);
+        assert_eq!(groups[0].end_inclusive, 11);
+        assert_eq!(groups[0].count, 9);
+        assert_eq!(groups[0].runs.len(), 3);
+        assert_eq!(stats.merge_accepted, 2);
+    }
+
+    #[test]
+    fn merge_reject_gap_too_large() {
+        // [1..3] + [8..10]: gap=4 > MAX_MERGE_GAP=3
+        let runs = build_forward_index_runs(&[1, 2, 3, 8, 9, 10]);
+        let mut stats = ForwardIndexBatchStats::default();
+        let groups = merge_dense_runs(
+            &runs,
+            MAX_MERGE_GAP,
+            MAX_SCAN_AMPLIFICATION_X100,
+            &mut stats,
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(stats.merge_rejected_gap, 1);
+        assert_eq!(stats.merge_accepted, 0);
+    }
+
+    #[test]
+    fn merge_becomes_scan_eligible() {
+        // Two runs each < 8, but merged count >= 8 -> single Range op
+        // [1..5] + [7..11]: gap=1, span=11, count=10, amp=1.1 OK
+        let ids: Vec<u32> = (1..=5).chain(7..=11).collect();
+        let runs = build_forward_index_runs(&ids);
+        let mut stats = ForwardIndexBatchStats::default();
+        let groups = merge_dense_runs(
+            &runs,
+            MAX_MERGE_GAP,
+            MAX_SCAN_AMPLIFICATION_X100,
+            &mut stats,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].count, 10);
+        let ops = plan_ops_from_groups(&groups, MIN_SCAN_RUN_LEN);
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            ForwardIndexBatchOp::Range {
+                start,
+                end_inclusive,
+                count,
+                runs,
+            } => {
+                assert_eq!(*start, 1);
+                assert_eq!(*end_inclusive, 11);
+                assert_eq!(*count, 10);
+                assert_eq!(runs.len(), 2);
+            }
+            _ => panic!("expected Range"),
+        }
+    }
+
+    #[test]
+    fn merge_below_threshold_point_correctness() {
+        // [1..3] + [5]: gap=1, span=5, count=4, amp=1.25 <= 1.5 -> merge accepted
+        // But count=4 < 8 -> expand to Points [1,2,3,5] — NOT [1,2,3,4,5]
+        let runs = build_forward_index_runs(&[1, 2, 3, 5]);
+        let mut stats = ForwardIndexBatchStats::default();
+        let groups = merge_dense_runs(
+            &runs,
+            MAX_MERGE_GAP,
+            MAX_SCAN_AMPLIFICATION_X100,
+            &mut stats,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].count, 4);
+        let ops = plan_ops_from_groups(&groups, MIN_SCAN_RUN_LEN);
+        assert_eq!(
+            ops,
+            vec![
+                ForwardIndexBatchOp::Point(1),
+                ForwardIndexBatchOp::Point(2),
+                ForwardIndexBatchOp::Point(3),
+                ForwardIndexBatchOp::Point(5),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_amplification_boundary() {
+        // Exact boundary: span*100 == count*150
+        // count=2, span=3: 300 == 300 -> should merge
+        // [1] + [3]: gap=1, span=3, count=2
+        let runs = build_forward_index_runs(&[1, 3]);
+        let mut stats = ForwardIndexBatchStats::default();
+        let groups = merge_dense_runs(
+            &runs,
+            MAX_MERGE_GAP,
+            MAX_SCAN_AMPLIFICATION_X100,
+            &mut stats,
+        );
+        assert_eq!(groups.len(), 1, "exact boundary should merge");
+        assert_eq!(stats.merge_accepted, 1);
+
+        // Just over: span*100 > count*150
+        // count=2, span=4: 400 > 300 -> should reject
+        // [1] + [4]: gap=2, span=4, count=2
+        let runs2 = build_forward_index_runs(&[1, 4]);
+        let mut stats2 = ForwardIndexBatchStats::default();
+        let groups2 = merge_dense_runs(
+            &runs2,
+            MAX_MERGE_GAP,
+            MAX_SCAN_AMPLIFICATION_X100,
+            &mut stats2,
+        );
+        assert_eq!(groups2.len(), 2, "over boundary should reject");
+        assert_eq!(stats2.merge_rejected_density, 1);
+    }
+
+    #[test]
+    fn merge_empty_and_single_run() {
+        let mut stats = ForwardIndexBatchStats::default();
+        assert!(
+            merge_dense_runs(&[], MAX_MERGE_GAP, MAX_SCAN_AMPLIFICATION_X100, &mut stats)
+                .is_empty()
+        );
+
+        let runs = build_forward_index_runs(&[42]);
+        let groups = merge_dense_runs(
+            &runs,
+            MAX_MERGE_GAP,
+            MAX_SCAN_AMPLIFICATION_X100,
+            &mut stats,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].start, 42);
+        assert_eq!(groups[0].count, 1);
+        assert_eq!(groups[0].runs.len(), 1);
+        assert_eq!(stats.merge_accepted, 0);
+    }
+
+    #[test]
+    fn merge_stats_counters() {
+        // [1..3], [5..7], [9..11], [20]: gaps 1, 1, 8
+        // First merge: gap=1, span=7, count=6, amp=1.17 -> accept (gap_accepted_1)
+        // Second merge: gap=1, span=11, count=9, amp=1.22 -> accept (gap_accepted_1)
+        // Third: gap=8 > 3 -> reject_gap
+        let runs = build_forward_index_runs(&[1, 2, 3, 5, 6, 7, 9, 10, 11, 20]);
+        let mut stats = ForwardIndexBatchStats::default();
+        merge_dense_runs(
+            &runs,
+            MAX_MERGE_GAP,
+            MAX_SCAN_AMPLIFICATION_X100,
+            &mut stats,
+        );
+        assert_eq!(stats.merge_accepted, 2);
+        assert_eq!(stats.merge_gap_accepted_1, 2);
+        assert_eq!(stats.merge_gap_accepted_2_3, 0);
+        assert_eq!(stats.merge_rejected_gap, 1);
+        assert_eq!(stats.merge_rejected_density, 0);
+    }
+
+    #[test]
+    fn merge_gap_accepted_2_3_bucket() {
+        // [1..4] + [7..10]: gap=2, span=10, count=8, amp=1.25 <= 1.5 -> accept
+        let runs = build_forward_index_runs(&[1, 2, 3, 4, 7, 8, 9, 10]);
+        let mut stats = ForwardIndexBatchStats::default();
+        let groups = merge_dense_runs(
+            &runs,
+            MAX_MERGE_GAP,
+            MAX_SCAN_AMPLIFICATION_X100,
+            &mut stats,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(stats.merge_accepted, 1);
+        assert_eq!(stats.merge_gap_accepted_2_3, 1);
+        assert_eq!(stats.merge_gap_accepted_1, 0);
+    }
+
+    // ── Integration tests for scan filtering correctness ──────────────
+
+    #[tokio::test]
+    async fn batched_fi_gap_id_absent_from_storage() {
+        // Insert IDs [10,11,12, 14,15,16,17,18] (gap at 13, not inserted).
+        // Query all 8 IDs. Merge combines into one group spanning [10..18], count=8 -> scan.
+        let bucket = TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let series: Vec<(SeriesId, &str)> = vec![
+            (10, "a"),
+            (11, "b"),
+            (12, "c"),
+            (14, "e"),
+            (15, "f"),
+            (16, "g"),
+            (17, "h"),
+            (18, "i"),
+        ];
+        let s = storage_with_forward_index(&series, &bucket).await;
+        let snapshot = s.snapshot().await.unwrap();
+        let ids: Vec<u32> = vec![10, 11, 12, 14, 15, 16, 17, 18];
+        let result = snapshot
+            .get_forward_index_series(&bucket, &ids)
+            .await
+            .unwrap();
+        // All 8 requested IDs returned, 13 is NOT in storage
+        assert_eq!(result.inner.series.len(), 8);
+        assert!(result.inner.series.get(&13).is_none());
+        assert_eq!(result.batch_stats.range_scans, 1);
+        assert_eq!(result.batch_stats.scan_span_series, 9); // span [10..18] = 9
+        assert_eq!(result.batch_stats.range_scan_series, 8);
+    }
+
+    #[tokio::test]
+    async fn batched_fi_gap_id_exists_but_not_requested() {
+        // Insert IDs [10,11,12,13,14,15,16,17,18] — all 9 exist in storage.
+        // But only request [10,11,12, 14,15,16,17,18] (8 IDs, excluding 13).
+        // Merge combines two runs into one group [10..18], count=8 -> scan.
+        // Scan returns all 9 keys including 13. Filter must exclude 13.
+        let bucket = TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let series: Vec<(SeriesId, &str)> = vec![
+            (10, "a"),
+            (11, "b"),
+            (12, "c"),
+            (13, "d"),
+            (14, "e"),
+            (15, "f"),
+            (16, "g"),
+            (17, "h"),
+            (18, "i"),
+        ];
+        let s = storage_with_forward_index(&series, &bucket).await;
+        let snapshot = s.snapshot().await.unwrap();
+        let ids: Vec<u32> = vec![10, 11, 12, 14, 15, 16, 17, 18];
+        let result = snapshot
+            .get_forward_index_series(&bucket, &ids)
+            .await
+            .unwrap();
+        // Only the 8 requested IDs, NOT 13
+        assert_eq!(result.inner.series.len(), 8);
+        assert!(result.inner.series.get(&13).is_none());
+        for &id in &[10, 11, 12, 14, 15, 16, 17, 18] {
+            assert!(
+                result.inner.series.get(&id).is_some(),
+                "missing requested id={}",
+                id
+            );
         }
     }
 }
