@@ -38,7 +38,8 @@ use std::ops::{Bound, Range};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
-use common::serde::key_prefix::{KeyPrefix, RecordTag};
+use common::serde::key_prefix::KeyPrefix;
+use common::serde::record_tag::RecordTag;
 use common::serde::terminated_bytes;
 use common::serde::varint::var_u64;
 
@@ -95,6 +96,10 @@ impl RecordType {
         }
     }
 
+    pub fn from_prefix(prefix: KeyPrefix) -> Result<Self, Error> {
+        RecordType::from_id((prefix.tag() & 0xF0) >> 4)
+    }
+
     /// Creates a RecordTag for this record type.
     ///
     /// Log records use 0 for the reserved bits.
@@ -104,7 +109,7 @@ impl RecordType {
 
     /// Creates a KeyPrefix for this record type with the current version.
     pub fn prefix(&self) -> KeyPrefix {
-        KeyPrefix::new(KEY_VERSION, self.tag())
+        KeyPrefix::new(KEY_VERSION, self.tag().as_byte())
     }
 }
 
@@ -165,7 +170,7 @@ impl LogEntryKey {
     /// sequence number.
     pub fn deserialize(data: &[u8], segment_start_seq: u64) -> Result<Self, Error> {
         let prefix = KeyPrefix::from_bytes_versioned(data, KEY_VERSION)?;
-        let record_type = RecordType::from_id(prefix.tag().record_type())?;
+        let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::LogEntry {
             return Err(Error::Encoding(format!(
                 "invalid record type: expected LogEntry, got {:?}",
@@ -244,7 +249,7 @@ impl SegmentMetaKey {
     /// Decodes a segment metadata key from bytes
     pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
         let prefix = KeyPrefix::from_bytes_versioned(data, KEY_VERSION)?;
-        let record_type = RecordType::from_id(prefix.tag().record_type())?;
+        let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::SegmentMeta {
             return Err(Error::Encoding(format!(
                 "invalid record type: expected SegmentMeta, got {:?}",
@@ -362,7 +367,7 @@ impl ListingEntryKey {
     /// Deserializes a listing entry key from bytes.
     pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
         let prefix = KeyPrefix::from_bytes_versioned(data, KEY_VERSION)?;
-        let record_type = RecordType::from_id(prefix.tag().record_type())?;
+        let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::ListingEntry {
             return Err(Error::Encoding(format!(
                 "invalid record type: expected ListingEntry, got {:?}",

@@ -2,7 +2,7 @@
 //!
 //! All keys use big-endian encoding for lexicographic ordering.
 
-use super::{EncodingError, FieldValue, KEY_VERSION, RecordKey, RecordType, record_type_from_tag};
+use super::{EncodingError, FieldValue, KEY_VERSION, RecordKey, RecordType};
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
 use common::serde::key_prefix::KeyPrefix;
@@ -414,7 +414,7 @@ impl CentroidStatsKey {
 /// Validates the key prefix (version and record tag).
 fn validate_key_prefix<T: RecordKey>(buf: &[u8]) -> Result<(), EncodingError> {
     let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
-    let record_type = record_type_from_tag(prefix.tag())?;
+    let record_type = RecordType::from_prefix(prefix)?;
 
     if record_type != T::RECORD_TYPE {
         return Err(EncodingError {

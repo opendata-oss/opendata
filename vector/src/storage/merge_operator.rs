@@ -37,8 +37,8 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
     fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
         let prefix =
             KeyPrefix::from_bytes_versioned(key, KEY_VERSION).expect("Failed to decode key prefix");
-        let record_type = RecordType::from_id(prefix.tag().record_type())
-            .expect("Failed to get record type from record tag");
+        let record_type =
+            RecordType::from_prefix(prefix).expect("Failed to get record type from record tag");
 
         match record_type {
             RecordType::Deletions | RecordType::MetadataIndex => {

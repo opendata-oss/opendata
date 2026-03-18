@@ -18,7 +18,7 @@ impl BucketListKey {
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
         let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
-        let record_type = record_type_from_tag(prefix.tag())?;
+        let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::BucketList {
             return Err(EncodingError {
                 message: format!(
@@ -27,7 +27,7 @@ impl BucketListKey {
                 ),
             });
         }
-        if bucket_size_from_tag(prefix.tag()).is_some() {
+        if bucket_size_from_prefix(prefix).is_some() {
             return Err(EncodingError {
                 message: "BucketListKey should be global-scoped (bucket_size should be None)"
                     .to_string(),
@@ -63,7 +63,7 @@ impl SeriesDictionaryKey {
             });
         }
         let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
-        let record_type = record_type_from_tag(prefix.tag())?;
+        let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::SeriesDictionary {
             return Err(EncodingError {
                 message: format!(
@@ -72,7 +72,7 @@ impl SeriesDictionaryKey {
                 ),
             });
         }
-        let bucket_size = bucket_size_from_tag(prefix.tag()).ok_or_else(|| EncodingError {
+        let bucket_size = bucket_size_from_prefix(prefix).ok_or_else(|| EncodingError {
             message: "SeriesDictionaryKey should be bucket-scoped".to_string(),
         })?;
 
@@ -129,7 +129,7 @@ impl ForwardIndexKey {
             });
         }
         let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
-        let record_type = record_type_from_tag(prefix.tag())?;
+        let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::ForwardIndex {
             return Err(EncodingError {
                 message: format!(
@@ -138,7 +138,7 @@ impl ForwardIndexKey {
                 ),
             });
         }
-        let bucket_size = bucket_size_from_tag(prefix.tag()).ok_or_else(|| EncodingError {
+        let bucket_size = bucket_size_from_prefix(prefix).ok_or_else(|| EncodingError {
             message: "ForwardIndexKey should be bucket-scoped".to_string(),
         })?;
 
@@ -208,7 +208,7 @@ impl InvertedIndexKey {
             });
         }
         let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
-        let record_type = record_type_from_tag(prefix.tag())?;
+        let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::InvertedIndex {
             return Err(EncodingError {
                 message: format!(
@@ -217,7 +217,7 @@ impl InvertedIndexKey {
                 ),
             });
         }
-        let bucket_size = bucket_size_from_tag(prefix.tag()).ok_or_else(|| EncodingError {
+        let bucket_size = bucket_size_from_prefix(prefix).ok_or_else(|| EncodingError {
             message: "InvertedIndexKey should be bucket-scoped".to_string(),
         })?;
 
@@ -284,7 +284,7 @@ impl TimeSeriesKey {
             });
         }
         let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
-        let record_type = record_type_from_tag(prefix.tag())?;
+        let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::TimeSeries {
             return Err(EncodingError {
                 message: format!(
@@ -293,7 +293,7 @@ impl TimeSeriesKey {
                 ),
             });
         }
-        let bucket_size = bucket_size_from_tag(prefix.tag()).ok_or_else(|| EncodingError {
+        let bucket_size = bucket_size_from_prefix(prefix).ok_or_else(|| EncodingError {
             message: "TimeSeriesKey should be bucket-scoped".to_string(),
         })?;
 
