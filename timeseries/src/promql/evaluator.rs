@@ -108,6 +108,11 @@ pub(crate) struct EvalStats {
     pub(crate) fi_point_lookups: u64,
     pub(crate) fi_range_scans: u64,
     pub(crate) fi_range_scan_series: u64,
+    pub(crate) fi_scan_span_series: u64,
+    pub(crate) fi_run_len_1: u64,
+    pub(crate) fi_run_len_2_3: u64,
+    pub(crate) fi_run_len_4_7: u64,
+    pub(crate) fi_run_len_8_plus: u64,
 }
 
 /// Canonical key for caching selector results across steps.
@@ -229,6 +234,11 @@ struct BucketResolutionStats {
     fi_point_lookups: u64,
     fi_range_scans: u64,
     fi_range_scan_series: u64,
+    fi_scan_span_series: u64,
+    fi_run_len_1: u64,
+    fi_run_len_2_3: u64,
+    fi_run_len_4_7: u64,
+    fi_run_len_8_plus: u64,
 }
 
 /// Work item for parallel sample loading (Phase B3).
@@ -728,6 +738,11 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             self.stats.fi_point_lookups += bs.point_lookups as u64;
             self.stats.fi_range_scans += bs.range_scans as u64;
             self.stats.fi_range_scan_series += bs.range_scan_series as u64;
+            self.stats.fi_scan_span_series += bs.scan_span_series as u64;
+            self.stats.fi_run_len_1 += bs.run_len_1 as u64;
+            self.stats.fi_run_len_2_3 += bs.run_len_2_3 as u64;
+            self.stats.fi_run_len_4_7 += bs.run_len_4_7 as u64;
+            self.stats.fi_run_len_8_plus += (bs.run_len_8_15 + bs.run_len_16_plus) as u64;
 
             self.cache
                 .cache_forward_index(*bucket, series_ids.clone(), forward_index);
@@ -1343,6 +1358,11 @@ async fn resolve_bucket_raw<R: QueryReader>(
     stats.fi_point_lookups += sel_stats.fi_point_lookups;
     stats.fi_range_scans += sel_stats.fi_range_scans;
     stats.fi_range_scan_series += sel_stats.fi_range_scan_series;
+    stats.fi_scan_span_series += sel_stats.fi_scan_span_series;
+    stats.fi_run_len_1 += sel_stats.fi_run_len_1;
+    stats.fi_run_len_2_3 += sel_stats.fi_run_len_2_3;
+    stats.fi_run_len_4_7 += sel_stats.fi_run_len_4_7;
+    stats.fi_run_len_8_plus += sel_stats.fi_run_len_8_plus;
 
     if candidates.is_empty() {
         stats.total_ms = total_start.elapsed().as_millis() as u64;
@@ -1393,6 +1413,11 @@ async fn resolve_bucket_raw<R: QueryReader>(
     stats.fi_point_lookups += fi_bs.point_lookups as u64;
     stats.fi_range_scans += fi_bs.range_scans as u64;
     stats.fi_range_scan_series += fi_bs.range_scan_series as u64;
+    stats.fi_scan_span_series += fi_bs.scan_span_series as u64;
+    stats.fi_run_len_1 += fi_bs.run_len_1 as u64;
+    stats.fi_run_len_2_3 += fi_bs.run_len_2_3 as u64;
+    stats.fi_run_len_4_7 += fi_bs.run_len_4_7 as u64;
+    stats.fi_run_len_8_plus += (fi_bs.run_len_8_15 + fi_bs.run_len_16_plus) as u64;
 
     // Step 3: Series meta computation (pure CPU)
     let mut series_meta = Vec::with_capacity(candidates.len());
@@ -2210,6 +2235,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 self.reader.stats.fi_point_lookups += bs.fi_point_lookups;
                 self.reader.stats.fi_range_scans += bs.fi_range_scans;
                 self.reader.stats.fi_range_scan_series += bs.fi_range_scan_series;
+                self.reader.stats.fi_scan_span_series += bs.fi_scan_span_series;
+                self.reader.stats.fi_run_len_1 += bs.fi_run_len_1;
+                self.reader.stats.fi_run_len_2_3 += bs.fi_run_len_2_3;
+                self.reader.stats.fi_run_len_4_7 += bs.fi_run_len_4_7;
+                self.reader.stats.fi_run_len_8_plus += bs.fi_run_len_8_plus;
                 self.reader.stats.parallel_selector_count += 1;
                 self.reader.stats.parallel_selector_sum_ms += bs.total_ms;
 

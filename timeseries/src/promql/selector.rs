@@ -233,6 +233,11 @@ pub(crate) struct SelectorRawStats {
     pub(crate) fi_point_lookups: u64,
     pub(crate) fi_range_scans: u64,
     pub(crate) fi_range_scan_series: u64,
+    pub(crate) fi_scan_span_series: u64,
+    pub(crate) fi_run_len_1: u64,
+    pub(crate) fi_run_len_2_3: u64,
+    pub(crate) fi_run_len_4_7: u64,
+    pub(crate) fi_run_len_8_plus: u64,
 }
 
 /// Selector evaluation using raw QueryReader — no caching layer.
@@ -369,6 +374,11 @@ async fn acquire_and_load_forward_index<R: QueryReader>(
     stats.fi_point_lookups += bs.point_lookups as u64;
     stats.fi_range_scans += bs.range_scans as u64;
     stats.fi_range_scan_series += bs.range_scan_series as u64;
+    stats.fi_scan_span_series += bs.scan_span_series as u64;
+    stats.fi_run_len_1 += bs.run_len_1 as u64;
+    stats.fi_run_len_2_3 += bs.run_len_2_3 as u64;
+    stats.fi_run_len_4_7 += bs.run_len_4_7 as u64;
+    stats.fi_run_len_8_plus += (bs.run_len_8_15 + bs.run_len_16_plus) as u64;
     Ok(result)
 }
 

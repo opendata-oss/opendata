@@ -19,6 +19,20 @@ pub(crate) struct ForwardIndexBatchStats {
     pub(crate) point_lookups: u32,
     pub(crate) range_scans: u32,
     pub(crate) range_scan_series: u32,
+    // Scan amplification: total series-id span covered by all scans
+    pub(crate) scan_span_series: u32,
+    // Run-length histogram (natural contiguous runs before threshold)
+    pub(crate) run_len_1: u32,
+    pub(crate) run_len_2_3: u32,
+    pub(crate) run_len_4_7: u32,
+    pub(crate) run_len_8_15: u32,
+    pub(crate) run_len_16_plus: u32,
+    // Gap histogram (between consecutive runs)
+    pub(crate) gap_1: u32,
+    pub(crate) gap_2_3: u32,
+    pub(crate) gap_4_7: u32,
+    pub(crate) gap_8_15: u32,
+    pub(crate) gap_16_plus: u32,
 }
 
 /// Trait for looking up series specs by ID.

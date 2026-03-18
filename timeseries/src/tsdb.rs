@@ -448,6 +448,11 @@ pub(crate) async fn evaluate_range(
         fi_point_lookups = stats.fi_point_lookups,
         fi_range_scans = stats.fi_range_scans,
         fi_range_scan_series = stats.fi_range_scan_series,
+        fi_scan_span_series = stats.fi_scan_span_series,
+        fi_run_len_1 = stats.fi_run_len_1,
+        fi_run_len_2_3 = stats.fi_run_len_2_3,
+        fi_run_len_4_7 = stats.fi_run_len_4_7,
+        fi_run_len_8_plus = stats.fi_run_len_8_plus,
         "evaluate_range complete"
     );
 

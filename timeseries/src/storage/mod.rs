@@ -25,6 +25,9 @@ pub(crate) mod merge_operator;
 
 // ── Batched forward index loading ──────────────────────────────────────
 
+/// Minimum contiguous run length to use a range scan instead of individual gets.
+const MIN_SCAN_RUN_LEN: u32 = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ForwardIndexBatchOp {
     Point(SeriesId),
@@ -35,36 +38,89 @@ enum ForwardIndexBatchOp {
     },
 }
 
-fn plan_forward_index_batches(sorted_ids: &[SeriesId]) -> Vec<ForwardIndexBatchOp> {
+/// A contiguous run of series IDs in the sorted, deduped input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForwardIndexRun {
+    start: SeriesId,
+    end_inclusive: SeriesId,
+    count: u32,
+}
+
+/// Build contiguous runs from sorted, deduped series IDs.
+fn build_forward_index_runs(sorted_ids: &[SeriesId]) -> Vec<ForwardIndexRun> {
     if sorted_ids.is_empty() {
         return Vec::new();
     }
-    let mut ops = Vec::new();
+    let mut runs = Vec::new();
     let mut run_start = sorted_ids[0];
     let mut run_end = sorted_ids[0];
     for &id in &sorted_ids[1..] {
         if run_end.checked_add(1) == Some(id) {
             run_end = id;
         } else {
-            emit_batch_op(&mut ops, run_start, run_end);
+            runs.push(ForwardIndexRun {
+                start: run_start,
+                end_inclusive: run_end,
+                count: run_end - run_start + 1,
+            });
             run_start = id;
             run_end = id;
         }
     }
-    emit_batch_op(&mut ops, run_start, run_end);
-    ops
+    runs.push(ForwardIndexRun {
+        start: run_start,
+        end_inclusive: run_end,
+        count: run_end - run_start + 1,
+    });
+    runs
 }
 
-fn emit_batch_op(ops: &mut Vec<ForwardIndexBatchOp>, start: SeriesId, end: SeriesId) {
-    if start == end {
-        ops.push(ForwardIndexBatchOp::Point(start));
-    } else {
-        ops.push(ForwardIndexBatchOp::Range {
-            start,
-            end_inclusive: end,
-            count: end - start + 1,
-        });
+/// Populate run-length and gap histograms from the runs.
+fn record_run_and_gap_stats(runs: &[ForwardIndexRun], stats: &mut ForwardIndexBatchStats) {
+    for run in runs {
+        match run.count {
+            1 => stats.run_len_1 += 1,
+            2..=3 => stats.run_len_2_3 += 1,
+            4..=7 => stats.run_len_4_7 += 1,
+            8..=15 => stats.run_len_8_15 += 1,
+            _ => stats.run_len_16_plus += 1,
+        }
     }
+    for pair in runs.windows(2) {
+        // Runs are sorted and non-overlapping, so next.start > prev.end_inclusive.
+        debug_assert!(pair[1].start > pair[0].end_inclusive);
+        let gap = pair[1]
+            .start
+            .saturating_sub(pair[0].end_inclusive)
+            .saturating_sub(1);
+        match gap {
+            0 => {} // adjacent (no gap) — shouldn't happen with distinct runs, but defensive
+            1 => stats.gap_1 += 1,
+            2..=3 => stats.gap_2_3 += 1,
+            4..=7 => stats.gap_4_7 += 1,
+            8..=15 => stats.gap_8_15 += 1,
+            _ => stats.gap_16_plus += 1,
+        }
+    }
+}
+
+/// Convert runs to batch ops, using range scans only for runs >= min_scan_run_len.
+fn plan_ops_from_runs(runs: &[ForwardIndexRun], min_scan_run_len: u32) -> Vec<ForwardIndexBatchOp> {
+    let mut ops = Vec::new();
+    for run in runs {
+        if run.count >= min_scan_run_len {
+            ops.push(ForwardIndexBatchOp::Range {
+                start: run.start,
+                end_inclusive: run.end_inclusive,
+                count: run.count,
+            });
+        } else {
+            for id in run.start..=run.end_inclusive {
+                ops.push(ForwardIndexBatchOp::Point(id));
+            }
+        }
+    }
+    ops
 }
 
 /// Forward index loaded from storage, carrying batch loading statistics.
@@ -264,14 +320,16 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         sorted_ids.dedup();
         let unique_count = sorted_ids.len() as u32;
 
-        let ops = plan_forward_index_batches(&sorted_ids);
+        let runs = build_forward_index_runs(&sorted_ids);
         let result = ForwardIndex::default();
         let mut stats = ForwardIndexBatchStats {
             total_series_requested: total_requested,
             unique_series: unique_count,
-            batch_ops: ops.len() as u32,
             ..Default::default()
         };
+        record_run_and_gap_stats(&runs, &mut stats);
+        let ops = plan_ops_from_runs(&runs, MIN_SCAN_RUN_LEN);
+        stats.batch_ops = ops.len() as u32;
 
         for op in &ops {
             match op {
@@ -295,6 +353,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
                 } => {
                     stats.range_scans += 1;
                     stats.range_scan_series += count;
+                    stats.scan_span_series += end_inclusive - start + 1;
                     let range = ForwardIndexKey::series_range(bucket, *start, *end_inclusive);
                     let records = self.scan(range).await?;
                     for record in records {
@@ -313,6 +372,17 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
             point_lookups = stats.point_lookups,
             range_scans = stats.range_scans,
             range_scan_series = stats.range_scan_series,
+            scan_span_series = stats.scan_span_series,
+            run_len_1 = stats.run_len_1,
+            run_len_2_3 = stats.run_len_2_3,
+            run_len_4_7 = stats.run_len_4_7,
+            run_len_8_15 = stats.run_len_8_15,
+            run_len_16_plus = stats.run_len_16_plus,
+            gap_1 = stats.gap_1,
+            gap_2_3 = stats.gap_2_3,
+            gap_4_7 = stats.gap_4_7,
+            gap_8_15 = stats.gap_8_15,
+            gap_16_plus = stats.gap_16_plus,
             "forward index batch load"
         );
 
@@ -545,38 +615,30 @@ mod tests {
         assert_eq!(starts(&buckets), vec![60]);
     }
 
-    // ── plan_forward_index_batches tests ───────────────────────────────
+    // ── build_forward_index_runs tests ─────────────────────────────────
 
     #[test]
-    fn batch_plan_empty() {
-        assert!(plan_forward_index_batches(&[]).is_empty());
+    fn runs_empty() {
+        assert!(build_forward_index_runs(&[]).is_empty());
     }
 
     #[test]
-    fn batch_plan_single() {
+    fn runs_single() {
         assert_eq!(
-            plan_forward_index_batches(&[42]),
-            vec![ForwardIndexBatchOp::Point(42)]
-        );
-    }
-
-    #[test]
-    fn batch_plan_two_contiguous() {
-        assert_eq!(
-            plan_forward_index_batches(&[10, 11]),
-            vec![ForwardIndexBatchOp::Range {
-                start: 10,
-                end_inclusive: 11,
-                count: 2
+            build_forward_index_runs(&[42]),
+            vec![ForwardIndexRun {
+                start: 42,
+                end_inclusive: 42,
+                count: 1
             }]
         );
     }
 
     #[test]
-    fn batch_plan_three_contiguous() {
+    fn runs_contiguous() {
         assert_eq!(
-            plan_forward_index_batches(&[10, 11, 12]),
-            vec![ForwardIndexBatchOp::Range {
+            build_forward_index_runs(&[10, 11, 12]),
+            vec![ForwardIndexRun {
                 start: 10,
                 end_inclusive: 12,
                 count: 3
@@ -585,24 +647,135 @@ mod tests {
     }
 
     #[test]
-    fn batch_plan_gap() {
+    fn runs_gap() {
         assert_eq!(
-            plan_forward_index_batches(&[10, 12, 13]),
+            build_forward_index_runs(&[10, 12, 13]),
             vec![
-                ForwardIndexBatchOp::Point(10),
-                ForwardIndexBatchOp::Range {
+                ForwardIndexRun {
+                    start: 10,
+                    end_inclusive: 10,
+                    count: 1
+                },
+                ForwardIndexRun {
                     start: 12,
                     end_inclusive: 13,
                     count: 2
-                }
+                },
             ]
         );
     }
 
     #[test]
-    fn batch_plan_all_isolated() {
+    fn runs_u32_max_contiguous() {
         assert_eq!(
-            plan_forward_index_batches(&[1, 5, 100]),
+            build_forward_index_runs(&[u32::MAX - 1, u32::MAX]),
+            vec![ForwardIndexRun {
+                start: u32::MAX - 1,
+                end_inclusive: u32::MAX,
+                count: 2
+            }]
+        );
+    }
+
+    // ── plan_ops_from_runs tests (with MIN_SCAN_RUN_LEN threshold) ───
+
+    fn plan(sorted_ids: &[SeriesId]) -> Vec<ForwardIndexBatchOp> {
+        let runs = build_forward_index_runs(sorted_ids);
+        plan_ops_from_runs(&runs, MIN_SCAN_RUN_LEN)
+    }
+
+    #[test]
+    fn plan_empty() {
+        assert!(plan(&[]).is_empty());
+    }
+
+    #[test]
+    fn plan_single_point() {
+        assert_eq!(plan(&[42]), vec![ForwardIndexBatchOp::Point(42)]);
+    }
+
+    #[test]
+    fn plan_run_of_3_becomes_points() {
+        // Run of 3 < MIN_SCAN_RUN_LEN=8, so each becomes a Point
+        assert_eq!(
+            plan(&[10, 11, 12]),
+            vec![
+                ForwardIndexBatchOp::Point(10),
+                ForwardIndexBatchOp::Point(11),
+                ForwardIndexBatchOp::Point(12),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_run_of_7_becomes_points() {
+        assert_eq!(
+            plan(&[1, 2, 3, 4, 5, 6, 7]),
+            (1..=7).map(ForwardIndexBatchOp::Point).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn plan_run_of_8_becomes_range() {
+        assert_eq!(
+            plan(&[1, 2, 3, 4, 5, 6, 7, 8]),
+            vec![ForwardIndexBatchOp::Range {
+                start: 1,
+                end_inclusive: 8,
+                count: 8
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_mixed_short_and_long() {
+        // [1,2,3] = run of 3 (< 8) -> 3 Points
+        // [10..=17] = run of 8 (>= 8) -> 1 Range
+        let mut ids: Vec<u32> = vec![1, 2, 3];
+        ids.extend(10..=17);
+        let ops = plan(&ids);
+        assert_eq!(
+            ops,
+            vec![
+                ForwardIndexBatchOp::Point(1),
+                ForwardIndexBatchOp::Point(2),
+                ForwardIndexBatchOp::Point(3),
+                ForwardIndexBatchOp::Range {
+                    start: 10,
+                    end_inclusive: 17,
+                    count: 8
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_mixed_long_point_short() {
+        // [1..=10] = range, [20] = point, [30,31,32] = 3 points
+        let mut ids: Vec<u32> = (1..=10).collect();
+        ids.push(20);
+        ids.extend(30..=32);
+        let ops = plan(&ids);
+        assert_eq!(
+            ops,
+            vec![
+                ForwardIndexBatchOp::Range {
+                    start: 1,
+                    end_inclusive: 10,
+                    count: 10
+                },
+                ForwardIndexBatchOp::Point(20),
+                ForwardIndexBatchOp::Point(30),
+                ForwardIndexBatchOp::Point(31),
+                ForwardIndexBatchOp::Point(32),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_all_isolated() {
+        assert_eq!(
+            plan(&[1, 5, 100]),
             vec![
                 ForwardIndexBatchOp::Point(1),
                 ForwardIndexBatchOp::Point(5),
@@ -611,49 +784,55 @@ mod tests {
         );
     }
 
+    // ── record_run_and_gap_stats tests ───────────────────────────────
+
     #[test]
-    fn batch_plan_mixed() {
-        assert_eq!(
-            plan_forward_index_batches(&[1, 2, 3, 10, 20, 21, 22, 23, 50]),
-            vec![
-                ForwardIndexBatchOp::Range {
-                    start: 1,
-                    end_inclusive: 3,
-                    count: 3
-                },
-                ForwardIndexBatchOp::Point(10),
-                ForwardIndexBatchOp::Range {
-                    start: 20,
-                    end_inclusive: 23,
-                    count: 4
-                },
-                ForwardIndexBatchOp::Point(50),
-            ]
-        );
+    fn stats_run_histogram() {
+        // [1,2,3] = run of 3, [5..=12] = run of 8
+        let runs = build_forward_index_runs(&{
+            let mut ids: Vec<u32> = vec![1, 2, 3];
+            ids.extend(5..=12);
+            ids
+        });
+        let mut stats = ForwardIndexBatchStats::default();
+        record_run_and_gap_stats(&runs, &mut stats);
+        assert_eq!(stats.run_len_2_3, 1);
+        assert_eq!(stats.run_len_8_15, 1);
+        assert_eq!(stats.run_len_1, 0);
+        assert_eq!(stats.gap_1, 1); // gap between 3 and 5 = 1
     }
 
     #[test]
-    fn batch_plan_u32_max_contiguous() {
-        assert_eq!(
-            plan_forward_index_batches(&[u32::MAX - 1, u32::MAX]),
-            vec![ForwardIndexBatchOp::Range {
-                start: u32::MAX - 1,
-                end_inclusive: u32::MAX,
-                count: 2
-            }]
-        );
+    fn stats_all_isolated() {
+        let runs = build_forward_index_runs(&[1, 10, 20]);
+        let mut stats = ForwardIndexBatchStats::default();
+        record_run_and_gap_stats(&runs, &mut stats);
+        assert_eq!(stats.run_len_1, 3);
+        assert_eq!(stats.gap_8_15, 2); // gaps of 8 and 9
     }
 
     #[test]
-    fn batch_plan_u32_max_isolated() {
-        // Gap of 1 between MAX-2 and MAX
-        assert_eq!(
-            plan_forward_index_batches(&[u32::MAX - 2, u32::MAX]),
-            vec![
-                ForwardIndexBatchOp::Point(u32::MAX - 2),
-                ForwardIndexBatchOp::Point(u32::MAX),
-            ]
-        );
+    fn stats_single_long_run() {
+        let ids: Vec<u32> = (1..=17).collect();
+        let runs = build_forward_index_runs(&ids);
+        let mut stats = ForwardIndexBatchStats::default();
+        record_run_and_gap_stats(&runs, &mut stats);
+        assert_eq!(stats.run_len_16_plus, 1);
+        assert_eq!(stats.gap_1, 0);
+    }
+
+    #[test]
+    fn stats_gap_buckets() {
+        // Gaps: 1, 3, 5, 10, 20
+        let runs = build_forward_index_runs(&[1, 3, 7, 13, 24, 45]);
+        let mut stats = ForwardIndexBatchStats::default();
+        record_run_and_gap_stats(&runs, &mut stats);
+        assert_eq!(stats.run_len_1, 6);
+        assert_eq!(stats.gap_1, 1); // gap=1 (1→3)
+        assert_eq!(stats.gap_2_3, 1); // gap=3 (3→7)
+        assert_eq!(stats.gap_4_7, 1); // gap=5 (7→13)
+        assert_eq!(stats.gap_8_15, 1); // gap=10 (13→24)
+        assert_eq!(stats.gap_16_plus, 1); // gap=20 (24→45)
     }
 
     // ── Integration tests for batched get_forward_index_series ─────────
@@ -712,10 +891,10 @@ mod tests {
             .unwrap();
         // All 5 should be present
         assert_eq!(result.inner.series.len(), 5);
-        // batch_stats: [1,2,3] = 1 range scan, [5] = 1 point, [10] = 1 point
-        assert_eq!(result.batch_stats.range_scans, 1);
-        assert_eq!(result.batch_stats.point_lookups, 2);
-        assert_eq!(result.batch_stats.batch_ops, 3);
+        // With MIN_SCAN_RUN_LEN=8: [1,2,3] run of 3 < 8 -> 3 points, [5] point, [10] point = 5 points total
+        assert_eq!(result.batch_stats.range_scans, 0);
+        assert_eq!(result.batch_stats.point_lookups, 5);
+        assert_eq!(result.batch_stats.batch_ops, 5);
     }
 
     #[tokio::test]
@@ -770,7 +949,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batched_fi_dense_run_stats() {
+    async fn batched_fi_dense_run_below_threshold() {
+        // Run of 5 < MIN_SCAN_RUN_LEN=8, so all become point lookups
         let bucket = TimeBucket {
             start: 100,
             size: 1,
@@ -786,11 +966,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.inner.series.len(), 5);
+        assert_eq!(result.batch_stats.range_scans, 0);
+        assert_eq!(result.batch_stats.point_lookups, 5);
+        assert_eq!(result.batch_stats.unique_series, 5);
+        assert_eq!(result.batch_stats.batch_ops, 5);
+        assert_eq!(result.batch_stats.range_scan_series, 0);
+        // Run histogram: one run of 5 -> run_len_4_7
+        assert_eq!(result.batch_stats.run_len_4_7, 1);
+    }
+
+    #[tokio::test]
+    async fn batched_fi_dense_run_meets_threshold() {
+        // Run of 8 >= MIN_SCAN_RUN_LEN=8, so becomes a range scan
+        let bucket = TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let series: Vec<(SeriesId, &str)> = (1..=8).map(|i| (i, "x")).collect();
+        let s = storage_with_forward_index(&series, &bucket).await;
+        let snapshot = s.snapshot().await.unwrap();
+        let ids: Vec<u32> = (1..=8).collect();
+        let result = snapshot
+            .get_forward_index_series(&bucket, &ids)
+            .await
+            .unwrap();
+        assert_eq!(result.inner.series.len(), 8);
         assert_eq!(result.batch_stats.range_scans, 1);
         assert_eq!(result.batch_stats.point_lookups, 0);
-        assert_eq!(result.batch_stats.unique_series, 5);
         assert_eq!(result.batch_stats.batch_ops, 1);
-        assert_eq!(result.batch_stats.range_scan_series, 5);
+        assert_eq!(result.batch_stats.range_scan_series, 8);
+        assert_eq!(result.batch_stats.scan_span_series, 8);
+        assert_eq!(result.batch_stats.run_len_8_15, 1);
     }
 
     #[tokio::test]
