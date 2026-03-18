@@ -57,7 +57,7 @@ impl SeriesDictionaryKey {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 2 + 4 + 16 {
+        if buf.len() < 3 + 4 + 16 {
             return Err(EncodingError {
                 message: "Buffer too short for SeriesDictionaryKey".to_string(),
             });
@@ -76,10 +76,10 @@ impl SeriesDictionaryKey {
             message: "SeriesDictionaryKey should be bucket-scoped".to_string(),
         })?;
 
-        let time_bucket = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
+        let time_bucket = u32::from_be_bytes([buf[3], buf[4], buf[5], buf[6]]);
         let series_fingerprint = u128::from_be_bytes([
-            buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-            buf[16], buf[17], buf[18], buf[19], buf[20], buf[21],
+            buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16],
+            buf[17], buf[18], buf[19], buf[20], buf[21], buf[22],
         ]);
 
         Ok(SeriesDictionaryKey {
@@ -123,7 +123,7 @@ impl ForwardIndexKey {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 2 + 4 + 4 {
+        if buf.len() < 3 + 4 + 4 {
             return Err(EncodingError {
                 message: "Buffer too short for ForwardIndexKey".to_string(),
             });
@@ -142,8 +142,8 @@ impl ForwardIndexKey {
             message: "ForwardIndexKey should be bucket-scoped".to_string(),
         })?;
 
-        let time_bucket = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
-        let series_id = u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]);
+        let time_bucket = u32::from_be_bytes([buf[3], buf[4], buf[5], buf[6]]);
+        let series_id = u32::from_be_bytes([buf[7], buf[8], buf[9], buf[10]]);
 
         Ok(ForwardIndexKey {
             time_bucket,
@@ -202,7 +202,7 @@ impl InvertedIndexKey {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 2 + 4 {
+        if buf.len() < 3 + 4 {
             return Err(EncodingError {
                 message: "Buffer too short for InvertedIndexKey".to_string(),
             });
@@ -221,7 +221,7 @@ impl InvertedIndexKey {
             message: "InvertedIndexKey should be bucket-scoped".to_string(),
         })?;
 
-        let mut slice = &buf[2..];
+        let mut slice = &buf[3..];
         let time_bucket = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
         slice = &slice[4..];
 
@@ -278,7 +278,7 @@ impl TimeSeriesKey {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 2 + 4 + 4 {
+        if buf.len() < 3 + 4 + 4 {
             return Err(EncodingError {
                 message: "Buffer too short for TimeSeriesKey".to_string(),
             });
@@ -297,8 +297,8 @@ impl TimeSeriesKey {
             message: "TimeSeriesKey should be bucket-scoped".to_string(),
         })?;
 
-        let time_bucket = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
-        let series_id = u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]);
+        let time_bucket = u32::from_be_bytes([buf[3], buf[4], buf[5], buf[6]]);
+        let series_id = u32::from_be_bytes([buf[7], buf[8], buf[9], buf[10]]);
 
         Ok(TimeSeriesKey {
             time_bucket,

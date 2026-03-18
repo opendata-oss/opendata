@@ -8,7 +8,7 @@
 ## Summary
 
 This RFC defines a common record key prefix format for OpenData storage systems built on SlateDB.
-All records use a standardized 2-byte prefix consisting of a version byte and a record tag byte.
+All records use a standardized 3-byte prefix consisting of a subsystem byte, a version byte, and a record tag byte.
 The record tag stores the record type as a full byte.
 This enables forward compatibility and consistent key organization across Opendata systems.
 
@@ -26,7 +26,7 @@ Formalizing this pattern as a common specification provides several benefits:
 
 ## Goals
 
-- Define the 2-byte record key prefix format
+- Define the 3-byte record key prefix format
 - Specify the record tag encoding
 - Document the versioning strategy for schema evolution
 - Establish conventions for big-endian key encoding
@@ -35,7 +35,7 @@ Formalizing this pattern as a common specification provides several benefits:
 
 - Subsystem-specific record definitions (covered by individual RFCs)
 - Value encoding conventions (covered by individual RFCs)
-- Key components beyond the 2-byte prefix
+- Key components beyond the 3-byte prefix
 
 ## Design
 
@@ -44,17 +44,33 @@ Formalizing this pattern as a common specification provides several benefits:
 All OpenData records stored in SlateDB use keys with the following prefix:
 
 ```
-┌─────────┬────────────┬─────────────────────┐
-│ version │ record_tag │  ... record fields  │
-│ 1 byte  │   1 byte   │    (varies)         │
-└─────────┴────────────┴─────────────────────┘
+┌───────────┬─────────┬────────────┬─────────────────────┐
+│ subsystem │ version │ record_tag │  ... record fields  │
+│  1 byte   │ 1 byte  │   1 byte   │    (varies)         │
+└───────────┴─────────┴────────────┴─────────────────────┘
 ```
 
-The 2-byte prefix is followed by record-specific fields that vary by subsystem and record type.
+The 3-byte prefix is followed by record-specific fields that vary by subsystem and record type.
+
+### Subsystem Byte
+
+The second byte identifies the key format version. Each subsystem manages its version independently—bumping the version in one subsystem does not affect others.
+
+| Value  | Description |
+|--------|-------------|
+| `0x00` | Reserved (invalid) |
+| `0x01`–`0xFF` | Subsystem-defined |
+
+Current subsystem allocations:
+
+- `0x01` Timeseries
+- `0x02` Vector
+- `0x03` Log
+- `0x04` KeyValue
 
 ### Version Byte
 
-The first byte identifies the key format version. Each subsystem manages its version independently—bumping the version in one subsystem does not affect others.
+The first byte identifies the subsystem that owns the key.
 
 | Value  | Description |
 |--------|-------------|
@@ -71,7 +87,7 @@ The version byte enables schema migration. When the key format changes in a back
 
 ### Record Tag Byte
 
-The second byte stores the record tag as a full byte value.
+The third byte stores the record tag as a full byte value.
 
 **Record Tag:** Identifies the kind of record. Values `0x01`–`0xFF` are available.
 Tag `0x00` is reserved in all subsystems.
@@ -92,9 +108,9 @@ See the following RFCs for subsystem-specific record type definitions:
 The standardized prefix enables efficient filtering by record type:
 
 ```rust
-// Build a 2-byte prefix
-fn key_prefix(version: u8, record_type: u8) -> [u8; 2] {
-    [version, record_type]
+// Build a 3-byte prefix
+fn key_prefix(subsystem: u8, version: u8, record_tag: u8) -> [u8; 3] {
+    [subsystem, version, record_tag]
 }
 ```
 
@@ -132,7 +148,7 @@ For example, timeseries encodes time bucket granularity in the lower 4 bits of t
 An alternative would use a shared version across all subsystems, requiring coordinated bumps when the prefix format changes:
 
 ```
-| prefix_version | record_tag | ... |
+| subsystem | prefix_version | record_tag | ... |
 ```
 
 A hybrid approach could reserve one bit (e.g., the high bit) to indicate prefix-level changes, leaving 7 bits for subsystem-specific versioning:
@@ -149,7 +165,7 @@ These approaches were deferred because:
 
 1. **Coordination overhead** — Requiring all subsystems to bump versions together is inconvenient and slows development.
 
-2. **Unlikely need** — The 2-byte prefix structure is simple and stable. Changes requiring cross-subsystem coordination are unlikely.
+2. **Unlikely need** — The 3-byte prefix structure is simple and stable. Changes requiring cross-subsystem coordination are unlikely.
 
 3. **Simplicity** — Independent versioning is easier to reason about and implement.
 
@@ -159,6 +175,7 @@ None at this time.
 
 ## Updates
 
-| Date       | Description |
-|------------|-------------|
-| 2026-01-09 | Initial draft |
+| Date       | Description                                |
+|------------|--------------------------------------------|
+| 2026-01-09 | Initial draft                              |
+| 2026-03-18 | Simplify record tag and add subsystem byte |

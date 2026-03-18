@@ -2,7 +2,7 @@ use crate::serde::DeserializeError;
 
 /// Record tag combining record type (high 4 bits) and reserved bits (low 4 bits).
 ///
-/// The record tag is the second byte of the key prefix. It encodes the record
+/// The record tag is the third byte of the key prefix. It encodes the record
 /// type in the high 4 bits, leaving the low 4 bits for subsystem-specific use.
 ///
 /// # Examples

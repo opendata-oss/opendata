@@ -96,6 +96,9 @@ pub fn decode_fixed_element_array<T: Decode>(
 /// Key format version (currently 0x01)
 pub const KEY_VERSION: u8 = 0x01;
 
+/// Subsystem-specific key prefix for timeseries storage.
+pub const SUBSYSTEM: u8 = 0x01;
+
 /// Record type enumeration for timeseries storage.
 ///
 /// Record types are encoded in the high 4 bits of the record tag byte,
@@ -131,6 +134,15 @@ impl RecordType {
     }
 
     pub fn from_prefix(prefix: KeyPrefix) -> Result<Self, EncodingError> {
+        if prefix.subsystem() != SUBSYSTEM {
+            return Err(EncodingError {
+                message: format!(
+                    "invalid subsystem: expected 0x{:02x}, got 0x{:02x}",
+                    SUBSYSTEM,
+                    prefix.subsystem()
+                ),
+            });
+        }
         RecordType::from_id((prefix.tag() & 0xF0) >> 4)
     }
 
@@ -146,12 +158,13 @@ impl RecordType {
 
     /// Creates a global-scoped KeyPrefix with the current version.
     pub fn prefix(&self) -> KeyPrefix {
-        KeyPrefix::new(KEY_VERSION, self.tag().as_byte())
+        KeyPrefix::new(SUBSYSTEM, KEY_VERSION, self.tag().as_byte())
     }
 
     /// Creates a bucket-scoped KeyPrefix with the current version.
     pub fn prefix_with_bucket_size(&self, bucket_size: BucketSize) -> KeyPrefix {
         KeyPrefix::new(
+            SUBSYSTEM,
             KEY_VERSION,
             self.tag_with_bucket_size(bucket_size).as_byte(),
         )
@@ -197,13 +210,13 @@ pub trait TimeBucketScoped: RecordKey {
             message: "record should be bucket-scoped".to_string(),
         })?;
 
-        if bytes.len() < 6 {
+        if bytes.len() < 7 {
             return Err(EncodingError {
                 message: "buffer too short for bucket prefix".to_string(),
             });
         }
 
-        let start_epoch_min = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+        let start_epoch_min = u32::from_be_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
 
         Ok(TimeBucket {
             start: start_epoch_min,

@@ -156,7 +156,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     /// Returns a map of centroid_id to accumulated vector count.
     #[allow(dead_code)]
     async fn scan_all_centroid_stats(&self) -> Result<Vec<(u64, CentroidStatsValue)>> {
-        let mut prefix_buf = bytes::BytesMut::with_capacity(2);
+        let mut prefix_buf = bytes::BytesMut::with_capacity(3);
         crate::serde::RecordType::CentroidStats
             .prefix()
             .write_to(&mut prefix_buf);
@@ -205,7 +205,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     /// ID and entry count for initializing chunk tracking state.
     async fn scan_all_centroids(&self, dimensions: usize) -> Result<CentroidScanResult> {
         // Create prefix for all CentroidChunk records
-        let mut prefix_buf = bytes::BytesMut::with_capacity(2);
+        let mut prefix_buf = bytes::BytesMut::with_capacity(3);
         crate::serde::RecordType::CentroidChunk
             .prefix()
             .write_to(&mut prefix_buf);

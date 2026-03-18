@@ -25,6 +25,9 @@ use common::serde::record_tag::RecordTag;
 /// Key format version (currently 0x01)
 pub const KEY_VERSION: u8 = 0x01;
 
+/// Subsystem-specific key prefix for vector storage.
+pub const SUBSYSTEM: u8 = 0x02;
+
 /// Record type enumeration for vector database records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordType {
@@ -64,6 +67,15 @@ impl RecordType {
     }
 
     pub fn from_prefix(prefix: KeyPrefix) -> Result<Self, EncodingError> {
+        if prefix.subsystem() != SUBSYSTEM {
+            return Err(EncodingError {
+                message: format!(
+                    "invalid subsystem: expected 0x{:02x}, got 0x{:02x}",
+                    SUBSYSTEM,
+                    prefix.subsystem()
+                ),
+            });
+        }
         RecordType::from_id((prefix.tag() & 0xF0) >> 4)
     }
 
@@ -74,7 +86,7 @@ impl RecordType {
 
     /// Creates a KeyPrefix with the current version for this record type.
     pub fn prefix(&self) -> KeyPrefix {
-        KeyPrefix::new(KEY_VERSION, self.tag().as_byte())
+        KeyPrefix::new(SUBSYSTEM, KEY_VERSION, self.tag().as_byte())
     }
 }
 

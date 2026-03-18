@@ -501,7 +501,7 @@ mod tests {
         let has_vector_data_put = frozen
             .ops
             .iter()
-            .any(|op| is_put_with_key_prefix(op, &vector_data_key_prefix[..2]));
+            .any(|op| is_put_with_key_prefix(op, &vector_data_key_prefix[..3]));
         assert!(has_vector_data_put, "should have vector data put op");
     }
 
@@ -663,7 +663,7 @@ mod tests {
         let id_dict_puts = frozen
             .ops
             .iter()
-            .filter(|op| is_put_with_key_prefix(op, &IdDictionaryKey::new("").encode()[..2]))
+            .filter(|op| is_put_with_key_prefix(op, &IdDictionaryKey::new("").encode()[..3]))
             .count();
         assert_eq!(id_dict_puts, 3, "should have 3 ID dictionary put ops");
 
@@ -671,7 +671,7 @@ mod tests {
         let vector_data_puts = frozen
             .ops
             .iter()
-            .filter(|op| is_put_with_key_prefix(op, &VectorDataKey::new(0).encode()[..2]))
+            .filter(|op| is_put_with_key_prefix(op, &VectorDataKey::new(0).encode()[..3]))
             .count();
         assert_eq!(vector_data_puts, 3, "should have 3 vector data put ops");
     }
@@ -792,7 +792,7 @@ mod tests {
         let posting_merges: Vec<_> = frozen
             .ops
             .iter()
-            .filter(|op| is_merge_with_key_prefix(op, &PostingListKey::new(0).encode()[..2]))
+            .filter(|op| is_merge_with_key_prefix(op, &PostingListKey::new(0).encode()[..3]))
             .collect();
 
         assert_eq!(
@@ -980,7 +980,7 @@ mod tests {
 
         // then - should have metadata index merge ops
         let metadata_prefix = crate::serde::RecordType::MetadataIndex.prefix();
-        let mut prefix_buf = bytes::BytesMut::with_capacity(2);
+        let mut prefix_buf = bytes::BytesMut::with_capacity(3);
         metadata_prefix.write_to(&mut prefix_buf);
         let prefix = prefix_buf.freeze();
 
@@ -1033,7 +1033,7 @@ mod tests {
 
         // then - should have NO metadata index merge ops
         let metadata_prefix = crate::serde::RecordType::MetadataIndex.prefix();
-        let mut prefix_buf = bytes::BytesMut::with_capacity(2);
+        let mut prefix_buf = bytes::BytesMut::with_capacity(3);
         metadata_prefix.write_to(&mut prefix_buf);
         let prefix = prefix_buf.freeze();
 
