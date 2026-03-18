@@ -443,7 +443,7 @@ pub(crate) async fn evaluate_range(
         parallel_sample_sum_ms = stats.parallel_sample_sum_ms,
         parallel_sample_bucket_count = stats.parallel_sample_bucket_count,
         // Batched forward index stats
-        fi_unique_series = stats.fi_unique_series,
+        fi_series_loaded = stats.fi_series_loaded,
         fi_batch_ops = stats.fi_batch_ops,
         fi_point_lookups = stats.fi_point_lookups,
         fi_range_scans = stats.fi_range_scans,

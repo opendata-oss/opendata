@@ -627,15 +627,11 @@ mod tests {
 
     #[test]
     fn series_range_does_not_cross_buckets() {
-        let bucket1 = crate::model::TimeBucket {
+        let bucket = crate::model::TimeBucket {
             start: 100,
             size: 1,
         };
-        let bucket2 = crate::model::TimeBucket {
-            start: 200,
-            size: 1,
-        };
-        let range = ForwardIndexKey::series_range(&bucket1, 10, 12);
+        let range = ForwardIndexKey::series_range(&bucket, 10, 12);
         let key_other_bucket = ForwardIndexKey {
             time_bucket: 200,
             bucket_size: 1,

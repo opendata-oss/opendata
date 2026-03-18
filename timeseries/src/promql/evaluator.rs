@@ -103,7 +103,7 @@ pub(crate) struct EvalStats {
     pub(crate) parallel_sample_sum_ms: u64,
     pub(crate) parallel_sample_bucket_count: u64,
     // Batched forward index stats
-    pub(crate) fi_unique_series: u64,
+    pub(crate) fi_series_loaded: u64,
     pub(crate) fi_batch_ops: u64,
     pub(crate) fi_point_lookups: u64,
     pub(crate) fi_range_scans: u64,
@@ -224,7 +224,7 @@ struct BucketResolutionStats {
     metadata_permit_acquires: u64,
     series_meta_count: u64,
     // Batched forward index stats
-    fi_unique_series: u64,
+    fi_series_loaded: u64,
     fi_batch_ops: u64,
     fi_point_lookups: u64,
     fi_range_scans: u64,
@@ -723,7 +723,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             self.stats.forward_index_miss_ms += wait_ms + load_ms;
 
             let bs = forward_index.batch_stats();
-            self.stats.fi_unique_series += bs.unique_series as u64;
+            self.stats.fi_series_loaded += bs.unique_series as u64;
             self.stats.fi_batch_ops += bs.batch_ops as u64;
             self.stats.fi_point_lookups += bs.point_lookups as u64;
             self.stats.fi_range_scans += bs.range_scans as u64;
@@ -1338,7 +1338,7 @@ async fn resolve_bucket_raw<R: QueryReader>(
     stats.metadata_queue_wait_ms += sel_stats.metadata_queue_wait_ms;
     stats.metadata_load_ms += sel_stats.metadata_load_ms;
     stats.metadata_permit_acquires += sel_stats.metadata_permit_acquires;
-    stats.fi_unique_series += sel_stats.fi_unique_series;
+    stats.fi_series_loaded += sel_stats.fi_series_loaded;
     stats.fi_batch_ops += sel_stats.fi_batch_ops;
     stats.fi_point_lookups += sel_stats.fi_point_lookups;
     stats.fi_range_scans += sel_stats.fi_range_scans;
@@ -1388,7 +1388,7 @@ async fn resolve_bucket_raw<R: QueryReader>(
     };
 
     let fi_bs = fi_view.batch_stats();
-    stats.fi_unique_series += fi_bs.unique_series as u64;
+    stats.fi_series_loaded += fi_bs.unique_series as u64;
     stats.fi_batch_ops += fi_bs.batch_ops as u64;
     stats.fi_point_lookups += fi_bs.point_lookups as u64;
     stats.fi_range_scans += fi_bs.range_scans as u64;
@@ -2205,7 +2205,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 self.reader.stats.metadata_load_ms += bs.metadata_load_ms;
                 self.reader.stats.metadata_permit_acquires += bs.metadata_permit_acquires;
                 self.reader.stats.series_meta_misses += bs.series_meta_count;
-                self.reader.stats.fi_unique_series += bs.fi_unique_series;
+                self.reader.stats.fi_series_loaded += bs.fi_series_loaded;
                 self.reader.stats.fi_batch_ops += bs.fi_batch_ops;
                 self.reader.stats.fi_point_lookups += bs.fi_point_lookups;
                 self.reader.stats.fi_range_scans += bs.fi_range_scans;
@@ -7355,5 +7355,54 @@ mod tests {
                 "parallel_sample_loads should not increase on cache hit"
             );
         }
+    }
+
+    /// Verify that forward_index cache hits do not re-accumulate batch stats.
+    /// MockQueryReader returns ForwardIndex (not LoadedForwardIndex), so batch_stats()
+    /// returns zeros. On cache miss the evaluator records those zeros. On cache hit
+    /// the evaluator skips batch_stats() entirely, so fi_batch_ops must not change.
+    #[tokio::test]
+    async fn forward_index_cache_hit_does_not_add_batch_stats() {
+        let bucket = TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let mut builder = MockQueryReaderBuilder::new(bucket);
+        builder.add_sample(
+            vec![
+                Label {
+                    name: METRIC_NAME.to_string(),
+                    value: "test_metric".to_string(),
+                },
+                Label {
+                    name: "host".to_string(),
+                    value: "a".to_string(),
+                },
+            ],
+            MetricType::Gauge,
+            Sample {
+                timestamp_ms: 6_000_000,
+                value: 1.0,
+            },
+        );
+        let reader = builder.build();
+        let mut cached = CachedQueryReader::new(&reader);
+
+        let series_ids = vec![0u32];
+
+        // First call — cache miss
+        let _ = cached.forward_index(&bucket, &series_ids).await.unwrap();
+        let after_miss = cached.stats.fi_batch_ops;
+
+        // Second call — cache hit
+        let _ = cached.forward_index(&bucket, &series_ids).await.unwrap();
+        let after_hit = cached.stats.fi_batch_ops;
+
+        assert_eq!(
+            after_miss, after_hit,
+            "fi_batch_ops should not increase on cache hit"
+        );
+        assert_eq!(cached.stats.forward_index_cache_hits, 1);
+        assert_eq!(cached.stats.forward_index_misses, 1);
     }
 }

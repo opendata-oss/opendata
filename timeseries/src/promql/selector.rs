@@ -228,7 +228,7 @@ pub(crate) struct SelectorRawStats {
     pub(crate) metadata_load_ms: u64,
     pub(crate) metadata_permit_acquires: u64,
     // Batched forward index stats (from negative/empty-string matcher filtering)
-    pub(crate) fi_unique_series: u64,
+    pub(crate) fi_series_loaded: u64,
     pub(crate) fi_batch_ops: u64,
     pub(crate) fi_point_lookups: u64,
     pub(crate) fi_range_scans: u64,
@@ -364,7 +364,7 @@ async fn acquire_and_load_forward_index<R: QueryReader>(
         result
     };
     let bs = result.batch_stats();
-    stats.fi_unique_series += bs.unique_series as u64;
+    stats.fi_series_loaded += bs.unique_series as u64;
     stats.fi_batch_ops += bs.batch_ops as u64;
     stats.fi_point_lookups += bs.point_lookups as u64;
     stats.fi_range_scans += bs.range_scans as u64;
