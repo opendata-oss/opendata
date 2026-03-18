@@ -434,6 +434,14 @@ pub(crate) async fn evaluate_range(
         metadata_load_ms = stats.metadata_load_ms,
         metadata_permit_acquires = stats.metadata_permit_acquires,
         parallel_sample_loads = stats.parallel_sample_loads,
+        // Phase B1: parallel selector + metadata resolution
+        parallel_selector_wall_ms = stats.parallel_selector_wall_ms,
+        parallel_selector_sum_ms = stats.parallel_selector_sum_ms,
+        parallel_selector_count = stats.parallel_selector_count,
+        // Phase B3: parallel sample loading
+        parallel_sample_wall_ms = stats.parallel_sample_wall_ms,
+        parallel_sample_sum_ms = stats.parallel_sample_sum_ms,
+        parallel_sample_bucket_count = stats.parallel_sample_bucket_count,
         "evaluate_range complete"
     );
 

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndex, InvertedIndexLookup};
+use crate::load_coordinator::ReadLoadCoordinator;
 use crate::model::Label;
 use crate::model::SeriesId;
 use crate::promql::evaluator::CachedQueryReader;
@@ -58,18 +59,18 @@ fn parse_limited_regex(pattern: &str) -> std::result::Result<Vec<String>, String
     }
 }
 
-/// Find candidate series IDs using a QueryReader
-async fn find_candidates_with_reader<'reader, R: QueryReader>(
-    reader: &mut CachedQueryReader<'reader, R>,
-    bucket: &crate::model::TimeBucket,
+/// (and_terms, or_groups, needs_metric_fallback)
+type SelectorTerms = (Vec<Label>, Vec<Vec<Label>>, bool);
+
+/// Selector term decomposition: (and_terms, or_groups, needs_metric_fallback).
+/// `needs_metric_fallback` is true when there are no positive matchers but empty-string matchers
+/// exist, requiring a metric-name-based fallback lookup.
+fn build_selector_terms(
     selector: &VectorSelector,
-) -> Result<Vec<SeriesId>> {
-    use std::collections::HashSet;
+) -> std::result::Result<SelectorTerms, crate::error::Error> {
+    let mut and_terms = Vec::new();
+    let mut or_groups = Vec::new();
 
-    let mut and_terms = Vec::new(); // Terms that must ALL match (AND)
-    let mut or_groups = Vec::new(); // Groups of terms where ANY can match (OR)
-
-    // Add metric name if specified
     if let Some(ref name) = selector.name {
         and_terms.push(Label {
             name: METRIC_NAME.to_string(),
@@ -80,8 +81,6 @@ async fn find_candidates_with_reader<'reader, R: QueryReader>(
     for matcher in &selector.matchers.matchers {
         match &matcher.op {
             MatchOp::Equal => {
-                // For empty string matchers, we skip adding them to and_terms
-                // and handle them later with post-filtering
                 if !matcher.value.is_empty() {
                     and_terms.push(Label {
                         name: matcher.name.clone(),
@@ -101,20 +100,60 @@ async fn find_candidates_with_reader<'reader, R: QueryReader>(
                     .collect();
                 or_groups.push(or_terms);
             }
-            _ => {
-                // Other match operations are handled in negative matchers
-            }
+            _ => {}
         }
     }
 
-    // If we have no positive matchers but have empty string matchers, we need to get all series
-    // Otherwise, if we have no positive matchers and no empty string matchers, return empty
+    let needs_metric_fallback =
+        and_terms.is_empty() && or_groups.is_empty() && has_empty_string_matchers(selector);
+
+    Ok((and_terms, or_groups, needs_metric_fallback))
+}
+
+/// Resolve candidates from an inverted index view using pre-built terms.
+fn resolve_candidates_from_index(
+    inverted_index_view: &dyn InvertedIndexLookup,
+    and_terms: &[Label],
+    or_groups: &[Vec<Label>],
+) -> HashSet<SeriesId> {
+    let mut result_set: HashSet<SeriesId> = if !and_terms.is_empty() {
+        inverted_index_view
+            .intersect(and_terms.to_vec())
+            .iter()
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    for or_terms in or_groups {
+        let mut or_result = HashSet::new();
+        for term in or_terms {
+            let term_result = inverted_index_view.intersect(vec![term.clone()]);
+            or_result.extend(term_result.iter());
+        }
+
+        if and_terms.is_empty() && result_set.is_empty() {
+            result_set = or_result;
+        } else {
+            result_set = result_set.intersection(&or_result).cloned().collect();
+        }
+    }
+
+    result_set
+}
+
+/// Find candidate series IDs using a QueryReader
+async fn find_candidates_with_reader<'reader, R: QueryReader>(
+    reader: &mut CachedQueryReader<'reader, R>,
+    bucket: &crate::model::TimeBucket,
+    selector: &VectorSelector,
+) -> Result<Vec<SeriesId>> {
+    let (and_terms, or_groups, needs_metric_fallback) = build_selector_terms(selector)?;
+
     if and_terms.is_empty() && or_groups.is_empty() {
-        if !has_empty_string_matchers(selector) {
+        if !needs_metric_fallback {
             return Ok(Vec::new());
         }
-        // For empty string matchers only, we need to get all series to filter later
-        // We'll get all series by getting the metric name (if specified) or all series
         if let Some(ref name) = selector.name {
             let metric_term = Label {
                 name: METRIC_NAME.to_string(),
@@ -129,47 +168,21 @@ async fn find_candidates_with_reader<'reader, R: QueryReader>(
                 .collect();
             return Ok(result_set);
         } else {
-            // No metric name specified - this would match all series, but that's expensive
-            // For now, return error
             return Err(crate::error::Error::InvalidInput(
                 "must specify a metric name when using empty label matcher".to_string(),
             ));
         }
     }
 
-    let all_terms = or_groups
+    let all_terms: Vec<Label> = or_groups
         .iter()
         .flat_map(|terms| terms.iter().cloned())
         .chain(and_terms.iter().cloned())
-        .collect::<Vec<_>>();
+        .collect();
     let inverted_index_view = reader.inverted_index(bucket, &all_terms).await?;
 
-    // Start with AND terms intersection
-    let mut result_set: HashSet<SeriesId> = if !and_terms.is_empty() {
-        inverted_index_view
-            .intersect(and_terms.clone())
-            .iter()
-            .collect()
-    } else {
-        HashSet::new()
-    };
-
-    // Apply OR groups
-    for or_terms in or_groups {
-        let mut or_result = HashSet::new();
-        // Get union of all terms in this OR group
-        // Since we can't use a union method on the trait, collect individual intersections
-        for term in or_terms {
-            let term_result = inverted_index_view.intersect(vec![term]);
-            or_result.extend(term_result.iter());
-        }
-
-        if and_terms.is_empty() && result_set.is_empty() {
-            result_set = or_result;
-        } else {
-            result_set = result_set.intersection(&or_result).cloned().collect();
-        }
-    }
+    let result_set =
+        resolve_candidates_from_index(inverted_index_view.as_ref(), &and_terms, &or_groups);
 
     Ok(result_set.into_iter().collect())
 }
@@ -207,6 +220,143 @@ pub(crate) async fn evaluate_selector_with_reader<'reader, R: QueryReader>(
     }
 
     Ok(filtered.into_iter().collect())
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SelectorRawStats {
+    pub(crate) metadata_queue_wait_ms: u64,
+    pub(crate) metadata_load_ms: u64,
+    pub(crate) metadata_permit_acquires: u64,
+}
+
+/// Selector evaluation using raw QueryReader — no caching layer.
+/// Acquires metadata permits around each individual raw I/O call.
+pub(crate) async fn evaluate_selector_raw<R: QueryReader>(
+    reader: &R,
+    bucket: &crate::model::TimeBucket,
+    selector: &VectorSelector,
+    coordinator: &Option<ReadLoadCoordinator>,
+) -> std::result::Result<(HashSet<SeriesId>, SelectorRawStats), crate::error::Error> {
+    let mut stats = SelectorRawStats::default();
+    let (and_terms, or_groups, needs_metric_fallback) = build_selector_terms(selector)?;
+
+    if and_terms.is_empty() && or_groups.is_empty() {
+        if !needs_metric_fallback {
+            return Ok((HashSet::new(), stats));
+        }
+        if let Some(ref name) = selector.name {
+            let metric_term = Label {
+                name: METRIC_NAME.to_string(),
+                value: name.clone(),
+            };
+            let inverted_index_view = acquire_and_load_inverted_index(
+                reader,
+                bucket,
+                std::slice::from_ref(&metric_term),
+                coordinator,
+                &mut stats,
+            )
+            .await?;
+            let result_set: HashSet<SeriesId> = inverted_index_view
+                .intersect(vec![metric_term])
+                .iter()
+                .collect();
+            return Ok((result_set, stats));
+        } else {
+            return Err(crate::error::Error::InvalidInput(
+                "must specify a metric name when using empty label matcher".to_string(),
+            ));
+        }
+    }
+
+    // Load inverted index with permit gating
+    let all_terms: Vec<Label> = or_groups
+        .iter()
+        .flat_map(|terms| terms.iter().cloned())
+        .chain(and_terms.iter().cloned())
+        .collect();
+    let inverted_index_view =
+        acquire_and_load_inverted_index(reader, bucket, &all_terms, coordinator, &mut stats)
+            .await?;
+
+    let candidates =
+        resolve_candidates_from_index(inverted_index_view.as_ref(), &and_terms, &or_groups);
+
+    if candidates.is_empty()
+        || (!has_negative_matchers(selector) && !has_empty_string_matchers(selector))
+    {
+        return Ok((candidates, stats));
+    }
+
+    // Need forward index for negative/empty-string filtering
+    let candidates_vec: Vec<_> = candidates.iter().copied().collect();
+    let forward_index_view =
+        acquire_and_load_forward_index(reader, bucket, &candidates_vec, coordinator, &mut stats)
+            .await?;
+
+    let mut filtered: Vec<_> = candidates.into_iter().collect();
+
+    if has_negative_matchers(selector) {
+        filtered = apply_negative_matchers(forward_index_view.as_ref(), filtered, selector)
+            .map_err(crate::error::Error::InvalidInput)?;
+    }
+
+    if has_empty_string_matchers(selector) {
+        filtered = apply_empty_string_matchers(forward_index_view.as_ref(), filtered, selector)
+            .map_err(crate::error::Error::InvalidInput)?;
+    }
+
+    Ok((filtered.into_iter().collect(), stats))
+}
+
+/// Acquire metadata permit and load inverted index from raw reader.
+async fn acquire_and_load_inverted_index<R: QueryReader>(
+    reader: &R,
+    bucket: &crate::model::TimeBucket,
+    terms: &[Label],
+    coordinator: &Option<ReadLoadCoordinator>,
+    stats: &mut SelectorRawStats,
+) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
+    if let Some(coord) = coordinator {
+        let (permit, wait) = coord.acquire_metadata().await;
+        stats.metadata_permit_acquires += 1;
+        stats.metadata_queue_wait_ms += wait.as_millis() as u64;
+        let t0 = std::time::Instant::now();
+        let result = reader.inverted_index(bucket, terms).await?;
+        stats.metadata_load_ms += t0.elapsed().as_millis() as u64;
+        drop(permit);
+        Ok(result)
+    } else {
+        let t0 = std::time::Instant::now();
+        let result = reader.inverted_index(bucket, terms).await?;
+        stats.metadata_load_ms += t0.elapsed().as_millis() as u64;
+        Ok(result)
+    }
+}
+
+/// Acquire metadata permit and load forward index from raw reader.
+async fn acquire_and_load_forward_index<R: QueryReader>(
+    reader: &R,
+    bucket: &crate::model::TimeBucket,
+    series_ids: &[SeriesId],
+    coordinator: &Option<ReadLoadCoordinator>,
+    stats: &mut SelectorRawStats,
+) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
+    if let Some(coord) = coordinator {
+        let (permit, wait) = coord.acquire_metadata().await;
+        stats.metadata_permit_acquires += 1;
+        stats.metadata_queue_wait_ms += wait.as_millis() as u64;
+        let t0 = std::time::Instant::now();
+        let result = reader.forward_index(bucket, series_ids).await?;
+        stats.metadata_load_ms += t0.elapsed().as_millis() as u64;
+        drop(permit);
+        Ok(result)
+    } else {
+        let t0 = std::time::Instant::now();
+        let result = reader.forward_index(bucket, series_ids).await?;
+        stats.metadata_load_ms += t0.elapsed().as_millis() as u64;
+        Ok(result)
+    }
 }
 
 /// Evaluate selector on in-memory indexes.

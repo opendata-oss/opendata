@@ -288,8 +288,14 @@ async fn handle_query_range(
         format!("{:016x}", hasher.finish())
     };
     let step_count = {
-        let start_ms = start.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
-        let end_ms = end.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let start_ms = start
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let end_ms = end
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
         let step_ms = step.as_millis() as i64;
         if step_ms > 0 {
             (end_ms - start_ms) / step_ms + 1

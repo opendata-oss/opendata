@@ -485,11 +485,7 @@ impl PromQLFunction for LabelReplaceFunction {
             .map_err(|err| EvaluationError::InternalError(err.to_string()))?;
 
         for sample in &mut samples {
-            let src_value = sample
-                .labels
-                .get(&src_label)
-                .unwrap_or("")
-                .to_string();
+            let src_value = sample.labels.get(&src_label).unwrap_or("").to_string();
 
             if let Some(captures) = regex.captures(&src_value) {
                 let mut replaced = String::new();
@@ -1506,14 +1502,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.len(), 2);
-        assert_eq!(
-            result[0].labels.get("dst"),
-            Some("destination-value-10")
-        );
-        assert_eq!(
-            result[1].labels.get("dst"),
-            Some("destination-value-20")
-        );
+        assert_eq!(result[0].labels.get("dst"), Some("destination-value-10"));
+        assert_eq!(result[1].labels.get("dst"), Some("destination-value-20"));
     }
 
     #[test]
@@ -1655,10 +1645,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            result[0].labels.get("\u{00ff}"),
-            Some("value-10")
-        );
+        assert_eq!(result[0].labels.get("\u{00ff}"), Some("value-10"));
     }
 
     #[test]
@@ -1912,10 +1899,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            result[0].labels.get(METRIC_NAME),
-            Some("rate_metric_total")
-        );
+        assert_eq!(result[0].labels.get(METRIC_NAME), Some("rate_metric_total"));
         assert!(!result[0].drop_name);
     }
 
@@ -1945,10 +1929,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            result[0].labels.get(METRIC_NAME),
-            Some("metric_total_1")
-        );
+        assert_eq!(result[0].labels.get(METRIC_NAME), Some("metric_total_1"));
         assert!(!result[0].drop_name);
     }
 
@@ -2348,10 +2329,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].value, 10.0);
         assert_eq!(result[0].timestamp_ms, 600_000);
-        assert_eq!(
-            result[0].labels.get(METRIC_NAME),
-            Some("metric")
-        );
+        assert_eq!(result[0].labels.get(METRIC_NAME), Some("metric"));
         assert_eq!(result[0].labels.get("job"), Some("api"));
         assert!(result[0].drop_name);
     }
@@ -2374,10 +2352,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].value, 4.0);
         assert_eq!(result[0].timestamp_ms, 600_000);
-        assert_eq!(
-            result[0].labels.get(METRIC_NAME),
-            Some("metric")
-        );
+        assert_eq!(result[0].labels.get(METRIC_NAME), Some("metric"));
         assert_eq!(result[0].labels.get("job"), Some("api"));
         assert!(result[0].drop_name);
     }
@@ -2442,10 +2417,7 @@ mod tests {
         assert!(!result[0].drop_name);
     }
 
-    fn create_eval_samples(
-        values: Vec<(i64, f64)>,
-        labels: EvalLabels,
-    ) -> EvalSamples {
+    fn create_eval_samples(values: Vec<(i64, f64)>, labels: EvalLabels) -> EvalSamples {
         let values = values
             .into_iter()
             .map(|(t, v)| Sample::new(t, v))
@@ -2625,7 +2597,10 @@ mod tests {
         let registry = FunctionRegistry::new();
         let func = registry.get_range_function("stddev_over_time").unwrap();
 
-        let samples = vec![create_eval_samples(vec![(1000, 42.0)], EvalLabels::Owned(Vec::new()))];
+        let samples = vec![create_eval_samples(
+            vec![(1000, 42.0)],
+            EvalLabels::Owned(Vec::new()),
+        )];
 
         // when
         let result = func.apply(samples, 1000).unwrap();
@@ -2868,7 +2843,10 @@ mod tests {
         let func = registry.get_range_function("rate").unwrap();
 
         // Create sample series with only one point
-        let samples = vec![create_eval_samples(vec![(1000, 100.0)], EvalLabels::Owned(Vec::new()))];
+        let samples = vec![create_eval_samples(
+            vec![(1000, 100.0)],
+            EvalLabels::Owned(Vec::new()),
+        )];
 
         let result = func.apply(samples, 1000).unwrap();
 

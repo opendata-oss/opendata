@@ -14,7 +14,7 @@ use crate::model::Sample;
 use crate::model::SeriesFingerprint;
 use crate::model::{Label, SeriesId, TimeBucket};
 use crate::promql::functions::{FunctionCallContext, FunctionRegistry, PromQLArg};
-use crate::promql::selector::evaluate_selector_with_reader;
+use crate::promql::selector::{evaluate_selector_raw, evaluate_selector_with_reader};
 use crate::promql::timestamp::Timestamp;
 use crate::query::QueryReader;
 use crate::util::Result;
@@ -94,6 +94,14 @@ pub(crate) struct EvalStats {
     pub(crate) metadata_permit_acquires: u64,
     // Parallel path counters
     pub(crate) parallel_sample_loads: u64,
+    // Phase B1: parallel selector + metadata resolution
+    pub(crate) parallel_selector_wall_ms: u64,
+    pub(crate) parallel_selector_sum_ms: u64,
+    pub(crate) parallel_selector_count: u64,
+    // Phase B3: parallel sample loading
+    pub(crate) parallel_sample_wall_ms: u64,
+    pub(crate) parallel_sample_sum_ms: u64,
+    pub(crate) parallel_sample_bucket_count: u64,
 }
 
 /// Canonical key for caching selector results across steps.
@@ -186,6 +194,62 @@ struct PreloadedInstantSeries {
 pub(crate) struct SeriesMeta {
     pub(crate) fingerprint: SeriesFingerprint,
     pub(crate) sorted_labels: Arc<[Label]>,
+}
+
+/// Result of Phase B1 parallel metadata resolution for one bucket.
+struct BucketResolutionResult {
+    bucket: TimeBucket,
+    candidates: HashSet<SeriesId>,
+    forward_index_view: Option<Box<dyn ForwardIndexLookup + Send + Sync + 'static>>,
+    forward_index_key: Vec<SeriesId>,
+    series_meta: Vec<(SeriesId, Arc<SeriesMeta>)>,
+    stats: BucketResolutionStats,
+}
+
+#[derive(Debug, Default)]
+struct BucketResolutionStats {
+    total_ms: u64,
+    selector_ms: u64,
+    forward_index_calls: u64,
+    forward_index_misses: u64,
+    forward_index_miss_ms: u64,
+    metadata_queue_wait_ms: u64,
+    metadata_load_ms: u64,
+    metadata_permit_acquires: u64,
+    series_meta_count: u64,
+}
+
+/// Work item for parallel sample loading (Phase B3).
+struct BucketSampleWorkItem {
+    bucket: TimeBucket,
+    to_load: Vec<(SeriesId, Arc<SeriesMeta>)>,
+}
+
+/// Per-series data loaded by the B3 sample worker.
+struct BucketSeriesData {
+    series_id: SeriesId,
+    meta: Arc<SeriesMeta>,
+    all_samples: Vec<Sample>,
+}
+
+#[derive(Debug, Default)]
+struct BucketSampleStats {
+    sample_loads: u64,
+    sample_misses: u64,
+    samples_loaded: u64,
+    sample_queue_wait_ms: u64,
+    sample_load_ms: u64,
+    sample_miss_ms: u64,
+    sample_permit_acquires: u64,
+    parallel_sample_loads: u64,
+    bucket_ms: u64,
+}
+
+/// Result of Phase B3 sample loading for one bucket.
+struct BucketSampleResult {
+    bucket: TimeBucket,
+    series_data: Vec<BucketSeriesData>,
+    stats: BucketSampleStats,
 }
 
 /// Type alias for complex HashMap used in matrix selector evaluation.
@@ -360,10 +424,10 @@ impl EvalLabels {
     /// Remove a label by name. Promotes Shared→Owned if needed.
     pub(crate) fn remove(&mut self, key: &str) {
         self.make_owned();
-        if let EvalLabels::Owned(vec) = self {
-            if let Ok(i) = vec.binary_search_by(|l| l.name.as_str().cmp(key)) {
-                vec.remove(i);
-            }
+        if let EvalLabels::Owned(vec) = self
+            && let Ok(i) = vec.binary_search_by(|l| l.name.as_str().cmp(key))
+        {
+            vec.remove(i);
         }
     }
 
@@ -1236,6 +1300,182 @@ fn collect_vector_selectors_inner<'a>(expr: &'a Expr, out: &mut Vec<&'a VectorSe
     }
 }
 
+/// Phase B1 worker: resolve bucket metadata using raw QueryReader (no caching layer).
+async fn resolve_bucket_raw<R: QueryReader>(
+    reader: &R,
+    bucket: TimeBucket,
+    selector: &VectorSelector,
+    coordinator: &Option<ReadLoadCoordinator>,
+) -> EvalResult<BucketResolutionResult> {
+    let total_start = std::time::Instant::now();
+    let mut stats = BucketResolutionStats::default();
+
+    // Step 1: Selector resolution (inverted_index + negative matcher filtering)
+    let selector_start = std::time::Instant::now();
+    let (candidates, sel_stats) = evaluate_selector_raw(reader, &bucket, selector, coordinator)
+        .await
+        .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+    stats.selector_ms = selector_start.elapsed().as_millis() as u64;
+    stats.metadata_queue_wait_ms += sel_stats.metadata_queue_wait_ms;
+    stats.metadata_load_ms += sel_stats.metadata_load_ms;
+    stats.metadata_permit_acquires += sel_stats.metadata_permit_acquires;
+
+    if candidates.is_empty() {
+        stats.total_ms = total_start.elapsed().as_millis() as u64;
+        return Ok(BucketResolutionResult {
+            bucket,
+            candidates,
+            forward_index_view: None,
+            forward_index_key: Vec::new(),
+            series_meta: Vec::new(),
+            stats,
+        });
+    }
+
+    // Step 2: Forward index load for full candidate set
+    let mut sorted_candidates: Vec<_> = candidates.iter().copied().collect();
+    sorted_candidates.sort();
+    stats.forward_index_calls += 1;
+    stats.forward_index_misses += 1;
+
+    let fi_view = if let Some(coord) = coordinator {
+        let (permit, wait) = coord.acquire_metadata().await;
+        stats.metadata_permit_acquires += 1;
+        stats.metadata_queue_wait_ms += wait.as_millis() as u64;
+        let t0 = std::time::Instant::now();
+        let fi = reader
+            .forward_index(&bucket, &sorted_candidates)
+            .await
+            .map_err(|e| EvaluationError::StorageError(e.to_string()))?;
+        let load_ms = t0.elapsed().as_millis() as u64;
+        stats.metadata_load_ms += load_ms;
+        stats.forward_index_miss_ms += load_ms;
+        drop(permit);
+        fi
+    } else {
+        let t0 = std::time::Instant::now();
+        let fi = reader
+            .forward_index(&bucket, &sorted_candidates)
+            .await
+            .map_err(|e| EvaluationError::StorageError(e.to_string()))?;
+        let load_ms = t0.elapsed().as_millis() as u64;
+        stats.forward_index_miss_ms += load_ms;
+        fi
+    };
+
+    // Step 3: Series meta computation (pure CPU)
+    let mut series_meta = Vec::with_capacity(candidates.len());
+    for &sid in &sorted_candidates {
+        if let Some(spec) = fi_view.get_spec(&sid) {
+            let fingerprint = CachedQueryReader::<R>::compute_fingerprint_static(&spec.labels);
+            let mut sorted_labels = spec.labels;
+            sorted_labels.sort();
+            let meta = Arc::new(SeriesMeta {
+                fingerprint,
+                sorted_labels: Arc::from(sorted_labels),
+            });
+            series_meta.push((sid, meta));
+        }
+    }
+    stats.series_meta_count = series_meta.len() as u64;
+    stats.total_ms = total_start.elapsed().as_millis() as u64;
+
+    tracing::debug!(
+        bucket_id = ?bucket,
+        candidates = candidates.len(),
+        series_meta_count = series_meta.len(),
+        total_ms = stats.total_ms,
+        selector_ms = stats.selector_ms,
+        forward_index_miss_ms = stats.forward_index_miss_ms,
+        metadata_queue_wait_ms = stats.metadata_queue_wait_ms,
+        metadata_load_ms = stats.metadata_load_ms,
+        "resolve_bucket_parallel"
+    );
+
+    Ok(BucketResolutionResult {
+        bucket,
+        candidates,
+        forward_index_view: Some(fi_view),
+        forward_index_key: sorted_candidates,
+        series_meta,
+        stats,
+    })
+}
+
+/// Phase B3 worker: parallel sample loading for one bucket's work items.
+async fn process_bucket_sample_loads<R: QueryReader>(
+    reader: &R,
+    work: BucketSampleWorkItem,
+    coordinator: Option<ReadLoadCoordinator>,
+) -> EvalResult<BucketSampleResult> {
+    const PER_QUERY_SAMPLE_CONCURRENCY: usize = 8;
+    let bucket_start = std::time::Instant::now();
+    let bucket = work.bucket;
+
+    let load_results: Vec<_> = futures::stream::iter(work.to_load.into_iter())
+        .map(|(series_id, meta)| {
+            let coord = coordinator.clone();
+            async move {
+                let (wait_ms, _permit) = if let Some(ref c) = coord {
+                    let (permit, wait) = c.acquire_sample().await;
+                    (wait.as_millis() as u64, Some(permit))
+                } else {
+                    (0, None)
+                };
+                let t0 = std::time::Instant::now();
+                let result = reader.samples(&bucket, series_id, i64::MIN, i64::MAX).await;
+                let load_ms = t0.elapsed().as_millis() as u64;
+                drop(_permit);
+                (series_id, meta, result, wait_ms, load_ms)
+            }
+        })
+        .buffer_unordered(PER_QUERY_SAMPLE_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut stats = BucketSampleStats::default();
+    let mut series_data = Vec::with_capacity(load_results.len());
+
+    for (series_id, meta, result, wait_ms, load_ms) in load_results {
+        let all_samples = result.map_err(|e| EvaluationError::StorageError(e.to_string()))?;
+
+        stats.sample_misses += 1;
+        stats.sample_loads += 1;
+        stats.samples_loaded += all_samples.len() as u64;
+        stats.sample_queue_wait_ms += wait_ms;
+        stats.sample_load_ms += load_ms;
+        stats.sample_miss_ms += wait_ms + load_ms;
+        if coordinator.is_some() {
+            stats.sample_permit_acquires += 1;
+        }
+        stats.parallel_sample_loads += 1;
+
+        series_data.push(BucketSeriesData {
+            series_id,
+            meta,
+            all_samples,
+        });
+    }
+
+    stats.bucket_ms = bucket_start.elapsed().as_millis() as u64;
+
+    tracing::debug!(
+        bucket_id = ?bucket,
+        series_count = series_data.len(),
+        samples_loaded = stats.samples_loaded,
+        bucket_ms = stats.bucket_ms,
+        sample_queue_wait_ms = stats.sample_queue_wait_ms,
+        sample_load_ms = stats.sample_load_ms,
+        "preload_bucket_parallel"
+    );
+
+    Ok(BucketSampleResult {
+        bucket,
+        series_data,
+        stats,
+    })
+}
+
 impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     pub(crate) fn new(reader: &'reader R) -> Self {
         Self {
@@ -1784,11 +2024,47 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         )
     }
 
+    /// Check sample cache for each candidate. Collect cache hits into series_samples.
+    /// Return cache misses with pre-computed meta for B3 sample loading.
+    fn plan_sample_hits_and_misses(
+        &mut self,
+        bucket: &TimeBucket,
+        series_with_meta: &[(SeriesId, Arc<SeriesMeta>)],
+        range_start_ms: i64,
+        range_end_ms: i64,
+        series_samples: &mut HashMap<SeriesFingerprint, (Arc<[Label]>, Vec<Sample>)>,
+    ) -> Vec<(SeriesId, Arc<SeriesMeta>)> {
+        let mut to_load = Vec::new();
+        for (series_id, meta) in series_with_meta {
+            if let Some(cached_samples) = self.reader.cache.get_samples(bucket, series_id) {
+                self.reader.stats.sample_loads += 1;
+                self.reader.stats.sample_cache_hits += 1;
+                let samples = CachedQueryReader::<R>::filter_samples_binary_search(
+                    cached_samples,
+                    range_start_ms,
+                    range_end_ms,
+                );
+                if !samples.is_empty() {
+                    let entry = series_samples
+                        .entry(meta.fingerprint)
+                        .or_insert_with(|| (Arc::clone(&meta.sorted_labels), Vec::new()));
+                    entry.1.extend(samples);
+                }
+            } else {
+                to_load.push((*series_id, Arc::clone(meta)));
+            }
+        }
+        to_load
+    }
+
     /// Fetches and normalizes samples for all matching series across all buckets.
     ///
-    /// Consolidates multi-bucket fetching, merging, sorting, and deduplication.
-    /// This avoids redundant selector evaluations by fetching all samples in the
-    /// range once instead of evaluating per-step.
+    /// Five-phase execution model:
+    /// - Phase A: Serial planning (cache checks for all buckets)
+    /// - Phase B1: Parallel metadata resolution (selector-miss buckets)
+    /// - Phase B2: Serial planning for newly-resolved buckets
+    /// - Phase B3: Parallel sample loading (all work items)
+    /// - Phase C: Sequential merge (cache + filter + merge results)
     async fn fetch_series_samples(
         &mut self,
         vector_selector: &VectorSelector,
@@ -1801,147 +2077,218 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let selector_key = SelectorKey::from_selector(vector_selector);
         let mut series_samples = HashMap::new();
 
+        // Per-bucket elapsed time accumulator for backward-compatible metrics
+        let mut bucket_totals: HashMap<TimeBucket, u64> = HashMap::new();
+
+        // ═══ Phase A: Serial planning (all buckets) ═══
+        let mut selector_miss_buckets: Vec<TimeBucket> = Vec::new();
+        let mut sample_work_items: Vec<BucketSampleWorkItem> = Vec::new();
+
         for bucket in &buckets {
             let bucket_start = std::time::Instant::now();
-            // Check selector cache first, fall back to full evaluation
-            let candidates =
-                if let Some(cached) = self.reader.get_cached_selector(bucket, &selector_key) {
-                    cached
-                } else {
-                    self.reader.stats.selector_misses += 1;
-                    let t0 = std::time::Instant::now();
-                    let result =
-                        evaluate_selector_with_reader(&mut self.reader, *bucket, vector_selector)
-                            .await
-                            .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
-                    self.reader.stats.selector_miss_ms += t0.elapsed().as_millis() as u64;
-                    self.reader
-                        .cache_selector(*bucket, selector_key.clone(), result.clone());
-                    Arc::new(result)
-                };
 
-            if candidates.is_empty() {
-                continue;
+            match self.reader.get_cached_selector(bucket, &selector_key) {
+                Some(candidates) => {
+                    if candidates.is_empty() {
+                        *bucket_totals.entry(*bucket).or_default() +=
+                            bucket_start.elapsed().as_millis() as u64;
+                        continue;
+                    }
+
+                    // Cached selector — resolve forward_index + series_meta through CachedQueryReader
+                    let candidates_vec: Vec<_> = candidates.iter().copied().collect();
+                    let fi_view = self
+                        .reader
+                        .forward_index(bucket, &candidates_vec)
+                        .await
+                        .map_err(|e| EvaluationError::StorageError(e.to_string()))?;
+                    let mut series_with_meta = Vec::new();
+                    for &sid in &candidates_vec {
+                        if let Some(meta) =
+                            self.reader
+                                .get_or_insert_series_meta(bucket, sid, fi_view.as_ref())
+                        {
+                            series_with_meta.push((sid, meta));
+                        }
+                    }
+
+                    let to_load = self.plan_sample_hits_and_misses(
+                        bucket,
+                        &series_with_meta,
+                        range_start_ms,
+                        range_end_ms,
+                        &mut series_samples,
+                    );
+
+                    *bucket_totals.entry(*bucket).or_default() +=
+                        bucket_start.elapsed().as_millis() as u64;
+
+                    if !to_load.is_empty() {
+                        sample_work_items.push(BucketSampleWorkItem {
+                            bucket: *bucket,
+                            to_load,
+                        });
+                    }
+                }
+                None => {
+                    *bucket_totals.entry(*bucket).or_default() +=
+                        bucket_start.elapsed().as_millis() as u64;
+                    selector_miss_buckets.push(*bucket);
+                }
             }
+        }
 
-            let candidates_vec: Vec<_> = candidates.iter().copied().collect();
-            let forward_index_view = self.reader.forward_index(bucket, &candidates_vec).await?;
+        // ═══ Phase B1: Parallel metadata resolution (selector-miss buckets) ═══
+        if !selector_miss_buckets.is_empty() {
+            const PER_QUERY_BUCKET_CONCURRENCY: usize = 4;
+            let underlying_reader = self.reader.reader;
+            let coordinator = self.reader.load_coordinator.clone();
+            let selector_clone = vector_selector.clone();
 
-            let mut bucket_sample_count: u64 = 0;
+            let b1_wall_start = std::time::Instant::now();
 
-            // Pass 1: Check sample cache, collect misses for parallel loading
-            let mut to_load: Vec<(SeriesId, Arc<SeriesMeta>)> = Vec::new();
-            for series_id in &candidates_vec {
-                let meta = match self.reader.get_or_insert_series_meta(
-                    bucket,
-                    *series_id,
-                    forward_index_view.as_ref(),
-                ) {
-                    Some(m) => m,
-                    None => continue,
-                };
+            let resolved: Vec<_> = futures::stream::iter(selector_miss_buckets.into_iter())
+                .map(|bucket| {
+                    let sel = selector_clone.clone();
+                    let coord = coordinator.clone();
+                    async move { resolve_bucket_raw(underlying_reader, bucket, &sel, &coord).await }
+                })
+                .buffer_unordered(PER_QUERY_BUCKET_CONCURRENCY)
+                .collect()
+                .await;
 
-                if let Some(cached_samples) = self.reader.cache.get_samples(bucket, series_id) {
-                    self.reader.stats.sample_loads += 1;
-                    self.reader.stats.sample_cache_hits += 1;
-                    let samples = CachedQueryReader::<R>::filter_samples_binary_search(
-                        cached_samples,
+            self.reader.stats.parallel_selector_wall_ms =
+                b1_wall_start.elapsed().as_millis() as u64;
+
+            // ═══ Phase B2: Serial planning for newly-resolved buckets ═══
+            for result in resolved {
+                let res = result?;
+                let bs = &res.stats;
+
+                self.reader.stats.selector_misses += 1;
+                self.reader.stats.selector_miss_ms += bs.selector_ms;
+                self.reader.stats.forward_index_calls += bs.forward_index_calls;
+                self.reader.stats.forward_index_misses += bs.forward_index_misses;
+                self.reader.stats.forward_index_miss_ms += bs.forward_index_miss_ms;
+                self.reader.stats.metadata_queue_wait_ms += bs.metadata_queue_wait_ms;
+                self.reader.stats.metadata_load_ms += bs.metadata_load_ms;
+                self.reader.stats.metadata_permit_acquires += bs.metadata_permit_acquires;
+                self.reader.stats.series_meta_misses += bs.series_meta_count;
+                self.reader.stats.parallel_selector_count += 1;
+                self.reader.stats.parallel_selector_sum_ms += bs.total_ms;
+
+                *bucket_totals.entry(res.bucket).or_default() += bs.total_ms;
+
+                // Cache selector result
+                self.reader.cache_selector(
+                    res.bucket,
+                    selector_key.clone(),
+                    res.candidates.clone(),
+                );
+
+                if res.candidates.is_empty() {
+                    continue;
+                }
+
+                let b2_bucket_start = std::time::Instant::now();
+
+                // Cache forward_index_view
+                if let Some(fi_view) = res.forward_index_view {
+                    self.reader.cache.cache_forward_index(
+                        res.bucket,
+                        res.forward_index_key,
+                        fi_view,
+                    );
+                }
+
+                // Cache series_meta entries
+                for (sid, meta) in &res.series_meta {
+                    self.reader
+                        .series_meta_cache
+                        .insert((res.bucket, *sid), Arc::clone(meta));
+                }
+
+                // Check sample cache
+                let to_load = self.plan_sample_hits_and_misses(
+                    &res.bucket,
+                    &res.series_meta,
+                    range_start_ms,
+                    range_end_ms,
+                    &mut series_samples,
+                );
+
+                *bucket_totals.entry(res.bucket).or_default() +=
+                    b2_bucket_start.elapsed().as_millis() as u64;
+
+                if !to_load.is_empty() {
+                    sample_work_items.push(BucketSampleWorkItem {
+                        bucket: res.bucket,
+                        to_load,
+                    });
+                }
+            }
+        }
+
+        // ═══ Phase B3: Parallel sample loading ═══
+        if !sample_work_items.is_empty() {
+            const PER_QUERY_BUCKET_CONCURRENCY: usize = 4;
+            let underlying_reader = self.reader.reader;
+            let coordinator = self.reader.load_coordinator.clone();
+
+            let b3_wall_start = std::time::Instant::now();
+
+            let sample_results: Vec<_> = futures::stream::iter(sample_work_items.into_iter())
+                .map(|work| {
+                    let coord = coordinator.clone();
+                    async move { process_bucket_sample_loads(underlying_reader, work, coord).await }
+                })
+                .buffer_unordered(PER_QUERY_BUCKET_CONCURRENCY)
+                .collect()
+                .await;
+
+            self.reader.stats.parallel_sample_wall_ms = b3_wall_start.elapsed().as_millis() as u64;
+
+            // ═══ Phase C: Sequential merge ═══
+            for result in sample_results {
+                let sr = result?;
+                let bs = &sr.stats;
+
+                self.reader.stats.sample_loads += bs.sample_loads;
+                self.reader.stats.sample_misses += bs.sample_misses;
+                self.reader.stats.samples_loaded += bs.samples_loaded;
+                self.reader.stats.sample_queue_wait_ms += bs.sample_queue_wait_ms;
+                self.reader.stats.sample_load_ms += bs.sample_load_ms;
+                self.reader.stats.sample_miss_ms += bs.sample_miss_ms;
+                self.reader.stats.sample_permit_acquires += bs.sample_permit_acquires;
+                self.reader.stats.parallel_sample_loads += bs.parallel_sample_loads;
+                self.reader.stats.parallel_sample_bucket_count += 1;
+                self.reader.stats.parallel_sample_sum_ms += bs.bucket_ms;
+
+                *bucket_totals.entry(sr.bucket).or_default() += bs.bucket_ms;
+
+                for sd in sr.series_data {
+                    let filtered = CachedQueryReader::<R>::filter_samples_binary_search(
+                        &sd.all_samples,
                         range_start_ms,
                         range_end_ms,
                     );
-                    if !samples.is_empty() {
-                        bucket_sample_count += samples.len() as u64;
-                        let entry = series_samples
-                            .entry(meta.fingerprint)
-                            .or_insert_with(|| (Arc::clone(&meta.sorted_labels), Vec::new()));
-                        entry.1.extend(samples);
-                    }
-                } else {
-                    to_load.push((*series_id, meta));
-                }
-            }
-
-            // Pass 2: Parallel loading of cache misses
-            if !to_load.is_empty() {
-                const PER_QUERY_SAMPLE_CONCURRENCY: usize = 8;
-
-                let underlying_reader = self.reader.reader;
-                let coordinator = self.reader.load_coordinator.clone();
-
-                let load_results: Vec<_> = futures::stream::iter(to_load.into_iter())
-                    .map(|(series_id, meta)| {
-                        let coord = coordinator.clone();
-                        async move {
-                            let (wait_ms, _permit) = if let Some(ref c) = coord {
-                                let (permit, wait) = c.acquire_sample().await;
-                                (wait.as_millis() as u64, Some(permit))
-                            } else {
-                                (0, None)
-                            };
-                            let t0 = std::time::Instant::now();
-                            let result = underlying_reader
-                                .samples(bucket, series_id, i64::MIN, i64::MAX)
-                                .await;
-                            let load_ms = t0.elapsed().as_millis() as u64;
-                            drop(_permit);
-                            (series_id, meta, result, wait_ms, load_ms)
-                        }
-                    })
-                    .buffer_unordered(PER_QUERY_SAMPLE_CONCURRENCY)
-                    .collect()
-                    .await;
-
-                // Sequential post-processing: update cache, stats, and series_samples
-                for (series_id, meta, result, wait_ms, load_ms) in load_results {
-                    let all_samples =
-                        result.map_err(|e| EvaluationError::StorageError(e.to_string()))?;
-
-                    self.reader.stats.sample_misses += 1;
-                    self.reader.stats.sample_loads += 1;
-                    self.reader.stats.samples_loaded += all_samples.len() as u64;
-                    self.reader.stats.sample_queue_wait_ms += wait_ms;
-                    self.reader.stats.sample_load_ms += load_ms;
-                    self.reader.stats.sample_miss_ms += wait_ms + load_ms;
-                    if self.reader.load_coordinator.is_some() {
-                        self.reader.stats.sample_permit_acquires += 1;
-                    }
-                    self.reader.stats.parallel_sample_loads += 1;
-
-                    // Cache the full sample set
                     self.reader
                         .cache
-                        .cache_samples(*bucket, series_id, all_samples.clone());
-
-                    // Filter by requested time range
-                    let samples = CachedQueryReader::<R>::filter_samples_binary_search(
-                        &all_samples,
-                        range_start_ms,
-                        range_end_ms,
-                    );
-
-                    if !samples.is_empty() {
-                        bucket_sample_count += samples.len() as u64;
+                        .cache_samples(sr.bucket, sd.series_id, sd.all_samples);
+                    if !filtered.is_empty() {
                         let entry = series_samples
-                            .entry(meta.fingerprint)
-                            .or_insert_with(|| (Arc::clone(&meta.sorted_labels), Vec::new()));
-                        entry.1.extend(samples);
+                            .entry(sd.meta.fingerprint)
+                            .or_insert_with(|| (Arc::clone(&sd.meta.sorted_labels), Vec::new()));
+                        entry.1.extend(filtered);
                     }
                 }
             }
-
-            let bucket_ms = bucket_start.elapsed().as_millis() as u64;
-            self.reader.stats.preload_bucket_ms_sum += bucket_ms;
-            if bucket_ms > self.reader.stats.preload_bucket_ms_max {
-                self.reader.stats.preload_bucket_ms_max = bucket_ms;
-            }
-            tracing::debug!(
-                bucket_id = ?bucket,
-                series_count = candidates_vec.len(),
-                sample_count = bucket_sample_count,
-                elapsed_ms = bucket_ms,
-                "preload_bucket"
-            );
         }
+
+        // Derive backward-compatible bucket metrics
+        self.reader.stats.preload_bucket_ms_sum = bucket_totals.values().sum();
+        self.reader.stats.preload_bucket_ms_max =
+            bucket_totals.values().copied().max().unwrap_or(0);
 
         for (_fp, (_labels, samples)) in series_samples.iter_mut() {
             samples.sort_by_key(|s| s.timestamp_ms);
@@ -6620,6 +6967,13 @@ mod tests {
                 stats.metadata_permit_acquires
             );
 
+            // Bucket parallelism stats should be populated
+            assert!(
+                stats.parallel_sample_bucket_count > 0,
+                "expected parallel_sample_bucket_count > 0, got {}",
+                stats.parallel_sample_bucket_count
+            );
+
             // Now verify the results are still correct by evaluating a step
             let query_time = UNIX_EPOCH + Duration::from_millis(6_300_000);
             let stmt = EvalStmt {
@@ -6680,6 +7034,238 @@ mod tests {
             // parallel_sample_loads is still populated (the buffer_unordered path
             // runs regardless of coordinator presence)
             assert!(stats.parallel_sample_loads > 0);
+        }
+
+        /// Multi-bucket query resolves selectors and loads samples in parallel,
+        /// populating both B1 and B3 phase stats.
+        #[tokio::test]
+        async fn multi_bucket_parallel_resolution_and_loading() {
+            let mut builder = MockMultiBucketQueryReaderBuilder::new();
+            let buckets = [
+                TimeBucket::hour(100),
+                TimeBucket::hour(101),
+                TimeBucket::hour(102),
+                TimeBucket::hour(103),
+            ];
+
+            // 2 series across 4 buckets
+            for &bucket in &buckets {
+                let base_ts = bucket.start as i64 * 3_600_000;
+                for env in ["prod", "staging"] {
+                    builder.add_sample(
+                        bucket,
+                        vec![
+                            Label {
+                                name: METRIC_NAME.to_string(),
+                                value: "http_requests".to_string(),
+                            },
+                            Label {
+                                name: "env".to_string(),
+                                value: env.to_string(),
+                            },
+                        ],
+                        MetricType::Gauge,
+                        Sample {
+                            timestamp_ms: base_ts + 1_800_000,
+                            value: 1.0,
+                        },
+                    );
+                }
+            }
+
+            let reader = builder.build();
+            let coordinator = ReadLoadCoordinator::new(16, 4);
+            let mut evaluator = Evaluator::with_coordinator(&reader, coordinator);
+
+            // Wide range covering all 4 buckets
+            let eval_start_ms = 100 * 3_600_000i64;
+            let eval_end_ms = 104 * 3_600_000i64;
+            let step_ms = 3_600_000i64;
+            let lookback_delta_ms = 3_600_000i64;
+
+            let expr = promql_parser::parser::parse("http_requests").unwrap();
+            evaluator
+                .preload_for_range(
+                    &expr,
+                    eval_start_ms,
+                    eval_end_ms,
+                    step_ms,
+                    lookback_delta_ms,
+                )
+                .await
+                .unwrap();
+
+            let stats = evaluator.stats();
+
+            // All 4 buckets were selector misses resolved via B1
+            assert_eq!(
+                stats.parallel_selector_count, 4,
+                "expected 4 parallel selector resolutions, got {}",
+                stats.parallel_selector_count
+            );
+            // B1 wall/sum may be 0ms for fast mock readers — just check count is populated
+
+            // All 4 buckets had samples loaded via B3
+            assert_eq!(
+                stats.parallel_sample_bucket_count, 4,
+                "expected 4 parallel sample buckets, got {}",
+                stats.parallel_sample_bucket_count
+            );
+
+            // 2 series × 4 buckets = 8 parallel sample loads
+            assert_eq!(
+                stats.parallel_sample_loads, 8,
+                "expected 8 parallel sample loads, got {}",
+                stats.parallel_sample_loads
+            );
+
+            // Backward-compatible metrics still populated
+            // preload_bucket_ms_sum/max may be 0 for fast mock readers — not worth asserting
+        }
+
+        /// Second preload for a different (uncached) selector reuses sample cache
+        /// entries from first preload's Phase C merge.
+        #[tokio::test]
+        async fn uncached_selector_reuses_sample_cache() {
+            let mut builder = MockMultiBucketQueryReaderBuilder::new();
+            let bucket = TimeBucket::hour(100);
+
+            // Series matches both selectors: http_requests{method="GET"} and http_requests{env="prod"}
+            for ts in [5_700_000i64, 6_000_000, 6_300_000] {
+                builder.add_sample(
+                    bucket,
+                    vec![
+                        Label {
+                            name: METRIC_NAME.to_string(),
+                            value: "http_requests".to_string(),
+                        },
+                        Label {
+                            name: "method".to_string(),
+                            value: "GET".to_string(),
+                        },
+                        Label {
+                            name: "env".to_string(),
+                            value: "prod".to_string(),
+                        },
+                    ],
+                    MetricType::Gauge,
+                    Sample {
+                        timestamp_ms: ts,
+                        value: 1.0,
+                    },
+                );
+            }
+
+            let reader = builder.build();
+            let coordinator = ReadLoadCoordinator::new(4, 2);
+            let mut evaluator = Evaluator::with_coordinator(&reader, coordinator);
+
+            // First preload — selector A loads samples
+            let expr_a = promql_parser::parser::parse(r#"http_requests{method="GET"}"#).unwrap();
+            evaluator
+                .preload_for_range(&expr_a, 5_700_000, 6_300_000, 300_000, 300_000)
+                .await
+                .unwrap();
+            let loads_after_a = evaluator.stats().parallel_sample_loads;
+            assert!(loads_after_a > 0, "first preload should load samples");
+
+            // Second preload — selector B (different, uncached) but same series
+            let expr_b = promql_parser::parser::parse(r#"http_requests{env="prod"}"#).unwrap();
+            evaluator
+                .preload_for_range(&expr_b, 5_700_000, 6_300_000, 300_000, 300_000)
+                .await
+                .unwrap();
+            let loads_after_b = evaluator.stats().parallel_sample_loads;
+
+            // No additional sample I/O — samples were cached from first preload
+            assert_eq!(
+                loads_after_a, loads_after_b,
+                "second preload should reuse cached samples (loads_after_a={}, loads_after_b={})",
+                loads_after_a, loads_after_b
+            );
+
+            // But sample cache hits should have increased
+            assert!(
+                evaluator.stats().sample_cache_hits > 0,
+                "expected sample_cache_hits > 0"
+            );
+        }
+
+        /// Empty buckets are cached and skipped on subsequent queries.
+        #[tokio::test]
+        async fn empty_bucket_cached_and_skipped() {
+            let mut builder = MockMultiBucketQueryReaderBuilder::new();
+            let bucket_with_data = TimeBucket::hour(100);
+            let bucket_empty = TimeBucket::hour(101);
+
+            // Only add data to one bucket; register the empty bucket via a different metric
+            builder.add_sample(
+                bucket_with_data,
+                vec![
+                    Label {
+                        name: METRIC_NAME.to_string(),
+                        value: "http_requests".to_string(),
+                    },
+                    Label {
+                        name: "k".to_string(),
+                        value: "v".to_string(),
+                    },
+                ],
+                MetricType::Gauge,
+                Sample {
+                    timestamp_ms: 100 * 3_600_000 + 1_800_000,
+                    value: 1.0,
+                },
+            );
+            builder.add_sample(
+                bucket_empty,
+                vec![
+                    Label {
+                        name: METRIC_NAME.to_string(),
+                        value: "other_metric".to_string(),
+                    },
+                    Label {
+                        name: "k".to_string(),
+                        value: "v".to_string(),
+                    },
+                ],
+                MetricType::Gauge,
+                Sample {
+                    timestamp_ms: 101 * 3_600_000 + 1_800_000,
+                    value: 2.0,
+                },
+            );
+
+            let reader = builder.build();
+            let coordinator = ReadLoadCoordinator::new(4, 2);
+            let mut evaluator = Evaluator::with_coordinator(&reader, coordinator);
+
+            let eval_start_ms = 100 * 3_600_000i64;
+            let eval_end_ms = 102 * 3_600_000i64;
+
+            let expr = promql_parser::parser::parse("http_requests").unwrap();
+            evaluator
+                .preload_for_range(&expr, eval_start_ms, eval_end_ms, 3_600_000, 3_600_000)
+                .await
+                .unwrap();
+
+            let misses_first = evaluator.stats().selector_misses;
+
+            // Second preload — same selector, both buckets should be cached
+            evaluator
+                .preload_for_range(&expr, eval_start_ms, eval_end_ms, 3_600_000, 3_600_000)
+                .await
+                .unwrap();
+
+            let misses_second = evaluator.stats().selector_misses;
+            assert_eq!(
+                misses_first, misses_second,
+                "second preload should have no additional selector misses"
+            );
+            assert!(
+                evaluator.stats().selector_cache_hits > 0,
+                "selector cache should be hit on second preload"
+            );
         }
 
         /// Cache hits bypass the parallel path — second preload for the same selector

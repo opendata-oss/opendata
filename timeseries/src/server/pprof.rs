@@ -72,11 +72,7 @@ pub(crate) async fn handle_pprof_profile(
         )
     })?;
 
-    tracing::info!(
-        seconds,
-        bytes = body.len(),
-        "CPU profile capture complete"
-    );
+    tracing::info!(seconds, bytes = body.len(), "CPU profile capture complete");
 
     Ok((
         StatusCode::OK,
