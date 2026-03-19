@@ -10,6 +10,7 @@ use crate::batched::indexer::state::{DirtyCentroidGraph, VectorIndexDelta, Vecto
 use crate::lire::commands::SplitPostings;
 use crate::lire::{heuristics, kmeans};
 use crate::{distance, DistanceMetric, Result};
+use crate::batched::indexer::indexer::IndexerOpts;
 use crate::serde::posting_list::{Posting, PostingList};
 
 #[derive(Clone)]
@@ -26,20 +27,26 @@ struct SplitResult {
     reassign_vectors: Vec<ReassignVector>,
 }
 
-struct SplitCentroids {
-    dimensions: usize,
-    distance_metric: DistanceMetric,
-    split_threshold_vectors: usize,
-    split_search_neighbourhood: usize,
+pub(crate) struct SplitCentroidsResult {
+    pub(crate) splits: usize,
+    pub(crate) reassignments: Vec<ReassignVector>
+}
+
+pub(crate) struct SplitCentroids {
+    opts: Arc<IndexerOpts>,
     snapshot: Arc<dyn StorageRead>
 }
 
 impl SplitCentroids {
-    async fn execute(
+    pub(crate) fn new(opts: &Arc<IndexerOpts>, snapshot: &Arc<dyn StorageRead>) -> Self {
+        Self {opts: opts.clone(), snapshot: snapshot.clone()}
+    }
+
+    pub(crate) async fn execute(
         self,
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta
-    ) -> Result<Vec<ReassignVector>> {
+    ) -> Result<SplitCentroidsResult> {
         let view = VectorIndexView::new(
             delta,
             state,
@@ -52,26 +59,30 @@ impl SplitCentroids {
         // compute the centroids that need to be split
         let to_split = counts
             .into_iter()
-            .filter(|(_k, v)| *v >= self.split_threshold_vectors as u64)
+            .filter(|(_k, v)| *v >= self.opts.split_threshold_vectors as u64)
             .map(|(k, _v)| k)
             .collect::<Vec<_>>();
+        if to_split.len() == 0 {
+            return Ok(SplitCentroidsResult{ splits: 0, reassignments: Vec::new() });
+        }
+
         // initialize the set of postings to fetch with the split centroids
-        let mut postings_to_retrive = HashSet::with_capacity(to_split.len() * self.split_search_neighbourhood);
+        let mut postings_to_retrive = HashSet::with_capacity(to_split.len() * self.opts.split_search_neighbourhood);
         postings_to_retrive.extend(to_split.clone());
         let mut splits = Vec::with_capacity(to_split.len());
         let centroid_graph = view.centroid_graph();
         // collect each centroids neighbours and add to postings to fetch, and initialize splits
         for c in to_split {
             let c_vec = centroid_graph.centroid(c).expect("unexpected missing centroid");
-            let neighbours = centroid_graph.search(&c_vec.vector, self.split_search_neighbourhood);
+            let neighbours = centroid_graph.search(&c_vec.vector, self.opts.split_search_neighbourhood);
             postings_to_retrive.extend(neighbours.clone());
             splits.push(
                 SplitCentroid {
                     c,
                     neighbours,
                     centroid_graph: centroid_graph.clone(),
-                    dimensions: self.dimensions,
-                    distance_metric: self.distance_metric,
+                    dimensions: self.opts.dimensions,
+                    distance_metric: self.opts.distance_metric,
                 }
             )
         }
@@ -79,7 +90,7 @@ impl SplitCentroids {
         // find all relevant postings (centroids and neighbours)
         let mut posting_reads = Vec::with_capacity(postings_to_retrive.len());
         for c in postings_to_retrive {
-            let read_fut = view.posting_list(c, self.dimensions)?;
+            let read_fut = view.posting_list(c, self.opts.dimensions)?;
             posting_reads.push(
                 Box::pin(async move {
                     read_fut.await.map(|p| (c, p))
@@ -95,6 +106,7 @@ impl SplitCentroids {
         let postings = Arc::new(postings);
 
         // execute splits. spawn a blocking task to avoid tying up runtime as this is compute heavy
+        let nsplits = splits.len();
         let results: Vec<_> = spawn_blocking(
             move || splits
                 .into_par_iter()
@@ -124,7 +136,11 @@ impl SplitCentroids {
         }
 
         // return reassign set
-        Ok(reassignments.values().cloned().collect())
+        let reassignments: Vec<_> = reassignments.values().cloned().collect();
+        Ok(SplitCentroidsResult {
+            splits: nsplits,
+            reassignments
+        })
     }
 }
 

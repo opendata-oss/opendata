@@ -5,6 +5,7 @@ use futures::future::BoxFuture;
 use rayon::iter::IntoParallelIterator;
 use common::StorageRead;
 use crate::batched::indexer::drivers::AsyncBatchDriver;
+use crate::batched::indexer::indexer::IndexerOpts;
 use crate::batched::indexer::split::ReassignVector;
 use crate::batched::indexer::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use crate::delta::VectorWrite;
@@ -20,15 +21,26 @@ struct ResolvedVectorUpsert {
     centroid: u64,
 }
 
-struct WriteVectors {
-    indexed_fields: HashSet<String>,
-    dimensions: usize,
+pub(crate) struct WriteVectors {
+    opts: Arc<IndexerOpts>,
     snapshot: Arc<dyn StorageRead>,
     writes: Vec<VectorWrite>
 }
 
 impl WriteVectors {
-    async fn execute(
+    pub(crate) fn new(
+        opts: &Arc<IndexerOpts>,
+        snapshot: &Arc<dyn StorageRead>,
+        writes: Vec<VectorWrite>
+    ) -> Self {
+        Self {
+            opts: opts.clone(),
+            snapshot: snapshot.clone(),
+            writes
+        }
+    }
+
+    pub(crate) async fn execute(
         self,
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta
@@ -49,7 +61,7 @@ impl WriteVectors {
             // this is a hack. we want to do the searches concurrently, but it probably doesn't
             // make sense to do them on the i/o tasks
             let this_centroid_graph = centroid_graph.clone();
-            let data_fut = view.vector_data_for_external_id(&w.external_id, self.dimensions);
+            let data_fut = view.vector_data_for_external_id(&w.external_id, self.opts.dimensions);
             to_resolve.push(
                 Box::pin(
                     async move {
@@ -90,7 +102,7 @@ impl WriteVectors {
                 if attr_name == VECTOR_FIELD_NAME {
                     continue;
                 }
-                if !self.indexed_fields.contains(attr_name) {
+                if !self.opts.indexed_fields.contains(attr_name) {
                     continue;
                 }
                 let field_value: FieldValue = attr_value.clone().into();
@@ -120,14 +132,26 @@ struct ResolvedVectorReassignment {
     centroid: u64,
 }
 
-struct ReassignVectors {
-    dimensions: usize,
+pub(crate) struct ReassignVectors {
+    opts: Arc<IndexerOpts>,
     snapshot: Arc<dyn StorageRead>,
     reassignments: Vec<ReassignVector>
 }
 
 impl ReassignVectors {
-    async fn execute(
+    pub(crate) fn new(
+        opts: &Arc<IndexerOpts>,
+        snapshot: &Arc<dyn StorageRead>,
+        reassignments: Vec<ReassignVector>
+    ) -> Self {
+        Self {
+            opts: opts.clone(),
+            snapshot: snapshot.clone(),
+            reassignments,
+        }
+    }
+
+    pub(crate) async fn execute(
         mut self,
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta
@@ -166,7 +190,7 @@ impl ReassignVectors {
         // pull the old vector data so we can update inverted indexes
         let mut to_resolve = Vec::with_capacity(reassignments.len());
         for r in reassignments {
-            let data_fut = view.vector_data(r.reassignment.vector_id, self.dimensions);
+            let data_fut = view.vector_data(r.reassignment.vector_id, self.opts.dimensions);
             to_resolve.push(
                 Box::pin(
                     async move {
