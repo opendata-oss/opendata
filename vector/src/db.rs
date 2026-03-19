@@ -12,9 +12,7 @@
 //! - Flusher applies ops atomically to storage
 
 use crate::VectorDbReader;
-use crate::batched::delta::{
-    VectorDbDeltaContext, VectorDbDeltaOpts, VectorDbWriteDelta,
-};
+use crate::batched::delta::{VectorDbDeltaContext, VectorDbDeltaOpts, VectorDbWriteDelta};
 use crate::batched::flusher::VectorDbFlusher;
 use crate::batched::indexer::indexer::{Indexer, IndexerOpts};
 use crate::delta::{VectorDbWrite, VectorWrite};
@@ -210,11 +208,7 @@ impl VectorDb {
         );
 
         // Create flusher and delta context for the WriteCoordinator
-        let flusher = VectorDbFlusher::new(
-            Arc::clone(&storage),
-            snapshot.clone(),
-            indexer,
-        );
+        let flusher = VectorDbFlusher::new(Arc::clone(&storage), snapshot.clone(), indexer);
 
         let ctx = VectorDbDeltaContext {
             opts: VectorDbDeltaOpts {

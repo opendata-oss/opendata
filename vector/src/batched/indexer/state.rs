@@ -3,11 +3,11 @@ use crate::Result;
 use crate::hnsw::CentroidGraph;
 use crate::serde::FieldValue;
 use crate::serde::centroid_chunk::CentroidEntry;
+use crate::serde::key::{PostingListKey, VectorDataKey};
 use crate::serde::posting_list::{
     PostingList, PostingListValue, PostingUpdate, merge_decoded_posting_lists,
 };
 use crate::serde::vector_data::{Field, VectorDataValue};
-use crate::serde::key::{PostingListKey, VectorDataKey};
 use crate::storage::{VectorDbStorageReadExt, record};
 use bytes::Bytes;
 use common::sequence::AllocatedSeqBlock;
@@ -304,7 +304,10 @@ impl VectorIndexDelta {
 
         // Deleted centroids bitmap
         if !deleted_centroids.is_empty() {
-            let bitmap = deleted_centroids.iter().copied().collect::<RoaringTreemap>();
+            let bitmap = deleted_centroids
+                .iter()
+                .copied()
+                .collect::<RoaringTreemap>();
             let op = record::merge_deleted_vectors(bitmap)
                 .expect("failure to construct deleted vectors row");
             ops.push(op);

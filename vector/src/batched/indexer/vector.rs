@@ -109,8 +109,7 @@ impl WriteVectors {
 
         // Apply inserts to delta (no old data to clean up)
         for insert in inserts {
-            let vector_id =
-                delta.add_vector(&insert.write.external_id, &insert.write.attributes);
+            let vector_id = delta.add_vector(&insert.write.external_id, &insert.write.attributes);
             delta.add_to_posting(insert.centroid, vector_id, insert.write.values.clone());
             for (attr_name, attr_value) in &insert.write.attributes {
                 if attr_name == VECTOR_FIELD_NAME {
@@ -129,8 +128,7 @@ impl WriteVectors {
             let (old_vector_id, _old_vector_data) = upsert.old;
             delta.delete_vector(old_vector_id);
             // todo: delete from old postings and inverted index
-            let vector_id =
-                delta.add_vector(&upsert.write.external_id, &upsert.write.attributes);
+            let vector_id = delta.add_vector(&upsert.write.external_id, &upsert.write.attributes);
             delta.add_to_posting(upsert.centroid, vector_id, upsert.write.values.clone());
             for (attr_name, attr_value) in &upsert.write.attributes {
                 if attr_name == VECTOR_FIELD_NAME {

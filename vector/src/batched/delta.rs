@@ -1,8 +1,8 @@
+use crate::delta::{VectorDbWrite, VectorWrite};
+use common::coordinator::Delta;
 use std::any::Any;
 use std::sync::Arc;
 use tracing::{debug, info};
-use crate::delta::{VectorDbWrite, VectorWrite};
-use common::coordinator::Delta;
 
 /// Configuration options for the delta.
 pub(crate) struct VectorDbDeltaOpts {
