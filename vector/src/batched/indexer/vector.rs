@@ -1,8 +1,11 @@
+use rayon::iter::ParallelIterator;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use futures::future::BoxFuture;
+use rayon::iter::IntoParallelIterator;
 use common::StorageRead;
 use crate::batched::indexer::drivers::AsyncBatchDriver;
+use crate::batched::indexer::split::ReassignVector;
 use crate::batched::indexer::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use crate::delta::VectorWrite;
 use crate::Error::Internal;
@@ -103,5 +106,91 @@ impl WriteVectors {
             compacted.insert(update.external_id.clone(), update);
         }
         compacted.into_values().collect()
+    }
+}
+
+struct VerifiedVectorReassignment {
+    reassignment: ReassignVector,
+    centroid: u64,
+}
+
+struct ResolvedVectorReassignment {
+    reassignment: ReassignVector,
+    data: VectorDataValue,
+    centroid: u64,
+}
+
+struct ReassignVectors {
+    dimensions: usize,
+    snapshot: Arc<dyn StorageRead>,
+    reassignments: Vec<ReassignVector>
+}
+
+impl ReassignVectors {
+    async fn execute(
+        mut self,
+        state: &VectorIndexState,
+        delta: &mut VectorIndexDelta
+    ) -> Result<()> {
+        let view = VectorIndexView::new(delta, state, self.snapshot);
+        let centroid_graph = view.centroid_graph();
+
+        // update current centroid in case centroid was moved as part of a split/merge
+        self.reassignments.
+            iter_mut()
+            .for_each(|r| {
+                if let Some(p) = view.last_written_posting(r.vector_id) {
+                    r.current_centroid = p;
+                }
+            });
+
+        // determine which vectors actually need a new assignment
+        let reassignments: Vec<_> = self.reassignments
+            .into_par_iter()
+            .filter_map(|r| {
+                let &closest_centroid = centroid_graph
+                    .search(&r.vector, 1)
+                    .first()
+                    .expect("no centroids");
+                if closest_centroid == r.current_centroid {
+                    None
+                } else {
+                    Some(VerifiedVectorReassignment {
+                        reassignment: r,
+                        centroid: closest_centroid,
+                    })
+                }
+            })
+            .collect();
+
+        // pull the old vector data so we can update inverted indexes
+        let mut to_resolve = Vec::with_capacity(reassignments.len());
+        for r in reassignments {
+            let data_fut = view.vector_data(r.reassignment.vector_id, self.dimensions);
+            to_resolve.push(
+                Box::pin(
+                    async move {
+                        Ok(ResolvedVectorReassignment {
+                            reassignment: r.reassignment,
+                            data: data_fut.await?.expect("missing vector data"),
+                            centroid: r.centroid
+                        })
+                    }
+                ) as BoxFuture<Result<ResolvedVectorReassignment>>
+            );
+        };
+        let resolve_results = AsyncBatchDriver::execute(to_resolve).await;
+        let mut resolved = Vec::with_capacity(resolve_results.len());
+        for result in resolve_results {
+            resolved.push(result?);
+        }
+        drop(view);
+
+        // execute the reassignments
+        for r in resolved {
+            delta.remove_from_posting(r.reassignment.current_centroid, r.reassignment.vector_id);
+            delta.add_to_posting(r.centroid, r.reassignment.vector_id, r.reassignment.vector);
+        }
+        Ok(())
     }
 }

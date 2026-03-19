@@ -1,6 +1,9 @@
+use tokio::task::spawn_blocking;
+use rayon::iter::ParallelIterator;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use futures::future::BoxFuture;
+use rayon::iter::IntoParallelIterator;
 use common::StorageRead;
 use crate::batched::indexer::drivers::AsyncBatchDriver;
 use crate::batched::indexer::state::{DirtyCentroidGraph, VectorIndexDelta, VectorIndexState, VectorIndexView};
@@ -9,10 +12,11 @@ use crate::lire::{heuristics, kmeans};
 use crate::{distance, DistanceMetric, Result};
 use crate::serde::posting_list::{Posting, PostingList};
 
-struct ReassignVector {
-    vector_id: u64,
-    vector: Vec<f32>,
-    current_centroid: u64,
+#[derive(Clone)]
+pub(crate) struct ReassignVector {
+    pub(crate) vector_id: u64,
+    pub(crate) vector: Vec<f32>,
+    pub(crate) current_centroid: u64,
 }
 
 struct SplitResult {
@@ -35,7 +39,7 @@ impl SplitCentroids {
         self,
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta
-    ) -> Result<()> {
+    ) -> Result<Vec<ReassignVector>> {
         let view = VectorIndexView::new(
             delta,
             state,
@@ -90,12 +94,37 @@ impl SplitCentroids {
         }
         let postings = Arc::new(postings);
 
-        // execute splits
+        // execute splits. spawn a blocking task to avoid tying up runtime as this is compute heavy
+        let results: Vec<_> = spawn_blocking(
+            move || splits
+                .into_par_iter()
+                .map(|split| split.execute(postings.clone()))
+                .collect()
+        ).await.expect("unexpected jo");
 
         // update delta
+        let mut reassignments = HashMap::new();
+        for result in results {
+            // track reassignments
+            reassignments.extend(
+                result.reassign_vectors.into_iter().map(|r| (r.vector_id, r))
+            );
+
+            // delete old centroid
+            delta.delete_centroids(vec![result.c]);
+
+            // create new centroids with postings
+            for new_centroid in [result.c_0, result.c_1] {
+                let entry = delta.add_centroid(new_centroid.centroid_vec().to_vec());
+                for p in new_centroid.postings() {
+                    delta.remove_from_posting(result.c, p.id());
+                    delta.add_to_posting(entry.centroid_id, p.id(), p.vector().to_vec());
+                }
+            }
+        }
 
         // return reassign set
-        Ok(())
+        Ok(reassignments.values().cloned().collect())
     }
 }
 

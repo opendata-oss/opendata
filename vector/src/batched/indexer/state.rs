@@ -173,6 +173,9 @@ impl VectorIndexDelta {
 
     pub(crate) fn freeze(self, ctx: &mut VectorIndexState) -> Vec<RecordOp> {
         // apply all mutations to ctx
+        // for centroid graph, make sure to delete all centroids before writing new centroids
+        // so that the new centroids are not connected to them.
+
         // construct ops that need to be written to storage
         todo!()
     }
