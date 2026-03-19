@@ -41,6 +41,9 @@ impl MergeCentroids {
             .filter(|(_k, v)| **v < self.opts.merge_threshold_vectors as u64)
             .map(|(&k, _v)| k)
             .collect::<Vec<_>>();
+        if to_merge.is_empty() {
+            return Ok(vec![]);
+        }
 
         // read postings of all mergees
         let mut to_resolve = Vec::with_capacity(to_merge.len());

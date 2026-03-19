@@ -89,7 +89,7 @@ impl VectorDbWriteDelta {
 
 #[derive(Clone)]
 pub(crate) struct VectorDbDeltaView {
-    writes: Vec<VectorWrite>,
+    pub(crate) writes: Vec<VectorWrite>,
 }
 
 impl VectorDbDeltaView {

@@ -45,6 +45,9 @@ impl WriteVectors {
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta,
     ) -> Result<()> {
+        if self.writes.is_empty() {
+            return Ok(());
+        }
         let view = VectorIndexView::new(delta, state, self.snapshot.clone());
 
         // compact so last write for each external id wins
@@ -145,6 +148,9 @@ impl ReassignVectors {
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta,
     ) -> Result<()> {
+        if self.reassignments.is_empty() {
+            return Ok(());
+        }
         let view = VectorIndexView::new(delta, state, self.snapshot);
         let centroid_graph = view.centroid_graph();
 

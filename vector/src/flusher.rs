@@ -24,7 +24,7 @@ pub struct VectorDbFlusher {
 #[async_trait]
 impl Flusher<VectorDbWriteDelta> for VectorDbFlusher {
     async fn flush_delta(
-        &self,
+        &mut self,
         frozen: VectorDbImmutableDelta,
         _epoch_range: &Range<u64>,
     ) -> Result<Arc<dyn StorageSnapshot>, String> {
@@ -74,7 +74,7 @@ mod tests {
     async fn should_propagate_apply_error() {
         // given
         let storage = create_failing_storage();
-        let flusher = VectorDbFlusher {
+        let mut flusher = VectorDbFlusher {
             storage: storage.clone(),
         };
         storage.fail_apply(common::StorageError::Storage("test apply error".into()));
@@ -96,7 +96,7 @@ mod tests {
     async fn should_propagate_snapshot_error_after_apply() {
         // given
         let storage = create_failing_storage();
-        let flusher = VectorDbFlusher {
+        let mut flusher = VectorDbFlusher {
             storage: storage.clone(),
         };
         // Apply succeeds, but snapshot after apply fails

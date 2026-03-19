@@ -1,5 +1,5 @@
 mod drivers;
-mod indexer;
+pub(crate) mod indexer;
 mod merge;
 mod split;
 mod state;

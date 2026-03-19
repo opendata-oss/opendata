@@ -6,8 +6,12 @@ use crate::batched::indexer::vector::{ReassignVectors, WriteVectors};
 use crate::delta::VectorWrite;
 use common::StorageRead;
 use common::storage::RecordOp;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use bytes::Bytes;
+use common::sequence::AllocatedSeqBlock;
+use crate::hnsw::CentroidGraph;
+use crate::Result;
 
 pub(crate) struct IndexerOpts {
     pub(crate) dimensions: usize,
@@ -18,55 +22,68 @@ pub(crate) struct IndexerOpts {
     pub(crate) indexed_fields: HashSet<String>,
 }
 
-struct Indexer {
+pub(crate) struct Indexer {
     opts: Arc<IndexerOpts>,
-    indexed_fields: HashSet<String>,
-    dimensions: usize,
     state: VectorIndexState,
 }
 
 impl Indexer {
-    async fn update_index(
+    pub(crate) fn new(
+        opts: IndexerOpts,
+        dictionary: HashMap<String, u64>,
+        centroid_counts: HashMap<u64, u64>,
+        centroid_graph: Arc<dyn CentroidGraph>,
+        sequence_block_key: Bytes,
+        sequence_block: AllocatedSeqBlock,
+    ) -> Self {
+        Self {
+            opts: Arc::new(opts),
+            state: VectorIndexState::new(
+                dictionary,
+                centroid_counts,
+                centroid_graph,
+                sequence_block_key,
+                sequence_block
+            ),
+        }
+    }
+
+    pub(crate) async fn update_index(
         &mut self,
         updates: Vec<VectorWrite>,
         snapshot: Arc<dyn StorageRead>,
-    ) -> Vec<RecordOp> {
+    ) -> Result<Vec<RecordOp>> {
         let mut delta = VectorIndexDelta::new(&self.state);
         // write all vectors
         let write = WriteVectors::new(&self.opts, &snapshot, updates);
         write
             .execute(&self.state, &mut delta)
-            .await
-            .expect("failed write");
+            .await?;
         // apply merges
         let merge = MergeCentroids::new(&self.opts, &snapshot);
         let reassigns = merge
             .execute(&self.state, &mut delta)
-            .await
-            .expect("failed merge");
+            .await?;
         // apply merge reassignments
         let reassign = ReassignVectors::new(&self.opts, &snapshot, reassigns);
         reassign
             .execute(&self.state, &mut delta)
-            .await
-            .expect("failed reassign");
+            .await?;
         // run split-reassign loop until no more splits. don't run merges as part of this loop
         // as it is not guaranteed to converge
         loop {
             let split = SplitCentroids::new(&self.opts, &snapshot);
             let result = split
                 .execute(&self.state, &mut delta)
-                .await
-                .expect("failed split");
+                .await?;
             if result.splits == 0 {
                 break;
             }
             let reassign = ReassignVectors::new(&self.opts, &snapshot, result.reassignments);
             reassign
                 .execute(&self.state, &mut delta)
-                .await
-                .expect("failed reassign");
+                .await?;
         }
-        delta.freeze(&mut self.state)
+        Ok(delta.freeze(&mut self.state))
     }
 }

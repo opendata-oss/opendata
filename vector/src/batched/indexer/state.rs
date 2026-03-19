@@ -61,6 +61,24 @@ pub(crate) struct VectorIndexState {
     sequence_block: AllocatedSeqBlock,
 }
 
+impl VectorIndexState {
+    pub(crate) fn new(
+        dictionary: HashMap<String, u64>,
+        centroid_counts: HashMap<u64, u64>,
+        centroid_graph: Arc<dyn CentroidGraph>,
+        sequence_block_key: Bytes,
+        sequence_block: AllocatedSeqBlock
+    ) -> Self {
+        Self {
+            dictionary,
+            centroid_counts,
+            centroid_graph,
+            sequence_block_key,
+            sequence_block,
+        }
+    }
+}
+
 pub(crate) struct VectorIndexDelta {
     new_centroids: HashMap<u64, CentroidEntry>,
     deleted_centroids: HashSet<u64>,
