@@ -1,7 +1,7 @@
 use crate::DistanceMetric;
 use crate::batched::indexer::merge::MergeCentroids;
 use crate::batched::indexer::split::SplitCentroids;
-use crate::batched::indexer::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
+use crate::batched::indexer::state::{CentroidChunkManager, VectorIndexDelta, VectorIndexState};
 use crate::batched::indexer::vector::{ReassignVectors, WriteVectors};
 use crate::delta::VectorWrite;
 use common::StorageRead;
@@ -20,6 +20,7 @@ pub(crate) struct IndexerOpts {
     pub(crate) split_threshold_vectors: usize,
     pub(crate) split_search_neighbourhood: usize,
     pub(crate) indexed_fields: HashSet<String>,
+    pub(crate) chunk_target: usize,
 }
 
 pub(crate) struct Indexer {
@@ -35,7 +36,15 @@ impl Indexer {
         centroid_graph: Arc<dyn CentroidGraph>,
         sequence_block_key: Bytes,
         sequence_block: AllocatedSeqBlock,
+        initial_chunk_id: u32,
+        initial_chunk_count: usize,
     ) -> Self {
+        let chunk_manager = CentroidChunkManager::new(
+            opts.dimensions,
+            opts.chunk_target,
+            initial_chunk_id,
+            initial_chunk_count,
+        );
         Self {
             opts: Arc::new(opts),
             state: VectorIndexState::new(
@@ -43,7 +52,8 @@ impl Indexer {
                 centroid_counts,
                 centroid_graph,
                 sequence_block_key,
-                sequence_block
+                sequence_block,
+                chunk_manager,
             ),
         }
     }

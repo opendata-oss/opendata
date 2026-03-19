@@ -7,22 +7,39 @@ use crate::serde::posting_list::{
     PostingList, PostingListValue, PostingUpdate, merge_decoded_posting_lists,
 };
 use crate::serde::vector_data::{Field, VectorDataValue};
+use crate::serde::key::{PostingListKey, VectorDataKey};
 use crate::storage::{VectorDbStorageReadExt, record};
 use bytes::Bytes;
 use common::sequence::AllocatedSeqBlock;
 use common::storage::RecordOp;
-use common::{SequenceAllocator, StorageRead};
+use common::{Record, SequenceAllocator, StorageRead};
 use futures::future::BoxFuture;
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
-struct CentroidChunkManager {
+pub(crate) struct CentroidChunkManager {
     current_chunk_count: usize,
     current_chunk_id: u32,
     chunk_target: usize,
     dimensions: usize,
+}
+
+impl CentroidChunkManager {
+    pub(crate) fn new(
+        dimensions: usize,
+        chunk_target: usize,
+        current_chunk_id: u32,
+        current_chunk_count: usize,
+    ) -> Self {
+        Self {
+            current_chunk_count,
+            current_chunk_id,
+            chunk_target,
+            dimensions,
+        }
+    }
 }
 
 impl CentroidChunkManager {
@@ -58,6 +75,7 @@ pub(crate) struct VectorIndexState {
     centroid_graph: Arc<dyn CentroidGraph>,
     sequence_block_key: Bytes,
     sequence_block: AllocatedSeqBlock,
+    chunk_manager: CentroidChunkManager,
 }
 
 impl VectorIndexState {
@@ -66,7 +84,8 @@ impl VectorIndexState {
         centroid_counts: HashMap<u64, u64>,
         centroid_graph: Arc<dyn CentroidGraph>,
         sequence_block_key: Bytes,
-        sequence_block: AllocatedSeqBlock
+        sequence_block: AllocatedSeqBlock,
+        chunk_manager: CentroidChunkManager,
     ) -> Self {
         Self {
             dictionary,
@@ -74,6 +93,7 @@ impl VectorIndexState {
             centroid_graph,
             sequence_block_key,
             sequence_block,
+            chunk_manager,
         }
     }
 }
@@ -161,7 +181,7 @@ impl VectorIndexDelta {
             .entry(centroid_id)
             .or_default()
             .push(PostingUpdate::append(vector_id, vector));
-        let c = self.centroid_count_deltas.entry(vector_id).or_insert(0);
+        let c = self.centroid_count_deltas.entry(centroid_id).or_insert(0);
         *c += 1;
     }
 
@@ -173,7 +193,7 @@ impl VectorIndexDelta {
             .entry(centroid_id)
             .or_default()
             .push(PostingUpdate::delete(vector_id));
-        let c = self.centroid_count_deltas.entry(vector_id).or_insert(0);
+        let c = self.centroid_count_deltas.entry(centroid_id).or_insert(0);
         *c -= 1;
     }
 
@@ -192,16 +212,111 @@ impl VectorIndexDelta {
     }
 
     pub(crate) fn freeze(self, state: &mut VectorIndexState) -> Vec<RecordOp> {
-        // apply all mutations to state:
-        // update the centroid counts
-        // update dictionary
-        // add/delete from centroid graph, make sure to delete all centroids before writing new centroids
-        //    so that the new centroids are not connected to them.
-        // update sequence allocator key/block by freezing self's allocator
+        let VectorIndexDelta {
+            new_centroids,
+            deleted_centroids,
+            centroid_count_deltas,
+            posting_updates,
+            inverted_index_updates,
+            dictionary_updates,
+            vector_updates,
+            vector_deletes,
+            id_allocator,
+            current_posting: _,
+            mut ops,
+        } = self;
 
-        // construct ops that need to be written to storage using the delta
-        // make sure to write all centroid posting tombstones at the end
-        todo!()
+        // === Apply mutations to state ===
+
+        // Update centroid counts
+        for (&centroid_id, &delta) in &centroid_count_deltas {
+            let count = state.centroid_counts.entry(centroid_id).or_insert(0);
+            *count = count.saturating_add_signed(delta);
+        }
+        for &centroid_id in &deleted_centroids {
+            state.centroid_counts.remove(&centroid_id);
+        }
+
+        // Update dictionary
+        for (external_id, &internal_id) in &dictionary_updates {
+            state.dictionary.insert(external_id.clone(), internal_id);
+        }
+
+        // Delete centroids from graph before adding new ones so new centroids
+        // are not connected to deleted centroids.
+        for &centroid_id in &deleted_centroids {
+            let _ = state.centroid_graph.remove_centroid(centroid_id);
+        }
+        for entry in new_centroids.values() {
+            let _ = state.centroid_graph.add_centroid(entry);
+        }
+
+        // Update sequence allocator
+        let (key, block) = id_allocator.freeze();
+        state.sequence_block_key = key;
+        state.sequence_block = block;
+
+        // === Construct record ops ===
+
+        // Dictionary puts
+        for (external_id, &internal_id) in &dictionary_updates {
+            ops.push(record::put_id_dictionary(external_id, internal_id));
+        }
+
+        // Vector data puts
+        for (vector_id, value) in vector_updates {
+            let key = VectorDataKey::new(vector_id).encode();
+            let encoded = value.encode_to_bytes();
+            ops.push(RecordOp::Put(Record::new(key, encoded).into()));
+        }
+
+        // Vector data deletes
+        for vector_id in &vector_deletes {
+            ops.push(record::delete_vector_data(*vector_id));
+        }
+
+        // New centroid chunks
+        let centroid_entries: Vec<CentroidEntry> = new_centroids.into_values().collect();
+        if !centroid_entries.is_empty() {
+            ops.extend(state.chunk_manager.allocate_centroids(centroid_entries));
+        }
+
+        // Posting list merges
+        for (centroid_id, updates) in posting_updates {
+            if let Ok(op) = record::merge_posting_list(centroid_id, updates) {
+                ops.push(op);
+            }
+        }
+
+        // Centroid stats deltas (skip deleted centroids)
+        for (&centroid_id, &delta) in &centroid_count_deltas {
+            if !deleted_centroids.contains(&centroid_id) && delta != 0 {
+                ops.push(record::merge_centroid_stats(centroid_id, delta as i32));
+            }
+        }
+
+        // Metadata inverted index merges
+        for (encoded_key, vector_ids) in &inverted_index_updates {
+            if let Ok(op) = record::merge_metadata_index_bitmap(encoded_key.clone(), vector_ids) {
+                ops.push(op);
+            }
+        }
+
+        // Deleted centroids bitmap
+        if !deleted_centroids.is_empty() {
+            let bitmap = deleted_centroids.iter().copied().collect::<RoaringTreemap>();
+            let op = record::merge_deleted_vectors(bitmap)
+                .expect("failure to construct deleted vectors row");
+            ops.push(op);
+        }
+
+        // Centroid posting tombstones at the end
+        for &centroid_id in &deleted_centroids {
+            let key = PostingListKey::new(centroid_id).encode();
+            ops.push(RecordOp::Delete(key));
+        }
+
+        ops
     }
 }
 
