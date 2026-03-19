@@ -113,6 +113,13 @@ typedef struct opendata_log_reader_config_t {
   int64_t refresh_interval_ms;
 } opendata_log_reader_config_t;
 
+/**
+ * Initializes a tracing subscriber that writes to stderr, controlled by the
+ * `RUST_LOG` environment variable. Safe to call multiple times — subsequent
+ * calls are no-ops. Call before `opendata_log_open` to capture startup logs.
+ */
+void opendata_log_init_tracing(void);
+
 struct opendata_log_result_t opendata_log_open(const struct opendata_log_config_t *config,
                                                struct opendata_log_t **out_log);
 

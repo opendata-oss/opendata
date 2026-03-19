@@ -4,8 +4,20 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::storage::config::StorageConfig;
 use log::{CompactionConfig, LogDbBuilder, LogRead};
+use tracing_subscriber::EnvFilter;
 
 use crate::ffi::*;
+
+/// Initializes a tracing subscriber that writes to stderr, controlled by the
+/// `RUST_LOG` environment variable. Safe to call multiple times — subsequent
+/// calls are no-ops. Call before `opendata_log_open` to capture startup logs.
+#[unsafe(no_mangle)]
+pub extern "C" fn opendata_log_init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_target(true)
+        .try_init();
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn opendata_log_open(
