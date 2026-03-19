@@ -2,5 +2,5 @@ mod drivers;
 pub(crate) mod indexer;
 mod merge;
 mod split;
-mod state;
+pub(crate) mod state;
 mod vector;

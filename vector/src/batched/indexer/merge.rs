@@ -44,6 +44,10 @@ impl MergeCentroids {
         if to_merge.is_empty() {
             return Ok(vec![]);
         }
+        // Don't merge if all centroids would be merged — there are no targets left
+        if to_merge.len() >= counts.len() {
+            return Ok(vec![]);
+        }
 
         // read postings of all mergees
         let mut to_resolve = Vec::with_capacity(to_merge.len());

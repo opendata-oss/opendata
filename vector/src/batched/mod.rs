@@ -1,3 +1,3 @@
-mod delta;
-mod indexer;
-mod flusher;
+pub(crate) mod delta;
+pub(crate) mod indexer;
+pub(crate) mod flusher;

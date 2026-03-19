@@ -2,15 +2,29 @@ use std::ops::Range;
 use std::sync::Arc;
 use async_trait::async_trait;
 use common::coordinator::Flusher;
-use common::{Storage, StorageRead};
+use common::Storage;
 use common::storage::StorageSnapshot;
 use crate::batched::delta::{VectorDbDeltaView, VectorDbWriteDelta};
 use crate::batched::indexer::indexer::Indexer;
 
-struct VectorDbFlusher {
+pub(crate) struct VectorDbFlusher {
     storage: Arc<dyn Storage>,
-    last_snapshot: Arc<dyn StorageRead>,
+    last_snapshot: Arc<dyn StorageSnapshot>,
     indexer: Indexer,
+}
+
+impl VectorDbFlusher {
+    pub(crate) fn new(
+        storage: Arc<dyn Storage>,
+        initial_snapshot: Arc<dyn StorageSnapshot>,
+        indexer: Indexer,
+    ) -> Self {
+        Self {
+            storage,
+            last_snapshot: initial_snapshot,
+            indexer,
+        }
+    }
 }
 
 #[async_trait]
@@ -34,7 +48,7 @@ impl Flusher<VectorDbWriteDelta> for VectorDbFlusher {
             .await
             .map_err(|e| e.to_string())?;
 
-        // StorageSnapshot extends StorageRead, so we can return it directly
+        self.last_snapshot = snapshot.clone();
         Ok(snapshot)
     }
 
