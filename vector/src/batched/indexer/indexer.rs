@@ -13,6 +13,8 @@ use common::sequence::AllocatedSeqBlock;
 use crate::hnsw::CentroidGraph;
 use crate::Result;
 
+const INDEXING_ROUNDS: usize = 1;
+
 pub(crate) struct IndexerOpts {
     pub(crate) dimensions: usize,
     pub(crate) distance_metric: DistanceMetric,
@@ -69,30 +71,32 @@ impl Indexer {
         write
             .execute(&self.state, &mut delta)
             .await?;
-        // apply merges
-        let merge = MergeCentroids::new(&self.opts, &snapshot);
-        let reassigns = merge
-            .execute(&self.state, &mut delta)
-            .await?;
-        // apply merge reassignments
-        let reassign = ReassignVectors::new(&self.opts, &snapshot, reassigns);
-        reassign
-            .execute(&self.state, &mut delta)
-            .await?;
-        // run split-reassign loop until no more splits. don't run merges as part of this loop
-        // as it is not guaranteed to converge
-        loop {
-            let split = SplitCentroids::new(&self.opts, &snapshot);
-            let result = split
+        for _ in 0..INDEXING_ROUNDS {
+            // apply merges
+            let merge = MergeCentroids::new(&self.opts, &snapshot);
+            let reassigns = merge
                 .execute(&self.state, &mut delta)
                 .await?;
-            if result.splits == 0 {
-                break;
-            }
-            let reassign = ReassignVectors::new(&self.opts, &snapshot, result.reassignments);
+            // apply merge reassignments
+            let reassign = ReassignVectors::new(&self.opts, &snapshot, reassigns);
             reassign
                 .execute(&self.state, &mut delta)
                 .await?;
+            // run split-reassign loop until no more splits. don't run merges as part of this loop
+            // as it is not guaranteed to converge
+            loop {
+                let split = SplitCentroids::new(&self.opts, &snapshot);
+                let result = split
+                    .execute(&self.state, &mut delta)
+                    .await?;
+                if result.splits == 0 {
+                    break;
+                }
+                let reassign = ReassignVectors::new(&self.opts, &snapshot, result.reassignments);
+                reassign
+                    .execute(&self.state, &mut delta)
+                    .await?;
+            }
         }
         Ok(delta.freeze(&mut self.state))
     }

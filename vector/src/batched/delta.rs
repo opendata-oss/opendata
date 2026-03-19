@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::sync::Arc;
-
+use tracing::info;
 use crate::delta::{VectorDbWrite, VectorWrite};
 use common::coordinator::Delta;
 
@@ -60,12 +60,14 @@ impl Delta for VectorDbWriteDelta {
     fn estimate_size(&self) -> usize {
         let view = self.view.read().expect("lock poisoned");
         view.writes.len() * self.context.opts.dimensions * 4
+        //view.writes.len()
     }
 
     fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
         let frozen = Arc::new(VectorDbDeltaView::clone(
             &self.view.read().expect("lock poisoned"),
         ));
+        info!("freezing delta view with {} writes", frozen.writes.len());
         let frozen_view = frozen.clone();
         (frozen, frozen_view, self.context)
     }

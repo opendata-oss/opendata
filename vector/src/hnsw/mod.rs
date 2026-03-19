@@ -44,10 +44,10 @@ pub trait CentroidGraph: Send + Sync {
     /// Vector of centroid_ids sorted by similarity (closest first)
     fn search_with_include_exclude(
         &self,
-        query: &[f32],
-        k: usize,
-        include: &[&CentroidEntry],
-        exclude: &HashSet<u64>,
+        _query: &[f32],
+        _k: usize,
+        _include: &[&CentroidEntry],
+        _exclude: &HashSet<u64>,
     ) -> Vec<u64> {
         unimplemented!();
     }

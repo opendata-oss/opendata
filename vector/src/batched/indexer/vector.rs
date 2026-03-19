@@ -14,10 +14,18 @@ use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tracing::debug;
 
-struct ResolvedVectorUpsert {
+/// A new vector insert (no existing vector with this external_id).
+struct ResolvedInsert {
     write: VectorWrite,
-    old: Option<(u64, VectorDataValue)>,
+    centroid: u64,
+}
+
+/// An upsert where we need to resolve the old vector data from storage.
+struct ResolvedUpsert {
+    write: VectorWrite,
+    old: (u64, VectorDataValue),
     centroid: u64,
 }
 
@@ -53,42 +61,76 @@ impl WriteVectors {
         // compact so last write for each external id wins
         let writes = Self::compact_writes(self.writes);
 
-        // resolve data required for all updates
-        let mut to_resolve = Vec::with_capacity(writes.len());
+        // Partition into inserts (new vectors) vs upserts (existing external_id).
+        // Inserts need no I/O — just a centroid search. Upserts need a storage
+        // read to fetch the old vector data.
         let centroid_graph = view.centroid_graph();
+        let mut inserts = Vec::with_capacity(writes.len());
+        let mut upsert_futures: Vec<BoxFuture<'static, Result<ResolvedUpsert>>> = Vec::new();
+
         for w in writes {
-            // this is a hack. we want to do the searches concurrently, but it probably doesn't
-            // make sense to do them on the i/o tasks
+            let Some(old_vector_id) = view.vector_id(&w.external_id) else {
+                // New vector — resolve centroid synchronously, no I/O needed
+                let centroid = centroid_graph
+                    .search(&w.values, 1)
+                    .first()
+                    .copied()
+                    .ok_or_else(|| Internal("no centroids found".to_string()))?;
+                inserts.push(ResolvedInsert { write: w, centroid });
+                continue;
+            };
+            // Upsert — need to read old vector data from storage
+            let data_fut = view.vector_data(old_vector_id, self.opts.dimensions);
             let this_centroid_graph = centroid_graph.clone();
-            let data_fut = view.vector_data_for_external_id(&w.external_id, self.opts.dimensions);
-            to_resolve.push(Box::pin(async move {
-                let centroid = this_centroid_graph.search(&w.values, 1);
-                let Some(&centroid) = centroid.first() else {
-                    return Err(Internal("no centroids found".to_string()));
-                };
-                Ok(ResolvedVectorUpsert {
+            upsert_futures.push(Box::pin(async move {
+                let centroid = this_centroid_graph
+                    .search(&w.values, 1)
+                    .first()
+                    .copied()
+                    .ok_or_else(|| Internal("no centroids found".to_string()))?;
+                let old_data = data_fut.await?.ok_or_else(|| {
+                    Internal(format!("missing vector data for id {}", old_vector_id))
+                })?;
+                Ok(ResolvedUpsert {
                     write: w,
-                    old: data_fut.await?,
+                    old: (old_vector_id, old_data),
                     centroid,
                 })
-            }) as BoxFuture<Result<ResolvedVectorUpsert>>);
+            }));
         }
-        let resolve_results = AsyncBatchDriver::execute(to_resolve).await;
-        let mut resolved = Vec::with_capacity(resolve_results.len());
-        for result in resolve_results {
-            resolved.push(result?);
+
+        // Resolve upserts concurrently (bounded by AsyncBatchDriver)
+        let upsert_results = AsyncBatchDriver::execute(upsert_futures).await;
+        let mut upserts = Vec::with_capacity(upsert_results.len());
+        for result in upsert_results {
+            upserts.push(result?);
         }
         drop(view);
 
-        // now do all serial work of updating the delta
-
-        // handle inserts
-        for upsert in resolved {
-            if let Some((old_vector_id, _old_vector_data)) = upsert.old {
-                delta.delete_vector(old_vector_id);
-                // todo: delete from old postings and inverted index
+        // Apply inserts to delta (no old data to clean up)
+        for insert in inserts {
+            let vector_id =
+                delta.add_vector(&insert.write.external_id, &insert.write.attributes);
+            delta.add_to_posting(insert.centroid, vector_id, insert.write.values.clone());
+            for (attr_name, attr_value) in &insert.write.attributes {
+                if attr_name == VECTOR_FIELD_NAME {
+                    continue;
+                }
+                if !self.opts.indexed_fields.contains(attr_name) {
+                    continue;
+                }
+                let field_value: FieldValue = attr_value.clone().into();
+                delta.add_to_inverted_index(attr_name.clone(), field_value, vector_id);
             }
-            let vector_id = delta.add_vector(&upsert.write.external_id, &upsert.write.attributes);
+        }
+
+        // Apply upserts to delta
+        for upsert in upserts {
+            let (old_vector_id, _old_vector_data) = upsert.old;
+            delta.delete_vector(old_vector_id);
+            // todo: delete from old postings and inverted index
+            let vector_id =
+                delta.add_vector(&upsert.write.external_id, &upsert.write.attributes);
             delta.add_to_posting(upsert.centroid, vector_id, upsert.write.values.clone());
             for (attr_name, attr_value) in &upsert.write.attributes {
                 if attr_name == VECTOR_FIELD_NAME {
@@ -203,6 +245,7 @@ impl ReassignVectors {
 
         // execute the reassignments
         for r in resolved {
+            debug!("old data: {:?}", r.data);
             delta.remove_from_posting(r.reassignment.current_centroid, r.reassignment.vector_id);
             delta.add_to_posting(r.centroid, r.reassignment.vector_id, r.reassignment.vector);
         }

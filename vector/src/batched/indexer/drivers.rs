@@ -1,17 +1,17 @@
-use futures::future::{BoxFuture, join_all};
-use tokio::task::JoinSet;
+use futures::future::BoxFuture;
+use futures::stream::{self, StreamExt};
+
+/// Maximum number of concurrent I/O futures to poll at once.
+const DEFAULT_CONCURRENCY: usize = 256;
 
 /// Driver for i/o heavy batches of tasks
 pub(crate) struct AsyncBatchDriver {}
 
 impl AsyncBatchDriver {
     pub(crate) async fn execute<T: Send + 'static>(batch: Vec<BoxFuture<'static, T>>) -> Vec<T> {
-        // TODO: do something better here that limits concurrent tasks/ios
-        join_all(batch.into_iter()).await
+        stream::iter(batch)
+            .buffer_unordered(DEFAULT_CONCURRENCY)
+            .collect()
+            .await
     }
 }
-
-/// Driver for compute-heavy batches of tasks
-pub(crate) struct ComputeBatchDriver {}
-
-impl ComputeBatchDriver {}
