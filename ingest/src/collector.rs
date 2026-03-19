@@ -2,8 +2,8 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::stream;
 use futures::StreamExt;
+use futures::stream;
 use slatedb::object_store::ObjectStore;
 use slatedb::object_store::path::Path;
 
