@@ -1,10 +1,8 @@
 use crate::batched::indexer::drivers::AsyncBatchDriver;
 use crate::batched::indexer::indexer::IndexerOpts;
-use crate::batched::indexer::state::{
-    DirtyCentroidGraph, VectorIndexDelta, VectorIndexState, VectorIndexView,
-};
+use crate::batched::indexer::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use crate::lire::commands::SplitPostings;
-use crate::lire::{heuristics, kmeans};
+use crate::lire::kmeans;
 use crate::serde::posting_list::{Posting, PostingList};
 use crate::{DistanceMetric, Result, distance};
 use common::StorageRead;
@@ -26,8 +24,7 @@ pub(crate) struct ReassignVector {
 
 struct SplitResult {
     c: u64,
-    c_0: SplitPostings,
-    c_1: SplitPostings,
+    new_centroids: Vec<SplitPostings>,
     reassign_vectors: Vec<ReassignVector>,
 }
 
@@ -91,9 +88,11 @@ impl SplitCentroids {
             splits.push(SplitCentroid {
                 c,
                 neighbours,
-                centroid_graph: centroid_graph.clone(),
+                old_centroid_vector: c_vec.vector.clone(),
                 dimensions: self.opts.dimensions,
                 distance_metric: self.opts.distance_metric,
+                merge_threshold_vectors: self.opts.merge_threshold_vectors,
+                split_threshold_vectors: self.opts.split_threshold_vectors,
             })
         }
 
@@ -138,7 +137,7 @@ impl SplitCentroids {
             delta.delete_centroids(vec![result.c]);
 
             // create new centroids with postings
-            for new_centroid in [result.c_0, result.c_1] {
+            for new_centroid in result.new_centroids {
                 let entry = delta.add_centroid(new_centroid.centroid_vec().to_vec());
                 for p in new_centroid.postings() {
                     delta.remove_from_posting(result.c, p.id());
@@ -159,9 +158,11 @@ impl SplitCentroids {
 struct SplitCentroid {
     c: u64,
     neighbours: Vec<u64>,
-    centroid_graph: Arc<DirtyCentroidGraph>,
+    old_centroid_vector: Vec<f32>,
     distance_metric: DistanceMetric,
     dimensions: usize,
+    merge_threshold_vectors: usize,
+    split_threshold_vectors: usize,
 }
 
 impl SplitCentroid {
@@ -179,126 +180,122 @@ impl SplitCentroid {
             .map(|p| (p.id(), p.vector().to_vec()))
             .collect();
 
-        // Run two_means clustering to find new centroids
+        // Run k-means clustering to find new centroids
         let c_vector_refs: Vec<(u64, &[f32])> = c_vectors
             .iter()
             .map(|(id, v)| (*id, v.as_slice()))
             .collect();
         let clustering = kmeans::for_metric(self.distance_metric);
-        let (c0_vector, c1_vector) = clustering.two_means(&c_vector_refs, self.dimensions);
+        let ncentroids = self.num_split_centroids(c_postings.len());
+        let centroid_vectors = clustering.k_means(&c_vector_refs, self.dimensions, ncentroids);
 
-        // Assign each vector to closer centroid
-        let mut c0_postings = Vec::new();
-        let mut c1_postings = Vec::new();
+        let mut centroid_postings: Vec<Vec<Posting>> =
+            (0..centroid_vectors.len()).map(|_| Vec::new()).collect();
         for (id, vector) in &c_vectors {
-            let d0 = distance::compute_distance(vector, &c0_vector, self.distance_metric);
-            let d1 = distance::compute_distance(vector, &c1_vector, self.distance_metric);
-
-            if d0 <= d1 {
-                c0_postings.push(Posting::new(*id, vector.clone()));
-            } else {
-                c1_postings.push(Posting::new(*id, vector.clone()));
-            }
+            let (closest_idx, _distance) = centroid_vectors
+                .iter()
+                .enumerate()
+                .map(|(idx, centroid)| {
+                    (
+                        idx,
+                        distance::compute_distance(vector, centroid, self.distance_metric),
+                    )
+                })
+                .min_by(|a, b| a.1.cmp(&b.1))
+                .expect("split must produce at least one centroid");
+            centroid_postings[closest_idx].push(Posting::new(*id, vector.clone()));
         }
 
-        // Compute reassignments
-        let mut reassignments = Vec::with_capacity(c0_postings.len() + c1_postings.len());
-        let c_vector = self
-            .centroid_graph
-            .centroid(self.c)
-            .expect("unexpected missing centroid");
-        reassignments.extend(self.compute_split_reassignments(
-            self.c,
-            &c_postings,
-            &c_vector.vector,
-            &c0_vector,
-            &c1_vector,
-        ));
-        reassignments.extend(self.compute_neighbour_reassignments(
-            &c_vector.vector,
-            &c0_vector,
-            &c1_vector,
-            postings.as_ref(),
-        ));
+        let reassignments =
+            self.compute_reassignments(&c_postings, &centroid_vectors, postings.as_ref());
+
+        let new_centroids = centroid_vectors
+            .into_iter()
+            .zip(centroid_postings)
+            .map(|(centroid_vec, postings)| SplitPostings::new(centroid_vec, postings))
+            .collect();
 
         SplitResult {
             c: self.c,
-            c_0: SplitPostings::new(c0_vector, c0_postings),
-            c_1: SplitPostings::new(c1_vector, c1_postings),
+            new_centroids,
             reassign_vectors: reassignments,
         }
     }
 
-    fn compute_split_reassignments(
-        &self,
-        centroid_id: u64,
-        postings: &[Posting],
-        c_vector: &[f32],
-        c0_vector: &[f32],
-        c1_vector: &[f32],
-    ) -> Vec<ReassignVector> {
-        // use the heuristic for c's vectors from the spfresh paper to cheaply determine if
-        // a vector may need reassignment. If it may, then check in the centroid graph for
-        // its nearest centroid. If the nearest centroid is not c0 or c1, then include in
-        // the reassignment set.
-        let mut reassignments = Vec::with_capacity(postings.len());
-        for p in postings {
-            if !heuristics::split_heuristic(
-                p.vector(),
-                c_vector,
-                c0_vector,
-                c1_vector,
-                self.distance_metric,
-            ) {
-                continue;
-            }
-            reassignments.push(ReassignVector {
-                vector_id: p.id(),
-                vector: p.vector().to_vec(),
-                current_centroid: centroid_id,
-            })
-        }
-        reassignments
+    fn num_split_centroids(&self, posting_count: usize) -> usize {
+        let target = (self.merge_threshold_vectors + self.split_threshold_vectors)
+            .div_ceil(2)
+            .max(1);
+        posting_count.div_ceil(target).max(2).min(posting_count)
     }
 
-    fn compute_neighbour_reassignments(
+    fn compute_reassignments(
         &self,
-        c_vector: &[f32],
-        c0_vector: &[f32],
-        c1_vector: &[f32],
+        c_postings: &[Posting],
+        new_centroid_vectors: &[Vec<f32>],
         postings: &HashMap<u64, PostingList>,
     ) -> Vec<ReassignVector> {
         let mut reassignments: Vec<ReassignVector> = Vec::new();
 
-        // Process each neighbour's postings to find reassignments
+        for p in c_postings {
+            if self.should_reassign_old_posting_vector(p.vector(), new_centroid_vectors) {
+                reassignments.push(ReassignVector {
+                    vector_id: p.id(),
+                    vector: p.vector().to_vec(),
+                    current_centroid: self.c,
+                });
+            }
+        }
+
         for neighbour_id in &self.neighbours {
             let neighbour_postings = postings
                 .get(neighbour_id)
                 .expect("missing postings for neighbour");
 
             for p in neighbour_postings.iter() {
-                // use the heuristic for neighbour vectors from the spfresh paper to cheaply
-                // determine if a vector may need reassignment. If it may, then check in the
-                // centroid graph for its nearest centroid. If the nearest centroid is changed,
-                // then add to reassignment set.
-                if !heuristics::neighbour_split_heuristic(
-                    p.vector(),
-                    c_vector,
-                    c0_vector,
-                    c1_vector,
-                    self.distance_metric,
-                ) {
-                    continue;
+                if self.should_reassign_neighbour_posting_vector(p.vector(), new_centroid_vectors) {
+                    reassignments.push(ReassignVector {
+                        vector_id: p.id(),
+                        vector: p.vector().to_vec(),
+                        current_centroid: *neighbour_id,
+                    });
                 }
-                let vector = p.vector().to_vec();
-
-                reassignments.push(ReassignVector {
-                    vector_id: p.id(),
-                    vector,
-                    current_centroid: *neighbour_id,
-                });
             }
         }
         reassignments
+    }
+
+    fn should_reassign_old_posting_vector(
+        &self,
+        vector: &[f32],
+        new_centroid_vectors: &[Vec<f32>],
+    ) -> bool {
+        let d_old =
+            distance::compute_distance(vector, &self.old_centroid_vector, self.distance_metric);
+        let d_new_best = self.min_new_centroid_distance(vector, new_centroid_vectors);
+        d_old <= d_new_best
+    }
+
+    fn should_reassign_neighbour_posting_vector(
+        &self,
+        vector: &[f32],
+        new_centroid_vectors: &[Vec<f32>],
+    ) -> bool {
+        let d_old =
+            distance::compute_distance(vector, &self.old_centroid_vector, self.distance_metric);
+        let d_new_best = self.min_new_centroid_distance(vector, new_centroid_vectors);
+        d_new_best <= d_old
+    }
+
+    fn min_new_centroid_distance(
+        &self,
+        vector: &[f32],
+        new_centroid_vectors: &[Vec<f32>],
+    ) -> distance::VectorDistance {
+        new_centroid_vectors
+            .iter()
+            .map(|centroid| distance::compute_distance(vector, centroid, self.distance_metric))
+            .min()
+            .expect("split must produce at least one centroid")
     }
 }
