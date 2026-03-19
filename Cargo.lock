@@ -2519,6 +2519,7 @@ dependencies = [
  "slatedb",
  "tokio",
  "tokio-util",
+ "tracing",
  "ulid",
 ]
 

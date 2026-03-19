@@ -8,7 +8,7 @@ use slatedb::object_store::path::Path;
 use crate::config::CollectorConfig;
 use crate::error::{Error, Result};
 use crate::model::decode_batch;
-use crate::queue::QueueConsumer;
+use crate::queue::{QueueConsumer, QueueEntry};
 
 const DEQUEUE_INTERVAL: u64 = 100;
 
@@ -131,7 +131,8 @@ impl Collector {
         let count = self.ack_count.get() + 1;
         self.ack_count.set(count);
         if count.is_multiple_of(DEQUEUE_INTERVAL) {
-            self.consumer.dequeue(sequence).await?;
+            let dequeued = self.consumer.dequeue(sequence).await?;
+            delete_dequeued_batches(self.object_store.clone(), dequeued);
         }
         Ok(())
     }
@@ -139,7 +140,8 @@ impl Collector {
     /// Flush any pending acks by dequeueing up to the last acked sequence.
     pub async fn flush(&self) -> Result<()> {
         if let Some(seq) = self.last_acked_sequence.get() {
-            self.consumer.dequeue(seq).await?;
+            let dequeued = self.consumer.dequeue(seq).await?;
+            delete_dequeued_batches(self.object_store.clone(), dequeued);
         }
         Ok(())
     }
@@ -163,6 +165,24 @@ impl Collector {
     pub fn conflict_rate(&self) -> f64 {
         self.consumer.conflict_rate()
     }
+}
+
+fn delete_dequeued_batches(object_store: Arc<dyn ObjectStore>, entries: Vec<QueueEntry>) {
+    if entries.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        for entry in entries {
+            let path = Path::from(entry.location.as_str());
+            if let Err(e) = object_store.delete(&path).await {
+                tracing::warn!(
+                    path = entry.location,
+                    error = %e,
+                    "failed to delete ingested data batch"
+                );
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -553,5 +573,84 @@ mod tests {
         let batch = collector.next_batch().await.unwrap().unwrap();
         assert_eq!(batch.location, "batches/second");
         assert_eq!(batch.sequence, 1);
+    }
+
+    async fn assert_batch_deleted(store: &Arc<dyn ObjectStore>, location: &str) {
+        // Yield to let the spawned deletion task run.
+        tokio::task::yield_now().await;
+        let path = Path::from(location);
+        let result = store.get(&path).await;
+        assert!(
+            result.is_err(),
+            "expected batch file to be deleted: {location}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_delete_batch_file_after_flush() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, collector) = make_collector(&store, test_collector_config());
+        collector.initialize(None).await.unwrap();
+
+        let entries = test_entries();
+        let location = "batches/delete-me";
+        write_batch(&store, location, &entries).await;
+        producer
+            .enqueue(location.to_string(), vec![])
+            .await
+            .unwrap();
+
+        let batch = collector.next_batch().await.unwrap().unwrap();
+        collector.ack(batch.sequence).await.unwrap();
+        collector.flush().await.unwrap();
+
+        assert_batch_deleted(&store, location).await;
+    }
+
+    #[tokio::test]
+    async fn should_delete_batch_files_after_dequeue_interval() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, collector) = make_collector(&store, test_collector_config());
+        collector.initialize(None).await.unwrap();
+
+        let entries = test_entries();
+        let mut locations = Vec::new();
+        for i in 0..DEQUEUE_INTERVAL {
+            let location = format!("batches/interval-{:04}", i);
+            write_batch(&store, &location, &entries).await;
+            producer.enqueue(location.clone(), vec![]).await.unwrap();
+            locations.push(location);
+        }
+
+        for _ in 0..DEQUEUE_INTERVAL {
+            let batch = collector.next_batch().await.unwrap().unwrap();
+            collector.ack(batch.sequence).await.unwrap();
+        }
+
+        // The DEQUEUE_INTERVAL-th ack triggers dequeue + deletion.
+        for location in &locations {
+            assert_batch_deleted(&store, location).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn should_delete_batch_files_on_close() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, collector) = make_collector(&store, test_collector_config());
+        collector.initialize(None).await.unwrap();
+
+        let entries = test_entries();
+        let location = "batches/close-me";
+        write_batch(&store, location, &entries).await;
+        producer
+            .enqueue(location.to_string(), vec![])
+            .await
+            .unwrap();
+
+        let batch = collector.next_batch().await.unwrap().unwrap();
+        collector.ack(batch.sequence).await.unwrap();
+        collector.close().await.unwrap();
+
+        assert_batch_deleted(&store, location).await;
     }
 }
