@@ -177,6 +177,7 @@ impl VectorIndexDelta {
         // so that the new centroids are not connected to them.
 
         // construct ops that need to be written to storage
+        // make sure to write all centroid posting tombstones at the end
         todo!()
     }
 }

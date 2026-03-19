@@ -22,35 +22,3 @@ impl Indexer {
         delta.freeze(&mut self.state)
     }
 }
-
-struct ReassignVectors {
-
-}
-
-impl ReassignVectors {
-    fn execute() {
-        // resolve new assignments, filtering out vectors that dont need reassignment
-
-        // get old vector data so inverted indexes can be updated
-
-        // update postings/inverted indexes
-    }
-}
-
-struct MergeCentroids {
-
-}
-
-impl MergeCentroids {
-    fn execute() {
-        // find all centroids that need to be merged
-
-        // find neighbouring centroids that can be merge partners
-
-        // execute merges (delete centroids only)
-
-        // read all relevant postings
-
-        // return reassign set
-    }
-}
