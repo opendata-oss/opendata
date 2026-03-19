@@ -207,22 +207,29 @@ impl UsearchCentroidGraphInner {
         include: &[&CentroidEntry],
         exclude: &HashSet<u64>,
     ) -> Vec<u64> {
-        // Search graph with extra capacity to account for excluded results
         let graph_size = self.key_to_centroid.len();
-        let search_k = (k + exclude.len() + 10).min(graph_size + 10);
+        let search_k = (k + 10).min(graph_size + 10);
 
         let mut candidates: Vec<(u64, f32)> = Vec::with_capacity(k + include.len());
 
-        if graph_size > 0 {
-            if let Ok(results) = self.index.search(query, search_k) {
+        if graph_size > 0 && search_k > 0 {
+            // Build set of usearch keys to exclude
+            let excluded_keys: HashSet<u64> = exclude
+                .iter()
+                .filter_map(|centroid_id| self.centroid_to_key.get(centroid_id).copied())
+                .collect();
+
+            let results = if excluded_keys.is_empty() {
+                self.index.search(query, search_k)
+            } else {
+                self.index
+                    .filtered_search(query, search_k, |key| !excluded_keys.contains(&key))
+            };
+
+            if let Ok(results) = results {
                 for (&key, &dist) in results.keys.iter().zip(results.distances.iter()) {
                     if let Some(&centroid_id) = self.key_to_centroid.get(&key) {
-                        if !exclude.contains(&centroid_id) {
-                            candidates.push((centroid_id, dist));
-                            if candidates.len() >= k + include.len() {
-                                break;
-                            }
-                        }
+                        candidates.push((centroid_id, dist));
                     }
                 }
             }
