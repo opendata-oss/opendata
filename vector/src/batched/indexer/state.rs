@@ -15,7 +15,6 @@ use common::{SequenceAllocator, StorageRead};
 use futures::future::BoxFuture;
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
-use std::pin::Pin;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -192,12 +191,15 @@ impl VectorIndexDelta {
             .insert(vector_id);
     }
 
-    pub(crate) fn freeze(self, ctx: &mut VectorIndexState) -> Vec<RecordOp> {
-        // apply all mutations to ctx
-        // for centroid graph, make sure to delete all centroids before writing new centroids
-        // so that the new centroids are not connected to them.
+    pub(crate) fn freeze(self, state: &mut VectorIndexState) -> Vec<RecordOp> {
+        // apply all mutations to state:
+        // update the centroid counts
+        // update dictionary
+        // add/delete from centroid graph, make sure to delete all centroids before writing new centroids
+        //    so that the new centroids are not connected to them.
+        // update sequence allocator key/block by freezing self's allocator
 
-        // construct ops that need to be written to storage
+        // construct ops that need to be written to storage using the delta
         // make sure to write all centroid posting tombstones at the end
         todo!()
     }

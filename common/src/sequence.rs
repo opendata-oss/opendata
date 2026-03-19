@@ -212,8 +212,8 @@ impl SequenceAllocator {
         (new_block, record)
     }
 
-    pub fn freeze(self) -> AllocatedSeqBlock {
-        self.block
+    pub fn freeze(self) -> (Bytes, AllocatedSeqBlock) {
+        (self.key, self.block)
     }
 }
 
