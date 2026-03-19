@@ -727,6 +727,7 @@ pub(crate) struct Tsdb {
     pub(crate) runtime_config: TsdbRuntimeConfig,
     #[cfg(feature = "http-server")]
     metrics: std::sync::OnceLock<Arc<Metrics>>,
+    warmer_handle: tokio::sync::Mutex<Option<crate::metadata_warmer::MetadataWarmerHandle>>,
 }
 
 impl Tsdb {
@@ -757,6 +758,7 @@ impl Tsdb {
             runtime_config: config,
             #[cfg(feature = "http-server")]
             metrics: std::sync::OnceLock::new(),
+            warmer_handle: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -772,6 +774,26 @@ impl Tsdb {
 
     pub(crate) fn storage(&self) -> &Arc<dyn Storage> {
         &self.storage
+    }
+
+    /// Start background tasks (metadata warmer).
+    /// Should be called after attach_metrics() and before serving queries.
+    #[cfg(feature = "http-server")]
+    pub(crate) async fn start_background_tasks(&self) {
+        let handle = crate::metadata_warmer::start_metadata_warmer(
+            self.runtime_config.metadata_warm.clone(),
+            self.storage.clone(),
+            self.load_coordinator.clone(),
+            self.metrics.get().cloned(),
+        );
+        *self.warmer_handle.lock().await = handle;
+    }
+
+    /// Stop background tasks before shutdown.
+    pub(crate) async fn stop_background_tasks(&self) {
+        if let Some(handle) = self.warmer_handle.lock().await.take() {
+            handle.stop().await;
+        }
     }
 
     /// Get or create a MiniTsdb for ingestion into a specific bucket.
@@ -873,6 +895,7 @@ impl Tsdb {
     }
 
     pub(crate) async fn close(self) -> Result<()> {
+        self.stop_background_tasks().await;
         self.flush().await?;
         self.storage.close().await?;
         Ok(())

@@ -147,6 +147,9 @@ impl TimeSeriesHttpServer {
         // Attach metrics to TSDB for query metrics publishing
         self.tsdb.attach_metrics(metrics.clone());
 
+        // Start background tasks (metadata warmer)
+        self.tsdb.start_background_tasks().await;
+
         // Start the scraper if there are scrape configs
         if !self.config.prometheus_config.scrape_configs.is_empty() {
             let scraper = Arc::new(Scraper::new(

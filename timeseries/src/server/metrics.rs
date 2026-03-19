@@ -287,30 +287,27 @@ impl Metrics {
             query_requests_total.clone(),
         );
 
-        let query_duration_seconds =
-            Family::<QueryLabels, Histogram>::new_with_constructor(|| {
-                Histogram::new(query_duration_buckets())
-            });
+        let query_duration_seconds = Family::<QueryLabels, Histogram>::new_with_constructor(|| {
+            Histogram::new(query_duration_buckets())
+        });
         registry.register(
             "tsdb_query_duration_seconds",
             "Total query duration in seconds",
             query_duration_seconds.clone(),
         );
 
-        let query_phase_wall =
-            Family::<QueryPhaseLabels, Histogram>::new_with_constructor(|| {
-                Histogram::new(query_duration_buckets())
-            });
+        let query_phase_wall = Family::<QueryPhaseLabels, Histogram>::new_with_constructor(|| {
+            Histogram::new(query_duration_buckets())
+        });
         registry.register(
             "tsdb_query_phase_wall_duration_seconds",
             "Wall-clock duration of query phases in seconds",
             query_phase_wall.clone(),
         );
 
-        let query_phase_work =
-            Family::<QueryWorkLabels, Histogram>::new_with_constructor(|| {
-                Histogram::new(query_duration_buckets())
-            });
+        let query_phase_work = Family::<QueryWorkLabels, Histogram>::new_with_constructor(|| {
+            Histogram::new(query_duration_buckets())
+        });
         registry.register(
             "tsdb_query_phase_work_duration_seconds",
             "Aggregated work duration of query phases in seconds",

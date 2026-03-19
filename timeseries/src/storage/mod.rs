@@ -271,7 +271,10 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
                     .into_iter()
                     .map(|(size, start)| TimeBucket { size, start })
                     .collect();
-                Ok(WarmBucketListResult { buckets, bytes_read })
+                Ok(WarmBucketListResult {
+                    buckets,
+                    bytes_read,
+                })
             }
             None => Ok(WarmBucketListResult {
                 buckets: Vec::new(),

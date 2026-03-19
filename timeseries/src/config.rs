@@ -223,7 +223,7 @@ impl Default for MetadataWarmConfig {
 }
 
 /// Top-level runtime config for Tsdb, aggregating all subsystem configs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct TsdbRuntimeConfig {
     pub read_load: ReadLoadConfig,
     pub metadata_warm: MetadataWarmConfig,
@@ -234,15 +234,6 @@ impl TsdbRuntimeConfig {
         Self {
             read_load: ReadLoadConfig::from_env(),
             metadata_warm: MetadataWarmConfig::from_env(),
-        }
-    }
-}
-
-impl Default for TsdbRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            read_load: ReadLoadConfig::default(),
-            metadata_warm: MetadataWarmConfig::default(),
         }
     }
 }
