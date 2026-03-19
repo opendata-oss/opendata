@@ -488,4 +488,120 @@ mod tests {
         let buckets = s.get_buckets_for_ranges(&[(3600, 7200)]).await.unwrap();
         assert_eq!(starts(&buckets), vec![60]);
     }
+
+    // ── warm helper tests ───────────────────────────────────────────────
+
+    use crate::serde::forward_index::{ForwardIndexValue, MetricMeta};
+    use crate::serde::inverted_index::InvertedIndexValue;
+
+    fn dummy_fi_value() -> ForwardIndexValue {
+        ForwardIndexValue {
+            metric_unit: None,
+            metric_meta: MetricMeta {
+                metric_type: 0,
+                flags: 0,
+            },
+            label_count: 1,
+            labels: vec![crate::model::Label {
+                name: "__name__".to_string(),
+                value: "test_metric".to_string(),
+            }],
+        }
+    }
+
+    fn dummy_ii_value() -> InvertedIndexValue {
+        InvertedIndexValue {
+            postings: roaring::RoaringBitmap::from_iter([1u32, 2, 3]),
+        }
+    }
+
+    /// Populate a storage with forward/inverted index entries for a bucket.
+    async fn storage_with_metadata(bucket_start: u32) -> Arc<InMemoryStorage> {
+        let storage = storage_with_buckets(&[bucket_start]).await;
+        let bucket = TimeBucket::hour(bucket_start);
+        let mut ops = Vec::new();
+
+        // Insert 3 forward index entries.
+        for series_id in 1u32..=3 {
+            let key = ForwardIndexKey {
+                time_bucket: bucket.start,
+                bucket_size: bucket.size,
+                series_id,
+            }
+            .encode();
+            let value = dummy_fi_value().encode();
+            ops.push(PutRecordOp::new(Record { key, value }));
+        }
+
+        // Insert 2 inverted index entries.
+        for (attr, val) in [("__name__", "test_metric"), ("env", "prod")] {
+            let key = InvertedIndexKey {
+                time_bucket: bucket.start,
+                bucket_size: bucket.size,
+                attribute: attr.to_string(),
+                value: val.to_string(),
+            }
+            .encode();
+            let value = dummy_ii_value().encode().unwrap();
+            ops.push(PutRecordOp::new(Record { key, value }));
+        }
+
+        storage.put(ops).await.unwrap();
+        storage
+    }
+
+    #[tokio::test]
+    async fn warm_bucket_list_returns_buckets_and_bytes() {
+        let s = storage_with_buckets(&[0, 60, 120]).await;
+        let result = s.warm_bucket_list().await.unwrap();
+        assert_eq!(result.buckets.len(), 3);
+        assert!(result.bytes_read > 0);
+        let starts: Vec<u32> = result.buckets.iter().map(|b| b.start).collect();
+        assert_eq!(starts, vec![0, 60, 120]);
+    }
+
+    #[tokio::test]
+    async fn warm_bucket_list_returns_empty_when_no_buckets() {
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let result = storage.warm_bucket_list().await.unwrap();
+        assert!(result.buckets.is_empty());
+        assert_eq!(result.bytes_read, 0);
+    }
+
+    #[tokio::test]
+    async fn warm_forward_index_bytes_returns_total_bytes() {
+        let s = storage_with_metadata(60).await;
+        let bucket = TimeBucket::hour(60);
+        let bytes = s.warm_forward_index_bytes(bucket).await.unwrap();
+        // 3 forward index entries, each with key + value > 0 bytes
+        assert!(bytes > 0, "expected non-zero bytes, got {bytes}");
+    }
+
+    #[tokio::test]
+    async fn warm_forward_index_bytes_zero_for_empty_bucket() {
+        let s = storage_with_buckets(&[60]).await;
+        // Bucket exists in list but has no forward index entries
+        let bucket = TimeBucket::hour(60);
+        let bytes = s.warm_forward_index_bytes(bucket).await.unwrap();
+        assert_eq!(bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn warm_inverted_index_bytes_returns_total_bytes() {
+        let s = storage_with_metadata(60).await;
+        let bucket = TimeBucket::hour(60);
+        let bytes = s.warm_inverted_index_bytes(bucket).await.unwrap();
+        // 2 inverted index entries
+        assert!(bytes > 0, "expected non-zero bytes, got {bytes}");
+    }
+
+    #[tokio::test]
+    async fn warm_inverted_index_bytes_zero_for_empty_bucket() {
+        let s = storage_with_buckets(&[60]).await;
+        let bucket = TimeBucket::hour(60);
+        let bytes = s.warm_inverted_index_bytes(bucket).await.unwrap();
+        assert_eq!(bytes, 0);
+    }
 }

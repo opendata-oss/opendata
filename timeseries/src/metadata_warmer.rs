@@ -374,7 +374,7 @@ async fn run_cycle(
 
     #[cfg(feature = "http-server")]
     if let Some(m) = metrics {
-        use crate::server::metrics::{QueryStatus, WarmerBytesLabels, WarmerReason, WarmerUnit};
+        use crate::server::metrics::{WarmerBytesLabels, WarmerReason, WarmerUnit};
         m.warmer
             .bytes_read_total
             .get_or_create(&WarmerBytesLabels {
@@ -386,7 +386,6 @@ async fn run_cycle(
                 },
             })
             .inc_by(warm_result.bytes_read);
-        let _ = QueryStatus::Ok; // suppress unused import
     }
 
     // 2. Plan cycle.

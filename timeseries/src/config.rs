@@ -237,3 +237,45 @@ impl TsdbRuntimeConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_load_config_defaults() {
+        let config = ReadLoadConfig::default();
+        assert_eq!(config.sample_permits, 32);
+        assert_eq!(config.metadata_permits, 16);
+    }
+
+    #[test]
+    fn metadata_warm_config_defaults() {
+        let config = MetadataWarmConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.preload_bytes, 0);
+        assert_eq!(config.refresh_interval, Duration::from_secs(60));
+        assert_eq!(config.rewarm_interval, Duration::from_secs(300));
+        assert_eq!(config.max_concurrent_buckets, 4);
+    }
+
+    #[test]
+    fn metadata_warm_config_enabled_when_preload_bytes_positive() {
+        let mut config = MetadataWarmConfig::default();
+        // Default is disabled (preload_bytes = 0).
+        assert!(!config.enabled);
+        // Simulate from_env with positive bytes.
+        config.enabled = config.preload_bytes > 0;
+        assert!(!config.enabled);
+        config.preload_bytes = 1024;
+        config.enabled = config.preload_bytes > 0;
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn tsdb_runtime_config_defaults() {
+        let config = TsdbRuntimeConfig::default();
+        assert_eq!(config.read_load.sample_permits, 32);
+        assert!(!config.metadata_warm.enabled);
+    }
+}
