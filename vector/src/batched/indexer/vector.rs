@@ -12,21 +12,15 @@ use common::StorageRead;
 use futures::future::BoxFuture;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::task;
 use tracing::debug;
-
-/// A new vector insert (no existing vector with this external_id).
-struct ResolvedInsert {
-    write: VectorWrite,
-    centroid: u64,
-}
 
 /// An upsert where we need to resolve the old vector data from storage.
 struct ResolvedUpsert {
     write: VectorWrite,
     old: (u64, VectorDataValue),
-    centroid: u64,
 }
 
 pub(crate) struct WriteVectors {
@@ -62,45 +56,43 @@ impl WriteVectors {
         let writes = Self::compact_writes(self.writes);
 
         // Partition into inserts (new vectors) vs upserts (existing external_id).
-        // Inserts need no I/O — just a centroid search. Upserts need a storage
-        // read to fetch the old vector data.
+        // Centroid assignment is computed separately on the blocking pool so it can run
+        // in parallel with the upsert storage reads.
         let centroid_graph = view.centroid_graph();
+        let assignment_inputs: Vec<_> = writes
+            .iter()
+            .map(|write| (write.external_id.clone(), write.values.clone()))
+            .collect();
+        let assignment_handle =
+            task::spawn_blocking(move || Self::assign_centroids(assignment_inputs, centroid_graph));
+
         let mut inserts = Vec::with_capacity(writes.len());
         let mut upsert_futures: Vec<BoxFuture<'static, Result<ResolvedUpsert>>> = Vec::new();
 
         for w in writes {
             let Some(old_vector_id) = view.vector_id(&w.external_id) else {
-                // New vector — resolve centroid synchronously, no I/O needed
-                let centroid = centroid_graph
-                    .search(&w.values, 1)
-                    .first()
-                    .copied()
-                    .ok_or_else(|| Internal("no centroids found".to_string()))?;
-                inserts.push(ResolvedInsert { write: w, centroid });
+                inserts.push(w);
                 continue;
             };
             // Upsert — need to read old vector data from storage
             let data_fut = view.vector_data(old_vector_id, self.opts.dimensions);
-            let this_centroid_graph = centroid_graph.clone();
             upsert_futures.push(Box::pin(async move {
-                let centroid = this_centroid_graph
-                    .search(&w.values, 1)
-                    .first()
-                    .copied()
-                    .ok_or_else(|| Internal("no centroids found".to_string()))?;
                 let old_data = data_fut.await?.ok_or_else(|| {
                     Internal(format!("missing vector data for id {}", old_vector_id))
                 })?;
                 Ok(ResolvedUpsert {
                     write: w,
                     old: (old_vector_id, old_data),
-                    centroid,
                 })
             }));
         }
 
-        // Resolve upserts concurrently (bounded by AsyncBatchDriver)
-        let upsert_results = AsyncBatchDriver::execute(upsert_futures).await;
+        // Resolve upserts concurrently (bounded by AsyncBatchDriver) while the
+        // centroid assignments run on the blocking pool.
+        let (centroid_assignments, upsert_results) =
+            tokio::join!(assignment_handle, AsyncBatchDriver::execute(upsert_futures));
+        let centroid_assignments = centroid_assignments
+            .map_err(|e| Internal(format!("centroid assignment task failed: {e}")))??;
         let mut upserts = Vec::with_capacity(upsert_results.len());
         for result in upsert_results {
             upserts.push(result?);
@@ -109,9 +101,17 @@ impl WriteVectors {
 
         // Apply inserts to delta (no old data to clean up)
         for insert in inserts {
-            let vector_id = delta.add_vector(&insert.write.external_id, &insert.write.attributes);
-            delta.add_to_posting(insert.centroid, vector_id, insert.write.values.clone());
-            for (attr_name, attr_value) in &insert.write.attributes {
+            let centroid = *centroid_assignments
+                .get(&insert.external_id)
+                .ok_or_else(|| {
+                    Internal(format!(
+                        "missing centroid assignment for external_id={}",
+                        insert.external_id
+                    ))
+                })?;
+            let vector_id = delta.add_vector(&insert.external_id, &insert.attributes);
+            delta.add_to_posting(centroid, vector_id, insert.values.clone());
+            for (attr_name, attr_value) in &insert.attributes {
                 if attr_name == VECTOR_FIELD_NAME {
                     continue;
                 }
@@ -125,11 +125,19 @@ impl WriteVectors {
 
         // Apply upserts to delta
         for upsert in upserts {
+            let centroid = *centroid_assignments
+                .get(&upsert.write.external_id)
+                .ok_or_else(|| {
+                    Internal(format!(
+                        "missing centroid assignment for external_id={}",
+                        upsert.write.external_id
+                    ))
+                })?;
             let (old_vector_id, _old_vector_data) = upsert.old;
             delta.delete_vector(old_vector_id);
             // todo: delete from old postings and inverted index
             let vector_id = delta.add_vector(&upsert.write.external_id, &upsert.write.attributes);
-            delta.add_to_posting(upsert.centroid, vector_id, upsert.write.values.clone());
+            delta.add_to_posting(centroid, vector_id, upsert.write.values.clone());
             for (attr_name, attr_value) in &upsert.write.attributes {
                 if attr_name == VECTOR_FIELD_NAME {
                     continue;
@@ -142,6 +150,31 @@ impl WriteVectors {
             }
         }
         Ok(())
+    }
+
+    fn assign_centroids(
+        writes: Vec<(String, Vec<f32>)>,
+        centroid_graph: Arc<crate::batched::indexer::state::DirtyCentroidGraph>,
+    ) -> Result<HashMap<String, u64>> {
+        let assignments: Vec<_> = writes
+            .into_par_iter()
+            .map(|(external_id, values)| {
+                centroid_graph
+                    .search(&values, 1)
+                    .first()
+                    .copied()
+                    .ok_or_else(|| Internal("no centroids found".to_string()))
+                    .map(|centroid| (external_id, centroid))
+            })
+            .collect();
+
+        let mut centroid_assignments = HashMap::with_capacity(assignments.len());
+        for assignment in assignments {
+            let (external_id, centroid) = assignment?;
+            centroid_assignments.insert(external_id, centroid);
+        }
+
+        Ok(centroid_assignments)
     }
 
     fn compact_writes(updates: Vec<VectorWrite>) -> Vec<VectorWrite> {
