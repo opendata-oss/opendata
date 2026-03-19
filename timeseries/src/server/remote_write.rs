@@ -241,7 +241,8 @@ pub async fn handle_remote_write(
             // Increment successful ingestion counter
             state
                 .metrics
-                .remote_write_samples_ingested
+                .remote_write
+                .samples_ingested
                 .inc_by(total_samples as u64);
             tracing::debug!("Successfully ingested remote write request");
 
@@ -252,7 +253,8 @@ pub async fn handle_remote_write(
             // Increment failed ingestion counter
             state
                 .metrics
-                .remote_write_samples_failed
+                .remote_write
+                .samples_failed
                 .inc_by(total_samples as u64);
             tracing::error!("Failed to ingest remote write request: {}", e);
             Err(e.into())

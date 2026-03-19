@@ -133,3 +133,116 @@ impl Default for ReaderConfig {
         }
     }
 }
+
+// ── Runtime config (parsed from env at startup) ──────────────────────
+
+/// Configuration for read-path load budgeting (semaphore permits).
+#[derive(Debug, Clone)]
+pub(crate) struct ReadLoadConfig {
+    pub sample_permits: usize,
+    pub metadata_permits: usize,
+}
+
+impl ReadLoadConfig {
+    const DEFAULT_SAMPLE_PERMITS: usize = 32;
+    const DEFAULT_METADATA_PERMITS: usize = 16;
+
+    pub(crate) fn from_env() -> Self {
+        let sample = std::env::var("TSDB_SAMPLE_PERMITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(Self::DEFAULT_SAMPLE_PERMITS);
+        let metadata = std::env::var("TSDB_METADATA_PERMITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(Self::DEFAULT_METADATA_PERMITS);
+        Self {
+            sample_permits: sample,
+            metadata_permits: metadata,
+        }
+    }
+}
+
+impl Default for ReadLoadConfig {
+    fn default() -> Self {
+        Self {
+            sample_permits: Self::DEFAULT_SAMPLE_PERMITS,
+            metadata_permits: Self::DEFAULT_METADATA_PERMITS,
+        }
+    }
+}
+
+/// Configuration for the background metadata warmer.
+#[derive(Debug, Clone)]
+pub(crate) struct MetadataWarmConfig {
+    pub enabled: bool,
+    pub preload_bytes: u64,
+    pub refresh_interval: Duration,
+    pub rewarm_interval: Duration,
+    pub max_concurrent_buckets: usize,
+}
+
+impl MetadataWarmConfig {
+    pub(crate) fn from_env() -> Self {
+        let preload_bytes = std::env::var("TSDB_METADATA_PRELOAD_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0u64);
+        let refresh_secs = std::env::var("TSDB_METADATA_REFRESH_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60u64);
+        let rewarm_secs = std::env::var("TSDB_METADATA_REWARM_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300u64);
+        let concurrency = std::env::var("TSDB_METADATA_PRELOAD_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4usize);
+        Self {
+            enabled: preload_bytes > 0,
+            preload_bytes,
+            refresh_interval: Duration::from_secs(refresh_secs),
+            rewarm_interval: Duration::from_secs(rewarm_secs),
+            max_concurrent_buckets: concurrency,
+        }
+    }
+}
+
+impl Default for MetadataWarmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            preload_bytes: 0,
+            refresh_interval: Duration::from_secs(60),
+            rewarm_interval: Duration::from_secs(300),
+            max_concurrent_buckets: 4,
+        }
+    }
+}
+
+/// Top-level runtime config for Tsdb, aggregating all subsystem configs.
+#[derive(Debug, Clone)]
+pub(crate) struct TsdbRuntimeConfig {
+    pub read_load: ReadLoadConfig,
+    pub metadata_warm: MetadataWarmConfig,
+}
+
+impl TsdbRuntimeConfig {
+    pub(crate) fn from_env() -> Self {
+        Self {
+            read_load: ReadLoadConfig::from_env(),
+            metadata_warm: MetadataWarmConfig::from_env(),
+        }
+    }
+}
+
+impl Default for TsdbRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            read_load: ReadLoadConfig::default(),
+            metadata_warm: MetadataWarmConfig::default(),
+        }
+    }
+}

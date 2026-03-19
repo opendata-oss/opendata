@@ -11,6 +11,7 @@ use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 use tokio::sync::RwLock;
 use tracing::{Instrument, error};
 
+use crate::config::TsdbRuntimeConfig;
 use crate::error::QueryError;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::load_coordinator::ReadLoadCoordinator;
@@ -24,6 +25,12 @@ use crate::promql::selector::evaluate_selector_with_reader;
 use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::util::Result;
+
+#[cfg(feature = "http-server")]
+use crate::server::metrics::{
+    Metrics, QueryLabels, QueryOperation, QueryOperationLabels, QueryPhase, QueryPhaseLabels,
+    QueryStatus, QueryWorkKind, QueryWorkLabels,
+};
 
 /// Compute the disjoint preload ranges for bucket discovery.
 ///
@@ -180,7 +187,8 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
-        evaluate_range(&reader, stmt, self.load_coordinator()).await
+        let (result, _stats) = evaluate_range(&reader, stmt, self.load_coordinator()).await?;
+        Ok(result)
     }
 
     /// Discover series matching any of the given selectors.
@@ -313,11 +321,12 @@ pub(crate) async fn evaluate_instant(
 }
 
 /// Evaluate a range PromQL query against the given reader.
+/// Returns the result and the EvalStats for metrics publishing.
 pub(crate) async fn evaluate_range(
     reader: &impl QueryReader,
     stmt: EvalStmt,
     coordinator: Option<&ReadLoadCoordinator>,
-) -> std::result::Result<Vec<RangeSample>, QueryError> {
+) -> std::result::Result<(Vec<RangeSample>, crate::promql::evaluator::EvalStats), QueryError> {
     let total_start = std::time::Instant::now();
     let start = stmt.start;
     let end = stmt.end;
@@ -445,10 +454,117 @@ pub(crate) async fn evaluate_range(
         "evaluate_range complete"
     );
 
-    Ok(series_map
+    let mut stats = evaluator.into_stats();
+    stats.step_loop_ms = step_loop_ms;
+
+    let result: Vec<RangeSample> = series_map
         .into_iter()
         .map(|(labels, samples)| RangeSample { labels, samples })
-        .collect())
+        .collect();
+    Ok((result, stats))
+}
+
+/// Publish query metrics into the Prometheus registry.
+#[cfg(feature = "http-server")]
+fn publish_query_metrics(metrics: &Metrics, total_duration_secs: f64, is_ok: bool) {
+    let op = QueryOperation::QueryRange;
+    let status = if is_ok {
+        QueryStatus::Ok
+    } else {
+        QueryStatus::Error
+    };
+
+    metrics
+        .query
+        .requests_total
+        .get_or_create(&QueryLabels {
+            operation: op.clone(),
+            status: status.clone(),
+        })
+        .inc();
+    metrics
+        .query
+        .duration_seconds
+        .get_or_create(&QueryLabels {
+            operation: op,
+            status,
+        })
+        .observe(total_duration_secs);
+}
+
+/// Publish detailed phase-level query metrics from EvalStats.
+#[cfg(feature = "http-server")]
+pub(crate) fn publish_query_phase_metrics(
+    metrics: &Metrics,
+    stats: &crate::promql::evaluator::EvalStats,
+) {
+    let op = QueryOperation::QueryRange;
+
+    // Phase wall durations
+    metrics
+        .query
+        .phase_wall_duration_seconds
+        .get_or_create(&QueryPhaseLabels {
+            operation: op.clone(),
+            phase: QueryPhase::Preload,
+        })
+        .observe(stats.preload_ms as f64 / 1000.0);
+    metrics
+        .query
+        .phase_wall_duration_seconds
+        .get_or_create(&QueryPhaseLabels {
+            operation: op.clone(),
+            phase: QueryPhase::StepLoop,
+        })
+        .observe(stats.step_loop_ms as f64 / 1000.0);
+
+    // Phase work durations
+    metrics
+        .query
+        .phase_work_duration_seconds
+        .get_or_create(&QueryWorkLabels {
+            operation: op.clone(),
+            kind: QueryWorkKind::MetadataQueueWait,
+        })
+        .observe(stats.metadata_queue_wait_ms as f64 / 1000.0);
+    metrics
+        .query
+        .phase_work_duration_seconds
+        .get_or_create(&QueryWorkLabels {
+            operation: op.clone(),
+            kind: QueryWorkKind::MetadataLoad,
+        })
+        .observe(stats.metadata_load_ms as f64 / 1000.0);
+    metrics
+        .query
+        .phase_work_duration_seconds
+        .get_or_create(&QueryWorkLabels {
+            operation: op.clone(),
+            kind: QueryWorkKind::SampleQueueWait,
+        })
+        .observe(stats.sample_queue_wait_ms as f64 / 1000.0);
+    metrics
+        .query
+        .phase_work_duration_seconds
+        .get_or_create(&QueryWorkLabels {
+            operation: op.clone(),
+            kind: QueryWorkKind::SampleLoad,
+        })
+        .observe(stats.sample_load_ms as f64 / 1000.0);
+
+    // Volume counters
+    metrics
+        .query
+        .samples_loaded_total
+        .get_or_create(&QueryOperationLabels {
+            operation: op.clone(),
+        })
+        .inc_by(stats.samples_loaded);
+    metrics
+        .query
+        .forward_index_series_loaded_total
+        .get_or_create(&QueryOperationLabels { operation: op })
+        .inc_by(stats.forward_index_misses);
 }
 
 /// Discover series matching any of the given selectors.
@@ -608,10 +724,20 @@ pub(crate) struct Tsdb {
     pub(crate) metadata_catalog: RwLock<HashMap<String, Vec<MetricMetadata>>>,
 
     load_coordinator: ReadLoadCoordinator,
+    pub(crate) runtime_config: TsdbRuntimeConfig,
+    #[cfg(feature = "http-server")]
+    metrics: std::sync::OnceLock<Arc<Metrics>>,
 }
 
 impl Tsdb {
     pub(crate) fn new(storage: Arc<dyn Storage>) -> Self {
+        Self::with_runtime_config(storage, TsdbRuntimeConfig::from_env())
+    }
+
+    pub(crate) fn with_runtime_config(
+        storage: Arc<dyn Storage>,
+        config: TsdbRuntimeConfig,
+    ) -> Self {
         // TTI cache: 15 minute idle timeout for ingest buckets
         let ingest_cache = Cache::builder()
             .time_to_idle(Duration::from_secs(15 * 60))
@@ -620,13 +746,32 @@ impl Tsdb {
         // LRU cache: max 50 buckets for query
         let query_cache = Cache::builder().max_capacity(50).build();
 
+        let load_coordinator = ReadLoadCoordinator::from_config(&config.read_load);
+
         Self {
             storage,
             ingest_cache,
             query_cache,
             metadata_catalog: RwLock::new(HashMap::new()),
-            load_coordinator: ReadLoadCoordinator::from_env(),
+            load_coordinator,
+            runtime_config: config,
+            #[cfg(feature = "http-server")]
+            metrics: std::sync::OnceLock::new(),
         }
+    }
+
+    #[cfg(feature = "http-server")]
+    pub(crate) fn attach_metrics(&self, metrics: Arc<Metrics>) {
+        let _ = self.metrics.set(metrics);
+    }
+
+    #[cfg(feature = "http-server")]
+    pub(crate) fn metrics(&self) -> Option<&Arc<Metrics>> {
+        self.metrics.get()
+    }
+
+    pub(crate) fn storage(&self) -> &Arc<dyn Storage> {
+        &self.storage
     }
 
     /// Get or create a MiniTsdb for ingestion into a specific bucket.
@@ -846,8 +991,8 @@ impl Tsdb {
     /// Evaluate a range PromQL query, returning typed `RangeSample`s.
     ///
     /// This inherent method converts `impl RangeBounds<SystemTime>` to the
-    /// `(start, end)` pair expected by `TsdbReadEngine`. The other 5 read methods
-    /// live on the `TsdbReadEngine` trait directly (identical signatures).
+    /// `(start, end)` pair expected by `TsdbReadEngine`. It captures EvalStats
+    /// for metrics publishing when the http-server feature is enabled.
     pub(crate) async fn eval_query_range(
         &self,
         query: &str,
@@ -855,7 +1000,46 @@ impl Tsdb {
         step: Duration,
         opts: &QueryOptions,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-        eval_query_range_bounds(self, query, range, step, opts).await
+        let t0 = std::time::Instant::now();
+        let (start, end) = crate::util::range_bounds_to_system_time(range);
+
+        let expr = promql_parser::parser::parse(query)
+            .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
+
+        let lookback_delta = opts.lookback_delta;
+        let stmt = EvalStmt {
+            expr,
+            start,
+            end,
+            interval: step,
+            lookback_delta,
+        };
+
+        let default_start_secs = start
+            .checked_sub(lookback_delta)
+            .unwrap_or(UNIX_EPOCH)
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs() as i64;
+        let default_end_secs = end.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
+        let reader = self.make_query_reader_for_ranges(&ranges).await?;
+
+        let eval_result = evaluate_range(&reader, stmt, self.load_coordinator()).await;
+
+        #[cfg(feature = "http-server")]
+        if let Some(metrics) = self.metrics() {
+            let total_secs = t0.elapsed().as_secs_f64();
+            let is_ok = eval_result.is_ok();
+            publish_query_metrics(metrics, total_secs, is_ok);
+            if let Ok((ref _result, ref stats)) = eval_result {
+                publish_query_phase_metrics(metrics, stats);
+            }
+        }
+        let _ = t0;
+
+        eval_result.map(|(result, _stats)| result)
     }
 
     /// Return metadata for all (or a specific) metric.

@@ -144,6 +144,9 @@ impl TimeSeriesHttpServer {
         self.storage.register_metrics(metrics.registry_mut());
         let metrics = Arc::new(metrics);
 
+        // Attach metrics to TSDB for query metrics publishing
+        self.tsdb.attach_metrics(metrics.clone());
+
         // Start the scraper if there are scrape configs
         if !self.config.prometheus_config.scrape_configs.is_empty() {
             let scraper = Arc::new(Scraper::new(

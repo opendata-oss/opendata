@@ -116,14 +116,16 @@ impl Scraper {
             Ok(sample_count) => {
                 // Record samples scraped
                 self.metrics
-                    .scrape_samples_scraped
+                    .scrape
+                    .samples_scraped
                     .get_or_create(&scrape_labels)
                     .inc_by(*sample_count as u64);
             }
             Err(_) => {
                 // Record failed scrape
                 self.metrics
-                    .scrape_samples_failed
+                    .scrape
+                    .samples_failed
                     .get_or_create(&scrape_labels)
                     .inc();
             }

@@ -20,7 +20,7 @@ struct InFlightGuard {
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.metrics.http_requests_in_flight.dec();
+        self.metrics.http.requests_in_flight.dec();
     }
 }
 
@@ -73,7 +73,7 @@ where
         let endpoint = normalize_endpoint(request.uri().path());
         let metrics = self.metrics.clone();
 
-        metrics.http_requests_in_flight.inc();
+        metrics.http.requests_in_flight.inc();
         let _guard = InFlightGuard {
             metrics: metrics.clone(),
         };
@@ -88,7 +88,8 @@ where
 
             // Record request count
             metrics
-                .http_requests_total
+                .http
+                .requests_total
                 .get_or_create(&HttpLabelsWithStatus {
                     method: method.clone(),
                     endpoint: endpoint.clone(),
@@ -98,7 +99,8 @@ where
 
             // Record request latency
             metrics
-                .http_request_duration_seconds
+                .http
+                .request_duration_seconds
                 .get_or_create(&HttpLabels { method, endpoint })
                 .observe(duration);
 
@@ -232,16 +234,16 @@ mod tests {
             metrics: metrics.clone(),
         };
 
-        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+        assert_eq!(metrics.http.requests_in_flight.get(), 0);
 
         // when
         let future = service.call(test_request("/test"));
-        assert_eq!(metrics.http_requests_in_flight.get(), 1);
+        assert_eq!(metrics.http.requests_in_flight.get(), 1);
         let response = future.await.unwrap();
 
         // then
         assert_eq!(response.status().as_u16(), 200);
-        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+        assert_eq!(metrics.http.requests_in_flight.get(), 0);
     }
 
     #[tokio::test]
@@ -258,16 +260,16 @@ mod tests {
             metrics: metrics.clone(),
         };
 
-        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+        assert_eq!(metrics.http.requests_in_flight.get(), 0);
 
         // when
         let future = service.call(test_request("/test"));
-        assert_eq!(metrics.http_requests_in_flight.get(), 1);
+        assert_eq!(metrics.http.requests_in_flight.get(), 1);
         let result = future.await;
 
         // then
         assert!(result.is_err());
-        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+        assert_eq!(metrics.http.requests_in_flight.get(), 0);
     }
 
     #[tokio::test]
@@ -281,16 +283,16 @@ mod tests {
             metrics: metrics.clone(),
         };
 
-        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+        assert_eq!(metrics.http.requests_in_flight.get(), 0);
 
         // when — call returns a future (gauge incremented), then drop it
         let future = service.call(test_request("/api/v1/query"));
-        assert_eq!(metrics.http_requests_in_flight.get(), 1);
+        assert_eq!(metrics.http.requests_in_flight.get(), 1);
 
         drop(future);
 
         // then — gauge must return to zero despite the future never completing
-        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+        assert_eq!(metrics.http.requests_in_flight.get(), 0);
     }
 
     #[test]

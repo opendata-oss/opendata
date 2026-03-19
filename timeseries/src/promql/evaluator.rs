@@ -1498,6 +1498,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         &self.reader.stats
     }
 
+    /// Consume the evaluator and return the aggregated statistics.
+    pub(crate) fn into_stats(self) -> EvalStats {
+        self.reader.stats
+    }
+
     /// Preload VectorSelector data for all steps of a range query.
     /// Must be called before the step loop. Walks the AST, deduplicates selectors,
     /// and builds dense per-step sample arrays for O(1) per-step lookup.

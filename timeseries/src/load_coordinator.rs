@@ -2,8 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-const DEFAULT_SAMPLE_PERMITS: usize = 32;
-const DEFAULT_METADATA_PERMITS: usize = 16;
+use crate::config::ReadLoadConfig;
 
 #[derive(Clone)]
 pub(crate) struct ReadLoadCoordinator {
@@ -13,7 +12,7 @@ pub(crate) struct ReadLoadCoordinator {
 
 impl Default for ReadLoadCoordinator {
     fn default() -> Self {
-        Self::new(DEFAULT_SAMPLE_PERMITS, DEFAULT_METADATA_PERMITS)
+        Self::from_config(&ReadLoadConfig::default())
     }
 }
 
@@ -25,18 +24,14 @@ impl ReadLoadCoordinator {
         }
     }
 
+    /// Build from a ReadLoadConfig.
+    pub(crate) fn from_config(config: &ReadLoadConfig) -> Self {
+        Self::new(config.sample_permits, config.metadata_permits)
+    }
+
     /// Build from environment variables, falling back to defaults.
-    /// Reads TSDB_SAMPLE_PERMITS and TSDB_METADATA_PERMITS.
     pub(crate) fn from_env() -> Self {
-        let sample = std::env::var("TSDB_SAMPLE_PERMITS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_SAMPLE_PERMITS);
-        let metadata = std::env::var("TSDB_METADATA_PERMITS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_METADATA_PERMITS);
-        Self::new(sample, metadata)
+        Self::from_config(&ReadLoadConfig::from_env())
     }
 
     /// Acquire a sample permit. Returns an owned permit (held across .await) and the wait duration.
