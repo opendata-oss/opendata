@@ -67,6 +67,9 @@ pub trait CentroidGraph: Send + Sync {
     /// Returns `None` if the centroid is not in the graph.
     fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>>;
 
+    /// Return all live centroid IDs currently present in the graph.
+    fn all_centroid_ids(&self) -> Vec<u64>;
+
     /// Returns the number of centroids in the graph.
     fn len(&self) -> usize;
 

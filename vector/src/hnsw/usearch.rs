@@ -172,6 +172,10 @@ impl CentroidGraph for UsearchCentroidGraph {
             .get_centroid_vector(centroid_id)
     }
 
+    fn all_centroid_ids(&self) -> Vec<u64> {
+        self.inner.read().expect("lock poisoned").all_centroid_ids()
+    }
+
     fn len(&self) -> usize {
         self.inner.read().expect("lock poisoned").len()
     }
@@ -287,6 +291,10 @@ impl UsearchCentroidGraphInner {
 
     fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>> {
         self.centroid_vectors.get(&centroid_id).cloned()
+    }
+
+    fn all_centroid_ids(&self) -> Vec<u64> {
+        self.centroid_vectors.keys().copied().collect()
     }
 
     fn len(&self) -> usize {
