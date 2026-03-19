@@ -69,6 +69,7 @@ pub(crate) struct VectorIndexDelta {
     vector_updates: HashMap<u64, VectorDataValue>,
     vector_deletes: HashSet<u64>,
     id_allocator: SequenceAllocator,
+    current_posting: HashMap<u64, u64>,
     ops: Vec<RecordOp>,
 }
 
@@ -83,6 +84,7 @@ impl VectorIndexDelta {
             dictionary_updates: HashMap::new(),
             vector_updates: HashMap::new(),
             vector_deletes: HashSet::new(),
+            current_posting: HashMap::new(),
             id_allocator: SequenceAllocator::new(
                 initial_state.sequence_block_key.clone(),
                 initial_state.sequence_block.clone()
@@ -134,6 +136,7 @@ impl VectorIndexDelta {
     }
 
     pub(crate) fn add_to_posting(&mut self, centroid_id: u64, vector_id: u64, vector: Vec<f32>) {
+        self.current_posting.insert(vector_id, centroid_id);
         self.posting_updates
             .entry(centroid_id)
             .or_default()
@@ -143,6 +146,9 @@ impl VectorIndexDelta {
     }
 
     pub(crate) fn remove_from_posting(&mut self, centroid_id: u64, vector_id: u64) {
+        if self.current_posting.get(&vector_id).cloned() == Some(centroid_id) {
+            self.current_posting.remove(&vector_id);
+        }
         self.posting_updates
             .entry(centroid_id)
             .or_default()
@@ -244,6 +250,11 @@ impl<'a> VectorIndexView<'a> {
                 snapshot.get_vector_data(vector_id, dimensions).await
             })
         }
+    }
+
+    /// The last written posting for the vector in this delta only
+    pub(crate) fn last_written_posting(&self, vector_id: u64) -> Option<u64> {
+        self.delta.current_posting.get(&vector_id).cloned()
     }
 
     pub(crate) fn centroid_counts(&self) -> HashMap<u64, u64> {
