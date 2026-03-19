@@ -3952,7 +3952,7 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 [[package]]
 name = "slatedb"
 version = "0.11.1"
-source = "git+https://github.com/hachikuji/slatedb.git?branch=parallel-l0-flush#f34a5ea6c6041f5e00116d8cd2c6e6d156f7806a"
+source = "git+https://github.com/hachikuji/slatedb.git?branch=parallel-l0-flush#953034ba6cefdb6632fde65070aac7231f8ce0d6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3999,7 +3999,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.11.1"
-source = "git+https://github.com/hachikuji/slatedb.git?branch=parallel-l0-flush#f34a5ea6c6041f5e00116d8cd2c6e6d156f7806a"
+source = "git+https://github.com/hachikuji/slatedb.git?branch=parallel-l0-flush#953034ba6cefdb6632fde65070aac7231f8ce0d6"
 dependencies = [
  "chrono",
  "tokio",
@@ -4008,7 +4008,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.11.1"
-source = "git+https://github.com/hachikuji/slatedb.git?branch=parallel-l0-flush#f34a5ea6c6041f5e00116d8cd2c6e6d156f7806a"
+source = "git+https://github.com/hachikuji/slatedb.git?branch=parallel-l0-flush#953034ba6cefdb6632fde65070aac7231f8ce0d6"
 dependencies = [
  "async-trait",
  "bytes",
