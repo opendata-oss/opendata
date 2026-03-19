@@ -226,8 +226,8 @@ impl VectorDb {
         let coordinator_config = WriteCoordinatorConfig {
             queue_capacity: 1000,
             flush_interval: Duration::from_secs(5),
-            // flush_size_threshold: 1000,
-            flush_size_threshold: 64 * 1024 * 1024,
+            flush_size_threshold: 10000,
+            // flush_size_threshold: 64 * 1024 * 1024,
         };
         let mut write_coordinator = WriteCoordinator::new(
             coordinator_config,
