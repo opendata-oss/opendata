@@ -2513,6 +2513,7 @@ name = "opendata-ingest"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures",
  "opendata-common",
  "serde",
  "serde_with",

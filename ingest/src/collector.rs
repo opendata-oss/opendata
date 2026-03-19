@@ -2,6 +2,8 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::stream;
+use futures::StreamExt;
 use slatedb::object_store::ObjectStore;
 use slatedb::object_store::path::Path;
 
@@ -172,15 +174,18 @@ fn delete_dequeued_batches(object_store: Arc<dyn ObjectStore>, entries: Vec<Queu
         return;
     }
     tokio::spawn(async move {
-        for entry in entries {
-            let path = Path::from(entry.location.as_str());
-            if let Err(e) = object_store.delete(&path).await {
+        let locations = stream::iter(entries.iter().map(|e| Ok(Path::from(e.location.as_str()))));
+        let mut results = object_store.delete_stream(locations.boxed());
+        let mut i = 0;
+        while let Some(result) = results.next().await {
+            if let Err(e) = result {
                 tracing::warn!(
-                    path = entry.location,
+                    path = entries[i].location,
                     error = %e,
                     "failed to delete ingested data batch"
                 );
             }
+            i += 1;
         }
     });
 }
