@@ -558,6 +558,8 @@ impl Benchmark for RecallBenchmark {
             num_vectors = base_vectors.len() as u64;
 
             let ingest_start = std::time::Instant::now();
+            let mut last_progress = ingest_start;
+            let mut last_progress_vectors = 0usize;
             let batch_size = 10;
             let num_batches = base_vectors.len().div_ceil(batch_size);
             for (batch_idx, chunk) in base_vectors.chunks(batch_size).enumerate() {
@@ -571,7 +573,23 @@ impl Benchmark for RecallBenchmark {
                     .collect();
                 db.write(batch).await?;
                 if (batch_idx + 1) % 10_000 == 0 {
-                    println!("  Written batch {}/{}", batch_idx + 1, num_batches);
+                    let ingested_vectors = (batch_idx + 1) * batch_size;
+                    let observed_vectors = ingested_vectors - last_progress_vectors;
+                    let elapsed = last_progress.elapsed().as_secs_f64();
+                    let observed_throughput = if elapsed > 0.0 {
+                        observed_vectors as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "  Written batch {}/{}, ingested {} vectors, observed throughput {:.0} vec/s",
+                        batch_idx + 1,
+                        num_batches,
+                        ingested_vectors,
+                        observed_throughput,
+                    );
+                    last_progress = std::time::Instant::now();
+                    last_progress_vectors = ingested_vectors;
                 }
             }
             db.flush().await?;
