@@ -15,6 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::task::spawn_blocking;
 
+const MAX_SPLITS: usize = usize::MAX;
+
 #[derive(Clone)]
 pub(crate) struct ReassignVector {
     pub(crate) vector_id: u64,
@@ -57,13 +59,15 @@ impl SplitCentroids {
         // find all centroids that need to be split, resolve their neighbours, and build up
         // a set of all postings that need to be fetched
         let counts = view.centroid_counts();
-        // compute the centroids that need to be split
-        let to_split = counts
+        // compute the centroids that need to be split, biggest first, capped at MAX_SPLITS
+        let mut to_split: Vec<_> = counts
             .into_iter()
             .filter(|(_k, v)| *v >= self.opts.split_threshold_vectors as u64)
-            .map(|(k, _v)| k)
-            .collect::<Vec<_>>();
-        if to_split.len() == 0 {
+            .collect();
+        to_split.sort_by(|a, b| b.1.cmp(&a.1));
+        to_split.truncate(MAX_SPLITS);
+        let to_split: Vec<u64> = to_split.into_iter().map(|(k, _v)| k).collect();
+        if to_split.is_empty() {
             return Ok(SplitCentroidsResult {
                 splits: 0,
                 reassignments: Vec::new(),
@@ -221,7 +225,7 @@ impl SplitCentroid {
             c: self.c,
             c_0: SplitPostings::new(c0_vector, c0_postings),
             c_1: SplitPostings::new(c1_vector, c1_postings),
-            reassign_vectors: vec![],
+            reassign_vectors: reassignments,
         }
     }
 
