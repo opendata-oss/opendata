@@ -1,2 +1,2 @@
 mod delta;
-mod lire;
+mod indexer; 

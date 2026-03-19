@@ -5,6 +5,7 @@
 
 mod usearch;
 
+use std::collections::HashSet;
 use crate::error::Result;
 
 use crate::serde::centroid_chunk::CentroidEntry;
@@ -27,6 +28,30 @@ pub trait CentroidGraph: Send + Sync {
     /// # Returns
     /// Vector of centroid_ids sorted by similarity (closest first)
     fn search(&self, query: &[f32], k: usize) -> Vec<u64>;
+
+    /// Search for k nearest centroids to a query vector. Exclude centroids with ids
+    /// from an exclude set. After search, factor in centroids from an include set.
+    /// The centroids from the include set are not part of the current graph, so must
+    /// be factored in after the graph search.
+    ///
+    /// # Arguments
+    /// * `query` - Query vector
+    /// * `k` - Number of nearest centroids to return
+    /// * `include` - New centroids to be considered after searching the graph
+    /// * `exclude` - Centroids to be excluded from the graph search
+    ///
+    /// # Returns
+    /// Vector of centroid_ids sorted by similarity (closest first)
+    fn search_with_include_exclude(
+        &self,
+        query: &[f32],
+        k: usize,
+        include: &[&CentroidEntry],
+        exclude: &HashSet<u64>,
+    ) -> Vec<u64> {
+        // TODO: dont implement this until you've rebased
+        unimplemented!();
+    }
 
     /// Add a centroid to the graph.
     ///
