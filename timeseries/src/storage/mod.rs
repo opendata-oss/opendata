@@ -254,6 +254,63 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
 
         Ok(values)
     }
+
+    // ── Warm helpers (touch storage to populate block cache) ────────
+
+    /// Warm the bucket list by reading it from storage. Returns the list of
+    /// buckets and the total bytes read (key + value).
+    async fn warm_bucket_list(&self) -> Result<WarmBucketListResult> {
+        let key = BucketListKey.encode();
+        let record = self.get(key).await?;
+        match record {
+            Some(record) => {
+                let bytes_read = (record.key.len() + record.value.len()) as u64;
+                let bucket_list = BucketListValue::decode(record.value.as_ref())?;
+                let buckets = bucket_list
+                    .buckets
+                    .into_iter()
+                    .map(|(size, start)| TimeBucket { size, start })
+                    .collect();
+                Ok(WarmBucketListResult { buckets, bytes_read })
+            }
+            None => Ok(WarmBucketListResult {
+                buckets: Vec::new(),
+                bytes_read: 0,
+            }),
+        }
+    }
+
+    /// Warm the forward index for a bucket by scanning all its keys.
+    /// Returns the total bytes read (sum of key + value sizes).
+    /// Does not decode values — only touches storage to populate cache.
+    async fn warm_forward_index_bytes(&self, bucket: TimeBucket) -> Result<u64> {
+        let range = ForwardIndexKey::bucket_range(&bucket);
+        let records = self.scan(range).await?;
+        let mut bytes = 0u64;
+        for record in records {
+            bytes += (record.key.len() + record.value.len()) as u64;
+        }
+        Ok(bytes)
+    }
+
+    /// Warm the inverted index for a bucket by scanning all its keys.
+    /// Returns the total bytes read (sum of key + value sizes).
+    /// Does not decode values — only touches storage to populate cache.
+    async fn warm_inverted_index_bytes(&self, bucket: TimeBucket) -> Result<u64> {
+        let range = InvertedIndexKey::bucket_range(&bucket);
+        let records = self.scan(range).await?;
+        let mut bytes = 0u64;
+        for record in records {
+            bytes += (record.key.len() + record.value.len()) as u64;
+        }
+        Ok(bytes)
+    }
+}
+
+/// Result of warming the bucket list.
+pub(crate) struct WarmBucketListResult {
+    pub buckets: Vec<TimeBucket>,
+    pub bytes_read: u64,
 }
 
 // Implement the trait for all types that implement StorageRead

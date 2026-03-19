@@ -616,7 +616,7 @@ impl Default for QueryOptions {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TimeBucket {
     pub(crate) start: BucketStart,
     pub(crate) size: BucketSize,

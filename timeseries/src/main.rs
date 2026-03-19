@@ -6,6 +6,7 @@ mod error;
 mod flusher;
 mod index;
 mod load_coordinator;
+mod metadata_warmer;
 mod minitsdb;
 mod model;
 #[cfg(feature = "otel")]
