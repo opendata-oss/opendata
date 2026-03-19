@@ -42,15 +42,25 @@ pub trait CentroidGraph: Send + Sync {
     ///
     /// # Returns
     /// Vector of centroid_ids sorted by similarity (closest first)
+    /// Search for k nearest centroids to a query vector. Exclude centroids with ids
+    /// from an exclude set. After search, factor in centroids from an include set.
+    /// The centroids from the include set are not part of the current graph, so must
+    /// be factored in after the graph search.
     fn search_with_include_exclude(
         &self,
         query: &[f32],
         k: usize,
-        include: &[&CentroidEntry],
+        _include: &[&CentroidEntry],
         exclude: &HashSet<u64>,
     ) -> Vec<u64> {
-        // TODO: dont implement this until you've rebased
-        unimplemented!();
+        // Default: search the graph and filter out excluded centroids.
+        // Does not consider include centroids — implementors should override
+        // for proper distance-based merging with include set.
+        self.search(query, k + exclude.len())
+            .into_iter()
+            .filter(|id| !exclude.contains(id))
+            .take(k)
+            .collect()
     }
 
     /// Add a centroid to the graph.

@@ -1,6 +1,6 @@
 //! HNSW implementation using the usearch library.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::RwLock;
 
@@ -29,6 +29,8 @@ struct UsearchCentroidGraphInner {
     centroid_vectors: HashMap<u64, Vec<f32>>,
     /// Next usearch key to allocate
     next_key: u64,
+    /// Distance metric used for computing distances
+    distance_metric: DistanceMetric,
 }
 
 /// HNSW graph implementation using the usearch library.
@@ -125,6 +127,7 @@ impl UsearchCentroidGraph {
                 centroid_to_key,
                 centroid_vectors,
                 next_key,
+                distance_metric,
             }),
         })
     }
@@ -133,6 +136,19 @@ impl UsearchCentroidGraph {
 impl CentroidGraph for UsearchCentroidGraph {
     fn search(&self, query: &[f32], k: usize) -> Vec<u64> {
         self.inner.read().expect("lock poisoned").search(query, k)
+    }
+
+    fn search_with_include_exclude(
+        &self,
+        query: &[f32],
+        k: usize,
+        include: &[&CentroidEntry],
+        exclude: &HashSet<u64>,
+    ) -> Vec<u64> {
+        self.inner
+            .read()
+            .expect("lock poisoned")
+            .search_with_include_exclude(query, k, include, exclude)
     }
 
     fn add_centroid(&self, entry: &CentroidEntry) -> Result<()> {
@@ -182,6 +198,54 @@ impl UsearchCentroidGraphInner {
             .filter_map(|&key| self.key_to_centroid.get(&key).copied())
             .take(k)
             .collect()
+    }
+
+    fn search_with_include_exclude(
+        &self,
+        query: &[f32],
+        k: usize,
+        include: &[&CentroidEntry],
+        exclude: &HashSet<u64>,
+    ) -> Vec<u64> {
+        // Search graph with extra capacity to account for excluded results
+        let graph_size = self.key_to_centroid.len();
+        let search_k = (k + exclude.len() + 10).min(graph_size + 10);
+
+        let mut candidates: Vec<(u64, f32)> = Vec::with_capacity(k + include.len());
+
+        if graph_size > 0 {
+            if let Ok(results) = self.index.search(query, search_k) {
+                for (&key, &dist) in results.keys.iter().zip(results.distances.iter()) {
+                    if let Some(&centroid_id) = self.key_to_centroid.get(&key) {
+                        if !exclude.contains(&centroid_id) {
+                            candidates.push((centroid_id, dist));
+                            if candidates.len() >= k + include.len() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Compute distances for include centroids (not in the graph)
+        for entry in include {
+            let dist = self.compute_distance(query, &entry.vector);
+            candidates.push((entry.centroid_id, dist));
+        }
+
+        // Sort by distance ascending and take top k
+        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.into_iter().take(k).map(|(id, _)| id).collect()
+    }
+
+    fn compute_distance(&self, a: &[f32], b: &[f32]) -> f32 {
+        match self.distance_metric {
+            DistanceMetric::L2 => a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum(),
+            DistanceMetric::DotProduct => {
+                1.0 - a.iter().zip(b.iter()).map(|(x, y)| x * y).sum::<f32>()
+            }
+        }
     }
 
     fn add_centroid(&mut self, entry: &CentroidEntry) -> Result<()> {
