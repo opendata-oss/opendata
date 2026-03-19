@@ -5,8 +5,8 @@
 
 mod usearch;
 
-use std::collections::HashSet;
 use crate::error::Result;
+use std::collections::HashSet;
 
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::collection_meta::DistanceMetric;

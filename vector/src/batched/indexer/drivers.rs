@@ -1,9 +1,8 @@
-use futures::future::{join_all, BoxFuture};
+use futures::future::{BoxFuture, join_all};
 use tokio::task::JoinSet;
 
 /// Driver for i/o heavy batches of tasks
-pub(crate) struct AsyncBatchDriver {
-}
+pub(crate) struct AsyncBatchDriver {}
 
 impl AsyncBatchDriver {
     pub(crate) async fn execute<T: Send + 'static>(batch: Vec<BoxFuture<'static, T>>) -> Vec<T> {
@@ -13,8 +12,6 @@ impl AsyncBatchDriver {
 }
 
 /// Driver for compute-heavy batches of tasks
-pub(crate) struct ComputeBatchDriver {
-}
+pub(crate) struct ComputeBatchDriver {}
 
-impl ComputeBatchDriver {
-}
+impl ComputeBatchDriver {}

@@ -1,20 +1,22 @@
-use std::collections::{HashMap, HashSet};
-use std::pin::Pin;
-use std::sync::Arc;
-use bytes::Bytes;
-use futures::future::BoxFuture;
-use roaring::RoaringTreemap;
-use common::storage::RecordOp;
-use common::{SequenceAllocator, StorageRead};
-use common::sequence::AllocatedSeqBlock;
 use crate::AttributeValue;
 use crate::Result;
 use crate::hnsw::CentroidGraph;
-use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::FieldValue;
-use crate::serde::posting_list::{merge_decoded_posting_lists, PostingList, PostingListValue, PostingUpdate};
+use crate::serde::centroid_chunk::CentroidEntry;
+use crate::serde::posting_list::{
+    PostingList, PostingListValue, PostingUpdate, merge_decoded_posting_lists,
+};
 use crate::serde::vector_data::{Field, VectorDataValue};
-use crate::storage::{record, VectorDbStorageReadExt};
+use crate::storage::{VectorDbStorageReadExt, record};
+use bytes::Bytes;
+use common::sequence::AllocatedSeqBlock;
+use common::storage::RecordOp;
+use common::{SequenceAllocator, StorageRead};
+use futures::future::BoxFuture;
+use roaring::RoaringTreemap;
+use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 struct CentroidChunkManager {
@@ -87,7 +89,7 @@ impl VectorIndexDelta {
             current_posting: HashMap::new(),
             id_allocator: SequenceAllocator::new(
                 initial_state.sequence_block_key.clone(),
-                initial_state.sequence_block.clone()
+                initial_state.sequence_block.clone(),
             ),
             ops: vec![],
         }
@@ -96,7 +98,7 @@ impl VectorIndexDelta {
     pub(crate) fn add_vector(
         &mut self,
         external_id: &str,
-        attributes: &[(String, AttributeValue)]
+        attributes: &[(String, AttributeValue)],
     ) -> u64 {
         let (vector_id, seq_alloc_put) = self.id_allocator.allocate_one();
         if let Some(seq_alloc_put) = seq_alloc_put {
@@ -108,7 +110,8 @@ impl VectorIndexDelta {
             .collect();
         let value = VectorDataValue::new(external_id, fields);
         self.vector_updates.insert(vector_id, value);
-        self.dictionary_updates.insert(String::from(external_id), vector_id);
+        self.dictionary_updates
+            .insert(String::from(external_id), vector_id);
         vector_id
     }
 
@@ -161,7 +164,7 @@ impl VectorIndexDelta {
         &mut self,
         field_name: String,
         field_value: FieldValue,
-        vector_id: u64
+        vector_id: u64,
     ) {
         let key = crate::serde::key::MetadataIndexKey::new(field_name, field_value).encode();
         #[allow(clippy::unwrap_or_default)]
@@ -185,15 +188,19 @@ impl VectorIndexDelta {
 pub(crate) struct VectorIndexView<'a> {
     delta: &'a VectorIndexDelta,
     state: &'a VectorIndexState,
-    snapshot: Arc<dyn StorageRead>
+    snapshot: Arc<dyn StorageRead>,
 }
 
 impl<'a> VectorIndexView<'a> {
-    pub(crate) fn new(delta: &'a VectorIndexDelta, state: &'a VectorIndexState, snapshot: Arc<dyn StorageRead>) -> Self {
+    pub(crate) fn new(
+        delta: &'a VectorIndexDelta,
+        state: &'a VectorIndexState,
+        snapshot: Arc<dyn StorageRead>,
+    ) -> Self {
         Self {
             delta,
             state,
-            snapshot
+            snapshot,
         }
     }
 
@@ -215,11 +222,7 @@ impl<'a> VectorIndexView<'a> {
         }
         let snapshot = self.snapshot.clone();
         Ok(Box::pin(async move {
-            all_postings.push(
-                snapshot
-                    .get_posting_list(centroid_id, dimensions)
-                    .await?,
-            );
+            all_postings.push(snapshot.get_posting_list(centroid_id, dimensions).await?);
             Ok(merge_decoded_posting_lists(all_postings).into())
         }))
     }
@@ -230,12 +233,10 @@ impl<'a> VectorIndexView<'a> {
         dimensions: usize,
     ) -> BoxFuture<'static, Result<Option<(u64, VectorDataValue)>>> {
         let Some(vector_id) = self.vector_id(external_id) else {
-            return Box::pin(async { Ok(None)});
+            return Box::pin(async { Ok(None) });
         };
         let fut = self.vector_data(vector_id, dimensions);
-        Box::pin(async move {
-            Ok(fut.await?.map(|d| (vector_id, d)))
-        })
+        Box::pin(async move { Ok(fut.await?.map(|d| (vector_id, d))) })
     }
 
     pub(crate) fn vector_data(
@@ -250,9 +251,7 @@ impl<'a> VectorIndexView<'a> {
             Box::pin(async move { Ok(Some(v)) })
         } else {
             let snapshot = self.snapshot.clone();
-            Box::pin(async move {
-                snapshot.get_vector_data(vector_id, dimensions).await
-            })
+            Box::pin(async move { snapshot.get_vector_data(vector_id, dimensions).await })
         }
     }
 
@@ -274,7 +273,7 @@ impl<'a> VectorIndexView<'a> {
         Arc::new(DirtyCentroidGraph {
             new_centroids: self.delta.new_centroids.clone(),
             deleted_centroids: self.delta.deleted_centroids.clone(),
-            inner: self.state.centroid_graph.clone()
+            inner: self.state.centroid_graph.clone(),
         })
     }
 }
@@ -288,12 +287,8 @@ pub(crate) struct DirtyCentroidGraph {
 impl DirtyCentroidGraph {
     pub(crate) fn search(&self, query: &[f32], k: usize) -> Vec<u64> {
         let include: Vec<_> = self.new_centroids.values().collect();
-        self.inner.search_with_include_exclude(
-            &query,
-            k,
-            &include,
-            &self.deleted_centroids
-        )
+        self.inner
+            .search_with_include_exclude(&query, k, &include, &self.deleted_centroids)
     }
 
     pub(crate) fn centroid(&self, centroid_id: u64) -> Option<CentroidEntry> {
@@ -302,8 +297,7 @@ impl DirtyCentroidGraph {
         } else if let Some(c) = self.new_centroids.get(&centroid_id) {
             Some(c.clone())
         } else {
-            self
-                .inner
+            self.inner
                 .get_centroid_vector(centroid_id)
                 .map(|v| CentroidEntry::new(centroid_id, v))
         }

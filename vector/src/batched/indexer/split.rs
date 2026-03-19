@@ -1,17 +1,19 @@
-use tokio::task::spawn_blocking;
+use crate::batched::indexer::drivers::AsyncBatchDriver;
+use crate::batched::indexer::indexer::IndexerOpts;
+use crate::batched::indexer::state::{
+    DirtyCentroidGraph, VectorIndexDelta, VectorIndexState, VectorIndexView,
+};
+use crate::lire::commands::SplitPostings;
+use crate::lire::{heuristics, kmeans};
+use crate::serde::posting_list::{Posting, PostingList};
+use crate::{DistanceMetric, Result, distance};
+use common::StorageRead;
+use futures::future::BoxFuture;
+use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use futures::future::BoxFuture;
-use rayon::iter::IntoParallelIterator;
-use common::StorageRead;
-use crate::batched::indexer::drivers::AsyncBatchDriver;
-use crate::batched::indexer::state::{DirtyCentroidGraph, VectorIndexDelta, VectorIndexState, VectorIndexView};
-use crate::lire::commands::SplitPostings;
-use crate::lire::{heuristics, kmeans};
-use crate::{distance, DistanceMetric, Result};
-use crate::batched::indexer::indexer::IndexerOpts;
-use crate::serde::posting_list::{Posting, PostingList};
+use tokio::task::spawn_blocking;
 
 #[derive(Clone)]
 pub(crate) struct ReassignVector {
@@ -29,29 +31,28 @@ struct SplitResult {
 
 pub(crate) struct SplitCentroidsResult {
     pub(crate) splits: usize,
-    pub(crate) reassignments: Vec<ReassignVector>
+    pub(crate) reassignments: Vec<ReassignVector>,
 }
 
 pub(crate) struct SplitCentroids {
     opts: Arc<IndexerOpts>,
-    snapshot: Arc<dyn StorageRead>
+    snapshot: Arc<dyn StorageRead>,
 }
 
 impl SplitCentroids {
     pub(crate) fn new(opts: &Arc<IndexerOpts>, snapshot: &Arc<dyn StorageRead>) -> Self {
-        Self {opts: opts.clone(), snapshot: snapshot.clone()}
+        Self {
+            opts: opts.clone(),
+            snapshot: snapshot.clone(),
+        }
     }
 
     pub(crate) async fn execute(
         self,
         state: &VectorIndexState,
-        delta: &mut VectorIndexDelta
+        delta: &mut VectorIndexDelta,
     ) -> Result<SplitCentroidsResult> {
-        let view = VectorIndexView::new(
-            delta,
-            state,
-            self.snapshot.clone()
-        );
+        let view = VectorIndexView::new(delta, state, self.snapshot.clone());
 
         // find all centroids that need to be split, resolve their neighbours, and build up
         // a set of all postings that need to be fetched
@@ -63,39 +64,41 @@ impl SplitCentroids {
             .map(|(k, _v)| k)
             .collect::<Vec<_>>();
         if to_split.len() == 0 {
-            return Ok(SplitCentroidsResult{ splits: 0, reassignments: Vec::new() });
+            return Ok(SplitCentroidsResult {
+                splits: 0,
+                reassignments: Vec::new(),
+            });
         }
 
         // initialize the set of postings to fetch with the split centroids
-        let mut postings_to_retrive = HashSet::with_capacity(to_split.len() * self.opts.split_search_neighbourhood);
+        let mut postings_to_retrive =
+            HashSet::with_capacity(to_split.len() * self.opts.split_search_neighbourhood);
         postings_to_retrive.extend(to_split.clone());
         let mut splits = Vec::with_capacity(to_split.len());
         let centroid_graph = view.centroid_graph();
         // collect each centroids neighbours and add to postings to fetch, and initialize splits
         for c in to_split {
-            let c_vec = centroid_graph.centroid(c).expect("unexpected missing centroid");
-            let neighbours = centroid_graph.search(&c_vec.vector, self.opts.split_search_neighbourhood);
+            let c_vec = centroid_graph
+                .centroid(c)
+                .expect("unexpected missing centroid");
+            let neighbours =
+                centroid_graph.search(&c_vec.vector, self.opts.split_search_neighbourhood);
             postings_to_retrive.extend(neighbours.clone());
-            splits.push(
-                SplitCentroid {
-                    c,
-                    neighbours,
-                    centroid_graph: centroid_graph.clone(),
-                    dimensions: self.opts.dimensions,
-                    distance_metric: self.opts.distance_metric,
-                }
-            )
+            splits.push(SplitCentroid {
+                c,
+                neighbours,
+                centroid_graph: centroid_graph.clone(),
+                dimensions: self.opts.dimensions,
+                distance_metric: self.opts.distance_metric,
+            })
         }
 
         // find all relevant postings (centroids and neighbours)
         let mut posting_reads = Vec::with_capacity(postings_to_retrive.len());
         for c in postings_to_retrive {
             let read_fut = view.posting_list(c, self.opts.dimensions)?;
-            posting_reads.push(
-                Box::pin(async move {
-                    read_fut.await.map(|p| (c, p))
-                }) as BoxFuture<'static, Result<(u64, PostingList)>>
-            );
+            posting_reads.push(Box::pin(async move { read_fut.await.map(|p| (c, p)) })
+                as BoxFuture<'static, Result<(u64, PostingList)>>);
         }
         let results = AsyncBatchDriver::execute(posting_reads).await;
         let mut postings = HashMap::new();
@@ -107,19 +110,24 @@ impl SplitCentroids {
 
         // execute splits. spawn a blocking task to avoid tying up runtime as this is compute heavy
         let nsplits = splits.len();
-        let results: Vec<_> = spawn_blocking(
-            move || splits
+        let results: Vec<_> = spawn_blocking(move || {
+            splits
                 .into_par_iter()
                 .map(|split| split.execute(postings.clone()))
                 .collect()
-        ).await.expect("unexpected jo");
+        })
+        .await
+        .expect("unexpected jo");
 
         // update delta
         let mut reassignments = HashMap::new();
         for result in results {
             // track reassignments
             reassignments.extend(
-                result.reassign_vectors.into_iter().map(|r| (r.vector_id, r))
+                result
+                    .reassign_vectors
+                    .into_iter()
+                    .map(|r| (r.vector_id, r)),
             );
 
             // delete old centroid
@@ -139,7 +147,7 @@ impl SplitCentroids {
         let reassignments: Vec<_> = reassignments.values().cloned().collect();
         Ok(SplitCentroidsResult {
             splits: nsplits,
-            reassignments
+            reassignments,
         })
     }
 }
@@ -153,20 +161,25 @@ struct SplitCentroid {
 }
 
 impl SplitCentroid {
-    fn execute(
-        self,
-        postings: Arc<HashMap<u64, PostingList>>,
-    ) -> SplitResult {
-        let c_postings = postings.get(&self.c).expect("unexpected missing postings for c");
-        assert!(c_postings.len() >= 2, "tried to split centroid {} with less than 2 postings", self.c);
+    fn execute(self, postings: Arc<HashMap<u64, PostingList>>) -> SplitResult {
+        let c_postings = postings
+            .get(&self.c)
+            .expect("unexpected missing postings for c");
+        assert!(
+            c_postings.len() >= 2,
+            "tried to split centroid {} with less than 2 postings",
+            self.c
+        );
         let c_vectors: Vec<(u64, Vec<f32>)> = c_postings
             .iter()
             .map(|p| (p.id(), p.vector().to_vec()))
             .collect();
 
         // Run two_means clustering to find new centroids
-        let c_vector_refs: Vec<(u64, &[f32])> =
-            c_vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        let c_vector_refs: Vec<(u64, &[f32])> = c_vectors
+            .iter()
+            .map(|(id, v)| (*id, v.as_slice()))
+            .collect();
         let clustering = kmeans::for_metric(self.distance_metric);
         let (c0_vector, c1_vector) = clustering.two_means(&c_vector_refs, self.dimensions);
 
@@ -186,7 +199,10 @@ impl SplitCentroid {
 
         // Compute reassignments
         let mut reassignments = Vec::with_capacity(c0_postings.len() + c1_postings.len());
-        let c_vector = self.centroid_graph.centroid(self.c).expect("unexpected missing centroid");
+        let c_vector = self
+            .centroid_graph
+            .centroid(self.c)
+            .expect("unexpected missing centroid");
         reassignments.extend(self.compute_split_reassignments(
             self.c,
             &c_postings,
@@ -198,7 +214,7 @@ impl SplitCentroid {
             &c_vector.vector,
             &c0_vector,
             &c1_vector,
-            postings.as_ref()
+            postings.as_ref(),
         ));
 
         SplitResult {
@@ -246,13 +262,15 @@ impl SplitCentroid {
         c_vector: &[f32],
         c0_vector: &[f32],
         c1_vector: &[f32],
-        postings: &HashMap<u64, PostingList>
+        postings: &HashMap<u64, PostingList>,
     ) -> Vec<ReassignVector> {
         let mut reassignments: Vec<ReassignVector> = Vec::new();
 
         // Process each neighbour's postings to find reassignments
         for neighbour_id in &self.neighbours {
-            let neighbour_postings = postings.get(neighbour_id).expect("missing postings for neighbour");
+            let neighbour_postings = postings
+                .get(neighbour_id)
+                .expect("missing postings for neighbour");
 
             for p in neighbour_postings.iter() {
                 // use the heuristic for neighbour vectors from the spfresh paper to cheaply

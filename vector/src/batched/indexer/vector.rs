@@ -1,19 +1,19 @@
-use rayon::iter::ParallelIterator;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use futures::future::BoxFuture;
-use rayon::iter::IntoParallelIterator;
-use common::StorageRead;
+use crate::Error::Internal;
+use crate::Result;
 use crate::batched::indexer::drivers::AsyncBatchDriver;
 use crate::batched::indexer::indexer::IndexerOpts;
 use crate::batched::indexer::split::ReassignVector;
 use crate::batched::indexer::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use crate::delta::VectorWrite;
-use crate::Error::Internal;
 use crate::model::VECTOR_FIELD_NAME;
-use crate::serde::vector_data::VectorDataValue;
-use crate::Result;
 use crate::serde::FieldValue;
+use crate::serde::vector_data::VectorDataValue;
+use common::StorageRead;
+use futures::future::BoxFuture;
+use rayon::iter::IntoParallelIterator;
+use rayon::iter::ParallelIterator;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 struct ResolvedVectorUpsert {
     write: VectorWrite,
@@ -24,32 +24,28 @@ struct ResolvedVectorUpsert {
 pub(crate) struct WriteVectors {
     opts: Arc<IndexerOpts>,
     snapshot: Arc<dyn StorageRead>,
-    writes: Vec<VectorWrite>
+    writes: Vec<VectorWrite>,
 }
 
 impl WriteVectors {
     pub(crate) fn new(
         opts: &Arc<IndexerOpts>,
         snapshot: &Arc<dyn StorageRead>,
-        writes: Vec<VectorWrite>
+        writes: Vec<VectorWrite>,
     ) -> Self {
         Self {
             opts: opts.clone(),
             snapshot: snapshot.clone(),
-            writes
+            writes,
         }
     }
 
     pub(crate) async fn execute(
         self,
         state: &VectorIndexState,
-        delta: &mut VectorIndexDelta
+        delta: &mut VectorIndexDelta,
     ) -> Result<()> {
-        let view = VectorIndexView::new(
-            delta,
-            state,
-            self.snapshot.clone()
-        );
+        let view = VectorIndexView::new(delta, state, self.snapshot.clone());
 
         // compact so last write for each external id wins
         let writes = Self::compact_writes(self.writes);
@@ -62,22 +58,18 @@ impl WriteVectors {
             // make sense to do them on the i/o tasks
             let this_centroid_graph = centroid_graph.clone();
             let data_fut = view.vector_data_for_external_id(&w.external_id, self.opts.dimensions);
-            to_resolve.push(
-                Box::pin(
-                    async move {
-                        let centroid = this_centroid_graph.search(&w.values, 1);
-                        let Some(&centroid) = centroid.first() else {
-                            return Err(Internal("no centroids found".to_string()));
-                        };
-                        Ok(ResolvedVectorUpsert {
-                            write: w,
-                            old: data_fut.await?,
-                            centroid
-                        })
-                    }
-                ) as BoxFuture<Result<ResolvedVectorUpsert>>
-            );
-        };
+            to_resolve.push(Box::pin(async move {
+                let centroid = this_centroid_graph.search(&w.values, 1);
+                let Some(&centroid) = centroid.first() else {
+                    return Err(Internal("no centroids found".to_string()));
+                };
+                Ok(ResolvedVectorUpsert {
+                    write: w,
+                    old: data_fut.await?,
+                    centroid,
+                })
+            }) as BoxFuture<Result<ResolvedVectorUpsert>>);
+        }
         let resolve_results = AsyncBatchDriver::execute(to_resolve).await;
         let mut resolved = Vec::with_capacity(resolve_results.len());
         for result in resolve_results {
@@ -93,10 +85,7 @@ impl WriteVectors {
                 delta.delete_vector(old_vector_id);
                 // todo: delete from old postings and inverted index
             }
-            let vector_id = delta.add_vector(
-                &upsert.write.external_id,
-                &upsert.write.attributes
-            );
+            let vector_id = delta.add_vector(&upsert.write.external_id, &upsert.write.attributes);
             delta.add_to_posting(upsert.centroid, vector_id, upsert.write.values.clone());
             for (attr_name, attr_value) in &upsert.write.attributes {
                 if attr_name == VECTOR_FIELD_NAME {
@@ -135,14 +124,14 @@ struct ResolvedVectorReassignment {
 pub(crate) struct ReassignVectors {
     opts: Arc<IndexerOpts>,
     snapshot: Arc<dyn StorageRead>,
-    reassignments: Vec<ReassignVector>
+    reassignments: Vec<ReassignVector>,
 }
 
 impl ReassignVectors {
     pub(crate) fn new(
         opts: &Arc<IndexerOpts>,
         snapshot: &Arc<dyn StorageRead>,
-        reassignments: Vec<ReassignVector>
+        reassignments: Vec<ReassignVector>,
     ) -> Self {
         Self {
             opts: opts.clone(),
@@ -154,22 +143,21 @@ impl ReassignVectors {
     pub(crate) async fn execute(
         mut self,
         state: &VectorIndexState,
-        delta: &mut VectorIndexDelta
+        delta: &mut VectorIndexDelta,
     ) -> Result<()> {
         let view = VectorIndexView::new(delta, state, self.snapshot);
         let centroid_graph = view.centroid_graph();
 
         // update current centroid in case centroid was moved as part of a split/merge
-        self.reassignments.
-            iter_mut()
-            .for_each(|r| {
-                if let Some(p) = view.last_written_posting(r.vector_id) {
-                    r.current_centroid = p;
-                }
-            });
+        self.reassignments.iter_mut().for_each(|r| {
+            if let Some(p) = view.last_written_posting(r.vector_id) {
+                r.current_centroid = p;
+            }
+        });
 
         // determine which vectors actually need a new assignment
-        let reassignments: Vec<_> = self.reassignments
+        let reassignments: Vec<_> = self
+            .reassignments
             .into_par_iter()
             .filter_map(|r| {
                 let &closest_centroid = centroid_graph
@@ -191,18 +179,15 @@ impl ReassignVectors {
         let mut to_resolve = Vec::with_capacity(reassignments.len());
         for r in reassignments {
             let data_fut = view.vector_data(r.reassignment.vector_id, self.opts.dimensions);
-            to_resolve.push(
-                Box::pin(
-                    async move {
-                        Ok(ResolvedVectorReassignment {
-                            reassignment: r.reassignment,
-                            data: data_fut.await?.expect("missing vector data"),
-                            centroid: r.centroid
-                        })
-                    }
-                ) as BoxFuture<Result<ResolvedVectorReassignment>>
-            );
-        };
+            to_resolve.push(Box::pin(async move {
+                Ok(ResolvedVectorReassignment {
+                    reassignment: r.reassignment,
+                    data: data_fut.await?.expect("missing vector data"),
+                    centroid: r.centroid,
+                })
+            })
+                as BoxFuture<Result<ResolvedVectorReassignment>>);
+        }
         let resolve_results = AsyncBatchDriver::execute(to_resolve).await;
         let mut resolved = Vec::with_capacity(resolve_results.len());
         for result in resolve_results {
