@@ -24,6 +24,28 @@ cargo run -p vector-bench --release -- --config bench.toml
 cargo run -p vector-bench --release -- --no-cleanup
 ```
 
+### Running Only The Centroid Graph Comparison
+
+This benchmark bypasses the full database and compares `usearch` and `sptag`
+directly on the same synthetic centroid/query set. It reports build time,
+query time, QPS, and the `sptag/usearch` ratios.
+
+```bash
+cargo run -p vector-bench --release -- --benchmark centroid_graph_compare
+```
+
+To override the default sizes, add a `[params.centroid_graph_compare]` section
+to the bench config:
+
+```toml
+[[params.centroid_graph_compare]]
+num_vectors = "100000"
+dimensions = "768"
+num_queries = "200"
+k = "25"
+seed = "7"
+```
+
 ### Skipping ingestion
 
 Set `VECTOR_BENCH_SKIP_INGEST=1` to skip the ingest phase and query an existing database. This requires persistent

@@ -1,48 +1,119 @@
 //! SPTAG-inspired centroid graph implementation.
 //!
-//! SPFresh maintains its head index as an explicit neighborhood graph and,
-//! during updates, refines the inserted node plus affected neighbors instead of
-//! relying on opaque dynamic HNSW mutations or full rebuilds. This module adapts
-//! that idea to the `CentroidGraph` abstraction used by `vector`.
+//! This follows the SPFresh/SPTAG head-index structure more closely than the
+//! prior graph-only version:
+//! - a BKT-style tree is used to seed search
+//! - a relative-neighborhood graph is used for refinement and traversal
+//! - inserts use a `RefineNode`-style local repair path
+//! - removals are tombstoned and periodically trigger tree/graph rebuilds
+//!
+//! The internal state is intentionally stored in flat vectors so the index can
+//! later be serialized externally without another structural redesign.
 
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::sync::RwLock;
 
-use crate::distance;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+
 use crate::error::{Error, Result};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::collection_meta::DistanceMetric;
 
 use super::CentroidGraph;
 
-const DEFAULT_NEIGHBORHOOD_SIZE: usize = 16;
-const DEFAULT_ENTRY_POINT_COUNT: usize = 8;
-const DEFAULT_SEARCH_BEAM: usize = 64;
-const DEFAULT_EXACT_SEARCH_THRESHOLD: usize = 256;
+const DEFAULT_TREE_NUMBER: usize = 1;
+const DEFAULT_BKT_KMEANS_K: usize = 32;
+const DEFAULT_BKT_LEAF_SIZE: usize = 8;
+const DEFAULT_BKT_SAMPLES: usize = 1000;
+const DEFAULT_NEIGHBORHOOD_SIZE: usize = 32;
+const DEFAULT_CEF: usize = 96;
+const DEFAULT_ADD_CEF: usize = 48;
+const DEFAULT_MAX_CHECK: usize = 512;
+const DEFAULT_INITIAL_DYNAMIC_PIVOTS: usize = 16;
+const DEFAULT_OTHER_DYNAMIC_PIVOTS: usize = 4;
+const DEFAULT_ADD_COUNT_FOR_REBUILD: usize = 64;
+const DEFAULT_DELETE_RATIO_FOR_REBUILD: f32 = 0.4;
+const DEFAULT_EXACT_SEARCH_THRESHOLD: usize = 64;
+const DEFAULT_GRAPH_BUILD_CANDIDATES: usize = 128;
+const INVALID_INDEX: usize = usize::MAX;
 
 #[derive(Debug, Clone)]
 struct GraphNode {
+    centroid_id: u64,
     vector: Vec<f32>,
-    neighbors: Vec<u64>,
+    neighbors: Vec<usize>,
+    deleted: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct GraphParams {
-    neighborhood_size: usize,
-    entry_point_count: usize,
-    search_beam: usize,
-    exact_search_threshold: usize,
+struct BktNode {
+    center_idx: usize,
+    child_start: usize,
+    child_end: usize,
+    collapsed_leaf: bool,
 }
 
-impl Default for GraphParams {
+impl BktNode {
+    fn leaf(center_idx: usize) -> Self {
+        Self {
+            center_idx,
+            child_start: 0,
+            child_end: 0,
+            collapsed_leaf: false,
+        }
+    }
+
+    fn is_leaf(&self) -> bool {
+        self.child_start == self.child_end
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BktRoot {
+    child_start: usize,
+    child_end: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SptagParams {
+    tree_number: usize,
+    bkt_kmeans_k: usize,
+    bkt_leaf_size: usize,
+    bkt_samples: usize,
+    neighborhood_size: usize,
+    cef: usize,
+    add_cef: usize,
+    max_check: usize,
+    initial_dynamic_pivots: usize,
+    other_dynamic_pivots: usize,
+    add_count_for_rebuild: usize,
+    delete_ratio_for_rebuild: f32,
+    exact_search_threshold: usize,
+    graph_build_candidates: usize,
+}
+
+impl Default for SptagParams {
     fn default() -> Self {
         Self {
+            tree_number: DEFAULT_TREE_NUMBER,
+            bkt_kmeans_k: DEFAULT_BKT_KMEANS_K,
+            bkt_leaf_size: DEFAULT_BKT_LEAF_SIZE,
+            bkt_samples: DEFAULT_BKT_SAMPLES,
             neighborhood_size: DEFAULT_NEIGHBORHOOD_SIZE,
-            entry_point_count: DEFAULT_ENTRY_POINT_COUNT,
-            search_beam: DEFAULT_SEARCH_BEAM,
+            cef: DEFAULT_CEF,
+            add_cef: DEFAULT_ADD_CEF,
+            max_check: DEFAULT_MAX_CHECK,
+            initial_dynamic_pivots: DEFAULT_INITIAL_DYNAMIC_PIVOTS,
+            other_dynamic_pivots: DEFAULT_OTHER_DYNAMIC_PIVOTS,
+            add_count_for_rebuild: DEFAULT_ADD_COUNT_FOR_REBUILD,
+            delete_ratio_for_rebuild: DEFAULT_DELETE_RATIO_FOR_REBUILD,
             exact_search_threshold: DEFAULT_EXACT_SEARCH_THRESHOLD,
+            graph_build_candidates: DEFAULT_GRAPH_BUILD_CANDIDATES,
         }
     }
 }
@@ -51,24 +122,29 @@ impl Default for GraphParams {
 struct SptagCentroidGraphInner {
     dimensions: usize,
     distance_metric: DistanceMetric,
-    params: GraphParams,
-    nodes: HashMap<u64, GraphNode>,
-    entry_points: Vec<u64>,
+    params: SptagParams,
+    nodes: Vec<GraphNode>,
+    centroid_to_index: HashMap<u64, usize>,
+    tree_roots: Vec<BktRoot>,
+    tree_nodes: Vec<BktNode>,
+    tree_leaf_backlinks: Vec<usize>,
+    bkt_balance_factor: Option<f32>,
+    pending_tree_mutations: usize,
+    deleted_count: usize,
 }
 
-/// Centroid graph backed by an explicit k-nearest-neighbor graph.
-///
-/// Build time constructs an exact k-NN graph for centroids, while incremental
-/// add/remove operations repair only the changed local neighborhood. Search uses
-/// a beam traversal seeded by diverse entry points, similar in spirit to the
-/// SPTAG head index in SPFresh.
+/// Centroid graph backed by a BKT tree plus relative-neighborhood graph.
 pub struct SptagCentroidGraph {
     inner: RwLock<SptagCentroidGraphInner>,
 }
 
+thread_local! {
+    static SEARCH_WORKSPACE: RefCell<SearchWorkspace> = RefCell::new(SearchWorkspace::default());
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ScoredCandidate {
-    id: u64,
+    idx: usize,
     distance: f32,
 }
 
@@ -84,16 +160,103 @@ impl Ord for ScoredCandidate {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.distance
             .total_cmp(&other.distance)
-            .then_with(|| self.id.cmp(&other.id))
+            .then_with(|| self.idx.cmp(&other.idx))
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TreeCandidate {
+    node_idx: usize,
+    distance: f32,
+}
+
+impl Eq for TreeCandidate {}
+
+impl PartialOrd for TreeCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TreeCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.distance
+            .total_cmp(&other.distance)
+            .then_with(|| self.node_idx.cmp(&other.node_idx))
+    }
+}
+
+#[derive(Default)]
+struct SearchWorkspace {
+    epoch: u32,
+    visited: Vec<u32>,
+    tree_queue: BinaryHeap<Reverse<TreeCandidate>>,
+    graph_queue: BinaryHeap<Reverse<ScoredCandidate>>,
+    result_bound: BinaryHeap<ScoredCandidate>,
+    top_results: BinaryHeap<ScoredCandidate>,
+}
+
+impl SearchWorkspace {
+    fn reset(&mut self, size: usize) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.epoch = 1;
+            self.visited.fill(0);
+        }
+        if self.visited.len() < size {
+            self.visited.resize(size, 0);
+        }
+        self.tree_queue.clear();
+        self.graph_queue.clear();
+        self.result_bound.clear();
+        self.top_results.clear();
+    }
+
+    fn check_and_visit(&mut self, idx: usize) -> bool {
+        if self.visited[idx] == self.epoch {
+            true
+        } else {
+            self.visited[idx] = self.epoch;
+            false
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SearchExclusions<'a> {
+    None,
+    ExternalIds(&'a HashSet<u64>),
+    SingleIndex(usize),
+}
+
+#[derive(Debug)]
+struct PartitionCluster {
+    indices: Vec<usize>,
+    center_idx: usize,
+}
+
+struct KmeansAssignment {
+    counts: Vec<usize>,
+    weighted_counts: Vec<f32>,
+    center_sums: Vec<Vec<f32>>,
+    cluster_indices: Vec<usize>,
+    cluster_dists: Vec<f32>,
+    labels: Vec<usize>,
+    total_distance: f32,
+}
+
+struct KmeansClusteringResult {
+    count_std: f32,
+    clusters: Vec<PartitionCluster>,
 }
 
 impl fmt::Debug for SptagCentroidGraph {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let inner = self.inner.read().expect("lock poisoned");
         f.debug_struct("SptagCentroidGraph")
-            .field("num_centroids", &inner.nodes.len())
-            .field("entry_points", &inner.entry_points)
+            .field("num_centroids", &inner.live_count())
+            .field("tree_roots", &inner.tree_roots.len())
+            .field("tree_nodes", &inner.tree_nodes.len())
             .finish()
     }
 }
@@ -117,26 +280,34 @@ impl SptagCentroidGraph {
             }
         }
 
-        let mut nodes = HashMap::with_capacity(centroids.len());
+        let mut nodes = Vec::with_capacity(centroids.len());
+        let mut centroid_to_index = HashMap::with_capacity(centroids.len());
         for centroid in centroids {
-            nodes.insert(
-                centroid.centroid_id,
-                GraphNode {
-                    vector: centroid.vector,
-                    neighbors: Vec::new(),
-                },
-            );
+            let idx = nodes.len();
+            centroid_to_index.insert(centroid.centroid_id, idx);
+            nodes.push(GraphNode {
+                centroid_id: centroid.centroid_id,
+                vector: centroid.vector,
+                neighbors: Vec::new(),
+                deleted: false,
+            });
         }
 
         let mut inner = SptagCentroidGraphInner {
             dimensions,
             distance_metric,
-            params: GraphParams::default(),
+            params: SptagParams::default(),
             nodes,
-            entry_points: Vec::new(),
+            centroid_to_index,
+            tree_roots: Vec::new(),
+            tree_nodes: Vec::new(),
+            tree_leaf_backlinks: Vec::new(),
+            bkt_balance_factor: None,
+            pending_tree_mutations: 0,
+            deleted_count: 0,
         };
-        inner.rebuild_all_neighbors();
-        inner.refresh_entry_points();
+        inner.rebuild_tree();
+        inner.rebuild_graph();
 
         Ok(Self {
             inner: RwLock::new(inner),
@@ -149,10 +320,7 @@ impl CentroidGraph for SptagCentroidGraph {
         self.inner
             .read()
             .expect("lock poisoned")
-            .search_scored(query, k, &HashSet::new())
-            .into_iter()
-            .map(|candidate| candidate.id)
-            .collect()
+            .search_ids(query, k, &HashSet::new())
     }
 
     fn search_with_include_exclude(
@@ -183,20 +351,22 @@ impl CentroidGraph for SptagCentroidGraph {
     }
 
     fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>> {
-        self.inner
-            .read()
-            .expect("lock poisoned")
-            .nodes
-            .get(&centroid_id)
-            .map(|node| node.vector.clone())
+        let inner = self.inner.read().expect("lock poisoned");
+        let idx = *inner.centroid_to_index.get(&centroid_id)?;
+        let node = inner.nodes.get(idx)?;
+        if node.deleted {
+            None
+        } else {
+            Some(node.vector.clone())
+        }
     }
 
     fn all_centroid_ids(&self) -> Vec<u64> {
-        self.inner.read().expect("lock poisoned").sorted_ids()
+        self.inner.read().expect("lock poisoned").all_centroid_ids()
     }
 
     fn len(&self) -> usize {
-        self.inner.read().expect("lock poisoned").nodes.len()
+        self.inner.read().expect("lock poisoned").live_count()
     }
 }
 
@@ -212,14 +382,15 @@ impl SptagCentroidGraphInner {
             return Vec::new();
         }
 
-        let search_k = k
-            .saturating_add(include.len())
-            .max(self.params.neighborhood_size)
-            .min(self.live_count(exclude));
+        if include.is_empty() {
+            return self.search_ids(query, k, exclude);
+        }
 
+        let search_k = k.saturating_add(include.len());
         let mut merged = HashMap::with_capacity(search_k.saturating_add(include.len()));
-        for candidate in self.search_scored(query, search_k, exclude) {
-            merged.insert(candidate.id, candidate.distance);
+        for candidate in self.search_scored(query, search_k, SearchExclusions::ExternalIds(exclude))
+        {
+            merged.insert(self.nodes[candidate.idx].centroid_id, candidate.distance);
         }
 
         for entry in include {
@@ -250,178 +421,59 @@ impl SptagCentroidGraphInner {
                 entry.dimensions()
             )));
         }
-        if self.nodes.contains_key(&entry.centroid_id) {
+        if self.centroid_to_index.contains_key(&entry.centroid_id) {
             return Err(Error::Internal(format!(
                 "Centroid {} already exists in graph",
                 entry.centroid_id
             )));
         }
 
-        self.nodes.insert(
-            entry.centroid_id,
-            GraphNode {
-                vector: entry.vector.clone(),
-                neighbors: Vec::new(),
-            },
-        );
+        let idx = self.nodes.len();
+        self.nodes.push(GraphNode {
+            centroid_id: entry.centroid_id,
+            vector: entry.vector.clone(),
+            neighbors: Vec::new(),
+            deleted: false,
+        });
+        self.centroid_to_index.insert(entry.centroid_id, idx);
+        self.tree_leaf_backlinks.push(INVALID_INDEX);
+        self.pending_tree_mutations = self.pending_tree_mutations.saturating_add(1);
 
-        let mut affected: HashSet<u64> = HashSet::new();
-        affected.insert(entry.centroid_id);
-
-        let nearest = self.exact_top_k_ids_for(entry.centroid_id, self.params.neighborhood_size);
-        if let Some(node) = self.nodes.get_mut(&entry.centroid_id) {
-            node.neighbors = nearest.clone();
-        }
-
-        for neighbor_id in nearest {
-            affected.insert(neighbor_id);
-            if let Some(node) = self.nodes.get(&neighbor_id) {
-                affected.extend(node.neighbors.iter().copied());
-            }
-        }
-
-        self.rebuild_local_neighbors(&affected);
-        self.refresh_entry_points();
+        self.refine_node(idx, true, self.params.add_cef);
+        self.maybe_rebuild_after_mutation(false);
         Ok(())
     }
 
     fn remove_centroid(&mut self, centroid_id: u64) -> Result<()> {
-        let removed = self.nodes.remove(&centroid_id).ok_or_else(|| {
+        let idx = *self.centroid_to_index.get(&centroid_id).ok_or_else(|| {
             Error::Internal(format!("Centroid {} not found in graph", centroid_id))
         })?;
-
-        let mut affected: HashSet<u64> = removed.neighbors.into_iter().collect();
-        for node in self.nodes.values_mut() {
-            node.neighbors
-                .retain(|neighbor_id| *neighbor_id != centroid_id);
+        let node = self.nodes.get_mut(idx).expect("index exists");
+        if node.deleted {
+            return Err(Error::Internal(format!(
+                "Centroid {} not found in graph",
+                centroid_id
+            )));
         }
 
-        let snapshot: Vec<u64> = affected.iter().copied().collect();
-        for neighbor_id in snapshot {
-            if let Some(node) = self.nodes.get(&neighbor_id) {
-                affected.extend(node.neighbors.iter().copied());
-            }
-        }
+        node.deleted = true;
+        node.neighbors.clear();
+        self.deleted_count = self.deleted_count.saturating_add(1);
+        self.pending_tree_mutations = self.pending_tree_mutations.saturating_add(1);
 
-        self.rebuild_local_neighbors(&affected);
-        self.refresh_entry_points();
+        self.maybe_rebuild_after_mutation(true);
         Ok(())
     }
 
-    fn rebuild_all_neighbors(&mut self) {
-        let ids = self.sorted_ids();
-        for centroid_id in &ids {
-            let neighbors = self.exact_top_k_ids_for(*centroid_id, self.params.neighborhood_size);
-            if let Some(node) = self.nodes.get_mut(centroid_id) {
-                node.neighbors = neighbors;
-            }
-        }
-        self.make_reverse_links(&ids);
-    }
-
-    fn rebuild_local_neighbors(&mut self, affected: &HashSet<u64>) {
-        if self.nodes.is_empty() || affected.is_empty() {
-            return;
-        }
-
-        let mut ids: Vec<u64> = affected
-            .iter()
-            .copied()
-            .filter(|centroid_id| self.nodes.contains_key(centroid_id))
-            .collect();
-        ids.sort_unstable();
-        ids.dedup();
-
-        for centroid_id in &ids {
-            let neighbors = self.exact_top_k_ids_for(*centroid_id, self.params.neighborhood_size);
-            if let Some(node) = self.nodes.get_mut(centroid_id) {
-                node.neighbors = neighbors;
-            }
-        }
-        self.make_reverse_links(&ids);
-    }
-
-    fn make_reverse_links(&mut self, source_ids: &[u64]) {
-        let edges: Vec<(u64, u64)> = source_ids
-            .iter()
-            .flat_map(|source_id| {
-                self.nodes.get(source_id).into_iter().flat_map(move |node| {
-                    node.neighbors
-                        .iter()
-                        .map(move |&neighbor| (neighbor, *source_id))
-                })
-            })
-            .collect();
-
-        for (target_id, candidate_id) in edges {
-            self.insert_neighbor(target_id, candidate_id);
-        }
-    }
-
-    fn insert_neighbor(&mut self, centroid_id: u64, candidate_id: u64) {
-        if centroid_id == candidate_id
-            || !self.nodes.contains_key(&centroid_id)
-            || !self.nodes.contains_key(&candidate_id)
-        {
-            return;
-        }
-
-        let mut candidate_ids = self
-            .nodes
-            .get(&centroid_id)
-            .map(|node| node.neighbors.clone())
-            .unwrap_or_default();
-        candidate_ids.push(candidate_id);
-
-        let neighbors = self.select_best_neighbors(centroid_id, candidate_ids);
-        if let Some(node) = self.nodes.get_mut(&centroid_id) {
-            node.neighbors = neighbors;
-        }
-    }
-
-    fn select_best_neighbors(&self, centroid_id: u64, candidate_ids: Vec<u64>) -> Vec<u64> {
-        let Some(node) = self.nodes.get(&centroid_id) else {
-            return Vec::new();
+    fn search_ids(&self, query: &[f32], k: usize, exclude: &HashSet<u64>) -> Vec<u64> {
+        let exclusions = if exclude.is_empty() {
+            SearchExclusions::None
+        } else {
+            SearchExclusions::ExternalIds(exclude)
         };
-
-        let mut seen = HashSet::with_capacity(candidate_ids.len());
-        let mut scored = Vec::with_capacity(candidate_ids.len());
-        for candidate_id in candidate_ids {
-            if candidate_id == centroid_id || !seen.insert(candidate_id) {
-                continue;
-            }
-            let Some(candidate) = self.nodes.get(&candidate_id) else {
-                continue;
-            };
-            scored.push((candidate_id, self.distance(&node.vector, &candidate.vector)));
-        }
-
-        scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        scored
+        self.search_scored(query, k, exclusions)
             .into_iter()
-            .take(self.params.neighborhood_size)
-            .map(|(candidate_id, _)| candidate_id)
-            .collect()
-    }
-
-    fn exact_top_k_ids_for(&self, centroid_id: u64, k: usize) -> Vec<u64> {
-        let Some(node) = self.nodes.get(&centroid_id) else {
-            return Vec::new();
-        };
-
-        let mut scored = Vec::with_capacity(self.nodes.len().saturating_sub(1));
-        for (&candidate_id, candidate) in &self.nodes {
-            if candidate_id == centroid_id {
-                continue;
-            }
-            scored.push((candidate_id, self.distance(&node.vector, &candidate.vector)));
-        }
-
-        scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        scored
-            .into_iter()
-            .take(k)
-            .map(|(candidate_id, _)| candidate_id)
+            .map(|candidate| self.nodes[candidate.idx].centroid_id)
             .collect()
     }
 
@@ -429,232 +481,1100 @@ impl SptagCentroidGraphInner {
         &self,
         query: &[f32],
         k: usize,
-        exclude: &HashSet<u64>,
+        exclusions: SearchExclusions<'_>,
     ) -> Vec<ScoredCandidate> {
         if k == 0 || query.len() != self.dimensions {
             return Vec::new();
         }
 
-        let live_count = self.live_count(exclude);
+        let live_count = self.live_count_with_exclusions(exclusions);
         if live_count == 0 {
             return Vec::new();
         }
 
-        if live_count <= self.params.exact_search_threshold {
-            return self.exact_search(query, k, exclude);
+        if live_count <= self.params.exact_search_threshold || self.tree_roots.is_empty() {
+            return self.exact_search(query, k, exclusions);
         }
 
-        let beam = self
-            .params
-            .search_beam
-            .max(k.saturating_mul(4))
+        let final_capacity = k.min(live_count);
+        let query_capacity = self.params.cef.max(final_capacity).min(live_count);
+        let reservoir_capacity = query_capacity
+            .max((self.params.max_check / 16).max(1))
             .min(live_count);
-        let mut seed_scores = self.seed_scores(query, exclude);
-        if seed_scores.is_empty() {
-            return self.exact_search(query, k, exclude);
-        }
-        seed_scores.sort_by(|a, b| {
-            a.distance
-                .total_cmp(&b.distance)
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        let max_check = self.params.max_check.min(live_count.max(1));
+        let initial_pivots = self.params.initial_dynamic_pivots.min(live_count);
+        let other_pivots = self.params.other_dynamic_pivots.min(live_count);
 
-        let mut visited = HashSet::with_capacity(beam.saturating_mul(2));
-        let mut candidates = BinaryHeap::new();
-        let mut results = BinaryHeap::new();
+        SEARCH_WORKSPACE.with(|workspace| {
+            let mut workspace = workspace.borrow_mut();
+            workspace.reset(self.nodes.len());
+            self.init_search_trees(query, &mut workspace.tree_queue);
 
-        for candidate in seed_scores
-            .into_iter()
-            .take(self.params.entry_point_count.max(1))
-        {
-            if !visited.insert(candidate.id) {
-                continue;
-            }
-            candidates.push(Reverse(candidate));
-            results.push(candidate);
-        }
+            let mut checked_leaves = 0usize;
+            self.search_trees(
+                query,
+                &mut workspace,
+                exclusions,
+                &mut checked_leaves,
+                initial_pivots,
+            );
 
-        while let Some(Reverse(candidate)) = candidates.pop() {
-            if results.len() >= beam {
-                let worst = results
+            while let Some(Reverse(candidate)) = workspace.graph_queue.pop() {
+                let worst_final = workspace
+                    .top_results
                     .peek()
-                    .expect("beam is non-empty when len >= beam")
-                    .distance;
-                if candidate.distance > worst {
+                    .map(|c| c.distance)
+                    .unwrap_or(f32::INFINITY);
+                if workspace.top_results.len() >= query_capacity && candidate.distance > worst_final
+                {
                     break;
                 }
-            }
 
-            let neighbors = self
-                .nodes
-                .get(&candidate.id)
-                .map(|node| node.neighbors.clone())
-                .unwrap_or_default();
+                self.push_candidate_results(
+                    query,
+                    candidate,
+                    exclusions,
+                    &mut workspace.top_results,
+                    query_capacity,
+                );
 
-            for neighbor_id in neighbors {
-                if exclude.contains(&neighbor_id) || !visited.insert(neighbor_id) {
+                if checked_leaves >= max_check {
                     continue;
                 }
 
-                let Some(neighbor) = self.nodes.get(&neighbor_id) else {
-                    continue;
-                };
+                let node = &self.nodes[candidate.idx];
+                for &neighbor_idx in &node.neighbors {
+                    if neighbor_idx == INVALID_INDEX || workspace.check_and_visit(neighbor_idx) {
+                        continue;
+                    }
+                    checked_leaves = checked_leaves.saturating_add(1);
 
-                let scored = ScoredCandidate {
-                    id: neighbor_id,
-                    distance: self.distance(query, &neighbor.vector),
-                };
+                    let scored = ScoredCandidate {
+                        idx: neighbor_idx,
+                        distance: self.distance(query, &self.nodes[neighbor_idx].vector),
+                    };
 
-                let should_add = results.len() < beam
-                    || scored.distance
-                        < results
-                            .peek()
-                            .expect("beam is non-empty when comparing against worst")
-                            .distance;
-                if should_add {
-                    candidates.push(Reverse(scored));
-                    results.push(scored);
-                    if results.len() > beam {
-                        results.pop();
+                    if Self::push_bound_candidate(
+                        &mut workspace.result_bound,
+                        scored,
+                        reservoir_capacity,
+                    ) {
+                        workspace.graph_queue.push(Reverse(scored));
+                    }
+
+                    if checked_leaves >= max_check {
+                        break;
+                    }
+                }
+
+                let best_graph = workspace.graph_queue.peek().map(|entry| entry.0.distance);
+                let best_tree = workspace.tree_queue.peek().map(|entry| entry.0.distance);
+                if let (Some(best_graph), Some(best_tree)) = (best_graph, best_tree) {
+                    if best_graph > best_tree {
+                        let limit = (other_pivots + checked_leaves).min(max_check);
+                        self.search_trees(
+                            query,
+                            &mut workspace,
+                            exclusions,
+                            &mut checked_leaves,
+                            limit,
+                        );
                     }
                 }
             }
+
+            let mut results = workspace.top_results.clone().into_sorted_vec();
+            results.truncate(final_capacity);
+            results
+        })
+    }
+
+    fn init_search_trees(
+        &self,
+        query: &[f32],
+        tree_queue: &mut BinaryHeap<Reverse<TreeCandidate>>,
+    ) {
+        for root in &self.tree_roots {
+            for node_idx in root.child_start..root.child_end {
+                let node = self.tree_nodes[node_idx];
+                tree_queue.push(Reverse(TreeCandidate {
+                    node_idx,
+                    distance: self.distance(query, &self.nodes[node.center_idx].vector),
+                }));
+            }
+        }
+    }
+
+    fn search_trees(
+        &self,
+        query: &[f32],
+        workspace: &mut SearchWorkspace,
+        exclusions: SearchExclusions<'_>,
+        checked_leaves: &mut usize,
+        limit: usize,
+    ) {
+        while let Some(Reverse(candidate)) = workspace.tree_queue.pop() {
+            let tree_node = self.tree_nodes[candidate.node_idx];
+            if tree_node.collapsed_leaf {
+                if !workspace.check_and_visit(tree_node.center_idx) {
+                    *checked_leaves = checked_leaves.saturating_add(1);
+                    workspace.graph_queue.push(Reverse(ScoredCandidate {
+                        idx: tree_node.center_idx,
+                        distance: candidate.distance,
+                    }));
+                }
+                if *checked_leaves >= limit {
+                    break;
+                }
+                continue;
+            }
+
+            if tree_node.is_leaf() {
+                if !workspace.check_and_visit(tree_node.center_idx) {
+                    *checked_leaves = checked_leaves.saturating_add(1);
+                    if !self.is_excluded(tree_node.center_idx, exclusions) {
+                        workspace.graph_queue.push(Reverse(ScoredCandidate {
+                            idx: tree_node.center_idx,
+                            distance: candidate.distance,
+                        }));
+                    }
+                }
+                if *checked_leaves >= limit {
+                    break;
+                }
+                continue;
+            }
+
+            if !workspace.check_and_visit(tree_node.center_idx) {
+                if !self.is_excluded(tree_node.center_idx, exclusions) {
+                    workspace.graph_queue.push(Reverse(ScoredCandidate {
+                        idx: tree_node.center_idx,
+                        distance: candidate.distance,
+                    }));
+                }
+            }
+
+            for child_idx in tree_node.child_start..tree_node.child_end {
+                let child = self.tree_nodes[child_idx];
+                workspace.tree_queue.push(Reverse(TreeCandidate {
+                    node_idx: child_idx,
+                    distance: self.distance(query, &self.nodes[child.center_idx].vector),
+                }));
+            }
+        }
+    }
+
+    fn refine_node(&mut self, node_idx: usize, update_neighbors: bool, cef: usize) {
+        if !self.is_live_idx(node_idx) {
+            return;
         }
 
-        let mut output = results.into_sorted_vec();
-        if output.is_empty() {
-            return self.exact_search(query, k, exclude);
+        let results = self.search_scored(
+            &self.nodes[node_idx].vector,
+            cef.saturating_add(1),
+            SearchExclusions::SingleIndex(node_idx),
+        );
+
+        let neighbors = self.rng_prune_from_candidates(node_idx, results.into_iter());
+        self.nodes[node_idx].neighbors = neighbors.clone();
+
+        if update_neighbors {
+            for neighbor_idx in neighbors {
+                self.insert_neighbor(neighbor_idx, node_idx);
+            }
         }
-        output.truncate(k.min(output.len()));
-        output
+    }
+
+    fn rebuild_graph(&mut self) {
+        for idx in 0..self.nodes.len() {
+            self.nodes[idx].neighbors.clear();
+        }
+
+        let live_indices = self.live_indices();
+        let candidate_count = self
+            .params
+            .graph_build_candidates
+            .max(self.params.neighborhood_size.saturating_mul(2));
+
+        for &idx in &live_indices {
+            let candidates = self.exact_search_by_index(idx, candidate_count);
+            self.nodes[idx].neighbors = self.rng_prune_from_candidates(idx, candidates.into_iter());
+        }
+
+        for &idx in &live_indices {
+            let neighbors = self.nodes[idx].neighbors.clone();
+            for neighbor_idx in neighbors {
+                self.insert_neighbor(neighbor_idx, idx);
+            }
+        }
+    }
+
+    fn rebuild_tree(&mut self) {
+        self.tree_roots.clear();
+        self.tree_nodes.clear();
+        self.tree_leaf_backlinks.clear();
+        self.tree_leaf_backlinks
+            .resize(self.nodes.len(), INVALID_INDEX);
+
+        let live_indices = self.live_indices();
+        if live_indices.is_empty() {
+            return;
+        }
+
+        if self.bkt_balance_factor.is_none() {
+            self.bkt_balance_factor = Some(self.dynamic_factor_select(&live_indices));
+        }
+
+        for tree_idx in 0..self.params.tree_number.max(1) {
+            let mut order = live_indices.clone();
+            if !order.is_empty() {
+                let mut rng = self.partition_rng(&order, tree_idx as u64);
+                order.shuffle(&mut rng);
+            }
+
+            let root_start = self.tree_nodes.len();
+            self.append_root_children(&order);
+            let root_end = self.tree_nodes.len();
+            self.tree_roots.push(BktRoot {
+                child_start: root_start,
+                child_end: root_end,
+            });
+        }
+
+        self.pending_tree_mutations = 0;
+    }
+
+    fn append_root_children(&mut self, indices: &[usize]) {
+        if indices.is_empty() {
+            return;
+        }
+
+        if indices.len() <= self.params.bkt_leaf_size {
+            let node_idx = self.tree_nodes.len();
+            self.tree_nodes.push(BktNode::leaf(indices[0]));
+            self.fill_tree_node(node_idx, indices.to_vec());
+            return;
+        }
+
+        let clusters = self.partition_cluster(indices);
+        if clusters.is_empty() {
+            let center_idx = self.choose_center_for_indices(indices);
+            let node_idx = self.tree_nodes.len();
+            self.tree_nodes.push(BktNode {
+                center_idx,
+                child_start: 0,
+                child_end: 0,
+                collapsed_leaf: false,
+            });
+            self.collapse_tree_node(
+                node_idx,
+                indices
+                    .iter()
+                    .copied()
+                    .filter(|idx| *idx != center_idx)
+                    .collect(),
+            );
+            return;
+        }
+
+        for cluster in clusters {
+            let node_idx = self.tree_nodes.len();
+            self.tree_nodes.push(BktNode {
+                center_idx: cluster.center_idx,
+                child_start: 0,
+                child_end: 0,
+                collapsed_leaf: false,
+            });
+            self.fill_tree_node(node_idx, cluster.indices);
+        }
+    }
+
+    fn fill_tree_node(&mut self, node_idx: usize, indices: Vec<usize>) {
+        let center_idx = self.tree_nodes[node_idx].center_idx;
+        let remaining: Vec<usize> = indices
+            .into_iter()
+            .filter(|idx| *idx != center_idx)
+            .collect();
+        if remaining.is_empty() {
+            self.tree_nodes[node_idx].child_start = 0;
+            self.tree_nodes[node_idx].child_end = 0;
+            return;
+        }
+
+        if remaining.len() <= self.params.bkt_leaf_size {
+            let child_start = self.tree_nodes.len();
+            for idx in remaining {
+                self.tree_nodes.push(BktNode::leaf(idx));
+            }
+            let child_end = self.tree_nodes.len();
+            self.tree_nodes[node_idx].child_start = child_start;
+            self.tree_nodes[node_idx].child_end = child_end;
+            return;
+        }
+
+        let child_clusters = self.partition_cluster(&remaining);
+        if child_clusters.is_empty() {
+            self.collapse_tree_node(node_idx, remaining);
+            return;
+        }
+        let child_start = self.tree_nodes.len();
+        let mut child_specs = Vec::with_capacity(child_clusters.len());
+        for cluster in child_clusters {
+            let child_idx = self.tree_nodes.len();
+            self.tree_nodes.push(BktNode {
+                center_idx: cluster.center_idx,
+                child_start: 0,
+                child_end: 0,
+                collapsed_leaf: false,
+            });
+            child_specs.push((child_idx, cluster.indices));
+        }
+        let child_end = self.tree_nodes.len();
+        self.tree_nodes[node_idx].child_start = child_start;
+        self.tree_nodes[node_idx].child_end = child_end;
+
+        for (child_idx, cluster) in child_specs {
+            self.fill_tree_node(child_idx, cluster);
+        }
+    }
+
+    fn partition_cluster(&self, indices: &[usize]) -> Vec<PartitionCluster> {
+        if indices.len() <= self.params.bkt_leaf_size {
+            return indices
+                .iter()
+                .copied()
+                .map(|idx| PartitionCluster {
+                    indices: vec![idx],
+                    center_idx: idx,
+                })
+                .collect();
+        }
+
+        let cluster_count = ((indices.len() / self.params.bkt_leaf_size) + 1)
+            .max(2)
+            .min(self.params.bkt_kmeans_k)
+            .min(indices.len());
+        let balance_factor = self.bkt_balance_factor.unwrap_or(100.0);
+        let clustering = self.kmeans_clustering(indices, cluster_count, balance_factor);
+        if clustering.clusters.len() > 1 {
+            return clustering.clusters;
+        }
+
+        Vec::new()
+    }
+
+    fn collapse_tree_node(&mut self, node_idx: usize, members: Vec<usize>) {
+        let center_idx = self.tree_nodes[node_idx].center_idx;
+        let child_start = self.tree_nodes.len();
+        for member_idx in members {
+            self.tree_nodes.push(BktNode::leaf(member_idx));
+        }
+        let child_end = self.tree_nodes.len();
+        self.tree_nodes[node_idx].child_start = child_start;
+        self.tree_nodes[node_idx].child_end = child_end;
+        self.tree_nodes[node_idx].collapsed_leaf = true;
+        if center_idx < self.tree_leaf_backlinks.len() {
+            self.tree_leaf_backlinks[center_idx] = node_idx;
+        }
+    }
+
+    fn dynamic_factor_select(&self, indices: &[usize]) -> f32 {
+        if indices.len() <= self.params.bkt_leaf_size {
+            return 100.0;
+        }
+
+        let cluster_count = ((indices.len() / self.params.bkt_leaf_size) + 1)
+            .max(2)
+            .min(self.params.bkt_kmeans_k)
+            .min(indices.len());
+
+        let mut best_lambda_factor = 100.0;
+        let mut best_count_std = f32::INFINITY;
+        for lambda_factor in [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0] {
+            let clustering = self.kmeans_clustering(indices, cluster_count, lambda_factor);
+            if clustering.count_std < best_count_std {
+                best_count_std = clustering.count_std;
+                best_lambda_factor = lambda_factor;
+            }
+        }
+        best_lambda_factor
+    }
+
+    fn kmeans_clustering(
+        &self,
+        indices: &[usize],
+        cluster_count: usize,
+        lambda_factor: f32,
+    ) -> KmeansClusteringResult {
+        let sample_len = self
+            .params
+            .bkt_samples
+            .min(indices.len())
+            .max(cluster_count)
+            .min(indices.len());
+        let mut order = indices.to_vec();
+        let mut rng = self.partition_rng(indices, lambda_factor.to_bits() as u64);
+        let (mut centers, mut counts, adjusted_lambda) =
+            self.init_kmeans_centers(&order, cluster_count, sample_len, &mut rng);
+        let original_lambda = 1.0f32 / lambda_factor.max(f32::EPSILON) / sample_len.max(1) as f32;
+        let mut min_cluster_dist = f32::INFINITY;
+        let mut no_improvement = 0usize;
+
+        for _ in 0..100 {
+            order.shuffle(&mut rng);
+            let assignment = self.kmeans_assign(
+                &order[..sample_len],
+                &centers,
+                &counts,
+                adjusted_lambda.min(original_lambda),
+                true,
+            );
+            counts = assignment.counts.clone();
+            if assignment.total_distance < min_cluster_dist {
+                min_cluster_dist = assignment.total_distance;
+                no_improvement = 0;
+            } else {
+                no_improvement = no_improvement.saturating_add(1);
+            }
+
+            let (next_centers, diff) = self.refine_centers(&centers, &assignment);
+            centers = next_centers;
+            if diff < 1e-3 || no_improvement >= 5 {
+                break;
+            }
+        }
+
+        let zero_counts = vec![0usize; cluster_count];
+        let nearest_assignment = self.kmeans_assign(&order, &centers, &zero_counts, 0.0, false);
+        for (cluster_idx, &center_idx) in nearest_assignment.cluster_indices.iter().enumerate() {
+            if center_idx != INVALID_INDEX {
+                centers[cluster_idx] = self.nodes[center_idx].vector.clone();
+            }
+        }
+
+        let final_assignment = self.kmeans_assign(&order, &centers, &zero_counts, 0.0, false);
+        let count_avg = order.len() as f32 / cluster_count.max(1) as f32;
+        let count_std = if count_avg == 0.0 {
+            0.0
+        } else {
+            let variance = final_assignment
+                .counts
+                .iter()
+                .map(|&count| {
+                    let delta = count as f32 - count_avg;
+                    delta * delta
+                })
+                .sum::<f32>()
+                / cluster_count.max(1) as f32;
+            variance.sqrt() / count_avg
+        };
+
+        KmeansClusteringResult {
+            count_std,
+            clusters: self.build_partition_clusters(&order, &final_assignment),
+        }
+    }
+
+    fn init_kmeans_centers(
+        &self,
+        order: &[usize],
+        cluster_count: usize,
+        sample_len: usize,
+        rng: &mut StdRng,
+    ) -> (Vec<Vec<f32>>, Vec<usize>, f32) {
+        let mut best_centers = Vec::new();
+        let mut best_counts = vec![0usize; cluster_count];
+        let mut best_lambda = 0.0f32;
+        let mut best_distance = f32::INFINITY;
+
+        for _ in 0..3 {
+            let mut seeded = order.to_vec();
+            seeded.shuffle(rng);
+            let centers: Vec<Vec<f32>> = seeded
+                .iter()
+                .take(cluster_count)
+                .map(|&idx| self.nodes[idx].vector.clone())
+                .collect();
+            let zero_counts = vec![0usize; cluster_count];
+            let assignment =
+                self.kmeans_assign(&order[..sample_len], &centers, &zero_counts, 0.0, true);
+            if assignment.total_distance < best_distance {
+                best_distance = assignment.total_distance;
+                best_lambda = self.refine_lambda(&assignment, sample_len);
+                best_counts = assignment.counts.clone();
+                best_centers = centers;
+            }
+        }
+
+        if best_centers.is_empty() {
+            best_centers = order
+                .iter()
+                .take(cluster_count)
+                .map(|&idx| self.nodes[idx].vector.clone())
+                .collect();
+        }
+
+        (best_centers, best_counts, best_lambda)
+    }
+
+    fn kmeans_assign(
+        &self,
+        order: &[usize],
+        centers: &[Vec<f32>],
+        balance_counts: &[usize],
+        lambda: f32,
+        update_centers: bool,
+    ) -> KmeansAssignment {
+        let cluster_count = centers.len();
+        let mut counts = vec![0usize; cluster_count];
+        let mut weighted_counts = vec![0.0f32; cluster_count];
+        let mut center_sums = vec![vec![0.0f32; self.dimensions]; cluster_count];
+        let mut cluster_indices = vec![INVALID_INDEX; cluster_count];
+        let mut cluster_dists = if update_centers {
+            vec![f32::NEG_INFINITY; cluster_count]
+        } else {
+            vec![f32::INFINITY; cluster_count]
+        };
+        let mut labels = Vec::with_capacity(order.len());
+        let mut total_distance = 0.0f32;
+
+        for &idx in order {
+            let mut best_cluster = 0usize;
+            let mut best_distance = f32::INFINITY;
+            for (cluster_idx, center) in centers.iter().enumerate() {
+                let distance = self.distance(&self.nodes[idx].vector, center)
+                    + lambda * balance_counts.get(cluster_idx).copied().unwrap_or(0) as f32;
+                if distance < best_distance {
+                    best_distance = distance;
+                    best_cluster = cluster_idx;
+                }
+            }
+
+            labels.push(best_cluster);
+            counts[best_cluster] = counts[best_cluster].saturating_add(1);
+            weighted_counts[best_cluster] += best_distance;
+            total_distance += best_distance;
+
+            if update_centers {
+                for (dim, value) in self.nodes[idx].vector.iter().enumerate() {
+                    center_sums[best_cluster][dim] += value;
+                }
+                if best_distance > cluster_dists[best_cluster] {
+                    cluster_dists[best_cluster] = best_distance;
+                    cluster_indices[best_cluster] = idx;
+                }
+            } else if best_distance <= cluster_dists[best_cluster] {
+                cluster_dists[best_cluster] = best_distance;
+                cluster_indices[best_cluster] = idx;
+            }
+        }
+
+        KmeansAssignment {
+            counts,
+            weighted_counts,
+            center_sums,
+            cluster_indices,
+            cluster_dists,
+            labels,
+            total_distance,
+        }
+    }
+
+    fn refine_lambda(&self, assignment: &KmeansAssignment, size: usize) -> f32 {
+        let mut max_cluster = INVALID_INDEX;
+        let mut max_count = 0usize;
+        for (cluster_idx, &count) in assignment.counts.iter().enumerate() {
+            if count > max_count && count > 0 {
+                max_count = count;
+                max_cluster = cluster_idx;
+            }
+        }
+
+        if max_cluster == INVALID_INDEX || size == 0 {
+            return 0.0;
+        }
+
+        let avg_distance = assignment.weighted_counts[max_cluster] / max_count as f32;
+        ((assignment.cluster_dists[max_cluster] - avg_distance) / size as f32).max(0.0)
+    }
+
+    fn refine_centers(
+        &self,
+        centers: &[Vec<f32>],
+        assignment: &KmeansAssignment,
+    ) -> (Vec<Vec<f32>>, f32) {
+        let mut max_cluster = INVALID_INDEX;
+        let mut max_count = 0usize;
+        for (cluster_idx, (&count, &sample_idx)) in assignment
+            .counts
+            .iter()
+            .zip(assignment.cluster_indices.iter())
+            .enumerate()
+        {
+            if count == 0 || sample_idx == INVALID_INDEX {
+                continue;
+            }
+            if count > max_count
+                && self.l2_distance(&self.nodes[sample_idx].vector, &centers[cluster_idx]) > 1e-6
+            {
+                max_count = count;
+                max_cluster = cluster_idx;
+            }
+        }
+
+        let mut next_centers = Vec::with_capacity(centers.len());
+        let mut diff = 0.0f32;
+        for (cluster_idx, center) in centers.iter().enumerate() {
+            let next_center = if assignment.counts[cluster_idx] == 0 {
+                if max_cluster != INVALID_INDEX {
+                    self.nodes[assignment.cluster_indices[max_cluster]]
+                        .vector
+                        .clone()
+                } else {
+                    center.clone()
+                }
+            } else {
+                assignment.center_sums[cluster_idx]
+                    .iter()
+                    .map(|value| *value / assignment.counts[cluster_idx] as f32)
+                    .collect()
+            };
+            diff += self.l2_distance(&next_center, center);
+            next_centers.push(next_center);
+        }
+
+        (next_centers, diff)
+    }
+
+    fn build_partition_clusters(
+        &self,
+        order: &[usize],
+        assignment: &KmeansAssignment,
+    ) -> Vec<PartitionCluster> {
+        let mut clustered = vec![Vec::new(); assignment.counts.len()];
+        for (&label, &idx) in assignment.labels.iter().zip(order.iter()) {
+            clustered[label].push(idx);
+        }
+
+        let mut clusters = Vec::with_capacity(clustered.len());
+        for (cluster_idx, mut members) in clustered.into_iter().enumerate() {
+            if members.is_empty() {
+                continue;
+            }
+
+            let mut center_idx = assignment.cluster_indices[cluster_idx];
+            if center_idx == INVALID_INDEX || !members.contains(&center_idx) {
+                center_idx = self.choose_center_for_indices(&members);
+            }
+            if let Some(pos) = members.iter().position(|&idx| idx == center_idx) {
+                let center = members.swap_remove(pos);
+                members.push(center);
+            }
+
+            clusters.push(PartitionCluster {
+                indices: members,
+                center_idx,
+            });
+        }
+        clusters
+    }
+
+    fn choose_center_for_indices(&self, indices: &[usize]) -> usize {
+        if indices.len() == 1 {
+            return indices[0];
+        }
+
+        let mut mean = vec![0.0f32; self.dimensions];
+        for &idx in indices {
+            for (dim, value) in self.nodes[idx].vector.iter().enumerate() {
+                mean[dim] += value;
+            }
+        }
+        let count = indices.len() as f32;
+        for value in &mut mean {
+            *value /= count;
+        }
+
+        indices
+            .iter()
+            .copied()
+            .min_by(|&a, &b| {
+                let da = self.distance(&mean, &self.nodes[a].vector);
+                let db = self.distance(&mean, &self.nodes[b].vector);
+                da.total_cmp(&db).then_with(|| a.cmp(&b))
+            })
+            .unwrap_or(indices[0])
+    }
+
+    fn partition_rng(&self, indices: &[usize], salt: u64) -> StdRng {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64 ^ salt ^ (indices.len() as u64).rotate_left(17);
+        for &idx in indices.iter().take(32) {
+            seed ^= self.nodes[idx]
+                .centroid_id
+                .wrapping_add(0x9e37_79b9_7f4a_7c15u64);
+            seed = seed.rotate_left(13).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        }
+        StdRng::seed_from_u64(seed)
+    }
+
+    fn l2_distance(&self, a: &[f32], b: &[f32]) -> f32 {
+        let len = a.len().min(b.len());
+        let mut sum0 = 0.0f32;
+        let mut sum1 = 0.0f32;
+        let mut sum2 = 0.0f32;
+        let mut sum3 = 0.0f32;
+        let mut i = 0usize;
+
+        while i + 4 <= len {
+            let delta0 = a[i] - b[i];
+            let delta1 = a[i + 1] - b[i + 1];
+            let delta2 = a[i + 2] - b[i + 2];
+            let delta3 = a[i + 3] - b[i + 3];
+            sum0 += delta0 * delta0;
+            sum1 += delta1 * delta1;
+            sum2 += delta2 * delta2;
+            sum3 += delta3 * delta3;
+            i += 4;
+        }
+
+        let mut sum = sum0 + sum1 + sum2 + sum3;
+        while i < len {
+            let delta = a[i] - b[i];
+            sum += delta * delta;
+            i += 1;
+        }
+
+        sum
+    }
+
+    fn push_candidate_results(
+        &self,
+        query: &[f32],
+        candidate: ScoredCandidate,
+        exclusions: SearchExclusions<'_>,
+        top_results: &mut BinaryHeap<ScoredCandidate>,
+        capacity: usize,
+    ) {
+        let tree_idx = self.tree_leaf_backlinks[candidate.idx];
+        if tree_idx == INVALID_INDEX {
+            if !self.is_excluded(candidate.idx, exclusions) {
+                Self::push_top_result(top_results, candidate, capacity);
+            }
+            return;
+        }
+
+        if !self.is_excluded(candidate.idx, exclusions) {
+            Self::push_top_result(top_results, candidate, capacity);
+        }
+
+        let tree_node = self.tree_nodes[tree_idx];
+        for child_idx in tree_node.child_start..tree_node.child_end {
+            let member_idx = self.tree_nodes[child_idx].center_idx;
+            if self.is_excluded(member_idx, exclusions) {
+                continue;
+            }
+            Self::push_top_result(
+                top_results,
+                ScoredCandidate {
+                    idx: member_idx,
+                    distance: self.distance(query, &self.nodes[member_idx].vector),
+                },
+                capacity,
+            );
+        }
+    }
+
+    fn exact_search_by_index(&self, idx: usize, k: usize) -> Vec<ScoredCandidate> {
+        let mut results = Vec::with_capacity(self.live_count().saturating_sub(1));
+        for candidate_idx in self.live_indices() {
+            if candidate_idx == idx {
+                continue;
+            }
+            results.push(ScoredCandidate {
+                idx: candidate_idx,
+                distance: self.distance(&self.nodes[idx].vector, &self.nodes[candidate_idx].vector),
+            });
+        }
+        results.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.idx.cmp(&b.idx))
+        });
+        results.truncate(k.min(results.len()));
+        results
     }
 
     fn exact_search(
         &self,
         query: &[f32],
         k: usize,
-        exclude: &HashSet<u64>,
+        exclusions: SearchExclusions<'_>,
     ) -> Vec<ScoredCandidate> {
-        let mut scored = Vec::with_capacity(self.nodes.len());
-        for (&centroid_id, node) in &self.nodes {
-            if exclude.contains(&centroid_id) {
+        let mut scored = Vec::with_capacity(self.live_count());
+        for idx in self.live_indices() {
+            if self.is_excluded(idx, exclusions) {
                 continue;
             }
             scored.push(ScoredCandidate {
-                id: centroid_id,
-                distance: self.distance(query, &node.vector),
+                idx,
+                distance: self.distance(query, &self.nodes[idx].vector),
             });
         }
         scored.sort_by(|a, b| {
             a.distance
                 .total_cmp(&b.distance)
-                .then_with(|| a.id.cmp(&b.id))
+                .then_with(|| a.idx.cmp(&b.idx))
         });
         scored.truncate(k.min(scored.len()));
         scored
     }
 
-    fn seed_scores(&self, query: &[f32], exclude: &HashSet<u64>) -> Vec<ScoredCandidate> {
-        let mut seeds: Vec<u64> = self
-            .entry_points
-            .iter()
-            .copied()
-            .filter(|centroid_id| {
-                !exclude.contains(centroid_id) && self.nodes.contains_key(centroid_id)
-            })
-            .collect();
-
-        if seeds.is_empty() {
-            seeds = self
-                .sorted_ids()
-                .into_iter()
-                .filter(|centroid_id| !exclude.contains(centroid_id))
-                .take(self.params.entry_point_count)
-                .collect();
-        }
-
-        seeds
-            .into_iter()
-            .filter_map(|centroid_id| {
-                self.nodes.get(&centroid_id).map(|node| ScoredCandidate {
-                    id: centroid_id,
-                    distance: self.distance(query, &node.vector),
-                })
-            })
-            .collect()
-    }
-
-    fn refresh_entry_points(&mut self) {
-        let ids = self.sorted_ids();
-        if ids.is_empty() {
-            self.entry_points.clear();
-            return;
-        }
-
-        let max_entries = self.params.entry_point_count.min(ids.len());
-        if max_entries == ids.len() {
-            self.entry_points = ids;
-            return;
-        }
-
-        let mut selected = Vec::with_capacity(max_entries);
-        let mut selected_set = HashSet::with_capacity(max_entries);
-
-        let first = ids[0];
-        selected.push(first);
-        selected_set.insert(first);
-
-        while selected.len() < max_entries {
-            let mut best: Option<(u64, f32)> = None;
-
-            for &candidate_id in &ids {
-                if selected_set.contains(&candidate_id) {
-                    continue;
-                }
-
-                let candidate_vector = &self
-                    .nodes
-                    .get(&candidate_id)
-                    .expect("candidate exists")
-                    .vector;
-                let min_distance = selected
-                    .iter()
-                    .filter_map(|selected_id| self.nodes.get(selected_id))
-                    .map(|selected_node| self.distance(candidate_vector, &selected_node.vector))
-                    .fold(f32::INFINITY, f32::min);
-
-                match best {
-                    Some((_, current_best)) if min_distance <= current_best => {}
-                    _ => best = Some((candidate_id, min_distance)),
-                }
+    fn rng_prune_from_candidates<I>(&self, node_idx: usize, candidates: I) -> Vec<usize>
+    where
+        I: IntoIterator<Item = ScoredCandidate>,
+    {
+        let mut selected: Vec<usize> = Vec::with_capacity(self.params.neighborhood_size);
+        for candidate in candidates {
+            if candidate.idx == node_idx || !self.is_live_idx(candidate.idx) {
+                continue;
             }
 
-            let Some((next_id, _)) = best else {
-                break;
-            };
+            let good = selected.iter().all(|&selected_idx| {
+                self.distance(
+                    &self.nodes[selected_idx].vector,
+                    &self.nodes[candidate.idx].vector,
+                ) >= candidate.distance
+            });
 
-            selected.push(next_id);
-            selected_set.insert(next_id);
+            if good {
+                selected.push(candidate.idx);
+                if selected.len() >= self.params.neighborhood_size {
+                    break;
+                }
+            }
         }
-
-        self.entry_points = selected;
+        selected
     }
 
-    fn sorted_ids(&self) -> Vec<u64> {
-        let mut ids: Vec<u64> = self.nodes.keys().copied().collect();
+    fn insert_neighbor(&mut self, node_idx: usize, candidate_idx: usize) {
+        if node_idx == candidate_idx
+            || !self.is_live_idx(node_idx)
+            || !self.is_live_idx(candidate_idx)
+        {
+            return;
+        }
+
+        if self.nodes[node_idx].neighbors.contains(&candidate_idx) {
+            return;
+        }
+
+        let mut candidates = Vec::with_capacity(self.nodes[node_idx].neighbors.len() + 1);
+        for &neighbor_idx in &self.nodes[node_idx].neighbors {
+            if self.is_live_idx(neighbor_idx) {
+                candidates.push(ScoredCandidate {
+                    idx: neighbor_idx,
+                    distance: self.distance(
+                        &self.nodes[node_idx].vector,
+                        &self.nodes[neighbor_idx].vector,
+                    ),
+                });
+            }
+        }
+        candidates.push(ScoredCandidate {
+            idx: candidate_idx,
+            distance: self.distance(
+                &self.nodes[node_idx].vector,
+                &self.nodes[candidate_idx].vector,
+            ),
+        });
+        candidates.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.idx.cmp(&b.idx))
+        });
+        self.nodes[node_idx].neighbors = self.rng_prune_from_candidates(node_idx, candidates);
+    }
+
+    fn maybe_rebuild_after_mutation(&mut self, deletion_mutation: bool) {
+        let live_count = self.live_count();
+        if live_count == 0 {
+            self.tree_roots.clear();
+            self.tree_nodes.clear();
+            return;
+        }
+
+        let delete_ratio = self.deleted_count as f32 / self.nodes.len().max(1) as f32;
+        if deletion_mutation && delete_ratio >= self.params.delete_ratio_for_rebuild {
+            self.compact_and_rebuild();
+            return;
+        }
+
+        if self.pending_tree_mutations >= self.params.add_count_for_rebuild {
+            self.rebuild_tree();
+        }
+    }
+
+    fn compact_and_rebuild(&mut self) {
+        let live_entries: Vec<_> = self
+            .nodes
+            .iter()
+            .filter(|node| !node.deleted)
+            .map(|node| CentroidEntry::new(node.centroid_id, node.vector.clone()))
+            .collect();
+
+        self.nodes.clear();
+        self.centroid_to_index.clear();
+        self.tree_roots.clear();
+        self.tree_nodes.clear();
+        self.tree_leaf_backlinks.clear();
+        self.pending_tree_mutations = 0;
+        self.deleted_count = 0;
+
+        for entry in live_entries {
+            let idx = self.nodes.len();
+            self.centroid_to_index.insert(entry.centroid_id, idx);
+            self.nodes.push(GraphNode {
+                centroid_id: entry.centroid_id,
+                vector: entry.vector,
+                neighbors: Vec::new(),
+                deleted: false,
+            });
+            self.tree_leaf_backlinks.push(INVALID_INDEX);
+        }
+
+        self.rebuild_tree();
+        self.rebuild_graph();
+    }
+
+    fn is_live_idx(&self, idx: usize) -> bool {
+        self.nodes.get(idx).is_some_and(|node| !node.deleted)
+    }
+
+    fn all_centroid_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .nodes
+            .iter()
+            .filter(|node| !node.deleted)
+            .map(|node| node.centroid_id)
+            .collect();
         ids.sort_unstable();
         ids
     }
 
-    fn live_count(&self, exclude: &HashSet<u64>) -> usize {
+    fn live_indices(&self) -> Vec<usize> {
         self.nodes
-            .keys()
-            .filter(|centroid_id| !exclude.contains(centroid_id))
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, node)| (!node.deleted).then_some(idx))
+            .collect()
+    }
+
+    fn live_count(&self) -> usize {
+        self.nodes.len().saturating_sub(self.deleted_count)
+    }
+
+    fn live_count_with_exclusions(&self, exclusions: SearchExclusions<'_>) -> usize {
+        if matches!(exclusions, SearchExclusions::None) {
+            return self.live_count();
+        }
+
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(idx, node)| !node.deleted && !self.is_excluded(*idx, exclusions))
             .count()
     }
 
+    fn is_excluded(&self, idx: usize, exclusions: SearchExclusions<'_>) -> bool {
+        let Some(node) = self.nodes.get(idx) else {
+            return true;
+        };
+        if node.deleted {
+            return true;
+        }
+
+        match exclusions {
+            SearchExclusions::None => false,
+            SearchExclusions::ExternalIds(ids) => ids.contains(&node.centroid_id),
+            SearchExclusions::SingleIndex(excluded_idx) => idx == excluded_idx,
+        }
+    }
+
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
-        distance::raw_distance(a, b, self.distance_metric)
+        match self.distance_metric {
+            DistanceMetric::L2 => self.l2_distance(a, b),
+            DistanceMetric::DotProduct => self.dot_distance(a, b),
+        }
+    }
+
+    fn dot_distance(&self, a: &[f32], b: &[f32]) -> f32 {
+        let len = a.len().min(b.len());
+        let mut sum0 = 0.0f32;
+        let mut sum1 = 0.0f32;
+        let mut sum2 = 0.0f32;
+        let mut sum3 = 0.0f32;
+        let mut i = 0usize;
+
+        while i + 4 <= len {
+            sum0 += a[i] * b[i];
+            sum1 += a[i + 1] * b[i + 1];
+            sum2 += a[i + 2] * b[i + 2];
+            sum3 += a[i + 3] * b[i + 3];
+            i += 4;
+        }
+
+        let mut sum = sum0 + sum1 + sum2 + sum3;
+        while i < len {
+            sum += a[i] * b[i];
+            i += 1;
+        }
+
+        -sum
+    }
+
+    fn push_top_result(
+        top_results: &mut BinaryHeap<ScoredCandidate>,
+        candidate: ScoredCandidate,
+        capacity: usize,
+    ) {
+        if capacity == 0 {
+            return;
+        }
+
+        if top_results.len() < capacity {
+            top_results.push(candidate);
+            return;
+        }
+
+        let worst = top_results.peek().expect("heap is non-empty");
+        if candidate.distance < worst.distance {
+            top_results.pop();
+            top_results.push(candidate);
+        }
+    }
+
+    fn push_bound_candidate(
+        reservoir: &mut BinaryHeap<ScoredCandidate>,
+        candidate: ScoredCandidate,
+        capacity: usize,
+    ) -> bool {
+        if capacity == 0 {
+            return false;
+        }
+
+        if reservoir.len() < capacity {
+            reservoir.push(candidate);
+            return true;
+        }
+
+        let worst = reservoir.peek().expect("heap is non-empty");
+        if candidate.distance < worst.distance {
+            reservoir.pop();
+            reservoir.push(candidate);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -718,7 +1638,7 @@ mod tests {
     }
 
     #[test]
-    fn should_remove_centroid_and_repair_local_graph() {
+    fn should_remove_centroid_and_exclude_it_from_search() {
         // given
         let centroids = vec![
             CentroidEntry::new(1, vec![0.0, 0.0]),

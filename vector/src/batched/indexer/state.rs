@@ -424,9 +424,19 @@ pub(crate) struct DirtyCentroidGraph {
 
 impl DirtyCentroidGraph {
     pub(crate) fn search(&self, query: &[f32], k: usize) -> Vec<u64> {
+        if self.new_centroids.is_empty() {
+            if self.deleted_centroids.is_empty() {
+                return self.inner.search(query, k);
+            }
+
+            return self
+                .inner
+                .search_with_include_exclude(query, k, &[], &self.deleted_centroids);
+        }
+
         let include: Vec<_> = self.new_centroids.values().collect();
         self.inner
-            .search_with_include_exclude(&query, k, &include, &self.deleted_centroids)
+            .search_with_include_exclude(query, k, &include, &self.deleted_centroids)
     }
 
     pub(crate) fn centroid(&self, centroid_id: u64) -> Option<CentroidEntry> {
