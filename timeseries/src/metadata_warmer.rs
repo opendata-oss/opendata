@@ -106,7 +106,7 @@ impl MetadataWarmState {
         let default_bucket_bytes = if self.entries.is_empty() {
             // No known sizes yet — use 1/10th of budget as a conservative estimate
             // so the first cycle doesn't warm unlimited buckets.
-            config.preload_bytes / 10
+            std::cmp::max(1, config.preload_bytes / 10)
         } else {
             let total: u64 = self.entries.values().map(|e| e.total_bytes).sum();
             total / self.entries.len() as u64
