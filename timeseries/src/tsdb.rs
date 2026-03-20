@@ -1026,6 +1026,40 @@ impl Tsdb {
         let t0 = std::time::Instant::now();
         let (start, end) = crate::util::range_bounds_to_system_time(range);
 
+        let eval_result = self
+            .eval_query_range_with_stats(query, start, end, step, opts)
+            .await;
+
+        #[cfg(feature = "http-server")]
+        if let Some(metrics) = self.metrics() {
+            let total_secs = t0.elapsed().as_secs_f64();
+            let is_ok = eval_result.is_ok();
+            publish_query_metrics(metrics, total_secs, is_ok);
+            if let Ok((ref _result, ref stats)) = eval_result {
+                publish_query_phase_metrics(metrics, stats);
+            }
+        }
+        let _ = t0;
+
+        eval_result.map(|(result, _stats)| result)
+    }
+
+    /// Inner implementation: runs the full eval pipeline and returns stats.
+    ///
+    /// NOTE: This duplicates the parse/stmt/reader logic from
+    /// `TsdbReadEngine::eval_query_range` so that `evaluate_range` can be
+    /// called directly and its `EvalStats` captured for Prometheus metrics.
+    /// The trait default discards stats, and changing the trait return type
+    /// would propagate to all implementors (`TimeSeriesDb`, `TimeSeriesDbReader`).
+    async fn eval_query_range_with_stats(
+        &self,
+        query: &str,
+        start: std::time::SystemTime,
+        end: std::time::SystemTime,
+        step: Duration,
+        opts: &QueryOptions,
+    ) -> std::result::Result<(Vec<RangeSample>, crate::promql::evaluator::EvalStats), QueryError>
+    {
         let expr = promql_parser::parser::parse(query)
             .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
 
@@ -1049,20 +1083,7 @@ impl Tsdb {
         let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
-        let eval_result = evaluate_range(&reader, stmt, self.load_coordinator()).await;
-
-        #[cfg(feature = "http-server")]
-        if let Some(metrics) = self.metrics() {
-            let total_secs = t0.elapsed().as_secs_f64();
-            let is_ok = eval_result.is_ok();
-            publish_query_metrics(metrics, total_secs, is_ok);
-            if let Ok((ref _result, ref stats)) = eval_result {
-                publish_query_phase_metrics(metrics, stats);
-            }
-        }
-        let _ = t0;
-
-        eval_result.map(|(result, _stats)| result)
+        evaluate_range(&reader, stmt, self.load_coordinator()).await
     }
 
     /// Return metadata for all (or a specific) metric.
