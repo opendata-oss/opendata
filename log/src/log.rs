@@ -407,7 +407,15 @@ impl LogDb {
                             "compactor/total_throughput_bytes_per_sec",
                         ],
                     ),
-                    ("throughput", &["db/wal_flush_bytes", "db/l0_flush_bytes"]),
+                    (
+                        "throughput",
+                        &[
+                            "db/wal_flush_bytes",
+                            "db/l0_flush_bytes",
+                            "db/l0_upload_busy_millis",
+                            "db/l0_upload_idle_millis",
+                        ],
+                    ),
                 ];
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
