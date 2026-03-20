@@ -45,8 +45,6 @@ const INVALID_INDEX: usize = usize::MAX;
 #[derive(Debug, Clone)]
 struct GraphNode {
     centroid_id: u64,
-    vector: Vec<f32>,
-    neighbors: Vec<usize>,
     deleted: bool,
 }
 
@@ -124,7 +122,9 @@ struct SptagCentroidGraphInner {
     distance_metric: DistanceMetric,
     params: SptagParams,
     nodes: Vec<GraphNode>,
+    vectors: Vec<f32>,
     centroid_to_index: HashMap<u64, usize>,
+    graph_neighbors: Vec<usize>,
     tree_roots: Vec<BktRoot>,
     tree_nodes: Vec<BktNode>,
     tree_leaf_backlinks: Vec<usize>,
@@ -281,24 +281,30 @@ impl SptagCentroidGraph {
         }
 
         let mut nodes = Vec::with_capacity(centroids.len());
+        let mut vectors = Vec::with_capacity(centroids.len().saturating_mul(dimensions));
         let mut centroid_to_index = HashMap::with_capacity(centroids.len());
         for centroid in centroids {
             let idx = nodes.len();
             centroid_to_index.insert(centroid.centroid_id, idx);
+            vectors.extend_from_slice(&centroid.vector);
             nodes.push(GraphNode {
                 centroid_id: centroid.centroid_id,
-                vector: centroid.vector,
-                neighbors: Vec::new(),
                 deleted: false,
             });
         }
 
+        let params = SptagParams::default();
+        let graph_neighbors =
+            vec![INVALID_INDEX; nodes.len().saturating_mul(params.neighborhood_size)];
+
         let mut inner = SptagCentroidGraphInner {
             dimensions,
             distance_metric,
-            params: SptagParams::default(),
+            params,
             nodes,
+            vectors,
             centroid_to_index,
+            graph_neighbors,
             tree_roots: Vec::new(),
             tree_nodes: Vec::new(),
             tree_leaf_backlinks: Vec::new(),
@@ -357,7 +363,7 @@ impl CentroidGraph for SptagCentroidGraph {
         if node.deleted {
             None
         } else {
-            Some(node.vector.clone())
+            Some(inner.vector(idx).to_vec())
         }
     }
 
@@ -429,13 +435,16 @@ impl SptagCentroidGraphInner {
         }
 
         let idx = self.nodes.len();
+        self.vectors.extend_from_slice(&entry.vector);
         self.nodes.push(GraphNode {
             centroid_id: entry.centroid_id,
-            vector: entry.vector.clone(),
-            neighbors: Vec::new(),
             deleted: false,
         });
         self.centroid_to_index.insert(entry.centroid_id, idx);
+        self.graph_neighbors.extend(std::iter::repeat_n(
+            INVALID_INDEX,
+            self.params.neighborhood_size,
+        ));
         self.tree_leaf_backlinks.push(INVALID_INDEX);
         self.pending_tree_mutations = self.pending_tree_mutations.saturating_add(1);
 
@@ -457,7 +466,7 @@ impl SptagCentroidGraphInner {
         }
 
         node.deleted = true;
-        node.neighbors.clear();
+        self.clear_graph_row(idx);
         self.deleted_count = self.deleted_count.saturating_add(1);
         self.pending_tree_mutations = self.pending_tree_mutations.saturating_add(1);
 
@@ -542,8 +551,7 @@ impl SptagCentroidGraphInner {
                     continue;
                 }
 
-                let node = &self.nodes[candidate.idx];
-                for &neighbor_idx in &node.neighbors {
+                for &neighbor_idx in self.graph_row(candidate.idx) {
                     if neighbor_idx == INVALID_INDEX || workspace.check_and_visit(neighbor_idx) {
                         continue;
                     }
@@ -551,7 +559,7 @@ impl SptagCentroidGraphInner {
 
                     let scored = ScoredCandidate {
                         idx: neighbor_idx,
-                        distance: self.distance(query, &self.nodes[neighbor_idx].vector),
+                        distance: self.distance(query, self.vector(neighbor_idx)),
                     };
 
                     if Self::push_bound_candidate(
@@ -583,7 +591,7 @@ impl SptagCentroidGraphInner {
                 }
             }
 
-            let mut results = workspace.top_results.clone().into_sorted_vec();
+            let mut results = std::mem::take(&mut workspace.top_results).into_sorted_vec();
             results.truncate(final_capacity);
             results
         })
@@ -599,7 +607,7 @@ impl SptagCentroidGraphInner {
                 let node = self.tree_nodes[node_idx];
                 tree_queue.push(Reverse(TreeCandidate {
                     node_idx,
-                    distance: self.distance(query, &self.nodes[node.center_idx].vector),
+                    distance: self.distance(query, self.vector(node.center_idx)),
                 }));
             }
         }
@@ -658,7 +666,7 @@ impl SptagCentroidGraphInner {
                 let child = self.tree_nodes[child_idx];
                 workspace.tree_queue.push(Reverse(TreeCandidate {
                     node_idx: child_idx,
-                    distance: self.distance(query, &self.nodes[child.center_idx].vector),
+                    distance: self.distance(query, self.vector(child.center_idx)),
                 }));
             }
         }
@@ -670,13 +678,13 @@ impl SptagCentroidGraphInner {
         }
 
         let results = self.search_scored(
-            &self.nodes[node_idx].vector,
+            self.vector(node_idx),
             cef.saturating_add(1),
             SearchExclusions::SingleIndex(node_idx),
         );
 
         let neighbors = self.rng_prune_from_candidates(node_idx, results.into_iter());
-        self.nodes[node_idx].neighbors = neighbors.clone();
+        self.set_graph_neighbors(node_idx, &neighbors);
 
         if update_neighbors {
             for neighbor_idx in neighbors {
@@ -686,9 +694,7 @@ impl SptagCentroidGraphInner {
     }
 
     fn rebuild_graph(&mut self) {
-        for idx in 0..self.nodes.len() {
-            self.nodes[idx].neighbors.clear();
-        }
+        self.graph_neighbors.fill(INVALID_INDEX);
 
         let live_indices = self.live_indices();
         let candidate_count = self
@@ -698,11 +704,12 @@ impl SptagCentroidGraphInner {
 
         for &idx in &live_indices {
             let candidates = self.exact_search_by_index(idx, candidate_count);
-            self.nodes[idx].neighbors = self.rng_prune_from_candidates(idx, candidates.into_iter());
+            let neighbors = self.rng_prune_from_candidates(idx, candidates.into_iter());
+            self.set_graph_neighbors(idx, &neighbors);
         }
 
         for &idx in &live_indices {
-            let neighbors = self.nodes[idx].neighbors.clone();
+            let neighbors = self.graph_neighbors_vec(idx);
             for neighbor_idx in neighbors {
                 self.insert_neighbor(neighbor_idx, idx);
             }
@@ -948,7 +955,7 @@ impl SptagCentroidGraphInner {
         let nearest_assignment = self.kmeans_assign(&order, &centers, &zero_counts, 0.0, false);
         for (cluster_idx, &center_idx) in nearest_assignment.cluster_indices.iter().enumerate() {
             if center_idx != INVALID_INDEX {
-                centers[cluster_idx] = self.nodes[center_idx].vector.clone();
+                centers[cluster_idx] = self.vector(center_idx).to_vec();
             }
         }
 
@@ -993,7 +1000,7 @@ impl SptagCentroidGraphInner {
             let centers: Vec<Vec<f32>> = seeded
                 .iter()
                 .take(cluster_count)
-                .map(|&idx| self.nodes[idx].vector.clone())
+                .map(|&idx| self.vector(idx).to_vec())
                 .collect();
             let zero_counts = vec![0usize; cluster_count];
             let assignment =
@@ -1010,7 +1017,7 @@ impl SptagCentroidGraphInner {
             best_centers = order
                 .iter()
                 .take(cluster_count)
-                .map(|&idx| self.nodes[idx].vector.clone())
+                .map(|&idx| self.vector(idx).to_vec())
                 .collect();
         }
 
@@ -1042,7 +1049,7 @@ impl SptagCentroidGraphInner {
             let mut best_cluster = 0usize;
             let mut best_distance = f32::INFINITY;
             for (cluster_idx, center) in centers.iter().enumerate() {
-                let distance = self.distance(&self.nodes[idx].vector, center)
+                let distance = self.distance(self.vector(idx), center)
                     + lambda * balance_counts.get(cluster_idx).copied().unwrap_or(0) as f32;
                 if distance < best_distance {
                     best_distance = distance;
@@ -1056,7 +1063,7 @@ impl SptagCentroidGraphInner {
             total_distance += best_distance;
 
             if update_centers {
-                for (dim, value) in self.nodes[idx].vector.iter().enumerate() {
+                for (dim, value) in self.vector(idx).iter().enumerate() {
                     center_sums[best_cluster][dim] += value;
                 }
                 if best_distance > cluster_dists[best_cluster] {
@@ -1115,7 +1122,7 @@ impl SptagCentroidGraphInner {
                 continue;
             }
             if count > max_count
-                && self.l2_distance(&self.nodes[sample_idx].vector, &centers[cluster_idx]) > 1e-6
+                && self.l2_distance(self.vector(sample_idx), &centers[cluster_idx]) > 1e-6
             {
                 max_count = count;
                 max_cluster = cluster_idx;
@@ -1127,9 +1134,8 @@ impl SptagCentroidGraphInner {
         for (cluster_idx, center) in centers.iter().enumerate() {
             let next_center = if assignment.counts[cluster_idx] == 0 {
                 if max_cluster != INVALID_INDEX {
-                    self.nodes[assignment.cluster_indices[max_cluster]]
-                        .vector
-                        .clone()
+                    self.vector(assignment.cluster_indices[max_cluster])
+                        .to_vec()
                 } else {
                     center.clone()
                 }
@@ -1186,7 +1192,7 @@ impl SptagCentroidGraphInner {
 
         let mut mean = vec![0.0f32; self.dimensions];
         for &idx in indices {
-            for (dim, value) in self.nodes[idx].vector.iter().enumerate() {
+            for (dim, value) in self.vector(idx).iter().enumerate() {
                 mean[dim] += value;
             }
         }
@@ -1199,8 +1205,8 @@ impl SptagCentroidGraphInner {
             .iter()
             .copied()
             .min_by(|&a, &b| {
-                let da = self.distance(&mean, &self.nodes[a].vector);
-                let db = self.distance(&mean, &self.nodes[b].vector);
+                let da = self.distance(&mean, self.vector(a));
+                let db = self.distance(&mean, self.vector(b));
                 da.total_cmp(&db).then_with(|| a.cmp(&b))
             })
             .unwrap_or(indices[0])
@@ -1277,7 +1283,7 @@ impl SptagCentroidGraphInner {
                 top_results,
                 ScoredCandidate {
                     idx: member_idx,
-                    distance: self.distance(query, &self.nodes[member_idx].vector),
+                    distance: self.distance(query, self.vector(member_idx)),
                 },
                 capacity,
             );
@@ -1292,7 +1298,7 @@ impl SptagCentroidGraphInner {
             }
             results.push(ScoredCandidate {
                 idx: candidate_idx,
-                distance: self.distance(&self.nodes[idx].vector, &self.nodes[candidate_idx].vector),
+                distance: self.distance(self.vector(idx), self.vector(candidate_idx)),
             });
         }
         results.sort_by(|a, b| {
@@ -1317,7 +1323,7 @@ impl SptagCentroidGraphInner {
             }
             scored.push(ScoredCandidate {
                 idx,
-                distance: self.distance(query, &self.nodes[idx].vector),
+                distance: self.distance(query, self.vector(idx)),
             });
         }
         scored.sort_by(|a, b| {
@@ -1340,10 +1346,8 @@ impl SptagCentroidGraphInner {
             }
 
             let good = selected.iter().all(|&selected_idx| {
-                self.distance(
-                    &self.nodes[selected_idx].vector,
-                    &self.nodes[candidate.idx].vector,
-                ) >= candidate.distance
+                self.distance(self.vector(selected_idx), self.vector(candidate.idx))
+                    >= candidate.distance
             });
 
             if good {
@@ -1356,6 +1360,52 @@ impl SptagCentroidGraphInner {
         selected
     }
 
+    fn graph_row_bounds(&self, node_idx: usize) -> (usize, usize) {
+        let start = node_idx.saturating_mul(self.params.neighborhood_size);
+        let end = start + self.params.neighborhood_size;
+        (start, end)
+    }
+
+    fn vector_bounds(&self, node_idx: usize) -> (usize, usize) {
+        let start = node_idx.saturating_mul(self.dimensions);
+        let end = start + self.dimensions;
+        (start, end)
+    }
+
+    fn vector(&self, node_idx: usize) -> &[f32] {
+        let (start, end) = self.vector_bounds(node_idx);
+        &self.vectors[start..end]
+    }
+
+    fn graph_row(&self, node_idx: usize) -> &[usize] {
+        let (start, end) = self.graph_row_bounds(node_idx);
+        &self.graph_neighbors[start..end]
+    }
+
+    fn graph_row_mut(&mut self, node_idx: usize) -> &mut [usize] {
+        let (start, end) = self.graph_row_bounds(node_idx);
+        &mut self.graph_neighbors[start..end]
+    }
+
+    fn clear_graph_row(&mut self, node_idx: usize) {
+        self.graph_row_mut(node_idx).fill(INVALID_INDEX);
+    }
+
+    fn set_graph_neighbors(&mut self, node_idx: usize, neighbors: &[usize]) {
+        let row = self.graph_row_mut(node_idx);
+        row.fill(INVALID_INDEX);
+        let len = neighbors.len().min(row.len());
+        row[..len].copy_from_slice(&neighbors[..len]);
+    }
+
+    fn graph_neighbors_vec(&self, node_idx: usize) -> Vec<usize> {
+        self.graph_row(node_idx)
+            .iter()
+            .copied()
+            .take_while(|idx| *idx != INVALID_INDEX)
+            .collect()
+    }
+
     fn insert_neighbor(&mut self, node_idx: usize, candidate_idx: usize) {
         if node_idx == candidate_idx
             || !self.is_live_idx(node_idx)
@@ -1364,35 +1414,31 @@ impl SptagCentroidGraphInner {
             return;
         }
 
-        if self.nodes[node_idx].neighbors.contains(&candidate_idx) {
+        if self.graph_row(node_idx).contains(&candidate_idx) {
             return;
         }
 
-        let mut candidates = Vec::with_capacity(self.nodes[node_idx].neighbors.len() + 1);
-        for &neighbor_idx in &self.nodes[node_idx].neighbors {
+        let existing_neighbors = self.graph_neighbors_vec(node_idx);
+        let mut candidates = Vec::with_capacity(existing_neighbors.len() + 1);
+        for neighbor_idx in existing_neighbors {
             if self.is_live_idx(neighbor_idx) {
                 candidates.push(ScoredCandidate {
                     idx: neighbor_idx,
-                    distance: self.distance(
-                        &self.nodes[node_idx].vector,
-                        &self.nodes[neighbor_idx].vector,
-                    ),
+                    distance: self.distance(self.vector(node_idx), self.vector(neighbor_idx)),
                 });
             }
         }
         candidates.push(ScoredCandidate {
             idx: candidate_idx,
-            distance: self.distance(
-                &self.nodes[node_idx].vector,
-                &self.nodes[candidate_idx].vector,
-            ),
+            distance: self.distance(self.vector(node_idx), self.vector(candidate_idx)),
         });
         candidates.sort_by(|a, b| {
             a.distance
                 .total_cmp(&b.distance)
                 .then_with(|| a.idx.cmp(&b.idx))
         });
-        self.nodes[node_idx].neighbors = self.rng_prune_from_candidates(node_idx, candidates);
+        let neighbors = self.rng_prune_from_candidates(node_idx, candidates);
+        self.set_graph_neighbors(node_idx, &neighbors);
     }
 
     fn maybe_rebuild_after_mutation(&mut self, deletion_mutation: bool) {
@@ -1418,12 +1464,15 @@ impl SptagCentroidGraphInner {
         let live_entries: Vec<_> = self
             .nodes
             .iter()
-            .filter(|node| !node.deleted)
-            .map(|node| CentroidEntry::new(node.centroid_id, node.vector.clone()))
+            .enumerate()
+            .filter(|(_, node)| !node.deleted)
+            .map(|(idx, node)| CentroidEntry::new(node.centroid_id, self.vector(idx).to_vec()))
             .collect();
 
         self.nodes.clear();
+        self.vectors.clear();
         self.centroid_to_index.clear();
+        self.graph_neighbors.clear();
         self.tree_roots.clear();
         self.tree_nodes.clear();
         self.tree_leaf_backlinks.clear();
@@ -1433,12 +1482,15 @@ impl SptagCentroidGraphInner {
         for entry in live_entries {
             let idx = self.nodes.len();
             self.centroid_to_index.insert(entry.centroid_id, idx);
+            self.vectors.extend_from_slice(&entry.vector);
             self.nodes.push(GraphNode {
                 centroid_id: entry.centroid_id,
-                vector: entry.vector,
-                neighbors: Vec::new(),
                 deleted: false,
             });
+            self.graph_neighbors.extend(std::iter::repeat_n(
+                INVALID_INDEX,
+                self.params.neighborhood_size,
+            ));
             self.tree_leaf_backlinks.push(INVALID_INDEX);
         }
 
