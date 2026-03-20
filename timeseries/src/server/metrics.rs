@@ -88,6 +88,8 @@ pub(crate) struct QueryPhaseLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
 pub(crate) enum QueryPhase {
     Preload,
+    Selector,
+    Sample,
     StepLoop,
 }
 

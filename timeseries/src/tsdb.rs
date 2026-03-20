@@ -514,6 +514,22 @@ pub(crate) fn publish_query_phase_metrics(
         .phase_wall_duration_seconds
         .get_or_create(&QueryPhaseLabels {
             operation: op.clone(),
+            phase: QueryPhase::Selector,
+        })
+        .observe(stats.parallel_selector_wall_ms as f64 / 1000.0);
+    metrics
+        .query
+        .phase_wall_duration_seconds
+        .get_or_create(&QueryPhaseLabels {
+            operation: op.clone(),
+            phase: QueryPhase::Sample,
+        })
+        .observe(stats.parallel_sample_wall_ms as f64 / 1000.0);
+    metrics
+        .query
+        .phase_wall_duration_seconds
+        .get_or_create(&QueryPhaseLabels {
+            operation: op.clone(),
             phase: QueryPhase::StepLoop,
         })
         .observe(stats.step_loop_ms as f64 / 1000.0);
@@ -564,7 +580,7 @@ pub(crate) fn publish_query_phase_metrics(
         .query
         .forward_index_series_loaded_total
         .get_or_create(&QueryOperationLabels { operation: op })
-        .inc_by(stats.forward_index_misses);
+        .inc_by(stats.preload_series);
 }
 
 /// Discover series matching any of the given selectors.

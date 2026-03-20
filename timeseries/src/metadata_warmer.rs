@@ -102,17 +102,26 @@ impl MetadataWarmState {
         let mut sorted: Vec<TimeBucket> = all_buckets.to_vec();
         sorted.sort_by(|a, b| b.start.cmp(&a.start));
 
+        // Compute a default estimate for unknown buckets from the average of known entries.
+        let default_bucket_bytes = if self.entries.is_empty() {
+            // No known sizes yet — use 1/10th of budget as a conservative estimate
+            // so the first cycle doesn't warm unlimited buckets.
+            config.preload_bytes / 10
+        } else {
+            let total: u64 = self.entries.values().map(|e| e.total_bytes).sum();
+            total / self.entries.len() as u64
+        };
+
         // Select buckets up to the byte budget.
         let mut selected: Vec<TimeBucket> = Vec::new();
         let mut budget_used: u64 = 0;
         for bucket in &sorted {
-            let estimated_bytes = self.entries.get(bucket).map(|e| e.total_bytes).unwrap_or(0);
-            // If we have no prior data, we still include the bucket (we'll learn
-            // its size after warming). Budget enforcement uses known sizes.
-            if budget_used > 0
-                && estimated_bytes > 0
-                && budget_used + estimated_bytes > config.preload_bytes
-            {
+            let estimated_bytes = self
+                .entries
+                .get(bucket)
+                .map(|e| e.total_bytes)
+                .unwrap_or(default_bucket_bytes);
+            if budget_used > 0 && budget_used + estimated_bytes > config.preload_bytes {
                 break;
             }
             selected.push(*bucket);
@@ -323,21 +332,24 @@ async fn warmer_loop(
         let cycle_secs = cycle_start.elapsed().as_secs_f64();
         let _is_ok = cycle_result.is_ok();
 
-        if let Err(ref e) = cycle_result {
-            state.fail_cycle();
-            tracing::warn!(
-                cycle = state.total_cycles,
-                error = %e,
-                consecutive_failures = state.consecutive_failures,
-                "metadata warmer cycle failed"
-            );
-        } else {
-            state.complete_cycle();
+        match &cycle_result {
+            Err(e) => {
+                state.fail_cycle();
+                tracing::warn!(
+                    cycle = state.total_cycles,
+                    error = %e,
+                    consecutive_failures = state.consecutive_failures,
+                    "metadata warmer cycle failed"
+                );
+            }
+            Ok(_) => {
+                state.complete_cycle();
+            }
         }
 
         #[cfg(feature = "http-server")]
         if let Some(ref m) = metrics {
-            publish_warmer_cycle_metrics(m, &state, cycle_secs, _is_ok);
+            publish_warmer_cycle_metrics(m, &state, cycle_secs, cycle_result.as_ref().ok());
         }
 
         tracing::info!(
@@ -361,13 +373,22 @@ async fn warmer_loop(
     }
 }
 
+/// Summary of a completed cycle, for metrics publishing.
+struct CycleResult {
+    selected: usize,
+    warmed: usize,
+    new: usize,
+    rewarmed: usize,
+    fresh: usize,
+}
+
 async fn run_cycle(
     config: &MetadataWarmConfig,
     storage: &Arc<dyn StorageRead>,
     coordinator: &ReadLoadCoordinator,
     state: &mut MetadataWarmState,
     #[cfg(feature = "http-server")] metrics: Option<&crate::server::metrics::Metrics>,
-) -> crate::util::Result<()> {
+) -> crate::util::Result<CycleResult> {
     // 1. Warm bucket list.
     let warm_result = storage.warm_bucket_list().await?;
     state.total_bytes_read += warm_result.bytes_read;
@@ -429,18 +450,20 @@ async fn run_cycle(
             let _sem_permit = sem.acquire().await.unwrap();
             // Acquire metadata permit to respect global budget.
             let (_permit, _wait) = coordinator.acquire_metadata().await;
-            let t0 = Instant::now();
+            let fi_t0 = Instant::now();
             let fi_result = storage.warm_forward_index_bytes(bucket).await;
+            let fi_elapsed = fi_t0.elapsed();
+            let ii_t0 = Instant::now();
             let ii_result = storage.warm_inverted_index_bytes(bucket).await;
-            let elapsed = t0.elapsed();
+            let ii_elapsed = ii_t0.elapsed();
             drop(_permit);
-            (bucket, reason, fi_result, ii_result, elapsed)
+            (bucket, reason, fi_result, ii_result, fi_elapsed, ii_elapsed)
         });
     }
 
     while let Some(join_result) = join_set.join_next().await {
         match join_result {
-            Ok((bucket, reason, fi_result, ii_result, elapsed)) => {
+            Ok((bucket, reason, fi_result, ii_result, fi_elapsed, ii_elapsed)) => {
                 match (&fi_result, &ii_result) {
                     (Ok(fi_bytes), Ok(ii_bytes)) => {
                         state.record_warm(bucket, *fi_bytes, *ii_bytes);
@@ -449,7 +472,8 @@ async fn run_cycle(
                             reason = ?reason,
                             forward_index_bytes = fi_bytes,
                             inverted_index_bytes = ii_bytes,
-                            duration_ms = elapsed.as_millis() as u64,
+                            fi_duration_ms = fi_elapsed.as_millis() as u64,
+                            ii_duration_ms = ii_elapsed.as_millis() as u64,
                             "warmed bucket metadata"
                         );
 
@@ -460,7 +484,8 @@ async fn run_cycle(
                                 reason,
                                 *fi_bytes,
                                 *ii_bytes,
-                                elapsed.as_secs_f64(),
+                                fi_elapsed.as_secs_f64(),
+                                ii_elapsed.as_secs_f64(),
                                 true,
                             );
                         }
@@ -481,7 +506,8 @@ async fn run_cycle(
                                 reason,
                                 0,
                                 0,
-                                elapsed.as_secs_f64(),
+                                fi_elapsed.as_secs_f64(),
+                                ii_elapsed.as_secs_f64(),
                                 false,
                             );
                         }
@@ -501,7 +527,19 @@ async fn run_cycle(
         m.warmer.inflight_buckets.set(0);
     }
 
-    Ok(())
+    // Count successful warms from results.
+    let warmed = results
+        .iter()
+        .filter(|(_, fi, ii)| fi.is_ok() && ii.is_ok())
+        .count();
+
+    Ok(CycleResult {
+        selected: plan.selected_count,
+        warmed,
+        new: plan.new_count,
+        rewarmed: plan.rewarm_count,
+        fresh: plan.fresh_count,
+    })
 }
 
 #[cfg(feature = "http-server")]
@@ -509,11 +547,11 @@ fn publish_warmer_cycle_metrics(
     metrics: &crate::server::metrics::Metrics,
     state: &MetadataWarmState,
     cycle_secs: f64,
-    is_ok: bool,
+    cycle_result: Option<&CycleResult>,
 ) {
     use crate::server::metrics::{QueryStatus, WarmerCycleLabels};
 
-    let status = if is_ok {
+    let status = if cycle_result.is_some() {
         QueryStatus::Ok
     } else {
         QueryStatus::Error
@@ -551,6 +589,24 @@ fn publish_warmer_cycle_metrics(
             .oldest_target_bucket_start_minutes
             .set(oldest.start as i64);
     }
+
+    // Cycle detail gauges — only set on successful cycles.
+    if let Some(cr) = cycle_result {
+        metrics
+            .warmer
+            .cycle_buckets_selected
+            .set(cr.selected as i64);
+        metrics.warmer.cycle_buckets_warmed.set(cr.warmed as i64);
+        metrics.warmer.cycle_new_buckets.set(cr.new as i64);
+        metrics
+            .warmer
+            .cycle_rewarmed_buckets
+            .set(cr.rewarmed as i64);
+        metrics
+            .warmer
+            .cycle_skipped_fresh_buckets
+            .set(cr.fresh as i64);
+    }
 }
 
 #[cfg(feature = "http-server")]
@@ -559,7 +615,8 @@ fn publish_bucket_warm_metrics(
     reason: WarmReason,
     fi_bytes: u64,
     ii_bytes: u64,
-    duration_secs: f64,
+    fi_duration_secs: f64,
+    ii_duration_secs: f64,
     is_ok: bool,
 ) {
     use crate::server::metrics::{
@@ -595,7 +652,7 @@ fn publish_bucket_warm_metrics(
             reason: reason_label.clone(),
             status: status.clone(),
         })
-        .observe(duration_secs);
+        .observe(fi_duration_secs);
     if fi_bytes > 0 {
         metrics
             .warmer
@@ -625,7 +682,7 @@ fn publish_bucket_warm_metrics(
             reason: reason_label.clone(),
             status,
         })
-        .observe(duration_secs);
+        .observe(ii_duration_secs);
     if ii_bytes > 0 {
         metrics
             .warmer
@@ -687,13 +744,44 @@ mod tests {
     }
 
     #[test]
-    fn should_allow_budget_to_cross_by_one_bucket() {
-        // given — budget = 100, but first bucket has no known size
+    fn should_enforce_budget_on_cold_start_with_unknown_sizes() {
+        // given — budget = 100, no known sizes. Default estimate = budget/10 = 10 per bucket.
         let config = config_with_budget(100);
         let mut state = MetadataWarmState::new(100);
-        let all_buckets = vec![bucket(60), bucket(120)];
+        // 20 unknown buckets × 10 bytes/bucket estimate = 200 > 100 budget.
+        let all_buckets: Vec<_> = (0..20).map(|i| bucket(i * 60)).collect();
 
-        // when — no prior sizes known, so both get included (budget_used stays 0)
+        // when
+        let plan = state.plan_cycle(&all_buckets, &config);
+
+        // then — should select ~10 buckets (budget/default_estimate), not all 20.
+        // First bucket always included, then each adds 10 until budget exceeded.
+        assert_eq!(plan.selected_count, 10);
+    }
+
+    #[test]
+    fn should_use_average_known_size_for_unknown_buckets() {
+        // given — two known buckets averaging 200 bytes each
+        let config = config_with_budget(500);
+        let mut state = MetadataWarmState::new(500);
+        for (start, bytes) in [(120, 100), (60, 300)] {
+            state.entries.insert(
+                bucket(start),
+                BucketWarmEntry {
+                    bucket: bucket(start),
+                    forward_index_bytes: bytes / 2,
+                    inverted_index_bytes: bytes / 2,
+                    total_bytes: bytes,
+                    last_warmed_at: Instant::now() - Duration::from_secs(600),
+                },
+            );
+        }
+        // Average known size = (100+300)/2 = 200. Budget = 500.
+        // Buckets newest-first: 180(unknown=200), 120(known=100), 60(known=300), 0(unknown=200).
+        // Budget: 200 + 100 = 300 + 300 = 600 > 500 → stop at 2.
+        let all_buckets = vec![bucket(0), bucket(60), bucket(120), bucket(180)];
+
+        // when
         let plan = state.plan_cycle(&all_buckets, &config);
 
         // then
