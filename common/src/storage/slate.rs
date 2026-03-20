@@ -31,7 +31,16 @@ impl prometheus_client::encoding::EncodeMetric for ReadableStatGauge {
         &self,
         mut encoder: prometheus_client::encoding::MetricEncoder,
     ) -> Result<(), std::fmt::Error> {
-        encoder.encode_gauge(&self.0.get())
+        match self.0.metric_type() {
+            slatedb::stats::MetricType::Counter => {
+                let value = self.0.get() as u64;
+                let exemplar: Option<
+                    &prometheus_client::metrics::exemplar::Exemplar<Vec<(String, String)>, f64>,
+                > = None;
+                encoder.encode_counter(&value, exemplar)
+            }
+            slatedb::stats::MetricType::Gauge => encoder.encode_gauge(&self.0.get()),
+        }
     }
 
     fn metric_type(&self) -> prometheus_client::metrics::MetricType {
