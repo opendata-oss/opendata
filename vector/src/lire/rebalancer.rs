@@ -1428,6 +1428,10 @@ mod tests {
                 .map(|(_, v)| v.clone())
         }
 
+        fn all_centroid_ids(&self) -> Vec<u64> {
+            self.centroids.iter().map(|(id, _)| *id).collect()
+        }
+
         fn len(&self) -> usize {
             self.centroids.len()
         }

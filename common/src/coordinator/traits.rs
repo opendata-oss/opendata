@@ -98,7 +98,7 @@ pub trait Flusher<D: Delta>: Send + Sync + 'static {
     /// Consumes the frozen delta by value and returns a snapshot for readers
     /// along with a broadcast payload for subscribers.
     async fn flush_delta(
-        &self,
+        &mut self,
         frozen: D::Frozen,
         epoch_range: &Range<u64>,
     ) -> Result<Arc<dyn StorageSnapshot>, String>;
