@@ -2652,6 +2652,7 @@ dependencies = [
  "opendata-macros",
  "prost",
  "rand 0.8.5",
+ "rayon",
  "reqwest",
  "roaring 0.10.12",
  "rstest",

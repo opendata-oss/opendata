@@ -100,9 +100,8 @@ impl QueryEngine {
             )));
         }
 
-        // Brute-force: compute distance from query to every centroid
-        let num_centroids = self.centroid_graph.len();
-        let all_centroid_ids = self.centroid_graph.search(&query.vector, num_centroids);
+        // Brute-force: compute distance from query to every live centroid
+        let all_centroid_ids = self.centroid_graph.all_centroid_ids();
         let mut scored: Vec<(u64, distance::VectorDistance)> = all_centroid_ids
             .iter()
             .filter_map(|&cid| {

@@ -829,7 +829,7 @@ mod tests {
     #[async_trait]
     impl Flusher<TestDelta> for TestFlusher {
         async fn flush_delta(
-            &self,
+            &mut self,
             frozen: FrozenTestDelta,
             epoch_range: &Range<u64>,
         ) -> Result<Arc<dyn StorageSnapshot>, String> {

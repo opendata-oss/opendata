@@ -396,6 +396,10 @@ mod tests {
                 .map(|(_, v)| v.clone())
         }
 
+        fn all_centroid_ids(&self) -> Vec<u64> {
+            todo!()
+        }
+
         fn len(&self) -> usize {
             self.centroids.len()
         }
@@ -729,6 +733,10 @@ mod tests {
 
             fn get_centroid_vector(&self, _centroid_id: u64) -> Option<Vec<f32>> {
                 None
+            }
+
+            fn all_centroid_ids(&self) -> Vec<u64> {
+                todo!()
             }
 
             fn len(&self) -> usize {
@@ -1074,6 +1082,10 @@ mod tests {
 
             fn get_centroid_vector(&self, _centroid_id: u64) -> Option<Vec<f32>> {
                 None
+            }
+
+            fn all_centroid_ids(&self) -> Vec<u64> {
+                todo!()
             }
 
             fn len(&self) -> usize {

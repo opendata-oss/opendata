@@ -6,6 +6,7 @@
 mod usearch;
 
 use crate::error::Result;
+use std::collections::HashSet;
 
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::collection_meta::DistanceMetric;
@@ -28,6 +29,29 @@ pub trait CentroidGraph: Send + Sync {
     /// Vector of centroid_ids sorted by similarity (closest first)
     fn search(&self, query: &[f32], k: usize) -> Vec<u64>;
 
+    /// Search for k nearest centroids to a query vector. Exclude centroids with ids
+    /// from an exclude set. After search, factor in centroids from an include set.
+    /// The centroids from the include set are not part of the current graph, so must
+    /// be factored in after the graph search.
+    ///
+    /// # Arguments
+    /// * `query` - Query vector
+    /// * `k` - Number of nearest centroids to return
+    /// * `include` - New centroids to be considered after searching the graph
+    /// * `exclude` - Centroids to be excluded from the graph search
+    ///
+    /// # Returns
+    /// Vector of centroid_ids sorted by similarity (closest first)
+    fn search_with_include_exclude(
+        &self,
+        _query: &[f32],
+        _k: usize,
+        _include: &[&CentroidEntry],
+        _exclude: &HashSet<u64>,
+    ) -> Vec<u64> {
+        unimplemented!();
+    }
+
     /// Add a centroid to the graph.
     ///
     /// Uses interior mutability since the graph is behind `Arc<dyn CentroidGraph>`.
@@ -42,6 +66,9 @@ pub trait CentroidGraph: Send + Sync {
     ///
     /// Returns `None` if the centroid is not in the graph.
     fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>>;
+
+    /// Return all live centroid IDs currently present in the graph.
+    fn all_centroid_ids(&self) -> Vec<u64>;
 
     /// Returns the number of centroids in the graph.
     fn len(&self) -> usize;
