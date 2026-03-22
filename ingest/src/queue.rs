@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{BufMut, Bytes, BytesMut};
-use common::clock::Clock;
 use slatedb::object_store::path::Path;
 use slatedb::object_store::{
     Error as ObjectStoreError, ObjectStore, PutMode, PutPayload, UpdateVersion,
@@ -36,6 +35,35 @@ pub(crate) struct QueueEntry {
     pub(crate) sequence: u64,
     pub(crate) location: String,
     pub(crate) metadata: Vec<Metadata>,
+}
+
+impl QueueEntry {
+    fn new(location: String, metadata: Vec<Metadata>) -> Result<Self> {
+        if location.len() > u16::MAX as usize {
+            return Err(Error::InvalidInput(format!(
+                "location length {} exceeds u16::MAX",
+                location.len()
+            )));
+        }
+        if metadata.len() > u32::MAX as usize {
+            return Err(Error::InvalidInput(format!(
+                "metadata count {} exceeds u32::MAX",
+                metadata.len()
+            )));
+        }
+        Ok(Self {
+            sequence: 0,
+            location,
+            metadata,
+        })
+    }
+
+    fn clone_with_sequence(&self, sequence: u64) -> Self {
+        Self {
+            sequence,
+            ..self.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -111,7 +139,7 @@ impl Manifest {
         let next_sequence = entries.iter().map(|e| e.sequence + 1).max().unwrap_or(0);
         let mut buf = BytesMut::new();
         for entry in entries {
-            Self::encode_entry(&mut buf, entry);
+            Self::encode_entry(&mut buf, entry).unwrap();
         }
         buf.put_u32_le(entries.len() as u32);
         buf.put_u64_le(next_sequence);
@@ -127,20 +155,18 @@ impl Manifest {
     }
 
     /// Number of entries (read from the footer, O(1)).
-    #[allow(dead_code)]
     fn entries_count(&self) -> usize {
         let base = self.existing_entries_count();
         base + self.appended_count
     }
 
     /// Whether the manifest contains no entries.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.entries_count() == 0
     }
 
     /// Return a borrowing iterator that lazily deserializes entries.
-    #[allow(dead_code)]
     pub(crate) fn iter(&self) -> ManifestIter<'_> {
         let base_count = self.existing_entries_count();
         let entries_end = if self.data.is_empty() {
@@ -175,21 +201,18 @@ impl Manifest {
     /// Append a single entry without copying existing data.
     /// The entry is encoded and stored internally; bytes are merged in `to_bytes()`.
     /// The entry's sequence number is overwritten with the manifest's next sequence.
-    fn append(&mut self, entry: &QueueEntry) {
-        let sequenced = QueueEntry {
-            sequence: self.next_sequence,
-            ..entry.clone()
-        };
-        Self::encode_entry(&mut self.appended, &sequenced);
+    fn append(&mut self, entry: &QueueEntry) -> Result<()> {
+        let sequenced = entry.clone_with_sequence(self.next_sequence);
+        Self::encode_entry(&mut self.appended, &sequenced)?;
         self.next_sequence += 1;
         self.appended_count += 1;
+        Ok(())
     }
 
     /// Remove all entries with sequence <= `through_sequence`, returning them.
     ///
     /// Optimized to avoid deserializing/re-serializing remaining entries: only the
     /// removed entries are fully decoded, while remaining entries are byte-copied.
-    #[allow(dead_code)]
     fn dequeue(&mut self, through_sequence: u64) -> Result<Vec<QueueEntry>> {
         let next_seq = self.next_sequence;
         let epoch = self.epoch;
@@ -237,7 +260,6 @@ impl Manifest {
     }
 
     /// Set the epoch and patch the data bytes in place.
-    #[allow(dead_code)]
     fn set_epoch(&mut self, epoch: u64) {
         self.epoch = epoch;
         let mut buf = BytesMut::from(self.data.as_ref());
@@ -249,9 +271,9 @@ impl Manifest {
     /// Serialize the manifest to bytes for writing to object storage.
     /// When an entry was appended, this merges existing data with the appended
     /// entry and writes a new footer.
-    fn to_bytes(&self) -> Bytes {
+    fn to_bytes(&self) -> Result<Bytes> {
         if self.appended.is_empty() {
-            return self.data.clone();
+            return Ok(self.data.clone());
         }
         let (prefix, base_count) = if self.data.is_empty() {
             (&[] as &[u8], 0u32)
@@ -264,17 +286,26 @@ impl Manifest {
             );
             (&self.data[..footer_start], count)
         };
+        let total_count: u32 = base_count
+            .checked_add(self.appended_count as u32)
+            .ok_or_else(|| {
+                Error::Serialization(format!(
+                    "total entry count consisting of {} existing entries + {} appended entries exceeds u32::MAX",
+                    base_count, self.appended_count
+                ))
+            })?;
         let mut buf = BytesMut::with_capacity(prefix.len() + self.appended.len() + FOOTER_SIZE);
         buf.extend_from_slice(prefix);
         buf.extend_from_slice(&self.appended);
-        buf.put_u32_le(base_count + self.appended_count as u32);
+        buf.put_u32_le(total_count);
         buf.put_u64_le(self.next_sequence);
         buf.put_u64_le(self.epoch);
         buf.put_u16_le(MANIFEST_VERSION);
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
-    fn encode_entry(buf: &mut BytesMut, entry: &QueueEntry) {
+    fn encode_entry(buf: &mut BytesMut, entry: &QueueEntry) -> Result<()> {
+        debug_assert!(entry.location.len() <= u16::MAX as usize);
         let metadata_size: usize = METADATA_COUNT_SIZE
             + entry
                 .metadata
@@ -283,18 +314,28 @@ impl Manifest {
                     START_INDEX_SIZE + INGESTION_TIME_MS_SIZE + METADATA_LEN_SIZE + m.payload.len()
                 })
                 .sum::<usize>();
-        let entry_len = SEQUENCE_SIZE + LOCATION_LEN_SIZE + entry.location.len() + metadata_size;
-        buf.put_u32_le(entry_len as u32);
+        let entry_body_len =
+            SEQUENCE_SIZE + LOCATION_LEN_SIZE + entry.location.len() + metadata_size;
+        debug_assert!(entry_body_len <= u32::MAX as usize);
+        buf.put_u32_le(entry_body_len as u32);
         buf.put_u64_le(entry.sequence);
         buf.put_u16_le(entry.location.len() as u16);
         buf.extend_from_slice(entry.location.as_bytes());
+        debug_assert!(entry.metadata.len() <= u32::MAX as usize);
         buf.put_u32_le(entry.metadata.len() as u32);
         for m in &entry.metadata {
+            if m.payload.len() > u32::MAX as usize {
+                return Err(Error::InvalidInput(format!(
+                    "metadata payload size {} exceeds u32::MAX",
+                    m.payload.len()
+                )));
+            }
             buf.put_u32_le(m.start_index);
             buf.put_i64_le(m.ingestion_time_ms);
             buf.put_u32_le(m.payload.len() as u32);
             buf.extend_from_slice(&m.payload);
         }
+        Ok(())
     }
 }
 
@@ -516,7 +557,7 @@ impl ManifestStore {
             Some(v) => PutMode::Update(v),
             None => PutMode::Create,
         };
-        let data = manifest.to_bytes();
+        let data = manifest.to_bytes().map_err(ManifestWriteError::Fatal)?;
 
         match self
             .object_store
@@ -587,16 +628,14 @@ impl QueueProducer {
 
     /// Append an entry to the queue with the given `location` and `metadata`.
     ///
-    /// The write is retried automatically on optimistic-concurrency conflicts.
+    /// Returns [`Error::InvalidInput`] if `location` exceeds 65 535 bytes or
+    /// `metadata` exceeds 2³²−1 items. The write is retried automatically on
+    /// optimistic-concurrency conflicts.
     pub async fn enqueue(&self, location: String, metadata: Vec<Metadata>) -> Result<()> {
-        let entry = QueueEntry {
-            sequence: 0,
-            location,
-            metadata,
-        };
+        let entry = QueueEntry::new(location, metadata)?;
         loop {
             let (mut manifest, version) = self.manifest_store.read().await?;
-            manifest.append(&entry);
+            manifest.append(&entry)?;
             self.counter.record_write();
             match self.manifest_store.write(&manifest, version).await {
                 Ok(()) => return Ok(()),
@@ -623,32 +662,24 @@ impl QueueProducer {
 /// fencing any previous consumer instance. Every subsequent read or dequeue
 /// checks that the local epoch still matches the manifest, returning
 /// [`Error::Fenced`] if another consumer has taken over.
-#[allow(dead_code)]
 pub struct QueueConsumer {
     manifest_store: ManifestStore,
     epoch: AtomicU64,
-    clock: Arc<dyn Clock>,
     counter: ConflictCounter,
     queue_len: AtomicU64,
 }
 
-#[allow(dead_code)]
 impl QueueConsumer {
     /// Create a new consumer backed by the given [`ObjectStore`].
     ///
     /// The consumer is not active until [`QueueConsumer::initialize`] is called.
-    pub fn with_object_store(
-        manifest_path: String,
-        object_store: Arc<dyn ObjectStore>,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
+    pub fn with_object_store(manifest_path: String, object_store: Arc<dyn ObjectStore>) -> Self {
         Self {
             manifest_store: ManifestStore {
                 object_store,
                 manifest_path,
             },
             epoch: AtomicU64::new(UNINITIALIZED_EPOCH),
-            clock,
             counter: ConflictCounter::new(),
             queue_len: AtomicU64::new(0),
         }
@@ -680,7 +711,7 @@ impl QueueConsumer {
 
     /// Return the first entry in the queue without dequeueing it.
     /// Returns `Fenced` if the consumer's epoch does not match the manifest's epoch.
-    async fn peek(&self) -> Result<Option<QueueEntry>> {
+    pub(crate) async fn peek(&self) -> Result<Option<QueueEntry>> {
         let (manifest, _) = self.read_manifest().await?;
         if manifest.epoch != self.epoch.load(Ordering::Relaxed) {
             return Err(Error::Fenced);
@@ -690,7 +721,7 @@ impl QueueConsumer {
 
     /// Return the entry with the given sequence number, or None if not found.
     /// Returns `Fenced` if the consumer's epoch does not match the manifest's epoch.
-    async fn read(&self, sequence: u64) -> Result<Option<QueueEntry>> {
+    pub(crate) async fn read(&self, sequence: u64) -> Result<Option<QueueEntry>> {
         let (manifest, _) = self.read_manifest().await?;
         if manifest.epoch != self.epoch.load(Ordering::Relaxed) {
             return Err(Error::Fenced);
@@ -703,7 +734,7 @@ impl QueueConsumer {
 
     /// Remove all entries with sequence <= `through_sequence`, returning the removed entries.
     /// Returns `Fenced` if the consumer's epoch does not match the manifest's epoch.
-    async fn dequeue(&self, through_sequence: u64) -> Result<Vec<QueueEntry>> {
+    pub(crate) async fn dequeue(&self, through_sequence: u64) -> Result<Vec<QueueEntry>> {
         loop {
             let (mut manifest, version) = self.read_manifest().await?;
             if manifest.epoch != self.epoch.load(Ordering::Relaxed) {
@@ -756,7 +787,6 @@ impl QueueConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::clock::SystemClock;
     use slatedb::object_store::memory::InMemory;
 
     const TEST_MANIFEST_PATH: &str = "test/manifest";
@@ -771,11 +801,8 @@ mod tests {
     #[tokio::test]
     async fn should_initialize_consumer_and_increment_epoch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         consumer.initialize().await.unwrap();
 
@@ -786,11 +813,8 @@ mod tests {
     #[tokio::test]
     async fn should_peek_none_when_queue_is_empty() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer.initialize().await.unwrap();
 
         let result = consumer.peek().await.unwrap();
@@ -816,11 +840,8 @@ mod tests {
             .await
             .unwrap();
 
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer.initialize().await.unwrap();
 
         let entry = consumer.read(1).await.unwrap().unwrap();
@@ -839,11 +860,8 @@ mod tests {
             .await
             .unwrap();
 
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer.initialize().await.unwrap();
 
         let result = consumer.read(99).await.unwrap();
@@ -853,18 +871,12 @@ mod tests {
     #[tokio::test]
     async fn should_fence_old_consumer_on_peek() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let consumer_a = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer_a =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer_a.initialize().await.unwrap();
 
-        let consumer_b = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer_b =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer_b.initialize().await.unwrap();
 
         let result = consumer_a.peek().await;
@@ -874,18 +886,12 @@ mod tests {
     #[tokio::test]
     async fn should_fence_old_consumer_on_dequeue() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let consumer_a = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer_a =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer_a.initialize().await.unwrap();
 
-        let consumer_b = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer_b =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer_b.initialize().await.unwrap();
 
         let result = consumer_a.dequeue(0).await;
@@ -903,11 +909,8 @@ mod tests {
             .await
             .unwrap();
 
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
 
         let result = consumer.peek().await;
         assert!(matches!(result, Err(Error::Fenced)));
@@ -921,15 +924,15 @@ mod tests {
         manifest.set_epoch(u64::MAX - 1);
         let path = Path::from(TEST_MANIFEST_PATH);
         store
-            .put(&path, PutPayload::from(manifest.to_bytes().to_vec()))
+            .put(
+                &path,
+                PutPayload::from(manifest.to_bytes().unwrap().to_vec()),
+            )
             .await
             .unwrap();
 
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer.initialize().await.unwrap();
 
         let manifest = read_producer_manifest(&store, TEST_MANIFEST_PATH).await;
@@ -951,11 +954,8 @@ mod tests {
             .await
             .unwrap();
 
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer.initialize().await.unwrap();
 
         let entry = consumer.peek().await.unwrap().unwrap();
@@ -981,11 +981,8 @@ mod tests {
             .await
             .unwrap();
 
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer.initialize().await.unwrap();
 
         let removed = consumer.dequeue(1).await.unwrap();
@@ -1012,11 +1009,8 @@ mod tests {
             .await
             .unwrap();
 
-        let consumer = QueueConsumer::with_object_store(
-            TEST_MANIFEST_PATH.to_string(),
-            store.clone(),
-            Arc::new(SystemClock),
-        );
+        let consumer =
+            QueueConsumer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
         consumer.initialize().await.unwrap();
 
         consumer.dequeue(1).await.unwrap();
@@ -1065,7 +1059,10 @@ mod tests {
         }]);
         let path = Path::from(TEST_MANIFEST_PATH);
         store
-            .put(&path, PutPayload::from(existing.to_bytes().to_vec()))
+            .put(
+                &path,
+                PutPayload::from(existing.to_bytes().unwrap().to_vec()),
+            )
             .await
             .unwrap();
 
@@ -1082,11 +1079,7 @@ mod tests {
     }
 
     fn entry(location: &str, metadata: Vec<Metadata>) -> QueueEntry {
-        QueueEntry {
-            sequence: 0,
-            location: location.to_string(),
-            metadata,
-        }
+        QueueEntry::new(location.to_string(), metadata).unwrap()
     }
 
     fn entry_seq(seq: u64, location: &str, metadata: Vec<Metadata>) -> QueueEntry {
@@ -1117,7 +1110,7 @@ mod tests {
         assert!(m.is_empty());
         assert_eq!(m.epoch, 0);
 
-        let bytes = m.to_bytes();
+        let bytes = m.to_bytes().unwrap();
         assert_eq!(bytes.len(), FOOTER_SIZE);
         assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 0);
         assert_eq!(u64::from_le_bytes(bytes[4..12].try_into().unwrap()), 0);
@@ -1134,7 +1127,7 @@ mod tests {
             entry_seq(0, "a", vec![meta(0, 1, "x")]),
             entry_seq(1, "b", vec![meta(0, 2, "y")]),
         ];
-        let data = Manifest::from_entries(&entries).to_bytes();
+        let data = Manifest::from_entries(&entries).to_bytes().unwrap();
 
         let m = Manifest::from_bytes(data).unwrap();
 
@@ -1155,7 +1148,7 @@ mod tests {
         assert_eq!(m.epoch, 0);
 
         let mut m = m;
-        m.append(&entry("loc", vec![]));
+        m.append(&entry("loc", vec![])).unwrap();
         let entries: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(entries[0].sequence, 42);
     }
@@ -1205,7 +1198,7 @@ mod tests {
     fn should_make_appended_entry_accessible_via_iter() {
         let mut m = Manifest::empty();
 
-        m.append(&entry("loc", vec![meta(0, 42, "meta")]));
+        m.append(&entry("loc", vec![meta(0, 42, "meta")])).unwrap();
 
         let entries: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(entries.len(), 1);
@@ -1217,10 +1210,10 @@ mod tests {
     #[test]
     fn should_append_to_existing_base_entries() {
         let base = Manifest::from_entries(&[entry_seq(0, "base", vec![])]);
-        let data = base.to_bytes();
+        let data = base.to_bytes().unwrap();
         let mut m = Manifest::from_bytes(data).unwrap();
 
-        m.append(&entry("appended", vec![]));
+        m.append(&entry("appended", vec![])).unwrap();
 
         assert_eq!(m.entries_count(), 2);
         assert_eq!(collect_locations(&m), vec!["base", "appended"]);
@@ -1233,9 +1226,9 @@ mod tests {
     fn should_preserve_append_order() {
         let mut m = Manifest::empty();
 
-        m.append(&entry("a", vec![]));
-        m.append(&entry("b", vec![]));
-        m.append(&entry("c", vec![]));
+        m.append(&entry("a", vec![])).unwrap();
+        m.append(&entry("b", vec![])).unwrap();
+        m.append(&entry("c", vec![])).unwrap();
 
         assert_eq!(collect_locations(&m), vec!["a", "b", "c"]);
         let entries: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
@@ -1284,7 +1277,7 @@ mod tests {
     fn should_return_footer_for_empty_manifest() {
         let m = Manifest::empty();
 
-        let bytes = m.to_bytes();
+        let bytes = m.to_bytes().unwrap();
 
         assert_eq!(bytes.len(), FOOTER_SIZE);
         assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 0);
@@ -1299,10 +1292,10 @@ mod tests {
     #[test]
     fn should_merge_base_and_appended() {
         let base = Manifest::from_entries(&[entry_seq(0, "base", vec![])]);
-        let mut m = Manifest::from_bytes(base.to_bytes()).unwrap();
-        m.append(&entry("appended", vec![]));
+        let mut m = Manifest::from_bytes(base.to_bytes().unwrap()).unwrap();
+        m.append(&entry("appended", vec![])).unwrap();
 
-        let serialized = m.to_bytes();
+        let serialized = m.to_bytes().unwrap();
         let reparsed = Manifest::from_bytes(serialized).unwrap();
 
         assert_eq!(reparsed.entries_count(), 2);
@@ -1315,12 +1308,12 @@ mod tests {
     #[test]
     fn should_write_correct_footer_count() {
         let base = Manifest::from_entries(&[entry_seq(0, "a", vec![]), entry_seq(1, "b", vec![])]);
-        let mut m = Manifest::from_bytes(base.to_bytes()).unwrap();
-        m.append(&entry("c", vec![]));
-        m.append(&entry("d", vec![]));
-        m.append(&entry("e", vec![]));
+        let mut m = Manifest::from_bytes(base.to_bytes().unwrap()).unwrap();
+        m.append(&entry("c", vec![])).unwrap();
+        m.append(&entry("d", vec![])).unwrap();
+        m.append(&entry("e", vec![])).unwrap();
 
-        let bytes = m.to_bytes();
+        let bytes = m.to_bytes().unwrap();
 
         let footer_start = bytes.len() - FOOTER_SIZE;
         let count = u32::from_le_bytes(bytes[footer_start..footer_start + 4].try_into().unwrap());
@@ -1349,7 +1342,7 @@ mod tests {
         ];
         let original = Manifest::from_entries(&entries);
 
-        let reparsed = Manifest::from_bytes(original.to_bytes()).unwrap();
+        let reparsed = Manifest::from_bytes(original.to_bytes().unwrap()).unwrap();
 
         assert_eq!(reparsed.entries_count(), 2);
         let decoded: Vec<QueueEntry> = reparsed.iter().map(|e| e.unwrap()).collect();
@@ -1364,10 +1357,10 @@ mod tests {
     #[test]
     fn should_round_trip_append_serialize_reparse() {
         let mut m = Manifest::empty();
-        m.append(&entry("x", vec![meta(0, 100, "data")]));
-        m.append(&entry("y", vec![meta(0, 200, "more")]));
+        m.append(&entry("x", vec![meta(0, 100, "data")])).unwrap();
+        m.append(&entry("y", vec![meta(0, 200, "more")])).unwrap();
 
-        let reparsed = Manifest::from_bytes(m.to_bytes()).unwrap();
+        let reparsed = Manifest::from_bytes(m.to_bytes().unwrap()).unwrap();
 
         assert_eq!(reparsed.entries_count(), 2);
         assert_eq!(collect_locations(&reparsed), vec!["x", "y"]);
@@ -1376,13 +1369,13 @@ mod tests {
     #[test]
     fn should_chain_serialize_reparse_append() {
         let original = Manifest::from_entries(&[entry_seq(0, "a", vec![])]);
-        let mut m = Manifest::from_bytes(original.to_bytes()).unwrap();
-        m.append(&entry("b", vec![]));
+        let mut m = Manifest::from_bytes(original.to_bytes().unwrap()).unwrap();
+        m.append(&entry("b", vec![])).unwrap();
 
-        let mut m2 = Manifest::from_bytes(m.to_bytes()).unwrap();
-        m2.append(&entry("c", vec![]));
+        let mut m2 = Manifest::from_bytes(m.to_bytes().unwrap()).unwrap();
+        m2.append(&entry("c", vec![])).unwrap();
 
-        let final_m = Manifest::from_bytes(m2.to_bytes()).unwrap();
+        let final_m = Manifest::from_bytes(m2.to_bytes().unwrap()).unwrap();
 
         assert_eq!(final_m.entries_count(), 3);
         assert_eq!(collect_locations(&final_m), vec!["a", "b", "c"]);
@@ -1394,7 +1387,7 @@ mod tests {
     fn should_dequeue_entries_through_sequence() {
         let mut m = Manifest::empty();
         for _ in 0..5 {
-            m.append(&entry("loc", vec![]));
+            m.append(&entry("loc", vec![])).unwrap();
         }
 
         let removed = m.dequeue(2).unwrap();
@@ -1414,7 +1407,7 @@ mod tests {
     fn should_dequeue_all_entries() {
         let mut m = Manifest::empty();
         for _ in 0..3 {
-            m.append(&entry("loc", vec![]));
+            m.append(&entry("loc", vec![])).unwrap();
         }
 
         let removed = m.dequeue(2).unwrap();
@@ -1443,7 +1436,7 @@ mod tests {
     fn should_append_after_dequeue() {
         let mut m = Manifest::empty();
         for _ in 0..3 {
-            m.append(&entry("loc", vec![]));
+            m.append(&entry("loc", vec![])).unwrap();
         }
 
         m.dequeue(0).unwrap();
@@ -1453,7 +1446,7 @@ mod tests {
         assert_eq!(remaining[0].sequence, 1);
         assert_eq!(remaining[1].sequence, 2);
 
-        m.append(&entry("new", vec![]));
+        m.append(&entry("new", vec![])).unwrap();
         let all: Vec<QueueEntry> = m.iter().map(|e| e.unwrap()).collect();
         assert_eq!(all.len(), 3);
         assert_eq!(all[2].sequence, 3);
@@ -1462,7 +1455,7 @@ mod tests {
     /// Serialize a single entry into raw bytes (without footer).
     fn encode_entry_bytes(entry: &QueueEntry) -> Vec<u8> {
         let mut buf = BytesMut::new();
-        Manifest::encode_entry(&mut buf, entry);
+        Manifest::encode_entry(&mut buf, entry).unwrap();
         buf.to_vec()
     }
 
@@ -1618,5 +1611,16 @@ mod tests {
             matches!(&err, Error::Serialization(msg) if msg.contains("metadata has less bytes than set")),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn should_reject_location_exceeding_u16_max() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let producer =
+            QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
+
+        let long_location = "x".repeat(u16::MAX as usize + 1);
+        let result = producer.enqueue(long_location, vec![]).await;
+        assert!(matches!(result, Err(Error::InvalidInput(msg)) if msg.contains("location length")));
     }
 }

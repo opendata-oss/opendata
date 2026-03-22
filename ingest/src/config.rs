@@ -47,6 +47,21 @@ pub struct IngestorConfig {
     pub max_buffered_inputs: usize,
 }
 
+/// Configuration for a [`Collector`](crate::Collector).
+///
+/// Controls where the queue manifest and data batches are read from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectorConfig {
+    /// Determines where and how ingest data is read. See [`StorageConfig`].
+    pub storage: StorageConfig,
+
+    /// Path to the queue manifest in object storage.
+    ///
+    /// Defaults to `"ingest/manifest"`.
+    #[serde(default = "default_manifest_path")]
+    pub manifest_path: String,
+}
+
 fn default_data_path_prefix() -> String {
     "ingest".to_string()
 }

@@ -70,13 +70,14 @@ impl DataAndNotifiers {
         ingestion_time_ms: i64,
         notifier: Notifier,
     ) -> Result<()> {
-        let start_index: u32 = self.entries.len().try_into().map_err(|_| {
-            Error::InvalidInput(format!(
+        let start_index = self.entries.len() as u32;
+        self.entries.extend(entries);
+        if self.entries.len() > u32::MAX as usize {
+            return Err(Error::InvalidInput(format!(
                 "batch entry count {} exceeds u32::MAX",
                 self.entries.len()
-            ))
-        })?;
-        self.entries.extend(entries);
+            )));
+        }
         self.metadata.push(Metadata {
             start_index,
             ingestion_time_ms,
@@ -114,7 +115,17 @@ impl Batch {
         notifier: Notifier,
         now: SystemTime,
     ) -> Result<()> {
-        self.size_bytes += entries.iter().map(|e| e.len()).sum::<usize>() + metadata.len();
+        let mut entry_size_sum = 0usize;
+        for e in &entries {
+            if e.len() > u32::MAX as usize {
+                return Err(Error::InvalidInput(format!(
+                    "entry size {} exceeds u32::MAX",
+                    e.len()
+                )));
+            }
+            entry_size_sum += e.len();
+        }
+        self.size_bytes += entry_size_sum + metadata.len();
         self.data_and_notifiers
             .add(entries, metadata, ingestion_time_ms, notifier)?;
         if self.started_at.is_none() {
@@ -217,7 +228,7 @@ impl BatchWriterTask {
     }
 
     async fn write_and_enqueue(&self, entries: Vec<Bytes>, metadata: Vec<Metadata>) -> Result<()> {
-        let payload = encode_batch(&entries)?;
+        let payload = encode_batch(&entries);
         let id = ulid::Ulid::new();
         let path = Path::from(format!("{}/{}.batch", self.data_path_prefix, id));
         self.object_store
@@ -353,9 +364,18 @@ impl Ingestor {
     ///
     /// Returns a [`WriteHandle`] that can be used to check or await durability.
     /// Applies backpressure when the message buffer is full.
+    ///
+    /// Returns [`Error::InvalidInput`] if `entries` is empty or if `metadata`
+    /// exceeds 2³²−1 bytes.
     pub async fn ingest(&self, entries: Vec<Bytes>, metadata: Bytes) -> Result<WriteHandle> {
         if entries.is_empty() {
             return Err(Error::InvalidInput("entries must not be empty".to_string()));
+        }
+        if metadata.len() > u32::MAX as usize {
+            return Err(Error::InvalidInput(format!(
+                "metadata size {} exceeds u32::MAX",
+                metadata.len()
+            )));
         }
         let ingestion_time_ms = millis(self.clock.now());
         let durability_watcher = self
