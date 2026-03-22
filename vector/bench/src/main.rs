@@ -1,12 +1,16 @@
 //! Benchmarks for the vector database.
 
 mod recall;
+mod usearch_build;
 
 use bencher::Benchmark;
 use tracing_subscriber::EnvFilter;
 
 fn benchmarks() -> Vec<Box<dyn Benchmark>> {
-    vec![Box::new(recall::RecallBenchmark::new())]
+    vec![
+        Box::new(recall::RecallBenchmark::new()),
+        Box::new(usearch_build::UsearchBuildBenchmark::new()),
+    ]
 }
 
 #[tokio::main]

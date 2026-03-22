@@ -558,6 +558,8 @@ impl Benchmark for RecallBenchmark {
             num_vectors = base_vectors.len() as u64;
 
             let ingest_start = std::time::Instant::now();
+            let mut last_progress = ingest_start;
+            let mut last_progress_vectors = 0usize;
             let batch_size = 10;
             let num_batches = base_vectors.len().div_ceil(batch_size);
             for (batch_idx, chunk) in base_vectors.chunks(batch_size).enumerate() {
@@ -571,7 +573,23 @@ impl Benchmark for RecallBenchmark {
                     .collect();
                 db.write(batch).await?;
                 if (batch_idx + 1) % 10_000 == 0 {
-                    println!("  Written batch {}/{}", batch_idx + 1, num_batches);
+                    let ingested_vectors = (batch_idx + 1) * batch_size;
+                    let observed_vectors = ingested_vectors - last_progress_vectors;
+                    let elapsed = last_progress.elapsed().as_secs_f64();
+                    let observed_throughput = if elapsed > 0.0 {
+                        observed_vectors as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "  Written batch {}/{}, ingested {} vectors, observed throughput {:.0} vec/s",
+                        batch_idx + 1,
+                        num_batches,
+                        ingested_vectors,
+                        observed_throughput,
+                    );
+                    last_progress = std::time::Instant::now();
+                    last_progress_vectors = ingested_vectors;
                 }
             }
             db.flush().await?;
@@ -606,6 +624,7 @@ impl Benchmark for RecallBenchmark {
 
         let query_start = std::time::Instant::now();
         let mut total_recall = 0.0;
+        let mut total_exact_recall = 0.0;
         let mut latencies_us = Vec::with_capacity(queries.len());
         for (i, query) in queries.iter().enumerate() {
             let t = std::time::Instant::now();
@@ -615,9 +634,13 @@ impl Benchmark for RecallBenchmark {
             query_latency.record(elapsed_us);
             latencies_us.push(elapsed_us);
             total_recall += recall_at_k(&results, &ground_truth[i], k);
+
+            let exact_results = db.search_exact_nprobe(&q, dataset.nprobe).await?;
+            total_exact_recall += recall_at_k(&exact_results, &ground_truth[i], k);
         }
         let query_secs = query_start.elapsed().as_secs_f64();
         let avg_recall = total_recall / queries.len() as f64;
+        let avg_exact_recall = total_exact_recall / queries.len() as f64;
         let qps = queries.len() as f64 / query_secs;
 
         latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -626,9 +649,11 @@ impl Benchmark for RecallBenchmark {
         let p99 = percentile(&latencies_us, 99.0);
 
         println!(
-            "  recall@{} = {:.4}, QPS = {:.1}, avg = {:.2} ms, p50 = {:.2} ms, p90 = {:.2} ms, p99 = {:.2} ms",
+            "  recall@{} = {:.4}, exact_recall@{} = {:.4}, QPS = {:.1}, avg = {:.2} ms, p50 = {:.2} ms, p90 = {:.2} ms, p99 = {:.2} ms",
             k,
             avg_recall,
+            k,
+            avg_exact_recall,
             qps,
             (query_secs / queries.len() as f64) * 1000.0,
             p50 / 1000.0,
@@ -638,6 +663,7 @@ impl Benchmark for RecallBenchmark {
 
         let mut summary = Summary::new()
             .add("recall_at_k", avg_recall)
+            .add("exact_recall_at_k", avg_exact_recall)
             .add("k", k as f64)
             .add("qps", qps)
             .add("num_queries", queries.len() as f64)
