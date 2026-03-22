@@ -24,7 +24,7 @@ use std::sync::{Arc, OnceLock};
 use crate::hnsw::CentroidGraph;
 use crate::lire::commands::RebalanceCommand;
 use crate::lire::rebalancer::IndexRebalancer;
-use crate::model::{AttributeValue, MetadataFieldSpec, VECTOR_FIELD_NAME};
+use crate::model::{AttributeValue, VECTOR_FIELD_NAME};
 use crate::serde::FieldValue;
 use crate::serde::posting_list::PostingUpdate;
 use crate::storage::record;
@@ -48,7 +48,7 @@ pub(crate) enum VectorDbWrite {
 ///
 /// The write path validates and enqueues this struct.
 /// The delta handles ID allocation, dictionary lookup, centroid assignment, and updates.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct VectorWrite {
     /// User-provided external ID.
     pub(crate) external_id: String,
@@ -69,17 +69,6 @@ pub(crate) struct VectorDbDeltaOpts {
     pub(crate) rebalance_backpressure_resume_threshold: usize,
     /// Names of indexed metadata fields (for maintaining the inverted index).
     pub(crate) indexed_fields: HashSet<String>,
-}
-
-impl VectorDbDeltaOpts {
-    /// Build the set of indexed field names from metadata field specs.
-    pub(crate) fn indexed_fields_from(specs: &[MetadataFieldSpec]) -> HashSet<String> {
-        specs
-            .iter()
-            .filter(|s| s.indexed)
-            .map(|s| s.name.clone())
-            .collect()
-    }
 }
 
 /// Image containing shared state for the delta.
@@ -397,7 +386,7 @@ mod tests {
         }
 
         fn all_centroid_ids(&self) -> Vec<u64> {
-            todo!()
+            self.centroids.iter().map(|(id, _)| *id).collect()
         }
 
         fn len(&self) -> usize {
@@ -736,7 +725,7 @@ mod tests {
             }
 
             fn all_centroid_ids(&self) -> Vec<u64> {
-                todo!()
+                vec![1, 2, 3]
             }
 
             fn len(&self) -> usize {
@@ -1085,7 +1074,7 @@ mod tests {
             }
 
             fn all_centroid_ids(&self) -> Vec<u64> {
-                todo!()
+                vec![1, 2, 3]
             }
 
             fn len(&self) -> usize {

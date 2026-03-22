@@ -47,7 +47,6 @@ pub mod server;
 pub(crate) mod storage;
 pub(crate) mod view_reader;
 
-#[allow(dead_code)]
 mod batched;
 #[cfg(test)]
 pub(crate) mod test_utils;
