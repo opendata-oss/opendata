@@ -31,6 +31,7 @@
 - Removed unnecessary `sqrt` work from internal L2 comparisons.
 - Replaced iterator-heavy distance loops with unrolled scalar L2 and dot-product kernels.
 - Avoided cloning the final result heap by consuming it directly at the end of search.
+- Profiled the isolated centroid benchmark and found `l2_distance` dominating CPU time, then replaced the scalar-only L2 / dot kernels with runtime-selected AVX kernels plus scalar fallback.
 
 ## Storage-layout improvements
 
@@ -63,21 +64,27 @@
   - `cargo test --release -p opendata-vector --test sift1m sift100k_recall -- --nocapture`
   - `hnsw_recall@10 = 0.9500`
   - test time `18.78s`
+- Latest local revalidation after the AVX kernel change:
+  - `cargo test --release -p opendata-vector --test sift1m sift100k_recall -- --nocapture`
+  - `hnsw_recall@10 = 0.9520`
+  - test time `25.08s`
+  - isolated centroid benchmarking improved substantially, but the end-to-end SIFT workload still needs further investigation
 
 ## Current isolated centroid benchmark state
 
 - Command:
   - `cargo run -p vector-bench --release -- --benchmark centroid_graph_compare --config /tmp/vector-bench-centroid-graph.toml`
 - Latest measured result on `5000` centroids, `256` dimensions, `50` queries, `k=10`:
-  - `usearch`: build `0.778s`, query `0.0061s`
-  - `sptag`: build `3.586s`, query `0.026s`
-  - build ratio: `4.61x`
-  - query ratio: `4.24x`
+  - `usearch`: build `1.561s`, query `0.012s`
+  - `sptag`: build `3.610s`, query `0.026s`
+  - build ratio: `2.31x`
+  - query ratio: `2.13x`
 
 ## What did not help enough
 
 - A more aggressive sample-to-center graph aliasing experiment regressed both runtime and recall, so it was backed out.
 - Replacing heap-based result reservoirs with a vector-backed fixed-capacity reservoir regressed query time, so it was backed out.
+- A no-exclusion frontier/search fork that reused the final-result heap as the traversal bound regressed the real SIFT recall workload, so it was backed out.
 
 ## Current conclusion
 

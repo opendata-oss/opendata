@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -326,7 +326,7 @@ impl CentroidGraph for SptagCentroidGraph {
         self.inner
             .read()
             .expect("lock poisoned")
-            .search_ids(query, k, &HashSet::new())
+            .search_ids_no_exclusions(query, k)
     }
 
     fn search_with_include_exclude(
@@ -389,7 +389,11 @@ impl SptagCentroidGraphInner {
         }
 
         if include.is_empty() {
-            return self.search_ids(query, k, exclude);
+            return if exclude.is_empty() {
+                self.search_ids_no_exclusions(query, k)
+            } else {
+                self.search_ids(query, k, exclude)
+            };
         }
 
         let search_k = k.saturating_add(include.len());
@@ -481,6 +485,13 @@ impl SptagCentroidGraphInner {
             SearchExclusions::ExternalIds(exclude)
         };
         self.search_scored(query, k, exclusions)
+            .into_iter()
+            .map(|candidate| self.nodes[candidate.idx].centroid_id)
+            .collect()
+    }
+
+    fn search_ids_no_exclusions(&self, query: &[f32], k: usize) -> Vec<u64> {
+        self.search_scored(query, k, SearchExclusions::None)
             .into_iter()
             .map(|candidate| self.nodes[candidate.idx].centroid_id)
             .collect()
@@ -1224,33 +1235,17 @@ impl SptagCentroidGraphInner {
     }
 
     fn l2_distance(&self, a: &[f32], b: &[f32]) -> f32 {
-        let len = a.len().min(b.len());
-        let mut sum0 = 0.0f32;
-        let mut sum1 = 0.0f32;
-        let mut sum2 = 0.0f32;
-        let mut sum3 = 0.0f32;
-        let mut i = 0usize;
-
-        while i + 4 <= len {
-            let delta0 = a[i] - b[i];
-            let delta1 = a[i + 1] - b[i + 1];
-            let delta2 = a[i + 2] - b[i + 2];
-            let delta3 = a[i + 3] - b[i + 3];
-            sum0 += delta0 * delta0;
-            sum1 += delta1 * delta1;
-            sum2 += delta2 * delta2;
-            sum3 += delta3 * delta3;
-            i += 4;
+        #[cfg(target_arch = "x86_64")]
+        {
+            static USE_AVX: OnceLock<bool> = OnceLock::new();
+            if *USE_AVX.get_or_init(|| std::arch::is_x86_feature_detected!("avx")) {
+                // SAFETY: The AVX kernel is only selected after runtime feature
+                // detection confirms the current CPU supports it.
+                return unsafe { l2_distance_avx(a, b) };
+            }
         }
 
-        let mut sum = sum0 + sum1 + sum2 + sum3;
-        while i < len {
-            let delta = a[i] - b[i];
-            sum += delta * delta;
-            i += 1;
-        }
-
-        sum
+        l2_distance_scalar(a, b)
     }
 
     fn push_candidate_results(
@@ -1560,28 +1555,17 @@ impl SptagCentroidGraphInner {
     }
 
     fn dot_distance(&self, a: &[f32], b: &[f32]) -> f32 {
-        let len = a.len().min(b.len());
-        let mut sum0 = 0.0f32;
-        let mut sum1 = 0.0f32;
-        let mut sum2 = 0.0f32;
-        let mut sum3 = 0.0f32;
-        let mut i = 0usize;
-
-        while i + 4 <= len {
-            sum0 += a[i] * b[i];
-            sum1 += a[i + 1] * b[i + 1];
-            sum2 += a[i + 2] * b[i + 2];
-            sum3 += a[i + 3] * b[i + 3];
-            i += 4;
+        #[cfg(target_arch = "x86_64")]
+        {
+            static USE_AVX: OnceLock<bool> = OnceLock::new();
+            if *USE_AVX.get_or_init(|| std::arch::is_x86_feature_detected!("avx")) {
+                // SAFETY: The AVX kernel is only selected after runtime feature
+                // detection confirms the current CPU supports it.
+                return unsafe { dot_distance_avx(a, b) };
+            }
         }
 
-        let mut sum = sum0 + sum1 + sum2 + sum3;
-        while i < len {
-            sum += a[i] * b[i];
-            i += 1;
-        }
-
-        -sum
+        dot_distance_scalar(a, b)
     }
 
     fn push_top_result(
@@ -1628,6 +1612,185 @@ impl SptagCentroidGraphInner {
             false
         }
     }
+}
+
+#[inline(always)]
+fn l2_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len().min(b.len());
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+    let mut sum2 = 0.0f32;
+    let mut sum3 = 0.0f32;
+    let mut i = 0usize;
+
+    while i + 4 <= len {
+        let delta0 = a[i] - b[i];
+        let delta1 = a[i + 1] - b[i + 1];
+        let delta2 = a[i + 2] - b[i + 2];
+        let delta3 = a[i + 3] - b[i + 3];
+        sum0 += delta0 * delta0;
+        sum1 += delta1 * delta1;
+        sum2 += delta2 * delta2;
+        sum3 += delta3 * delta3;
+        i += 4;
+    }
+
+    let mut sum = sum0 + sum1 + sum2 + sum3;
+    while i < len {
+        let delta = a[i] - b[i];
+        sum += delta * delta;
+        i += 1;
+    }
+
+    sum
+}
+
+#[inline(always)]
+fn dot_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len().min(b.len());
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+    let mut sum2 = 0.0f32;
+    let mut sum3 = 0.0f32;
+    let mut i = 0usize;
+
+    while i + 4 <= len {
+        sum0 += a[i] * b[i];
+        sum1 += a[i + 1] * b[i + 1];
+        sum2 += a[i + 2] * b[i + 2];
+        sum3 += a[i + 3] * b[i + 3];
+        i += 4;
+    }
+
+    let mut sum = sum0 + sum1 + sum2 + sum3;
+    while i < len {
+        sum += a[i] * b[i];
+        i += 1;
+    }
+
+    -sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn l2_distance_avx(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::{
+        __m128, _mm_add_ps, _mm_cvtss_f32, _mm_movehl_ps, _mm_shuffle_ps, _mm256_add_ps,
+        _mm256_castps256_ps128, _mm256_extractf128_ps, _mm256_setzero_ps,
+    };
+
+    let len = a.len().min(b.len());
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+    let mut i = 0usize;
+
+    while i + 32 <= len {
+        acc0 = unsafe { sum_squared_delta(acc0, a, b, i) };
+        acc1 = unsafe { sum_squared_delta(acc1, a, b, i + 8) };
+        acc2 = unsafe { sum_squared_delta(acc2, a, b, i + 16) };
+        acc3 = unsafe { sum_squared_delta(acc3, a, b, i + 24) };
+        i += 32;
+    }
+
+    let mut acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    while i + 8 <= len {
+        acc = unsafe { sum_squared_delta(acc, a, b, i) };
+        i += 8;
+    }
+
+    let upper = _mm256_extractf128_ps(acc, 1);
+    let lower = _mm256_castps256_ps128(acc);
+    let pair_sum: __m128 = _mm_add_ps(lower, upper);
+    let hi = _mm_movehl_ps(pair_sum, pair_sum);
+    let pair_sum = _mm_add_ps(pair_sum, hi);
+    let shuffled = _mm_shuffle_ps(pair_sum, pair_sum, 0x55);
+    let mut sum = _mm_cvtss_f32(_mm_add_ps(pair_sum, shuffled));
+
+    while i < len {
+        let delta = a[i] - b[i];
+        sum += delta * delta;
+        i += 1;
+    }
+
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn dot_distance_avx(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::{
+        __m128, _mm_add_ps, _mm_cvtss_f32, _mm_movehl_ps, _mm_shuffle_ps, _mm256_add_ps,
+        _mm256_castps256_ps128, _mm256_extractf128_ps, _mm256_setzero_ps,
+    };
+
+    let len = a.len().min(b.len());
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+    let mut i = 0usize;
+
+    while i + 32 <= len {
+        acc0 = unsafe { sum_product(acc0, a, b, i) };
+        acc1 = unsafe { sum_product(acc1, a, b, i + 8) };
+        acc2 = unsafe { sum_product(acc2, a, b, i + 16) };
+        acc3 = unsafe { sum_product(acc3, a, b, i + 24) };
+        i += 32;
+    }
+
+    let mut acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    while i + 8 <= len {
+        acc = unsafe { sum_product(acc, a, b, i) };
+        i += 8;
+    }
+
+    let upper = _mm256_extractf128_ps(acc, 1);
+    let lower = _mm256_castps256_ps128(acc);
+    let pair_sum: __m128 = _mm_add_ps(lower, upper);
+    let hi = _mm_movehl_ps(pair_sum, pair_sum);
+    let pair_sum = _mm_add_ps(pair_sum, hi);
+    let shuffled = _mm_shuffle_ps(pair_sum, pair_sum, 0x55);
+    let mut sum = _mm_cvtss_f32(_mm_add_ps(pair_sum, shuffled));
+
+    while i < len {
+        sum += a[i] * b[i];
+        i += 1;
+    }
+
+    -sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn sum_squared_delta(
+    acc: std::arch::x86_64::__m256,
+    a: &[f32],
+    b: &[f32],
+    offset: usize,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::{_mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_sub_ps};
+
+    let lhs = unsafe { _mm256_loadu_ps(a.as_ptr().add(offset)) };
+    let rhs = unsafe { _mm256_loadu_ps(b.as_ptr().add(offset)) };
+    let delta = unsafe { _mm256_sub_ps(lhs, rhs) };
+    unsafe { _mm256_add_ps(acc, _mm256_mul_ps(delta, delta)) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn sum_product(
+    acc: std::arch::x86_64::__m256,
+    a: &[f32],
+    b: &[f32],
+    offset: usize,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::{_mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps};
+
+    let lhs = unsafe { _mm256_loadu_ps(a.as_ptr().add(offset)) };
+    let rhs = unsafe { _mm256_loadu_ps(b.as_ptr().add(offset)) };
+    unsafe { _mm256_add_ps(acc, _mm256_mul_ps(lhs, rhs)) }
 }
 
 #[cfg(test)]

@@ -12,10 +12,14 @@ use common::StorageRead;
 use futures::future::BoxFuture;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
+use rayon::slice::ParallelSlice;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task;
 use tracing::debug;
+
+const ASSIGNMENT_PARALLEL_THRESHOLD: usize = 128;
+const ASSIGNMENT_SEARCH_CHUNK: usize = 32;
 
 /// An upsert where we need to resolve the old vector data from storage.
 struct ResolvedUpsert {
@@ -156,25 +160,50 @@ impl WriteVectors {
         writes: Vec<(String, Vec<f32>)>,
         centroid_graph: Arc<crate::batched::indexer::state::DirtyCentroidGraph>,
     ) -> Result<HashMap<String, u64>> {
-        let assignments: Vec<_> = writes
-            .into_par_iter()
-            .map(|(external_id, values)| {
-                centroid_graph
-                    .search(&values, 1)
-                    .first()
-                    .copied()
-                    .ok_or_else(|| Internal("no centroids found".to_string()))
-                    .map(|centroid| (external_id, centroid))
-            })
-            .collect();
+        let assignments = if writes.len() < ASSIGNMENT_PARALLEL_THRESHOLD {
+            Self::assign_centroid_chunk(&writes, centroid_graph.as_ref())?
+        } else {
+            let chunk_results: Vec<_> = writes
+                .par_chunks(ASSIGNMENT_SEARCH_CHUNK)
+                .map(|chunk| Self::assign_centroid_chunk(chunk, centroid_graph.as_ref()))
+                .collect();
+
+            let mut assignments = Vec::with_capacity(writes.len());
+            for chunk_result in chunk_results {
+                assignments.extend(chunk_result?);
+            }
+            assignments
+        };
 
         let mut centroid_assignments = HashMap::with_capacity(assignments.len());
         for assignment in assignments {
-            let (external_id, centroid) = assignment?;
+            let (external_id, centroid) = assignment;
             centroid_assignments.insert(external_id, centroid);
         }
 
         Ok(centroid_assignments)
+    }
+
+    fn assign_centroid_chunk(
+        writes: &[(String, Vec<f32>)],
+        centroid_graph: &crate::batched::indexer::state::DirtyCentroidGraph,
+    ) -> Result<Vec<(String, u64)>> {
+        let queries: Vec<&[f32]> = writes
+            .iter()
+            .map(|(_, values)| values.as_slice())
+            .collect();
+        let results = centroid_graph.search_batch(&queries, 1);
+
+        let mut assignments = Vec::with_capacity(writes.len());
+        for ((external_id, _), centroids) in writes.iter().zip(results.into_iter()) {
+            let centroid = centroids
+                .first()
+                .copied()
+                .ok_or_else(|| Internal("no centroids found".to_string()))?;
+            assignments.push((external_id.clone(), centroid));
+        }
+
+        Ok(assignments)
     }
 
     fn compact_writes(updates: Vec<VectorWrite>) -> Vec<VectorWrite> {

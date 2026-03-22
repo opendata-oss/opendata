@@ -31,6 +31,14 @@ pub trait CentroidGraph: Send + Sync {
     /// Vector of centroid_ids sorted by similarity (closest first)
     fn search(&self, query: &[f32], k: usize) -> Vec<u64>;
 
+    /// Search for k nearest centroids for a batch of query vectors.
+    ///
+    /// The default implementation delegates to [`CentroidGraph::search`] for
+    /// each query independently.
+    fn search_batch(&self, queries: &[&[f32]], k: usize) -> Vec<Vec<u64>> {
+        queries.iter().map(|query| self.search(query, k)).collect()
+    }
+
     /// Search for k nearest centroids to a query vector. Exclude centroids with ids
     /// from an exclude set. After search, factor in centroids from an include set.
     /// The centroids from the include set are not part of the current graph, so must

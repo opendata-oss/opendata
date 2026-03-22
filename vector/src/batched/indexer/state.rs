@@ -439,6 +439,35 @@ impl DirtyCentroidGraph {
             .search_with_include_exclude(query, k, &include, &self.deleted_centroids)
     }
 
+    pub(crate) fn search_batch(&self, queries: &[&[f32]], k: usize) -> Vec<Vec<u64>> {
+        if self.new_centroids.is_empty() {
+            if self.deleted_centroids.is_empty() {
+                return self.inner.search_batch(queries, k);
+            }
+
+            return queries
+                .iter()
+                .map(|query| {
+                    self.inner.search_with_include_exclude(
+                        query,
+                        k,
+                        &[],
+                        &self.deleted_centroids,
+                    )
+                })
+                .collect();
+        }
+
+        let include: Vec<_> = self.new_centroids.values().collect();
+        queries
+            .iter()
+            .map(|query| {
+                self.inner
+                    .search_with_include_exclude(query, k, &include, &self.deleted_centroids)
+            })
+            .collect()
+    }
+
     pub(crate) fn centroid(&self, centroid_id: u64) -> Option<CentroidEntry> {
         if self.deleted_centroids.contains(&centroid_id) {
             None
