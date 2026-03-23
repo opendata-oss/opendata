@@ -179,7 +179,7 @@ impl LogEntryKey {
     /// caller must provide the segment's start sequence to recover the absolute
     /// sequence number.
     pub fn deserialize(data: &[u8], segment_start_seq: u64) -> Result<Self, Error> {
-        let prefix = KeyPrefix::from_bytes_versioned(data, KEY_VERSION)?;
+        let prefix = KeyPrefix::from_bytes_with_validation(data, SUBSYSTEM, KEY_VERSION)?;
         let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::LogEntry {
             return Err(Error::Encoding(format!(
@@ -258,7 +258,7 @@ impl SegmentMetaKey {
 
     /// Decodes a segment metadata key from bytes
     pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
-        let prefix = KeyPrefix::from_bytes_versioned(data, KEY_VERSION)?;
+        let prefix = KeyPrefix::from_bytes_with_validation(data, SUBSYSTEM, KEY_VERSION)?;
         let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::SegmentMeta {
             return Err(Error::Encoding(format!(
@@ -376,7 +376,7 @@ impl ListingEntryKey {
 
     /// Deserializes a listing entry key from bytes.
     pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
-        let prefix = KeyPrefix::from_bytes_versioned(data, KEY_VERSION)?;
+        let prefix = KeyPrefix::from_bytes_with_validation(data, SUBSYSTEM, KEY_VERSION)?;
         let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::ListingEntry {
             return Err(Error::Encoding(format!(

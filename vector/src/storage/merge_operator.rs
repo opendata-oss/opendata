@@ -6,7 +6,7 @@
 use crate::serde::centroid_chunk::CentroidChunkValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::posting_list::merge_batch_posting_list;
-use crate::serde::{EncodingError, KEY_VERSION, RecordType};
+use crate::serde::{EncodingError, KEY_VERSION, RecordType, SUBSYSTEM};
 use bytes::Bytes;
 use common::serde::key_prefix::KeyPrefix;
 use common::storage::default_merge_batch;
@@ -35,8 +35,8 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
     }
 
     fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
-        let prefix =
-            KeyPrefix::from_bytes_versioned(key, KEY_VERSION).expect("Failed to decode key prefix");
+        let prefix = KeyPrefix::from_bytes_with_validation(key, SUBSYSTEM, KEY_VERSION)
+            .expect("Failed to decode key prefix");
         let record_type =
             RecordType::from_prefix(prefix).expect("Failed to get record type from record tag");
 

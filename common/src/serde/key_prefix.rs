@@ -121,21 +121,31 @@ impl KeyPrefix {
         })
     }
 
-    /// Parses a key prefix, validating the version matches expected.
+    /// Parses a key prefix, validating the subsystem and version match expected values.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The buffer is too short
     /// - The subsystem is 0
+    /// - The subsystem doesn't match `expected_subsystem`
     /// - The key version is 0
-    /// - The version doesn't match
+    /// - The version doesn't match `expected_version`
     /// - The record type is 0
-    pub fn from_bytes_versioned(
+    pub fn from_bytes_with_validation(
         data: &[u8],
+        expected_subsystem: u8,
         expected_version: u8,
     ) -> Result<Self, DeserializeError> {
         let prefix = Self::from_bytes(data)?;
+        if prefix.subsystem != expected_subsystem {
+            return Err(DeserializeError {
+                message: format!(
+                    "invalid subsystem: expected 0x{:02x}, got 0x{:02x}",
+                    expected_subsystem, prefix.subsystem
+                ),
+            });
+        }
         if prefix.version != expected_version {
             return Err(DeserializeError {
                 message: format!(
@@ -254,7 +264,9 @@ mod tests {
         let result = KeyPrefix::from_bytes(&bytes);
 
         // then
-        matches!(result, Err(DeserializeError { message }) if  message.contains("subsystem 0 is reserved"));
+        assert!(
+            matches!(result, Err(DeserializeError { message }) if  message.contains("subsystem 0 is reserved"))
+        );
     }
 
     #[test]
@@ -266,7 +278,9 @@ mod tests {
         let result = KeyPrefix::from_bytes(&bytes);
 
         // then
-        matches!(result, Err(DeserializeError { message }) if  message.contains("version 0 is reserved"));
+        assert!(
+            matches!(result, Err(DeserializeError { message }) if  message.contains("version 0 is reserved"))
+        );
     }
 
     #[test]
@@ -278,7 +292,9 @@ mod tests {
         let result = KeyPrefix::from_bytes(&bytes);
 
         // then
-        matches!(result, Err(DeserializeError { message }) if  message.contains("tag 0 is reserved"));
+        assert!(
+            matches!(result, Err(DeserializeError { message }) if  message.contains("tag 0 is reserved"))
+        );
     }
 
     #[test]
@@ -311,18 +327,35 @@ mod tests {
     }
 
     #[test]
-    fn should_parse_key_prefix_versioned() {
+    fn should_parse_key_prefix_with_validation() {
         // given
+        let expected_subsystem = 0x10;
         let expected_version = 0x01;
-        let data = [0x10, expected_version, 0x25];
+        let data = [expected_subsystem, expected_version, 0x25];
 
         // when
-        let prefix = KeyPrefix::from_bytes_versioned(&data, expected_version).unwrap();
+        let prefix =
+            KeyPrefix::from_bytes_with_validation(&data, expected_subsystem, expected_version)
+                .unwrap();
 
         // then
-        assert_eq!(prefix.subsystem(), 0x10);
+        assert_eq!(prefix.subsystem(), expected_subsystem);
         assert_eq!(prefix.version(), expected_version);
         assert_eq!(prefix.tag(), 0x25);
+    }
+
+    #[test]
+    fn should_reject_wrong_subsystem() {
+        // given
+        let data = [0x10, 0x01, 0x25];
+
+        // when
+        let result = KeyPrefix::from_bytes_with_validation(&data, 0x20, 0x01);
+
+        // then
+        assert!(
+            matches!(result, Err(DeserializeError { message }) if  message.contains("invalid subsystem"))
+        );
     }
 
     #[test]
@@ -331,10 +364,12 @@ mod tests {
         let data = [0x10, 0x02, 0x10]; // wrong version
 
         // when
-        let result = KeyPrefix::from_bytes_versioned(&data, 0x01);
+        let result = KeyPrefix::from_bytes_with_validation(&data, 0x10, 0x01);
 
         // then
-        matches!(result, Err(DeserializeError { message }) if  message.contains("invalid key version"));
+        assert!(
+            matches!(result, Err(DeserializeError { message }) if  message.contains("invalid key version"))
+        );
     }
 
     #[test]
@@ -346,6 +381,8 @@ mod tests {
         let result = KeyPrefix::from_bytes(&data);
 
         // then
-        matches!(result, Err(DeserializeError { message }) if  message.contains("buffer too short"));
+        assert!(
+            matches!(result, Err(DeserializeError { message }) if  message.contains("buffer too short"))
+        );
     }
 }

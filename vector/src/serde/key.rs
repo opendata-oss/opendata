@@ -2,7 +2,7 @@
 //!
 //! All keys use big-endian encoding for lexicographic ordering.
 
-use super::{EncodingError, FieldValue, KEY_VERSION, RecordKey, RecordType};
+use super::{EncodingError, FieldValue, KEY_VERSION, RecordKey, RecordType, SUBSYSTEM};
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
 use common::serde::key_prefix::KeyPrefix;
@@ -413,7 +413,7 @@ impl CentroidStatsKey {
 
 /// Validates the key prefix (version and record tag).
 fn validate_key_prefix<T: RecordKey>(buf: &[u8]) -> Result<(), EncodingError> {
-    let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
+    let prefix = KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
     let record_type = RecordType::from_prefix(prefix)?;
 
     if record_type != T::RECORD_TYPE {
@@ -714,8 +714,8 @@ mod tests {
     fn should_reject_wrong_version() {
         // given
         let mut buf = BytesMut::new();
-        buf.put_u8(0x99); // Wrong version
         buf.put_u8(crate::serde::SUBSYSTEM);
+        buf.put_u8(0x99); // Wrong version
         buf.put_u8(RecordType::CollectionMeta.tag().as_byte());
 
         // when

@@ -17,7 +17,7 @@ impl BucketListKey {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
+        let prefix = KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
         let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::BucketList {
             return Err(EncodingError {
@@ -62,7 +62,7 @@ impl SeriesDictionaryKey {
                 message: "Buffer too short for SeriesDictionaryKey".to_string(),
             });
         }
-        let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
+        let prefix = KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
         let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::SeriesDictionary {
             return Err(EncodingError {
@@ -128,7 +128,7 @@ impl ForwardIndexKey {
                 message: "Buffer too short for ForwardIndexKey".to_string(),
             });
         }
-        let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
+        let prefix = KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
         let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::ForwardIndex {
             return Err(EncodingError {
@@ -207,7 +207,7 @@ impl InvertedIndexKey {
                 message: "Buffer too short for InvertedIndexKey".to_string(),
             });
         }
-        let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
+        let prefix = KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
         let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::InvertedIndex {
             return Err(EncodingError {
@@ -283,7 +283,7 @@ impl TimeSeriesKey {
                 message: "Buffer too short for TimeSeriesKey".to_string(),
             });
         }
-        let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
+        let prefix = KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
         let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::TimeSeries {
             return Err(EncodingError {

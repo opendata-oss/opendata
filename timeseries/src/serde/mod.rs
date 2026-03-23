@@ -193,7 +193,7 @@ pub trait TimeBucketScoped: RecordKey {
     /// Decodes and validates the bucket-scoped prefix of a key.
     /// Returns the TimeBucket if the record type matches the expected type.
     fn decode_bucket_prefix(bytes: &[u8]) -> Result<TimeBucket, EncodingError> {
-        let prefix = KeyPrefix::from_bytes_versioned(bytes, KEY_VERSION)?;
+        let prefix = KeyPrefix::from_bytes_with_validation(bytes, SUBSYSTEM, KEY_VERSION)?;
         let record_type = RecordType::from_prefix(prefix)?;
 
         if record_type != Self::RECORD_TYPE {
