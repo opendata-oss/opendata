@@ -2643,6 +2643,7 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
+ "criterion",
  "dashmap",
  "fail",
  "figment",

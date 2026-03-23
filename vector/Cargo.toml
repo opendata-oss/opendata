@@ -23,6 +23,7 @@ required-features = ["http-server"]
 default = []
 http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prost", "dep:serde_json", "dep:serde_with"]
 embedded-reader = ["dep:reqwest", "dep:serde_json"]
+bench-internals = []
 
 [dependencies]
 anyhow.workspace = true
@@ -69,6 +70,17 @@ required-features = ["embedded-reader"]
 
 [dev-dependencies]
 common = { workspace = true, features = ["test-utils"] }
+criterion.workspace = true
 opendata-macros.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "l2_distance"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "l2_score_and_rank"
+harness = false
+required-features = ["bench-internals"]
