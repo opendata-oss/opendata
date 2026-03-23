@@ -54,23 +54,22 @@ The 3-byte prefix is followed by record-specific fields that vary by subsystem a
 
 ### Subsystem Byte
 
-The second byte identifies the key format version. Each subsystem manages its version independently—bumping the version in one subsystem does not affect others.
+The first byte identifies the subsystem that owns the key.
 
-| Value  | Description |
-|--------|-------------|
-| `0x00` | Reserved (invalid) |
-| `0x01`–`0xFF` | Subsystem-defined |
+| Value         | Description        |
+|---------------|--------------------|
+| `0x00`        | Reserved (invalid) |
+| `0x01`        | Timeseries         |
+| `0x02`        | Vector             |
+| `0x03`        | Log                |
+| `0x04`        | KeyValue           |
+| `0x01`–`0xFF` | Subsystem-defined  |
 
-Current subsystem allocations:
-
-- `0x01` Timeseries
-- `0x02` Vector
-- `0x03` Log
-- `0x04` KeyValue
 
 ### Version Byte
 
-The first byte identifies the subsystem that owns the key.
+The second byte identifies the key format version.
+Each subsystem manages its version independently—bumping the version in one subsystem does not affect others.
 
 | Value  | Description |
 |--------|-------------|
@@ -78,7 +77,9 @@ The first byte identifies the subsystem that owns the key.
 | `0x01` | Current version (all subsystems) |
 | `0x02`–`0xFF` | Reserved for future versions |
 
-The version byte enables schema migration. When the key format changes in a backwards-incompatible way, the subsystem increments its version. Readers encountering an unknown version can reject the record or apply version-specific parsing logic.
+The version byte enables schema migration.
+When the key format changes in a backwards-incompatible way, the subsystem increments its version.
+Readers encountering an unknown version can reject the record or apply version-specific parsing logic.
 
 **Guidelines for version changes:**
 - Additive changes to value schemas do not require a version bump
