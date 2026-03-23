@@ -24,7 +24,22 @@ pub struct RecordTag(u8);
 
 impl RecordTag {
     /// Creates a new record tag with the given record type and reserved bits.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `record_type` is 0 or greater than 15, or if `reserved` is
+    /// greater than 15.
     pub fn new(record_type: u8, reserved: u8) -> Self {
+        assert!(
+            record_type > 0 && record_type <= 0x0F,
+            "record type {} must be in range 1-15",
+            record_type
+        );
+        assert!(
+            reserved <= 0x0F,
+            "reserved bits {} must be in range 0-15",
+            reserved
+        );
         RecordTag((record_type << 4) | reserved)
     }
 
@@ -151,6 +166,24 @@ mod tests {
         assert_eq!(new_tag.record_type(), 0x05);
         assert_eq!(new_tag.reserved(), 0x0A);
         assert_eq!(new_tag.as_byte(), 0x5A);
+    }
+
+    #[test]
+    #[should_panic(expected = "record type 0 must be in range 1-15")]
+    fn should_panic_on_zero_record_type() {
+        RecordTag::new(0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "record type 16 must be in range 1-15")]
+    fn should_panic_on_record_type_overflow() {
+        RecordTag::new(16, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "reserved bits 16 must be in range 0-15")]
+    fn should_panic_on_reserved_overflow() {
+        RecordTag::new(1, 16);
     }
 
     #[test]
