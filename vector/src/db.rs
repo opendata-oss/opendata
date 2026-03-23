@@ -350,7 +350,7 @@ impl VectorDb {
         dictionary: &DashMap<String, u64>,
     ) -> Result<()> {
         // Create prefix for all IdDictionary records
-        let mut prefix_buf = bytes::BytesMut::with_capacity(2);
+        let mut prefix_buf = bytes::BytesMut::with_capacity(3);
         crate::serde::RecordType::IdDictionary
             .prefix()
             .write_to(&mut prefix_buf);

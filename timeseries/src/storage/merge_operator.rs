@@ -1,10 +1,9 @@
-use bytes::Bytes;
-
-use crate::model::RecordTag;
 use crate::serde::bucket_list::BucketListValue;
 use crate::serde::inverted_index::InvertedIndexValue;
 use crate::serde::timeseries::merge_batch_time_series;
-use crate::serde::{EncodingError, RecordType, record_type_from_tag};
+use crate::serde::{EncodingError, RecordType};
+use bytes::Bytes;
+use common::serde::key_prefix::KeyPrefix;
 use common::storage::default_merge_batch;
 
 /// Merge operator for OpenTSDB that handles merging of different record types.
@@ -20,15 +19,10 @@ impl common::storage::MergeOperator for OpenTsdbMergeOperator {
 
     fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
         // Decode record type from key
-        if key.len() < 2 {
-            panic!("Invalid key: key length is less than 2 bytes");
-        }
-
-        let record_tag =
-            RecordTag::from_byte(key[1]).expect("Failed to decode record tag from key");
+        let key_prefix = KeyPrefix::from_bytes(key.as_ref()).unwrap();
 
         let record_type =
-            record_type_from_tag(record_tag).expect("Failed to get record type from record tag");
+            RecordType::from_prefix(key_prefix).expect("Failed to get record type from record tag");
 
         match record_type {
             RecordType::InvertedIndex => merge_batch_inverted_index(existing_value, operands)

@@ -2,7 +2,7 @@
 //!
 //! All keys use big-endian encoding for lexicographic ordering.
 
-use super::{EncodingError, FieldValue, KEY_VERSION, RecordKey, RecordType, record_type_from_tag};
+use super::{EncodingError, FieldValue, KEY_VERSION, RecordKey, RecordType, SUBSYSTEM};
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
 use common::serde::key_prefix::KeyPrefix;
@@ -10,7 +10,7 @@ use common::serde::terminated_bytes;
 
 /// CollectionMeta key - singleton record storing collection schema.
 ///
-/// Key layout: `[version | tag]` (2 bytes)
+/// Key layout: `[subsystem | version | tag]` (3 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionMetaKey;
 
@@ -20,13 +20,13 @@ impl RecordKey for CollectionMetaKey {
 
 impl CollectionMetaKey {
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(2);
+        let mut buf = BytesMut::with_capacity(3);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
         buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 2 {
+        if buf.len() < 3 {
             return Err(EncodingError {
                 message: "Buffer too short for CollectionMetaKey".to_string(),
             });
@@ -38,7 +38,7 @@ impl CollectionMetaKey {
 
 /// Deletions key - singleton record storing deleted vector IDs bitmap.
 ///
-/// Key layout: `[version | tag]` (2 bytes)
+/// Key layout: `[subsystem | version | tag]` (3 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletionsKey;
 
@@ -52,13 +52,13 @@ impl DeletionsKey {
     }
 
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(2);
+        let mut buf = BytesMut::with_capacity(3);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
         buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 2 {
+        if buf.len() < 3 {
             return Err(EncodingError {
                 message: "Buffer too short for DeletionsKey".to_string(),
             });
@@ -76,7 +76,7 @@ impl Default for DeletionsKey {
 
 /// CentroidChunk key - stores a chunk of cluster centroids.
 ///
-/// Key layout: `[version | tag | chunk_id:u32-BE]` (6 bytes)
+/// Key layout: `[subsystem | version | tag | chunk_id:u32-BE]` (7 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CentroidChunkKey {
     pub chunk_id: u32,
@@ -92,26 +92,26 @@ impl CentroidChunkKey {
     }
 
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(6);
+        let mut buf = BytesMut::with_capacity(7);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
         buf.put_u32(self.chunk_id); // Big-endian
         buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 6 {
+        if buf.len() < 7 {
             return Err(EncodingError {
                 message: "Buffer too short for CentroidChunkKey".to_string(),
             });
         }
         validate_key_prefix::<Self>(buf)?;
-        let chunk_id = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
+        let chunk_id = u32::from_be_bytes([buf[3], buf[4], buf[5], buf[6]]);
         Ok(CentroidChunkKey { chunk_id })
     }
 
     /// Returns a range covering all centroid chunk keys.
     pub fn all_chunks_range() -> BytesRange {
-        let mut buf = BytesMut::with_capacity(2);
+        let mut buf = BytesMut::with_capacity(3);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
         BytesRange::prefix(buf.freeze())
     }
@@ -119,7 +119,7 @@ impl CentroidChunkKey {
 
 /// PostingList key - maps centroid ID to vector IDs.
 ///
-/// Key layout: `[version | tag | centroid_id:u64-BE]` (10 bytes)
+/// Key layout: `[subsystem | version | tag | centroid_id:u64-BE]` (11 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostingListKey {
     pub centroid_id: u64,
@@ -135,28 +135,28 @@ impl PostingListKey {
     }
 
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(10);
+        let mut buf = BytesMut::with_capacity(11);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
         buf.put_u64(self.centroid_id); // Big-endian
         buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 10 {
+        if buf.len() < 11 {
             return Err(EncodingError {
                 message: "Buffer too short for PostingListKey".to_string(),
             });
         }
         validate_key_prefix::<Self>(buf)?;
         let centroid_id = u64::from_be_bytes([
-            buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+            buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10],
         ]);
         Ok(PostingListKey { centroid_id })
     }
 
     /// Returns a range covering all posting list keys.
     pub fn all_posting_lists_range() -> BytesRange {
-        let mut buf = BytesMut::with_capacity(2);
+        let mut buf = BytesMut::with_capacity(3);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
         BytesRange::prefix(buf.freeze())
     }
@@ -164,7 +164,7 @@ impl PostingListKey {
 
 /// IdDictionary key - maps external string IDs to internal u64 vector IDs.
 ///
-/// Key layout: `[version | tag | external_id:TerminatedBytes]` (variable)
+/// Key layout: `[subsystem | version | tag | external_id:TerminatedBytes]` (variable)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdDictionaryKey {
     pub external_id: String,
@@ -189,15 +189,15 @@ impl IdDictionaryKey {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 3 {
-            // At minimum: version + tag + terminator
+        if buf.len() < 4 {
+            // At minimum: subsystem + version + tag + terminator
             return Err(EncodingError {
                 message: "Buffer too short for IdDictionaryKey".to_string(),
             });
         }
         validate_key_prefix::<Self>(buf)?;
 
-        let mut slice = &buf[2..];
+        let mut slice = &buf[3..];
         let external_id_bytes =
             terminated_bytes::deserialize(&mut slice).map_err(|e| EncodingError {
                 message: format!("Failed to decode external_id: {}", e),
@@ -213,7 +213,7 @@ impl IdDictionaryKey {
 
     /// Returns a range covering all ID dictionary keys.
     pub fn all_ids_range() -> BytesRange {
-        let mut buf = BytesMut::with_capacity(2);
+        let mut buf = BytesMut::with_capacity(3);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
         BytesRange::prefix(buf.freeze())
     }
@@ -233,7 +233,7 @@ impl IdDictionaryKey {
 
 /// VectorData key - stores raw vector bytes.
 ///
-/// Key layout: `[version | tag | vector_id:u64-BE]` (10 bytes)
+/// Key layout: `[subsystem | version | tag | vector_id:u64-BE]` (11 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorDataKey {
     pub vector_id: u64,
@@ -249,28 +249,28 @@ impl VectorDataKey {
     }
 
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(10);
+        let mut buf = BytesMut::with_capacity(11);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
         buf.put_u64(self.vector_id); // Big-endian
         buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 10 {
+        if buf.len() < 11 {
             return Err(EncodingError {
                 message: "Buffer too short for VectorDataKey".to_string(),
             });
         }
         validate_key_prefix::<Self>(buf)?;
         let vector_id = u64::from_be_bytes([
-            buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+            buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10],
         ]);
         Ok(VectorDataKey { vector_id })
     }
 
     /// Returns a range covering all vector data keys.
     pub fn all_vectors_range() -> BytesRange {
-        let mut buf = BytesMut::with_capacity(2);
+        let mut buf = BytesMut::with_capacity(3);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
         BytesRange::prefix(buf.freeze())
     }
@@ -278,7 +278,7 @@ impl VectorDataKey {
 
 /// MetadataIndex key - inverted index mapping metadata values to vector IDs.
 ///
-/// Key layout: `[version | tag | field:TerminatedBytes | value:FieldValue]` (variable)
+/// Key layout: `[subsystem | version | tag | field:TerminatedBytes | value:FieldValue]` (variable)
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetadataIndexKey {
     pub field: String,
@@ -306,15 +306,15 @@ impl MetadataIndexKey {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 4 {
-            // Minimum: version + tag + field terminator + value type
+        if buf.len() < 5 {
+            // Minimum: subsystem + version + tag + field terminator + value type
             return Err(EncodingError {
                 message: "Buffer too short for MetadataIndexKey".to_string(),
             });
         }
         validate_key_prefix::<Self>(buf)?;
 
-        let mut slice = &buf[2..];
+        let mut slice = &buf[3..];
 
         let field_bytes = terminated_bytes::deserialize(&mut slice).map_err(|e| EncodingError {
             message: format!("Failed to decode field: {}", e),
@@ -339,7 +339,7 @@ impl MetadataIndexKey {
 
     /// Returns a range covering all metadata index keys.
     pub fn all_indexes_range() -> BytesRange {
-        let mut buf = BytesMut::with_capacity(2);
+        let mut buf = BytesMut::with_capacity(3);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
         BytesRange::prefix(buf.freeze())
     }
@@ -347,7 +347,7 @@ impl MetadataIndexKey {
 
 /// SeqBlock key - singleton record storing sequence allocation state.
 ///
-/// Key layout: `[version | tag]` (2 bytes)
+/// Key layout: `[subsystem | version | tag]` (3 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeqBlockKey;
 
@@ -357,13 +357,13 @@ impl RecordKey for SeqBlockKey {
 
 impl SeqBlockKey {
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(2);
+        let mut buf = BytesMut::with_capacity(3);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
         buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 2 {
+        if buf.len() < 3 {
             return Err(EncodingError {
                 message: "Buffer too short for SeqBlockKey".to_string(),
             });
@@ -375,7 +375,7 @@ impl SeqBlockKey {
 
 /// CentroidStats key - per-centroid vector count for rebalance triggers.
 ///
-/// Key layout: `[version | tag | centroid_id:u64-BE]` (10 bytes)
+/// Key layout: `[subsystem | version | tag | centroid_id:u64-BE]` (11 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CentroidStatsKey {
     pub centroid_id: u64,
@@ -391,21 +391,21 @@ impl CentroidStatsKey {
     }
 
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(10);
+        let mut buf = BytesMut::with_capacity(11);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
         buf.put_u64(self.centroid_id); // Big-endian
         buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 10 {
+        if buf.len() < 11 {
             return Err(EncodingError {
                 message: "Buffer too short for CentroidStatsKey".to_string(),
             });
         }
         validate_key_prefix::<Self>(buf)?;
         let centroid_id = u64::from_be_bytes([
-            buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+            buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10],
         ]);
         Ok(CentroidStatsKey { centroid_id })
     }
@@ -413,8 +413,8 @@ impl CentroidStatsKey {
 
 /// Validates the key prefix (version and record tag).
 fn validate_key_prefix<T: RecordKey>(buf: &[u8]) -> Result<(), EncodingError> {
-    let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
-    let record_type = record_type_from_tag(prefix.tag())?;
+    let prefix = KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
+    let record_type = RecordType::from_prefix(prefix)?;
 
     if record_type != T::RECORD_TYPE {
         return Err(EncodingError {
@@ -444,7 +444,7 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 2);
+        assert_eq!(encoded.len(), 3);
     }
 
     #[test]
@@ -458,7 +458,7 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 6);
+        assert_eq!(encoded.len(), 7);
     }
 
     #[test]
@@ -545,7 +545,7 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 10);
+        assert_eq!(encoded.len(), 11);
     }
 
     #[test]
@@ -662,7 +662,7 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 2);
+        assert_eq!(encoded.len(), 3);
     }
 
     #[test]
@@ -690,7 +690,7 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 10);
+        assert_eq!(encoded.len(), 11);
     }
 
     #[test]
@@ -714,6 +714,7 @@ mod tests {
     fn should_reject_wrong_version() {
         // given
         let mut buf = BytesMut::new();
+        buf.put_u8(crate::serde::SUBSYSTEM);
         buf.put_u8(0x99); // Wrong version
         buf.put_u8(RecordType::CollectionMeta.tag().as_byte());
 

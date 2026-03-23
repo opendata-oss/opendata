@@ -96,6 +96,9 @@ pub fn decode_fixed_element_array<T: Decode>(
 /// Key format version (currently 0x01)
 pub const KEY_VERSION: u8 = 0x01;
 
+/// Subsystem-specific key prefix for timeseries storage.
+pub const SUBSYSTEM: u8 = 0x01;
+
 /// Record type enumeration for timeseries storage.
 ///
 /// Record types are encoded in the high 4 bits of the record tag byte,
@@ -130,6 +133,19 @@ impl RecordType {
         }
     }
 
+    pub fn from_prefix(prefix: KeyPrefix) -> Result<Self, EncodingError> {
+        if prefix.subsystem() != SUBSYSTEM {
+            return Err(EncodingError {
+                message: format!(
+                    "invalid subsystem: expected 0x{:02x}, got 0x{:02x}",
+                    SUBSYSTEM,
+                    prefix.subsystem()
+                ),
+            });
+        }
+        RecordType::from_id((prefix.tag() & 0xF0) >> 4)
+    }
+
     /// Creates a global-scoped RecordTag (reserved bits = 0).
     pub fn tag(&self) -> RecordTag {
         RecordTag::new(self.id(), 0)
@@ -142,25 +158,24 @@ impl RecordType {
 
     /// Creates a global-scoped KeyPrefix with the current version.
     pub fn prefix(&self) -> KeyPrefix {
-        KeyPrefix::new(KEY_VERSION, self.tag())
+        KeyPrefix::new(SUBSYSTEM, KEY_VERSION, self.tag().as_byte())
     }
 
     /// Creates a bucket-scoped KeyPrefix with the current version.
     pub fn prefix_with_bucket_size(&self, bucket_size: BucketSize) -> KeyPrefix {
-        KeyPrefix::new(KEY_VERSION, self.tag_with_bucket_size(bucket_size))
+        KeyPrefix::new(
+            SUBSYSTEM,
+            KEY_VERSION,
+            self.tag_with_bucket_size(bucket_size).as_byte(),
+        )
     }
 }
 
-/// Extracts the RecordType from a RecordTag.
-pub fn record_type_from_tag(tag: RecordTag) -> Result<RecordType, EncodingError> {
-    RecordType::from_id(tag.record_type())
-}
-
-/// Extracts the bucket size from a RecordTag.
+/// Extracts the bucket size from a key prefix.
 ///
 /// Returns None if the reserved bits are 0 (global-scoped record).
-pub fn bucket_size_from_tag(tag: RecordTag) -> Option<BucketSize> {
-    let size = tag.reserved();
+pub fn bucket_size_from_prefix(prefix: KeyPrefix) -> Option<BucketSize> {
+    let size = prefix.tag() & 0x0F;
     if size == 0 { None } else { Some(size) }
 }
 
@@ -178,8 +193,8 @@ pub trait TimeBucketScoped: RecordKey {
     /// Decodes and validates the bucket-scoped prefix of a key.
     /// Returns the TimeBucket if the record type matches the expected type.
     fn decode_bucket_prefix(bytes: &[u8]) -> Result<TimeBucket, EncodingError> {
-        let prefix = KeyPrefix::from_bytes_versioned(bytes, KEY_VERSION)?;
-        let record_type = record_type_from_tag(prefix.tag())?;
+        let prefix = KeyPrefix::from_bytes_with_validation(bytes, SUBSYSTEM, KEY_VERSION)?;
+        let record_type = RecordType::from_prefix(prefix)?;
 
         if record_type != Self::RECORD_TYPE {
             return Err(EncodingError {
@@ -191,17 +206,17 @@ pub trait TimeBucketScoped: RecordKey {
             });
         }
 
-        let bucket_size = bucket_size_from_tag(prefix.tag()).ok_or_else(|| EncodingError {
+        let bucket_size = bucket_size_from_prefix(prefix).ok_or_else(|| EncodingError {
             message: "record should be bucket-scoped".to_string(),
         })?;
 
-        if bytes.len() < 6 {
+        if bytes.len() < 7 {
             return Err(EncodingError {
                 message: "buffer too short for bucket prefix".to_string(),
             });
         }
 
-        let start_epoch_min = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+        let start_epoch_min = u32::from_be_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
 
         Ok(TimeBucket {
             start: start_epoch_min,
@@ -233,6 +248,16 @@ pub fn write_bucket_scoped_prefix<T: TimeBucketScoped>(buf: &mut BytesMut, recor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Extracts the RecordType from a RecordTag.
+    fn record_type_from_tag(tag: RecordTag) -> Result<RecordType, EncodingError> {
+        RecordType::from_id(tag.record_type())
+    }
+
+    fn bucket_size_from_tag(tag: RecordTag) -> Option<BucketSize> {
+        let size = tag.reserved();
+        if size == 0 { None } else { Some(size) }
+    }
 
     #[test]
     fn should_encode_and_decode_record_tag_global_scoped() {
