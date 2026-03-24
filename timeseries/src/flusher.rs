@@ -301,4 +301,95 @@ mod tests {
             .unwrap();
         assert_eq!(count, 2);
     }
+
+    /// End-to-end test: ingest the same series across multiple deltas/flushes
+    /// with MetricPrefixed layout and verify all samples remain visible.
+    ///
+    /// This is a regression test for a bug where the merge operator did not
+    /// handle RecordType::MetricTimeSeries, causing each flush to overwrite
+    /// previous samples instead of merging them.
+    #[tokio::test]
+    async fn should_merge_metric_prefixed_samples_across_multiple_flushes() {
+        // given
+        let storage = create_test_storage();
+        let flusher = TsdbFlusher {
+            storage: storage.clone(),
+            sample_storage_layout: SampleStorageLayout::MetricPrefixed,
+        };
+        let bucket = create_test_bucket();
+
+        // Flush 1: samples at t=60_000_001 and t=60_000_002
+        let ctx1 = TsdbContext {
+            bucket,
+            series_dict: Arc::new(HashMap::new()),
+            next_series_id: 0,
+        };
+        let mut delta1 = TsdbWriteDelta::init(ctx1);
+        delta1
+            .apply(vec![create_test_series(
+                "http_requests",
+                vec![("env", "prod")],
+                Sample { timestamp_ms: 60_000_001, value: 1.0 },
+            )])
+            .unwrap();
+        delta1
+            .apply(vec![create_test_series(
+                "http_requests",
+                vec![("env", "prod")],
+                Sample { timestamp_ms: 60_000_002, value: 2.0 },
+            )])
+            .unwrap();
+        let (frozen1, _, ctx2) = delta1.freeze();
+        flusher.flush_delta(frozen1, &(1..2)).await.unwrap();
+
+        // Flush 2: samples at t=60_000_003 and t=60_000_004
+        let mut delta2 = TsdbWriteDelta::init(ctx2);
+        delta2
+            .apply(vec![create_test_series(
+                "http_requests",
+                vec![("env", "prod")],
+                Sample { timestamp_ms: 60_000_003, value: 3.0 },
+            )])
+            .unwrap();
+        delta2
+            .apply(vec![create_test_series(
+                "http_requests",
+                vec![("env", "prod")],
+                Sample { timestamp_ms: 60_000_004, value: 4.0 },
+            )])
+            .unwrap();
+        let (frozen2, _, ctx3) = delta2.freeze();
+        flusher.flush_delta(frozen2, &(2..3)).await.unwrap();
+
+        // Flush 3: sample at t=60_000_005
+        let mut delta3 = TsdbWriteDelta::init(ctx3);
+        delta3
+            .apply(vec![create_test_series(
+                "http_requests",
+                vec![("env", "prod")],
+                Sample { timestamp_ms: 60_000_005, value: 5.0 },
+            )])
+            .unwrap();
+        let (frozen3, _, _) = delta3.freeze();
+        let snapshot = flusher.flush_delta(frozen3, &(3..4)).await.unwrap();
+
+        // then: all 5 samples from all 3 flushes must be present
+        let samples = snapshot
+            .get_metric_samples(&bucket, "http_requests", 0, i64::MIN, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            samples.len(),
+            5,
+            "Expected 5 samples across 3 flushes, got {}. \
+             If only the last flush's samples are present, the merge operator \
+             is discarding existing values for MetricTimeSeries keys.",
+            samples.len()
+        );
+        assert_eq!(samples[0].timestamp_ms, 60_000_001);
+        assert_eq!(samples[1].timestamp_ms, 60_000_002);
+        assert_eq!(samples[2].timestamp_ms, 60_000_003);
+        assert_eq!(samples[3].timestamp_ms, 60_000_004);
+        assert_eq!(samples[4].timestamp_ms, 60_000_005);
+    }
 }

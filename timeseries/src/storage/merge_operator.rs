@@ -33,7 +33,7 @@ impl common::storage::MergeOperator for OpenTsdbMergeOperator {
         match record_type {
             RecordType::InvertedIndex => merge_batch_inverted_index(existing_value, operands)
                 .expect("Failed to batch merge inverted index"),
-            RecordType::TimeSeries => merge_batch_time_series(existing_value, operands)
+            RecordType::TimeSeries | RecordType::MetricTimeSeries => merge_batch_time_series(existing_value, operands)
                 .expect("Failed to batch merge time series"),
             RecordType::BucketList => merge_batch_bucket_list(existing_value, operands)
                 .expect("Failed to batch merge bucket list"),
@@ -101,7 +101,7 @@ fn merge_batch_bucket_list(
 mod tests {
     use super::*;
     use crate::model::Sample;
-    use crate::serde::key::{BucketListKey, InvertedIndexKey, TimeSeriesKey};
+    use crate::serde::key::{BucketListKey, InvertedIndexKey, MetricTimeSeriesKey, TimeSeriesKey};
     use crate::serde::timeseries::TimeSeriesValue;
     use bytes::Bytes;
     use common::storage::MergeOperator;
@@ -898,6 +898,48 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn should_merge_metric_time_series_samples() {
+        // given: MetricTimeSeries key must route to merge_batch_time_series,
+        // not the catch-all that discards existing values
+        let operator = OpenTsdbMergeOperator;
+        let key = MetricTimeSeriesKey {
+            time_bucket: 1000,
+            bucket_size: 1,
+            metric_name: "http_requests_total".to_string(),
+            series_id: 42,
+        }
+        .encode();
+
+        let existing = TimeSeriesValue {
+            points: vec![
+                Sample { timestamp_ms: 1000, value: 10.0 },
+                Sample { timestamp_ms: 2000, value: 20.0 },
+            ],
+        }
+        .encode()
+        .unwrap();
+        let new = TimeSeriesValue {
+            points: vec![
+                Sample { timestamp_ms: 3000, value: 30.0 },
+                Sample { timestamp_ms: 4000, value: 40.0 },
+            ],
+        }
+        .encode()
+        .unwrap();
+
+        // when
+        let merged = operator.merge(&key, Some(existing), new);
+        let decoded = TimeSeriesValue::decode(merged.as_ref()).unwrap();
+
+        // then - all 4 samples must be present (merge, not overwrite)
+        assert_eq!(decoded.points.len(), 4);
+        assert_eq!(decoded.points[0].timestamp_ms, 1000);
+        assert_eq!(decoded.points[1].timestamp_ms, 2000);
+        assert_eq!(decoded.points[2].timestamp_ms, 3000);
+        assert_eq!(decoded.points[3].timestamp_ms, 4000);
     }
 
     #[test]
