@@ -245,7 +245,15 @@ impl SampleStorageLayout {
     fn parse(value: Option<&str>) -> Self {
         match value {
             Some("metric_prefixed") => Self::MetricPrefixed,
-            _ => Self::LegacySeriesId,
+            None | Some("legacy") | Some("") => Self::LegacySeriesId,
+            Some(other) => {
+                tracing::warn!(
+                    value = other,
+                    "Unknown TSDB_SAMPLE_STORAGE_LAYOUT value, falling back to legacy. \
+                     Valid values: 'legacy', 'metric_prefixed'"
+                );
+                Self::LegacySeriesId
+            }
         }
     }
 }
@@ -334,9 +342,18 @@ mod tests {
     }
 
     #[test]
-    fn should_default_to_legacy_for_unknown_layout_value() {
+    fn should_warn_and_fallback_to_legacy_for_unknown_layout_value() {
+        // Unknown values fall back to legacy (with a tracing::warn)
         assert_eq!(
             SampleStorageLayout::parse(Some("unknown_value")),
+            SampleStorageLayout::LegacySeriesId
+        );
+    }
+
+    #[test]
+    fn should_parse_empty_string_as_legacy() {
+        assert_eq!(
+            SampleStorageLayout::parse(Some("")),
             SampleStorageLayout::LegacySeriesId
         );
     }

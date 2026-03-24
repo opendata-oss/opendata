@@ -2278,6 +2278,73 @@ mod tests {
     }
 
     #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_range_query_with_metric_prefixed_layout_via_b3(storage: Arc<dyn Storage>) {
+        use crate::test_utils::assertions::assert_approx_eq;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // given: two buckets with metric-prefixed layout
+        let config = TsdbRuntimeConfig {
+            sample_storage_layout: SampleStorageLayout::MetricPrefixed,
+            ..Default::default()
+        };
+        let tsdb = Tsdb::with_runtime_config(storage, config);
+
+        // Bucket 60: minutes 60-119, ms 3,600,000-7,199,999
+        let bucket1 = TimeBucket::hour(60);
+        let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
+        mini1
+            .ingest(&create_sample("http_requests", vec![("env", "prod")], 3_900_000, 10.0))
+            .await
+            .unwrap();
+        mini1
+            .ingest(&create_sample("http_requests", vec![("env", "staging")], 3_900_000, 20.0))
+            .await
+            .unwrap();
+
+        // Bucket 120: minutes 120-179, ms 7,200,000-10,799,999
+        let bucket2 = TimeBucket::hour(120);
+        let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
+        mini2
+            .ingest(&create_sample("http_requests", vec![("env", "prod")], 7_500_000, 30.0))
+            .await
+            .unwrap();
+        mini2
+            .ingest(&create_sample("http_requests", vec![("env", "staging")], 7_500_000, 40.0))
+            .await
+            .unwrap();
+
+        tsdb.flush().await.unwrap();
+
+        // when: range query spanning both buckets (exercises B3 parallel sample loading)
+        let start = UNIX_EPOCH + Duration::from_secs(3900);
+        let end = UNIX_EPOCH + Duration::from_secs(7600);
+        let step = Duration::from_secs(3600);
+        let opts = QueryOptions::default();
+
+        let mut results = tsdb
+            .eval_query_range("http_requests", start..=end, step, &opts)
+            .await
+            .unwrap();
+        results.sort_by(|a, b| a.labels.get("env").cmp(&b.labels.get("env")));
+
+        // then: both series returned with samples from both buckets
+        assert_eq!(results.len(), 2, "expected 2 series");
+
+        // env=prod
+        assert_eq!(results[0].labels.get("env"), Some("prod"));
+        assert!(!results[0].samples.is_empty(), "prod should have samples");
+        // The latest sample for prod should be 30.0 from bucket2
+        let prod_last = results[0].samples.last().unwrap();
+        assert_approx_eq(prod_last.1, 30.0);
+
+        // env=staging
+        assert_eq!(results[1].labels.get("env"), Some("staging"));
+        assert!(!results[1].samples.is_empty(), "staging should have samples");
+        let staging_last = results[1].samples.last().unwrap();
+        assert_approx_eq(staging_last.1, 40.0);
+    }
+
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
     async fn eval_query_range_rejects_zero_step(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
 

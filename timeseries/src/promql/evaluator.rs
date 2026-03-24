@@ -256,9 +256,10 @@ struct BucketSampleStats {
     sample_permit_acquires: u64,
     parallel_sample_loads: u64,
     bucket_ms: u64,
-    // Metric-prefixed layout experiment
-    sample_distinct_metrics: u64,
+    // Metric-prefixed layout experiment: per-bucket max series for a single metric
     sample_series_per_metric_max: u64,
+    // Metric names loaded in this bucket (moved to Phase C for cross-bucket dedup)
+    metric_names: Vec<Arc<str>>,
 }
 
 /// Result of Phase B3 sample loading for one bucket.
@@ -1494,14 +1495,19 @@ async fn process_bucket_sample_loads<R: QueryReader>(
     let bucket = work.bucket;
 
     // Compute per-metric distribution for experiment instrumentation
-    let (distinct_metrics, max_series_per_metric) = {
+    let max_series_per_metric = {
         let mut metric_counts: HashMap<&str, u64> = HashMap::new();
         for (_, metric_name, _) in &work.to_load {
             *metric_counts.entry(metric_name.as_ref()).or_default() += 1;
         }
-        let max = metric_counts.values().copied().max().unwrap_or(0);
-        (metric_counts.len() as u64, max)
+        metric_counts.values().copied().max().unwrap_or(0)
     };
+    // Collect metric names for cross-bucket dedup at Phase C
+    let bucket_metric_names: Vec<Arc<str>> = work
+        .to_load
+        .iter()
+        .map(|(_, name, _)| Arc::clone(name))
+        .collect();
 
     let load_results: Vec<_> = futures::stream::iter(work.to_load.into_iter())
         .map(|(series_id, metric_name, meta)| {
@@ -1556,8 +1562,8 @@ async fn process_bucket_sample_loads<R: QueryReader>(
     }
 
     stats.bucket_ms = bucket_start.elapsed().as_millis() as u64;
-    stats.sample_distinct_metrics = distinct_metrics;
     stats.sample_series_per_metric_max = max_series_per_metric;
+    stats.metric_names = bucket_metric_names;
 
     tracing::debug!(
         bucket_id = ?bucket,
@@ -1566,7 +1572,6 @@ async fn process_bucket_sample_loads<R: QueryReader>(
         bucket_ms = stats.bucket_ms,
         sample_queue_wait_ms = stats.sample_queue_wait_ms,
         sample_load_ms = stats.sample_load_ms,
-        distinct_metrics = stats.sample_distinct_metrics,
         max_series_per_metric = stats.sample_series_per_metric_max,
         "preload_bucket_parallel"
     );
@@ -2363,6 +2368,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             self.reader.stats.parallel_sample_wall_ms = b3_wall_start.elapsed().as_millis() as u64;
 
             // ═══ Phase C: Sequential merge ═══
+            let mut all_metric_names: HashSet<Arc<str>> = HashSet::new();
             for result in sample_results {
                 let sr = result?;
                 let bs = &sr.stats;
@@ -2377,7 +2383,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 self.reader.stats.parallel_sample_loads += bs.parallel_sample_loads;
                 self.reader.stats.parallel_sample_bucket_count += 1;
                 self.reader.stats.parallel_sample_sum_ms += bs.bucket_ms;
-                self.reader.stats.sample_distinct_metrics += bs.sample_distinct_metrics;
+                all_metric_names.extend(bs.metric_names.iter().cloned());
                 self.reader.stats.sample_series_per_metric_max = self
                     .reader
                     .stats
@@ -2403,6 +2409,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     }
                 }
             }
+            self.reader.stats.sample_distinct_metrics = all_metric_names.len() as u64;
         }
 
         // Derive backward-compatible bucket metrics
