@@ -129,7 +129,11 @@ impl MiniTsdb {
         }
     }
 
-    pub(crate) async fn load(bucket: TimeBucket, storage: Arc<dyn Storage>) -> Result<Self> {
+    pub(crate) async fn load(
+        bucket: TimeBucket,
+        storage: Arc<dyn Storage>,
+        sample_storage_layout: crate::config::SampleStorageLayout,
+    ) -> Result<Self> {
         let snapshot = storage.snapshot().await?;
 
         let mut series_dict = HashMap::new();
@@ -147,6 +151,7 @@ impl MiniTsdb {
 
         let flusher = TsdbFlusher {
             storage: storage.clone(),
+            sample_storage_layout,
         };
 
         let initial_snapshot: Arc<dyn StorageSnapshot> = storage

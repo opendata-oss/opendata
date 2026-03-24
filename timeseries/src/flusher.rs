@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use common::coordinator::Flusher;
 use common::storage::{Storage, StorageSnapshot};
 
+use crate::config::SampleStorageLayout;
 use crate::delta::{FrozenTsdbDelta, TsdbWriteDelta};
 use crate::storage::OpenTsdbStorageExt;
 
@@ -14,6 +15,7 @@ use crate::storage::OpenTsdbStorageExt;
 /// atomically, then returns a new snapshot for readers.
 pub(crate) struct TsdbFlusher {
     pub(crate) storage: Arc<dyn Storage>,
+    pub(crate) sample_storage_layout: SampleStorageLayout,
 }
 
 #[async_trait]
@@ -58,12 +60,19 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
             );
         }
 
-        for (series_id, samples) in frozen.samples {
-            ops.push(
-                self.storage
-                    .merge_samples(frozen.bucket, series_id, samples)
-                    .map_err(|e| e.to_string())?,
-            );
+        for (series_id, series_samples) in frozen.samples {
+            let op = match self.sample_storage_layout {
+                SampleStorageLayout::LegacySeriesId => self
+                    .storage
+                    .merge_samples(frozen.bucket, series_id, series_samples.samples),
+                SampleStorageLayout::MetricPrefixed => self.storage.merge_metric_samples(
+                    frozen.bucket,
+                    &series_samples.metric_name,
+                    series_id,
+                    series_samples.samples,
+                ),
+            };
+            ops.push(op.map_err(|e| e.to_string())?);
         }
 
         self.storage.apply(ops).await.map_err(|e| e.to_string())?;
@@ -117,6 +126,7 @@ mod tests {
         let storage = create_test_storage();
         let flusher = TsdbFlusher {
             storage: storage.clone(),
+            sample_storage_layout: SampleStorageLayout::LegacySeriesId,
         };
         let ctx = TsdbContext {
             bucket: create_test_bucket(),
@@ -144,6 +154,7 @@ mod tests {
         let storage = create_test_storage();
         let flusher = TsdbFlusher {
             storage: storage.clone(),
+            sample_storage_layout: SampleStorageLayout::LegacySeriesId,
         };
         let ctx = TsdbContext {
             bucket: create_test_bucket(),
@@ -188,6 +199,7 @@ mod tests {
         let storage = create_failing_storage();
         let flusher = TsdbFlusher {
             storage: storage.clone(),
+            sample_storage_layout: SampleStorageLayout::LegacySeriesId,
         };
         storage.fail_apply(common::StorageError::Storage("test apply error".into()));
 
@@ -210,6 +222,7 @@ mod tests {
         let storage = create_failing_storage();
         let flusher = TsdbFlusher {
             storage: storage.clone(),
+            sample_storage_layout: SampleStorageLayout::LegacySeriesId,
         };
         // Apply succeeds, but snapshot after apply fails
         storage.fail_snapshot(common::StorageError::Storage("test snapshot error".into()));
@@ -233,6 +246,7 @@ mod tests {
         let storage = create_failing_storage();
         let flusher = TsdbFlusher {
             storage: storage.clone(),
+            sample_storage_layout: SampleStorageLayout::LegacySeriesId,
         };
         storage.fail_flush(common::StorageError::Storage("test flush error".into()));
 
@@ -253,6 +267,7 @@ mod tests {
         let storage = create_test_storage();
         let flusher = TsdbFlusher {
             storage: storage.clone(),
+            sample_storage_layout: SampleStorageLayout::LegacySeriesId,
         };
         let ctx = TsdbContext {
             bucket: create_test_bucket(),

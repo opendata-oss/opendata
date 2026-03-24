@@ -824,7 +824,14 @@ impl Tsdb {
         }
 
         // Load from storage and put in ingest cache
-        let mini = Arc::new(MiniTsdb::load(bucket, self.storage.clone()).await?);
+        let mini = Arc::new(
+            MiniTsdb::load(
+                bucket,
+                self.storage.clone(),
+                self.runtime_config.sample_storage_layout,
+            )
+            .await?,
+        );
         self.ingest_cache.insert(bucket, mini.clone()).await;
         Ok(mini)
     }
@@ -842,7 +849,14 @@ impl Tsdb {
         }
 
         // 3. Load from storage into query cache (NOT ingest cache)
-        let mini = Arc::new(MiniTsdb::load(bucket, self.storage.clone()).await?);
+        let mini = Arc::new(
+            MiniTsdb::load(
+                bucket,
+                self.storage.clone(),
+                self.runtime_config.sample_storage_layout,
+            )
+            .await?,
+        );
         self.query_cache.insert(bucket, mini.clone()).await;
         Ok(mini)
     }

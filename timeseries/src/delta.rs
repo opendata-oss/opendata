@@ -7,6 +7,13 @@ use crate::index::{ForwardIndex, InvertedIndex, SeriesSpec};
 use crate::model::{Label, MetricType, Sample, Series, SeriesFingerprint, SeriesId, TimeBucket};
 use crate::util::Fingerprint;
 
+/// Per-series sample data in a frozen delta, carrying the metric name
+/// for metric-prefixed sample key construction in the flusher.
+pub(crate) struct SeriesSamples {
+    pub metric_name: Arc<str>,
+    pub samples: Vec<Sample>,
+}
+
 /// State that persists across delta freezes.
 pub(crate) struct TsdbContext {
     pub(crate) bucket: TimeBucket,
@@ -20,7 +27,7 @@ pub(crate) struct FrozenTsdbDelta {
     pub(crate) forward_index: ForwardIndex,
     pub(crate) inverted_index: InvertedIndex,
     pub(crate) series_dict_delta: HashMap<SeriesFingerprint, SeriesId>,
-    pub(crate) samples: HashMap<SeriesId, Vec<Sample>>,
+    pub(crate) samples: HashMap<SeriesId, SeriesSamples>,
 }
 
 impl FrozenTsdbDelta {
@@ -41,7 +48,7 @@ pub(crate) struct TsdbWriteDelta {
     series_dict_delta: HashMap<SeriesFingerprint, SeriesId>,
     forward_index: ForwardIndex,
     inverted_index: InvertedIndex,
-    samples: HashMap<SeriesId, Vec<Sample>>,
+    samples: HashMap<SeriesId, SeriesSamples>,
     next_series_id: u32,
 }
 
@@ -81,15 +88,38 @@ impl TsdbWriteDelta {
 
         let fingerprint = labels.fingerprint();
 
+        // Extract metric name from labels for metric-prefixed key construction.
+        let metric_name = || -> Arc<str> {
+            labels
+                .iter()
+                .find(|l| l.name == "__name__")
+                .map(|l| Arc::from(l.value.as_str()))
+                .unwrap_or_else(|| Arc::from(""))
+        };
+
         // Check delta overlay first (for series created in this delta)
         if let Some(&series_id) = self.series_dict_delta.get(&fingerprint) {
-            self.samples.entry(series_id).or_default().push(sample);
+            self.samples
+                .entry(series_id)
+                .or_insert_with(|| SeriesSamples {
+                    metric_name: metric_name(),
+                    samples: Vec::new(),
+                })
+                .samples
+                .push(sample);
             return Ok(());
         }
 
         // Check base dictionary
         if let Some(&series_id) = self.series_dict_base.get(&fingerprint) {
-            self.samples.entry(series_id).or_default().push(sample);
+            self.samples
+                .entry(series_id)
+                .or_insert_with(|| SeriesSamples {
+                    metric_name: metric_name(),
+                    samples: Vec::new(),
+                })
+                .samples
+                .push(sample);
             return Ok(());
         }
 
@@ -116,7 +146,14 @@ impl TsdbWriteDelta {
                 .insert(series_id);
         }
 
-        self.samples.entry(series_id).or_default().push(sample);
+        self.samples
+            .entry(series_id)
+            .or_insert_with(|| SeriesSamples {
+                metric_name: metric_name(),
+                samples: Vec::new(),
+            })
+            .samples
+            .push(sample);
         Ok(())
     }
 }
@@ -150,7 +187,7 @@ impl Delta for TsdbWriteDelta {
 
     fn estimate_size(&self) -> usize {
         // Rough estimate: 16 bytes per sample + index overhead
-        let sample_count: usize = self.samples.values().map(|v| v.len()).sum();
+        let sample_count: usize = self.samples.values().map(|v| v.samples.len()).sum();
         sample_count * 16
             + self.forward_index.series.len() * 128
             + self.inverted_index.postings.len() * 64
@@ -234,7 +271,7 @@ mod tests {
         assert_eq!(delta.next_series_id, 1);
         assert_eq!(delta.series_dict_delta.len(), 1);
         assert_eq!(delta.samples.len(), 1);
-        assert_eq!(delta.samples.get(&0).unwrap().len(), 1);
+        assert_eq!(delta.samples.get(&0).unwrap().samples.len(), 1);
     }
 
     #[test]
@@ -260,7 +297,7 @@ mod tests {
         // then
         assert_eq!(delta.next_series_id, 1); // Only one series created
         assert_eq!(delta.series_dict_delta.len(), 1);
-        assert_eq!(delta.samples.get(&0).unwrap().len(), 2);
+        assert_eq!(delta.samples.get(&0).unwrap().samples.len(), 2);
     }
 
     #[test]
@@ -287,11 +324,11 @@ mod tests {
         // then: should reuse series_id from frozen context
         assert_eq!(delta2.next_series_id, 1); // No new ID allocated
         assert_eq!(delta2.series_dict_delta.len(), 0); // Not in delta overlay
-        assert_eq!(delta2.samples.get(&0).unwrap().len(), 1);
+        assert_eq!(delta2.samples.get(&0).unwrap().samples.len(), 1);
 
         // And the frozen delta has the original series
         assert_eq!(frozen.series_dict_delta.len(), 1);
-        assert_eq!(frozen.samples.get(&0).unwrap().len(), 1);
+        assert_eq!(frozen.samples.get(&0).unwrap().samples.len(), 1);
     }
 
     #[test]
@@ -331,7 +368,7 @@ mod tests {
 
         // then
         assert_eq!(delta.next_series_id, 1);
-        assert_eq!(delta.samples.get(&0).unwrap().len(), 3);
+        assert_eq!(delta.samples.get(&0).unwrap().samples.len(), 3);
     }
 
     #[test]
