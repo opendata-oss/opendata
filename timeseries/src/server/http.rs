@@ -174,7 +174,10 @@ impl TimeSeriesHttpServer {
         );
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.port));
-        tracing::info!("Starting Prometheus-compatible server on {}", addr);
+        tracing::info!(
+            sample_storage_layout = ?self.tsdb.runtime_config.sample_storage_layout,
+            "Starting Prometheus-compatible server on {}", addr
+        );
 
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         axum::serve(listener, app)

@@ -222,11 +222,40 @@ impl Default for MetadataWarmConfig {
     }
 }
 
+/// Physical layout for sample records in storage.
+///
+/// Controls how sample keys are structured:
+/// - `LegacySeriesId`: keys are `<bucket, series_id>` (current default)
+/// - `MetricPrefixed`: keys are `<bucket, metric_name, series_id>` (experimental)
+///
+/// The metric-prefixed layout groups all series for one metric together in the
+/// keyspace, which may reduce read amplification for single-metric queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SampleStorageLayout {
+    #[default]
+    LegacySeriesId,
+    MetricPrefixed,
+}
+
+impl SampleStorageLayout {
+    pub(crate) fn from_env() -> Self {
+        Self::parse(std::env::var("TSDB_SAMPLE_STORAGE_LAYOUT").ok().as_deref())
+    }
+
+    fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("metric_prefixed") => Self::MetricPrefixed,
+            _ => Self::LegacySeriesId,
+        }
+    }
+}
+
 /// Top-level runtime config for Tsdb, aggregating all subsystem configs.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TsdbRuntimeConfig {
     pub read_load: ReadLoadConfig,
     pub metadata_warm: MetadataWarmConfig,
+    pub sample_storage_layout: SampleStorageLayout,
 }
 
 impl TsdbRuntimeConfig {
@@ -234,6 +263,7 @@ impl TsdbRuntimeConfig {
         Self {
             read_load: ReadLoadConfig::from_env(),
             metadata_warm: MetadataWarmConfig::from_env(),
+            sample_storage_layout: SampleStorageLayout::from_env(),
         }
     }
 }
@@ -277,5 +307,37 @@ mod tests {
         let config = TsdbRuntimeConfig::default();
         assert_eq!(config.read_load.sample_permits, 32);
         assert!(!config.metadata_warm.enabled);
+    }
+
+    #[test]
+    fn should_parse_legacy_sample_storage_layout_by_default() {
+        assert_eq!(
+            SampleStorageLayout::parse(None),
+            SampleStorageLayout::LegacySeriesId
+        );
+    }
+
+    #[test]
+    fn should_parse_metric_prefixed_sample_storage_layout() {
+        assert_eq!(
+            SampleStorageLayout::parse(Some("metric_prefixed")),
+            SampleStorageLayout::MetricPrefixed
+        );
+    }
+
+    #[test]
+    fn should_parse_legacy_sample_storage_layout_explicitly() {
+        assert_eq!(
+            SampleStorageLayout::parse(Some("legacy")),
+            SampleStorageLayout::LegacySeriesId
+        );
+    }
+
+    #[test]
+    fn should_default_to_legacy_for_unknown_layout_value() {
+        assert_eq!(
+            SampleStorageLayout::parse(Some("unknown_value")),
+            SampleStorageLayout::LegacySeriesId
+        );
     }
 }

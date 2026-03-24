@@ -16,7 +16,7 @@ use crate::model::{Label, SeriesId, TimeBucket};
 use crate::promql::functions::{FunctionCallContext, FunctionRegistry, PromQLArg};
 use crate::promql::selector::{evaluate_selector_raw, evaluate_selector_with_reader};
 use crate::promql::timestamp::Timestamp;
-use crate::query::QueryReader;
+use crate::query::{QueryReader, SampleLocator};
 use crate::util::Result;
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::*;
@@ -25,6 +25,16 @@ use promql_parser::parser::{
     AggregateExpr, AtModifier, BinaryExpr, Call, EvalStmt, Expr, LabelModifier, MatrixSelector,
     Offset, SubqueryExpr, VectorMatchCardinality, VectorSelector,
 };
+
+/// Extract the `__name__` label value from a sorted label slice.
+/// Returns an empty string if not found (should not happen for well-formed series).
+fn extract_metric_name(labels: &[Label]) -> Arc<str> {
+    labels
+        .iter()
+        .find(|l| l.name == METRIC_NAME)
+        .map(|l| Arc::from(l.value.as_str()))
+        .unwrap_or_else(|| Arc::from(""))
+}
 
 #[derive(Debug)]
 pub enum EvaluationError {
@@ -222,7 +232,7 @@ struct BucketResolutionStats {
 /// Work item for parallel sample loading (Phase B3).
 struct BucketSampleWorkItem {
     bucket: TimeBucket,
-    to_load: Vec<(SeriesId, Arc<SeriesMeta>)>,
+    to_load: Vec<(SeriesId, Arc<str>, Arc<SeriesMeta>)>,
 }
 
 /// Per-series data loaded by the B3 sample worker.
@@ -1413,7 +1423,7 @@ async fn process_bucket_sample_loads<R: QueryReader>(
     let bucket = work.bucket;
 
     let load_results: Vec<_> = futures::stream::iter(work.to_load.into_iter())
-        .map(|(series_id, meta)| {
+        .map(|(series_id, metric_name, meta)| {
             let coord = coordinator.clone();
             async move {
                 let (wait_ms, _permit) = if let Some(ref c) = coord {
@@ -1422,8 +1432,15 @@ async fn process_bucket_sample_loads<R: QueryReader>(
                 } else {
                     (0, None)
                 };
+                let locator = SampleLocator {
+                    bucket,
+                    metric_name,
+                    series_id,
+                };
                 let t0 = std::time::Instant::now();
-                let result = reader.samples(&bucket, series_id, i64::MIN, i64::MAX).await;
+                let result = reader
+                    .samples_by_locator(&locator, i64::MIN, i64::MAX)
+                    .await;
                 let load_ms = t0.elapsed().as_millis() as u64;
                 drop(_permit);
                 (series_id, meta, result, wait_ms, load_ms)
@@ -2031,6 +2048,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
     /// Check sample cache for each candidate. Collect cache hits into series_samples.
     /// Return cache misses with pre-computed meta for B3 sample loading.
+    /// Each miss carries (series_id, metric_name, meta) for SampleLocator construction.
     fn plan_sample_hits_and_misses(
         &mut self,
         bucket: &TimeBucket,
@@ -2038,7 +2056,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         range_start_ms: i64,
         range_end_ms: i64,
         series_samples: &mut HashMap<SeriesFingerprint, (Arc<[Label]>, Vec<Sample>)>,
-    ) -> Vec<(SeriesId, Arc<SeriesMeta>)> {
+    ) -> Vec<(SeriesId, Arc<str>, Arc<SeriesMeta>)> {
         let mut to_load = Vec::new();
         for (series_id, meta) in series_with_meta {
             if let Some(cached_samples) = self.reader.cache.get_samples(bucket, series_id) {
@@ -2056,7 +2074,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     entry.1.extend(samples);
                 }
             } else {
-                to_load.push((*series_id, Arc::clone(meta)));
+                let metric_name = extract_metric_name(&meta.sorted_labels);
+                to_load.push((*series_id, metric_name, Arc::clone(meta)));
             }
         }
         to_load

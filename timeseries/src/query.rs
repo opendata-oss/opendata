@@ -1,9 +1,21 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::model::{Label, Sample};
 use crate::model::{SeriesId, TimeBucket};
 use crate::util::Result;
+
+/// Identifies a sample record in storage, carrying enough information to
+/// construct either a legacy `<bucket, series_id>` key or a metric-prefixed
+/// `<bucket, metric_name, series_id>` key.
+#[derive(Debug, Clone)]
+pub(crate) struct SampleLocator {
+    pub bucket: TimeBucket,
+    pub metric_name: Arc<str>,
+    pub series_id: SeriesId,
+}
 
 /// Trait for read-only queries within a single time bucket.
 /// This is the bucket-scoped interface that works with bucket-local series IDs.
@@ -84,6 +96,19 @@ pub(crate) trait QueryReader: Send + Sync {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<Sample>>;
+
+    /// Get samples using a SampleLocator, which carries the metric name for
+    /// metric-prefixed storage layouts. Default implementation delegates to
+    /// `samples()`, ignoring the metric name (legacy behavior).
+    async fn samples_by_locator(
+        &self,
+        locator: &SampleLocator,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Sample>> {
+        self.samples(&locator.bucket, locator.series_id, start_ms, end_ms)
+            .await
+    }
 }
 
 #[cfg(any(test, feature = "bench-internals"))]
