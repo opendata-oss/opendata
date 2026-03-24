@@ -31,6 +31,11 @@ impl MiniQueryReader {
             snapshot: storage,
         }
     }
+
+    /// Access the underlying storage snapshot for layout-specific reads.
+    pub(crate) fn snapshot(&self) -> &dyn StorageRead {
+        self.snapshot.as_ref()
+    }
 }
 
 #[async_trait]

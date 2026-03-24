@@ -850,6 +850,71 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         ))
     }
 
+    /// Load samples using a SampleLocator, which carries the metric name for
+    /// metric-prefixed storage layouts. Same cache logic as `samples()`.
+    pub(crate) async fn samples_by_locator(
+        &mut self,
+        locator: &SampleLocator,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Sample>> {
+        self.stats.sample_loads += 1;
+        // Check cache first
+        if let Some(cached_samples) = self.cache.get_samples(&locator.bucket, &locator.series_id) {
+            self.stats.sample_cache_hits += 1;
+            return Ok(Self::filter_samples_binary_search(
+                cached_samples,
+                start_ms,
+                end_ms,
+            ));
+        }
+
+        // Not in cache, load from underlying reader with wide bounds to cache the whole bucket
+        self.stats.sample_misses += 1;
+        let wide_locator = SampleLocator {
+            bucket: locator.bucket,
+            metric_name: Arc::clone(&locator.metric_name),
+            series_id: locator.series_id,
+        };
+        let (wait_ms, load_ms);
+        let samples = if let Some(ref coord) = self.load_coordinator {
+            let (permit, wait) = coord.acquire_sample().await;
+            self.stats.sample_permit_acquires += 1;
+            wait_ms = wait.as_millis() as u64;
+            let t0 = std::time::Instant::now();
+            let s = self
+                .reader
+                .samples_by_locator(&wide_locator, i64::MIN, i64::MAX)
+                .await?;
+            load_ms = t0.elapsed().as_millis() as u64;
+            drop(permit);
+            s
+        } else {
+            wait_ms = 0;
+            let t0 = std::time::Instant::now();
+            let s = self
+                .reader
+                .samples_by_locator(&wide_locator, i64::MIN, i64::MAX)
+                .await?;
+            load_ms = t0.elapsed().as_millis() as u64;
+            s
+        };
+        self.stats.sample_queue_wait_ms += wait_ms;
+        self.stats.sample_load_ms += load_ms;
+        self.stats.sample_miss_ms += wait_ms + load_ms;
+
+        self.stats.samples_loaded += samples.len() as u64;
+
+        // Cache the full sample set
+        self.cache
+            .cache_samples(locator.bucket, locator.series_id, samples.clone());
+
+        // Filter by requested time range using binary search
+        Ok(Self::filter_samples_binary_search(
+            &samples, start_ms, end_ms,
+        ))
+    }
+
     /// Filter samples to (start_ms, end_ms] using binary search on sorted timestamps.
     /// Samples are sorted by timestamp_ms (storage invariant), so we use partition_point
     /// to find bounds in O(log n) instead of scanning the full vector.
@@ -1869,9 +1934,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     }
                 };
 
+                let locator = SampleLocator {
+                    bucket,
+                    metric_name: extract_metric_name(&meta.sorted_labels),
+                    series_id,
+                };
                 let sample_data = self
                     .reader
-                    .samples(&bucket, series_id, start_ms, end_ms)
+                    .samples_by_locator(&locator, start_ms, end_ms)
                     .await?;
 
                 // Use sorted_labels as map key via Arc to avoid cloning the Vec<Label>
@@ -2515,9 +2585,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 }
 
                 // Read samples from this bucket within the lookback window
+                let locator = SampleLocator {
+                    bucket,
+                    metric_name: extract_metric_name(&meta.sorted_labels),
+                    series_id,
+                };
                 let sample_data = self
                     .reader
-                    .samples(&bucket, series_id, start_ms, end_ms)
+                    .samples_by_locator(&locator, start_ms, end_ms)
                     .await?;
 
                 // Find the best (latest) point in the time range

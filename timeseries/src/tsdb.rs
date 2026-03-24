@@ -11,7 +11,7 @@ use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 use tokio::sync::RwLock;
 use tracing::{Instrument, error};
 
-use crate::config::TsdbRuntimeConfig;
+use crate::config::{SampleStorageLayout, TsdbRuntimeConfig};
 use crate::error::QueryError;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::load_coordinator::ReadLoadCoordinator;
@@ -22,7 +22,7 @@ use crate::model::{
 };
 use crate::promql::evaluator::{CachedQueryReader, Evaluator, ExprResult, compute_preload_ranges};
 use crate::promql::selector::evaluate_selector_with_reader;
-use crate::query::{BucketQueryReader, QueryReader};
+use crate::query::{BucketQueryReader, QueryReader, SampleLocator};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::util::Result;
 
@@ -885,7 +885,7 @@ impl Tsdb {
             readers.push((bucket, reader));
         }
 
-        Ok(TsdbQueryReader::new(readers))
+        Ok(TsdbQueryReader::new(readers, self.runtime_config.sample_storage_layout))
     }
 
     /// Create a QueryReader for a set of disjoint time ranges.
@@ -904,7 +904,7 @@ impl Tsdb {
             readers.push((bucket, reader));
         }
 
-        Ok(TsdbQueryReader::new(readers))
+        Ok(TsdbQueryReader::new(readers, self.runtime_config.sample_storage_layout))
     }
 
     /// Flush all dirty buckets to durable storage.
@@ -1153,13 +1153,18 @@ impl TsdbReadEngine for Tsdb {
 pub(crate) struct TsdbQueryReader {
     /// Map from bucket to MiniTsdb for efficient bucket queries
     mini_readers: HashMap<TimeBucket, MiniQueryReader>,
+    sample_storage_layout: SampleStorageLayout,
 }
 
 impl TsdbQueryReader {
-    pub fn new(mini_tsdbs: Vec<(TimeBucket, MiniQueryReader)>) -> Self {
+    pub fn new(
+        mini_tsdbs: Vec<(TimeBucket, MiniQueryReader)>,
+        sample_storage_layout: SampleStorageLayout,
+    ) -> Self {
         let bucket_minis = mini_tsdbs.into_iter().collect();
         Self {
             mini_readers: bucket_minis,
+            sample_storage_layout,
         }
     }
 }
@@ -1221,6 +1226,37 @@ impl QueryReader for TsdbQueryReader {
             crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
         })?;
         mini.samples(series_id, start_ms, end_ms).await
+    }
+
+    async fn samples_by_locator(
+        &self,
+        locator: &SampleLocator,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Sample>> {
+        match self.sample_storage_layout {
+            SampleStorageLayout::LegacySeriesId => {
+                self.samples(&locator.bucket, locator.series_id, start_ms, end_ms)
+                    .await
+            }
+            SampleStorageLayout::MetricPrefixed => {
+                let mini = self.mini_readers.get(&locator.bucket).ok_or_else(|| {
+                    crate::error::Error::Internal(format!(
+                        "Bucket {:?} not found",
+                        locator.bucket
+                    ))
+                })?;
+                mini.snapshot()
+                    .get_metric_samples(
+                        &locator.bucket,
+                        &locator.metric_name,
+                        locator.series_id,
+                        start_ms,
+                        end_ms,
+                    )
+                    .await
+            }
+        }
     }
 }
 
@@ -2143,6 +2179,98 @@ mod tests {
 
         let results = tsdb.find_metadata(Some("nonexistent")).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_ingest_and_query_with_metric_prefixed_layout(storage: Arc<dyn Storage>) {
+        use crate::promql::evaluator::Evaluator;
+        use promql_parser::parser::EvalStmt;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // given: Tsdb configured with MetricPrefixed sample storage layout
+        let config = TsdbRuntimeConfig {
+            sample_storage_layout: SampleStorageLayout::MetricPrefixed,
+            ..Default::default()
+        };
+        let tsdb = Tsdb::with_runtime_config(storage, config);
+
+        // Ingest two different metrics into the same bucket
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+
+        mini.ingest(&create_sample(
+            "http_requests",
+            vec![("env", "prod")],
+            4_000_000,
+            42.0,
+        ))
+        .await
+        .unwrap();
+        mini.ingest(&create_sample(
+            "http_requests",
+            vec![("env", "staging")],
+            4_000_000,
+            10.0,
+        ))
+        .await
+        .unwrap();
+        mini.ingest(&create_sample(
+            "cpu_usage",
+            vec![("host", "web1")],
+            4_000_000,
+            0.75,
+        ))
+        .await
+        .unwrap();
+
+        tsdb.flush().await.unwrap();
+
+        // when: query via evaluator (exercises samples_by_locator dispatch)
+        let reader = tsdb.query_reader(3600, 7200).await.unwrap();
+        let mut evaluator = Evaluator::new(&reader);
+
+        let query_time = UNIX_EPOCH + Duration::from_secs(4100);
+        let expr = promql_parser::parser::parse("http_requests").unwrap();
+        let stmt = EvalStmt {
+            expr,
+            start: query_time,
+            end: query_time,
+            interval: Duration::from_secs(0),
+            lookback_delta: Duration::from_secs(300),
+        };
+        let mut results = evaluator
+            .evaluate(stmt)
+            .await
+            .unwrap()
+            .expect_instant_vector("Expected instant vector result");
+        results.sort_by(|a, b| a.labels.get("env").cmp(&b.labels.get("env")));
+
+        // then: should return both http_requests series, not cpu_usage
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].labels.get("env"), Some("prod"));
+        assert_eq!(results[0].value, 42.0);
+        assert_eq!(results[1].labels.get("env"), Some("staging"));
+        assert_eq!(results[1].value, 10.0);
+
+        // also query cpu_usage
+        let mut evaluator2 = Evaluator::new(&reader);
+        let expr2 = promql_parser::parser::parse("cpu_usage").unwrap();
+        let stmt2 = EvalStmt {
+            expr: expr2,
+            start: query_time,
+            end: query_time,
+            interval: Duration::from_secs(0),
+            lookback_delta: Duration::from_secs(300),
+        };
+        let results2 = evaluator2
+            .evaluate(stmt2)
+            .await
+            .unwrap()
+            .expect_instant_vector("Expected instant vector result");
+
+        assert_eq!(results2.len(), 1);
+        assert_eq!(results2[0].labels.get("host"), Some("web1"));
+        assert_eq!(results2[0].value, 0.75);
     }
 
     #[storage_test(merge_operator = OpenTsdbMergeOperator)]
