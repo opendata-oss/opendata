@@ -47,9 +47,9 @@ pub(crate) fn raw_distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 
     }
 }
 
-/// Compute L2 (Euclidean) distance between two vectors.
+/// Compute squared L2 distance between two vectors.
 ///
-/// Formula: sqrt(sum((a[i] - b[i])²))
+/// Formula: sum((a[i] - b[i])²)
 ///
 /// Lower scores indicate more similar vectors.
 fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
@@ -65,11 +65,7 @@ fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn l2_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).powi(2))
-        .sum::<f32>()
-        .sqrt()
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum()
 }
 
 /// Compute dot product between two vectors.
@@ -178,7 +174,7 @@ unsafe fn l2_distance_avx(a: &[f32], b: &[f32]) -> f32 {
         sum += diff * diff;
     }
 
-    sum.sqrt()
+    sum
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -260,7 +256,7 @@ mod tests {
 
     // Parameterized tests for distance functions
     #[rstest]
-    #[case(vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0], 5.196, "different vectors")]
+    #[case(vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0], 27.0, "different vectors")]
     #[case(vec![1.0, 2.0, 3.0], vec![1.0, 2.0, 3.0], 0.0, "identical vectors")]
     fn should_compute_l2_distance(
         #[case] a: Vec<f32>,

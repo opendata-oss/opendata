@@ -229,7 +229,12 @@ impl QueryEngine {
             return scored.into_iter().map(|(id, _)| id).collect();
         }
 
-        let threshold = (1.0 + epsilon) * closest_dist;
+        let threshold = match metric {
+            // raw_distance uses squared L2, so preserve epsilon semantics in
+            // Euclidean space by squaring the multiplicative factor.
+            DistanceMetric::L2 => (1.0 + epsilon).powi(2) * closest_dist,
+            DistanceMetric::DotProduct => (1.0 + epsilon) * closest_dist,
+        };
         scored
             .into_iter()
             .take_while(|&(_, d)| d <= threshold)

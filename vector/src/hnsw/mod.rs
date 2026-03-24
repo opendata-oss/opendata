@@ -1,8 +1,9 @@
-//! HNSW graph implementations for centroid search.
+//! Centroid graph implementations for centroid search.
 //!
-//! This module provides a trait-based abstraction for HNSW indexes with
-//! an implementation backed by the usearch library.
+//! This module provides a trait-based abstraction for centroid indexes with
+//! implementations backed by the usearch library and exhaustive raw-vector search.
 
+mod exhaustive;
 mod usearch;
 
 use crate::error::Result;
@@ -12,9 +13,10 @@ use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::collection_meta::DistanceMetric;
 
 // Re-export implementations
+pub use exhaustive::ExhaustiveCentroidGraph;
 pub use usearch::UsearchCentroidGraph;
 
-/// Trait for HNSW-based centroid graph implementations.
+/// Trait for centroid graph implementations.
 ///
 /// The graph stores centroids and enables fast approximate nearest neighbor search
 /// to find relevant clusters during query execution.
@@ -79,12 +81,12 @@ pub trait CentroidGraph: Send + Sync {
     }
 }
 
-/// Build a centroid graph using the default implementation (usearch).
+/// Build a centroid graph using the default implementation (exhaustive).
 pub fn build_centroid_graph(
     centroids: Vec<CentroidEntry>,
     distance_metric: DistanceMetric,
 ) -> Result<Box<dyn CentroidGraph>> {
-    let graph = UsearchCentroidGraph::build(centroids, distance_metric)?;
+    let graph = ExhaustiveCentroidGraph::build(centroids, distance_metric)?;
     Ok(Box::new(graph))
 }
 
