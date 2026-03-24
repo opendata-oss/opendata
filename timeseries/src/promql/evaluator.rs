@@ -112,6 +112,9 @@ pub(crate) struct EvalStats {
     pub(crate) parallel_sample_wall_ms: u64,
     pub(crate) parallel_sample_sum_ms: u64,
     pub(crate) parallel_sample_bucket_count: u64,
+    // Metric-prefixed layout experiment instrumentation
+    pub(crate) sample_distinct_metrics: u64,
+    pub(crate) sample_series_per_metric_max: u64,
 }
 
 /// Canonical key for caching selector results across steps.
@@ -253,6 +256,9 @@ struct BucketSampleStats {
     sample_permit_acquires: u64,
     parallel_sample_loads: u64,
     bucket_ms: u64,
+    // Metric-prefixed layout experiment
+    sample_distinct_metrics: u64,
+    sample_series_per_metric_max: u64,
 }
 
 /// Result of Phase B3 sample loading for one bucket.
@@ -1487,6 +1493,16 @@ async fn process_bucket_sample_loads<R: QueryReader>(
     let bucket_start = std::time::Instant::now();
     let bucket = work.bucket;
 
+    // Compute per-metric distribution for experiment instrumentation
+    let (distinct_metrics, max_series_per_metric) = {
+        let mut metric_counts: HashMap<&str, u64> = HashMap::new();
+        for (_, metric_name, _) in &work.to_load {
+            *metric_counts.entry(metric_name.as_ref()).or_default() += 1;
+        }
+        let max = metric_counts.values().copied().max().unwrap_or(0);
+        (metric_counts.len() as u64, max)
+    };
+
     let load_results: Vec<_> = futures::stream::iter(work.to_load.into_iter())
         .map(|(series_id, metric_name, meta)| {
             let coord = coordinator.clone();
@@ -1540,6 +1556,8 @@ async fn process_bucket_sample_loads<R: QueryReader>(
     }
 
     stats.bucket_ms = bucket_start.elapsed().as_millis() as u64;
+    stats.sample_distinct_metrics = distinct_metrics;
+    stats.sample_series_per_metric_max = max_series_per_metric;
 
     tracing::debug!(
         bucket_id = ?bucket,
@@ -1548,6 +1566,8 @@ async fn process_bucket_sample_loads<R: QueryReader>(
         bucket_ms = stats.bucket_ms,
         sample_queue_wait_ms = stats.sample_queue_wait_ms,
         sample_load_ms = stats.sample_load_ms,
+        distinct_metrics = stats.sample_distinct_metrics,
+        max_series_per_metric = stats.sample_series_per_metric_max,
         "preload_bucket_parallel"
     );
 
@@ -2357,6 +2377,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 self.reader.stats.parallel_sample_loads += bs.parallel_sample_loads;
                 self.reader.stats.parallel_sample_bucket_count += 1;
                 self.reader.stats.parallel_sample_sum_ms += bs.bucket_ms;
+                self.reader.stats.sample_distinct_metrics += bs.sample_distinct_metrics;
+                self.reader.stats.sample_series_per_metric_max = self
+                    .reader
+                    .stats
+                    .sample_series_per_metric_max
+                    .max(bs.sample_series_per_metric_max);
 
                 *bucket_totals.entry(sr.bucket).or_default() += bs.bucket_ms;
 
@@ -7071,6 +7097,18 @@ mod tests {
                 stats.parallel_sample_bucket_count > 0,
                 "expected parallel_sample_bucket_count > 0, got {}",
                 stats.parallel_sample_bucket_count
+            );
+
+            // Metric-prefixed layout experiment stats
+            assert!(
+                stats.sample_distinct_metrics > 0,
+                "expected sample_distinct_metrics > 0, got {}",
+                stats.sample_distinct_metrics
+            );
+            assert!(
+                stats.sample_series_per_metric_max > 0,
+                "expected sample_series_per_metric_max > 0, got {}",
+                stats.sample_series_per_metric_max
             );
 
             // Now verify the results are still correct by evaluating a step

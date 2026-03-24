@@ -451,6 +451,10 @@ pub(crate) async fn evaluate_range(
         parallel_sample_wall_ms = stats.parallel_sample_wall_ms,
         parallel_sample_sum_ms = stats.parallel_sample_sum_ms,
         parallel_sample_bucket_count = stats.parallel_sample_bucket_count,
+        // Metric-prefixed layout experiment
+        sample_distinct_metrics = stats.sample_distinct_metrics,
+        sample_series_per_metric_max = stats.sample_series_per_metric_max,
+        sample_logical_bytes = stats.samples_loaded * 16,
         "evaluate_range complete"
     );
 
