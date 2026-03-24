@@ -63,8 +63,8 @@ pub enum SubscribeError {
     Shutdown,
     /// [`ViewSubscriber::recv()`] was called before [`ViewSubscriber::initialize()`].
     NotInitialized,
-    /// The subscriber is lagging behind the coordinator's progress.
-    Lagged,
+    /// A message was lost indicating that the subscriber is lagging behind the coordinator's progress.
+    MessageLost,
 }
 
 impl std::fmt::Display for SubscribeError {
@@ -74,7 +74,7 @@ impl std::fmt::Display for SubscribeError {
             SubscribeError::NotInitialized => {
                 write!(f, "initialize() must be called before recv()")
             }
-            SubscribeError::Lagged => write!(f, "subscriber is lagging behind"),
+            SubscribeError::MessageLost => write!(f, "message was lost, subscriber is lagging behind"),
         }
     }
 }
@@ -132,7 +132,7 @@ impl<D: Delta> ViewSubscriber<D> {
         }
         match self.view_rx.recv().await {
             Ok(view) => Ok(view),
-            Err(broadcast::error::RecvError::Lagged(_)) => Err(SubscribeError::Lagged), // the subscriber is lagging behind the coordinator's progress.
+            Err(broadcast::error::RecvError::Lagged(_)) => Err(SubscribeError::MessageLost), // the subscriber is lagging behind the coordinator's progress.
             Err(broadcast::error::RecvError::Closed) => Err(SubscribeError::Shutdown),
         }
     }
