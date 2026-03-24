@@ -5,8 +5,8 @@ use roaring::RoaringBitmap;
 
 use crate::index::{InvertedIndex, SeriesSpec};
 use crate::model::{Sample, SeriesFingerprint, SeriesId, TimeBucket};
-use crate::serde::key::TimeSeriesKey;
-use crate::serde::timeseries::TimeSeriesValue;
+use crate::serde::key::{MetricTimeSeriesKey, TimeSeriesKey};
+use crate::serde::timeseries::{TimeSeriesIterator, TimeSeriesValue};
 use crate::{
     index::ForwardIndex,
     model::Label,
@@ -257,6 +257,43 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
 
     // ── Warm helpers (touch storage to populate block cache) ────────
 
+    /// Load samples for a single series using the metric-prefixed key layout.
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn get_metric_samples(
+        &self,
+        bucket: &TimeBucket,
+        metric_name: &str,
+        series_id: SeriesId,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Sample>> {
+        let key = MetricTimeSeriesKey {
+            time_bucket: bucket.start,
+            bucket_size: bucket.size,
+            metric_name: metric_name.to_string(),
+            series_id,
+        }
+        .encode();
+
+        let record = self.get(key).await?;
+        match record {
+            Some(record) => {
+                let iter = TimeSeriesIterator::new(record.value.as_ref()).ok_or_else(|| {
+                    crate::error::Error::Internal(
+                        "Invalid timeseries data in metric-prefixed storage".into(),
+                    )
+                })?;
+
+                let samples: Vec<Sample> = iter
+                    .filter_map(|r| r.ok())
+                    .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
+                    .collect();
+                Ok(samples)
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// Warm the bucket list by reading it from storage. Returns the list of
     /// buckets and the total bytes read (key + value).
     async fn warm_bucket_list(&self) -> Result<WarmBucketListResult> {
@@ -394,6 +431,24 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
         let key = TimeSeriesKey {
             time_bucket: bucket.start,
             bucket_size: bucket.size,
+            series_id,
+        }
+        .encode();
+        let value = TimeSeriesValue { points: samples }.encode()?;
+        Ok(RecordOp::Merge(Record { key, value }.into()))
+    }
+
+    fn merge_metric_samples(
+        &self,
+        bucket: TimeBucket,
+        metric_name: &str,
+        series_id: SeriesId,
+        samples: Vec<Sample>,
+    ) -> Result<RecordOp> {
+        let key = MetricTimeSeriesKey {
+            time_bucket: bucket.start,
+            bucket_size: bucket.size,
+            metric_name: metric_name.to_string(),
             series_id,
         }
         .encode();
@@ -603,5 +658,106 @@ mod tests {
         let bucket = TimeBucket::hour(60);
         let bytes = s.warm_inverted_index_bytes(bucket).await.unwrap();
         assert_eq!(bytes, 0);
+    }
+
+    // ── metric-prefixed sample storage tests ────────────────────────────
+
+    #[tokio::test]
+    async fn should_merge_and_read_metric_prefixed_samples() {
+        // given
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let bucket = TimeBucket::hour(60);
+        let samples = vec![
+            Sample {
+                timestamp_ms: 1000,
+                value: 1.0,
+            },
+            Sample {
+                timestamp_ms: 2000,
+                value: 2.0,
+            },
+        ];
+
+        // when - write via merge_metric_samples
+        let op = storage
+            .merge_metric_samples(bucket, "http_requests_total", 42, samples)
+            .unwrap();
+        match op {
+            common::storage::RecordOp::Merge(record) => {
+                storage.merge(vec![record]).await.unwrap();
+            }
+            _ => panic!("expected Merge op"),
+        }
+
+        // then - read back via get_metric_samples
+        let result = storage
+            .get_metric_samples(&bucket, "http_requests_total", 42, i64::MIN, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].timestamp_ms, 1000);
+        assert_eq!(result[1].timestamp_ms, 2000);
+    }
+
+    #[tokio::test]
+    async fn should_return_empty_for_nonexistent_metric_prefixed_sample() {
+        // given
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let bucket = TimeBucket::hour(60);
+
+        // when
+        let result = storage
+            .get_metric_samples(&bucket, "nonexistent_metric", 1, i64::MIN, i64::MAX)
+            .await
+            .unwrap();
+
+        // then
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_filter_metric_prefixed_samples_by_time_range() {
+        // given
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let bucket = TimeBucket::hour(60);
+        let samples = vec![
+            Sample {
+                timestamp_ms: 1000,
+                value: 1.0,
+            },
+            Sample {
+                timestamp_ms: 2000,
+                value: 2.0,
+            },
+            Sample {
+                timestamp_ms: 3000,
+                value: 3.0,
+            },
+        ];
+        let op = storage
+            .merge_metric_samples(bucket, "cpu_usage", 10, samples)
+            .unwrap();
+        match op {
+            common::storage::RecordOp::Merge(record) => {
+                storage.merge(vec![record]).await.unwrap();
+            }
+            _ => panic!("expected Merge op"),
+        }
+
+        // when - query with range (1000, 2500] (exclusive start, inclusive end)
+        let result = storage
+            .get_metric_samples(&bucket, "cpu_usage", 10, 1000, 2500)
+            .await
+            .unwrap();
+
+        // then - only timestamp 2000 is in (1000, 2500]
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].timestamp_ms, 2000);
     }
 }

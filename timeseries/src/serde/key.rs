@@ -321,6 +321,105 @@ impl TimeBucketScoped for TimeSeriesKey {
     }
 }
 
+/// Experimental metric-prefixed sample key.
+///
+/// Key layout: `<record_prefix, time_bucket, metric_name (terminated), series_id>`
+///
+/// This groups all series for one metric together within a bucket, providing
+/// physical locality for single-metric queries. The metric_name uses terminated
+/// encoding so prefix scans over all series for a given metric are efficient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricTimeSeriesKey {
+    pub time_bucket: BucketStart,
+    pub bucket_size: BucketSize,
+    pub metric_name: String,
+    pub series_id: SeriesId,
+}
+
+impl MetricTimeSeriesKey {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        RecordType::MetricTimeSeries
+            .prefix_with_bucket_size(self.bucket_size)
+            .write_to(&mut buf);
+        buf.extend_from_slice(&self.time_bucket.to_be_bytes());
+        terminated_bytes::serialize(self.metric_name.as_bytes(), &mut buf);
+        buf.extend_from_slice(&self.series_id.to_be_bytes());
+        buf.freeze()
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < 2 + 4 {
+            return Err(EncodingError {
+                message: "Buffer too short for MetricTimeSeriesKey".to_string(),
+            });
+        }
+        let prefix = KeyPrefix::from_bytes_versioned(buf, KEY_VERSION)?;
+        let record_type = record_type_from_tag(prefix.tag())?;
+        if record_type != RecordType::MetricTimeSeries {
+            return Err(EncodingError {
+                message: format!(
+                    "invalid record type: expected MetricTimeSeries, got {:?}",
+                    record_type
+                ),
+            });
+        }
+        let bucket_size = bucket_size_from_tag(prefix.tag()).ok_or_else(|| EncodingError {
+            message: "MetricTimeSeriesKey should be bucket-scoped".to_string(),
+        })?;
+
+        let time_bucket = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
+        let mut slice = &buf[6..];
+
+        let metric_name_bytes = terminated_bytes::deserialize(&mut slice)?;
+        let metric_name =
+            String::from_utf8(metric_name_bytes.to_vec()).map_err(|e| EncodingError {
+                message: format!("Invalid UTF-8 in metric_name: {}", e),
+            })?;
+
+        if slice.len() < 4 {
+            return Err(EncodingError {
+                message: "Buffer too short for series_id in MetricTimeSeriesKey".to_string(),
+            });
+        }
+        let series_id = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
+
+        Ok(MetricTimeSeriesKey {
+            time_bucket,
+            bucket_size,
+            metric_name,
+            series_id,
+        })
+    }
+
+    /// Create a BytesRange covering all series for a given metric within a bucket.
+    pub fn metric_range(
+        bucket: &crate::model::TimeBucket,
+        metric_name: &str,
+    ) -> BytesRange {
+        let mut buf = BytesMut::new();
+        RecordType::MetricTimeSeries
+            .prefix_with_bucket_size(bucket.size)
+            .write_to(&mut buf);
+        buf.extend_from_slice(&bucket.start.to_be_bytes());
+        terminated_bytes::serialize(metric_name.as_bytes(), &mut buf);
+        BytesRange::prefix(buf.freeze())
+    }
+}
+
+impl RecordKey for MetricTimeSeriesKey {
+    const RECORD_TYPE: RecordType = RecordType::MetricTimeSeries;
+}
+
+impl TimeBucketScoped for MetricTimeSeriesKey {
+    fn bucket(&self) -> crate::model::TimeBucket {
+        crate::model::TimeBucket {
+            start: self.time_bucket,
+            size: self.bucket_size,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,5 +638,89 @@ mod tests {
             0x00,
             "Byte before value should be 0x00 (attribute terminator)"
         );
+    }
+
+    #[test]
+    fn should_encode_and_decode_metric_time_series_key() {
+        // given
+        let key = MetricTimeSeriesKey {
+            time_bucket: 12345,
+            bucket_size: 1,
+            metric_name: "http_requests_total".to_string(),
+            series_id: 42,
+        };
+
+        // when
+        let encoded = key.encode();
+        let decoded = MetricTimeSeriesKey::decode(&encoded).unwrap();
+
+        // then
+        assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn should_order_metric_time_series_keys_by_metric_then_series_id() {
+        // given - two keys for same metric, different series
+        let bucket = crate::model::TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let key_a = MetricTimeSeriesKey {
+            time_bucket: bucket.start,
+            bucket_size: bucket.size,
+            metric_name: "cpu_usage".to_string(),
+            series_id: 5,
+        };
+        let key_b = MetricTimeSeriesKey {
+            time_bucket: bucket.start,
+            bucket_size: bucket.size,
+            metric_name: "cpu_usage".to_string(),
+            series_id: 10,
+        };
+        // different metric
+        let key_c = MetricTimeSeriesKey {
+            time_bucket: bucket.start,
+            bucket_size: bucket.size,
+            metric_name: "mem_usage".to_string(),
+            series_id: 1,
+        };
+
+        // when
+        let enc_a = key_a.encode();
+        let enc_b = key_b.encode();
+        let enc_c = key_c.encode();
+
+        // then - same metric: ordered by series_id
+        assert!(enc_a < enc_b, "same metric: lower series_id should sort first");
+        // different metric: ordered lexicographically by metric name
+        assert!(enc_b < enc_c, "cpu_usage should sort before mem_usage");
+    }
+
+    #[test]
+    fn should_scan_metric_prefix_range_for_bucket() {
+        // given
+        let bucket = crate::model::TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let key_match = MetricTimeSeriesKey {
+            time_bucket: 100,
+            bucket_size: 1,
+            metric_name: "cpu_usage".to_string(),
+            series_id: 5,
+        };
+        let key_diff_metric = MetricTimeSeriesKey {
+            time_bucket: 100,
+            bucket_size: 1,
+            metric_name: "mem_usage".to_string(),
+            series_id: 5,
+        };
+
+        // when
+        let range = MetricTimeSeriesKey::metric_range(&bucket, "cpu_usage");
+
+        // then
+        assert!(range.contains(&key_match.encode()));
+        assert!(!range.contains(&key_diff_metric.encode()));
     }
 }

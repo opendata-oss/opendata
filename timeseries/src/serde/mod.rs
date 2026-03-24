@@ -108,6 +108,9 @@ pub enum RecordType {
     ForwardIndex = 0x03,
     InvertedIndex = 0x04,
     TimeSeries = 0x05,
+    /// Experimental: sample records keyed by metric name for locality.
+    /// Key layout: `<prefix, bucket, metric_name, series_id>`.
+    MetricTimeSeries = 0x06,
 }
 
 impl RecordType {
@@ -124,6 +127,7 @@ impl RecordType {
             0x03 => Ok(RecordType::ForwardIndex),
             0x04 => Ok(RecordType::InvertedIndex),
             0x05 => Ok(RecordType::TimeSeries),
+            0x06 => Ok(RecordType::MetricTimeSeries),
             _ => Err(EncodingError {
                 message: format!("invalid record type: 0x{:02x}", id),
             }),
