@@ -722,6 +722,12 @@ mod tests {
         writes: HashMap<String, (u64, u64)>,
     }
 
+    impl std::fmt::Debug for View<TestDelta> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("View<TestDelta>")
+        }
+    }
+
     impl Delta for TestDelta {
         type Context = TestContext;
         type Write = TestWrite;
@@ -2312,7 +2318,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn should_recover_from_lagged_subscriber() {
+    async fn should_recover_from_message_lost_subscriber() {
         // given - a coordinator with a small broadcast buffer (16)
         let flusher = TestFlusher::default();
         let mut coordinator = WriteCoordinator::new(
@@ -2342,40 +2348,46 @@ mod tests {
             let _ = handle.flush(false).await.unwrap();
         }
 
-        // then - subscriber should get Lagged error on first recv()
+        // make changes durable
+        let mut watermark = handle.flush(true).await.expect("flush(true) should succeed");
+
+        // wait for durability watermark
+        watermark.wait(Durability::Durable).await;
+
+        // expect SubscribeError to be MessageLost
+        let result = subscriber
+            .recv()
+            .await
+            .expect_err("expected recv() to yield an error");
+        assert!(matches!(result, SubscribeError::MessageLost));
+
+        // when - resubscribe to recover
+        let (rx, initial_view) = handle.subscribe();
+        (subscriber, _) = ViewSubscriber::new(rx, initial_view);
+        let view = subscriber.initialize();
+
+        // then - the fresh view should reflect the current state
+        // (all 20 writes should be in the snapshot after all the flushes)
+        let records = view.snapshot.scan(BytesRange::unbounded()).await.unwrap();
+        assert!(
+            records.len() >= 20,
+            "expected at least 20 rows, got {}",
+            records.len()
+        );
+
+        // and - we should be able to receive future broadcasts
+        let _write_handle = handle
+            .try_write(TestWrite {
+                key: "post_recovery".into(),
+                value: 100,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        let _ = handle.flush(false).await.unwrap();
+
         let result = subscriber.recv().await;
-        if let Err(SubscribeError::Lagged) = result {
-            // when - resubscribe to recover
-            let (rx, initial_view) = handle.subscribe();
-            (subscriber, _) = ViewSubscriber::new(rx, initial_view);
-            let view = subscriber.initialize();
-
-            // then - the fresh view should reflect the current state
-            // (all 20 writes should be in the snapshot after all the flushes)
-            let records = view.snapshot.scan(BytesRange::unbounded()).await.unwrap();
-            assert!(
-                records.len() >= 20,
-                "expected at least 20 rows, got {}",
-                records.len()
-            );
-
-            // and - we should be able to receive future broadcasts
-            let _write_handle = handle
-                .try_write(TestWrite {
-                    key: "post_recovery".into(),
-                    value: 100,
-                    size: 10,
-                })
-                .await
-                .unwrap();
-            let _ = handle.flush(false).await.unwrap();
-
-            let result = subscriber.recv().await;
-            assert!(result.is_ok());
-        } else {
-            // If the subscriber didn't lag (possible on a fast machine), that's ok
-            // The important thing is that recovery works when it does lag
-        }
+        assert!(result.is_ok());
 
         // cleanup
         coordinator.stop().await;
