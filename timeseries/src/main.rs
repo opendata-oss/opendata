@@ -13,6 +13,7 @@ mod model;
 mod otel;
 mod promql;
 mod query;
+mod query_io;
 mod serde;
 mod server;
 mod storage;
