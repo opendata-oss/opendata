@@ -42,6 +42,12 @@ pub struct PrometheusConfig {
     /// Defaults to 5 seconds.
     #[serde(default = "default_flush_interval_secs")]
     pub flush_interval_secs: u64,
+    /// Run in read-only mode (no writes, no scraping, no fencing).
+    #[serde(default)]
+    pub read_only: bool,
+    /// Reader-specific configuration (only used when `read_only` is true).
+    #[serde(default)]
+    pub reader: ServerReaderConfig,
 }
 
 fn default_flush_interval_secs() -> u64 {
@@ -56,6 +62,31 @@ impl Default for PrometheusConfig {
             otel: OtelServerConfig::default(),
             storage: StorageConfig::default(),
             flush_interval_secs: default_flush_interval_secs(),
+            read_only: false,
+            reader: ServerReaderConfig::default(),
+        }
+    }
+}
+
+/// Reader-specific configuration for read-only server mode.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerReaderConfig {
+    /// Manifest poll interval in seconds.
+    /// The reader polls the SlateDB manifest at this interval to discover
+    /// new data written by the writer process.
+    /// Defaults to 300 (5 minutes).
+    #[serde(default = "default_reader_refresh_interval_secs")]
+    pub refresh_interval_secs: u64,
+}
+
+fn default_reader_refresh_interval_secs() -> u64 {
+    300
+}
+
+impl Default for ServerReaderConfig {
+    fn default() -> Self {
+        Self {
+            refresh_interval_secs: default_reader_refresh_interval_secs(),
         }
     }
 }

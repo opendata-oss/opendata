@@ -499,7 +499,8 @@ mod tests {
     /// without fencing.
     #[tokio::test]
     async fn slatedb_writer_and_reader_coexist_no_fencing() {
-        use crate::{Config, ReaderConfig, TimeSeriesDb};
+        use crate::config::{Config, ReaderConfig};
+        use crate::timeseries::TimeSeriesDb;
         use common::storage::config::{
             LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
         };
@@ -610,7 +611,8 @@ mod tests {
 
     #[tokio::test]
     async fn should_persist_data_after_flush_and_writer_reopen() {
-        use crate::{Config, TimeSeriesDb};
+        use crate::config::Config;
+        use crate::timeseries::TimeSeriesDb;
         use common::storage::config::{
             LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
         };
