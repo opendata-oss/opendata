@@ -79,3 +79,8 @@ tempfile.workspace = true
 name = "l2_distance"
 harness = false
 required-features = ["bench-internals"]
+
+[[bench]]
+name = "l2_score_and_rank"
+harness = false
+required-features = ["bench-internals"]

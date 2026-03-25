@@ -7,7 +7,8 @@ use crate::serde::collection_meta::DistanceMetric;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
     _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
-    _mm256_sub_ps,
+    _mm256_sub_ps, _mm512_add_ps, _mm512_loadu_ps, _mm512_mul_ps, _mm512_setzero_ps,
+    _mm512_storeu_ps, _mm512_sub_ps,
 };
 use std::cmp::Ordering;
 
@@ -55,6 +56,11 @@ pub(crate) fn raw_distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 
 fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
+        if std::is_x86_feature_detected!("avx512f") {
+            // SAFETY: AVX-512F support is checked at runtime before calling the AVX-512 variant.
+            return unsafe { l2_distance_avx512(a, b) };
+        }
+
         if std::is_x86_feature_detected!("avx") {
             // SAFETY: AVX support is checked at runtime before calling the AVX variant.
             return unsafe { l2_distance_avx(a, b) };
@@ -76,6 +82,11 @@ fn l2_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
 fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
+        if std::is_x86_feature_detected!("avx512f") {
+            // SAFETY: AVX-512F support is checked at runtime before calling the AVX-512 variant.
+            return unsafe { dot_product_avx512(a, b) };
+        }
+
         if std::is_x86_feature_detected!("avx") {
             // SAFETY: AVX support is checked at runtime before calling the AVX variant.
             return unsafe { dot_product_avx(a, b) };
@@ -138,6 +149,11 @@ pub fn bench_l2_distance_avx(a: &[f32], b: &[f32]) -> Option<f32> {
 
     #[cfg(target_arch = "x86_64")]
     {
+        if std::is_x86_feature_detected!("avx512f") {
+            // SAFETY: AVX-512F support is checked at runtime before calling the AVX-512 variant.
+            return Some(unsafe { l2_distance_avx512(a, b) });
+        }
+
         if std::is_x86_feature_detected!("avx") {
             // SAFETY: AVX support is checked at runtime before calling the AVX variant.
             return Some(unsafe { l2_distance_avx(a, b) });
@@ -145,6 +161,36 @@ pub fn bench_l2_distance_avx(a: &[f32], b: &[f32]) -> Option<f32> {
     }
 
     None
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn l2_distance_avx512(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = _mm512_setzero_ps();
+    let mut idx = 0;
+    let len = a.len();
+
+    while idx + 16 <= len {
+        // SAFETY: `idx + 16 <= len` guarantees each load reads 16 initialized `f32`s.
+        let lhs = unsafe { _mm512_loadu_ps(a.as_ptr().add(idx)) };
+        // SAFETY: `idx + 16 <= len` guarantees each load reads 16 initialized `f32`s.
+        let rhs = unsafe { _mm512_loadu_ps(b.as_ptr().add(idx)) };
+        let diff = _mm512_sub_ps(lhs, rhs);
+        acc = _mm512_add_ps(acc, _mm512_mul_ps(diff, diff));
+        idx += 16;
+    }
+
+    let mut lanes = [0.0; 16];
+    // SAFETY: `lanes` is a valid contiguous buffer for 16 `f32`s.
+    unsafe { _mm512_storeu_ps(lanes.as_mut_ptr(), acc) };
+
+    let mut sum = lanes.into_iter().sum::<f32>();
+    for (x, y) in a[idx..].iter().zip(&b[idx..]) {
+        let diff = x - y;
+        sum += diff * diff;
+    }
+
+    sum
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -172,6 +218,34 @@ unsafe fn l2_distance_avx(a: &[f32], b: &[f32]) -> f32 {
     for (x, y) in a[idx..].iter().zip(&b[idx..]) {
         let diff = x - y;
         sum += diff * diff;
+    }
+
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn dot_product_avx512(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = _mm512_setzero_ps();
+    let mut idx = 0;
+    let len = a.len();
+
+    while idx + 16 <= len {
+        // SAFETY: `idx + 16 <= len` guarantees each load reads 16 initialized `f32`s.
+        let lhs = unsafe { _mm512_loadu_ps(a.as_ptr().add(idx)) };
+        // SAFETY: `idx + 16 <= len` guarantees each load reads 16 initialized `f32`s.
+        let rhs = unsafe { _mm512_loadu_ps(b.as_ptr().add(idx)) };
+        acc = _mm512_add_ps(acc, _mm512_mul_ps(lhs, rhs));
+        idx += 16;
+    }
+
+    let mut lanes = [0.0; 16];
+    // SAFETY: `lanes` is a valid contiguous buffer for 16 `f32`s.
+    unsafe { _mm512_storeu_ps(lanes.as_mut_ptr(), acc) };
+
+    let mut sum = lanes.into_iter().sum::<f32>();
+    for (x, y) in a[idx..].iter().zip(&b[idx..]) {
+        sum += x * y;
     }
 
     sum
@@ -325,6 +399,46 @@ mod tests {
 
         // then
         assert!((scalar - avx).abs() < 1e-5);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn should_match_scalar_l2_distance_with_avx512() {
+        if !std::is_x86_feature_detected!("avx512f") {
+            return;
+        }
+
+        // given
+        let a: Vec<f32> = (0..37).map(|i| (i as f32 * 0.25) - 2.0).collect();
+        let b: Vec<f32> = (0..37).map(|i| ((i % 11) as f32 * 1.5) - 1.0).collect();
+
+        // when
+        let scalar = l2_distance_scalar(&a, &b);
+        // SAFETY: AVX-512F support is checked above for this test process.
+        let avx512 = unsafe { l2_distance_avx512(&a, &b) };
+
+        // then
+        assert!((scalar - avx512).abs() < 1e-5);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn should_match_scalar_dot_product_with_avx512() {
+        if !std::is_x86_feature_detected!("avx512f") {
+            return;
+        }
+
+        // given
+        let a: Vec<f32> = (0..41).map(|i| (i as f32 * 0.5) - 4.0).collect();
+        let b: Vec<f32> = (0..41).map(|i| ((i % 9) as f32 * 0.75) + 0.5).collect();
+
+        // when
+        let scalar = dot_product_scalar(&a, &b);
+        // SAFETY: AVX-512F support is checked above for this test process.
+        let avx512 = unsafe { dot_product_avx512(&a, &b) };
+
+        // then
+        assert!((scalar - avx512).abs() < 1e-5);
     }
 
     #[rstest]
