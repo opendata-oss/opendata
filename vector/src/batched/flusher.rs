@@ -44,7 +44,7 @@ impl Flusher<VectorDbWriteDelta> for VectorDbFlusher {
         }
 
         // do indexing work — this mutates in-memory index state
-        let updates = self
+        let (updates, _stats) = self
             .indexer
             .update_index(frozen.writes.clone(), self.last_snapshot.clone())
             .await
