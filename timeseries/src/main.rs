@@ -74,20 +74,17 @@ async fn main() {
 
     let read_only = prometheus_config.read_only;
     let (tsdb, storage) = if read_only {
-        // Read-only mode: open a non-fencing reader
-        let reader_config = config::ReaderConfig {
-            storage: prometheus_config.storage.clone(),
-            refresh_interval: std::time::Duration::from_secs(
-                prometheus_config.reader.refresh_interval_secs,
-            ),
-            ..Default::default()
-        };
-        let reader = TimeSeriesDbReader::open(reader_config)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!("Failed to open read-only storage: {}", e);
-                std::process::exit(1);
-            });
+        // Read-only mode: open a non-fencing reader.
+        let reader = TimeSeriesDbReader::open(
+            prometheus_config.storage.clone(),
+            prometheus_config.reader.clone(),
+            prometheus_config.cache_capacity,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to open read-only storage: {}", e);
+            std::process::exit(1);
+        });
         let engine: Arc<TsdbEngine> = Arc::new(Arc::new(reader).into());
         tracing::info!("Opened storage in read-only mode");
         (engine, None)
