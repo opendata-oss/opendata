@@ -859,7 +859,7 @@ mod tests {
 
     #[tokio::test]
     async fn should_only_scan_requested_metric_prefix() {
-        // given - two different metrics in the same bucket
+        // given - two metrics: cpu_usage with 1 series, memory_usage with 3 series
         let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
             OpenTsdbMergeOperator,
         )));
@@ -875,19 +875,21 @@ mod tests {
             }],
         )
         .await;
-        insert_metric_samples(
-            &storage,
-            bucket,
-            "memory_usage",
-            1,
-            vec![Sample {
-                timestamp_ms: 1000,
-                value: 2.0,
-            }],
-        )
-        .await;
+        for sid in 1..=3 {
+            insert_metric_samples(
+                &storage,
+                bucket,
+                "memory_usage",
+                sid,
+                vec![Sample {
+                    timestamp_ms: 1000,
+                    value: 2.0,
+                }],
+            )
+            .await;
+        }
 
-        // when - warm only cpu_usage
+        // when
         let cpu_bytes = storage
             .warm_metric_samples_bytes(&bucket, "cpu_usage")
             .await
@@ -897,12 +899,13 @@ mod tests {
             .await
             .unwrap();
 
-        // then - each scan only touches its own metric's data
+        // then - memory_usage has 3x the series, so its scan must return more bytes
         assert!(cpu_bytes > 0);
         assert!(mem_bytes > 0);
-        // The scans should return similar sizes (1 series each with 1 sample)
-        // but more importantly, neither should include the other metric's data.
-        // We can't easily verify exclusion in an InMemory test, but the prefix
-        // range construction in MetricTimeSeriesKey::metric_range guarantees it.
+        assert!(
+            mem_bytes > cpu_bytes,
+            "memory_usage (3 series) should scan more bytes than cpu_usage (1 series), \
+             got mem={mem_bytes} cpu={cpu_bytes}"
+        );
     }
 }

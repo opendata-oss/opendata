@@ -2485,8 +2485,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 }
             }
             self.reader.stats.sample_distinct_metrics = all_metric_names.len() as u64;
-            self.reader.stats.sample_prefetch_enabled = self.prefetch_metric_prefix;
         }
+
+        // Always reflect the config state, even when no sample work was needed
+        self.reader.stats.sample_prefetch_enabled = self.prefetch_metric_prefix;
 
         // Derive backward-compatible bucket metrics
         self.reader.stats.preload_bucket_ms_sum = bucket_totals.values().sum();
@@ -7537,6 +7539,158 @@ mod tests {
             assert_eq!(
                 after_first, after_second,
                 "parallel_sample_loads should not increase on cache hit"
+            );
+        }
+
+        /// Prefetch-enabled query produces identical results to prefetch-disabled,
+        /// and stats confirm the prefetch path actually ran.
+        #[tokio::test]
+        async fn prefetch_enabled_produces_correct_results_and_stats() {
+            // Build data: 2 metrics × 2 series each, spanning 1 bucket
+            let mut builder = MockMultiBucketQueryReaderBuilder::new();
+            let bucket = TimeBucket::hour(100);
+            let base_ts = 100 * 3_600_000i64 + 1_800_000;
+
+            for (metric, envs) in [
+                ("http_requests", vec!["prod", "staging"]),
+                ("disk_usage", vec!["prod", "staging"]),
+            ] {
+                for (i, env) in envs.iter().enumerate() {
+                    builder.add_sample(
+                        bucket,
+                        vec![
+                            Label {
+                                name: METRIC_NAME.to_string(),
+                                value: metric.to_string(),
+                            },
+                            Label {
+                                name: "env".to_string(),
+                                value: env.to_string(),
+                            },
+                        ],
+                        MetricType::Gauge,
+                        Sample {
+                            timestamp_ms: base_ts + i as i64,
+                            value: (i + 1) as f64 * 10.0,
+                        },
+                    );
+                }
+            }
+
+            let reader = builder.build();
+
+            // Run without prefetch
+            let mut eval_off = Evaluator::new(&reader).with_prefetch_metric_prefix(false);
+            let expr = promql_parser::parser::parse("http_requests").unwrap();
+            eval_off
+                .preload_for_range(
+                    &expr,
+                    base_ts - 300_000,
+                    base_ts + 300_000,
+                    300_000,
+                    300_000,
+                )
+                .await
+                .unwrap();
+            let stats_off = eval_off.into_stats();
+
+            // Run with prefetch
+            let mut eval_on = Evaluator::new(&reader).with_prefetch_metric_prefix(true);
+            let expr = promql_parser::parser::parse("http_requests").unwrap();
+            eval_on
+                .preload_for_range(
+                    &expr,
+                    base_ts - 300_000,
+                    base_ts + 300_000,
+                    300_000,
+                    300_000,
+                )
+                .await
+                .unwrap();
+            let stats_on = eval_on.into_stats();
+
+            // Both should load the same number of samples via exact gets
+            assert_eq!(
+                stats_off.parallel_sample_loads, stats_on.parallel_sample_loads,
+                "prefetch should not change the number of exact sample loads"
+            );
+            assert_eq!(
+                stats_off.samples_loaded, stats_on.samples_loaded,
+                "prefetch should not change the number of samples returned"
+            );
+
+            // Prefetch-enabled stats should reflect actual execution
+            assert!(
+                !stats_off.sample_prefetch_enabled,
+                "prefetch should be disabled in control run"
+            );
+            assert!(
+                stats_on.sample_prefetch_enabled,
+                "prefetch should be enabled in experiment run"
+            );
+            assert!(
+                stats_on.sample_metric_groups > 0,
+                "expected metric groups > 0, got {}",
+                stats_on.sample_metric_groups
+            );
+            assert!(
+                stats_on.sample_metric_prefetch_groups > 0,
+                "expected prefetch groups > 0, got {}",
+                stats_on.sample_metric_prefetch_groups
+            );
+            // MockQueryReader::warm_metric_samples_bytes returns Ok(0) (default trait impl),
+            // so prefetch_bytes will be 0 — but the groups counter proves the path ran.
+            assert_eq!(
+                stats_on.sample_metric_prefetch_bytes, 0,
+                "MockQueryReader warm returns 0 bytes by default"
+            );
+        }
+
+        /// sample_prefetch_enabled reflects config even when no samples need loading.
+        #[tokio::test]
+        async fn prefetch_enabled_stat_reported_even_without_sample_work() {
+            let mut builder = MockMultiBucketQueryReaderBuilder::new();
+            let bucket = TimeBucket::hour(100);
+
+            builder.add_sample(
+                bucket,
+                vec![
+                    Label {
+                        name: METRIC_NAME.to_string(),
+                        value: "metric".to_string(),
+                    },
+                    Label {
+                        name: "k".to_string(),
+                        value: "v".to_string(),
+                    },
+                ],
+                MetricType::Gauge,
+                Sample {
+                    timestamp_ms: 6_000_000,
+                    value: 1.0,
+                },
+            );
+
+            let reader = builder.build();
+            let mut evaluator = Evaluator::new(&reader).with_prefetch_metric_prefix(true);
+
+            // First preload populates sample cache
+            let expr = promql_parser::parser::parse("metric").unwrap();
+            evaluator
+                .preload_for_range(&expr, 5_700_000, 6_300_000, 300_000, 300_000)
+                .await
+                .unwrap();
+
+            // Second preload — all samples cached, no B3 work items
+            evaluator
+                .preload_for_range(&expr, 5_700_000, 6_300_000, 300_000, 300_000)
+                .await
+                .unwrap();
+
+            // Despite no sample work in second preload, the stat should still report true
+            assert!(
+                evaluator.stats().sample_prefetch_enabled,
+                "sample_prefetch_enabled should be true even when all samples are cached"
             );
         }
     }
