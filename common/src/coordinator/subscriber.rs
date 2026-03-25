@@ -31,7 +31,7 @@
 //!                 // Process the view (update read state)...
 //!                 subscriber.update_durable(epoch);
 //!             }
-//!             Err(SubscribeError::Lagged) => {
+//!             Err(SubscribeError::MessageLost) => {
 //!                 // Re-subscribe to get a consistent initial view, then
 //!                 // recover db-specific state from the snapshot.
 //!                 let (rx, view) = handle.subscribe();
