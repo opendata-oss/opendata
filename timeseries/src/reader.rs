@@ -115,7 +115,7 @@ impl QueryReader for ReaderQueryReader {
 
 /// A read-only view of a time series database.
 ///
-/// `TimeSeriesDbReader` provides the same read API as [`TimeSeriesDb`](crate::TimeSeriesDb)
+/// `TimeSeriesDbReader` provides the same read API as [`TimeSeriesDb`](crate::timeseries::TimeSeriesDb)
 /// but without write operations. It uses SlateDB's `DbReader`, which opens the
 /// database without fencing — this means it can safely coexist with a production
 /// writer on the same storage path.

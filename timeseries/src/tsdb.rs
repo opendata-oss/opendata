@@ -801,7 +801,7 @@ impl TsdbReadEngine for Tsdb {
 
 // ── TsdbEngine: unified read/write or read-only dispatch ────────────
 
-/// Wraps either a read-write [`Tsdb`] or a read-only [`TimeSeriesDbReader`],
+/// Wraps either a read-write [`Tsdb`] or a read-only [`crate::reader::TimeSeriesDbReader`],
 /// dispatching read methods to the inner engine and rejecting writes in
 /// read-only mode.
 pub(crate) enum TsdbEngine {

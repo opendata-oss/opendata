@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use common::StorageConfig;
 
-/// Configuration for opening a [`TimeSeriesDb`](crate::TimeSeriesDb) database.
+/// Configuration for opening a [`TimeSeriesDb`](crate::timeseries::TimeSeriesDb) database.
 ///
 /// This struct holds all the settings needed to initialize a time series
 /// instance, including storage backend configuration and operational parameters.
