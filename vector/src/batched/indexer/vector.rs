@@ -42,13 +42,14 @@ impl WriteVectors {
         }
     }
 
+    /// Returns (inserts, updates) counts.
     pub(crate) async fn execute(
         self,
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta,
-    ) -> Result<()> {
+    ) -> Result<(usize, usize)> {
         if self.writes.is_empty() {
-            return Ok(());
+            return Ok((0, 0));
         }
         let view = VectorIndexView::new(delta, state, self.snapshot.clone());
 
@@ -98,6 +99,9 @@ impl WriteVectors {
             upserts.push(result?);
         }
         drop(view);
+
+        let insert_count = inserts.len();
+        let update_count = upserts.len();
 
         // Apply inserts to delta (no old data to clean up)
         for insert in inserts {
@@ -149,7 +153,7 @@ impl WriteVectors {
                 delta.add_to_inverted_index(attr_name.clone(), field_value, vector_id);
             }
         }
-        Ok(())
+        Ok((insert_count, update_count))
     }
 
     fn assign_centroids(
@@ -216,13 +220,14 @@ impl ReassignVectors {
         }
     }
 
+    /// Returns the number of vectors actually reassigned.
     pub(crate) async fn execute(
         mut self,
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         if self.reassignments.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let view = VectorIndexView::new(delta, state, self.snapshot);
         let centroid_graph = view.centroid_graph();
@@ -275,12 +280,13 @@ impl ReassignVectors {
         drop(view);
 
         // execute the reassignments
+        let reassigned = resolved.len();
         for r in resolved {
             debug!("old data: {:?}", r.data);
             delta.remove_from_posting(r.reassignment.current_centroid, r.reassignment.vector_id);
             delta.add_to_posting(r.centroid, r.reassignment.vector_id, r.reassignment.vector);
         }
-        Ok(())
+        Ok(reassigned)
     }
 }
 

@@ -26,11 +26,12 @@ impl MergeCentroids {
         }
     }
 
+    /// Returns (reassignment_vectors, merge_count).
     pub(crate) async fn execute(
         self,
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta,
-    ) -> Result<Vec<ReassignVector>> {
+    ) -> Result<(Vec<ReassignVector>, usize)> {
         let view = VectorIndexView::new(delta, state, self.snapshot.clone());
 
         // find all centroids that need to be merged
@@ -42,11 +43,11 @@ impl MergeCentroids {
             .map(|(&k, _v)| k)
             .collect::<Vec<_>>();
         if to_merge.is_empty() {
-            return Ok(vec![]);
+            return Ok((vec![], 0));
         }
         // Don't merge if all centroids would be merged — there are no targets left
         if to_merge.len() >= counts.len() {
-            return Ok(vec![]);
+            return Ok((vec![], 0));
         }
 
         // read postings of all mergees
@@ -67,6 +68,7 @@ impl MergeCentroids {
         }
 
         // execute merges
+        let merge_count = resolved.len();
         let total_moved = resolved.iter().map(|m| m.postings.len()).sum();
         let mut reassignments = Vec::with_capacity(total_moved);
         for merge in resolved {
@@ -81,7 +83,7 @@ impl MergeCentroids {
         }
 
         // return reassign set
-        Ok(reassignments)
+        Ok((reassignments, merge_count))
     }
 }
 
@@ -153,7 +155,7 @@ mod tests {
         let snapshot = h.storage.snapshot().await.unwrap();
         let mut delta = VectorIndexDelta::new(&h.state);
         let merge = MergeCentroids::new(&opts, &(snapshot as Arc<dyn StorageRead>));
-        let reassignments = merge.execute(&h.state, &mut delta).await.unwrap();
+        let (reassignments, _merge_count) = merge.execute(&h.state, &mut delta).await.unwrap();
         let ops = delta.freeze(&mut h.state);
         h.storage.apply(ops).await.unwrap();
 
@@ -203,7 +205,7 @@ mod tests {
         let snapshot = h.storage.snapshot().await.unwrap();
         let mut delta = VectorIndexDelta::new(&h.state);
         let merge = MergeCentroids::new(&opts, &(snapshot as Arc<dyn StorageRead>));
-        let reassignments = merge.execute(&h.state, &mut delta).await.unwrap();
+        let (reassignments, _merge_count) = merge.execute(&h.state, &mut delta).await.unwrap();
 
         // then — no merges, no reassignments
         assert!(
@@ -239,7 +241,7 @@ mod tests {
         let snapshot = h.storage.snapshot().await.unwrap();
         let mut delta = VectorIndexDelta::new(&h.state);
         let merge = MergeCentroids::new(&opts, &(snapshot as Arc<dyn StorageRead>));
-        let reassignments = merge.execute(&h.state, &mut delta).await.unwrap();
+        let (reassignments, _merge_count) = merge.execute(&h.state, &mut delta).await.unwrap();
 
         // then — no merges
         assert!(
