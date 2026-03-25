@@ -258,12 +258,85 @@ impl SampleStorageLayout {
     }
 }
 
+/// Configuration for sample-loading experiments in B3.
+#[derive(Debug, Clone)]
+pub(crate) struct SampleReadExperimentConfig {
+    pub enable_range_scan_batches: bool,
+    pub range_scan_min_series: usize,
+    pub range_scan_min_density: f64,
+    pub range_scan_max_ranges: usize,
+    pub range_scan_merge_gap_series: u32,
+    pub per_query_sample_scan_concurrency: usize,
+}
+
+impl SampleReadExperimentConfig {
+    const DEFAULT_MIN_SERIES: usize = 16;
+    const DEFAULT_MIN_DENSITY: f64 = 0.25;
+    const DEFAULT_MAX_RANGES: usize = 4;
+    const DEFAULT_MERGE_GAP: u32 = 8;
+    const DEFAULT_CONCURRENCY: usize = 4;
+
+    pub(crate) fn from_env() -> Self {
+        Self::parse(
+            std::env::var("TSDB_SAMPLE_RANGE_SCAN_BATCHES").ok().as_deref(),
+            std::env::var("TSDB_SAMPLE_RANGE_SCAN_MIN_SERIES").ok().as_deref(),
+            std::env::var("TSDB_SAMPLE_RANGE_SCAN_MIN_DENSITY").ok().as_deref(),
+            std::env::var("TSDB_SAMPLE_RANGE_SCAN_MAX_RANGES").ok().as_deref(),
+            std::env::var("TSDB_SAMPLE_RANGE_SCAN_MERGE_GAP").ok().as_deref(),
+            std::env::var("TSDB_SAMPLE_SCAN_CONCURRENCY").ok().as_deref(),
+        )
+    }
+
+    fn parse(
+        enable: Option<&str>,
+        min_series: Option<&str>,
+        min_density: Option<&str>,
+        max_ranges: Option<&str>,
+        merge_gap: Option<&str>,
+        concurrency: Option<&str>,
+    ) -> Self {
+        let enable_range_scan_batches = matches!(enable, Some("true") | Some("1"));
+        Self {
+            enable_range_scan_batches,
+            range_scan_min_series: min_series
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(Self::DEFAULT_MIN_SERIES),
+            range_scan_min_density: min_density
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(Self::DEFAULT_MIN_DENSITY),
+            range_scan_max_ranges: max_ranges
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(Self::DEFAULT_MAX_RANGES),
+            range_scan_merge_gap_series: merge_gap
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(Self::DEFAULT_MERGE_GAP),
+            per_query_sample_scan_concurrency: concurrency
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(Self::DEFAULT_CONCURRENCY),
+        }
+    }
+}
+
+impl Default for SampleReadExperimentConfig {
+    fn default() -> Self {
+        Self {
+            enable_range_scan_batches: false,
+            range_scan_min_series: Self::DEFAULT_MIN_SERIES,
+            range_scan_min_density: Self::DEFAULT_MIN_DENSITY,
+            range_scan_max_ranges: Self::DEFAULT_MAX_RANGES,
+            range_scan_merge_gap_series: Self::DEFAULT_MERGE_GAP,
+            per_query_sample_scan_concurrency: Self::DEFAULT_CONCURRENCY,
+        }
+    }
+}
+
 /// Top-level runtime config for Tsdb, aggregating all subsystem configs.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TsdbRuntimeConfig {
     pub read_load: ReadLoadConfig,
     pub metadata_warm: MetadataWarmConfig,
     pub sample_storage_layout: SampleStorageLayout,
+    pub sample_read_experiment: SampleReadExperimentConfig,
 }
 
 impl TsdbRuntimeConfig {
@@ -272,6 +345,7 @@ impl TsdbRuntimeConfig {
             read_load: ReadLoadConfig::from_env(),
             metadata_warm: MetadataWarmConfig::from_env(),
             sample_storage_layout: SampleStorageLayout::from_env(),
+            sample_read_experiment: SampleReadExperimentConfig::from_env(),
         }
     }
 }
@@ -356,5 +430,79 @@ mod tests {
             SampleStorageLayout::parse(Some("")),
             SampleStorageLayout::LegacySeriesId
         );
+    }
+
+    #[test]
+    fn sample_read_experiment_defaults() {
+        let config = SampleReadExperimentConfig::default();
+        assert!(!config.enable_range_scan_batches);
+        assert_eq!(config.range_scan_min_series, 16);
+        assert!((config.range_scan_min_density - 0.25).abs() < f64::EPSILON);
+        assert_eq!(config.range_scan_max_ranges, 4);
+        assert_eq!(config.range_scan_merge_gap_series, 8);
+        assert_eq!(config.per_query_sample_scan_concurrency, 4);
+    }
+
+    #[test]
+    fn sample_read_experiment_parse_defaults() {
+        let config =
+            SampleReadExperimentConfig::parse(None, None, None, None, None, None);
+        assert!(!config.enable_range_scan_batches);
+        assert_eq!(config.range_scan_min_series, 16);
+        assert!((config.range_scan_min_density - 0.25).abs() < f64::EPSILON);
+        assert_eq!(config.range_scan_max_ranges, 4);
+        assert_eq!(config.range_scan_merge_gap_series, 8);
+        assert_eq!(config.per_query_sample_scan_concurrency, 4);
+    }
+
+    #[test]
+    fn sample_read_experiment_parse_enabled() {
+        let config = SampleReadExperimentConfig::parse(
+            Some("true"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(config.enable_range_scan_batches);
+
+        let config = SampleReadExperimentConfig::parse(
+            Some("1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(config.enable_range_scan_batches);
+
+        let config = SampleReadExperimentConfig::parse(
+            Some("false"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!config.enable_range_scan_batches);
+    }
+
+    #[test]
+    fn sample_read_experiment_parse_custom_values() {
+        let config = SampleReadExperimentConfig::parse(
+            Some("true"),
+            Some("32"),
+            Some("0.5"),
+            Some("8"),
+            Some("16"),
+            Some("8"),
+        );
+        assert!(config.enable_range_scan_batches);
+        assert_eq!(config.range_scan_min_series, 32);
+        assert!((config.range_scan_min_density - 0.5).abs() < f64::EPSILON);
+        assert_eq!(config.range_scan_max_ranges, 8);
+        assert_eq!(config.range_scan_merge_gap_series, 16);
+        assert_eq!(config.per_query_sample_scan_concurrency, 8);
     }
 }
