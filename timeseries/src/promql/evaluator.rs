@@ -116,8 +116,9 @@ pub(crate) struct EvalStats {
     // Metric-prefixed layout experiment instrumentation
     pub(crate) sample_distinct_metrics: u64,
     pub(crate) sample_series_per_metric_max: u64,
-    // Logical metadata entry counts (actual entries loaded, not cache misses)
+    // Logical metadata entry counts (actual entries returned from storage)
     pub(crate) bucket_list_entries_loaded: u64,
+    pub(crate) inverted_index_entries_loaded: u64,
     pub(crate) forward_index_entries_loaded: u64,
     pub(crate) sample_series_loaded: u64,
     // Per-query physical I/O stats (populated from task-local collector)
@@ -230,6 +231,7 @@ struct BucketResolutionResult {
 struct BucketResolutionStats {
     total_ms: u64,
     selector_ms: u64,
+    inverted_index_entries_loaded: u64,
     forward_index_calls: u64,
     forward_index_misses: u64,
     forward_index_miss_ms: u64,
@@ -735,7 +737,6 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             self.stats.metadata_queue_wait_ms += wait_ms;
             self.stats.metadata_load_ms += load_ms;
             self.stats.forward_index_miss_ms += wait_ms + load_ms;
-            self.stats.forward_index_entries_loaded += series_ids.len() as u64;
 
             self.cache
                 .cache_forward_index(*bucket, series_ids.clone(), forward_index);
@@ -782,6 +783,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         self.stats.metadata_queue_wait_ms += wait_ms;
         self.stats.metadata_load_ms += load_ms;
         self.stats.selector_miss_ms += wait_ms + load_ms;
+        self.stats.inverted_index_entries_loaded += inverted_index.all_keys().len() as u64;
 
         // Cache the result
         self.cache
@@ -1408,6 +1410,7 @@ async fn resolve_bucket_raw<R: QueryReader>(
         .await
         .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
     stats.selector_ms = selector_start.elapsed().as_millis() as u64;
+    stats.inverted_index_entries_loaded += sel_stats.inverted_index_entries_loaded;
     stats.metadata_queue_wait_ms += sel_stats.metadata_queue_wait_ms;
     stats.metadata_load_ms += sel_stats.metadata_load_ms;
     stats.metadata_permit_acquires += sel_stats.metadata_permit_acquires;
@@ -1470,7 +1473,7 @@ async fn resolve_bucket_raw<R: QueryReader>(
         }
     }
     stats.series_meta_count = series_meta.len() as u64;
-    stats.forward_index_entries_loaded = sorted_candidates.len() as u64;
+    stats.forward_index_entries_loaded = series_meta.len() as u64;
     stats.total_ms = total_start.elapsed().as_millis() as u64;
 
     tracing::debug!(
@@ -2242,6 +2245,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                         }
                     }
 
+                    self.reader.stats.forward_index_entries_loaded += series_with_meta.len() as u64;
+
                     let to_load = self.plan_sample_hits_and_misses(
                         bucket,
                         &series_with_meta,
@@ -2297,6 +2302,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
                 self.reader.stats.selector_misses += 1;
                 self.reader.stats.selector_miss_ms += bs.selector_ms;
+                self.reader.stats.inverted_index_entries_loaded += bs.inverted_index_entries_loaded;
                 self.reader.stats.forward_index_calls += bs.forward_index_calls;
                 self.reader.stats.forward_index_misses += bs.forward_index_misses;
                 self.reader.stats.forward_index_miss_ms += bs.forward_index_miss_ms;
@@ -2387,7 +2393,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
                 self.reader.stats.sample_loads += bs.sample_loads;
                 self.reader.stats.sample_misses += bs.sample_misses;
-                self.reader.stats.sample_series_loaded += bs.sample_misses;
+                self.reader.stats.sample_series_loaded += sr.series_data.len() as u64;
                 self.reader.stats.samples_loaded += bs.samples_loaded;
                 self.reader.stats.sample_queue_wait_ms += bs.sample_queue_wait_ms;
                 self.reader.stats.sample_load_ms += bs.sample_load_ms;

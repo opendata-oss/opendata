@@ -472,6 +472,7 @@ pub(crate) async fn evaluate_range(
         sample_series_per_metric_max = stats.sample_series_per_metric_max,
         // Logical metadata entry counts
         bucket_list_entries_loaded = stats.bucket_list_entries_loaded,
+        inverted_index_entries_loaded = stats.inverted_index_entries_loaded,
         forward_index_entries_loaded = stats.forward_index_entries_loaded,
         sample_series_loaded = stats.sample_series_loaded,
         sample_logical_bytes = stats.samples_loaded * 16,
@@ -2737,6 +2738,101 @@ mod tests {
         assert!(io.bucket_list_bytes > 0);
 
         // Full reconciliation
+        assert_eq!(
+            io.physical_bytes_total(),
+            io.bucket_list_bytes
+                + io.inverted_index_bytes
+                + io.forward_index_bytes
+                + io.sample_get_bytes
+                + io.sample_metric_get_bytes
+        );
+    }
+
+    /// Negative-path test: a phantom series ID in the inverted index that has
+    /// no forward index entry. Verifies that logical counters count actual
+    /// materialized entries, not requested/attempted counts.
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn io_stats_phantom_series_does_not_inflate_counters(storage: Arc<dyn Storage>) {
+        use crate::query_io::{self, QueryIoCollector};
+        use crate::serde::inverted_index::InvertedIndexValue;
+        use crate::serde::key::InvertedIndexKey;
+        use common::storage::PutRecordOp;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // given: MetricPrefixed layout, 2 real series
+        let config = TsdbRuntimeConfig {
+            sample_storage_layout: SampleStorageLayout::MetricPrefixed,
+            ..Default::default()
+        };
+        let tsdb = Tsdb::with_runtime_config(storage.clone(), config);
+
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+        mini.ingest(&create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0))
+            .await
+            .unwrap();
+        mini.ingest(&create_sample("cpu", vec![("host", "b")], 4_000_000, 2.0))
+            .await
+            .unwrap();
+        tsdb.flush().await.unwrap();
+
+        // Inject a phantom series ID (999) into the __name__=cpu inverted index
+        // entry. This ID has no forward index or sample data.
+        let ii_key = InvertedIndexKey {
+            time_bucket: bucket.start,
+            bucket_size: bucket.size,
+            attribute: "__name__".to_string(),
+            value: "cpu".to_string(),
+        }
+        .encode();
+        let snapshot = storage.snapshot().await.unwrap();
+        let existing = snapshot.get(ii_key.clone()).await.unwrap().unwrap();
+        let mut ii_val = InvertedIndexValue::decode(existing.value.as_ref()).unwrap();
+        ii_val.postings.insert(999); // phantom series ID
+        let new_val = ii_val.encode().unwrap();
+        storage
+            .put(vec![PutRecordOp::new(common::Record::new(ii_key, new_val))])
+            .await
+            .unwrap();
+        storage.flush().await.unwrap();
+
+        // Clear caches so the query reads fresh data with the phantom ID
+        tsdb.ingest_cache.invalidate_all();
+        tsdb.query_cache.invalidate_all();
+        tsdb.ingest_cache.run_pending_tasks().await;
+        tsdb.query_cache.run_pending_tasks().await;
+
+        // when: query
+        let io_collector = QueryIoCollector::new();
+        let (_result, stats) = query_io::run_with_collector(&io_collector, async {
+            let reader = tsdb.query_reader(3600, 7200).await.unwrap();
+            let expr = promql_parser::parser::parse("cpu").unwrap();
+            let stmt = EvalStmt {
+                expr,
+                start: UNIX_EPOCH + Duration::from_secs(4000),
+                end: UNIX_EPOCH + Duration::from_secs(4000),
+                interval: Duration::from_secs(15),
+                lookback_delta: Duration::from_secs(300),
+            };
+            evaluate_range(&reader, stmt, None).await
+        })
+        .await
+        .unwrap();
+
+        // then: logical counters should reflect 2 actual entries, not 3
+        // The inverted index returns 3 candidates (including phantom 999),
+        // but get_spec(999) returns None, so forward_index_entries_loaded = 2.
+        assert_eq!(
+            stats.forward_index_entries_loaded, 2,
+            "phantom series should not inflate forward_index_entries_loaded"
+        );
+        assert_eq!(
+            stats.sample_series_loaded, 2,
+            "phantom series should not inflate sample_series_loaded"
+        );
+
+        // Physical IO should still be consistent
+        let io = &stats.io;
         assert_eq!(
             io.physical_bytes_total(),
             io.bucket_list_bytes

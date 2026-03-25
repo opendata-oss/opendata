@@ -227,6 +227,7 @@ pub(crate) struct SelectorRawStats {
     pub(crate) metadata_queue_wait_ms: u64,
     pub(crate) metadata_load_ms: u64,
     pub(crate) metadata_permit_acquires: u64,
+    pub(crate) inverted_index_entries_loaded: u64,
 }
 
 /// Selector evaluation using raw QueryReader — no caching layer.
@@ -317,7 +318,7 @@ async fn acquire_and_load_inverted_index<R: QueryReader>(
     coordinator: &Option<ReadLoadCoordinator>,
     stats: &mut SelectorRawStats,
 ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
-    if let Some(coord) = coordinator {
+    let result = if let Some(coord) = coordinator {
         let (permit, wait) = coord.acquire_metadata().await;
         stats.metadata_permit_acquires += 1;
         stats.metadata_queue_wait_ms += wait.as_millis() as u64;
@@ -325,13 +326,15 @@ async fn acquire_and_load_inverted_index<R: QueryReader>(
         let result = reader.inverted_index(bucket, terms).await?;
         stats.metadata_load_ms += t0.elapsed().as_millis() as u64;
         drop(permit);
-        Ok(result)
+        result
     } else {
         let t0 = std::time::Instant::now();
         let result = reader.inverted_index(bucket, terms).await?;
         stats.metadata_load_ms += t0.elapsed().as_millis() as u64;
-        Ok(result)
-    }
+        result
+    };
+    stats.inverted_index_entries_loaded += result.all_keys().len() as u64;
+    Ok(result)
 }
 
 /// Acquire metadata permit and load forward index from raw reader.
