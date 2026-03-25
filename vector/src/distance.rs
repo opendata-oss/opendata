@@ -7,8 +7,12 @@ use crate::serde::collection_meta::DistanceMetric;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
     _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
-    _mm256_sub_ps, _mm512_add_ps, _mm512_loadu_ps, _mm512_mul_ps, _mm512_setzero_ps,
-    _mm512_storeu_ps, _mm512_sub_ps,
+    _mm256_sub_ps,
+};
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+use std::arch::x86_64::{
+    _mm512_add_ps, _mm512_loadu_ps, _mm512_mul_ps, _mm512_setzero_ps, _mm512_storeu_ps,
+    _mm512_sub_ps,
 };
 use std::cmp::Ordering;
 
@@ -54,13 +58,16 @@ pub(crate) fn raw_distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 
 ///
 /// Lower scores indicate more similar vectors.
 fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
     {
         if std::is_x86_feature_detected!("avx512f") {
             // SAFETY: AVX-512F support is checked at runtime before calling the AVX-512 variant.
             return unsafe { l2_distance_avx512(a, b) };
         }
+    }
 
+    #[cfg(target_arch = "x86_64")]
+    {
         if std::is_x86_feature_detected!("avx") {
             // SAFETY: AVX support is checked at runtime before calling the AVX variant.
             return unsafe { l2_distance_avx(a, b) };
@@ -80,13 +87,16 @@ fn l2_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// Higher scores indicate more similar vectors (for normalized vectors).
 fn dot_product(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
     {
         if std::is_x86_feature_detected!("avx512f") {
             // SAFETY: AVX-512F support is checked at runtime before calling the AVX-512 variant.
             return unsafe { dot_product_avx512(a, b) };
         }
+    }
 
+    #[cfg(target_arch = "x86_64")]
+    {
         if std::is_x86_feature_detected!("avx") {
             // SAFETY: AVX support is checked at runtime before calling the AVX variant.
             return unsafe { dot_product_avx(a, b) };
@@ -147,13 +157,16 @@ pub fn bench_l2_distance_avx(a: &[f32], b: &[f32]) -> Option<f32> {
         "Cannot compute distance between vectors of different lengths"
     );
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
     {
         if std::is_x86_feature_detected!("avx512f") {
             // SAFETY: AVX-512F support is checked at runtime before calling the AVX-512 variant.
             return Some(unsafe { l2_distance_avx512(a, b) });
         }
+    }
 
+    #[cfg(target_arch = "x86_64")]
+    {
         if std::is_x86_feature_detected!("avx") {
             // SAFETY: AVX support is checked at runtime before calling the AVX variant.
             return Some(unsafe { l2_distance_avx(a, b) });
@@ -163,7 +176,7 @@ pub fn bench_l2_distance_avx(a: &[f32], b: &[f32]) -> Option<f32> {
     None
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 #[target_feature(enable = "avx512f")]
 unsafe fn l2_distance_avx512(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = _mm512_setzero_ps();
@@ -223,7 +236,7 @@ unsafe fn l2_distance_avx(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 #[target_feature(enable = "avx512f")]
 unsafe fn dot_product_avx512(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = _mm512_setzero_ps();
@@ -401,7 +414,7 @@ mod tests {
         assert!((scalar - avx).abs() < 1e-5);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
     #[test]
     fn should_match_scalar_l2_distance_with_avx512() {
         if !std::is_x86_feature_detected!("avx512f") {
@@ -421,7 +434,7 @@ mod tests {
         assert!((scalar - avx512).abs() < 1e-5);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
     #[test]
     fn should_match_scalar_dot_product_with_avx512() {
         if !std::is_x86_feature_detected!("avx512f") {
