@@ -7687,6 +7687,233 @@ mod tests {
         }
     }
 
+    /// End-to-end tests for range-scan batch dispatch through the evaluator.
+    /// Tests use the preload_for_range path which invokes fetch_series_samples
+    /// and process_bucket_sample_loads (the B3 parallel path).
+    mod range_scan_batch_e2e_tests {
+        use super::super::*;
+        use crate::config::SampleReadExperimentConfig;
+        use crate::model::{Label, MetricType, Sample, TimeBucket};
+        use crate::query::test_utils::MockQueryReaderBuilder;
+        use promql_parser::label::METRIC_NAME;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        /// Build a mock reader with `n` series for one metric in one bucket.
+        fn build_reader_with_n_series(
+            n: usize,
+            metric_name: &str,
+            bucket: TimeBucket,
+            base_ts: i64,
+        ) -> crate::query::test_utils::MockQueryReader {
+            let mut builder = MockQueryReaderBuilder::new(bucket);
+            for i in 0..n {
+                builder.add_sample(
+                    vec![
+                        Label {
+                            name: METRIC_NAME.to_string(),
+                            value: metric_name.to_string(),
+                        },
+                        Label {
+                            name: "idx".to_string(),
+                            value: format!("{:03}", i),
+                        },
+                    ],
+                    MetricType::Gauge,
+                    Sample {
+                        timestamp_ms: base_ts,
+                        value: i as f64,
+                    },
+                );
+            }
+            builder.build()
+        }
+
+        /// Helper: preload and evaluate, returning (results, stats).
+        async fn preload_and_evaluate(
+            reader: &crate::query::test_utils::MockQueryReader,
+            config: SampleReadExperimentConfig,
+            eval_start_ms: i64,
+            eval_end_ms: i64,
+            step_ms: i64,
+            lookback_delta_ms: i64,
+        ) -> (Vec<EvalSample>, EvalStats) {
+            let mut evaluator = Evaluator::new(reader);
+            evaluator.set_sample_read_config(config);
+
+            let expr = promql_parser::parser::parse("http_requests").unwrap();
+            evaluator
+                .preload_for_range(&expr, eval_start_ms, eval_end_ms, step_ms, lookback_delta_ms)
+                .await
+                .unwrap();
+
+            let query_time = UNIX_EPOCH + Duration::from_millis(eval_end_ms as u64);
+            let stmt = EvalStmt {
+                expr: promql_parser::parser::parse("http_requests").unwrap(),
+                start: query_time,
+                end: query_time,
+                interval: Duration::from_secs(0),
+                lookback_delta: Duration::from_millis(lookback_delta_ms as u64),
+            };
+            let result = evaluator
+                .evaluate(stmt)
+                .await
+                .unwrap()
+                .expect_instant_vector("expected instant vector");
+            let stats = evaluator.into_stats();
+            (result, stats)
+        }
+
+        /// Range-scan enabled with enough series: results are identical to point-gets.
+        #[tokio::test]
+        async fn range_scan_results_match_point_gets() {
+            let bucket = TimeBucket::hour(100);
+            let base_ts = 100 * 3_600_000 + 1_000;
+            let reader = build_reader_with_n_series(20, "http_requests", bucket, base_ts);
+
+            let eval_start_ms = 100 * 3_600_000i64;
+            let eval_end_ms = 101 * 3_600_000i64;
+            let step_ms = 3_600_000i64;
+            let lookback_delta_ms = 3_600_000i64;
+
+            let (result_disabled, _) = preload_and_evaluate(
+                &reader,
+                SampleReadExperimentConfig::default(),
+                eval_start_ms,
+                eval_end_ms,
+                step_ms,
+                lookback_delta_ms,
+            )
+            .await;
+
+            let (result_enabled, _) = preload_and_evaluate(
+                &reader,
+                SampleReadExperimentConfig {
+                    enable_range_scan_batches: true,
+                    range_scan_min_series: 4,
+                    ..SampleReadExperimentConfig::default()
+                },
+                eval_start_ms,
+                eval_end_ms,
+                step_ms,
+                lookback_delta_ms,
+            )
+            .await;
+
+            assert_eq!(result_disabled.len(), result_enabled.len());
+            assert_eq!(result_disabled.len(), 20);
+
+            let mut d: Vec<f64> = result_disabled.iter().map(|s| s.value).collect();
+            let mut e: Vec<f64> = result_enabled.iter().map(|s| s.value).collect();
+            d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            e.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            assert_eq!(d, e, "values should be identical");
+        }
+
+        /// With range-scan enabled and enough series, stats show RangeScans were used.
+        #[tokio::test]
+        async fn range_scan_stats_populated_when_enabled() {
+            let bucket = TimeBucket::hour(100);
+            let base_ts = 100 * 3_600_000 + 1_000;
+            let reader = build_reader_with_n_series(20, "http_requests", bucket, base_ts);
+
+            let eval_start_ms = 100 * 3_600_000i64;
+            let eval_end_ms = 101 * 3_600_000i64;
+
+            let (_, stats) = preload_and_evaluate(
+                &reader,
+                SampleReadExperimentConfig {
+                    enable_range_scan_batches: true,
+                    range_scan_min_series: 4,
+                    ..SampleReadExperimentConfig::default()
+                },
+                eval_start_ms,
+                eval_end_ms,
+                3_600_000,
+                3_600_000,
+            )
+            .await;
+
+            assert_eq!(
+                stats.sample_range_scan_groups, 1,
+                "expected 1 range-scan group, got {}",
+                stats.sample_range_scan_groups
+            );
+            assert!(
+                stats.sample_range_scan_chunks > 0,
+                "expected range_scan_chunks > 0"
+            );
+            assert_eq!(
+                stats.sample_range_scan_series, 20,
+                "expected 20 range-scan series, got {}",
+                stats.sample_range_scan_series
+            );
+            assert_eq!(
+                stats.sample_point_get_groups, 0,
+                "expected 0 point-get groups"
+            );
+        }
+
+        /// With range-scan disabled, all groups use PointGets.
+        #[tokio::test]
+        async fn point_get_stats_when_disabled() {
+            let bucket = TimeBucket::hour(100);
+            let base_ts = 100 * 3_600_000 + 1_000;
+            let reader = build_reader_with_n_series(20, "http_requests", bucket, base_ts);
+
+            let eval_start_ms = 100 * 3_600_000i64;
+            let eval_end_ms = 101 * 3_600_000i64;
+
+            let (_, stats) = preload_and_evaluate(
+                &reader,
+                SampleReadExperimentConfig::default(),
+                eval_start_ms,
+                eval_end_ms,
+                3_600_000,
+                3_600_000,
+            )
+            .await;
+
+            assert_eq!(
+                stats.sample_point_get_groups, 1,
+                "expected 1 point-get group, got {}",
+                stats.sample_point_get_groups
+            );
+            assert_eq!(
+                stats.sample_range_scan_groups, 0,
+                "expected 0 range-scan groups"
+            );
+        }
+
+        /// Small metric group stays on PointGets even when feature is enabled.
+        #[tokio::test]
+        async fn small_group_uses_point_gets() {
+            let bucket = TimeBucket::hour(100);
+            let base_ts = 100 * 3_600_000 + 1_000;
+            let reader = build_reader_with_n_series(3, "http_requests", bucket, base_ts);
+
+            let eval_start_ms = 100 * 3_600_000i64;
+            let eval_end_ms = 101 * 3_600_000i64;
+
+            let (result, stats) = preload_and_evaluate(
+                &reader,
+                SampleReadExperimentConfig {
+                    enable_range_scan_batches: true,
+                    range_scan_min_series: 16,
+                    ..SampleReadExperimentConfig::default()
+                },
+                eval_start_ms,
+                eval_end_ms,
+                3_600_000,
+                3_600_000,
+            )
+            .await;
+
+            assert_eq!(result.len(), 3);
+            assert_eq!(stats.sample_point_get_groups, 1);
+            assert_eq!(stats.sample_range_scan_groups, 0);
+        }
+    }
+
     mod sample_load_planner_tests {
         use super::super::*;
         use crate::config::SampleReadExperimentConfig;
