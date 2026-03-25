@@ -58,8 +58,17 @@ pub struct SlateDbStorageConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum BlockCacheConfig {
+    /// Memory-only cache using foyer (no disk tier).
+    FoyerMemory(FoyerMemoryCacheConfig),
     /// Two-tier cache using foyer: in-memory + on-disk (ideally NVMe).
     FoyerHybrid(FoyerHybridCacheConfig),
+}
+
+/// Configuration for foyer's memory-only block cache.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FoyerMemoryCacheConfig {
+    /// In-memory cache capacity in bytes.
+    pub memory_capacity: u64,
 }
 
 /// Configuration for foyer's hybrid (memory + disk) block cache.
@@ -303,6 +312,7 @@ block_cache:
                         assert_eq!(foyer.disk_capacity, 150323855360);
                         assert_eq!(foyer.disk_path, "/mnt/nvme/block-cache");
                     }
+                    other => panic!("Expected FoyerHybrid, got {:?}", other),
                 }
             }
             _ => panic!("Expected SlateDb config"),

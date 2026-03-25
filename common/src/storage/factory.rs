@@ -323,6 +323,19 @@ async fn create_block_cache_from_config(
         return Ok(None);
     };
     match config {
+        BlockCacheConfig::FoyerMemory(foyer_config) => {
+            let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
+                max_capacity: foyer_config.memory_capacity,
+                shards: 64,
+            });
+
+            info!(
+                memory_mb = foyer_config.memory_capacity / (1024 * 1024),
+                "memory-only block cache enabled"
+            );
+
+            Ok(Some(Arc::new(cache) as Arc<dyn DbCache>))
+        }
         BlockCacheConfig::FoyerHybrid(foyer_config) => {
             use foyer::{DirectFsDeviceOptions, Engine, HybridCacheBuilder};
 
