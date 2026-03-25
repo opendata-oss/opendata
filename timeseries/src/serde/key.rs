@@ -393,10 +393,7 @@ impl MetricTimeSeriesKey {
     }
 
     /// Create a BytesRange covering all series for a given metric within a bucket.
-    pub fn metric_range(
-        bucket: &crate::model::TimeBucket,
-        metric_name: &str,
-    ) -> BytesRange {
+    pub fn metric_range(bucket: &crate::model::TimeBucket, metric_name: &str) -> BytesRange {
         let mut buf = BytesMut::new();
         RecordType::MetricTimeSeries
             .prefix_with_bucket_size(bucket.size)
@@ -717,7 +714,10 @@ mod tests {
         let enc_c = key_c.encode();
 
         // then - same metric: ordered by series_id
-        assert!(enc_a < enc_b, "same metric: lower series_id should sort first");
+        assert!(
+            enc_a < enc_b,
+            "same metric: lower series_id should sort first"
+        );
         // different metric: ordered lexicographically by metric name
         assert!(enc_b < enc_c, "cpu_usage should sort before mem_usage");
     }
@@ -770,12 +770,30 @@ mod tests {
         let range = MetricTimeSeriesKey::series_range(&bucket, "cpu_usage", 10, 20);
 
         // then
-        assert!(range.contains(&key_inside_low.encode()), "start boundary should be included");
-        assert!(range.contains(&key_inside_mid.encode()), "mid-range should be included");
-        assert!(range.contains(&key_inside_high.encode()), "end boundary should be included");
-        assert!(!range.contains(&key_below.encode()), "below range should be excluded");
-        assert!(!range.contains(&key_above.encode()), "above range should be excluded");
-        assert!(!range.contains(&key_diff_metric.encode()), "different metric should be excluded");
+        assert!(
+            range.contains(&key_inside_low.encode()),
+            "start boundary should be included"
+        );
+        assert!(
+            range.contains(&key_inside_mid.encode()),
+            "mid-range should be included"
+        );
+        assert!(
+            range.contains(&key_inside_high.encode()),
+            "end boundary should be included"
+        );
+        assert!(
+            !range.contains(&key_below.encode()),
+            "below range should be excluded"
+        );
+        assert!(
+            !range.contains(&key_above.encode()),
+            "above range should be excluded"
+        );
+        assert!(
+            !range.contains(&key_diff_metric.encode()),
+            "different metric should be excluded"
+        );
     }
 
     #[test]
@@ -808,9 +826,18 @@ mod tests {
         let range = MetricTimeSeriesKey::series_range(&bucket, "cpu_usage", 42, 42);
 
         // then
-        assert!(range.contains(&key_exact.encode()), "exact ID should be included");
-        assert!(!range.contains(&key_below.encode()), "ID below should be excluded");
-        assert!(!range.contains(&key_above.encode()), "ID above should be excluded");
+        assert!(
+            range.contains(&key_exact.encode()),
+            "exact ID should be included"
+        );
+        assert!(
+            !range.contains(&key_below.encode()),
+            "ID below should be excluded"
+        );
+        assert!(
+            !range.contains(&key_above.encode()),
+            "ID above should be excluded"
+        );
     }
 
     #[test]

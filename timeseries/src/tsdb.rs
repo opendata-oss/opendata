@@ -920,7 +920,10 @@ impl Tsdb {
             readers.push((bucket, reader));
         }
 
-        Ok(TsdbQueryReader::new(readers, self.runtime_config.sample_storage_layout))
+        Ok(TsdbQueryReader::new(
+            readers,
+            self.runtime_config.sample_storage_layout,
+        ))
     }
 
     /// Create a QueryReader for a set of disjoint time ranges.
@@ -939,7 +942,10 @@ impl Tsdb {
             readers.push((bucket, reader));
         }
 
-        Ok(TsdbQueryReader::new(readers, self.runtime_config.sample_storage_layout))
+        Ok(TsdbQueryReader::new(
+            readers,
+            self.runtime_config.sample_storage_layout,
+        ))
     }
 
     /// Flush all dirty buckets to durable storage.
@@ -1286,10 +1292,7 @@ impl QueryReader for TsdbQueryReader {
             }
             SampleStorageLayout::MetricPrefixed => {
                 let mini = self.mini_readers.get(&locator.bucket).ok_or_else(|| {
-                    crate::error::Error::Internal(format!(
-                        "Bucket {:?} not found",
-                        locator.bucket
-                    ))
+                    crate::error::Error::Internal(format!("Bucket {:?} not found", locator.bucket))
                 })?;
                 mini.snapshot()
                     .get_metric_samples(
@@ -1319,7 +1322,13 @@ impl QueryReader for TsdbQueryReader {
         })?;
         mini.snapshot()
             .get_metric_samples_series_range(
-                bucket, metric_name, start_series_id, end_series_id, wanted, start_ms, end_ms,
+                bucket,
+                metric_name,
+                start_series_id,
+                end_series_id,
+                wanted,
+                start_ms,
+                end_ms,
             )
             .await
     }
@@ -2354,11 +2363,21 @@ mod tests {
         let bucket1 = TimeBucket::hour(60);
         let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
         mini1
-            .ingest(&create_sample("http_requests", vec![("env", "prod")], 3_900_000, 10.0))
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod")],
+                3_900_000,
+                10.0,
+            ))
             .await
             .unwrap();
         mini1
-            .ingest(&create_sample("http_requests", vec![("env", "staging")], 3_900_000, 20.0))
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging")],
+                3_900_000,
+                20.0,
+            ))
             .await
             .unwrap();
 
@@ -2366,11 +2385,21 @@ mod tests {
         let bucket2 = TimeBucket::hour(120);
         let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
         mini2
-            .ingest(&create_sample("http_requests", vec![("env", "prod")], 7_500_000, 30.0))
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod")],
+                7_500_000,
+                30.0,
+            ))
             .await
             .unwrap();
         mini2
-            .ingest(&create_sample("http_requests", vec![("env", "staging")], 7_500_000, 40.0))
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging")],
+                7_500_000,
+                40.0,
+            ))
             .await
             .unwrap();
 
@@ -2400,7 +2429,10 @@ mod tests {
 
         // env=staging
         assert_eq!(results[1].labels.get("env"), Some("staging"));
-        assert!(!results[1].samples.is_empty(), "staging should have samples");
+        assert!(
+            !results[1].samples.is_empty(),
+            "staging should have samples"
+        );
         let staging_last = results[1].samples.last().unwrap();
         assert_approx_eq(staging_last.1, 40.0);
     }

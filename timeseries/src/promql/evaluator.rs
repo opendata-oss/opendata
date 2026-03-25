@@ -349,9 +349,7 @@ fn plan_sample_load_strategy(
     // If still more than max_ranges, repeatedly merge the pair with smallest gap.
     while merged_runs.len() > config.range_scan_max_ranges {
         let min_gap_idx = (0..merged_runs.len() - 1)
-            .min_by_key(|&i| {
-                sorted[merged_runs[i + 1].0] - sorted[merged_runs[i].1]
-            })
+            .min_by_key(|&i| sorted[merged_runs[i + 1].0] - sorted[merged_runs[i].1])
             .expect("at least two runs");
         let next = merged_runs.remove(min_gap_idx + 1);
         merged_runs[min_gap_idx].1 = next.1;
@@ -361,8 +359,7 @@ fn plan_sample_load_strategy(
     let chunks: Vec<SeriesIdRangeChunk> = merged_runs
         .iter()
         .map(|&(start_idx, end_idx)| {
-            let wanted: BTreeSet<SeriesId> =
-                sorted[start_idx..=end_idx].iter().copied().collect();
+            let wanted: BTreeSet<SeriesId> = sorted[start_idx..=end_idx].iter().copied().collect();
             SeriesIdRangeChunk {
                 start_series_id: sorted[start_idx],
                 end_series_id: sorted[end_idx],
@@ -1654,36 +1651,35 @@ async fn process_bucket_sample_loads<R: QueryReader>(
             SampleLoadStrategy::PointGets => {
                 stats.point_get_groups += 1;
                 // Existing point-get path: fan out individual gets with bounded concurrency.
-                let load_results: Vec<_> =
-                    futures::stream::iter(series_ids.into_iter())
-                        .map(|series_id| {
-                            let coord = coordinator.clone();
-                            let mn = Arc::clone(&metric_name);
-                            let meta = Arc::clone(&meta_map[&series_id]);
-                            async move {
-                                let (wait_ms, _permit) = if let Some(ref c) = coord {
-                                    let (permit, wait) = c.acquire_sample().await;
-                                    (wait.as_millis() as u64, Some(permit))
-                                } else {
-                                    (0, None)
-                                };
-                                let locator = SampleLocator {
-                                    bucket,
-                                    metric_name: mn,
-                                    series_id,
-                                };
-                                let t0 = std::time::Instant::now();
-                                let result = reader
-                                    .samples_by_locator(&locator, i64::MIN, i64::MAX)
-                                    .await;
-                                let load_ms = t0.elapsed().as_millis() as u64;
-                                drop(_permit);
-                                (series_id, meta, result, wait_ms, load_ms)
-                            }
-                        })
-                        .buffer_unordered(PER_QUERY_SAMPLE_CONCURRENCY)
-                        .collect()
-                        .await;
+                let load_results: Vec<_> = futures::stream::iter(series_ids.into_iter())
+                    .map(|series_id| {
+                        let coord = coordinator.clone();
+                        let mn = Arc::clone(&metric_name);
+                        let meta = Arc::clone(&meta_map[&series_id]);
+                        async move {
+                            let (wait_ms, _permit) = if let Some(ref c) = coord {
+                                let (permit, wait) = c.acquire_sample().await;
+                                (wait.as_millis() as u64, Some(permit))
+                            } else {
+                                (0, None)
+                            };
+                            let locator = SampleLocator {
+                                bucket,
+                                metric_name: mn,
+                                series_id,
+                            };
+                            let t0 = std::time::Instant::now();
+                            let result = reader
+                                .samples_by_locator(&locator, i64::MIN, i64::MAX)
+                                .await;
+                            let load_ms = t0.elapsed().as_millis() as u64;
+                            drop(_permit);
+                            (series_id, meta, result, wait_ms, load_ms)
+                        }
+                    })
+                    .buffer_unordered(PER_QUERY_SAMPLE_CONCURRENCY)
+                    .collect()
+                    .await;
 
                 for (series_id, meta, result, wait_ms, load_ms) in load_results {
                     let all_samples =
@@ -7742,7 +7738,13 @@ mod tests {
 
             let expr = promql_parser::parser::parse("http_requests").unwrap();
             evaluator
-                .preload_for_range(&expr, eval_start_ms, eval_end_ms, step_ms, lookback_delta_ms)
+                .preload_for_range(
+                    &expr,
+                    eval_start_ms,
+                    eval_end_ms,
+                    step_ms,
+                    lookback_delta_ms,
+                )
                 .await
                 .unwrap();
 

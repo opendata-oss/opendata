@@ -278,12 +278,24 @@ impl SampleReadExperimentConfig {
 
     pub(crate) fn from_env() -> Self {
         Self::parse(
-            std::env::var("TSDB_SAMPLE_RANGE_SCAN_BATCHES").ok().as_deref(),
-            std::env::var("TSDB_SAMPLE_RANGE_SCAN_MIN_SERIES").ok().as_deref(),
-            std::env::var("TSDB_SAMPLE_RANGE_SCAN_MIN_DENSITY").ok().as_deref(),
-            std::env::var("TSDB_SAMPLE_RANGE_SCAN_MAX_RANGES").ok().as_deref(),
-            std::env::var("TSDB_SAMPLE_RANGE_SCAN_MERGE_GAP").ok().as_deref(),
-            std::env::var("TSDB_SAMPLE_SCAN_CONCURRENCY").ok().as_deref(),
+            std::env::var("TSDB_SAMPLE_RANGE_SCAN_BATCHES")
+                .ok()
+                .as_deref(),
+            std::env::var("TSDB_SAMPLE_RANGE_SCAN_MIN_SERIES")
+                .ok()
+                .as_deref(),
+            std::env::var("TSDB_SAMPLE_RANGE_SCAN_MIN_DENSITY")
+                .ok()
+                .as_deref(),
+            std::env::var("TSDB_SAMPLE_RANGE_SCAN_MAX_RANGES")
+                .ok()
+                .as_deref(),
+            std::env::var("TSDB_SAMPLE_RANGE_SCAN_MERGE_GAP")
+                .ok()
+                .as_deref(),
+            std::env::var("TSDB_SAMPLE_SCAN_CONCURRENCY")
+                .ok()
+                .as_deref(),
         )
     }
 
@@ -445,8 +457,7 @@ mod tests {
 
     #[test]
     fn sample_read_experiment_parse_defaults() {
-        let config =
-            SampleReadExperimentConfig::parse(None, None, None, None, None, None);
+        let config = SampleReadExperimentConfig::parse(None, None, None, None, None, None);
         assert!(!config.enable_range_scan_batches);
         assert_eq!(config.range_scan_min_series, 16);
         assert!((config.range_scan_min_density - 0.25).abs() < f64::EPSILON);
@@ -457,34 +468,13 @@ mod tests {
 
     #[test]
     fn sample_read_experiment_parse_enabled() {
-        let config = SampleReadExperimentConfig::parse(
-            Some("true"),
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let config = SampleReadExperimentConfig::parse(Some("true"), None, None, None, None, None);
         assert!(config.enable_range_scan_batches);
 
-        let config = SampleReadExperimentConfig::parse(
-            Some("1"),
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let config = SampleReadExperimentConfig::parse(Some("1"), None, None, None, None, None);
         assert!(config.enable_range_scan_batches);
 
-        let config = SampleReadExperimentConfig::parse(
-            Some("false"),
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let config = SampleReadExperimentConfig::parse(Some("false"), None, None, None, None, None);
         assert!(!config.enable_range_scan_batches);
     }
 

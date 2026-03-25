@@ -310,12 +310,8 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<(SeriesId, Vec<Sample>)>> {
-        let range = MetricTimeSeriesKey::series_range(
-            bucket,
-            metric_name,
-            start_series_id,
-            end_series_id,
-        );
+        let range =
+            MetricTimeSeriesKey::series_range(bucket, metric_name, start_series_id, end_series_id);
         let records = self.scan(range).await?;
 
         let mut results = Vec::new();
@@ -841,17 +837,38 @@ mod tests {
         let bucket = TimeBucket::hour(60);
 
         insert_metric_samples(
-            &storage, bucket, "cpu", 10,
-            vec![Sample { timestamp_ms: 1000, value: 1.0 }],
-        ).await;
+            &storage,
+            bucket,
+            "cpu",
+            10,
+            vec![Sample {
+                timestamp_ms: 1000,
+                value: 1.0,
+            }],
+        )
+        .await;
         insert_metric_samples(
-            &storage, bucket, "cpu", 11,
-            vec![Sample { timestamp_ms: 1000, value: 2.0 }],
-        ).await;
+            &storage,
+            bucket,
+            "cpu",
+            11,
+            vec![Sample {
+                timestamp_ms: 1000,
+                value: 2.0,
+            }],
+        )
+        .await;
         insert_metric_samples(
-            &storage, bucket, "cpu", 12,
-            vec![Sample { timestamp_ms: 1000, value: 3.0 }],
-        ).await;
+            &storage,
+            bucket,
+            "cpu",
+            12,
+            vec![Sample {
+                timestamp_ms: 1000,
+                value: 3.0,
+            }],
+        )
+        .await;
 
         // when
         let wanted: BTreeSet<SeriesId> = [10, 11, 12].into_iter().collect();
@@ -877,17 +894,38 @@ mod tests {
         let bucket = TimeBucket::hour(60);
 
         insert_metric_samples(
-            &storage, bucket, "cpu", 10,
-            vec![Sample { timestamp_ms: 1000, value: 1.0 }],
-        ).await;
+            &storage,
+            bucket,
+            "cpu",
+            10,
+            vec![Sample {
+                timestamp_ms: 1000,
+                value: 1.0,
+            }],
+        )
+        .await;
         insert_metric_samples(
-            &storage, bucket, "cpu", 11,
-            vec![Sample { timestamp_ms: 1000, value: 2.0 }],
-        ).await;
+            &storage,
+            bucket,
+            "cpu",
+            11,
+            vec![Sample {
+                timestamp_ms: 1000,
+                value: 2.0,
+            }],
+        )
+        .await;
         insert_metric_samples(
-            &storage, bucket, "cpu", 12,
-            vec![Sample { timestamp_ms: 1000, value: 3.0 }],
-        ).await;
+            &storage,
+            bucket,
+            "cpu",
+            12,
+            vec![Sample {
+                timestamp_ms: 1000,
+                value: 3.0,
+            }],
+        )
+        .await;
 
         // when - wanted excludes series 11
         let wanted: BTreeSet<SeriesId> = [10, 12].into_iter().collect();
@@ -913,9 +951,16 @@ mod tests {
         let bucket = TimeBucket::hour(60);
 
         insert_metric_samples(
-            &storage, bucket, "cpu", 10,
-            vec![Sample { timestamp_ms: 1000, value: 1.0 }],
-        ).await;
+            &storage,
+            bucket,
+            "cpu",
+            10,
+            vec![Sample {
+                timestamp_ms: 1000,
+                value: 1.0,
+            }],
+        )
+        .await;
 
         // when - scan range [20, 30] which has no data
         let wanted: BTreeSet<SeriesId> = [20, 25, 30].into_iter().collect();
@@ -937,17 +982,38 @@ mod tests {
         let bucket = TimeBucket::hour(60);
 
         insert_metric_samples(
-            &storage, bucket, "cpu", 5,
-            vec![Sample { timestamp_ms: 1000, value: 0.5 }],
-        ).await;
+            &storage,
+            bucket,
+            "cpu",
+            5,
+            vec![Sample {
+                timestamp_ms: 1000,
+                value: 0.5,
+            }],
+        )
+        .await;
         insert_metric_samples(
-            &storage, bucket, "cpu", 10,
-            vec![Sample { timestamp_ms: 1000, value: 1.0 }],
-        ).await;
+            &storage,
+            bucket,
+            "cpu",
+            10,
+            vec![Sample {
+                timestamp_ms: 1000,
+                value: 1.0,
+            }],
+        )
+        .await;
         insert_metric_samples(
-            &storage, bucket, "cpu", 15,
-            vec![Sample { timestamp_ms: 1000, value: 1.5 }],
-        ).await;
+            &storage,
+            bucket,
+            "cpu",
+            15,
+            vec![Sample {
+                timestamp_ms: 1000,
+                value: 1.5,
+            }],
+        )
+        .await;
 
         // when - scan range [10, 15], wanted={10, 15}
         let wanted: BTreeSet<SeriesId> = [10, 15].into_iter().collect();
