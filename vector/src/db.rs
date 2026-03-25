@@ -12,13 +12,12 @@
 //! - Flusher applies ops atomically to storage
 
 use crate::VectorDbReader;
-use crate::delta::{
-    VectorDbDeltaContext, VectorDbDeltaOpts, VectorDbWrite, VectorDbWriteDelta, VectorWrite,
-};
+use crate::batched::delta::VectorDbWriteDelta;
+use crate::batched::flusher::VectorDbFlusher;
+use crate::batched::indexer::{Indexer, IndexerOpts};
+use crate::delta::{VectorDbWrite, VectorWrite};
 use crate::error::{Error, Result};
-use crate::flusher::VectorDbFlusher;
 use crate::hnsw::{CentroidGraph, build_centroid_graph};
-use crate::lire::rebalancer::{IndexRebalancer, IndexRebalancerOpts};
 use crate::model::{
     AttributeValue, Config, Query, SearchResult, VECTOR_FIELD_NAME, Vector, attributes_to_map,
 };
@@ -32,13 +31,11 @@ use common::SequenceAllocator;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};
 use common::storage::{Storage, StorageRead, StorageSnapshot};
 use common::{StorageBuilder, StorageSemantics};
-use dashmap::DashMap;
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) const WRITE_CHANNEL: &str = "write";
-pub(crate) const REBALANCE_CHANNEL: &str = "rebalance";
 
 /// Trait for querying the vector db
 #[async_trait]
@@ -162,19 +159,13 @@ impl VectorDb {
         // Get initial snapshot
         let snapshot = storage.snapshot().await?;
 
-        // For now, load the full ID dictionary from storage into memory at startup
-        // Eventually, we should load this in the background and allow the delta to
-        // read ids that are not yet loaded from storage
-        let dictionary = Arc::new(DashMap::new());
-        {
-            Self::load_dictionary_from_storage(snapshot.as_ref(), &dictionary).await?;
-        }
+        // Load the full ID dictionary from storage into memory at startup
+        let dictionary = Self::load_dictionary_from_storage(snapshot.as_ref()).await?;
 
         // Load centroid counts from storage
         let centroid_counts = Self::load_centroid_counts_from_storage(snapshot.as_ref()).await?;
 
-        // For now, just force bootstrap centroids. Eventually we'll derive these automatically
-        // from the vectors
+        // Load or bootstrap centroids
         let (centroid_graph, current_chunk_id, current_chunk_count) =
             Self::load_or_create_centroids(
                 &storage,
@@ -185,68 +176,54 @@ impl VectorDb {
             )
             .await?;
 
-        // Create flusher for the WriteCoordinator
-        let flusher = VectorDbFlusher {
-            storage: Arc::clone(&storage),
-        };
+        // Freeze the allocator to get the sequence block state for the Indexer
+        let (seq_block_key, seq_block) = id_allocator.freeze();
 
-        let handle_tx = Arc::new(OnceLock::new());
-        let rebalancer = IndexRebalancer::new(
-            IndexRebalancerOpts {
+        // Build indexed fields set from config
+        let indexed_fields: HashSet<String> = config
+            .metadata_fields
+            .iter()
+            .filter(|s| s.indexed)
+            .map(|s| s.name.clone())
+            .collect();
+
+        // Create Indexer for batch index maintenance
+        let indexer = Indexer::new(
+            IndexerOpts {
                 dimensions: config.dimensions as usize,
                 distance_metric: config.distance_metric,
-                split_search_neighbourhood: config.split_search_neighbourhood,
-                split_threshold_vectors: config.split_threshold_vectors,
                 merge_threshold_vectors: config.merge_threshold_vectors,
-                max_rebalance_tasks: config.max_rebalance_tasks,
-            },
-            centroid_graph.clone(),
-            centroid_counts,
-            handle_tx.clone(),
-        );
-
-        let pause_handle = Arc::new(OnceLock::new());
-        let ctx = VectorDbDeltaContext {
-            opts: VectorDbDeltaOpts {
-                dimensions: config.dimensions as usize,
-                chunk_target: config.chunk_target as usize,
-                max_pending_and_running_rebalance_tasks: config
-                    .max_pending_and_running_rebalance_tasks,
-                rebalance_backpressure_resume_threshold: config
-                    .rebalance_backpressure_resume_threshold,
                 split_threshold_vectors: config.split_threshold_vectors,
-                indexed_fields: VectorDbDeltaOpts::indexed_fields_from(&config.metadata_fields),
+                split_search_neighbourhood: config.split_search_neighbourhood,
+                indexed_fields,
+                chunk_target: config.chunk_target as usize,
             },
-            dictionary: Arc::clone(&dictionary),
-            centroid_graph: Arc::clone(&centroid_graph),
-            id_allocator,
+            dictionary,
+            centroid_counts,
+            centroid_graph.clone(),
+            seq_block_key,
+            seq_block,
             current_chunk_id,
             current_chunk_count,
-            rebalancer,
-            pause_handle: pause_handle.clone(),
-        };
+        );
 
-        // start write coordinator
+        // Create flusher and delta context for the WriteCoordinator
+        let flusher = VectorDbFlusher::new(Arc::clone(&storage), snapshot.clone(), indexer);
+
+        // Start write coordinator
         let coordinator_config = WriteCoordinatorConfig {
             queue_capacity: 1000,
             flush_interval: Duration::from_secs(5),
-            flush_size_threshold: 64 * 1024 * 1024,
+            flush_size_threshold: 10000,
+            // flush_size_threshold: 64 * 1024 * 1024,
         };
         let mut write_coordinator = WriteCoordinator::new(
             coordinator_config,
-            vec![WRITE_CHANNEL.to_string(), REBALANCE_CHANNEL.to_string()],
-            ctx,
+            vec![WRITE_CHANNEL.to_string()],
+            (),
             snapshot.clone(),
             flusher,
         );
-        handle_tx
-            .set(write_coordinator.handle(REBALANCE_CHANNEL))
-            .map_err(|_e| "unreachable")
-            .unwrap();
-        pause_handle
-            .set(write_coordinator.pause_handle(WRITE_CHANNEL))
-            .map_err(|_e| "unreachable")
-            .unwrap();
         write_coordinator.start();
 
         Ok(Self {
@@ -344,11 +321,10 @@ impl VectorDb {
         Ok((Arc::from(graph), last_chunk_id, last_chunk_count))
     }
 
-    /// Load ID dictionary entries from storage into the in-memory DashMap.
+    /// Load ID dictionary entries from storage into a HashMap.
     async fn load_dictionary_from_storage(
         snapshot: &dyn StorageRead,
-        dictionary: &DashMap<String, u64>,
-    ) -> Result<()> {
+    ) -> Result<HashMap<String, u64>> {
         // Create prefix for all IdDictionary records
         let mut prefix_buf = bytes::BytesMut::with_capacity(3);
         crate::serde::RecordType::IdDictionary
@@ -360,6 +336,7 @@ impl VectorDb {
         let range = common::BytesRange::prefix(prefix);
         let records = snapshot.scan(range).await?;
 
+        let mut dictionary = HashMap::new();
         for record in records {
             // Decode the key to get external_id
             let key = crate::serde::key::IdDictionaryKey::decode(&record.key)?;
@@ -376,7 +353,7 @@ impl VectorDb {
             dictionary.insert(external_id, internal_id);
         }
 
-        Ok(())
+        Ok(dictionary)
     }
 
     /// Load centroid counts from storage into a HashMap.

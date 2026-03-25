@@ -13,10 +13,6 @@ use common::storage::default_merge_batch;
 pub(crate) struct OpenTsdbMergeOperator;
 
 impl common::storage::MergeOperator for OpenTsdbMergeOperator {
-    fn merge(&self, key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
-        self.merge_batch(key, existing_value, &[new_value])
-    }
-
     fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
         // Decode record type from key
         let key_prefix = KeyPrefix::from_bytes(key.as_ref()).unwrap();
@@ -442,7 +438,7 @@ mod tests {
         };
 
         // when
-        let merged = operator.merge(&key, Some(existing_value.clone()), new_value.clone());
+        let merged = operator.merge_batch(&key, Some(existing_value), &[new_value]);
 
         // then - verify the merge actually happened (not just returning new_value)
         // For InvertedIndex, check it's a union
@@ -492,7 +488,7 @@ mod tests {
         .unwrap();
 
         // when
-        let result = operator.merge(&key, None, new_value);
+        let result = operator.merge_batch(&key, None, &[new_value]);
 
         // then
         let decoded = InvertedIndexValue::decode(result.as_ref()).unwrap();
@@ -508,7 +504,8 @@ mod tests {
         let new_value = Bytes::from(b"new_value".to_vec());
 
         // when
-        let result = operator.merge(&key, Some(existing_value), new_value.clone());
+        let result =
+            operator.merge_batch(&key, Some(existing_value), std::slice::from_ref(&new_value));
 
         // then - should return new_value without merging
         assert_eq!(result, new_value);

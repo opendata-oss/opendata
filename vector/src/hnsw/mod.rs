@@ -1,19 +1,22 @@
-//! HNSW graph implementations for centroid search.
+//! Centroid graph implementations for centroid search.
 //!
-//! This module provides a trait-based abstraction for HNSW indexes with
-//! an implementation backed by the usearch library.
+//! This module provides a trait-based abstraction for centroid indexes with
+//! implementations backed by the usearch library and exhaustive raw-vector search.
 
+mod exhaustive;
 mod usearch;
 
 use crate::error::Result;
+use std::collections::HashSet;
 
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::collection_meta::DistanceMetric;
 
 // Re-export implementations
+pub use exhaustive::ExhaustiveCentroidGraph;
 pub use usearch::UsearchCentroidGraph;
 
-/// Trait for HNSW-based centroid graph implementations.
+/// Trait for centroid graph implementations.
 ///
 /// The graph stores centroids and enables fast approximate nearest neighbor search
 /// to find relevant clusters during query execution.
@@ -27,6 +30,29 @@ pub trait CentroidGraph: Send + Sync {
     /// # Returns
     /// Vector of centroid_ids sorted by similarity (closest first)
     fn search(&self, query: &[f32], k: usize) -> Vec<u64>;
+
+    /// Search for k nearest centroids to a query vector. Exclude centroids with ids
+    /// from an exclude set. After search, factor in centroids from an include set.
+    /// The centroids from the include set are not part of the current graph, so must
+    /// be factored in after the graph search.
+    ///
+    /// # Arguments
+    /// * `query` - Query vector
+    /// * `k` - Number of nearest centroids to return
+    /// * `include` - New centroids to be considered after searching the graph
+    /// * `exclude` - Centroids to be excluded from the graph search
+    ///
+    /// # Returns
+    /// Vector of centroid_ids sorted by similarity (closest first)
+    fn search_with_include_exclude(
+        &self,
+        _query: &[f32],
+        _k: usize,
+        _include: &[&CentroidEntry],
+        _exclude: &HashSet<u64>,
+    ) -> Vec<u64> {
+        unimplemented!();
+    }
 
     /// Add a centroid to the graph.
     ///
@@ -43,6 +69,9 @@ pub trait CentroidGraph: Send + Sync {
     /// Returns `None` if the centroid is not in the graph.
     fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>>;
 
+    /// Return all live centroid IDs currently present in the graph.
+    fn all_centroid_ids(&self) -> Vec<u64>;
+
     /// Returns the number of centroids in the graph.
     fn len(&self) -> usize;
 
@@ -52,12 +81,12 @@ pub trait CentroidGraph: Send + Sync {
     }
 }
 
-/// Build a centroid graph using the default implementation (usearch).
+/// Build a centroid graph using the default implementation (exhaustive).
 pub fn build_centroid_graph(
     centroids: Vec<CentroidEntry>,
     distance_metric: DistanceMetric,
 ) -> Result<Box<dyn CentroidGraph>> {
-    let graph = UsearchCentroidGraph::build(centroids, distance_metric)?;
+    let graph = ExhaustiveCentroidGraph::build(centroids, distance_metric)?;
     Ok(Box::new(graph))
 }
 

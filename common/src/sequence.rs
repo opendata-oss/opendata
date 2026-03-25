@@ -88,6 +88,7 @@ impl From<DeserializeError> for SequenceError {
 /// Result type alias for sequence allocation operations.
 pub type SequenceResult<T> = std::result::Result<T, SequenceError>;
 
+#[derive(Clone)]
 pub struct AllocatedSeqBlock {
     current_block: Option<SeqBlock>,
     next_sequence: u64,
@@ -139,6 +140,10 @@ impl SequenceAllocator {
     pub async fn load(storage: &dyn Storage, key: Bytes) -> SequenceResult<Self> {
         let block = AllocatedSeqBlock::load(storage, &key).await?;
         Ok(Self { key, block })
+    }
+
+    pub fn new(key: Bytes, block: AllocatedSeqBlock) -> Self {
+        Self { key, block }
     }
 
     /// Returns the next sequence number that would be allocated.
@@ -205,6 +210,10 @@ impl SequenceAllocator {
         let value: Bytes = new_block.serialize();
         let record = Record::new(self.key.clone(), value);
         (new_block, record)
+    }
+
+    pub fn freeze(self) -> (Bytes, AllocatedSeqBlock) {
+        (self.key, self.block)
     }
 }
 

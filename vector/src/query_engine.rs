@@ -100,9 +100,8 @@ impl QueryEngine {
             )));
         }
 
-        // Brute-force: compute distance from query to every centroid
-        let num_centroids = self.centroid_graph.len();
-        let all_centroid_ids = self.centroid_graph.search(&query.vector, num_centroids);
+        // Brute-force: compute distance from query to every live centroid
+        let all_centroid_ids = self.centroid_graph.all_centroid_ids();
         let mut scored: Vec<(u64, distance::VectorDistance)> = all_centroid_ids
             .iter()
             .filter_map(|&cid| {
@@ -230,7 +229,12 @@ impl QueryEngine {
             return scored.into_iter().map(|(id, _)| id).collect();
         }
 
-        let threshold = (1.0 + epsilon) * closest_dist;
+        let threshold = match metric {
+            // raw_distance uses squared L2, so preserve epsilon semantics in
+            // Euclidean space by squaring the multiplicative factor.
+            DistanceMetric::L2 => (1.0 + epsilon).powi(2) * closest_dist,
+            DistanceMetric::DotProduct => (1.0 + epsilon) * closest_dist,
+        };
         scored
             .into_iter()
             .take_while(|&(_, d)| d <= threshold)

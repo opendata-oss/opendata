@@ -19,7 +19,7 @@ pub(crate) struct TsdbFlusher {
 #[async_trait]
 impl Flusher<TsdbWriteDelta> for TsdbFlusher {
     async fn flush_delta(
-        &self,
+        &mut self,
         frozen: FrozenTsdbDelta,
         _epoch_range: &Range<u64>,
     ) -> Result<Arc<dyn StorageSnapshot>, String> {
@@ -115,7 +115,7 @@ mod tests {
     async fn should_flush_delta_to_storage() {
         // given
         let storage = create_test_storage();
-        let flusher = TsdbFlusher {
+        let mut flusher = TsdbFlusher {
             storage: storage.clone(),
         };
         let ctx = TsdbContext {
@@ -142,7 +142,7 @@ mod tests {
     async fn should_skip_empty_delta() {
         // given
         let storage = create_test_storage();
-        let flusher = TsdbFlusher {
+        let mut flusher = TsdbFlusher {
             storage: storage.clone(),
         };
         let ctx = TsdbContext {
@@ -186,7 +186,7 @@ mod tests {
     async fn should_propagate_apply_error() {
         // given
         let storage = create_failing_storage();
-        let flusher = TsdbFlusher {
+        let mut flusher = TsdbFlusher {
             storage: storage.clone(),
         };
         storage.fail_apply(common::StorageError::Storage("test apply error".into()));
@@ -208,7 +208,7 @@ mod tests {
     async fn should_propagate_snapshot_error_after_apply() {
         // given
         let storage = create_failing_storage();
-        let flusher = TsdbFlusher {
+        let mut flusher = TsdbFlusher {
             storage: storage.clone(),
         };
         // Apply succeeds, but snapshot after apply fails
@@ -251,7 +251,7 @@ mod tests {
     async fn should_persist_series_dict_entries() {
         // given
         let storage = create_test_storage();
-        let flusher = TsdbFlusher {
+        let mut flusher = TsdbFlusher {
             storage: storage.clone(),
         };
         let ctx = TsdbContext {
