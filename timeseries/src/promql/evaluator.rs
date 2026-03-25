@@ -116,6 +116,10 @@ pub(crate) struct EvalStats {
     // Metric-prefixed layout experiment instrumentation
     pub(crate) sample_distinct_metrics: u64,
     pub(crate) sample_series_per_metric_max: u64,
+    // Logical metadata entry counts (actual entries loaded, not cache misses)
+    pub(crate) bucket_list_entries_loaded: u64,
+    pub(crate) forward_index_entries_loaded: u64,
+    pub(crate) sample_series_loaded: u64,
     // Per-query physical I/O stats (populated from task-local collector)
     pub(crate) io: QueryIoStats,
 }
@@ -229,6 +233,7 @@ struct BucketResolutionStats {
     forward_index_calls: u64,
     forward_index_misses: u64,
     forward_index_miss_ms: u64,
+    forward_index_entries_loaded: u64,
     metadata_queue_wait_ms: u64,
     metadata_load_ms: u64,
     metadata_permit_acquires: u64,
@@ -691,6 +696,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         let t0 = std::time::Instant::now();
         let buckets = self.reader.list_buckets().await?;
         self.stats.list_buckets_miss_ms += t0.elapsed().as_millis() as u64;
+        self.stats.bucket_list_entries_loaded = buckets.len() as u64;
         self.cached_buckets = Some(buckets.clone());
         Ok(buckets)
     }
@@ -729,6 +735,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             self.stats.metadata_queue_wait_ms += wait_ms;
             self.stats.metadata_load_ms += load_ms;
             self.stats.forward_index_miss_ms += wait_ms + load_ms;
+            self.stats.forward_index_entries_loaded += series_ids.len() as u64;
 
             self.cache
                 .cache_forward_index(*bucket, series_ids.clone(), forward_index);
@@ -1463,6 +1470,7 @@ async fn resolve_bucket_raw<R: QueryReader>(
         }
     }
     stats.series_meta_count = series_meta.len() as u64;
+    stats.forward_index_entries_loaded = sorted_candidates.len() as u64;
     stats.total_ms = total_start.elapsed().as_millis() as u64;
 
     tracing::debug!(
@@ -2292,6 +2300,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 self.reader.stats.forward_index_calls += bs.forward_index_calls;
                 self.reader.stats.forward_index_misses += bs.forward_index_misses;
                 self.reader.stats.forward_index_miss_ms += bs.forward_index_miss_ms;
+                self.reader.stats.forward_index_entries_loaded += bs.forward_index_entries_loaded;
                 self.reader.stats.metadata_queue_wait_ms += bs.metadata_queue_wait_ms;
                 self.reader.stats.metadata_load_ms += bs.metadata_load_ms;
                 self.reader.stats.metadata_permit_acquires += bs.metadata_permit_acquires;
@@ -2378,6 +2387,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
                 self.reader.stats.sample_loads += bs.sample_loads;
                 self.reader.stats.sample_misses += bs.sample_misses;
+                self.reader.stats.sample_series_loaded += bs.sample_misses;
                 self.reader.stats.samples_loaded += bs.samples_loaded;
                 self.reader.stats.sample_queue_wait_ms += bs.sample_queue_wait_ms;
                 self.reader.stats.sample_load_ms += bs.sample_load_ms;

@@ -187,6 +187,13 @@ where
     QUERY_IO_COLLECTOR.scope(collector.clone(), f).await
 }
 
+/// Snapshot the current task-local collector's stats, or return defaults if none is active.
+pub(crate) fn snapshot_current() -> QueryIoStats {
+    QUERY_IO_COLLECTOR
+        .try_with(|c| c.snapshot())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

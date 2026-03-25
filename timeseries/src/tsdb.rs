@@ -186,9 +186,16 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         let default_end_secs = end.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
 
         let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
-        let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
-        let (result, _stats) = evaluate_range(&reader, stmt, self.load_coordinator()).await?;
+        // Install I/O collector scope around reader construction + evaluation
+        // so bucket-list reads during reader construction are captured.
+        let io_collector = QueryIoCollector::new();
+        let result = query_io::run_with_collector(&io_collector, async {
+            let reader = self.make_query_reader_for_ranges(&ranges).await?;
+            let (result, _stats) = evaluate_range(&reader, stmt, self.load_coordinator()).await?;
+            Ok::<_, QueryError>(result)
+        })
+        .await?;
         Ok(result)
     }
 
@@ -340,90 +347,78 @@ pub(crate) async fn evaluate_range(
         ));
     }
 
-    // Install per-query I/O collector for physical byte tracking
-    let io_collector = QueryIoCollector::new();
+    let mut series_map: HashMap<Labels, Vec<(i64, f64)>> = HashMap::new();
+    let mut evaluator = if let Some(coord) = coordinator {
+        Evaluator::with_coordinator(reader, coord.clone())
+    } else {
+        Evaluator::new(reader)
+    };
 
-    type EvalInner = (
-        HashMap<Labels, Vec<(i64, f64)>>,
-        u64,
-        crate::promql::evaluator::EvalStats,
-    );
-    let eval_result: std::result::Result<EvalInner, QueryError> =
-        query_io::run_with_collector(&io_collector, async {
-        let mut series_map: HashMap<Labels, Vec<(i64, f64)>> = HashMap::new();
-        let mut evaluator = if let Some(coord) = coordinator {
-            Evaluator::with_coordinator(reader, coord.clone())
-        } else {
-            Evaluator::new(reader)
+    // Preload VectorSelector data for all steps
+    let start_ms = start.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    let end_ms = end.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    let step_ms = step.as_millis() as i64;
+    let lookback_delta_ms = lookback_delta.as_millis() as i64;
+
+    let preload_span = tracing::info_span!("preload_for_range");
+    evaluator
+        .preload_for_range(&stmt.expr, start_ms, end_ms, step_ms, lookback_delta_ms)
+        .instrument(preload_span)
+        .await?;
+
+    let step_loop_start = std::time::Instant::now();
+    let mut current_time = start;
+    let mut step_count: u64 = 0;
+
+    while current_time <= end {
+        let instant_stmt = EvalStmt {
+            expr: stmt.expr.clone(),
+            start: current_time,
+            end: current_time,
+            interval: Duration::from_secs(0),
+            lookback_delta,
         };
 
-        // Preload VectorSelector data for all steps
-        let start_ms = start.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-        let end_ms = end.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-        let step_ms = step.as_millis() as i64;
-        let lookback_delta_ms = lookback_delta.as_millis() as i64;
+        let result = evaluator.evaluate(instant_stmt).await?;
+        let timestamp_ms = current_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
 
-        let preload_span = tracing::info_span!("preload_for_range");
-        evaluator
-            .preload_for_range(&stmt.expr, start_ms, end_ms, step_ms, lookback_delta_ms)
-            .instrument(preload_span)
-            .await?;
-
-        let step_loop_start = std::time::Instant::now();
-        let mut current_time = start;
-        let mut step_count: u64 = 0;
-
-        while current_time <= end {
-            let instant_stmt = EvalStmt {
-                expr: stmt.expr.clone(),
-                start: current_time,
-                end: current_time,
-                interval: Duration::from_secs(0),
-                lookback_delta,
-            };
-
-            let result = evaluator.evaluate(instant_stmt).await?;
-            let timestamp_ms = current_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-
-            match result {
-                ExprResult::InstantVector(samples) => {
-                    for sample in samples {
-                        let labels = sample.labels.into_labels();
-                        series_map
-                            .entry(labels)
-                            .or_default()
-                            .push((sample.timestamp_ms, sample.value));
-                    }
-                }
-                ExprResult::Scalar(value) => {
-                    let labels = Labels::empty();
+        match result {
+            ExprResult::InstantVector(samples) => {
+                for sample in samples {
+                    let labels = sample.labels.into_labels();
                     series_map
                         .entry(labels)
                         .or_default()
-                        .push((timestamp_ms, value));
-                }
-                ExprResult::RangeVector(_) => {
-                    return Err(QueryError::Execution(
-                        "range vectors not supported in range query evaluation".to_string(),
-                    ));
+                        .push((sample.timestamp_ms, sample.value));
                 }
             }
-
-            step_count += 1;
-            current_time += step;
+            ExprResult::Scalar(value) => {
+                let labels = Labels::empty();
+                series_map
+                    .entry(labels)
+                    .or_default()
+                    .push((timestamp_ms, value));
+            }
+            ExprResult::RangeVector(_) => {
+                return Err(QueryError::Execution(
+                    "range vectors not supported in range query evaluation".to_string(),
+                ));
+            }
         }
 
-        let step_loop_ms = step_loop_start.elapsed().as_millis() as u64;
-        let mut stats = evaluator.into_stats();
-        stats.step_loop_ms = step_loop_ms;
-        Ok((series_map, step_count, stats))
-    })
-    .await;
+        step_count += 1;
+        current_time += step;
+    }
 
-    let (series_map, step_count, mut stats) = eval_result?;
+    let step_loop_ms = step_loop_start.elapsed().as_millis() as u64;
+    let mut stats = evaluator.into_stats();
+    stats.step_loop_ms = step_loop_ms;
 
-    // Capture physical I/O stats from the collector
-    stats.io = io_collector.snapshot();
+    // Snapshot physical I/O stats from the task-local collector (if active).
+    // The caller is responsible for installing the collector scope via
+    // query_io::run_with_collector() so that reader construction and
+    // evaluation are both captured.
+    stats.io = query_io::snapshot_current();
     let io = &stats.io;
 
     tracing::info!(
@@ -475,6 +470,10 @@ pub(crate) async fn evaluate_range(
         // Metric-prefixed layout experiment
         sample_distinct_metrics = stats.sample_distinct_metrics,
         sample_series_per_metric_max = stats.sample_series_per_metric_max,
+        // Logical metadata entry counts
+        bucket_list_entries_loaded = stats.bucket_list_entries_loaded,
+        forward_index_entries_loaded = stats.forward_index_entries_loaded,
+        sample_series_loaded = stats.sample_series_loaded,
         sample_logical_bytes = stats.samples_loaded * 16,
         // Physical I/O stats
         io_bucket_list_bytes = io.bucket_list_bytes,
@@ -1152,9 +1151,15 @@ impl Tsdb {
         let default_end_secs = end.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
 
         let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
-        let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
-        evaluate_range(&reader, stmt, self.load_coordinator()).await
+        // Install I/O collector scope around reader construction + evaluation
+        // so bucket-list reads during reader construction are captured.
+        let io_collector = QueryIoCollector::new();
+        query_io::run_with_collector(&io_collector, async {
+            let reader = self.make_query_reader_for_ranges(&ranges).await?;
+            evaluate_range(&reader, stmt, self.load_coordinator()).await
+        })
+        .await
     }
 
     /// Return metadata for all (or a specific) metric.
@@ -2403,6 +2408,7 @@ mod tests {
 
     #[storage_test(merge_operator = OpenTsdbMergeOperator)]
     async fn evaluate_range_should_capture_physical_io_stats(storage: Arc<dyn Storage>) {
+        use crate::query_io::{self, QueryIoCollector};
         use std::time::{Duration, UNIX_EPOCH};
 
         // given: metric-prefixed layout with data in one bucket
@@ -2426,25 +2432,34 @@ mod tests {
         }
         tsdb.flush().await.unwrap();
 
-        // when: run evaluate_range
-        let reader = tsdb.query_reader(3600, 7200).await.unwrap();
-        let expr = promql_parser::parser::parse("cpu").unwrap();
-        let stmt = EvalStmt {
-            expr,
-            start: UNIX_EPOCH + Duration::from_secs(4000),
-            end: UNIX_EPOCH + Duration::from_secs(4060),
-            interval: Duration::from_secs(15),
-            lookback_delta: Duration::from_secs(300),
-        };
-
-        let (_result, stats) = evaluate_range(&reader, stmt, None).await.unwrap();
+        // when: run evaluate_range with collector scope covering reader construction
+        // so bucket-list bytes are captured
+        let io_collector = QueryIoCollector::new();
+        let (_result, stats) = query_io::run_with_collector(&io_collector, async {
+            let reader = tsdb.query_reader(3600, 7200).await.unwrap();
+            let expr = promql_parser::parser::parse("cpu").unwrap();
+            let stmt = EvalStmt {
+                expr,
+                start: UNIX_EPOCH + Duration::from_secs(4000),
+                end: UNIX_EPOCH + Duration::from_secs(4060),
+                interval: Duration::from_secs(15),
+                lookback_delta: Duration::from_secs(300),
+            };
+            evaluate_range(&reader, stmt, None).await
+        })
+        .await
+        .unwrap();
 
         // then: IO stats should be populated
         let io = &stats.io;
 
-        // Note: bucket list reads happen during query_reader() construction,
-        // before the collector is installed in evaluate_range(). That's fine —
-        // the bucket list is a single small get. The interesting data is below.
+        // Bucket list: captured because collector scope includes reader construction
+        assert!(
+            io.bucket_list_bytes > 0,
+            "expected bucket_list_bytes > 0 (scope includes reader construction)"
+        );
+        assert_eq!(io.bucket_list_gets, 1, "single bucket list get");
+        assert_eq!(io.bucket_list_records, 1, "single bucket list record");
 
         // Inverted index: should have loaded terms for __name__=cpu
         assert!(
@@ -2478,7 +2493,7 @@ mod tests {
             "expected sample_metric_get_bytes > 0"
         );
 
-        // Derived totals
+        // Derived totals: physical_bytes_total == metadata + samples
         assert!(io.physical_bytes_total() > 0);
         assert!(io.metadata_bytes() > 0);
         assert!(io.sample_bytes() > 0);
@@ -2486,6 +2501,20 @@ mod tests {
             io.physical_bytes_total(),
             io.metadata_bytes() + io.sample_bytes()
         );
+
+        // Reconciliation: total == all parts
+        assert_eq!(
+            io.physical_bytes_total(),
+            io.bucket_list_bytes
+                + io.inverted_index_bytes
+                + io.forward_index_bytes
+                + io.sample_get_bytes
+                + io.sample_metric_get_bytes
+        );
+
+        // MetricPrefixed layout: no legacy sample gets
+        assert_eq!(io.sample_get_bytes, 0);
+        assert!(io.sample_metric_get_bytes > 0);
 
         // Logical vs physical: sample_logical_bytes should be less than physical
         let sample_logical_bytes = stats.samples_loaded * 16;
@@ -2495,6 +2524,226 @@ mod tests {
             "physical sample bytes ({}) should exceed logical ({})",
             io.sample_bytes(),
             sample_logical_bytes,
+        );
+    }
+
+    /// Deterministic test: exact record counts and byte reconciliation for a
+    /// small known dataset. Validates the full I/O instrumentation pipeline
+    /// from storage through to the evaluate_range stats.
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn io_stats_deterministic_record_counts(storage: Arc<dyn Storage>) {
+        use crate::query_io::{self, QueryIoCollector};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // given: MetricPrefixed layout, 1 metric, 2 series, 1 sample each
+        let config = TsdbRuntimeConfig {
+            sample_storage_layout: SampleStorageLayout::MetricPrefixed,
+            ..Default::default()
+        };
+        let tsdb = Tsdb::with_runtime_config(storage.clone(), config);
+
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+        mini.ingest(&create_sample("temp", vec![("loc", "a")], 4_000_000, 1.0))
+            .await
+            .unwrap();
+        mini.ingest(&create_sample("temp", vec![("loc", "b")], 4_000_000, 2.0))
+            .await
+            .unwrap();
+        tsdb.flush().await.unwrap();
+
+        // Compute expected physical bytes by reading records directly from storage.
+        // This gives us exact byte counts to compare against the collector.
+        let snapshot = storage.snapshot().await.unwrap();
+        use crate::serde::TimeBucketScoped;
+        use crate::serde::key::{
+            BucketListKey, ForwardIndexKey, InvertedIndexKey, MetricTimeSeriesKey,
+        };
+
+        // Bucket list: single key
+        let bl_record = snapshot.get(BucketListKey.encode()).await.unwrap().unwrap();
+        let expected_bucket_list_bytes = (bl_record.key.len() + bl_record.value.len()) as u64;
+
+        // Inverted index: terms for __name__=temp, loc=a, loc=b
+        let mut expected_inverted_bytes = 0u64;
+        for (name, value) in [("__name__", "temp"), ("loc", "a"), ("loc", "b")] {
+            let key = InvertedIndexKey {
+                time_bucket: bucket.start,
+                bucket_size: bucket.size,
+                attribute: name.to_string(),
+                value: value.to_string(),
+            }
+            .encode();
+            if let Some(record) = snapshot.get(key).await.unwrap() {
+                expected_inverted_bytes += (record.key.len() + record.value.len()) as u64;
+            }
+        }
+
+        // Forward index: 2 series entries
+        let fi_range = ForwardIndexKey::bucket_range(&bucket);
+        let fi_records = snapshot.scan(fi_range).await.unwrap();
+        let expected_forward_bytes: u64 = fi_records
+            .iter()
+            .map(|r| (r.key.len() + r.value.len()) as u64)
+            .sum();
+        let expected_forward_records = fi_records.len() as u64;
+
+        // Sample (MetricPrefixed): 2 series blobs
+        // Note: both series share the metric "temp" but have different series IDs.
+        // We read all records under the metric-prefixed key range.
+        let sample_range = MetricTimeSeriesKey::metric_range(&bucket, "temp");
+        let sample_records = snapshot.scan(sample_range).await.unwrap();
+        let expected_sample_bytes: u64 = sample_records
+            .iter()
+            .map(|r| (r.key.len() + r.value.len()) as u64)
+            .sum();
+        let expected_sample_records = sample_records.len() as u64;
+
+        // when: run query with collector scope around everything
+        let io_collector = QueryIoCollector::new();
+        let (_result, stats) = query_io::run_with_collector(&io_collector, async {
+            let reader = tsdb.query_reader(3600, 7200).await.unwrap();
+            let expr = promql_parser::parser::parse("temp").unwrap();
+            let stmt = EvalStmt {
+                expr,
+                start: UNIX_EPOCH + Duration::from_secs(4000),
+                end: UNIX_EPOCH + Duration::from_secs(4000),
+                interval: Duration::from_secs(15),
+                lookback_delta: Duration::from_secs(300),
+            };
+            evaluate_range(&reader, stmt, None).await
+        })
+        .await
+        .unwrap();
+
+        let io = &stats.io;
+
+        // then: exact record counts
+        assert_eq!(io.bucket_list_gets, 1, "one bucket list get");
+        assert_eq!(io.bucket_list_records, 1, "one bucket list record");
+        assert_eq!(
+            io.forward_index_records, expected_forward_records,
+            "forward index records"
+        );
+        assert_eq!(
+            io.sample_metric_get_records, expected_sample_records,
+            "sample metric get records"
+        );
+        assert_eq!(io.sample_get_records, 0, "no legacy sample gets");
+
+        // Exact byte counts matching direct storage reads
+        assert_eq!(
+            io.bucket_list_bytes, expected_bucket_list_bytes,
+            "bucket list bytes: collector={} vs direct={}",
+            io.bucket_list_bytes, expected_bucket_list_bytes
+        );
+        assert_eq!(
+            io.forward_index_bytes, expected_forward_bytes,
+            "forward index bytes: collector={} vs direct={}",
+            io.forward_index_bytes, expected_forward_bytes
+        );
+        assert_eq!(
+            io.sample_metric_get_bytes, expected_sample_bytes,
+            "sample metric bytes: collector={} vs direct={}",
+            io.sample_metric_get_bytes, expected_sample_bytes
+        );
+
+        // Inverted index bytes: the query only loads terms it needs (__name__=temp),
+        // which may differ from all 3 terms. Assert consistency, not exact match.
+        assert!(io.inverted_index_bytes > 0, "inverted index bytes > 0");
+        assert!(
+            io.inverted_index_bytes <= expected_inverted_bytes,
+            "inverted index bytes ({}) should not exceed all-terms total ({})",
+            io.inverted_index_bytes,
+            expected_inverted_bytes
+        );
+
+        // Full reconciliation
+        assert_eq!(
+            io.physical_bytes_total(),
+            io.bucket_list_bytes
+                + io.inverted_index_bytes
+                + io.forward_index_bytes
+                + io.sample_get_bytes
+                + io.sample_metric_get_bytes
+        );
+
+        // Logical metadata entry counts
+        assert_eq!(stats.bucket_list_entries_loaded, 1, "1 bucket");
+        assert_eq!(
+            stats.forward_index_entries_loaded, 2,
+            "2 forward index entries"
+        );
+        assert_eq!(stats.sample_series_loaded, 2, "2 sample series loaded");
+    }
+
+    /// Verify that the legacy (LegacySeriesId) layout path records
+    /// sample_get_bytes and NOT sample_metric_get_bytes.
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn io_stats_legacy_layout_uses_sample_get(storage: Arc<dyn Storage>) {
+        use crate::query_io::{self, QueryIoCollector};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let config = TsdbRuntimeConfig {
+            sample_storage_layout: SampleStorageLayout::LegacySeriesId,
+            ..Default::default()
+        };
+        let tsdb = Tsdb::with_runtime_config(storage, config);
+
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+        mini.ingest(&create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0))
+            .await
+            .unwrap();
+        tsdb.flush().await.unwrap();
+
+        let io_collector = QueryIoCollector::new();
+        let (_result, stats) = query_io::run_with_collector(&io_collector, async {
+            let reader = tsdb.query_reader(3600, 7200).await.unwrap();
+            let expr = promql_parser::parser::parse("cpu").unwrap();
+            let stmt = EvalStmt {
+                expr,
+                start: UNIX_EPOCH + Duration::from_secs(4000),
+                end: UNIX_EPOCH + Duration::from_secs(4000),
+                interval: Duration::from_secs(15),
+                lookback_delta: Duration::from_secs(300),
+            };
+            evaluate_range(&reader, stmt, None).await
+        })
+        .await
+        .unwrap();
+
+        let io = &stats.io;
+
+        // Legacy layout: sample_get path used, not metric-prefixed
+        assert!(
+            io.sample_get_bytes > 0,
+            "expected sample_get_bytes > 0 for legacy layout"
+        );
+        assert_eq!(
+            io.sample_get_records, 1,
+            "expected 1 legacy sample get record"
+        );
+        assert_eq!(
+            io.sample_metric_get_bytes, 0,
+            "no metric-prefixed gets for legacy layout"
+        );
+        assert_eq!(
+            io.sample_metric_get_records, 0,
+            "no metric-prefixed records for legacy layout"
+        );
+
+        // Bucket list captured
+        assert!(io.bucket_list_bytes > 0);
+
+        // Full reconciliation
+        assert_eq!(
+            io.physical_bytes_total(),
+            io.bucket_list_bytes
+                + io.inverted_index_bytes
+                + io.forward_index_bytes
+                + io.sample_get_bytes
+                + io.sample_metric_get_bytes
         );
     }
 
