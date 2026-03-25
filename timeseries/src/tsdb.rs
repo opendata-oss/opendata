@@ -486,6 +486,10 @@ pub(crate) async fn evaluate_range(
         sample_range_scan_groups = stats.sample_range_scan_groups,
         sample_range_scan_chunks = stats.sample_range_scan_chunks,
         sample_range_scan_series = stats.sample_range_scan_series,
+        sample_range_scan_span = stats.sample_range_scan_span,
+        sample_range_scan_overread = stats
+            .sample_range_scan_span
+            .saturating_sub(stats.sample_range_scan_series),
         "evaluate_range complete"
     );
 
@@ -2435,6 +2439,102 @@ mod tests {
         );
         let staging_last = results[1].samples.last().unwrap();
         assert_approx_eq(staging_last.1, 40.0);
+    }
+
+    /// Storage-backed test exercising the real range-scan path through
+    /// TsdbQueryReader::metric_samples_range → storage scan/decode.
+    /// Unlike the evaluator planner integration tests (which use MockQueryReader's
+    /// point-get fallback), this test hits the actual scan implementation.
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_range_scan_via_b3_with_metric_prefixed_layout(storage: Arc<dyn Storage>) {
+        use crate::config::SampleReadExperimentConfig;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // given: metric-prefixed layout with range-scan batching enabled (min_series=4)
+        let config = TsdbRuntimeConfig {
+            sample_storage_layout: SampleStorageLayout::MetricPrefixed,
+            sample_read_experiment: SampleReadExperimentConfig {
+                enable_range_scan_batches: true,
+                range_scan_min_series: 4,
+                ..SampleReadExperimentConfig::default()
+            },
+            ..Default::default()
+        };
+        let tsdb = Tsdb::with_runtime_config(storage, config);
+
+        // Ingest 8 series for one metric in one bucket
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+        for i in 0..8u32 {
+            mini.ingest(&create_sample(
+                "http_requests",
+                vec![("idx", &format!("{:03}", i))],
+                3_900_000,
+                i as f64 * 10.0,
+            ))
+            .await
+            .unwrap();
+        }
+        tsdb.flush().await.unwrap();
+
+        // when: range query using evaluate_range (returns stats)
+        let start = UNIX_EPOCH + Duration::from_secs(3600);
+        let end = UNIX_EPOCH + Duration::from_secs(4200);
+        let step = Duration::from_secs(600);
+        let lookback_delta = Duration::from_secs(600);
+
+        let expr = promql_parser::parser::parse("http_requests").unwrap();
+        let stmt = EvalStmt {
+            expr,
+            start,
+            end,
+            interval: step,
+            lookback_delta,
+        };
+
+        let reader = tsdb.query_reader(3600, 4200).await.unwrap();
+        let (results, stats) = evaluate_range(
+            &reader,
+            stmt,
+            tsdb.load_coordinator(),
+            tsdb.sample_read_config(),
+        )
+        .await
+        .unwrap();
+
+        // then: correct results — 8 series returned
+        assert_eq!(results.len(), 8, "expected 8 series, got {}", results.len());
+
+        // Verify values are present and correct
+        let mut values: Vec<f64> = results
+            .iter()
+            .filter_map(|r| r.samples.last().map(|s| s.1))
+            .collect();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let expected: Vec<f64> = (0..8).map(|i| i as f64 * 10.0).collect();
+        assert_eq!(values, expected);
+
+        // Range-scan was used (not point gets)
+        assert_eq!(
+            stats.sample_range_scan_groups, 1,
+            "expected 1 range-scan group, got {}",
+            stats.sample_range_scan_groups
+        );
+        assert!(
+            stats.sample_range_scan_chunks > 0,
+            "expected range_scan_chunks > 0, got {}",
+            stats.sample_range_scan_chunks
+        );
+        assert_eq!(
+            stats.sample_range_scan_series, 8,
+            "expected 8 range-scan series, got {}",
+            stats.sample_range_scan_series
+        );
+        assert_eq!(
+            stats.sample_point_get_groups, 0,
+            "expected 0 point-get groups, got {}",
+            stats.sample_point_get_groups
+        );
     }
 
     #[storage_test(merge_operator = OpenTsdbMergeOperator)]

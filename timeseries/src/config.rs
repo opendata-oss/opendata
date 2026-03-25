@@ -308,23 +308,36 @@ impl SampleReadExperimentConfig {
         concurrency: Option<&str>,
     ) -> Self {
         let enable_range_scan_batches = matches!(enable, Some("true") | Some("1"));
+
+        let range_scan_min_series = min_series
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(Self::DEFAULT_MIN_SERIES);
+        let range_scan_min_density = min_density
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(Self::DEFAULT_MIN_DENSITY);
+        let range_scan_max_ranges = max_ranges
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(Self::DEFAULT_MAX_RANGES);
+        let range_scan_merge_gap_series = merge_gap
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(Self::DEFAULT_MERGE_GAP);
+        let per_query_sample_scan_concurrency = concurrency
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(Self::DEFAULT_CONCURRENCY);
+
+        // Clamp invalid values to safe minimums.
+        let range_scan_min_series = range_scan_min_series.max(1);
+        let range_scan_min_density = range_scan_min_density.clamp(0.0, 1.0);
+        let range_scan_max_ranges = range_scan_max_ranges.max(1);
+        let per_query_sample_scan_concurrency = per_query_sample_scan_concurrency.max(1);
+
         Self {
             enable_range_scan_batches,
-            range_scan_min_series: min_series
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(Self::DEFAULT_MIN_SERIES),
-            range_scan_min_density: min_density
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(Self::DEFAULT_MIN_DENSITY),
-            range_scan_max_ranges: max_ranges
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(Self::DEFAULT_MAX_RANGES),
-            range_scan_merge_gap_series: merge_gap
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(Self::DEFAULT_MERGE_GAP),
-            per_query_sample_scan_concurrency: concurrency
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(Self::DEFAULT_CONCURRENCY),
+            range_scan_min_series,
+            range_scan_min_density,
+            range_scan_max_ranges,
+            range_scan_merge_gap_series,
+            per_query_sample_scan_concurrency,
         }
     }
 }
@@ -494,5 +507,52 @@ mod tests {
         assert_eq!(config.range_scan_max_ranges, 8);
         assert_eq!(config.range_scan_merge_gap_series, 16);
         assert_eq!(config.per_query_sample_scan_concurrency, 8);
+    }
+
+    #[test]
+    fn sample_read_experiment_clamps_zero_max_ranges() {
+        let config = SampleReadExperimentConfig::parse(None, None, None, Some("0"), None, None);
+        assert_eq!(config.range_scan_max_ranges, 1);
+    }
+
+    #[test]
+    fn sample_read_experiment_clamps_zero_concurrency() {
+        let config = SampleReadExperimentConfig::parse(None, None, None, None, None, Some("0"));
+        assert_eq!(config.per_query_sample_scan_concurrency, 1);
+    }
+
+    #[test]
+    fn sample_read_experiment_clamps_zero_min_series() {
+        let config = SampleReadExperimentConfig::parse(None, Some("0"), None, None, None, None);
+        assert_eq!(config.range_scan_min_series, 1);
+    }
+
+    #[test]
+    fn sample_read_experiment_clamps_density_above_one() {
+        let config = SampleReadExperimentConfig::parse(None, None, Some("1.5"), None, None, None);
+        assert!((config.range_scan_min_density - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sample_read_experiment_clamps_negative_density() {
+        let config = SampleReadExperimentConfig::parse(None, None, Some("-0.5"), None, None, None);
+        assert!((config.range_scan_min_density - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sample_read_experiment_unparsable_falls_back_to_default() {
+        let config = SampleReadExperimentConfig::parse(
+            None,
+            Some("abc"),
+            Some("xyz"),
+            Some("!"),
+            Some("???"),
+            Some("nope"),
+        );
+        assert_eq!(config.range_scan_min_series, 16);
+        assert!((config.range_scan_min_density - 0.25).abs() < f64::EPSILON);
+        assert_eq!(config.range_scan_max_ranges, 4);
+        assert_eq!(config.range_scan_merge_gap_series, 8);
+        assert_eq!(config.per_query_sample_scan_concurrency, 4);
     }
 }

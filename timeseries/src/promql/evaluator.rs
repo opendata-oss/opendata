@@ -121,6 +121,8 @@ pub(crate) struct EvalStats {
     pub(crate) sample_range_scan_groups: u64,
     pub(crate) sample_range_scan_chunks: u64,
     pub(crate) sample_range_scan_series: u64,
+    /// Total span (end - start + 1) across all scan chunks. Overread = span - series.
+    pub(crate) sample_range_scan_span: u64,
 }
 
 /// Canonical key for caching selector results across steps.
@@ -272,6 +274,7 @@ struct BucketSampleStats {
     range_scan_groups: u64,
     range_scan_chunks: u64,
     range_scan_series: u64,
+    range_scan_span: u64,
 }
 
 /// Result of Phase B3 sample loading for one bucket.
@@ -1706,6 +1709,10 @@ async fn process_bucket_sample_loads<R: QueryReader>(
                 stats.range_scan_chunks += chunks.len() as u64;
                 stats.range_scan_series +=
                     chunks.iter().map(|c| c.wanted.len() as u64).sum::<u64>();
+                stats.range_scan_span += chunks
+                    .iter()
+                    .map(|c| (c.end_series_id - c.start_series_id + 1) as u64)
+                    .sum::<u64>();
                 // Range-scan path: bounded parallel scans per chunk.
                 let scan_concurrency = config.per_query_sample_scan_concurrency;
                 let scan_results: Vec<_> = futures::stream::iter(chunks.into_iter())
@@ -2607,6 +2614,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 self.reader.stats.sample_range_scan_groups += bs.range_scan_groups;
                 self.reader.stats.sample_range_scan_chunks += bs.range_scan_chunks;
                 self.reader.stats.sample_range_scan_series += bs.range_scan_series;
+                self.reader.stats.sample_range_scan_span += bs.range_scan_span;
 
                 *bucket_totals.entry(sr.bucket).or_default() += bs.bucket_ms;
 
@@ -7683,10 +7691,12 @@ mod tests {
         }
     }
 
-    /// End-to-end tests for range-scan batch dispatch through the evaluator.
-    /// Tests use the preload_for_range path which invokes fetch_series_samples
-    /// and process_bucket_sample_loads (the B3 parallel path).
-    mod range_scan_batch_e2e_tests {
+    /// Planner integration tests for range-scan batch dispatch through the evaluator.
+    /// These exercise the preload_for_range → fetch_series_samples → process_bucket_sample_loads
+    /// pipeline using MockQueryReader, which falls back to point gets for metric_samples_range().
+    /// They validate planner decisions and stats propagation, NOT the real storage scan path.
+    /// See tsdb.rs `should_range_scan_via_b3_with_metric_prefixed_layout` for storage-backed coverage.
+    mod range_scan_batch_planner_integration_tests {
         use super::super::*;
         use crate::config::SampleReadExperimentConfig;
         use crate::model::{Label, MetricType, Sample, TimeBucket};
