@@ -490,6 +490,8 @@ pub(crate) async fn evaluate_range(
         sample_range_scan_overread = stats
             .sample_range_scan_span
             .saturating_sub(stats.sample_range_scan_series),
+        sample_range_scan_candidate_groups = stats.sample_range_scan_candidate_groups,
+        sample_range_scan_rejected_groups = stats.sample_range_scan_rejected_groups,
         "evaluate_range complete"
     );
 
@@ -2534,6 +2536,87 @@ mod tests {
             stats.sample_point_get_groups, 0,
             "expected 0 point-get groups, got {}",
             stats.sample_point_get_groups
+        );
+    }
+
+    /// With conservative defaults (min_series=128), a small metric group falls back
+    /// to point gets even when range-scan batching is enabled.
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn should_fall_back_to_point_gets_for_small_group_with_storage(
+        storage: Arc<dyn Storage>,
+    ) {
+        use crate::config::SampleReadExperimentConfig;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // given: metric-prefixed layout, range-scan enabled with conservative defaults
+        let config = TsdbRuntimeConfig {
+            sample_storage_layout: SampleStorageLayout::MetricPrefixed,
+            sample_read_experiment: SampleReadExperimentConfig {
+                enable_range_scan_batches: true,
+                // Use defaults (min_series=128, min_density=0.8)
+                ..SampleReadExperimentConfig::default()
+            },
+            ..Default::default()
+        };
+        let tsdb = Tsdb::with_runtime_config(storage, config);
+
+        // Ingest only 8 series — well below min_series=128
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+        for i in 0..8u32 {
+            mini.ingest(&create_sample(
+                "http_requests",
+                vec![("idx", &format!("{:03}", i))],
+                3_900_000,
+                i as f64 * 10.0,
+            ))
+            .await
+            .unwrap();
+        }
+        tsdb.flush().await.unwrap();
+
+        // when: range query
+        let start = UNIX_EPOCH + Duration::from_secs(3600);
+        let end = UNIX_EPOCH + Duration::from_secs(4200);
+        let step = Duration::from_secs(600);
+        let lookback_delta = Duration::from_secs(600);
+
+        let expr = promql_parser::parser::parse("http_requests").unwrap();
+        let stmt = EvalStmt {
+            expr,
+            start,
+            end,
+            interval: step,
+            lookback_delta,
+        };
+
+        let reader = tsdb.query_reader(3600, 4200).await.unwrap();
+        let (results, stats) = evaluate_range(
+            &reader,
+            stmt,
+            tsdb.load_coordinator(),
+            tsdb.sample_read_config(),
+        )
+        .await
+        .unwrap();
+
+        // then: correct results returned via point-get path
+        assert_eq!(results.len(), 8, "expected 8 series, got {}", results.len());
+        assert_eq!(
+            stats.sample_point_get_groups, 1,
+            "small group should use point gets"
+        );
+        assert_eq!(
+            stats.sample_range_scan_groups, 0,
+            "should not use range scans for small group"
+        );
+        assert_eq!(
+            stats.sample_range_scan_candidate_groups, 1,
+            "planner should evaluate the group"
+        );
+        assert_eq!(
+            stats.sample_range_scan_rejected_groups, 1,
+            "planner should reject the group"
         );
     }
 

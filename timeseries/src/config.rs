@@ -270,11 +270,11 @@ pub(crate) struct SampleReadExperimentConfig {
 }
 
 impl SampleReadExperimentConfig {
-    const DEFAULT_MIN_SERIES: usize = 16;
-    const DEFAULT_MIN_DENSITY: f64 = 0.25;
-    const DEFAULT_MAX_RANGES: usize = 4;
-    const DEFAULT_MERGE_GAP: u32 = 8;
-    const DEFAULT_CONCURRENCY: usize = 4;
+    const DEFAULT_MIN_SERIES: usize = 128;
+    const DEFAULT_MIN_DENSITY: f64 = 0.8;
+    const DEFAULT_MAX_RANGES: usize = 2;
+    const DEFAULT_MERGE_GAP: u32 = 4;
+    const DEFAULT_CONCURRENCY: usize = 2;
 
     pub(crate) fn from_env() -> Self {
         Self::parse(
@@ -461,22 +461,22 @@ mod tests {
     fn sample_read_experiment_defaults() {
         let config = SampleReadExperimentConfig::default();
         assert!(!config.enable_range_scan_batches);
-        assert_eq!(config.range_scan_min_series, 16);
-        assert!((config.range_scan_min_density - 0.25).abs() < f64::EPSILON);
-        assert_eq!(config.range_scan_max_ranges, 4);
-        assert_eq!(config.range_scan_merge_gap_series, 8);
-        assert_eq!(config.per_query_sample_scan_concurrency, 4);
+        assert_eq!(config.range_scan_min_series, 128);
+        assert!((config.range_scan_min_density - 0.8).abs() < f64::EPSILON);
+        assert_eq!(config.range_scan_max_ranges, 2);
+        assert_eq!(config.range_scan_merge_gap_series, 4);
+        assert_eq!(config.per_query_sample_scan_concurrency, 2);
     }
 
     #[test]
     fn sample_read_experiment_parse_defaults() {
         let config = SampleReadExperimentConfig::parse(None, None, None, None, None, None);
         assert!(!config.enable_range_scan_batches);
-        assert_eq!(config.range_scan_min_series, 16);
-        assert!((config.range_scan_min_density - 0.25).abs() < f64::EPSILON);
-        assert_eq!(config.range_scan_max_ranges, 4);
-        assert_eq!(config.range_scan_merge_gap_series, 8);
-        assert_eq!(config.per_query_sample_scan_concurrency, 4);
+        assert_eq!(config.range_scan_min_series, 128);
+        assert!((config.range_scan_min_density - 0.8).abs() < f64::EPSILON);
+        assert_eq!(config.range_scan_max_ranges, 2);
+        assert_eq!(config.range_scan_merge_gap_series, 4);
+        assert_eq!(config.per_query_sample_scan_concurrency, 2);
     }
 
     #[test]
@@ -507,6 +507,24 @@ mod tests {
         assert_eq!(config.range_scan_max_ranges, 8);
         assert_eq!(config.range_scan_merge_gap_series, 16);
         assert_eq!(config.per_query_sample_scan_concurrency, 8);
+    }
+
+    #[test]
+    fn sample_read_experiment_defaults_are_conservative() {
+        // Verify conservative defaults: scans require large, dense groups.
+        let config = SampleReadExperimentConfig::default();
+        assert!(
+            config.range_scan_min_series >= 64,
+            "min_series should be high to avoid scanning small groups"
+        );
+        assert!(
+            config.range_scan_min_density >= 0.5,
+            "min_density should be high to avoid sparse scans"
+        );
+        assert!(
+            config.range_scan_max_ranges <= 4,
+            "max_ranges should be low to limit scan fan-out"
+        );
     }
 
     #[test]
@@ -549,10 +567,10 @@ mod tests {
             Some("???"),
             Some("nope"),
         );
-        assert_eq!(config.range_scan_min_series, 16);
-        assert!((config.range_scan_min_density - 0.25).abs() < f64::EPSILON);
-        assert_eq!(config.range_scan_max_ranges, 4);
-        assert_eq!(config.range_scan_merge_gap_series, 8);
-        assert_eq!(config.per_query_sample_scan_concurrency, 4);
+        assert_eq!(config.range_scan_min_series, 128);
+        assert!((config.range_scan_min_density - 0.8).abs() < f64::EPSILON);
+        assert_eq!(config.range_scan_max_ranges, 2);
+        assert_eq!(config.range_scan_merge_gap_series, 4);
+        assert_eq!(config.per_query_sample_scan_concurrency, 2);
     }
 }

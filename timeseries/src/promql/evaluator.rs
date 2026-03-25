@@ -123,6 +123,10 @@ pub(crate) struct EvalStats {
     pub(crate) sample_range_scan_series: u64,
     /// Total span (end - start + 1) across all scan chunks. Overread = span - series.
     pub(crate) sample_range_scan_span: u64,
+    /// Number of metric groups evaluated by the planner.
+    pub(crate) sample_range_scan_candidate_groups: u64,
+    /// Number of metric groups that failed planner criteria (fell back to point gets).
+    pub(crate) sample_range_scan_rejected_groups: u64,
 }
 
 /// Canonical key for caching selector results across steps.
@@ -275,6 +279,9 @@ struct BucketSampleStats {
     range_scan_chunks: u64,
     range_scan_series: u64,
     range_scan_span: u64,
+    // Planner diagnostics: how many metric groups were evaluated and rejected
+    range_scan_candidate_groups: u64,
+    range_scan_rejected_groups: u64,
 }
 
 /// Result of Phase B3 sample loading for one bucket.
@@ -339,10 +346,8 @@ fn plan_sample_load_strategy(
     let span = (sorted[sorted.len() - 1] - sorted[0] + 1) as f64;
     let density = sorted.len() as f64 / span;
 
-    let should_range_scan =
-        density >= config.range_scan_min_density || runs.len() <= config.range_scan_max_ranges;
-
-    if !should_range_scan {
+    // Density must meet threshold — run count alone does not qualify for scans.
+    if density < config.range_scan_min_density {
         return SampleLoadStrategy::PointGets;
     }
 
@@ -1649,10 +1654,12 @@ async fn process_bucket_sample_loads<R: QueryReader>(
         let series_ids: Vec<SeriesId> = group.iter().map(|(id, _)| *id).collect();
         let meta_map: HashMap<SeriesId, Arc<SeriesMeta>> = group.into_iter().collect();
         let strategy = plan_sample_load_strategy(&series_ids, &config);
+        stats.range_scan_candidate_groups += 1;
 
         match strategy {
             SampleLoadStrategy::PointGets => {
                 stats.point_get_groups += 1;
+                stats.range_scan_rejected_groups += 1;
                 // Existing point-get path: fan out individual gets with bounded concurrency.
                 let load_results: Vec<_> = futures::stream::iter(series_ids.into_iter())
                     .map(|series_id| {
@@ -2615,6 +2622,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 self.reader.stats.sample_range_scan_chunks += bs.range_scan_chunks;
                 self.reader.stats.sample_range_scan_series += bs.range_scan_series;
                 self.reader.stats.sample_range_scan_span += bs.range_scan_span;
+                self.reader.stats.sample_range_scan_candidate_groups +=
+                    bs.range_scan_candidate_groups;
+                self.reader.stats.sample_range_scan_rejected_groups +=
+                    bs.range_scan_rejected_groups;
 
                 *bucket_totals.entry(sr.bucket).or_default() += bs.bucket_ms;
 
@@ -7930,10 +7941,15 @@ mod tests {
         use super::super::*;
         use crate::config::SampleReadExperimentConfig;
 
-        fn default_enabled_config() -> SampleReadExperimentConfig {
+        /// Helper config: enabled with permissive thresholds for testing scan mechanics.
+        fn permissive_enabled_config() -> SampleReadExperimentConfig {
             SampleReadExperimentConfig {
                 enable_range_scan_batches: true,
-                ..SampleReadExperimentConfig::default()
+                range_scan_min_series: 4,
+                range_scan_min_density: 0.01,
+                range_scan_max_ranges: 10,
+                range_scan_merge_gap_series: 4,
+                per_query_sample_scan_concurrency: 2,
             }
         }
 
@@ -7942,7 +7958,7 @@ mod tests {
             let config = SampleReadExperimentConfig::default();
             assert!(!config.enable_range_scan_batches);
             // Even a large dense set should return PointGets when disabled.
-            let ids: Vec<SeriesId> = (100..200).collect();
+            let ids: Vec<SeriesId> = (100..300).collect();
             assert!(matches!(
                 plan_sample_load_strategy(&ids, &config),
                 SampleLoadStrategy::PointGets
@@ -7951,9 +7967,12 @@ mod tests {
 
         #[test]
         fn should_choose_point_gets_for_small_group() {
-            let config = default_enabled_config();
-            // Fewer than range_scan_min_series (16).
-            let ids: Vec<SeriesId> = (1..10).collect();
+            // With defaults (min_series=128), a 100-series dense group is too small.
+            let config = SampleReadExperimentConfig {
+                enable_range_scan_batches: true,
+                ..SampleReadExperimentConfig::default()
+            };
+            let ids: Vec<SeriesId> = (1..101).collect();
             assert!(matches!(
                 plan_sample_load_strategy(&ids, &config),
                 SampleLoadStrategy::PointGets
@@ -7961,43 +7980,60 @@ mod tests {
         }
 
         #[test]
-        fn should_choose_range_scans_for_dense_group() {
-            let config = default_enabled_config();
-            // 20 contiguous ids -> density = 1.0 >= 0.25.
-            let ids: Vec<SeriesId> = (100..120).collect();
+        fn should_choose_range_scans_for_large_dense_group() {
+            // 200 contiguous ids meets default thresholds (128 min, 0.8 density).
+            let config = SampleReadExperimentConfig {
+                enable_range_scan_batches: true,
+                ..SampleReadExperimentConfig::default()
+            };
+            let ids: Vec<SeriesId> = (100..300).collect();
             match plan_sample_load_strategy(&ids, &config) {
                 SampleLoadStrategy::RangeScans(chunks) => {
                     assert_eq!(chunks.len(), 1);
                     assert_eq!(chunks[0].start_series_id, 100);
-                    assert_eq!(chunks[0].end_series_id, 119);
-                    assert_eq!(chunks[0].wanted.len(), 20);
+                    assert_eq!(chunks[0].end_series_id, 299);
+                    assert_eq!(chunks[0].wanted.len(), 200);
                 }
                 SampleLoadStrategy::PointGets => panic!("expected RangeScans"),
             }
         }
 
         #[test]
-        fn should_choose_range_scans_when_run_count_is_low() {
+        fn should_reject_low_density_even_when_runs_fit_max_ranges() {
+            // 3 runs, each contiguous but widely spaced => low density.
+            // With old logic, run_count(3) <= max_ranges would trigger scans.
+            // New logic requires density >= threshold.
             let config = SampleReadExperimentConfig {
                 enable_range_scan_batches: true,
                 range_scan_min_series: 4,
-                range_scan_min_density: 0.9, // very high density threshold
+                range_scan_min_density: 0.8,
                 range_scan_max_ranges: 4,
                 ..SampleReadExperimentConfig::default()
             };
-            // 3 separate runs (each >= 2 contiguous) => 3 runs <= max_ranges(4).
-            // density will be low, but run_count check triggers.
             let ids: Vec<SeriesId> = vec![
                 10, 11, 12, // run 1
                 100, 101, 102, // run 2
                 200, 201, 202, // run 3
             ];
-            match plan_sample_load_strategy(&ids, &config) {
-                SampleLoadStrategy::RangeScans(chunks) => {
-                    assert_eq!(chunks.len(), 3);
-                }
-                SampleLoadStrategy::PointGets => panic!("expected RangeScans"),
-            }
+            // density = 9 / 193 ≈ 0.047, well below 0.8
+            assert!(matches!(
+                plan_sample_load_strategy(&ids, &config),
+                SampleLoadStrategy::PointGets
+            ));
+        }
+
+        #[test]
+        fn should_reject_small_group_even_when_contiguous() {
+            // 50 contiguous ids => density 1.0 but below min_series=128.
+            let config = SampleReadExperimentConfig {
+                enable_range_scan_batches: true,
+                ..SampleReadExperimentConfig::default()
+            };
+            let ids: Vec<SeriesId> = (1..51).collect();
+            assert!(matches!(
+                plan_sample_load_strategy(&ids, &config),
+                SampleLoadStrategy::PointGets
+            ));
         }
 
         #[test]
@@ -8008,10 +8044,9 @@ mod tests {
                 range_scan_min_density: 0.25,
                 range_scan_max_ranges: 3,
                 range_scan_merge_gap_series: 2,
-                ..SampleReadExperimentConfig::default()
+                per_query_sample_scan_concurrency: 2,
             };
-            // 8 singleton runs spread across a wide range -> density very low,
-            // run_count(8) > max_ranges(3).
+            // 8 singleton runs spread across a wide range -> density very low.
             let ids: Vec<SeriesId> = vec![10, 100, 200, 300, 400, 500, 600, 700];
             assert!(matches!(
                 plan_sample_load_strategy(&ids, &config),
@@ -8022,12 +8057,8 @@ mod tests {
         #[test]
         fn should_merge_adjacent_runs_with_small_gap() {
             let config = SampleReadExperimentConfig {
-                enable_range_scan_batches: true,
-                range_scan_min_series: 4,
-                range_scan_min_density: 0.01, // low threshold so density always passes
-                range_scan_max_ranges: 10,
                 range_scan_merge_gap_series: 5,
-                ..SampleReadExperimentConfig::default()
+                ..permissive_enabled_config()
             };
             // Two runs with gap of 3 (<=5), should merge into one chunk.
             let ids: Vec<SeriesId> = vec![
@@ -8051,25 +8082,18 @@ mod tests {
         #[test]
         fn should_merge_smallest_gaps_until_max_ranges_is_met() {
             let config = SampleReadExperimentConfig {
-                enable_range_scan_batches: true,
-                range_scan_min_series: 4,
-                range_scan_min_density: 0.01, // low threshold so density always passes
                 range_scan_max_ranges: 2,
                 range_scan_merge_gap_series: 1, // only merge gap=1 in first pass
-                ..SampleReadExperimentConfig::default()
+                ..permissive_enabled_config()
             };
             // 4 runs after initial merge pass (gaps all > 1):
             //   run1: [10,11]  gap=5  run2: [16,17]  gap=100  run3: [117,118]  gap=5  run4: [123,124]
             // Initial merge: no merges (all gaps > 1).
             // Need to reduce from 4 to 2: merge smallest gaps first.
-            // Gaps: 5, 100, 5. The two smallest are both 5.
-            // First merge picks the first gap=5 -> merge run1+run2 => [10..17], now 3 runs with gaps 100, 5.
-            // Second merge picks gap=5 -> merge run3+run4 => [117..124], now 2 runs. Done.
             let ids: Vec<SeriesId> = vec![10, 11, 16, 17, 117, 118, 123, 124];
             match plan_sample_load_strategy(&ids, &config) {
                 SampleLoadStrategy::RangeScans(chunks) => {
                     assert_eq!(chunks.len(), 2);
-                    // Chunk boundaries depend on merge order
                     assert_eq!(chunks[0].start_series_id, 10);
                     assert_eq!(chunks[0].end_series_id, 17);
                     assert_eq!(chunks[0].wanted.len(), 4);
@@ -8078,6 +8102,36 @@ mod tests {
                     assert_eq!(chunks[1].wanted.len(), 4);
                 }
                 SampleLoadStrategy::PointGets => panic!("expected RangeScans"),
+            }
+        }
+
+        #[test]
+        fn should_limit_dense_group_to_two_ranges_with_defaults() {
+            // Large dense group with a single gap — defaults allow max 2 ranges.
+            let config = SampleReadExperimentConfig {
+                enable_range_scan_batches: true,
+                ..SampleReadExperimentConfig::default()
+            };
+            // 200 ids split into two runs with a large gap.
+            let mut ids: Vec<SeriesId> = (100..200).collect(); // 100 ids
+            ids.extend(300..400); // another 100 ids, gap of 100
+            // density = 200/300 ≈ 0.667 < 0.8 default => PointGets
+            assert!(matches!(
+                plan_sample_load_strategy(&ids, &config),
+                SampleLoadStrategy::PointGets
+            ));
+
+            // But with lowered density threshold, two dense runs merge to max_ranges=2.
+            let config2 = SampleReadExperimentConfig {
+                enable_range_scan_batches: true,
+                range_scan_min_density: 0.5,
+                ..SampleReadExperimentConfig::default()
+            };
+            match plan_sample_load_strategy(&ids, &config2) {
+                SampleLoadStrategy::RangeScans(chunks) => {
+                    assert!(chunks.len() <= 2);
+                }
+                SampleLoadStrategy::PointGets => panic!("expected RangeScans with lowered density"),
             }
         }
     }

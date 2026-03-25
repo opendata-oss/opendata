@@ -318,9 +318,9 @@ async fn handle_query_range(
         "query_range",
         request_id = %request_id,
         query_hash = %query_hash,
+        query = %params.query,
         step_count = step_count,
     );
-    tracing::debug!(parent: &span, query = %params.query, "query_range request");
 
     let result = async {
         state
