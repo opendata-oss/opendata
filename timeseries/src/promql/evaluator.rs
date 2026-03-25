@@ -237,6 +237,7 @@ struct BucketResolutionStats {
 struct BucketSampleWorkItem {
     bucket: TimeBucket,
     to_load: Vec<(SeriesId, Arc<str>, Arc<SeriesMeta>)>,
+    config: SampleReadExperimentConfig,
 }
 
 /// Per-series data loaded by the B3 sample worker.
@@ -773,6 +774,8 @@ pub(crate) struct CachedQueryReader<'reader, R: QueryReader> {
     series_meta_cache: HashMap<(TimeBucket, SeriesId), Arc<SeriesMeta>>,
     /// Optional load coordinator for semaphore-based I/O budgeting.
     load_coordinator: Option<ReadLoadCoordinator>,
+    /// Sample-loading experiment config for B3 range-scan dispatch.
+    sample_read_config: SampleReadExperimentConfig,
 }
 
 impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
@@ -785,6 +788,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             selector_cache: HashMap::new(),
             series_meta_cache: HashMap::new(),
             load_coordinator: None,
+            sample_read_config: SampleReadExperimentConfig::default(),
         }
     }
 
@@ -1609,72 +1613,147 @@ async fn process_bucket_sample_loads<R: QueryReader>(
     const PER_QUERY_SAMPLE_CONCURRENCY: usize = 8;
     let bucket_start = std::time::Instant::now();
     let bucket = work.bucket;
+    let config = work.config;
 
-    // Compute per-metric distribution for experiment instrumentation
-    let max_series_per_metric = {
-        let mut metric_counts: HashMap<&str, u64> = HashMap::new();
-        for (_, metric_name, _) in &work.to_load {
-            *metric_counts.entry(metric_name.as_ref()).or_default() += 1;
-        }
-        metric_counts.values().copied().max().unwrap_or(0)
-    };
-    // Collect metric names for cross-bucket dedup at Phase C
-    let bucket_metric_names: Vec<Arc<str>> = work
-        .to_load
-        .iter()
-        .map(|(_, name, _)| Arc::clone(name))
-        .collect();
+    // Group to_load by metric_name for per-group strategy planning.
+    let mut metric_groups: HashMap<Arc<str>, Vec<(SeriesId, Arc<SeriesMeta>)>> = HashMap::new();
+    for (series_id, metric_name, meta) in work.to_load {
+        metric_groups
+            .entry(metric_name)
+            .or_default()
+            .push((series_id, meta));
+    }
 
-    let load_results: Vec<_> = futures::stream::iter(work.to_load.into_iter())
-        .map(|(series_id, metric_name, meta)| {
-            let coord = coordinator.clone();
-            async move {
-                let (wait_ms, _permit) = if let Some(ref c) = coord {
-                    let (permit, wait) = c.acquire_sample().await;
-                    (wait.as_millis() as u64, Some(permit))
-                } else {
-                    (0, None)
-                };
-                let locator = SampleLocator {
-                    bucket,
-                    metric_name,
-                    series_id,
-                };
-                let t0 = std::time::Instant::now();
-                let result = reader
-                    .samples_by_locator(&locator, i64::MIN, i64::MAX)
-                    .await;
-                let load_ms = t0.elapsed().as_millis() as u64;
-                drop(_permit);
-                (series_id, meta, result, wait_ms, load_ms)
-            }
-        })
-        .buffer_unordered(PER_QUERY_SAMPLE_CONCURRENCY)
-        .collect()
-        .await;
+    let max_series_per_metric = metric_groups
+        .values()
+        .map(|v| v.len() as u64)
+        .max()
+        .unwrap_or(0);
+    let bucket_metric_names: Vec<Arc<str>> = metric_groups.keys().cloned().collect();
 
     let mut stats = BucketSampleStats::default();
-    let mut series_data = Vec::with_capacity(load_results.len());
+    let mut series_data = Vec::new();
 
-    for (series_id, meta, result, wait_ms, load_ms) in load_results {
-        let all_samples = result.map_err(|e| EvaluationError::StorageError(e.to_string()))?;
+    // Process each metric group sequentially within this bucket.
+    for (metric_name, group) in metric_groups {
+        let series_ids: Vec<SeriesId> = group.iter().map(|(id, _)| *id).collect();
+        let meta_map: HashMap<SeriesId, Arc<SeriesMeta>> = group.into_iter().collect();
+        let strategy = plan_sample_load_strategy(&series_ids, &config);
 
-        stats.sample_misses += 1;
-        stats.sample_loads += 1;
-        stats.samples_loaded += all_samples.len() as u64;
-        stats.sample_queue_wait_ms += wait_ms;
-        stats.sample_load_ms += load_ms;
-        stats.sample_miss_ms += wait_ms + load_ms;
-        if coordinator.is_some() {
-            stats.sample_permit_acquires += 1;
+        match strategy {
+            SampleLoadStrategy::PointGets => {
+                // Existing point-get path: fan out individual gets with bounded concurrency.
+                let load_results: Vec<_> =
+                    futures::stream::iter(series_ids.into_iter())
+                        .map(|series_id| {
+                            let coord = coordinator.clone();
+                            let mn = Arc::clone(&metric_name);
+                            let meta = Arc::clone(&meta_map[&series_id]);
+                            async move {
+                                let (wait_ms, _permit) = if let Some(ref c) = coord {
+                                    let (permit, wait) = c.acquire_sample().await;
+                                    (wait.as_millis() as u64, Some(permit))
+                                } else {
+                                    (0, None)
+                                };
+                                let locator = SampleLocator {
+                                    bucket,
+                                    metric_name: mn,
+                                    series_id,
+                                };
+                                let t0 = std::time::Instant::now();
+                                let result = reader
+                                    .samples_by_locator(&locator, i64::MIN, i64::MAX)
+                                    .await;
+                                let load_ms = t0.elapsed().as_millis() as u64;
+                                drop(_permit);
+                                (series_id, meta, result, wait_ms, load_ms)
+                            }
+                        })
+                        .buffer_unordered(PER_QUERY_SAMPLE_CONCURRENCY)
+                        .collect()
+                        .await;
+
+                for (series_id, meta, result, wait_ms, load_ms) in load_results {
+                    let all_samples =
+                        result.map_err(|e| EvaluationError::StorageError(e.to_string()))?;
+                    stats.sample_misses += 1;
+                    stats.sample_loads += 1;
+                    stats.samples_loaded += all_samples.len() as u64;
+                    stats.sample_queue_wait_ms += wait_ms;
+                    stats.sample_load_ms += load_ms;
+                    stats.sample_miss_ms += wait_ms + load_ms;
+                    if coordinator.is_some() {
+                        stats.sample_permit_acquires += 1;
+                    }
+                    stats.parallel_sample_loads += 1;
+                    series_data.push(BucketSeriesData {
+                        series_id,
+                        meta,
+                        all_samples,
+                    });
+                }
+            }
+            SampleLoadStrategy::RangeScans(chunks) => {
+                // Range-scan path: bounded parallel scans per chunk.
+                let scan_concurrency = config.per_query_sample_scan_concurrency;
+                let scan_results: Vec<_> = futures::stream::iter(chunks.into_iter())
+                    .map(|chunk| {
+                        let coord = coordinator.clone();
+                        let mn = Arc::clone(&metric_name);
+                        async move {
+                            let (wait_ms, _permit) = if let Some(ref c) = coord {
+                                let (permit, wait) = c.acquire_sample().await;
+                                (wait.as_millis() as u64, Some(permit))
+                            } else {
+                                (0, None)
+                            };
+                            let t0 = std::time::Instant::now();
+                            let result = reader
+                                .metric_samples_range(
+                                    &bucket,
+                                    &mn,
+                                    chunk.start_series_id,
+                                    chunk.end_series_id,
+                                    &chunk.wanted,
+                                    i64::MIN,
+                                    i64::MAX,
+                                )
+                                .await;
+                            let load_ms = t0.elapsed().as_millis() as u64;
+                            drop(_permit);
+                            (result, wait_ms, load_ms, chunk.wanted.len() as u64)
+                        }
+                    })
+                    .buffer_unordered(scan_concurrency)
+                    .collect()
+                    .await;
+
+                for (result, wait_ms, load_ms, wanted_count) in scan_results {
+                    let chunk_results =
+                        result.map_err(|e| EvaluationError::StorageError(e.to_string()))?;
+                    stats.sample_loads += wanted_count;
+                    stats.sample_misses += wanted_count;
+                    stats.sample_queue_wait_ms += wait_ms;
+                    stats.sample_load_ms += load_ms;
+                    stats.sample_miss_ms += wait_ms + load_ms;
+                    if coordinator.is_some() {
+                        stats.sample_permit_acquires += 1;
+                    }
+                    stats.parallel_sample_loads += 1;
+                    for (series_id, all_samples) in chunk_results {
+                        stats.samples_loaded += all_samples.len() as u64;
+                        if let Some(meta) = meta_map.get(&series_id) {
+                            series_data.push(BucketSeriesData {
+                                series_id,
+                                meta: Arc::clone(meta),
+                                all_samples,
+                            });
+                        }
+                    }
+                }
+            }
         }
-        stats.parallel_sample_loads += 1;
-
-        series_data.push(BucketSeriesData {
-            series_id,
-            meta,
-            all_samples,
-        });
     }
 
     stats.bucket_ms = bucket_start.elapsed().as_millis() as u64;
@@ -1714,6 +1793,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             preloaded_instant: HashMap::new(),
             preload_eligible: true,
         }
+    }
+
+    /// Configure the sample-loading experiment (range-scan batching).
+    pub(crate) fn set_sample_read_config(&mut self, config: SampleReadExperimentConfig) {
+        self.reader.sample_read_config = config;
     }
 
     /// Access aggregated evaluation statistics.
@@ -2362,6 +2446,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                         sample_work_items.push(BucketSampleWorkItem {
                             bucket: *bucket,
                             to_load,
+                            config: self.reader.sample_read_config.clone(),
                         });
                     }
                 }
@@ -2459,6 +2544,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     sample_work_items.push(BucketSampleWorkItem {
                         bucket: res.bucket,
                         to_load,
+                        config: self.reader.sample_read_config.clone(),
                     });
                 }
             }

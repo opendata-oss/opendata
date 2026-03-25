@@ -11,7 +11,7 @@ use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 use tokio::sync::RwLock;
 use tracing::{Instrument, error};
 
-use crate::config::{SampleStorageLayout, TsdbRuntimeConfig};
+use crate::config::{SampleReadExperimentConfig, SampleStorageLayout, TsdbRuntimeConfig};
 use crate::error::QueryError;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::load_coordinator::ReadLoadCoordinator;
@@ -119,6 +119,11 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         None
     }
 
+    /// Optional sample-read experiment config for range-scan batching.
+    fn sample_read_config(&self) -> Option<SampleReadExperimentConfig> {
+        None
+    }
+
     // ── Provided: 5 default methods written once ──
 
     /// Evaluate an instant PromQL query, returning typed `InstantSample`s.
@@ -152,7 +157,14 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         let ranges = preload_ranges(&stmt, lookback_start_secs, query_time_secs);
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
-        evaluate_instant(&reader, stmt, query_time, self.load_coordinator()).await
+        evaluate_instant(
+            &reader,
+            stmt,
+            query_time,
+            self.load_coordinator(),
+            self.sample_read_config(),
+        )
+        .await
     }
 
     /// Evaluate a range PromQL query, returning typed `RangeSample`s.
@@ -187,7 +199,13 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
-        let (result, _stats) = evaluate_range(&reader, stmt, self.load_coordinator()).await?;
+        let (result, _stats) = evaluate_range(
+            &reader,
+            stmt,
+            self.load_coordinator(),
+            self.sample_read_config(),
+        )
+        .await?;
         Ok(result)
     }
 
@@ -278,12 +296,16 @@ pub(crate) async fn evaluate_instant(
     stmt: EvalStmt,
     query_time: std::time::SystemTime,
     coordinator: Option<&ReadLoadCoordinator>,
+    sample_read_config: Option<SampleReadExperimentConfig>,
 ) -> std::result::Result<QueryValue, QueryError> {
     let mut evaluator = if let Some(coord) = coordinator {
         Evaluator::with_coordinator(reader, coord.clone())
     } else {
         Evaluator::new(reader)
     };
+    if let Some(cfg) = sample_read_config {
+        evaluator.set_sample_read_config(cfg);
+    }
     let result = evaluator.evaluate(stmt).await?;
 
     match result {
@@ -326,6 +348,7 @@ pub(crate) async fn evaluate_range(
     reader: &impl QueryReader,
     stmt: EvalStmt,
     coordinator: Option<&ReadLoadCoordinator>,
+    sample_read_config: Option<SampleReadExperimentConfig>,
 ) -> std::result::Result<(Vec<RangeSample>, crate::promql::evaluator::EvalStats), QueryError> {
     let total_start = std::time::Instant::now();
     let start = stmt.start;
@@ -345,6 +368,9 @@ pub(crate) async fn evaluate_range(
     } else {
         Evaluator::new(reader)
     };
+    if let Some(cfg) = sample_read_config {
+        evaluator.set_sample_read_config(cfg);
+    }
 
     // Preload VectorSelector data for all steps
     let start_ms = start.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
@@ -1117,7 +1143,13 @@ impl Tsdb {
         let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
-        evaluate_range(&reader, stmt, self.load_coordinator()).await
+        evaluate_range(
+            &reader,
+            stmt,
+            self.load_coordinator(),
+            self.sample_read_config(),
+        )
+        .await
     }
 
     /// Return metadata for all (or a specific) metric.
@@ -1150,6 +1182,10 @@ impl TsdbReadEngine for Tsdb {
 
     fn load_coordinator(&self) -> Option<&ReadLoadCoordinator> {
         Some(&self.load_coordinator)
+    }
+
+    fn sample_read_config(&self) -> Option<SampleReadExperimentConfig> {
+        Some(self.runtime_config.sample_read_experiment.clone())
     }
 }
 
