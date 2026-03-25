@@ -2,7 +2,7 @@
 
 use rand::Rng;
 
-use crate::distance;
+use crate::math::distance;
 use crate::serde::collection_meta::DistanceMetric;
 
 /// Trait for splitting a set of vectors into two clusters.

@@ -1,8 +1,26 @@
-use crate::delta::{VectorDbWrite, VectorWrite};
+use crate::AttributeValue;
 use common::coordinator::Delta;
 use std::any::Any;
 use std::sync::Arc;
 use tracing::debug;
+
+pub(crate) enum VectorDbWrite {
+    Write(Vec<VectorWrite>),
+}
+
+/// A vector write ready for the coordinator.
+///
+/// The write path validates and enqueues this struct.
+/// The delta handles ID allocation, dictionary lookup, centroid assignment, and updates.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VectorWrite {
+    /// User-provided external ID.
+    pub(crate) external_id: String,
+    /// Vector embedding values.
+    pub(crate) values: Vec<f32>,
+    /// All attributes including the vector field.
+    pub(crate) attributes: Vec<(String, AttributeValue)>,
+}
 
 /// Mutable delta that accumulates writes and builds RecordOps.
 ///
@@ -32,9 +50,6 @@ impl Delta for VectorDbWriteDelta {
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         match write {
             VectorDbWrite::Write(writes) => self.apply_write(writes),
-            VectorDbWrite::Rebalance(_cmd) => {
-                panic!("no rebalance commands in batched write")
-            }
         }
     }
 

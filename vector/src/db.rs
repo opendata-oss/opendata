@@ -12,10 +12,6 @@
 //! - Flusher applies ops atomically to storage
 
 use crate::VectorDbReader;
-use crate::batched::delta::VectorDbWriteDelta;
-use crate::batched::flusher::VectorDbFlusher;
-use crate::batched::indexer::{Indexer, IndexerOpts};
-use crate::delta::{VectorDbWrite, VectorWrite};
 use crate::error::{Error, Result};
 use crate::hnsw::{CentroidGraph, build_centroid_graph};
 use crate::model::{
@@ -26,6 +22,9 @@ use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::key::SeqBlockKey;
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
+use crate::write::delta::{VectorDbWrite, VectorDbWriteDelta, VectorWrite};
+use crate::write::flusher::VectorDbFlusher;
+use crate::write::indexer::{Indexer, IndexerOpts};
 use async_trait::async_trait;
 use common::SequenceAllocator;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};

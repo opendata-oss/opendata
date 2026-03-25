@@ -1,11 +1,12 @@
 use crate::error::{Error, Result};
 use crate::hnsw::CentroidGraph;
+use crate::math::distance;
 use crate::model::{FieldSelection, Filter, Query, SearchResult};
 use crate::serde::collection_meta::DistanceMetric;
 use crate::serde::posting_list::PostingList;
 use crate::serde::vector_data::VectorDataValue;
 use crate::storage::VectorDbStorageReadExt;
-use crate::{Attribute, Vector, distance};
+use crate::{Attribute, Vector};
 use common::storage::StorageRead;
 use roaring::RoaringTreemap;
 use std::cmp::Reverse;

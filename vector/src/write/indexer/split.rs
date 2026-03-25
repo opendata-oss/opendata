@@ -1,13 +1,12 @@
-use crate::batched::indexer::IndexerOpts;
-use crate::batched::indexer::drivers::AsyncBatchDriver;
-use crate::batched::indexer::state::{
-    DirtyCentroidGraph, VectorIndexDelta, VectorIndexState, VectorIndexView,
-};
-use crate::lire::commands::SplitPostings;
-use crate::lire::{heuristics, kmeans};
+use crate::math::{distance, heuristics, kmeans};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::posting_list::{Posting, PostingList};
-use crate::{DistanceMetric, Result, distance};
+use crate::write::indexer::IndexerOpts;
+use crate::write::indexer::drivers::AsyncBatchDriver;
+use crate::write::indexer::state::{
+    DirtyCentroidGraph, VectorIndexDelta, VectorIndexState, VectorIndexView,
+};
+use crate::{DistanceMetric, Result};
 use common::StorageRead;
 use futures::future::BoxFuture;
 use rayon::iter::IntoParallelIterator;
@@ -23,6 +22,28 @@ pub(crate) struct ReassignVector {
     pub(crate) vector_id: u64,
     pub(crate) vector: Vec<f32>,
     pub(crate) current_centroid: u64,
+}
+
+pub(crate) struct SplitPostings {
+    centroid_vec: Vec<f32>,
+    postings: PostingList,
+}
+
+impl SplitPostings {
+    pub(crate) fn new(centroid_vec: Vec<f32>, postings: PostingList) -> Self {
+        Self {
+            centroid_vec,
+            postings,
+        }
+    }
+
+    pub(crate) fn centroid_vec(&self) -> &[f32] {
+        &self.centroid_vec
+    }
+
+    pub(crate) fn postings(self) -> PostingList {
+        self.postings
+    }
 }
 
 struct SplitResult {
@@ -359,10 +380,10 @@ impl SplitCentroid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batched::indexer::IndexerOpts;
-    use crate::batched::indexer::test_utils::IndexerOpTestHarness;
     use crate::serde::centroid_chunk::CentroidEntry;
     use crate::storage::VectorDbStorageReadExt;
+    use crate::write::indexer::IndexerOpts;
+    use crate::write::indexer::test_utils::IndexerOpTestHarness;
     use common::StorageRead;
 
     const DIMS: usize = 2;

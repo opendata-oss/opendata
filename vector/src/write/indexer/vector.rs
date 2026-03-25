@@ -1,13 +1,13 @@
 use crate::Error::Internal;
 use crate::Result;
-use crate::batched::indexer::IndexerOpts;
-use crate::batched::indexer::drivers::AsyncBatchDriver;
-use crate::batched::indexer::split::ReassignVector;
-use crate::batched::indexer::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
-use crate::delta::VectorWrite;
 use crate::model::VECTOR_FIELD_NAME;
 use crate::serde::FieldValue;
 use crate::serde::vector_data::VectorDataValue;
+use crate::write::delta::VectorWrite;
+use crate::write::indexer::IndexerOpts;
+use crate::write::indexer::drivers::AsyncBatchDriver;
+use crate::write::indexer::split::ReassignVector;
+use crate::write::indexer::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use common::StorageRead;
 use futures::future::BoxFuture;
 use rayon::iter::IntoParallelIterator;
@@ -158,7 +158,7 @@ impl WriteVectors {
 
     fn assign_centroids(
         writes: Vec<(String, Vec<f32>)>,
-        centroid_graph: Arc<crate::batched::indexer::state::DirtyCentroidGraph>,
+        centroid_graph: Arc<crate::write::indexer::state::DirtyCentroidGraph>,
     ) -> Result<HashMap<String, u64>> {
         let assignments: Vec<_> = writes
             .into_par_iter()
@@ -293,11 +293,11 @@ impl ReassignVectors {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batched::indexer::test_utils::IndexerOpTestHarness;
     use crate::model::AttributeValue;
     use crate::serde::collection_meta::DistanceMetric;
     use crate::serde::vector_data::Field;
     use crate::storage::VectorDbStorageReadExt;
+    use crate::write::indexer::test_utils::IndexerOpTestHarness;
     use std::collections::HashSet;
 
     const DIMS: usize = 3;
