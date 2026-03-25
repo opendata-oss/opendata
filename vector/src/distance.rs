@@ -134,6 +134,7 @@ pub fn bench_l2_distance_runtime(a: &[f32], b: &[f32]) -> f32 {
     l2_distance(a, b)
 }
 
+#[allow(clippy::needless_return)]
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub fn bench_l2_distance_avx_available() -> bool {
