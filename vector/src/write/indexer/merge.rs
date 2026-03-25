@@ -1,8 +1,8 @@
 use crate::Result;
-use crate::batched::indexer::IndexerOpts;
-use crate::batched::indexer::drivers::AsyncBatchDriver;
-use crate::batched::indexer::split::ReassignVector;
-use crate::batched::indexer::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
+use crate::write::indexer::IndexerOpts;
+use crate::write::indexer::drivers::AsyncBatchDriver;
+use crate::write::indexer::split::ReassignVector;
+use crate::write::indexer::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use crate::serde::posting_list::PostingList;
 use common::StorageRead;
 use futures::future::BoxFuture;
@@ -90,8 +90,8 @@ impl MergeCentroids {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batched::indexer::IndexerOpts;
-    use crate::batched::indexer::test_utils::IndexerOpTestHarness;
+    use crate::write::indexer::IndexerOpts;
+    use crate::write::indexer::test_utils::IndexerOpTestHarness;
     use crate::serde::centroid_chunk::CentroidEntry;
     use crate::serde::collection_meta::DistanceMetric;
     use crate::storage::VectorDbStorageReadExt;

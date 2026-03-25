@@ -33,14 +33,14 @@ fn make_random_dataset(seed: u64) -> Vec<f32> {
 fn score_dataset_scalar(query: &[f32], dataset: &[f32]) -> f32 {
     dataset
         .chunks_exact(DIMENSIONS)
-        .map(|candidate| vector::distance::bench_l2_distance_scalar(query, candidate))
+        .map(|candidate| vector::math::distance::bench_l2_distance_scalar(query, candidate))
         .sum()
 }
 
 fn score_dataset_avx(query: &[f32], dataset: &[f32]) -> Option<f32> {
     let mut sum = 0.0;
     for candidate in dataset.chunks_exact(DIMENSIONS) {
-        sum += vector::distance::bench_l2_distance_avx(query, candidate)?;
+        sum += vector::math::distance::bench_l2_distance_avx(query, candidate)?;
     }
     Some(sum)
 }
@@ -48,14 +48,14 @@ fn score_dataset_avx(query: &[f32], dataset: &[f32]) -> Option<f32> {
 fn score_dataset_rayon(query: &[f32], dataset: &[f32]) -> f32 {
     dataset
         .par_chunks_exact(DIMENSIONS)
-        .map(|candidate| vector::distance::bench_l2_distance_runtime(query, candidate))
+        .map(|candidate| vector::math::distance::bench_l2_distance_runtime(query, candidate))
         .sum()
 }
 
 fn score_dataset_rayon_scalar(query: &[f32], dataset: &[f32]) -> f32 {
     dataset
         .par_chunks_exact(DIMENSIONS)
-        .map(|candidate| vector::distance::bench_l2_distance_scalar(query, candidate))
+        .map(|candidate| vector::math::distance::bench_l2_distance_scalar(query, candidate))
         .sum()
 }
 
@@ -72,7 +72,7 @@ fn bench_l2_distance_single_pair(c: &mut Criterion) {
         &(&a, &b),
         |bench, (lhs, rhs)| {
             bench.iter(|| {
-                black_box(vector::distance::bench_l2_distance_scalar(
+                black_box(vector::math::distance::bench_l2_distance_scalar(
                     black_box(lhs),
                     black_box(rhs),
                 ))
@@ -80,14 +80,14 @@ fn bench_l2_distance_single_pair(c: &mut Criterion) {
         },
     );
 
-    if vector::distance::bench_l2_distance_avx_available() {
+    if vector::math::distance::bench_l2_distance_avx_available() {
         group.bench_with_input(
             BenchmarkId::new("avx", "avx_on"),
             &(&a, &b),
             |bench, (lhs, rhs)| {
                 bench.iter(|| {
                     black_box(
-                        vector::distance::bench_l2_distance_avx(black_box(lhs), black_box(rhs))
+                        vector::math::distance::bench_l2_distance_avx(black_box(lhs), black_box(rhs))
                             .expect("AVX benchmark should only run when AVX is available"),
                     )
                 })
@@ -119,7 +119,7 @@ fn bench_l2_distance_dataset(c: &mut Criterion) {
         },
     );
 
-    if vector::distance::bench_l2_distance_avx_available() {
+    if vector::math::distance::bench_l2_distance_avx_available() {
         group.bench_with_input(
             BenchmarkId::new("avx", "avx_on"),
             &(&query, &dataset),

@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::RwLock;
 
-use crate::distance::{VectorDistance, compute_distance};
+use crate::math::distance::{VectorDistance, compute_distance};
 use crate::error::{Error, Result};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::collection_meta::DistanceMetric;

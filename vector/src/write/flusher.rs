@@ -1,5 +1,5 @@
-use crate::batched::delta::{VectorDbDeltaView, VectorDbWriteDelta};
-use crate::batched::indexer::Indexer;
+use crate::write::delta::{VectorDbDeltaView, VectorDbWriteDelta};
+use crate::write::indexer::Indexer;
 use async_trait::async_trait;
 use common::Storage;
 use common::coordinator::Flusher;
@@ -83,9 +83,9 @@ impl VectorDbFlusher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batched::delta::VectorDbDeltaView;
-    use crate::batched::indexer::{Indexer, IndexerOpts};
-    use crate::batched::delta::VectorWrite;
+    use crate::write::delta::VectorDbDeltaView;
+    use crate::write::indexer::{Indexer, IndexerOpts};
+    use crate::write::delta::VectorWrite;
     use crate::hnsw::build_centroid_graph;
     use crate::model::AttributeValue;
     use crate::serde::centroid_chunk::CentroidEntry;

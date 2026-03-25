@@ -1,12 +1,12 @@
-use crate::batched::indexer::IndexerOpts;
-use crate::batched::indexer::drivers::AsyncBatchDriver;
-use crate::batched::indexer::state::{
+use crate::write::indexer::IndexerOpts;
+use crate::write::indexer::drivers::AsyncBatchDriver;
+use crate::write::indexer::state::{
     DirtyCentroidGraph, VectorIndexDelta, VectorIndexState, VectorIndexView,
 };
-use crate::lire::{heuristics, kmeans};
+use crate::math::{distance, heuristics, kmeans};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::posting_list::{Posting, PostingList};
-use crate::{DistanceMetric, Result, distance};
+use crate::{DistanceMetric, Result};
 use common::StorageRead;
 use futures::future::BoxFuture;
 use rayon::iter::IntoParallelIterator;
@@ -380,8 +380,8 @@ impl SplitCentroid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batched::indexer::IndexerOpts;
-    use crate::batched::indexer::test_utils::IndexerOpTestHarness;
+    use crate::write::indexer::IndexerOpts;
+    use crate::write::indexer::test_utils::IndexerOpTestHarness;
     use crate::serde::centroid_chunk::CentroidEntry;
     use crate::storage::VectorDbStorageReadExt;
     use common::StorageRead;

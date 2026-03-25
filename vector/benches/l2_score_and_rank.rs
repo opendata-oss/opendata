@@ -32,7 +32,7 @@ fn score_and_rank_scalar(query: &[f32], dataset: &[f32]) -> Vec<(u32, f32)> {
         .map(|(idx, candidate)| {
             (
                 idx as u32,
-                vector::distance::bench_l2_distance_scalar(query, candidate),
+                vector::math::distance::bench_l2_distance_scalar(query, candidate),
             )
         })
         .collect();
@@ -48,7 +48,7 @@ fn score_and_rank_avx(query: &[f32], dataset: &[f32]) -> Option<Vec<(u32, f32)>>
         .map(|(idx, candidate)| {
             Ok::<_, ()>((
                 idx as u32,
-                vector::distance::bench_l2_distance_avx(query, candidate).ok_or(())?,
+                vector::math::distance::bench_l2_distance_avx(query, candidate).ok_or(())?,
             ))
         })
         .collect::<Result<_, _>>()
@@ -65,7 +65,7 @@ fn score_and_rank_rayon(query: &[f32], dataset: &[f32]) -> Vec<(u32, f32)> {
         .map(|(idx, candidate)| {
             (
                 idx as u32,
-                vector::distance::bench_l2_distance_runtime(query, candidate),
+                vector::math::distance::bench_l2_distance_runtime(query, candidate),
             )
         })
         .collect();
@@ -81,7 +81,7 @@ fn score_and_rank_rayon_scalar(query: &[f32], dataset: &[f32]) -> Vec<(u32, f32)
         .map(|(idx, candidate)| {
             (
                 idx as u32,
-                vector::distance::bench_l2_distance_scalar(query, candidate),
+                vector::math::distance::bench_l2_distance_scalar(query, candidate),
             )
         })
         .collect();
@@ -111,7 +111,7 @@ fn bench_l2_score_and_rank(c: &mut Criterion) {
         },
     );
 
-    if vector::distance::bench_l2_distance_avx_available() {
+    if vector::math::distance::bench_l2_distance_avx_available() {
         group.bench_with_input(
             BenchmarkId::new("avx", "avx_on"),
             &(&query, &dataset),

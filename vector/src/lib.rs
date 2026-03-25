@@ -32,10 +32,9 @@
 //! ```
 
 pub mod db;
-pub mod distance;
 pub(crate) mod error;
 pub mod hnsw;
-pub(crate) mod lire;
+pub mod math;
 pub mod model;
 pub(crate) mod query_engine;
 pub mod reader;
@@ -44,7 +43,7 @@ pub mod serde;
 pub mod server;
 pub(crate) mod storage;
 
-mod batched;
+pub(crate) mod write;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
