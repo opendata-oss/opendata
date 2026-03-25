@@ -6,13 +6,13 @@
 use crate::serde::collection_meta::DistanceMetric;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
-    _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
-    _mm256_sub_ps,
+    _mm256_add_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps,
+    _mm256_storeu_ps, _mm256_sub_ps,
 };
 #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 use std::arch::x86_64::{
-    _mm512_add_ps, _mm512_loadu_ps, _mm512_mul_ps, _mm512_setzero_ps, _mm512_storeu_ps,
-    _mm512_sub_ps,
+    _mm512_add_ps, _mm512_fmadd_ps, _mm512_loadu_ps, _mm512_mul_ps, _mm512_setzero_ps,
+    _mm512_storeu_ps, _mm512_sub_ps,
 };
 use std::cmp::Ordering;
 
@@ -68,6 +68,11 @@ fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     {
+        if std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: AVX and FMA support are checked at runtime before calling the FMA variant.
+            return unsafe { l2_distance_avx_fma(a, b) };
+        }
+
         if std::is_x86_feature_detected!("avx") {
             // SAFETY: AVX support is checked at runtime before calling the AVX variant.
             return unsafe { l2_distance_avx(a, b) };
@@ -168,6 +173,11 @@ pub fn bench_l2_distance_avx(a: &[f32], b: &[f32]) -> Option<f32> {
 
     #[cfg(target_arch = "x86_64")]
     {
+        if std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: AVX and FMA support are checked at runtime before calling the FMA variant.
+            return Some(unsafe { l2_distance_avx_fma(a, b) });
+        }
+
         if std::is_x86_feature_detected!("avx") {
             // SAFETY: AVX support is checked at runtime before calling the AVX variant.
             return Some(unsafe { l2_distance_avx(a, b) });
@@ -190,13 +200,43 @@ unsafe fn l2_distance_avx512(a: &[f32], b: &[f32]) -> f32 {
         // SAFETY: `idx + 16 <= len` guarantees each load reads 16 initialized `f32`s.
         let rhs = unsafe { _mm512_loadu_ps(b.as_ptr().add(idx)) };
         let diff = _mm512_sub_ps(lhs, rhs);
-        acc = _mm512_add_ps(acc, _mm512_mul_ps(diff, diff));
+        acc = _mm512_fmadd_ps(diff, diff, acc);
         idx += 16;
     }
 
     let mut lanes = [0.0; 16];
     // SAFETY: `lanes` is a valid contiguous buffer for 16 `f32`s.
     unsafe { _mm512_storeu_ps(lanes.as_mut_ptr(), acc) };
+
+    let mut sum = lanes.into_iter().sum::<f32>();
+    for (x, y) in a[idx..].iter().zip(&b[idx..]) {
+        let diff = x - y;
+        sum += diff * diff;
+    }
+
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,fma")]
+unsafe fn l2_distance_avx_fma(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = _mm256_setzero_ps();
+    let mut idx = 0;
+    let len = a.len();
+
+    while idx + 8 <= len {
+        // SAFETY: `idx + 8 <= len` guarantees each load reads 8 initialized `f32`s.
+        let lhs = unsafe { _mm256_loadu_ps(a.as_ptr().add(idx)) };
+        // SAFETY: `idx + 8 <= len` guarantees each load reads 8 initialized `f32`s.
+        let rhs = unsafe { _mm256_loadu_ps(b.as_ptr().add(idx)) };
+        let diff = _mm256_sub_ps(lhs, rhs);
+        acc = _mm256_fmadd_ps(diff, diff, acc);
+        idx += 8;
+    }
+
+    let mut lanes = [0.0; 8];
+    // SAFETY: `lanes` is a valid contiguous buffer for 8 `f32`s.
+    unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), acc) };
 
     let mut sum = lanes.into_iter().sum::<f32>();
     for (x, y) in a[idx..].iter().zip(&b[idx..]) {
@@ -393,6 +433,26 @@ mod tests {
 
         // then
         assert!((scalar - avx).abs() < 1e-5);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn should_match_scalar_l2_distance_with_avx_fma() {
+        if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
+            return;
+        }
+
+        // given
+        let a: Vec<f32> = (0..29).map(|i| (i as f32 * 0.25) - 2.0).collect();
+        let b: Vec<f32> = (0..29).map(|i| ((i % 7) as f32 * 1.5) - 1.0).collect();
+
+        // when
+        let scalar = l2_distance_scalar(&a, &b);
+        // SAFETY: AVX and FMA support are checked above for this test process.
+        let avx_fma = unsafe { l2_distance_avx_fma(&a, &b) };
+
+        // then
+        assert!((scalar - avx_fma).abs() < 1e-5);
     }
 
     #[cfg(target_arch = "x86_64")]
