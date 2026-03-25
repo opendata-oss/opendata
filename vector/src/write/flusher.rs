@@ -83,9 +83,6 @@ impl VectorDbFlusher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::write::delta::VectorDbDeltaView;
-    use crate::write::indexer::{Indexer, IndexerOpts};
-    use crate::write::delta::VectorWrite;
     use crate::hnsw::build_centroid_graph;
     use crate::model::AttributeValue;
     use crate::serde::centroid_chunk::CentroidEntry;
@@ -93,6 +90,9 @@ mod tests {
     use crate::serde::key::{IdDictionaryKey, VectorDataKey};
     use crate::serde::vector_data::VectorDataValue;
     use crate::storage::merge_operator::VectorDbMergeOperator;
+    use crate::write::delta::VectorDbDeltaView;
+    use crate::write::delta::VectorWrite;
+    use crate::write::indexer::{Indexer, IndexerOpts};
     use common::coordinator::Flusher;
     use common::storage::in_memory::{FailingStorage, InMemoryStorage};
     use common::{SequenceAllocator, Storage};

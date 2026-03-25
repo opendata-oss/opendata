@@ -8,12 +8,12 @@ mod vector;
 
 use crate::DistanceMetric;
 use crate::Result;
+use crate::hnsw::CentroidGraph;
+use crate::write::delta::VectorWrite;
 use crate::write::indexer::merge::MergeCentroids;
 use crate::write::indexer::split::SplitCentroids;
 use crate::write::indexer::state::{CentroidChunkManager, VectorIndexDelta, VectorIndexState};
 use crate::write::indexer::vector::{ReassignVectors, WriteVectors};
-use crate::write::delta::VectorWrite;
-use crate::hnsw::CentroidGraph;
 use bytes::Bytes;
 use common::StorageRead;
 use common::sequence::AllocatedSeqBlock;

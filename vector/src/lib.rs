@@ -43,9 +43,9 @@ pub mod serde;
 pub mod server;
 pub(crate) mod storage;
 
-pub(crate) mod write;
 #[cfg(test)]
 pub(crate) mod test_utils;
+pub(crate) mod write;
 
 // Public API exports
 pub use db::{VectorDb, VectorDbRead};

@@ -87,8 +87,11 @@ fn bench_l2_distance_single_pair(c: &mut Criterion) {
             |bench, (lhs, rhs)| {
                 bench.iter(|| {
                     black_box(
-                        vector::math::distance::bench_l2_distance_avx(black_box(lhs), black_box(rhs))
-                            .expect("AVX benchmark should only run when AVX is available"),
+                        vector::math::distance::bench_l2_distance_avx(
+                            black_box(lhs),
+                            black_box(rhs),
+                        )
+                        .expect("AVX benchmark should only run when AVX is available"),
                     )
                 })
             },

@@ -1,8 +1,8 @@
+use crate::AttributeValue;
 use common::coordinator::Delta;
 use std::any::Any;
 use std::sync::Arc;
 use tracing::debug;
-use crate::AttributeValue;
 
 pub(crate) enum VectorDbWrite {
     Write(Vec<VectorWrite>),

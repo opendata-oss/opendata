@@ -1,12 +1,12 @@
-use crate::write::indexer::IndexerOpts;
-use crate::write::indexer::state::{CentroidChunkManager, VectorIndexDelta, VectorIndexState};
-use crate::write::indexer::vector::WriteVectors;
-use crate::write::delta::VectorWrite;
 use crate::hnsw::build_centroid_graph;
 use crate::model::AttributeValue;
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::collection_meta::DistanceMetric;
 use crate::storage::merge_operator::VectorDbMergeOperator;
+use crate::write::delta::VectorWrite;
+use crate::write::indexer::IndexerOpts;
+use crate::write::indexer::state::{CentroidChunkManager, VectorIndexDelta, VectorIndexState};
+use crate::write::indexer::vector::WriteVectors;
 use common::storage::in_memory::InMemoryStorage;
 use common::{SequenceAllocator, Storage, StorageRead};
 use std::collections::HashMap;
