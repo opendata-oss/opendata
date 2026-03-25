@@ -1,7 +1,7 @@
 use crate::batched::indexer::IndexerOpts;
 use crate::batched::indexer::state::{CentroidChunkManager, VectorIndexDelta, VectorIndexState};
 use crate::batched::indexer::vector::WriteVectors;
-use crate::delta::VectorWrite;
+use crate::batched::delta::VectorWrite;
 use crate::hnsw::build_centroid_graph;
 use crate::model::AttributeValue;
 use crate::serde::centroid_chunk::CentroidEntry;

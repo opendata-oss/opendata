@@ -85,7 +85,7 @@ mod tests {
     use super::*;
     use crate::batched::delta::VectorDbDeltaView;
     use crate::batched::indexer::{Indexer, IndexerOpts};
-    use crate::delta::VectorWrite;
+    use crate::batched::delta::VectorWrite;
     use crate::hnsw::build_centroid_graph;
     use crate::model::AttributeValue;
     use crate::serde::centroid_chunk::CentroidEntry;

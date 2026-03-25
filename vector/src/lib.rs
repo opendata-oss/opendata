@@ -32,10 +32,8 @@
 //! ```
 
 pub mod db;
-pub mod delta;
 pub mod distance;
 pub(crate) mod error;
-pub mod flusher;
 pub mod hnsw;
 pub(crate) mod lire;
 pub mod model;
@@ -45,7 +43,6 @@ pub mod serde;
 #[cfg(feature = "http-server")]
 pub mod server;
 pub(crate) mod storage;
-pub(crate) mod view_reader;
 
 mod batched;
 #[cfg(test)]

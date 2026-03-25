@@ -12,7 +12,7 @@ use crate::batched::indexer::merge::MergeCentroids;
 use crate::batched::indexer::split::SplitCentroids;
 use crate::batched::indexer::state::{CentroidChunkManager, VectorIndexDelta, VectorIndexState};
 use crate::batched::indexer::vector::{ReassignVectors, WriteVectors};
-use crate::delta::VectorWrite;
+use crate::batched::delta::VectorWrite;
 use crate::hnsw::CentroidGraph;
 use bytes::Bytes;
 use common::StorageRead;

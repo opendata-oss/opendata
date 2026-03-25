@@ -4,7 +4,7 @@ use crate::batched::indexer::IndexerOpts;
 use crate::batched::indexer::drivers::AsyncBatchDriver;
 use crate::batched::indexer::split::ReassignVector;
 use crate::batched::indexer::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
-use crate::delta::VectorWrite;
+use crate::batched::delta::VectorWrite;
 use crate::model::VECTOR_FIELD_NAME;
 use crate::serde::FieldValue;
 use crate::serde::vector_data::VectorDataValue;

@@ -53,10 +53,6 @@ impl Posting {
     pub(crate) fn vector(&self) -> &[f32] {
         self.vector.as_slice()
     }
-
-    pub(crate) fn unpack(self) -> (u64, Vec<f32>) {
-        (self.id, self.vector)
-    }
 }
 
 pub(crate) type PostingList = Vec<Posting>;
