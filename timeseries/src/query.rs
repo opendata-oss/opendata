@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -108,6 +109,35 @@ pub(crate) trait QueryReader: Send + Sync {
     ) -> Result<Vec<Sample>> {
         self.samples(&locator.bucket, locator.series_id, start_ms, end_ms)
             .await
+    }
+
+    /// Scan a series_id range within a (bucket, metric_name) group and return
+    /// decoded samples for only the wanted series IDs.
+    #[allow(clippy::too_many_arguments)]
+    async fn metric_samples_range(
+        &self,
+        bucket: &TimeBucket,
+        metric_name: &str,
+        _start_series_id: SeriesId,
+        _end_series_id: SeriesId,
+        wanted: &BTreeSet<SeriesId>,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<(SeriesId, Vec<Sample>)>> {
+        // Default: fall back to individual point gets
+        let mut results = Vec::new();
+        for &sid in wanted {
+            let locator = SampleLocator {
+                bucket: *bucket,
+                metric_name: Arc::from(metric_name),
+                series_id: sid,
+            };
+            let samples = self.samples_by_locator(&locator, start_ms, end_ms).await?;
+            if !samples.is_empty() {
+                results.push((sid, samples));
+            }
+        }
+        Ok(results)
     }
 }
 

@@ -405,6 +405,32 @@ impl MetricTimeSeriesKey {
         terminated_bytes::serialize(metric_name.as_bytes(), &mut buf);
         BytesRange::prefix(buf.freeze())
     }
+
+    /// Create a BytesRange covering a specific series_id range within a metric and bucket.
+    /// Both start and end are inclusive: [start_series_id, end_series_id].
+    pub fn series_range(
+        bucket: &crate::model::TimeBucket,
+        metric_name: &str,
+        start_series_id: SeriesId,
+        end_series_id: SeriesId,
+    ) -> BytesRange {
+        use std::ops::Bound::Included;
+
+        let encode_key = |series_id: SeriesId| -> Bytes {
+            let mut buf = BytesMut::new();
+            RecordType::MetricTimeSeries
+                .prefix_with_bucket_size(bucket.size)
+                .write_to(&mut buf);
+            buf.extend_from_slice(&bucket.start.to_be_bytes());
+            terminated_bytes::serialize(metric_name.as_bytes(), &mut buf);
+            buf.extend_from_slice(&series_id.to_be_bytes());
+            buf.freeze()
+        };
+
+        let start = encode_key(start_series_id);
+        let end = encode_key(end_series_id);
+        BytesRange::new(Included(start), Included(end))
+    }
 }
 
 impl RecordKey for MetricTimeSeriesKey {
@@ -694,6 +720,97 @@ mod tests {
         assert!(enc_a < enc_b, "same metric: lower series_id should sort first");
         // different metric: ordered lexicographically by metric name
         assert!(enc_b < enc_c, "cpu_usage should sort before mem_usage");
+    }
+
+    #[test]
+    fn should_create_series_range_containing_bounded_series_ids() {
+        // given
+        let bucket = crate::model::TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let key_inside_low = MetricTimeSeriesKey {
+            time_bucket: 100,
+            bucket_size: 1,
+            metric_name: "cpu_usage".to_string(),
+            series_id: 10,
+        };
+        let key_inside_mid = MetricTimeSeriesKey {
+            time_bucket: 100,
+            bucket_size: 1,
+            metric_name: "cpu_usage".to_string(),
+            series_id: 15,
+        };
+        let key_inside_high = MetricTimeSeriesKey {
+            time_bucket: 100,
+            bucket_size: 1,
+            metric_name: "cpu_usage".to_string(),
+            series_id: 20,
+        };
+        let key_below = MetricTimeSeriesKey {
+            time_bucket: 100,
+            bucket_size: 1,
+            metric_name: "cpu_usage".to_string(),
+            series_id: 5,
+        };
+        let key_above = MetricTimeSeriesKey {
+            time_bucket: 100,
+            bucket_size: 1,
+            metric_name: "cpu_usage".to_string(),
+            series_id: 25,
+        };
+        let key_diff_metric = MetricTimeSeriesKey {
+            time_bucket: 100,
+            bucket_size: 1,
+            metric_name: "mem_usage".to_string(),
+            series_id: 15,
+        };
+
+        // when
+        let range = MetricTimeSeriesKey::series_range(&bucket, "cpu_usage", 10, 20);
+
+        // then
+        assert!(range.contains(&key_inside_low.encode()), "start boundary should be included");
+        assert!(range.contains(&key_inside_mid.encode()), "mid-range should be included");
+        assert!(range.contains(&key_inside_high.encode()), "end boundary should be included");
+        assert!(!range.contains(&key_below.encode()), "below range should be excluded");
+        assert!(!range.contains(&key_above.encode()), "above range should be excluded");
+        assert!(!range.contains(&key_diff_metric.encode()), "different metric should be excluded");
+    }
+
+    #[test]
+    fn should_create_series_range_for_single_id() {
+        // given
+        let bucket = crate::model::TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let key_exact = MetricTimeSeriesKey {
+            time_bucket: 100,
+            bucket_size: 1,
+            metric_name: "cpu_usage".to_string(),
+            series_id: 42,
+        };
+        let key_below = MetricTimeSeriesKey {
+            time_bucket: 100,
+            bucket_size: 1,
+            metric_name: "cpu_usage".to_string(),
+            series_id: 41,
+        };
+        let key_above = MetricTimeSeriesKey {
+            time_bucket: 100,
+            bucket_size: 1,
+            metric_name: "cpu_usage".to_string(),
+            series_id: 43,
+        };
+
+        // when - start == end
+        let range = MetricTimeSeriesKey::series_range(&bucket, "cpu_usage", 42, 42);
+
+        // then
+        assert!(range.contains(&key_exact.encode()), "exact ID should be included");
+        assert!(!range.contains(&key_below.encode()), "ID below should be excluded");
+        assert!(!range.contains(&key_above.encode()), "ID above should be excluded");
     }
 
     #[test]

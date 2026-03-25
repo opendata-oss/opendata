@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use async_trait::async_trait;
 use common::storage::RecordOp;
 use common::{Record, Storage, StorageRead};
@@ -292,6 +294,54 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
             }
             None => Ok(Vec::new()),
         }
+    }
+
+    /// Scan a series_id range within a (bucket, metric_name) group.
+    /// Decodes keys and sample values, filters to `wanted` set, returns typed results.
+    #[tracing::instrument(level = "trace", skip_all)]
+    #[allow(clippy::too_many_arguments)]
+    async fn get_metric_samples_series_range(
+        &self,
+        bucket: &TimeBucket,
+        metric_name: &str,
+        start_series_id: SeriesId,
+        end_series_id: SeriesId,
+        wanted: &BTreeSet<SeriesId>,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<(SeriesId, Vec<Sample>)>> {
+        let range = MetricTimeSeriesKey::series_range(
+            bucket,
+            metric_name,
+            start_series_id,
+            end_series_id,
+        );
+        let records = self.scan(range).await?;
+
+        let mut results = Vec::new();
+        for record in records {
+            let key = MetricTimeSeriesKey::decode(record.key.as_ref())?;
+            if !wanted.contains(&key.series_id) {
+                continue;
+            }
+
+            let iter = TimeSeriesIterator::new(record.value.as_ref()).ok_or_else(|| {
+                crate::error::Error::Internal(
+                    "Invalid timeseries data in metric-prefixed storage".into(),
+                )
+            })?;
+
+            let samples: Vec<Sample> = iter
+                .filter_map(|r| r.ok())
+                .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
+                .collect();
+
+            if !samples.is_empty() {
+                results.push((key.series_id, samples));
+            }
+        }
+
+        Ok(results)
     }
 
     /// Warm the bucket list by reading it from storage. Returns the list of
@@ -759,5 +809,158 @@ mod tests {
         // then - only timestamp 2000 is in (1000, 2500]
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].timestamp_ms, 2000);
+    }
+
+    // ── series range scan tests ───────────────────────────────────────
+
+    /// Insert metric-prefixed samples for a given metric, series_id, and bucket.
+    async fn insert_metric_samples(
+        storage: &InMemoryStorage,
+        bucket: TimeBucket,
+        metric_name: &str,
+        series_id: SeriesId,
+        samples: Vec<Sample>,
+    ) {
+        let op = storage
+            .merge_metric_samples(bucket, metric_name, series_id, samples)
+            .unwrap();
+        match op {
+            common::storage::RecordOp::Merge(record) => {
+                storage.merge(vec![record]).await.unwrap();
+            }
+            _ => panic!("expected Merge op"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_scan_metric_series_range_and_return_matching_series() {
+        // given
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let bucket = TimeBucket::hour(60);
+
+        insert_metric_samples(
+            &storage, bucket, "cpu", 10,
+            vec![Sample { timestamp_ms: 1000, value: 1.0 }],
+        ).await;
+        insert_metric_samples(
+            &storage, bucket, "cpu", 11,
+            vec![Sample { timestamp_ms: 1000, value: 2.0 }],
+        ).await;
+        insert_metric_samples(
+            &storage, bucket, "cpu", 12,
+            vec![Sample { timestamp_ms: 1000, value: 3.0 }],
+        ).await;
+
+        // when
+        let wanted: BTreeSet<SeriesId> = [10, 11, 12].into_iter().collect();
+        let result = storage
+            .get_metric_samples_series_range(&bucket, "cpu", 10, 12, &wanted, i64::MIN, i64::MAX)
+            .await
+            .unwrap();
+
+        // then
+        assert_eq!(result.len(), 3);
+        let ids: Vec<SeriesId> = result.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&10));
+        assert!(ids.contains(&11));
+        assert!(ids.contains(&12));
+    }
+
+    #[tokio::test]
+    async fn should_filter_out_unwanted_series_inside_scanned_range() {
+        // given
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let bucket = TimeBucket::hour(60);
+
+        insert_metric_samples(
+            &storage, bucket, "cpu", 10,
+            vec![Sample { timestamp_ms: 1000, value: 1.0 }],
+        ).await;
+        insert_metric_samples(
+            &storage, bucket, "cpu", 11,
+            vec![Sample { timestamp_ms: 1000, value: 2.0 }],
+        ).await;
+        insert_metric_samples(
+            &storage, bucket, "cpu", 12,
+            vec![Sample { timestamp_ms: 1000, value: 3.0 }],
+        ).await;
+
+        // when - wanted excludes series 11
+        let wanted: BTreeSet<SeriesId> = [10, 12].into_iter().collect();
+        let result = storage
+            .get_metric_samples_series_range(&bucket, "cpu", 10, 12, &wanted, i64::MIN, i64::MAX)
+            .await
+            .unwrap();
+
+        // then
+        assert_eq!(result.len(), 2);
+        let ids: Vec<SeriesId> = result.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&10));
+        assert!(ids.contains(&12));
+        assert!(!ids.contains(&11));
+    }
+
+    #[tokio::test]
+    async fn should_return_empty_for_missing_range() {
+        // given
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let bucket = TimeBucket::hour(60);
+
+        insert_metric_samples(
+            &storage, bucket, "cpu", 10,
+            vec![Sample { timestamp_ms: 1000, value: 1.0 }],
+        ).await;
+
+        // when - scan range [20, 30] which has no data
+        let wanted: BTreeSet<SeriesId> = [20, 25, 30].into_iter().collect();
+        let result = storage
+            .get_metric_samples_series_range(&bucket, "cpu", 20, 30, &wanted, i64::MIN, i64::MAX)
+            .await
+            .unwrap();
+
+        // then
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_only_scan_requested_series_id_interval() {
+        // given
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let bucket = TimeBucket::hour(60);
+
+        insert_metric_samples(
+            &storage, bucket, "cpu", 5,
+            vec![Sample { timestamp_ms: 1000, value: 0.5 }],
+        ).await;
+        insert_metric_samples(
+            &storage, bucket, "cpu", 10,
+            vec![Sample { timestamp_ms: 1000, value: 1.0 }],
+        ).await;
+        insert_metric_samples(
+            &storage, bucket, "cpu", 15,
+            vec![Sample { timestamp_ms: 1000, value: 1.5 }],
+        ).await;
+
+        // when - scan range [10, 15], wanted={10, 15}
+        let wanted: BTreeSet<SeriesId> = [10, 15].into_iter().collect();
+        let result = storage
+            .get_metric_samples_series_range(&bucket, "cpu", 10, 15, &wanted, i64::MIN, i64::MAX)
+            .await
+            .unwrap();
+
+        // then - only 10 and 15 returned, not 5
+        assert_eq!(result.len(), 2);
+        let ids: Vec<SeriesId> = result.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&10));
+        assert!(ids.contains(&15));
+        assert!(!ids.contains(&5));
     }
 }

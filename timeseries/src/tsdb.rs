@@ -1262,6 +1262,26 @@ impl QueryReader for TsdbQueryReader {
             }
         }
     }
+
+    async fn metric_samples_range(
+        &self,
+        bucket: &TimeBucket,
+        metric_name: &str,
+        start_series_id: SeriesId,
+        end_series_id: SeriesId,
+        wanted: &std::collections::BTreeSet<SeriesId>,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<(SeriesId, Vec<Sample>)>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.snapshot()
+            .get_metric_samples_series_range(
+                bucket, metric_name, start_series_id, end_series_id, wanted, start_ms, end_ms,
+            )
+            .await
+    }
 }
 
 #[cfg(test)]
