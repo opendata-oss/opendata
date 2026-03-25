@@ -51,6 +51,7 @@ mod metadata_warmer;
 mod minitsdb;
 mod promql;
 mod query;
+mod query_io;
 mod serde;
 #[cfg(feature = "http-server")]
 mod server;

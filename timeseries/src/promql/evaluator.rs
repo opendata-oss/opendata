@@ -17,6 +17,7 @@ use crate::promql::functions::{FunctionCallContext, FunctionRegistry, PromQLArg}
 use crate::promql::selector::{evaluate_selector_raw, evaluate_selector_with_reader};
 use crate::promql::timestamp::Timestamp;
 use crate::query::{QueryReader, SampleLocator};
+use crate::query_io::QueryIoStats;
 use crate::util::Result;
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::*;
@@ -115,6 +116,8 @@ pub(crate) struct EvalStats {
     // Metric-prefixed layout experiment instrumentation
     pub(crate) sample_distinct_metrics: u64,
     pub(crate) sample_series_per_metric_max: u64,
+    // Per-query physical I/O stats (populated from task-local collector)
+    pub(crate) io: QueryIoStats,
 }
 
 /// Canonical key for caching selector results across steps.

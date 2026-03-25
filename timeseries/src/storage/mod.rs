@@ -10,6 +10,7 @@ use crate::serde::timeseries::{TimeSeriesIterator, TimeSeriesValue};
 use crate::{
     index::ForwardIndex,
     model::Label,
+    query_io::{self, ReadKind},
     serde::{
         TimeBucketScoped,
         bucket_list::BucketListValue,
@@ -50,6 +51,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
 
         let key = BucketListKey.encode();
         let record = self.get(key).await?;
+        query_io::record_get(ReadKind::BucketList, &record);
         let bucket_list = match record {
             Some(record) => BucketListValue::decode(record.value.as_ref())?,
             None => BucketListValue {
@@ -93,6 +95,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
 
         let key = BucketListKey.encode();
         let record = self.get(key).await?;
+        query_io::record_get(ReadKind::BucketList, &record);
         let bucket_list = match record {
             Some(record) => BucketListValue::decode(record.value.as_ref())?,
             None => {
@@ -127,6 +130,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
     async fn get_forward_index(&self, bucket: TimeBucket) -> Result<ForwardIndex> {
         let range = ForwardIndexKey::bucket_range(&bucket);
         let records = self.scan(range).await?;
+        query_io::record_scan(ReadKind::ForwardIndex, &records);
 
         let forward_index = ForwardIndex::default();
         for record in records {
@@ -142,6 +146,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
     async fn get_inverted_index(&self, bucket: TimeBucket) -> Result<InvertedIndex> {
         let range = InvertedIndexKey::bucket_range(&bucket);
         let records = self.scan(range).await?;
+        query_io::record_scan(ReadKind::InvertedIndex, &records);
 
         let inverted_index = InvertedIndex::default();
         for record in records {
@@ -175,7 +180,9 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
                 value: term.value.clone(),
             }
             .encode();
-            if let Some(record) = self.get(key).await? {
+            let record = self.get(key).await?;
+            query_io::record_get(ReadKind::InvertedIndex, &record);
+            if let Some(record) = record {
                 let value = InvertedIndexValue::decode(record.value.as_ref())?;
                 result.postings.insert(term.clone(), value.postings);
             }
@@ -198,7 +205,9 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
                 series_id,
             }
             .encode();
-            if let Some(record) = self.get(key).await? {
+            let record = self.get(key).await?;
+            query_io::record_get(ReadKind::ForwardIndex, &record);
+            if let Some(record) = record {
                 let value = ForwardIndexValue::decode(record.value.as_ref())?;
                 result.series.insert(series_id, value.into());
             }
@@ -276,6 +285,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         .encode();
 
         let record = self.get(key).await?;
+        query_io::record_get(ReadKind::SampleMetricGet, &record);
         match record {
             Some(record) => {
                 let iter = TimeSeriesIterator::new(record.value.as_ref()).ok_or_else(|| {

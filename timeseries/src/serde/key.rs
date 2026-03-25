@@ -393,10 +393,7 @@ impl MetricTimeSeriesKey {
     }
 
     /// Create a BytesRange covering all series for a given metric within a bucket.
-    pub fn metric_range(
-        bucket: &crate::model::TimeBucket,
-        metric_name: &str,
-    ) -> BytesRange {
+    pub fn metric_range(bucket: &crate::model::TimeBucket, metric_name: &str) -> BytesRange {
         let mut buf = BytesMut::new();
         RecordType::MetricTimeSeries
             .prefix_with_bucket_size(bucket.size)
@@ -691,7 +688,10 @@ mod tests {
         let enc_c = key_c.encode();
 
         // then - same metric: ordered by series_id
-        assert!(enc_a < enc_b, "same metric: lower series_id should sort first");
+        assert!(
+            enc_a < enc_b,
+            "same metric: lower series_id should sort first"
+        );
         // different metric: ordered lexicographically by metric name
         assert!(enc_b < enc_c, "cpu_usage should sort before mem_usage");
     }

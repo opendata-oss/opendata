@@ -23,6 +23,7 @@ use crate::model::{
 use crate::promql::evaluator::{CachedQueryReader, Evaluator, ExprResult, compute_preload_ranges};
 use crate::promql::selector::evaluate_selector_with_reader;
 use crate::query::{BucketQueryReader, QueryReader, SampleLocator};
+use crate::query_io::{self, QueryIoCollector};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::util::Result;
 
@@ -339,78 +340,98 @@ pub(crate) async fn evaluate_range(
         ));
     }
 
-    let mut series_map: HashMap<Labels, Vec<(i64, f64)>> = HashMap::new();
-    let mut evaluator = if let Some(coord) = coordinator {
-        Evaluator::with_coordinator(reader, coord.clone())
-    } else {
-        Evaluator::new(reader)
-    };
+    // Install per-query I/O collector for physical byte tracking
+    let io_collector = QueryIoCollector::new();
 
-    // Preload VectorSelector data for all steps
-    let start_ms = start.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-    let end_ms = end.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-    let step_ms = step.as_millis() as i64;
-    let lookback_delta_ms = lookback_delta.as_millis() as i64;
-
-    let preload_span = tracing::info_span!("preload_for_range");
-    evaluator
-        .preload_for_range(&stmt.expr, start_ms, end_ms, step_ms, lookback_delta_ms)
-        .instrument(preload_span)
-        .await?;
-
-    let step_loop_start = std::time::Instant::now();
-    let mut current_time = start;
-    let mut step_count: u64 = 0;
-
-    while current_time <= end {
-        let instant_stmt = EvalStmt {
-            expr: stmt.expr.clone(),
-            start: current_time,
-            end: current_time,
-            interval: Duration::from_secs(0),
-            lookback_delta,
+    type EvalInner = (
+        HashMap<Labels, Vec<(i64, f64)>>,
+        u64,
+        crate::promql::evaluator::EvalStats,
+    );
+    let eval_result: std::result::Result<EvalInner, QueryError> =
+        query_io::run_with_collector(&io_collector, async {
+        let mut series_map: HashMap<Labels, Vec<(i64, f64)>> = HashMap::new();
+        let mut evaluator = if let Some(coord) = coordinator {
+            Evaluator::with_coordinator(reader, coord.clone())
+        } else {
+            Evaluator::new(reader)
         };
 
-        let result = evaluator.evaluate(instant_stmt).await?;
-        let timestamp_ms = current_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+        // Preload VectorSelector data for all steps
+        let start_ms = start.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+        let end_ms = end.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+        let step_ms = step.as_millis() as i64;
+        let lookback_delta_ms = lookback_delta.as_millis() as i64;
 
-        match result {
-            ExprResult::InstantVector(samples) => {
-                for sample in samples {
-                    let labels = sample.labels.into_labels();
+        let preload_span = tracing::info_span!("preload_for_range");
+        evaluator
+            .preload_for_range(&stmt.expr, start_ms, end_ms, step_ms, lookback_delta_ms)
+            .instrument(preload_span)
+            .await?;
+
+        let step_loop_start = std::time::Instant::now();
+        let mut current_time = start;
+        let mut step_count: u64 = 0;
+
+        while current_time <= end {
+            let instant_stmt = EvalStmt {
+                expr: stmt.expr.clone(),
+                start: current_time,
+                end: current_time,
+                interval: Duration::from_secs(0),
+                lookback_delta,
+            };
+
+            let result = evaluator.evaluate(instant_stmt).await?;
+            let timestamp_ms = current_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+
+            match result {
+                ExprResult::InstantVector(samples) => {
+                    for sample in samples {
+                        let labels = sample.labels.into_labels();
+                        series_map
+                            .entry(labels)
+                            .or_default()
+                            .push((sample.timestamp_ms, sample.value));
+                    }
+                }
+                ExprResult::Scalar(value) => {
+                    let labels = Labels::empty();
                     series_map
                         .entry(labels)
                         .or_default()
-                        .push((sample.timestamp_ms, sample.value));
+                        .push((timestamp_ms, value));
+                }
+                ExprResult::RangeVector(_) => {
+                    return Err(QueryError::Execution(
+                        "range vectors not supported in range query evaluation".to_string(),
+                    ));
                 }
             }
-            ExprResult::Scalar(value) => {
-                let labels = Labels::empty();
-                series_map
-                    .entry(labels)
-                    .or_default()
-                    .push((timestamp_ms, value));
-            }
-            ExprResult::RangeVector(_) => {
-                return Err(QueryError::Execution(
-                    "range vectors not supported in range query evaluation".to_string(),
-                ));
-            }
+
+            step_count += 1;
+            current_time += step;
         }
 
-        step_count += 1;
-        current_time += step;
-    }
+        let step_loop_ms = step_loop_start.elapsed().as_millis() as u64;
+        let mut stats = evaluator.into_stats();
+        stats.step_loop_ms = step_loop_ms;
+        Ok((series_map, step_count, stats))
+    })
+    .await;
 
-    let step_loop_ms = step_loop_start.elapsed().as_millis() as u64;
+    let (series_map, step_count, mut stats) = eval_result?;
 
-    let stats = evaluator.stats();
+    // Capture physical I/O stats from the collector
+    stats.io = io_collector.snapshot();
+    let io = &stats.io;
+
     tracing::info!(
         step_count,
         total_ms = total_start.elapsed().as_millis() as u64,
         // Phase timing
         preload_ms = stats.preload_ms,
-        step_loop_ms,
+        step_loop_ms = stats.step_loop_ms,
         // Existing counters
         list_buckets_calls = stats.list_buckets_calls,
         list_buckets_misses = stats.list_buckets_misses,
@@ -455,11 +476,21 @@ pub(crate) async fn evaluate_range(
         sample_distinct_metrics = stats.sample_distinct_metrics,
         sample_series_per_metric_max = stats.sample_series_per_metric_max,
         sample_logical_bytes = stats.samples_loaded * 16,
+        // Physical I/O stats
+        io_bucket_list_bytes = io.bucket_list_bytes,
+        io_inverted_index_bytes = io.inverted_index_bytes,
+        io_inverted_index_records = io.inverted_index_records,
+        io_forward_index_bytes = io.forward_index_bytes,
+        io_forward_index_records = io.forward_index_records,
+        io_sample_get_bytes = io.sample_get_bytes,
+        io_sample_get_records = io.sample_get_records,
+        io_sample_metric_get_bytes = io.sample_metric_get_bytes,
+        io_sample_metric_get_records = io.sample_metric_get_records,
+        io_metadata_bytes = io.metadata_bytes(),
+        io_sample_bytes = io.sample_bytes(),
+        io_physical_bytes_total = io.physical_bytes_total(),
         "evaluate_range complete"
     );
-
-    let mut stats = evaluator.into_stats();
-    stats.step_loop_ms = step_loop_ms;
 
     let result: Vec<RangeSample> = series_map
         .into_iter()
@@ -889,7 +920,10 @@ impl Tsdb {
             readers.push((bucket, reader));
         }
 
-        Ok(TsdbQueryReader::new(readers, self.runtime_config.sample_storage_layout))
+        Ok(TsdbQueryReader::new(
+            readers,
+            self.runtime_config.sample_storage_layout,
+        ))
     }
 
     /// Create a QueryReader for a set of disjoint time ranges.
@@ -908,7 +942,10 @@ impl Tsdb {
             readers.push((bucket, reader));
         }
 
-        Ok(TsdbQueryReader::new(readers, self.runtime_config.sample_storage_layout))
+        Ok(TsdbQueryReader::new(
+            readers,
+            self.runtime_config.sample_storage_layout,
+        ))
     }
 
     /// Flush all dirty buckets to durable storage.
@@ -1245,10 +1282,7 @@ impl QueryReader for TsdbQueryReader {
             }
             SampleStorageLayout::MetricPrefixed => {
                 let mini = self.mini_readers.get(&locator.bucket).ok_or_else(|| {
-                    crate::error::Error::Internal(format!(
-                        "Bucket {:?} not found",
-                        locator.bucket
-                    ))
+                    crate::error::Error::Internal(format!("Bucket {:?} not found", locator.bucket))
                 })?;
                 mini.snapshot()
                     .get_metric_samples(
@@ -2293,11 +2327,21 @@ mod tests {
         let bucket1 = TimeBucket::hour(60);
         let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
         mini1
-            .ingest(&create_sample("http_requests", vec![("env", "prod")], 3_900_000, 10.0))
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod")],
+                3_900_000,
+                10.0,
+            ))
             .await
             .unwrap();
         mini1
-            .ingest(&create_sample("http_requests", vec![("env", "staging")], 3_900_000, 20.0))
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging")],
+                3_900_000,
+                20.0,
+            ))
             .await
             .unwrap();
 
@@ -2305,11 +2349,21 @@ mod tests {
         let bucket2 = TimeBucket::hour(120);
         let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
         mini2
-            .ingest(&create_sample("http_requests", vec![("env", "prod")], 7_500_000, 30.0))
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod")],
+                7_500_000,
+                30.0,
+            ))
             .await
             .unwrap();
         mini2
-            .ingest(&create_sample("http_requests", vec![("env", "staging")], 7_500_000, 40.0))
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging")],
+                7_500_000,
+                40.0,
+            ))
             .await
             .unwrap();
 
@@ -2339,9 +2393,109 @@ mod tests {
 
         // env=staging
         assert_eq!(results[1].labels.get("env"), Some("staging"));
-        assert!(!results[1].samples.is_empty(), "staging should have samples");
+        assert!(
+            !results[1].samples.is_empty(),
+            "staging should have samples"
+        );
         let staging_last = results[1].samples.last().unwrap();
         assert_approx_eq(staging_last.1, 40.0);
+    }
+
+    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
+    async fn evaluate_range_should_capture_physical_io_stats(storage: Arc<dyn Storage>) {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // given: metric-prefixed layout with data in one bucket
+        let config = TsdbRuntimeConfig {
+            sample_storage_layout: SampleStorageLayout::MetricPrefixed,
+            ..Default::default()
+        };
+        let tsdb = Tsdb::with_runtime_config(storage, config);
+
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+        for i in 0..5 {
+            mini.ingest(&create_sample(
+                "cpu",
+                vec![("host", &format!("h{i}"))],
+                4_000_000,
+                i as f64,
+            ))
+            .await
+            .unwrap();
+        }
+        tsdb.flush().await.unwrap();
+
+        // when: run evaluate_range
+        let reader = tsdb.query_reader(3600, 7200).await.unwrap();
+        let expr = promql_parser::parser::parse("cpu").unwrap();
+        let stmt = EvalStmt {
+            expr,
+            start: UNIX_EPOCH + Duration::from_secs(4000),
+            end: UNIX_EPOCH + Duration::from_secs(4060),
+            interval: Duration::from_secs(15),
+            lookback_delta: Duration::from_secs(300),
+        };
+
+        let (_result, stats) = evaluate_range(&reader, stmt, None).await.unwrap();
+
+        // then: IO stats should be populated
+        let io = &stats.io;
+
+        // Note: bucket list reads happen during query_reader() construction,
+        // before the collector is installed in evaluate_range(). That's fine —
+        // the bucket list is a single small get. The interesting data is below.
+
+        // Inverted index: should have loaded terms for __name__=cpu
+        assert!(
+            io.inverted_index_records > 0,
+            "expected inverted_index_records > 0"
+        );
+        assert!(
+            io.inverted_index_bytes > 0,
+            "expected inverted_index_bytes > 0"
+        );
+
+        // Forward index: should have loaded 5 series entries
+        assert!(
+            io.forward_index_records >= 5,
+            "expected forward_index_records >= 5, got {}",
+            io.forward_index_records
+        );
+        assert!(
+            io.forward_index_bytes > 0,
+            "expected forward_index_bytes > 0"
+        );
+
+        // Sample metric-prefixed gets: 5 series
+        assert!(
+            io.sample_metric_get_records >= 5,
+            "expected sample_metric_get_records >= 5, got {}",
+            io.sample_metric_get_records
+        );
+        assert!(
+            io.sample_metric_get_bytes > 0,
+            "expected sample_metric_get_bytes > 0"
+        );
+
+        // Derived totals
+        assert!(io.physical_bytes_total() > 0);
+        assert!(io.metadata_bytes() > 0);
+        assert!(io.sample_bytes() > 0);
+        assert_eq!(
+            io.physical_bytes_total(),
+            io.metadata_bytes() + io.sample_bytes()
+        );
+
+        // Logical vs physical: sample_logical_bytes should be less than physical
+        let sample_logical_bytes = stats.samples_loaded * 16;
+        assert!(sample_logical_bytes > 0, "expected samples_loaded > 0");
+        assert!(
+            io.sample_bytes() > sample_logical_bytes,
+            "physical sample bytes ({}) should exceed logical ({})",
+            io.sample_bytes(),
+            sample_logical_bytes,
+        );
     }
 
     #[storage_test(merge_operator = OpenTsdbMergeOperator)]
