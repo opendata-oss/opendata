@@ -109,6 +109,16 @@ pub(crate) trait QueryReader: Send + Sync {
         self.samples(&locator.bucket, locator.series_id, start_ms, end_ms)
             .await
     }
+
+    /// Warm the block cache for all sample records of a single metric within
+    /// a bucket. Returns logical bytes touched. Default: no-op (0 bytes).
+    async fn warm_metric_samples_bytes(
+        &self,
+        _bucket: &TimeBucket,
+        _metric_name: &str,
+    ) -> Result<u64> {
+        Ok(0)
+    }
 }
 
 #[cfg(any(test, feature = "bench-internals"))]

@@ -33,8 +33,10 @@ impl common::storage::MergeOperator for OpenTsdbMergeOperator {
         match record_type {
             RecordType::InvertedIndex => merge_batch_inverted_index(existing_value, operands)
                 .expect("Failed to batch merge inverted index"),
-            RecordType::TimeSeries | RecordType::MetricTimeSeries => merge_batch_time_series(existing_value, operands)
-                .expect("Failed to batch merge time series"),
+            RecordType::TimeSeries | RecordType::MetricTimeSeries => {
+                merge_batch_time_series(existing_value, operands)
+                    .expect("Failed to batch merge time series")
+            }
             RecordType::BucketList => merge_batch_bucket_list(existing_value, operands)
                 .expect("Failed to batch merge bucket list"),
             _ => {
@@ -915,16 +917,28 @@ mod tests {
 
         let existing = TimeSeriesValue {
             points: vec![
-                Sample { timestamp_ms: 1000, value: 10.0 },
-                Sample { timestamp_ms: 2000, value: 20.0 },
+                Sample {
+                    timestamp_ms: 1000,
+                    value: 10.0,
+                },
+                Sample {
+                    timestamp_ms: 2000,
+                    value: 20.0,
+                },
             ],
         }
         .encode()
         .unwrap();
         let new = TimeSeriesValue {
             points: vec![
-                Sample { timestamp_ms: 3000, value: 30.0 },
-                Sample { timestamp_ms: 4000, value: 40.0 },
+                Sample {
+                    timestamp_ms: 3000,
+                    value: 30.0,
+                },
+                Sample {
+                    timestamp_ms: 4000,
+                    value: 40.0,
+                },
             ],
         }
         .encode()

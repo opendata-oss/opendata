@@ -176,6 +176,7 @@ impl TimeSeriesHttpServer {
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.port));
         tracing::info!(
             sample_storage_layout = ?self.tsdb.runtime_config.sample_storage_layout,
+            sample_prefetch_metric_prefix_before_get = self.tsdb.runtime_config.sample_read_experiment.prefetch_metric_prefix_before_get,
             "Starting Prometheus-compatible server on {}", addr
         );
 

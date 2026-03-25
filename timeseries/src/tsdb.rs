@@ -119,6 +119,11 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         None
     }
 
+    /// Whether to prefetch metric prefix before parallel sample gets.
+    fn prefetch_metric_prefix(&self) -> bool {
+        false
+    }
+
     // ── Provided: 5 default methods written once ──
 
     /// Evaluate an instant PromQL query, returning typed `InstantSample`s.
@@ -187,7 +192,13 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
-        let (result, _stats) = evaluate_range(&reader, stmt, self.load_coordinator()).await?;
+        let (result, _stats) = evaluate_range(
+            &reader,
+            stmt,
+            self.load_coordinator(),
+            self.prefetch_metric_prefix(),
+        )
+        .await?;
         Ok(result)
     }
 
@@ -326,6 +337,7 @@ pub(crate) async fn evaluate_range(
     reader: &impl QueryReader,
     stmt: EvalStmt,
     coordinator: Option<&ReadLoadCoordinator>,
+    prefetch_metric_prefix: bool,
 ) -> std::result::Result<(Vec<RangeSample>, crate::promql::evaluator::EvalStats), QueryError> {
     let total_start = std::time::Instant::now();
     let start = stmt.start;
@@ -344,7 +356,8 @@ pub(crate) async fn evaluate_range(
         Evaluator::with_coordinator(reader, coord.clone())
     } else {
         Evaluator::new(reader)
-    };
+    }
+    .with_prefetch_metric_prefix(prefetch_metric_prefix);
 
     // Preload VectorSelector data for all steps
     let start_ms = start.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
@@ -455,6 +468,12 @@ pub(crate) async fn evaluate_range(
         sample_distinct_metrics = stats.sample_distinct_metrics,
         sample_series_per_metric_max = stats.sample_series_per_metric_max,
         sample_logical_bytes = stats.samples_loaded * 16,
+        // Metric-prefix prefetch experiment
+        sample_prefetch_enabled = stats.sample_prefetch_enabled,
+        sample_metric_groups = stats.sample_metric_groups,
+        sample_metric_prefetch_groups = stats.sample_metric_prefetch_groups,
+        sample_metric_prefetch_bytes = stats.sample_metric_prefetch_bytes,
+        sample_metric_prefetch_ms = stats.sample_metric_prefetch_ms,
         "evaluate_range complete"
     );
 
@@ -889,7 +908,10 @@ impl Tsdb {
             readers.push((bucket, reader));
         }
 
-        Ok(TsdbQueryReader::new(readers, self.runtime_config.sample_storage_layout))
+        Ok(TsdbQueryReader::new(
+            readers,
+            self.runtime_config.sample_storage_layout,
+        ))
     }
 
     /// Create a QueryReader for a set of disjoint time ranges.
@@ -908,7 +930,10 @@ impl Tsdb {
             readers.push((bucket, reader));
         }
 
-        Ok(TsdbQueryReader::new(readers, self.runtime_config.sample_storage_layout))
+        Ok(TsdbQueryReader::new(
+            readers,
+            self.runtime_config.sample_storage_layout,
+        ))
     }
 
     /// Flush all dirty buckets to durable storage.
@@ -1116,8 +1141,12 @@ impl Tsdb {
 
         let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
+        let prefetch = self
+            .runtime_config
+            .sample_read_experiment
+            .prefetch_metric_prefix_before_get;
 
-        evaluate_range(&reader, stmt, self.load_coordinator()).await
+        evaluate_range(&reader, stmt, self.load_coordinator(), prefetch).await
     }
 
     /// Return metadata for all (or a specific) metric.
@@ -1150,6 +1179,12 @@ impl TsdbReadEngine for Tsdb {
 
     fn load_coordinator(&self) -> Option<&ReadLoadCoordinator> {
         Some(&self.load_coordinator)
+    }
+
+    fn prefetch_metric_prefix(&self) -> bool {
+        self.runtime_config
+            .sample_read_experiment
+            .prefetch_metric_prefix_before_get
     }
 }
 
@@ -1245,10 +1280,7 @@ impl QueryReader for TsdbQueryReader {
             }
             SampleStorageLayout::MetricPrefixed => {
                 let mini = self.mini_readers.get(&locator.bucket).ok_or_else(|| {
-                    crate::error::Error::Internal(format!(
-                        "Bucket {:?} not found",
-                        locator.bucket
-                    ))
+                    crate::error::Error::Internal(format!("Bucket {:?} not found", locator.bucket))
                 })?;
                 mini.snapshot()
                     .get_metric_samples(
@@ -1261,6 +1293,19 @@ impl QueryReader for TsdbQueryReader {
                     .await
             }
         }
+    }
+
+    async fn warm_metric_samples_bytes(
+        &self,
+        bucket: &TimeBucket,
+        metric_name: &str,
+    ) -> Result<u64> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.snapshot()
+            .warm_metric_samples_bytes(bucket, metric_name)
+            .await
     }
 }
 
@@ -2293,11 +2338,21 @@ mod tests {
         let bucket1 = TimeBucket::hour(60);
         let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
         mini1
-            .ingest(&create_sample("http_requests", vec![("env", "prod")], 3_900_000, 10.0))
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod")],
+                3_900_000,
+                10.0,
+            ))
             .await
             .unwrap();
         mini1
-            .ingest(&create_sample("http_requests", vec![("env", "staging")], 3_900_000, 20.0))
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging")],
+                3_900_000,
+                20.0,
+            ))
             .await
             .unwrap();
 
@@ -2305,11 +2360,21 @@ mod tests {
         let bucket2 = TimeBucket::hour(120);
         let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
         mini2
-            .ingest(&create_sample("http_requests", vec![("env", "prod")], 7_500_000, 30.0))
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "prod")],
+                7_500_000,
+                30.0,
+            ))
             .await
             .unwrap();
         mini2
-            .ingest(&create_sample("http_requests", vec![("env", "staging")], 7_500_000, 40.0))
+            .ingest(&create_sample(
+                "http_requests",
+                vec![("env", "staging")],
+                7_500_000,
+                40.0,
+            ))
             .await
             .unwrap();
 
@@ -2339,7 +2404,10 @@ mod tests {
 
         // env=staging
         assert_eq!(results[1].labels.get("env"), Some("staging"));
-        assert!(!results[1].samples.is_empty(), "staging should have samples");
+        assert!(
+            !results[1].samples.is_empty(),
+            "staging should have samples"
+        );
         let staging_last = results[1].samples.last().unwrap();
         assert_approx_eq(staging_last.1, 40.0);
     }

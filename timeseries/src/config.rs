@@ -258,12 +258,44 @@ impl SampleStorageLayout {
     }
 }
 
+/// Configuration for the metric-prefix prefetch experiment.
+///
+/// When enabled, before B3 fires parallel exact sample gets for a metric
+/// group, issue one storage scan over the metric prefix to warm the block
+/// cache, then discard the result and continue with exact gets as before.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SampleReadExperimentConfig {
+    pub prefetch_metric_prefix_before_get: bool,
+}
+
+impl SampleReadExperimentConfig {
+    pub(crate) fn from_env() -> Self {
+        let prefetch = std::env::var("TSDB_SAMPLE_PREFETCH_METRIC_PREFIX_BEFORE_GET")
+            .ok()
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
+        Self {
+            prefetch_metric_prefix_before_get: prefetch,
+        }
+    }
+
+    fn parse(value: Option<&str>) -> Self {
+        Self {
+            prefetch_metric_prefix_before_get: matches!(
+                value,
+                Some(v) if v.eq_ignore_ascii_case("true") || v == "1"
+            ),
+        }
+    }
+}
+
 /// Top-level runtime config for Tsdb, aggregating all subsystem configs.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TsdbRuntimeConfig {
     pub read_load: ReadLoadConfig,
     pub metadata_warm: MetadataWarmConfig,
     pub sample_storage_layout: SampleStorageLayout,
+    pub sample_read_experiment: SampleReadExperimentConfig,
 }
 
 impl TsdbRuntimeConfig {
@@ -272,6 +304,7 @@ impl TsdbRuntimeConfig {
             read_load: ReadLoadConfig::from_env(),
             metadata_warm: MetadataWarmConfig::from_env(),
             sample_storage_layout: SampleStorageLayout::from_env(),
+            sample_read_experiment: SampleReadExperimentConfig::from_env(),
         }
     }
 }
@@ -356,5 +389,32 @@ mod tests {
             SampleStorageLayout::parse(Some("")),
             SampleStorageLayout::LegacySeriesId
         );
+    }
+
+    #[test]
+    fn should_parse_sample_prefetch_metric_prefix_flag_disabled_by_default() {
+        let config = SampleReadExperimentConfig::parse(None);
+        assert!(!config.prefetch_metric_prefix_before_get);
+    }
+
+    #[test]
+    fn should_parse_sample_prefetch_metric_prefix_flag_enabled() {
+        let config = SampleReadExperimentConfig::parse(Some("true"));
+        assert!(config.prefetch_metric_prefix_before_get);
+
+        let config = SampleReadExperimentConfig::parse(Some("1"));
+        assert!(config.prefetch_metric_prefix_before_get);
+
+        let config = SampleReadExperimentConfig::parse(Some("TRUE"));
+        assert!(config.prefetch_metric_prefix_before_get);
+    }
+
+    #[test]
+    fn should_parse_sample_prefetch_metric_prefix_flag_disabled_explicitly() {
+        let config = SampleReadExperimentConfig::parse(Some("false"));
+        assert!(!config.prefetch_metric_prefix_before_get);
+
+        let config = SampleReadExperimentConfig::parse(Some("0"));
+        assert!(!config.prefetch_metric_prefix_before_get);
     }
 }

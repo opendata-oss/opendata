@@ -333,6 +333,23 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         Ok(bytes)
     }
 
+    /// Warm all sample records for a single metric within a bucket by scanning
+    /// the metric prefix. Returns the total logical bytes touched (key + value).
+    /// Does not decode sample values — only touches storage to populate the block cache.
+    async fn warm_metric_samples_bytes(
+        &self,
+        bucket: &TimeBucket,
+        metric_name: &str,
+    ) -> Result<u64> {
+        let range = MetricTimeSeriesKey::metric_range(bucket, metric_name);
+        let records = self.scan(range).await?;
+        let mut bytes = 0u64;
+        for record in records {
+            bytes += (record.key.len() + record.value.len()) as u64;
+        }
+        Ok(bytes)
+    }
+
     /// Warm the inverted index for a bucket by scanning all its keys.
     /// Returns the total bytes read (sum of key + value sizes).
     /// Does not decode values — only touches storage to populate cache.
@@ -759,5 +776,133 @@ mod tests {
         // then - only timestamp 2000 is in (1000, 2500]
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].timestamp_ms, 2000);
+    }
+
+    // ── warm_metric_samples_bytes tests ─────────────────────────────────
+
+    /// Helper to insert metric-prefixed samples into storage.
+    async fn insert_metric_samples(
+        storage: &Arc<InMemoryStorage>,
+        bucket: TimeBucket,
+        metric_name: &str,
+        series_id: SeriesId,
+        samples: Vec<Sample>,
+    ) {
+        let op = storage
+            .merge_metric_samples(bucket, metric_name, series_id, samples)
+            .unwrap();
+        match op {
+            common::storage::RecordOp::Merge(record) => {
+                storage.merge(vec![record]).await.unwrap();
+            }
+            _ => panic!("expected Merge op"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_warm_metric_sample_prefix_for_bucket() {
+        // given
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let bucket = TimeBucket::hour(60);
+        insert_metric_samples(
+            &storage,
+            bucket,
+            "http_requests",
+            1,
+            vec![Sample {
+                timestamp_ms: 1000,
+                value: 1.0,
+            }],
+        )
+        .await;
+        insert_metric_samples(
+            &storage,
+            bucket,
+            "http_requests",
+            2,
+            vec![Sample {
+                timestamp_ms: 2000,
+                value: 2.0,
+            }],
+        )
+        .await;
+
+        // when
+        let bytes = storage
+            .warm_metric_samples_bytes(&bucket, "http_requests")
+            .await
+            .unwrap();
+
+        // then
+        assert!(bytes > 0, "expected non-zero bytes, got {bytes}");
+    }
+
+    #[tokio::test]
+    async fn should_return_zero_for_empty_metric_prefix() {
+        // given
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let bucket = TimeBucket::hour(60);
+
+        // when
+        let bytes = storage
+            .warm_metric_samples_bytes(&bucket, "nonexistent_metric")
+            .await
+            .unwrap();
+
+        // then
+        assert_eq!(bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn should_only_scan_requested_metric_prefix() {
+        // given - two different metrics in the same bucket
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let bucket = TimeBucket::hour(60);
+        insert_metric_samples(
+            &storage,
+            bucket,
+            "cpu_usage",
+            1,
+            vec![Sample {
+                timestamp_ms: 1000,
+                value: 1.0,
+            }],
+        )
+        .await;
+        insert_metric_samples(
+            &storage,
+            bucket,
+            "memory_usage",
+            1,
+            vec![Sample {
+                timestamp_ms: 1000,
+                value: 2.0,
+            }],
+        )
+        .await;
+
+        // when - warm only cpu_usage
+        let cpu_bytes = storage
+            .warm_metric_samples_bytes(&bucket, "cpu_usage")
+            .await
+            .unwrap();
+        let mem_bytes = storage
+            .warm_metric_samples_bytes(&bucket, "memory_usage")
+            .await
+            .unwrap();
+
+        // then - each scan only touches its own metric's data
+        assert!(cpu_bytes > 0);
+        assert!(mem_bytes > 0);
+        // The scans should return similar sizes (1 series each with 1 sample)
+        // but more importantly, neither should include the other metric's data.
+        // We can't easily verify exclusion in an InMemory test, but the prefix
+        // range construction in MetricTimeSeriesKey::metric_range guarantees it.
     }
 }

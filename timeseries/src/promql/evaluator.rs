@@ -115,6 +115,12 @@ pub(crate) struct EvalStats {
     // Metric-prefixed layout experiment instrumentation
     pub(crate) sample_distinct_metrics: u64,
     pub(crate) sample_series_per_metric_max: u64,
+    // Metric-prefix prefetch experiment
+    pub(crate) sample_prefetch_enabled: bool,
+    pub(crate) sample_metric_groups: u64,
+    pub(crate) sample_metric_prefetch_groups: u64,
+    pub(crate) sample_metric_prefetch_bytes: u64,
+    pub(crate) sample_metric_prefetch_ms: u64,
 }
 
 /// Canonical key for caching selector results across steps.
@@ -236,6 +242,7 @@ struct BucketResolutionStats {
 struct BucketSampleWorkItem {
     bucket: TimeBucket,
     to_load: Vec<(SeriesId, Arc<str>, Arc<SeriesMeta>)>,
+    prefetch_metric_prefix: bool,
 }
 
 /// Per-series data loaded by the B3 sample worker.
@@ -260,6 +267,11 @@ struct BucketSampleStats {
     sample_series_per_metric_max: u64,
     // Metric names loaded in this bucket (moved to Phase C for cross-bucket dedup)
     metric_names: Vec<Arc<str>>,
+    // Metric-prefix prefetch experiment stats
+    sample_metric_groups: u64,
+    sample_metric_prefetch_groups: u64,
+    sample_metric_prefetch_bytes: u64,
+    sample_metric_prefetch_ms: u64,
 }
 
 /// Result of Phase B3 sample loading for one bucket.
@@ -640,6 +652,8 @@ pub(crate) struct Evaluator<'reader, R: QueryReader> {
     /// Set to false inside subquery evaluation to prevent cross-context
     /// reuse of preloaded data (subqueries have different step grids).
     preload_eligible: bool,
+    /// Experiment: prefetch metric prefix before parallel exact sample gets.
+    prefetch_metric_prefix: bool,
 }
 
 /// A wrapper around QueryReader that uses QueryReaderEvalCache for caching
@@ -1485,6 +1499,11 @@ async fn resolve_bucket_raw<R: QueryReader>(
 }
 
 /// Phase B3 worker: parallel sample loading for one bucket's work items.
+///
+/// When `prefetch_metric_prefix` is enabled, groups misses by metric name
+/// and issues a scan over each metric prefix before running the exact gets.
+/// This warms the block cache so subsequent exact gets hit cached blocks
+/// instead of each independently fetching overlapping data from S3.
 async fn process_bucket_sample_loads<R: QueryReader>(
     reader: &R,
     work: BucketSampleWorkItem,
@@ -1493,15 +1512,24 @@ async fn process_bucket_sample_loads<R: QueryReader>(
     const PER_QUERY_SAMPLE_CONCURRENCY: usize = 8;
     let bucket_start = std::time::Instant::now();
     let bucket = work.bucket;
+    let prefetch_enabled = work.prefetch_metric_prefix;
 
-    // Compute per-metric distribution for experiment instrumentation
-    let max_series_per_metric = {
-        let mut metric_counts: HashMap<&str, u64> = HashMap::new();
-        for (_, metric_name, _) in &work.to_load {
-            *metric_counts.entry(metric_name.as_ref()).or_default() += 1;
-        }
-        metric_counts.values().copied().max().unwrap_or(0)
-    };
+    // Group by metric name for instrumentation and prefetch
+    let mut metric_groups: HashMap<Arc<str>, Vec<(SeriesId, Arc<SeriesMeta>)>> = HashMap::new();
+    for (series_id, metric_name, meta) in &work.to_load {
+        metric_groups
+            .entry(Arc::clone(metric_name))
+            .or_default()
+            .push((*series_id, Arc::clone(meta)));
+    }
+
+    let max_series_per_metric = metric_groups
+        .values()
+        .map(|v| v.len() as u64)
+        .max()
+        .unwrap_or(0);
+    let metric_group_count = metric_groups.len() as u64;
+
     // Collect metric names for cross-bucket dedup at Phase C
     let bucket_metric_names: Vec<Arc<str>> = work
         .to_load
@@ -1509,6 +1537,31 @@ async fn process_bucket_sample_loads<R: QueryReader>(
         .map(|(_, name, _)| Arc::clone(name))
         .collect();
 
+    // Metric-prefix prefetch: scan each metric's key range to warm block cache
+    let mut prefetch_groups = 0u64;
+    let mut prefetch_bytes = 0u64;
+    let mut prefetch_ms = 0u64;
+    if prefetch_enabled {
+        for metric_name in metric_groups.keys() {
+            let t0 = std::time::Instant::now();
+            match reader.warm_metric_samples_bytes(&bucket, metric_name).await {
+                Ok(bytes) => {
+                    prefetch_bytes += bytes;
+                    prefetch_groups += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        metric_name = metric_name.as_ref(),
+                        error = %e,
+                        "metric prefix prefetch failed, continuing with exact gets"
+                    );
+                }
+            }
+            prefetch_ms += t0.elapsed().as_millis() as u64;
+        }
+    }
+
+    // Parallel exact gets (unchanged from before)
     let load_results: Vec<_> = futures::stream::iter(work.to_load.into_iter())
         .map(|(series_id, metric_name, meta)| {
             let coord = coordinator.clone();
@@ -1564,6 +1617,10 @@ async fn process_bucket_sample_loads<R: QueryReader>(
     stats.bucket_ms = bucket_start.elapsed().as_millis() as u64;
     stats.sample_series_per_metric_max = max_series_per_metric;
     stats.metric_names = bucket_metric_names;
+    stats.sample_metric_groups = metric_group_count;
+    stats.sample_metric_prefetch_groups = prefetch_groups;
+    stats.sample_metric_prefetch_bytes = prefetch_bytes;
+    stats.sample_metric_prefetch_ms = prefetch_ms;
 
     tracing::debug!(
         bucket_id = ?bucket,
@@ -1573,6 +1630,10 @@ async fn process_bucket_sample_loads<R: QueryReader>(
         sample_queue_wait_ms = stats.sample_queue_wait_ms,
         sample_load_ms = stats.sample_load_ms,
         max_series_per_metric = stats.sample_series_per_metric_max,
+        metric_groups = stats.sample_metric_groups,
+        prefetch_groups = stats.sample_metric_prefetch_groups,
+        prefetch_bytes = stats.sample_metric_prefetch_bytes,
+        prefetch_ms = stats.sample_metric_prefetch_ms,
         "preload_bucket_parallel"
     );
 
@@ -1589,6 +1650,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             reader: CachedQueryReader::new(reader),
             preloaded_instant: HashMap::new(),
             preload_eligible: true,
+            prefetch_metric_prefix: false,
         }
     }
 
@@ -1597,7 +1659,13 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             reader: CachedQueryReader::with_coordinator(reader, coordinator),
             preloaded_instant: HashMap::new(),
             preload_eligible: true,
+            prefetch_metric_prefix: false,
         }
+    }
+
+    pub(crate) fn with_prefetch_metric_prefix(mut self, enabled: bool) -> Self {
+        self.prefetch_metric_prefix = enabled;
+        self
     }
 
     /// Access aggregated evaluation statistics.
@@ -2246,6 +2314,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                         sample_work_items.push(BucketSampleWorkItem {
                             bucket: *bucket,
                             to_load,
+                            prefetch_metric_prefix: self.prefetch_metric_prefix,
                         });
                     }
                 }
@@ -2343,6 +2412,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     sample_work_items.push(BucketSampleWorkItem {
                         bucket: res.bucket,
                         to_load,
+                        prefetch_metric_prefix: self.prefetch_metric_prefix,
                     });
                 }
             }
@@ -2389,6 +2459,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     .stats
                     .sample_series_per_metric_max
                     .max(bs.sample_series_per_metric_max);
+                // Prefetch experiment stats
+                self.reader.stats.sample_metric_groups += bs.sample_metric_groups;
+                self.reader.stats.sample_metric_prefetch_groups += bs.sample_metric_prefetch_groups;
+                self.reader.stats.sample_metric_prefetch_bytes += bs.sample_metric_prefetch_bytes;
+                self.reader.stats.sample_metric_prefetch_ms += bs.sample_metric_prefetch_ms;
 
                 *bucket_totals.entry(sr.bucket).or_default() += bs.bucket_ms;
 
@@ -2410,6 +2485,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 }
             }
             self.reader.stats.sample_distinct_metrics = all_metric_names.len() as u64;
+            self.reader.stats.sample_prefetch_enabled = self.prefetch_metric_prefix;
         }
 
         // Derive backward-compatible bucket metrics

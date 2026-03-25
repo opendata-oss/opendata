@@ -62,9 +62,10 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
 
         for (series_id, series_samples) in frozen.samples {
             let op = match self.sample_storage_layout {
-                SampleStorageLayout::LegacySeriesId => self
-                    .storage
-                    .merge_samples(frozen.bucket, series_id, series_samples.samples),
+                SampleStorageLayout::LegacySeriesId => {
+                    self.storage
+                        .merge_samples(frozen.bucket, series_id, series_samples.samples)
+                }
                 SampleStorageLayout::MetricPrefixed => self.storage.merge_metric_samples(
                     frozen.bucket,
                     &series_samples.metric_name,
@@ -329,14 +330,20 @@ mod tests {
             .apply(vec![create_test_series(
                 "http_requests",
                 vec![("env", "prod")],
-                Sample { timestamp_ms: 60_000_001, value: 1.0 },
+                Sample {
+                    timestamp_ms: 60_000_001,
+                    value: 1.0,
+                },
             )])
             .unwrap();
         delta1
             .apply(vec![create_test_series(
                 "http_requests",
                 vec![("env", "prod")],
-                Sample { timestamp_ms: 60_000_002, value: 2.0 },
+                Sample {
+                    timestamp_ms: 60_000_002,
+                    value: 2.0,
+                },
             )])
             .unwrap();
         let (frozen1, _, ctx2) = delta1.freeze();
@@ -348,14 +355,20 @@ mod tests {
             .apply(vec![create_test_series(
                 "http_requests",
                 vec![("env", "prod")],
-                Sample { timestamp_ms: 60_000_003, value: 3.0 },
+                Sample {
+                    timestamp_ms: 60_000_003,
+                    value: 3.0,
+                },
             )])
             .unwrap();
         delta2
             .apply(vec![create_test_series(
                 "http_requests",
                 vec![("env", "prod")],
-                Sample { timestamp_ms: 60_000_004, value: 4.0 },
+                Sample {
+                    timestamp_ms: 60_000_004,
+                    value: 4.0,
+                },
             )])
             .unwrap();
         let (frozen2, _, ctx3) = delta2.freeze();
@@ -367,7 +380,10 @@ mod tests {
             .apply(vec![create_test_series(
                 "http_requests",
                 vec![("env", "prod")],
-                Sample { timestamp_ms: 60_000_005, value: 5.0 },
+                Sample {
+                    timestamp_ms: 60_000_005,
+                    value: 5.0,
+                },
             )])
             .unwrap();
         let (frozen3, _, _) = delta3.freeze();
