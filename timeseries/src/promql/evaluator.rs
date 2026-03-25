@@ -116,6 +116,11 @@ pub(crate) struct EvalStats {
     // Metric-prefixed layout experiment instrumentation
     pub(crate) sample_distinct_metrics: u64,
     pub(crate) sample_series_per_metric_max: u64,
+    // Range-scan batch experiment stats
+    pub(crate) sample_point_get_groups: u64,
+    pub(crate) sample_range_scan_groups: u64,
+    pub(crate) sample_range_scan_chunks: u64,
+    pub(crate) sample_range_scan_series: u64,
 }
 
 /// Canonical key for caching selector results across steps.
@@ -262,6 +267,11 @@ struct BucketSampleStats {
     sample_series_per_metric_max: u64,
     // Metric names loaded in this bucket (moved to Phase C for cross-bucket dedup)
     metric_names: Vec<Arc<str>>,
+    // Range-scan batch experiment stats
+    point_get_groups: u64,
+    range_scan_groups: u64,
+    range_scan_chunks: u64,
+    range_scan_series: u64,
 }
 
 /// Result of Phase B3 sample loading for one bucket.
@@ -1642,6 +1652,7 @@ async fn process_bucket_sample_loads<R: QueryReader>(
 
         match strategy {
             SampleLoadStrategy::PointGets => {
+                stats.point_get_groups += 1;
                 // Existing point-get path: fan out individual gets with bounded concurrency.
                 let load_results: Vec<_> =
                     futures::stream::iter(series_ids.into_iter())
@@ -1695,6 +1706,10 @@ async fn process_bucket_sample_loads<R: QueryReader>(
                 }
             }
             SampleLoadStrategy::RangeScans(chunks) => {
+                stats.range_scan_groups += 1;
+                stats.range_scan_chunks += chunks.len() as u64;
+                stats.range_scan_series +=
+                    chunks.iter().map(|c| c.wanted.len() as u64).sum::<u64>();
                 // Range-scan path: bounded parallel scans per chunk.
                 let scan_concurrency = config.per_query_sample_scan_concurrency;
                 let scan_results: Vec<_> = futures::stream::iter(chunks.into_iter())
@@ -2591,6 +2606,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     .stats
                     .sample_series_per_metric_max
                     .max(bs.sample_series_per_metric_max);
+                // Range-scan batch experiment
+                self.reader.stats.sample_point_get_groups += bs.point_get_groups;
+                self.reader.stats.sample_range_scan_groups += bs.range_scan_groups;
+                self.reader.stats.sample_range_scan_chunks += bs.range_scan_chunks;
+                self.reader.stats.sample_range_scan_series += bs.range_scan_series;
 
                 *bucket_totals.entry(sr.bucket).or_default() += bs.bucket_ms;
 

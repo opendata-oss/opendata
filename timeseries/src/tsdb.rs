@@ -481,6 +481,11 @@ pub(crate) async fn evaluate_range(
         sample_distinct_metrics = stats.sample_distinct_metrics,
         sample_series_per_metric_max = stats.sample_series_per_metric_max,
         sample_logical_bytes = stats.samples_loaded * 16,
+        // Range-scan batch experiment
+        sample_point_get_groups = stats.sample_point_get_groups,
+        sample_range_scan_groups = stats.sample_range_scan_groups,
+        sample_range_scan_chunks = stats.sample_range_scan_chunks,
+        sample_range_scan_series = stats.sample_range_scan_series,
         "evaluate_range complete"
     );
 
