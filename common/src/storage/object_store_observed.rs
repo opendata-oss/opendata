@@ -11,6 +11,7 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -21,6 +22,49 @@ use slatedb::object_store::{
 };
 
 use super::query_io::{ObjectReadSignature, QueryIoCollector, try_get_collector};
+
+// ─── Per-call structured logging ──────────────────────────────────────────────
+
+/// Emit one structured log event for a completed object-store call.
+///
+/// All fields are always present so JSON parsers don't need conditional logic.
+/// Fields that are not applicable for a given op are set to 0 or "".
+fn log_object_store_call(
+    op: &'static str,
+    path: &str,
+    range_start: Option<u64>,
+    range_end: Option<u64>,
+    range_count: Option<u32>,
+    bytes_returned: Option<u64>,
+    entries_returned: Option<u64>,
+    status: &'static str,
+    error: Option<&str>,
+    started_at: SystemTime,
+    started: Instant,
+) {
+    let started_at_unix_ms = started_at
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let finished_at_unix_ms = started_at_unix_ms + duration_ms;
+
+    tracing::debug!(
+        op,
+        path,
+        range_start = range_start.unwrap_or(0),
+        range_end = range_end.unwrap_or(0),
+        range_count = range_count.unwrap_or(0),
+        bytes_returned = bytes_returned.unwrap_or(0),
+        entries_returned = entries_returned.unwrap_or(0),
+        status,
+        error = error.unwrap_or(""),
+        started_at_unix_ms,
+        finished_at_unix_ms,
+        duration_ms,
+        "object_store_call"
+    );
+}
 
 /// Wraps an [`ObjectStore`] and records per-query object-store stats.
 ///
