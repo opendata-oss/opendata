@@ -15,6 +15,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use bytes::Bytes;
+
 use crate::Record;
 
 // ─── Storage-layer stats ────────────────────────────────────────────────────
@@ -275,20 +277,29 @@ impl QueryIoCollector {
     }
 
     /// Record a get_ranges call (multi-range batch).
-    pub fn record_os_get_ranges(&self, path: Arc<str>, ranges_bytes: &[u64]) {
+    ///
+    /// Tracks one signature per subrange so repeated-read analysis remains
+    /// meaningful even when SlateDB batches multiple ranges in one call.
+    pub fn record_os_get_ranges(
+        &self,
+        path: &Arc<str>,
+        ranges: &[std::ops::Range<u64>],
+        results: &[Bytes],
+    ) {
         let mut inner = self.inner.lock().unwrap();
         let stats = &mut inner.stats;
         stats.os_get_ranges_calls += 1;
-        let total: u64 = ranges_bytes.iter().sum();
+        let total: u64 = results.iter().map(|b| b.len() as u64).sum();
         stats.os_get_ranges_bytes += total;
-        // Each sub-range is a distinct signature.
-        // But we track the batch call as one per path for simplicity.
-        let sig = ObjectReadSignature {
-            path,
-            range_start: None,
-            range_end: None,
-        };
-        *inner.read_signatures.entry(sig).or_insert(0) += 1;
+        // One signature per subrange for accurate repeated-read tracking.
+        for range in ranges {
+            let sig = ObjectReadSignature {
+                path: Arc::clone(path),
+                range_start: Some(range.start),
+                range_end: Some(range.end),
+            };
+            *inner.read_signatures.entry(sig).or_insert(0) += 1;
+        }
     }
 
     /// Record a get_ranges error.

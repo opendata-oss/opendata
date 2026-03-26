@@ -156,8 +156,8 @@ impl ObjectStore for ObservedObjectStore {
         match self.inner.get_ranges(location, ranges).await {
             Ok(results) => {
                 if let Some(c) = &collector {
-                    let bytes: Vec<u64> = results.iter().map(|b| b.len() as u64).collect();
-                    c.record_os_get_ranges(Arc::from(location.as_ref()), &bytes);
+                    let path = Arc::from(location.as_ref());
+                    c.record_os_get_ranges(&path, ranges, &results);
                 }
                 Ok(results)
             }
@@ -246,6 +246,7 @@ struct ByteCountingStream {
     is_range: bool,
     bytes_so_far: u64,
     recorded: bool,
+    error_recorded: bool,
 }
 
 impl ByteCountingStream {
@@ -262,6 +263,7 @@ impl ByteCountingStream {
             is_range,
             bytes_so_far: 0,
             recorded: false,
+            error_recorded: false,
         }
     }
 
@@ -270,6 +272,13 @@ impl ByteCountingStream {
             self.recorded = true;
             self.collector
                 .record_os_read(self.signature.clone(), self.bytes_so_far, self.is_range);
+        }
+    }
+
+    fn record_error(&mut self) {
+        if !self.error_recorded {
+            self.error_recorded = true;
+            self.collector.record_os_read_error(self.is_range);
         }
     }
 }
@@ -284,8 +293,9 @@ impl Stream for ByteCountingStream {
                 self.bytes_so_far += bytes.len() as u64;
             }
             Poll::Ready(Some(Err(_))) => {
-                // Record what we have so far, then mark as error.
+                // Record bytes consumed so far AND the error.
                 self.record_final();
+                self.record_error();
             }
             Poll::Ready(None) => {
                 // Stream complete — record total.
@@ -312,6 +322,7 @@ struct ListCountingStream {
     collector: QueryIoCollector,
     count: u64,
     recorded: bool,
+    error_recorded: bool,
     is_with_delimiter: bool,
 }
 
@@ -326,6 +337,7 @@ impl ListCountingStream {
             collector,
             count: 0,
             recorded: false,
+            error_recorded: false,
             is_with_delimiter,
         }
     }
@@ -340,6 +352,13 @@ impl ListCountingStream {
             }
         }
     }
+
+    fn record_error(&mut self) {
+        if !self.error_recorded {
+            self.error_recorded = true;
+            self.collector.record_os_list_error();
+        }
+    }
 }
 
 impl Stream for ListCountingStream {
@@ -352,7 +371,9 @@ impl Stream for ListCountingStream {
                 self.count += 1;
             }
             Poll::Ready(Some(Err(_))) => {
+                // Record entries consumed so far AND the error.
                 self.record_final();
+                self.record_error();
             }
             Poll::Ready(None) => {
                 self.record_final();
@@ -521,5 +542,491 @@ mod tests {
         assert_eq!(stats.os_get_calls + stats.os_get_range_calls, 1);
         assert_eq!(stats.os_read_bytes_total(), 17);
         assert_eq!(stats.os_distinct_read_signatures, 1);
+    }
+
+    // ─── Stream error tests ────────────────────────────────────────────────
+
+    /// An object store that yields `n` chunks of `chunk_size` bytes, then an error.
+    #[derive(Debug)]
+    struct FailingChunkStore {
+        inner: Arc<dyn ObjectStore>,
+        /// Number of successful chunks before the error.
+        ok_chunks: usize,
+        /// Size of each successful chunk.
+        chunk_size: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FailingChunkStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            // Delegate to inner for metadata, then replace payload with our failing stream.
+            let result = self.inner.get_opts(location, options).await?;
+            let meta = result.meta.clone();
+            let range = result.range.clone();
+            let attributes = result.attributes.clone();
+
+            let ok_chunks = self.ok_chunks;
+            let chunk_size = self.chunk_size;
+            let stream = futures::stream::iter((0..ok_chunks + 1).map(move |i| {
+                if i < ok_chunks {
+                    Ok(Bytes::from(vec![0xAB; chunk_size]))
+                } else {
+                    Err(object_store::Error::Generic {
+                        store: "test",
+                        source: "injected error".into(),
+                    })
+                }
+            }));
+
+            Ok(GetResult {
+                payload: GetResultPayload::Stream(stream.boxed()),
+                meta,
+                range,
+                attributes,
+            })
+        }
+
+        async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+            self.inner.head(location).await
+        }
+
+        async fn delete(&self, location: &Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    impl Display for FailingChunkStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "FailingChunkStore({})", self.inner)
+        }
+    }
+
+    #[tokio::test]
+    async fn should_record_get_stream_error_after_partial_bytes() {
+        let mem = Arc::new(InMemory::new());
+        mem.put(
+            &Path::from("test/obj.sst"),
+            PutPayload::from_static(b"hello world 12345"),
+        )
+        .await
+        .unwrap();
+
+        let failing: Arc<dyn ObjectStore> = Arc::new(FailingChunkStore {
+            inner: mem,
+            ok_chunks: 3,
+            chunk_size: 10,
+        });
+        let store = ObservedObjectStore::wrap(failing);
+        let collector = QueryIoCollector::new();
+
+        query_io::run_with_collector(&collector, async {
+            let result = store.get(&Path::from("test/obj.sst")).await.unwrap();
+            // Consume the stream — it will yield 3 chunks then error.
+            let err = result.bytes().await;
+            assert!(err.is_err());
+        })
+        .await;
+
+        let stats = collector.snapshot();
+        // 3 chunks of 10 bytes each were delivered before the error.
+        assert_eq!(stats.os_get_bytes, 30);
+        assert_eq!(stats.os_get_calls, 1);
+        assert_eq!(stats.os_get_errors, 1);
+    }
+
+    /// A list stream that yields `n` entries then errors.
+    #[derive(Debug)]
+    struct FailingListStore {
+        inner: Arc<dyn ObjectStore>,
+        /// Number of successful entries before the error.
+        ok_entries: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FailingListStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+            self.inner.head(location).await
+        }
+
+        async fn delete(&self, location: &Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            let ok_entries = self.ok_entries;
+            let inner_stream = self.inner.list(prefix);
+
+            // Take ok_entries items, then yield an error.
+            let capped = futures::stream::unfold(
+                (inner_stream, 0usize, ok_entries, false),
+                |(mut stream, count, limit, done)| async move {
+                    if done {
+                        return None;
+                    }
+                    if count >= limit {
+                        return Some((
+                            Err(object_store::Error::Generic {
+                                store: "test",
+                                source: "injected list error".into(),
+                            }),
+                            (stream, count, limit, true),
+                        ));
+                    }
+                    match stream.next().await {
+                        Some(item) => Some((item, (stream, count + 1, limit, false))),
+                        None => None,
+                    }
+                },
+            );
+            capped.boxed()
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    impl Display for FailingListStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "FailingListStore({})", self.inner)
+        }
+    }
+
+    #[tokio::test]
+    async fn should_record_list_stream_error_after_partial_entries() {
+        let mem = Arc::new(InMemory::new());
+        for i in 0..5 {
+            mem.put(
+                &Path::from(format!("test/obj{i}.sst")),
+                PutPayload::from_static(b"data"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let failing: Arc<dyn ObjectStore> = Arc::new(FailingListStore {
+            inner: mem,
+            ok_entries: 3,
+        });
+        let store = ObservedObjectStore::wrap(failing);
+        let collector = QueryIoCollector::new();
+
+        query_io::run_with_collector(&collector, async {
+            let entries: Vec<_> = store
+                .list(Some(&Path::from("test")))
+                .collect::<Vec<_>>()
+                .await;
+            // 3 Ok entries + 1 Err.
+            assert_eq!(entries.len(), 4);
+            assert!(entries[3].is_err());
+        })
+        .await;
+
+        let stats = collector.snapshot();
+        assert_eq!(stats.os_list_calls, 1);
+        assert_eq!(stats.os_list_entries, 3);
+        assert_eq!(stats.os_list_errors, 1);
+    }
+
+    // ─── Deterministic multi-chunk stream tests ──────────────────────────
+
+    /// An object store that splits get_opts responses into fixed-size chunks.
+    #[derive(Debug)]
+    struct ChunkedStore {
+        inner: Arc<dyn ObjectStore>,
+        chunk_size: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ChunkedStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            let result = self.inner.get_opts(location, options).await?;
+            let meta = result.meta.clone();
+            let range = result.range.clone();
+            let attributes = result.attributes.clone();
+
+            // Collect the full payload, then re-chunk it.
+            let full = result.bytes().await?;
+            let chunk_size = self.chunk_size;
+            let chunks: Vec<Bytes> = full
+                .chunks(chunk_size)
+                .map(|c| Bytes::copy_from_slice(c))
+                .collect();
+            let stream = futures::stream::iter(chunks.into_iter().map(Ok));
+
+            Ok(GetResult {
+                payload: GetResultPayload::Stream(stream.boxed()),
+                meta,
+                range,
+                attributes,
+            })
+        }
+
+        async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+            self.inner.head(location).await
+        }
+
+        async fn delete(&self, location: &Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    impl Display for ChunkedStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "ChunkedStore({})", self.inner)
+        }
+    }
+
+    #[tokio::test]
+    async fn should_count_exact_bytes_across_multiple_stream_chunks() {
+        let mem = Arc::new(InMemory::new());
+        // 17 bytes, chunked into 5-byte pieces → 4 chunks (5+5+5+2).
+        mem.put(
+            &Path::from("test/obj.sst"),
+            PutPayload::from_static(b"hello world 12345"),
+        )
+        .await
+        .unwrap();
+
+        let chunked: Arc<dyn ObjectStore> = Arc::new(ChunkedStore {
+            inner: mem,
+            chunk_size: 5,
+        });
+        let store = ObservedObjectStore::wrap(chunked);
+        let collector = QueryIoCollector::new();
+
+        query_io::run_with_collector(&collector, async {
+            let result = store.get(&Path::from("test/obj.sst")).await.unwrap();
+            let bytes = result.bytes().await.unwrap();
+            assert_eq!(bytes.len(), 17);
+        })
+        .await;
+
+        let stats = collector.snapshot();
+        assert_eq!(stats.os_get_calls, 1);
+        assert_eq!(stats.os_get_bytes, 17);
+        assert_eq!(stats.os_get_errors, 0);
+        assert_eq!(stats.os_distinct_read_signatures, 1);
+    }
+
+    #[tokio::test]
+    async fn should_count_exact_bytes_for_ranged_stream() {
+        let mem = Arc::new(InMemory::new());
+        mem.put(
+            &Path::from("test/obj.sst"),
+            PutPayload::from_static(b"hello world 12345"),
+        )
+        .await
+        .unwrap();
+
+        let chunked: Arc<dyn ObjectStore> = Arc::new(ChunkedStore {
+            inner: mem,
+            chunk_size: 3,
+        });
+        let store = ObservedObjectStore::wrap(chunked);
+        let collector = QueryIoCollector::new();
+
+        query_io::run_with_collector(&collector, async {
+            // Range get [2..10) → 8 bytes, chunked into 3-byte pieces → 3 chunks (3+3+2).
+            let result = store
+                .get_opts(
+                    &Path::from("test/obj.sst"),
+                    GetOptions {
+                        range: Some(object_store::GetRange::Bounded(std::ops::Range {
+                            start: 2,
+                            end: 10,
+                        })),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let bytes = result.bytes().await.unwrap();
+            assert_eq!(bytes.len(), 8);
+        })
+        .await;
+
+        let stats = collector.snapshot();
+        assert_eq!(stats.os_get_range_calls, 1);
+        assert_eq!(stats.os_get_range_bytes, 8);
+        assert_eq!(stats.os_get_errors, 0);
+        assert_eq!(stats.os_get_range_errors, 0);
+        assert_eq!(stats.os_distinct_read_signatures, 1);
+    }
+
+    // ─── get_ranges signature tracking tests ───────────────────────────────
+
+    #[tokio::test]
+    async fn should_track_distinct_signatures_per_get_ranges_subrange() {
+        let store = setup_store_with_data().await;
+        let collector = QueryIoCollector::new();
+
+        query_io::run_with_collector(&collector, async {
+            // Single get_ranges call with 2 subranges.
+            let _ = store
+                .get_ranges(&Path::from("test/obj1.sst"), &[0..3, 5..10])
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let stats = collector.snapshot();
+        assert_eq!(stats.os_get_ranges_calls, 1);
+        // Each subrange is a distinct signature.
+        assert_eq!(stats.os_distinct_read_signatures, 2);
+        assert_eq!(stats.os_repeated_read_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn should_track_repeated_subranges_across_get_ranges_calls() {
+        let store = setup_store_with_data().await;
+        let collector = QueryIoCollector::new();
+
+        query_io::run_with_collector(&collector, async {
+            // First call: subranges [0..3] and [5..10].
+            let _ = store
+                .get_ranges(&Path::from("test/obj1.sst"), &[0..3, 5..10])
+                .await
+                .unwrap();
+            // Second call: subrange [0..3] again (repeat) and [10..15].
+            let _ = store
+                .get_ranges(&Path::from("test/obj1.sst"), &[0..3, 10..15])
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let stats = collector.snapshot();
+        assert_eq!(stats.os_get_ranges_calls, 2);
+        // 3 distinct signatures: [0..3], [5..10], [10..15]
+        assert_eq!(stats.os_distinct_read_signatures, 3);
+        // [0..3] was read twice → 1 repeated call
+        assert_eq!(stats.os_repeated_read_calls, 1);
+        assert_eq!(stats.os_max_repeats_single_signature, 2);
     }
 }

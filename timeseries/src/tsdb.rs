@@ -511,6 +511,16 @@ pub(crate) async fn evaluate_range(
         os_distinct_read_signatures = io.os_distinct_read_signatures,
         os_repeated_read_calls = io.os_repeated_read_calls,
         os_max_repeats_single_signature = io.os_max_repeats_single_signature,
+        // Derived: OS-to-storage read amplification (object store bytes / storage-returned bytes).
+        // Values >1.0 indicate overhead from SST block reads, compression, or repeated reads.
+        os_to_storage_read_amp = {
+            let storage = io.physical_bytes_total();
+            if storage > 0 {
+                format!("{:.2}", io.os_read_bytes_total() as f64 / storage as f64)
+            } else {
+                "n/a".to_string()
+            }
+        },
         "evaluate_range complete"
     );
 
@@ -2881,7 +2891,9 @@ mod tests {
     #[tokio::test]
     async fn os_stats_captured_through_slatedb() {
         use crate::query_io::{self, QueryIoCollector};
-        use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
+        use common::storage::config::{
+            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+        };
         use common::{StorageBuilder, StorageConfig, StorageSemantics};
         use std::time::{Duration, UNIX_EPOCH};
 
@@ -2901,8 +2913,7 @@ mod tests {
                 .await
                 .unwrap()
                 .with_semantics(
-                    StorageSemantics::new()
-                        .with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
+                    StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
                 )
                 .build()
                 .await
@@ -2938,8 +2949,7 @@ mod tests {
                 .await
                 .unwrap()
                 .with_semantics(
-                    StorageSemantics::new()
-                        .with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
+                    StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
                 )
                 .build()
                 .await

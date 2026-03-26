@@ -659,7 +659,12 @@ mod tests {
 
         // Write data and close
         {
-            let storage = StorageBuilder::new(&config).await.unwrap().build().await.unwrap();
+            let storage = StorageBuilder::new(&config)
+                .await
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
             storage
                 .put(vec![crate::storage::PutRecordOp::new(crate::Record::new(
                     Bytes::from_static(b"test-key"),
@@ -674,7 +679,12 @@ mod tests {
         // Reopen within collector scope so WAL replay reads are captured
         let collector = QueryIoCollector::new();
         let storage = query_io::run_with_collector(&collector, async {
-            let s = StorageBuilder::new(&config).await.unwrap().build().await.unwrap();
+            let s = StorageBuilder::new(&config)
+                .await
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
             let result = s.get(Bytes::from_static(b"test-key")).await.unwrap();
             assert!(result.is_some(), "expected key to exist");
             s
@@ -689,5 +699,56 @@ mod tests {
         );
 
         let _ = storage.close().await;
+    }
+
+    #[tokio::test]
+    async fn observed_object_store_should_record_through_db_reader() {
+        use crate::storage::query_io::{self, QueryIoCollector};
+        use bytes::Bytes;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = slatedb_config_with_local_dir(tmp.path());
+
+        // Write data via a full DB, flush, and close.
+        {
+            let storage = StorageBuilder::new(&config)
+                .await
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            storage
+                .put(vec![crate::storage::PutRecordOp::new(crate::Record::new(
+                    Bytes::from_static(b"reader-key"),
+                    Bytes::from_static(b"reader-value-0123456789"),
+                ))])
+                .await
+                .unwrap();
+            storage.flush().await.unwrap();
+            storage.close().await.unwrap();
+        }
+
+        // Open via create_storage_read (DbReader path) within collector scope.
+        let collector = QueryIoCollector::new();
+        query_io::run_with_collector(&collector, async {
+            let reader = create_storage_read(
+                &config,
+                StorageReaderRuntime::new(),
+                StorageSemantics::new(),
+                slatedb::config::DbReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            let result = reader.get(Bytes::from_static(b"reader-key")).await.unwrap();
+            assert!(result.is_some(), "expected key to exist via DbReader");
+        })
+        .await;
+
+        let stats = collector.snapshot();
+        assert!(
+            stats.os_read_bytes_total() > 0,
+            "expected DbReader path to record OS read bytes > 0, got {}",
+            stats.os_read_bytes_total()
+        );
     }
 }
