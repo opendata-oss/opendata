@@ -2,6 +2,7 @@ pub mod config;
 pub mod factory;
 pub mod in_memory;
 pub mod loader;
+pub mod object_store_observed;
 pub mod query_io;
 pub mod slate;
 pub mod util;
