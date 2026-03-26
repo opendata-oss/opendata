@@ -153,6 +153,12 @@ tokio::task_local! {
     static QUERY_IO_COLLECTOR: QueryIoCollector;
 }
 
+impl Default for QueryIoCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl QueryIoCollector {
     pub fn new() -> Self {
         Self {

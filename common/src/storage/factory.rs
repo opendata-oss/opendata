@@ -648,4 +648,46 @@ mod tests {
 
         assert!(storage.is_ok());
     }
+
+    #[tokio::test]
+    async fn observed_object_store_should_record_through_slatedb() {
+        use crate::storage::query_io::{self, QueryIoCollector};
+        use bytes::Bytes;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = slatedb_config_with_local_dir(tmp.path());
+
+        // Write data and close
+        {
+            let storage = StorageBuilder::new(&config).await.unwrap().build().await.unwrap();
+            storage
+                .put(vec![crate::storage::PutRecordOp::new(crate::Record::new(
+                    Bytes::from_static(b"test-key"),
+                    Bytes::from_static(b"test-value-1234567890"),
+                ))])
+                .await
+                .unwrap();
+            storage.flush().await.unwrap();
+            storage.close().await.unwrap();
+        }
+
+        // Reopen within collector scope so WAL replay reads are captured
+        let collector = QueryIoCollector::new();
+        let storage = query_io::run_with_collector(&collector, async {
+            let s = StorageBuilder::new(&config).await.unwrap().build().await.unwrap();
+            let result = s.get(Bytes::from_static(b"test-key")).await.unwrap();
+            assert!(result.is_some(), "expected key to exist");
+            s
+        })
+        .await;
+
+        let stats = collector.snapshot();
+        assert!(
+            stats.os_read_bytes_total() > 0,
+            "expected OS read bytes > 0, got {}",
+            stats.os_read_bytes_total()
+        );
+
+        let _ = storage.close().await;
+    }
 }
