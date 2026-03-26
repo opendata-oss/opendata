@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use super::config::{BlockCacheConfig, ObjectStoreConfig, StorageConfig};
 use super::in_memory::InMemoryStorage;
+use super::object_store_observed::ObservedObjectStore;
 use super::slate::{SlateDbStorage, SlateDbStorageReader};
 use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
 use slatedb::DbReader;
@@ -69,7 +70,8 @@ impl StorageBuilder {
         let inner = match config {
             StorageConfig::InMemory => StorageBuilderInner::InMemory,
             StorageConfig::SlateDb(slate_config) => {
-                let object_store = create_object_store(&slate_config.object_store)?;
+                let raw_store = create_object_store(&slate_config.object_store)?;
+                let object_store = ObservedObjectStore::wrap(raw_store);
                 let settings = match &slate_config.settings_path {
                     Some(path) => Settings::from_file(path).map_err(|e| {
                         StorageError::Storage(format!(
@@ -285,7 +287,8 @@ pub async fn create_storage_read(
             Ok(Arc::new(storage))
         }
         StorageConfig::SlateDb(slate_config) => {
-            let object_store = create_object_store(&slate_config.object_store)?;
+            let raw_store = create_object_store(&slate_config.object_store)?;
+            let object_store = ObservedObjectStore::wrap(raw_store);
 
             let mut options = reader_options;
             if let Some(op) = semantics.merge_operator {
