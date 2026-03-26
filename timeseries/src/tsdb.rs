@@ -489,7 +489,8 @@ pub(crate) async fn evaluate_range(
         io_metadata_bytes = io.metadata_bytes(),
         io_sample_bytes = io.sample_bytes(),
         io_physical_bytes_total = io.physical_bytes_total(),
-        // Object-store stats
+        // Object-store aggregate stats (summary view).
+        // Per-call detail is in "object_store_call" debug events.
         os_get_calls = io.os_get_calls,
         os_get_bytes = io.os_get_bytes,
         os_get_errors = io.os_get_errors,
