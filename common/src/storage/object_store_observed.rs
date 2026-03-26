@@ -362,9 +362,13 @@ impl ObjectStore for ObservedObjectStore {
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         let collector = try_get_collector();
         let inner_stream = self.inner.list(prefix);
+        let prefix_str: Arc<str> = Arc::from(prefix.map(|p| p.as_ref()).unwrap_or(""));
+        let started_at = SystemTime::now();
+        let started = Instant::now();
 
         if let Some(c) = collector {
-            ListCountingStream::new(inner_stream, c, false).boxed()
+            ListCountingStream::new(inner_stream, c, false, prefix_str, started_at, started)
+                .boxed()
         } else {
             inner_stream
         }
@@ -545,6 +549,11 @@ struct ListCountingStream {
     recorded: bool,
     error_recorded: bool,
     is_with_delimiter: bool,
+    // Per-call logging fields.
+    prefix: Arc<str>,
+    started_at: SystemTime,
+    started: Instant,
+    error_msg: Option<String>,
 }
 
 impl ListCountingStream {
@@ -552,6 +561,9 @@ impl ListCountingStream {
         stream: BoxStream<'static, object_store::Result<ObjectMeta>>,
         collector: QueryIoCollector,
         is_with_delimiter: bool,
+        prefix: Arc<str>,
+        started_at: SystemTime,
+        started: Instant,
     ) -> Self {
         Self {
             inner: stream,
@@ -560,6 +572,10 @@ impl ListCountingStream {
             recorded: false,
             error_recorded: false,
             is_with_delimiter,
+            prefix,
+            started_at,
+            started,
+            error_msg: None,
         }
     }
 
@@ -571,6 +587,19 @@ impl ListCountingStream {
             } else {
                 self.collector.record_os_list(self.count);
             }
+            log_object_store_call(
+                "list",
+                &self.prefix,
+                None,
+                None,
+                None,
+                Some(0),
+                Some(self.count),
+                if self.error_msg.is_some() { "err" } else { "ok" },
+                self.error_msg.as_deref(),
+                self.started_at,
+                self.started,
+            );
         }
     }
 
@@ -591,8 +620,9 @@ impl Stream for ListCountingStream {
             Poll::Ready(Some(Ok(_))) => {
                 self.count += 1;
             }
-            Poll::Ready(Some(Err(_))) => {
-                // Record entries consumed so far AND the error.
+            Poll::Ready(Some(Err(e))) => {
+                // Capture error message before record_final so the log includes it.
+                self.error_msg = Some(e.to_string());
                 self.record_final();
                 self.record_error();
             }
