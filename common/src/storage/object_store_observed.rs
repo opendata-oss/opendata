@@ -23,6 +23,20 @@ use slatedb::object_store::{
 
 use super::query_io::{ObjectReadSignature, QueryIoCollector, try_get_collector};
 
+/// Extract (range_start, range_end) from a `GetRange` for logging.
+///
+/// For `Bounded`, returns the exact start/end. For `Offset`, returns (start, None).
+/// For `Suffix`, returns (None, suffix_bytes) — note this is "last N bytes", not an
+/// absolute offset, but is still useful for diagnosing the request shape.
+fn get_range_params(range: &Option<object_store::GetRange>) -> (Option<u64>, Option<u64>) {
+    match range {
+        Some(object_store::GetRange::Bounded(r)) => (Some(r.start), Some(r.end)),
+        Some(object_store::GetRange::Offset(offset)) => (Some(*offset), None),
+        Some(object_store::GetRange::Suffix(n)) => (None, Some(*n)),
+        None => (None, None),
+    }
+}
+
 // ─── Per-call structured logging ──────────────────────────────────────────────
 
 /// Emit one structured log event for a completed object-store call.
@@ -120,7 +134,9 @@ impl ObjectStore for ObservedObjectStore {
     ) -> object_store::Result<GetResult> {
         let collector = try_get_collector();
         let is_head = options.head;
-        let is_range = options.range.is_some();
+        let original_range = options.range.clone();
+        let is_range = original_range.is_some();
+        let (log_range_start, log_range_end) = get_range_params(&original_range);
         let path: Arc<str> = Arc::from(location.as_ref());
         let started_at = SystemTime::now();
         let started = Instant::now();
@@ -145,7 +161,7 @@ impl ObjectStore for ObservedObjectStore {
                         started,
                     );
                     Ok(result)
-                } else if let Some(c) = collector {
+                } else {
                     // Capture metadata before consuming the result into a stream.
                     let meta = result.meta.clone();
                     let range = result.range.clone();
@@ -154,21 +170,20 @@ impl ObjectStore for ObservedObjectStore {
                     let op = if is_range { "get_opts_range" } else { "get" };
                     let sig = ObjectReadSignature {
                         path,
-                        range_start: if is_range { Some(range.start) } else { None },
-                        range_end: if is_range { Some(range.end) } else { None },
+                        range_start: log_range_start,
+                        range_end: log_range_end,
                     };
 
                     let stream = result.into_stream();
-                    let counting_stream =
-                        ByteCountingStream::new(stream, c, sig, is_range, op, started_at, started);
+                    let counting_stream = ByteCountingStream::new(
+                        stream, collector, sig, is_range, op, started_at, started,
+                    );
                     Ok(GetResult {
                         payload: GetResultPayload::Stream(counting_stream.boxed()),
                         meta,
                         range,
                         attributes,
                     })
-                } else {
-                    Ok(result)
                 }
             }
             Err(e) => {
@@ -189,8 +204,8 @@ impl ObjectStore for ObservedObjectStore {
                 log_object_store_call(
                     op,
                     &path,
-                    None,
-                    None,
+                    log_range_start,
+                    log_range_end,
                     None,
                     None,
                     None,
@@ -272,11 +287,13 @@ impl ObjectStore for ObservedObjectStore {
                     c.record_os_get_ranges(&path, ranges, &results);
                 }
                 let total_bytes: u64 = results.iter().map(|b| b.len() as u64).sum();
+                let range_start = ranges.iter().map(|r| r.start).min();
+                let range_end = ranges.iter().map(|r| r.end).max();
                 log_object_store_call(
                     "get_ranges",
                     location.as_ref(),
-                    None,
-                    None,
+                    range_start,
+                    range_end,
                     Some(ranges.len() as u32),
                     Some(total_bytes),
                     None,
@@ -291,11 +308,13 @@ impl ObjectStore for ObservedObjectStore {
                 if let Some(c) = &collector {
                     c.record_os_get_ranges_error();
                 }
+                let range_start = ranges.iter().map(|r| r.start).min();
+                let range_end = ranges.iter().map(|r| r.end).max();
                 log_object_store_call(
                     "get_ranges",
                     location.as_ref(),
-                    None,
-                    None,
+                    range_start,
+                    range_end,
                     Some(ranges.len() as u32),
                     None,
                     None,
@@ -367,11 +386,16 @@ impl ObjectStore for ObservedObjectStore {
         let started_at = SystemTime::now();
         let started = Instant::now();
 
-        if let Some(c) = collector {
-            ListCountingStream::new(inner_stream, c, false, prefix_str, started_at, started).boxed()
-        } else {
-            inner_stream
-        }
+        // Always wrap to ensure per-call logging regardless of collector presence.
+        ListCountingStream::new(
+            inner_stream,
+            collector,
+            false,
+            prefix_str,
+            started_at,
+            started,
+        )
+        .boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
@@ -440,7 +464,7 @@ impl ObjectStore for ObservedObjectStore {
 /// for drop, because drop may not happen on the right task.
 struct ByteCountingStream {
     inner: BoxStream<'static, object_store::Result<Bytes>>,
-    collector: QueryIoCollector,
+    collector: Option<QueryIoCollector>,
     signature: ObjectReadSignature,
     is_range: bool,
     bytes_so_far: u64,
@@ -456,7 +480,7 @@ struct ByteCountingStream {
 impl ByteCountingStream {
     fn new(
         stream: BoxStream<'static, object_store::Result<Bytes>>,
-        collector: QueryIoCollector,
+        collector: Option<QueryIoCollector>,
         signature: ObjectReadSignature,
         is_range: bool,
         op: &'static str,
@@ -481,8 +505,9 @@ impl ByteCountingStream {
     fn record_final(&mut self) {
         if !self.recorded {
             self.recorded = true;
-            self.collector
-                .record_os_read(self.signature.clone(), self.bytes_so_far, self.is_range);
+            if let Some(c) = &self.collector {
+                c.record_os_read(self.signature.clone(), self.bytes_so_far, self.is_range);
+            }
             log_object_store_call(
                 self.op,
                 &self.signature.path,
@@ -506,7 +531,9 @@ impl ByteCountingStream {
     fn record_error(&mut self) {
         if !self.error_recorded {
             self.error_recorded = true;
-            self.collector.record_os_read_error(self.is_range);
+            if let Some(c) = &self.collector {
+                c.record_os_read_error(self.is_range);
+            }
         }
     }
 }
@@ -548,7 +575,7 @@ impl Drop for ByteCountingStream {
 /// Wraps a list stream and counts entries yielded.
 struct ListCountingStream {
     inner: BoxStream<'static, object_store::Result<ObjectMeta>>,
-    collector: QueryIoCollector,
+    collector: Option<QueryIoCollector>,
     count: u64,
     recorded: bool,
     error_recorded: bool,
@@ -563,7 +590,7 @@ struct ListCountingStream {
 impl ListCountingStream {
     fn new(
         stream: BoxStream<'static, object_store::Result<ObjectMeta>>,
-        collector: QueryIoCollector,
+        collector: Option<QueryIoCollector>,
         is_with_delimiter: bool,
         prefix: Arc<str>,
         started_at: SystemTime,
@@ -586,10 +613,12 @@ impl ListCountingStream {
     fn record_final(&mut self) {
         if !self.recorded {
             self.recorded = true;
-            if self.is_with_delimiter {
-                self.collector.record_os_list_with_delimiter(self.count);
-            } else {
-                self.collector.record_os_list(self.count);
+            if let Some(c) = &self.collector {
+                if self.is_with_delimiter {
+                    c.record_os_list_with_delimiter(self.count);
+                } else {
+                    c.record_os_list(self.count);
+                }
             }
             log_object_store_call(
                 "list",
@@ -614,7 +643,9 @@ impl ListCountingStream {
     fn record_error(&mut self) {
         if !self.error_recorded {
             self.error_recorded = true;
-            self.collector.record_os_list_error();
+            if let Some(c) = &self.collector {
+                c.record_os_list_error();
+            }
         }
     }
 }
@@ -1287,5 +1318,284 @@ mod tests {
         // [0..3] was read twice → 1 repeated call
         assert_eq!(stats.os_repeated_read_calls, 1);
         assert_eq!(stats.os_max_repeats_single_signature, 2);
+    }
+
+    // ─── Per-call log capture tests ─────────────────────────────────────
+
+    /// Tests that validate the actual tracing events emitted by each method.
+    /// Uses a custom capturing subscriber to collect events, avoiding the
+    /// subscriber-isolation problems that plague global/thread-local defaults.
+    mod log_capture {
+        use super::*;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Debug)]
+        struct CapturedEvent {
+            fields: HashMap<String, String>,
+        }
+
+        impl CapturedEvent {
+            fn get(&self, key: &str) -> Option<&str> {
+                self.fields.get(key).map(|s| s.as_str())
+            }
+        }
+
+        struct CapturingLayer {
+            events: Arc<Mutex<Vec<CapturedEvent>>>,
+        }
+
+        #[derive(Default)]
+        struct FieldCollector {
+            fields: HashMap<String, String>,
+        }
+
+        impl Visit for FieldCollector {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.fields
+                    .insert(field.name().to_string(), format!("{:?}", value));
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturingLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut visitor = FieldCollector::default();
+                event.record(&mut visitor);
+                self.events.lock().unwrap().push(CapturedEvent {
+                    fields: visitor.fields,
+                });
+            }
+        }
+
+        /// Run an async block with a capturing subscriber scoped to this thread.
+        /// Returns only the `object_store_call` events.
+        fn run_capturing<F: std::future::Future<Output = ()>>(
+            f: impl FnOnce() -> F,
+        ) -> Vec<CapturedEvent> {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = CapturingLayer {
+                events: events.clone(),
+            };
+            let subscriber = tracing_subscriber::registry().with(layer);
+
+            tracing::subscriber::with_default(subscriber, || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(f())
+            });
+
+            let all = Arc::try_unwrap(events).unwrap().into_inner().unwrap();
+            all.into_iter()
+                .filter(|e| e.get("message") == Some("object_store_call"))
+                .collect()
+        }
+
+        fn setup_store() -> Arc<dyn ObjectStore> {
+            ObservedObjectStore::wrap(Arc::new(InMemory::new()))
+        }
+
+        async fn put_data(store: &Arc<dyn ObjectStore>) {
+            store
+                .put(
+                    &Path::from("test/obj.sst"),
+                    PutPayload::from_static(b"hello world 12345"),
+                )
+                .await
+                .unwrap();
+        }
+
+        #[test]
+        fn emits_log_for_get_range() {
+            let events = run_capturing(|| async {
+                let store = setup_store();
+                put_data(&store).await;
+                let _ = store
+                    .get_range(&Path::from("test/obj.sst"), 2..10)
+                    .await
+                    .unwrap();
+            });
+
+            assert_eq!(events.len(), 1);
+            let e = &events[0];
+            assert_eq!(e.get("op"), Some("get_range"));
+            assert_eq!(e.get("path"), Some("test/obj.sst"));
+            assert_eq!(e.get("range_start"), Some("2"));
+            assert_eq!(e.get("range_end"), Some("10"));
+            assert_eq!(e.get("bytes_returned"), Some("8"));
+            assert_eq!(e.get("status"), Some("ok"));
+        }
+
+        #[test]
+        fn emits_log_for_get_without_collector() {
+            // Finding 1 regression: get must log even without a QueryIoCollector.
+            let events = run_capturing(|| async {
+                let store = setup_store();
+                put_data(&store).await;
+                let result = store.get(&Path::from("test/obj.sst")).await.unwrap();
+                let bytes = result.bytes().await.unwrap();
+                assert_eq!(bytes.len(), 17);
+            });
+
+            assert_eq!(events.len(), 1);
+            let e = &events[0];
+            assert_eq!(e.get("op"), Some("get"));
+            assert_eq!(e.get("bytes_returned"), Some("17"));
+            assert_eq!(e.get("status"), Some("ok"));
+        }
+
+        #[test]
+        fn emits_log_for_list_without_collector() {
+            // Finding 1 regression: list must log even without a QueryIoCollector.
+            let events = run_capturing(|| async {
+                let store = setup_store();
+                put_data(&store).await;
+                let entries: Vec<_> = store
+                    .list(Some(&Path::from("test")))
+                    .collect::<Vec<_>>()
+                    .await;
+                assert_eq!(entries.len(), 1);
+            });
+
+            assert_eq!(events.len(), 1);
+            let e = &events[0];
+            assert_eq!(e.get("op"), Some("list"));
+            assert_eq!(e.get("entries_returned"), Some("1"));
+            assert_eq!(e.get("status"), Some("ok"));
+        }
+
+        #[test]
+        fn emits_log_for_get_ranges_with_boundaries() {
+            // Finding 2: get_ranges logs range_start/range_end from actual ranges.
+            let events = run_capturing(|| async {
+                let store = setup_store();
+                put_data(&store).await;
+                let _ = store
+                    .get_ranges(&Path::from("test/obj.sst"), &[2..5, 8..12])
+                    .await
+                    .unwrap();
+            });
+
+            assert_eq!(events.len(), 1);
+            let e = &events[0];
+            assert_eq!(e.get("op"), Some("get_ranges"));
+            assert_eq!(e.get("range_start"), Some("2"));
+            assert_eq!(e.get("range_end"), Some("12"));
+            assert_eq!(e.get("range_count"), Some("2"));
+            assert_eq!(e.get("status"), Some("ok"));
+        }
+
+        #[test]
+        fn emits_log_for_head() {
+            let events = run_capturing(|| async {
+                let store = setup_store();
+                put_data(&store).await;
+                let _ = store.head(&Path::from("test/obj.sst")).await.unwrap();
+            });
+
+            assert_eq!(events.len(), 1);
+            let e = &events[0];
+            assert_eq!(e.get("op"), Some("head"));
+            assert_eq!(e.get("bytes_returned"), Some("0"));
+            assert_eq!(e.get("status"), Some("ok"));
+        }
+
+        #[test]
+        fn emits_log_for_get_opts_range_with_original_params() {
+            // Finding 2: uses original request range, not resolved range.
+            let events = run_capturing(|| async {
+                let store = setup_store();
+                put_data(&store).await;
+                let result = store
+                    .get_opts(
+                        &Path::from("test/obj.sst"),
+                        GetOptions {
+                            range: Some(object_store::GetRange::Bounded(std::ops::Range {
+                                start: 3,
+                                end: 10,
+                            })),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let bytes = result.bytes().await.unwrap();
+                assert_eq!(bytes.len(), 7);
+            });
+
+            assert_eq!(events.len(), 1);
+            let e = &events[0];
+            assert_eq!(e.get("op"), Some("get_opts_range"));
+            assert_eq!(e.get("range_start"), Some("3"));
+            assert_eq!(e.get("range_end"), Some("10"));
+            assert_eq!(e.get("bytes_returned"), Some("7"));
+            assert_eq!(e.get("status"), Some("ok"));
+        }
+
+        #[test]
+        fn emits_log_with_range_on_error() {
+            // Finding 2: get_opts error path must log original range params.
+            let events = run_capturing(|| async {
+                let store = setup_store();
+                let err = store
+                    .get_opts(
+                        &Path::from("test/missing.sst"),
+                        GetOptions {
+                            range: Some(object_store::GetRange::Bounded(std::ops::Range {
+                                start: 0,
+                                end: 100,
+                            })),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                assert!(err.is_err());
+            });
+
+            assert_eq!(events.len(), 1);
+            let e = &events[0];
+            assert_eq!(e.get("op"), Some("get_opts_range"));
+            assert_eq!(e.get("range_start"), Some("0"));
+            assert_eq!(e.get("range_end"), Some("100"));
+            assert_eq!(e.get("status"), Some("err"));
+            assert!(e.get("error").is_some());
+            assert!(!e.get("error").unwrap().is_empty());
+        }
+
+        #[test]
+        fn emits_log_for_list_with_delimiter() {
+            let events = run_capturing(|| async {
+                let store = setup_store();
+                put_data(&store).await;
+                let _ = store
+                    .list_with_delimiter(Some(&Path::from("test")))
+                    .await
+                    .unwrap();
+            });
+
+            assert_eq!(events.len(), 1);
+            let e = &events[0];
+            assert_eq!(e.get("op"), Some("list_with_delimiter"));
+            assert_eq!(e.get("status"), Some("ok"));
+        }
     }
 }
