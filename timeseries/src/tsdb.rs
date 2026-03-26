@@ -489,6 +489,28 @@ pub(crate) async fn evaluate_range(
         io_metadata_bytes = io.metadata_bytes(),
         io_sample_bytes = io.sample_bytes(),
         io_physical_bytes_total = io.physical_bytes_total(),
+        // Object-store stats
+        os_get_calls = io.os_get_calls,
+        os_get_bytes = io.os_get_bytes,
+        os_get_errors = io.os_get_errors,
+        os_get_range_calls = io.os_get_range_calls,
+        os_get_range_bytes = io.os_get_range_bytes,
+        os_get_range_errors = io.os_get_range_errors,
+        os_get_ranges_calls = io.os_get_ranges_calls,
+        os_get_ranges_bytes = io.os_get_ranges_bytes,
+        os_get_ranges_errors = io.os_get_ranges_errors,
+        os_head_calls = io.os_head_calls,
+        os_head_errors = io.os_head_errors,
+        os_list_calls = io.os_list_calls,
+        os_list_entries = io.os_list_entries,
+        os_list_errors = io.os_list_errors,
+        os_list_with_delimiter_calls = io.os_list_with_delimiter_calls,
+        os_list_with_delimiter_entries = io.os_list_with_delimiter_entries,
+        os_list_with_delimiter_errors = io.os_list_with_delimiter_errors,
+        os_read_bytes_total = io.os_read_bytes_total(),
+        os_distinct_read_signatures = io.os_distinct_read_signatures,
+        os_repeated_read_calls = io.os_repeated_read_calls,
+        os_max_repeats_single_signature = io.os_max_repeats_single_signature,
         "evaluate_range complete"
     );
 
