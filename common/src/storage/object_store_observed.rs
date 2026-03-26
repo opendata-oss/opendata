@@ -121,6 +121,8 @@ impl ObjectStore for ObservedObjectStore {
         let is_head = options.head;
         let is_range = options.range.is_some();
         let path: Arc<str> = Arc::from(location.as_ref());
+        let started_at = SystemTime::now();
+        let started = Instant::now();
 
         match self.inner.get_opts(location, options).await {
             Ok(result) => {
@@ -128,6 +130,19 @@ impl ObjectStore for ObservedObjectStore {
                     if let Some(c) = &collector {
                         c.record_os_head();
                     }
+                    log_object_store_call(
+                        "head_via_get_opts",
+                        &path,
+                        None,
+                        None,
+                        None,
+                        Some(0),
+                        None,
+                        "ok",
+                        None,
+                        started_at,
+                        started,
+                    );
                     Ok(result)
                 } else if let Some(c) = collector {
                     // Capture metadata before consuming the result into a stream.
@@ -135,6 +150,7 @@ impl ObjectStore for ObservedObjectStore {
                     let range = result.range.clone();
                     let attributes = result.attributes.clone();
 
+                    let op = if is_range { "get_opts_range" } else { "get" };
                     let sig = ObjectReadSignature {
                         path,
                         range_start: if is_range { Some(range.start) } else { None },
@@ -142,7 +158,8 @@ impl ObjectStore for ObservedObjectStore {
                     };
 
                     let stream = result.into_stream();
-                    let counting_stream = ByteCountingStream::new(stream, c, sig, is_range);
+                    let counting_stream =
+                        ByteCountingStream::new(stream, c, sig, is_range, op, started_at, started);
                     Ok(GetResult {
                         payload: GetResultPayload::Stream(counting_stream.boxed()),
                         meta,
@@ -161,6 +178,26 @@ impl ObjectStore for ObservedObjectStore {
                         c.record_os_read_error(is_range);
                     }
                 }
+                let op = if is_head {
+                    "head_via_get_opts"
+                } else if is_range {
+                    "get_opts_range"
+                } else {
+                    "get"
+                };
+                log_object_store_call(
+                    op,
+                    &path,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "err",
+                    Some(&e.to_string()),
+                    started_at,
+                    started,
+                );
                 Err(e)
             }
         }
@@ -405,6 +442,11 @@ struct ByteCountingStream {
     bytes_so_far: u64,
     recorded: bool,
     error_recorded: bool,
+    // Per-call logging fields.
+    op: &'static str,
+    started_at: SystemTime,
+    started: Instant,
+    error_msg: Option<String>,
 }
 
 impl ByteCountingStream {
@@ -413,6 +455,9 @@ impl ByteCountingStream {
         collector: QueryIoCollector,
         signature: ObjectReadSignature,
         is_range: bool,
+        op: &'static str,
+        started_at: SystemTime,
+        started: Instant,
     ) -> Self {
         Self {
             inner: stream,
@@ -422,6 +467,10 @@ impl ByteCountingStream {
             bytes_so_far: 0,
             recorded: false,
             error_recorded: false,
+            op,
+            started_at,
+            started,
+            error_msg: None,
         }
     }
 
@@ -430,6 +479,19 @@ impl ByteCountingStream {
             self.recorded = true;
             self.collector
                 .record_os_read(self.signature.clone(), self.bytes_so_far, self.is_range);
+            log_object_store_call(
+                self.op,
+                &self.signature.path,
+                self.signature.range_start,
+                self.signature.range_end,
+                None,
+                Some(self.bytes_so_far),
+                None,
+                if self.error_msg.is_some() { "err" } else { "ok" },
+                self.error_msg.as_deref(),
+                self.started_at,
+                self.started,
+            );
         }
     }
 
@@ -450,8 +512,9 @@ impl Stream for ByteCountingStream {
             Poll::Ready(Some(Ok(bytes))) => {
                 self.bytes_so_far += bytes.len() as u64;
             }
-            Poll::Ready(Some(Err(_))) => {
-                // Record bytes consumed so far AND the error.
+            Poll::Ready(Some(Err(e))) => {
+                // Capture error message before record_final so the log includes it.
+                self.error_msg = Some(e.to_string());
                 self.record_final();
                 self.record_error();
             }
