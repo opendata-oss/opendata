@@ -29,6 +29,7 @@ use super::query_io::{ObjectReadSignature, QueryIoCollector, try_get_collector};
 ///
 /// All fields are always present so JSON parsers don't need conditional logic.
 /// Fields that are not applicable for a given op are set to 0 or "".
+#[allow(clippy::too_many_arguments)]
 fn log_object_store_call(
     op: &'static str,
     path: &str,
@@ -367,8 +368,7 @@ impl ObjectStore for ObservedObjectStore {
         let started = Instant::now();
 
         if let Some(c) = collector {
-            ListCountingStream::new(inner_stream, c, false, prefix_str, started_at, started)
-                .boxed()
+            ListCountingStream::new(inner_stream, c, false, prefix_str, started_at, started).boxed()
         } else {
             inner_stream
         }
@@ -491,7 +491,11 @@ impl ByteCountingStream {
                 None,
                 Some(self.bytes_so_far),
                 None,
-                if self.error_msg.is_some() { "err" } else { "ok" },
+                if self.error_msg.is_some() {
+                    "err"
+                } else {
+                    "ok"
+                },
                 self.error_msg.as_deref(),
                 self.started_at,
                 self.started,
@@ -595,7 +599,11 @@ impl ListCountingStream {
                 None,
                 Some(0),
                 Some(self.count),
-                if self.error_msg.is_some() { "err" } else { "ok" },
+                if self.error_msg.is_some() {
+                    "err"
+                } else {
+                    "ok"
+                },
                 self.error_msg.as_deref(),
                 self.started_at,
                 self.started,
