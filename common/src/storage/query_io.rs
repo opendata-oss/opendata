@@ -113,6 +113,31 @@ impl QueryIoStats {
     pub fn os_read_bytes_total(&self) -> u64 {
         self.os_get_bytes + self.os_get_range_bytes + self.os_get_ranges_bytes
     }
+
+    // ─── Storage read API call totals ────────────────────────────────────
+    // These count Timeseries-initiated read API calls against the
+    // SlateDB-backed storage layer. They are NOT object-store calls
+    // and NOT S3 requests. Comparing these totals against os_* and
+    // CloudWatch metrics reveals where read amplification occurs.
+
+    /// Total point-get calls across all read kinds.
+    pub fn storage_get_calls_total(&self) -> u64 {
+        self.bucket_list_gets
+            + self.inverted_index_gets
+            + self.forward_index_gets
+            + self.sample_get_calls
+            + self.sample_metric_get_calls
+    }
+
+    /// Total scan calls across all read kinds.
+    pub fn storage_scan_calls_total(&self) -> u64 {
+        self.inverted_index_scans + self.forward_index_scans
+    }
+
+    /// Total storage read API calls (gets + scans).
+    pub fn storage_read_api_calls_total(&self) -> u64 {
+        self.storage_get_calls_total() + self.storage_scan_calls_total()
+    }
 }
 
 /// Which logical read kind the current storage call belongs to.

@@ -476,7 +476,18 @@ pub(crate) async fn evaluate_range(
         forward_index_entries_loaded = stats.forward_index_entries_loaded,
         sample_series_loaded = stats.sample_series_loaded,
         sample_logical_bytes = stats.samples_loaded * 16,
-        // Physical I/O stats
+        // Storage read API call counts (Timeseries → SlateDB, not object-store calls)
+        io_bucket_list_gets = io.bucket_list_gets,
+        io_inverted_index_gets = io.inverted_index_gets,
+        io_inverted_index_scans = io.inverted_index_scans,
+        io_forward_index_gets = io.forward_index_gets,
+        io_forward_index_scans = io.forward_index_scans,
+        io_sample_get_calls = io.sample_get_calls,
+        io_sample_metric_get_calls = io.sample_metric_get_calls,
+        io_storage_get_calls_total = io.storage_get_calls_total(),
+        io_storage_scan_calls_total = io.storage_scan_calls_total(),
+        io_storage_read_api_calls_total = io.storage_read_api_calls_total(),
+        // Physical I/O bytes and records
         io_bucket_list_bytes = io.bucket_list_bytes,
         io_inverted_index_bytes = io.inverted_index_bytes,
         io_inverted_index_records = io.inverted_index_records,
@@ -2487,15 +2498,32 @@ mod tests {
         // then: IO stats should be populated
         let io = &stats.io;
 
-        // Bucket list: captured because collector scope includes reader construction
+        // Storage read API call counts (Timeseries → SlateDB)
+        assert_eq!(io.bucket_list_gets, 1, "single bucket list get");
+        assert_eq!(
+            io.inverted_index_gets, 1,
+            "one inverted index get (__name__=cpu)"
+        );
+        assert_eq!(io.inverted_index_scans, 0, "no scans on point-get path");
+        assert_eq!(io.forward_index_gets, 5, "one forward index get per series");
+        assert_eq!(io.forward_index_scans, 0, "no scans on point-get path");
+        assert_eq!(io.sample_get_calls, 0, "no legacy sample gets");
+        assert_eq!(io.sample_metric_get_calls, 5, "one metric get per series");
+        // Totals: 1 bucket_list + 1 inverted + 5 forward + 5 sample = 12 gets
+        assert_eq!(io.storage_get_calls_total(), 12, "total get calls");
+        assert_eq!(io.storage_scan_calls_total(), 0, "no scans");
+        assert_eq!(
+            io.storage_read_api_calls_total(),
+            12,
+            "total read API calls"
+        );
+
+        // Record counts and bytes
+        assert_eq!(io.bucket_list_records, 1, "single bucket list record");
         assert!(
             io.bucket_list_bytes > 0,
             "expected bucket_list_bytes > 0 (scope includes reader construction)"
         );
-        assert_eq!(io.bucket_list_gets, 1, "single bucket list get");
-        assert_eq!(io.bucket_list_records, 1, "single bucket list record");
-
-        // Inverted index: should have loaded terms for __name__=cpu
         assert!(
             io.inverted_index_records > 0,
             "expected inverted_index_records > 0"
@@ -2504,23 +2532,14 @@ mod tests {
             io.inverted_index_bytes > 0,
             "expected inverted_index_bytes > 0"
         );
-
-        // Forward index: should have loaded 5 series entries
-        assert!(
-            io.forward_index_records >= 5,
-            "expected forward_index_records >= 5, got {}",
-            io.forward_index_records
-        );
+        assert_eq!(io.forward_index_records, 5, "5 forward index records");
         assert!(
             io.forward_index_bytes > 0,
             "expected forward_index_bytes > 0"
         );
-
-        // Sample metric-prefixed gets: 5 series
-        assert!(
-            io.sample_metric_get_records >= 5,
-            "expected sample_metric_get_records >= 5, got {}",
-            io.sample_metric_get_records
+        assert_eq!(
+            io.sample_metric_get_records, 5,
+            "5 metric-prefixed sample records"
         );
         assert!(
             io.sample_metric_get_bytes > 0,
@@ -2652,8 +2671,43 @@ mod tests {
 
         let io = &stats.io;
 
-        // then: exact record counts
+        // then: exact call counts (Timeseries → SlateDB read API calls)
         assert_eq!(io.bucket_list_gets, 1, "one bucket list get");
+        assert_eq!(
+            io.inverted_index_gets, 1,
+            "one inverted index get (__name__=temp)"
+        );
+        assert_eq!(
+            io.inverted_index_scans, 0,
+            "no inverted index scans on this path"
+        );
+        assert_eq!(
+            io.forward_index_gets, expected_forward_records,
+            "one forward index get per series"
+        );
+        assert_eq!(
+            io.forward_index_scans, 0,
+            "no forward index scans on this path"
+        );
+        assert_eq!(io.sample_get_calls, 0, "no legacy sample gets");
+        assert_eq!(
+            io.sample_metric_get_calls, expected_sample_records,
+            "one metric-prefixed get per series"
+        );
+        // Derived totals
+        assert_eq!(
+            io.storage_get_calls_total(),
+            1 + 1 + expected_forward_records + expected_sample_records,
+            "total gets = bucket_list + inverted + forward + sample"
+        );
+        assert_eq!(io.storage_scan_calls_total(), 0, "no scans on this path");
+        assert_eq!(
+            io.storage_read_api_calls_total(),
+            io.storage_get_calls_total(),
+            "total reads = total gets (no scans)"
+        );
+
+        // Exact record counts
         assert_eq!(io.bucket_list_records, 1, "one bucket list record");
         assert_eq!(
             io.forward_index_records, expected_forward_records,
@@ -2748,6 +2802,17 @@ mod tests {
         .unwrap();
 
         let io = &stats.io;
+
+        // Legacy layout: call counts
+        assert_eq!(io.bucket_list_gets, 1, "one bucket list get");
+        assert_eq!(io.sample_get_calls, 1, "one legacy sample get");
+        assert_eq!(io.sample_metric_get_calls, 0, "no metric-prefixed gets");
+        assert!(io.storage_get_calls_total() > 0, "total gets > 0");
+        assert_eq!(
+            io.storage_scan_calls_total(),
+            0,
+            "no scans on point-get path"
+        );
 
         // Legacy layout: sample_get path used, not metric-prefixed
         assert!(
