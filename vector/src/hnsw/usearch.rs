@@ -2,8 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
+use rayon::prelude::*;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 use crate::error::{Error, Result};
@@ -16,6 +17,21 @@ use super::CentroidGraph;
 /// Initial capacity reserved for the usearch index.
 /// Kept artificially high to avoid usearch deadlock issues near capacity limits.
 const INITIAL_CAPACITY: usize = 200_000;
+
+/// Build-time options for the USEARCH-backed centroid graph.
+#[derive(Debug, Clone, Copy)]
+pub struct UsearchBuildOptions {
+    /// When true, bulk graph construction inserts centroids in parallel.
+    pub parallel_inserts: bool,
+}
+
+impl Default for UsearchBuildOptions {
+    fn default() -> Self {
+        Self {
+            parallel_inserts: true,
+        }
+    }
+}
 
 /// Inner state for UsearchCentroidGraph, protected by a single RwLock.
 struct UsearchCentroidGraphInner {
@@ -60,6 +76,15 @@ impl UsearchCentroidGraph {
     /// # Returns
     /// A UsearchCentroidGraph ready for searching
     pub fn build(centroids: Vec<CentroidEntry>, distance_metric: DistanceMetric) -> Result<Self> {
+        Self::build_with_options(centroids, distance_metric, UsearchBuildOptions::default())
+    }
+
+    /// Build a new HNSW graph from centroids using usearch with explicit options.
+    pub fn build_with_options(
+        centroids: Vec<CentroidEntry>,
+        distance_metric: DistanceMetric,
+        build_options: UsearchBuildOptions,
+    ) -> Result<Self> {
         if centroids.is_empty() {
             return Err(Error::InvalidInput(
                 "Cannot build HNSW graph with no centroids".to_string(),
@@ -85,40 +110,67 @@ impl UsearchCentroidGraph {
         };
 
         // Create index options
-        let options = IndexOptions {
+        let index_options = IndexOptions {
             dimensions,
             metric,
             quantization: ScalarKind::F32,
             connectivity: 16,      // M parameter
             expansion_add: 200,    // ef_construction
-            expansion_search: 100, // ef_search default
+            expansion_search: 200, // ef_search default
             multi: false,
         };
 
-        // Create index
-        let index = Index::new(&options).map_err(|e| Error::Internal(e.to_string()))?;
-
-        // Reserve 200K capacity upfront
-        index
-            .reserve(INITIAL_CAPACITY)
-            .map_err(|e| Error::Internal(e.to_string()))?;
+        // Create index and reserve enough space for the current build using
+        // the thread-aware API so concurrent insertions don't fight capacity growth.
+        let index =
+            Arc::new(Index::new(&index_options).map_err(|e| Error::Internal(e.to_string()))?);
+        let centroid_count = centroids.len();
+        let reserve_capacity = INITIAL_CAPACITY.max(centroid_count);
+        let build_threads = rayon::current_num_threads().min(centroid_count);
+        if build_options.parallel_inserts && build_threads > 1 {
+            index
+                .reserve_capacity_and_threads(reserve_capacity, build_threads)
+                .map_err(|e| Error::Internal(e.to_string()))?;
+        } else {
+            index
+                .reserve(reserve_capacity)
+                .map_err(|e| Error::Internal(e.to_string()))?;
+        }
 
         // Build mappings and insert
         let mut key_to_centroid = HashMap::with_capacity(centroids.len());
         let mut centroid_to_key = HashMap::with_capacity(centroids.len());
         let mut centroid_vectors = HashMap::with_capacity(centroids.len());
+        if build_options.parallel_inserts && build_threads > 1 {
+            centroids
+                .par_iter()
+                .enumerate()
+                .try_for_each(|(key, centroid)| {
+                    index
+                        .add(key as u64, &centroid.vector)
+                        .map_err(|e| Error::Internal(e.to_string()))
+                })?;
+        } else {
+            for (key, centroid) in centroids.iter().enumerate() {
+                index
+                    .add(key as u64, &centroid.vector)
+                    .map_err(|e| Error::Internal(e.to_string()))?;
+            }
+        }
 
         for (key, centroid) in centroids.iter().enumerate() {
             let key = key as u64;
-            index
-                .add(key, &centroid.vector)
-                .map_err(|e| Error::Internal(e.to_string()))?;
             key_to_centroid.insert(key, centroid.centroid_id);
             centroid_to_key.insert(centroid.centroid_id, key);
             centroid_vectors.insert(centroid.centroid_id, centroid.vector.clone());
         }
 
-        let next_key = centroids.len() as u64;
+        let next_key = centroid_count as u64;
+        let index = Arc::try_unwrap(index).map_err(|_| {
+            Error::Internal(
+                "failed to reclaim shared usearch index after parallel build".to_string(),
+            )
+        })?;
 
         Ok(Self {
             inner: RwLock::new(UsearchCentroidGraphInner {
@@ -319,6 +371,31 @@ mod tests {
         let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
         let query = vec![0.9, 0.1, 0.1];
         let results = graph.search(&query, 1);
+
+        // then
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], 1);
+    }
+
+    #[test]
+    fn should_build_and_search_l2_graph_with_sequential_inserts() {
+        // given
+        let centroids = vec![
+            CentroidEntry::new(1, vec![1.0, 0.0, 0.0]),
+            CentroidEntry::new(2, vec![0.0, 1.0, 0.0]),
+            CentroidEntry::new(3, vec![0.0, 0.0, 1.0]),
+        ];
+
+        // when
+        let graph = UsearchCentroidGraph::build_with_options(
+            centroids,
+            DistanceMetric::L2,
+            UsearchBuildOptions {
+                parallel_inserts: false,
+            },
+        )
+        .unwrap();
+        let results = graph.search(&[0.9, 0.1, 0.1], 1);
 
         // then
         assert_eq!(results.len(), 1);

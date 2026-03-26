@@ -1,8 +1,11 @@
-# Vector Recall Benchmark
+# Vector Benchmarks
 
-Measures recall@k, query latency, and ingestion throughput for the vector database. The benchmark ingests a dataset of
-base vectors, then runs a set of queries against the database and compares the results to precomputed ground truth
-nearest neighbors.
+Includes two benchmarks for the vector database:
+
+- `recall` measures recall@k, query latency, and ingestion throughput after ingesting a dataset and comparing search
+  results to precomputed ground truth nearest neighbors.
+- `usearch` measures USEARCH index build throughput, approximate search recall, and query latency/QPS on Cohere
+  vectors, using exhaustive search over the same subset as ground truth.
 
 Reported metrics:
 
@@ -14,11 +17,23 @@ Reported metrics:
 ## Running
 
 ```bash
-# Run with default settings (in-memory storage, sift1M):
+# Run all benchmarks with default settings (in-memory storage, sift1M for recall):
 cargo run -p vector-bench --release
+
+# Run only the recall benchmark:
+cargo run -p vector-bench --release -- recall
+
+# Run only the USEARCH benchmark:
+cargo run -p vector-bench --release -- usearch
+
+# Equivalent explicit form:
+cargo run -p vector-bench --release -- --benchmark recall
 
 # Run with a config file:
 cargo run -p vector-bench --release -- --config bench.toml
+
+# Run the USEARCH benchmark on a custom Cohere subset:
+cargo run -p vector-bench --release -- --config bench.toml usearch
 
 # Skip cleanup to inspect the database after the run:
 cargo run -p vector-bench --release -- --no-cleanup
@@ -106,6 +121,7 @@ The benchmark is configured via a TOML config file passed with `--config`. The c
 2. **`[reporter]`** — (Optional) Where to persist benchmark metrics.
 3. **`[[params.recall]]`** — (Optional) Per-dataset parameter overrides. Each entry runs one benchmark iteration. When
    present, these replace the default dataset list.
+4. **`[[params.usearch]]`** — (Optional) USEARCH benchmark parameter overrides. Each entry runs one Cohere subset size.
 
 ### Parameters
 
@@ -121,6 +137,15 @@ The benchmark is configured via a TOML config file passed with `--config`. The c
 | `block_cache_bytes` | u64    | Block cache size in bytes (default: none)                          |
 | `data_dir`          | string | Directory containing dataset files (default: `vector/bench/data/`) |
 | `vector_config`     | string | Path to a YAML file with vector `Config` overrides                 |
+
+USEARCH-specific params:
+
+- `num_vectors`: number of Cohere base vectors to index.
+- `num_queries`: number of Cohere query vectors to evaluate.
+- `k`: nearest-neighbor cutoff used for both ANN search and recall.
+- `parallel_inserts`: `"true"` or `"false"` to enable or disable USEARCH bulk-build parallel insertion.
+- `data_dir`: parent directory containing `cohere/cohere_base.fvecs` and `cohere/cohere_query.fvecs`.
+- `dimensions`: optional guard that must match the Cohere file dimensions when provided.
 
 ### Example: SlateDB with S3
 

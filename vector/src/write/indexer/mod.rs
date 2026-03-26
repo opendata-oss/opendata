@@ -20,7 +20,7 @@ use common::sequence::AllocatedSeqBlock;
 use common::storage::RecordOp;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, info};
 
 const INDEXING_ROUNDS: usize = 1;
 
@@ -67,6 +67,10 @@ impl Indexer {
             opts.chunk_target,
             initial_chunk_id,
             initial_chunk_count,
+        );
+        info!(
+            split_search_neighbourhood = opts.split_search_neighbourhood,
+            "initialized batched vector indexer"
         );
         Self {
             opts: Arc::new(opts),

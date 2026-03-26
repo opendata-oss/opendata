@@ -14,7 +14,7 @@ use crate::serde::collection_meta::DistanceMetric;
 
 // Re-export implementations
 pub use exhaustive::ExhaustiveCentroidGraph;
-pub use usearch::UsearchCentroidGraph;
+pub use usearch::{UsearchBuildOptions, UsearchCentroidGraph};
 
 /// Trait for centroid graph implementations.
 ///

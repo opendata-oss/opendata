@@ -129,15 +129,20 @@ impl SplitCentroids {
         let centroid_graph = view.centroid_graph();
         // collect each centroids neighbours and add to postings to fetch, and initialize splits
         for c in to_split {
-            let c_vec = centroid_graph
-                .centroid(c)
-                .expect("unexpected missing centroid");
-            let neighbours = centroid_graph
-                .search(&c_vec.vector, self.opts.split_search_neighbourhood + 1)
-                .into_iter()
-                .filter(|&neighbour| c != neighbour)
-                .collect::<Vec<_>>();
-            postings_to_retrive.extend(neighbours.clone());
+            let neighbours = if self.opts.split_search_neighbourhood == 0 {
+                Vec::new()
+            } else {
+                let c_vec = centroid_graph
+                    .centroid(c)
+                    .expect("unexpected missing centroid");
+                let neighbours = centroid_graph
+                    .search(&c_vec.vector, self.opts.split_search_neighbourhood + 1)
+                    .into_iter()
+                    .filter(|&neighbour| c != neighbour)
+                    .collect::<Vec<_>>();
+                postings_to_retrive.extend(neighbours.iter().copied());
+                neighbours
+            };
             splits.push(SplitCentroid {
                 c,
                 neighbours,
@@ -505,7 +510,15 @@ mod tests {
     #[tokio::test]
     async fn should_split_single_centroid_with_no_neighbours() {
         let mut h = IndexerOpTestHarness::with_single_centroid(CENTROID_ID, DIMS).await;
-        let opts = create_opts();
+        let opts = Arc::new(IndexerOpts {
+            dimensions: DIMS,
+            distance_metric: DistanceMetric::L2,
+            merge_threshold_vectors: 0,
+            split_threshold_vectors: SPLIT_THRESHOLD,
+            split_search_neighbourhood: 0,
+            indexed_fields: HashSet::new(),
+            chunk_target: 4096,
+        });
         let writes = vec![
             h.make_write("a", vec![0.9, 0.1]),
             h.make_write("b", vec![0.8, 0.2]),

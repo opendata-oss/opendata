@@ -11,6 +11,10 @@ use crate::config::{Config, DataConfig};
 #[derive(Parser, Debug)]
 #[command(about = "OpenData benchmark runner")]
 pub struct Args {
+    /// Run only the benchmark with this name.
+    #[arg(value_name = "BENCHMARK", conflicts_with = "benchmark")]
+    pub benchmark_name: Option<String>,
+
     /// Path to config file (TOML).
     #[arg(short, long)]
     pub config: Option<PathBuf>,
@@ -34,6 +38,11 @@ impl Args {
         Self::parse()
     }
 
+    /// Get the selected benchmark name.
+    pub fn benchmark(&self) -> Option<&str> {
+        self.benchmark.as_deref().or(self.benchmark_name.as_deref())
+    }
+
     /// Get the benchmark duration.
     pub fn duration(&self) -> Duration {
         Duration::from_secs(self.duration)
@@ -49,6 +58,30 @@ impl Args {
             }
             None => Ok(Config::default()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn should_parse_benchmark_from_flag() {
+        // given/when
+        let args = Args::parse_from(["vector-bench", "--benchmark", "recall"]);
+
+        // then
+        assert_eq!(args.benchmark(), Some("recall"));
+    }
+
+    #[test]
+    fn should_parse_benchmark_from_positional_argument() {
+        // given/when
+        let args = Args::parse_from(["vector-bench", "usearch"]);
+
+        // then
+        assert_eq!(args.benchmark(), Some("usearch"));
     }
 }
 

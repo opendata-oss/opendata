@@ -170,6 +170,16 @@ pub trait Benchmark: Send + Sync {
     /// Name of the benchmark.
     fn name(&self) -> &str;
 
+    /// Backward-compatible aliases for the benchmark name.
+    fn aliases(&self) -> &[&str] {
+        &[]
+    }
+
+    /// Whether the benchmark can be selected by the provided name.
+    fn matches_name(&self, name: &str) -> bool {
+        self.name() == name || self.aliases().contains(&name)
+    }
+
     /// Static labels for this benchmark (constant across all runs).
     fn labels(&self) -> Vec<Label> {
         vec![]
@@ -200,7 +210,7 @@ pub async fn run(benchmarks: Vec<Box<dyn Benchmark>>) -> anyhow::Result<()> {
 
     let benchmarks: Vec<_> = benchmarks
         .into_iter()
-        .filter(|b| args.benchmark.as_ref().is_none_or(|name| b.name() == name))
+        .filter(|b| args.benchmark().is_none_or(|name| b.matches_name(name)))
         .collect();
 
     let duration = args.duration();
@@ -216,6 +226,12 @@ pub async fn run(benchmarks: Vec<Box<dyn Benchmark>>) -> anyhow::Result<()> {
             .params
             .get(benchmark.name())
             .cloned()
+            .or_else(|| {
+                benchmark
+                    .aliases()
+                    .iter()
+                    .find_map(|alias| config.params.get(*alias).cloned())
+            })
             .unwrap_or_else(|| benchmark.default_params());
         for p in params {
             // Create a unique storage path for this benchmark run
