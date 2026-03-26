@@ -168,6 +168,8 @@ impl ObjectStore for ObservedObjectStore {
 
     async fn get_range(&self, location: &Path, range: Range<u64>) -> object_store::Result<Bytes> {
         let collector = try_get_collector();
+        let started_at = SystemTime::now();
+        let started = Instant::now();
 
         match self.inner.get_range(location, range.clone()).await {
             Ok(bytes) => {
@@ -179,12 +181,38 @@ impl ObjectStore for ObservedObjectStore {
                     };
                     c.record_os_read(sig, bytes.len() as u64, true);
                 }
+                log_object_store_call(
+                    "get_range",
+                    location.as_ref(),
+                    Some(range.start),
+                    Some(range.end),
+                    None,
+                    Some(bytes.len() as u64),
+                    None,
+                    "ok",
+                    None,
+                    started_at,
+                    started,
+                );
                 Ok(bytes)
             }
             Err(e) => {
                 if let Some(c) = &collector {
                     c.record_os_read_error(true);
                 }
+                log_object_store_call(
+                    "get_range",
+                    location.as_ref(),
+                    Some(range.start),
+                    Some(range.end),
+                    None,
+                    None,
+                    None,
+                    "err",
+                    Some(&e.to_string()),
+                    started_at,
+                    started,
+                );
                 Err(e)
             }
         }
@@ -196,6 +224,8 @@ impl ObjectStore for ObservedObjectStore {
         ranges: &[Range<u64>],
     ) -> object_store::Result<Vec<Bytes>> {
         let collector = try_get_collector();
+        let started_at = SystemTime::now();
+        let started = Instant::now();
 
         match self.inner.get_ranges(location, ranges).await {
             Ok(results) => {
@@ -203,12 +233,39 @@ impl ObjectStore for ObservedObjectStore {
                     let path = Arc::from(location.as_ref());
                     c.record_os_get_ranges(&path, ranges, &results);
                 }
+                let total_bytes: u64 = results.iter().map(|b| b.len() as u64).sum();
+                log_object_store_call(
+                    "get_ranges",
+                    location.as_ref(),
+                    None,
+                    None,
+                    Some(ranges.len() as u32),
+                    Some(total_bytes),
+                    None,
+                    "ok",
+                    None,
+                    started_at,
+                    started,
+                );
                 Ok(results)
             }
             Err(e) => {
                 if let Some(c) = &collector {
                     c.record_os_get_ranges_error();
                 }
+                log_object_store_call(
+                    "get_ranges",
+                    location.as_ref(),
+                    None,
+                    None,
+                    Some(ranges.len() as u32),
+                    None,
+                    None,
+                    "err",
+                    Some(&e.to_string()),
+                    started_at,
+                    started,
+                );
                 Err(e)
             }
         }
@@ -216,18 +273,46 @@ impl ObjectStore for ObservedObjectStore {
 
     async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
         let collector = try_get_collector();
+        let started_at = SystemTime::now();
+        let started = Instant::now();
 
         match self.inner.head(location).await {
             Ok(meta) => {
                 if let Some(c) = &collector {
                     c.record_os_head();
                 }
+                log_object_store_call(
+                    "head",
+                    location.as_ref(),
+                    None,
+                    None,
+                    None,
+                    Some(0),
+                    None,
+                    "ok",
+                    None,
+                    started_at,
+                    started,
+                );
                 Ok(meta)
             }
             Err(e) => {
                 if let Some(c) = &collector {
                     c.record_os_head_error();
                 }
+                log_object_store_call(
+                    "head",
+                    location.as_ref(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "err",
+                    Some(&e.to_string()),
+                    started_at,
+                    started,
+                );
                 Err(e)
             }
         }
@@ -250,18 +335,47 @@ impl ObjectStore for ObservedObjectStore {
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
         let collector = try_get_collector();
+        let path_str = prefix.map(|p| p.as_ref()).unwrap_or("");
+        let started_at = SystemTime::now();
+        let started = Instant::now();
 
         match self.inner.list_with_delimiter(prefix).await {
             Ok(result) => {
                 if let Some(c) = &collector {
                     c.record_os_list_with_delimiter(result.objects.len() as u64);
                 }
+                log_object_store_call(
+                    "list_with_delimiter",
+                    path_str,
+                    None,
+                    None,
+                    None,
+                    Some(0),
+                    Some(result.objects.len() as u64),
+                    "ok",
+                    None,
+                    started_at,
+                    started,
+                );
                 Ok(result)
             }
             Err(e) => {
                 if let Some(c) = &collector {
                     c.record_os_list_with_delimiter_error();
                 }
+                log_object_store_call(
+                    "list_with_delimiter",
+                    path_str,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "err",
+                    Some(&e.to_string()),
+                    started_at,
+                    started,
+                );
                 Err(e)
             }
         }
