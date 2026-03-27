@@ -20,7 +20,6 @@ use crate::config::L0OnlyCompactionConfig;
 pub struct L0OnlyCompactionScheduler {
     min_compaction_sources: usize,
     max_compaction_sources: usize,
-    max_concurrent_compactions: usize,
 }
 
 impl L0OnlyCompactionScheduler {
@@ -28,7 +27,6 @@ impl L0OnlyCompactionScheduler {
         Self {
             min_compaction_sources: config.min_compaction_sources,
             max_compaction_sources: config.max_compaction_sources,
-            max_concurrent_compactions: config.max_concurrent_compactions,
         }
     }
 }
@@ -50,6 +48,11 @@ impl CompactionScheduler for L0OnlyCompactionScheduler {
             }
         }
 
+        // Only one L0 compaction at a time — parallel L0 compactions are not supported.
+        if active_count > 0 {
+            return Vec::new();
+        }
+
         // Collect available L0 SSTs not in use, in manifest order (newest-first).
         let available: Vec<SourceId> = manifest
             .l0
@@ -61,33 +64,22 @@ impl CompactionScheduler for L0OnlyCompactionScheduler {
         // Destination SR id: one past the highest existing SR id.
         let base_dst = manifest.compacted.first().map_or(0, |sr| sr.id + 1);
 
-        // Split available L0s into consecutive batches from the tail (oldest).
-        // Each batch is capped at max_compaction_sources and stays in manifest
-        // order so that validate() sees consecutive entries.
-        let mut specs = Vec::new();
-        let mut end = available.len();
+        // Take up to max_compaction_sources from the tail (oldest L0s).
+        if available.len() < self.min_compaction_sources {
+            return Vec::new();
+        }
+
+        // Skip destination SR IDs already claimed by active compactions.
         let mut next_dst = base_dst;
-
-        while active_count + specs.len() < self.max_concurrent_compactions {
-            if end < self.min_compaction_sources {
-                break;
-            }
-
-            // Skip destination SR IDs already claimed by active compactions.
-            while sources_used.contains(&SourceId::SortedRun(next_dst)) {
-                next_dst += 1;
-            }
-
-            let take = end.min(self.max_compaction_sources);
-            let start = end - take;
-            let batch: Vec<SourceId> = available[start..end].to_vec();
-            end = start;
-
-            specs.push(CompactionSpec::new(batch, next_dst));
+        while sources_used.contains(&SourceId::SortedRun(next_dst)) {
             next_dst += 1;
         }
 
-        specs
+        let take = available.len().min(self.max_compaction_sources);
+        let start = available.len() - take;
+        let batch: Vec<SourceId> = available[start..].to_vec();
+
+        vec![CompactionSpec::new(batch, next_dst)]
     }
 
     fn validate(

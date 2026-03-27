@@ -86,19 +86,13 @@ pub struct L0OnlyCompactionConfig {
     /// Maximum number of L0 SSTs included in a single compaction.
     #[serde(default = "default_max_l0_sources")]
     pub max_compaction_sources: usize,
-    /// Maximum number of compactions running concurrently.
-    #[serde(default = "default_max_concurrent")]
-    pub max_concurrent_compactions: usize,
 }
 
 fn default_min_l0_sources() -> usize {
     2
 }
 fn default_max_l0_sources() -> usize {
-    4
-}
-fn default_max_concurrent() -> usize {
-    4
+    8
 }
 
 impl Default for L0OnlyCompactionConfig {
@@ -106,7 +100,6 @@ impl Default for L0OnlyCompactionConfig {
         Self {
             min_compaction_sources: default_min_l0_sources(),
             max_compaction_sources: default_max_l0_sources(),
-            max_concurrent_compactions: default_max_concurrent(),
         }
     }
 }
