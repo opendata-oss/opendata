@@ -416,6 +416,16 @@ impl LogDb {
                             "db/l0_upload_idle_millis",
                         ],
                     ),
+                    (
+                        "l0-latency",
+                        &[
+                            "db/l0_flush_created_to_pending_millis",
+                            "db/l0_flush_pending_to_uploading_millis",
+                            "db/l0_flush_uploading_to_writing_millis",
+                            "db/l0_flush_writing_to_complete_millis",
+                            "db/l0_flush_end_to_end_millis",
+                        ],
+                    ),
                 ];
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
