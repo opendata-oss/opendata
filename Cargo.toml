@@ -4,6 +4,7 @@ members = [
     "bencher",
     "common",
     "ingest",
+    "ingest-bindings",
     "keyvalue",
     "log",
     "log/bench",
@@ -36,6 +37,7 @@ futures = { version = "0.3", features = ["std"] }
 moka = { version = "0.12", features = ["future"] }
 bencher = { path = "./bencher" }
 common = { path = "./common", package = "opendata-common", version = "0.1.11" }
+ingest = { path = "./ingest", package = "opendata-ingest" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 roaring = "0.10"
 rstest = "0.19"
@@ -61,6 +63,7 @@ prost = "0.13"
 proptest = "1"
 dashu-float = "0.4"
 snap = "1"
+uniffi = { version = "0.29", features = ["cli"] }
 zstd = "0.13"
 criterion = "0.5"
 tempfile = "3"

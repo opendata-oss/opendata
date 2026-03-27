@@ -1,0 +1,15 @@
+[package]
+name = "opendata-ingest-bindings"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+common.workspace = true
+ingest.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uniffi.workspace = true
