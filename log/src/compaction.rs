@@ -54,7 +54,7 @@ impl CompactionScheduler for L0OnlyCompactionScheduler {
         let available: Vec<SourceId> = manifest
             .l0
             .iter()
-            .map(|sst| SourceId::Sst(sst.id.unwrap_compacted_id()))
+            .map(|view| SourceId::SstView(view.id))
             .filter(|id| !sources_used.contains(id))
             .collect();
 
@@ -109,7 +109,7 @@ impl CompactionScheduler for L0OnlyCompactionScheduler {
             .manifest()
             .l0
             .iter()
-            .map(|sst| SourceId::Sst(sst.id.unwrap_compacted_id()))
+            .map(|view| SourceId::SstView(view.id))
             .collect();
 
         if spec.sources().is_empty() {

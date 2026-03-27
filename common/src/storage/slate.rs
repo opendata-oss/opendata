@@ -455,7 +455,7 @@ mod tests {
     use super::*;
     use crate::BytesRange;
     use slatedb::DbBuilder;
-    use slatedb::config::{DbReaderOptions, Settings};
+    use slatedb::config::Settings;
     use slatedb::object_store::memory::InMemory;
     use slatedb_common::clock::MockSystemClock;
 
@@ -781,13 +781,11 @@ mod tests {
         key: &str,
         merge_op: Option<Arc<dyn SlateDbMergeOperator + Send + Sync>>,
     ) -> bool {
-        let options = DbReaderOptions {
-            merge_operator: merge_op,
-            ..Default::default()
-        };
-        let reader = DbReader::open(path, object_store, None, options)
-            .await
-            .unwrap();
+        let mut builder = DbReader::builder(path, object_store);
+        if let Some(op) = merge_op {
+            builder = builder.with_merge_operator(op);
+        }
+        let reader = builder.build().await.unwrap();
         let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
         storage_reader
             .get(Bytes::from(key.to_owned()))
