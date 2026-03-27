@@ -419,6 +419,7 @@ impl LogDb {
                     (
                         "l0-latency",
                         &[
+                            "db/l0_flush_count",
                             "db/l0_flush_created_to_pending_millis",
                             "db/l0_flush_pending_to_uploading_millis",
                             "db/l0_flush_uploading_to_writing_millis",
@@ -426,9 +427,25 @@ impl LogDb {
                             "db/l0_flush_end_to_end_millis",
                         ],
                     ),
+                    (
+                        "l0-latency-max",
+                        &[
+                            "db/l0_flush_created_to_pending_max_millis",
+                            "db/l0_flush_pending_to_uploading_max_millis",
+                            "db/l0_flush_uploading_to_writing_max_millis",
+                            "db/l0_flush_writing_to_complete_max_millis",
+                            "db/l0_flush_end_to_end_max_millis",
+                        ],
+                    ),
                 ];
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let elapsed = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    let secs = elapsed.as_secs();
+                    let millis = elapsed.subsec_millis();
+                    eprintln!("[slatedb:time] {}.{:03}", secs, millis);
                     for (group, metrics) in metric_groups {
                         let mut parts = Vec::new();
                         for name in *metrics {
@@ -438,7 +455,7 @@ impl LogDb {
                             }
                         }
                         if !parts.is_empty() {
-                            eprintln!("[slatedb:{}] {}", group, parts.join(" "));
+                            eprintln!("\t[slatedb:{}] {}", group, parts.join(" "));
                         }
                     }
                 }

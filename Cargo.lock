@@ -3953,7 +3953,7 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 [[package]]
 name = "slatedb"
 version = "0.11.1"
-source = "git+https://github.com/hachikuji/slatedb.git?branch=debug-parallel-memtable-flush#9b1a210c25b2d1b8a04d5489d2e3c9adc0e2541e"
+source = "git+https://github.com/hachikuji/slatedb.git?branch=debug-parallel-memtable-flush#f8ccdc0d3ae6dd40259f56b928f9ddc953f21488"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -4001,7 +4001,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.11.1"
-source = "git+https://github.com/hachikuji/slatedb.git?branch=debug-parallel-memtable-flush#9b1a210c25b2d1b8a04d5489d2e3c9adc0e2541e"
+source = "git+https://github.com/hachikuji/slatedb.git?branch=debug-parallel-memtable-flush#f8ccdc0d3ae6dd40259f56b928f9ddc953f21488"
 dependencies = [
  "chrono",
  "log",
@@ -4012,7 +4012,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.11.1"
-source = "git+https://github.com/hachikuji/slatedb.git?branch=debug-parallel-memtable-flush#9b1a210c25b2d1b8a04d5489d2e3c9adc0e2541e"
+source = "git+https://github.com/hachikuji/slatedb.git?branch=debug-parallel-memtable-flush#f8ccdc0d3ae6dd40259f56b928f9ddc953f21488"
 dependencies = [
  "async-trait",
  "bytes",
