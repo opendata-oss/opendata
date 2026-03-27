@@ -484,6 +484,8 @@ pub(crate) async fn evaluate_range(
         io_forward_index_scans = io.forward_index_scans,
         io_sample_get_calls = io.sample_get_calls,
         io_sample_metric_get_calls = io.sample_metric_get_calls,
+        io_sample_scan_calls = io.sample_scan_calls,
+        io_sample_metric_scan_calls = io.sample_metric_scan_calls,
         io_storage_get_calls_total = io.storage_get_calls_total(),
         io_storage_scan_calls_total = io.storage_scan_calls_total(),
         io_storage_read_api_calls_total = io.storage_read_api_calls_total(),
@@ -497,6 +499,10 @@ pub(crate) async fn evaluate_range(
         io_sample_get_records = io.sample_get_records,
         io_sample_metric_get_bytes = io.sample_metric_get_bytes,
         io_sample_metric_get_records = io.sample_metric_get_records,
+        io_sample_scan_bytes = io.sample_scan_bytes,
+        io_sample_scan_records = io.sample_scan_records,
+        io_sample_metric_scan_bytes = io.sample_metric_scan_bytes,
+        io_sample_metric_scan_records = io.sample_metric_scan_records,
         io_metadata_bytes = io.metadata_bytes(),
         io_sample_bytes = io.sample_bytes(),
         io_physical_bytes_total = io.physical_bytes_total(),
@@ -2508,10 +2514,15 @@ mod tests {
         assert_eq!(io.forward_index_gets, 5, "one forward index get per series");
         assert_eq!(io.forward_index_scans, 0, "no scans on point-get path");
         assert_eq!(io.sample_get_calls, 0, "no legacy sample gets");
-        assert_eq!(io.sample_metric_get_calls, 5, "one metric get per series");
-        // Totals: 1 bucket_list + 1 inverted + 5 forward + 5 sample = 12 gets
-        assert_eq!(io.storage_get_calls_total(), 12, "total get calls");
-        assert_eq!(io.storage_scan_calls_total(), 0, "no scans");
+        assert_eq!(
+            io.sample_metric_get_calls, 0,
+            "no metric point gets (now using scans)"
+        );
+        assert_eq!(io.sample_metric_scan_calls, 5, "one metric scan per series");
+        // Totals: 1 bucket_list + 1 inverted + 5 forward = 7 gets
+        assert_eq!(io.storage_get_calls_total(), 7, "total get calls");
+        // 5 sample scans
+        assert_eq!(io.storage_scan_calls_total(), 5, "sample singleton scans");
         assert_eq!(
             io.storage_read_api_calls_total(),
             12,
@@ -2538,12 +2549,12 @@ mod tests {
             "expected forward_index_bytes > 0"
         );
         assert_eq!(
-            io.sample_metric_get_records, 5,
-            "5 metric-prefixed sample records"
+            io.sample_metric_scan_records, 5,
+            "5 metric-prefixed sample scan records"
         );
         assert!(
-            io.sample_metric_get_bytes > 0,
-            "expected sample_metric_get_bytes > 0"
+            io.sample_metric_scan_bytes > 0,
+            "expected sample_metric_scan_bytes > 0"
         );
 
         // Derived totals: physical_bytes_total == metadata + samples
@@ -2563,11 +2574,14 @@ mod tests {
                 + io.forward_index_bytes
                 + io.sample_get_bytes
                 + io.sample_metric_get_bytes
+                + io.sample_scan_bytes
+                + io.sample_metric_scan_bytes
         );
 
-        // MetricPrefixed layout: no legacy sample gets
+        // MetricPrefixed layout: no legacy sample gets, uses scans
         assert_eq!(io.sample_get_bytes, 0);
-        assert!(io.sample_metric_get_bytes > 0);
+        assert_eq!(io.sample_metric_get_bytes, 0);
+        assert!(io.sample_metric_scan_bytes > 0);
 
         // Logical vs physical: sample_logical_bytes should be less than physical
         let sample_logical_bytes = stats.samples_loaded * 16;
@@ -2691,20 +2705,28 @@ mod tests {
         );
         assert_eq!(io.sample_get_calls, 0, "no legacy sample gets");
         assert_eq!(
-            io.sample_metric_get_calls, expected_sample_records,
-            "one metric-prefixed get per series"
+            io.sample_metric_get_calls, 0,
+            "no metric point gets (now using scans)"
+        );
+        assert_eq!(
+            io.sample_metric_scan_calls, expected_sample_records,
+            "one metric-prefixed scan per series"
         );
         // Derived totals
         assert_eq!(
             io.storage_get_calls_total(),
-            1 + 1 + expected_forward_records + expected_sample_records,
-            "total gets = bucket_list + inverted + forward + sample"
+            1 + 1 + expected_forward_records,
+            "total gets = bucket_list + inverted + forward"
         );
-        assert_eq!(io.storage_scan_calls_total(), 0, "no scans on this path");
+        assert_eq!(
+            io.storage_scan_calls_total(),
+            expected_sample_records,
+            "sample singleton scans"
+        );
         assert_eq!(
             io.storage_read_api_calls_total(),
-            io.storage_get_calls_total(),
-            "total reads = total gets (no scans)"
+            io.storage_get_calls_total() + io.storage_scan_calls_total(),
+            "total reads = gets + scans"
         );
 
         // Exact record counts
@@ -2714,10 +2736,11 @@ mod tests {
             "forward index records"
         );
         assert_eq!(
-            io.sample_metric_get_records, expected_sample_records,
-            "sample metric get records"
+            io.sample_metric_scan_records, expected_sample_records,
+            "sample metric scan records"
         );
         assert_eq!(io.sample_get_records, 0, "no legacy sample gets");
+        assert_eq!(io.sample_scan_records, 0, "no legacy sample scans");
 
         // Exact byte counts matching direct storage reads
         assert_eq!(
@@ -2731,9 +2754,9 @@ mod tests {
             io.forward_index_bytes, expected_forward_bytes
         );
         assert_eq!(
-            io.sample_metric_get_bytes, expected_sample_bytes,
-            "sample metric bytes: collector={} vs direct={}",
-            io.sample_metric_get_bytes, expected_sample_bytes
+            io.sample_metric_scan_bytes, expected_sample_bytes,
+            "sample metric scan bytes: collector={} vs direct={}",
+            io.sample_metric_scan_bytes, expected_sample_bytes
         );
 
         // Inverted index bytes: the query only loads terms it needs (__name__=temp),
@@ -2754,6 +2777,8 @@ mod tests {
                 + io.forward_index_bytes
                 + io.sample_get_bytes
                 + io.sample_metric_get_bytes
+                + io.sample_scan_bytes
+                + io.sample_metric_scan_bytes
         );
 
         // Logical metadata entry counts
@@ -2803,33 +2828,42 @@ mod tests {
 
         let io = &stats.io;
 
-        // Legacy layout: call counts
+        // Legacy layout: call counts (now using singleton scans)
         assert_eq!(io.bucket_list_gets, 1, "one bucket list get");
-        assert_eq!(io.sample_get_calls, 1, "one legacy sample get");
+        assert_eq!(io.sample_get_calls, 0, "no legacy sample point gets");
+        assert_eq!(io.sample_scan_calls, 1, "one legacy sample scan");
         assert_eq!(io.sample_metric_get_calls, 0, "no metric-prefixed gets");
+        assert_eq!(
+            io.sample_metric_scan_calls, 0,
+            "no metric-prefixed scans for legacy layout"
+        );
         assert!(io.storage_get_calls_total() > 0, "total gets > 0");
         assert_eq!(
             io.storage_scan_calls_total(),
-            0,
-            "no scans on point-get path"
+            1,
+            "one sample singleton scan"
         );
 
-        // Legacy layout: sample_get path used, not metric-prefixed
+        // Legacy layout: sample_scan path used, not metric-prefixed
         assert!(
-            io.sample_get_bytes > 0,
-            "expected sample_get_bytes > 0 for legacy layout"
+            io.sample_scan_bytes > 0,
+            "expected sample_scan_bytes > 0 for legacy layout"
         );
         assert_eq!(
-            io.sample_get_records, 1,
-            "expected 1 legacy sample get record"
+            io.sample_scan_records, 1,
+            "expected 1 legacy sample scan record"
+        );
+        assert_eq!(
+            io.sample_get_bytes, 0,
+            "no sample point gets for legacy layout (now using scans)"
         );
         assert_eq!(
             io.sample_metric_get_bytes, 0,
             "no metric-prefixed gets for legacy layout"
         );
         assert_eq!(
-            io.sample_metric_get_records, 0,
-            "no metric-prefixed records for legacy layout"
+            io.sample_metric_scan_bytes, 0,
+            "no metric-prefixed scans for legacy layout"
         );
 
         // Bucket list captured
@@ -2843,6 +2877,8 @@ mod tests {
                 + io.forward_index_bytes
                 + io.sample_get_bytes
                 + io.sample_metric_get_bytes
+                + io.sample_scan_bytes
+                + io.sample_metric_scan_bytes
         );
     }
 
@@ -2938,6 +2974,8 @@ mod tests {
                 + io.forward_index_bytes
                 + io.sample_get_bytes
                 + io.sample_metric_get_bytes
+                + io.sample_scan_bytes
+                + io.sample_metric_scan_bytes
         );
     }
 

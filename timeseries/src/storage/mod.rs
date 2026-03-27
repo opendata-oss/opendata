@@ -1,7 +1,10 @@
 use async_trait::async_trait;
+use bytes::Bytes;
+use common::bytes::{BytesRange, lex_increment};
 use common::storage::RecordOp;
 use common::{Record, Storage, StorageRead};
 use roaring::RoaringBitmap;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 
 use crate::index::{InvertedIndex, SeriesSpec};
 use crate::model::{Sample, SeriesFingerprint, SeriesId, TimeBucket};
@@ -264,6 +267,31 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         Ok(values)
     }
 
+    // ── Singleton scan for merge-written keys ──────────────────────
+    //
+    // For keys written with RecordOp::Merge, a point get() must walk
+    // sorted runs sequentially to discover all merge operands. By
+    // contrast, a scan forces SlateDB's scan path, which can fan out
+    // across sorted runs concurrently. This helper wraps a singleton
+    // scan: it builds a range [key, lex_successor(key)) so that only
+    // the exact key can match, then verifies the returned record.
+
+    /// Read a merge-written key via singleton scan instead of point get.
+    ///
+    /// This forces SlateDB's scan path, which handles merge operands
+    /// more efficiently than sequential get() for merge-heavy keys.
+    /// The `kind` parameter controls instrumentation attribution.
+    async fn get_merged_record(&self, key: Bytes, kind: ReadKind) -> Result<Option<Record>> {
+        let range = match lex_increment(&key) {
+            Some(successor) => BytesRange::new(Included(key.clone()), Excluded(successor)),
+            // Effectively impossible for normal Timeseries keys, but handle defensively.
+            None => BytesRange::new(Included(key.clone()), Unbounded),
+        };
+        let records = self.scan(range).await?;
+        query_io::record_scan(kind, &records);
+        Ok(records.into_iter().find(|r| r.key == key))
+    }
+
     // ── Warm helpers (touch storage to populate block cache) ────────
 
     /// Load samples for a single series using the metric-prefixed key layout.
@@ -284,8 +312,9 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         }
         .encode();
 
-        let record = self.get(key).await?;
-        query_io::record_get(ReadKind::SampleMetricGet, &record);
+        let record = self
+            .get_merged_record(key, ReadKind::SampleMetricScan)
+            .await?;
         match record {
             Some(record) => {
                 let iter = TimeSeriesIterator::new(record.value.as_ref()).ok_or_else(|| {
@@ -769,5 +798,290 @@ mod tests {
         // then - only timestamp 2000 is in (1000, 2500]
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].timestamp_ms, 2000);
+    }
+
+    // ── get_merged_record (singleton scan) tests ────────────────────
+
+    #[tokio::test]
+    async fn singleton_scan_returns_exact_merged_record() {
+        // given: two merge writes for the same metric/series key
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let bucket = TimeBucket::hour(60);
+
+        // First merge: samples at t=1000
+        let op1 = storage
+            .merge_metric_samples(
+                bucket,
+                "http_total",
+                7,
+                vec![Sample {
+                    timestamp_ms: 1000,
+                    value: 1.0,
+                }],
+            )
+            .unwrap();
+        // Second merge: samples at t=2000
+        let op2 = storage
+            .merge_metric_samples(
+                bucket,
+                "http_total",
+                7,
+                vec![Sample {
+                    timestamp_ms: 2000,
+                    value: 2.0,
+                }],
+            )
+            .unwrap();
+        for op in [op1, op2] {
+            match op {
+                RecordOp::Merge(record) => {
+                    storage.merge(vec![record]).await.unwrap();
+                }
+                _ => panic!("expected Merge op"),
+            }
+        }
+
+        // when: read via singleton scan
+        let key = MetricTimeSeriesKey {
+            time_bucket: bucket.start,
+            bucket_size: bucket.size,
+            metric_name: "http_total".to_string(),
+            series_id: 7,
+        }
+        .encode();
+        let record = storage
+            .get_merged_record(key, ReadKind::SampleMetricScan)
+            .await
+            .unwrap();
+
+        // then: record exists and contains merged samples
+        assert!(record.is_some(), "singleton scan should return the record");
+        let record = record.unwrap();
+        let iter = TimeSeriesIterator::new(record.value.as_ref()).unwrap();
+        let samples: Vec<Sample> = iter.filter_map(|r| r.ok()).collect();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].timestamp_ms, 1000);
+        assert_eq!(samples[1].timestamp_ms, 2000);
+    }
+
+    #[tokio::test]
+    async fn singleton_scan_does_not_match_neighboring_keys() {
+        // given: two metric/series keys that are lexicographically adjacent
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let bucket = TimeBucket::hour(60);
+
+        // Write series_id=7 and series_id=8 for the same metric
+        for (series_id, value) in [(7, 1.0), (8, 2.0)] {
+            let op = storage
+                .merge_metric_samples(
+                    bucket,
+                    "cpu",
+                    series_id,
+                    vec![Sample {
+                        timestamp_ms: 1000,
+                        value,
+                    }],
+                )
+                .unwrap();
+            match op {
+                RecordOp::Merge(record) => {
+                    storage.merge(vec![record]).await.unwrap();
+                }
+                _ => panic!("expected Merge op"),
+            }
+        }
+
+        // when: singleton scan for series_id=7
+        let key_7 = MetricTimeSeriesKey {
+            time_bucket: bucket.start,
+            bucket_size: bucket.size,
+            metric_name: "cpu".to_string(),
+            series_id: 7,
+        }
+        .encode();
+        let record = storage
+            .get_merged_record(key_7, ReadKind::SampleMetricScan)
+            .await
+            .unwrap();
+
+        // then: only series 7 returned, not series 8
+        let record = record.unwrap();
+        let iter = TimeSeriesIterator::new(record.value.as_ref()).unwrap();
+        let samples: Vec<Sample> = iter.filter_map(|r| r.ok()).collect();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].value, 1.0, "should be series 7, not 8");
+    }
+
+    #[tokio::test]
+    async fn singleton_scan_missing_key_returns_none() {
+        // given: empty storage
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let bucket = TimeBucket::hour(60);
+
+        // when: singleton scan for a key that doesn't exist
+        let key = MetricTimeSeriesKey {
+            time_bucket: bucket.start,
+            bucket_size: bucket.size,
+            metric_name: "nonexistent".to_string(),
+            series_id: 1,
+        }
+        .encode();
+        let record = storage
+            .get_merged_record(key, ReadKind::SampleMetricScan)
+            .await
+            .unwrap();
+
+        // then: None
+        assert!(record.is_none());
+    }
+
+    #[tokio::test]
+    async fn singleton_scan_records_scan_instrumentation() {
+        use crate::query_io::{self, QueryIoCollector};
+
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let bucket = TimeBucket::hour(60);
+
+        // Write one sample
+        let op = storage
+            .merge_metric_samples(
+                bucket,
+                "req_total",
+                1,
+                vec![Sample {
+                    timestamp_ms: 1000,
+                    value: 42.0,
+                }],
+            )
+            .unwrap();
+        match op {
+            RecordOp::Merge(record) => {
+                storage.merge(vec![record]).await.unwrap();
+            }
+            _ => panic!("expected Merge op"),
+        }
+
+        // when: read within a collector scope
+        let collector = QueryIoCollector::new();
+        let _record = query_io::run_with_collector(&collector, async {
+            let key = MetricTimeSeriesKey {
+                time_bucket: bucket.start,
+                bucket_size: bucket.size,
+                metric_name: "req_total".to_string(),
+                series_id: 1,
+            }
+            .encode();
+            storage
+                .get_merged_record(key, ReadKind::SampleMetricScan)
+                .await
+        })
+        .await
+        .unwrap();
+
+        // then: scan counters populated, get counters zero
+        let io = collector.snapshot();
+        assert_eq!(io.sample_metric_scan_calls, 1, "one scan call");
+        assert_eq!(io.sample_metric_scan_records, 1, "one record returned");
+        assert!(io.sample_metric_scan_bytes > 0, "bytes recorded");
+        assert_eq!(io.sample_metric_get_calls, 0, "no get calls");
+        assert_eq!(io.sample_get_calls, 0, "no legacy get calls");
+
+        // Scan should appear in scan totals, not get totals
+        assert_eq!(io.storage_scan_calls_total(), 1);
+        assert_eq!(io.storage_get_calls_total(), 0);
+        assert_eq!(io.storage_read_api_calls_total(), 1);
+    }
+
+    #[tokio::test]
+    async fn singleton_scan_miss_records_zero_bytes() {
+        use crate::query_io::{self, QueryIoCollector};
+
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let bucket = TimeBucket::hour(60);
+
+        // when: singleton scan on missing key within a collector scope
+        let collector = QueryIoCollector::new();
+        let record = query_io::run_with_collector(&collector, async {
+            let key = MetricTimeSeriesKey {
+                time_bucket: bucket.start,
+                bucket_size: bucket.size,
+                metric_name: "missing".to_string(),
+                series_id: 1,
+            }
+            .encode();
+            storage
+                .get_merged_record(key, ReadKind::SampleMetricScan)
+                .await
+        })
+        .await
+        .unwrap();
+
+        // then: None result, scan call counted but 0 records/bytes
+        assert!(record.is_none());
+        let io = collector.snapshot();
+        assert_eq!(io.sample_metric_scan_calls, 1, "scan call counted");
+        assert_eq!(io.sample_metric_scan_records, 0, "no records");
+        assert_eq!(io.sample_metric_scan_bytes, 0, "no bytes");
+    }
+
+    #[tokio::test]
+    async fn legacy_singleton_scan_records_correct_kind() {
+        use crate::query_io::{self, QueryIoCollector};
+
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let bucket = TimeBucket::hour(60);
+
+        // Write one legacy sample
+        let op = storage
+            .merge_samples(
+                bucket,
+                1,
+                vec![Sample {
+                    timestamp_ms: 1000,
+                    value: 10.0,
+                }],
+            )
+            .unwrap();
+        match op {
+            RecordOp::Merge(record) => {
+                storage.merge(vec![record]).await.unwrap();
+            }
+            _ => panic!("expected Merge op"),
+        }
+
+        // when: read with SampleScan kind
+        let collector = QueryIoCollector::new();
+        let record = query_io::run_with_collector(&collector, async {
+            let key = TimeSeriesKey {
+                time_bucket: bucket.start,
+                bucket_size: bucket.size,
+                series_id: 1,
+            }
+            .encode();
+            storage.get_merged_record(key, ReadKind::SampleScan).await
+        })
+        .await
+        .unwrap();
+
+        // then: SampleScan counters populated
+        assert!(record.is_some());
+        let io = collector.snapshot();
+        assert_eq!(io.sample_scan_calls, 1, "one legacy scan");
+        assert_eq!(io.sample_scan_records, 1, "one record");
+        assert!(io.sample_scan_bytes > 0, "bytes recorded");
+        assert_eq!(io.sample_metric_scan_calls, 0, "not metric scan");
+        assert_eq!(io.sample_get_calls, 0, "no legacy get");
     }
 }

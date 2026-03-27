@@ -14,7 +14,7 @@ use crate::flusher::TsdbFlusher;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::model::{Label, Sample, Series, SeriesId, TimeBucket};
 use crate::query::BucketQueryReader;
-use crate::query_io::{self, ReadKind};
+use crate::query_io::ReadKind;
 use crate::serde::key::TimeSeriesKey;
 use crate::serde::timeseries::TimeSeriesIterator;
 use crate::storage::OpenTsdbStorageReadExt;
@@ -94,8 +94,10 @@ impl BucketQueryReader for MiniQueryReader {
             bucket_size: self.bucket.size,
             series_id,
         };
-        let record = self.snapshot.get(storage_key.encode()).await?;
-        query_io::record_get(ReadKind::SampleGet, &record);
+        let record = self
+            .snapshot
+            .get_merged_record(storage_key.encode(), ReadKind::SampleScan)
+            .await?;
 
         match record {
             Some(record) => {

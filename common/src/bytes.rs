@@ -25,7 +25,7 @@ use std::ops::{Bound, RangeBounds};
 /// - `[0x61, 0xFF]` → `Some([0x62])`
 /// - `[0xFF]` → `None`
 /// - `[]` → `None`
-pub(crate) fn lex_increment(data: &[u8]) -> Option<Bytes> {
+pub fn lex_increment(data: &[u8]) -> Option<Bytes> {
     if data.is_empty() {
         return None;
     }

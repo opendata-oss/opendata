@@ -52,6 +52,16 @@ pub struct QueryIoStats {
     pub sample_metric_get_records: u64,
     pub sample_metric_get_bytes: u64,
 
+    // Sample singleton scans (legacy per-series key layout, via scan path)
+    pub sample_scan_calls: u64,
+    pub sample_scan_records: u64,
+    pub sample_scan_bytes: u64,
+
+    // Sample metric-prefixed singleton scans (via scan path)
+    pub sample_metric_scan_calls: u64,
+    pub sample_metric_scan_records: u64,
+    pub sample_metric_scan_bytes: u64,
+
     // ─── Object-store stats ─────────────────────────────────────────────
 
     // get_opts with no range (full object reads)
@@ -97,6 +107,8 @@ impl QueryIoStats {
             + self.forward_index_bytes
             + self.sample_get_bytes
             + self.sample_metric_get_bytes
+            + self.sample_scan_bytes
+            + self.sample_metric_scan_bytes
     }
 
     /// Total metadata bytes (bucket list + inverted index + forward index).
@@ -104,9 +116,12 @@ impl QueryIoStats {
         self.bucket_list_bytes + self.inverted_index_bytes + self.forward_index_bytes
     }
 
-    /// Total sample bytes (point gets + metric-prefixed gets).
+    /// Total sample bytes (point gets + metric-prefixed gets + scans).
     pub fn sample_bytes(&self) -> u64 {
-        self.sample_get_bytes + self.sample_metric_get_bytes
+        self.sample_get_bytes
+            + self.sample_metric_get_bytes
+            + self.sample_scan_bytes
+            + self.sample_metric_scan_bytes
     }
 
     /// Total bytes read from the object store across all operation types.
@@ -131,7 +146,10 @@ impl QueryIoStats {
 
     /// Total scan calls across all read kinds.
     pub fn storage_scan_calls_total(&self) -> u64 {
-        self.inverted_index_scans + self.forward_index_scans
+        self.inverted_index_scans
+            + self.forward_index_scans
+            + self.sample_scan_calls
+            + self.sample_metric_scan_calls
     }
 
     /// Total storage read API calls (gets + scans).
@@ -148,6 +166,8 @@ pub enum ReadKind {
     ForwardIndex,
     SampleGet,
     SampleMetricGet,
+    SampleScan,
+    SampleMetricScan,
 }
 
 // ─── Read signature for repeated-read tracking ──────────────────────────────
@@ -251,6 +271,9 @@ impl QueryIoCollector {
                 }
                 stats.sample_metric_get_bytes += record_bytes;
             }
+            ReadKind::SampleScan | ReadKind::SampleMetricScan => {
+                // Scan-based reads should use record_scan(), not record_get().
+            }
         }
     }
 
@@ -268,8 +291,18 @@ impl QueryIoCollector {
                 stats.forward_index_records += record_count;
                 stats.forward_index_bytes += total_bytes;
             }
+            ReadKind::SampleScan => {
+                stats.sample_scan_calls += 1;
+                stats.sample_scan_records += record_count;
+                stats.sample_scan_bytes += total_bytes;
+            }
+            ReadKind::SampleMetricScan => {
+                stats.sample_metric_scan_calls += 1;
+                stats.sample_metric_scan_records += record_count;
+                stats.sample_metric_scan_bytes += total_bytes;
+            }
             _ => {
-                // Other read kinds don't use scan on the current query path.
+                // BucketList, SampleGet, SampleMetricGet don't use scan.
             }
         }
     }
