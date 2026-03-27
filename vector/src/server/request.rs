@@ -11,7 +11,7 @@ use super::proto;
 use super::response::is_binary_protobuf;
 use crate::Error;
 use crate::model::VECTOR_FIELD_NAME;
-use crate::{Attribute, AttributeValue, FieldType, Filter, Query};
+use crate::{Attribute, AttributeValue, FieldType, Filter, Query, SearchOptions};
 
 /// Check if the request body is protobuf based on Content-Type header.
 fn is_protobuf_content(headers: &HeaderMap) -> bool {
@@ -118,7 +118,7 @@ impl WriteRequest {
 #[derive(Debug)]
 pub struct SearchRequest {
     pub query: Query,
-    pub nprobe: Option<usize>,
+    pub options: SearchOptions,
 }
 
 impl SearchRequest {
@@ -163,7 +163,9 @@ impl SearchRequest {
         }
         Ok(Self {
             query,
-            nprobe: proto_request.nprobe.map(|n| n as usize),
+            options: SearchOptions {
+                nprobe: proto_request.nprobe.map(|n| n as usize),
+            },
         })
     }
 
@@ -188,7 +190,9 @@ impl SearchRequest {
 
         Ok(Self {
             query,
-            nprobe: json_request.nprobe.map(|n| n as usize),
+            options: SearchOptions {
+                nprobe: json_request.nprobe.map(|n| n as usize),
+            },
         })
     }
 }
@@ -804,7 +808,7 @@ mod tests {
         // then
         assert_eq!(request.query.vector, vec![1.0, 2.0, 3.0]);
         assert_eq!(request.query.limit, 10);
-        assert_eq!(request.nprobe, Some(20));
+        assert_eq!(request.options.nprobe, Some(20));
         assert_eq!(
             request.query.filter,
             Some(Filter::eq("category", "electronics"))
@@ -822,7 +826,7 @@ mod tests {
 
         // then
         assert_eq!(request.query.limit, 5);
-        assert_eq!(request.nprobe, None);
+        assert_eq!(request.options.nprobe, None);
     }
 
     #[test]
@@ -904,7 +908,7 @@ mod tests {
             request.query.filter,
             Some(Filter::eq("category", "electronics"))
         );
-        assert_eq!(request.nprobe, Some(20));
+        assert_eq!(request.options.nprobe, Some(20));
     }
 
     #[test]

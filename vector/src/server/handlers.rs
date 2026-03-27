@@ -60,11 +60,10 @@ pub(crate) async fn handle_search<T: VectorDbRead + Send + Sync + 'static>(
     let format = ResponseFormat::from_headers(&headers);
 
     let request = SearchRequest::from_body(&headers, &body, &state.metadata_fields)?;
-    let results = if let Some(nprobe) = request.nprobe {
-        state.db.search_with_nprobe(&request.query, nprobe).await?
-    } else {
-        state.db.search(&request.query).await?
-    };
+    let results = state
+        .db
+        .search_with_options(&request.query, request.options)
+        .await?;
 
     let result_protos: Vec<SearchResultProto> = results
         .into_iter()

@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::hnsw::CentroidGraph;
 use crate::math::distance;
-use crate::model::{FieldSelection, Filter, Query, SearchResult};
+use crate::model::{FieldSelection, Filter, Query, SearchOptions, SearchResult};
 use crate::serde::collection_meta::DistanceMetric;
 use crate::serde::posting_list::PostingList;
 use crate::serde::vector_data::VectorDataValue;
@@ -83,11 +83,6 @@ impl QueryEngine {
         }
     }
 
-    pub(crate) async fn search(&self, query: &Query) -> Result<Vec<SearchResult>> {
-        let nprobe = query.limit.clamp(10, 100);
-        self.search_with_nprobe(query, nprobe).await
-    }
-
     pub(crate) async fn search_exact_nprobe(
         &self,
         query: &Query,
@@ -136,11 +131,12 @@ impl QueryEngine {
         Ok(results)
     }
 
-    pub(crate) async fn search_with_nprobe(
+    pub(crate) async fn search_with_options(
         &self,
         query: &Query,
-        nprobe: usize,
+        options: SearchOptions,
     ) -> Result<Vec<SearchResult>> {
+        let nprobe = options.nprobe.unwrap_or_else(|| query.limit.clamp(10, 100));
         // 1. Validate query dimensions
         if query.vector.len() != self.options.dimensions as usize {
             return Err(Error::InvalidInput(format!(
@@ -645,7 +641,7 @@ mod tests {
 
         // when - search for vector similar to cluster 0
         let q = Query::new(vec![1.0; 128]).with_limit(10);
-        let results = db.query_engine().search(&q).await.unwrap();
+        let results = db.search(&q).await.unwrap();
 
         // then - should find vectors from cluster 0
         assert_eq!(results.len(), 10);
@@ -683,7 +679,6 @@ mod tests {
 
         // when - search
         let results = db
-            .query_engine()
             .search(&Query::new(vec![1.0, 0.0, 0.0]).with_limit(10))
             .await
             .unwrap();
@@ -721,7 +716,6 @@ mod tests {
 
         // when - search for vectors near origin
         let results = db
-            .query_engine()
             .search(&Query::new(vec![0.0, 0.0, 0.0]).with_limit(3))
             .await
             .unwrap();
@@ -748,10 +742,7 @@ mod tests {
         let db = VectorDb::open(config).await.unwrap();
 
         // when - query with wrong dimensions
-        let result = db
-            .query_engine()
-            .search(&Query::new(vec![1.0, 2.0]).with_limit(10))
-            .await;
+        let result = db.search(&Query::new(vec![1.0, 2.0]).with_limit(10)).await;
 
         // then - should fail
         assert!(result.is_err());
@@ -771,7 +762,6 @@ mod tests {
 
         // when
         let results = db
-            .query_engine()
             .search(&Query::new(vec![1.0, 0.0, 0.0]).with_limit(10))
             .await
             .unwrap();
@@ -794,7 +784,6 @@ mod tests {
 
         // when - search for k=5
         let results = db
-            .query_engine()
             .search(&Query::new(vec![1.0, 0.0]).with_limit(5))
             .await
             .unwrap();
@@ -1030,7 +1019,6 @@ mod tests {
 
         // when - search in between centroids 1 and 2
         let results = db
-            .query_engine()
             .search(&Query::new(vec![0.7, 0.7]).with_limit(10))
             .await
             .unwrap();

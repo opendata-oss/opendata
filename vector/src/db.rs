@@ -15,7 +15,8 @@ use crate::VectorDbReader;
 use crate::error::{Error, Result};
 use crate::hnsw::{CentroidGraph, build_centroid_graph};
 use crate::model::{
-    AttributeValue, Config, Query, SearchResult, VECTOR_FIELD_NAME, Vector, attributes_to_map,
+    AttributeValue, Config, Query, SearchOptions, SearchResult, VECTOR_FIELD_NAME, Vector,
+    attributes_to_map,
 };
 use crate::query_engine::{QueryEngine, QueryEngineOptions};
 use crate::serde::centroid_chunk::CentroidEntry;
@@ -39,6 +40,13 @@ pub(crate) const WRITE_CHANNEL: &str = "write";
 /// Trait for querying the vector db
 #[async_trait]
 pub trait VectorDbRead {
+    /// Convenience method that calls [`search_with_options`](Self::search_with_options)
+    /// with default options.
+    async fn search(&self, query: &Query) -> Result<Vec<SearchResult>> {
+        self.search_with_options(query, SearchOptions::default())
+            .await
+    }
+
     /// Search for k-nearest neighbors to a query vector.
     ///
     /// This implements the SPANN-style query algorithm:
@@ -49,6 +57,7 @@ pub trait VectorDbRead {
     ///
     /// # Arguments
     /// * `query` - search query
+    /// * `options` - search options
     ///
     /// # Returns
     /// Vector of SearchResults sorted by similarity (best first)
@@ -57,9 +66,11 @@ pub trait VectorDbRead {
     /// Returns an error if:
     /// - Query dimensions don't match collection dimensions
     /// - Storage read fails
-    async fn search(&self, query: &Query) -> Result<Vec<SearchResult>>;
-
-    async fn search_with_nprobe(&self, query: &Query, nprobe: usize) -> Result<Vec<SearchResult>>;
+    async fn search_with_options(
+        &self,
+        query: &Query,
+        options: SearchOptions,
+    ) -> Result<Vec<SearchResult>>;
 
     /// Retrieve a vector record by its external ID.
     ///
@@ -647,12 +658,14 @@ impl VectorDb {
 
 #[async_trait]
 impl VectorDbRead for VectorDb {
-    async fn search(&self, query: &Query) -> Result<Vec<SearchResult>> {
-        self.query_engine().search(query).await
-    }
-
-    async fn search_with_nprobe(&self, query: &Query, nprobe: usize) -> Result<Vec<SearchResult>> {
-        self.query_engine().search_with_nprobe(query, nprobe).await
+    async fn search_with_options(
+        &self,
+        query: &Query,
+        options: SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
+        self.query_engine()
+            .search_with_options(query, options)
+            .await
     }
 
     async fn get(&self, id: &str) -> Result<Option<Vector>> {

@@ -52,6 +52,6 @@ pub use db::{VectorDb, VectorDbRead};
 pub use error::{Error, Result};
 pub use model::{
     Attribute, AttributeValue, Config, DistanceMetric, FieldSelection, FieldType, Filter,
-    MetadataFieldSpec, Query, ReaderConfig, SearchResult, Vector, VectorBuilder,
+    MetadataFieldSpec, Query, ReaderConfig, SearchOptions, SearchResult, Vector, VectorBuilder,
 };
 pub use reader::VectorDbReader;

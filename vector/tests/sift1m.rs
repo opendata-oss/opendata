@@ -4,7 +4,7 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
-use vector::{Config, DistanceMetric, Query, Vector, VectorDb, VectorDbRead};
+use vector::{Config, DistanceMetric, Query, SearchOptions, Vector, VectorDb, VectorDbRead};
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -139,7 +139,12 @@ async fn sift1m_recall() {
     for (i, query) in queries.iter().enumerate() {
         let q = Query::new(query.clone()).with_limit(k);
         let hnsw_results = db
-            .search_with_nprobe(&q, nprobe)
+            .search_with_options(
+                &q,
+                SearchOptions {
+                    nprobe: Some(nprobe),
+                },
+            )
             .await
             .expect("search failed");
         hnsw_recall += recall_at_k(&hnsw_results, &ground_truth[i], k);
@@ -241,7 +246,12 @@ async fn sift100k_recall() {
         }
         let q = Query::new(query.clone()).with_limit(k);
         let hnsw_results = db
-            .search_with_nprobe(&q, nprobe)
+            .search_with_options(
+                &q,
+                SearchOptions {
+                    nprobe: Some(nprobe),
+                },
+            )
             .await
             .expect("search failed");
         hnsw_recall += recall_at_k(&hnsw_results, &ground_truth[i], k);
