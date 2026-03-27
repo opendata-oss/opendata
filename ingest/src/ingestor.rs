@@ -8,7 +8,7 @@ use slatedb::object_store::{ObjectStore, PutPayload};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::IngestorConfig;
+use crate::config::{BatchCompression, IngestorConfig};
 use crate::error::{Error, Result};
 use crate::model::encode_batch;
 use crate::queue::{Metadata, QueueProducer};
@@ -151,6 +151,7 @@ struct BatchWriterTask {
     data_path_prefix: String,
     flush_interval: Duration,
     flush_size_bytes: usize,
+    batch_compression: BatchCompression,
     batch: Batch,
     clock: Arc<dyn Clock>,
 }
@@ -162,6 +163,7 @@ impl BatchWriterTask {
         data_path_prefix: String,
         flush_interval: Duration,
         flush_size_bytes: usize,
+        batch_compression: BatchCompression,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
@@ -170,6 +172,7 @@ impl BatchWriterTask {
             data_path_prefix,
             flush_interval,
             flush_size_bytes,
+            batch_compression,
             batch: Batch::new(),
             clock,
         }
@@ -228,7 +231,7 @@ impl BatchWriterTask {
     }
 
     async fn write_and_enqueue(&self, entries: Vec<Bytes>, metadata: Vec<Metadata>) -> Result<()> {
-        let payload = encode_batch(&entries);
+        let payload = encode_batch(&entries, &self.batch_compression)?;
         let id = ulid::Ulid::new();
         let path = Path::from(format!("{}/{}.batch", self.data_path_prefix, id));
         self.object_store
@@ -250,6 +253,7 @@ struct BatchWriter {
 }
 
 impl BatchWriter {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         object_store: Arc<dyn ObjectStore>,
         queue_manifest_path: String,
@@ -257,6 +261,7 @@ impl BatchWriter {
         flush_interval: Duration,
         flush_size_bytes: usize,
         max_buffered_inputs: usize,
+        batch_compression: BatchCompression,
         clock: Arc<dyn Clock>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(max_buffered_inputs);
@@ -270,6 +275,7 @@ impl BatchWriter {
             data_path_prefix,
             flush_interval,
             flush_size_bytes,
+            batch_compression,
             clock,
         );
         let shutdown = CancellationToken::new();
@@ -355,6 +361,7 @@ impl Ingestor {
             config.flush_interval,
             config.flush_size_bytes,
             config.max_buffered_inputs,
+            config.batch_compression,
             clock.clone(),
         );
         Ok(Self { writer, clock })
@@ -406,7 +413,7 @@ impl Ingestor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::IngestorConfig;
+    use crate::config::{BatchCompression, IngestorConfig};
     use crate::model::decode_batch;
     use crate::queue::{Manifest, QueueEntry};
     use bytes::Bytes;
@@ -431,6 +438,7 @@ mod tests {
             flush_interval: Duration::from_hours(24),
             flush_size_bytes: 64 * 1024 * 1024,
             max_buffered_inputs: 1000,
+            batch_compression: BatchCompression::None,
         }
     }
 

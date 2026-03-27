@@ -4,6 +4,14 @@ use common::StorageConfig;
 use serde::{Deserialize, Serialize};
 use serde_with::{DurationMilliSeconds, serde_as};
 
+/// Compression codec applied to the record region of a data batch object.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub enum BatchCompression {
+    #[default]
+    None,
+    Zstd,
+}
+
 /// Configuration for an [`Ingestor`](crate::Ingestor).
 ///
 /// Controls where data batches and the queue manifest are stored, how often
@@ -45,6 +53,12 @@ pub struct IngestorConfig {
     /// Defaults to 1000.
     #[serde(default = "default_max_buffered_inputs")]
     pub max_buffered_inputs: usize,
+
+    /// Compression codec for flushed data batch objects.
+    ///
+    /// Defaults to `None` (no compression).
+    #[serde(default)]
+    pub batch_compression: BatchCompression,
 }
 
 /// Configuration for a [`Collector`](crate::Collector).

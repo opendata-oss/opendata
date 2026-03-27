@@ -14,6 +14,16 @@ use crate::queue::{QueueConsumer, QueueEntry};
 
 const DEQUEUE_INTERVAL: u64 = 100;
 
+/// Metadata associated with a range of entries in a [`CollectedBatch`].
+pub struct CollectedMetadata {
+    /// The index of the first entry in the batch that this metadata applies to.
+    pub start_index: u32,
+    /// Wall-clock ingestion time in milliseconds since the Unix epoch.
+    pub ingestion_time_ms: i64,
+    /// The opaque metadata payload provided by the producer.
+    pub payload: Bytes,
+}
+
 /// A batch of entries read from object storage by the [`Collector`].
 pub struct CollectedBatch {
     /// The deserialized opaque byte entries from the data batch.
@@ -22,6 +32,8 @@ pub struct CollectedBatch {
     pub sequence: u64,
     /// The object storage path of the data batch.
     pub location: String,
+    /// Metadata items for ranges of entries in this batch.
+    pub metadata: Vec<CollectedMetadata>,
 }
 
 /// Reads batches of ingested entries from object storage via a queue consumer.
@@ -106,10 +118,21 @@ impl Collector {
 
         let entries = decode_batch(data)?;
 
+        let metadata = queue_entry
+            .metadata
+            .into_iter()
+            .map(|m| CollectedMetadata {
+                start_index: m.start_index,
+                ingestion_time_ms: m.ingestion_time_ms,
+                payload: m.payload,
+            })
+            .collect();
+
         Ok(Some(CollectedBatch {
             entries,
             sequence: queue_entry.sequence,
             location: queue_entry.location,
+            metadata,
         }))
     }
 
@@ -193,7 +216,7 @@ fn delete_dequeued_batches(object_store: Arc<dyn ObjectStore>, entries: Vec<Queu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::CollectorConfig;
+    use crate::config::{BatchCompression, CollectorConfig};
     use crate::model::encode_batch;
     use crate::queue::QueueProducer;
     use bytes::Bytes;
@@ -215,7 +238,16 @@ mod tests {
     }
 
     async fn write_batch(store: &Arc<dyn ObjectStore>, location: &str, entries: &[Bytes]) {
-        let payload = encode_batch(entries);
+        write_batch_compressed(store, location, entries, &BatchCompression::None).await;
+    }
+
+    async fn write_batch_compressed(
+        store: &Arc<dyn ObjectStore>,
+        location: &str,
+        entries: &[Bytes],
+        compression: &BatchCompression,
+    ) {
+        let payload = encode_batch(entries, compression).unwrap();
         let path = Path::from(location);
         store.put(&path, PutPayload::from(payload)).await.unwrap();
     }
@@ -657,5 +689,55 @@ mod tests {
         collector.close().await.unwrap();
 
         assert_batch_deleted(&store, location).await;
+    }
+
+    #[tokio::test]
+    async fn should_collect_zstd_compressed_batch() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, collector) = make_collector(&store, test_collector_config());
+        collector.initialize(None).await.unwrap();
+
+        let entries = test_entries();
+        let location = "batches/compressed";
+        write_batch_compressed(&store, location, &entries, &BatchCompression::Zstd).await;
+        producer
+            .enqueue(location.to_string(), vec![])
+            .await
+            .unwrap();
+
+        let batch = collector.next_batch().await.unwrap().unwrap();
+        assert_eq!(batch.entries.len(), 2);
+        assert_eq!(batch.entries[0], Bytes::from("data1"));
+        assert_eq!(batch.entries[1], Bytes::from("data2"));
+        assert_eq!(batch.location, location);
+    }
+
+    #[tokio::test]
+    async fn should_expose_metadata_in_collected_batch() {
+        use crate::queue::Metadata;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, collector) = make_collector(&store, test_collector_config());
+        collector.initialize(None).await.unwrap();
+
+        let entries = test_entries();
+        let location = "batches/with-metadata";
+        write_batch(&store, location, &entries).await;
+
+        let metadata = vec![Metadata {
+            start_index: 0,
+            ingestion_time_ms: 1_700_000_000_000,
+            payload: Bytes::from(vec![1u8, 1, 1, 0]),
+        }];
+        producer
+            .enqueue(location.to_string(), metadata)
+            .await
+            .unwrap();
+
+        let batch = collector.next_batch().await.unwrap().unwrap();
+        assert_eq!(batch.metadata.len(), 1);
+        assert_eq!(batch.metadata[0].start_index, 0);
+        assert_eq!(batch.metadata[0].ingestion_time_ms, 1_700_000_000_000);
+        assert_eq!(batch.metadata[0].payload, Bytes::from(vec![1u8, 1, 1, 0]));
     }
 }
