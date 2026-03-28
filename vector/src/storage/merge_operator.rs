@@ -402,7 +402,7 @@ mod tests {
     ) {
         // given
         let operator = VectorDbMergeOperator::new(3);
-        let key = CentroidStatsKey::new(1).encode();
+        let key = CentroidStatsKey::new(0, 1).encode();
         let existing_value = CentroidStatsValue::new(existing_count).encode_to_bytes();
         let new_value = CentroidStatsValue::new(new_count).encode_to_bytes();
 
@@ -452,7 +452,7 @@ mod tests {
     fn should_route_merge_batch_centroid_stats() {
         // given
         let operator = VectorDbMergeOperator::new(3);
-        let key = CentroidStatsKey::new(1).encode();
+        let key = CentroidStatsKey::new(0, 1).encode();
         let existing = CentroidStatsValue::new(10).encode_to_bytes();
         let op0 = CentroidStatsValue::new(5).encode_to_bytes();
         let op1 = CentroidStatsValue::new(-3).encode_to_bytes();

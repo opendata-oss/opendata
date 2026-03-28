@@ -299,7 +299,7 @@ impl VectorIndexDelta {
         // Centroid stats deltas (skip deleted centroids)
         for (&centroid_id, &delta) in &centroid_count_deltas {
             if !deleted_centroids.contains(&centroid_id) && delta != 0 {
-                ops.push(record::merge_centroid_stats(centroid_id, delta as i32));
+                ops.push(record::merge_centroid_stats(0, centroid_id, delta as i32));
             }
         }
 
@@ -325,7 +325,7 @@ impl VectorIndexDelta {
         for &centroid_id in &deleted_centroids {
             let posting_key = PostingListKey::new(centroid_id).encode();
             ops.push(RecordOp::Delete(posting_key));
-            let stats_key = crate::serde::key::CentroidStatsKey::new(centroid_id).encode();
+            let stats_key = crate::serde::key::CentroidStatsKey::new(0, centroid_id).encode();
             ops.push(RecordOp::Delete(stats_key));
         }
 
@@ -565,7 +565,10 @@ mod tests {
         delta.add_to_posting(entry.centroid_id, 10, vec![1.0, 0.0]);
         storage.apply(delta.freeze(&mut state)).await.unwrap();
         // verify stats exist before deletion
-        let stats = storage.get_centroid_stats(entry.centroid_id).await.unwrap();
+        let stats = storage
+            .get_centroid_stats(0, entry.centroid_id)
+            .await
+            .unwrap();
         assert_eq!(stats.num_vectors, 1);
 
         // when
@@ -583,7 +586,10 @@ mod tests {
         assert!(!state.centroid_counts().contains_key(&entry.centroid_id));
         let deletions = storage.get_deleted_vectors().await.unwrap();
         assert!(deletions.contains(entry.centroid_id));
-        let stats = storage.get_centroid_stats(entry.centroid_id).await.unwrap();
+        let stats = storage
+            .get_centroid_stats(0, entry.centroid_id)
+            .await
+            .unwrap();
         assert_eq!(stats.num_vectors, 0, "centroid stats should be deleted");
         assert!(
             storage
@@ -616,7 +622,7 @@ mod tests {
         assert!(ids.contains(&11));
 
         // storage: centroid stats
-        let stats = storage.get_centroid_stats(1000).await.unwrap();
+        let stats = storage.get_centroid_stats(0, 1000).await.unwrap();
         assert_eq!(stats.num_vectors, 2);
     }
 
@@ -642,7 +648,7 @@ mod tests {
             ops.iter()
                 .any(|op| matches!(op, RecordOp::Merge(r) if r.record.key == posting_key))
         );
-        let stats_key = crate::serde::key::CentroidStatsKey::new(1000).encode();
+        let stats_key = crate::serde::key::CentroidStatsKey::new(0, 1000).encode();
         assert!(
             ops.iter()
                 .any(|op| matches!(op, RecordOp::Merge(r) if r.record.key == stats_key))
@@ -725,7 +731,11 @@ mod tests {
         delta.add_to_posting(1000, 11, vec![0.0, 1.0]);
         storage.apply(delta.freeze(&mut state)).await.unwrap();
         assert_eq!(
-            storage.get_centroid_stats(1000).await.unwrap().num_vectors,
+            storage
+                .get_centroid_stats(0, 1000)
+                .await
+                .unwrap()
+                .num_vectors,
             2
         );
 
@@ -735,7 +745,7 @@ mod tests {
         let ops = delta.freeze(&mut state);
 
         // then — should NOT have a stats merge (no point updating stats for deleted centroid)
-        let stats_key = crate::serde::key::CentroidStatsKey::new(1000).encode();
+        let stats_key = crate::serde::key::CentroidStatsKey::new(0, 1000).encode();
         assert!(
             !ops.iter()
                 .any(|op| matches!(op, RecordOp::Merge(r) if r.record.key == stats_key))
@@ -750,7 +760,11 @@ mod tests {
         // then — after applying, stats should be gone
         storage.apply(ops).await.unwrap();
         assert_eq!(
-            storage.get_centroid_stats(1000).await.unwrap().num_vectors,
+            storage
+                .get_centroid_stats(0, 1000)
+                .await
+                .unwrap()
+                .num_vectors,
             0
         );
     }

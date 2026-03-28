@@ -95,8 +95,8 @@ pub fn delete_centroid_chunk(chunk_id: u32) -> RecordOp {
 
 /// Create a RecordOp to merge a vector count delta into centroid stats.
 #[allow(dead_code)]
-pub fn merge_centroid_stats(centroid_id: u64, delta: i32) -> RecordOp {
-    let key = CentroidStatsKey::new(centroid_id).encode();
+pub fn merge_centroid_stats(level: u8, centroid_id: u64, delta: i32) -> RecordOp {
+    let key = CentroidStatsKey::new(level, centroid_id).encode();
     let value = CentroidStatsValue::new(delta).encode_to_bytes();
     RecordOp::Merge(Record::new(key, value).into())
 }

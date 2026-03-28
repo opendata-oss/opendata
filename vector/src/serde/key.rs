@@ -74,6 +74,44 @@ impl Default for DeletionsKey {
     }
 }
 
+/// Centroids key - singleton record storing centroid tree metadata.
+///
+/// Key layout: `[subsystem | version | tag]` (3 bytes)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CentroidsKey;
+
+impl RecordKey for CentroidsKey {
+    const RECORD_TYPE: RecordType = RecordType::Centroids;
+}
+
+impl CentroidsKey {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(3);
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
+        buf.freeze()
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < 3 {
+            return Err(EncodingError {
+                message: "Buffer too short for CentroidsKey".to_string(),
+            });
+        }
+        validate_key_prefix::<Self>(buf)?;
+        Ok(CentroidsKey)
+    }
+}
+
+impl Default for CentroidsKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// CentroidChunk key - stores a chunk of cluster centroids.
 ///
 /// Key layout: `[subsystem | version | tag | chunk_id:u32-BE]` (7 bytes)
@@ -373,11 +411,40 @@ impl SeqBlockKey {
     }
 }
 
+/// CentroidSeqBlock key - singleton record storing centroid sequence allocation state.
+///
+/// Key layout: `[subsystem | version | tag]` (3 bytes)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CentroidSeqBlockKey;
+
+impl RecordKey for CentroidSeqBlockKey {
+    const RECORD_TYPE: RecordType = RecordType::CentroidSeqBlock;
+}
+
+impl CentroidSeqBlockKey {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(3);
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
+        buf.freeze()
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < 3 {
+            return Err(EncodingError {
+                message: "Buffer too short for CentroidSeqBlockKey".to_string(),
+            });
+        }
+        validate_key_prefix::<Self>(buf)?;
+        Ok(CentroidSeqBlockKey)
+    }
+}
+
 /// CentroidStats key - per-centroid vector count for rebalance triggers.
 ///
-/// Key layout: `[subsystem | version | tag | centroid_id:u64-BE]` (11 bytes)
+/// Key layout: `[subsystem | version | tag | level:u8 | centroid_id:u64-BE]` (12 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CentroidStatsKey {
+    pub level: u8,
     pub centroid_id: u64,
 }
 
@@ -386,6 +453,46 @@ impl RecordKey for CentroidStatsKey {
 }
 
 impl CentroidStatsKey {
+    pub fn new(level: u8, centroid_id: u64) -> Self {
+        Self { level, centroid_id }
+    }
+
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(12);
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
+        buf.put_u8(self.level);
+        buf.put_u64(self.centroid_id); // Big-endian
+        buf.freeze()
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < 12 {
+            return Err(EncodingError {
+                message: "Buffer too short for CentroidStatsKey".to_string(),
+            });
+        }
+        validate_key_prefix::<Self>(buf)?;
+        let level = buf[3];
+        let centroid_id = u64::from_be_bytes([
+            buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+        ]);
+        Ok(CentroidStatsKey { level, centroid_id })
+    }
+}
+
+/// CentroidInfo key - per-centroid metadata for the centroid tree.
+///
+/// Key layout: `[subsystem | version | tag | centroid_id:u64-BE]` (11 bytes)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CentroidInfoKey {
+    pub centroid_id: u64,
+}
+
+impl RecordKey for CentroidInfoKey {
+    const RECORD_TYPE: RecordType = RecordType::CentroidInfo;
+}
+
+impl CentroidInfoKey {
     pub fn new(centroid_id: u64) -> Self {
         Self { centroid_id }
     }
@@ -393,21 +500,28 @@ impl CentroidStatsKey {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(11);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
-        buf.put_u64(self.centroid_id); // Big-endian
+        buf.put_u64(self.centroid_id);
         buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
         if buf.len() < 11 {
             return Err(EncodingError {
-                message: "Buffer too short for CentroidStatsKey".to_string(),
+                message: "Buffer too short for CentroidInfoKey".to_string(),
             });
         }
         validate_key_prefix::<Self>(buf)?;
         let centroid_id = u64::from_be_bytes([
             buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10],
         ]);
-        Ok(CentroidStatsKey { centroid_id })
+        Ok(CentroidInfoKey { centroid_id })
+    }
+
+    /// Returns a range covering all centroid info keys.
+    pub fn all_centroid_infos_range() -> BytesRange {
+        let mut buf = BytesMut::with_capacity(3);
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
+        BytesRange::prefix(buf.freeze())
     }
 }
 
@@ -502,6 +616,20 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn should_encode_and_decode_centroids_key() {
+        // given
+        let key = CentroidsKey::new();
+
+        // when
+        let encoded = key.encode();
+        let decoded = CentroidsKey::decode(&encoded).unwrap();
+
+        // then
+        assert_eq!(decoded, key);
+        assert_eq!(encoded.len(), 3);
     }
 
     #[test]
@@ -666,6 +794,20 @@ mod tests {
     }
 
     #[test]
+    fn should_encode_and_decode_centroid_seq_block_key() {
+        // given
+        let key = CentroidSeqBlockKey;
+
+        // when
+        let encoded = key.encode();
+        let decoded = CentroidSeqBlockKey::decode(&encoded).unwrap();
+
+        // then
+        assert_eq!(decoded, key);
+        assert_eq!(encoded.len(), 3);
+    }
+
+    #[test]
     fn should_reject_wrong_record_type() {
         // given
         let collection_meta_key = CollectionMetaKey;
@@ -682,7 +824,7 @@ mod tests {
     #[test]
     fn should_encode_and_decode_centroid_stats_key() {
         // given
-        let key = CentroidStatsKey::new(42);
+        let key = CentroidStatsKey::new(3, 42);
 
         // when
         let encoded = key.encode();
@@ -690,15 +832,46 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 11);
+        assert_eq!(encoded.len(), 12);
     }
 
     #[test]
     fn should_preserve_centroid_stats_key_ordering() {
         // given
-        let key1 = CentroidStatsKey::new(1);
-        let key2 = CentroidStatsKey::new(2);
-        let key3 = CentroidStatsKey::new(u64::MAX);
+        let key1 = CentroidStatsKey::new(0, 1);
+        let key2 = CentroidStatsKey::new(0, 2);
+        let key3 = CentroidStatsKey::new(1, 1);
+
+        // when
+        let encoded1 = key1.encode();
+        let encoded2 = key2.encode();
+        let encoded3 = key3.encode();
+
+        // then
+        assert!(encoded1 < encoded2);
+        assert!(encoded2 < encoded3);
+    }
+
+    #[test]
+    fn should_encode_and_decode_centroid_info_key() {
+        // given
+        let key = CentroidInfoKey::new(42);
+
+        // when
+        let encoded = key.encode();
+        let decoded = CentroidInfoKey::decode(&encoded).unwrap();
+
+        // then
+        assert_eq!(decoded, key);
+        assert_eq!(encoded.len(), 11);
+    }
+
+    #[test]
+    fn should_preserve_centroid_info_key_ordering() {
+        // given
+        let key1 = CentroidInfoKey::new(1);
+        let key2 = CentroidInfoKey::new(2);
+        let key3 = CentroidInfoKey::new(u64::MAX);
 
         // when
         let encoded1 = key1.encode();

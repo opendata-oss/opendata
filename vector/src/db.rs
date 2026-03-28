@@ -375,8 +375,10 @@ impl VectorDb {
     ) -> Result<HashMap<u64, u64>> {
         let stats = snapshot.scan_all_centroid_stats().await?;
         let mut counts = HashMap::new();
-        for (centroid_id, value) in stats {
-            counts.insert(centroid_id, value.num_vectors.max(0) as u64);
+        for ((level, centroid_id), value) in stats {
+            if level == 0 {
+                counts.insert(centroid_id, value.num_vectors.max(0) as u64);
+            }
         }
         Ok(counts)
     }

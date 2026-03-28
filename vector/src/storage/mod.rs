@@ -137,8 +137,8 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     ///
     /// Returns a zero count if no stats exist yet.
     #[allow(dead_code)]
-    async fn get_centroid_stats(&self, centroid_id: u64) -> Result<CentroidStatsValue> {
-        let key = CentroidStatsKey::new(centroid_id).encode();
+    async fn get_centroid_stats(&self, level: u8, centroid_id: u64) -> Result<CentroidStatsValue> {
+        let key = CentroidStatsKey::new(level, centroid_id).encode();
         let record = self.get(key).await?;
         match record {
             Some(record) => {
@@ -153,9 +153,9 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
 
     /// Scan all centroid stats records.
     ///
-    /// Returns a map of centroid_id to accumulated vector count.
+    /// Returns a list of `(level, centroid_id)` to accumulated vector count.
     #[allow(dead_code)]
-    async fn scan_all_centroid_stats(&self) -> Result<Vec<(u64, CentroidStatsValue)>> {
+    async fn scan_all_centroid_stats(&self) -> Result<Vec<((u8, u64), CentroidStatsValue)>> {
         let mut prefix_buf = bytes::BytesMut::with_capacity(3);
         crate::serde::RecordType::CentroidStats
             .prefix()
@@ -171,7 +171,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
             let value = CentroidStatsValue::decode_from_bytes(&record.value).map_err(|e| {
                 Error::Encoding(format!("failed to decode CentroidStatsValue: {e}"))
             })?;
-            stats.push((key.centroid_id, value));
+            stats.push(((key.level, key.centroid_id), value));
         }
 
         Ok(stats)
