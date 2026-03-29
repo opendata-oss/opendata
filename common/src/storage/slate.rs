@@ -62,7 +62,7 @@ impl SlateDbMergeOperator for SlateDbMergeOperatorAdapter {
         existing_value: Option<Bytes>,
         value: Bytes,
     ) -> Result<Bytes, MergeOperatorError> {
-        Ok(self.operator.merge(key, existing_value, value))
+        Ok(self.operator.merge_batch(key, existing_value, &[value]))
     }
 
     fn merge_batch(
@@ -657,16 +657,17 @@ mod tests {
     struct ConcatMergeOperator;
 
     impl MergeOperator for ConcatMergeOperator {
-        fn merge(&self, _key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
-            match existing_value {
-                Some(existing) => {
-                    let mut result = Vec::with_capacity(existing.len() + new_value.len());
-                    result.extend_from_slice(&existing);
-                    result.extend_from_slice(&new_value);
-                    Bytes::from(result)
-                }
-                None => new_value,
+        fn merge_batch(
+            &self,
+            _key: &Bytes,
+            existing_value: Option<Bytes>,
+            operands: &[Bytes],
+        ) -> Bytes {
+            let mut result = existing_value.unwrap_or_default().to_vec();
+            for operand in operands {
+                result.extend_from_slice(operand);
             }
+            Bytes::from(result)
         }
     }
 

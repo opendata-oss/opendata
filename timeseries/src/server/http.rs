@@ -5,9 +5,7 @@ use axum::extract::Request;
 use axum::extract::{FromRequest, Path, State};
 use axum::http::{Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::get;
-#[cfg(any(feature = "remote-write", feature = "otel"))]
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_extra::extract::{Form, Query};
 use rust_embed::Embed;
@@ -29,7 +27,7 @@ use crate::promql::response::{
     QueryRangeResponse, QueryResponse, SeriesResponse,
 };
 use crate::promql::scraper::Scraper;
-use crate::tsdb::{Tsdb, TsdbReadEngine};
+use crate::tsdb::TsdbEngine;
 
 use crate::util::{parse_duration, parse_timestamp, parse_timestamp_to_seconds};
 
@@ -40,7 +38,7 @@ struct UiAssets;
 /// Shared application state.
 #[derive(Clone)]
 pub(crate) struct AppState {
-    pub(crate) tsdb: Arc<Tsdb>,
+    pub(crate) tsdb: Arc<TsdbEngine>,
     pub(crate) metrics: Arc<Metrics>,
     #[cfg(feature = "otel")]
     pub(crate) otel_converter: Arc<OtelConverter>,
@@ -65,7 +63,7 @@ impl Default for ServerConfig {
 ///
 /// Used by `TimeSeriesHttpServer::run()` and the `testing` module for integration tests.
 pub(crate) fn build_router(
-    tsdb: Arc<Tsdb>,
+    tsdb: Arc<TsdbEngine>,
     metrics: Arc<Metrics>,
     _otel_config: OtelServerConfig,
 ) -> Router {
@@ -92,7 +90,8 @@ pub(crate) fn build_router(
         .route("/federate", get(handle_federate))
         .route("/metrics", get(handle_metrics))
         .route("/-/healthy", get(handle_healthy))
-        .route("/-/ready", get(handle_ready));
+        .route("/-/ready", get(handle_ready))
+        .route("/-/flush", post(handle_flush));
 
     #[cfg(feature = "remote-write")]
     let app = app.route(
@@ -112,16 +111,16 @@ pub(crate) fn build_router(
 
 /// Prometheus-compatible HTTP server
 pub(crate) struct TimeSeriesHttpServer {
-    tsdb: Arc<Tsdb>,
+    tsdb: Arc<TsdbEngine>,
     config: ServerConfig,
-    storage: Arc<dyn common::Storage>,
+    storage: Option<Arc<dyn common::Storage>>,
 }
 
 impl TimeSeriesHttpServer {
     pub(crate) fn new(
-        tsdb: Arc<Tsdb>,
+        tsdb: Arc<TsdbEngine>,
         config: ServerConfig,
-        storage: Arc<dyn common::Storage>,
+        storage: Option<Arc<dyn common::Storage>>,
     ) -> Self {
         Self {
             tsdb,
@@ -134,21 +133,27 @@ impl TimeSeriesHttpServer {
     pub(crate) async fn run(self) {
         // Create metrics registry and register storage engine metrics
         let mut metrics = Metrics::new();
-        self.storage.register_metrics(metrics.registry_mut());
+        if let Some(storage) = &self.storage {
+            storage.register_metrics(metrics.registry_mut());
+        }
         let metrics = Arc::new(metrics);
 
-        // Start the scraper if there are scrape configs
+        // Start the scraper if there are scrape configs (requires read-write mode)
         if !self.config.prometheus_config.scrape_configs.is_empty() {
-            let scraper = Arc::new(Scraper::new(
-                self.tsdb.clone(),
-                self.config.prometheus_config.clone(),
-                metrics.clone(),
-            ));
-            scraper.run();
-            tracing::info!(
-                "Started scraper with {} job(s)",
-                self.config.prometheus_config.scrape_configs.len()
-            );
+            if let Some(tsdb) = self.tsdb.as_tsdb() {
+                let scraper = Arc::new(Scraper::new(
+                    tsdb,
+                    self.config.prometheus_config.clone(),
+                    metrics.clone(),
+                ));
+                scraper.run();
+                tracing::info!(
+                    "Started scraper with {} job(s)",
+                    self.config.prometheus_config.scrape_configs.len()
+                );
+            } else {
+                tracing::warn!("Scrape configs present but ignored in read-only mode");
+            }
         } else {
             tracing::info!("No scrape configs found, scraper not started");
         }
@@ -490,6 +495,14 @@ async fn handle_healthy() -> (StatusCode, &'static str) {
 async fn handle_ready(State(_state): State<AppState>) -> (StatusCode, &'static str) {
     // Service is ready if it's running (TSDB is initialized in AppState)
     (StatusCode::OK, "OK")
+}
+
+/// Handle /-/flush endpoint - flushes buffered data to durable storage
+async fn handle_flush(
+    State(state): State<AppState>,
+) -> Result<(StatusCode, &'static str), ApiError> {
+    state.tsdb.flush().await?;
+    Ok((StatusCode::OK, "OK"))
 }
 
 /// Redirect `/` to `/query`.

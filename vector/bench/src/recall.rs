@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 use bencher::{Bench, Benchmark, Params, Summary};
 use common::StorageBuilder;
 use common::storage::factory::{FoyerCache, FoyerCacheOptions};
-use vector::{Config, DistanceMetric, Query, SearchResult, Vector, VectorDb, VectorDbRead};
+use vector::{
+    Config, DistanceMetric, Query, SearchOptions, SearchResult, Vector, VectorDb, VectorDbRead,
+};
 
 const DEFAULT_NUM_QUERIES: usize = 100;
 
@@ -592,7 +594,14 @@ impl Benchmark for RecallBenchmark {
         for query in queries.iter() {
             let t = std::time::Instant::now();
             let q = Query::new(query.clone()).with_limit(k);
-            let _ = db.search_with_nprobe(&q, dataset.nprobe).await?;
+            let _ = db
+                .search_with_options(
+                    &q,
+                    SearchOptions {
+                        nprobe: Some(dataset.nprobe),
+                    },
+                )
+                .await?;
             let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
             query_latency.record(elapsed_us);
             cold_latencies_us.push(elapsed_us);
@@ -610,7 +619,14 @@ impl Benchmark for RecallBenchmark {
         for (i, query) in queries.iter().enumerate() {
             let t = std::time::Instant::now();
             let q = Query::new(query.clone()).with_limit(k);
-            let results = db.search_with_nprobe(&q, dataset.nprobe).await?;
+            let results = db
+                .search_with_options(
+                    &q,
+                    SearchOptions {
+                        nprobe: Some(dataset.nprobe),
+                    },
+                )
+                .await?;
             let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
             query_latency.record(elapsed_us);
             latencies_us.push(elapsed_us);

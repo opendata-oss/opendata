@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use common::storage::config::StorageConfig;
-use serde::Deserialize;
-
 use crate::util::Result;
+use common::storage::config::StorageConfig;
+use serde::{Deserialize, Deserializer};
+use slatedb::config::DbReaderOptions;
 
 #[cfg(feature = "http-server")]
 use clap::Parser;
@@ -28,7 +28,7 @@ pub struct CliArgs {
 }
 
 /// Root configuration matching prometheus.yaml structure.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct PrometheusConfig {
     #[serde(default)]
     pub global: GlobalConfig,
@@ -42,10 +42,62 @@ pub struct PrometheusConfig {
     /// Defaults to 5 seconds.
     #[serde(default = "default_flush_interval_secs")]
     pub flush_interval_secs: u64,
+    /// Run in read-only mode (no writes, no scraping, no fencing).
+    #[serde(default)]
+    pub read_only: bool,
+    /// SlateDB reader configuration used when `read_only` is true.
+    #[serde(
+        default = "default_reader_options",
+        deserialize_with = "deserialize_reader_options"
+    )]
+    pub reader: DbReaderOptions,
+    /// Maximum number of bucket readers to cache in memory.
+    #[serde(default = "default_cache_capacity")]
+    pub cache_capacity: u64,
 }
 
 fn default_flush_interval_secs() -> u64 {
     5
+}
+
+fn default_reader_options() -> DbReaderOptions {
+    DbReaderOptions {
+        skip_wal_replay: true,
+        ..DbReaderOptions::default()
+    }
+}
+
+fn deserialize_reader_options<'de, D>(
+    deserializer: D,
+) -> std::result::Result<DbReaderOptions, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let overrides = serde_yaml::Value::deserialize(deserializer)?;
+    let mut defaults =
+        serde_yaml::to_value(default_reader_options()).map_err(serde::de::Error::custom)?;
+    merge_yaml_value(&mut defaults, overrides);
+    serde_yaml::from_value(defaults).map_err(serde::de::Error::custom)
+}
+
+fn merge_yaml_value(base: &mut serde_yaml::Value, overrides: serde_yaml::Value) {
+    match (base, overrides) {
+        (serde_yaml::Value::Mapping(base_map), serde_yaml::Value::Mapping(overrides_map)) => {
+            for (key, value) in overrides_map {
+                match base_map.get_mut(&key) {
+                    Some(existing) => merge_yaml_value(existing, value),
+                    None => {
+                        base_map.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base_slot, override_value) => *base_slot = override_value,
+    }
+}
+
+fn default_cache_capacity() -> u64 {
+    crate::reader::DEFAULT_CACHE_CAPACITY
 }
 
 impl Default for PrometheusConfig {
@@ -56,6 +108,9 @@ impl Default for PrometheusConfig {
             otel: OtelServerConfig::default(),
             storage: StorageConfig::default(),
             flush_interval_secs: default_flush_interval_secs(),
+            read_only: false,
+            reader: default_reader_options(),
+            cache_capacity: default_cache_capacity(),
         }
     }
 }
@@ -337,5 +392,33 @@ scrape_configs:
         // then
         assert!(config.otel.include_resource_attrs);
         assert!(config.otel.include_scope_attrs);
+    }
+
+    #[test]
+    fn should_parse_reader_config() {
+        // given
+        let yaml = r#"
+storage:
+  type: InMemory
+read_only: true
+cache_capacity: 200
+reader:
+  manifest_poll_interval:
+    secs: 86400
+    nanos: 0
+  skip_wal_replay: false
+"#;
+
+        // when
+        let config: PrometheusConfig = serde_yaml::from_str(yaml).unwrap();
+
+        // then
+        assert!(config.read_only);
+        assert_eq!(
+            config.reader.manifest_poll_interval,
+            Duration::from_secs(86400)
+        );
+        assert_eq!(config.cache_capacity, 200);
+        assert!(!config.reader.skip_wal_replay);
     }
 }

@@ -1,6 +1,6 @@
 //! SPFresh split heuristics for centroid rebalancing.
 
-use crate::distance;
+use crate::math::distance;
 use crate::serde::collection_meta::DistanceMetric;
 
 /// SPFresh split heuristic: returns true if vector `v` may need reassignment

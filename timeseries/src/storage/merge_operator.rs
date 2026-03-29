@@ -1,10 +1,9 @@
-use bytes::Bytes;
-
-use crate::model::RecordTag;
 use crate::serde::bucket_list::BucketListValue;
 use crate::serde::inverted_index::InvertedIndexValue;
 use crate::serde::timeseries::merge_batch_time_series;
-use crate::serde::{EncodingError, RecordType, record_type_from_tag};
+use crate::serde::{EncodingError, RecordType};
+use bytes::Bytes;
+use common::serde::key_prefix::KeyPrefix;
 use common::storage::default_merge_batch;
 
 /// Merge operator for OpenTSDB that handles merging of different record types.
@@ -14,21 +13,12 @@ use common::storage::default_merge_batch;
 pub(crate) struct OpenTsdbMergeOperator;
 
 impl common::storage::MergeOperator for OpenTsdbMergeOperator {
-    fn merge(&self, key: &Bytes, existing_value: Option<Bytes>, new_value: Bytes) -> Bytes {
-        self.merge_batch(key, existing_value, &[new_value])
-    }
-
     fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
         // Decode record type from key
-        if key.len() < 2 {
-            panic!("Invalid key: key length is less than 2 bytes");
-        }
-
-        let record_tag =
-            RecordTag::from_byte(key[1]).expect("Failed to decode record tag from key");
+        let key_prefix = KeyPrefix::from_bytes(key.as_ref()).unwrap();
 
         let record_type =
-            record_type_from_tag(record_tag).expect("Failed to get record type from record tag");
+            RecordType::from_prefix(key_prefix).expect("Failed to get record type from record tag");
 
         match record_type {
             RecordType::InvertedIndex => merge_batch_inverted_index(existing_value, operands)
@@ -448,7 +438,7 @@ mod tests {
         };
 
         // when
-        let merged = operator.merge(&key, Some(existing_value.clone()), new_value.clone());
+        let merged = operator.merge_batch(&key, Some(existing_value), &[new_value]);
 
         // then - verify the merge actually happened (not just returning new_value)
         // For InvertedIndex, check it's a union
@@ -498,7 +488,7 @@ mod tests {
         .unwrap();
 
         // when
-        let result = operator.merge(&key, None, new_value);
+        let result = operator.merge_batch(&key, None, &[new_value]);
 
         // then
         let decoded = InvertedIndexValue::decode(result.as_ref()).unwrap();
@@ -514,7 +504,8 @@ mod tests {
         let new_value = Bytes::from(b"new_value".to_vec());
 
         // when
-        let result = operator.merge(&key, Some(existing_value), new_value.clone());
+        let result =
+            operator.merge_batch(&key, Some(existing_value), std::slice::from_ref(&new_value));
 
         // then - should return new_value without merging
         assert_eq!(result, new_value);

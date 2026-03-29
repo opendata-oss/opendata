@@ -19,10 +19,14 @@ use bytes::BytesMut;
 pub use common::serde::encoding::{
     EncodingError, decode_optional_utf8, decode_utf8, encode_optional_utf8, encode_utf8,
 };
-use common::serde::key_prefix::{KeyPrefix, RecordTag};
+use common::serde::key_prefix::KeyPrefix;
+use common::serde::record_tag::RecordTag;
 
 /// Key format version (currently 0x01)
 pub const KEY_VERSION: u8 = 0x01;
+
+/// Subsystem-specific key prefix for vector storage.
+pub const SUBSYSTEM: u8 = 0x02;
 
 /// Record type enumeration for vector database records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +66,19 @@ impl RecordType {
         }
     }
 
+    pub fn from_prefix(prefix: KeyPrefix) -> Result<Self, EncodingError> {
+        if prefix.subsystem() != SUBSYSTEM {
+            return Err(EncodingError {
+                message: format!(
+                    "invalid subsystem: expected 0x{:02x}, got 0x{:02x}",
+                    SUBSYSTEM,
+                    prefix.subsystem()
+                ),
+            });
+        }
+        RecordType::from_id((prefix.tag() & 0xF0) >> 4)
+    }
+
     /// Creates a RecordTag for this record type (reserved bits = 0).
     pub fn tag(&self) -> RecordTag {
         RecordTag::new(self.id(), 0)
@@ -69,13 +86,8 @@ impl RecordType {
 
     /// Creates a KeyPrefix with the current version for this record type.
     pub fn prefix(&self) -> KeyPrefix {
-        KeyPrefix::new(KEY_VERSION, self.tag())
+        KeyPrefix::new(SUBSYSTEM, KEY_VERSION, self.tag().as_byte())
     }
-}
-
-/// Extracts the RecordType from a RecordTag.
-pub fn record_type_from_tag(tag: RecordTag) -> Result<RecordType, EncodingError> {
-    RecordType::from_id(tag.record_type())
 }
 
 /// Trait for record keys that have a record type.
@@ -677,7 +689,7 @@ mod tests {
         // then
         assert_eq!(decoded.as_byte(), record_tag.as_byte());
         assert_eq!(
-            record_type_from_tag(decoded).unwrap(),
+            RecordType::from_id(decoded.record_type()).unwrap(),
             RecordType::CollectionMeta
         );
     }

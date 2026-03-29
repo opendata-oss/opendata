@@ -8,16 +8,16 @@
 //!
 //! # Key Format
 //!
-//! All keys start with a version byte and record type discriminator:
+//! All keys start with a subsystem byte, version byte, and record type discriminator:
 //!
 //! ```text
-//! | version (u8) | type (u8) | ... record-specific fields ... |
+//! | subsystem (u8) | version (u8) | type (u8) | ... record-specific fields ... |
 //! ```
 //!
 //! # Record Types
 //!
-//! - `LogEntry` (0x01): User data entries with key and sequence number
-//! - `SeqBlock` (0x02): Sequence number block allocation tracking (value type in `common` crate)
+//! - `LogEntry` (0x10): User data entries with key and sequence number
+//! - `SeqBlock` (0x20): Sequence number block allocation tracking (value type in `common` crate)
 //!
 //! # TerminatedBytes Encoding
 //!
@@ -38,7 +38,8 @@ use std::ops::{Bound, Range};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
-use common::serde::key_prefix::{KeyPrefix, RecordTag};
+use common::serde::key_prefix::KeyPrefix;
+use common::serde::record_tag::RecordTag;
 use common::serde::terminated_bytes;
 use common::serde::varint::var_u64;
 
@@ -55,8 +56,11 @@ impl From<common::serde::DeserializeError> for Error {
 /// Key format version (currently 0x01)
 pub const KEY_VERSION: u8 = 0x01;
 
+/// Subsystem-specific key prefix for log storage.
+pub const SUBSYSTEM: u8 = 0x03;
+
 /// Storage key for the SeqBlock record.
-pub const SEQ_BLOCK_KEY: [u8; 2] = [KEY_VERSION, 0x02]; // RecordType::SeqBlock
+pub const SEQ_BLOCK_KEY: [u8; 3] = [SUBSYSTEM, KEY_VERSION, 0x20]; // RecordType::SeqBlock
 
 /// Record type discriminators for log storage.
 ///
@@ -95,6 +99,17 @@ impl RecordType {
         }
     }
 
+    pub fn from_prefix(prefix: KeyPrefix) -> Result<Self, Error> {
+        if prefix.subsystem() != SUBSYSTEM {
+            return Err(Error::Encoding(format!(
+                "invalid subsystem: expected 0x{:02x}, got 0x{:02x}",
+                SUBSYSTEM,
+                prefix.subsystem()
+            )));
+        }
+        RecordType::from_id((prefix.tag() & 0xF0) >> 4)
+    }
+
     /// Creates a RecordTag for this record type.
     ///
     /// Log records use 0 for the reserved bits.
@@ -104,7 +119,7 @@ impl RecordType {
 
     /// Creates a KeyPrefix for this record type with the current version.
     pub fn prefix(&self) -> KeyPrefix {
-        KeyPrefix::new(KEY_VERSION, self.tag())
+        KeyPrefix::new(SUBSYSTEM, KEY_VERSION, self.tag().as_byte())
     }
 }
 
@@ -114,7 +129,7 @@ impl RecordType {
 /// that preserves lexicographic ordering:
 ///
 /// ```text
-/// | version (u8) | type (u8) | segment_id (u32 BE) | terminated_key | relative_seq (var_u64) |
+/// | subsystem (u8) | version (u8) | type (u8) | segment_id (u32 BE) | terminated_key | relative_seq (var_u64) |
 /// ```
 ///
 /// The `relative_seq` is the entry's sequence number relative to the segment's `start_seq`
@@ -164,8 +179,8 @@ impl LogEntryKey {
     /// caller must provide the segment's start sequence to recover the absolute
     /// sequence number.
     pub fn deserialize(data: &[u8], segment_start_seq: u64) -> Result<Self, Error> {
-        let prefix = KeyPrefix::from_bytes_versioned(data, KEY_VERSION)?;
-        let record_type = RecordType::from_id(prefix.tag().record_type())?;
+        let prefix = KeyPrefix::from_bytes_with_validation(data, SUBSYSTEM, KEY_VERSION)?;
+        let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::LogEntry {
             return Err(Error::Encoding(format!(
                 "invalid record type: expected LogEntry, got {:?}",
@@ -173,15 +188,15 @@ impl LogEntryKey {
             )));
         }
 
-        if data.len() < 6 {
+        if data.len() < 7 {
             return Err(Error::Encoding(
                 "buffer too short for log entry key".to_string(),
             ));
         }
 
-        let segment_id = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+        let segment_id = u32::from_be_bytes([data[3], data[4], data[5], data[6]]);
 
-        let mut buf = &data[6..];
+        let mut buf = &data[7..];
         let key = terminated_bytes::deserialize(&mut buf)?;
         let relative_seq = var_u64::deserialize(&mut buf)?;
         let sequence = segment_start_seq + relative_seq;
@@ -219,7 +234,7 @@ impl LogEntryKey {
 /// Key for a segment metadata record.
 ///
 /// ```text
-/// | version (u8) | type (u8=0x03) | segment_id (u32 BE) |
+/// | subsystem (u8) | version (u8) | type (u8=0x30) | segment_id (u32 BE) |
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentMetaKey {
@@ -235,7 +250,7 @@ impl SegmentMetaKey {
 
     /// Encodes the key to bytes for storage
     pub fn serialize(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(6);
+        let mut buf = BytesMut::with_capacity(7);
         RecordType::SegmentMeta.prefix().write_to(&mut buf);
         buf.put_u32(self.segment_id);
         buf.freeze()
@@ -243,8 +258,8 @@ impl SegmentMetaKey {
 
     /// Decodes a segment metadata key from bytes
     pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
-        let prefix = KeyPrefix::from_bytes_versioned(data, KEY_VERSION)?;
-        let record_type = RecordType::from_id(prefix.tag().record_type())?;
+        let prefix = KeyPrefix::from_bytes_with_validation(data, SUBSYSTEM, KEY_VERSION)?;
+        let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::SegmentMeta {
             return Err(Error::Encoding(format!(
                 "invalid record type: expected SegmentMeta, got {:?}",
@@ -252,13 +267,13 @@ impl SegmentMetaKey {
             )));
         }
 
-        if data.len() < 6 {
+        if data.len() < 7 {
             return Err(Error::Encoding(
                 "buffer too short for SegmentMeta key".to_string(),
             ));
         }
 
-        let segment_id = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+        let segment_id = u32::from_be_bytes([data[3], data[4], data[5], data[6]]);
 
         Ok(SegmentMetaKey { segment_id })
     }
@@ -331,7 +346,7 @@ impl SegmentMeta {
 /// listing records for a segment are contiguous for efficient prefix scans.
 ///
 /// ```text
-/// | version (u8) | type (u8=0x04) | segment_id (u32 BE) | key (Bytes) |
+/// | subsystem (u8) | version (u8) | type (u8=0x40) | segment_id (u32 BE) | key (Bytes) |
 /// ```
 ///
 /// Unlike log entry keys, the user key is stored as raw bytes without
@@ -361,8 +376,8 @@ impl ListingEntryKey {
 
     /// Deserializes a listing entry key from bytes.
     pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
-        let prefix = KeyPrefix::from_bytes_versioned(data, KEY_VERSION)?;
-        let record_type = RecordType::from_id(prefix.tag().record_type())?;
+        let prefix = KeyPrefix::from_bytes_with_validation(data, SUBSYSTEM, KEY_VERSION)?;
+        let record_type = RecordType::from_prefix(prefix)?;
         if record_type != RecordType::ListingEntry {
             return Err(Error::Encoding(format!(
                 "invalid record type: expected ListingEntry, got {:?}",
@@ -370,14 +385,14 @@ impl ListingEntryKey {
             )));
         }
 
-        if data.len() < 6 {
+        if data.len() < 7 {
             return Err(Error::Encoding(
                 "buffer too short for listing entry key".to_string(),
             ));
         }
 
-        let segment_id = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
-        let key = Bytes::copy_from_slice(&data[6..]);
+        let segment_id = u32::from_be_bytes([data[3], data[4], data[5], data[6]]);
+        let key = Bytes::copy_from_slice(&data[7..]);
 
         Ok(ListingEntryKey { segment_id, key })
     }
@@ -394,7 +409,7 @@ impl ListingEntryKey {
 
     /// Returns the prefix key for a segment (smallest possible key for segment).
     fn segment_prefix(segment_id: SegmentId) -> Bytes {
-        let mut buf = BytesMut::with_capacity(6);
+        let mut buf = BytesMut::with_capacity(7);
         RecordType::ListingEntry.prefix().write_to(&mut buf);
         buf.put_u32(segment_id);
         buf.freeze()
@@ -493,21 +508,22 @@ mod tests {
         let serialized = key.serialize(segment_start_seq);
 
         // then
-        // version (1) + tag (1) + segment_id (4) + key "k" (1) + terminator (1) + relative_seq (varint, 2 bytes for 100) = 10
-        assert_eq!(serialized.len(), 10);
-        assert_eq!(serialized[0], KEY_VERSION);
+        // subsystem (1) + version (1) + tag (1) + segment_id (4) + key "k" (1) + terminator (1) + relative_seq (varint, 2 bytes for 100) = 11
+        assert_eq!(serialized.len(), 11);
+        assert_eq!(serialized[0], SUBSYSTEM);
+        assert_eq!(serialized[1], KEY_VERSION);
         // Record tag: type 0x01 in high nibble, reserved 0x00 in low nibble = 0x10
-        assert_eq!(serialized[1], RecordType::LogEntry.tag().as_byte());
-        assert_eq!(serialized[1], 0x10);
+        assert_eq!(serialized[2], RecordType::LogEntry.tag().as_byte());
+        assert_eq!(serialized[2], 0x10);
         // segment_id = 1 in big endian
-        assert_eq!(&serialized[2..6], &[0, 0, 0, 1]);
+        assert_eq!(&serialized[3..7], &[0, 0, 0, 1]);
         // key "k" + terminator
-        assert_eq!(serialized[6], b'k');
-        assert_eq!(serialized[7], 0x00); // terminator
+        assert_eq!(serialized[7], b'k');
+        assert_eq!(serialized[8], 0x00); // terminator
         // relative_seq = 100 as varint: length code 1 (2 bytes total), value 100
         // First byte: (1 << 4) | (100 >> 8) = 0x10
         // Second byte: 100 & 0xFF = 0x64
-        assert_eq!(&serialized[8..10], &[0x10, 0x64]);
+        assert_eq!(&serialized[9..11], &[0x10, 0x64]);
     }
 
     #[test]
@@ -521,10 +537,10 @@ mod tests {
 
         // then
         // relative_seq = 5 fits in 1 byte (length code 0)
-        // version (1) + type (1) + segment_id (4) + key "k" (1) + terminator (1) + relative_seq (1) = 9
-        assert_eq!(serialized.len(), 9);
+        // subsystem (1) + version (1) + type (1) + segment_id (4) + key "k" (1) + terminator (1) + relative_seq (1) = 10
+        assert_eq!(serialized.len(), 10);
         // relative_seq = 5 as varint: length code 0, value 5
-        assert_eq!(serialized[8], 0x05);
+        assert_eq!(serialized[9], 0x05);
     }
 
     #[test]
@@ -568,7 +584,14 @@ mod tests {
     #[test]
     fn should_fail_deserialize_log_entry_key_too_short() {
         // given
-        let data = vec![KEY_VERSION, RecordType::LogEntry.tag().as_byte(), 0, 0, 0]; // only 5 bytes
+        let data = vec![
+            SUBSYSTEM,
+            KEY_VERSION,
+            RecordType::LogEntry.tag().as_byte(),
+            0,
+            0,
+            0,
+        ]; // only 6 bytes
 
         // when
         let result = LogEntryKey::deserialize(&data, 0);
@@ -600,16 +623,17 @@ mod tests {
         let serialized = key.serialize();
 
         // then
-        // version (1) + tag (1) + segment_id (4) + key "k" (1) = 7
-        assert_eq!(serialized.len(), 7);
-        assert_eq!(serialized[0], KEY_VERSION);
+        // subsystem (1) + version (1) + tag (1) + segment_id (4) + key "k" (1) = 8
+        assert_eq!(serialized.len(), 8);
+        assert_eq!(serialized[0], SUBSYSTEM);
+        assert_eq!(serialized[1], KEY_VERSION);
         // Record tag: type 0x04 in high nibble, reserved 0x00 in low nibble = 0x40
-        assert_eq!(serialized[1], RecordType::ListingEntry.tag().as_byte());
-        assert_eq!(serialized[1], 0x40);
+        assert_eq!(serialized[2], RecordType::ListingEntry.tag().as_byte());
+        assert_eq!(serialized[2], 0x40);
         // segment_id = 1 in big endian
-        assert_eq!(&serialized[2..6], &[0, 0, 0, 1]);
+        assert_eq!(&serialized[3..7], &[0, 0, 0, 1]);
         // key "k" (raw bytes, no terminator)
-        assert_eq!(serialized[6], b'k');
+        assert_eq!(serialized[7], b'k');
     }
 
     #[test]
@@ -622,7 +646,7 @@ mod tests {
         let deserialized = ListingEntryKey::deserialize(&serialized).unwrap();
 
         // then
-        assert_eq!(serialized.len(), 6); // version + tag + segment_id only
+        assert_eq!(serialized.len(), 7); // subsystem + version + tag + segment_id only
         assert_eq!(deserialized.segment_id, 1);
         assert_eq!(deserialized.key, Bytes::new());
     }
@@ -691,12 +715,13 @@ mod tests {
     fn should_fail_deserialize_listing_entry_key_too_short() {
         // given
         let data = vec![
+            SUBSYSTEM,
             KEY_VERSION,
             RecordType::ListingEntry.tag().as_byte(),
             0,
             0,
             0,
-        ]; // only 5 bytes
+        ]; // only 6 bytes
 
         // when
         let result = ListingEntryKey::deserialize(&data);

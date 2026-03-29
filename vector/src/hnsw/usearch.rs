@@ -1,6 +1,6 @@
 //! HNSW implementation using the usearch library.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::RwLock;
 
@@ -29,6 +29,8 @@ struct UsearchCentroidGraphInner {
     centroid_vectors: HashMap<u64, Vec<f32>>,
     /// Next usearch key to allocate
     next_key: u64,
+    /// Distance metric used for computing distances
+    distance_metric: DistanceMetric,
 }
 
 /// HNSW graph implementation using the usearch library.
@@ -125,6 +127,7 @@ impl UsearchCentroidGraph {
                 centroid_to_key,
                 centroid_vectors,
                 next_key,
+                distance_metric,
             }),
         })
     }
@@ -133,6 +136,19 @@ impl UsearchCentroidGraph {
 impl CentroidGraph for UsearchCentroidGraph {
     fn search(&self, query: &[f32], k: usize) -> Vec<u64> {
         self.inner.read().expect("lock poisoned").search(query, k)
+    }
+
+    fn search_with_include_exclude(
+        &self,
+        query: &[f32],
+        k: usize,
+        include: &[&CentroidEntry],
+        exclude: &HashSet<u64>,
+    ) -> Vec<u64> {
+        self.inner
+            .read()
+            .expect("lock poisoned")
+            .search_with_include_exclude(query, k, include, exclude)
     }
 
     fn add_centroid(&self, entry: &CentroidEntry) -> Result<()> {
@@ -154,6 +170,10 @@ impl CentroidGraph for UsearchCentroidGraph {
             .read()
             .expect("lock poisoned")
             .get_centroid_vector(centroid_id)
+    }
+
+    fn all_centroid_ids(&self) -> Vec<u64> {
+        self.inner.read().expect("lock poisoned").all_centroid_ids()
     }
 
     fn len(&self) -> usize {
@@ -182,6 +202,61 @@ impl UsearchCentroidGraphInner {
             .filter_map(|&key| self.key_to_centroid.get(&key).copied())
             .take(k)
             .collect()
+    }
+
+    fn search_with_include_exclude(
+        &self,
+        query: &[f32],
+        k: usize,
+        include: &[&CentroidEntry],
+        exclude: &HashSet<u64>,
+    ) -> Vec<u64> {
+        let graph_size = self.key_to_centroid.len();
+        let search_k = (k + 10).min(graph_size + 10);
+
+        let mut candidates: Vec<(u64, f32)> = Vec::with_capacity(k + include.len());
+
+        if graph_size > 0 && search_k > 0 {
+            // Build set of usearch keys to exclude
+            let excluded_keys: HashSet<u64> = exclude
+                .iter()
+                .filter_map(|centroid_id| self.centroid_to_key.get(centroid_id).copied())
+                .collect();
+
+            let results = if excluded_keys.is_empty() {
+                self.index.search(query, search_k)
+            } else {
+                self.index
+                    .filtered_search(query, search_k, |key| !excluded_keys.contains(&key))
+            };
+
+            if let Ok(results) = results {
+                for (&key, &dist) in results.keys.iter().zip(results.distances.iter()) {
+                    if let Some(&centroid_id) = self.key_to_centroid.get(&key) {
+                        candidates.push((centroid_id, dist));
+                    }
+                }
+            }
+        }
+
+        // Compute distances for include centroids (not in the graph)
+        for entry in include {
+            let dist = self.compute_distance(query, &entry.vector);
+            candidates.push((entry.centroid_id, dist));
+        }
+
+        // Sort by distance ascending and take top k
+        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.into_iter().take(k).map(|(id, _)| id).collect()
+    }
+
+    fn compute_distance(&self, a: &[f32], b: &[f32]) -> f32 {
+        match self.distance_metric {
+            DistanceMetric::L2 => a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum(),
+            DistanceMetric::DotProduct => {
+                1.0 - a.iter().zip(b.iter()).map(|(x, y)| x * y).sum::<f32>()
+            }
+        }
     }
 
     fn add_centroid(&mut self, entry: &CentroidEntry) -> Result<()> {
@@ -216,6 +291,10 @@ impl UsearchCentroidGraphInner {
 
     fn get_centroid_vector(&self, centroid_id: u64) -> Option<Vec<f32>> {
         self.centroid_vectors.get(&centroid_id).cloned()
+    }
+
+    fn all_centroid_ids(&self) -> Vec<u64> {
+        self.centroid_vectors.keys().copied().collect()
     }
 
     fn len(&self) -> usize {
@@ -414,5 +493,111 @@ mod tests {
         // when - remove centroid
         graph.remove_centroid(2).unwrap();
         assert_eq!(graph.get_centroid_vector(2), None);
+    }
+
+    // ---- search_with_include_exclude ----
+
+    #[test]
+    fn should_exclude_centroids_from_search() {
+        // given - 3 centroids, query near centroid 1
+        let centroids = vec![
+            CentroidEntry::new(1, vec![1.0, 0.0, 0.0]),
+            CentroidEntry::new(2, vec![0.0, 1.0, 0.0]),
+            CentroidEntry::new(3, vec![0.0, 0.0, 1.0]),
+        ];
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
+        let exclude = HashSet::from([1]);
+
+        // when - search near centroid 1 but exclude it
+        let results = graph.search_with_include_exclude(&[0.9, 0.1, 0.0], 1, &[], &exclude);
+
+        // then - should return centroid 2 or 3, not 1
+        assert_eq!(results.len(), 1);
+        assert_ne!(results[0], 1, "excluded centroid should not appear");
+    }
+
+    #[test]
+    fn should_include_centroids_not_in_graph() {
+        // given - graph has centroids 1 and 2, include adds centroid 99 closer to query
+        let centroids = vec![
+            CentroidEntry::new(1, vec![1.0, 0.0]),
+            CentroidEntry::new(2, vec![0.0, 1.0]),
+        ];
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
+        let include_entry = CentroidEntry::new(99, vec![0.5, 0.5]);
+
+        // when - search near [0.5, 0.5], include centroid 99 which is right there
+        let results =
+            graph.search_with_include_exclude(&[0.5, 0.5], 1, &[&include_entry], &HashSet::new());
+
+        // then - centroid 99 should be the closest
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], 99);
+    }
+
+    #[test]
+    fn should_combine_include_and_exclude() {
+        // given - 3 centroids in graph, exclude 1, include 99
+        let centroids = vec![
+            CentroidEntry::new(1, vec![1.0, 0.0, 0.0]),
+            CentroidEntry::new(2, vec![0.0, 1.0, 0.0]),
+            CentroidEntry::new(3, vec![0.0, 0.0, 1.0]),
+        ];
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
+        let exclude = HashSet::from([1]);
+        let include_entry = CentroidEntry::new(99, vec![0.9, 0.1, 0.0]);
+
+        // when - query near [1,0,0], exclude centroid 1 (the nearest graph centroid),
+        // but include 99 which is also near [1,0,0]
+        let results =
+            graph.search_with_include_exclude(&[1.0, 0.0, 0.0], 2, &[&include_entry], &exclude);
+
+        // then - should include 99 and one of 2/3, but not 1
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&99));
+        assert!(!results.contains(&1));
+    }
+
+    #[test]
+    fn should_fall_back_to_normal_search_with_empty_include_exclude() {
+        // given
+        let centroids = vec![
+            CentroidEntry::new(1, vec![1.0, 0.0]),
+            CentroidEntry::new(2, vec![0.0, 1.0]),
+        ];
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
+
+        // when - no include, no exclude
+        let results = graph.search_with_include_exclude(&[0.9, 0.1], 1, &[], &HashSet::new());
+
+        // then - same as regular search
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], 1);
+    }
+
+    #[test]
+    fn should_rank_include_and_graph_results_by_distance() {
+        // given - graph centroid at [1,0], include centroid at [0,1]
+        let centroids = vec![CentroidEntry::new(1, vec![1.0, 0.0])];
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
+        let include_entry = CentroidEntry::new(99, vec![0.0, 1.0]);
+
+        // when - query at [0.1, 0.9] — closer to include centroid 99
+        let results =
+            graph.search_with_include_exclude(&[0.1, 0.9], 2, &[&include_entry], &HashSet::new());
+
+        // then - 99 should be first (closer), 1 second
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], 99);
+        assert_eq!(results[1], 1);
+
+        // when - query at [0.9, 0.1] — closer to graph centroid 1
+        let results =
+            graph.search_with_include_exclude(&[0.9, 0.1], 2, &[&include_entry], &HashSet::new());
+
+        // then - 1 should be first (closer), 99 second
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], 1);
+        assert_eq!(results[1], 99);
     }
 }

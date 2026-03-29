@@ -22,7 +22,7 @@ pub(crate) type BucketStart = u32;
 pub(crate) type BucketSize = u8;
 
 // Re-export common RecordTag for internal use
-pub(crate) use common::serde::key_prefix::RecordTag;
+pub(crate) use common::serde::record_tag::RecordTag;
 
 /// NormalNaN is a quiet NaN (same as f64::NAN)
 pub const NORMAL_NAN: u64 = 0x7ff8000000000001;

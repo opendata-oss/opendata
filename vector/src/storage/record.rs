@@ -40,6 +40,7 @@ pub fn delete_id_dictionary(external_id: &str) -> RecordOp {
 /// Create a RecordOp to write vector data (including external_id, vector, and metadata).
 ///
 /// The `attributes` must include a "vector" field with the embedding values.
+#[allow(dead_code)]
 pub fn put_vector_data(
     internal_id: u64,
     external_id: &str,

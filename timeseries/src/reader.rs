@@ -11,13 +11,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
+use common::StorageConfig;
 use common::StorageRead;
 use common::storage::factory::create_storage_read;
 use common::{StorageReaderRuntime, StorageSemantics};
 use futures::stream::{self, StreamExt};
 use moka::future::Cache;
 
-use crate::config::ReaderConfig;
 use crate::error::{QueryError, Result};
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::minitsdb::MiniQueryReader;
@@ -33,6 +33,8 @@ use crate::tsdb::{
 };
 
 // ── ReaderQueryReader ────────────────────────────────────────────────
+
+pub(crate) const DEFAULT_CACHE_CAPACITY: u64 = 50;
 
 /// QueryReader implementation for read-only access.
 ///
@@ -113,7 +115,7 @@ impl QueryReader for ReaderQueryReader {
 
 /// A read-only view of a time series database.
 ///
-/// `TimeSeriesDbReader` provides the same read API as [`TimeSeriesDb`](crate::TimeSeriesDb)
+/// `TimeSeriesDbReader` provides the same read API as [`TimeSeriesDb`](crate::timeseries::TimeSeriesDb)
 /// but without write operations. It uses SlateDB's `DbReader`, which opens the
 /// database without fencing — this means it can safely coexist with a production
 /// writer on the same storage path.
@@ -130,14 +132,13 @@ impl QueryReader for ReaderQueryReader {
 /// # Example
 ///
 /// ```ignore
-/// use timeseries::{TimeSeriesDbReader, ReaderConfig};
 /// use common::StorageConfig;
+/// use slatedb::config::DbReaderOptions;
+/// use timeseries::TimeSeriesDbReader;
 ///
-/// let config = ReaderConfig {
-///     storage: StorageConfig::default(),
-///     ..Default::default()
-/// };
-/// let reader = TimeSeriesDbReader::open(config).await?;
+/// let storage = StorageConfig::default();
+/// let reader_options = DbReaderOptions::default();
+/// let reader = TimeSeriesDbReader::open(storage, reader_options, 50).await?;
 ///
 /// let result = reader.query("rate(http_requests_total[5m])", None).await?;
 /// ```
@@ -150,34 +151,30 @@ pub struct TimeSeriesDbReader {
 impl TimeSeriesDbReader {
     /// Opens a read-only view of the time series database.
     ///
-    /// Uses SlateDB's `DbReader` which polls the manifest at `refresh_interval`
+    /// Uses SlateDB's `DbReader` which polls the manifest based on `reader_options`
     /// to discover new data. Does **not** fence the existing writer.
     ///
     /// # Errors
     ///
     /// Returns an error if the storage backend cannot be initialized.
-    pub async fn open(config: ReaderConfig) -> Result<Self> {
-        let reader_options = slatedb::config::DbReaderOptions {
-            manifest_poll_interval: config.refresh_interval,
-            ..Default::default()
-        };
-
+    pub async fn open(
+        storage_config: StorageConfig,
+        reader_options: slatedb::config::DbReaderOptions,
+        cache_capacity: u64,
+    ) -> Result<Self> {
         let storage = create_storage_read(
-            &config.storage,
+            &storage_config,
             StorageReaderRuntime::new(),
             StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
             reader_options,
         )
         .await?;
-        Ok(Self::from_storage_with_capacity(
-            storage,
-            config.cache_capacity,
-        ))
+        Ok(Self::from_storage_with_capacity(storage, cache_capacity))
     }
 
     /// Creates a TimeSeriesDbReader from an existing storage implementation.
     pub(crate) fn from_storage(storage: Arc<dyn StorageRead>) -> Self {
-        Self::from_storage_with_capacity(storage, crate::config::DEFAULT_CACHE_CAPACITY)
+        Self::from_storage_with_capacity(storage, DEFAULT_CACHE_CAPACITY)
     }
 
     fn from_storage_with_capacity(storage: Arc<dyn StorageRead>, cache_capacity: u64) -> Self {
@@ -497,9 +494,11 @@ mod tests {
     /// TimeSeriesDbReader::open on the same local path. This exercises the
     /// actual DbReader open path and verifies writer + reader coexistence
     /// without fencing.
+    ///
     #[tokio::test]
     async fn slatedb_writer_and_reader_coexist_no_fencing() {
-        use crate::{Config, ReaderConfig, TimeSeriesDb};
+        use crate::config::Config;
+        use crate::timeseries::TimeSeriesDb;
         use common::storage::config::{
             LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
         };
@@ -535,13 +534,14 @@ mod tests {
         writer.flush().await.unwrap();
 
         // 2. Open reader via the public API (exercises create_storage_read + DbReader)
-        let reader = TimeSeriesDbReader::open(ReaderConfig {
-            storage: storage_config.clone(),
-            refresh_interval: Duration::from_millis(100),
+        let reader_options = slatedb::config::DbReaderOptions {
+            manifest_poll_interval: Duration::from_millis(100),
+            skip_wal_replay: false,
             ..Default::default()
-        })
-        .await
-        .unwrap();
+        };
+        let reader = TimeSeriesDbReader::open(storage_config.clone(), reader_options, 50)
+            .await
+            .unwrap();
 
         // 3. Reader sees written data
         let query_time = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000001000);
@@ -610,7 +610,8 @@ mod tests {
 
     #[tokio::test]
     async fn should_persist_data_after_flush_and_writer_reopen() {
-        use crate::{Config, TimeSeriesDb};
+        use crate::config::Config;
+        use crate::timeseries::TimeSeriesDb;
         use common::storage::config::{
             LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
         };
@@ -774,33 +775,12 @@ mod tests {
     }
 
     #[test]
-    fn reader_config_deserializes_default_cache_capacity() {
-        let yaml = r#"
-storage:
-  type: InMemory
-"#;
-        let config: crate::config::ReaderConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.cache_capacity, crate::config::DEFAULT_CACHE_CAPACITY);
-    }
-
-    #[test]
-    fn reader_config_honors_custom_cache_capacity() {
-        let yaml = r#"
-storage:
-  type: InMemory
-cache_capacity: 200
-"#;
-        let config: crate::config::ReaderConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.cache_capacity, 200);
-    }
-
-    #[test]
     fn from_storage_uses_default_cache_capacity() {
         let storage = create_shared_storage();
         let reader = TimeSeriesDbReader::from_storage(storage);
         assert_eq!(
             reader.query_cache.policy().max_capacity(),
-            Some(crate::config::DEFAULT_CACHE_CAPACITY)
+            Some(DEFAULT_CACHE_CAPACITY)
         );
     }
 

@@ -799,6 +799,144 @@ impl TsdbReadEngine for Tsdb {
     }
 }
 
+// ── TsdbEngine: unified read/write or read-only dispatch ────────────
+
+/// Wraps either a read-write [`Tsdb`] or a read-only [`crate::reader::TimeSeriesDbReader`],
+/// dispatching read methods to the inner engine and rejecting writes in
+/// read-only mode.
+pub(crate) enum TsdbEngine {
+    ReadWrite(Arc<Tsdb>),
+    ReadOnly(Arc<crate::reader::TimeSeriesDbReader>),
+}
+
+impl TsdbEngine {
+    /// Returns `true` when the engine is read-only.
+    pub(crate) fn is_read_only(&self) -> bool {
+        matches!(self, Self::ReadOnly(_))
+    }
+
+    /// Returns a clone of the inner `Arc<Tsdb>` if this is a read-write engine.
+    pub(crate) fn as_tsdb(&self) -> Option<Arc<Tsdb>> {
+        match self {
+            Self::ReadWrite(tsdb) => Some(tsdb.clone()),
+            Self::ReadOnly(_) => None,
+        }
+    }
+
+    // ── Read methods (dispatch to inner engine) ──
+
+    pub(crate) async fn eval_query(
+        &self,
+        query: &str,
+        time: Option<SystemTime>,
+        opts: &QueryOptions,
+    ) -> std::result::Result<QueryValue, QueryError> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.eval_query(query, time, opts).await,
+            Self::ReadOnly(reader) => reader.eval_query(query, time, opts).await,
+        }
+    }
+
+    pub(crate) async fn eval_query_range(
+        &self,
+        query: &str,
+        range: impl RangeBounds<SystemTime>,
+        step: Duration,
+        opts: &QueryOptions,
+    ) -> std::result::Result<Vec<RangeSample>, QueryError> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.eval_query_range(query, range, step, opts).await,
+            Self::ReadOnly(reader) => {
+                eval_query_range_bounds(reader.as_ref(), query, range, step, opts).await
+            }
+        }
+    }
+
+    pub(crate) async fn find_series(
+        &self,
+        matchers: &[&str],
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<Labels>, QueryError> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.find_series(matchers, start_secs, end_secs).await,
+            Self::ReadOnly(reader) => reader.find_series(matchers, start_secs, end_secs).await,
+        }
+    }
+
+    pub(crate) async fn find_labels(
+        &self,
+        matchers: Option<&[&str]>,
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.find_labels(matchers, start_secs, end_secs).await,
+            Self::ReadOnly(reader) => reader.find_labels(matchers, start_secs, end_secs).await,
+        }
+    }
+
+    pub(crate) async fn find_label_values(
+        &self,
+        label_name: &str,
+        matchers: Option<&[&str]>,
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        match self {
+            Self::ReadWrite(tsdb) => {
+                tsdb.find_label_values(label_name, matchers, start_secs, end_secs)
+                    .await
+            }
+            Self::ReadOnly(reader) => {
+                reader
+                    .find_label_values(label_name, matchers, start_secs, end_secs)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn find_metadata(
+        &self,
+        metric: Option<&str>,
+    ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.find_metadata(metric).await,
+            Self::ReadOnly(_) => Ok(vec![]),
+        }
+    }
+
+    // ── Write methods (error in read-only mode) ──
+
+    pub(crate) async fn ingest_samples(&self, series_list: Vec<Series>) -> Result<()> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.ingest_samples(series_list).await,
+            Self::ReadOnly(_) => Err(crate::error::Error::InvalidInput(
+                "write operations are not supported in read-only mode".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) async fn flush(&self) -> Result<()> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.flush().await,
+            Self::ReadOnly(_) => Ok(()),
+        }
+    }
+}
+
+impl From<Arc<Tsdb>> for TsdbEngine {
+    fn from(tsdb: Arc<Tsdb>) -> Self {
+        Self::ReadWrite(tsdb)
+    }
+}
+
+impl From<Arc<crate::reader::TimeSeriesDbReader>> for TsdbEngine {
+    fn from(reader: Arc<crate::reader::TimeSeriesDbReader>) -> Self {
+        Self::ReadOnly(reader)
+    }
+}
+
 /// QueryReader implementation that properly handles bucket-scoped series IDs.
 pub(crate) struct TsdbQueryReader {
     /// Map from bucket to MiniTsdb for efficient bucket queries
