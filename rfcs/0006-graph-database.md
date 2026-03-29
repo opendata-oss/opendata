@@ -242,8 +242,9 @@ monotonicity.
 
 All records use the standard 3-byte prefix per [RFC 0001](../../rfcs/0001-record-key-prefix.md):
 a `u8` subsystem byte, a `u8` version byte (currently `0x01`), and a `u8` record tag. The graph
-subsystem uses subsystem byte `0x05`. The record tag is a full byte value; some record types
-(Catalog, SeqBlock) encode a sub-type discriminant in the lower 4 bits.
+subsystem uses subsystem byte `0x05` (to be registered in RFC 0001 upon acceptance of this RFC).
+The record tag is a full byte value; some record types (Catalog, SeqBlock) encode a sub-type
+discriminant in the lower 4 bits.
 
 ### Common Encodings
 
@@ -263,7 +264,7 @@ Key encodings use the primitives defined in [RFC 0004](../../rfcs/0004-common-en
 | `0x60` | `BackwardAdj`      | Incoming adjacency: dst -> (edge_type, src, edge_id)    |
 | `0x70` | `LabelIndex`       | Label -> node ID mapping for label scans                |
 | `0x80` | `PropertyIndex`    | Sortable property value -> node ID for filtered search  |
-| `0x9_` | `Catalog`          | Name-to-ID dictionaries (6 sub-types via reserved bits) |
+| `0x9_` | `Catalog`          | Name-to-ID dictionaries (6 sub-types)                   |
 | `0xE0` | `Metadata`         | Global counters (node count, edge count)                |
 | `0xF0` | `SeqBlock`         | Sequence allocation state for node/edge ID generation   |
 
@@ -489,11 +490,8 @@ Mirror of `ForwardAdj` with source and destination swapped.
 Backward adjacency is always maintained. While Grafeo allows disabling backward edges via
 `Config::backward_edges`, the SlateDB implementation always writes backward adjacency entries.
 
-**Cost and justification:** Each backward adjacency key is 31 bytes with an empty value, adding
-one extra PUT per edge creation. For N edges this adds ~31N bytes (e.g., ~3.1 GB for 100M edges).
-This is small relative to the total record set (each edge already produces an EdgeRecord +
-ForwardAdj + property records), and the benefit is first-class `Incoming`/`Both` traversal without
-scanning all ForwardAdj records.
+**Cost and justification:** One extra 31-byte PUT per edge creation; small relative to the total
+record set and enables first-class `Incoming`/`Both` traversal without scanning ForwardAdj.
 
 ### `LabelIndex` (`0x70`)
 
@@ -631,13 +629,11 @@ On startup, prefix scan `[0x05, 0x01, 0x90]`, `[0x05, 0x01, 0x92]`, and `[0x05, 
 to populate the in-memory bidirectional maps (name → ID and ID → name). The catalog is expected
 to be small (thousands of entries at most), so full loading is practical.
 
-**Why keep the catalog?** Labels, edge types, and property keys are typically a small, stable set
-(dozens, not millions). Other graph engines like Neo4j and JanusGraph use integer IDs internally
-for the same reason. Adjacency keys include the edge type on every entry, so a 4-byte integer
-instead of a variable-length string adds up when you have billions of edges. This differs from
-the timeseries engine which decided against a dictionary, that trade-off makes sense there
-because metric label cardinality is higher and series fingerprinting provides an alternative
-compact identifier.
+**Why keep the catalog?** Labels, edge types, and property keys are a small stable set (dozens,
+not millions) and adjacency keys include the edge type on every entry; a 4-byte integer instead
+of a variable-length string saves significant space at scale. The timeseries engine decided
+against a dictionary because metric label cardinality is higher and series fingerprinting
+provides an alternative compact identifier.
 
 **ID Assignment:**
 
@@ -740,6 +736,10 @@ The adapter uses two patterns depending on the operation type:
    via `Storage::apply()`. All records for a single logical operation (entity record, indexes,
    counter merges) are written atomically in one batch.
 
+   Note: `set_*_property` is write-only when the property is new. When updating an existing
+   indexed property, the adapter reads the old value to delete the stale `PropertyIndex` entry
+   before writing the new one; this follows the read-then-write pattern below.
+
 2. **Read-then-write operations** (`delete_node`, `delete_edge`, `add_label`, `remove_label`,
    `remove_*_property`): Use `StorageTransaction` for snapshot-isolated atomicity. The operation
    begins a transaction, reads the current state within that transaction's snapshot, buffers
@@ -755,19 +755,11 @@ operations up to 3 times with a fresh transaction on each attempt.
 
 **Why not custom MVCC?**
 
-An earlier draft of this RFC included epoch-based MVCC with version chains in entity record keys.
-This was rejected for several reasons:
-
-- **Redundant**: SlateDB already provides snapshot isolation via `DbTransaction`, making a
-  custom MVCC layer unnecessary.
-- **Race condition**: The epoch-based design required reading and incrementing a global epoch
-  counter, which was not protected by a transaction. Two concurrent writers could read the same
-  epoch and stamp their records with duplicate epoch values.
-- **Complexity**: Version chains required scanning and filtering for every point lookup (O(v)
-  where v is the number of versions), garbage collection of old versions, and special handling
-  of deletion markers. Without these, each point lookup is a single `get()` call.
-- **Forward-compatible**: If time-travel queries are needed in the future, the key layout can
-  be extended with an epoch suffix without changing the record tag allocation.
+An earlier draft included epoch-based MVCC with version chains in entity record keys. Rejected
+because SlateDB already provides snapshot isolation (making it redundant), the epoch
+read-increment-write was not protected by a transaction (race condition), and version chains
+turned every point lookup into a prefix scan with GC overhead. The key layout remains
+forward-compatible with an epoch suffix if time-travel queries are needed later.
 
 ### Write Path
 
@@ -784,6 +776,8 @@ WriteBatch (via Storage::apply):
   PUT [0x05, 0x01, 0x10, node_id]              → NodeRecordValue { labels: [0, 1] }
   PUT [0x05, 0x01, 0x30, node_id, PropKeyId(0)] → Value::serialize(String("Alice"))
   PUT [0x05, 0x01, 0x30, node_id, PropKeyId(1)] → Value::serialize(Int64(30))
+  PUT [0x05, 0x01, 0x80, PropKeyId(0), SortableValue("Alice"), node_id] → (empty)
+  PUT [0x05, 0x01, 0x80, PropKeyId(1), SortableValue(30), node_id]     → (empty)
   PUT [0x05, 0x01, 0x70, LabelId(0), node_id]  → (empty)
   PUT [0x05, 0x01, 0x70, LabelId(1), node_id]  → (empty)
   MERGE [0x05, 0x01, 0xE0, 0x00]               → +1  (NodeCount)
@@ -813,8 +807,10 @@ StorageTransaction:
   BEGIN
   GET  [0x05, 0x01, 0x10, 42]  → NodeRecordValue { labels: [0, 1] }  (if absent → return false)
   DEL  [0x05, 0x01, 0x10, 42]
-  SCAN [0x05, 0x01, 0x30, 42, ...]  → delete all NodeProperty records
-  DEL  [0x05, 0x01, 0x80, ...]      → delete matching PropertyIndex entries for each property
+  SCAN [0x05, 0x01, 0x30, 42, ...]  → for each (prop_key_id, value):
+    DEL  [0x05, 0x01, 0x30, 42, prop_key_id]
+    if value is sortable:
+      DEL  [0x05, 0x01, 0x80, prop_key_id, SortableValue(value), 42]
   DEL  [0x05, 0x01, 0x70, LabelId(0), 42]
   DEL  [0x05, 0x01, 0x70, LabelId(1), 42]
   MERGE [0x05, 0x01, 0xE0, 0x00]  → -1  (NodeCount)
@@ -825,7 +821,9 @@ Edge cascade is handled separately: Grafeo's engine calls `delete_node_edges` be
 `delete_node`, which scans ForwardAdj and BackwardAdj to find connected edges and deletes
 each via `delete_edge` (removing the EdgeRecord, both adjacency entries, edge properties
 and the EdgeCount merge). This keeps the storage adapter's `delete_node` focused on the node
-itself while the engine controls cascade semantics.
+itself while the engine controls cascade semantics. The cascade is not atomic with node
+deletion; a crash between the two calls may leave the node intact with some edges already
+deleted. This is acceptable under retry semantics.
 
 ### Read Path: Assembling a Full Node
 
@@ -858,14 +856,9 @@ Key:   [0x05, 0x01, 0x30, node_id]
 Value: Map { "name": "Alice", "age": 30, "email": "alice@example.com" }
 ```
 
-**Rejected because:**
-
-1. **Read amplification** — Reading one property requires deserializing the entire map.
-   `get_node_property(id, "name")` must load and decode all properties.
-2. **Write amplification** — Setting one property requires read-modify-write of the entire map.
-   For nodes with many properties or large values, this is expensive.
-3. **Projection pushdown** — Grafeo's selective batch methods (`get_nodes_properties_selective_batch`)
-   become less effective when the smallest unit of storage is the full property map.
+**Rejected because** reading or writing a single property requires loading and deserializing
+the entire map (read and write amplification), defeating projection pushdown in Grafeo's
+selective batch methods.
 
 ### Adjacency Lists as Serialized Arrays
 
@@ -876,15 +869,9 @@ Key:   [0x05, 0x01, 0x50, src_node_id]
 Value: [(edge_type_id, dst_node_id, edge_id), ...]
 ```
 
-**Rejected because:**
-
-1. **Read-modify-write**: Adding or removing one edge requires loading, deserializing, modifying,
-   re-serializing, and writing the entire list. For high-degree nodes (thousands of edges), this
-   is prohibitively expensive.
-2. **No type-filtered prefix scans**: The per-key layout enables `[subsystem, version, tag, src, edge_type]` scans
-   for type-filtered traversal. A single array requires filtering after deserialization.
-3. **Concurrent writes**: Multiple concurrent edge creations on the same node conflict on the
-   same key. Individual keys allow concurrent writes without conflicts.
+**Rejected because** each edge mutation requires read-modify-write on the entire list (expensive
+for high-degree nodes), concurrent edge creations conflict on the same key, and type-filtered
+traversal requires deserializing the full array instead of a prefix scan.
 
 ### Bitmap-Based Label Index
 
@@ -944,6 +931,13 @@ Value: { flags: DELETED, label_ids: [] }
 
 5. ~~**MVCC model**~~: **Resolved.** Concurrency control is delegated to SlateDB's transaction
    support. No custom epoch-based MVCC. See the "Concurrency Model" section.
+
+6. **Single-writer enforcement**: The storage design assumes single-writer semantics but does not
+   enforce it at runtime. If a second writer starts against the same SlateDB instance (e.g. zombie
+   process after k8s failover), the failure mode is silent: duplicate catalog IDs, overlapping
+   node/edge IDs from the SequenceAllocator, and divergent counters. A fencing mechanism (e.g. CAS
+   on a writer-epoch key or leveraging SlateDB's manifest fencing) is needed before production
+   deployment. See "Write coordination" in Future Considerations.
 
 ## Future Considerations
 
