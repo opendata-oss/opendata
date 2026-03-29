@@ -60,16 +60,22 @@ The storage design must support:
 - Define merge operators for atomic counter updates
 - Define the concurrency model: delegated to SlateDB transactions
 
-## Non-Goals (left for future RFCs)
+## Non-Goals
 
-- RDF triple store support (SPARQL, triple indexes)
-- Query languages beyond GQL (Cypher, Gremlin, GraphQL, SQL/PGQ)
-- Graph algorithms plugin (`algos` feature)
-- Vector, text, and hybrid search indexes on graph properties
-- GWP (gRPC) and Bolt (Neo4j) protocol support
-- Write coordination and distributed deployment
-- Compaction policies and garbage collection mechanics
-- HTTP API design (covered in a future write/read API RFC)
+This RFC covers the storage model only. The following are out of scope:
+
+- **Query languages beyond GQL**, **RDF support**, and **graph algorithms**: Available via
+  Grafeo feature flags (`cypher`, `sparql`, `gremlin`, `graphql`, `sql-pgq`, `rdf`, `algos`)
+  but their storage implications are identical to GQL — they all operate on the same
+  `GraphStore`/`GraphStoreMut` traits defined here.
+- **GWP (gRPC) and Bolt (Neo4j) protocol support**: Available via `gwp` and `bolt` feature
+  flags. These are transport layers above the storage model.
+- **Vector, text, and hybrid search indexes on graph properties**: Not yet implemented.
+  Would require new index record types.
+- **Write coordination and distributed deployment**: Requires fencing and consensus
+  mechanisms beyond the single-writer model described here. See Open Question #6.
+- **Compaction policies and garbage collection mechanics**: Delegated to SlateDB.
+- **HTTP API design**: Covered in a future write/read API RFC.
 
 ## Dependencies
 
@@ -93,9 +99,9 @@ default and mandatory interface.
 | Crate          | Version | Role                                                                  |
 |----------------|---------|-----------------------------------------------------------------------|
 | `parking_lot`  | 0.12    | Faster RwLock/Mutex for catalog cache and sequence allocators         |
-| `hashbrown`    | 0.14    | HashMap variant used by Grafeo types                                  |
+| `hashbrown`    | 0.16    | HashMap variant used by Grafeo types                                  |
 | `arcstr`       | 1.2     | Atomic reference-counted strings (used for label/type/property names) |
-| `smallvec`     | 1.13    | Stack-allocated vectors (used for node label lists)                   |
+| `smallvec`     | 1.15    | Stack-allocated vectors (used for node label lists)                   |
 
 ### Precedent
 
@@ -115,6 +121,12 @@ dictionaries are all stored as key-value pairs in the LSM tree. Grafeo's query e
 on a `SlateGraphStore` adapter that translates trait method calls into SlateDB reads and writes.
 Concurrency control is delegated to SlateDB's built-in transaction support, the adapter does not
 maintain its own MVCC layer.
+
+**Sync-async bridge:** Grafeo's `GraphStore` and `GraphStoreMut` traits are synchronous, while
+SlateDB's API is async. The adapter bridges this via `tokio::task::block_in_place`, which blocks
+the current tokio worker thread for each storage call. Under high query concurrency this can
+exhaust the runtime thread pool. Mitigation options include a dedicated blocking thread pool or
+making the Grafeo traits async in a future version.
 
 ```ascii
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -173,6 +185,14 @@ pruning, and statistics for the cost-based optimizer.
 
 `GraphStoreMut` extends `GraphStore` with mutations: create/delete nodes and edges, set/remove
 properties, add/remove labels, and batch edge creation.
+
+Both traits include versioned variants of most methods (e.g., `get_node_versioned`,
+`create_node_versioned`) and temporal visibility methods (`is_node_visible_at_epoch`,
+`filter_visible_node_ids`, `get_node_history`). The SlateDB adapter stubs these to delegate to
+their non-versioned counterparts, returning the current state regardless of the requested epoch.
+Catalog introspection methods (`all_labels`, `all_edge_types`, `all_property_keys`) are served
+directly from the in-memory catalog cache. These stubs will be activated when time-travel query
+support is added (see Future Considerations).
 
 #### Core Types
 
@@ -249,8 +269,9 @@ discriminant in the lower 4 bits.
 ### Common Encodings
 
 Key encodings use the primitives defined in [RFC 0004](../../rfcs/0004-common-encodings.md):
-`TerminatedBytes` for variable-length keys, sortable `i64`/`f64` for ordered numeric keys
-(sign-bit flip, big-endian). Value fields are little-endian.
+`TerminatedBytes` for variable-length keys and `FixedElementArray<T>` for fixed-width arrays.
+Sortable `i64`/`f64` encodings (sign-bit flip, big-endian) use `common::serde::sortable`
+(`encode_i64_sortable`, `encode_f64_sortable`). Value fields are little-endian.
 
 ### Record Type Reference
 
@@ -553,10 +574,10 @@ Since each `PropertyIndex` key is scoped to a single `property_key_id`, all valu
 scan are the same type.
 
 ```text
-Bool    → u8 (0 or 1)              (1 byte)
-Int64   → sortable i64             (8 bytes BE)
-Float64 → sortable f64             (8 bytes BE)
-String  → TerminatedBytes          (variable)
+Bool    → u8 (0 or 1)                               (1 byte)
+Int64   → sign-bit flip, big-endian (common::serde::sortable)  (8 bytes)
+Float64 → sign-bit flip, big-endian (common::serde::sortable)  (8 bytes)
+String  → TerminatedBytes per RFC 0004                         (variable)
 ```
 
 Only these four types support sortable encoding; other `Value` types are not indexed.
@@ -711,12 +732,13 @@ Follows the same allocation pattern as the common crate's `SequenceAllocator`.
 ### Value Serialization
 
 Property values (`NodeProperty` / `EdgeProperty` values) are serialized using Grafeo's native
-[`Value::serialize()` / `Value::deserialize()`](https://github.com/GrafeoDB/grafeo/blob/main/crates/grafeo-common/src/value/serde.rs).
-The format is a one-byte type tag followed by the payload; the tag values match the table in the
-"Core Types" section above. This delegates the wire format entirely to `grafeo-common`, ensuring
-that the storage layer is always compatible with the query engine's type system without maintaining
-a separate encoding. The format is not yet stable across Grafeo major versions; the storage layer
-pins a specific Grafeo version and any breaking format change would require a key version bump.
+[`Value::serialize()` / `Value::deserialize()`](https://github.com/GrafeoDB/grafeo/blob/main/crates/grafeo-common/src/types/value.rs).
+The implementation delegates to `bincode::serde::encode_to_vec(self, bincode::config::standard())`
+— the storage layer treats the serialized bytes as opaque. This delegates the wire format entirely
+to `grafeo-common`, ensuring that the storage layer is always compatible with the query engine's
+type system without maintaining a separate encoding. The format is not yet stable across Grafeo
+major versions; the storage layer pins a specific Grafeo version and any breaking format change
+would require a key version bump.
 
 The `SortableValue` encoding used in `PropertyIndex` keys (see PropertyIndex section) is a
 separate, sort-preserving encoding distinct from `Value::serialize()`. Only Bool, Int64, Float64,
@@ -751,7 +773,8 @@ The adapter uses two patterns depending on the operation type:
 
 SlateDB transactions use snapshot isolation. If two concurrent transactions write to the same key,
 the second to commit receives a `TransactionConflict` error. The adapter retries conflicting
-operations up to 3 times with a fresh transaction on each attempt.
+operations up to 3 times with a fresh transaction on each attempt. Retries should include
+a small random jitter (e.g. 1–5 ms) to avoid retry storms under contention.
 
 **Why not custom MVCC?**
 
@@ -817,13 +840,17 @@ StorageTransaction:
   COMMIT
 ```
 
-Edge cascade is handled separately: Grafeo's engine calls `delete_node_edges` before
-`delete_node`, which scans ForwardAdj and BackwardAdj to find connected edges and deletes
-each via `delete_edge` (removing the EdgeRecord, both adjacency entries, edge properties
-and the EdgeCount merge). This keeps the storage adapter's `delete_node` focused on the node
-itself while the engine controls cascade semantics. The cascade is not atomic with node
-deletion; a crash between the two calls may leave the node intact with some edges already
-deleted. This is acceptable under retry semantics.
+Edge cascade is handled within `delete_node` itself: the implementation scans ForwardAdj and
+BackwardAdj within the same `StorageTransaction`, deleting each connected edge's EdgeRecord,
+both adjacency entries, edge properties, and applying EdgeCount counter merges — all before
+committing. This makes node deletion fully atomic: the node, all connected edges, their
+properties, label index entries, property index entries, and counter adjustments are committed
+or rolled back as a single unit.
+
+A separate `delete_node_edges` method exists to satisfy Grafeo's `GraphStoreMut` trait contract
+(the engine may call it independently). If `delete_node_edges` was previously called — or
+partially completed before a crash — `delete_node` re-scans adjacency within its transaction
+and cleans up any remaining edges, making the operation convergent.
 
 ### Read Path: Assembling a Full Node
 
@@ -844,6 +871,11 @@ to the record type described above (e.g., `get_node` is a direct `get` on `NodeR
 `edges_from` prefix scans `ForwardAdj`/`BackwardAdj`; `nodes_by_label` prefix scans
 `LabelIndex`). `node_ids()` is the only expensive operation (full `NodeRecord` scan, O(N)); the
 query engine avoids it when label or property predicates are available.
+
+**Error handling:** Grafeo's `GraphStore` trait returns `Option<Node>` / `Option<Edge>` for
+lookups, with no way to signal storage errors. The adapter maps storage errors to `None`,
+making a transient I/O failure indistinguishable from a missing entity. Storage errors are
+logged at `warn` level before returning `None` to aid debugging.
 
 ## Alternatives
 
@@ -934,10 +966,17 @@ Value: { flags: DELETED, label_ids: [] }
 
 6. **Single-writer enforcement**: The storage design assumes single-writer semantics but does not
    enforce it at runtime. If a second writer starts against the same SlateDB instance (e.g. zombie
-   process after k8s failover), the failure mode is silent: duplicate catalog IDs, overlapping
-   node/edge IDs from the SequenceAllocator, and divergent counters. A fencing mechanism (e.g. CAS
-   on a writer-epoch key or leveraging SlateDB's manifest fencing) is needed before production
-   deployment. See "Write coordination" in Future Considerations.
+   process after k8s failover), the failure modes are **silent and corrupting**:
+   - **SequenceAllocator**: Two writers allocate overlapping node/edge ID blocks, producing
+     duplicate IDs that overwrite each other's data.
+   - **Catalog**: Duplicate label/edge-type/property-key IDs assigned to different names,
+     corrupting all keys that embed those IDs.
+   - **Metadata counters**: Merge-based counters diverge (double-counting creates and deletes).
+
+   SlateDB provides manifest-based writer fencing: only one writer can hold the manifest lease at
+   a time, and a stale writer's writes are rejected on the next manifest update. This is the
+   intended enforcement mechanism, but the graph adapter does not yet surface fencing errors to
+   callers. This must be resolved before any multi-node or failover-capable deployment.
 
 ## Future Considerations
 
@@ -990,3 +1029,9 @@ Future RFCs will address:
 |            | Updated to Grafeo v0.5.28. NodeRecordValue uses `FixedElementArray<u32>` per      |
 |            | RFC 0004. Added Value format link, GCounter/OnCounter variants, PropertyIndex     |
 |            | cleanup in delete_node, edge cascade semantics. Addressed reviewer feedback.      |
+| 2026-03-29 | Post-review fixes: corrected sortable encoding attribution (was "per RFC 0004",   |
+|            | now references `common::serde::sortable`). Fixed dependency versions (hashbrown   |
+|            | 0.16, smallvec 1.15). Documented stubbed temporal/visibility trait methods and    |
+|            | error handling in read path. Implementation: atomic edge cascade in delete_node,  |
+|            | single-WriteBatch batch_create_edges, catalog name length validation, warn        |
+|            | logging for storage errors in get_node/get_edge, transaction retry jitter.        |
