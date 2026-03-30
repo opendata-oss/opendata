@@ -1,5 +1,5 @@
-use std::cell::Cell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -13,6 +13,7 @@ use crate::model::decode_batch;
 use crate::queue::{QueueConsumer, QueueEntry};
 
 const DEQUEUE_INTERVAL: u64 = 100;
+const NO_SEQUENCE: u64 = u64::MAX;
 
 /// Metadata associated with a range of entries in a [`CollectedBatch`].
 pub struct CollectedMetadata {
@@ -45,8 +46,9 @@ pub struct CollectedBatch {
 pub struct Collector {
     consumer: QueueConsumer,
     object_store: Arc<dyn ObjectStore>,
-    ack_count: Cell<u64>,
-    last_acked_sequence: Cell<Option<u64>>,
+    ack_count: AtomicU64,
+    /// Stores the last acked sequence, or `NO_SEQUENCE` if none has been acked.
+    last_acked_sequence: AtomicU64,
 }
 
 impl Collector {
@@ -66,8 +68,8 @@ impl Collector {
         Self {
             consumer,
             object_store,
-            ack_count: Cell::new(0),
-            last_acked_sequence: Cell::new(None),
+            ack_count: AtomicU64::new(0),
+            last_acked_sequence: AtomicU64::new(NO_SEQUENCE),
         }
     }
 
@@ -80,7 +82,7 @@ impl Collector {
     pub async fn initialize(&self, last_acked_sequence: Option<u64>) -> Result<()> {
         self.consumer.initialize().await?;
         if let Some(seq) = last_acked_sequence {
-            self.last_acked_sequence.set(Some(seq));
+            self.last_acked_sequence.store(seq, Ordering::Relaxed);
             self.flush().await?;
         }
         Ok(())
@@ -92,9 +94,10 @@ impl Collector {
     /// Otherwise, reads the entry with sequence `last_acked_sequence + 1`.
     /// Returns `None` if no matching entry is available.
     pub async fn next_batch(&self) -> Result<Option<CollectedBatch>> {
-        let queue_entry = match self.last_acked_sequence.get() {
-            Some(seq) => self.consumer.read(seq.wrapping_add(1)).await?,
-            None => self.consumer.peek().await?,
+        let last = self.last_acked_sequence.load(Ordering::Relaxed);
+        let queue_entry = match last {
+            NO_SEQUENCE => self.consumer.peek().await?,
+            seq => self.consumer.read(seq.wrapping_add(1)).await?,
         };
         match queue_entry {
             Some(entry) => self.fetch_batch(entry).await,
@@ -143,18 +146,16 @@ impl Collector {
     /// collector only calls `dequeue()` on the queue consumer every
     /// 100 acks.
     pub async fn ack(&self, sequence: u64) -> Result<()> {
-        if let Some(last) = self.last_acked_sequence.get()
-            && sequence != last + 1
-        {
+        let last = self.last_acked_sequence.load(Ordering::Relaxed);
+        if last != NO_SEQUENCE && sequence != last + 1 {
             return Err(Error::Storage(format!(
                 "out-of-order ack: expected sequence {}, got {}",
                 last + 1,
                 sequence
             )));
         }
-        self.last_acked_sequence.set(Some(sequence));
-        let count = self.ack_count.get() + 1;
-        self.ack_count.set(count);
+        self.last_acked_sequence.store(sequence, Ordering::Relaxed);
+        let count = self.ack_count.fetch_add(1, Ordering::Relaxed) + 1;
         if count.is_multiple_of(DEQUEUE_INTERVAL) {
             let dequeued = self.consumer.dequeue(sequence).await?;
             delete_dequeued_batches(self.object_store.clone(), dequeued);
@@ -164,7 +165,8 @@ impl Collector {
 
     /// Flush any pending acks by dequeueing up to the last acked sequence.
     pub async fn flush(&self) -> Result<()> {
-        if let Some(seq) = self.last_acked_sequence.get() {
+        let seq = self.last_acked_sequence.load(Ordering::Relaxed);
+        if seq != NO_SEQUENCE {
             let dequeued = self.consumer.dequeue(seq).await?;
             delete_dequeued_batches(self.object_store.clone(), dequeued);
         }

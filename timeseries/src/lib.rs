@@ -61,6 +61,8 @@ mod util;
 #[cfg(feature = "bench-internals")]
 mod bench_api;
 
+#[cfg(feature = "ingest-consumer")]
+pub mod ingest_consumer;
 #[cfg(feature = "otel")]
 pub mod otel;
 

@@ -1,0 +1,18 @@
+storage:
+  type: InMemory
+
+flush_interval_secs: 2
+
+ingest_consumer:
+  storage:
+    type: SlateDb
+    path: ingest
+    object_store:
+      type: Aws
+      region: us-east-1
+      bucket: opendata-ingest
+  manifest_path: ingest/otel/metrics/manifest
+  poll_interval_ms: 1000
+  otel:
+    include_resource_attrs: true
+    include_scope_attrs: true

@@ -54,6 +54,11 @@ pub struct PrometheusConfig {
     /// Maximum number of bucket readers to cache in memory.
     #[serde(default = "default_cache_capacity")]
     pub cache_capacity: u64,
+    /// Optional ingest consumer configuration. When set, the server reads
+    /// OTLP metrics from an ingest queue and writes them to the TSDB.
+    #[cfg(feature = "ingest-consumer")]
+    #[serde(default)]
+    pub ingest_consumer: Option<crate::ingest_consumer::IngestConsumerConfig>,
 }
 
 fn default_flush_interval_secs() -> u64 {
@@ -111,6 +116,8 @@ impl Default for PrometheusConfig {
             read_only: false,
             reader: default_reader_options(),
             cache_capacity: default_cache_capacity(),
+            #[cfg(feature = "ingest-consumer")]
+            ingest_consumer: None,
         }
     }
 }

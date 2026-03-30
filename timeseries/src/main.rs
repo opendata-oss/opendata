@@ -5,6 +5,8 @@ mod delta;
 mod error;
 mod flusher;
 mod index;
+#[cfg(feature = "ingest-consumer")]
+mod ingest_consumer;
 mod minitsdb;
 mod model;
 #[cfg(feature = "otel")]
@@ -107,6 +109,26 @@ async fn main() {
         tracing::info!("Storage created successfully");
         let engine: Arc<TsdbEngine> = Arc::new(Arc::new(Tsdb::new(storage.clone())).into());
         (engine, Some(storage))
+    };
+
+    // Start ingest consumer if configured
+    #[cfg(feature = "ingest-consumer")]
+    let _ingest_handle = {
+        if let Some(ingest_config) = prometheus_config.ingest_consumer.clone() {
+            let tsdb_clone = tsdb.clone();
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let shutdown_clone = shutdown.clone();
+            let handle = tokio::spawn(async move {
+                if let Err(e) =
+                    ingest_consumer::run(ingest_config, tsdb_clone, shutdown_clone).await
+                {
+                    tracing::error!("ingest consumer failed: {}", e);
+                }
+            });
+            Some((handle, shutdown))
+        } else {
+            None
+        }
     };
 
     // Create server configuration
