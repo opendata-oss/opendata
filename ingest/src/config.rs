@@ -4,6 +4,8 @@ use common::StorageConfig;
 use serde::{Deserialize, Serialize};
 use serde_with::{DurationMilliSeconds, serde_as};
 
+use crate::model::CompressionType;
+
 /// Configuration for an [`Ingestor`](crate::Ingestor).
 ///
 /// Controls where data batches and the queue manifest are stored, how often
@@ -45,6 +47,12 @@ pub struct IngestorConfig {
     /// Defaults to 1000.
     #[serde(default = "default_max_buffered_inputs")]
     pub max_buffered_inputs: usize,
+
+    /// Compression algorithm applied to the record block in data batches.
+    ///
+    /// Defaults to `None` (uncompressed).
+    #[serde(default)]
+    pub batch_compression: CompressionType,
 }
 
 /// Configuration for a [`Collector`](crate::Collector).

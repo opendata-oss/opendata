@@ -10,3 +10,4 @@ pub use collector::{CollectedBatch, Collector};
 pub use config::{CollectorConfig, IngestorConfig};
 pub use error::{Error, Result};
 pub use ingestor::{DurabilityWatcher, Ingestor, WriteHandle};
+pub use model::CompressionType;
