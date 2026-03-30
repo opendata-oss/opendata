@@ -70,15 +70,12 @@ impl QueryPlan {
         metadata: &BucketMetadata,
         seen_fingerprints: Option<&HashSet<SeriesFingerprint>>,
     ) -> EvalResult<BucketSampleWork> {
-        match &self.path_kind {
-            QueryPathKind::SubqueryVectorSelector { .. } => {
-                Ok(build_bucket_sample_work_lenient(self, metadata))
-            }
-            QueryPathKind::InstantVector { .. } => {
-                build_bucket_sample_work(self, metadata, seen_fingerprints)
-            }
-            QueryPathKind::Matrix => build_bucket_sample_work(self, metadata, None),
-        }
+        let (skip, strict) = match &self.path_kind {
+            QueryPathKind::InstantVector { .. } => (seen_fingerprints, true),
+            QueryPathKind::Matrix => (None, true),
+            QueryPathKind::SubqueryVectorSelector { .. } => (None, false),
+        };
+        build_bucket_sample_work(self, metadata, skip, strict)
     }
 
     /// For the instant path, record fingerprints of series that had data so
@@ -296,25 +293,31 @@ pub(crate) async fn resolve_bucket_metadata<R: QueryReader>(
 
 /// Build explicit sample work for a bucket from resolved metadata.
 ///
-/// For instant vector selectors, `skip_fingerprints` enables cross-bucket dedup
+/// `skip_fingerprints` enables cross-bucket dedup for instant vector selectors
 /// (series already found in a newer bucket are excluded from the work list).
 ///
-/// Returns an error if a candidate series ID is missing from the forward index
-/// (matching the strict behavior of the instant and matrix paths).
+/// When `strict` is true, a candidate series ID missing from the forward index
+/// is an error (instant and matrix paths). When false, missing specs are
+/// silently skipped (subquery path, matching existing `fetch_series_samples`).
 pub(crate) fn build_bucket_sample_work(
     plan: &QueryPlan,
     metadata: &BucketMetadata,
-    skip_fingerprints: Option<&std::collections::HashSet<SeriesFingerprint>>,
+    skip_fingerprints: Option<&HashSet<SeriesFingerprint>>,
+    strict: bool,
 ) -> EvalResult<BucketSampleWork> {
     let mut series = Vec::with_capacity(metadata.candidates.len());
 
     for &series_id in &metadata.candidates {
-        let spec = metadata.forward_index.get_spec(&series_id).ok_or_else(|| {
-            EvaluationError::InternalError(format!(
-                "Series {} not found in bucket {:?}",
-                series_id, metadata.bucket
-            ))
-        })?;
+        let spec = match metadata.forward_index.get_spec(&series_id) {
+            Some(spec) => spec,
+            None if strict => {
+                return Err(EvaluationError::InternalError(format!(
+                    "Series {} not found in bucket {:?}",
+                    series_id, metadata.bucket
+                )));
+            }
+            None => continue,
+        };
 
         let fingerprint = compute_fingerprint(&spec.labels);
 
@@ -337,38 +340,6 @@ pub(crate) fn build_bucket_sample_work(
         start_ms: plan.sample_start_ms,
         end_ms: plan.sample_end_ms,
     })
-}
-
-/// Build sample work with lenient error handling (skip missing specs).
-///
-/// Matches the existing `fetch_series_samples` behavior where a missing forward
-/// index spec is silently skipped rather than treated as an error.
-pub(crate) fn build_bucket_sample_work_lenient(
-    plan: &QueryPlan,
-    metadata: &BucketMetadata,
-) -> BucketSampleWork {
-    let mut series = Vec::with_capacity(metadata.candidates.len());
-
-    for &series_id in &metadata.candidates {
-        let Some(spec) = metadata.forward_index.get_spec(&series_id) else {
-            continue;
-        };
-
-        let fingerprint = compute_fingerprint(&spec.labels);
-
-        series.push(SeriesWorkItem {
-            series_id,
-            fingerprint,
-            labels: spec.labels.clone(),
-        });
-    }
-
-    BucketSampleWork {
-        bucket: metadata.bucket,
-        series,
-        start_ms: plan.sample_start_ms,
-        end_ms: plan.sample_end_ms,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -971,7 +942,7 @@ mod tests {
         let mut skip = HashSet::new();
         skip.insert(fp_a); // skip series_id=0
 
-        let work = build_bucket_sample_work(&plan, &metadata, Some(&skip)).unwrap();
+        let work = build_bucket_sample_work(&plan, &metadata, Some(&skip), true).unwrap();
         assert_eq!(work.series.len(), 1);
         assert_eq!(work.series[0].series_id, 1);
     }
