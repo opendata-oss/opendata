@@ -1,10 +1,10 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use common::StorageRead;
-use crate::write::indexer::tree::IndexerOpts;
-use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use crate::Result;
 use crate::serde::posting_list::{Posting, PostingList};
+use crate::write::indexer::tree::IndexerOpts;
+use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
+use common::StorageRead;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 pub(crate) struct SplitRoot {
     opts: Arc<IndexerOpts>,
@@ -28,7 +28,7 @@ impl SplitRoot {
     pub(crate) async fn execute(
         self,
         delta: &mut VectorIndexDelta,
-        state: &VectorIndexState
+        state: &VectorIndexState,
     ) -> Result<()> {
         let view = VectorIndexView::new(delta, state, &self.snapshot, self.snapshot_epoch);
 
@@ -64,7 +64,8 @@ impl SplitRoot {
         let updates_for_original_root_postings = {
             let view = VectorIndexView::new(delta, state, &self.snapshot, self.snapshot_epoch);
             let centroid_index = view.centroid_index(self.opts.dimensions);
-            let mut updates_for_original_root_postings = HashMap::with_capacity(original_root_postings.len());
+            let mut updates_for_original_root_postings =
+                HashMap::with_capacity(original_root_postings.len());
             for posting in &original_root_postings {
                 let mut original_c = view
                     .centroid(posting.id())
@@ -75,10 +76,7 @@ impl SplitRoot {
                     .first()
                     .expect("unexpected missing centroid");
                 original_c.parent_vector_id = Some(root_c);
-                updates_for_original_root_postings.insert(
-                    posting.id(),
-                    original_c
-                );
+                updates_for_original_root_postings.insert(posting.id(), original_c);
             }
             updates_for_original_root_postings
         };
@@ -88,7 +86,7 @@ impl SplitRoot {
                 tree_meta.depth as u16,
                 entry.parent_vector_id.expect("unreachable"),
                 original_c_id,
-                entry.vector.clone()
+                entry.vector.clone(),
             );
             delta.search_index.update_centroid(original_c_id, entry);
         }

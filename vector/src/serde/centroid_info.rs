@@ -11,6 +11,7 @@
 //! │  CentroidInfoEntry                                        │
 //! │  ┌──────────────────────────────────────────────────────┐ │
 //! │  │  level:           u8                                 │ │
+//! │  │  vector:          Array<f32>                         │ │
 //! │  │  has_parent:      u8 (0 = none, 1 = some)           │ │
 //! │  │  parent_vector_id: u64 LE (present when has_parent) │ │
 //! │  └──────────────────────────────────────────────────────┘ │
@@ -41,6 +42,7 @@ impl CentroidInfoEntry {
 impl Encode for CentroidInfoEntry {
     fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(self.level);
+        encode_array(&self.vector, buf);
         match self.parent_vector_id {
             Some(parent_vector_id) => {
                 buf.put_u8(1);
@@ -53,18 +55,30 @@ impl Encode for CentroidInfoEntry {
 
 impl Decode for CentroidInfoEntry {
     fn decode(buf: &mut &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 2 {
+        if buf.is_empty() {
             return Err(EncodingError {
                 message: format!(
-                    "Buffer too short for CentroidInfoEntry header: expected at least 2 bytes, got {}",
+                    "Buffer too short for CentroidInfoEntry level: expected at least 1 byte, got {}",
                     buf.len()
                 ),
             });
         }
 
         let level = buf[0];
-        let has_parent = buf[1];
-        *buf = &buf[2..];
+        *buf = &buf[1..];
+
+        let vector = decode_array(buf)?;
+
+        if buf.is_empty() {
+            return Err(EncodingError {
+                message: format!(
+                    "Buffer too short for CentroidInfoEntry parent flag: expected at least 1 byte, got {}",
+                    buf.len()
+                ),
+            });
+        }
+        let has_parent = buf[0];
+        *buf = &buf[1..];
 
         let parent_vector_id = match has_parent {
             0 => None,
@@ -95,13 +109,14 @@ impl Decode for CentroidInfoEntry {
 
         Ok(Self {
             level,
+            vector,
             parent_vector_id,
         })
     }
 }
 
 /// Per-centroid metadata value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CentroidInfoValue {
     pub entries: Vec<CentroidInfoEntry>,
 }
@@ -131,7 +146,11 @@ mod tests {
     #[test]
     fn should_encode_and_decode_centroid_info_with_parent() {
         // given
-        let value = CentroidInfoValue::new(vec![CentroidInfoEntry::new(2, Some(99))]);
+        let value = CentroidInfoValue::new(vec![CentroidInfoEntry::new(
+            2,
+            vec![1.0, 2.0, 3.0],
+            Some(99),
+        )]);
 
         // when
         let encoded = value.encode_to_bytes();
@@ -144,7 +163,7 @@ mod tests {
     #[test]
     fn should_encode_and_decode_centroid_info_without_parent() {
         // given
-        let value = CentroidInfoValue::new(vec![CentroidInfoEntry::new(3, None)]);
+        let value = CentroidInfoValue::new(vec![CentroidInfoEntry::new(3, vec![4.0, 5.0], None)]);
 
         // when
         let encoded = value.encode_to_bytes();
@@ -158,9 +177,9 @@ mod tests {
     fn should_encode_and_decode_multiple_centroid_info_entries() {
         // given
         let value = CentroidInfoValue::new(vec![
-            CentroidInfoEntry::new(0, Some(10)),
-            CentroidInfoEntry::new(1, Some(20)),
-            CentroidInfoEntry::new(2, None),
+            CentroidInfoEntry::new(0, vec![0.0, 1.0], Some(10)),
+            CentroidInfoEntry::new(1, vec![2.0, 3.0], Some(20)),
+            CentroidInfoEntry::new(2, vec![4.0, 5.0], None),
         ]);
 
         // when

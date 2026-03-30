@@ -1,21 +1,23 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use crate::Error::Internal;
+use crate::Result;
+use crate::model::VECTOR_FIELD_NAME;
+use crate::serde::FieldValue;
+use crate::serde::vector_data::VectorDataValue;
+use crate::write::delta::VectorWrite;
+use crate::write::indexer::drivers::AsyncBatchDriver;
+use crate::write::indexer::tree::IndexerOpts;
+use crate::write::indexer::tree::centroids::{
+    LeveledCentroidIndex, batch_search_centroids, batch_search_centroids_up_to_level,
+};
+use crate::write::indexer::tree::split::ReassignVector;
+use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
+use common::StorageRead;
 use futures::future::BoxFuture;
 use log::debug;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
-use common::StorageRead;
-use crate::Error::Internal;
-use crate::model::VECTOR_FIELD_NAME;
-use crate::serde::vector_data::VectorDataValue;
-use crate::write::delta::VectorWrite;
-use crate::write::indexer::tree::centroids::{batch_search_centroids, batch_search_centroids_up_to_level, LeveledCentroidIndex};
-use crate::write::indexer::tree::IndexerOpts;
-use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
-use crate::Result;
-use crate::serde::FieldValue;
-use crate::write::indexer::drivers::AsyncBatchDriver;
-use crate::write::indexer::tree::split::ReassignVector;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// An upsert where we need to resolve the old vector data from storage.
 struct ResolvedUpsert {
@@ -55,12 +57,7 @@ impl WriteVectors {
             return Ok((0, 0));
         }
         let (inserts, upserts, centroid_assignments) = {
-            let view = VectorIndexView::new(
-                delta,
-                state,
-                &self.snapshot,
-                self.snapshot_epoch
-            );
+            let view = VectorIndexView::new(delta, state, &self.snapshot, self.snapshot_epoch);
 
             // compact so last write for each external id wins
             let writes = Self::compact_writes(self.writes);
@@ -73,10 +70,7 @@ impl WriteVectors {
                 .iter()
                 .map(|write| (write.external_id.clone(), write.values.as_slice()))
                 .collect();
-            let assignments_fut = Self::assign_centroids(
-                assignment_inputs,
-                &centroid_index
-            );
+            let assignments_fut = Self::assign_centroids(assignment_inputs, &centroid_index);
 
             let mut inserts = Vec::with_capacity(writes.len());
             let mut upsert_futures: Vec<BoxFuture<'static, Result<ResolvedUpsert>>> = Vec::new();
@@ -124,8 +118,12 @@ impl WriteVectors {
                         insert.external_id
                     ))
                 })?;
-            let vector_id = delta.forward_index.add_vector(&insert.external_id, &insert.attributes);
-            delta.search_index.add_to_posting(0, centroid, vector_id, insert.values.clone());
+            let vector_id = delta
+                .forward_index
+                .add_vector(&insert.external_id, &insert.attributes);
+            delta
+                .search_index
+                .add_to_posting(0, centroid, vector_id, insert.values.clone());
             for (attr_name, attr_value) in &insert.attributes {
                 if attr_name == VECTOR_FIELD_NAME {
                     continue;
@@ -134,7 +132,9 @@ impl WriteVectors {
                     continue;
                 }
                 let field_value: FieldValue = attr_value.clone().into();
-                delta.search_index.add_to_inverted_index(attr_name.clone(), field_value, vector_id);
+                delta
+                    .search_index
+                    .add_to_inverted_index(attr_name.clone(), field_value, vector_id);
             }
         }
 
@@ -151,8 +151,12 @@ impl WriteVectors {
             let (old_vector_id, _old_vector_data) = upsert.old;
             delta.forward_index.delete_vector(old_vector_id);
             // todo: delete from old postings and inverted index
-            let vector_id = delta.forward_index.add_vector(&upsert.write.external_id, &upsert.write.attributes);
-            delta.search_index.add_to_posting(0, centroid, vector_id, upsert.write.values.clone());
+            let vector_id = delta
+                .forward_index
+                .add_vector(&upsert.write.external_id, &upsert.write.attributes);
+            delta
+                .search_index
+                .add_to_posting(0, centroid, vector_id, upsert.write.values.clone());
             for (attr_name, attr_value) in &upsert.write.attributes {
                 if attr_name == VECTOR_FIELD_NAME {
                     continue;
@@ -161,7 +165,9 @@ impl WriteVectors {
                     continue;
                 }
                 let field_value: FieldValue = attr_value.clone().into();
-                delta.search_index.add_to_inverted_index(attr_name.clone(), field_value, vector_id);
+                delta
+                    .search_index
+                    .add_to_inverted_index(attr_name.clone(), field_value, vector_id);
             }
         }
         Ok((insert_count, update_count))
@@ -169,7 +175,7 @@ impl WriteVectors {
 
     async fn assign_centroids(
         writes: Vec<(String, &[f32])>,
-        centroid_index: &LeveledCentroidIndex<'_>
+        centroid_index: &LeveledCentroidIndex<'_>,
     ) -> Result<HashMap<String, u64>> {
         let search_result = batch_search_centroids(centroid_index, 1, writes).await?;
         let mut centroid_assignments = HashMap::with_capacity(search_result.len());
@@ -253,14 +259,21 @@ impl ReassignVectors {
                 .iter()
                 .map(|r| (r.vector_id, r.vector.as_slice()))
                 .collect();
-            let assignments = batch_search_centroids_up_to_level(&centroid_index, 1, ann_search_batch, self.level).await?;
+            let assignments = batch_search_centroids_up_to_level(
+                &centroid_index,
+                1,
+                ann_search_batch,
+                self.level,
+            )
+            .await?;
 
             // determine which vectors actually need a new assignment
             let reassignments: Vec<_> = self
                 .reassignments
                 .into_iter()
                 .filter_map(|r| {
-                    let &closest_centroid = assignments.get(&r.vector_id)
+                    let &closest_centroid = assignments
+                        .get(&r.vector_id)
                         .expect("no centroids")
                         .first()
                         .expect("no centroids");
@@ -301,8 +314,17 @@ impl ReassignVectors {
         let reassigned = resolved.len();
         for r in resolved {
             debug!("old data: {:?}", r.data);
-            delta.search_index.remove_from_posting(self.level, r.reassignment.current_centroid, r.reassignment.vector_id);
-            delta.search_index.add_to_posting(self.level, r.centroid, r.reassignment.vector_id, r.reassignment.vector);
+            delta.search_index.remove_from_posting(
+                self.level,
+                r.reassignment.current_centroid,
+                r.reassignment.vector_id,
+            );
+            delta.search_index.add_to_posting(
+                self.level,
+                r.centroid,
+                r.reassignment.vector_id,
+                r.reassignment.vector,
+            );
         }
         Ok(reassigned)
     }

@@ -4,8 +4,8 @@ mod split;
 pub(crate) mod state;
 #[cfg(test)]
 pub(crate) mod test_utils;
-mod vector;
 mod tree;
+mod vector;
 
 use crate::DistanceMetric;
 use crate::Result;

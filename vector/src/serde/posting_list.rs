@@ -221,7 +221,7 @@ impl PostingUpdate {
 
 impl From<Posting> for PostingUpdate {
     fn from(value: Posting) -> Self {
-        Self {
+        Self::Append {
             id: value.id,
             vector: value.vector,
         }

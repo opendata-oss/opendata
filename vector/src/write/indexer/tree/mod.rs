@@ -1,22 +1,22 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use common::storage::RecordOp;
-use common::StorageRead;
 use crate::DistanceMetric;
-use crate::write::delta::VectorWrite;
-use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState};
 use crate::Result;
+use crate::write::delta::VectorWrite;
 use crate::write::indexer::tree::merge::MergeCentroids;
 use crate::write::indexer::tree::root::SplitRoot;
 use crate::write::indexer::tree::split::{ReassignVector, SplitCentroids};
+use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState};
 use crate::write::indexer::tree::vector::{ReassignVectors, WriteVectors};
+use common::StorageRead;
+use common::storage::RecordOp;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-mod state;
 mod centroids;
-mod vector;
-mod split;
 mod merge;
 mod root;
+mod split;
+mod state;
+mod vector;
 
 #[derive(Debug, Default)]
 pub(crate) struct IndexerStats {
@@ -66,33 +66,24 @@ impl Indexer {
         let depth = self.state.centroids_meta().depth as u16;
         for level in 0..depth {
             // apply merges
-            let merge = MergeCentroids::new(
-                &self.opts,
-                level,
-                depth,
-                &snapshot,
-                snapshot_epoch
-            );
+            let merge = MergeCentroids::new(&self.opts, level, depth, &snapshot, snapshot_epoch);
             let (reassigns, merge_count) = merge.execute(&self.state, &mut delta).await?;
             *stats.merges.entry(level).or_default() += merge_count;
 
             // apply merge reassignments
-            self.reassign_vectors(&snapshot, snapshot_epoch, &mut delta, reassigns).await?;
+            self.reassign_vectors(&snapshot, snapshot_epoch, &mut delta, reassigns)
+                .await?;
 
             // apply split reassign loop
             loop {
-                let split = SplitCentroids::new(
-                    &self.opts,
-                    level,
-                    depth,
-                    &snapshot,
-                    snapshot_epoch,
-                );
+                let split =
+                    SplitCentroids::new(&self.opts, level, depth, &snapshot, snapshot_epoch);
                 let result = split.execute(&self.state, &mut delta).await?;
                 if result.splits.is_empty() {
                     break;
                 }
-                self.reassign_vectors(&snapshot, snapshot_epoch, &mut delta, result.reassignments).await?;
+                self.reassign_vectors(&snapshot, snapshot_epoch, &mut delta, result.reassignments)
+                    .await?;
             }
         }
 
@@ -109,7 +100,7 @@ impl Indexer {
         snapshot: &Arc<dyn StorageRead>,
         snapshot_epoch: u64,
         delta: &mut VectorIndexDelta,
-        reassigns: Vec<ReassignVector>
+        reassigns: Vec<ReassignVector>,
     ) -> Result<usize> {
         let mut total_reassigned = 0;
         let mut reassigns_by_level: HashMap<u16, Vec<ReassignVector>> = HashMap::new();
@@ -122,7 +113,8 @@ impl Indexer {
             let Some(reassigns) = reassigns_by_level.remove(&level) else {
                 continue;
             };
-            let reassign = ReassignVectors::new(&self.opts, snapshot, snapshot_epoch, reassigns, level);
+            let reassign =
+                ReassignVectors::new(&self.opts, snapshot, snapshot_epoch, reassigns, level);
             total_reassigned += reassign.execute(&self.state, delta).await?;
         }
         assert!(reassigns_by_level.is_empty());

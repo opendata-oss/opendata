@@ -1,18 +1,18 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use crate::math::{distance, heuristics, kmeans};
+use crate::serde::centroid_info::CentroidInfoEntry;
+use crate::serde::posting_list::{Posting, PostingList};
+use crate::write::indexer::drivers::AsyncBatchDriver;
+use crate::write::indexer::tree::IndexerOpts;
+use crate::write::indexer::tree::centroids::batch_search_centroids_up_to_level;
+use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
+use crate::{DistanceMetric, Result};
+use common::StorageRead;
 use futures::future::BoxFuture;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::task::spawn_blocking;
-use common::StorageRead;
-use crate::serde::posting_list::{Posting, PostingList};
-use crate::write::indexer::tree::IndexerOpts;
-use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
-use crate::{DistanceMetric, Result};
-use crate::math::{distance, heuristics, kmeans};
-use crate::serde::centroid_info::CentroidInfoEntry;
-use crate::write::indexer::drivers::AsyncBatchDriver;
-use crate::write::indexer::tree::centroids::batch_search_centroids_up_to_level;
 
 const MAX_SPLITS: usize = usize::MAX;
 
@@ -143,7 +143,14 @@ impl SplitCentroids {
             // resolve centroids to full info
             let to_split: Vec<_> = to_split
                 .into_iter()
-                .map(|c| (c, view.centroid(c).expect("unexpected missing centroid").clone()))
+                .map(|c| {
+                    (
+                        c,
+                        view.centroid(c)
+                            .expect("unexpected missing centroid")
+                            .clone(),
+                    )
+                })
                 .collect();
 
             // collect each centroids neighbours
@@ -152,9 +159,13 @@ impl SplitCentroids {
                 batch_search_centroids_up_to_level(
                     &centroid_index,
                     self.opts.split_search_neighbourhood + 1,
-                    to_split.iter().map(|(c, c_info)| (*c, c_info.vector.as_slice())).collect(),
-                    self.level
-                ).await?
+                    to_split
+                        .iter()
+                        .map(|(c, c_info)| (*c, c_info.vector.as_slice()))
+                        .collect(),
+                    self.level,
+                )
+                .await?
             } else {
                 HashMap::new()
             };
@@ -198,8 +209,8 @@ impl SplitCentroids {
                 .map(|split| split.execute(postings.clone()))
                 .collect()
         })
-            .await
-            .expect("unexpected join error");
+        .await
+        .expect("unexpected join error");
 
         // update delta
         let mut total_candidates_evaluated = 0usize;
@@ -218,10 +229,14 @@ impl SplitCentroids {
             );
 
             // delete old centroid and its posting entries
-            delta.search_index.delete_centroids(self.level, vec![result.c]);
+            delta
+                .search_index
+                .delete_centroids(self.level, vec![result.c]);
             if let Some(parent) = result.c_info.parent_vector_id {
                 assert!(self.level + 1 < self.depth);
-                delta.search_index.remove_from_posting(self.level + 1, parent, result.c);
+                delta
+                    .search_index
+                    .remove_from_posting(self.level + 1, parent, result.c);
             } else {
                 assert_eq!(self.level + 1, self.depth);
                 delta.search_index.remove_from_root(result.c);
@@ -234,10 +249,15 @@ impl SplitCentroids {
                 let (c_id, entry) = delta.search_index.add_centroid(
                     self.level,
                     new_centroid.centroid_vec().to_vec(),
-                    result.c_info.parent_vector_id
+                    result.c_info.parent_vector_id,
                 );
                 if let Some(parent) = result.c_info.parent_vector_id {
-                    delta.search_index.add_to_posting(self.level + 1, parent, c_id, entry.vector.clone());
+                    delta.search_index.add_to_posting(
+                        self.level + 1,
+                        parent,
+                        c_id,
+                        entry.vector.clone(),
+                    );
                     reassignments.insert(
                         c_id,
                         ReassignVector {
@@ -245,14 +265,19 @@ impl SplitCentroids {
                             vector: entry.vector.clone(),
                             current_centroid: parent,
                             level: self.level + 1,
-                        }
+                        },
                     );
                 } else {
                     delta.search_index.add_to_root(c_id, entry.vector.clone());
                 }
                 // add all posting entries for the new centroid
                 for p in new_centroid.postings() {
-                    delta.search_index.add_to_posting(self.level, c_id, p.id(), p.vector().to_vec());
+                    delta.search_index.add_to_posting(
+                        self.level,
+                        c_id,
+                        p.id(),
+                        p.vector().to_vec(),
+                    );
                 }
                 new_centroids.push(entry);
             }
@@ -428,7 +453,7 @@ impl SplitCentroid {
                     vector_id: p.id(),
                     vector,
                     current_centroid: *neighbour_id,
-                    level
+                    level,
                 });
             }
         }

@@ -1,13 +1,13 @@
 use crate::Result;
-use crate::serde::posting_list::PostingList;
-use common::StorageRead;
-use futures::future::BoxFuture;
-use std::sync::Arc;
 use crate::serde::centroid_info::CentroidInfoEntry;
+use crate::serde::posting_list::PostingList;
 use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::tree::IndexerOpts;
 use crate::write::indexer::tree::split::ReassignVector;
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
+use common::StorageRead;
+use futures::future::BoxFuture;
+use std::sync::Arc;
 
 struct MergeCentroid {
     c: u64,
@@ -46,12 +46,7 @@ impl MergeCentroids {
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta,
     ) -> Result<(Vec<ReassignVector>, usize)> {
-        let view = VectorIndexView::new(
-            delta,
-            state,
-            &self.snapshot,
-            self.snapshot_epoch
-        );
+        let view = VectorIndexView::new(delta, state, &self.snapshot, self.snapshot_epoch);
 
         // find all centroids that need to be merged at the specified level
         let counts = view.centroid_counts(self.level);
@@ -72,7 +67,10 @@ impl MergeCentroids {
         let mut to_resolve = Vec::with_capacity(to_merge.len());
         for c in to_merge {
             let posting_fut = view.posting_list(c, self.opts.dimensions)?;
-            let c_info = view.centroid(c).expect("unexpected missing centroid").clone();
+            let c_info = view
+                .centroid(c)
+                .expect("unexpected missing centroid")
+                .clone();
             to_resolve.push(Box::pin(async move {
                 Ok(MergeCentroid {
                     c,
@@ -92,10 +90,14 @@ impl MergeCentroids {
         let total_moved = resolved.iter().map(|m| m.postings.len()).sum();
         let mut reassignments = Vec::with_capacity(total_moved);
         for merge in resolved {
-            delta.search_index.delete_centroids(self.level, vec![merge.c]);
+            delta
+                .search_index
+                .delete_centroids(self.level, vec![merge.c]);
             if let Some(parent) = merge.c_info.parent_vector_id {
                 assert!(self.level + 1 < self.depth);
-                delta.search_index.remove_from_posting(self.level + 1, parent, merge.c);
+                delta
+                    .search_index
+                    .remove_from_posting(self.level + 1, parent, merge.c);
             } else {
                 assert_eq!(self.level + 1, self.depth);
                 delta.search_index.remove_from_root(merge.c);

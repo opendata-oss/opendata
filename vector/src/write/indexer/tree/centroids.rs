@@ -1,14 +1,14 @@
+use crate::Result;
+use crate::serde::posting_list::{PostingList, PostingListValue};
+use crate::storage::VectorDbStorageReadExt;
+use crate::write::indexer::drivers::AsyncBatchDriver;
+use common::StorageRead;
+use futures::future::BoxFuture;
 use rayon::iter::ParallelIterator;
+use rayon::prelude::IntoParallelIterator;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
-use futures::future::BoxFuture;
-use rayon::prelude::IntoParallelIterator;
-use common::StorageRead;
-use crate::serde::posting_list::{PostingList, PostingListValue};
-use crate::Result;
-use crate::storage::VectorDbStorageReadExt;
-use crate::write::indexer::drivers::AsyncBatchDriver;
 
 pub(crate) struct IntermediatePostingsRead {
     /// The level the reads are for
@@ -33,14 +33,17 @@ impl IntermediatePostingsRead {
     }
 
     pub(crate) fn start(
-        self
-    ) -> (Vec<(u64, BoxFuture<'static, Result<(u64, Arc<PostingList>)>>)>, InFlightIntermediatePostingsRead) {
+        self,
+    ) -> (
+        Vec<(u64, BoxFuture<'static, Result<(u64, Arc<PostingList>)>>)>,
+        InFlightIntermediatePostingsRead,
+    ) {
         let reads = self.reads;
         let ids = reads.iter().map(|(id, _)| *id).collect();
-        let in_flight = InFlightIntermediatePostingsRead{
+        let in_flight = InFlightIntermediatePostingsRead {
             level: self.level,
             found: self.found,
-            reads: ids
+            reads: ids,
         };
         (reads, in_flight)
     }
@@ -52,18 +55,20 @@ struct InFlightIntermediatePostingsRead {
     /// Centroid postings that were already cached at this level
     found: Vec<(u64, Arc<PostingList>)>,
     /// Centroid postings that need to be read
-    reads: Vec<u64>
+    reads: Vec<u64>,
 }
 
 impl InFlightIntermediatePostingsRead {
     pub(crate) fn finish(self, read: &HashMap<u64, Arc<PostingList>>) -> IntermediatePostings {
-        let read = self.reads.into_iter()
+        let read = self
+            .reads
+            .into_iter()
             .map(|c| (c, read[&c].clone()))
             .collect::<Vec<_>>();
         IntermediatePostings {
             level: self.level,
             found: self.found,
-            read
+            read,
         }
     }
 }
@@ -74,48 +79,60 @@ struct IntermediatePostings {
     /// Centroid postings that were already cached at this level
     found: Vec<(u64, Arc<PostingList>)>,
     /// Centroid postings that need to be read
-    read: Vec<(u64, Arc<PostingList>)>
+    read: Vec<(u64, Arc<PostingList>)>,
 }
 
 enum SearchResult {
     PostingReadRequired(IntermediatePostingsRead),
-    Ann(Vec<u64>)
+    Ann(Vec<u64>),
 }
 
 pub(crate) trait CentroidIndex {
-
     fn search(&self, query: &[f32], k: usize) -> SearchResult;
 
-    fn resume_search(&self, query: &[f32], k: usize, postings: Option<IntermediatePostings>) -> SearchResult;
+    fn resume_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        postings: Option<IntermediatePostings>,
+    ) -> SearchResult;
 }
 
 pub(crate) trait CentroidReader: Send + Sync {
     fn read_root(&self) -> BoxFuture<'static, Result<PostingListValue>>;
 
-    fn read_postings(&self, centroid_id: u64) -> Result<BoxFuture<'static, Result<PostingListValue>>>;
+    fn read_postings(
+        &self,
+        centroid_id: u64,
+    ) -> Result<BoxFuture<'static, Result<PostingListValue>>>;
 }
 
 pub(crate) struct LeveledCentroidIndex<'a> {
     reader: Arc<dyn CentroidReader + 'a>,
 }
 
-impl <'a> LeveledCentroidIndex<'a> {
+impl<'a> LeveledCentroidIndex<'a> {
     pub(crate) fn new(reader: Arc<dyn CentroidReader + 'a>) -> Self {
         Self { reader }
     }
 }
 
-impl <'a> CentroidIndex for LeveledCentroidIndex<'a> {
+impl<'a> CentroidIndex for LeveledCentroidIndex<'a> {
     fn search(&self, query: &[f32], k: usize) -> SearchResult {
         self.search_up_to_level(query, k, 0)
     }
 
-    fn resume_search(&self, query: &[f32], k: usize, postings: Option<IntermediatePostings>) -> SearchResult {
+    fn resume_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        postings: Option<IntermediatePostings>,
+    ) -> SearchResult {
         self.resume_search_up_to_level(query, k, 0, postings)
     }
 }
 
-impl <'a> LeveledCentroidIndex<'a> {
+impl<'a> LeveledCentroidIndex<'a> {
     pub(crate) fn search_root(&self, query: &[f32], k: usize) -> Vec<u64> {
         todo!()
     }
@@ -131,7 +148,7 @@ impl <'a> LeveledCentroidIndex<'a> {
         query: &[f32],
         k: usize,
         level: u16,
-        postings: Option<IntermediatePostings>
+        postings: Option<IntermediatePostings>,
     ) -> SearchResult {
         // postings as the centroids required at a given level, resume search at the next level
         todo!()
@@ -142,16 +159,16 @@ impl <'a> LeveledCentroidIndex<'a> {
 pub(crate) struct StoredCentroidReader {
     dimensions: usize,
     epoch: u64,
-    snapshot: Arc<dyn StorageRead>
+    snapshot: Arc<dyn StorageRead>,
 }
 
 impl StoredCentroidReader {
-    pub(crate) fn new(
-        dimensions: usize,
-        snapshot: Arc<dyn StorageRead>,
-        epoch: u64
-    ) -> Self {
-        Self { dimensions, epoch, snapshot }
+    pub(crate) fn new(dimensions: usize, snapshot: Arc<dyn StorageRead>, epoch: u64) -> Self {
+        Self {
+            dimensions,
+            epoch,
+            snapshot,
+        }
     }
 }
 
@@ -162,17 +179,22 @@ impl CentroidReader for StoredCentroidReader {
         Box::pin(async move { snapshot.get_root_posting_list(dimensions).await })
     }
 
-    fn read_postings(&self, centroid_id: u64) -> Result<BoxFuture<'static, Result<PostingListValue>>> {
+    fn read_postings(
+        &self,
+        centroid_id: u64,
+    ) -> Result<BoxFuture<'static, Result<PostingListValue>>> {
         let snapshot = self.snapshot.clone();
         let dimensions = self.dimensions;
-        Ok(Box::pin(async move { snapshot.get_posting_list(centroid_id, dimensions).await }))
+        Ok(Box::pin(async move {
+            snapshot.get_posting_list(centroid_id, dimensions).await
+        }))
     }
 }
 
 pub(crate) async fn batch_search_centroids<K: Hash + Eq + Sized + Send + Sync>(
     index: &LeveledCentroidIndex<'_>,
     k: usize,
-    queries: Vec<(K, &[f32])>
+    queries: Vec<(K, &[f32])>,
 ) -> Result<HashMap<K, Vec<u64>>> {
     batch_search_centroids_up_to_level(index, k, queries, 0).await
 }
@@ -181,7 +203,7 @@ pub(crate) async fn batch_search_centroids_up_to_level<K: Hash + Eq + Sized + Se
     index: &LeveledCentroidIndex<'_>,
     k: usize,
     queries: Vec<(K, &[f32])>,
-    level: u16
+    level: u16,
 ) -> Result<HashMap<K, Vec<u64>>> {
     let mut results = HashMap::with_capacity(queries.len());
     let queries: Vec<(K, &[f32], Option<IntermediatePostings>)> = queries
@@ -227,11 +249,10 @@ pub(crate) async fn batch_search_centroids_up_to_level<K: Hash + Eq + Sized + Se
         }
         // construct next batch of resumed queries
         let _ = queries.insert(
-            pending.into_iter().map(
-                |(key, q, in_flight)| {
-                    (key, q, Some(in_flight.finish(&postings)))
-                }
-            ).collect()
+            pending
+                .into_iter()
+                .map(|(key, q, in_flight)| (key, q, Some(in_flight.finish(&postings))))
+                .collect(),
         );
     }
     Ok(results)
