@@ -1,5 +1,5 @@
 use crate::math::{distance, heuristics, kmeans};
-use crate::serde::centroid_info::CentroidInfoEntry;
+use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::posting_list::{Posting, PostingList};
 use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::tree::IndexerOpts;
@@ -48,7 +48,7 @@ impl SplitPostings {
 
 struct SplitResult {
     c: u64,
-    c_info: CentroidInfoEntry,
+    c_info: CentroidInfoValue,
     c_0: SplitPostings,
     c_1: SplitPostings,
     reassign_vectors: Vec<ReassignVector>,
@@ -61,7 +61,7 @@ pub(crate) struct SplitSummary {
     #[allow(dead_code)]
     pub(crate) c: u64,
     #[allow(dead_code)]
-    pub(crate) new_centroids: Vec<CentroidInfoEntry>,
+    pub(crate) new_centroids: Vec<CentroidInfoValue>,
 }
 
 #[derive(Debug)]
@@ -300,7 +300,7 @@ impl SplitCentroids {
 
 struct SplitCentroid {
     c: u64,
-    c_info: CentroidInfoEntry,
+    c_info: CentroidInfoValue,
     neighbours: Vec<u64>,
     distance_metric: DistanceMetric,
     dimensions: usize,

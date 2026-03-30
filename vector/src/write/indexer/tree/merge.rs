@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::serde::centroid_info::CentroidInfoEntry;
+use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::posting_list::PostingList;
 use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::tree::IndexerOpts;
@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 struct MergeCentroid {
     c: u64,
-    c_info: CentroidInfoEntry,
+    c_info: CentroidInfoValue,
     postings: PostingList,
 }
 

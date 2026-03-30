@@ -1,7 +1,7 @@
 use crate::AttributeValue;
 use crate::Result;
 use crate::serde::FieldValue;
-use crate::serde::centroid_info::CentroidInfoEntry;
+use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::centroids::CentroidsValue;
 use crate::serde::key::VectorDataKey;
 use crate::serde::posting_list::{
@@ -26,7 +26,7 @@ pub(crate) struct VectorIndexState {
     dictionary: HashMap<String, u64>,
     centroids_meta: CentroidsValue,
     root_centroid_count: u64,
-    centroids: HashMap<u64, CentroidInfoEntry>,
+    centroids: HashMap<u64, CentroidInfoValue>,
     centroid_counts: HashMap<u16, HashMap<u64, u64>>,
     sequence_block_key: Bytes,
     sequence_block: AllocatedSeqBlock,
@@ -39,7 +39,7 @@ impl VectorIndexState {
         dictionary: HashMap<String, u64>,
         centroids_meta: CentroidsValue,
         root_centroid_count: u64,
-        centroids: HashMap<u64, CentroidInfoEntry>,
+        centroids: HashMap<u64, CentroidInfoValue>,
         centroid_counts: HashMap<u16, HashMap<u64, u64>>,
         sequence_block_key: Bytes,
         sequence_block: AllocatedSeqBlock,
@@ -71,7 +71,7 @@ impl VectorIndexState {
         &self.centroid_counts
     }
 
-    pub(crate) fn centroids(&self) -> &HashMap<u64, CentroidInfoEntry> {
+    pub(crate) fn centroids(&self) -> &HashMap<u64, CentroidInfoValue> {
         &self.centroids
     }
 }
@@ -163,7 +163,7 @@ impl ForwardIndexDelta {
 
 pub(crate) struct SearchIndexDelta {
     centroids_meta: Option<CentroidsValue>,
-    upserted_centroids: HashMap<u64, CentroidInfoEntry>,
+    upserted_centroids: HashMap<u64, CentroidInfoValue>,
     deleted_centroids: HashSet<u64>,
     centroid_count_deltas: HashMap<u16, HashMap<u64, i64>>,
     root_count_delta: i64,
@@ -221,7 +221,7 @@ impl SearchIndexDelta {
         self.root_updates = vec![];
     }
 
-    pub(crate) fn update_centroid(&mut self, centroid_id: u64, entry: CentroidInfoEntry) {
+    pub(crate) fn update_centroid(&mut self, centroid_id: u64, entry: CentroidInfoValue) {
         self.upserted_centroids.insert(centroid_id, entry);
     }
 
@@ -230,12 +230,12 @@ impl SearchIndexDelta {
         level: u16,
         vector: Vec<f32>,
         parent: Option<u64>,
-    ) -> (u64, CentroidInfoEntry) {
+    ) -> (u64, CentroidInfoValue) {
         let (id, seq_alloc_put) = self.id_allocator.allocate_one();
         if let Some(seq_alloc_put) = seq_alloc_put {
             self.ops.push(RecordOp::Put(seq_alloc_put.into()));
         }
-        let centroid = CentroidInfoEntry::new(level as u8, vector, parent);
+        let centroid = CentroidInfoValue::new(level as u8, vector, parent);
         let deltas = self
             .centroid_count_deltas
             .entry(level)
@@ -482,7 +482,7 @@ impl<'a> VectorIndexView<'a> {
             .cloned()
     }
 
-    pub(crate) fn centroid(&self, centroid_id: u64) -> Option<&CentroidInfoEntry> {
+    pub(crate) fn centroid(&self, centroid_id: u64) -> Option<&CentroidInfoValue> {
         if let Some(centroid) = self.delta.search_index.upserted_centroids.get(&centroid_id) {
             Some(centroid)
         } else if self
