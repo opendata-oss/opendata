@@ -3150,7 +3150,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -4021,7 +4021,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slatedb"
 version = "0.11.1"
-source = "git+https://github.com/hachikuji/slatedb.git?branch=debug-compaction-bottleneck#66a58cf649370a5c37bee589a6d4723aa75782d3"
+source = "git+https://github.com/hachikuji/slatedb.git?branch=debug-compaction-bottleneck#451d95d37867a61ad81954e172ede354580098ed"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -4069,7 +4069,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.11.1"
-source = "git+https://github.com/hachikuji/slatedb.git?branch=debug-compaction-bottleneck#66a58cf649370a5c37bee589a6d4723aa75782d3"
+source = "git+https://github.com/hachikuji/slatedb.git?branch=debug-compaction-bottleneck#451d95d37867a61ad81954e172ede354580098ed"
 dependencies = [
  "chrono",
  "log",
@@ -4080,7 +4080,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.11.1"
-source = "git+https://github.com/hachikuji/slatedb.git?branch=debug-compaction-bottleneck#66a58cf649370a5c37bee589a6d4723aa75782d3"
+source = "git+https://github.com/hachikuji/slatedb.git?branch=debug-compaction-bottleneck#451d95d37867a61ad81954e172ede354580098ed"
 dependencies = [
  "async-trait",
  "bytes",
