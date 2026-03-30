@@ -41,6 +41,16 @@ pub(crate) enum QueryPathKind {
     },
 }
 
+impl QueryPathKind {
+    fn name(&self) -> &'static str {
+        match self {
+            QueryPathKind::InstantVector { .. } => "instant",
+            QueryPathKind::Matrix => "matrix",
+            QueryPathKind::SubqueryVectorSelector { .. } => "subquery",
+        }
+    }
+}
+
 /// Computed execution plan for a query path.
 pub(crate) struct QueryPlan {
     /// Exclusive lower bound for sample filtering (timestamp > start).
@@ -51,6 +61,38 @@ pub(crate) struct QueryPlan {
     pub buckets: Vec<TimeBucket>,
     /// Path-specific behavior and parameters.
     pub path_kind: QueryPathKind,
+}
+
+impl QueryPlan {
+    /// Build sample work for a bucket, dispatching strict vs lenient by path kind.
+    fn build_work(
+        &self,
+        metadata: &BucketMetadata,
+        seen_fingerprints: Option<&HashSet<SeriesFingerprint>>,
+    ) -> EvalResult<BucketSampleWork> {
+        match &self.path_kind {
+            QueryPathKind::SubqueryVectorSelector { .. } => {
+                Ok(build_bucket_sample_work_lenient(self, metadata))
+            }
+            QueryPathKind::InstantVector { .. } => {
+                build_bucket_sample_work(self, metadata, seen_fingerprints)
+            }
+            QueryPathKind::Matrix => build_bucket_sample_work(self, metadata, None),
+        }
+    }
+
+    /// Shape all loaded bucket data into the final ExprResult for this path.
+    fn shape(&self, all_bucket_data: &[BucketSampleData]) -> ExprResult {
+        match &self.path_kind {
+            QueryPathKind::InstantVector { .. } => {
+                ExprResult::InstantVector(shape_instant_results(all_bucket_data))
+            }
+            QueryPathKind::Matrix => ExprResult::RangeVector(shape_matrix_results(all_bucket_data)),
+            QueryPathKind::SubqueryVectorSelector { .. } => {
+                ExprResult::RangeVector(shape_subquery_results(all_bucket_data, self))
+            }
+        }
+    }
 }
 
 /// Resolved metadata for one bucket.
@@ -507,22 +549,13 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
     let mut timings = PipelineTimings::default();
 
     for &bucket in &plan.buckets {
-        // Phase: ResolveMetadata
+        // Phase: ResolveMetadata + BuildWork
         let t0 = Instant::now();
         let Some(metadata) = resolve_bucket_metadata(reader, bucket, selector).await? else {
             timings.metadata_resolve_ms += t0.elapsed().as_secs_f64() * 1000.0;
             continue;
         };
-
-        let work = match &plan.path_kind {
-            QueryPathKind::SubqueryVectorSelector { .. } => {
-                build_bucket_sample_work_lenient(plan, &metadata)
-            }
-            QueryPathKind::InstantVector { .. } => {
-                build_bucket_sample_work(plan, &metadata, Some(&seen_fingerprints))?
-            }
-            QueryPathKind::Matrix => build_bucket_sample_work(plan, &metadata, None)?,
-        };
+        let work = plan.build_work(&metadata, Some(&seen_fingerprints))?;
         timings.metadata_resolve_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
         // Phase: LoadSamples
@@ -530,6 +563,7 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
         let data = load_bucket_samples(reader, &work).await?;
         timings.sample_load_ms += t1.elapsed().as_secs_f64() * 1000.0;
 
+        // Instant path: track seen fingerprints for cross-bucket dedup
         if matches!(plan.path_kind, QueryPathKind::InstantVector { .. }) {
             for series in &data.series_data {
                 if series.samples.last().is_some() {
@@ -543,26 +577,11 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
 
     // Phase: ShapeSamples
     let t2 = Instant::now();
-    let result = match &plan.path_kind {
-        QueryPathKind::InstantVector { .. } => Ok(ExprResult::InstantVector(
-            shape_instant_results(&all_bucket_data),
-        )),
-        QueryPathKind::Matrix => Ok(ExprResult::RangeVector(shape_matrix_results(
-            &all_bucket_data,
-        ))),
-        QueryPathKind::SubqueryVectorSelector { .. } => Ok(ExprResult::RangeVector(
-            shape_subquery_results(&all_bucket_data, plan),
-        )),
-    };
+    let result = plan.shape(&all_bucket_data);
     timings.shape_samples_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
-    let path_name = match &plan.path_kind {
-        QueryPathKind::InstantVector { .. } => "instant",
-        QueryPathKind::Matrix => "matrix",
-        QueryPathKind::SubqueryVectorSelector { .. } => "subquery",
-    };
     tracing::debug!(
-        path = path_name,
+        path = plan.path_kind.name(),
         buckets = plan.buckets.len(),
         metadata_ms = format!("{:.2}", timings.metadata_resolve_ms),
         load_ms = format!("{:.2}", timings.sample_load_ms),
@@ -570,7 +589,7 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
         "pipeline phase timings"
     );
 
-    result
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
