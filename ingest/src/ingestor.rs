@@ -334,11 +334,7 @@ pub struct Ingestor {
 impl Ingestor {
     /// Create a new ingestor from the given configuration and clock.
     pub fn new(config: IngestorConfig, clock: Arc<dyn Clock>) -> Result<Self> {
-        let object_store_config = match &config.storage {
-            common::StorageConfig::InMemory => common::storage::config::ObjectStoreConfig::InMemory,
-            common::StorageConfig::SlateDb(c) => c.object_store.clone(),
-        };
-        let object_store = common::storage::factory::create_object_store(&object_store_config)
+        let object_store = common::storage::factory::create_object_store(&config.object_store)
             .map_err(|e| Error::Storage(e.to_string()))?;
         Self::with_object_store(config, object_store, clock)
     }
@@ -410,7 +406,7 @@ mod tests {
     use crate::model::decode_batch;
     use crate::queue::{Manifest, QueueEntry};
     use bytes::Bytes;
-    use common::StorageConfig;
+    use common::ObjectStoreConfig;
     use common::clock::{MockClock, SystemClock};
     use slatedb::object_store::ObjectStore;
     use slatedb::object_store::memory::InMemory;
@@ -425,7 +421,7 @@ mod tests {
 
     fn test_config() -> IngestorConfig {
         IngestorConfig {
-            storage: StorageConfig::InMemory,
+            object_store: ObjectStoreConfig::InMemory,
             data_path_prefix: "test-ingest".to_string(),
             manifest_path: "test/manifest".to_string(),
             flush_interval: Duration::from_hours(24),
