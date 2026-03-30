@@ -147,7 +147,7 @@ impl SplitCentroids {
                 .collect();
 
             // collect each centroids neighbours
-            let centroid_index = view.centroid_index();
+            let centroid_index = view.centroid_index(self.opts.dimensions);
             let neighbours_by_centroid = if self.opts.split_search_neighbourhood > 0 {
                 batch_search_centroids_up_to_level(
                     &centroid_index,

@@ -163,7 +163,7 @@ struct SearchIndexDelta {
     deleted_centroids: HashSet<u64>,
     centroid_count_deltas: HashMap<u16, HashMap<u64, i64>>,
     root_count_delta: i64,
-    root: Option<PostingList>,
+    root: Option<Vec<PostingUpdate>>,
     root_updates: Vec<PostingUpdate>,
     posting_updates: HashMap<u64, Vec<PostingUpdate>>,
     inverted_index_updates: HashMap<Bytes, RoaringTreemap>,
@@ -198,20 +198,18 @@ impl SearchIndexDelta {
     }
 
     pub(crate) fn add_to_root(&mut self, centroid_id: u64, vector: Vec<f32>) {
-        // todo: update root postings
         self.root_updates.push(PostingUpdate::Append {id: centroid_id, vector});
         self.root_count_delta += 1;
     }
 
     pub(crate) fn remove_from_root(&mut self, centroid_id: u64) {
-        // todo: update root postings
         self.root_updates.push(PostingUpdate::Delete { id: centroid_id });
         self.root_count_delta -= 1;
     }
 
     pub(crate) fn set_root(&mut self, postings: PostingList) {
         self.root_count_delta = postings.len() as i64;
-        self.root = Some(postings);
+        self.root = Some(postings.into_iter().map(|posting| posting.into()).collect());
         self.root_updates = vec![];
     }
 
@@ -311,22 +309,33 @@ struct DirtyCentroidReader<'a> {
 }
 
 impl <'a> CentroidReader for DirtyCentroidReader<'a> {
-    fn read_root(&self) -> BoxFuture<'static, crate::Result<PostingList>> {
+    fn read_root(&self) -> BoxFuture<'static, crate::Result<PostingListValue>> {
         if let Some(root) = &self.delta.root {
-            let root = root.clone();
-            Box::pin(async move { Ok(root)})
+            let mut root = root.clone();
+            root.extend(self.delta.root_updates.iter().cloned());
+            Box::pin(async move { Ok(PostingListValue::from_posting_updates(root)?)})
         } else {
             let stored = self.stored.clone();
             let updates = self.delta.root_updates.clone();
             Box::pin(async move {
+                let updates = PostingListValue::from_posting_updates(updates)?;
                 let root = stored.read_root().await?;
-                todo!("merge root with updates")
+                Ok(merge_decoded_posting_lists(vec![updates, root]))
             })
         }
     }
 
-    fn read_postings(&self, centroid_id: u32) -> BoxFuture<'static, crate::Result<PostingList>> {
-        todo!()
+    fn read_postings(&self, centroid_id: u64) -> Result<BoxFuture<'static, crate::Result<PostingListValue>>> {
+        // TODO: this is basically the same as the view below
+        let mut all_postings = Vec::with_capacity(2);
+        if let Some(current) = self.delta.posting_updates.get(&centroid_id) {
+            all_postings.push(PostingListValue::from_posting_updates(current.clone())?);
+        }
+        let stored=  self.stored.clone();
+        Ok(Box::pin(async move {
+            all_postings.push(stored.read_postings(centroid_id)?.await?);
+            Ok(merge_decoded_posting_lists(all_postings).into())
+        }))
     }
 }
 
@@ -371,7 +380,7 @@ impl <'a> VectorIndexView<'a> {
         &self,
         vector_id: u64,
         dimensions: usize,
-    ) -> BoxFuture<'static, crate::Result<Option<VectorDataValue>>> {
+    ) -> BoxFuture<'static, Result<Option<VectorDataValue>>> {
         if self.delta.forward_index.vector_deletes.contains(&vector_id) {
             Box::pin(async { Ok(None) })
         } else if let Some(d) = self.delta.forward_index.vector_updates.get(&vector_id) {
@@ -404,8 +413,17 @@ impl <'a> VectorIndexView<'a> {
         (self.state.root_centroid_count as i64 + self.delta.search_index.root_count_delta) as u64
     }
 
-    pub(crate) fn root_posting_list(&self) -> Result<BoxFuture<'static, Result<PostingList>>> {
-        todo!()
+    pub(crate) fn root_posting_list(&self, dimensions: usize) -> Result<BoxFuture<'static, Result<PostingListValue>>> {
+        let stored = StoredCentroidReader::new(
+            dimensions,
+            self.snapshot.clone(),
+            self.snapshot_epoch
+        );
+        let reader = DirtyCentroidReader {
+            stored,
+            delta: &self.delta.search_index
+        };
+        Ok(reader.read_root())
     }
 
     pub(crate) fn posting_list(
@@ -439,8 +457,8 @@ impl <'a> VectorIndexView<'a> {
         }
     }
 
-    pub(crate) fn centroid_index(&self) -> LeveledCentroidIndex<'a> {
-        let stored = StoredCentroidReader::new(self.snapshot.clone(), self.snapshot_epoch);
+    pub(crate) fn centroid_index(&self, dimensions: usize) -> LeveledCentroidIndex<'a> {
+        let stored = StoredCentroidReader::new(dimensions, self.snapshot.clone(), self.snapshot_epoch);
         let reader = DirtyCentroidReader {
             stored,
             delta: &self.delta.search_index

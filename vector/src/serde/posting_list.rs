@@ -219,6 +219,15 @@ impl PostingUpdate {
     }
 }
 
+impl From<Posting> for PostingUpdate {
+    fn from(value: Posting) -> Self {
+        Self {
+            id: value.id,
+            vector: value.vector,
+        }
+    }
+}
+
 /// PostingList value storing vector updates for a centroid cluster.
 ///
 /// Each posting list maps a single centroid ID to the list of vector updates

@@ -117,7 +117,8 @@ impl Indexer {
             let entry = reassigns_by_level.entry(r.level).or_default();
             entry.push(r);
         }
-        for level in 0..self.state.centroids_meta().depth as u16 {
+        // reassign from the top down to improve recall at higher levels first
+        for level in (0..self.state.centroids_meta().depth as u16).rev() {
             let Some(reassigns) = reassigns_by_level.remove(&level) else {
                 continue;
             };

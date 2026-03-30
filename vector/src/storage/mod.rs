@@ -75,10 +75,16 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         }
     }
 
+    async fn get_root_posting_list(
+        &self,
+        dimensions: usize,
+    ) -> Result<PostingListValue> {
+        todo!()
+    }
+
     /// Load a posting list for a centroid.
     ///
     /// Requires dimensions to decode the embedded vector data.
-    #[allow(dead_code)]
     async fn get_posting_list(
         &self,
         centroid_id: u64,

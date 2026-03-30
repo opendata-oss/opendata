@@ -5,8 +5,9 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use rayon::prelude::IntoParallelIterator;
 use common::StorageRead;
-use crate::serde::posting_list::PostingList;
+use crate::serde::posting_list::{PostingList, PostingListValue};
 use crate::Result;
+use crate::storage::VectorDbStorageReadExt;
 use crate::write::indexer::drivers::AsyncBatchDriver;
 
 pub(crate) struct IntermediatePostingsRead {
@@ -89,9 +90,9 @@ pub(crate) trait CentroidIndex {
 }
 
 pub(crate) trait CentroidReader: Send + Sync {
-    fn read_root(&self) -> BoxFuture<'static, Result<PostingList>>;
+    fn read_root(&self) -> BoxFuture<'static, Result<PostingListValue>>;
 
-    fn read_postings(&self, centroid_id: u32) -> BoxFuture<'static, Result<PostingList>>;
+    fn read_postings(&self, centroid_id: u64) -> Result<BoxFuture<'static, Result<PostingListValue>>>;
 }
 
 pub(crate) struct LeveledCentroidIndex<'a> {
@@ -139,23 +140,32 @@ impl <'a> LeveledCentroidIndex<'a> {
 
 #[derive(Clone)]
 pub(crate) struct StoredCentroidReader {
+    dimensions: usize,
     epoch: u64,
     snapshot: Arc<dyn StorageRead>
 }
 
 impl StoredCentroidReader {
-    pub(crate) fn new(snapshot: Arc<dyn StorageRead>, epoch: u64) -> Self {
-        Self { epoch, snapshot }
+    pub(crate) fn new(
+        dimensions: usize,
+        snapshot: Arc<dyn StorageRead>,
+        epoch: u64
+    ) -> Self {
+        Self { dimensions, epoch, snapshot }
     }
 }
 
 impl CentroidReader for StoredCentroidReader {
-    fn read_root(&self) -> BoxFuture<'static, Result<PostingList>> {
-        todo!()
+    fn read_root(&self) -> BoxFuture<'static, Result<PostingListValue>> {
+        let snapshot = self.snapshot.clone();
+        let dimensions = self.dimensions;
+        Box::pin(async move { snapshot.get_root_posting_list(dimensions).await })
     }
 
-    fn read_postings(&self, centroid_id: u32) -> BoxFuture<'static, Result<PostingList>> {
-        todo!()
+    fn read_postings(&self, centroid_id: u64) -> Result<BoxFuture<'static, Result<PostingListValue>>> {
+        let snapshot = self.snapshot.clone();
+        let dimensions = self.dimensions;
+        Ok(Box::pin(async move { snapshot.get_posting_list(centroid_id, dimensions).await }))
     }
 }
 

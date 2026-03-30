@@ -97,7 +97,7 @@ impl MergeCentroids {
                 assert!(self.level + 1 < self.depth);
                 delta.search_index.remove_from_posting(self.level + 1, parent, merge.c);
             } else {
-                assert!(self.level + 1 == self.depth);
+                assert_eq!(self.level + 1, self.depth);
                 delta.search_index.remove_from_root(merge.c);
             }
             for p in merge.postings {
