@@ -405,6 +405,9 @@ impl LogDb {
                             "compactor/running_compactions",
                             "compactor/bytes_compacted",
                             "compactor/total_throughput_bytes_per_sec",
+                            "compactor/read_millis",
+                            "compactor/write_millis",
+                            "compactor/close_millis",
                         ],
                     ),
                     (

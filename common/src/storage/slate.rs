@@ -38,6 +38,10 @@ impl prometheus_client::encoding::EncodeMetric for ReadableStatGauge {
         match self.0.metric_type() {
             slatedb::stats::MetricType::Counter => prometheus_client::metrics::MetricType::Counter,
             slatedb::stats::MetricType::Gauge => prometheus_client::metrics::MetricType::Gauge,
+            slatedb::stats::MetricType::UpDownCounter => {
+                prometheus_client::metrics::MetricType::Gauge
+            }
+            slatedb::stats::MetricType::Histogram => prometheus_client::metrics::MetricType::Gauge,
         }
     }
 }
@@ -351,7 +355,7 @@ impl Storage for SlateDbStorage {
         let stat_registry = self.db.metrics();
         let mut seen = std::collections::HashSet::new();
         for name in stat_registry.names() {
-            if let Some(stat) = stat_registry.lookup(name) {
+            if let Some(stat) = stat_registry.lookup(&name) {
                 let sanitized: String = name
                     .chars()
                     .map(|c| {
