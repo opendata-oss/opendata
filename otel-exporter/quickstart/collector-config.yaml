@@ -10,9 +10,10 @@ receivers:
 exporters:
   opendata:
     storage:
-      type: local
-      local:
-        path: /tmp/opendata-otel-quickstart
+      type: aws
+      aws:
+        bucket: opendata-ingest
+        region: us-east-1
     data_path_prefix: ingest/otel/metrics/data
     manifest_path: ingest/otel/metrics/manifest
     flush_interval_ms: 1000
