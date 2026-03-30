@@ -152,7 +152,7 @@ impl SplitCentroids {
                 batch_search_centroids_up_to_level(
                     &centroid_index,
                     self.opts.split_search_neighbourhood + 1,
-                    to_split.iter().map(|(c, c_info)| (*c, c_info.vector.clone())).collect(),
+                    to_split.iter().map(|(c, c_info)| (*c, c_info.vector.as_slice())).collect(),
                     self.level
                 ).await?
             } else {

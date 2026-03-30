@@ -82,6 +82,7 @@ enum SearchResult {
 }
 
 pub(crate) trait CentroidIndex {
+
     fn search(&self, query: &[f32], k: usize) -> SearchResult;
 
     fn resume_search(&self, query: &[f32], k: usize, postings: Option<IntermediatePostings>) -> SearchResult;
@@ -114,6 +115,10 @@ impl <'a> CentroidIndex for LeveledCentroidIndex<'a> {
 }
 
 impl <'a> LeveledCentroidIndex<'a> {
+    pub(crate) fn search_root(&self, query: &[f32], k: usize) -> Vec<u64> {
+        todo!()
+    }
+
     fn search_up_to_level(&self, query: &[f32], k: usize, level: u16) -> SearchResult {
         // start search at root, finding the 100 nearest neighbours, then move all the way down
         // to level 0, expanding out 100 at each level
@@ -157,7 +162,7 @@ impl CentroidReader for StoredCentroidReader {
 pub(crate) async fn batch_search_centroids<K: Hash + Eq + Sized + Send + Sync>(
     index: &LeveledCentroidIndex<'_>,
     k: usize,
-    queries: Vec<(K, Vec<f32>)>
+    queries: Vec<(K, &[f32])>
 ) -> Result<HashMap<K, Vec<u64>>> {
     batch_search_centroids_up_to_level(index, k, queries, 0).await
 }
@@ -165,11 +170,11 @@ pub(crate) async fn batch_search_centroids<K: Hash + Eq + Sized + Send + Sync>(
 pub(crate) async fn batch_search_centroids_up_to_level<K: Hash + Eq + Sized + Send + Sync>(
     index: &LeveledCentroidIndex<'_>,
     k: usize,
-    queries: Vec<(K, Vec<f32>)>,
+    queries: Vec<(K, &[f32])>,
     level: u16
 ) -> Result<HashMap<K, Vec<u64>>> {
     let mut results = HashMap::with_capacity(queries.len());
-    let queries: Vec<(K, Vec<f32>, Option<IntermediatePostings>)> = queries
+    let queries: Vec<(K, &[f32], Option<IntermediatePostings>)> = queries
         .into_iter()
         .map(|(k, queries)| (k, queries, None))
         .collect();

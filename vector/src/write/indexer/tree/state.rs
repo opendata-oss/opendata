@@ -159,7 +159,7 @@ impl ForwardIndexDelta {
 
 struct SearchIndexDelta {
     centroids_meta: Option<CentroidsValue>,
-    new_centroids: HashMap<u64, CentroidInfoEntry>,
+    upserted_centroids: HashMap<u64, CentroidInfoEntry>,
     deleted_centroids: HashSet<u64>,
     centroid_count_deltas: HashMap<u16, HashMap<u64, i64>>,
     root_count_delta: i64,
@@ -176,7 +176,7 @@ impl SearchIndexDelta {
     fn new(initial_state: &VectorIndexState) -> Self {
         Self {
             centroids_meta: None,
-            new_centroids: HashMap::new(),
+            upserted_centroids: HashMap::new(),
             deleted_centroids: HashSet::new(),
             centroid_count_deltas: HashMap::new(),
             root_count_delta: 0,
@@ -215,6 +215,10 @@ impl SearchIndexDelta {
         self.root_updates = vec![];
     }
 
+    pub(crate) fn update_centroid(&mut self, centroid_id: u64, entry: CentroidInfoEntry) {
+        self.upserted_centroids.insert(centroid_id, entry);
+    }
+
     pub(crate) fn add_centroid(&mut self, level: u16, vector: Vec<f32>, parent: Option<u64>) -> (u64, CentroidInfoEntry) {
         let (id, seq_alloc_put) = self.id_allocator.allocate_one();
         if let Some(seq_alloc_put) = seq_alloc_put {
@@ -223,7 +227,7 @@ impl SearchIndexDelta {
         let centroid = CentroidInfoEntry::new(level as u8, vector, parent);
         let deltas = self.centroid_count_deltas.entry(level).or_insert(HashMap::new());
         deltas.insert(id, 0);
-        self.new_centroids.insert(id, centroid.clone());
+        self.upserted_centroids.insert(id, centroid.clone());
         (id, centroid)
     }
 
@@ -232,7 +236,7 @@ impl SearchIndexDelta {
             if let Some(deltas) = self.centroid_count_deltas.get_mut(&level) {
                 deltas.remove(c);
             }
-            self.new_centroids.remove(c);
+            self.upserted_centroids.remove(c);
         }
         self.deleted_centroids.extend(centroids);
     }
@@ -348,6 +352,14 @@ impl <'a> VectorIndexView<'a> {
         }
     }
 
+    pub(crate) fn centroids_meta(&self) -> &CentroidsValue {
+        if let Some(meta) = self.delta.search_index.centroids_meta.as_ref() {
+            meta
+        } else {
+            self.state.centroids_meta()
+        }
+    }
+
     pub(crate) fn vector_id(&self, external_id: &str) -> Option<u64> {
         if let Some(id) = self.delta.forward_index.dictionary_updates.get(external_id) {
             return Some(*id);
@@ -388,6 +400,14 @@ impl <'a> VectorIndexView<'a> {
         counts
     }
 
+    pub(crate) fn root_count(&self) -> u64 {
+        (self.state.root_centroid_count as i64 + self.delta.search_index.root_count_delta) as u64
+    }
+
+    pub(crate) fn root_posting_list(&self) -> Result<BoxFuture<'static, Result<PostingList>>> {
+        todo!()
+    }
+
     pub(crate) fn posting_list(
         &self,
         centroid_id: u64,
@@ -404,8 +424,13 @@ impl <'a> VectorIndexView<'a> {
         }))
     }
 
+    /// The last written posting for the vector in this delta only
+    pub(crate) fn last_written_posting(&self, vector_id: u64) -> Option<u64> {
+        self.delta.search_index.current_posting.get(&vector_id).cloned()
+    }
+
     pub(crate) fn centroid(&self, centroid_id: u64) -> Option<&CentroidInfoEntry> {
-        if let Some(centroid) = self.delta.search_index.new_centroids.get(&centroid_id) {
+        if let Some(centroid) = self.delta.search_index.upserted_centroids.get(&centroid_id) {
             Some(centroid)
         } else if self.delta.search_index.deleted_centroids.contains(&centroid_id) {
             None
