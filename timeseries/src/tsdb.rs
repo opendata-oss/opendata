@@ -676,6 +676,10 @@ impl Tsdb {
 
     /// Ingest series into the TSDB.
     /// Each series is split by time bucket based on sample timestamps.
+    ///
+    /// If `timeout` is provided, each bucket batch will wait up to the given
+    /// duration for space in the write queue. Otherwise, writes fail
+    /// immediately if the queue is full.
     #[tracing::instrument(
         level = "debug",
         skip_all,
@@ -685,7 +689,11 @@ impl Tsdb {
             buckets_touched = tracing::field::Empty
         )
     )]
-    pub(crate) async fn ingest_samples(&self, series_list: Vec<Series>) -> Result<()> {
+    pub(crate) async fn ingest_samples(
+        &self,
+        series_list: Vec<Series>,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
         let mut bucket_series_map: HashMap<TimeBucket, Vec<Series>> = HashMap::new();
         let mut total_samples = 0;
 
@@ -761,7 +769,7 @@ impl Tsdb {
                     return Err(err);
                 }
             };
-            mini.ingest_batch(&series_list).await?;
+            mini.ingest_batch(&series_list, timeout).await?;
 
             tracing::debug!(
                 bucket = ?bucket,
@@ -937,9 +945,13 @@ impl TsdbEngine {
 
     // ── Write methods (error in read-only mode) ──
 
-    pub(crate) async fn ingest_samples(&self, series_list: Vec<Series>) -> Result<()> {
+    pub(crate) async fn ingest_samples(
+        &self,
+        series_list: Vec<Series>,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
         match self {
-            Self::ReadWrite(tsdb) => tsdb.ingest_samples(series_list).await,
+            Self::ReadWrite(tsdb) => tsdb.ingest_samples(series_list, timeout).await,
             Self::ReadOnly(_) => Err(crate::error::Error::InvalidInput(
                 "write operations are not supported in read-only mode".to_string(),
             )),
@@ -1468,7 +1480,7 @@ mod tests {
             create_sample("http_requests", vec![("env", "prod")], 4_000_000, 42.0),
             create_sample("http_requests", vec![("env", "staging")], 4_000_000, 10.0),
         ];
-        tsdb.ingest_samples(series).await.unwrap();
+        tsdb.ingest_samples(series, None).await.unwrap();
         tsdb.flush().await.unwrap();
         tsdb
     }
@@ -1703,7 +1715,9 @@ mod tests {
         // Same series in two different buckets
         let series1 = create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0);
         let series2 = create_sample("cpu", vec![("host", "a")], 7_500_000, 2.0);
-        tsdb.ingest_samples(vec![series1, series2]).await.unwrap();
+        tsdb.ingest_samples(vec![series1, series2], None)
+            .await
+            .unwrap();
         tsdb.flush().await.unwrap();
 
         let results = tsdb.find_series(&["cpu"], 0, i64::MAX).await.unwrap();
@@ -1785,7 +1799,7 @@ mod tests {
         let mut series = create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0);
         series.description = Some("CPU usage".to_string());
         series.unit = Some("percent".to_string());
-        tsdb.ingest_samples(vec![series]).await.unwrap();
+        tsdb.ingest_samples(vec![series], None).await.unwrap();
 
         let results = tsdb.find_metadata(None).await.unwrap();
 
@@ -1909,7 +1923,9 @@ mod tests {
         // Same series in two different buckets
         let series1 = create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0);
         let series2 = create_sample("cpu", vec![("host", "a")], 7_500_000, 2.0);
-        tsdb.ingest_samples(vec![series1, series2]).await.unwrap();
+        tsdb.ingest_samples(vec![series1, series2], None)
+            .await
+            .unwrap();
         tsdb.flush().await.unwrap();
 
         let results = tsdb.find_labels(None, 0, i64::MAX).await.unwrap();
@@ -1934,7 +1950,9 @@ mod tests {
         // Same series in two different buckets
         let series1 = create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0);
         let series2 = create_sample("cpu", vec![("host", "a")], 7_500_000, 2.0);
-        tsdb.ingest_samples(vec![series1, series2]).await.unwrap();
+        tsdb.ingest_samples(vec![series1, series2], None)
+            .await
+            .unwrap();
         tsdb.flush().await.unwrap();
 
         let results = tsdb
@@ -1953,10 +1971,13 @@ mod tests {
     async fn find_metadata_should_filter_by_metric(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
 
-        tsdb.ingest_samples(vec![
-            create_sample("cpu", vec![], 4_000_000, 1.0),
-            create_sample("mem", vec![], 4_000_000, 2.0),
-        ])
+        tsdb.ingest_samples(
+            vec![
+                create_sample("cpu", vec![], 4_000_000, 1.0),
+                create_sample("mem", vec![], 4_000_000, 2.0),
+            ],
+            None,
+        )
         .await
         .unwrap();
 
@@ -1972,7 +1993,7 @@ mod tests {
     async fn eval_query_range_rejects_zero_step(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
 
-        tsdb.ingest_samples(vec![create_sample("cpu", vec![], 1_000_000, 1.0)])
+        tsdb.ingest_samples(vec![create_sample("cpu", vec![], 1_000_000, 1.0)], None)
             .await
             .unwrap();
         tsdb.flush().await.unwrap();
