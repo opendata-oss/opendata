@@ -10,7 +10,7 @@ use slatedb::object_store::path::Path;
 use crate::config::CollectorConfig;
 use crate::error::{Error, Result};
 use crate::model::decode_batch;
-use crate::queue::{QueueConsumer, QueueEntry};
+use crate::queue::{Metadata, QueueConsumer, QueueEntry};
 
 const DEQUEUE_INTERVAL: u64 = 100;
 
@@ -22,6 +22,8 @@ pub struct CollectedBatch {
     pub sequence: u64,
     /// The object storage path of the data batch.
     pub location: String,
+    /// Metadata ranges attached by the ingestor(s) that contributed to this batch.
+    pub metadata: Vec<Metadata>,
 }
 
 /// Reads batches of ingested entries from object storage via a queue consumer.
@@ -106,6 +108,7 @@ impl Collector {
             entries,
             sequence: queue_entry.sequence,
             location: queue_entry.location,
+            metadata: queue_entry.metadata,
         }))
     }
 
@@ -191,7 +194,7 @@ mod tests {
     use super::*;
     use crate::config::CollectorConfig;
     use crate::model::{CompressionType, encode_batch};
-    use crate::queue::QueueProducer;
+    use crate::queue::{Metadata, QueueProducer};
     use bytes::Bytes;
     use common::ObjectStoreConfig;
     use slatedb::object_store::PutPayload;
@@ -245,6 +248,36 @@ mod tests {
         assert_eq!(batch.entries[0], Bytes::from("data1"));
         assert_eq!(batch.entries[1], Bytes::from("data2"));
         assert_eq!(batch.location, location);
+    }
+
+    #[tokio::test]
+    async fn should_collect_metadata_from_queue_entry() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, collector) = make_collector(&store, test_collector_config());
+        collector.initialize(None).await.unwrap();
+
+        let entries = test_entries();
+        let location = "batches/batch-meta";
+        write_batch(&store, location, &entries).await;
+
+        let metadata = vec![Metadata {
+            start_index: 0,
+            ingestion_time_ms: 1_700_000_000_000,
+            payload: Bytes::from(r#"{"topic":"events"}"#),
+        }];
+        producer
+            .enqueue(location.to_string(), metadata)
+            .await
+            .unwrap();
+
+        let batch = collector.next_batch().await.unwrap().unwrap();
+        assert_eq!(batch.metadata.len(), 1);
+        assert_eq!(batch.metadata[0].start_index, 0);
+        assert_eq!(batch.metadata[0].ingestion_time_ms, 1_700_000_000_000);
+        assert_eq!(
+            batch.metadata[0].payload,
+            Bytes::from(r#"{"topic":"events"}"#)
+        );
     }
 
     #[tokio::test]
