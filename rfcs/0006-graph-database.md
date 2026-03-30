@@ -10,7 +10,7 @@
 
 This RFC defines the storage model for a labeled property graph (LPG) database built on
 [SlateDB](https://github.com/slatedb/slatedb). The graph database integrates
-[Grafeo](https://github.com/GrafeoDB/grafeo) (v0.5.28) as its query engine, implementing Grafeo's
+[Grafeo](https://github.com/GrafeoDB/grafeo) (v0.5.30) as its query engine, implementing Grafeo's
 `GraphStore` and `GraphStoreMut` traits over SlateDB's ordered key-value interface. The design maps
 graph primitives: nodes, edges, labels, properties and adjacency, to SlateDB records using the
 standard 3-byte key prefix, with additional index structures for label lookups, property searches,
@@ -85,9 +85,9 @@ The graph engine introduces the following external crate dependencies:
 
 | Crate            | Version | Role                                                                                                                                     |
 |------------------|---------|------------------------------------------------------------------------------------------------------------------------------------------|
-| `grafeo-core`    | 0.5.28  | Graph storage traits (`GraphStore`, `GraphStoreMut`), core types (`Node`, `Edge`, `NodeId`, `EdgeId`, `Value`, `PropertyKey`)            |
-| `grafeo-common`  | 0.5.28  | Shared primitives (`NodeId`, `EdgeId`, `Value` enum); also provides `EpochId` used by the optional `temporal` feature                    |
-| `grafeo-engine`  | 0.5.28  | Query engine: GQL parser, cost-based optimizer, push-based vectorized executor. GQL is the primary query interface and is always enabled |
+| `grafeo-core`    | 0.5.30  | Graph storage traits (`GraphStore`, `GraphStoreMut`), core types (`Node`, `Edge`, `NodeId`, `EdgeId`, `Value`, `PropertyKey`)            |
+| `grafeo-common`  | 0.5.30  | Shared primitives (`NodeId`, `EdgeId`, `Value` enum); also provides `EpochId` used by the optional `temporal` feature                    |
+| `grafeo-engine`  | 0.5.30  | Query engine: GQL parser, cost-based optimizer, push-based vectorized executor. GQL is the primary query interface and is always enabled |
 
 Grafeo is published on crates.io. All three crates are required dependencies. The graph database
 always includes the GQL query engine; there is no "storage-only" deployment mode. Additional query
@@ -207,27 +207,30 @@ The following Grafeo types are serialized to/from SlateDB records:
 | `PropertyKeyId(u32)` | Property key dictionary ID         | 4 bytes  |
 | `Value`              | Dynamic property value (see below) | variable |
 
-The `Value` enum represents property values:
+The `Value` enum represents property values. The variant indices below are assigned implicitly by
+bincode (via `#[derive(Serialize, Deserialize)]`) based on declaration order in `grafeo-common`.
+They are not explicit discriminants — reordering or inserting variants in a future Grafeo release
+would change the wire format, which is why the storage layer pins a specific Grafeo version.
 
 ```text
-Value variants:
-├─ Null                         tag 0x00
-├─ Bool(bool)                   tag 0x01
-├─ Int64(i64)                   tag 0x02
-├─ Float64(f64)                 tag 0x03
-├─ String(ArcStr)               tag 0x04
-├─ Bytes(Arc<[u8]>)             tag 0x05
-├─ Timestamp(i64 micros)        tag 0x06
-├─ Date(i32 days)               tag 0x07
-├─ Time(i64 nanos, Option<i32>) tag 0x08
-├─ Duration(months,days,nanos)  tag 0x09
-├─ ZonedDatetime(...)           tag 0x0A
-├─ List(Arc<[Value]>)           tag 0x0B
-├─ Map(Arc<BTreeMap<...>>)      tag 0x0C
-├─ Vector(Arc<[f32]>)           tag 0x0D
-├─ Path { nodes, edges }        tag 0x0E
-├─ GCounter(BTreeMap<…>)        tag 0x0F
-└─ OnCounter(BTreeMap<…>)       tag 0x10
+Value variants (bincode variant index):
+├─ Null                         0x00
+├─ Bool(bool)                   0x01
+├─ Int64(i64)                   0x02
+├─ Float64(f64)                 0x03
+├─ String(ArcStr)               0x04
+├─ Bytes(Arc<[u8]>)             0x05
+├─ Timestamp(i64 micros)        0x06
+├─ Date(i32 days)               0x07
+├─ Time(i64 nanos, Option<i32>) 0x08
+├─ Duration(months,days,nanos)  0x09
+├─ ZonedDatetime(...)           0x0A
+├─ List(Arc<[Value]>)           0x0B
+├─ Map(Arc<BTreeMap<...>>)      0x0C
+├─ Vector(Arc<[f32]>)           0x0D
+├─ Path { nodes, edges }        0x0E
+├─ GCounter(BTreeMap<…>)        0x0F
+└─ OnCounter(BTreeMap<…>)       0x10
 ```
 
 ### Identifiers: External and Internal
@@ -1026,8 +1029,9 @@ Future RFCs will address:
 |            | Updated to Grafeo v0.5.22. Addressed reviewer feedback from cadonna and apurvam.  |
 | 2026-03-29 | Adopted 3-byte key prefix (subsystem `0x05`, version, tag) per RFC 0001 update    |
 |            | (PR #326). Updated all key layouts, byte sizes, and prefix examples.              |
-|            | Updated to Grafeo v0.5.28. NodeRecordValue uses `FixedElementArray<u32>` per      |
-|            | RFC 0004. Added Value format link, GCounter/OnCounter variants, PropertyIndex     |
+|            | Updated to Grafeo v0.5.28 (later bumped to v0.5.30). NodeRecordValue uses         |
+|            | `FixedElementArray<u32>` per RFC 0004. Added Value format link,                   |
+|            | GCounter/OnCounter variants, PropertyIndex                                        |
 |            | cleanup in delete_node, edge cascade semantics. Addressed reviewer feedback.      |
 | 2026-03-29 | Post-review fixes: corrected sortable encoding attribution (was "per RFC 0004",   |
 |            | now references `common::serde::sortable`). Fixed dependency versions (hashbrown   |
@@ -1035,3 +1039,5 @@ Future RFCs will address:
 |            | error handling in read path. Implementation: atomic edge cascade in delete_node,  |
 |            | single-WriteBatch batch_create_edges, catalog name length validation, warn        |
 |            | logging for storage errors in get_node/get_edge, transaction retry jitter.        |
+| 2026-03-30 | Bumped Grafeo dependency to v0.5.30. Clarified Value variant indices are          |
+|            | bincode-assigned (not explicit discriminants).                                    |
