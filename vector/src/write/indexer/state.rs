@@ -97,11 +97,11 @@ impl VectorIndexState {
         }
     }
 
-    pub(crate) fn dictionary(&self) -> &HashMap<String, u64> {
+    fn dictionary(&self) -> &HashMap<String, u64> {
         &self.dictionary
     }
 
-    pub(crate) fn centroid_counts(&self) -> &HashMap<u64, u64> {
+    fn centroid_counts(&self) -> &HashMap<u64, u64> {
         &self.centroid_counts
     }
 }

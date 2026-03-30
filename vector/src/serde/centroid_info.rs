@@ -21,16 +21,18 @@ use super::{Decode, Encode, EncodingError, decode_array, encode_array};
 use bytes::{BufMut, Bytes, BytesMut};
 
 /// One centroid metadata entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CentroidInfoEntry {
     pub level: u8,
+    pub vector: Vec<f32>,
     pub parent_vector_id: Option<u64>,
 }
 
 impl CentroidInfoEntry {
-    pub fn new(level: u8, parent_vector_id: Option<u64>) -> Self {
+    pub fn new(level: u8, vector: Vec<f32>, parent_vector_id: Option<u64>) -> Self {
         Self {
             level,
+            vector,
             parent_vector_id,
         }
     }

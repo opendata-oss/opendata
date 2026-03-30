@@ -5,6 +5,7 @@ pub(crate) mod state;
 #[cfg(test)]
 pub(crate) mod test_utils;
 mod vector;
+mod tree;
 
 use crate::DistanceMetric;
 use crate::Result;

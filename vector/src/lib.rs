@@ -31,6 +31,8 @@
 //! # }
 //! ```
 
+extern crate core;
+
 pub mod db;
 pub(crate) mod error;
 pub mod hnsw;
