@@ -7,10 +7,8 @@ use std::sync::Arc;
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::Sample;
-use crate::model::SeriesFingerprint;
 use crate::model::{Label, SeriesId, TimeBucket};
 use crate::promql::functions::{FunctionCallContext, FunctionRegistry, PromQLArg};
-use crate::promql::selector::evaluate_selector_with_reader;
 use crate::promql::timestamp::Timestamp;
 use crate::query::QueryReader;
 use crate::util::Result;
@@ -46,10 +44,6 @@ impl From<crate::error::Error> for EvaluationError {
 }
 
 pub(crate) type EvalResult<T> = std::result::Result<T, EvaluationError>;
-
-/// Type alias for complex HashMap used in matrix selector evaluation.
-/// Maps from label key (sorted vector of label pairs) to samples vector
-type SeriesMap = HashMap<Vec<Label>, Vec<Sample>>;
 
 pub(crate) struct QueryReaderBucketEvalCache {
     // Map from terms (series_ids for forward, labels for inverted) to cached results
@@ -905,6 +899,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         query_end: Timestamp,
         evaluation_ts: Timestamp,
     ) -> EvalResult<ExprResult> {
+        use crate::promql::pipeline::{self, QueryPlan};
+
         let vector_selector = &matrix_selector.vs;
         let range = matrix_selector.range;
 
@@ -917,78 +913,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             evaluation_ts,
         )?;
 
-        // Example where this matters:
-        //   sum_over_time(metric[100s] @ 100 offset 50s)
-        //   → adjusted_eval_ts = 50s
-        //   → start = 50s - 100s = -50s (before UNIX_EPOCH!)
-        //
-        // NOTE: Prometheus represents timestamps internally as int64 milliseconds
-        // and allows negative timestamps (times before UNIX_EPOCH).
-        // See: https://github.com/prometheus/prometheus/blob/main/model/timestamp/timestamp.go
-        let end_ms = adjusted_eval_ts.as_millis();
-        let start_ms = end_ms - (range.as_millis() as i64);
+        let buckets = self.reader.list_buckets().await?;
+        let plan = QueryPlan::for_matrix(
+            adjusted_eval_ts.as_millis(),
+            range.as_millis() as i64,
+            buckets,
+        );
 
-        // order buckets in chronological order
-        let mut buckets = self.reader.list_buckets().await?;
-        buckets.sort_by(|a, b| a.start.cmp(&b.start));
-
-        // Group samples by series (using sorted label vector as key since HashMap doesn't impl Hash)
-        let mut series_map: SeriesMap = HashMap::new();
-
-        for bucket in buckets {
-            // Check if bucket overlaps with our time range
-            let bucket_start_ms = (bucket.start as i64) * 60 * 1000; // Convert minutes to milliseconds
-            let bucket_end_ms = bucket_start_ms + (bucket.size_in_mins() as i64) * 60 * 1000;
-            if bucket_end_ms < start_ms || bucket_start_ms > end_ms {
-                continue;
-            }
-
-            let candidates =
-                evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
-                    .await
-                    .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
-
-            if candidates.is_empty() {
-                continue;
-            }
-
-            let candidates_vec: Vec<_> = candidates.into_iter().collect();
-            let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
-
-            for series_id in candidates_vec {
-                let series_spec = match forward_index_view.get_spec(&series_id) {
-                    Some(spec) => spec,
-                    None => {
-                        return Err(EvaluationError::InternalError(format!(
-                            "Series {} not found in bucket {:?}",
-                            series_id, bucket
-                        )));
-                    }
-                };
-
-                let sample_data = self
-                    .reader
-                    .samples(&bucket, series_id, start_ms, end_ms)
-                    .await?;
-
-                let mut labels_key: Vec<Label> = series_spec.labels.clone();
-                // Sort by canonical Label ordering (name, then value) for series grouping
-                labels_key.sort();
-
-                let values = series_map.entry(labels_key).or_default();
-                for sample in sample_data {
-                    values.push(sample);
-                }
-            }
-        }
-
-        let mut range_vector = Vec::new();
-        for (labels, values) in series_map {
-            let labels = self.labels_to_hashmap(&labels);
-            range_vector.push(EvalSamples { values, labels });
-        }
-
-        Ok(ExprResult::RangeVector(range_vector))
+        pipeline::execute_selector_pipeline(&mut self.reader, &plan, vector_selector).await
     }
 
     async fn evaluate_subquery(
@@ -1105,161 +1037,18 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         let mut range_vector = Vec::new();
         for (labels, values) in series_map {
-            let labels = self.labels_to_hashmap(&labels);
+            let labels = crate::promql::pipeline::labels_to_hashmap(&labels);
             range_vector.push(EvalSamples { values, labels });
         }
 
         Ok(ExprResult::RangeVector(range_vector))
     }
 
-    /// Computes time alignment and range boundaries for subquery evaluation.
-    ///
-    /// Aligns the start time to step boundaries using floor division to ensure
-    /// consistent evaluation points. Extends the range backwards to include
-    /// lookback for the first step.
-    fn compute_subquery_plan(
-        subquery_start_ms: i64,
-        subquery_end_ms: i64,
-        step_ms: i64,
-        lookback_delta_ms: i64,
-    ) -> (i64, i64, i64, usize) {
-        let div = subquery_start_ms.div_euclid(step_ms);
-        let mut aligned_start_ms = div * step_ms;
-        if aligned_start_ms <= subquery_start_ms {
-            aligned_start_ms += step_ms;
-        }
-
-        let expected_steps = ((subquery_end_ms - aligned_start_ms) / step_ms) as usize + 1;
-        let range_start_ms = aligned_start_ms - lookback_delta_ms;
-        let range_end_ms = subquery_end_ms;
-
-        (
-            aligned_start_ms,
-            range_start_ms,
-            range_end_ms,
-            expected_steps,
-        )
-    }
-
-    /// Fetches and normalizes samples for all matching series across all buckets.
-    ///
-    /// Consolidates multi-bucket fetching, merging, sorting, and deduplication.
-    /// This avoids redundant selector evaluations by fetching all samples in the
-    /// range once instead of evaluating per-step.
-    async fn fetch_series_samples(
-        &mut self,
-        vector_selector: &VectorSelector,
-        range_start_ms: i64,
-        range_end_ms: i64,
-    ) -> EvalResult<HashMap<SeriesFingerprint, (HashMap<String, String>, Vec<Sample>)>> {
-        let mut buckets = self.reader.list_buckets().await?;
-        buckets.sort_by(|a, b| b.start.cmp(&a.start));
-
-        let mut series_samples = HashMap::new();
-
-        for bucket in buckets {
-            let candidates =
-                evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
-                    .await
-                    .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
-
-            if candidates.is_empty() {
-                continue;
-            }
-
-            let candidates_vec: Vec<_> = candidates.into_iter().collect();
-            let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
-
-            for series_id in candidates_vec {
-                let Some(series_spec) = forward_index_view.get_spec(&series_id) else {
-                    continue;
-                };
-
-                let fingerprint = self.compute_fingerprint(&series_spec.labels);
-
-                let samples = self
-                    .reader
-                    .samples(&bucket, series_id, range_start_ms, range_end_ms)
-                    .await?;
-
-                if samples.is_empty() {
-                    continue;
-                }
-
-                let entry = series_samples.entry(fingerprint).or_insert_with(|| {
-                    let labels = self.labels_to_hashmap(&series_spec.labels);
-                    (labels, Vec::new())
-                });
-
-                entry.1.extend(samples);
-            }
-        }
-
-        for (_fp, (_labels, samples)) in series_samples.iter_mut() {
-            samples.sort_by_key(|s| s.timestamp_ms);
-            samples.dedup_by_key(|s| s.timestamp_ms);
-        }
-
-        Ok(series_samples)
-    }
-
-    /// Buckets samples into step-aligned time windows using a sliding window algorithm.
-    ///
-    /// Uses O(samples + steps) complexity instead of O(samples × steps) by maintaining
-    /// a monotonic pointer through sorted samples. For each step, finds the most recent
-    /// sample within the lookback window. Uses > (not >=) for start boundary to match
-    /// Prometheus staleness semantics.
-    fn bucket_series_samples(
-        series_samples: HashMap<SeriesFingerprint, (HashMap<String, String>, Vec<Sample>)>,
-        aligned_start_ms: i64,
-        subquery_end_ms: i64,
-        step_ms: i64,
-        lookback_delta_ms: i64,
-        expected_steps: usize,
-    ) -> Vec<EvalSamples> {
-        let mut range_vector = Vec::with_capacity(series_samples.len());
-
-        for (_fingerprint, (labels, samples)) in series_samples {
-            let mut step_samples = Vec::with_capacity(expected_steps);
-            let mut i = 0usize;
-            let mut last_valid: Option<&Sample> = None;
-
-            for current_step_ms in (aligned_start_ms..=subquery_end_ms).step_by(step_ms as usize) {
-                let lookback_start_ms = current_step_ms - lookback_delta_ms;
-
-                while i < samples.len() && samples[i].timestamp_ms <= current_step_ms {
-                    last_valid = Some(&samples[i]);
-                    i += 1;
-                }
-
-                if let Some(sample) = last_valid
-                    && sample.timestamp_ms > lookback_start_ms
-                {
-                    step_samples.push(Sample {
-                        timestamp_ms: current_step_ms,
-                        value: sample.value,
-                    });
-                }
-            }
-
-            if !step_samples.is_empty() {
-                range_vector.push(EvalSamples {
-                    values: step_samples,
-                    labels,
-                });
-            }
-        }
-
-        range_vector
-    }
-
     /// Fast path for VectorSelector subqueries using range-based evaluation.
     ///
     /// Instead of evaluating the selector once per step (O(steps × series × index_lookup)),
     /// this fetches all samples in the range once and buckets them into steps
-    /// (O(series × samples_in_range + samples + steps)). Achieves 113× speedup for
-    /// typical workloads by eliminating redundant selector evaluations and using
-    /// a sliding window algorithm for bucketing.
+    /// (O(series × samples_in_range + samples + steps)).
     async fn evaluate_subquery_vector_selector(
         &mut self,
         vector_selector: &VectorSelector,
@@ -1268,28 +1057,18 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         step_ms: i64,
         lookback_delta_ms: i64,
     ) -> EvalResult<ExprResult> {
-        let (aligned_start_ms, range_start_ms, range_end_ms, expected_steps) =
-            Self::compute_subquery_plan(
-                subquery_start_ms,
-                subquery_end_ms,
-                step_ms,
-                lookback_delta_ms,
-            );
+        use crate::promql::pipeline::{self, QueryPlan};
 
-        let series_samples = self
-            .fetch_series_samples(vector_selector, range_start_ms, range_end_ms)
-            .await?;
-
-        let range_vector = Self::bucket_series_samples(
-            series_samples,
-            aligned_start_ms,
+        let buckets = self.reader.list_buckets().await?;
+        let plan = QueryPlan::for_subquery_vector_selector(
+            subquery_start_ms,
             subquery_end_ms,
             step_ms,
             lookback_delta_ms,
-            expected_steps,
+            buckets,
         );
 
-        Ok(ExprResult::RangeVector(range_vector))
+        pipeline::execute_selector_pipeline(&mut self.reader, &plan, vector_selector).await
     }
 
     async fn evaluate_vector_selector(
@@ -1300,6 +1079,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         evaluation_ts: Timestamp,
         lookback_delta_ms: i64,
     ) -> EvalResult<ExprResult> {
+        use crate::promql::pipeline::{self, QueryPlan};
+
         // Apply time modifiers (offset and @)
         let adjusted_eval_ts = self.apply_time_modifiers(
             vector_selector.at.as_ref(),
@@ -1309,75 +1090,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             evaluation_ts,
         )?;
 
-        let end_ms = adjusted_eval_ts.as_millis();
-        let start_ms = end_ms - lookback_delta_ms;
+        let buckets = self.reader.list_buckets().await?;
+        let plan =
+            QueryPlan::for_instant_vector(adjusted_eval_ts.as_millis(), lookback_delta_ms, buckets);
 
-        // Get all buckets and sort by start time in reverse order (newest first)
-        let mut buckets = self.reader.list_buckets().await?;
-        buckets.sort_by(|a, b| b.start.cmp(&a.start)); // newest first
-
-        let mut series_with_results: HashSet<SeriesFingerprint> = HashSet::new();
-        let mut samples = Vec::new();
-
-        // Iterate through buckets in reverse time order (newest first)
-        for bucket in buckets {
-            // Find matching series in this bucket
-            let candidates =
-                evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
-                    .await
-                    .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
-
-            if candidates.is_empty() {
-                continue;
-            }
-
-            // Batch load forward index for all candidates upfront
-            let candidates_vec: Vec<_> = candidates.into_iter().collect();
-            let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
-
-            for series_id in candidates_vec {
-                // Get series spec from forward index view (batched lookup)
-                let series_spec = match forward_index_view.get_spec(&series_id) {
-                    Some(spec) => spec,
-                    None => {
-                        return Err(EvaluationError::InternalError(format!(
-                            "Series {} not found in bucket {:?}",
-                            series_id, bucket
-                        )));
-                    }
-                };
-                let fingerprint = self.compute_fingerprint(&series_spec.labels);
-
-                // Skip if we already found a sample for this series in a newer bucket
-                if series_with_results.contains(&fingerprint) {
-                    continue;
-                }
-
-                // Read samples from this bucket within the lookback window
-                let sample_data = self
-                    .reader
-                    .samples(&bucket, series_id, start_ms, end_ms)
-                    .await?;
-
-                // Find the best (latest) point in the time range
-                if let Some(best_sample) = sample_data.last() {
-                    // Convert attributes to labels HashMap
-                    let labels = self.labels_to_hashmap(&series_spec.labels);
-
-                    samples.push(EvalSample {
-                        timestamp_ms: best_sample.timestamp_ms,
-                        value: best_sample.value,
-                        labels,
-                        drop_name: false,
-                    });
-
-                    // Mark this series fingerprint as found so we don't add it again from older buckets
-                    series_with_results.insert(fingerprint);
-                }
-            }
-        }
-
-        Ok(ExprResult::InstantVector(samples))
+        pipeline::execute_selector_pipeline(&mut self.reader, &plan, vector_selector).await
     }
 
     /// Apply offset and @ modifiers to adjust the evaluation time.
@@ -1432,28 +1149,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         }
 
         Ok(Timestamp::from_millis(adjusted_time_ms))
-    }
-
-    /// Convert labels to HashMap
-    fn labels_to_hashmap(&self, labels: &[Label]) -> HashMap<String, String> {
-        labels
-            .iter()
-            .map(|label| (label.name.clone(), label.value.clone()))
-            .collect()
-    }
-
-    /// Compute fingerprint from labels (simple hash for deduplication)
-    fn compute_fingerprint(&self, labels: &[Label]) -> SeriesFingerprint {
-        // Use a simple hash of sorted labels
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        let mut sorted_labels: Vec<_> = labels.iter().collect();
-        sorted_labels.sort_by(|a, b| a.name.cmp(&b.name));
-        for label in sorted_labels {
-            label.name.hash(&mut hasher);
-            label.value.hash(&mut hasher);
-        }
-        hasher.finish() as SeriesFingerprint
     }
 
     async fn evaluate_call(
