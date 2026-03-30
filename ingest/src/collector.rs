@@ -40,11 +40,7 @@ pub struct Collector {
 impl Collector {
     /// Create a new collector from the given configuration.
     pub fn new(config: CollectorConfig) -> Result<Self> {
-        let object_store_config = match &config.storage {
-            common::StorageConfig::InMemory => common::storage::config::ObjectStoreConfig::InMemory,
-            common::StorageConfig::SlateDb(c) => c.object_store.clone(),
-        };
-        let object_store = common::storage::factory::create_object_store(&object_store_config)
+        let object_store = common::storage::factory::create_object_store(&config.object_store)
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(Self::with_object_store(config, object_store))
     }
@@ -194,10 +190,10 @@ fn delete_dequeued_batches(object_store: Arc<dyn ObjectStore>, entries: Vec<Queu
 mod tests {
     use super::*;
     use crate::config::CollectorConfig;
-    use crate::model::encode_batch;
+    use crate::model::{CompressionType, encode_batch};
     use crate::queue::QueueProducer;
     use bytes::Bytes;
-    use common::StorageConfig;
+    use common::ObjectStoreConfig;
     use slatedb::object_store::PutPayload;
     use slatedb::object_store::memory::InMemory;
 
@@ -205,7 +201,7 @@ mod tests {
 
     fn test_collector_config() -> CollectorConfig {
         CollectorConfig {
-            storage: StorageConfig::InMemory,
+            object_store: ObjectStoreConfig::InMemory,
             manifest_path: TEST_MANIFEST_PATH.to_string(),
         }
     }
@@ -215,7 +211,7 @@ mod tests {
     }
 
     async fn write_batch(store: &Arc<dyn ObjectStore>, location: &str, entries: &[Bytes]) {
-        let payload = encode_batch(entries);
+        let payload = encode_batch(entries, CompressionType::None).unwrap();
         let path = Path::from(location);
         store.put(&path, PutPayload::from(payload)).await.unwrap();
     }

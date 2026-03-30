@@ -62,6 +62,7 @@ proptest = "1"
 dashu-float = "0.4"
 snap = "1"
 criterion = "0.5"
+zstd = "0.13"
 tempfile = "3"
 opendata-macros = { path = "./macros" }
 
