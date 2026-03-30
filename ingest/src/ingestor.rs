@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::IngestorConfig;
 use crate::error::{Error, Result};
-use crate::model::encode_batch;
+use crate::model::{CompressionType, encode_batch};
 use crate::queue::{Metadata, QueueProducer};
 use crate::util::millis;
 
@@ -151,6 +151,7 @@ struct BatchWriterTask {
     data_path_prefix: String,
     flush_interval: Duration,
     flush_size_bytes: usize,
+    batch_compression: CompressionType,
     batch: Batch,
     clock: Arc<dyn Clock>,
 }
@@ -162,6 +163,7 @@ impl BatchWriterTask {
         data_path_prefix: String,
         flush_interval: Duration,
         flush_size_bytes: usize,
+        batch_compression: CompressionType,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
@@ -170,6 +172,7 @@ impl BatchWriterTask {
             data_path_prefix,
             flush_interval,
             flush_size_bytes,
+            batch_compression,
             batch: Batch::new(),
             clock,
         }
@@ -228,7 +231,7 @@ impl BatchWriterTask {
     }
 
     async fn write_and_enqueue(&self, entries: Vec<Bytes>, metadata: Vec<Metadata>) -> Result<()> {
-        let payload = encode_batch(&entries);
+        let payload = encode_batch(&entries, self.batch_compression)?;
         let id = ulid::Ulid::new();
         let path = Path::from(format!("{}/{}.batch", self.data_path_prefix, id));
         self.object_store
@@ -252,24 +255,21 @@ struct BatchWriter {
 impl BatchWriter {
     fn new(
         object_store: Arc<dyn ObjectStore>,
-        queue_manifest_path: String,
-        data_path_prefix: String,
-        flush_interval: Duration,
-        flush_size_bytes: usize,
-        max_buffered_inputs: usize,
+        config: &IngestorConfig,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        let (sender, receiver) = mpsc::channel(max_buffered_inputs);
+        let (sender, receiver) = mpsc::channel(config.max_buffered_inputs);
         let producer = Arc::new(QueueProducer::with_object_store(
-            queue_manifest_path,
+            config.manifest_path.clone(),
             object_store.clone(),
         ));
         let mut task = BatchWriterTask::new(
             object_store,
             producer.clone(),
-            data_path_prefix,
-            flush_interval,
-            flush_size_bytes,
+            config.data_path_prefix.clone(),
+            config.flush_interval,
+            config.flush_size_bytes,
+            config.batch_compression,
             clock,
         );
         let shutdown = CancellationToken::new();
@@ -348,15 +348,7 @@ impl Ingestor {
         object_store: Arc<dyn ObjectStore>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
-        let writer = BatchWriter::new(
-            object_store,
-            config.manifest_path,
-            config.data_path_prefix,
-            config.flush_interval,
-            config.flush_size_bytes,
-            config.max_buffered_inputs,
-            clock.clone(),
-        );
+        let writer = BatchWriter::new(object_store, &config, clock.clone());
         Ok(Self { writer, clock })
     }
 
@@ -431,6 +423,7 @@ mod tests {
             flush_interval: Duration::from_hours(24),
             flush_size_bytes: 64 * 1024 * 1024,
             max_buffered_inputs: 1000,
+            batch_compression: CompressionType::None,
         }
     }
 

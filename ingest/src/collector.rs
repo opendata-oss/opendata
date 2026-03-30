@@ -194,7 +194,7 @@ fn delete_dequeued_batches(object_store: Arc<dyn ObjectStore>, entries: Vec<Queu
 mod tests {
     use super::*;
     use crate::config::CollectorConfig;
-    use crate::model::encode_batch;
+    use crate::model::{CompressionType, encode_batch};
     use crate::queue::QueueProducer;
     use bytes::Bytes;
     use common::StorageConfig;
@@ -215,7 +215,7 @@ mod tests {
     }
 
     async fn write_batch(store: &Arc<dyn ObjectStore>, location: &str, entries: &[Bytes]) {
-        let payload = encode_batch(entries);
+        let payload = encode_batch(entries, CompressionType::None).unwrap();
         let path = Path::from(location);
         store.put(&path, PutPayload::from(payload)).await.unwrap();
     }
