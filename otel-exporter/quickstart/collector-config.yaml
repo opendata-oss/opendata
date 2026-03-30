@@ -1,0 +1,26 @@
+receivers:
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: "mock-metrics"
+          scrape_interval: 5s
+          static_configs:
+            - targets: ["localhost:8080"]
+
+exporters:
+  opendata:
+    storage:
+      type: local
+      local:
+        path: /tmp/opendata-otel-quickstart
+    data_path_prefix: ingest/otel/metrics/data
+    manifest_path: ingest/otel/metrics/manifest
+    flush_interval_ms: 1000
+    flush_size_bytes: 1048576
+    compression: zstd
+
+service:
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      exporters: [opendata]
