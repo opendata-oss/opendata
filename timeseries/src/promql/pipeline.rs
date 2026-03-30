@@ -81,6 +81,22 @@ impl QueryPlan {
         }
     }
 
+    /// For the instant path, record fingerprints of series that had data so
+    /// older buckets can skip them. No-op for other path kinds.
+    fn track_seen_fingerprints(
+        &self,
+        data: &BucketSampleData,
+        seen: &mut HashSet<SeriesFingerprint>,
+    ) {
+        if matches!(self.path_kind, QueryPathKind::InstantVector { .. }) {
+            for series in &data.series_data {
+                if series.samples.last().is_some() {
+                    seen.insert(series.fingerprint);
+                }
+            }
+        }
+    }
+
     /// Shape all loaded bucket data into the final ExprResult for this path.
     fn shape(&self, all_bucket_data: &[BucketSampleData]) -> ExprResult {
         match &self.path_kind {
@@ -563,15 +579,7 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
         let data = load_bucket_samples(reader, &work).await?;
         timings.sample_load_ms += t1.elapsed().as_secs_f64() * 1000.0;
 
-        // Instant path: track seen fingerprints for cross-bucket dedup
-        if matches!(plan.path_kind, QueryPathKind::InstantVector { .. }) {
-            for series in &data.series_data {
-                if series.samples.last().is_some() {
-                    seen_fingerprints.insert(series.fingerprint);
-                }
-            }
-        }
-
+        plan.track_seen_fingerprints(&data, &mut seen_fingerprints);
         all_bucket_data.push(data);
     }
 
