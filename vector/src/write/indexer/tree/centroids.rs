@@ -10,6 +10,17 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
+pub(crate) enum MaybeBoxFuture<T> {
+    Value(T),
+    Future(BoxFuture<'static, T>),
+}
+
+impl <T> Into<MaybeBoxFuture<T>> for BoxFuture<'static, T> {
+    fn into(self) -> MaybeBoxFuture<T> {
+        MaybeBoxFuture::Future(self)
+    }
+}
+
 pub(crate) struct IntermediatePostingsRead {
     /// The level the reads are for
     level: u16,
@@ -49,7 +60,7 @@ impl IntermediatePostingsRead {
     }
 }
 
-struct InFlightIntermediatePostingsRead {
+pub(crate) struct InFlightIntermediatePostingsRead {
     /// The level the reads are for
     level: u16,
     /// Centroid postings that were already cached at this level
@@ -73,7 +84,7 @@ impl InFlightIntermediatePostingsRead {
     }
 }
 
-struct IntermediatePostings {
+pub(crate) struct IntermediatePostings {
     /// The level the reads are for
     level: u16,
     /// Centroid postings that were already cached at this level
@@ -82,7 +93,7 @@ struct IntermediatePostings {
     read: Vec<(u64, Arc<PostingList>)>,
 }
 
-enum SearchResult {
+pub(crate) enum SearchResult {
     PostingReadRequired(IntermediatePostingsRead),
     Ann(Vec<u64>),
 }
@@ -99,12 +110,12 @@ pub(crate) trait CentroidIndex {
 }
 
 pub(crate) trait CentroidReader: Send + Sync {
-    fn read_root(&self) -> BoxFuture<'static, Result<Arc<PostingList>>>;
+    fn read_root(&self) -> MaybeBoxFuture<Result<Arc<PostingList>>>;
 
     fn read_postings(
         &self,
         centroid_id: u64,
-    ) -> Result<BoxFuture<'static, Result<Arc<PostingList>>>>;
+    ) -> Result<MaybeBoxFuture<Result<Arc<PostingList>>>>;
 }
 
 pub(crate) trait CentroidCache: Send + Sync {
@@ -191,21 +202,22 @@ impl StoredCentroidReader {
 }
 
 impl CentroidReader for StoredCentroidReader {
-    fn read_root(&self) -> BoxFuture<'static, Result<Arc<PostingList>>> {
+    fn read_root(&self) -> MaybeBoxFuture<Result<Arc<PostingList>>> {
         let snapshot = self.snapshot.clone();
         let dimensions = self.dimensions;
-        Box::pin(async move { Ok(Arc::new(snapshot.get_root_posting_list(dimensions).await?.into())) })
+        MaybeBoxFuture::Future(
+            Box::pin(async move { Ok(Arc::new(snapshot.get_root_posting_list(dimensions).await?.into())) }))
     }
 
     fn read_postings(
         &self,
         centroid_id: u64,
-    ) -> Result<BoxFuture<'static, Result<Arc<PostingList>>>> {
+    ) -> Result<MaybeBoxFuture<Result<Arc<PostingList>>>> {
         let snapshot = self.snapshot.clone();
         let dimensions = self.dimensions;
-        Ok(Box::pin(async move {
+        Ok(MaybeBoxFuture::Future(Box::pin(async move {
             Ok(Arc::new(snapshot.get_posting_list(centroid_id, dimensions).await?.into()))
-        }))
+        })))
     }
 }
 
@@ -227,17 +239,17 @@ impl<'a> CachedCentroidReader {
 }
 
 impl CentroidReader for CachedCentroidReader {
-    fn read_root(&self) -> BoxFuture<'static, Result<Arc<PostingList>>> {
+    fn read_root(&self) -> MaybeBoxFuture<Result<Arc<PostingList>>> {
         if let Some(root) = self.cache.root(self.inner.epoch) {
-            Box::pin(async move { Ok(root) })
+            MaybeBoxFuture::Value(Ok(root))
         } else {
             self.inner.read_root()
         }
     }
 
-    fn read_postings(&self, centroid_id: u64) -> Result<BoxFuture<'static, Result<Arc<PostingList>>>> {
+    fn read_postings(&self, centroid_id: u64) -> Result<MaybeBoxFuture<Result<Arc<PostingList>>>> {
         if let Some(postings) = self.cache.posting(centroid_id, self.inner.epoch) {
-            Ok(Box::pin(async move { Ok(postings) }))
+            Ok(MaybeBoxFuture::Value(Ok(postings)))
         } else {
             self.inner.read_postings(centroid_id)
         }
