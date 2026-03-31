@@ -46,7 +46,7 @@ impl<T> Into<MaybeCached<T>> for BoxFuture<'static, Result<T>> {
     }
 }
 
-pub(crate) struct IntermediatePostingsRead {
+pub(crate) struct BlockedCentroidSearch {
     /// The level the reads are for
     level: u16,
     /// Centroid postings that were already cached at this level
@@ -55,7 +55,7 @@ pub(crate) struct IntermediatePostingsRead {
     reads: Vec<(u64, BoxFuture<'static, Result<(u64, Arc<PostingList>)>>)>,
 }
 
-impl IntermediatePostingsRead {
+impl BlockedCentroidSearch {
     pub(crate) fn new(
         level: u16,
         found: Vec<(u64, Arc<PostingList>)>,
@@ -72,11 +72,11 @@ impl IntermediatePostingsRead {
         self,
     ) -> (
         Vec<(u64, BoxFuture<'static, Result<(u64, Arc<PostingList>)>>)>,
-        InFlightIntermediatePostingsRead,
+        InFlightBlockedCentroidSearch,
     ) {
         let reads = self.reads;
         let ids = reads.iter().map(|(id, _)| *id).collect();
-        let in_flight = InFlightIntermediatePostingsRead {
+        let in_flight = InFlightBlockedCentroidSearch {
             level: self.level,
             found: self.found,
             reads: ids,
@@ -85,7 +85,7 @@ impl IntermediatePostingsRead {
     }
 }
 
-pub(crate) struct InFlightIntermediatePostingsRead {
+pub(crate) struct InFlightBlockedCentroidSearch {
     /// The level the reads are for
     level: u16,
     /// Centroid postings that were already cached at this level
@@ -94,14 +94,14 @@ pub(crate) struct InFlightIntermediatePostingsRead {
     reads: Vec<u64>,
 }
 
-impl InFlightIntermediatePostingsRead {
-    pub(crate) fn finish(self, read: &HashMap<u64, Arc<PostingList>>) -> IntermediatePostings {
+impl InFlightBlockedCentroidSearch {
+    pub(crate) fn finish(self, read: &HashMap<u64, Arc<PostingList>>) -> ResumableCentroidSearch {
         let read = self
             .reads
             .into_iter()
             .map(|c| (c, read[&c].clone()))
             .collect::<Vec<_>>();
-        IntermediatePostings {
+        ResumableCentroidSearch {
             level: self.level,
             found: self.found,
             read,
@@ -109,7 +109,7 @@ impl InFlightIntermediatePostingsRead {
     }
 }
 
-pub(crate) struct IntermediatePostings {
+pub(crate) struct ResumableCentroidSearch {
     /// The level the reads are for
     level: u16,
     /// Centroid postings that were already cached at this level
@@ -118,7 +118,7 @@ pub(crate) struct IntermediatePostings {
     read: Vec<(u64, Arc<PostingList>)>,
 }
 
-impl IntermediatePostings {
+impl ResumableCentroidSearch {
     fn all_found(level: u16, found: Vec<(u64, Arc<PostingList>)>) -> Self {
         Self {
             level,
@@ -129,7 +129,7 @@ impl IntermediatePostings {
 }
 
 pub(crate) enum SearchResult {
-    PostingReadRequired(IntermediatePostingsRead),
+    ReadsRequired(BlockedCentroidSearch),
     Ann(Vec<u64>),
 }
 
@@ -140,7 +140,7 @@ pub(crate) trait CentroidIndex {
         &self,
         query: &[f32],
         k: usize,
-        postings: IntermediatePostings,
+        postings: ResumableCentroidSearch,
     ) -> SearchResult;
 }
 
@@ -195,7 +195,7 @@ impl<'a> CentroidIndex for LeveledCentroidIndex<'a> {
         &self,
         query: &[f32],
         k: usize,
-        postings: IntermediatePostings,
+        postings: ResumableCentroidSearch,
     ) -> SearchResult {
         self.resume_search_up_to_level(query, k, 0, postings)
     }
@@ -306,10 +306,10 @@ impl<'a> LeveledCentroidIndex<'a> {
                 query,
                 k,
                 level,
-                IntermediatePostings::all_found(inner_level, found),
+                ResumableCentroidSearch::all_found(inner_level, found),
             )
         } else {
-            SearchResult::PostingReadRequired(IntermediatePostingsRead::new(
+            SearchResult::ReadsRequired(BlockedCentroidSearch::new(
                 inner_level,
                 found,
                 reads,
@@ -322,7 +322,7 @@ impl<'a> LeveledCentroidIndex<'a> {
         query: &[f32],
         k: usize,
         level: u16,
-        postings: IntermediatePostings,
+        postings: ResumableCentroidSearch,
     ) -> SearchResult {
         let all_postings = postings
             .found
@@ -540,7 +540,7 @@ pub(crate) async fn batch_search_centroids_up_to_level<K: Hash + Eq + Sized + Se
     level: u16,
 ) -> Result<HashMap<K, Vec<u64>>> {
     let mut results = HashMap::with_capacity(queries.len());
-    let queries: Vec<(K, &[f32], Option<IntermediatePostings>)> = queries
+    let queries: Vec<(K, &[f32], Option<ResumableCentroidSearch>)> = queries
         .into_iter()
         .map(|(k, queries)| (k, queries, None))
         .collect();
@@ -566,7 +566,7 @@ pub(crate) async fn batch_search_centroids_up_to_level<K: Hash + Eq + Sized + Se
         // separate finished results from intermediate posting reads
         for (key, q, result) in intermediate {
             match result {
-                SearchResult::PostingReadRequired(reads) => {
+                SearchResult::ReadsRequired(reads) => {
                     let (reads, in_flight) = reads.start();
                     for (centroid, fut) in reads {
                         posting_reads.insert(centroid, fut);
@@ -888,7 +888,7 @@ mod tests {
         build_tree(2, root, postings).await
     }
 
-    async fn finish_reads(reads: IntermediatePostingsRead) -> IntermediatePostings {
+    async fn finish_reads(reads: BlockedCentroidSearch) -> ResumableCentroidSearch {
         let (reads, in_flight) = reads.start();
         let mut resolved = HashMap::with_capacity(reads.len());
         for (_, read) in reads {
@@ -980,7 +980,7 @@ mod tests {
         let expected = tree.exhaustive_search(&[0.9, 0.1], 2);
 
         // when
-        let SearchResult::PostingReadRequired(reads) = index.search(&[0.9, 0.1], 2) else {
+        let SearchResult::ReadsRequired(reads) = index.search(&[0.9, 0.1], 2) else {
             panic!("search should require posting reads");
         };
         assert!(reads.found.is_empty());
@@ -1002,7 +1002,7 @@ mod tests {
         let expected = tree.exhaustive_search(&[0.9, 0.1], 2);
 
         // when
-        let SearchResult::PostingReadRequired(reads) = index.search(&[0.9, 0.1], 2) else {
+        let SearchResult::ReadsRequired(reads) = index.search(&[0.9, 0.1], 2) else {
             panic!("search should require posting reads");
         };
         assert_eq!(reads.found.len(), 1);
@@ -1026,7 +1026,7 @@ mod tests {
         expected.sort_unstable();
 
         // when
-        let SearchResult::PostingReadRequired(reads) = index.search(&[0.0, 0.0], 1) else {
+        let SearchResult::ReadsRequired(reads) = index.search(&[0.0, 0.0], 1) else {
             panic!("search should require posting reads");
         };
 
