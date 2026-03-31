@@ -2,9 +2,12 @@ use crate::AttributeValue;
 use crate::Result;
 use crate::serde::FieldValue;
 use crate::serde::centroid_info::CentroidInfoValue;
+use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::centroids::CentroidsValue;
 use crate::serde::collection_meta::DistanceMetric;
-use crate::serde::key::VectorDataKey;
+use crate::serde::key::{
+    CentroidInfoKey, CentroidStatsKey, CentroidsKey, PostingListKey, VectorDataKey,
+};
 use crate::serde::posting_list::{PostingList, PostingListValue, PostingUpdate};
 use crate::serde::vector_data::{Field, VectorDataValue};
 use crate::storage::{VectorDbStorageReadExt, record};
@@ -165,8 +168,8 @@ pub(crate) struct SearchIndexDelta {
     upserted_centroids: HashMap<u64, CentroidInfoValue>,
     deleted_centroids: HashSet<u64>,
     centroid_count_deltas: HashMap<u16, HashMap<u64, i64>>,
-    root_count_delta: i64,
     root: Option<Vec<PostingUpdate>>,
+    root_centroid_count: u64,
     root_updates: Vec<PostingUpdate>,
     posting_updates: HashMap<u64, Vec<PostingUpdate>>,
     inverted_index_updates: HashMap<Bytes, RoaringTreemap>,
@@ -182,7 +185,7 @@ impl SearchIndexDelta {
             upserted_centroids: HashMap::new(),
             deleted_centroids: HashSet::new(),
             centroid_count_deltas: HashMap::new(),
-            root_count_delta: 0,
+            root_centroid_count: initial_state.root_centroid_count,
             root: None,
             root_updates: vec![],
             posting_updates: HashMap::new(),
@@ -205,17 +208,18 @@ impl SearchIndexDelta {
             id: centroid_id,
             vector,
         });
-        self.root_count_delta += 1;
+        self.root_centroid_count += 1;
     }
 
     pub(crate) fn remove_from_root(&mut self, centroid_id: u64) {
         self.root_updates
             .push(PostingUpdate::Delete { id: centroid_id });
-        self.root_count_delta -= 1;
+        assert!(self.root_centroid_count > 0);
+        self.root_centroid_count = self.root_centroid_count.saturating_sub(1);
     }
 
     pub(crate) fn set_root(&mut self, postings: PostingList) {
-        self.root_count_delta = postings.len() as i64;
+        self.root_centroid_count = postings.len() as u64;
         self.root = Some(postings.into_iter().map(|posting| posting.into()).collect());
         self.root_updates = vec![];
     }
@@ -305,7 +309,132 @@ impl SearchIndexDelta {
     }
 
     pub(crate) fn freeze(self, state: &mut VectorIndexState, output_ops: &mut Vec<RecordOp>) {
-        // TODO: fill me in
+        let SearchIndexDelta {
+            centroids_meta,
+            upserted_centroids,
+            deleted_centroids,
+            centroid_count_deltas,
+            root_centroid_count,
+            root,
+            root_updates,
+            posting_updates,
+            inverted_index_updates,
+            id_allocator,
+            current_posting: _,
+            ops,
+        } = self;
+
+        let deleted_centroid_levels: HashMap<u64, u8> = deleted_centroids
+            .iter()
+            .filter_map(|centroid_id| {
+                state
+                    .centroids
+                    .get(centroid_id)
+                    .map(|centroid| (*centroid_id, centroid.level))
+            })
+            .collect();
+
+        // === Apply mutations to state ===
+        if let Some(centroids_meta) = &centroids_meta {
+            state.centroids_meta = centroids_meta.clone();
+        }
+
+        state.root_centroid_count = root_centroid_count;
+
+        for (&level, deltas) in &centroid_count_deltas {
+            let counts = state.centroid_counts.entry(level).or_default();
+            for (&centroid_id, &delta) in deltas {
+                let count = counts.entry(centroid_id).or_insert(0);
+                *count = count.saturating_add_signed(delta);
+            }
+        }
+
+        for centroid_id in &deleted_centroids {
+            state.centroids.remove(centroid_id);
+            for counts in state.centroid_counts.values_mut() {
+                counts.remove(centroid_id);
+            }
+        }
+        for (&centroid_id, centroid) in &upserted_centroids {
+            state.centroids.insert(centroid_id, centroid.clone());
+        }
+
+        let (key, block) = id_allocator.freeze();
+        state.centroid_sequence_block_key = key;
+        state.centroid_sequence_block = block;
+
+        // === Construct record ops ===
+        output_ops.extend(ops.into_iter());
+
+        if let Some(centroids_meta) = centroids_meta {
+            let key = CentroidsKey::new().encode();
+            output_ops.push(RecordOp::Put(
+                Record::new(key, centroids_meta.encode_to_bytes()).into(),
+            ));
+        }
+
+        if let Some(root) = root {
+            let key = PostingListKey::new(0).encode();
+            let value = PostingListValue::from_posting_updates(root)
+                .expect("root postings should always encode")
+                .encode_to_bytes();
+            output_ops.push(RecordOp::Put(Record::new(key, value).into()));
+        } else if !root_updates.is_empty() {
+            let op = record::merge_posting_list(0, root_updates)
+                .expect("root posting updates should encode");
+            output_ops.push(op);
+        }
+
+        for (centroid_id, centroid) in upserted_centroids {
+            let key = CentroidInfoKey::new(centroid_id).encode();
+            output_ops.push(RecordOp::Put(
+                Record::new(key, centroid.encode_to_bytes()).into(),
+            ));
+        }
+
+        for (centroid_id, updates) in posting_updates {
+            if let Ok(op) = record::merge_posting_list(centroid_id, updates) {
+                output_ops.push(op);
+            }
+        }
+
+        for (&level, deltas) in &centroid_count_deltas {
+            let Some(counts) = state.centroid_counts.get(&level) else {
+                continue;
+            };
+            for &centroid_id in deltas.keys() {
+                if !deleted_centroids.contains(&centroid_id) {
+                    let count = counts
+                        .get(&centroid_id)
+                        .copied()
+                        .expect("centroid count should be present after freeze");
+                    let key = CentroidStatsKey::new(level as u8, centroid_id).encode();
+                    let value = CentroidStatsValue::new(
+                        i32::try_from(count).expect("centroid count should fit in i32"),
+                    )
+                    .encode_to_bytes();
+                    output_ops.push(RecordOp::Put(Record::new(key, value).into()));
+                }
+            }
+        }
+
+        for (encoded_key, vector_ids) in &inverted_index_updates {
+            if let Ok(op) = record::merge_metadata_index_bitmap(encoded_key.clone(), vector_ids) {
+                output_ops.push(op);
+            }
+        }
+
+        for centroid_id in &deleted_centroids {
+            output_ops.push(RecordOp::Delete(
+                CentroidInfoKey::new(*centroid_id).encode(),
+            ));
+            output_ops.push(RecordOp::Delete(PostingListKey::new(*centroid_id).encode()));
+            if let Some(level) = deleted_centroid_levels.get(centroid_id) {
+                output_ops.push(RecordOp::Delete(
+                    CentroidStatsKey::new(*level, *centroid_id).encode(),
+                ));
+            }
+        }
     }
 }
 
@@ -461,7 +590,7 @@ impl<'a> VectorIndexView<'a> {
     }
 
     pub(crate) fn root_count(&self) -> u64 {
-        (self.state.root_centroid_count as i64 + self.delta.search_index.root_count_delta) as u64
+        self.delta.search_index.root_centroid_count
     }
 
     pub(crate) fn root_posting_list(&self, dimensions: usize) -> MaybeCached<Arc<PostingList>> {

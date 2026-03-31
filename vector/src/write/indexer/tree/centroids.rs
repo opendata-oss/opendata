@@ -309,11 +309,7 @@ impl<'a> LeveledCentroidIndex<'a> {
                 ResumableCentroidSearch::all_found(inner_level, found),
             )
         } else {
-            SearchResult::ReadsRequired(BlockedCentroidSearch::new(
-                inner_level,
-                found,
-                reads,
-            ))
+            SearchResult::ReadsRequired(BlockedCentroidSearch::new(inner_level, found, reads))
         }
     }
 
