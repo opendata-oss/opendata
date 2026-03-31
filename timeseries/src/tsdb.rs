@@ -1956,4 +1956,144 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), QueryError::InvalidQuery(_)));
     }
+
+    /// End-to-end test: Ingestor → IngestConsumer → Tsdb → query.
+    ///
+    /// Runs the real consumer poll loop (metadata validation, ack/flush) and
+    /// shuts it down gracefully via [`ConsumerHandle`].
+    #[cfg(all(feature = "otel", feature = "http-server"))]
+    #[tokio::test]
+    async fn should_ingest_via_consumer_and_query_back() {
+        use bytes::Bytes;
+        use opentelemetry_proto::tonic::{
+            collector::metrics::v1::ExportMetricsServiceRequest,
+            common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value},
+            metrics::v1::{
+                Gauge, Metric, NumberDataPoint, ScopeMetrics, metric, number_data_point,
+            },
+            resource::v1::Resource,
+        };
+        use prost::Message;
+
+        use slatedb::object_store::ObjectStore;
+        use slatedb::object_store::memory::InMemory;
+
+        // given — shared in-memory object store for ingestor and consumer
+        let obj_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let manifest = "ingest/manifest".to_string();
+
+        // Build an OTLP gauge: cpu_temperature{host="server1"} = 72.5 at t=3_900s
+        let ts_nanos = 3_900_000_000_000u64; // 3900s in nanos
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![opentelemetry_proto::tonic::metrics::v1::ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: Some(InstrumentationScope {
+                        name: "test".to_string(),
+                        version: "1.0".to_string(),
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                    }),
+                    metrics: vec![Metric {
+                        name: "cpu_temperature".to_string(),
+                        description: String::new(),
+                        unit: String::new(),
+                        metadata: vec![],
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                attributes: vec![KeyValue {
+                                    key: "host".to_string(),
+                                    value: Some(AnyValue {
+                                        value: Some(any_value::Value::StringValue(
+                                            "server1".to_string(),
+                                        )),
+                                    }),
+                                }],
+                                start_time_unix_nano: 0,
+                                time_unix_nano: ts_nanos,
+                                value: Some(number_data_point::Value::AsDouble(72.5)),
+                                exemplars: vec![],
+                                flags: 0,
+                            }],
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let proto_bytes = request.encode_to_vec();
+
+        // Metadata: version=1, signal_type=metrics(1), encoding=otlp_proto(1), reserved=0
+        let metadata = Bytes::from_static(&[1, 1, 1, 0]);
+
+        // Produce via Ingestor
+        let ingestor_config = ingest::IngestorConfig {
+            object_store: common::ObjectStoreConfig::InMemory,
+            data_path_prefix: "ingest".to_string(),
+            manifest_path: manifest.clone(),
+            flush_interval: Duration::from_millis(10),
+            flush_size_bytes: 64 * 1024 * 1024,
+            max_buffered_inputs: 1000,
+            batch_compression: ingest::CompressionType::None,
+        };
+        let ingestor = ingest::Ingestor::with_object_store(
+            ingestor_config,
+            obj_store.clone(),
+            Arc::new(common::clock::SystemClock),
+        )
+        .unwrap();
+        ingestor
+            .ingest(vec![Bytes::from(proto_bytes)], metadata)
+            .await
+            .unwrap();
+        ingestor.close().await.unwrap();
+
+        // Start the real IngestConsumer against the shared object store
+        let tsdb = Arc::new(Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(
+            Arc::new(OpenTsdbMergeOperator),
+        ))));
+        let converter = Arc::new(crate::otel::OtelConverter::new(
+            crate::otel::OtelConfig::default(),
+        ));
+        let consumer_config = crate::promql::config::IngestConsumerConfig {
+            object_store: common::ObjectStoreConfig::InMemory,
+            manifest_path: manifest,
+            poll_interval: Duration::from_millis(10),
+        };
+        let consumer = Arc::new(crate::server::ingest_consumer::IngestConsumer::new(
+            tsdb.clone(),
+            converter,
+            consumer_config,
+        ));
+        let handle = consumer.run_with_object_store(obj_store).await.unwrap();
+
+        // Wait for the consumer to process the batch
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Graceful shutdown — flushes pending acks
+        handle.shutdown().await;
+
+        tsdb.flush().await.unwrap();
+
+        // when — query back
+        let query_time = UNIX_EPOCH + Duration::from_secs(3900);
+        let opts = QueryOptions::default();
+        let result = tsdb
+            .eval_query("cpu_temperature", Some(query_time), &opts)
+            .await
+            .unwrap();
+
+        // then
+        let samples = match result {
+            QueryValue::Vector(s) => s,
+            other => panic!("expected Vector, got {:?}", other),
+        };
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].value, 72.5);
+        assert_eq!(samples[0].labels.get("host"), Some("server1"));
+    }
 }
