@@ -1145,7 +1145,6 @@ mod tests {
 
         // when - search for a vector in the same direction
         let results = db
-            .query_engine()
             .search(&Query::new(vec![5.0, 0.0, 0.0]).with_limit(2))
             .await
             .unwrap();
@@ -1205,7 +1204,6 @@ mod tests {
 
         // when - query with an unnormalized vector pointing mostly along x
         let results = db
-            .query_engine()
             .search(&Query::new(vec![100.0, 1.0, 0.0]).with_limit(3))
             .await
             .unwrap();
@@ -1233,7 +1231,6 @@ mod tests {
 
         // when - query along the same "below-45" direction
         let results = db
-            .query_engine()
             .search(&Query::new(vec![50.0, 45.0]).with_limit(4))
             .await
             .unwrap();
