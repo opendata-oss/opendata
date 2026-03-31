@@ -188,8 +188,8 @@ impl SplitCentroids {
             // find all relevant postings (centroids and neighbours)
             let mut posting_reads = Vec::with_capacity(postings_to_retrive.len());
             for c in postings_to_retrive {
-                let read_fut = view.posting_list(c, self.opts.dimensions)?;
-                posting_reads.push(Box::pin(async move { read_fut.await.map(|p| (c, p)) })
+                let read_fut = view.posting_list(c, self.opts.dimensions);
+                posting_reads.push(Box::pin(async move { read_fut.get().await.map(|p| (c, p)) })
                     as BoxFuture<'static, Result<(u64, Arc<PostingList>)>>);
             }
             let results = AsyncBatchDriver::execute(posting_reads).await;

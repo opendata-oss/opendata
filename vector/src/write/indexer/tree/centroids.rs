@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::serde::posting_list::{PostingList, PostingListValue};
+use crate::serde::posting_list::{PostingList};
 use crate::storage::VectorDbStorageReadExt;
 use crate::write::indexer::drivers::AsyncBatchDriver;
 use common::StorageRead;
@@ -10,14 +10,34 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
-pub(crate) enum MaybeBoxFuture<T> {
+pub(crate) enum MaybeCached<T> {
     Value(T),
-    Future(BoxFuture<'static, T>),
+    Future(BoxFuture<'static, Result<T>>),
 }
 
-impl <T> Into<MaybeBoxFuture<T>> for BoxFuture<'static, T> {
-    fn into(self) -> MaybeBoxFuture<T> {
-        MaybeBoxFuture::Future(self)
+impl <T> MaybeCached<T> {
+    pub(crate) async fn get(self) -> Result<T> {
+        match self {
+            MaybeCached::Value(value) => Ok(value),
+            MaybeCached::Future(future) => future.await,
+        }
+    }
+}
+
+impl <T: 'static> MaybeCached<T> {
+    pub(crate) fn map<O>(self, mapper: impl FnOnce(T) -> O + Send + Sync + 'static) -> MaybeCached<O> {
+        match self {
+            MaybeCached::Value(v) => MaybeCached::Value(mapper(v)),
+            MaybeCached::Future(fut) => MaybeCached::Future(
+                Box::pin(async move { fut.await.map(|v| mapper(v)) }),
+            )
+        }
+    }
+}
+
+impl <T> Into<MaybeCached<T>> for BoxFuture<'static, Result<T>> {
+    fn into(self) -> MaybeCached<T> {
+        MaybeCached::Future(self)
     }
 }
 
@@ -93,6 +113,16 @@ pub(crate) struct IntermediatePostings {
     read: Vec<(u64, Arc<PostingList>)>,
 }
 
+impl IntermediatePostings {
+    fn all_found(level: u16, found: Vec<(u64, Arc<PostingList>)>) -> Self {
+        Self {
+            level,
+            found,
+            read: vec![],
+        }
+    }
+}
+
 pub(crate) enum SearchResult {
     PostingReadRequired(IntermediatePostingsRead),
     Ann(Vec<u64>),
@@ -105,17 +135,17 @@ pub(crate) trait CentroidIndex {
         &self,
         query: &[f32],
         k: usize,
-        postings: Option<IntermediatePostings>,
+        postings: IntermediatePostings,
     ) -> SearchResult;
 }
 
 pub(crate) trait CentroidReader: Send + Sync {
-    fn read_root(&self) -> MaybeBoxFuture<Result<Arc<PostingList>>>;
+    fn read_root(&self) -> MaybeCached<Arc<PostingList>>;
 
     fn read_postings(
         &self,
         centroid_id: u64,
-    ) -> Result<MaybeBoxFuture<Result<Arc<PostingList>>>>;
+    ) -> MaybeCached<Arc<PostingList>>;
 }
 
 pub(crate) trait CentroidCache: Send + Sync {
@@ -133,14 +163,19 @@ pub(crate) trait CentroidCache: Send + Sync {
 }
 
 pub(crate) struct LeveledCentroidIndex<'a> {
+    depth: u16,
+    beam: usize,
     reader: Arc<dyn CentroidReader + 'a>,
 }
 
 impl<'a> LeveledCentroidIndex<'a> {
     pub(crate) fn new(
+        depth: u16,
         reader: Arc<dyn CentroidReader + 'a>
     ) -> Self {
         Self {
+            depth,
+            beam: 100,
             reader
         }
     }
@@ -155,21 +190,82 @@ impl<'a> CentroidIndex for LeveledCentroidIndex<'a> {
         &self,
         query: &[f32],
         k: usize,
-        postings: Option<IntermediatePostings>,
+        postings: IntermediatePostings,
     ) -> SearchResult {
         self.resume_search_up_to_level(query, k, 0, postings)
     }
 }
 
 impl<'a> LeveledCentroidIndex<'a> {
-    pub(crate) fn search_root(&self, query: &[f32], k: usize) -> Vec<u64> {
+    fn score_and_rank(query: &[f32], postings: &[Arc<PostingList>], k: usize) -> Vec<u64> {
+        // compute the distance from query to all vectors in postings
+        // return the top k nearest vectors
         todo!()
     }
 
+    pub(crate) fn search_root(&self, query: &[f32], k: usize) -> Vec<u64> {
+        let MaybeCached::Value(root) = self.reader.read_root() else {
+            panic!("LeveledCentroidIndex::search_root() couldn't find root");
+        };
+        Self::score_and_rank(query, &[root], k)
+    }
+
     fn search_up_to_level(&self, query: &[f32], k: usize, level: u16) -> SearchResult {
-        // start search at root, finding the 100 nearest neighbours, then move all the way down
-        // to level 0, expanding out 100 at each level
-        todo!()
+        let this_level = self.depth - 1;
+        assert!(level <= this_level);
+        assert!(level >= 0);
+        if level == this_level {
+            return SearchResult::Ann(self.search_root(query, k))
+        }
+        let next_centroids = self.search_root(query, self.beam);
+        self.search_up_to_level_with_centroids_at_inner_level(
+            query,
+            k,
+            level,
+            this_level - 1,
+            next_centroids
+        )
+    }
+
+    fn search_up_to_level_with_centroids_at_inner_level(
+        &self,
+        query: &[f32],
+        k: usize,
+        level: u16,
+        inner_level: u16,
+        centroids: Vec<u64>,
+    ) -> SearchResult {
+        let posting_futs: Vec<_> = centroids.iter().map(|&c| (c, self.reader.read_postings(c))).collect();
+        let mut found = Vec::with_capacity(centroids.len());
+        let mut reads = Vec::with_capacity(centroids.len());
+        for (c, fut) in posting_futs {
+            match fut {
+                MaybeCached::Value(p) => {
+                    found.push((c, p));
+                }
+                MaybeCached::Future(fut) => {
+                    reads.push(
+                        (c,
+                         Box::pin(
+                             async move {
+                                 fut.await.map(|p| (c, p))
+                             }) as BoxFuture<'static, _>)
+                    );
+                }
+            }
+        }
+        if reads.is_empty() {
+            self.resume_search_up_to_level(
+                query,
+                k,
+                level,
+                IntermediatePostings::all_found(inner_level, found),
+            )
+        } else {
+            SearchResult::PostingReadRequired(
+                IntermediatePostingsRead::new(inner_level, found, reads)
+            )
+        }
     }
 
     fn resume_search_up_to_level(
@@ -177,10 +273,28 @@ impl<'a> LeveledCentroidIndex<'a> {
         query: &[f32],
         k: usize,
         level: u16,
-        postings: Option<IntermediatePostings>,
+        postings: IntermediatePostings,
     ) -> SearchResult {
-        // postings as the centroids required at a given level, resume search at the next level
-        todo!()
+        let all_postings = postings
+            .found
+            .iter()
+            .map(|(_, p)| p.clone())
+            .chain(postings.read.iter().map(|(_, p)| p.clone()))
+            .collect::<Vec<_>>();
+        if postings.level == level {
+            SearchResult::Ann(Self::score_and_rank(query, &all_postings, k))
+        } else {
+            // find the top beam postings at this level and search at the next level
+            // then call search_up_to_level_with_centroids_at_inner_level
+            let next_centroids = Self::score_and_rank(query, &all_postings, self.beam);
+            self.search_up_to_level_with_centroids_at_inner_level(
+                query,
+                k,
+                level,
+                postings.level - 1,
+                next_centroids
+            )
+        }
     }
 }
 
@@ -202,22 +316,22 @@ impl StoredCentroidReader {
 }
 
 impl CentroidReader for StoredCentroidReader {
-    fn read_root(&self) -> MaybeBoxFuture<Result<Arc<PostingList>>> {
+    fn read_root(&self) -> MaybeCached<Arc<PostingList>> {
         let snapshot = self.snapshot.clone();
         let dimensions = self.dimensions;
-        MaybeBoxFuture::Future(
+        MaybeCached::Future(
             Box::pin(async move { Ok(Arc::new(snapshot.get_root_posting_list(dimensions).await?.into())) }))
     }
 
     fn read_postings(
         &self,
         centroid_id: u64,
-    ) -> Result<MaybeBoxFuture<Result<Arc<PostingList>>>> {
+    ) -> MaybeCached<Arc<PostingList>> {
         let snapshot = self.snapshot.clone();
         let dimensions = self.dimensions;
-        Ok(MaybeBoxFuture::Future(Box::pin(async move {
+        MaybeCached::Future(Box::pin(async move {
             Ok(Arc::new(snapshot.get_posting_list(centroid_id, dimensions).await?.into()))
-        })))
+        }))
     }
 }
 
@@ -239,17 +353,17 @@ impl<'a> CachedCentroidReader {
 }
 
 impl CentroidReader for CachedCentroidReader {
-    fn read_root(&self) -> MaybeBoxFuture<Result<Arc<PostingList>>> {
+    fn read_root(&self) -> MaybeCached<Arc<PostingList>> {
         if let Some(root) = self.cache.root(self.inner.epoch) {
-            MaybeBoxFuture::Value(Ok(root))
+            MaybeCached::Value(root)
         } else {
             self.inner.read_root()
         }
     }
 
-    fn read_postings(&self, centroid_id: u64) -> Result<MaybeBoxFuture<Result<Arc<PostingList>>>> {
+    fn read_postings(&self, centroid_id: u64) -> MaybeCached<Arc<PostingList>> {
         if let Some(postings) = self.cache.posting(centroid_id, self.inner.epoch) {
-            Ok(MaybeBoxFuture::Value(Ok(postings)))
+            MaybeCached::Value(postings)
         } else {
             self.inner.read_postings(centroid_id)
         }
@@ -342,7 +456,11 @@ pub(crate) async fn batch_search_centroids_up_to_level<K: Hash + Eq + Sized + Se
         let intermediate = remaining
             .into_par_iter()
             .map(|(key, q, ip)| {
-                let result = index.resume_search_up_to_level(&q, k, level, ip);
+                let result = if let Some(ip) = ip {
+                    index.resume_search_up_to_level(&q, k, level, ip)
+                } else {
+                    index.search_up_to_level(&q, k, level)
+                };
                 (key, q, result)
             })
             .collect::<Vec<_>>();

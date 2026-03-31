@@ -5,11 +5,11 @@ use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::centroids::CentroidsValue;
 use crate::serde::key::VectorDataKey;
 use crate::serde::posting_list::{
-    PostingList, PostingListValue, PostingUpdate, merge_decoded_posting_lists,
+    PostingList, PostingListValue, PostingUpdate,
 };
 use crate::serde::vector_data::{Field, VectorDataValue};
 use crate::storage::{VectorDbStorageReadExt, record};
-use crate::write::indexer::tree::centroids::{CentroidReader, LeveledCentroidIndex, MaybeBoxFuture, StoredCentroidReader};
+use crate::write::indexer::tree::centroids::{CentroidReader, LeveledCentroidIndex, MaybeCached, StoredCentroidReader};
 use bytes::Bytes;
 use common::sequence::AllocatedSeqBlock;
 use common::storage::RecordOp;
@@ -351,66 +351,43 @@ impl <'a> DirtyCentroidReader<'a> {
 }
 
 impl<'a> CentroidReader for DirtyCentroidReader<'a> {
-    fn read_root(&self) -> MaybeBoxFuture<Result<Arc<PostingList>>> {
+    fn read_root(&self) -> MaybeCached<Arc<PostingList>> {
         if let Some(root) = &self.delta.root {
             let mut root = root.clone();
             root.extend(self.delta.root_updates.iter().cloned());
             let root = PostingListValue::from_posting_updates(root)
                 .expect("unreachable");
-            MaybeBoxFuture::Value(Ok(Arc::new(root.into())))
+            MaybeCached::Value(Arc::new(root.into()))
         } else {
             let stored = self.stored.clone();
             let updates = self.delta.root_updates.clone();
             let root = stored.read_root();
-            match root {
-                MaybeBoxFuture::Value(root) => {
-                    MaybeBoxFuture::Value(root.map(|r| Self::apply_updates_to_posting(&r, &updates)))
+            root.map(
+                move |p| {
+                    if !updates.is_empty() {
+                        Self::apply_updates_to_posting(p.as_ref(), &updates)
+                    } else {
+                        p
+                    }
                 }
-                MaybeBoxFuture::Future(fut) => {
-                    MaybeBoxFuture::Future(
-                        Box::pin(async move {
-                            let root = fut.await?;
-                            if updates.is_empty() {
-                                return Ok(root);
-                            }
-                            let updated = Self::apply_updates_to_posting(root.as_ref(), &updates);
-                            Ok(updated)
-                        })
-                    )
-                }
-            }
+            )
         }
     }
 
     fn read_postings(
         &self,
         centroid_id: u64,
-    ) -> Result<MaybeBoxFuture<Result<Arc<PostingList>>>> {
+    ) -> MaybeCached<Arc<PostingList>> {
         let updates = self.delta.posting_updates.get(&centroid_id).cloned();
         let stored = self.stored.clone();
-        let posting = stored.read_postings(centroid_id)?;
-        match posting {
-            MaybeBoxFuture::Value(posting) => {
-                let posting = posting?;
-                Ok(MaybeBoxFuture::Value(
-                    if let Some(updates) = updates {
-                        Ok(Self::apply_updates_to_posting(posting.as_ref(), &updates))
-                    } else {
-                        Ok(posting)
-                    }
-               ))
+        let posting = stored.read_postings(centroid_id);
+        posting.map(|p| {
+            if let Some(updates) = updates {
+                Self::apply_updates_to_posting(p.as_ref(), &updates)
+            } else {
+                p
             }
-            MaybeBoxFuture::Future(fut) => {
-                Ok(MaybeBoxFuture::Future(Box::pin(async move {
-                    let posting = fut.await?;
-                    if let Some(updates) = updates {
-                        Ok(Self::apply_updates_to_posting(posting.as_ref(), &updates))
-                    } else {
-                        Ok(posting)
-                    }
-                })))
-            }
-        }
+        })
     }
 }
 
@@ -491,7 +468,7 @@ impl<'a> VectorIndexView<'a> {
     pub(crate) fn root_posting_list(
         &self,
         dimensions: usize,
-    ) -> BoxFuture<'static, Result<Arc<PostingList>>> {
+    ) -> MaybeCached<Arc<PostingList>> {
         let stored =
             StoredCentroidReader::new(dimensions, self.snapshot.clone(), self.snapshot_epoch);
         let reader = DirtyCentroidReader {
@@ -505,7 +482,7 @@ impl<'a> VectorIndexView<'a> {
         &self,
         centroid_id: u64,
         dimensions: usize,
-    ) -> Result<BoxFuture<'static, Result<Arc<PostingList>>>> {
+    ) -> MaybeCached<Arc<PostingList>> {
         let stored =
             StoredCentroidReader::new(dimensions, self.snapshot.clone(), self.snapshot_epoch);
         let reader = DirtyCentroidReader {
@@ -546,6 +523,7 @@ impl<'a> VectorIndexView<'a> {
             stored,
             delta: &self.delta.search_index,
         };
-        LeveledCentroidIndex::new(Arc::new(reader))
+
+        LeveledCentroidIndex::new(self.centroids_meta().depth as u16, Arc::new(reader))
     }
 }

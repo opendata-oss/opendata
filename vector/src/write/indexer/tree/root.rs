@@ -36,7 +36,7 @@ impl SplitRoot {
             return Ok(());
         }
 
-        let original_root_postings = view.root_posting_list(self.opts.dimensions).await?;
+        let original_root_postings = view.root_posting_list(self.opts.dimensions).get().await?;
         let root_vecs: Vec<_> = original_root_postings
             .iter()
             .map(|p| (p.id(), p.vector()))

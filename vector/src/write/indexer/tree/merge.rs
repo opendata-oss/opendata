@@ -66,7 +66,7 @@ impl MergeCentroids {
         // read postings of all mergees
         let mut to_resolve = Vec::with_capacity(to_merge.len());
         for c in to_merge {
-            let posting_fut = view.posting_list(c, self.opts.dimensions)?;
+            let posting_fut = view.posting_list(c, self.opts.dimensions);
             let c_info = view
                 .centroid(c)
                 .expect("unexpected missing centroid")
@@ -75,7 +75,7 @@ impl MergeCentroids {
                 Ok(MergeCentroid {
                     c,
                     c_info,
-                    postings: posting_fut.await?,
+                    postings: posting_fut.get().await?,
                 })
             }) as BoxFuture<'static, Result<MergeCentroid>>)
         }
