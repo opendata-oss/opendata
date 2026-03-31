@@ -45,54 +45,50 @@ impl From<crate::error::Error> for EvaluationError {
 
 pub(crate) type EvalResult<T> = std::result::Result<T, EvaluationError>;
 
-pub(crate) struct QueryReaderBucketEvalCache {
-    // Map from terms (series_ids for forward, labels for inverted) to cached results
+struct QueryReaderBucketEvalCache {
     forward_index_cache:
-        HashMap<Vec<SeriesId>, Arc<dyn ForwardIndexLookup + Send + Sync + 'static>>,
-    inverted_index_cache: HashMap<Vec<Label>, Arc<dyn InvertedIndexLookup + Send + Sync + 'static>>,
-    samples: HashMap<SeriesId, Vec<Sample>>,
+        dashmap::DashMap<Vec<SeriesId>, Arc<dyn ForwardIndexLookup + Send + Sync + 'static>>,
+    inverted_index_cache:
+        dashmap::DashMap<Vec<Label>, Arc<dyn InvertedIndexLookup + Send + Sync + 'static>>,
+    samples: dashmap::DashMap<SeriesId, Arc<Vec<Sample>>>,
 }
 
 impl QueryReaderBucketEvalCache {
     fn new() -> Self {
         Self {
-            forward_index_cache: HashMap::new(),
-            inverted_index_cache: HashMap::new(),
-            samples: HashMap::new(),
+            forward_index_cache: dashmap::DashMap::new(),
+            inverted_index_cache: dashmap::DashMap::new(),
+            samples: dashmap::DashMap::new(),
         }
     }
 }
 
 pub(crate) struct QueryReaderEvalCache {
-    cache: HashMap<TimeBucket, QueryReaderBucketEvalCache>,
+    cache: dashmap::DashMap<TimeBucket, QueryReaderBucketEvalCache>,
 }
 
 impl QueryReaderEvalCache {
     pub(crate) fn new() -> Self {
         Self {
-            cache: HashMap::new(),
+            cache: dashmap::DashMap::new(),
         }
     }
 
-    pub(crate) fn get_bucket_cache_mut(
-        &mut self,
-        bucket: &TimeBucket,
-    ) -> &mut QueryReaderBucketEvalCache {
-        self.cache
-            .entry(*bucket)
-            .or_insert_with(QueryReaderBucketEvalCache::new)
+    fn get_or_create_bucket(&self, bucket: &TimeBucket) -> dashmap::mapref::one::Ref<'_, TimeBucket, QueryReaderBucketEvalCache> {
+        if !self.cache.contains_key(bucket) {
+            self.cache.entry(*bucket).or_insert_with(QueryReaderBucketEvalCache::new);
+        }
+        self.cache.get(bucket).expect("bucket just inserted")
     }
 
     pub(crate) fn cache_forward_index(
-        &mut self,
+        &self,
         bucket: TimeBucket,
         series_ids: Vec<SeriesId>,
         forward_index: Box<dyn ForwardIndexLookup + Send + Sync + 'static>,
     ) {
-        let bucket_cache = self.get_bucket_cache_mut(&bucket);
-        bucket_cache
-            .forward_index_cache
-            .insert(series_ids, forward_index.into());
+        let bc = self.get_or_create_bucket(&bucket);
+        bc.forward_index_cache.insert(series_ids, forward_index.into());
     }
 
     pub(crate) fn get_forward_index(
@@ -100,22 +96,18 @@ impl QueryReaderEvalCache {
         bucket: &TimeBucket,
         series_ids: &[SeriesId],
     ) -> Option<Arc<dyn ForwardIndexLookup + Send + Sync + 'static>> {
-        self.cache
-            .get(bucket)
-            .and_then(|bucket_cache| bucket_cache.forward_index_cache.get(series_ids))
-            .cloned()
+        let bc = self.cache.get(bucket)?;
+        bc.forward_index_cache.get(series_ids).map(|v| v.value().clone())
     }
 
     pub(crate) fn cache_inverted_index(
-        &mut self,
+        &self,
         bucket: TimeBucket,
         terms: Vec<Label>,
         result: Box<dyn InvertedIndexLookup + Send + Sync + 'static>,
     ) {
-        let bucket_cache = self.get_bucket_cache_mut(&bucket);
-        bucket_cache
-            .inverted_index_cache
-            .insert(terms, result.into());
+        let bc = self.get_or_create_bucket(&bucket);
+        bc.inverted_index_cache.insert(terms, result.into());
     }
 
     pub(crate) fn get_inverted_index(
@@ -123,30 +115,27 @@ impl QueryReaderEvalCache {
         bucket: &TimeBucket,
         terms: &[Label],
     ) -> Option<Arc<dyn InvertedIndexLookup + Send + Sync + 'static>> {
-        self.cache
-            .get(bucket)
-            .and_then(|bucket_cache| bucket_cache.inverted_index_cache.get(terms))
-            .cloned()
+        let bc = self.cache.get(bucket)?;
+        bc.inverted_index_cache.get(terms).map(|v| v.value().clone())
     }
 
     pub(crate) fn cache_samples(
-        &mut self,
+        &self,
         bucket: TimeBucket,
         series_id: SeriesId,
         samples: Vec<Sample>,
     ) {
-        let bucket_cache = self.get_bucket_cache_mut(&bucket);
-        bucket_cache.samples.insert(series_id, samples);
+        let bc = self.get_or_create_bucket(&bucket);
+        bc.samples.insert(series_id, Arc::new(samples));
     }
 
     pub(crate) fn get_samples(
         &self,
         bucket: &TimeBucket,
         series_id: &SeriesId,
-    ) -> Option<&Vec<Sample>> {
-        self.cache
-            .get(bucket)
-            .and_then(|bucket_cache| bucket_cache.samples.get(series_id))
+    ) -> Option<Arc<Vec<Sample>>> {
+        let bc = self.cache.get(bucket)?;
+        bc.samples.get(series_id).map(|v| Arc::clone(v.value()))
     }
 }
 
@@ -299,20 +288,40 @@ fn select_k_indices_with_heap(
 
 pub(crate) struct Evaluator<'reader, R: QueryReader> {
     reader: CachedQueryReader<'reader, R>,
+    concurrency: crate::promql::pipeline::PipelineConcurrency,
 }
 
-/// A wrapper around QueryReader that uses QueryReaderEvalCache for caching
+/// A wrapper around QueryReader that uses a shared QueryReaderEvalCache.
+///
+/// The cache is behind an `Arc` so that multiple `CachedQueryReader` instances
+/// (e.g. one per bucket task in the pipeline) can share the same query-scoped
+/// cache. All methods take `&self`; interior concurrency is provided by DashMap.
 pub(crate) struct CachedQueryReader<'reader, R: QueryReader> {
     reader: &'reader R,
-    cache: QueryReaderEvalCache,
+    cache: Arc<QueryReaderEvalCache>,
 }
 
 impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
     pub(crate) fn new(reader: &'reader R) -> Self {
         Self {
             reader,
-            cache: QueryReaderEvalCache::new(),
+            cache: Arc::new(QueryReaderEvalCache::new()),
         }
+    }
+
+    /// Create a CachedQueryReader that shares an existing cache.
+    pub(crate) fn with_shared_cache(reader: &'reader R, cache: Arc<QueryReaderEvalCache>) -> Self {
+        Self { reader, cache }
+    }
+
+    /// Access the underlying reader reference.
+    pub(crate) fn raw_reader(&self) -> &'reader R {
+        self.reader
+    }
+
+    /// Access the shared cache handle.
+    pub(crate) fn shared_cache(&self) -> &Arc<QueryReaderEvalCache> {
+        &self.cache
     }
 
     pub(crate) async fn list_buckets(&self) -> Result<Vec<TimeBucket>> {
@@ -320,7 +329,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
     }
 
     pub(crate) async fn forward_index(
-        &mut self,
+        &self,
         bucket: &TimeBucket,
         series_ids: &[SeriesId],
     ) -> Result<Arc<dyn ForwardIndexLookup + Send + Sync + 'static>> {
@@ -344,7 +353,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
     }
 
     pub(crate) async fn inverted_index(
-        &mut self,
+        &self,
         bucket: &TimeBucket,
         terms: &[Label],
     ) -> Result<Arc<dyn InvertedIndexLookup + Send + Sync + 'static>> {
@@ -385,7 +394,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
     }
 
     pub(crate) async fn samples(
-        &mut self,
+        &self,
         bucket: &TimeBucket,
         series_id: SeriesId,
         start_ms: i64,
@@ -408,12 +417,15 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             .samples(bucket, series_id, i64::MIN, i64::MAX)
             .await?;
 
-        // Cache the full sample set
+        // Cache the full sample set, then filter the shared handle
         self.cache
-            .cache_samples(*bucket, series_id, samples.clone());
+            .cache_samples(*bucket, series_id, samples);
 
-        // Filter by requested time range
-        let filtered: Vec<Sample> = samples
+        let cached = self
+            .cache
+            .get_samples(bucket, &series_id)
+            .expect("just cached");
+        let filtered: Vec<Sample> = cached
             .iter()
             .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
             .cloned()
@@ -738,11 +750,17 @@ fn preload_ranges_inner(
 
 impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     pub(crate) fn new(reader: &'reader R) -> Self {
+        Self::with_concurrency(reader, crate::promql::pipeline::PipelineConcurrency::default())
+    }
+
+    pub(crate) fn with_concurrency(
+        reader: &'reader R,
+        concurrency: crate::promql::pipeline::PipelineConcurrency,
+    ) -> Self {
+        let cache = Arc::new(QueryReaderEvalCache::new());
         Self {
-            reader: CachedQueryReader {
-                reader,
-                cache: QueryReaderEvalCache::new(),
-            },
+            reader: CachedQueryReader::with_shared_cache(reader, cache),
+            concurrency,
         }
     }
 
@@ -920,7 +938,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             buckets,
         );
 
-        pipeline::execute_selector_pipeline(&mut self.reader, &plan, vector_selector).await
+        pipeline::execute_selector_pipeline(self.reader.raw_reader(), self.reader.shared_cache(), &plan, vector_selector, &self.concurrency).await
     }
 
     async fn evaluate_subquery(
@@ -1068,7 +1086,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             buckets,
         );
 
-        pipeline::execute_selector_pipeline(&mut self.reader, &plan, vector_selector).await
+        pipeline::execute_selector_pipeline(self.reader.raw_reader(), self.reader.shared_cache(), &plan, vector_selector, &self.concurrency).await
     }
 
     async fn evaluate_vector_selector(
@@ -1094,7 +1112,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let plan =
             QueryPlan::for_instant_vector(adjusted_eval_ts.as_millis(), lookback_delta_ms, buckets);
 
-        pipeline::execute_selector_pipeline(&mut self.reader, &plan, vector_selector).await
+        pipeline::execute_selector_pipeline(self.reader.raw_reader(), self.reader.shared_cache(), &plan, vector_selector, &self.concurrency).await
     }
 
     /// Apply offset and @ modifiers to adjust the evaluation time.

@@ -59,10 +59,10 @@ async fn get_matching_series<R: QueryReader>(
 ) -> std::result::Result<HashSet<SeriesId>, String> {
     let mut all_series = HashSet::new();
 
-    let mut cached_reader = CachedQueryReader::new(reader);
+    let cached_reader = CachedQueryReader::new(reader);
     for selector_str in matches {
         let selector = parse_selector(selector_str)?;
-        let series = evaluate_selector_with_reader(&mut cached_reader, bucket, &selector)
+        let series = evaluate_selector_with_reader(&cached_reader, bucket, &selector)
             .await
             .map_err(|e| e.to_string())?;
         all_series.extend(series);
@@ -139,7 +139,8 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         let ranges = preload_ranges(&stmt, lookback_start_secs, query_time_secs);
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
-        evaluate_instant(&reader, stmt, query_time).await
+        let concurrency = crate::promql::pipeline::PipelineConcurrency::from(opts);
+        evaluate_instant(&reader, stmt, query_time, concurrency).await
     }
 
     /// Evaluate a range PromQL query, returning typed `RangeSample`s.
@@ -174,7 +175,8 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
-        evaluate_range(&reader, stmt).await
+        let concurrency = crate::promql::pipeline::PipelineConcurrency::from(opts);
+        evaluate_range(&reader, stmt, concurrency).await
     }
 
     /// Discover series matching any of the given selectors.
@@ -263,8 +265,9 @@ pub(crate) async fn evaluate_instant(
     reader: &impl QueryReader,
     stmt: EvalStmt,
     query_time: std::time::SystemTime,
+    concurrency: crate::promql::pipeline::PipelineConcurrency,
 ) -> std::result::Result<QueryValue, QueryError> {
-    let mut evaluator = Evaluator::new(reader);
+    let mut evaluator = Evaluator::with_concurrency(reader, concurrency);
     let result = evaluator.evaluate(stmt).await?;
 
     match result {
@@ -305,6 +308,7 @@ pub(crate) async fn evaluate_instant(
 pub(crate) async fn evaluate_range(
     reader: &impl QueryReader,
     stmt: EvalStmt,
+    concurrency: crate::promql::pipeline::PipelineConcurrency,
 ) -> std::result::Result<Vec<RangeSample>, QueryError> {
     let start = stmt.start;
     let end = stmt.end;
@@ -318,7 +322,7 @@ pub(crate) async fn evaluate_range(
     }
 
     let mut series_map: HashMap<Labels, Vec<(i64, f64)>> = HashMap::new();
-    let mut evaluator = Evaluator::new(reader);
+    let mut evaluator = Evaluator::with_concurrency(reader, concurrency);
     let mut current_time = start;
 
     while current_time <= end {
@@ -1488,6 +1492,7 @@ mod tests {
 
         let narrow = QueryOptions {
             lookback_delta: std::time::Duration::from_secs(10),
+            ..Default::default()
         };
         let results = tsdb
             .eval_query("http_requests", Some(query_time), &narrow)
@@ -1518,6 +1523,7 @@ mod tests {
 
         let narrow = QueryOptions {
             lookback_delta: std::time::Duration::from_secs(10),
+            ..Default::default()
         };
         let results = tsdb
             .eval_query_range("http_requests", start..=end, step, &narrow)
