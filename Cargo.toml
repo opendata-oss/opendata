@@ -47,7 +47,7 @@ foyer = "0.18"
 slatedb = "0.11.1"
 slatedb-common = "0.11.1"
 thiserror = "2.0"
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.0", features = ["full", "test-util"] }
 tokio-util = "0.7"
 toml = "0.8"
 tower = "0.5"

@@ -78,12 +78,10 @@ impl QueryReaderEvalCache {
         &self,
         bucket: &TimeBucket,
     ) -> dashmap::mapref::one::Ref<'_, TimeBucket, QueryReaderBucketEvalCache> {
-        if !self.cache.contains_key(bucket) {
-            self.cache
-                .entry(*bucket)
-                .or_insert_with(QueryReaderBucketEvalCache::new);
-        }
-        self.cache.get(bucket).expect("bucket just inserted")
+        self.cache
+            .entry(*bucket)
+            .or_insert_with(QueryReaderBucketEvalCache::new)
+            .downgrade()
     }
 
     pub(crate) fn cache_forward_index(
@@ -421,7 +419,9 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             return Ok(filtered);
         }
 
-        // Not in cache, load from underlying reader with wide bounds to cache the whole bucket
+        // Cache the full bucket on a miss so later overlapping range-query
+        // steps and sibling selector evaluations can slice locally without
+        // paying for another storage read.
         let samples = self
             .reader
             .samples(bucket, series_id, i64::MIN, i64::MAX)

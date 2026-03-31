@@ -15,12 +15,17 @@ use crate::index::ForwardIndexLookup;
 use crate::model::{Label, Sample, SeriesFingerprint, SeriesId, TimeBucket};
 use crate::promql::evaluator::{
     CachedQueryReader, EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult,
+    QueryReaderEvalCache,
 };
 use crate::promql::selector::evaluate_selector_with_reader;
 use crate::query::QueryReader;
+use futures::stream;
+use futures::{StreamExt, TryStreamExt};
 use promql_parser::parser::VectorSelector;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
 // Phase artifact types
@@ -66,9 +71,9 @@ pub(crate) struct QueryPlan {
 impl QueryPlan {
     /// Build sample work for a bucket, dispatching strict vs lenient by path kind.
     ///
-    /// Under the pipelined executor, all buckets load all matching series
-    /// uniformly (no cross-bucket pruning). Newest-wins semantics for instant
-    /// selectors are enforced in shaping, not here.
+    /// All matching series in the bucket become explicit sample work items.
+    /// Instant selectors rely on `shape_instant_results` to enforce newest-wins
+    /// across buckets, so planning does not prune cross-bucket duplicates here.
     fn build_work(&self, metadata: &BucketMetadata) -> EvalResult<BucketSampleWork> {
         let strict = !matches!(self.path_kind, QueryPathKind::SubqueryVectorSelector { .. });
         build_bucket_sample_work(self, metadata, strict)
@@ -524,24 +529,39 @@ struct BucketTaskTiming {
     sample_load_ms: f64,
 }
 
+/// One bucket waiting to be processed by the metadata worker pool.
+struct MetadataStageJob {
+    idx: usize,
+    bucket: TimeBucket,
+    queued_at: Instant,
+}
+
+/// One bucket whose metadata has been resolved and is ready for sample loading.
+struct SampleStageItem {
+    idx: usize,
+    work: Option<BucketSampleWork>,
+    timing: BucketTaskTiming,
+    queued_at: Instant,
+}
+
 /// Aggregate phase timings for the selector pipeline.
 ///
 /// Under parallel execution, wall time shows user-visible latency while sum
-/// time shows total work. Queue wait measures time spent waiting for a
-/// concurrency permit.
+/// time shows total work. Queue wait measures time spent waiting for a stage
+/// worker slot.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PipelineTimings {
     /// Wall-clock time for the entire metadata+sample pipeline phase.
     pub pipeline_wall_ms: f64,
     /// Sum of per-bucket metadata resolution durations.
     pub metadata_resolve_sum_ms: f64,
-    /// Sum of per-bucket metadata semaphore wait durations.
+    /// Sum of per-bucket metadata stage queue wait durations.
     pub metadata_queue_wait_sum_ms: f64,
     /// Number of buckets that had metadata resolved.
     pub metadata_bucket_count: usize,
     /// Sum of per-bucket sample load durations.
     pub sample_load_sum_ms: f64,
-    /// Sum of per-bucket sample semaphore wait durations.
+    /// Sum of per-bucket sample stage queue wait durations.
     pub sample_queue_wait_sum_ms: f64,
     /// Number of buckets that had samples loaded.
     pub sample_bucket_count: usize,
@@ -577,91 +597,180 @@ impl PipelineTimings {
     }
 }
 
+/// Execute one metadata-stage job.
+///
+/// A metadata worker dequeues a bucket, resolves selector metadata for it, and
+/// packages explicit sample work for the sample stage.
+async fn execute_metadata_stage_job<R: QueryReader>(
+    reader: &R,
+    cache: Arc<QueryReaderEvalCache>,
+    plan: &QueryPlan,
+    selector: &VectorSelector,
+    job: MetadataStageJob,
+) -> EvalResult<SampleStageItem> {
+    let mut timing = BucketTaskTiming {
+        metadata_queue_wait_ms: job.queued_at.elapsed().as_secs_f64() * 1000.0,
+        ..Default::default()
+    };
+
+    let metadata_start = Instant::now();
+    let cached = CachedQueryReader::with_shared_cache(reader, cache);
+    let metadata = resolve_bucket_metadata(&cached, job.bucket, selector).await?;
+    timing.metadata_resolve_ms = metadata_start.elapsed().as_secs_f64() * 1000.0;
+
+    let work = match metadata {
+        Some(metadata) => Some(plan.build_work(&metadata)?),
+        None => None,
+    };
+
+    Ok(SampleStageItem {
+        idx: job.idx,
+        work,
+        timing,
+        queued_at: Instant::now(),
+    })
+}
+
+/// Execute one sample-stage job.
+///
+/// Today a sample worker loads all series for the bucket serially via
+/// `load_bucket_samples`.
+///
+/// For `#366`, this helper is the seam where bucket-scoped sample loading can
+/// become per-series loading without changing the outer metadata queue or the
+/// `SampleStageItem` handoff. The intended model is:
+/// - keep this outer sample stage as a bucket coordinator
+/// - iterate `work.series` lazily
+/// - use a small per-bucket `buffer_unordered(PER_BUCKET_READAHEAD)` window
+/// - let `CachedQueryReader::samples` enforce the real global
+///   `sample_concurrency` limit at the cache-miss read sites
+///
+/// Suggested basis for the follow-up:
+///
+/// ```ignore
+/// async fn load_bucket_samples_parallel<R: QueryReader>(
+///     reader: &CachedQueryReader<'_, R>,
+///     work: &BucketSampleWork,
+/// ) -> EvalResult<BucketSampleData> {
+///     let series_data = stream::iter(work.series.iter().cloned())
+///         .map(|item| async move {
+///             let samples = reader
+///                 .samples(&work.bucket, item.series_id, work.start_ms, work.end_ms)
+///                 .await?;
+///
+///             Ok::<_, EvaluationError>(LoadedSeriesSamples {
+///                 fingerprint: item.fingerprint,
+///                 labels: item.labels,
+///                 samples,
+///             })
+///         })
+///         .buffer_unordered(PER_BUCKET_READAHEAD)
+///         .try_collect::<Vec<_>>()
+///         .await?;
+///
+///     Ok(BucketSampleData {
+///         bucket: work.bucket,
+///         series_data,
+///     })
+/// }
+/// ```
+async fn execute_sample_stage_job<R: QueryReader>(
+    reader: &R,
+    cache: Arc<QueryReaderEvalCache>,
+    item: SampleStageItem,
+) -> EvalResult<(usize, Option<BucketSampleData>, BucketTaskTiming)> {
+    let mut timing = item.timing;
+    let Some(work) = item.work else {
+        return Ok((item.idx, None, timing));
+    };
+
+    timing.sample_queue_wait_ms = item.queued_at.elapsed().as_secs_f64() * 1000.0;
+
+    let sample_start = Instant::now();
+    let cached = CachedQueryReader::with_shared_cache(reader, cache);
+    let data = load_bucket_samples(&cached, &work).await?;
+    timing.sample_load_ms = sample_start.elapsed().as_secs_f64() * 1000.0;
+
+    Ok((item.idx, Some(data), timing))
+}
+
 /// Execute the shared selector pipeline for all evaluator-backed query paths.
 ///
 /// Orchestrates: resolve metadata -> build work -> load samples -> shape results.
 /// Branching on `QueryPathKind` handles the behavioral differences between
 /// instant vector selectors, matrix selectors, and subquery fast paths.
 ///
-/// Buckets progress independently through the pipeline. Metadata resolution
-/// and sample loading are bounded by separate concurrency limits via
-/// semaphores. Results are reassembled in plan order before shaping to
-/// preserve query semantics.
+/// Concurrency model:
+/// - One `MetadataStageJob` is created per bucket.
+/// - `buffer_unordered(metadata_concurrency)` forms the metadata worker pool.
+/// - As each metadata worker finishes, it forwards a `SampleStageItem` into a
+///   bounded channel.
+/// - `buffer_unordered(sample_concurrency)` forms the sample worker pool that
+///   dequeues those items and loads bucket sample data.
+/// - Results are reassembled in plan order before shaping to preserve query
+///   semantics.
 pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
     reader: &R,
-    cache: &Arc<crate::promql::evaluator::QueryReaderEvalCache>,
+    cache: &Arc<QueryReaderEvalCache>,
     plan: &QueryPlan,
     selector: &VectorSelector,
     concurrency: &PipelineConcurrency,
 ) -> EvalResult<ExprResult> {
-    use futures::TryStreamExt;
-    use futures::stream::StreamExt;
-    use std::sync::Arc;
-    use std::time::Instant;
-    use tokio::sync::Semaphore;
-
     let pipeline_start = Instant::now();
+    let metadata_concurrency = concurrency.metadata.max(1);
+    let sample_concurrency = concurrency.samples.max(1);
 
-    let metadata_sem = Arc::new(Semaphore::new(concurrency.metadata));
-    let sample_sem = Arc::new(Semaphore::new(concurrency.samples));
-
-    // Per-bucket pipelined tasks: each bucket independently progresses through
-    // metadata resolution → build work → sample loading, bounded by separate
-    // semaphores for metadata and sample phases.
-    let bucket_futs: Vec<_> = plan
+    let metadata_jobs: Vec<_> = plan
         .buckets
         .iter()
         .enumerate()
-        .map(|(idx, &bucket)| {
-            let meta_sem = metadata_sem.clone();
-            let samp_sem = sample_sem.clone();
-            let task_cache = cache.clone();
-            async move {
-                let mut timing = BucketTaskTiming::default();
-
-                // -- Metadata phase (bounded by metadata semaphore) --
-                let meta_queue_start = Instant::now();
-                let _meta_permit = meta_sem.acquire().await.map_err(|_| {
-                    EvaluationError::InternalError("metadata semaphore closed".into())
-                })?;
-                timing.metadata_queue_wait_ms = meta_queue_start.elapsed().as_secs_f64() * 1000.0;
-
-                let meta_start = Instant::now();
-                let cached = CachedQueryReader::with_shared_cache(reader, task_cache);
-                let meta_result = resolve_bucket_metadata(&cached, bucket, selector).await?;
-                timing.metadata_resolve_ms = meta_start.elapsed().as_secs_f64() * 1000.0;
-                drop(_meta_permit);
-
-                let Some(metadata) = meta_result else {
-                    return Ok::<_, EvaluationError>((idx, None, timing));
-                };
-
-                // -- Build work (no permit, fast) --
-                let work = plan.build_work(&metadata)?;
-
-                // -- Sample phase (bounded by sample semaphore) --
-                let samp_queue_start = Instant::now();
-                let _samp_permit = samp_sem.acquire().await.map_err(|_| {
-                    EvaluationError::InternalError("sample semaphore closed".into())
-                })?;
-                timing.sample_queue_wait_ms = samp_queue_start.elapsed().as_secs_f64() * 1000.0;
-
-                let samp_start = Instant::now();
-                let data = load_bucket_samples(&cached, &work).await?;
-                timing.sample_load_ms = samp_start.elapsed().as_secs_f64() * 1000.0;
-                drop(_samp_permit);
-
-                Ok((idx, Some(data), timing))
-            }
+        .map(|(idx, &bucket)| MetadataStageJob {
+            idx,
+            bucket,
+            queued_at: pipeline_start,
         })
         .collect();
 
-    // Run all bucket tasks concurrently — semaphores bound actual I/O.
-    let results: Vec<(usize, Option<BucketSampleData>, BucketTaskTiming)> =
-        futures::stream::iter(bucket_futs)
-            .buffer_unordered(plan.buckets.len().max(1))
-            .try_collect()
-            .await?;
+    let (sample_tx, sample_rx) = mpsc::channel(sample_concurrency);
+
+    let metadata_stage = {
+        let metadata_cache = cache.clone();
+        async move {
+            stream::iter(metadata_jobs)
+                .map(|job| {
+                    let job_cache = metadata_cache.clone();
+                    async move {
+                        execute_metadata_stage_job(reader, job_cache, plan, selector, job).await
+                    }
+                })
+                .buffer_unordered(metadata_concurrency)
+                .try_for_each(|item| {
+                    let sample_tx = sample_tx.clone();
+                    async move {
+                        // As each metadata worker finishes, it immediately
+                        // hands off its bucket's sample work to the bounded
+                        // queue so sample workers can start without waiting
+                        // for the rest of metadata resolution to complete.
+                        sample_tx.send(item).await.map_err(|_| {
+                            EvaluationError::InternalError("sample work queue closed".into())
+                        })
+                    }
+                })
+                .await
+        }
+    };
+
+    let sample_stage = stream::unfold(sample_rx, |mut sample_rx| async move {
+        sample_rx.recv().await.map(|item| (item, sample_rx))
+    })
+    .map(|item| {
+        let sample_cache = cache.clone();
+        async move { execute_sample_stage_job(reader, sample_cache, item).await }
+    })
+    .buffer_unordered(sample_concurrency)
+    .try_collect::<Vec<_>>();
+
+    let (_, results) = tokio::try_join!(metadata_stage, sample_stage)?;
 
     let pipeline_elapsed_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1581,7 +1690,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn should_preserve_instant_newest_wins_when_newer_bucket_finishes_last() {
         // Newer bucket (200) has a longer metadata delay than older bucket (100),
         // so older finishes first. Instant result must still pick the newer sample.
@@ -1618,7 +1727,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn should_record_nonzero_metadata_queue_wait_under_contention() {
         // With metadata_concurrency=1 and two buckets that each take 20ms of
         // metadata work, the second bucket must wait for the first's permit.
@@ -1644,7 +1753,7 @@ mod tests {
             _ => panic!("expected vector selector"),
         };
 
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let result = execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
             .await
             .unwrap();
@@ -1666,7 +1775,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn should_record_nonzero_sample_queue_wait_under_contention() {
         // With sample_concurrency=1 and two buckets with 20ms sample delays,
         // sample loads must serialize.
@@ -1688,7 +1797,7 @@ mod tests {
             _ => panic!("expected vector selector"),
         };
 
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let result = execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
             .await
             .unwrap();
