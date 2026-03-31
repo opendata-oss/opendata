@@ -65,7 +65,8 @@ impl WriteVectors {
             // Partition into inserts (new vectors) vs upserts (existing external_id).
             // Centroid assignment is computed separately on the blocking pool so it can run
             // in parallel with the upsert storage reads.
-            let centroid_index = view.centroid_index(self.opts.dimensions);
+            let centroid_index =
+                view.centroid_index(self.opts.dimensions, self.opts.distance_metric);
             let assignment_inputs: Vec<_> = writes
                 .iter()
                 .map(|write| (write.external_id.clone(), write.values.as_slice()))
@@ -244,7 +245,8 @@ impl ReassignVectors {
         }
         let resolved = {
             let view = VectorIndexView::new(delta, state, &self.snapshot, self.snapshot_epoch);
-            let centroid_index = view.centroid_index(self.opts.dimensions);
+            let centroid_index =
+                view.centroid_index(self.opts.dimensions, self.opts.distance_metric);
 
             // update current centroid in case centroid was moved as part of a split/merge
             self.reassignments.iter_mut().for_each(|r| {

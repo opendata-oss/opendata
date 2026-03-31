@@ -154,7 +154,8 @@ impl SplitCentroids {
                 .collect();
 
             // collect each centroids neighbours
-            let centroid_index = view.centroid_index(self.opts.dimensions);
+            let centroid_index =
+                view.centroid_index(self.opts.dimensions, self.opts.distance_metric);
             let neighbours_by_centroid = if self.opts.split_search_neighbourhood > 0 {
                 batch_search_centroids_up_to_level(
                     &centroid_index,
@@ -189,8 +190,10 @@ impl SplitCentroids {
             let mut posting_reads = Vec::with_capacity(postings_to_retrive.len());
             for c in postings_to_retrive {
                 let read_fut = view.posting_list(c, self.opts.dimensions);
-                posting_reads.push(Box::pin(async move { read_fut.get().await.map(|p| (c, p)) })
-                    as BoxFuture<'static, Result<(u64, Arc<PostingList>)>>);
+                posting_reads.push(
+                    Box::pin(async move { read_fut.get().await.map(|p| (c, p)) })
+                        as BoxFuture<'static, Result<(u64, Arc<PostingList>)>>,
+                );
             }
             let results = AsyncBatchDriver::execute(posting_reads).await;
             let mut postings = HashMap::new();

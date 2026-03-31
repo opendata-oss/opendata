@@ -62,7 +62,8 @@ impl SplitRoot {
         // assign all the existing root centroid vecs to the new centroids
         let updates_for_original_root_postings = {
             let view = VectorIndexView::new(delta, state, &self.snapshot, self.snapshot_epoch);
-            let centroid_index = view.centroid_index(self.opts.dimensions);
+            let centroid_index =
+                view.centroid_index(self.opts.dimensions, self.opts.distance_metric);
             let mut updates_for_original_root_postings =
                 HashMap::with_capacity(original_root_postings.len());
             for posting in original_root_postings.iter() {

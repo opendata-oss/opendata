@@ -3,13 +3,14 @@ use crate::Result;
 use crate::serde::FieldValue;
 use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::centroids::CentroidsValue;
+use crate::serde::collection_meta::DistanceMetric;
 use crate::serde::key::VectorDataKey;
-use crate::serde::posting_list::{
-    PostingList, PostingListValue, PostingUpdate,
-};
+use crate::serde::posting_list::{PostingList, PostingListValue, PostingUpdate};
 use crate::serde::vector_data::{Field, VectorDataValue};
 use crate::storage::{VectorDbStorageReadExt, record};
-use crate::write::indexer::tree::centroids::{CentroidReader, LeveledCentroidIndex, MaybeCached, StoredCentroidReader};
+use crate::write::indexer::tree::centroids::{
+    CentroidReader, LeveledCentroidIndex, MaybeCached, StoredCentroidReader,
+};
 use bytes::Bytes;
 use common::sequence::AllocatedSeqBlock;
 use common::storage::RecordOp;
@@ -334,19 +335,23 @@ struct DirtyCentroidReader<'a> {
     delta: &'a SearchIndexDelta,
 }
 
-impl <'a> DirtyCentroidReader<'a> {
+impl<'a> DirtyCentroidReader<'a> {
     fn apply_updates_to_posting(
         posting_list: &PostingList,
-        updates: &[PostingUpdate]
+        updates: &[PostingUpdate],
     ) -> Arc<PostingList> {
         let mut all_updates = Vec::with_capacity(posting_list.len() + updates.len());
         all_updates.extend(
             posting_list
-            .iter()
-            .map(|p| PostingUpdate::append(p.id(), p.vector().to_vec()))
+                .iter()
+                .map(|p| PostingUpdate::append(p.id(), p.vector().to_vec())),
         );
         all_updates.extend(updates.iter().cloned());
-        Arc::new(PostingListValue::from_posting_updates(all_updates).expect("unreachable").into())
+        Arc::new(
+            PostingListValue::from_posting_updates(all_updates)
+                .expect("unreachable")
+                .into(),
+        )
     }
 }
 
@@ -355,29 +360,23 @@ impl<'a> CentroidReader for DirtyCentroidReader<'a> {
         if let Some(root) = &self.delta.root {
             let mut root = root.clone();
             root.extend(self.delta.root_updates.iter().cloned());
-            let root = PostingListValue::from_posting_updates(root)
-                .expect("unreachable");
+            let root = PostingListValue::from_posting_updates(root).expect("unreachable");
             MaybeCached::Value(Arc::new(root.into()))
         } else {
             let stored = self.stored.clone();
             let updates = self.delta.root_updates.clone();
             let root = stored.read_root();
-            root.map(
-                move |p| {
-                    if !updates.is_empty() {
-                        Self::apply_updates_to_posting(p.as_ref(), &updates)
-                    } else {
-                        p
-                    }
+            root.map(move |p| {
+                if !updates.is_empty() {
+                    Self::apply_updates_to_posting(p.as_ref(), &updates)
+                } else {
+                    p
                 }
-            )
+            })
         }
     }
 
-    fn read_postings(
-        &self,
-        centroid_id: u64,
-    ) -> MaybeCached<Arc<PostingList>> {
+    fn read_postings(&self, centroid_id: u64) -> MaybeCached<Arc<PostingList>> {
         let updates = self.delta.posting_updates.get(&centroid_id).cloned();
         let stored = self.stored.clone();
         let posting = stored.read_postings(centroid_id);
@@ -465,10 +464,7 @@ impl<'a> VectorIndexView<'a> {
         (self.state.root_centroid_count as i64 + self.delta.search_index.root_count_delta) as u64
     }
 
-    pub(crate) fn root_posting_list(
-        &self,
-        dimensions: usize,
-    ) -> MaybeCached<Arc<PostingList>> {
+    pub(crate) fn root_posting_list(&self, dimensions: usize) -> MaybeCached<Arc<PostingList>> {
         let stored =
             StoredCentroidReader::new(dimensions, self.snapshot.clone(), self.snapshot_epoch);
         let reader = DirtyCentroidReader {
@@ -516,7 +512,11 @@ impl<'a> VectorIndexView<'a> {
         }
     }
 
-    pub(crate) fn centroid_index(&self, dimensions: usize) -> LeveledCentroidIndex<'a> {
+    pub(crate) fn centroid_index(
+        &self,
+        dimensions: usize,
+        distance_metric: DistanceMetric,
+    ) -> LeveledCentroidIndex<'a> {
         let stored =
             StoredCentroidReader::new(dimensions, self.snapshot.clone(), self.snapshot_epoch);
         let reader = DirtyCentroidReader {
@@ -524,6 +524,10 @@ impl<'a> VectorIndexView<'a> {
             delta: &self.delta.search_index,
         };
 
-        LeveledCentroidIndex::new(self.centroids_meta().depth as u16, Arc::new(reader))
+        LeveledCentroidIndex::new(
+            self.centroids_meta().depth as u16,
+            distance_metric,
+            Arc::new(reader),
+        )
     }
 }
