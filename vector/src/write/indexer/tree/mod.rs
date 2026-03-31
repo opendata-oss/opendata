@@ -1,6 +1,10 @@
 use crate::DistanceMetric;
 use crate::Result;
+use crate::query_engine::QueryCentroidIndexState;
 use crate::write::delta::VectorWrite;
+use crate::write::indexer::tree::centroids::{
+    CachedCentroidReader, CentroidCache, LeveledCentroidIndex, StoredCentroidReader,
+};
 use crate::write::indexer::tree::merge::MergeCentroids;
 use crate::write::indexer::tree::root::SplitRoot;
 use crate::write::indexer::tree::split::{ReassignVector, SplitCentroids};
@@ -11,11 +15,11 @@ use common::storage::RecordOp;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-mod centroids;
+pub(crate) mod centroids;
 mod merge;
 mod root;
 mod split;
-mod state;
+pub(crate) mod state;
 mod vector;
 
 #[derive(Debug, Default)]
@@ -36,14 +40,35 @@ pub(crate) struct IndexerOpts {
     pub(crate) chunk_target: usize,
 }
 
-struct Indexer {
+pub(crate) struct Indexer {
     opts: Arc<IndexerOpts>,
     state: VectorIndexState,
 }
 
 impl Indexer {
-    pub(crate) fn new() -> Self {
-        todo!()
+    pub(crate) fn new(opts: IndexerOpts, state: VectorIndexState) -> Self {
+        Self {
+            opts: Arc::new(opts),
+            state,
+        }
+    }
+
+    pub(crate) fn query_centroid_index(
+        &self,
+        snapshot: Arc<dyn StorageRead>,
+        snapshot_epoch: u64,
+    ) -> QueryCentroidIndexState {
+        let cache = Arc::new(self.state.centroid_cache()) as Arc<dyn CentroidCache>;
+        let reader = Arc::new(CachedCentroidReader::new(
+            &cache,
+            StoredCentroidReader::new(self.opts.dimensions, snapshot, snapshot_epoch),
+        ));
+        let ann_index = Arc::new(LeveledCentroidIndex::new(
+            self.state.centroids_meta().depth as u16,
+            self.opts.distance_metric,
+            reader,
+        ));
+        QueryCentroidIndexState::new(ann_index, self.state.centroids())
     }
 
     pub(crate) async fn update_index(

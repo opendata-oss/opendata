@@ -13,29 +13,50 @@
 
 use crate::VectorDbReader;
 use crate::error::{Error, Result};
-use crate::hnsw::{CentroidGraph, build_centroid_graph};
 use crate::model::{
     AttributeValue, Config, Query, SearchOptions, SearchResult, VECTOR_FIELD_NAME, Vector,
     attributes_to_map,
 };
-use crate::query_engine::{QueryEngine, QueryEngineOptions};
-use crate::serde::centroid_chunk::CentroidEntry;
-use crate::serde::key::SeqBlockKey;
+use crate::query_engine::{QueryCentroidIndexState, QueryEngine, QueryEngineOptions};
+use crate::serde::centroid_info::CentroidInfoValue;
+use crate::serde::centroid_stats::CentroidStatsValue;
+use crate::serde::centroids::CentroidsValue;
+use crate::serde::key::{
+    CentroidInfoKey, CentroidSeqBlockKey, CentroidStatsKey, CentroidsKey, PostingListKey,
+    SeqBlockKey,
+};
+use crate::serde::posting_list::{PostingList, PostingListValue, PostingUpdate};
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
 use crate::write::delta::{VectorDbWrite, VectorDbWriteDelta, VectorWrite};
 use crate::write::flusher::VectorDbFlusher;
-use crate::write::indexer::{Indexer, IndexerOpts};
+use crate::write::indexer::tree::Indexer;
+use crate::write::indexer::tree::IndexerOpts;
+use crate::write::indexer::tree::centroids::{
+    AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex,
+    StoredCentroidReader,
+};
+use crate::write::indexer::tree::state::VectorIndexState;
 use async_trait::async_trait;
+use common::Record;
 use common::SequenceAllocator;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};
 use common::storage::{Storage, StorageRead, StorageSnapshot};
 use common::{StorageBuilder, StorageSemantics};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub(crate) const WRITE_CHANNEL: &str = "write";
+
+struct LoadedTreeIndex {
+    centroids_meta: CentroidsValue,
+    root_centroid_count: u64,
+    centroids: HashMap<u64, CentroidInfoValue>,
+    centroid_counts: HashMap<u16, HashMap<u64, u64>>,
+    centroid_cache: AllCentroidsCacheWriter,
+    query_centroid_index: QueryCentroidIndexState,
+}
 
 /// Trait for querying the vector db
 #[async_trait]
@@ -100,8 +121,8 @@ pub struct VectorDb {
     /// The WriteCoordinator itself (stored to keep it alive).
     write_coordinator: WriteCoordinator<VectorDbWriteDelta, VectorDbFlusher>,
 
-    /// In-memory HNSW graph for centroid search (immutable after initialization).
-    centroid_graph: Arc<dyn CentroidGraph>,
+    /// In-memory centroid routing state for queries.
+    query_centroid_index: Arc<Mutex<QueryCentroidIndexState>>,
 }
 
 impl VectorDb {
@@ -162,34 +183,36 @@ impl VectorDb {
         config: Config,
         centroids: Vec<Vec<f32>>,
     ) -> Result<Self> {
-        // Initialize sequence allocator for internal ID generation
         let seq_key = SeqBlockKey.encode();
-        let mut id_allocator = SequenceAllocator::load(storage.as_ref(), seq_key).await?;
+        let id_allocator = SequenceAllocator::load(storage.as_ref(), seq_key).await?;
+        let centroid_seq_key = CentroidSeqBlockKey.encode();
+        let mut centroid_id_allocator =
+            SequenceAllocator::load(storage.as_ref(), centroid_seq_key).await?;
 
-        // Get initial snapshot
+        let initial_snapshot = storage.snapshot().await?;
+        let dictionary = Self::load_dictionary_from_storage(initial_snapshot.as_ref()).await?;
+
+        Self::bootstrap_tree_index_if_needed(
+            &storage,
+            initial_snapshot.as_ref(),
+            &config,
+            centroids,
+            &mut centroid_id_allocator,
+        )
+        .await?;
+
         let snapshot = storage.snapshot().await?;
+        let loaded_tree = Self::load_tree_index(
+            snapshot.clone(),
+            0,
+            config.dimensions as usize,
+            config.distance_metric,
+        )
+        .await?;
 
-        // Load the full ID dictionary from storage into memory at startup
-        let dictionary = Self::load_dictionary_from_storage(snapshot.as_ref()).await?;
-
-        // Load centroid counts from storage
-        let centroid_counts = Self::load_centroid_counts_from_storage(snapshot.as_ref()).await?;
-
-        // Load or bootstrap centroids
-        let (centroid_graph, current_chunk_id, current_chunk_count) =
-            Self::load_or_create_centroids(
-                &storage,
-                snapshot.as_ref(),
-                &config,
-                centroids,
-                &mut id_allocator,
-            )
-            .await?;
-
-        // Freeze the allocator to get the sequence block state for the Indexer
         let (seq_block_key, seq_block) = id_allocator.freeze();
+        let (centroid_seq_block_key, centroid_seq_block) = centroid_id_allocator.freeze();
 
-        // Build indexed fields set from config
         let indexed_fields: HashSet<String> = config
             .metadata_fields
             .iter()
@@ -197,35 +220,45 @@ impl VectorDb {
             .map(|s| s.name.clone())
             .collect();
 
-        // Create Indexer for batch index maintenance
+        let indexer_state = VectorIndexState::new(
+            dictionary,
+            loaded_tree.centroids_meta,
+            loaded_tree.root_centroid_count,
+            loaded_tree.centroids,
+            loaded_tree.centroid_counts,
+            seq_block_key,
+            seq_block,
+            centroid_seq_block_key,
+            centroid_seq_block,
+            loaded_tree.centroid_cache,
+        );
         let indexer = Indexer::new(
             IndexerOpts {
                 dimensions: config.dimensions as usize,
                 distance_metric: config.distance_metric,
+                root_threshold_vectors: config.split_threshold_vectors,
                 merge_threshold_vectors: config.merge_threshold_vectors,
                 split_threshold_vectors: config.split_threshold_vectors,
                 split_search_neighbourhood: config.split_search_neighbourhood,
                 indexed_fields,
                 chunk_target: config.chunk_target as usize,
             },
-            dictionary,
-            centroid_counts,
-            centroid_graph.clone(),
-            seq_block_key,
-            seq_block,
-            current_chunk_id,
-            current_chunk_count,
+            indexer_state,
+        );
+        let query_centroid_index = Arc::new(Mutex::new(loaded_tree.query_centroid_index));
+
+        let flusher = VectorDbFlusher::new(
+            Arc::clone(&storage),
+            snapshot.clone(),
+            0,
+            indexer,
+            query_centroid_index.clone(),
         );
 
-        // Create flusher and delta context for the WriteCoordinator
-        let flusher = VectorDbFlusher::new(Arc::clone(&storage), snapshot.clone(), indexer);
-
-        // Start write coordinator
         let coordinator_config = WriteCoordinatorConfig {
             queue_capacity: 1000,
             flush_interval: Duration::from_secs(5),
             flush_size_threshold: 10000,
-            // flush_size_threshold: 64 * 1024 * 1024,
         };
         let mut write_coordinator = WriteCoordinator::new(
             coordinator_config,
@@ -240,47 +273,27 @@ impl VectorDb {
             config,
             storage,
             write_coordinator,
-            centroid_graph,
+            query_centroid_index,
         })
     }
 
-    /// Load centroids from storage if they exist, otherwise create them from the provided entries.
-    /// Returns the centroid graph and the last chunk's ID and entry count, used for initializing
-    /// chunk tracking state.
-    async fn load_or_create_centroids(
+    async fn bootstrap_tree_index_if_needed(
         storage: &Arc<dyn Storage>,
         snapshot: &dyn StorageSnapshot,
         config: &Config,
         centroids: Vec<Vec<f32>>,
-        id_allocator: &mut SequenceAllocator,
-    ) -> Result<(Arc<dyn CentroidGraph>, u32, usize)> {
-        // Check if centroids already exist in storage
-        let scan_result = snapshot
-            .scan_all_centroids(config.dimensions as usize)
-            .await?;
-
-        if !scan_result.entries.is_empty() {
-            let last_chunk_id = scan_result.last_chunk_id;
-            let last_chunk_count = scan_result.last_chunk_count;
-            // Filter out centroids that have been deleted (tracked in deletions bitmap)
-            let deletions = snapshot.get_deleted_vectors().await?;
-            let live_centroids: Vec<CentroidEntry> = scan_result
-                .entries
-                .into_iter()
-                .filter(|c| !deletions.contains(c.centroid_id))
-                .collect();
-            let graph = build_centroid_graph(live_centroids, config.distance_metric)?;
-            return Ok((Arc::from(graph), last_chunk_id, last_chunk_count));
+        centroid_id_allocator: &mut SequenceAllocator,
+    ) -> Result<()> {
+        if snapshot.get_centroids_meta().await?.is_some() {
+            return Ok(());
         }
 
-        // No existing centroids - validate and write the provided ones
         if centroids.is_empty() {
             return Err(Error::InvalidInput(
                 "Centroids must be provided when creating a new database".to_string(),
             ));
         }
 
-        // Validate centroid dimensions
         for centroid in &centroids {
             if centroid.len() != config.dimensions as usize {
                 return Err(Error::InvalidInput(format!(
@@ -291,44 +304,109 @@ impl VectorDb {
             }
         }
 
-        // Allocate IDs and build CentroidEntries
         let mut ops = Vec::new();
-        let mut entries = Vec::with_capacity(centroids.len());
+        let (root_id, seq_alloc_put) = centroid_id_allocator.allocate_one();
+        if let Some(seq_alloc_put) = seq_alloc_put {
+            ops.push(common::storage::RecordOp::Put(seq_alloc_put.into()));
+        }
+        assert_eq!(root_id, 0, "root centroid must be id 0");
+
+        let mut root_postings = Vec::with_capacity(centroids.len());
         for vector in centroids {
-            let (centroid_id, seq_alloc_put) = id_allocator.allocate_one();
+            let (centroid_id, seq_alloc_put) = centroid_id_allocator.allocate_one();
             if let Some(seq_alloc_put) = seq_alloc_put {
                 ops.push(common::storage::RecordOp::Put(seq_alloc_put.into()));
             }
-            entries.push(CentroidEntry::new(centroid_id, vector));
-        }
-
-        // Write centroids to storage in chunks
-        let chunk_target = config.chunk_target as usize;
-        let num_chunks = entries.chunks(chunk_target).len();
-        for (chunk_idx, chunk_entries) in entries.chunks(chunk_target).enumerate() {
-            ops.push(crate::storage::record::put_centroid_chunk(
-                chunk_idx as u32,
-                chunk_entries.to_vec(),
-                config.dimensions as usize,
+            let centroid_info = CentroidInfoValue::new(0, vector.clone(), None);
+            ops.push(common::storage::RecordOp::Put(
+                Record::new(
+                    CentroidInfoKey::new(centroid_id).encode(),
+                    centroid_info.encode_to_bytes(),
+                )
+                .into(),
             ));
+            ops.push(common::storage::RecordOp::Put(
+                Record::new(
+                    CentroidStatsKey::new(0, centroid_id).encode(),
+                    CentroidStatsValue::new(0).encode_to_bytes(),
+                )
+                .into(),
+            ));
+            root_postings.push(PostingUpdate::append(centroid_id, vector));
         }
+
+        ops.push(common::storage::RecordOp::Put(
+            Record::new(
+                CentroidsKey::new().encode(),
+                CentroidsValue::new(1).encode_to_bytes(),
+            )
+            .into(),
+        ));
+        ops.push(common::storage::RecordOp::Put(
+            Record::new(
+                PostingListKey::new(0).encode(),
+                PostingListValue::from_posting_updates(root_postings)?.encode_to_bytes(),
+            )
+            .into(),
+        ));
         storage.apply(ops).await?;
+        Ok(())
+    }
 
-        // Compute last chunk state from what we just wrote
-        let last_chunk_id = if num_chunks == 0 {
-            0
-        } else {
-            (num_chunks - 1) as u32
-        };
-        let last_chunk_count = if entries.is_empty() {
-            0
-        } else {
-            entries.len() - (last_chunk_id as usize * chunk_target)
-        };
+    async fn load_tree_index(
+        snapshot: Arc<dyn StorageSnapshot>,
+        snapshot_epoch: u64,
+        dimensions: usize,
+        distance_metric: crate::DistanceMetric,
+    ) -> Result<LoadedTreeIndex> {
+        let centroids_meta = snapshot
+            .get_centroids_meta()
+            .await?
+            .ok_or_else(|| Error::Storage("missing centroid tree metadata".to_string()))?;
+        let root_posting_list: PostingList =
+            snapshot.get_root_posting_list(dimensions).await?.into();
+        let centroids: HashMap<u64, CentroidInfoValue> = snapshot
+            .scan_all_centroid_info()
+            .await?
+            .into_iter()
+            .collect();
+        let centroid_counts = Self::load_centroid_counts_from_storage(snapshot.as_ref()).await?;
+        let centroid_postings = snapshot
+            .scan_all_posting_lists(dimensions)
+            .await?
+            .into_iter()
+            .filter_map(|(centroid_id, posting_list)| {
+                centroids.get(&centroid_id).and_then(|centroid| {
+                    if centroid.level > 0 {
+                        Some((centroid_id, Arc::new(PostingList::from(posting_list))))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        let centroid_cache =
+            AllCentroidsCacheWriter::new(Arc::new(root_posting_list.clone()), centroid_postings);
+        let cache = Arc::new(centroid_cache.cache()) as Arc<dyn CentroidCache>;
+        let reader = Arc::new(CachedCentroidReader::new(
+            &cache,
+            StoredCentroidReader::new(dimensions, snapshot, snapshot_epoch),
+        ));
+        let ann_index = Arc::new(LeveledCentroidIndex::new(
+            centroids_meta.depth as u16,
+            distance_metric,
+            reader,
+        ));
+        let query_centroid_index = QueryCentroidIndexState::new(ann_index, &centroids);
 
-        // Build and return the graph
-        let graph = build_centroid_graph(entries, config.distance_metric)?;
-        Ok((Arc::from(graph), last_chunk_id, last_chunk_count))
+        Ok(LoadedTreeIndex {
+            centroids_meta,
+            root_centroid_count: root_posting_list.len() as u64,
+            centroids,
+            centroid_counts,
+            centroid_cache,
+            query_centroid_index,
+        })
     }
 
     /// Load ID dictionary entries from storage into a HashMap.
@@ -372,13 +450,14 @@ impl VectorDb {
     /// for each centroid.
     async fn load_centroid_counts_from_storage(
         snapshot: &dyn StorageRead,
-    ) -> Result<HashMap<u64, u64>> {
+    ) -> Result<HashMap<u16, HashMap<u64, u64>>> {
         let stats = snapshot.scan_all_centroid_stats().await?;
         let mut counts = HashMap::new();
         for ((level, centroid_id), value) in stats {
-            if level == 0 {
-                counts.insert(centroid_id, value.num_vectors.max(0) as u64);
-            }
+            counts
+                .entry(level as u16)
+                .or_insert_with(HashMap::new)
+                .insert(centroid_id, value.num_vectors.max(0) as u64);
         }
         Ok(counts)
     }
@@ -630,7 +709,10 @@ impl VectorDb {
     }
 
     pub fn num_centroids(&self) -> usize {
-        self.centroid_graph.len()
+        self.query_centroid_index
+            .lock()
+            .expect("lock poisoned")
+            .num_leaf_centroids()
     }
 
     /// Create a QueryEngine from the current snapshot for executing queries.
@@ -641,7 +723,12 @@ impl VectorDb {
             distance_metric: self.config.distance_metric,
             query_pruning_factor: self.config.query_pruning_factor,
         };
-        QueryEngine::new(options, self.centroid_graph.clone(), snapshot)
+        let centroid_index = self
+            .query_centroid_index
+            .lock()
+            .expect("lock poisoned")
+            .clone();
+        QueryEngine::new(options, centroid_index, snapshot)
     }
 
     /// Search using brute-force centroid lookup (for diagnostics).
@@ -747,13 +834,12 @@ mod tests {
 
         // then - verify records exist in storage
         // Check VectorData records (now contain external_id, vector, and metadata)
-        // Note: centroid IDs are allocated from the same sequence as vector IDs.
-        // With 1 centroid (ID 0), vectors start at ID 1.
-        let vec1_data_key = VectorDataKey::new(1).encode();
+        // Vector IDs are allocated independently from centroid IDs.
+        let vec1_data_key = VectorDataKey::new(0).encode();
         let vec1_data = storage.get(vec1_data_key).await.unwrap();
         assert!(vec1_data.is_some());
 
-        let vec2_data_key = VectorDataKey::new(2).encode();
+        let vec2_data_key = VectorDataKey::new(1).encode();
         let vec2_data = storage.get(vec2_data_key).await.unwrap();
         assert!(vec2_data.is_some());
 
@@ -789,8 +875,9 @@ mod tests {
         db.flush().await.unwrap();
 
         // then - verify new vector data
-        // Centroid takes ID 0, first write gets ID 1, upsert gets ID 2
-        let vec_data_key = VectorDataKey::new(2).encode(); // New internal ID
+        // Vector IDs are allocated independently from centroid IDs, so the first write
+        // gets ID 0 and the upsert gets ID 1.
+        let vec_data_key = VectorDataKey::new(1).encode(); // New internal ID
         let vec_data = storage.get(vec_data_key).await.unwrap();
         assert!(vec_data.is_some());
         let decoded = VectorDataValue::decode_from_bytes(&vec_data.unwrap().value, 3).unwrap();

@@ -8,15 +8,18 @@
 use crate::Vector;
 use crate::db::VectorDbRead;
 use crate::error::{Error, Result};
-use crate::hnsw::{CentroidGraph, build_centroid_graph};
 use crate::model::{Query, ReaderConfig, SearchOptions, SearchResult};
 use crate::query_engine::{QueryEngine, QueryEngineOptions};
-use crate::serde::centroid_chunk::CentroidEntry;
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
+use crate::write::indexer::tree::centroids::{
+    AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex,
+    StoredCentroidReader,
+};
 use async_trait::async_trait;
 use common::StorageSemantics;
 use common::storage::factory::{StorageReaderRuntime, create_storage_read};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Read-only client for querying a vector database.
@@ -53,26 +56,49 @@ impl VectorDbReader {
         )
         .await?;
 
-        // Load centroids from storage
         let dimensions = config.dimensions as usize;
-        let scan_result = storage.scan_all_centroids(dimensions).await?;
-
-        if scan_result.entries.is_empty() {
+        let centroids_meta = storage.get_centroids_meta().await?;
+        if centroids_meta.is_none() {
             return Err(Error::Storage(
-                "No centroids found in storage. Database must be initialized by VectorDb first."
+                "No centroid tree found in storage. Database must be initialized by VectorDb first."
                     .to_string(),
             ));
         }
-
-        // Filter out deleted centroids
-        let deletions = storage.get_deleted_vectors().await?;
-        let live_centroids: Vec<CentroidEntry> = scan_result
-            .entries
+        let root_posting_list = storage.get_root_posting_list(dimensions).await?.into();
+        let centroids: HashMap<_, _> = storage
+            .scan_all_centroid_info()
+            .await?
             .into_iter()
-            .filter(|c| !deletions.contains(c.centroid_id))
             .collect();
-
-        let centroid_graph = build_centroid_graph(live_centroids, config.distance_metric)?;
+        let centroid_postings = storage
+            .scan_all_posting_lists(dimensions)
+            .await?
+            .into_iter()
+            .filter_map(|(centroid_id, posting_list)| {
+                centroids.get(&centroid_id).and_then(|centroid| {
+                    if centroid.level > 0 {
+                        Some((centroid_id, Arc::new(posting_list.into())))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        let centroid_cache =
+            AllCentroidsCacheWriter::new(Arc::new(root_posting_list), centroid_postings);
+        let cache = Arc::new(centroid_cache.cache()) as Arc<dyn CentroidCache>;
+        let reader = Arc::new(CachedCentroidReader::new(
+            &cache,
+            StoredCentroidReader::new(dimensions, storage.clone(), 0),
+        ));
+        let centroid_index = crate::query_engine::QueryCentroidIndexState::new(
+            Arc::new(LeveledCentroidIndex::new(
+                centroids_meta.expect("checked above").depth as u16,
+                config.distance_metric,
+                reader,
+            )),
+            &centroids,
+        );
 
         let options = QueryEngineOptions {
             dimensions: config.dimensions,
@@ -80,8 +106,7 @@ impl VectorDbReader {
             query_pruning_factor: config.query_pruning_factor,
         };
 
-        let centroid_graph: Arc<dyn CentroidGraph> = Arc::from(centroid_graph);
-        let query_engine = QueryEngine::new(options, centroid_graph, storage);
+        let query_engine = QueryEngine::new(options, centroid_index, storage);
         Ok(Self::new(query_engine))
     }
 

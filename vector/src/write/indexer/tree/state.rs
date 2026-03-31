@@ -12,8 +12,8 @@ use crate::serde::posting_list::{PostingList, PostingListValue, PostingUpdate};
 use crate::serde::vector_data::{Field, VectorDataValue};
 use crate::storage::{VectorDbStorageReadExt, record};
 use crate::write::indexer::tree::centroids::{
-    AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, CentroidReader,
-    LeveledCentroidIndex, MaybeCached, StoredCentroidReader,
+    AllCentroidsCache, AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache,
+    CentroidReader, LeveledCentroidIndex, MaybeCached, StoredCentroidReader,
 };
 use bytes::Bytes;
 use common::sequence::AllocatedSeqBlock;
@@ -79,6 +79,10 @@ impl VectorIndexState {
 
     pub(crate) fn centroids(&self) -> &HashMap<u64, CentroidInfoValue> {
         &self.centroids
+    }
+
+    pub(crate) fn centroid_cache(&self) -> AllCentroidsCache {
+        self.centroid_cache.cache()
     }
 }
 

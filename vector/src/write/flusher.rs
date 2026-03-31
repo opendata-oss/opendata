@@ -1,16 +1,19 @@
+use crate::query_engine::QueryCentroidIndexState;
 use crate::write::delta::{VectorDbDeltaView, VectorDbWriteDelta};
-use crate::write::indexer::Indexer;
+use crate::write::indexer::tree::Indexer;
 use async_trait::async_trait;
 use common::Storage;
 use common::coordinator::Flusher;
 use common::storage::StorageSnapshot;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub(crate) struct VectorDbFlusher {
     storage: Arc<dyn Storage>,
     last_snapshot: Arc<dyn StorageSnapshot>,
+    last_snapshot_epoch: u64,
     indexer: Indexer,
+    query_centroid_index: Arc<Mutex<QueryCentroidIndexState>>,
     /// Set after update_index succeeds but a subsequent storage operation fails.
     /// Once set, the in-memory index state is out of sync with storage and the
     /// flusher is no longer usable.
@@ -21,12 +24,16 @@ impl VectorDbFlusher {
     pub(crate) fn new(
         storage: Arc<dyn Storage>,
         initial_snapshot: Arc<dyn StorageSnapshot>,
+        initial_snapshot_epoch: u64,
         indexer: Indexer,
+        query_centroid_index: Arc<Mutex<QueryCentroidIndexState>>,
     ) -> Self {
         Self {
             storage,
             last_snapshot: initial_snapshot,
+            last_snapshot_epoch: initial_snapshot_epoch,
             indexer,
+            query_centroid_index,
             poisoned: None,
         }
     }
@@ -37,22 +44,28 @@ impl Flusher<VectorDbWriteDelta> for VectorDbFlusher {
     async fn flush_delta(
         &mut self,
         frozen: Arc<VectorDbDeltaView>,
-        _epoch_range: &Range<u64>,
+        epoch_range: &Range<u64>,
     ) -> Result<Arc<dyn StorageSnapshot>, String> {
         if let Some(err) = &self.poisoned {
             return Err(format!("flusher is poisoned due to prior error: {err}"));
         }
 
+        let update_epoch = epoch_range.end.saturating_sub(1);
         // do indexing work — this mutates in-memory index state
         let (updates, _stats) = self
             .indexer
-            .update_index(frozen.writes.clone(), self.last_snapshot.clone())
+            .update_index(
+                frozen.writes.clone(),
+                update_epoch,
+                self.last_snapshot.clone(),
+                self.last_snapshot_epoch,
+            )
             .await
             .map_err(|e| e.to_string())?;
 
         // From this point, in-memory state has diverged from storage.
         // If any subsequent operation fails, poison the flusher.
-        let result = self.apply_and_snapshot(updates).await;
+        let result = self.apply_and_snapshot(updates, update_epoch).await;
         if let Err(err) = &result {
             self.poisoned = Some(err.clone());
         }
@@ -68,6 +81,7 @@ impl VectorDbFlusher {
     async fn apply_and_snapshot(
         &mut self,
         updates: Vec<common::storage::RecordOp>,
+        snapshot_epoch: u64,
     ) -> Result<Arc<dyn StorageSnapshot>, String> {
         self.storage
             .apply(updates)
@@ -75,7 +89,12 @@ impl VectorDbFlusher {
             .map_err(|e| e.to_string())?;
 
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
+        let query_centroid_index = self
+            .indexer
+            .query_centroid_index(snapshot.clone(), snapshot_epoch);
+        *self.query_centroid_index.lock().expect("lock poisoned") = query_centroid_index;
         self.last_snapshot = snapshot.clone();
+        self.last_snapshot_epoch = snapshot_epoch;
         Ok(snapshot)
     }
 }
@@ -83,20 +102,23 @@ impl VectorDbFlusher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hnsw::build_centroid_graph;
     use crate::model::AttributeValue;
-    use crate::serde::centroid_chunk::CentroidEntry;
+    use crate::serde::centroid_info::CentroidInfoValue;
     use crate::serde::collection_meta::DistanceMetric;
     use crate::serde::key::{IdDictionaryKey, VectorDataKey};
+    use crate::serde::posting_list::{Posting, PostingList};
     use crate::serde::vector_data::VectorDataValue;
     use crate::storage::merge_operator::VectorDbMergeOperator;
     use crate::write::delta::VectorDbDeltaView;
     use crate::write::delta::VectorWrite;
-    use crate::write::indexer::{Indexer, IndexerOpts};
+    use crate::write::indexer::tree::IndexerOpts;
+    use crate::write::indexer::tree::centroids::AllCentroidsCacheWriter;
+    use crate::write::indexer::tree::state::VectorIndexState;
     use common::coordinator::Flusher;
     use common::storage::in_memory::{FailingStorage, InMemoryStorage};
     use common::{SequenceAllocator, Storage};
     use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
 
     const DIMS: usize = 3;
 
@@ -118,35 +140,49 @@ mod tests {
         let id_allocator = SequenceAllocator::load(storage.as_ref(), seq_key)
             .await
             .unwrap();
-
-        // Bootstrap one centroid (gets ID 0)
-        let centroid = CentroidEntry::new(0, vec![0.0; DIMS]);
-        let graph = build_centroid_graph(vec![centroid], DistanceMetric::L2).unwrap();
-        let centroid_graph: Arc<dyn crate::hnsw::CentroidGraph> = Arc::from(graph);
+        let centroid_seq_key = bytes::Bytes::from_static(&[0x01, 0x03]);
+        let centroid_id_allocator = SequenceAllocator::load(storage.as_ref(), centroid_seq_key)
+            .await
+            .unwrap();
 
         let (seq_block_key, seq_block) = id_allocator.freeze();
+        let (centroid_seq_block_key, centroid_seq_block) = centroid_id_allocator.freeze();
+        let centroid_cache = AllCentroidsCacheWriter::new(
+            Arc::new(PostingList::from(vec![Posting::new(1, vec![0.0; DIMS])])),
+            vec![],
+        );
+        let state = VectorIndexState::new(
+            HashMap::new(),
+            crate::serde::centroids::CentroidsValue::new(1),
+            1,
+            HashMap::from([(1, CentroidInfoValue::new(0, vec![0.0; DIMS], None))]),
+            HashMap::from([(0, HashMap::from([(1, 0)]))]),
+            seq_block_key,
+            seq_block,
+            centroid_seq_block_key,
+            centroid_seq_block,
+            centroid_cache,
+        );
 
         let indexer = Indexer::new(
             IndexerOpts {
                 dimensions: DIMS,
                 distance_metric: DistanceMetric::L2,
+                root_threshold_vectors: usize::MAX,
                 merge_threshold_vectors: 0,
                 split_threshold_vectors: usize::MAX,
                 split_search_neighbourhood: 4,
                 indexed_fields: HashSet::new(),
                 chunk_target: 4096,
             },
-            HashMap::new(),
-            HashMap::from([(0, 0)]),
-            centroid_graph,
-            seq_block_key,
-            seq_block,
-            0,
-            1,
+            state,
         );
 
         let snapshot = storage.snapshot().await.unwrap();
-        VectorDbFlusher::new(storage, snapshot, indexer)
+        let query_centroid_index = Arc::new(Mutex::new(
+            indexer.query_centroid_index(snapshot.clone(), 0),
+        ));
+        VectorDbFlusher::new(storage, snapshot, 0, indexer, query_centroid_index)
     }
 
     fn make_writes(n: usize) -> Vec<VectorWrite> {

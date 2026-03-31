@@ -5,11 +5,13 @@ use crate::error::{Error, Result};
 use std::ops::Bound::Included;
 
 use crate::serde::centroid_chunk::CentroidChunkValue;
+use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
+use crate::serde::centroids::CentroidsValue;
 use crate::serde::deletions::DeletionsValue;
 use crate::serde::key::{
-    CentroidChunkKey, CentroidStatsKey, DeletionsKey, IdDictionaryKey, MetadataIndexKey,
-    PostingListKey, VectorDataKey,
+    CentroidChunkKey, CentroidInfoKey, CentroidStatsKey, CentroidsKey, DeletionsKey,
+    IdDictionaryKey, MetadataIndexKey, PostingListKey, VectorDataKey,
 };
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::PostingListValue;
@@ -77,6 +79,24 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
 
     async fn get_root_posting_list(&self, dimensions: usize) -> Result<PostingListValue> {
         self.get_posting_list(0, dimensions).await
+    }
+
+    async fn get_centroids_meta(&self) -> Result<Option<CentroidsValue>> {
+        let key = CentroidsKey::new().encode();
+        let record = self.get(key).await?;
+        match record {
+            Some(record) => Ok(Some(CentroidsValue::decode_from_bytes(&record.value)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn get_centroid_info(&self, centroid_id: u64) -> Result<Option<CentroidInfoValue>> {
+        let key = CentroidInfoKey::new(centroid_id).encode();
+        let record = self.get(key).await?;
+        match record {
+            Some(record) => Ok(Some(CentroidInfoValue::decode_from_bytes(&record.value)?)),
+            None => Ok(None),
+        }
     }
 
     /// Load a posting list for a centroid.
@@ -178,6 +198,47 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         }
 
         Ok(stats)
+    }
+
+    async fn scan_all_centroid_info(&self) -> Result<Vec<(u64, CentroidInfoValue)>> {
+        let mut prefix_buf = bytes::BytesMut::with_capacity(3);
+        crate::serde::RecordType::CentroidInfo
+            .prefix()
+            .write_to(&mut prefix_buf);
+        let prefix = prefix_buf.freeze();
+
+        let range = common::BytesRange::prefix(prefix);
+        let records = self.scan(range).await?;
+
+        let mut centroids = Vec::with_capacity(records.len());
+        for record in records {
+            let key = CentroidInfoKey::decode(&record.key)?;
+            let value = CentroidInfoValue::decode_from_bytes(&record.value)?;
+            centroids.push((key.centroid_id, value));
+        }
+        Ok(centroids)
+    }
+
+    async fn scan_all_posting_lists(
+        &self,
+        dimensions: usize,
+    ) -> Result<Vec<(u64, PostingListValue)>> {
+        let mut prefix_buf = bytes::BytesMut::with_capacity(3);
+        crate::serde::RecordType::PostingList
+            .prefix()
+            .write_to(&mut prefix_buf);
+        let prefix = prefix_buf.freeze();
+
+        let range = common::BytesRange::prefix(prefix);
+        let records = self.scan(range).await?;
+
+        let mut posting_lists = Vec::with_capacity(records.len());
+        for record in records {
+            let key = PostingListKey::decode(&record.key)?;
+            let value = PostingListValue::decode_from_bytes(&record.value, dimensions)?;
+            posting_lists.push((key.centroid_id, value));
+        }
+        Ok(posting_lists)
     }
 
     /// Load a metadata index entry for a specific field/value pair.

@@ -485,6 +485,7 @@ impl CentroidCache for AllCentroidsCache {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct AllCentroidsCacheWriter {
     inner: Arc<Mutex<AllCentroidsCacheInner>>,
 }
