@@ -594,8 +594,8 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
     selector: &VectorSelector,
     concurrency: &PipelineConcurrency,
 ) -> EvalResult<ExprResult> {
-    use futures::stream::StreamExt;
     use futures::TryStreamExt;
+    use futures::stream::StreamExt;
     use std::sync::Arc;
     use std::time::Instant;
     use tokio::sync::Semaphore;
@@ -621,21 +621,15 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
 
                 // -- Metadata phase (bounded by metadata semaphore) --
                 let meta_queue_start = Instant::now();
-                let _meta_permit = meta_sem
-                    .acquire()
-                    .await
-                    .map_err(|_| EvaluationError::InternalError(
-                        "metadata semaphore closed".into(),
-                    ))?;
-                timing.metadata_queue_wait_ms =
-                    meta_queue_start.elapsed().as_secs_f64() * 1000.0;
+                let _meta_permit = meta_sem.acquire().await.map_err(|_| {
+                    EvaluationError::InternalError("metadata semaphore closed".into())
+                })?;
+                timing.metadata_queue_wait_ms = meta_queue_start.elapsed().as_secs_f64() * 1000.0;
 
                 let meta_start = Instant::now();
                 let cached = CachedQueryReader::with_shared_cache(reader, task_cache);
-                let meta_result =
-                    resolve_bucket_metadata(&cached, bucket, selector).await?;
-                timing.metadata_resolve_ms =
-                    meta_start.elapsed().as_secs_f64() * 1000.0;
+                let meta_result = resolve_bucket_metadata(&cached, bucket, selector).await?;
+                timing.metadata_resolve_ms = meta_start.elapsed().as_secs_f64() * 1000.0;
                 drop(_meta_permit);
 
                 let Some(metadata) = meta_result else {
@@ -647,19 +641,14 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
 
                 // -- Sample phase (bounded by sample semaphore) --
                 let samp_queue_start = Instant::now();
-                let _samp_permit = samp_sem
-                    .acquire()
-                    .await
-                    .map_err(|_| EvaluationError::InternalError(
-                        "sample semaphore closed".into(),
-                    ))?;
-                timing.sample_queue_wait_ms =
-                    samp_queue_start.elapsed().as_secs_f64() * 1000.0;
+                let _samp_permit = samp_sem.acquire().await.map_err(|_| {
+                    EvaluationError::InternalError("sample semaphore closed".into())
+                })?;
+                timing.sample_queue_wait_ms = samp_queue_start.elapsed().as_secs_f64() * 1000.0;
 
                 let samp_start = Instant::now();
                 let data = load_bucket_samples(&cached, &work).await?;
-                timing.sample_load_ms =
-                    samp_start.elapsed().as_secs_f64() * 1000.0;
+                timing.sample_load_ms = samp_start.elapsed().as_secs_f64() * 1000.0;
                 drop(_samp_permit);
 
                 Ok((idx, Some(data), timing))
@@ -1134,10 +1123,20 @@ mod tests {
             forward_index: Arc::new(forward_index),
         };
 
-        let plan = QueryPlan::for_subquery_vector_selector(0, 100_000, 10_000, 60_000, vec![TimeBucket::hour(100)]);
+        let plan = QueryPlan::for_subquery_vector_selector(
+            0,
+            100_000,
+            10_000,
+            60_000,
+            vec![TimeBucket::hour(100)],
+        );
 
         let work = build_bucket_sample_work(&plan, &metadata, false).unwrap();
-        assert_eq!(work.series.len(), 1, "lenient mode should skip missing spec");
+        assert_eq!(
+            work.series.len(),
+            1,
+            "lenient mode should skip missing spec"
+        );
         assert_eq!(work.series[0].series_id, 0);
     }
 
@@ -1252,14 +1251,12 @@ mod tests {
     fn pipeline_timings_metadata_only_bucket() {
         // A bucket that resolved metadata but had no matching series (no
         // sample work) should count toward metadata but not sample.
-        let bucket_timings = vec![
-            BucketTaskTiming {
-                metadata_queue_wait_ms: 0.5,
-                metadata_resolve_ms: 5.0,
-                sample_queue_wait_ms: 0.0,
-                sample_load_ms: 0.0,
-            },
-        ];
+        let bucket_timings = vec![BucketTaskTiming {
+            metadata_queue_wait_ms: 0.5,
+            metadata_resolve_ms: 5.0,
+            sample_queue_wait_ms: 0.0,
+            sample_load_ms: 0.0,
+        }];
 
         let timings = PipelineTimings::from_bucket_timings(&bucket_timings, 6.0, 0.5);
 
@@ -1354,9 +1351,7 @@ mod tests {
             promql_parser::parser::Expr::VectorSelector(vs) => vs,
             _ => panic!("expected vector selector"),
         };
-        let cache = std::sync::Arc::new(
-            crate::promql::evaluator::QueryReaderEvalCache::new(),
-        );
+        let cache = std::sync::Arc::new(crate::promql::evaluator::QueryReaderEvalCache::new());
         execute_selector_pipeline(reader, &cache, plan, &selector, concurrency).await
     }
 
@@ -1396,8 +1391,13 @@ mod tests {
         );
 
         // Use concurrency=4 to allow out-of-order completion
-        let concurrency = PipelineConcurrency { metadata: 4, samples: 4 };
-        let result = run_pipeline(&reader, &plan, "cpu", &concurrency).await.unwrap();
+        let concurrency = PipelineConcurrency {
+            metadata: 4,
+            samples: 4,
+        };
+        let result = run_pipeline(&reader, &plan, "cpu", &concurrency)
+            .await
+            .unwrap();
 
         match result {
             ExprResult::InstantVector(samples) => {
@@ -1414,14 +1414,15 @@ mod tests {
         // identical results.
         let reader = build_two_bucket_reader();
         let buckets = reader.list_buckets().await.unwrap();
-        let plan = QueryPlan::for_instant_vector(
-            12_200_000,
-            300_001,
-            buckets,
-        );
+        let plan = QueryPlan::for_instant_vector(12_200_000, 300_001, buckets);
 
-        let concurrency = PipelineConcurrency { metadata: 1, samples: 1 };
-        let result = run_pipeline(&reader, &plan, "cpu", &concurrency).await.unwrap();
+        let concurrency = PipelineConcurrency {
+            metadata: 1,
+            samples: 1,
+        };
+        let result = run_pipeline(&reader, &plan, "cpu", &concurrency)
+            .await
+            .unwrap();
 
         match result {
             ExprResult::InstantVector(samples) => {
@@ -1438,13 +1439,17 @@ mod tests {
         let buckets = reader.list_buckets().await.unwrap();
         // Range covers both buckets
         let plan = QueryPlan::for_matrix(
-            12_200_000,
-            7_000_000, // range back to ~5_200_000
+            12_200_000, 7_000_000, // range back to ~5_200_000
             buckets,
         );
 
-        let concurrency = PipelineConcurrency { metadata: 4, samples: 4 };
-        let result = run_pipeline(&reader, &plan, "cpu", &concurrency).await.unwrap();
+        let concurrency = PipelineConcurrency {
+            metadata: 4,
+            samples: 4,
+        };
+        let result = run_pipeline(&reader, &plan, "cpu", &concurrency)
+            .await
+            .unwrap();
 
         match result {
             ExprResult::RangeVector(samples) => {
@@ -1494,11 +1499,13 @@ mod tests {
         }
 
         fn forward_index_count(&self) -> usize {
-            self.forward_index_calls.load(std::sync::atomic::Ordering::SeqCst)
+            self.forward_index_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn inverted_index_count(&self) -> usize {
-            self.inverted_index_calls.load(std::sync::atomic::Ordering::SeqCst)
+            self.inverted_index_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn samples_count(&self) -> usize {
@@ -1518,7 +1525,8 @@ mod tests {
             series_ids: &[crate::model::SeriesId],
         ) -> crate::util::Result<Box<dyn crate::index::ForwardIndexLookup + Send + Sync + 'static>>
         {
-            self.forward_index_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.forward_index_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(&delay) = self.metadata_delays.get(bucket) {
                 tokio::time::sleep(delay).await;
             }
@@ -1531,7 +1539,8 @@ mod tests {
             terms: &[crate::model::Label],
         ) -> crate::util::Result<Box<dyn crate::index::InvertedIndexLookup + Send + Sync + 'static>>
         {
-            self.inverted_index_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inverted_index_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(&delay) = self.metadata_delays.get(bucket) {
                 tokio::time::sleep(delay).await;
             }
@@ -1561,11 +1570,14 @@ mod tests {
             start_ms: i64,
             end_ms: i64,
         ) -> crate::util::Result<Vec<crate::model::Sample>> {
-            self.samples_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.samples_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(&delay) = self.sample_delays.get(bucket) {
                 tokio::time::sleep(delay).await;
             }
-            self.inner.samples(bucket, series_id, start_ms, end_ms).await
+            self.inner
+                .samples(bucket, series_id, start_ms, end_ms)
+                .await
         }
     }
 
@@ -1579,7 +1591,10 @@ mod tests {
 
         let buckets = reader.list_buckets().await.unwrap();
         let plan = QueryPlan::for_instant_vector(12_200_000, 300_001, buckets);
-        let concurrency = PipelineConcurrency { metadata: 4, samples: 4 };
+        let concurrency = PipelineConcurrency {
+            metadata: 4,
+            samples: 4,
+        };
 
         let cache = std::sync::Arc::new(crate::promql::evaluator::QueryReaderEvalCache::new());
         let selector = match promql_parser::parser::parse("cpu").unwrap() {
@@ -1594,7 +1609,10 @@ mod tests {
         match result {
             ExprResult::InstantVector(samples) => {
                 assert_eq!(samples.len(), 1);
-                assert_eq!(samples[0].value, 2.0, "newer bucket must win despite finishing last");
+                assert_eq!(
+                    samples[0].value, 2.0,
+                    "newer bucket must win despite finishing last"
+                );
             }
             _ => panic!("expected InstantVector"),
         }
@@ -1615,7 +1633,10 @@ mod tests {
         let buckets = reader.list_buckets().await.unwrap();
         let plan = QueryPlan::for_instant_vector(12_200_000, 300_001, buckets);
         // metadata_concurrency=1 forces serial metadata, creating contention
-        let concurrency = PipelineConcurrency { metadata: 1, samples: 4 };
+        let concurrency = PipelineConcurrency {
+            metadata: 1,
+            samples: 4,
+        };
 
         let cache = std::sync::Arc::new(crate::promql::evaluator::QueryReaderEvalCache::new());
         let selector = match promql_parser::parser::parse("cpu").unwrap() {
@@ -1656,7 +1677,10 @@ mod tests {
 
         let buckets = reader.list_buckets().await.unwrap();
         let plan = QueryPlan::for_instant_vector(12_200_000, 300_001, buckets);
-        let concurrency = PipelineConcurrency { metadata: 4, samples: 1 };
+        let concurrency = PipelineConcurrency {
+            metadata: 4,
+            samples: 1,
+        };
 
         let cache = std::sync::Arc::new(crate::promql::evaluator::QueryReaderEvalCache::new());
         let selector = match promql_parser::parser::parse("cpu").unwrap() {

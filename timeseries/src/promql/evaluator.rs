@@ -74,9 +74,14 @@ impl QueryReaderEvalCache {
         }
     }
 
-    fn get_or_create_bucket(&self, bucket: &TimeBucket) -> dashmap::mapref::one::Ref<'_, TimeBucket, QueryReaderBucketEvalCache> {
+    fn get_or_create_bucket(
+        &self,
+        bucket: &TimeBucket,
+    ) -> dashmap::mapref::one::Ref<'_, TimeBucket, QueryReaderBucketEvalCache> {
         if !self.cache.contains_key(bucket) {
-            self.cache.entry(*bucket).or_insert_with(QueryReaderBucketEvalCache::new);
+            self.cache
+                .entry(*bucket)
+                .or_insert_with(QueryReaderBucketEvalCache::new);
         }
         self.cache.get(bucket).expect("bucket just inserted")
     }
@@ -88,7 +93,8 @@ impl QueryReaderEvalCache {
         forward_index: Box<dyn ForwardIndexLookup + Send + Sync + 'static>,
     ) {
         let bc = self.get_or_create_bucket(&bucket);
-        bc.forward_index_cache.insert(series_ids, forward_index.into());
+        bc.forward_index_cache
+            .insert(series_ids, forward_index.into());
     }
 
     pub(crate) fn get_forward_index(
@@ -97,7 +103,9 @@ impl QueryReaderEvalCache {
         series_ids: &[SeriesId],
     ) -> Option<Arc<dyn ForwardIndexLookup + Send + Sync + 'static>> {
         let bc = self.cache.get(bucket)?;
-        bc.forward_index_cache.get(series_ids).map(|v| v.value().clone())
+        bc.forward_index_cache
+            .get(series_ids)
+            .map(|v| v.value().clone())
     }
 
     pub(crate) fn cache_inverted_index(
@@ -116,7 +124,9 @@ impl QueryReaderEvalCache {
         terms: &[Label],
     ) -> Option<Arc<dyn InvertedIndexLookup + Send + Sync + 'static>> {
         let bc = self.cache.get(bucket)?;
-        bc.inverted_index_cache.get(terms).map(|v| v.value().clone())
+        bc.inverted_index_cache
+            .get(terms)
+            .map(|v| v.value().clone())
     }
 
     pub(crate) fn cache_samples(
@@ -418,8 +428,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             .await?;
 
         // Cache the full sample set, then filter the shared handle
-        self.cache
-            .cache_samples(*bucket, series_id, samples);
+        self.cache.cache_samples(*bucket, series_id, samples);
 
         let cached = self
             .cache
@@ -750,7 +759,10 @@ fn preload_ranges_inner(
 
 impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     pub(crate) fn new(reader: &'reader R) -> Self {
-        Self::with_concurrency(reader, crate::promql::pipeline::PipelineConcurrency::default())
+        Self::with_concurrency(
+            reader,
+            crate::promql::pipeline::PipelineConcurrency::default(),
+        )
     }
 
     pub(crate) fn with_concurrency(
@@ -938,7 +950,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             buckets,
         );
 
-        pipeline::execute_selector_pipeline(self.reader.raw_reader(), self.reader.shared_cache(), &plan, vector_selector, &self.concurrency).await
+        pipeline::execute_selector_pipeline(
+            self.reader.raw_reader(),
+            self.reader.shared_cache(),
+            &plan,
+            vector_selector,
+            &self.concurrency,
+        )
+        .await
     }
 
     async fn evaluate_subquery(
@@ -1086,7 +1105,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             buckets,
         );
 
-        pipeline::execute_selector_pipeline(self.reader.raw_reader(), self.reader.shared_cache(), &plan, vector_selector, &self.concurrency).await
+        pipeline::execute_selector_pipeline(
+            self.reader.raw_reader(),
+            self.reader.shared_cache(),
+            &plan,
+            vector_selector,
+            &self.concurrency,
+        )
+        .await
     }
 
     async fn evaluate_vector_selector(
@@ -1112,7 +1138,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let plan =
             QueryPlan::for_instant_vector(adjusted_eval_ts.as_millis(), lookback_delta_ms, buckets);
 
-        pipeline::execute_selector_pipeline(self.reader.raw_reader(), self.reader.shared_cache(), &plan, vector_selector, &self.concurrency).await
+        pipeline::execute_selector_pipeline(
+            self.reader.raw_reader(),
+            self.reader.shared_cache(),
+            &plan,
+            vector_selector,
+            &self.concurrency,
+        )
+        .await
     }
 
     /// Apply offset and @ modifiers to adjust the evaluation time.
