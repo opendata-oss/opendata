@@ -339,7 +339,11 @@ impl Ingestor {
         Self::with_object_store(config, object_store, clock)
     }
 
-    fn with_object_store(
+    /// Create a new ingestor using a pre-built object store.
+    ///
+    /// This is useful when you need to share an object store instance
+    /// between an `Ingestor` and a [`Collector`](crate::Collector) (e.g. in tests).
+    pub fn with_object_store(
         config: IngestorConfig,
         object_store: Arc<dyn ObjectStore>,
         clock: Arc<dyn Clock>,
