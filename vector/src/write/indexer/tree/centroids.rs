@@ -8,7 +8,7 @@ use rayon::iter::ParallelIterator;
 use rayon::prelude::IntoParallelIterator;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub(crate) struct IntermediatePostingsRead {
     /// The level the reads are for
@@ -107,13 +107,34 @@ pub(crate) trait CentroidReader: Send + Sync {
     ) -> Result<BoxFuture<'static, Result<PostingListValue>>>;
 }
 
+pub(crate) trait CentroidCache: Send + Sync {
+    fn root(&self, _epoch: u64) -> Option<Arc<PostingList>> {
+        None
+    }
+
+    fn posting(&self, centroid_id: u64, epoch: u64) -> Option<Arc<PostingList>> {
+        self.postings(&[centroid_id], epoch).first().cloned()
+    }
+
+    fn postings(&self, _centroid_ids: &[u64], _epoch: u64) -> Vec<Arc<PostingList>> {
+        Vec::new()
+    }
+}
+
 pub(crate) struct LeveledCentroidIndex<'a> {
+    centroid_cache: Arc<dyn CentroidCache + 'a>,
     reader: Arc<dyn CentroidReader + 'a>,
 }
 
 impl<'a> LeveledCentroidIndex<'a> {
-    pub(crate) fn new(reader: Arc<dyn CentroidReader + 'a>) -> Self {
-        Self { reader }
+    pub(crate) fn new(
+        centroid_cache: Arc<dyn CentroidCache + 'a>,
+        reader: Arc<dyn CentroidReader + 'a>
+    ) -> Self {
+        Self {
+            centroid_cache,
+            reader
+        }
     }
 }
 
@@ -188,6 +209,64 @@ impl CentroidReader for StoredCentroidReader {
         Ok(Box::pin(async move {
             snapshot.get_posting_list(centroid_id, dimensions).await
         }))
+    }
+}
+
+#[derive(Clone)]
+struct WrittenPostingList {
+    posting_list: Arc<PostingList>,
+    written_epoch: u64,
+}
+
+struct AllCentroidsCache {
+    inner: Arc<Mutex<AllCentroidsCacheInner>>,
+}
+
+impl CentroidCache for AllCentroidsCache {
+    fn root(&self, epoch: u64) -> Option<Arc<PostingList>> {
+        let root = self.inner.lock().expect("lock poisoned").root();
+        if epoch < root.written_epoch {
+            None
+        } else {
+            Some(root.posting_list.clone())
+        }
+    }
+
+    fn posting(&self, centroid_id: u64, epoch: u64) -> Option<Arc<PostingList>> {
+        self.postings(&[centroid_id], epoch).into_iter().next()
+    }
+
+    fn postings(&self, centroid_ids: &[u64], epoch: u64) -> Vec<Arc<PostingList>> {
+        self
+            .inner
+            .lock()
+            .expect("lock poisoned")
+            .postings(centroid_ids)
+            .into_iter()
+            .filter_map(|p| if epoch < p.written_epoch { None } else { Some(p.posting_list.clone()) })
+            .collect()
+    }
+}
+
+struct AllCentroidsCacheInner {
+    root: WrittenPostingList,
+    postings: HashMap<u64, WrittenPostingList>,
+}
+
+impl AllCentroidsCacheInner {
+    pub(crate) fn new(
+        root: WrittenPostingList,
+        postings: HashMap<u64, WrittenPostingList>,
+    ) -> Self {
+        Self { root, postings}
+    }
+
+    pub(crate) fn root(&self) -> WrittenPostingList {
+        self.root.clone()
+    }
+
+    pub(crate) fn postings(&self, centroids: &[u64]) -> Vec<WrittenPostingList> {
+        centroids.iter().filter_map(|c| self.postings.get(c)).cloned().collect()
     }
 }
 
