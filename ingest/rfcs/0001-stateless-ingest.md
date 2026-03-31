@@ -366,12 +366,26 @@ The queue manifest takes the name specified in `manifest_path`.
 
 The collector internally creates a queue consumer and an object store client from the configuration.
 
-A `CollectedBatch` contains the deserialized entries, the sequence number, and the location of the batch:
+A `CollectedBatch` contains the deserialized entries, the sequence number, the location of the batch,
+and the per-range metadata items attached by the ingestor(s):
 ```rust
 pub struct CollectedBatch {
     pub entries: Vec<Bytes>,
     pub sequence: u64,
     pub location: String,
+    pub metadata: Vec<Metadata>,
+}
+```
+
+The `Metadata` struct exposes the per-range metadata that ingestors attach to each batch:
+```rust
+pub struct Metadata {
+    /// Index of the first entry in the batch that this metadata range covers.
+    pub start_index: u32,
+    /// Wall-clock ingestion time in milliseconds since the Unix epoch.
+    pub ingestion_time_ms: i64,
+    /// Opaque metadata payload supplied by the caller of `Ingestor::ingest`.
+    pub payload: Bytes,
 }
 ```
 
@@ -489,6 +503,7 @@ None at this time.
 | 2026-03-11 | Changed queue metadata to per-range format with start_index and ingestion_time per metadata item |
 | 2026-03-11 | Replaced IngestEntry with ingest(entries: Vec\<Bytes\>, metadata: Bytes) |
 | 2026-03-30 | Added native compression support to data batch format |
+| 2026-03-30 | Added metadata field to CollectedBatch and documented public Metadata struct |
 
 
 
