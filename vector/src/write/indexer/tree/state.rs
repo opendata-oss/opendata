@@ -11,9 +11,7 @@ use crate::serde::key::{
 use crate::serde::posting_list::{PostingList, PostingListValue, PostingUpdate};
 use crate::serde::vector_data::{Field, VectorDataValue};
 use crate::storage::{VectorDbStorageReadExt, record};
-use crate::write::indexer::tree::centroids::{
-    CentroidReader, LeveledCentroidIndex, MaybeCached, StoredCentroidReader,
-};
+use crate::write::indexer::tree::centroids::{AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, CentroidReader, LeveledCentroidIndex, MaybeCached, StoredCentroidReader};
 use bytes::Bytes;
 use common::sequence::AllocatedSeqBlock;
 use common::storage::RecordOp;
@@ -34,6 +32,7 @@ pub(crate) struct VectorIndexState {
     sequence_block: AllocatedSeqBlock,
     centroid_sequence_block_key: Bytes,
     centroid_sequence_block: AllocatedSeqBlock,
+    centroid_cache: AllCentroidsCacheWriter,
 }
 
 impl VectorIndexState {
@@ -47,6 +46,7 @@ impl VectorIndexState {
         sequence_block: AllocatedSeqBlock,
         centroid_sequence_block_key: Bytes,
         centroid_sequence_block: AllocatedSeqBlock,
+        centroid_cache: AllCentroidsCacheWriter,
     ) -> Self {
         Self {
             dictionary,
@@ -58,6 +58,7 @@ impl VectorIndexState {
             sequence_block,
             centroid_sequence_block_key,
             centroid_sequence_block,
+            centroid_cache,
         }
     }
 
@@ -308,7 +309,12 @@ impl SearchIndexDelta {
             .insert(vector_id);
     }
 
-    pub(crate) fn freeze(self, state: &mut VectorIndexState, output_ops: &mut Vec<RecordOp>) {
+    pub(crate) fn freeze(
+        self,
+        epoch: u64,
+        state: &mut VectorIndexState,
+        output_ops: &mut Vec<RecordOp>
+    ) {
         let SearchIndexDelta {
             centroids_meta,
             upserted_centroids,
@@ -358,6 +364,8 @@ impl SearchIndexDelta {
         for (&centroid_id, centroid) in &upserted_centroids {
             state.centroids.insert(centroid_id, centroid.clone());
         }
+
+        state.centroid_cache.update_postings(epoch, todo!(), todo!(), todo!(), todo!());
 
         let (key, block) = id_allocator.freeze();
         state.centroid_sequence_block_key = key;
@@ -451,16 +459,16 @@ impl VectorIndexDelta {
         }
     }
 
-    pub(crate) fn freeze(self, state: &mut VectorIndexState) -> Vec<RecordOp> {
+    pub(crate) fn freeze(self, epoch: u64, state: &mut VectorIndexState) -> Vec<RecordOp> {
         let mut ops = vec![];
         self.forward_index.freeze(state, &mut ops);
-        self.search_index.freeze(state, &mut ops);
+        self.search_index.freeze(epoch, state, &mut ops);
         ops
     }
 }
 
 struct DirtyCentroidReader<'a> {
-    stored: StoredCentroidReader,
+    reader: CachedCentroidReader,
     delta: &'a SearchIndexDelta,
 }
 
@@ -492,7 +500,7 @@ impl<'a> CentroidReader for DirtyCentroidReader<'a> {
             let root = PostingListValue::from_posting_updates(root).expect("unreachable");
             MaybeCached::Value(Arc::new(root.into()))
         } else {
-            let stored = self.stored.clone();
+            let stored = self.reader.clone();
             let updates = self.delta.root_updates.clone();
             let root = stored.read_root();
             root.map(move |p| {
@@ -507,7 +515,7 @@ impl<'a> CentroidReader for DirtyCentroidReader<'a> {
 
     fn read_postings(&self, centroid_id: u64) -> MaybeCached<Arc<PostingList>> {
         let updates = self.delta.posting_updates.get(&centroid_id).cloned();
-        let stored = self.stored.clone();
+        let stored = self.reader.clone();
         let posting = stored.read_postings(centroid_id);
         posting.map(|p| {
             if let Some(updates) = updates {
@@ -594,13 +602,7 @@ impl<'a> VectorIndexView<'a> {
     }
 
     pub(crate) fn root_posting_list(&self, dimensions: usize) -> MaybeCached<Arc<PostingList>> {
-        let stored =
-            StoredCentroidReader::new(dimensions, self.snapshot.clone(), self.snapshot_epoch);
-        let reader = DirtyCentroidReader {
-            stored,
-            delta: &self.delta.search_index,
-        };
-        reader.read_root()
+        self.centroid_reader(dimensions).read_root()
     }
 
     pub(crate) fn posting_list(
@@ -608,13 +610,7 @@ impl<'a> VectorIndexView<'a> {
         centroid_id: u64,
         dimensions: usize,
     ) -> MaybeCached<Arc<PostingList>> {
-        let stored =
-            StoredCentroidReader::new(dimensions, self.snapshot.clone(), self.snapshot_epoch);
-        let reader = DirtyCentroidReader {
-            stored,
-            delta: &self.delta.search_index,
-        };
-        reader.read_postings(centroid_id)
+        self.centroid_reader(dimensions).read_postings(centroid_id)
     }
 
     /// The last written posting for the vector in this delta only
@@ -641,22 +637,28 @@ impl<'a> VectorIndexView<'a> {
         }
     }
 
+    fn centroid_reader(&self, dimensions: usize) -> DirtyCentroidReader<'a> {
+        let stored =
+            StoredCentroidReader::new(dimensions, self.snapshot.clone(), self.snapshot_epoch);
+        let cached_reader = CachedCentroidReader::new(
+            &(Arc::new(self.state.centroid_cache.cache()) as Arc<dyn CentroidCache>),
+            stored
+        );
+        DirtyCentroidReader {
+            reader: cached_reader,
+            delta: &self.delta.search_index,
+        }
+    }
+
     pub(crate) fn centroid_index(
         &self,
         dimensions: usize,
         distance_metric: DistanceMetric,
     ) -> LeveledCentroidIndex<'a> {
-        let stored =
-            StoredCentroidReader::new(dimensions, self.snapshot.clone(), self.snapshot_epoch);
-        let reader = DirtyCentroidReader {
-            stored,
-            delta: &self.delta.search_index,
-        };
-
         LeveledCentroidIndex::new(
             self.centroids_meta().depth as u16,
             distance_metric,
-            Arc::new(reader),
+            Arc::new(self.centroid_reader(dimensions)),
         )
     }
 }

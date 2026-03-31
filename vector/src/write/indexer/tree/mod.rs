@@ -91,7 +91,7 @@ impl Indexer {
         let split_root = SplitRoot::new(&self.opts, &snapshot, snapshot_epoch);
         split_root.execute(&mut delta, &self.state).await?;
 
-        let ops = delta.freeze(&mut self.state);
+        let ops = delta.freeze(update_epoch, &mut self.state);
         Ok((ops, stats))
     }
 
