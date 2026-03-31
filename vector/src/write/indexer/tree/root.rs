@@ -36,8 +36,7 @@ impl SplitRoot {
             return Ok(());
         }
 
-        let original_root_postings = view.root_posting_list(self.opts.dimensions)?.await?;
-        let original_root_postings: PostingList = original_root_postings.into();
+        let original_root_postings = view.root_posting_list(self.opts.dimensions).await?;
         let root_vecs: Vec<_> = original_root_postings
             .iter()
             .map(|p| (p.id(), p.vector()))
@@ -66,7 +65,7 @@ impl SplitRoot {
             let centroid_index = view.centroid_index(self.opts.dimensions);
             let mut updates_for_original_root_postings =
                 HashMap::with_capacity(original_root_postings.len());
-            for posting in &original_root_postings {
+            for posting in original_root_postings.iter() {
                 let mut original_c = view
                     .centroid(posting.id())
                     .expect("unexpected missing centroid")

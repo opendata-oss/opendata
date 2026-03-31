@@ -12,7 +12,7 @@ use std::sync::Arc;
 struct MergeCentroid {
     c: u64,
     c_info: CentroidInfoValue,
-    postings: PostingList,
+    postings: Arc<PostingList>,
 }
 
 pub(crate) struct MergeCentroids {
@@ -102,7 +102,7 @@ impl MergeCentroids {
                 assert_eq!(self.level + 1, self.depth);
                 delta.search_index.remove_from_root(merge.c);
             }
-            for p in merge.postings {
+            for p in merge.postings.iter() {
                 reassignments.push(ReassignVector {
                     level: self.level,
                     vector_id: p.id(),

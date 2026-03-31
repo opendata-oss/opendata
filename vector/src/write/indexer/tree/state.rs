@@ -336,19 +336,38 @@ struct DirtyCentroidReader<'a> {
     delta: &'a SearchIndexDelta,
 }
 
+impl <'a> DirtyCentroidReader<'a> {
+    fn apply_updates_to_posting(
+        posting_list: &PostingList,
+        updates: &[PostingUpdate]
+    ) -> Arc<PostingList> {
+        let mut all_updates = Vec::with_capacity(posting_list.len() + updates.len());
+        all_updates.extend(
+            posting_list
+            .iter()
+            .map(|p| PostingUpdate::append(p.id(), p.vector().to_vec()))
+        );
+        all_updates.extend(updates.iter().cloned());
+        Arc::new(PostingListValue::from_posting_updates(all_updates).expect("unreachable").into())
+    }
+}
+
 impl<'a> CentroidReader for DirtyCentroidReader<'a> {
-    fn read_root(&self) -> BoxFuture<'static, crate::Result<PostingListValue>> {
+    fn read_root(&self) -> BoxFuture<'static, Result<Arc<PostingList>>> {
         if let Some(root) = &self.delta.root {
             let mut root = root.clone();
             root.extend(self.delta.root_updates.iter().cloned());
-            Box::pin(async move { Ok(PostingListValue::from_posting_updates(root)?) })
+            Box::pin(async move { Ok(Arc::new(PostingListValue::from_posting_updates(root)?.into())) })
         } else {
             let stored = self.stored.clone();
             let updates = self.delta.root_updates.clone();
             Box::pin(async move {
-                let updates = PostingListValue::from_posting_updates(updates)?;
                 let root = stored.read_root().await?;
-                Ok(merge_decoded_posting_lists(vec![updates, root]))
+                if updates.is_empty() {
+                    return Ok(root);
+                }
+                let updated = Self::apply_updates_to_posting(root.as_ref(), &updates);
+                Ok(updated)
             })
         }
     }
@@ -356,16 +375,16 @@ impl<'a> CentroidReader for DirtyCentroidReader<'a> {
     fn read_postings(
         &self,
         centroid_id: u64,
-    ) -> Result<BoxFuture<'static, crate::Result<PostingListValue>>> {
-        // TODO: this is basically the same as the view below
-        let mut all_postings = Vec::with_capacity(2);
-        if let Some(current) = self.delta.posting_updates.get(&centroid_id) {
-            all_postings.push(PostingListValue::from_posting_updates(current.clone())?);
-        }
+    ) -> Result<BoxFuture<'static, crate::Result<Arc<PostingList>>>> {
+        let updates = self.delta.posting_updates.get(&centroid_id).cloned();
         let stored = self.stored.clone();
         Ok(Box::pin(async move {
-            all_postings.push(stored.read_postings(centroid_id)?.await?);
-            Ok(merge_decoded_posting_lists(all_postings).into())
+            let posting = stored.read_postings(centroid_id)?.await?;
+            if let Some(updates) = updates {
+                Ok(Self::apply_updates_to_posting(posting.as_ref(), &updates))
+            } else {
+                Ok(posting)
+            }
         }))
     }
 }
@@ -447,30 +466,28 @@ impl<'a> VectorIndexView<'a> {
     pub(crate) fn root_posting_list(
         &self,
         dimensions: usize,
-    ) -> Result<BoxFuture<'static, Result<PostingListValue>>> {
+    ) -> BoxFuture<'static, Result<Arc<PostingList>>> {
         let stored =
             StoredCentroidReader::new(dimensions, self.snapshot.clone(), self.snapshot_epoch);
         let reader = DirtyCentroidReader {
             stored,
             delta: &self.delta.search_index,
         };
-        Ok(reader.read_root())
+        reader.read_root()
     }
 
     pub(crate) fn posting_list(
         &self,
         centroid_id: u64,
         dimensions: usize,
-    ) -> Result<BoxFuture<'static, Result<PostingList>>> {
-        let mut all_postings = Vec::with_capacity(2);
-        if let Some(current) = self.delta.search_index.posting_updates.get(&centroid_id) {
-            all_postings.push(PostingListValue::from_posting_updates(current.clone())?);
-        }
-        let snapshot = self.snapshot.clone();
-        Ok(Box::pin(async move {
-            all_postings.push(snapshot.get_posting_list(centroid_id, dimensions).await?);
-            Ok(merge_decoded_posting_lists(all_postings).into())
-        }))
+    ) -> Result<BoxFuture<'static, Result<Arc<PostingList>>>> {
+        let stored =
+            StoredCentroidReader::new(dimensions, self.snapshot.clone(), self.snapshot_epoch);
+        let reader = DirtyCentroidReader {
+            stored,
+            delta: &self.delta.search_index,
+        };
+        reader.read_postings(centroid_id)
     }
 
     /// The last written posting for the vector in this delta only

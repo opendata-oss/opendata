@@ -99,12 +99,12 @@ pub(crate) trait CentroidIndex {
 }
 
 pub(crate) trait CentroidReader: Send + Sync {
-    fn read_root(&self) -> BoxFuture<'static, Result<PostingListValue>>;
+    fn read_root(&self) -> BoxFuture<'static, Result<Arc<PostingList>>>;
 
     fn read_postings(
         &self,
         centroid_id: u64,
-    ) -> Result<BoxFuture<'static, Result<PostingListValue>>>;
+    ) -> Result<BoxFuture<'static, Result<Arc<PostingList>>>>;
 }
 
 pub(crate) trait CentroidCache: Send + Sync {
@@ -122,17 +122,14 @@ pub(crate) trait CentroidCache: Send + Sync {
 }
 
 pub(crate) struct LeveledCentroidIndex<'a> {
-    centroid_cache: Arc<dyn CentroidCache + 'a>,
     reader: Arc<dyn CentroidReader + 'a>,
 }
 
 impl<'a> LeveledCentroidIndex<'a> {
     pub(crate) fn new(
-        centroid_cache: Arc<dyn CentroidCache + 'a>,
         reader: Arc<dyn CentroidReader + 'a>
     ) -> Self {
         Self {
-            centroid_cache,
             reader
         }
     }
@@ -194,21 +191,56 @@ impl StoredCentroidReader {
 }
 
 impl CentroidReader for StoredCentroidReader {
-    fn read_root(&self) -> BoxFuture<'static, Result<PostingListValue>> {
+    fn read_root(&self) -> BoxFuture<'static, Result<Arc<PostingList>>> {
         let snapshot = self.snapshot.clone();
         let dimensions = self.dimensions;
-        Box::pin(async move { snapshot.get_root_posting_list(dimensions).await })
+        Box::pin(async move { Ok(Arc::new(snapshot.get_root_posting_list(dimensions).await?.into())) })
     }
 
     fn read_postings(
         &self,
         centroid_id: u64,
-    ) -> Result<BoxFuture<'static, Result<PostingListValue>>> {
+    ) -> Result<BoxFuture<'static, Result<Arc<PostingList>>>> {
         let snapshot = self.snapshot.clone();
         let dimensions = self.dimensions;
         Ok(Box::pin(async move {
-            snapshot.get_posting_list(centroid_id, dimensions).await
+            Ok(Arc::new(snapshot.get_posting_list(centroid_id, dimensions).await?.into()))
         }))
+    }
+}
+
+struct CachedCentroidReader {
+    cache: Arc<dyn CentroidCache>,
+    inner: StoredCentroidReader
+}
+
+impl<'a> CachedCentroidReader {
+    pub(crate) fn new(
+        cache: &Arc<dyn CentroidCache>,
+        inner: StoredCentroidReader
+    ) -> Self {
+        Self {
+            cache: cache.clone(),
+            inner
+        }
+    }
+}
+
+impl CentroidReader for CachedCentroidReader {
+    fn read_root(&self) -> BoxFuture<'static, Result<Arc<PostingList>>> {
+        if let Some(root) = self.cache.root(self.inner.epoch) {
+            Box::pin(async move { Ok(root) })
+        } else {
+            self.inner.read_root()
+        }
+    }
+
+    fn read_postings(&self, centroid_id: u64) -> Result<BoxFuture<'static, Result<Arc<PostingList>>>> {
+        if let Some(postings) = self.cache.posting(centroid_id, self.inner.epoch) {
+            Ok(Box::pin(async move { Ok(postings) }))
+        } else {
+            self.inner.read_postings(centroid_id)
+        }
     }
 }
 

@@ -190,7 +190,7 @@ impl SplitCentroids {
             for c in postings_to_retrive {
                 let read_fut = view.posting_list(c, self.opts.dimensions)?;
                 posting_reads.push(Box::pin(async move { read_fut.await.map(|p| (c, p)) })
-                    as BoxFuture<'static, Result<(u64, PostingList)>>);
+                    as BoxFuture<'static, Result<(u64, Arc<PostingList>)>>);
             }
             let results = AsyncBatchDriver::execute(posting_reads).await;
             let mut postings = HashMap::new();
@@ -308,7 +308,7 @@ struct SplitCentroid {
 }
 
 impl SplitCentroid {
-    fn execute(self, postings: Arc<HashMap<u64, PostingList>>) -> SplitResult {
+    fn execute(self, postings: Arc<HashMap<u64, Arc<PostingList>>>) -> SplitResult {
         let c_postings = postings
             .get(&self.c)
             .expect("unexpected missing postings for c");
@@ -422,7 +422,7 @@ impl SplitCentroid {
         c_vector: &[f32],
         c0_vector: &[f32],
         c1_vector: &[f32],
-        postings: &HashMap<u64, PostingList>,
+        postings: &HashMap<u64, Arc<PostingList>>,
         level: u16,
     ) -> Vec<ReassignVector> {
         let mut reassignments: Vec<ReassignVector> = Vec::new();
