@@ -2,6 +2,12 @@
 name = "opendata-ingest"
 version.workspace = true
 edition.workspace = true
+description = "Stateless object storage ingestion library for OpenData systems"
+license = "MIT"
+repository = "https://github.com/opendata-oss/opendata"
+readme = "README.md"
+keywords = ["database", "ingest", "batching", "streaming"]
+categories = ["database"]
 
 [lib]
 name = "ingest"
