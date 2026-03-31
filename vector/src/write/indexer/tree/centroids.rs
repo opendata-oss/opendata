@@ -1,7 +1,7 @@
 use crate::Result;
 use crate::math::distance::{VectorDistance, compute_distance};
 use crate::serde::collection_meta::DistanceMetric;
-use crate::serde::posting_list::{PostingList, PostingUpdate};
+use crate::serde::posting_list::{PostingList, PostingListValue, PostingUpdate};
 use crate::storage::VectorDbStorageReadExt;
 use crate::write::indexer::drivers::AsyncBatchDriver;
 use common::StorageRead;
@@ -492,7 +492,7 @@ pub(crate) struct AllCentroidsCacheWriter {
 impl AllCentroidsCacheWriter {
     pub(crate) fn new(
         root_posting_list: Arc<PostingList>,
-        centroid_postings: Vec<(u64, Arc<PostingList>)>
+        centroid_postings: Vec<(u64, Arc<PostingList>)>,
     ) -> Self {
         let root = WrittenPostingList {
             written_epoch: 0,
@@ -500,18 +500,18 @@ impl AllCentroidsCacheWriter {
         };
         let postings = centroid_postings
             .into_iter()
-            .map(|(centroid_id, posting_list)| (
-                centroid_id,
-                WrittenPostingList { written_epoch: 0, posting_list },
-            ))
+            .map(|(centroid_id, posting_list)| {
+                (
+                    centroid_id,
+                    WrittenPostingList {
+                        written_epoch: 0,
+                        posting_list,
+                    },
+                )
+            })
             .collect();
-        let inner = Arc::new(Mutex::new(AllCentroidsCacheInner {
-            root,
-            postings,
-        }));
-        Self {
-            inner
-        }
+        let inner = Arc::new(Mutex::new(AllCentroidsCacheInner { root, postings }));
+        Self { inner }
     }
 
     pub(crate) fn update_postings(
@@ -520,15 +520,74 @@ impl AllCentroidsCacheWriter {
         root: Option<Vec<PostingUpdate>>,
         root_updates: Vec<PostingUpdate>,
         centroid_postings: Vec<(u64, Vec<PostingUpdate>)>,
-        deleted_centroids: Vec<u64>
+        deleted_centroids: &HashSet<u64>,
     ) {
-        let inner = self.inner.lock().expect("lock poisoned");
-        // if root is set, overwrite current root
-        // apply all root updates to root
-        // for each centroid in centroid_postings, look up the centroid in cache. If its not there,
-        //   then initialize it with its posting updates, otherwise apply its posting updates
-        // delete any deleted centroids
-        todo!("update all postings")
+        fn apply_updates(
+            posting_list: Option<&Arc<PostingList>>,
+            updates: Vec<PostingUpdate>,
+        ) -> Arc<PostingList> {
+            let Some(posting_list) = posting_list else {
+                return Arc::new(
+                    PostingListValue::from_posting_updates(updates)
+                        .expect("posting updates should always encode")
+                        .into(),
+                );
+            };
+
+            let mut all_updates = Vec::with_capacity(posting_list.len() + updates.len());
+            all_updates.extend(
+                posting_list
+                    .iter()
+                    .map(|p| PostingUpdate::append(p.id(), p.vector().to_vec())),
+            );
+            all_updates.extend(updates);
+            Arc::new(
+                PostingListValue::from_posting_updates(all_updates)
+                    .expect("posting updates should always encode")
+                    .into(),
+            )
+        }
+
+        let mut inner = self.inner.lock().expect("lock poisoned");
+
+        if root.is_some() || !root_updates.is_empty() {
+            let root = if let Some(root) = root {
+                apply_updates(None, root)
+            } else {
+                inner.root.posting_list.clone()
+            };
+            let root = if root_updates.is_empty() {
+                root
+            } else {
+                apply_updates(Some(&root), root_updates)
+            };
+            inner.root = WrittenPostingList {
+                posting_list: root,
+                written_epoch: epoch,
+            };
+        }
+
+        for (centroid_id, updates) in centroid_postings {
+            let posting_list = inner
+                .postings
+                .get(&centroid_id)
+                .map(|p| p.posting_list.clone());
+            let posting_list = apply_updates(
+                posting_list.as_ref(),
+                updates
+            );
+            inner.postings.insert(
+                centroid_id,
+                WrittenPostingList {
+                    posting_list,
+                    written_epoch: epoch,
+                },
+            );
+        }
+
+        for centroid_id in deleted_centroids {
+            inner.postings.remove(&centroid_id);
+        }
     }
 
     pub(crate) fn cache(&self) -> AllCentroidsCache {

@@ -11,7 +11,10 @@ use crate::serde::key::{
 use crate::serde::posting_list::{PostingList, PostingListValue, PostingUpdate};
 use crate::serde::vector_data::{Field, VectorDataValue};
 use crate::storage::{VectorDbStorageReadExt, record};
-use crate::write::indexer::tree::centroids::{AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, CentroidReader, LeveledCentroidIndex, MaybeCached, StoredCentroidReader};
+use crate::write::indexer::tree::centroids::{
+    AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, CentroidReader,
+    LeveledCentroidIndex, MaybeCached, StoredCentroidReader,
+};
 use bytes::Bytes;
 use common::sequence::AllocatedSeqBlock;
 use common::storage::RecordOp;
@@ -313,7 +316,7 @@ impl SearchIndexDelta {
         self,
         epoch: u64,
         state: &mut VectorIndexState,
-        output_ops: &mut Vec<RecordOp>
+        output_ops: &mut Vec<RecordOp>,
     ) {
         let SearchIndexDelta {
             centroids_meta,
@@ -365,7 +368,25 @@ impl SearchIndexDelta {
             state.centroids.insert(centroid_id, centroid.clone());
         }
 
-        state.centroid_cache.update_postings(epoch, todo!(), todo!(), todo!(), todo!());
+        let cache_posting_updates = posting_updates
+            .iter()
+            .filter_map(|(&centroid_id, updates)| {
+                state.centroids.get(&centroid_id).and_then(|centroid| {
+                    if centroid.level > 0 {
+                        Some((centroid_id, updates.clone()))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        state.centroid_cache.update_postings(
+            epoch,
+            root.clone(),
+            root_updates.clone(),
+            cache_posting_updates,
+            &deleted_centroids
+        );
 
         let (key, block) = id_allocator.freeze();
         state.centroid_sequence_block_key = key;
@@ -642,7 +663,7 @@ impl<'a> VectorIndexView<'a> {
             StoredCentroidReader::new(dimensions, self.snapshot.clone(), self.snapshot_epoch);
         let cached_reader = CachedCentroidReader::new(
             &(Arc::new(self.state.centroid_cache.cache()) as Arc<dyn CentroidCache>),
-            stored
+            stored,
         );
         DirtyCentroidReader {
             reader: cached_reader,
