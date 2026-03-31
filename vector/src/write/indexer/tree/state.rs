@@ -385,7 +385,7 @@ impl SearchIndexDelta {
             root.clone(),
             root_updates.clone(),
             cache_posting_updates,
-            &deleted_centroids
+            &deleted_centroids,
         );
 
         let (key, block) = id_allocator.freeze();

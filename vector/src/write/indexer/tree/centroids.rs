@@ -572,10 +572,7 @@ impl AllCentroidsCacheWriter {
                 .postings
                 .get(&centroid_id)
                 .map(|p| p.posting_list.clone());
-            let posting_list = apply_updates(
-                posting_list.as_ref(),
-                updates
-            );
+            let posting_list = apply_updates(posting_list.as_ref(), updates);
             inner.postings.insert(
                 centroid_id,
                 WrittenPostingList {
@@ -716,7 +713,7 @@ mod tests {
     use crate::serde::posting_list::{PostingListValue, PostingUpdate};
     use common::storage::in_memory::InMemoryStorage;
     use common::{Record, Storage, StorageRead};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn should_score_and_rank_l2_postings() {
@@ -759,6 +756,15 @@ mod tests {
     const ROOT_POSTING_ID: u64 = 0;
     const DIMS: usize = 2;
 
+    fn posting_list(postings: Vec<(u64, Vec<f32>)>) -> Arc<PostingList> {
+        Arc::new(
+            postings
+                .into_iter()
+                .map(|(id, vector)| Posting::new(id, vector))
+                .collect(),
+        )
+    }
+
     fn posting_list_value(postings: Vec<(u64, Vec<f32>)>) -> PostingListValue {
         PostingListValue::from_posting_updates(
             postings
@@ -767,6 +773,15 @@ mod tests {
                 .collect(),
         )
         .unwrap()
+    }
+
+    fn assert_posting_list_eq(actual: Arc<PostingList>, expected: Vec<(u64, Vec<f32>)>) {
+        let expected = posting_list(expected);
+        assert_eq!(actual.as_ref(), expected.as_ref());
+    }
+
+    fn empty_deleted_centroids() -> HashSet<u64> {
+        HashSet::new()
     }
 
     async fn put_posting_list(
@@ -1191,5 +1206,182 @@ mod tests {
         // then
         assert_eq!(results["x"], expected_x);
         assert_eq!(results["y"], expected_y);
+    }
+
+    #[test]
+    fn should_update_cached_root_posting() {
+        // given
+        let writer = AllCentroidsCacheWriter::new(
+            posting_list(vec![(1, vec![1.0, 0.0]), (2, vec![2.0, 0.0])]),
+            vec![],
+        );
+
+        // when
+        writer.update_postings(
+            5,
+            None,
+            vec![
+                PostingUpdate::delete(1),
+                PostingUpdate::append(3, vec![3.0, 0.0]),
+            ],
+            vec![],
+            &empty_deleted_centroids(),
+        );
+
+        // then
+        let cache = writer.cache();
+        assert!(cache.root(4).is_none());
+        assert_posting_list_eq(
+            cache.root(5).expect("root should be cached"),
+            vec![(2, vec![2.0, 0.0]), (3, vec![3.0, 0.0])],
+        );
+    }
+
+    #[test]
+    fn should_overwrite_cached_root_with_new_root() {
+        // given
+        let writer = AllCentroidsCacheWriter::new(
+            posting_list(vec![(1, vec![1.0, 0.0]), (2, vec![2.0, 0.0])]),
+            vec![],
+        );
+
+        // when
+        writer.update_postings(
+            5,
+            Some(vec![
+                PostingUpdate::append(10, vec![10.0, 0.0]),
+                PostingUpdate::append(11, vec![11.0, 0.0]),
+            ]),
+            vec![],
+            vec![],
+            &empty_deleted_centroids(),
+        );
+
+        // then
+        let cache = writer.cache();
+        assert_posting_list_eq(
+            cache.root(5).expect("root should be cached"),
+            vec![(10, vec![10.0, 0.0]), (11, vec![11.0, 0.0])],
+        );
+    }
+
+    #[test]
+    fn should_apply_updates_to_new_root() {
+        // given
+        let writer = AllCentroidsCacheWriter::new(posting_list(vec![(1, vec![1.0, 0.0])]), vec![]);
+
+        // when
+        writer.update_postings(
+            5,
+            Some(vec![
+                PostingUpdate::append(10, vec![10.0, 0.0]),
+                PostingUpdate::append(11, vec![11.0, 0.0]),
+            ]),
+            vec![
+                PostingUpdate::delete(10),
+                PostingUpdate::append(12, vec![12.0, 0.0]),
+            ],
+            vec![],
+            &empty_deleted_centroids(),
+        );
+
+        // then
+        let cache = writer.cache();
+        assert_posting_list_eq(
+            cache.root(5).expect("root should be cached"),
+            vec![(11, vec![11.0, 0.0]), (12, vec![12.0, 0.0])],
+        );
+    }
+
+    #[test]
+    fn should_add_new_cached_centroid_posting() {
+        // given
+        let writer = AllCentroidsCacheWriter::new(posting_list(vec![]), vec![]);
+
+        // when
+        writer.update_postings(
+            5,
+            None,
+            vec![],
+            vec![(
+                100,
+                vec![
+                    PostingUpdate::append(1, vec![1.0, 0.0]),
+                    PostingUpdate::append(2, vec![2.0, 0.0]),
+                ],
+            )],
+            &empty_deleted_centroids(),
+        );
+
+        // then
+        let cache = writer.cache();
+        assert_posting_list_eq(
+            cache.posting(100, 5).expect("centroid should be cached"),
+            vec![(1, vec![1.0, 0.0]), (2, vec![2.0, 0.0])],
+        );
+    }
+
+    #[test]
+    fn should_apply_updates_to_cached_centroid_posting() {
+        // given
+        let writer = AllCentroidsCacheWriter::new(
+            posting_list(vec![]),
+            vec![(
+                100,
+                posting_list(vec![(1, vec![1.0, 0.0]), (2, vec![2.0, 0.0])]),
+            )],
+        );
+
+        // when
+        writer.update_postings(
+            5,
+            None,
+            vec![],
+            vec![(
+                100,
+                vec![
+                    PostingUpdate::delete(1),
+                    PostingUpdate::append(3, vec![3.0, 0.0]),
+                ],
+            )],
+            &empty_deleted_centroids(),
+        );
+
+        // then
+        let cache = writer.cache();
+        assert_posting_list_eq(
+            cache.posting(100, 5).expect("centroid should be cached"),
+            vec![(2, vec![2.0, 0.0]), (3, vec![3.0, 0.0])],
+        );
+    }
+
+    #[test]
+    fn should_apply_updates_when_adding_new_cached_centroid_posting() {
+        // given
+        let writer = AllCentroidsCacheWriter::new(posting_list(vec![]), vec![]);
+
+        // when
+        writer.update_postings(
+            5,
+            None,
+            vec![],
+            vec![(
+                100,
+                vec![
+                    PostingUpdate::append(1, vec![1.0, 0.0]),
+                    PostingUpdate::append(2, vec![2.0, 0.0]),
+                    PostingUpdate::delete(1),
+                    PostingUpdate::append(3, vec![3.0, 0.0]),
+                ],
+            )],
+            &empty_deleted_centroids(),
+        );
+
+        // then
+        let cache = writer.cache();
+        assert_posting_list_eq(
+            cache.posting(100, 5).expect("centroid should be cached"),
+            vec![(2, vec![2.0, 0.0]), (3, vec![3.0, 0.0])],
+        );
     }
 }
