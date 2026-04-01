@@ -108,8 +108,7 @@ impl QueryReader for ReaderQueryReader {
         let mini = self.mini_readers.get(bucket).ok_or_else(|| {
             crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
         })?;
-        mini.samples(series_id, metric_name, start_ms, end_ms)
-            .await
+        mini.samples(series_id, metric_name, start_ms, end_ms).await
     }
 }
 
