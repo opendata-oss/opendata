@@ -786,8 +786,8 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
     // concurrency knobs (metadata / samples) only size the read-permit
     // semaphores on the shared cache.
     let num_buckets = plan.buckets.len();
-    let metadata_stage_width = num_buckets.min(METADATA_STAGE_READAHEAD).max(1);
-    let sample_stage_width = num_buckets.min(SAMPLE_STAGE_READAHEAD).max(1);
+    let metadata_stage_width = num_buckets.clamp(1, METADATA_STAGE_READAHEAD);
+    let sample_stage_width = num_buckets.clamp(1, SAMPLE_STAGE_READAHEAD);
 
     let metadata_jobs: Vec<_> = plan
         .buckets
