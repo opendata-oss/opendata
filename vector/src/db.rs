@@ -25,7 +25,7 @@ use crate::serde::key::{
     CentroidInfoKey, CentroidSeqBlockKey, CentroidStatsKey, CentroidsKey, PostingListKey,
     SeqBlockKey,
 };
-use crate::serde::posting_list::{PostingList, PostingListValue, PostingUpdate};
+use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
 use crate::write::delta::{VectorDbWrite, VectorDbWriteDelta, VectorWrite};
@@ -36,6 +36,7 @@ use crate::write::indexer::tree::centroids::{
     AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex,
     StoredCentroidReader,
 };
+use crate::write::indexer::tree::posting_list::{IntoTreePostingList, PostingList};
 use crate::write::indexer::tree::state::VectorIndexState;
 use async_trait::async_trait;
 use common::Record;
@@ -377,8 +378,8 @@ impl VectorDb {
             .get_centroids_meta()
             .await?
             .ok_or_else(|| Error::Storage("missing centroid tree metadata".to_string()))?;
-        let root_posting_list: PostingList =
-            snapshot.get_root_posting_list(dimensions).await?.into();
+        let root_posting_list =
+            PostingList::from_value(snapshot.get_root_posting_list(dimensions).await?);
         let centroids: HashMap<u64, CentroidInfoValue> = snapshot
             .scan_all_centroid_info()
             .await?
@@ -396,15 +397,21 @@ impl VectorDb {
             .filter_map(|(centroid_id, posting_list)| {
                 centroids.get(&centroid_id).and_then(|centroid| {
                     if centroid.level > 0 {
-                        Some((centroid_id, Arc::new(PostingList::from(posting_list))))
+                        Some((
+                            centroid_id,
+                            Arc::new(PostingList::from_value(posting_list))
+                                as Arc<dyn IntoTreePostingList>,
+                        ))
                     } else {
                         None
                     }
                 })
             })
             .collect();
-        let centroid_cache =
-            AllCentroidsCacheWriter::new(Arc::new(root_posting_list.clone()), centroid_postings);
+        let centroid_cache = AllCentroidsCacheWriter::new(
+            Arc::new(root_posting_list.clone()) as Arc<dyn IntoTreePostingList>,
+            centroid_postings,
+        );
         let cache = Arc::new(centroid_cache.cache()) as Arc<dyn CentroidCache>;
         let reader = Arc::new(CachedCentroidReader::new(
             &cache,

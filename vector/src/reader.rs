@@ -16,6 +16,7 @@ use crate::write::indexer::tree::centroids::{
     AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex,
     StoredCentroidReader,
 };
+use crate::write::indexer::tree::posting_list::{IntoTreePostingList, PostingList};
 use async_trait::async_trait;
 use common::StorageSemantics;
 use common::storage::factory::{StorageReaderRuntime, create_storage_read};
@@ -64,7 +65,8 @@ impl VectorDbReader {
                     .to_string(),
             ));
         }
-        let root_posting_list = storage.get_root_posting_list(dimensions).await?.into();
+        let root_posting_list =
+            PostingList::from_value(storage.get_root_posting_list(dimensions).await?);
         let centroids: HashMap<_, _> = storage
             .scan_all_centroid_info()
             .await?
@@ -77,15 +79,21 @@ impl VectorDbReader {
             .filter_map(|(centroid_id, posting_list)| {
                 centroids.get(&centroid_id).and_then(|centroid| {
                     if centroid.level > 0 {
-                        Some((centroid_id, Arc::new(posting_list.into())))
+                        Some((
+                            centroid_id,
+                            Arc::new(PostingList::from_value(posting_list))
+                                as Arc<dyn IntoTreePostingList>,
+                        ))
                     } else {
                         None
                     }
                 })
             })
             .collect();
-        let centroid_cache =
-            AllCentroidsCacheWriter::new(Arc::new(root_posting_list), centroid_postings);
+        let centroid_cache = AllCentroidsCacheWriter::new(
+            Arc::new(root_posting_list) as Arc<dyn IntoTreePostingList>,
+            centroid_postings,
+        );
         let cache = Arc::new(centroid_cache.cache()) as Arc<dyn CentroidCache>;
         let reader = Arc::new(CachedCentroidReader::new(
             &cache,

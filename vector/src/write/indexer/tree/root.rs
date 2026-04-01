@@ -1,6 +1,6 @@
 use crate::Result;
-use crate::serde::posting_list::{Posting, PostingList};
 use crate::write::indexer::tree::IndexerOpts;
+use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use common::StorageRead;
 use std::collections::HashMap;

@@ -16,11 +16,11 @@ use tracing::{debug, debug_span};
 
 pub(crate) mod centroids;
 mod merge;
+pub(crate) mod posting_list;
 mod root;
 mod split;
 pub(crate) mod state;
 mod vector;
-mod posting_list;
 
 #[derive(Debug, Default)]
 pub(crate) struct IndexerStats {

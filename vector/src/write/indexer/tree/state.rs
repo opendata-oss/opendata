@@ -8,13 +8,14 @@ use crate::serde::collection_meta::DistanceMetric;
 use crate::serde::key::{
     CentroidInfoKey, CentroidStatsKey, CentroidsKey, PostingListKey, VectorDataKey,
 };
-use crate::serde::posting_list::{PostingList, PostingListValue, PostingUpdate};
+use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_data::{Field, VectorDataValue};
 use crate::storage::{VectorDbStorageReadExt, record};
 use crate::write::indexer::tree::centroids::{
     AllCentroidsCache, AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache,
     CentroidReader, LeveledCentroidIndex, MaybeCached, StoredCentroidReader,
 };
+use crate::write::indexer::tree::posting_list::PostingList;
 use bytes::Bytes;
 use common::sequence::AllocatedSeqBlock;
 use common::storage::RecordOp;
@@ -502,18 +503,7 @@ impl<'a> DirtyCentroidReader<'a> {
         posting_list: &PostingList,
         updates: &[PostingUpdate],
     ) -> Arc<PostingList> {
-        let mut all_updates = Vec::with_capacity(posting_list.len() + updates.len());
-        all_updates.extend(
-            posting_list
-                .iter()
-                .map(|p| PostingUpdate::append(p.id(), p.vector().to_vec())),
-        );
-        all_updates.extend(updates.iter().cloned());
-        Arc::new(
-            PostingListValue::from_posting_updates(all_updates)
-                .expect("unreachable")
-                .into(),
-        )
+        Arc::new(posting_list.update_in_place(updates.to_vec()))
     }
 }
 
@@ -523,7 +513,7 @@ impl<'a> CentroidReader for DirtyCentroidReader<'a> {
             let mut root = root.clone();
             root.extend(self.delta.root_updates.iter().cloned());
             let root = PostingListValue::from_posting_updates(root).expect("unreachable");
-            MaybeCached::Value(Arc::new(root.into()))
+            MaybeCached::Value(Arc::new(PostingList::from_value(root)))
         } else {
             let stored = self.reader.clone();
             let updates = self.delta.root_updates.clone();
@@ -542,7 +532,7 @@ impl<'a> CentroidReader for DirtyCentroidReader<'a> {
         let updates = self.delta.posting_updates.get(&centroid_id).cloned();
         let stored = self.reader.clone();
         let posting = stored.read_postings(centroid_id);
-        posting.map(|p| {
+        posting.map(move |p| {
             if let Some(updates) = updates {
                 Self::apply_updates_to_posting(p.as_ref(), &updates)
             } else {

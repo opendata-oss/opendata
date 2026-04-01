@@ -133,7 +133,7 @@ mod tests {
     use crate::serde::centroid_info::CentroidInfoValue;
     use crate::serde::collection_meta::DistanceMetric;
     use crate::serde::key::{IdDictionaryKey, VectorDataKey};
-    use crate::serde::posting_list::{Posting, PostingList};
+    use crate::serde::posting_list::Posting;
     use crate::serde::vector_data::VectorDataValue;
     use crate::storage::merge_operator::VectorDbMergeOperator;
     use crate::write::delta::VectorDbDeltaView;
@@ -143,6 +143,7 @@ mod tests {
         AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex,
         StoredCentroidReader,
     };
+    use crate::write::indexer::tree::posting_list::{IntoTreePostingList, PostingList};
     use crate::write::indexer::tree::state::VectorIndexState;
     use common::coordinator::Flusher;
     use common::storage::in_memory::{FailingStorage, InMemoryStorage};
@@ -178,7 +179,8 @@ mod tests {
         let (seq_block_key, seq_block) = id_allocator.freeze();
         let (centroid_seq_block_key, centroid_seq_block) = centroid_id_allocator.freeze();
         let centroid_cache = AllCentroidsCacheWriter::new(
-            Arc::new(PostingList::from(vec![Posting::new(1, vec![0.0; DIMS])])),
+            Arc::new(PostingList::from(vec![Posting::new(1, vec![0.0; DIMS])]))
+                as Arc<dyn IntoTreePostingList>,
             vec![],
         );
         let state = VectorIndexState::new(

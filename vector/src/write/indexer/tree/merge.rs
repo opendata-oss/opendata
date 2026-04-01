@@ -1,8 +1,8 @@
 use crate::Result;
 use crate::serde::centroid_info::CentroidInfoValue;
-use crate::serde::posting_list::PostingList;
 use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::tree::IndexerOpts;
+use crate::write::indexer::tree::posting_list::PostingList;
 use crate::write::indexer::tree::split::ReassignVector;
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use common::StorageRead;

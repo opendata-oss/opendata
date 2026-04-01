@@ -1,9 +1,9 @@
 use crate::math::{distance, heuristics, kmeans};
 use crate::serde::centroid_info::CentroidInfoValue;
-use crate::serde::posting_list::{Posting, PostingList};
 use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::tree::IndexerOpts;
 use crate::write::indexer::tree::centroids::batch_search_centroids_up_to_level;
+use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use crate::{DistanceMetric, Result};
 use common::StorageRead;
@@ -339,8 +339,8 @@ impl SplitCentroid {
         let clustering = kmeans::for_metric(self.distance_metric);
         let (c0_vector, c1_vector) = clustering.two_means(&c_vector_refs, self.dimensions);
         // Assign each vector to closer centroid
-        let mut c0_postings = Vec::new();
-        let mut c1_postings = Vec::new();
+        let mut c0_postings = PostingList::with_capacity(c_vectors.len());
+        let mut c1_postings = PostingList::with_capacity(c_vectors.len());
         for (id, vector) in &c_vectors {
             let d0 = distance::compute_distance(vector, &c0_vector, self.distance_metric);
             let d1 = distance::compute_distance(vector, &c1_vector, self.distance_metric);
@@ -366,7 +366,7 @@ impl SplitCentroid {
         let mut reassignments = Vec::with_capacity(c0_postings.len() + c1_postings.len());
         reassignments.extend(self.compute_split_reassignments(
             self.c,
-            c_postings,
+            c_postings.as_ref(),
             &self.c_info.vector,
             &c0_vector,
             &c1_vector,
@@ -395,7 +395,7 @@ impl SplitCentroid {
     fn compute_split_reassignments(
         &self,
         centroid_id: u64,
-        postings: &[Posting],
+        postings: &PostingList,
         c_vector: &[f32],
         c0_vector: &[f32],
         c1_vector: &[f32],
@@ -406,7 +406,7 @@ impl SplitCentroid {
         // its nearest centroid. If the nearest centroid is not c0 or c1, then include in
         // the reassignment set.
         let mut reassignments = Vec::with_capacity(postings.len());
-        for p in postings {
+        for p in postings.iter() {
             if !heuristics::split_heuristic(
                 p.vector(),
                 c_vector,

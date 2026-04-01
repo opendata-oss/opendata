@@ -1,9 +1,10 @@
 use crate::Result;
 use crate::math::distance::{VectorDistance, compute_distance};
 use crate::serde::collection_meta::DistanceMetric;
-use crate::serde::posting_list::{PostingList, PostingListValue, PostingUpdate};
+use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::storage::VectorDbStorageReadExt;
 use crate::write::indexer::drivers::AsyncBatchDriver;
+use crate::write::indexer::tree::posting_list::{IntoTreePostingList, Posting, PostingList};
 use common::StorageRead;
 use futures::future::BoxFuture;
 use rayon::iter::ParallelIterator;
@@ -434,9 +435,9 @@ impl CentroidReader for StoredCentroidReader {
         let snapshot = self.snapshot.clone();
         let dimensions = self.dimensions;
         MaybeCached::Future(Box::pin(async move {
-            Ok(Arc::new(
-                snapshot.get_root_posting_list(dimensions).await?.into(),
-            ))
+            Ok(Arc::new(PostingList::from_value(
+                snapshot.get_root_posting_list(dimensions).await?,
+            )))
         }))
     }
 
@@ -444,12 +445,9 @@ impl CentroidReader for StoredCentroidReader {
         let snapshot = self.snapshot.clone();
         let dimensions = self.dimensions;
         MaybeCached::Future(Box::pin(async move {
-            Ok(Arc::new(
-                snapshot
-                    .get_posting_list(centroid_id, dimensions)
-                    .await?
-                    .into(),
-            ))
+            Ok(Arc::new(PostingList::from_value(
+                snapshot.get_posting_list(centroid_id, dimensions).await?,
+            )))
         }))
     }
 }
@@ -534,12 +532,12 @@ pub(crate) struct AllCentroidsCacheWriter {
 
 impl AllCentroidsCacheWriter {
     pub(crate) fn new(
-        root_posting_list: Arc<PostingList>,
-        centroid_postings: Vec<(u64, Arc<PostingList>)>,
+        root_posting_list: Arc<dyn IntoTreePostingList>,
+        centroid_postings: Vec<(u64, Arc<dyn IntoTreePostingList>)>,
     ) -> Self {
         let root = WrittenPostingList {
             written_epoch: 0,
-            posting_list: root_posting_list,
+            posting_list: Arc::new(root_posting_list.clone_into_tree()),
         };
         let postings = centroid_postings
             .into_iter()
@@ -548,7 +546,7 @@ impl AllCentroidsCacheWriter {
                     centroid_id,
                     WrittenPostingList {
                         written_epoch: 0,
-                        posting_list,
+                        posting_list: Arc::new(posting_list.clone_into_tree()),
                     },
                 )
             })
@@ -570,25 +568,12 @@ impl AllCentroidsCacheWriter {
             updates: Vec<PostingUpdate>,
         ) -> Arc<PostingList> {
             let Some(posting_list) = posting_list else {
-                return Arc::new(
+                return Arc::new(PostingList::from_value(
                     PostingListValue::from_posting_updates(updates)
-                        .expect("posting updates should always encode")
-                        .into(),
-                );
+                        .expect("posting updates should always encode"),
+                ));
             };
-
-            let mut all_updates = Vec::with_capacity(posting_list.len() + updates.len());
-            all_updates.extend(
-                posting_list
-                    .iter()
-                    .map(|p| PostingUpdate::append(p.id(), p.vector().to_vec())),
-            );
-            all_updates.extend(updates);
-            Arc::new(
-                PostingListValue::from_posting_updates(all_updates)
-                    .expect("posting updates should always encode")
-                    .into(),
-            )
+            Arc::new(posting_list.update_and_flatten(updates))
         }
 
         let mut inner = self.inner.lock().expect("lock poisoned");
@@ -752,7 +737,6 @@ pub(crate) async fn batch_search_centroids_up_to_level<K: Hash + Eq + Sized + Se
 mod tests {
     use super::*;
     use crate::serde::key::PostingListKey;
-    use crate::serde::posting_list::Posting;
     use crate::serde::posting_list::{PostingListValue, PostingUpdate};
     use common::storage::in_memory::InMemoryStorage;
     use common::{Record, Storage, StorageRead};
@@ -761,11 +745,15 @@ mod tests {
     #[test]
     fn should_score_and_rank_l2_postings() {
         // given
-        let postings = Arc::new(vec![
-            Posting::new(10, vec![1.0, 0.0]),
-            Posting::new(11, vec![0.0, 1.0]),
-            Posting::new(12, vec![3.0, 0.0]),
-        ]);
+        let postings = Arc::new(
+            vec![
+                Posting::new(10, vec![1.0, 0.0]),
+                Posting::new(11, vec![0.0, 1.0]),
+                Posting::new(12, vec![3.0, 0.0]),
+            ]
+            .into_iter()
+            .collect(),
+        );
 
         // when
         let ranked =
@@ -778,11 +766,15 @@ mod tests {
     #[test]
     fn should_deduplicate_ids_and_keep_best_score() {
         // given
-        let postings_a = Arc::new(vec![
-            Posting::new(10, vec![1.0, 0.0]),
-            Posting::new(11, vec![0.0, 1.0]),
-        ]);
-        let postings_b = Arc::new(vec![Posting::new(10, vec![1.0, 0.0])]);
+        let postings_a = Arc::new(
+            vec![
+                Posting::new(10, vec![1.0, 0.0]),
+                Posting::new(11, vec![0.0, 1.0]),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let postings_b = Arc::new(vec![Posting::new(10, vec![1.0, 0.0])].into_iter().collect());
 
         // when
         let ranked = LeveledCentroidIndex::score_and_rank(
@@ -838,7 +830,7 @@ mod tests {
     ) -> Arc<PostingList> {
         let key = PostingListKey::new(centroid_id).encode();
         let value = posting_list_value(postings);
-        let posting_list = Arc::new(value.clone().into());
+        let posting_list = Arc::new(PostingList::from_value(value.clone()));
         storage
             .put(vec![Record::new(key, value.encode_to_bytes()).into()])
             .await
