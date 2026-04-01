@@ -252,7 +252,7 @@ impl From<Posting> for PostingUpdate {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PostingListValue {
     /// List of posting updates (appends or deletes).
-    postings: Vec<PostingUpdate>,
+    pub(crate) postings: Vec<PostingUpdate>,
 }
 
 impl PostingListValue {

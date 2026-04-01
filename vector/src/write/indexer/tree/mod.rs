@@ -20,6 +20,7 @@ mod root;
 mod split;
 pub(crate) mod state;
 mod vector;
+mod posting_list;
 
 #[derive(Debug, Default)]
 pub(crate) struct IndexerStats {
