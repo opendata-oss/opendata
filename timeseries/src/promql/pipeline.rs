@@ -329,30 +329,95 @@ pub(crate) fn build_bucket_sample_work(
 // Phase 4: Sample loading
 // ---------------------------------------------------------------------------
 
+/// Maximum number of per-series sample futures in flight within one bucket.
+///
+/// This bounds local fan-out (memory, polling pressure, label clones held
+/// in-flight). The global `sample_semaphore` on `QueryReaderEvalCache`
+/// independently bounds real cache-miss storage I/O. For narrow queries,
+/// this local window can be the tighter limit, so observed sample parallelism
+/// may be lower than `sample_concurrency` even though the semaphore remains
+/// the query-global I/O ceiling.
+const PER_BUCKET_SAMPLE_READAHEAD: usize = 8;
+
 /// Load samples for all series in a bucket sample work item.
+///
+/// Uses a manual `FuturesUnordered` window of size
+/// `PER_BUCKET_SAMPLE_READAHEAD` to bound in-memory fan-out while
+/// `CachedQueryReader::samples` handles cache-hit/miss logic and
+/// semaphore acquisition internally. Results are stored by original
+/// index and reassembled in input order for deterministic output.
 pub(crate) async fn load_bucket_samples<R: QueryReader>(
-    reader: &CachedQueryReader<'_, R>,
+    reader: &R,
+    cache: &Arc<QueryReaderEvalCache>,
     work: &BucketSampleWork,
 ) -> EvalResult<BucketSampleData> {
-    let mut series_data = Vec::with_capacity(work.series.len());
+    use futures::stream::FuturesUnordered;
 
-    for item in &work.series {
-        let samples = reader
-            .samples(
-                &work.bucket,
-                item.series_id,
-                &item.metric_name,
+    /// Build a future that loads samples for one series.  Extracted as a
+    /// named function so both the seed and refill sites produce the same
+    /// concrete type (avoiding "no two async blocks have the same type").
+    async fn load_one<R: QueryReader>(
+        reader: &R,
+        cache: Arc<QueryReaderEvalCache>,
+        bucket: TimeBucket,
+        idx: usize,
+        item: &SeriesWorkItem,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> EvalResult<(usize, LoadedSeriesSamples)> {
+        let cached = CachedQueryReader::with_shared_cache(reader, cache);
+        let samples = cached
+            .samples(&bucket, item.series_id, &item.metric_name, start_ms, end_ms)
+            .await?;
+        Ok((
+            idx,
+            LoadedSeriesSamples {
+                fingerprint: item.fingerprint,
+                labels: item.labels.clone(),
+                samples,
+            },
+        ))
+    }
+
+    let total = work.series.len();
+    let mut results: Vec<Option<LoadedSeriesSamples>> = (0..total).map(|_| None).collect();
+    let mut iter = work.series.iter().enumerate();
+    let mut in_flight = FuturesUnordered::new();
+
+    // Seed the window.
+    for _ in 0..PER_BUCKET_SAMPLE_READAHEAD.min(total) {
+        if let Some((idx, item)) = iter.next() {
+            in_flight.push(load_one(
+                reader,
+                cache.clone(),
+                work.bucket,
+                idx,
+                item,
                 work.start_ms,
                 work.end_ms,
-            )
-            .await?;
-
-        series_data.push(LoadedSeriesSamples {
-            fingerprint: item.fingerprint,
-            labels: item.labels.clone(),
-            samples,
-        });
+            ));
+        }
     }
+
+    // Drain completions and refill the window.
+    while let Some(result) = in_flight.next().await {
+        let (idx, loaded) = result?;
+        results[idx] = Some(loaded);
+
+        if let Some((idx, item)) = iter.next() {
+            in_flight.push(load_one(
+                reader,
+                cache.clone(),
+                work.bucket,
+                idx,
+                item,
+                work.start_ms,
+                work.end_ms,
+            ));
+        }
+    }
+
+    let series_data: Vec<_> = results.into_iter().map(|r| r.unwrap()).collect();
 
     Ok(BucketSampleData {
         bucket: work.bucket,
@@ -502,13 +567,15 @@ pub(crate) fn shape_subquery_results(
 
 /// Concurrency limits for the selector pipeline.
 ///
-/// Controls bounded parallelism for metadata resolution and sample loading
-/// phases independently, allowing each to be tuned for its workload.
+/// These values control how many cache-miss storage reads can be in flight
+/// concurrently within a single query. Cache hits are free and never acquire
+/// a permit. They do not directly control how many bucket tasks the pipeline
+/// schedules concurrently.
 #[derive(Debug, Clone)]
 pub(crate) struct PipelineConcurrency {
-    /// Maximum number of concurrent bucket metadata resolutions.
+    /// Maximum concurrent cache-miss metadata reads (inverted + forward index).
     pub metadata: usize,
-    /// Maximum number of concurrent bucket sample loads.
+    /// Maximum concurrent cache-miss sample reads.
     pub samples: usize,
 }
 
@@ -533,6 +600,19 @@ impl From<&crate::model::QueryOptions> for PipelineConcurrency {
 // ---------------------------------------------------------------------------
 // Unified pipeline orchestrator
 // ---------------------------------------------------------------------------
+
+/// Maximum coordinator-level readahead for the metadata stage.
+///
+/// This is an internal scheduling constant, not a public knob. It caps how
+/// many bucket metadata jobs are polled concurrently by `buffer_unordered`.
+/// The *real* cache-miss read limit is the `metadata_semaphore` on the
+/// shared `QueryReaderEvalCache`.
+const METADATA_STAGE_READAHEAD: usize = 32;
+
+/// Maximum coordinator-level readahead for the sample stage.
+///
+/// Same semantics as `METADATA_STAGE_READAHEAD` but for sample loading.
+const SAMPLE_STAGE_READAHEAD: usize = 32;
 
 /// Per-bucket timing from a single bucket task within the pipeline.
 #[derive(Debug, Clone, Default)]
@@ -560,22 +640,31 @@ struct SampleStageItem {
 
 /// Aggregate phase timings for the selector pipeline.
 ///
+/// There are two kinds of wait time tracked here:
+///
+/// - **Stage queue wait** (`metadata_queue_wait_sum_ms`, `sample_queue_wait_sum_ms`):
+///   time a bucket spends waiting for a `buffer_unordered` worker slot at the
+///   pipeline coordinator level.
+/// - **Permit wait** (reported via `ReadPathStats` in the debug log):
+///   time a cache-miss read spends waiting for a global semaphore permit.
+///
 /// Under parallel execution, wall time shows user-visible latency while sum
-/// time shows total work. Queue wait measures time spent waiting for a stage
-/// worker slot.
+/// time shows total work.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PipelineTimings {
     /// Wall-clock time for the entire metadata+sample pipeline phase.
     pub pipeline_wall_ms: f64,
     /// Sum of per-bucket metadata resolution durations.
     pub metadata_resolve_sum_ms: f64,
-    /// Sum of per-bucket metadata stage queue wait durations.
+    /// Sum of per-bucket metadata stage queue wait durations (time waiting
+    /// for a `buffer_unordered` worker slot, not a read permit).
     pub metadata_queue_wait_sum_ms: f64,
     /// Number of buckets that had metadata resolved.
     pub metadata_bucket_count: usize,
     /// Sum of per-bucket sample load durations.
     pub sample_load_sum_ms: f64,
-    /// Sum of per-bucket sample stage queue wait durations.
+    /// Sum of per-bucket sample stage queue wait durations (time waiting
+    /// for a `buffer_unordered` worker slot, not a read permit).
     pub sample_queue_wait_sum_ms: f64,
     /// Number of buckets that had samples loaded.
     pub sample_bucket_count: usize,
@@ -647,47 +736,12 @@ async fn execute_metadata_stage_job<R: QueryReader>(
 
 /// Execute one sample-stage job.
 ///
-/// Today a sample worker loads all series for the bucket serially via
-/// `load_bucket_samples`.
-///
-/// For `#366`, this helper is the seam where bucket-scoped sample loading can
-/// become per-series loading without changing the outer metadata queue or the
-/// `SampleStageItem` handoff. The intended model is:
-/// - keep this outer sample stage as a bucket coordinator
-/// - iterate `work.series` lazily
-/// - use a small per-bucket `buffer_unordered(PER_BUCKET_READAHEAD)` window
-/// - let `CachedQueryReader::samples` enforce the real global
-///   `sample_concurrency` limit at the cache-miss read sites
-///
-/// Suggested basis for the follow-up:
-///
-/// ```ignore
-/// async fn load_bucket_samples_parallel<R: QueryReader>(
-///     reader: &CachedQueryReader<'_, R>,
-///     work: &BucketSampleWork,
-/// ) -> EvalResult<BucketSampleData> {
-///     let series_data = stream::iter(work.series.iter().cloned())
-///         .map(|item| async move {
-///             let samples = reader
-///                 .samples(&work.bucket, item.series_id, &item.metric_name, work.start_ms, work.end_ms)
-///                 .await?;
-///
-///             Ok::<_, EvaluationError>(LoadedSeriesSamples {
-///                 fingerprint: item.fingerprint,
-///                 labels: item.labels,
-///                 samples,
-///             })
-///         })
-///         .buffer_unordered(PER_BUCKET_READAHEAD)
-///         .try_collect::<Vec<_>>()
-///         .await?;
-///
-///     Ok(BucketSampleData {
-///         bucket: work.bucket,
-///         series_data,
-///     })
-/// }
-/// ```
+/// This is the bucket coordinator for sample loading. It delegates to
+/// `load_bucket_samples` which uses a bounded `FuturesUnordered` window
+/// (`PER_BUCKET_SAMPLE_READAHEAD`) for inner per-series parallelism.
+/// Cache-miss reads are bounded by the global `sample_semaphore` in
+/// `QueryReaderEvalCache`; cache hits resolve immediately without
+/// acquiring a permit.
 async fn execute_sample_stage_job<R: QueryReader>(
     reader: &R,
     cache: Arc<QueryReaderEvalCache>,
@@ -701,8 +755,7 @@ async fn execute_sample_stage_job<R: QueryReader>(
     timing.sample_queue_wait_ms = item.queued_at.elapsed().as_secs_f64() * 1000.0;
 
     let sample_start = Instant::now();
-    let cached = CachedQueryReader::with_shared_cache(reader, cache);
-    let data = load_bucket_samples(&cached, &work).await?;
+    let data = load_bucket_samples(reader, &cache, &work).await?;
     timing.sample_load_ms = sample_start.elapsed().as_secs_f64() * 1000.0;
 
     Ok((item.idx, Some(data), timing))
@@ -716,11 +769,18 @@ async fn execute_sample_stage_job<R: QueryReader>(
 ///
 /// Concurrency model:
 /// - One `MetadataStageJob` is created per bucket.
-/// - `buffer_unordered(metadata_concurrency)` forms the metadata worker pool.
+/// - `buffer_unordered(metadata_stage_width)` forms the metadata worker pool
+///   (sized by `METADATA_STAGE_READAHEAD`, not the public concurrency knob).
 /// - As each metadata worker finishes, it forwards a `SampleStageItem` into a
 ///   bounded channel.
-/// - `buffer_unordered(sample_concurrency)` forms the sample worker pool that
-///   dequeues those items and loads bucket sample data.
+/// - `buffer_unordered(sample_stage_width)` forms the sample worker pool
+///   (sized by `SAMPLE_STAGE_READAHEAD`).
+/// - Within each bucket, `load_bucket_samples` uses a bounded
+///   `FuturesUnordered` window (`PER_BUCKET_SAMPLE_READAHEAD`) for inner
+///   per-series parallelism.
+/// - Cache-miss reads across all stages are bounded by semaphores on the
+///   shared `QueryReaderEvalCache`, sized by the public `PipelineConcurrency`
+///   knobs.
 /// - Results are reassembled in plan order before shaping to preserve query
 ///   semantics.
 pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
@@ -728,11 +788,17 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
     cache: &Arc<QueryReaderEvalCache>,
     plan: &QueryPlan,
     selector: &VectorSelector,
-    concurrency: &PipelineConcurrency,
 ) -> EvalResult<ExprResult> {
     let pipeline_start = Instant::now();
-    let metadata_concurrency = concurrency.metadata.max(1);
-    let sample_concurrency = concurrency.samples.max(1);
+    let stats_before = cache.snapshot_stats();
+
+    // Coordinator widths are internal scheduling constants. The public
+    // concurrency knobs (metadata / samples) only size the read-permit
+    // semaphores on the shared cache; these widths and the per-bucket sample
+    // window bound resident pipeline work and can become the tighter limit.
+    let num_buckets = plan.buckets.len();
+    let metadata_stage_width = num_buckets.clamp(1, METADATA_STAGE_READAHEAD);
+    let sample_stage_width = num_buckets.clamp(1, SAMPLE_STAGE_READAHEAD);
 
     let metadata_jobs: Vec<_> = plan
         .buckets
@@ -745,7 +811,7 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
         })
         .collect();
 
-    let (sample_tx, sample_rx) = mpsc::channel(sample_concurrency);
+    let (sample_tx, sample_rx) = mpsc::channel(sample_stage_width);
 
     let metadata_stage = {
         let metadata_cache = cache.clone();
@@ -757,14 +823,10 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
                         execute_metadata_stage_job(reader, job_cache, plan, selector, job).await
                     }
                 })
-                .buffer_unordered(metadata_concurrency)
+                .buffer_unordered(metadata_stage_width)
                 .try_for_each(|item| {
                     let sample_tx = sample_tx.clone();
                     async move {
-                        // As each metadata worker finishes, it immediately
-                        // hands off its bucket's sample work to the bounded
-                        // queue so sample workers can start without waiting
-                        // for the rest of metadata resolution to complete.
                         sample_tx.send(item).await.map_err(|_| {
                             EvaluationError::InternalError("sample work queue closed".into())
                         })
@@ -781,7 +843,7 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
         let sample_cache = cache.clone();
         async move { execute_sample_stage_job(reader, sample_cache, item).await }
     })
-    .buffer_unordered(sample_concurrency)
+    .buffer_unordered(sample_stage_width)
     .try_collect::<Vec<_>>();
 
     let (_, results) = tokio::try_join!(metadata_stage, sample_stage)?;
@@ -806,16 +868,23 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
     let timings =
         PipelineTimings::from_bucket_timings(&bucket_timings, pipeline_elapsed_ms, shape_ms);
 
+    let stats_delta = cache.snapshot_stats().delta_since(&stats_before);
     tracing::debug!(
         path = plan.path_kind.name(),
         buckets = plan.buckets.len(),
         pipeline_wall_ms = timings.pipeline_wall_ms,
         metadata_resolve_sum_ms = timings.metadata_resolve_sum_ms,
-        metadata_queue_wait_sum_ms = timings.metadata_queue_wait_sum_ms,
+        metadata_stage_queue_wait_sum_ms = timings.metadata_queue_wait_sum_ms,
         metadata_bucket_count = timings.metadata_bucket_count,
+        metadata_cache_hits = stats_delta.metadata_cache_hits,
+        metadata_cache_misses = stats_delta.metadata_cache_misses,
+        metadata_permit_wait_sum_ms = stats_delta.metadata_permit_wait_ns as f64 / 1_000_000.0,
         sample_load_sum_ms = timings.sample_load_sum_ms,
-        sample_queue_wait_sum_ms = timings.sample_queue_wait_sum_ms,
+        sample_stage_queue_wait_sum_ms = timings.sample_queue_wait_sum_ms,
         sample_bucket_count = timings.sample_bucket_count,
+        sample_cache_hits = stats_delta.sample_cache_hits,
+        sample_cache_misses = stats_delta.sample_cache_misses,
+        sample_permit_wait_sum_ms = stats_delta.sample_permit_wait_ns as f64 / 1_000_000.0,
         shape_ms = timings.shape_samples_ms,
         "pipeline phase timings"
     );
@@ -1474,8 +1543,10 @@ mod tests {
             promql_parser::parser::Expr::VectorSelector(vs) => vs,
             _ => panic!("expected vector selector"),
         };
-        let cache = std::sync::Arc::new(crate::promql::evaluator::QueryReaderEvalCache::new());
-        execute_selector_pipeline(reader, &cache, plan, &selector, concurrency).await
+        let cache = std::sync::Arc::new(
+            crate::promql::evaluator::QueryReaderEvalCache::with_concurrency(concurrency),
+        );
+        execute_selector_pipeline(reader, &cache, plan, &selector).await
     }
 
     fn build_two_bucket_reader() -> crate::query::test_utils::MockQueryReader {
@@ -1587,16 +1658,28 @@ mod tests {
     // Instrumented reader for concurrency tests
     // -----------------------------------------------------------------------
 
-    /// A QueryReader wrapper that counts calls and supports per-bucket delays.
+    /// A QueryReader wrapper that counts calls, tracks in-flight concurrency,
+    /// and supports per-bucket and per-series delays.
     struct CountingQueryReader<R: crate::query::QueryReader> {
         inner: R,
         forward_index_calls: std::sync::atomic::AtomicUsize,
         inverted_index_calls: std::sync::atomic::AtomicUsize,
         samples_calls: std::sync::atomic::AtomicUsize,
+        /// Current number of in-flight metadata reads.
+        in_flight_metadata: std::sync::atomic::AtomicUsize,
+        /// High-water mark of concurrent metadata reads observed.
+        max_in_flight_metadata: std::sync::atomic::AtomicUsize,
+        /// Current number of in-flight sample reads.
+        in_flight_samples: std::sync::atomic::AtomicUsize,
+        /// High-water mark of concurrent sample reads observed.
+        max_in_flight_samples: std::sync::atomic::AtomicUsize,
         /// Per-bucket metadata delay (applied to both forward_index and inverted_index).
         metadata_delays: HashMap<TimeBucket, std::time::Duration>,
-        /// Per-bucket sample delay.
+        /// Per-bucket sample delay (fallback when no per-series delay is set).
         sample_delays: HashMap<TimeBucket, std::time::Duration>,
+        /// Per-(bucket, series) sample delay — takes priority over per-bucket.
+        per_series_sample_delays:
+            HashMap<(TimeBucket, crate::model::SeriesId), std::time::Duration>,
     }
 
     impl<R: crate::query::QueryReader> CountingQueryReader<R> {
@@ -1606,8 +1689,13 @@ mod tests {
                 forward_index_calls: std::sync::atomic::AtomicUsize::new(0),
                 inverted_index_calls: std::sync::atomic::AtomicUsize::new(0),
                 samples_calls: std::sync::atomic::AtomicUsize::new(0),
+                in_flight_metadata: std::sync::atomic::AtomicUsize::new(0),
+                max_in_flight_metadata: std::sync::atomic::AtomicUsize::new(0),
+                in_flight_samples: std::sync::atomic::AtomicUsize::new(0),
+                max_in_flight_samples: std::sync::atomic::AtomicUsize::new(0),
                 metadata_delays: HashMap::new(),
                 sample_delays: HashMap::new(),
+                per_series_sample_delays: HashMap::new(),
             }
         }
 
@@ -1618,6 +1706,17 @@ mod tests {
 
         fn with_sample_delay(mut self, bucket: TimeBucket, delay: std::time::Duration) -> Self {
             self.sample_delays.insert(bucket, delay);
+            self
+        }
+
+        fn with_per_series_sample_delay(
+            mut self,
+            bucket: TimeBucket,
+            series_id: crate::model::SeriesId,
+            delay: std::time::Duration,
+        ) -> Self {
+            self.per_series_sample_delays
+                .insert((bucket, series_id), delay);
             self
         }
 
@@ -1634,6 +1733,40 @@ mod tests {
         fn samples_count(&self) -> usize {
             self.samples_calls.load(std::sync::atomic::Ordering::SeqCst)
         }
+
+        fn max_in_flight_metadata(&self) -> usize {
+            self.max_in_flight_metadata
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn max_in_flight_samples(&self) -> usize {
+            self.max_in_flight_samples
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// RAII guard that decrements an atomic counter on drop.
+    struct InFlightGuard<'a> {
+        counter: &'a std::sync::atomic::AtomicUsize,
+    }
+
+    impl<'a> Drop for InFlightGuard<'a> {
+        fn drop(&mut self) {
+            self.counter
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Increment `current`, update `max` if needed, return a guard that
+    /// decrements `current` on drop.
+    fn track_in_flight<'a>(
+        current: &'a std::sync::atomic::AtomicUsize,
+        max: &std::sync::atomic::AtomicUsize,
+    ) -> InFlightGuard<'a> {
+        let prev = current.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let now = prev + 1;
+        max.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+        InFlightGuard { counter: current }
     }
 
     #[async_trait::async_trait]
@@ -1650,6 +1783,7 @@ mod tests {
         {
             self.forward_index_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _guard = track_in_flight(&self.in_flight_metadata, &self.max_in_flight_metadata);
             if let Some(&delay) = self.metadata_delays.get(bucket) {
                 tokio::time::sleep(delay).await;
             }
@@ -1664,6 +1798,7 @@ mod tests {
         {
             self.inverted_index_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _guard = track_in_flight(&self.in_flight_metadata, &self.max_in_flight_metadata);
             if let Some(&delay) = self.metadata_delays.get(bucket) {
                 tokio::time::sleep(delay).await;
             }
@@ -1696,7 +1831,13 @@ mod tests {
         ) -> crate::util::Result<Vec<crate::model::Sample>> {
             self.samples_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if let Some(&delay) = self.sample_delays.get(bucket) {
+            let _guard = track_in_flight(&self.in_flight_samples, &self.max_in_flight_samples);
+            // Per-series delay takes priority, then per-bucket fallback.
+            if let Some(&delay) = self
+                .per_series_sample_delays
+                .get(&(*bucket, series_id))
+                .or_else(|| self.sample_delays.get(bucket))
+            {
                 tokio::time::sleep(delay).await;
             }
             self.inner
@@ -1720,13 +1861,15 @@ mod tests {
             samples: 4,
         };
 
-        let cache = std::sync::Arc::new(crate::promql::evaluator::QueryReaderEvalCache::new());
+        let cache = std::sync::Arc::new(
+            crate::promql::evaluator::QueryReaderEvalCache::with_concurrency(&concurrency),
+        );
         let selector = match promql_parser::parser::parse("cpu").unwrap() {
             promql_parser::parser::Expr::VectorSelector(vs) => vs,
             _ => panic!("expected vector selector"),
         };
 
-        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
+        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector)
             .await
             .unwrap();
 
@@ -1743,12 +1886,10 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn should_record_nonzero_metadata_queue_wait_under_contention() {
+    async fn should_serialize_metadata_reads_with_permit_concurrency_1() {
         // With metadata_concurrency=1 and two buckets that each take 20ms of
-        // metadata work, the second bucket must wait for the first's permit.
-        // We can't inspect PipelineTimings directly from here, but we can
-        // verify the pipeline completes correctly under contention and that
-        // wall time reflects serialized metadata work.
+        // metadata work, the metadata semaphore forces serialization.
+        // Wall time should reflect serialized metadata reads (>= 40ms).
         let inner = build_two_bucket_reader();
         let reader = CountingQueryReader::new(inner)
             .with_metadata_delay(TimeBucket::hour(100), std::time::Duration::from_millis(20))
@@ -1756,28 +1897,30 @@ mod tests {
 
         let buckets = reader.list_buckets().await.unwrap();
         let plan = QueryPlan::for_instant_vector(12_200_000, 300_001, buckets);
-        // metadata_concurrency=1 forces serial metadata, creating contention
+        // metadata_concurrency=1 sizes the metadata semaphore to 1 permit
         let concurrency = PipelineConcurrency {
             metadata: 1,
             samples: 4,
         };
 
-        let cache = std::sync::Arc::new(crate::promql::evaluator::QueryReaderEvalCache::new());
+        let cache = std::sync::Arc::new(
+            crate::promql::evaluator::QueryReaderEvalCache::with_concurrency(&concurrency),
+        );
         let selector = match promql_parser::parser::parse("cpu").unwrap() {
             promql_parser::parser::Expr::VectorSelector(vs) => vs,
             _ => panic!("expected vector selector"),
         };
 
         let start = tokio::time::Instant::now();
-        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
+        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector)
             .await
             .unwrap();
         let elapsed = start.elapsed();
 
-        // With concurrency=1, two 20ms metadata delays must serialize → >= 40ms
+        // With 1 permit, two 20ms metadata reads must serialize → >= 40ms
         assert!(
             elapsed >= std::time::Duration::from_millis(35),
-            "expected serialized metadata: elapsed={:?}",
+            "expected serialized metadata via permit: elapsed={:?}",
             elapsed,
         );
 
@@ -1791,9 +1934,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn should_record_nonzero_sample_queue_wait_under_contention() {
+    async fn should_serialize_sample_reads_with_permit_concurrency_1() {
         // With sample_concurrency=1 and two buckets with 20ms sample delays,
-        // sample loads must serialize.
+        // the sample semaphore forces serialization.
         let inner = build_two_bucket_reader();
         let reader = CountingQueryReader::new(inner)
             .with_sample_delay(TimeBucket::hour(100), std::time::Duration::from_millis(20))
@@ -1801,27 +1944,30 @@ mod tests {
 
         let buckets = reader.list_buckets().await.unwrap();
         let plan = QueryPlan::for_instant_vector(12_200_000, 300_001, buckets);
+        // sample_concurrency=1 sizes the sample semaphore to 1 permit
         let concurrency = PipelineConcurrency {
             metadata: 4,
             samples: 1,
         };
 
-        let cache = std::sync::Arc::new(crate::promql::evaluator::QueryReaderEvalCache::new());
+        let cache = std::sync::Arc::new(
+            crate::promql::evaluator::QueryReaderEvalCache::with_concurrency(&concurrency),
+        );
         let selector = match promql_parser::parser::parse("cpu").unwrap() {
             promql_parser::parser::Expr::VectorSelector(vs) => vs,
             _ => panic!("expected vector selector"),
         };
 
         let start = tokio::time::Instant::now();
-        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
+        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector)
             .await
             .unwrap();
         let elapsed = start.elapsed();
 
-        // With sample concurrency=1, two 20ms sample delays serialize → >= 40ms
+        // With 1 permit, two 20ms sample reads must serialize → >= 40ms
         assert!(
             elapsed >= std::time::Duration::from_millis(35),
-            "expected serialized sample loads: elapsed={:?}",
+            "expected serialized sample reads via permit: elapsed={:?}",
             elapsed,
         );
 
@@ -1851,8 +1997,10 @@ mod tests {
         );
         let reader = CountingQueryReader::new(builder.build());
 
-        let cache = std::sync::Arc::new(crate::promql::evaluator::QueryReaderEvalCache::new());
         let concurrency = PipelineConcurrency::default();
+        let cache = std::sync::Arc::new(
+            crate::promql::evaluator::QueryReaderEvalCache::with_concurrency(&concurrency),
+        );
         let selector = match promql_parser::parser::parse("mem").unwrap() {
             promql_parser::parser::Expr::VectorSelector(vs) => vs,
             _ => panic!("expected vector selector"),
@@ -1862,7 +2010,7 @@ mod tests {
         let plan = QueryPlan::for_instant_vector(6_200_000, 300_000, buckets.clone());
 
         // First invocation: populates cache, calls underlying reader
-        execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
+        execute_selector_pipeline(&reader, &cache, &plan, &selector)
             .await
             .unwrap();
         let samples_after_first = reader.samples_count();
@@ -1871,7 +2019,7 @@ mod tests {
 
         // Second invocation: should reuse cache, no new reader calls
         let plan2 = QueryPlan::for_instant_vector(6_200_000, 300_000, buckets);
-        let r2 = execute_selector_pipeline(&reader, &cache, &plan2, &selector, &concurrency)
+        let r2 = execute_selector_pipeline(&reader, &cache, &plan2, &selector)
             .await
             .unwrap();
 
@@ -1958,6 +2106,527 @@ mod tests {
             reader.forward_index_count(),
             1,
             "forward_index() should be called once, not once per step"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2 tests: cache-miss read-site concurrency control
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn should_bound_metadata_cache_miss_reads_globally() {
+        // With metadata_concurrency=1 and two buckets, the underlying reader
+        // should never see more than 1 concurrent metadata read at a time.
+        // Each bucket's metadata takes 20ms, so they must serialize.
+        let inner = build_two_bucket_reader();
+        let reader = CountingQueryReader::new(inner)
+            .with_metadata_delay(TimeBucket::hour(100), std::time::Duration::from_millis(20))
+            .with_metadata_delay(TimeBucket::hour(200), std::time::Duration::from_millis(20));
+
+        let buckets = reader.list_buckets().await.unwrap();
+        let plan = QueryPlan::for_instant_vector(12_200_000, 300_001, buckets);
+        let concurrency = PipelineConcurrency {
+            metadata: 1,
+            samples: 4,
+        };
+
+        let cache = std::sync::Arc::new(
+            crate::promql::evaluator::QueryReaderEvalCache::with_concurrency(&concurrency),
+        );
+        let selector = match promql_parser::parser::parse("cpu").unwrap() {
+            promql_parser::parser::Expr::VectorSelector(vs) => vs,
+            _ => panic!("expected vector selector"),
+        };
+
+        execute_selector_pipeline(&reader, &cache, &plan, &selector)
+            .await
+            .unwrap();
+
+        assert!(
+            reader.max_in_flight_metadata() <= 1,
+            "metadata_concurrency=1 should bound in-flight metadata reads to 1, got {}",
+            reader.max_in_flight_metadata(),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn should_acquire_sample_permit_only_on_cache_miss() {
+        // Run the pipeline twice with the same shared cache. The first run
+        // causes cache misses (samples reader called). The second run should
+        // hit the cache and NOT call the underlying reader again.
+        use crate::model::MetricType;
+        use crate::query::test_utils::MockMultiBucketQueryReaderBuilder;
+
+        let labels = vec![label("__name__", "mem"), label("host", "b")];
+        let mut builder = MockMultiBucketQueryReaderBuilder::new();
+        builder.add_sample(
+            TimeBucket::hour(100),
+            labels,
+            MetricType::Gauge,
+            sample(6_100_000, 42.0),
+        );
+        let reader = CountingQueryReader::new(builder.build())
+            .with_sample_delay(TimeBucket::hour(100), std::time::Duration::from_millis(10));
+
+        let concurrency = PipelineConcurrency {
+            metadata: 4,
+            samples: 1,
+        };
+        let cache = std::sync::Arc::new(
+            crate::promql::evaluator::QueryReaderEvalCache::with_concurrency(&concurrency),
+        );
+        let selector = match promql_parser::parser::parse("mem").unwrap() {
+            promql_parser::parser::Expr::VectorSelector(vs) => vs,
+            _ => panic!("expected vector selector"),
+        };
+
+        let buckets = reader.list_buckets().await.unwrap();
+        let plan = QueryPlan::for_instant_vector(6_200_000, 300_000, buckets.clone());
+
+        // First run: cache miss, reader called
+        execute_selector_pipeline(&reader, &cache, &plan, &selector)
+            .await
+            .unwrap();
+        let samples_after_first = reader.samples_count();
+        assert!(samples_after_first > 0, "first call should load samples");
+
+        // Second run: cache hit, reader NOT called
+        let plan2 = QueryPlan::for_instant_vector(6_200_000, 300_000, buckets);
+        execute_selector_pipeline(&reader, &cache, &plan2, &selector)
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.samples_count(),
+            samples_after_first,
+            "cache hit should not call underlying reader"
+        );
+
+        // Verify stats
+        let stats = &cache.stats;
+        assert!(
+            stats
+                .sample_cache_hits
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
+            "should record sample cache hits on second run"
+        );
+        assert!(
+            stats
+                .sample_cache_misses
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
+            "should record sample cache misses on first run"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3 tests: inner per-bucket sample parallelism
+    // -----------------------------------------------------------------------
+
+    /// Build a reader with one bucket containing multiple series, each with
+    /// a per-series sample delay.
+    fn build_multi_series_reader(
+        num_series: usize,
+        per_series_delay: std::time::Duration,
+    ) -> CountingQueryReader<crate::query::test_utils::MockQueryReader> {
+        use crate::model::MetricType;
+        use crate::query::test_utils::MockMultiBucketQueryReaderBuilder;
+
+        let mut builder = MockMultiBucketQueryReaderBuilder::new();
+        for i in 0..num_series {
+            let labels = vec![
+                label("__name__", "cpu"),
+                label("host", &format!("host-{i}")),
+            ];
+            builder.add_sample(
+                TimeBucket::hour(100),
+                labels,
+                MetricType::Gauge,
+                sample(6_100_000 + i as i64, i as f64),
+            );
+        }
+        CountingQueryReader::new(builder.build())
+            .with_sample_delay(TimeBucket::hour(100), per_series_delay)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn should_load_bucket_samples_in_parallel_within_one_bucket() {
+        // One bucket with 4 series, each taking 20ms to load.
+        // Serial: >= 80ms. Parallel with concurrency=4: ~20ms.
+        let reader = build_multi_series_reader(4, std::time::Duration::from_millis(20));
+
+        let buckets = reader.list_buckets().await.unwrap();
+        let plan = QueryPlan::for_instant_vector(6_200_000, 300_001, buckets);
+        let concurrency = PipelineConcurrency {
+            metadata: 4,
+            samples: 4,
+        };
+
+        let cache = std::sync::Arc::new(
+            crate::promql::evaluator::QueryReaderEvalCache::with_concurrency(&concurrency),
+        );
+        let selector = match promql_parser::parser::parse("cpu").unwrap() {
+            promql_parser::parser::Expr::VectorSelector(vs) => vs,
+            _ => panic!("expected vector selector"),
+        };
+
+        let start = tokio::time::Instant::now();
+        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector)
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        match result {
+            ExprResult::InstantVector(samples) => {
+                assert_eq!(samples.len(), 4, "all 4 series should be returned");
+            }
+            _ => panic!("expected InstantVector"),
+        }
+
+        // With 4 series at 20ms each, serial would take >= 80ms.
+        // Parallel with concurrency=4 should complete in ~20ms (+ overhead).
+        assert!(
+            elapsed < std::time::Duration::from_millis(60),
+            "expected parallel sample loading: elapsed={:?} (serial baseline >= 80ms)",
+            elapsed,
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn should_preserve_global_sample_bound_across_buckets_with_inner_parallelism() {
+        // Two buckets, 3 series each, per-series delay 20ms, sample_concurrency=2.
+        // Both bucket coordinators are active simultaneously (sample_stage_width
+        // is large), so the global semaphore is what bounds in-flight reads.
+        use crate::model::MetricType;
+        use crate::query::test_utils::MockMultiBucketQueryReaderBuilder;
+
+        let mut builder = MockMultiBucketQueryReaderBuilder::new();
+        for i in 0..3u32 {
+            let labels = vec![
+                label("__name__", "cpu"),
+                label("host", &format!("host-{i}")),
+            ];
+            builder.add_sample(
+                TimeBucket::hour(100),
+                labels.clone(),
+                MetricType::Gauge,
+                sample(6_100_000 + i as i64, i as f64),
+            );
+            builder.add_sample(
+                TimeBucket::hour(200),
+                labels,
+                MetricType::Gauge,
+                sample(12_100_000 + i as i64, 10.0 + i as f64),
+            );
+        }
+        let reader = CountingQueryReader::new(builder.build())
+            .with_sample_delay(TimeBucket::hour(100), std::time::Duration::from_millis(20))
+            .with_sample_delay(TimeBucket::hour(200), std::time::Duration::from_millis(20));
+
+        let buckets = reader.list_buckets().await.unwrap();
+        let plan = QueryPlan::for_instant_vector(12_200_000, 300_001, buckets);
+        // sample_concurrency=2: at most 2 concurrent cache-miss reads
+        let concurrency = PipelineConcurrency {
+            metadata: 4,
+            samples: 2,
+        };
+
+        let cache = std::sync::Arc::new(
+            crate::promql::evaluator::QueryReaderEvalCache::with_concurrency(&concurrency),
+        );
+        let selector = match promql_parser::parser::parse("cpu").unwrap() {
+            promql_parser::parser::Expr::VectorSelector(vs) => vs,
+            _ => panic!("expected vector selector"),
+        };
+
+        execute_selector_pipeline(&reader, &cache, &plan, &selector)
+            .await
+            .unwrap();
+
+        assert!(
+            reader.max_in_flight_samples() <= 2,
+            "sample_concurrency=2 should bound in-flight sample reads to 2, got {}",
+            reader.max_in_flight_samples(),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn should_preserve_instant_newest_wins_under_out_of_order_series_completion() {
+        // One bucket with 3 series, each with a different per-series delay
+        // so they complete out of order within the bucket. The second bucket
+        // has its own delay. Instant vector must still pick the newest sample
+        // for each fingerprint.
+        use crate::model::MetricType;
+        use crate::query::test_utils::MockMultiBucketQueryReaderBuilder;
+
+        let mut builder = MockMultiBucketQueryReaderBuilder::new();
+        // series_ids assigned by the mock start at 0
+        for i in 0..3u32 {
+            let labels = vec![
+                label("__name__", "cpu"),
+                label("host", &format!("host-{i}")),
+            ];
+            builder.add_sample(
+                TimeBucket::hour(100),
+                labels.clone(),
+                MetricType::Gauge,
+                sample(6_100_000, i as f64),
+            );
+            builder.add_sample(
+                TimeBucket::hour(200),
+                labels,
+                MetricType::Gauge,
+                sample(12_100_000, 100.0 + i as f64),
+            );
+        }
+        // Scramble per-series delays within bucket 200 so completion order
+        // differs from input order.
+        let reader = CountingQueryReader::new(builder.build())
+            .with_per_series_sample_delay(
+                TimeBucket::hour(200),
+                0,
+                std::time::Duration::from_millis(30),
+            )
+            .with_per_series_sample_delay(
+                TimeBucket::hour(200),
+                1,
+                std::time::Duration::from_millis(10),
+            )
+            .with_per_series_sample_delay(
+                TimeBucket::hour(200),
+                2,
+                std::time::Duration::from_millis(20),
+            );
+
+        let buckets = reader.list_buckets().await.unwrap();
+        let plan = QueryPlan::for_instant_vector(12_200_000, 300_001, buckets);
+        let concurrency = PipelineConcurrency {
+            metadata: 4,
+            samples: 4,
+        };
+
+        let cache = std::sync::Arc::new(
+            crate::promql::evaluator::QueryReaderEvalCache::with_concurrency(&concurrency),
+        );
+        let selector = match promql_parser::parser::parse("cpu").unwrap() {
+            promql_parser::parser::Expr::VectorSelector(vs) => vs,
+            _ => panic!("expected vector selector"),
+        };
+
+        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector)
+            .await
+            .unwrap();
+
+        match result {
+            ExprResult::InstantVector(mut samples) => {
+                assert_eq!(samples.len(), 3, "all 3 series");
+                samples.sort_by(|a, b| a.value.partial_cmp(&b.value).unwrap());
+                // All values should be from the newer bucket (100.0, 101.0, 102.0)
+                assert_eq!(samples[0].value, 100.0);
+                assert_eq!(samples[1].value, 101.0);
+                assert_eq!(samples[2].value, 102.0);
+            }
+            _ => panic!("expected InstantVector"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn should_preserve_matrix_results_under_scrambled_series_completion() {
+        // Matrix with 3 series in one bucket, per-series delays vary so
+        // completion order is scrambled. Final samples must match serial.
+        use crate::model::MetricType;
+        use crate::query::test_utils::MockMultiBucketQueryReaderBuilder;
+
+        let mut builder = MockMultiBucketQueryReaderBuilder::new();
+        for i in 0..3u32 {
+            let labels = vec![
+                label("__name__", "cpu"),
+                label("host", &format!("host-{i}")),
+            ];
+            builder.add_sample(
+                TimeBucket::hour(100),
+                labels,
+                MetricType::Gauge,
+                sample(6_100_000, i as f64 * 10.0),
+            );
+        }
+        let reader = CountingQueryReader::new(builder.build())
+            .with_per_series_sample_delay(
+                TimeBucket::hour(100),
+                0,
+                std::time::Duration::from_millis(30),
+            )
+            .with_per_series_sample_delay(
+                TimeBucket::hour(100),
+                1,
+                std::time::Duration::from_millis(5),
+            )
+            .with_per_series_sample_delay(
+                TimeBucket::hour(100),
+                2,
+                std::time::Duration::from_millis(20),
+            );
+
+        let buckets = reader.list_buckets().await.unwrap();
+        let plan = QueryPlan::for_matrix(6_200_000, 200_000, buckets);
+        let concurrency = PipelineConcurrency {
+            metadata: 4,
+            samples: 4,
+        };
+
+        let cache = std::sync::Arc::new(
+            crate::promql::evaluator::QueryReaderEvalCache::with_concurrency(&concurrency),
+        );
+        let selector = match promql_parser::parser::parse("cpu").unwrap() {
+            promql_parser::parser::Expr::VectorSelector(vs) => vs,
+            _ => panic!("expected vector selector"),
+        };
+
+        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector)
+            .await
+            .unwrap();
+
+        match result {
+            ExprResult::RangeVector(mut samples) => {
+                assert_eq!(samples.len(), 3, "all 3 series");
+                samples.sort_by(|a, b| a.values[0].value.partial_cmp(&b.values[0].value).unwrap());
+                assert_eq!(samples[0].values[0].value, 0.0);
+                assert_eq!(samples[1].values[0].value, 10.0);
+                assert_eq!(samples[2].values[0].value, 20.0);
+            }
+            _ => panic!("expected RangeVector"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn should_bound_inner_bucket_fanout_with_readahead_window() {
+        // One bucket with 20 series, sample_concurrency high enough that it
+        // is not the limiting factor. The FuturesUnordered window
+        // (PER_BUCKET_SAMPLE_READAHEAD=8) should cap max in-flight samples.
+        let reader = build_multi_series_reader(20, std::time::Duration::from_millis(10));
+
+        let buckets = reader.list_buckets().await.unwrap();
+        let plan = QueryPlan::for_instant_vector(6_200_000, 300_001, buckets);
+        let concurrency = PipelineConcurrency {
+            metadata: 4,
+            samples: 20, // high enough to not be the bottleneck
+        };
+
+        let cache = std::sync::Arc::new(
+            crate::promql::evaluator::QueryReaderEvalCache::with_concurrency(&concurrency),
+        );
+        let selector = match promql_parser::parser::parse("cpu").unwrap() {
+            promql_parser::parser::Expr::VectorSelector(vs) => vs,
+            _ => panic!("expected vector selector"),
+        };
+
+        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector)
+            .await
+            .unwrap();
+
+        match result {
+            ExprResult::InstantVector(samples) => {
+                assert_eq!(samples.len(), 20, "all 20 series");
+            }
+            _ => panic!("expected InstantVector"),
+        }
+
+        assert!(
+            reader.max_in_flight_samples() <= super::PER_BUCKET_SAMPLE_READAHEAD,
+            "inner window should cap in-flight samples to {}, got {}",
+            super::PER_BUCKET_SAMPLE_READAHEAD,
+            reader.max_in_flight_samples(),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Patch 5 tests: per-pipeline stats snapshot/delta
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stats_snapshot_delta_since() {
+        use crate::promql::evaluator::ReadPathStatsSnapshot;
+
+        let before = ReadPathStatsSnapshot {
+            metadata_cache_hits: 2,
+            metadata_cache_misses: 1,
+            sample_cache_hits: 10,
+            sample_cache_misses: 3,
+            metadata_permit_wait_ns: 100,
+            sample_permit_wait_ns: 200,
+        };
+        let after = ReadPathStatsSnapshot {
+            metadata_cache_hits: 5,
+            metadata_cache_misses: 2,
+            sample_cache_hits: 15,
+            sample_cache_misses: 3,
+            metadata_permit_wait_ns: 150,
+            sample_permit_wait_ns: 200,
+        };
+        let delta = after.delta_since(&before);
+        assert_eq!(delta.metadata_cache_hits, 3);
+        assert_eq!(delta.metadata_cache_misses, 1);
+        assert_eq!(delta.sample_cache_hits, 5);
+        assert_eq!(delta.sample_cache_misses, 0);
+        assert_eq!(delta.metadata_permit_wait_ns, 50);
+        assert_eq!(delta.sample_permit_wait_ns, 0);
+    }
+
+    #[tokio::test]
+    async fn should_report_per_pipeline_delta_not_cumulative_stats() {
+        // Two pipeline invocations sharing the same cache. The second
+        // invocation's stats delta should show hits only (zero misses),
+        // proving per-pipeline deltas rather than cumulative counters.
+        use crate::model::MetricType;
+        use crate::query::test_utils::MockMultiBucketQueryReaderBuilder;
+
+        let labels = vec![label("__name__", "mem"), label("host", "b")];
+        let mut builder = MockMultiBucketQueryReaderBuilder::new();
+        builder.add_sample(
+            TimeBucket::hour(100),
+            labels,
+            MetricType::Gauge,
+            sample(6_100_000, 42.0),
+        );
+        let reader = builder.build();
+
+        let concurrency = PipelineConcurrency::default();
+        let cache = std::sync::Arc::new(
+            crate::promql::evaluator::QueryReaderEvalCache::with_concurrency(&concurrency),
+        );
+        let selector = match promql_parser::parser::parse("mem").unwrap() {
+            promql_parser::parser::Expr::VectorSelector(vs) => vs,
+            _ => panic!("expected vector selector"),
+        };
+
+        let buckets = reader.list_buckets().await.unwrap();
+        let plan = QueryPlan::for_instant_vector(6_200_000, 300_000, buckets.clone());
+
+        // First invocation: populates cache (misses)
+        let snap1 = cache.snapshot_stats();
+        execute_selector_pipeline(&reader, &cache, &plan, &selector)
+            .await
+            .unwrap();
+        let delta1 = cache.snapshot_stats().delta_since(&snap1);
+        assert!(
+            delta1.sample_cache_misses > 0,
+            "first invocation should have sample misses"
+        );
+
+        // Second invocation: cache hits only
+        let snap2 = cache.snapshot_stats();
+        let plan2 = QueryPlan::for_instant_vector(6_200_000, 300_000, buckets);
+        execute_selector_pipeline(&reader, &cache, &plan2, &selector)
+            .await
+            .unwrap();
+        let delta2 = cache.snapshot_stats().delta_since(&snap2);
+        assert_eq!(
+            delta2.sample_cache_misses, 0,
+            "second invocation should have zero sample misses (all hits)"
+        );
+        assert!(
+            delta2.sample_cache_hits > 0,
+            "second invocation should have sample hits"
         );
     }
 }
