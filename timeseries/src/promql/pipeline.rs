@@ -325,7 +325,10 @@ pub(crate) fn build_bucket_sample_work(
 ///
 /// This bounds local fan-out (memory, polling pressure, label clones held
 /// in-flight). The global `sample_semaphore` on `QueryReaderEvalCache`
-/// independently bounds real cache-miss storage I/O.
+/// independently bounds real cache-miss storage I/O. For narrow queries,
+/// this local window can be the tighter limit, so observed sample parallelism
+/// may be lower than `sample_concurrency` even though the semaphore remains
+/// the query-global I/O ceiling.
 const PER_BUCKET_SAMPLE_READAHEAD: usize = 8;
 
 /// Load samples for all series in a bucket sample work item.
@@ -777,14 +780,14 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
     cache: &Arc<QueryReaderEvalCache>,
     plan: &QueryPlan,
     selector: &VectorSelector,
-    _concurrency: &PipelineConcurrency,
 ) -> EvalResult<ExprResult> {
     let pipeline_start = Instant::now();
     let stats_before = cache.snapshot_stats();
 
     // Coordinator widths are internal scheduling constants. The public
     // concurrency knobs (metadata / samples) only size the read-permit
-    // semaphores on the shared cache.
+    // semaphores on the shared cache; these widths and the per-bucket sample
+    // window bound resident pipeline work and can become the tighter limit.
     let num_buckets = plan.buckets.len();
     let metadata_stage_width = num_buckets.clamp(1, METADATA_STAGE_READAHEAD);
     let sample_stage_width = num_buckets.clamp(1, SAMPLE_STAGE_READAHEAD);
@@ -1535,7 +1538,7 @@ mod tests {
         let cache = std::sync::Arc::new(
             crate::promql::evaluator::QueryReaderEvalCache::with_concurrency(concurrency),
         );
-        execute_selector_pipeline(reader, &cache, plan, &selector, concurrency).await
+        execute_selector_pipeline(reader, &cache, plan, &selector).await
     }
 
     fn build_two_bucket_reader() -> crate::query::test_utils::MockQueryReader {
@@ -1857,7 +1860,7 @@ mod tests {
             _ => panic!("expected vector selector"),
         };
 
-        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
+        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector)
             .await
             .unwrap();
 
@@ -1900,7 +1903,7 @@ mod tests {
         };
 
         let start = tokio::time::Instant::now();
-        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
+        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector)
             .await
             .unwrap();
         let elapsed = start.elapsed();
@@ -1947,7 +1950,7 @@ mod tests {
         };
 
         let start = tokio::time::Instant::now();
-        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
+        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector)
             .await
             .unwrap();
         let elapsed = start.elapsed();
@@ -1998,7 +2001,7 @@ mod tests {
         let plan = QueryPlan::for_instant_vector(6_200_000, 300_000, buckets.clone());
 
         // First invocation: populates cache, calls underlying reader
-        execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
+        execute_selector_pipeline(&reader, &cache, &plan, &selector)
             .await
             .unwrap();
         let samples_after_first = reader.samples_count();
@@ -2007,7 +2010,7 @@ mod tests {
 
         // Second invocation: should reuse cache, no new reader calls
         let plan2 = QueryPlan::for_instant_vector(6_200_000, 300_000, buckets);
-        let r2 = execute_selector_pipeline(&reader, &cache, &plan2, &selector, &concurrency)
+        let r2 = execute_selector_pipeline(&reader, &cache, &plan2, &selector)
             .await
             .unwrap();
 
@@ -2126,7 +2129,7 @@ mod tests {
             _ => panic!("expected vector selector"),
         };
 
-        execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
+        execute_selector_pipeline(&reader, &cache, &plan, &selector)
             .await
             .unwrap();
 
@@ -2172,7 +2175,7 @@ mod tests {
         let plan = QueryPlan::for_instant_vector(6_200_000, 300_000, buckets.clone());
 
         // First run: cache miss, reader called
-        execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
+        execute_selector_pipeline(&reader, &cache, &plan, &selector)
             .await
             .unwrap();
         let samples_after_first = reader.samples_count();
@@ -2180,7 +2183,7 @@ mod tests {
 
         // Second run: cache hit, reader NOT called
         let plan2 = QueryPlan::for_instant_vector(6_200_000, 300_000, buckets);
-        execute_selector_pipeline(&reader, &cache, &plan2, &selector, &concurrency)
+        execute_selector_pipeline(&reader, &cache, &plan2, &selector)
             .await
             .unwrap();
         assert_eq!(
@@ -2259,7 +2262,7 @@ mod tests {
         };
 
         let start = tokio::time::Instant::now();
-        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
+        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector)
             .await
             .unwrap();
         let elapsed = start.elapsed();
@@ -2327,7 +2330,7 @@ mod tests {
             _ => panic!("expected vector selector"),
         };
 
-        execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
+        execute_selector_pipeline(&reader, &cache, &plan, &selector)
             .await
             .unwrap();
 
@@ -2401,7 +2404,7 @@ mod tests {
             _ => panic!("expected vector selector"),
         };
 
-        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
+        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector)
             .await
             .unwrap();
 
@@ -2470,7 +2473,7 @@ mod tests {
             _ => panic!("expected vector selector"),
         };
 
-        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
+        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector)
             .await
             .unwrap();
 
@@ -2508,7 +2511,7 @@ mod tests {
             _ => panic!("expected vector selector"),
         };
 
-        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
+        let result = execute_selector_pipeline(&reader, &cache, &plan, &selector)
             .await
             .unwrap();
 
@@ -2592,7 +2595,7 @@ mod tests {
 
         // First invocation: populates cache (misses)
         let snap1 = cache.snapshot_stats();
-        execute_selector_pipeline(&reader, &cache, &plan, &selector, &concurrency)
+        execute_selector_pipeline(&reader, &cache, &plan, &selector)
             .await
             .unwrap();
         let delta1 = cache.snapshot_stats().delta_since(&snap1);
@@ -2604,7 +2607,7 @@ mod tests {
         // Second invocation: cache hits only
         let snap2 = cache.snapshot_stats();
         let plan2 = QueryPlan::for_instant_vector(6_200_000, 300_000, buckets);
-        execute_selector_pipeline(&reader, &cache, &plan2, &selector, &concurrency)
+        execute_selector_pipeline(&reader, &cache, &plan2, &selector)
             .await
             .unwrap();
         let delta2 = cache.snapshot_stats().delta_since(&snap2);

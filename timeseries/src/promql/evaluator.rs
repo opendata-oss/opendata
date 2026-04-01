@@ -1202,7 +1202,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             self.reader.shared_cache(),
             &plan,
             vector_selector,
-            &self.concurrency,
         )
         .await
     }
@@ -1357,7 +1356,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             self.reader.shared_cache(),
             &plan,
             vector_selector,
-            &self.concurrency,
         )
         .await
     }
@@ -1390,7 +1388,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             self.reader.shared_cache(),
             &plan,
             vector_selector,
-            &self.concurrency,
         )
         .await
     }
