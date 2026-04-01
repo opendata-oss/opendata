@@ -34,15 +34,20 @@ use super::EncodingError;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Posting {
     id: u64,
-    vector: Vec<f32>,
+    vector: Arc<Vec<f32>>,
 }
 
 impl Posting {
     pub(crate) fn new(id: u64, vector: Vec<f32>) -> Self {
+        Self { id, vector: Arc::new(vector) }
+    }
+
+    fn new_arc(id: u64, vector: Arc<Vec<f32>>) -> Self {
         Self { id, vector }
     }
 
@@ -66,7 +71,7 @@ impl From<PostingListValue> for PostingList {
             .filter_map(|posting| {
                 assert!(seen.insert(posting.id()));
                 match posting {
-                    PostingUpdate::Append { id, vector } => Some(Posting::new(id, vector)),
+                    PostingUpdate::Append { id, vector } => Some(Posting::new_arc(id, vector)),
                     PostingUpdate::Delete { .. } => None,
                 }
             })
@@ -91,7 +96,7 @@ pub enum PostingUpdate {
         /// Internal vector ID.
         id: u64,
         /// The full vector data.
-        vector: Vec<f32>,
+        vector: Arc<Vec<f32>>,
     },
     Delete {
         /// Internal vector ID
@@ -102,7 +107,7 @@ pub enum PostingUpdate {
 impl PostingUpdate {
     /// Create a new append posting update.
     pub fn append(id: u64, vector: Vec<f32>) -> Self {
-        Self::Append { id, vector }
+        Self::Append { id, vector: Arc::new(vector) }
     }
 
     /// Create a new delete posting update.
@@ -144,7 +149,7 @@ impl PostingUpdate {
             Self::Append { id, vector } => {
                 buf.put_u8(POSTING_UPDATE_TYPE_APPEND_BYTE);
                 buf.put_u64_le(*id);
-                for &val in vector {
+                for &val in vector.as_slice() {
                     buf.put_f32_le(val);
                 }
             }
@@ -190,7 +195,7 @@ impl PostingUpdate {
                 vector.push(buf.get_f32_le());
             }
 
-            Ok(PostingUpdate::Append { id, vector })
+            Ok(PostingUpdate::Append { id, vector: Arc::new(vector) })
         } else if posting_type == POSTING_UPDATE_TYPE_DELETE_BYTE {
             Ok(PostingUpdate::Delete { id })
         } else {

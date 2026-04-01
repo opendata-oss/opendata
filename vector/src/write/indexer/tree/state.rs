@@ -215,7 +215,7 @@ impl SearchIndexDelta {
     pub(crate) fn add_to_root(&mut self, centroid_id: u64, vector: Vec<f32>) {
         self.root_updates.push(PostingUpdate::Append {
             id: centroid_id,
-            vector,
+            vector: Arc::new(vector),
         });
         self.root_centroid_count += 1;
     }

@@ -107,7 +107,12 @@ impl PostingList {
             .cloned()
             .collect::<Vec<_>>();
         postings.extend(updates.into_iter().filter_map(|update| match update {
-            PostingUpdate::Append { id, vector } => Some(Posting::new(id, vector)),
+            PostingUpdate::Append { id, vector } => Some(Posting::from_shared_buffer(
+                id,
+                vector.clone(),
+                0,
+                vector.len(),
+            )),
             PostingUpdate::Delete { .. } => None,
         }));
         Self { postings }
@@ -124,9 +129,9 @@ impl PostingList {
             .postings
             .iter()
             .filter(|posting| !updated_ids.contains(&posting.id))
-            .map(|posting| (posting.id, posting.vector().to_vec()));
-        let appended = updates.into_iter().filter_map(|update| match update {
-            PostingUpdate::Append { id, vector } => Some((id, vector)),
+            .map(|posting| (posting.id, posting.vector()));
+        let appended = updates.iter().filter_map(|update| match update {
+            PostingUpdate::Append { id, vector } => Some((*id, vector.as_slice())),
             PostingUpdate::Delete { .. } => None,
         });
         Self::from_vectors(retained.chain(appended).collect())
@@ -136,12 +141,12 @@ impl PostingList {
         Self::from_vectors(
             self.postings
                 .iter()
-                .map(|posting| (posting.id, posting.vector().to_vec()))
+                .map(|posting| (posting.id, posting.vector()))
                 .collect(),
         )
     }
 
-    fn from_vectors(vectors: Vec<(u64, Vec<f32>)>) -> Self {
+    fn from_vectors(vectors: Vec<(u64, &[f32])>) -> Self {
         let total_len = vectors.iter().map(|(_, vector)| vector.len()).sum();
         let mut buffer = Vec::with_capacity(total_len);
         let mut offsets = Vec::with_capacity(vectors.len());
@@ -165,11 +170,11 @@ impl PostingList {
         let mut seen = HashSet::new();
         let vectors = value
             .postings
-            .into_iter()
+            .iter()
             .filter_map(|posting| {
                 assert!(seen.insert(posting.id()));
                 match posting {
-                    PostingUpdate::Append { id, vector } => Some((id, vector)),
+                    PostingUpdate::Append { id, vector } => Some((*id, vector.as_slice())),
                     PostingUpdate::Delete { .. } => None,
                 }
             })
