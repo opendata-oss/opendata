@@ -8,8 +8,11 @@ use vector::{Config, DistanceMetric, Query, SearchOptions, Vector, VectorDb, Vec
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_test_writer()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("opendata_vector=debug,vector=debug")),
+        )
+        .with_writer(std::io::stdout)
         .try_init();
 }
 

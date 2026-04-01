@@ -18,6 +18,7 @@ use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::trace;
 
 /// An upsert where we need to resolve the old vector data from storage.
 struct ResolvedUpsert {
@@ -315,7 +316,7 @@ impl ReassignVectors {
         // execute the reassignments
         let reassigned = resolved.len();
         for r in resolved {
-            debug!("old data: {:?}", r.data);
+            trace!("old data: {:?}", r.data);
             delta.search_index.remove_from_posting(
                 self.level,
                 r.reassignment.current_centroid,

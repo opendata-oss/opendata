@@ -1,19 +1,20 @@
+use crate::db::LastAppliedSnapshot;
 use crate::write::delta::{VectorDbDeltaView, VectorDbWriteDelta};
+use crate::write::indexer::tree::centroids::{
+    CachedCentroidReader, LeveledCentroidIndex, StoredCentroidReader,
+};
 use crate::write::indexer::tree::{IndexUpdateResults, Indexer};
-use crate::write::indexer::tree::centroids::{CachedCentroidReader, CentroidCache, LeveledCentroidIndex, StoredCentroidReader};
+use crate::{Config, DistanceMetric};
 use async_trait::async_trait;
 use common::Storage;
 use common::coordinator::Flusher;
 use common::storage::StorageSnapshot;
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use crate::{Config, DistanceMetric};
-use crate::db::LastAppliedSnapshot;
 
 struct VectorDbFlusherOpts {
     dimensions: u16,
-    distance_metric: DistanceMetric
+    distance_metric: DistanceMetric,
 }
 
 pub(crate) struct VectorDbFlusher {
@@ -41,7 +42,7 @@ impl VectorDbFlusher {
         Self {
             opts: VectorDbFlusherOpts {
                 dimensions: config.dimensions,
-                distance_metric: config.distance_metric
+                distance_metric: config.distance_metric,
             },
             storage,
             last_snapshot: initial_snapshot,
@@ -79,8 +80,7 @@ impl Flusher<VectorDbWriteDelta> for VectorDbFlusher {
 
         // From this point, in-memory state has diverged from storage.
         // If any subsequent operation fails, poison the flusher.
-        let result = self.apply_and_snapshot(result, update_epoch)
-            .await;
+        let result = self.apply_and_snapshot(result, update_epoch).await;
         if let Err(err) = &result {
             self.poisoned = Some(err.clone());
         }
@@ -104,12 +104,16 @@ impl VectorDbFlusher {
             .map_err(|e| e.to_string())?;
 
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
-        let stored_reader = StoredCentroidReader::new(self.opts.dimensions as usize, snapshot.clone(), snapshot_epoch);
+        let stored_reader = StoredCentroidReader::new(
+            self.opts.dimensions as usize,
+            snapshot.clone(),
+            snapshot_epoch,
+        );
         let cached_reader = CachedCentroidReader::new(&index_outputs.centroid_cache, stored_reader);
         let query_centroid_index = LeveledCentroidIndex::new(
             index_outputs.centroid_tree_depth as u16,
             self.opts.distance_metric,
-            Arc::new(cached_reader)
+            Arc::new(cached_reader),
         );
         *self.last_applied_snapshot.lock().expect("lock poisoned") = LastAppliedSnapshot {
             snapshot: snapshot.clone(),
@@ -195,11 +199,8 @@ mod tests {
             &cache,
             StoredCentroidReader::new(DIMS, snapshot.clone(), 0),
         ));
-        let query_centroid_index = Arc::new(LeveledCentroidIndex::new(
-            1,
-            DistanceMetric::L2,
-            reader,
-        ));
+        let query_centroid_index =
+            Arc::new(LeveledCentroidIndex::new(1, DistanceMetric::L2, reader));
 
         let config = Config {
             dimensions: DIMS as u16,
@@ -229,7 +230,7 @@ mod tests {
                 snapshot,
                 centroid_index: query_centroid_index,
                 centroid_count: 1,
-            }))
+            })),
         )
     }
 

@@ -15,7 +15,7 @@ use rayon::iter::ParallelIterator;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task;
-use tracing::debug;
+use tracing::{debug, trace};
 
 /// An upsert where we need to resolve the old vector data from storage.
 struct ResolvedUpsert {
@@ -282,7 +282,7 @@ impl ReassignVectors {
         // execute the reassignments
         let reassigned = resolved.len();
         for r in resolved {
-            debug!("old data: {:?}", r.data);
+            trace!("old data: {:?}", r.data);
             delta.remove_from_posting(r.reassignment.current_centroid, r.reassignment.vector_id);
             delta.add_to_posting(r.centroid, r.reassignment.vector_id, r.reassignment.vector);
         }

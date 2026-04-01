@@ -32,7 +32,10 @@ use crate::write::delta::{VectorDbWrite, VectorDbWriteDelta, VectorWrite};
 use crate::write::flusher::VectorDbFlusher;
 use crate::write::indexer::tree::Indexer;
 use crate::write::indexer::tree::IndexerOpts;
-use crate::write::indexer::tree::centroids::{AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, CentroidIndex, LeveledCentroidIndex, StoredCentroidReader};
+use crate::write::indexer::tree::centroids::{
+    AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex,
+    StoredCentroidReader,
+};
 use crate::write::indexer::tree::state::VectorIndexState;
 use async_trait::async_trait;
 use common::Record;
@@ -41,7 +44,6 @@ use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};
 use common::storage::{Storage, StorageRead, StorageSnapshot};
 use common::{StorageBuilder, StorageSemantics};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -129,7 +131,7 @@ pub struct VectorDb {
     write_coordinator: WriteCoordinator<VectorDbWriteDelta, VectorDbFlusher>,
 
     /// snapshot state for queries
-    last_applied_snapshot: Arc<Mutex<LastAppliedSnapshot>>
+    last_applied_snapshot: Arc<Mutex<LastAppliedSnapshot>>,
 }
 
 impl VectorDb {
@@ -219,7 +221,7 @@ impl VectorDb {
         let last_applied_snapshot = Arc::new(Mutex::new(LastAppliedSnapshot {
             snapshot: snapshot.clone(),
             centroid_index: loaded_tree.query_centroid_index,
-            centroid_count: loaded_tree.centroids.len()
+            centroid_count: loaded_tree.num_leaf_centroids,
         }));
 
         let (seq_block_key, seq_block) = id_allocator.freeze();
@@ -248,7 +250,7 @@ impl VectorDb {
             IndexerOpts {
                 dimensions: config.dimensions as usize,
                 distance_metric: config.distance_metric,
-                root_threshold_vectors: config.split_threshold_vectors,
+                root_threshold_vectors: 10000, // config.split_threshold_vectors,
                 merge_threshold_vectors: config.merge_threshold_vectors,
                 split_threshold_vectors: config.split_threshold_vectors,
                 split_search_neighbourhood: config.split_search_neighbourhood,
@@ -726,7 +728,10 @@ impl VectorDb {
     }
 
     pub fn num_centroids(&self) -> usize {
-        self.last_applied_snapshot.lock().expect("lock_poisoned").centroid_count
+        self.last_applied_snapshot
+            .lock()
+            .expect("lock_poisoned")
+            .centroid_count
     }
 
     /// Create a QueryEngine from the current snapshot for executing queries.
