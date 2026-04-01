@@ -1,7 +1,7 @@
 //! PromQL engine microbenchmarks.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use timeseries::SubqueryLabelCacheHarness;
+use timeseries::{SubqueryLabelCacheHarness, WarmRangeQueryHarness};
 
 mod common;
 
@@ -55,9 +55,63 @@ fn bench_subquery_label_cache(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Warm range-query benchmarks (Issue #348)
+// ---------------------------------------------------------------------------
+
+fn bench_warm_range_vector_selector(c: &mut Criterion) {
+    let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+
+    // 100 series x 10 labels, 6h range at 30s step = 720 steps
+    let harness = WarmRangeQueryHarness::vector_selector(
+        100,      // num_series
+        10,       // num_labels
+        6 * 3600, // range_secs (6h)
+        30,       // step_secs
+        300_000,  // lookback_delta_ms (5min)
+    );
+
+    // Warmup: one full range evaluation
+    runtime.block_on(harness.run_once()).expect("warmup failed");
+
+    c.bench_function("evaluator_micorbench/warm_range_vector_selector", |b| {
+        b.iter(|| {
+            runtime
+                .block_on(harness.run_once())
+                .expect("benchmark iteration failed");
+        })
+    });
+}
+
+fn bench_warm_range_aggregation(c: &mut Criterion) {
+    let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+
+    // sum by (label_0) over 100 series, 6h range at 30s step = 720 steps
+    let harness = WarmRangeQueryHarness::aggregation(
+        100,      // num_series
+        10,       // num_labels
+        6 * 3600, // range_secs (6h)
+        30,       // step_secs
+        300_000,  // lookback_delta_ms (5min)
+    );
+
+    runtime.block_on(harness.run_once()).expect("warmup failed");
+
+    c.bench_function("evaluator_micorbench/warm_range_aggregation", |b| {
+        b.iter(|| {
+            runtime
+                .block_on(harness.run_once())
+                .expect("benchmark iteration failed");
+        })
+    });
+}
+
 criterion_group! {
     name = benches;
     config = common::default_criterion();
-    targets = bench_subquery_label_cache
+    targets =
+        bench_subquery_label_cache,
+        bench_warm_range_vector_selector,
+        bench_warm_range_aggregation
 }
 criterion_main!(benches);

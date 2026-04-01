@@ -77,6 +77,8 @@ mod timeseries;
 // Public re-exports
 #[cfg(feature = "bench-internals")]
 pub use bench_api::SubqueryLabelCacheHarness;
+#[cfg(feature = "bench-internals")]
+pub use bench_api::WarmRangeQueryHarness;
 pub use config::Config;
 pub use error::{Error, QueryError, Result};
 pub use model::{
