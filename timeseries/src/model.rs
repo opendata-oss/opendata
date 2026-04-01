@@ -607,12 +607,13 @@ pub struct QueryOptions {
     /// Defaults to 5 minutes (the Prometheus staleness delta).
     pub lookback_delta: Duration,
 
-    /// Maximum number of concurrent bucket metadata resolutions during query
-    /// pipeline execution.
+    /// Maximum number of concurrent cache-miss metadata reads (inverted index
+    /// and forward index) during query pipeline execution. Cache hits are free
+    /// and do not consume a permit.
     pub metadata_concurrency: usize,
 
-    /// Maximum number of concurrent bucket sample loads during query pipeline
-    /// execution.
+    /// Maximum number of concurrent cache-miss sample reads during query
+    /// pipeline execution. Cache hits are free and do not consume a permit.
     pub sample_concurrency: usize,
 }
 

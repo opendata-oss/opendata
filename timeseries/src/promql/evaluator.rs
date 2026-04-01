@@ -4,6 +4,7 @@ use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::Sample;
@@ -63,15 +64,195 @@ impl QueryReaderBucketEvalCache {
     }
 }
 
+/// Distinguishes metadata reads (inverted/forward index) from sample reads
+/// for permit acquisition and stat recording.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ReadPathKind {
+    Metadata,
+    Sample,
+}
+
+/// Atomic counters for cache-miss read-path observability.
+///
+/// All fields are monotonically increasing counters updated at the read sites
+/// in `CachedQueryReader`. They are cheap to read at pipeline end for the
+/// debug log line and carry no per-request allocation.
+pub(crate) struct ReadPathStats {
+    pub metadata_cache_hits: AtomicU64,
+    pub metadata_cache_misses: AtomicU64,
+    pub sample_cache_hits: AtomicU64,
+    pub sample_cache_misses: AtomicU64,
+    pub metadata_permit_wait_ns: AtomicU64,
+    pub sample_permit_wait_ns: AtomicU64,
+}
+
+impl ReadPathStats {
+    fn new() -> Self {
+        Self {
+            metadata_cache_hits: AtomicU64::new(0),
+            metadata_cache_misses: AtomicU64::new(0),
+            sample_cache_hits: AtomicU64::new(0),
+            sample_cache_misses: AtomicU64::new(0),
+            metadata_permit_wait_ns: AtomicU64::new(0),
+            sample_permit_wait_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn record_cache_hit(&self, kind: ReadPathKind) {
+        match kind {
+            ReadPathKind::Metadata => {
+                self.metadata_cache_hits
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            ReadPathKind::Sample => {
+                self.sample_cache_hits.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+    }
+
+    fn record_cache_miss(&self, kind: ReadPathKind) {
+        match kind {
+            ReadPathKind::Metadata => {
+                self.metadata_cache_misses
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            ReadPathKind::Sample => {
+                self.sample_cache_misses
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+    }
+
+    fn record_permit_wait(&self, kind: ReadPathKind, wait_ns: u64) {
+        match kind {
+            ReadPathKind::Metadata => {
+                self.metadata_permit_wait_ns
+                    .fetch_add(wait_ns, AtomicOrdering::Relaxed);
+            }
+            ReadPathKind::Sample => {
+                self.sample_permit_wait_ns
+                    .fetch_add(wait_ns, AtomicOrdering::Relaxed);
+            }
+        }
+    }
+
+    /// Capture a point-in-time snapshot of all counters.
+    pub(crate) fn snapshot(&self) -> ReadPathStatsSnapshot {
+        ReadPathStatsSnapshot {
+            metadata_cache_hits: self.metadata_cache_hits.load(AtomicOrdering::Relaxed),
+            metadata_cache_misses: self.metadata_cache_misses.load(AtomicOrdering::Relaxed),
+            sample_cache_hits: self.sample_cache_hits.load(AtomicOrdering::Relaxed),
+            sample_cache_misses: self.sample_cache_misses.load(AtomicOrdering::Relaxed),
+            metadata_permit_wait_ns: self.metadata_permit_wait_ns.load(AtomicOrdering::Relaxed),
+            sample_permit_wait_ns: self.sample_permit_wait_ns.load(AtomicOrdering::Relaxed),
+        }
+    }
+}
+
+/// Point-in-time snapshot of read-path counters, used for computing deltas.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReadPathStatsSnapshot {
+    pub metadata_cache_hits: u64,
+    pub metadata_cache_misses: u64,
+    pub sample_cache_hits: u64,
+    pub sample_cache_misses: u64,
+    pub metadata_permit_wait_ns: u64,
+    pub sample_permit_wait_ns: u64,
+}
+
+impl ReadPathStatsSnapshot {
+    /// Compute the delta between this snapshot and an earlier one.
+    pub(crate) fn delta_since(&self, earlier: &ReadPathStatsSnapshot) -> ReadPathStatsSnapshot {
+        ReadPathStatsSnapshot {
+            metadata_cache_hits: self
+                .metadata_cache_hits
+                .saturating_sub(earlier.metadata_cache_hits),
+            metadata_cache_misses: self
+                .metadata_cache_misses
+                .saturating_sub(earlier.metadata_cache_misses),
+            sample_cache_hits: self
+                .sample_cache_hits
+                .saturating_sub(earlier.sample_cache_hits),
+            sample_cache_misses: self
+                .sample_cache_misses
+                .saturating_sub(earlier.sample_cache_misses),
+            metadata_permit_wait_ns: self
+                .metadata_permit_wait_ns
+                .saturating_sub(earlier.metadata_permit_wait_ns),
+            sample_permit_wait_ns: self
+                .sample_permit_wait_ns
+                .saturating_sub(earlier.sample_permit_wait_ns),
+        }
+    }
+}
+
+/// Filter samples by time range: `(start_ms, end_ms]`.
+fn filter_samples_in_range(samples: &[Sample], start_ms: i64, end_ms: i64) -> Vec<Sample> {
+    samples
+        .iter()
+        .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
+        .cloned()
+        .collect()
+}
+
 pub(crate) struct QueryReaderEvalCache {
     cache: dashmap::DashMap<TimeBucket, QueryReaderBucketEvalCache>,
+    /// Limits concurrent cache-miss metadata reads (inverted_index, forward_index).
+    pub(crate) metadata_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Limits concurrent cache-miss sample reads.
+    pub(crate) sample_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Atomic counters for read-path observability.
+    pub(crate) stats: ReadPathStats,
 }
 
 impl QueryReaderEvalCache {
     pub(crate) fn new() -> Self {
+        let defaults = crate::promql::pipeline::PipelineConcurrency::default();
+        Self::with_concurrency(&defaults)
+    }
+
+    /// Build a cache with semaphores sized to the given concurrency limits.
+    ///
+    /// `metadata_concurrency` and `sample_concurrency` control how many
+    /// cache-miss storage reads can be in flight at once, not how many
+    /// bucket-level pipeline workers run concurrently.
+    pub(crate) fn with_concurrency(
+        concurrency: &crate::promql::pipeline::PipelineConcurrency,
+    ) -> Self {
         Self {
             cache: dashmap::DashMap::new(),
+            metadata_semaphore: Arc::new(tokio::sync::Semaphore::new(concurrency.metadata.max(1))),
+            sample_semaphore: Arc::new(tokio::sync::Semaphore::new(concurrency.samples.max(1))),
+            stats: ReadPathStats::new(),
         }
+    }
+
+    /// Capture a point-in-time snapshot of all read-path counters.
+    pub(crate) fn snapshot_stats(&self) -> ReadPathStatsSnapshot {
+        self.stats.snapshot()
+    }
+
+    /// Acquire a read permit for the given path kind, recording wait time.
+    ///
+    /// Returns an `OwnedSemaphorePermit` so callers can hold it across await
+    /// points without borrowing `self`. A closed semaphore produces an
+    /// `EvaluationError` rather than a panic.
+    pub(crate) async fn acquire_permit(
+        &self,
+        kind: ReadPathKind,
+    ) -> EvalResult<tokio::sync::OwnedSemaphorePermit> {
+        let sem = match kind {
+            ReadPathKind::Metadata => Arc::clone(&self.metadata_semaphore),
+            ReadPathKind::Sample => Arc::clone(&self.sample_semaphore),
+        };
+        let wait_start = std::time::Instant::now();
+        let permit = sem
+            .acquire_owned()
+            .await
+            .map_err(|_| EvaluationError::InternalError("read permit semaphore closed".into()))?;
+        self.stats
+            .record_permit_wait(kind, wait_start.elapsed().as_nanos() as u64);
+        Ok(permit)
     }
 
     fn get_or_create_bucket(
@@ -343,21 +524,16 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
     ) -> Result<Arc<dyn ForwardIndexLookup + Send + Sync + 'static>> {
         let mut series_ids = Vec::from(series_ids);
         series_ids.sort();
-        // Check cache first
         if let Some(cached_data) = self.cache.get_forward_index(bucket, &series_ids) {
-            Ok(cached_data)
-        } else {
-            // Load from underlying reader
-            let forward_index = self.reader.forward_index(bucket, &series_ids).await?;
-
-            self.cache
-                .cache_forward_index(*bucket, series_ids.clone(), forward_index);
-
-            Ok(self
-                .cache
-                .get_forward_index(bucket, &series_ids)
-                .expect("unreachable"))
+            self.cache.stats.record_cache_hit(ReadPathKind::Metadata);
+            return Ok(cached_data);
         }
+
+        // Delegate to a free function so the semaphore `.await` does not
+        // hold `&self` (and therefore `&'reader R`) in the future state.
+        // This avoids higher-ranked lifetime `Send` issues with the
+        // recursive `evaluate_expr` return type.
+        cached_forward_index_miss(self.reader, Arc::clone(&self.cache), *bucket, series_ids).await
     }
 
     pub(crate) async fn inverted_index(
@@ -366,24 +542,13 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         terms: &[Label],
     ) -> Result<Arc<dyn InvertedIndexLookup + Send + Sync + 'static>> {
         let mut terms = terms.to_vec();
-        // Sort by canonical Label ordering (name, then value) for cache key consistency
         terms.sort();
-        // Check cache first
         if let Some(cached_result) = self.cache.get_inverted_index(bucket, &terms) {
+            self.cache.stats.record_cache_hit(ReadPathKind::Metadata);
             return Ok(cached_result);
         }
 
-        // Load from underlying reader
-        let inverted_index = self.reader.inverted_index(bucket, &terms).await?;
-
-        // Cache the result
-        self.cache
-            .cache_inverted_index(*bucket, terms.clone(), inverted_index);
-
-        Ok(self
-            .cache
-            .get_inverted_index(bucket, &terms)
-            .expect("unreachable"))
+        cached_inverted_index_miss(self.reader, Arc::clone(&self.cache), *bucket, terms).await
     }
 
     pub(crate) async fn all_inverted_index(
@@ -408,40 +573,122 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<Sample>> {
-        // Check cache first
         if let Some(cached_samples) = self.cache.get_samples(bucket, &series_id) {
-            // Filter cached samples by requested time range
-            let filtered: Vec<Sample> = cached_samples
-                .iter()
-                .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
-                .cloned()
-                .collect();
-            return Ok(filtered);
+            self.cache.stats.record_cache_hit(ReadPathKind::Sample);
+            return Ok(filter_samples_in_range(&cached_samples, start_ms, end_ms));
         }
 
-        // Cache the full bucket on a miss so later overlapping range-query
-        // steps and sibling selector evaluations can slice locally without
-        // paying for another storage read.
-        let samples = self
-            .reader
-            .samples(bucket, series_id, i64::MIN, i64::MAX)
-            .await?;
-
-        // Cache the full sample set, then filter the shared handle
-        self.cache.cache_samples(*bucket, series_id, samples);
-
-        let cached = self
-            .cache
-            .get_samples(bucket, &series_id)
-            .expect("just cached");
-        let filtered: Vec<Sample> = cached
-            .iter()
-            .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
-            .cloned()
-            .collect();
-
-        Ok(filtered)
+        cached_samples_miss(
+            self.reader,
+            Arc::clone(&self.cache),
+            *bucket,
+            series_id,
+            start_ms,
+            end_ms,
+        )
+        .await
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cache-miss read helpers (free functions)
+//
+// These are free functions rather than methods on `CachedQueryReader` so that
+// the semaphore `.await` does not hold `&CachedQueryReader<'reader, R>` in
+// the generated future state.  Holding that reference across an await point
+// triggers a "Send is not general enough" error for the `'reader` lifetime
+// when the future is stored inside `Pin<Box<dyn Future + Send>>` in the
+// recursive `evaluate_expr` return type.  By taking `reader: &R` and
+// `cache: Arc<QueryReaderEvalCache>` as separate parameters the generated
+// future's Send bound depends only on `&R` (fine, `R: Sync`) and owned
+// `Arc` values.
+// ---------------------------------------------------------------------------
+
+async fn cached_forward_index_miss<R: QueryReader>(
+    reader: &R,
+    cache: Arc<QueryReaderEvalCache>,
+    bucket: TimeBucket,
+    series_ids: Vec<SeriesId>,
+) -> Result<Arc<dyn ForwardIndexLookup + Send + Sync + 'static>> {
+    let _permit = cache
+        .acquire_permit(ReadPathKind::Metadata)
+        .await
+        .map_err(|e| crate::error::Error::Internal(e.to_string()))?;
+
+    // Post-permit recheck: another task may have populated while we waited.
+    if let Some(cached_data) = cache.get_forward_index(&bucket, &series_ids) {
+        cache.stats.record_cache_hit(ReadPathKind::Metadata);
+        return Ok(cached_data);
+    }
+
+    cache.stats.record_cache_miss(ReadPathKind::Metadata);
+    let forward_index = reader.forward_index(&bucket, &series_ids).await?;
+
+    cache.cache_forward_index(bucket, series_ids.clone(), forward_index);
+
+    Ok(cache
+        .get_forward_index(&bucket, &series_ids)
+        .expect("unreachable"))
+}
+
+async fn cached_inverted_index_miss<R: QueryReader>(
+    reader: &R,
+    cache: Arc<QueryReaderEvalCache>,
+    bucket: TimeBucket,
+    terms: Vec<Label>,
+) -> Result<Arc<dyn InvertedIndexLookup + Send + Sync + 'static>> {
+    let _permit = cache
+        .acquire_permit(ReadPathKind::Metadata)
+        .await
+        .map_err(|e| crate::error::Error::Internal(e.to_string()))?;
+
+    if let Some(cached_result) = cache.get_inverted_index(&bucket, &terms) {
+        cache.stats.record_cache_hit(ReadPathKind::Metadata);
+        return Ok(cached_result);
+    }
+
+    cache.stats.record_cache_miss(ReadPathKind::Metadata);
+    let inverted_index = reader.inverted_index(&bucket, &terms).await?;
+
+    cache.cache_inverted_index(bucket, terms.clone(), inverted_index);
+
+    Ok(cache
+        .get_inverted_index(&bucket, &terms)
+        .expect("unreachable"))
+}
+
+async fn cached_samples_miss<R: QueryReader>(
+    reader: &R,
+    cache: Arc<QueryReaderEvalCache>,
+    bucket: TimeBucket,
+    series_id: SeriesId,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Vec<Sample>> {
+    let _permit = cache
+        .acquire_permit(ReadPathKind::Sample)
+        .await
+        .map_err(|e| crate::error::Error::Internal(e.to_string()))?;
+
+    // Post-permit recheck.
+    if let Some(cached_samples) = cache.get_samples(&bucket, &series_id) {
+        cache.stats.record_cache_hit(ReadPathKind::Sample);
+        return Ok(filter_samples_in_range(&cached_samples, start_ms, end_ms));
+    }
+
+    cache.stats.record_cache_miss(ReadPathKind::Sample);
+
+    // Cache the full bucket on a miss so later overlapping range-query
+    // steps and sibling selector evaluations can slice locally without
+    // paying for another storage read.
+    let samples = reader
+        .samples(&bucket, series_id, i64::MIN, i64::MAX)
+        .await?;
+
+    cache.cache_samples(bucket, series_id, samples);
+
+    let cached = cache.get_samples(&bucket, &series_id).expect("just cached");
+    Ok(filter_samples_in_range(&cached, start_ms, end_ms))
 }
 
 #[derive(Debug)]
@@ -769,7 +1016,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         reader: &'reader R,
         concurrency: crate::promql::pipeline::PipelineConcurrency,
     ) -> Self {
-        let cache = Arc::new(QueryReaderEvalCache::new());
+        let cache = Arc::new(QueryReaderEvalCache::with_concurrency(&concurrency));
         Self {
             reader: CachedQueryReader::with_shared_cache(reader, cache),
             concurrency,
