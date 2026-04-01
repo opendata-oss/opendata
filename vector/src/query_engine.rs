@@ -6,6 +6,7 @@ use crate::serde::posting_list::PostingList;
 use crate::serde::vector_data::VectorDataValue;
 use crate::storage::VectorDbStorageReadExt;
 use crate::write::indexer::tree::centroids::{LeveledCentroidIndex, search_centroids};
+use crate::write::indexer::tree::posting_list::Posting;
 use crate::{Attribute, Vector};
 use common::storage::StorageRead;
 use roaring::RoaringTreemap;
@@ -101,7 +102,7 @@ impl QueryEngine {
         let centroid_ids: Vec<u64> = centroid_candidates
             .iter()
             .take(nprobe)
-            .map(|(id, _)| *id)
+            .map(|posting| posting.id())
             .collect();
 
         if centroid_ids.is_empty() {
@@ -196,14 +197,10 @@ impl QueryEngine {
     ///
     /// Returns the pruned centroid IDs. If pruning is disabled (`None`), returns
     /// the input unchanged.
-    pub(crate) fn prune_centroids(
-        &self,
-        centroid_ids: &[(u64, Vec<f32>)],
-        query: &[f32],
-    ) -> Vec<u64> {
+    pub(crate) fn prune_centroids(&self, centroid_ids: &[Posting], query: &[f32]) -> Vec<u64> {
         let epsilon = match self.options.query_pruning_factor {
             Some(e) => e,
-            None => return centroid_ids.iter().map(|(id, _)| *id).collect(),
+            None => return centroid_ids.iter().map(|posting| posting.id()).collect(),
         };
 
         let metric = self.options.distance_metric;
@@ -211,7 +208,12 @@ impl QueryEngine {
         // Compute raw distance (lower = closer) from query to each centroid.
         let mut scored: Vec<(u64, f32)> = centroid_ids
             .iter()
-            .map(|(cid, cv)| (*cid, distance::raw_distance(query, cv, metric)))
+            .map(|posting| {
+                (
+                    posting.id(),
+                    distance::raw_distance(query, posting.vector(), metric),
+                )
+            })
             .collect();
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -239,7 +241,7 @@ impl QueryEngine {
             .collect()
     }
 
-    async fn search_centroids(&self, query: &[f32], k: usize) -> Result<Vec<(u64, Vec<f32>)>> {
+    async fn search_centroids(&self, query: &[f32], k: usize) -> Result<Vec<Posting>> {
         search_centroids(self.centroid_index.as_ref(), query, k).await
     }
 
@@ -497,6 +499,7 @@ mod tests {
     use crate::db::{VectorDb, VectorDbRead};
     use crate::model::{Config, Query, VECTOR_FIELD_NAME, Vector};
     use crate::serde::collection_meta::DistanceMetric;
+    use crate::write::indexer::tree::posting_list::Posting;
     use common::{StorageBuilder, StorageConfig};
 
     fn create_config(dimensions: u16, metric: DistanceMetric) -> Config {
@@ -540,10 +543,10 @@ mod tests {
         let query = [0.0, 0.0, 0.0];
         let engine = db.query_engine();
         let all_centroids = vec![
-            (1, vec![1.0, 0.0, 0.0]),
-            (2, vec![1.4, 0.0, 0.0]),
-            (3, vec![2.0, 0.0, 0.0]),
-            (4, vec![5.0, 0.0, 0.0]),
+            Posting::new(1, vec![1.0, 0.0, 0.0]),
+            Posting::new(2, vec![1.4, 0.0, 0.0]),
+            Posting::new(3, vec![2.0, 0.0, 0.0]),
+            Posting::new(4, vec![5.0, 0.0, 0.0]),
         ];
 
         // when
@@ -569,7 +572,10 @@ mod tests {
 
         let query = [0.0, 0.0, 0.0];
         let engine = db.query_engine();
-        let all_centroids = vec![(1, vec![1.0, 0.0, 0.0]), (2, vec![100.0, 0.0, 0.0])];
+        let all_centroids = vec![
+            Posting::new(1, vec![1.0, 0.0, 0.0]),
+            Posting::new(2, vec![100.0, 0.0, 0.0]),
+        ];
 
         // when
         let result = engine.prune_centroids(&all_centroids, &query);
@@ -601,9 +607,9 @@ mod tests {
         let engine = db.query_engine();
         // pass centroids in reverse distance order: far, medium, close
         let ids = vec![
-            (1, vec![5.0, 0.0, 0.0]),
-            (3, vec![3.0, 0.0, 0.0]),
-            (2, vec![1.0, 0.0, 0.0]),
+            Posting::new(1, vec![5.0, 0.0, 0.0]),
+            Posting::new(3, vec![3.0, 0.0, 0.0]),
+            Posting::new(2, vec![1.0, 0.0, 0.0]),
         ];
 
         // when

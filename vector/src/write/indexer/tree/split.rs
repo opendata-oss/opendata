@@ -179,7 +179,7 @@ impl SplitCentroids {
                     .cloned()
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|(id, _)| id)
+                    .map(|posting| posting.id())
                     .collect::<Vec<_>>();
                 postings_to_retrive.extend(neighbours.clone());
                 splits.push(SplitCentroid {

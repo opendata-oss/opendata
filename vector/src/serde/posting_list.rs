@@ -44,7 +44,10 @@ pub(crate) struct Posting {
 
 impl Posting {
     pub(crate) fn new(id: u64, vector: Vec<f32>) -> Self {
-        Self { id, vector: Arc::new(vector) }
+        Self {
+            id,
+            vector: Arc::new(vector),
+        }
     }
 
     fn new_arc(id: u64, vector: Arc<Vec<f32>>) -> Self {
@@ -107,7 +110,10 @@ pub enum PostingUpdate {
 impl PostingUpdate {
     /// Create a new append posting update.
     pub fn append(id: u64, vector: Vec<f32>) -> Self {
-        Self::Append { id, vector: Arc::new(vector) }
+        Self::Append {
+            id,
+            vector: Arc::new(vector),
+        }
     }
 
     /// Create a new delete posting update.
@@ -195,7 +201,10 @@ impl PostingUpdate {
                 vector.push(buf.get_f32_le());
             }
 
-            Ok(PostingUpdate::Append { id, vector: Arc::new(vector) })
+            Ok(PostingUpdate::Append {
+                id,
+                vector: Arc::new(vector),
+            })
         } else if posting_type == POSTING_UPDATE_TYPE_DELETE_BYTE {
             Ok(PostingUpdate::Delete { id })
         } else {

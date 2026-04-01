@@ -131,7 +131,7 @@ impl ResumableCentroidSearch {
 
 pub(crate) enum SearchResult {
     ReadsRequired(BlockedCentroidSearch),
-    Ann(Vec<(u64, Vec<f32>)>),
+    Ann(Vec<Posting>),
 }
 
 pub(crate) trait CentroidIndex {
@@ -208,7 +208,7 @@ impl<'a> LeveledCentroidIndex<'a> {
         postings: &[Arc<PostingList>],
         k: usize,
         distance_metric: DistanceMetric,
-    ) -> Vec<(u64, Vec<f32>)> {
+    ) -> Vec<Posting> {
         if k == 0 || postings.is_empty() {
             return Vec::new();
         }
@@ -222,17 +222,13 @@ impl<'a> LeveledCentroidIndex<'a> {
                         continue;
                     }
                     ranked.push(RankedPosting {
-                        id: posting.id(),
-                        vector: posting.vector().to_vec(),
+                        posting: &posting,
                         distance: compute_distance(query, posting.vector(), distance_metric),
                     });
                 }
             }
             ranked.sort_unstable();
-            return ranked
-                .into_iter()
-                .map(|posting| (posting.id, posting.vector))
-                .collect();
+            return ranked.into_iter().map(|rp| rp.posting.clone()).collect();
         }
 
         let mut ranked = BinaryHeap::with_capacity(k);
@@ -242,17 +238,16 @@ impl<'a> LeveledCentroidIndex<'a> {
             for posting in posting_list.iter() {
                 let distance = compute_distance(query, posting.vector(), distance_metric);
                 let candidate = RankedPosting {
-                    id: posting.id(),
-                    vector: posting.vector().to_vec(),
+                    posting: &posting,
                     distance,
                 };
 
-                if heap_ids.contains(&candidate.id) {
+                if heap_ids.contains(&candidate.posting.id()) {
                     continue;
                 }
 
                 if ranked.len() < k {
-                    heap_ids.insert(candidate.id);
+                    heap_ids.insert(candidate.posting.id());
                     ranked.push(candidate);
                     continue;
                 }
@@ -262,8 +257,8 @@ impl<'a> LeveledCentroidIndex<'a> {
                 };
                 if candidate < *worst {
                     let removed = ranked.pop().expect("heap should be non-empty");
-                    heap_ids.remove(&removed.id);
-                    heap_ids.insert(candidate.id);
+                    heap_ids.remove(&removed.posting.id());
+                    heap_ids.insert(candidate.posting.id());
                     ranked.push(candidate);
                 }
             }
@@ -271,13 +266,10 @@ impl<'a> LeveledCentroidIndex<'a> {
 
         let mut ranked = ranked.into_vec();
         ranked.sort_unstable();
-        ranked
-            .into_iter()
-            .map(|posting| (posting.id, posting.vector))
-            .collect()
+        ranked.into_iter().map(|rp| rp.posting.clone()).collect()
     }
 
-    pub(crate) fn search_root(&self, query: &[f32], k: usize) -> Vec<(u64, Vec<f32>)> {
+    pub(crate) fn search_root(&self, query: &[f32], k: usize) -> Vec<Posting> {
         let MaybeCached::Value(root) = self.reader.read_root() else {
             panic!("LeveledCentroidIndex::search_root() couldn't find root");
         };
@@ -294,7 +286,7 @@ impl<'a> LeveledCentroidIndex<'a> {
         let next_centroids = self
             .search_root(query, beam)
             .into_iter()
-            .map(|(id, _)| id)
+            .map(|posting| posting.id())
             .collect();
         self.search_up_to_level_with_centroids_at_inner_level(
             query,
@@ -371,7 +363,7 @@ impl<'a> LeveledCentroidIndex<'a> {
             let next_centroids =
                 Self::score_and_rank(query, &all_postings, beam, self.distance_metric)
                     .into_iter()
-                    .map(|(id, _)| id)
+                    .map(|posting| posting.id())
                     .collect();
             self.search_up_to_level_with_centroids_at_inner_level(
                 query,
@@ -385,31 +377,30 @@ impl<'a> LeveledCentroidIndex<'a> {
 }
 
 #[derive(Clone, Debug)]
-struct RankedPosting {
-    id: u64,
-    vector: Vec<f32>,
+struct RankedPosting<'a> {
+    posting: &'a Posting,
     distance: VectorDistance,
 }
 
-impl PartialEq for RankedPosting {
+impl <'a> PartialEq for RankedPosting<'a> {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.distance == other.distance
+        self.posting.id() == other.posting.id() && self.distance == other.distance
     }
 }
 
-impl Eq for RankedPosting {}
+impl <'a> Eq for RankedPosting<'a> {}
 
-impl PartialOrd for RankedPosting {
+impl <'a> PartialOrd for RankedPosting<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for RankedPosting {
+impl <'a> Ord for RankedPosting<'a> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.distance
             .cmp(&other.distance)
-            .then_with(|| self.id.cmp(&other.id))
+            .then_with(|| self.posting.id().cmp(&other.posting.id()))
     }
 }
 
@@ -652,7 +643,7 @@ pub(crate) async fn search_centroids(
     index: &LeveledCentroidIndex<'_>,
     query: &[f32],
     k: usize,
-) -> Result<Vec<(u64, Vec<f32>)>> {
+) -> Result<Vec<Posting>> {
     Ok(batch_search_centroids(index, k, vec![(0, query)])
         .await?
         .remove(&0)
@@ -663,7 +654,7 @@ pub(crate) async fn batch_search_centroids<K: Hash + Eq + Sized + Send + Sync>(
     index: &LeveledCentroidIndex<'_>,
     k: usize,
     queries: Vec<(K, &[f32])>,
-) -> Result<HashMap<K, Vec<(u64, Vec<f32>)>>> {
+) -> Result<HashMap<K, Vec<Posting>>> {
     batch_search_centroids_up_to_level(index, k, queries, 0).await
 }
 
@@ -672,7 +663,7 @@ pub(crate) async fn batch_search_centroids_up_to_level<K: Hash + Eq + Sized + Se
     k: usize,
     queries: Vec<(K, &[f32])>,
     level: u16,
-) -> Result<HashMap<K, Vec<(u64, Vec<f32>)>>> {
+) -> Result<HashMap<K, Vec<Posting>>> {
     let mut results = HashMap::with_capacity(queries.len());
     let queries: Vec<(K, &[f32], Option<ResumableCentroidSearch>)> = queries
         .into_iter()
@@ -815,8 +806,8 @@ mod tests {
         assert_eq!(actual.as_ref(), expected.as_ref());
     }
 
-    fn ranked_ids(ranked: &[(u64, Vec<f32>)]) -> Vec<u64> {
-        ranked.iter().map(|(id, _)| *id).collect()
+    fn ranked_ids(ranked: &[Posting]) -> Vec<u64> {
+        ranked.iter().map(|posting| posting.id()).collect()
     }
 
     fn empty_deleted_centroids() -> HashSet<u64> {
@@ -915,7 +906,7 @@ mod tests {
                 .collect()
         }
 
-        fn exhaustive_search(&self, query: &[f32], k: usize) -> Vec<(u64, Vec<f32>)> {
+        fn exhaustive_search(&self, query: &[f32], k: usize) -> Vec<Posting> {
             self.exhaustive_search_up_to_level(query, k, 0)
         }
 
@@ -924,7 +915,7 @@ mod tests {
             query: &[f32],
             k: usize,
             target_level: u16,
-        ) -> Vec<(u64, Vec<f32>)> {
+        ) -> Vec<Posting> {
             assert!(target_level < self.depth);
 
             let mut current_level = self.depth - 1;

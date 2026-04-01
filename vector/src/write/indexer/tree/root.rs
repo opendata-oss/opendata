@@ -73,7 +73,7 @@ impl SplitRoot {
                     .clone();
                 let root_search = centroid_index.search_root(posting.vector(), 1);
                 let root_c = root_search.first().expect("unexpected missing centroid");
-                original_c.parent_vector_id = Some(root_c.0);
+                original_c.parent_vector_id = Some(root_c.id());
                 updates_for_original_root_postings.insert(posting.id(), original_c);
             }
             updates_for_original_root_postings
