@@ -174,7 +174,13 @@ impl SplitCentroids {
             // initialize split tasks
             let mut splits = Vec::with_capacity(to_split.len());
             for (c, c_info) in to_split {
-                let neighbours = neighbours_by_centroid.get(&c).cloned().unwrap_or_default();
+                let neighbours = neighbours_by_centroid
+                    .get(&c)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>();
                 postings_to_retrive.extend(neighbours.clone());
                 splits.push(SplitCentroid {
                     c,

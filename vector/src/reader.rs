@@ -91,14 +91,11 @@ impl VectorDbReader {
             &cache,
             StoredCentroidReader::new(dimensions, storage.clone(), 0),
         ));
-        let centroid_index = crate::query_engine::QueryCentroidIndexState::new(
-            Arc::new(LeveledCentroidIndex::new(
-                centroids_meta.expect("checked above").depth as u16,
-                config.distance_metric,
-                reader,
-            )),
-            &centroids,
-        );
+        let centroid_index = Arc::new(LeveledCentroidIndex::new(
+            centroids_meta.expect("checked above").depth as u16,
+            config.distance_metric,
+            reader,
+        ));
 
         let options = QueryEngineOptions {
             dimensions: config.dimensions,

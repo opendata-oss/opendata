@@ -181,10 +181,10 @@ impl WriteVectors {
         let search_result = batch_search_centroids(centroid_index, 1, writes).await?;
         let mut centroid_assignments = HashMap::with_capacity(search_result.len());
         for (external_id, centroids) in search_result {
-            let Some(&centroid) = centroids.first() else {
+            let Some((centroid, _)) = centroids.first() else {
                 return Err(Internal("no centroids found".to_string()));
             };
-            centroid_assignments.insert(external_id, centroid);
+            centroid_assignments.insert(external_id, *centroid);
         }
         Ok(centroid_assignments)
     }
@@ -274,7 +274,7 @@ impl ReassignVectors {
                 .reassignments
                 .into_iter()
                 .filter_map(|r| {
-                    let &closest_centroid = assignments
+                    let &(closest_centroid, _) = assignments
                         .get(&r.vector_id)
                         .expect("no centroids")
                         .first()

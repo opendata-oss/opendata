@@ -1,7 +1,6 @@
 use crate::error::{Error, Result};
 use crate::math::distance;
 use crate::model::{FieldSelection, Filter, Query, SearchOptions, SearchResult};
-use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::collection_meta::DistanceMetric;
 use crate::serde::posting_list::PostingList;
 use crate::serde::vector_data::VectorDataValue;
@@ -11,7 +10,7 @@ use crate::{Attribute, Vector};
 use common::storage::StorageRead;
 use roaring::RoaringTreemap;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -31,62 +30,16 @@ pub(crate) struct QueryEngineOptions {
 ///
 /// Each query on `VectorDb` creates a short-lived `QueryEngine` from the current
 /// snapshot. `QueryEngine` is also used by `VectorDbReader` for read-only access.
-#[derive(Clone)]
-pub(crate) struct QueryCentroidIndexState {
-    ann_index: Arc<LeveledCentroidIndex<'static>>,
-    centroid_vectors: Arc<HashMap<u64, Vec<f32>>>,
-    leaf_centroid_ids: Arc<Vec<u64>>,
-}
-
-impl QueryCentroidIndexState {
-    pub(crate) fn new(
-        ann_index: Arc<LeveledCentroidIndex<'static>>,
-        centroids: &HashMap<u64, CentroidInfoValue>,
-    ) -> Self {
-        let centroid_vectors = centroids
-            .iter()
-            .map(|(&centroid_id, centroid)| (centroid_id, centroid.vector.clone()))
-            .collect();
-        let leaf_centroid_ids = centroids
-            .iter()
-            .filter_map(|(&centroid_id, centroid)| (centroid.level == 0).then_some(centroid_id))
-            .collect::<Vec<_>>();
-        let mut leaf_centroid_ids = leaf_centroid_ids;
-        leaf_centroid_ids.sort_unstable();
-        Self {
-            ann_index,
-            centroid_vectors: Arc::new(centroid_vectors),
-            leaf_centroid_ids: Arc::new(leaf_centroid_ids),
-        }
-    }
-
-    pub(crate) async fn search(&self, query: &[f32], k: usize) -> Result<Vec<u64>> {
-        search_centroids(self.ann_index.as_ref(), query, k).await
-    }
-
-    pub(crate) fn leaf_centroid_ids(&self) -> &[u64] {
-        self.leaf_centroid_ids.as_ref()
-    }
-
-    pub(crate) fn num_leaf_centroids(&self) -> usize {
-        self.leaf_centroid_ids.len()
-    }
-
-    fn centroid_vector(&self, centroid_id: u64) -> Option<&[f32]> {
-        self.centroid_vectors.get(&centroid_id).map(Vec::as_slice)
-    }
-}
-
 pub(crate) struct QueryEngine {
     options: QueryEngineOptions,
-    centroid_index: QueryCentroidIndexState,
+    centroid_index: Arc<LeveledCentroidIndex<'static>>,
     storage: Arc<dyn StorageRead>,
 }
 
 impl QueryEngine {
     pub(crate) fn new(
         options: QueryEngineOptions,
-        centroid_index: QueryCentroidIndexState,
+        centroid_index: Arc<LeveledCentroidIndex<'static>>,
         storage: Arc<dyn StorageRead>,
     ) -> Self {
         Self {
@@ -144,23 +97,24 @@ impl QueryEngine {
         }
 
         // Brute-force: compute distance from query to every live centroid
-        let all_centroid_ids = self.centroid_index.leaf_centroid_ids();
-        let mut scored: Vec<(u64, distance::VectorDistance)> = all_centroid_ids
+        let centroid_candidates = self.search_centroids(&query.vector, usize::MAX).await?;
+        let centroid_ids: Vec<u64> = centroid_candidates
             .iter()
-            .filter_map(|&cid| {
-                let cv = self.centroid_index.centroid_vector(cid)?;
-                let d = distance::compute_distance(&query.vector, cv, self.options.distance_metric);
-                Some((cid, d))
-            })
+            .take(nprobe)
+            .map(|(id, _)| *id)
             .collect();
-        scored.sort_by(|a, b| a.1.cmp(&b.1));
-        let centroid_ids: Vec<u64> = scored.iter().take(nprobe).map(|(id, _)| *id).collect();
 
         if centroid_ids.is_empty() {
             return Ok(Vec::new());
         }
 
-        let centroid_ids = self.prune_centroids(&centroid_ids, &query.vector);
+        let centroid_ids = self.prune_centroids(
+            &centroid_candidates
+                .into_iter()
+                .take(nprobe)
+                .collect::<Vec<_>>(),
+            &query.vector,
+        );
 
         let mut sorted_lists = self.load_and_score(&centroid_ids, &query.vector).await?;
         if sorted_lists.is_empty() {
@@ -194,23 +148,20 @@ impl QueryEngine {
 
         // 2. Search HNSW for nearest centroids
         let num_centroids = nprobe;
-        let centroid_ids = self
-            .centroid_index
-            .search(&query.vector, num_centroids)
-            .await?;
+        let centroid_candidates = self.search_centroids(&query.vector, num_centroids).await?;
         debug!(
             "searched for {} centroids, found: {}",
             num_centroids,
-            centroid_ids.len()
+            centroid_candidates.len()
         );
 
-        if centroid_ids.is_empty() {
+        if centroid_candidates.is_empty() {
             return Ok(Vec::new());
         }
 
         // 3. Dynamic pruning: skip posting lists whose centroids are far from query
-        let original_ncentroids = centroid_ids.len();
-        let centroid_ids = self.prune_centroids(&centroid_ids, &query.vector);
+        let original_ncentroids = centroid_candidates.len();
+        let centroid_ids = self.prune_centroids(&centroid_candidates, &query.vector);
         debug!(
             "query: {:?}, before pruning: {} centroids, after dynamic pruning: {} centroids",
             query.vector,
@@ -245,10 +196,14 @@ impl QueryEngine {
     ///
     /// Returns the pruned centroid IDs. If pruning is disabled (`None`), returns
     /// the input unchanged.
-    pub(crate) fn prune_centroids(&self, centroid_ids: &[u64], query: &[f32]) -> Vec<u64> {
+    pub(crate) fn prune_centroids(
+        &self,
+        centroid_ids: &[(u64, Vec<f32>)],
+        query: &[f32],
+    ) -> Vec<u64> {
         let epsilon = match self.options.query_pruning_factor {
             Some(e) => e,
-            None => return centroid_ids.to_vec(),
+            None => return centroid_ids.iter().map(|(id, _)| *id).collect(),
         };
 
         let metric = self.options.distance_metric;
@@ -256,11 +211,7 @@ impl QueryEngine {
         // Compute raw distance (lower = closer) from query to each centroid.
         let mut scored: Vec<(u64, f32)> = centroid_ids
             .iter()
-            .filter_map(|&cid| {
-                let cv = self.centroid_index.centroid_vector(cid)?;
-                let d = distance::raw_distance(query, cv, metric);
-                Some((cid, d))
-            })
+            .map(|(cid, cv)| (*cid, distance::raw_distance(query, cv, metric)))
             .collect();
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -288,9 +239,8 @@ impl QueryEngine {
             .collect()
     }
 
-    #[cfg(test)]
-    pub(crate) fn all_leaf_centroid_ids(&self) -> &[u64] {
-        self.centroid_index.leaf_centroid_ids()
+    async fn search_centroids(&self, query: &[f32], k: usize) -> Result<Vec<(u64, Vec<f32>)>> {
+        search_centroids(self.centroid_index.as_ref(), query, k).await
     }
 
     /// Spawn a task per centroid to load its posting list and score all candidates
@@ -589,15 +539,20 @@ mod tests {
 
         let query = [0.0, 0.0, 0.0];
         let engine = db.query_engine();
-        let all_ids = engine.all_leaf_centroid_ids().to_vec();
+        let all_centroids = vec![
+            (1, vec![1.0, 0.0, 0.0]),
+            (2, vec![1.4, 0.0, 0.0]),
+            (3, vec![2.0, 0.0, 0.0]),
+            (4, vec![5.0, 0.0, 0.0]),
+        ];
 
         // when
-        let pruned = engine.prune_centroids(&all_ids, &query);
+        let pruned = engine.prune_centroids(&all_centroids, &query);
 
         // then
         assert_eq!(pruned.len(), 2);
-        assert_eq!(pruned[0], all_ids[0]); // closest
-        assert_eq!(pruned[1], all_ids[1]); // within threshold
+        assert_eq!(pruned[0], 1); // closest
+        assert_eq!(pruned[1], 2); // within threshold
     }
 
     #[tokio::test]
@@ -614,10 +569,10 @@ mod tests {
 
         let query = [0.0, 0.0, 0.0];
         let engine = db.query_engine();
-        let all_ids = engine.all_leaf_centroid_ids().to_vec();
+        let all_centroids = vec![(1, vec![1.0, 0.0, 0.0]), (2, vec![100.0, 0.0, 0.0])];
 
         // when
-        let result = engine.prune_centroids(&all_ids, &query);
+        let result = engine.prune_centroids(&all_centroids, &query);
 
         // then - all centroids returned regardless of distance
         assert_eq!(result.len(), 2);
@@ -644,15 +599,18 @@ mod tests {
 
         let query = [0.0, 0.0, 0.0];
         let engine = db.query_engine();
-        let leaf_ids = engine.all_leaf_centroid_ids().to_vec();
-        // pass IDs in reverse distance order: far, medium, close
-        let ids: Vec<u64> = vec![leaf_ids[0], leaf_ids[2], leaf_ids[1]];
+        // pass centroids in reverse distance order: far, medium, close
+        let ids = vec![
+            (1, vec![5.0, 0.0, 0.0]),
+            (3, vec![3.0, 0.0, 0.0]),
+            (2, vec![1.0, 0.0, 0.0]),
+        ];
 
         // when
         let result = engine.prune_centroids(&ids, &query);
 
         // then - sorted by ascending distance: c1 (1.0), c2 (3.0), c0 (5.0)
-        assert_eq!(result, vec![leaf_ids[1], leaf_ids[2], leaf_ids[0]]);
+        assert_eq!(result, vec![2, 3, 1]);
     }
 
     // --- Search tests ---

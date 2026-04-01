@@ -17,7 +17,7 @@ use crate::model::{
     AttributeValue, Config, Query, SearchOptions, SearchResult, VECTOR_FIELD_NAME, Vector,
     attributes_to_map,
 };
-use crate::query_engine::{QueryCentroidIndexState, QueryEngine, QueryEngineOptions};
+use crate::query_engine::{QueryEngine, QueryEngineOptions};
 use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::centroids::CentroidsValue;
@@ -32,10 +32,7 @@ use crate::write::delta::{VectorDbWrite, VectorDbWriteDelta, VectorWrite};
 use crate::write::flusher::VectorDbFlusher;
 use crate::write::indexer::tree::Indexer;
 use crate::write::indexer::tree::IndexerOpts;
-use crate::write::indexer::tree::centroids::{
-    AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex,
-    StoredCentroidReader,
-};
+use crate::write::indexer::tree::centroids::{AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, CentroidIndex, LeveledCentroidIndex, StoredCentroidReader};
 use crate::write::indexer::tree::state::VectorIndexState;
 use async_trait::async_trait;
 use common::Record;
@@ -44,6 +41,7 @@ use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};
 use common::storage::{Storage, StorageRead, StorageSnapshot};
 use common::{StorageBuilder, StorageSemantics};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -55,7 +53,8 @@ struct LoadedTreeIndex {
     centroids: HashMap<u64, CentroidInfoValue>,
     centroid_counts: HashMap<u16, HashMap<u64, u64>>,
     centroid_cache: AllCentroidsCacheWriter,
-    query_centroid_index: QueryCentroidIndexState,
+    query_centroid_index: Arc<LeveledCentroidIndex<'static>>,
+    num_leaf_centroids: usize,
 }
 
 /// Trait for querying the vector db
@@ -108,6 +107,14 @@ pub trait VectorDbRead {
     async fn get(&self, id: &str) -> Result<Option<Vector>>;
 }
 
+/// TODO: we shouldn't need this. We should be able to hold a ref to the centroid cache
+///       and then construct the centroid index directly from that plus the snapshot
+pub(crate) struct LastAppliedSnapshot {
+    pub(crate) snapshot: Arc<dyn StorageSnapshot>,
+    pub(crate) centroid_index: Arc<LeveledCentroidIndex<'static>>,
+    pub(crate) centroid_count: usize,
+}
+
 /// Vector database for storing and querying embedding vectors.
 ///
 /// `VectorDb` provides a high-level API for ingesting vectors with metadata.
@@ -121,8 +128,8 @@ pub struct VectorDb {
     /// The WriteCoordinator itself (stored to keep it alive).
     write_coordinator: WriteCoordinator<VectorDbWriteDelta, VectorDbFlusher>,
 
-    /// In-memory centroid routing state for queries.
-    query_centroid_index: Arc<Mutex<QueryCentroidIndexState>>,
+    /// snapshot state for queries
+    last_applied_snapshot: Arc<Mutex<LastAppliedSnapshot>>
 }
 
 impl VectorDb {
@@ -209,6 +216,11 @@ impl VectorDb {
             config.distance_metric,
         )
         .await?;
+        let last_applied_snapshot = Arc::new(Mutex::new(LastAppliedSnapshot {
+            snapshot: snapshot.clone(),
+            centroid_index: loaded_tree.query_centroid_index,
+            centroid_count: loaded_tree.centroids.len()
+        }));
 
         let (seq_block_key, seq_block) = id_allocator.freeze();
         let (centroid_seq_block_key, centroid_seq_block) = centroid_id_allocator.freeze();
@@ -245,14 +257,14 @@ impl VectorDb {
             },
             indexer_state,
         );
-        let query_centroid_index = Arc::new(Mutex::new(loaded_tree.query_centroid_index));
 
         let flusher = VectorDbFlusher::new(
+            &config,
             Arc::clone(&storage),
             snapshot.clone(),
             0,
             indexer,
-            query_centroid_index.clone(),
+            last_applied_snapshot.clone(),
         );
 
         let coordinator_config = WriteCoordinatorConfig {
@@ -273,7 +285,7 @@ impl VectorDb {
             config,
             storage,
             write_coordinator,
-            query_centroid_index,
+            last_applied_snapshot,
         })
     }
 
@@ -371,6 +383,10 @@ impl VectorDb {
             .into_iter()
             .collect();
         let centroid_counts = Self::load_centroid_counts_from_storage(snapshot.as_ref()).await?;
+        let num_leaf_centroids = centroid_counts
+            .get(&0)
+            .map(HashMap::len)
+            .unwrap_or_default();
         let centroid_postings = snapshot
             .scan_all_posting_lists(dimensions)
             .await?
@@ -397,7 +413,7 @@ impl VectorDb {
             distance_metric,
             reader,
         ));
-        let query_centroid_index = QueryCentroidIndexState::new(ann_index, &centroids);
+        let query_centroid_index = ann_index;
 
         Ok(LoadedTreeIndex {
             centroids_meta,
@@ -406,6 +422,7 @@ impl VectorDb {
             centroid_counts,
             centroid_cache,
             query_centroid_index,
+            num_leaf_centroids,
         })
     }
 
@@ -709,25 +726,20 @@ impl VectorDb {
     }
 
     pub fn num_centroids(&self) -> usize {
-        self.query_centroid_index
-            .lock()
-            .expect("lock poisoned")
-            .num_leaf_centroids()
+        self.last_applied_snapshot.lock().expect("lock_poisoned").centroid_count
     }
 
     /// Create a QueryEngine from the current snapshot for executing queries.
     pub(crate) fn query_engine(&self) -> QueryEngine {
-        let snapshot = self.write_coordinator.view().snapshot.clone();
+        let (snapshot, centroid_index) = {
+            let guard = self.last_applied_snapshot.lock().expect("lock poisoned");
+            (guard.snapshot.clone(), guard.centroid_index.clone())
+        };
         let options = QueryEngineOptions {
             dimensions: self.config.dimensions,
             distance_metric: self.config.distance_metric,
             query_pruning_factor: self.config.query_pruning_factor,
         };
-        let centroid_index = self
-            .query_centroid_index
-            .lock()
-            .expect("lock poisoned")
-            .clone();
         QueryEngine::new(options, centroid_index, snapshot)
     }
 
