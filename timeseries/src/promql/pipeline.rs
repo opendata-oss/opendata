@@ -107,6 +107,7 @@ pub(crate) struct SeriesWorkItem {
     pub series_id: SeriesId,
     pub fingerprint: SeriesFingerprint,
     pub labels: Vec<Label>,
+    pub metric_name: String,
 }
 
 /// All sample I/O work for one bucket.
@@ -301,11 +302,18 @@ pub(crate) fn build_bucket_sample_work(
         };
 
         let fingerprint = compute_fingerprint(&spec.labels);
+        let metric_name = spec
+            .labels
+            .iter()
+            .find(|l| l.name == "__name__")
+            .map(|l| l.value.clone())
+            .unwrap_or_default();
 
         series.push(SeriesWorkItem {
             series_id,
             fingerprint,
             labels: spec.labels.clone(),
+            metric_name,
         });
     }
 
@@ -330,7 +338,13 @@ pub(crate) async fn load_bucket_samples<R: QueryReader>(
 
     for item in &work.series {
         let samples = reader
-            .samples(&work.bucket, item.series_id, work.start_ms, work.end_ms)
+            .samples(
+                &work.bucket,
+                item.series_id,
+                &item.metric_name,
+                work.start_ms,
+                work.end_ms,
+            )
             .await?;
 
         series_data.push(LoadedSeriesSamples {
@@ -655,7 +669,7 @@ async fn execute_metadata_stage_job<R: QueryReader>(
 ///     let series_data = stream::iter(work.series.iter().cloned())
 ///         .map(|item| async move {
 ///             let samples = reader
-///                 .samples(&work.bucket, item.series_id, work.start_ms, work.end_ms)
+///                 .samples(&work.bucket, item.series_id, &item.metric_name, work.start_ms, work.end_ms)
 ///                 .await?;
 ///
 ///             Ok::<_, EvaluationError>(LoadedSeriesSamples {
@@ -1676,6 +1690,7 @@ mod tests {
             &self,
             bucket: &TimeBucket,
             series_id: crate::model::SeriesId,
+            metric_name: &str,
             start_ms: i64,
             end_ms: i64,
         ) -> crate::util::Result<Vec<crate::model::Sample>> {
@@ -1685,7 +1700,7 @@ mod tests {
                 tokio::time::sleep(delay).await;
             }
             self.inner
-                .samples(bucket, series_id, start_ms, end_ms)
+                .samples(bucket, series_id, metric_name, start_ms, end_ms)
                 .await
         }
     }

@@ -329,11 +329,13 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
         &self,
         bucket: TimeBucket,
         series_id: SeriesId,
+        metric_name: &str,
         samples: Vec<Sample>,
     ) -> Result<RecordOp> {
         let key = TimeSeriesKey {
             time_bucket: bucket.start,
             bucket_size: bucket.size,
+            metric_name: metric_name.to_string(),
             series_id,
         }
         .encode();

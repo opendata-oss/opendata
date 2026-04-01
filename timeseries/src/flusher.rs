@@ -58,10 +58,15 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
             );
         }
 
-        for (series_id, samples) in frozen.samples {
+        for (series_id, series_samples) in frozen.samples {
             ops.push(
                 self.storage
-                    .merge_samples(frozen.bucket, series_id, samples)
+                    .merge_samples(
+                        frozen.bucket,
+                        series_id,
+                        &series_samples.metric_name,
+                        series_samples.points,
+                    )
                     .map_err(|e| e.to_string())?,
             );
         }

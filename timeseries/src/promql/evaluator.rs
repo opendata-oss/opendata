@@ -405,10 +405,11 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         &self,
         bucket: &TimeBucket,
         series_id: SeriesId,
+        metric_name: &str,
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<Sample>> {
-        // Check cache first
+        // Check cache first (cache is keyed by (bucket, series_id), not metric_name)
         if let Some(cached_samples) = self.cache.get_samples(bucket, &series_id) {
             // Filter cached samples by requested time range
             let filtered: Vec<Sample> = cached_samples
@@ -424,7 +425,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         // paying for another storage read.
         let samples = self
             .reader
-            .samples(bucket, series_id, i64::MIN, i64::MAX)
+            .samples(bucket, series_id, metric_name, i64::MIN, i64::MAX)
             .await?;
 
         // Cache the full sample set, then filter the shared handle
