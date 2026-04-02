@@ -6,13 +6,15 @@ use crate::write::indexer::tree::merge::MergeCentroids;
 use crate::write::indexer::tree::root::SplitRoot;
 use crate::write::indexer::tree::split::{ReassignVector, SplitCentroids};
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState};
+use crate::write::indexer::tree::validator::validate as validate_tree_index;
 use crate::write::indexer::tree::vector::{ReassignVectors, WriteVectors};
 use common::StorageRead;
 use common::storage::RecordOp;
+use common::storage::StorageSnapshot;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, debug_span};
+use tracing::{debug, debug_span, info};
 
 pub(crate) mod centroids;
 mod merge;
@@ -20,6 +22,7 @@ pub(crate) mod posting_list;
 mod root;
 mod split;
 pub(crate) mod state;
+mod validator;
 mod vector;
 
 #[derive(Debug, Default)]
@@ -91,7 +94,6 @@ impl Indexer {
         let mut stats = IndexerStats::default();
         let mut delta = VectorIndexDelta::new(&self.state);
 
-        // write all vectors
         let write = WriteVectors::new(&self.opts, &snapshot, snapshot_epoch, updates);
         let write_start = Instant::now();
         let (inserts, updates) = write.execute(&self.state, &mut delta).await?;
@@ -106,10 +108,8 @@ impl Indexer {
         stats.inserts = inserts;
         stats.updates = updates;
 
-        // update the centroid tree level by level
         let depth = self.state.centroids_meta().depth as u16;
         for level in 0..depth {
-            // apply merges
             let merge = MergeCentroids::new(&self.opts, level, depth, &snapshot, snapshot_epoch);
             let merge_start = Instant::now();
             let (reassigns, merge_count) = merge.execute(&self.state, &mut delta).await?;
@@ -125,7 +125,6 @@ impl Indexer {
             );
             *stats.merges.entry(level).or_default() += merge_count;
 
-            // apply merge reassignments
             let reassign_after_merge_start = Instant::now();
             let reassign_after_merge_count = self
                 .reassign_vectors(&snapshot, snapshot_epoch, &mut delta, reassigns)
@@ -139,7 +138,6 @@ impl Indexer {
                 "completed"
             );
 
-            // apply split reassign loop
             let mut split_round = 0usize;
             loop {
                 let split =
@@ -177,7 +175,6 @@ impl Indexer {
             }
         }
 
-        // maybe split root
         let split_root = SplitRoot::new(&self.opts, &snapshot, snapshot_epoch);
         let split_root_start = Instant::now();
         split_root.execute(&mut delta, &self.state).await?;
@@ -198,10 +195,11 @@ impl Indexer {
             record_op_count = ops.len(),
             "completed"
         );
-        debug!(
+        info!(
             parent: &update_span,
             elapsed_ms = elapsed_ms(update_start),
             leaf_centroid_count = self.leaf_centroid_count(),
+            stats = format!("{:?}", stats),
             "completed"
         );
         Ok(IndexUpdateResults {
@@ -211,6 +209,17 @@ impl Indexer {
             leaf_centroids: self.leaf_centroid_count(),
             centroid_tree_depth: self.state.centroids_meta().depth as usize,
         })
+    }
+
+    pub(crate) async fn validate(&self, snapshot: Arc<dyn StorageSnapshot>) {
+        #[cfg(debug_assertions)]
+        {
+            validate_tree_index(
+                snapshot,
+                &self.state,
+                self.opts.dimensions
+            ).await.expect("validation failed");
+        }
     }
 
     async fn reassign_vectors(
@@ -228,7 +237,6 @@ impl Indexer {
             let entry = reassigns_by_level.entry(r.level).or_default();
             entry.push(r);
         }
-        // reassign from the top down to improve recall at higher levels first
         for level in (0..self.state.centroids_meta().depth as u16).rev() {
             let Some(reassigns) = reassigns_by_level.remove(&level) else {
                 continue;

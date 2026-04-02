@@ -8,11 +8,11 @@ use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, Vec
 use crate::{DistanceMetric, Result};
 use common::StorageRead;
 use futures::future::BoxFuture;
+use log::debug;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use log::debug;
 use tokio::task::spawn_blocking;
 
 const MAX_SPLITS: usize = usize::MAX;
@@ -148,7 +148,10 @@ impl SplitCentroids {
                     (
                         c,
                         view.centroid(c)
-                            .expect(&format!("unexpected missing centroid {} at level: {}", c, self.level))
+                            .expect(&format!(
+                                "unexpected missing centroid {} at level: {}",
+                                c, self.level
+                            ))
                             .clone(),
                     )
                 })
@@ -295,13 +298,14 @@ impl SplitCentroids {
                                 level: (self.level - 1) as u8,
                                 vector: p.vector().to_vec(),
                                 parent_vector_id: Some(c_id),
-                            }
+                            },
                         )
                     }
                 }
                 new_centroids.push((c_id, entry));
             }
-            debug!("split: delete centroid {}/{}, add new centroids: {:?}",
+            debug!(
+                "split: delete centroid {}/{}, add new centroids: {:?}",
                 self.level,
                 result.c,
                 new_centroids

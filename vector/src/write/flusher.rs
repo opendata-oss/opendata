@@ -104,6 +104,9 @@ impl VectorDbFlusher {
             .map_err(|e| e.to_string())?;
 
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
+        self.indexer
+            .validate(snapshot.clone())
+            .await;
         let stored_reader = StoredCentroidReader::new(
             self.opts.dimensions as usize,
             snapshot.clone(),
@@ -131,9 +134,14 @@ mod tests {
     use super::*;
     use crate::model::AttributeValue;
     use crate::serde::centroid_info::CentroidInfoValue;
+    use crate::serde::centroid_stats::CentroidStatsValue;
+    use crate::serde::centroids::CentroidsValue;
     use crate::serde::collection_meta::DistanceMetric;
-    use crate::serde::key::{IdDictionaryKey, VectorDataKey};
-    use crate::serde::posting_list::Posting;
+    use crate::serde::key::{
+        CentroidInfoKey, CentroidStatsKey, CentroidsKey, IdDictionaryKey, PostingListKey,
+        VectorDataKey,
+    };
+    use crate::serde::posting_list::{Posting, PostingListValue, PostingUpdate};
     use crate::serde::vector_data::VectorDataValue;
     use crate::storage::merge_operator::VectorDbMergeOperator;
     use crate::write::delta::VectorDbDeltaView;
@@ -147,7 +155,7 @@ mod tests {
     use crate::write::indexer::tree::state::VectorIndexState;
     use common::coordinator::Flusher;
     use common::storage::in_memory::{FailingStorage, InMemoryStorage};
-    use common::{SequenceAllocator, Storage};
+    use common::{Record, SequenceAllocator, Storage};
     use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
 
@@ -178,6 +186,36 @@ mod tests {
 
         let (seq_block_key, seq_block) = id_allocator.freeze();
         let (centroid_seq_block_key, centroid_seq_block) = centroid_id_allocator.freeze();
+        storage
+            .put(vec![
+                Record::new(
+                    CentroidsKey::new().encode(),
+                    CentroidsValue::new(1).encode_to_bytes(),
+                )
+                .into(),
+                Record::new(
+                    PostingListKey::new(0).encode(),
+                    PostingListValue::from_posting_updates(vec![PostingUpdate::append(
+                        1,
+                        vec![0.0; DIMS],
+                    )])
+                    .unwrap()
+                    .encode_to_bytes(),
+                )
+                .into(),
+                Record::new(
+                    CentroidInfoKey::new(1).encode(),
+                    CentroidInfoValue::new(0, vec![0.0; DIMS], None).encode_to_bytes(),
+                )
+                .into(),
+                Record::new(
+                    CentroidStatsKey::new(0, 1).encode(),
+                    CentroidStatsValue::new(0).encode_to_bytes(),
+                )
+                .into(),
+            ])
+            .await
+            .unwrap();
         let centroid_cache = AllCentroidsCacheWriter::new(
             Arc::new(PostingList::from(vec![Posting::new(1, vec![0.0; DIMS])]))
                 as Arc<dyn IntoTreePostingList>,

@@ -2,6 +2,7 @@ use crate::Error::Internal;
 use crate::Result;
 use crate::model::VECTOR_FIELD_NAME;
 use crate::serde::FieldValue;
+use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::vector_data::VectorDataValue;
 use crate::write::delta::VectorWrite;
 use crate::write::indexer::drivers::AsyncBatchDriver;
@@ -16,10 +17,9 @@ use futures::future::BoxFuture;
 use log::debug;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::trace;
-use crate::serde::centroid_info::CentroidInfoValue;
 
 /// An upsert where we need to resolve the old vector data from storage.
 struct ResolvedUpsert {
@@ -202,7 +202,7 @@ impl WriteVectors {
 
 struct VerifiedVectorReassignment {
     reassignment: ReassignVector,
-    centroid: u64,
+    new_centroid: u64,
 }
 
 struct ResolvedVectorReassignment {
@@ -214,7 +214,7 @@ struct ResolvedVectorReassignment {
 struct ResolvedCentroidReassignment {
     reassignment: ReassignVector,
     data: CentroidInfoValue,
-    centroid: u64
+    centroid: u64,
 }
 
 pub(crate) struct ReassignVectors {
@@ -251,6 +251,8 @@ impl ReassignVectors {
         if self.reassignments.is_empty() {
             return Ok(0);
         }
+        let ids = self.reassignments.iter().map(|r| r.vector_id).collect::<HashSet<_>>();
+        assert_eq!(ids.len(), self.reassignments.len());
         let (resolved, resolved_centroids) = {
             let view = VectorIndexView::new(delta, state, &self.snapshot, self.snapshot_epoch);
             let centroid_index =
@@ -259,7 +261,7 @@ impl ReassignVectors {
             // update current centroid in case centroid was moved as part of a split/merge
             self.reassignments.iter_mut().for_each(|r| {
                 assert_eq!(r.level, self.level);
-                if let Some(p) = view.last_written_posting(r.vector_id) {
+                if let Some(p) = view.last_written_posting(self.level, r.vector_id) {
                     r.current_centroid = p;
                 }
             });
@@ -293,7 +295,7 @@ impl ReassignVectors {
                     } else {
                         Some(VerifiedVectorReassignment {
                             reassignment: r,
-                            centroid: closest_centroid,
+                            new_centroid: closest_centroid,
                         })
                     }
                 })
@@ -308,7 +310,7 @@ impl ReassignVectors {
                         Ok(ResolvedVectorReassignment {
                             reassignment: r.reassignment,
                             data: data_fut.await?.expect("missing vector data"),
-                            centroid: r.centroid,
+                            centroid: r.new_centroid,
                         })
                     })
                         as BoxFuture<Result<ResolvedVectorReassignment>>);
@@ -321,11 +323,12 @@ impl ReassignVectors {
                 drop(view);
                 (resolved, vec![])
             } else {
-                let resolved = reassignments.into_iter()
+                let resolved = reassignments
+                    .into_iter()
                     .map(|r| ResolvedCentroidReassignment {
+                        data: view.centroid(r.reassignment.vector_id).cloned().unwrap(),
                         reassignment: r.reassignment,
-                        data: view.centroid(r.centroid).cloned().unwrap(),
-                        centroid: r.centroid,
+                        centroid: r.new_centroid,
                     })
                     .collect();
                 (vec![], resolved)
@@ -361,7 +364,9 @@ impl ReassignVectors {
                 r.reassignment.vector,
             );
             r.data.parent_vector_id = Some(r.centroid);
-            delta.search_index.update_centroid(r.reassignment.vector_id, r.data);
+            delta
+                .search_index
+                .update_centroid(r.reassignment.vector_id, r.data);
         }
         Ok(reassigned)
     }

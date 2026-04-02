@@ -79,6 +79,10 @@ impl VectorIndexState {
         &self.centroid_counts
     }
 
+    pub(crate) fn root_centroid_count(&self) -> u64 {
+        self.root_centroid_count
+    }
+
     pub(crate) fn centroids(&self) -> &HashMap<u64, CentroidInfoValue> {
         &self.centroids
     }
@@ -184,7 +188,7 @@ pub(crate) struct SearchIndexDelta {
     posting_updates: HashMap<u64, Vec<PostingUpdate>>,
     inverted_index_updates: HashMap<Bytes, RoaringTreemap>,
     id_allocator: SequenceAllocator,
-    current_posting: HashMap<u64, u64>,
+    current_posting: HashMap<(u16, u64), u64>,
     ops: Vec<RecordOp>,
 }
 
@@ -276,7 +280,8 @@ impl SearchIndexDelta {
         vector_id: u64,
         vector: Vec<f32>,
     ) {
-        self.current_posting.insert(vector_id, centroid_id);
+        debug!("postings({}): add vector {}", centroid_id, vector_id);
+        self.current_posting.insert((level, vector_id), centroid_id);
         self.posting_updates
             .entry(centroid_id)
             .or_default()
@@ -290,8 +295,9 @@ impl SearchIndexDelta {
     }
 
     pub(crate) fn remove_from_posting(&mut self, level: u16, centroid_id: u64, vector_id: u64) {
-        if self.current_posting.get(&vector_id).cloned() == Some(centroid_id) {
-            self.current_posting.remove(&vector_id);
+        debug!("postings({}): remove vector {}", centroid_id, vector_id);
+        if self.current_posting.get(&(level, vector_id)).cloned() == Some(centroid_id) {
+            self.current_posting.remove(&(level, vector_id));
         }
         self.posting_updates
             .entry(centroid_id)
@@ -608,7 +614,13 @@ impl<'a> VectorIndexView<'a> {
             .get(&level)
             .cloned()
             .unwrap_or_default();
-        let level_delta = self.delta.search_index.centroid_count_deltas.get(&level).cloned().unwrap_or_default();
+        let level_delta = self
+            .delta
+            .search_index
+            .centroid_count_deltas
+            .get(&level)
+            .cloned()
+            .unwrap_or_default();
         for (&k, &v) in level_delta.iter() {
             let base_count = counts.entry(k).or_insert(0);
             *base_count = base_count.saturating_add_signed(v);
@@ -636,11 +648,11 @@ impl<'a> VectorIndexView<'a> {
     }
 
     /// The last written posting for the vector in this delta only
-    pub(crate) fn last_written_posting(&self, vector_id: u64) -> Option<u64> {
+    pub(crate) fn last_written_posting(&self, level: u16, vector_id: u64) -> Option<u64> {
         self.delta
             .search_index
             .current_posting
-            .get(&vector_id)
+            .get(&(level, vector_id))
             .cloned()
     }
 

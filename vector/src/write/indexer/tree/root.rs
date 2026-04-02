@@ -3,9 +3,9 @@ use crate::write::indexer::tree::IndexerOpts;
 use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use common::StorageRead;
+use log::info;
 use std::collections::HashMap;
 use std::sync::Arc;
-use log::info;
 
 pub(crate) struct SplitRoot {
     opts: Arc<IndexerOpts>,

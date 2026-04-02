@@ -382,21 +382,21 @@ struct RankedPosting<'a> {
     distance: VectorDistance,
 }
 
-impl <'a> PartialEq for RankedPosting<'a> {
+impl<'a> PartialEq for RankedPosting<'a> {
     fn eq(&self, other: &Self) -> bool {
         self.posting.id() == other.posting.id() && self.distance == other.distance
     }
 }
 
-impl <'a> Eq for RankedPosting<'a> {}
+impl<'a> Eq for RankedPosting<'a> {}
 
-impl <'a> PartialOrd for RankedPosting<'a> {
+impl<'a> PartialOrd for RankedPosting<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl <'a> Ord for RankedPosting<'a> {
+impl<'a> Ord for RankedPosting<'a> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.distance
             .cmp(&other.distance)
