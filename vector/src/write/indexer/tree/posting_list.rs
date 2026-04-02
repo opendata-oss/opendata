@@ -67,7 +67,7 @@ pub(crate) struct PostingList {
 }
 
 impl PostingList {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn empty() -> Self {
         Self { postings: vec![] }
     }
 

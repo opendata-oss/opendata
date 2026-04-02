@@ -24,6 +24,7 @@ use futures::future::BoxFuture;
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tracing::debug;
 
 /// In-memory preserved state of vector index
 pub(crate) struct VectorIndexState {
@@ -263,6 +264,7 @@ impl SearchIndexDelta {
                 deltas.remove(c);
             }
             self.upserted_centroids.remove(c);
+            self.posting_updates.remove(c);
         }
         self.deleted_centroids.extend(centroids);
     }
@@ -469,6 +471,7 @@ impl SearchIndexDelta {
                 ));
             }
         }
+        debug!("centroid counts: {:?}", state.centroid_counts);
     }
 }
 
@@ -529,6 +532,9 @@ impl<'a> CentroidReader for DirtyCentroidReader<'a> {
     }
 
     fn read_postings(&self, centroid_id: u64) -> MaybeCached<Arc<PostingList>> {
+        if self.delta.deleted_centroids.contains(&centroid_id) {
+            return MaybeCached::Value(Arc::new(PostingList::empty()));
+        }
         let updates = self.delta.posting_updates.get(&centroid_id).cloned();
         let stored = self.reader.clone();
         let posting = stored.read_postings(centroid_id);
@@ -602,12 +608,13 @@ impl<'a> VectorIndexView<'a> {
             .get(&level)
             .cloned()
             .unwrap_or_default();
-        let Some(level_delta) = self.delta.search_index.centroid_count_deltas.get(&level) else {
-            return counts;
-        };
+        let level_delta = self.delta.search_index.centroid_count_deltas.get(&level).cloned().unwrap_or_default();
         for (&k, &v) in level_delta.iter() {
             let base_count = counts.entry(k).or_insert(0);
             *base_count = base_count.saturating_add_signed(v);
+        }
+        for deleted in &self.delta.search_index.deleted_centroids {
+            counts.remove(deleted);
         }
         counts
     }

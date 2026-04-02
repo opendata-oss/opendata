@@ -5,6 +5,7 @@ use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, Vec
 use common::StorageRead;
 use std::collections::HashMap;
 use std::sync::Arc;
+use log::info;
 
 pub(crate) struct SplitRoot {
     opts: Arc<IndexerOpts>,
@@ -50,10 +51,11 @@ impl SplitRoot {
         drop(view);
 
         tree_meta.depth += 1;
-        let new_level = tree_meta.depth as u16;
+        let new_level = tree_meta.depth as u16 - 1;
         let mut new_root_postings = PostingList::with_capacity(new_root_centroids.len());
         for new_c_vec in new_root_centroids {
             let (new_c_id, new_c) = delta.search_index.add_centroid(new_level, new_c_vec, None);
+            info!("writing new root centroid {}/{}", new_level, new_c_id);
             new_root_postings.push(Posting::new(new_c_id, new_c.vector))
         }
         delta.search_index.set_root(new_root_postings);
@@ -81,7 +83,7 @@ impl SplitRoot {
 
         for (original_c_id, entry) in updates_for_original_root_postings {
             delta.search_index.add_to_posting(
-                tree_meta.depth as u16,
+                new_level,
                 entry.parent_vector_id.expect("unreachable"),
                 original_c_id,
                 entry.vector.clone(),

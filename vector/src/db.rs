@@ -251,7 +251,7 @@ impl VectorDb {
             IndexerOpts {
                 dimensions: config.dimensions as usize,
                 distance_metric: config.distance_metric,
-                root_threshold_vectors: 10000, // config.split_threshold_vectors,
+                root_threshold_vectors: config.split_threshold_vectors,
                 merge_threshold_vectors: config.merge_threshold_vectors,
                 split_threshold_vectors: config.split_threshold_vectors,
                 split_search_neighbourhood: config.split_search_neighbourhood,
@@ -390,6 +390,7 @@ impl VectorDb {
             .get(&0)
             .map(HashMap::len)
             .unwrap_or_default();
+        // todo: this needs to scan all centroid posting lists, not those in level 0
         let centroid_postings = snapshot
             .scan_all_posting_lists(dimensions)
             .await?

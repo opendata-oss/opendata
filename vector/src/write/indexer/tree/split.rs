@@ -12,6 +12,7 @@ use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use log::debug;
 use tokio::task::spawn_blocking;
 
 const MAX_SPLITS: usize = usize::MAX;
@@ -61,7 +62,7 @@ pub(crate) struct SplitSummary {
     #[allow(dead_code)]
     pub(crate) c: u64,
     #[allow(dead_code)]
-    pub(crate) new_centroids: Vec<CentroidInfoValue>,
+    pub(crate) new_centroids: Vec<(u64, CentroidInfoValue)>,
 }
 
 #[derive(Debug)]
@@ -147,7 +148,7 @@ impl SplitCentroids {
                     (
                         c,
                         view.centroid(c)
-                            .expect("unexpected missing centroid")
+                            .expect(&format!("unexpected missing centroid {} at level: {}", c, self.level))
                             .clone(),
                     )
                 })
@@ -287,9 +288,27 @@ impl SplitCentroids {
                         p.id(),
                         p.vector().to_vec(),
                     );
+                    if self.level > 0 {
+                        delta.search_index.update_centroid(
+                            p.id(),
+                            CentroidInfoValue {
+                                level: (self.level - 1) as u8,
+                                vector: p.vector().to_vec(),
+                                parent_vector_id: Some(c_id),
+                            }
+                        )
+                    }
                 }
-                new_centroids.push(entry);
+                new_centroids.push((c_id, entry));
             }
+            debug!("split: delete centroid {}/{}, add new centroids: {:?}",
+                self.level,
+                result.c,
+                new_centroids
+                    .iter()
+                    .map(|(c_id, c)| (c.level, *c_id))
+                    .collect::<Vec<_>>(),
+            );
             splits.push(SplitSummary {
                 c: result.c,
                 new_centroids,

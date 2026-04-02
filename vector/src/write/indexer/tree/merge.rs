@@ -69,7 +69,7 @@ impl MergeCentroids {
             let posting_fut = view.posting_list(c, self.opts.dimensions);
             let c_info = view
                 .centroid(c)
-                .expect("unexpected missing centroid")
+                .expect(&format!("unexpected missing centroid {}/{}", self.level, c))
                 .clone();
             to_resolve.push(Box::pin(async move {
                 Ok(MergeCentroid {
@@ -94,12 +94,25 @@ impl MergeCentroids {
                 .search_index
                 .delete_centroids(self.level, vec![merge.c]);
             if let Some(parent) = merge.c_info.parent_vector_id {
-                assert!(self.level + 1 < self.depth);
+                assert!(
+                    self.level + 1 < self.depth,
+                    "unexpected parent for c({}) level({}) depth({})",
+                    merge.c,
+                    self.level,
+                    self.depth
+                );
                 delta
                     .search_index
                     .remove_from_posting(self.level + 1, parent, merge.c);
             } else {
-                assert_eq!(self.level + 1, self.depth);
+                assert_eq!(
+                    self.level + 1,
+                    self.depth,
+                    "unexpected missing parent for c({}) level({}) depth({})",
+                    merge.c,
+                    self.level,
+                    self.depth
+                );
                 delta.search_index.remove_from_root(merge.c);
             }
             for p in merge.postings.iter() {

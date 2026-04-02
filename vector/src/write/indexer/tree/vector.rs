@@ -19,6 +19,7 @@ use rayon::iter::ParallelIterator;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::trace;
+use crate::serde::centroid_info::CentroidInfoValue;
 
 /// An upsert where we need to resolve the old vector data from storage.
 struct ResolvedUpsert {
@@ -210,6 +211,12 @@ struct ResolvedVectorReassignment {
     centroid: u64,
 }
 
+struct ResolvedCentroidReassignment {
+    reassignment: ReassignVector,
+    data: CentroidInfoValue,
+    centroid: u64
+}
+
 pub(crate) struct ReassignVectors {
     opts: Arc<IndexerOpts>,
     snapshot: Arc<dyn StorageRead>,
@@ -244,7 +251,7 @@ impl ReassignVectors {
         if self.reassignments.is_empty() {
             return Ok(0);
         }
-        let resolved = {
+        let (resolved, resolved_centroids) = {
             let view = VectorIndexView::new(delta, state, &self.snapshot, self.snapshot_epoch);
             let centroid_index =
                 view.centroid_index(self.opts.dimensions, self.opts.distance_metric);
@@ -292,30 +299,41 @@ impl ReassignVectors {
                 })
                 .collect();
 
-            // pull the old vector data so we can update inverted indexes
-            let mut to_resolve = Vec::with_capacity(reassignments.len());
-            for r in reassignments {
-                let data_fut = view.vector_data(r.reassignment.vector_id, self.opts.dimensions);
-                to_resolve.push(Box::pin(async move {
-                    Ok(ResolvedVectorReassignment {
+            if self.level == 0 {
+                // pull the old vector data so we can update inverted indexes
+                let mut to_resolve = Vec::with_capacity(reassignments.len());
+                for r in reassignments {
+                    let data_fut = view.vector_data(r.reassignment.vector_id, self.opts.dimensions);
+                    to_resolve.push(Box::pin(async move {
+                        Ok(ResolvedVectorReassignment {
+                            reassignment: r.reassignment,
+                            data: data_fut.await?.expect("missing vector data"),
+                            centroid: r.centroid,
+                        })
+                    })
+                        as BoxFuture<Result<ResolvedVectorReassignment>>);
+                }
+                let resolve_results = AsyncBatchDriver::execute(to_resolve).await;
+                let mut resolved = Vec::with_capacity(resolve_results.len());
+                for result in resolve_results {
+                    resolved.push(result?);
+                }
+                drop(view);
+                (resolved, vec![])
+            } else {
+                let resolved = reassignments.into_iter()
+                    .map(|r| ResolvedCentroidReassignment {
                         reassignment: r.reassignment,
-                        data: data_fut.await?.expect("missing vector data"),
+                        data: view.centroid(r.centroid).cloned().unwrap(),
                         centroid: r.centroid,
                     })
-                })
-                    as BoxFuture<Result<ResolvedVectorReassignment>>);
+                    .collect();
+                (vec![], resolved)
             }
-            let resolve_results = AsyncBatchDriver::execute(to_resolve).await;
-            let mut resolved = Vec::with_capacity(resolve_results.len());
-            for result in resolve_results {
-                resolved.push(result?);
-            }
-            drop(view);
-            resolved
         };
 
         // execute the reassignments
-        let reassigned = resolved.len();
+        let reassigned = resolved.len() + resolved_centroids.len();
         for r in resolved {
             trace!("old data: {:?}", r.data);
             delta.search_index.remove_from_posting(
@@ -329,6 +347,21 @@ impl ReassignVectors {
                 r.reassignment.vector_id,
                 r.reassignment.vector,
             );
+        }
+        for mut r in resolved_centroids {
+            delta.search_index.remove_from_posting(
+                self.level,
+                r.reassignment.current_centroid,
+                r.reassignment.vector_id,
+            );
+            delta.search_index.add_to_posting(
+                self.level,
+                r.centroid,
+                r.reassignment.vector_id,
+                r.reassignment.vector,
+            );
+            r.data.parent_vector_id = Some(r.centroid);
+            delta.search_index.update_centroid(r.reassignment.vector_id, r.data);
         }
         Ok(reassigned)
     }
