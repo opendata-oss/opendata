@@ -54,6 +54,282 @@ tar xzf sift.tar.gz --strip-components=1
 # Expected files: sift_base.fvecs, sift_query.fvecs, sift_groundtruth.ivecs
 ```
 
+### DEEP10M and DEEP1B
+
+96 dimensions, L2 distance, `fvecs` format. These benchmark entries expect local DEEP vectors converted into the same
+`fvecs` / `ivecs` file layout as the other benchmarks.
+
+Create this directory layout under `vector/bench/data/deep/`:
+
+```text
+vector/bench/data/deep/
+├── deep_base.fvecs
+├── deep_query.fvecs
+├── deep_groundtruth_10M.ivecs
+└── deep_groundtruth_1B.ivecs
+```
+
+Recommended sources:
+
+- Download the DEEP1B base/query data from the [Yandex billion-scale ANN benchmark resources](https://research.yandex.com/blog/benchmarks-for-billion-scale-similarity-search).
+- For `deep10m`, use the first 10M base vectors from the DEEP1B base set and a matching top-k ground truth file.
+- For `deep1b`, use the full DEEP1B base set and the corresponding top-k ground truth file.
+
+Notes:
+
+- The benchmark expects **all vectors in `fvecs` format** and **ground truth in `ivecs` format**.
+- If your source files are in another binary format, convert them before running the benchmark.
+- `deep10m` and `deep1b` share the same `deep_base.fvecs` and `deep_query.fvecs`; `deep10m` simply ingests the first
+  10M vectors and uses `deep_groundtruth_10M.ivecs`.
+
+#### Copy-paste setup for `deep10m`
+
+```bash
+mkdir -p vector/bench/data/deep
+cd vector/bench/data/deep
+
+curl -L -o base.10M.fbin \
+  https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/base.10M.fbin
+curl -L -o query.public.10K.fbin \
+  https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/query.public.10K.fbin
+curl -L -o gt.zip \
+  https://github.com/matsui528/deep1b_gt/releases/download/v0.1.0/gt.zip
+unzip -o gt.zip deep10M_groundtruth.ivecs
+
+python3 - <<'PY'
+from pathlib import Path
+import numpy as np
+
+root = Path("vector/bench/data/deep")
+
+def fbin_to_fvecs(src: Path, dst: Path) -> None:
+    with src.open("rb") as f:
+        n = int(np.fromfile(f, dtype=np.uint32, count=1)[0])
+        d = int(np.fromfile(f, dtype=np.uint32, count=1)[0])
+    data = np.memmap(src, dtype=np.float32, mode="r", offset=8, shape=(n, d))
+    out = np.memmap(
+        dst,
+        dtype=np.dtype([("dim", "<i4"), ("vec", "<f4", (d,))]),
+        mode="w+",
+        shape=(n,),
+    )
+    chunk = 100_000
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        out["dim"][start:end] = d
+        out["vec"][start:end] = data[start:end]
+    out.flush()
+
+fbin_to_fvecs(root / "base.10M.fbin", root / "deep_base.fvecs")
+fbin_to_fvecs(root / "query.public.10K.fbin", root / "deep_query.fvecs")
+(root / "deep10M_groundtruth.ivecs").rename(root / "deep_groundtruth_10M.ivecs")
+PY
+```
+
+Then run:
+
+```bash
+cargo run -p vector-bench --release -- --config bench.toml
+```
+
+with a `[[params.recall]]` entry like:
+
+```toml
+[[params.recall]]
+dataset = "deep10m"
+```
+
+#### Copy-paste setup for `deep1b`
+
+This is the same flow, but the base file is much larger, around 388 GB just for `base.1B.fbin`.
+
+```bash
+mkdir -p vector/bench/data/deep
+cd vector/bench/data/deep
+
+curl -L -o base.1B.fbin \
+  https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/base.1B.fbin
+curl -L -o query.public.10K.fbin \
+  https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/query.public.10K.fbin
+curl -L -o groundtruth.public.10K.ibin \
+  https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/groundtruth.public.10K.ibin
+
+python3 - <<'PY'
+from pathlib import Path
+import numpy as np
+
+root = Path("vector/bench/data/deep")
+
+def fbin_to_fvecs(src: Path, dst: Path) -> None:
+    with src.open("rb") as f:
+        n = int(np.fromfile(f, dtype=np.uint32, count=1)[0])
+        d = int(np.fromfile(f, dtype=np.uint32, count=1)[0])
+    data = np.memmap(src, dtype=np.float32, mode="r", offset=8, shape=(n, d))
+    out = np.memmap(
+        dst,
+        dtype=np.dtype([("dim", "<i4"), ("vec", "<f4", (d,))]),
+        mode="w+",
+        shape=(n,),
+    )
+    chunk = 100_000
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        out["dim"][start:end] = d
+        out["vec"][start:end] = data[start:end]
+    out.flush()
+
+def ibin_to_ivecs(src: Path, dst: Path) -> None:
+    with src.open("rb") as f:
+        n = int(np.fromfile(f, dtype=np.uint32, count=1)[0])
+        d = int(np.fromfile(f, dtype=np.uint32, count=1)[0])
+    data = np.memmap(src, dtype=np.int32, mode="r", offset=8, shape=(n, d))
+    out = np.memmap(
+        dst,
+        dtype=np.dtype([("dim", "<i4"), ("vec", "<i4", (d,))]),
+        mode="w+",
+        shape=(n,),
+    )
+    chunk = 100_000
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        out["dim"][start:end] = d
+        out["vec"][start:end] = data[start:end]
+    out.flush()
+
+fbin_to_fvecs(root / "base.1B.fbin", root / "deep_base.fvecs")
+fbin_to_fvecs(root / "query.public.10K.fbin", root / "deep_query.fvecs")
+ibin_to_ivecs(root / "groundtruth.public.10K.ibin", root / "deep_groundtruth_1B.ivecs")
+PY
+```
+
+### Upstash Wikipedia BGE-M3
+
+The benchmark includes an English Wikipedia BGE-M3 dataset entry named `wikipedia_bge_m3_en`.
+
+Expected local layout:
+
+```text
+vector/bench/data/wikipedia-bge-m3/en/
+├── base.fvecs
+├── query.fvecs
+└── groundtruth.ivecs
+```
+
+Dataset characteristics:
+
+- 1024 dimensions
+- dot-product search
+- embeddings generated with `BAAI/bge-m3`
+
+Recommended sourcing flow:
+
+1. Download the English split from `Upstash/wikipedia-2024-06-bge-m3`.
+   Source: <https://huggingface.co/datasets/Upstash/wikipedia-2024-06-bge-m3>
+2. Extract paragraph embeddings and write them to `base.fvecs`.
+3. Prepare a held-out query set in the same 1024-d format and write it to `query.fvecs`.
+4. Compute exact top-k neighbors for those queries and write them to `groundtruth.ivecs`.
+
+Notes:
+
+- The benchmark does **not** read Hugging Face parquet directly; convert embeddings to `fvecs` first.
+- The benchmark assumes vectors are already in the same embedding space as the base set. If you generate queries with
+  `BAAI/bge-m3`, use the same model and normalization settings you used for the base vectors when you computed ground
+  truth.
+
+#### Copy-paste setup for `wikipedia_bge_m3_en`
+
+This example builds a runnable benchmark dataset from the first 1,000,000 English embeddings and the next 1,000
+embeddings as queries.
+
+```bash
+python3 -m venv .venv-vector-bench
+source .venv-vector-bench/bin/activate
+pip install -U pip
+pip install datasets numpy faiss-cpu
+
+mkdir -p vector/bench/data/wikipedia-bge-m3/en
+
+python3 - <<'PY'
+from pathlib import Path
+import numpy as np
+import faiss
+from datasets import load_dataset
+
+OUT = Path("vector/bench/data/wikipedia-bge-m3/en")
+BASE_COUNT = 1_000_000
+QUERY_COUNT = 1_000
+TOPK = 100
+
+def write_fvecs(path: Path, arr: np.ndarray) -> None:
+    arr = np.asarray(arr, dtype=np.float32)
+    n, d = arr.shape
+    out = np.memmap(
+        path,
+        dtype=np.dtype([("dim", "<i4"), ("vec", "<f4", (d,))]),
+        mode="w+",
+        shape=(n,),
+    )
+    out["dim"][:] = d
+    out["vec"][:] = arr
+    out.flush()
+
+def write_ivecs(path: Path, arr: np.ndarray) -> None:
+    arr = np.asarray(arr, dtype=np.int32)
+    n, d = arr.shape
+    out = np.memmap(
+        path,
+        dtype=np.dtype([("dim", "<i4"), ("vec", "<i4", (d,))]),
+        mode="w+",
+        shape=(n,),
+    )
+    out["dim"][:] = d
+    out["vec"][:] = arr
+    out.flush()
+
+dataset = load_dataset(
+    "Upstash/wikipedia-2024-06-bge-m3",
+    "en",
+    split="train",
+    streaming=True,
+)
+
+base = []
+queries = []
+for row in dataset:
+    vec = np.asarray(row["embedding"], dtype=np.float32)
+    if len(base) < BASE_COUNT:
+        base.append(vec)
+    elif len(queries) < QUERY_COUNT:
+        queries.append(vec)
+    else:
+        break
+
+base = np.vstack(base)
+queries = np.vstack(queries)
+
+index = faiss.IndexFlatIP(base.shape[1])
+index.add(base)
+_, gt = index.search(queries, TOPK)
+
+write_fvecs(OUT / "base.fvecs", base)
+write_fvecs(OUT / "query.fvecs", queries)
+write_ivecs(OUT / "groundtruth.ivecs", gt)
+PY
+```
+
+Then run:
+
+```bash
+cargo run -p vector-bench --release -- --config bench.toml
+```
+
+with:
+
+```toml
+[[params.recall]]
+dataset = "wikipedia_bge_m3_en"
+```
+
 ### Cohere1M
 
 1M vectors, 768 dimensions, cosine distance. Uses Cohere's `embed-english-v3.0` embeddings from
@@ -111,7 +387,7 @@ The benchmark is configured via a TOML config file passed with `--config`. The c
 
 | Parameter           | Type   | Description                                                        |
 |---------------------|--------|--------------------------------------------------------------------|
-| `dataset`           | string | Dataset name (`sift1m`, `cohere1m`, `sift10m`, etc.)               |
+| `dataset`           | string | Dataset name (`sift1m`, `cohere1m`, `deep10m`, `deep1b`, `wikipedia_bge_m3_en`, `sift10m`, etc.) |
 | `dimensions`        | u16    | Vector dimensions (default: from dataset)                          |
 | `distance_metric`   | string | `l2`, `cosine`, or `dot_product` (default: from dataset)           |
 | `split_threshold`   | usize  | Centroid split threshold (default: from dataset)                   |

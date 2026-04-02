@@ -391,6 +391,66 @@ const COHERE1M: Dataset = Dataset {
     normalize: true,
 };
 
+const DEEP10M: Dataset = Dataset {
+    name: "deep10m",
+    dimensions: 96,
+    distance_metric: DistanceMetric::L2,
+    base_file: "deep/deep_base.fvecs",
+    query_file: "deep/deep_query.fvecs",
+    ground_truth_file: "deep/deep_groundtruth_10M.ivecs",
+    split_threshold: 1500,
+    merge_threshold: 500,
+    query_pruning_factor: Some(0.5),
+    nprobe: 100,
+    num_queries: DEFAULT_NUM_QUERIES,
+    block_cache_bytes: None,
+    data_dir: None,
+    vector_config: None,
+    format: VecFormat::Fvecs,
+    max_vectors: Some(10_000_000),
+    normalize: false,
+};
+
+const DEEP1B: Dataset = Dataset {
+    name: "deep1b",
+    dimensions: 96,
+    distance_metric: DistanceMetric::L2,
+    base_file: "deep/deep_base.fvecs",
+    query_file: "deep/deep_query.fvecs",
+    ground_truth_file: "deep/deep_groundtruth_1B.ivecs",
+    split_threshold: 1500,
+    merge_threshold: 500,
+    query_pruning_factor: Some(0.5),
+    nprobe: 100,
+    num_queries: DEFAULT_NUM_QUERIES,
+    block_cache_bytes: None,
+    data_dir: None,
+    vector_config: None,
+    format: VecFormat::Fvecs,
+    max_vectors: None,
+    normalize: false,
+};
+
+const WIKIPEDIA_BGE_M3_EN: Dataset = Dataset {
+    name: "wikipedia_bge_m3_en",
+    dimensions: 1024,
+    distance_metric: DistanceMetric::DotProduct,
+    base_file: "wikipedia-bge-m3/en/base.fvecs",
+    query_file: "wikipedia-bge-m3/en/query.fvecs",
+    ground_truth_file: "wikipedia-bge-m3/en/groundtruth.ivecs",
+    split_threshold: 1500,
+    merge_threshold: 500,
+    query_pruning_factor: Some(0.5),
+    nprobe: 100,
+    num_queries: DEFAULT_NUM_QUERIES,
+    block_cache_bytes: None,
+    data_dir: None,
+    vector_config: None,
+    format: VecFormat::Fvecs,
+    max_vectors: None,
+    normalize: false,
+};
+
 // BigANN / SIFT1B variants — all share the same base and query files but
 // differ in the number of vectors ingested and their ground truth files.
 
@@ -474,7 +534,17 @@ const SIFT1B: Dataset = Dataset {
     normalize: false,
 };
 
-const ALL_DATASETS: &[&Dataset] = &[&SIFT1M, &COHERE1M, &SIFT10M, &SIFT50M, &SIFT100M, &SIFT1B];
+const ALL_DATASETS: &[&Dataset] = &[
+    &SIFT1M,
+    &COHERE1M,
+    &DEEP10M,
+    &DEEP1B,
+    &WIKIPEDIA_BGE_M3_EN,
+    &SIFT10M,
+    &SIFT50M,
+    &SIFT100M,
+    &SIFT1B,
+];
 
 fn lookup_dataset(name: &str) -> Option<&'static Dataset> {
     ALL_DATASETS.iter().find(|d| d.name == name).copied()

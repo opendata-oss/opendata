@@ -313,6 +313,7 @@ impl ReassignVectors {
                     to_resolve.push(Box::pin(async move {
                         Ok(ResolvedVectorReassignment {
                             reassignment: r.reassignment,
+                            // TODO: this will panic on update - we need to delete vector from old posting
                             data: data_fut.await?.expect("missing vector data"),
                             centroid: r.new_centroid,
                         })
