@@ -6,6 +6,7 @@ use crate::write::indexer::tree::Indexer;
 use crate::write::indexer::tree::validator::validate as validate_tree_index;
 use common::Storage;
 use common::{StorageBuilder, StorageSemantics};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Administrative entry point for vector index maintenance.
@@ -54,6 +55,42 @@ impl VectorDbAdmin {
         let snapshot = self.snapshot().await?;
         let indexer = self.load_indexer(snapshot.clone()).await?;
         validate_tree_index(snapshot, indexer.state(), self.config.dimensions as usize).await
+    }
+
+    /// Render the current persisted tree state level by level.
+    pub async fn print_tree(&self) -> Result<String> {
+        let snapshot = self.snapshot().await?;
+        let state =
+            VectorDb::load_indexer_state(self.storage.clone(), snapshot, &self.config, 0).await?;
+
+        let mut out = String::new();
+        let depth = state.centroids_meta().depth as u16;
+        out.push_str(&format!("root count={}\n", state.root_centroid_count()));
+
+        let mut by_level: BTreeMap<u16, Vec<(u64, u64)>> = BTreeMap::new();
+        for (&centroid_id, centroid) in state.centroids() {
+            let count = state
+                .centroid_counts()
+                .get(&(centroid.level as u16))
+                .and_then(|counts| counts.get(&centroid_id))
+                .copied()
+                .unwrap_or(0);
+            by_level
+                .entry(centroid.level as u16)
+                .or_default()
+                .push((centroid_id, count));
+        }
+
+        for level in (0..depth).rev() {
+            out.push_str(&format!("level {level}\n"));
+            let mut entries = by_level.remove(&level).unwrap_or_default();
+            entries.sort_by_key(|(centroid_id, _)| *centroid_id);
+            for (centroid_id, count) in entries {
+                out.push_str(&format!("  centroid {centroid_id} count={count}\n"));
+            }
+        }
+
+        Ok(out)
     }
 
     async fn snapshot(&self) -> Result<Arc<dyn common::storage::StorageSnapshot>> {

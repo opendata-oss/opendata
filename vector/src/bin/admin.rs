@@ -13,7 +13,7 @@ fn load_vector_config(path: &str) -> Config {
 }
 
 fn usage(program: &str) {
-    eprintln!("Usage: {program} <config.yaml> <index|validate>");
+    eprintln!("Usage: {program} <config.yaml> <index|validate|print-tree>");
 }
 
 #[tokio::main]
@@ -39,6 +39,9 @@ async fn main() {
     let result = match args[2].as_str() {
         "index" => admin.index_once().await,
         "validate" => admin.validate_index().await,
+        "print-tree" => admin.print_tree().await.map(|tree| {
+            print!("{tree}");
+        }),
         _ => {
             usage(&args[0]);
             process::exit(2);
