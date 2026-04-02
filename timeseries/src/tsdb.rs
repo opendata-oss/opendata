@@ -367,7 +367,7 @@ pub(crate) async fn evaluate_range(
 
     let stats = evaluator.stats();
     let rp_delta = evaluator.read_path_stats().delta_since(&rp_before);
-    tracing::debug!(
+    tracing::trace!(
         step_count = stats.step_count,
         bucket_list_reuses = stats.bucket_list_reuses,
         bucket_list_init_attempts = stats.bucket_list_init_attempts,

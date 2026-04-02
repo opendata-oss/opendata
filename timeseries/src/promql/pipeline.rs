@@ -338,17 +338,11 @@ pub(crate) fn build_bucket_sample_work(
                 .stats
                 .series_meta_hits
                 .fetch_add(1, AtomicOrdering::Relaxed);
-            let metric_name = meta
-                .canonical_labels
-                .iter()
-                .find(|l| l.name == "__name__")
-                .map(|l| l.value.clone())
-                .unwrap_or_default();
             series.push(SeriesWorkItem {
                 series_id,
                 fingerprint: meta.fingerprint,
                 labels: meta.canonical_labels,
-                metric_name,
+                metric_name: meta.metric_name,
             });
             continue;
         }
@@ -385,6 +379,7 @@ pub(crate) fn build_bucket_sample_work(
             SeriesMeta {
                 fingerprint,
                 canonical_labels: Arc::clone(&canonical_labels),
+                metric_name: metric_name.clone(),
             },
         );
 
@@ -965,7 +960,7 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
         PipelineTimings::from_bucket_timings(&bucket_timings, pipeline_elapsed_ms, shape_ms);
 
     let stats_delta = cache.snapshot_stats().delta_since(&stats_before);
-    tracing::debug!(
+    tracing::trace!(
         path = plan.path_kind.name(),
         buckets = plan.buckets.len(),
         pipeline_wall_ms = timings.pipeline_wall_ms,

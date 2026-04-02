@@ -356,6 +356,7 @@ impl SelectorCacheKey {
 pub(crate) struct SeriesMeta {
     pub fingerprint: crate::model::SeriesFingerprint,
     pub canonical_labels: Arc<[Label]>,
+    pub metric_name: String,
 }
 
 pub(crate) struct QueryReaderEvalCache {
