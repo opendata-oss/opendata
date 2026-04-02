@@ -50,7 +50,7 @@ use std::time::Duration;
 
 pub(crate) const WRITE_CHANNEL: &str = "write";
 
-struct LoadedTreeIndex {
+pub(crate) struct LoadedTreeIndex {
     centroids_meta: CentroidsValue,
     root_centroid_count: u64,
     centroids: HashMap<u64, CentroidInfoValue>,
@@ -136,6 +136,25 @@ pub struct VectorDb {
 }
 
 impl VectorDb {
+    pub(crate) fn indexer_opts(config: &Config) -> IndexerOpts {
+        let indexed_fields: HashSet<String> = config
+            .metadata_fields
+            .iter()
+            .filter(|s| s.indexed)
+            .map(|s| s.name.clone())
+            .collect();
+        IndexerOpts {
+            dimensions: config.dimensions as usize,
+            distance_metric: config.distance_metric,
+            root_threshold_vectors: config.split_threshold_vectors,
+            merge_threshold_vectors: config.merge_threshold_vectors,
+            split_threshold_vectors: config.split_threshold_vectors,
+            split_search_neighbourhood: config.split_search_neighbourhood,
+            indexed_fields,
+            chunk_target: config.chunk_target as usize,
+        }
+    }
+
     /// Open or create a vector database with the given configuration and centroids.
     ///
     /// If the database already exists (centroids are already stored), the provided
@@ -200,7 +219,6 @@ impl VectorDb {
             SequenceAllocator::load(storage.as_ref(), centroid_seq_key).await?;
 
         let initial_snapshot = storage.snapshot().await?;
-        let dictionary = Self::load_dictionary_from_storage(initial_snapshot.as_ref()).await?;
 
         Self::bootstrap_tree_index_if_needed(
             &storage,
@@ -225,41 +243,12 @@ impl VectorDb {
             centroid_count: loaded_tree.num_leaf_centroids,
         }));
 
-        let (seq_block_key, seq_block) = id_allocator.freeze();
-        let (centroid_seq_block_key, centroid_seq_block) = centroid_id_allocator.freeze();
+        let _ = id_allocator.freeze();
+        let _ = centroid_id_allocator.freeze();
 
-        let indexed_fields: HashSet<String> = config
-            .metadata_fields
-            .iter()
-            .filter(|s| s.indexed)
-            .map(|s| s.name.clone())
-            .collect();
-
-        let indexer_state = VectorIndexState::new(
-            dictionary,
-            loaded_tree.centroids_meta,
-            loaded_tree.root_centroid_count,
-            loaded_tree.centroids,
-            loaded_tree.centroid_counts,
-            seq_block_key,
-            seq_block,
-            centroid_seq_block_key,
-            centroid_seq_block,
-            loaded_tree.centroid_cache,
-        );
-        let indexer = Indexer::new(
-            IndexerOpts {
-                dimensions: config.dimensions as usize,
-                distance_metric: config.distance_metric,
-                root_threshold_vectors: config.split_threshold_vectors,
-                merge_threshold_vectors: config.merge_threshold_vectors,
-                split_threshold_vectors: config.split_threshold_vectors,
-                split_search_neighbourhood: config.split_search_neighbourhood,
-                indexed_fields,
-                chunk_target: config.chunk_target as usize,
-            },
-            indexer_state,
-        );
+        let indexer_state =
+            Self::load_indexer_state(storage.clone(), snapshot.clone(), &config, 0).await?;
+        let indexer = Indexer::new(Self::indexer_opts(&config), indexer_state);
 
         let flusher = VectorDbFlusher::new(
             &config,
@@ -368,7 +357,7 @@ impl VectorDb {
         Ok(())
     }
 
-    async fn load_tree_index(
+    pub(crate) async fn load_tree_index(
         snapshot: Arc<dyn StorageSnapshot>,
         snapshot_epoch: u64,
         dimensions: usize,
@@ -436,8 +425,44 @@ impl VectorDb {
         })
     }
 
+    pub(crate) async fn load_indexer_state(
+        storage: Arc<dyn Storage>,
+        snapshot: Arc<dyn StorageSnapshot>,
+        config: &Config,
+        snapshot_epoch: u64,
+    ) -> Result<VectorIndexState> {
+        let seq_key = SeqBlockKey.encode();
+        let id_allocator = SequenceAllocator::load(storage.as_ref(), seq_key).await?;
+        let centroid_seq_key = CentroidSeqBlockKey.encode();
+        let centroid_id_allocator =
+            SequenceAllocator::load(storage.as_ref(), centroid_seq_key).await?;
+        let dictionary = Self::load_dictionary_from_storage(snapshot.as_ref()).await?;
+        let loaded_tree = Self::load_tree_index(
+            snapshot,
+            snapshot_epoch,
+            config.dimensions as usize,
+            config.distance_metric,
+        )
+        .await?;
+        let (seq_block_key, seq_block) = id_allocator.freeze();
+        let (centroid_seq_block_key, centroid_seq_block) = centroid_id_allocator.freeze();
+
+        Ok(VectorIndexState::new(
+            dictionary,
+            loaded_tree.centroids_meta,
+            loaded_tree.root_centroid_count,
+            loaded_tree.centroids,
+            loaded_tree.centroid_counts,
+            seq_block_key,
+            seq_block,
+            centroid_seq_block_key,
+            centroid_seq_block,
+            loaded_tree.centroid_cache,
+        ))
+    }
+
     /// Load ID dictionary entries from storage into a HashMap.
-    async fn load_dictionary_from_storage(
+    pub(crate) async fn load_dictionary_from_storage(
         snapshot: &dyn StorageRead,
     ) -> Result<HashMap<String, u64>> {
         // Create prefix for all IdDictionary records
@@ -475,7 +500,7 @@ impl VectorDb {
     ///
     /// Scans all CentroidStats records and extracts the accumulated num_vectors
     /// for each centroid.
-    async fn load_centroid_counts_from_storage(
+    pub(crate) async fn load_centroid_counts_from_storage(
         snapshot: &dyn StorageRead,
     ) -> Result<HashMap<u16, HashMap<u64, u64>>> {
         let stats = snapshot.scan_all_centroid_stats().await?;

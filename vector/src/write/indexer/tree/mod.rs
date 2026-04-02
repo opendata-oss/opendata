@@ -22,7 +22,7 @@ pub(crate) mod posting_list;
 mod root;
 mod split;
 pub(crate) mod state;
-mod validator;
+pub(crate) mod validator;
 mod vector;
 
 #[derive(Debug, Default)]
@@ -66,6 +66,10 @@ impl Indexer {
             opts: Arc::new(opts),
             state,
         }
+    }
+
+    pub(crate) fn state(&self) -> &VectorIndexState {
+        &self.state
     }
 
     fn leaf_centroid_count(&self) -> usize {
