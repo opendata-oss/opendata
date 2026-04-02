@@ -42,8 +42,13 @@ pub(crate) trait BucketQueryReader: Send + Sync {
 
     /// Get samples for a series within a time range, merging from all layers.
     /// Returns samples sorted by timestamp with duplicates removed (head takes priority).
-    async fn samples(&self, series_id: SeriesId, start_ms: i64, end_ms: i64)
-    -> Result<Vec<Sample>>;
+    async fn samples(
+        &self,
+        series_id: SeriesId,
+        metric_name: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Sample>>;
 }
 
 /// Trait for read-only queries that may span multiple time buckets.
@@ -81,6 +86,7 @@ pub(crate) trait QueryReader: Send + Sync {
         &self,
         bucket: &TimeBucket,
         series_id: SeriesId,
+        metric_name: &str,
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<Sample>>;
@@ -176,6 +182,7 @@ pub(crate) mod test_utils {
             &self,
             bucket: &TimeBucket,
             series_id: SeriesId,
+            _metric_name: &str,
             start_ms: i64,
             end_ms: i64,
         ) -> Result<Vec<Sample>> {

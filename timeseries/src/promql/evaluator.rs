@@ -4,13 +4,12 @@ use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::Sample;
-use crate::model::SeriesFingerprint;
 use crate::model::{Label, SeriesId, TimeBucket};
 use crate::promql::functions::{FunctionCallContext, FunctionRegistry, PromQLArg};
-use crate::promql::selector::evaluate_selector_with_reader;
 use crate::promql::timestamp::Timestamp;
 use crate::query::QueryReader;
 use crate::util::Result;
@@ -47,57 +46,233 @@ impl From<crate::error::Error> for EvaluationError {
 
 pub(crate) type EvalResult<T> = std::result::Result<T, EvaluationError>;
 
-/// Type alias for complex HashMap used in matrix selector evaluation.
-/// Maps from label key (sorted vector of label pairs) to samples vector
-type SeriesMap = HashMap<Vec<Label>, Vec<Sample>>;
-
-pub(crate) struct QueryReaderBucketEvalCache {
-    // Map from terms (series_ids for forward, labels for inverted) to cached results
+struct QueryReaderBucketEvalCache {
     forward_index_cache:
-        HashMap<Vec<SeriesId>, Arc<dyn ForwardIndexLookup + Send + Sync + 'static>>,
-    inverted_index_cache: HashMap<Vec<Label>, Arc<dyn InvertedIndexLookup + Send + Sync + 'static>>,
-    samples: HashMap<SeriesId, Vec<Sample>>,
+        dashmap::DashMap<Vec<SeriesId>, Arc<dyn ForwardIndexLookup + Send + Sync + 'static>>,
+    inverted_index_cache:
+        dashmap::DashMap<Vec<Label>, Arc<dyn InvertedIndexLookup + Send + Sync + 'static>>,
+    samples: dashmap::DashMap<SeriesId, Arc<Vec<Sample>>>,
 }
 
 impl QueryReaderBucketEvalCache {
     fn new() -> Self {
         Self {
-            forward_index_cache: HashMap::new(),
-            inverted_index_cache: HashMap::new(),
-            samples: HashMap::new(),
+            forward_index_cache: dashmap::DashMap::new(),
+            inverted_index_cache: dashmap::DashMap::new(),
+            samples: dashmap::DashMap::new(),
         }
     }
 }
 
+/// Distinguishes metadata reads (inverted/forward index) from sample reads
+/// for permit acquisition and stat recording.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ReadPathKind {
+    Metadata,
+    Sample,
+}
+
+/// Atomic counters for cache-miss read-path observability.
+///
+/// All fields are monotonically increasing counters updated at the read sites
+/// in `CachedQueryReader`. They are cheap to read at pipeline end for the
+/// debug log line and carry no per-request allocation.
+pub(crate) struct ReadPathStats {
+    pub metadata_cache_hits: AtomicU64,
+    pub metadata_cache_misses: AtomicU64,
+    pub sample_cache_hits: AtomicU64,
+    pub sample_cache_misses: AtomicU64,
+    pub metadata_permit_wait_ns: AtomicU64,
+    pub sample_permit_wait_ns: AtomicU64,
+}
+
+impl ReadPathStats {
+    fn new() -> Self {
+        Self {
+            metadata_cache_hits: AtomicU64::new(0),
+            metadata_cache_misses: AtomicU64::new(0),
+            sample_cache_hits: AtomicU64::new(0),
+            sample_cache_misses: AtomicU64::new(0),
+            metadata_permit_wait_ns: AtomicU64::new(0),
+            sample_permit_wait_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn record_cache_hit(&self, kind: ReadPathKind) {
+        match kind {
+            ReadPathKind::Metadata => {
+                self.metadata_cache_hits
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            ReadPathKind::Sample => {
+                self.sample_cache_hits.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+    }
+
+    fn record_cache_miss(&self, kind: ReadPathKind) {
+        match kind {
+            ReadPathKind::Metadata => {
+                self.metadata_cache_misses
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            ReadPathKind::Sample => {
+                self.sample_cache_misses
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+    }
+
+    fn record_permit_wait(&self, kind: ReadPathKind, wait_ns: u64) {
+        match kind {
+            ReadPathKind::Metadata => {
+                self.metadata_permit_wait_ns
+                    .fetch_add(wait_ns, AtomicOrdering::Relaxed);
+            }
+            ReadPathKind::Sample => {
+                self.sample_permit_wait_ns
+                    .fetch_add(wait_ns, AtomicOrdering::Relaxed);
+            }
+        }
+    }
+
+    /// Capture a point-in-time snapshot of all counters.
+    pub(crate) fn snapshot(&self) -> ReadPathStatsSnapshot {
+        ReadPathStatsSnapshot {
+            metadata_cache_hits: self.metadata_cache_hits.load(AtomicOrdering::Relaxed),
+            metadata_cache_misses: self.metadata_cache_misses.load(AtomicOrdering::Relaxed),
+            sample_cache_hits: self.sample_cache_hits.load(AtomicOrdering::Relaxed),
+            sample_cache_misses: self.sample_cache_misses.load(AtomicOrdering::Relaxed),
+            metadata_permit_wait_ns: self.metadata_permit_wait_ns.load(AtomicOrdering::Relaxed),
+            sample_permit_wait_ns: self.sample_permit_wait_ns.load(AtomicOrdering::Relaxed),
+        }
+    }
+}
+
+/// Point-in-time snapshot of read-path counters, used for computing deltas.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReadPathStatsSnapshot {
+    pub metadata_cache_hits: u64,
+    pub metadata_cache_misses: u64,
+    pub sample_cache_hits: u64,
+    pub sample_cache_misses: u64,
+    pub metadata_permit_wait_ns: u64,
+    pub sample_permit_wait_ns: u64,
+}
+
+impl ReadPathStatsSnapshot {
+    /// Compute the delta between this snapshot and an earlier one.
+    pub(crate) fn delta_since(&self, earlier: &ReadPathStatsSnapshot) -> ReadPathStatsSnapshot {
+        ReadPathStatsSnapshot {
+            metadata_cache_hits: self
+                .metadata_cache_hits
+                .saturating_sub(earlier.metadata_cache_hits),
+            metadata_cache_misses: self
+                .metadata_cache_misses
+                .saturating_sub(earlier.metadata_cache_misses),
+            sample_cache_hits: self
+                .sample_cache_hits
+                .saturating_sub(earlier.sample_cache_hits),
+            sample_cache_misses: self
+                .sample_cache_misses
+                .saturating_sub(earlier.sample_cache_misses),
+            metadata_permit_wait_ns: self
+                .metadata_permit_wait_ns
+                .saturating_sub(earlier.metadata_permit_wait_ns),
+            sample_permit_wait_ns: self
+                .sample_permit_wait_ns
+                .saturating_sub(earlier.sample_permit_wait_ns),
+        }
+    }
+}
+
+/// Filter samples by time range: `(start_ms, end_ms]`.
+fn filter_samples_in_range(samples: &[Sample], start_ms: i64, end_ms: i64) -> Vec<Sample> {
+    samples
+        .iter()
+        .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
+        .cloned()
+        .collect()
+}
+
 pub(crate) struct QueryReaderEvalCache {
-    cache: HashMap<TimeBucket, QueryReaderBucketEvalCache>,
+    cache: dashmap::DashMap<TimeBucket, QueryReaderBucketEvalCache>,
+    /// Limits concurrent cache-miss metadata reads (inverted_index, forward_index).
+    pub(crate) metadata_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Limits concurrent cache-miss sample reads.
+    pub(crate) sample_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Atomic counters for read-path observability.
+    pub(crate) stats: ReadPathStats,
 }
 
 impl QueryReaderEvalCache {
     pub(crate) fn new() -> Self {
+        let defaults = crate::promql::pipeline::PipelineConcurrency::default();
+        Self::with_concurrency(&defaults)
+    }
+
+    /// Build a cache with semaphores sized to the given concurrency limits.
+    ///
+    /// `metadata_concurrency` and `sample_concurrency` control how many
+    /// cache-miss storage reads can be in flight at once, not how many
+    /// bucket-level pipeline workers run concurrently.
+    pub(crate) fn with_concurrency(
+        concurrency: &crate::promql::pipeline::PipelineConcurrency,
+    ) -> Self {
         Self {
-            cache: HashMap::new(),
+            cache: dashmap::DashMap::new(),
+            metadata_semaphore: Arc::new(tokio::sync::Semaphore::new(concurrency.metadata.max(1))),
+            sample_semaphore: Arc::new(tokio::sync::Semaphore::new(concurrency.samples.max(1))),
+            stats: ReadPathStats::new(),
         }
     }
 
-    pub(crate) fn get_bucket_cache_mut(
-        &mut self,
+    /// Capture a point-in-time snapshot of all read-path counters.
+    pub(crate) fn snapshot_stats(&self) -> ReadPathStatsSnapshot {
+        self.stats.snapshot()
+    }
+
+    /// Acquire a read permit for the given path kind, recording wait time.
+    ///
+    /// Returns an `OwnedSemaphorePermit` so callers can hold it across await
+    /// points without borrowing `self`. A closed semaphore produces an
+    /// `EvaluationError` rather than a panic.
+    pub(crate) async fn acquire_permit(
+        &self,
+        kind: ReadPathKind,
+    ) -> EvalResult<tokio::sync::OwnedSemaphorePermit> {
+        let sem = match kind {
+            ReadPathKind::Metadata => Arc::clone(&self.metadata_semaphore),
+            ReadPathKind::Sample => Arc::clone(&self.sample_semaphore),
+        };
+        let wait_start = std::time::Instant::now();
+        let permit = sem
+            .acquire_owned()
+            .await
+            .map_err(|_| EvaluationError::InternalError("read permit semaphore closed".into()))?;
+        self.stats
+            .record_permit_wait(kind, wait_start.elapsed().as_nanos() as u64);
+        Ok(permit)
+    }
+
+    fn get_or_create_bucket(
+        &self,
         bucket: &TimeBucket,
-    ) -> &mut QueryReaderBucketEvalCache {
+    ) -> dashmap::mapref::one::Ref<'_, TimeBucket, QueryReaderBucketEvalCache> {
         self.cache
             .entry(*bucket)
             .or_insert_with(QueryReaderBucketEvalCache::new)
+            .downgrade()
     }
 
     pub(crate) fn cache_forward_index(
-        &mut self,
+        &self,
         bucket: TimeBucket,
         series_ids: Vec<SeriesId>,
         forward_index: Box<dyn ForwardIndexLookup + Send + Sync + 'static>,
     ) {
-        let bucket_cache = self.get_bucket_cache_mut(&bucket);
-        bucket_cache
-            .forward_index_cache
+        let bc = self.get_or_create_bucket(&bucket);
+        bc.forward_index_cache
             .insert(series_ids, forward_index.into());
     }
 
@@ -106,22 +281,20 @@ impl QueryReaderEvalCache {
         bucket: &TimeBucket,
         series_ids: &[SeriesId],
     ) -> Option<Arc<dyn ForwardIndexLookup + Send + Sync + 'static>> {
-        self.cache
-            .get(bucket)
-            .and_then(|bucket_cache| bucket_cache.forward_index_cache.get(series_ids))
-            .cloned()
+        let bc = self.cache.get(bucket)?;
+        bc.forward_index_cache
+            .get(series_ids)
+            .map(|v| v.value().clone())
     }
 
     pub(crate) fn cache_inverted_index(
-        &mut self,
+        &self,
         bucket: TimeBucket,
         terms: Vec<Label>,
         result: Box<dyn InvertedIndexLookup + Send + Sync + 'static>,
     ) {
-        let bucket_cache = self.get_bucket_cache_mut(&bucket);
-        bucket_cache
-            .inverted_index_cache
-            .insert(terms, result.into());
+        let bc = self.get_or_create_bucket(&bucket);
+        bc.inverted_index_cache.insert(terms, result.into());
     }
 
     pub(crate) fn get_inverted_index(
@@ -129,30 +302,29 @@ impl QueryReaderEvalCache {
         bucket: &TimeBucket,
         terms: &[Label],
     ) -> Option<Arc<dyn InvertedIndexLookup + Send + Sync + 'static>> {
-        self.cache
-            .get(bucket)
-            .and_then(|bucket_cache| bucket_cache.inverted_index_cache.get(terms))
-            .cloned()
+        let bc = self.cache.get(bucket)?;
+        bc.inverted_index_cache
+            .get(terms)
+            .map(|v| v.value().clone())
     }
 
     pub(crate) fn cache_samples(
-        &mut self,
+        &self,
         bucket: TimeBucket,
         series_id: SeriesId,
         samples: Vec<Sample>,
     ) {
-        let bucket_cache = self.get_bucket_cache_mut(&bucket);
-        bucket_cache.samples.insert(series_id, samples);
+        let bc = self.get_or_create_bucket(&bucket);
+        bc.samples.insert(series_id, Arc::new(samples));
     }
 
     pub(crate) fn get_samples(
         &self,
         bucket: &TimeBucket,
         series_id: &SeriesId,
-    ) -> Option<&Vec<Sample>> {
-        self.cache
-            .get(bucket)
-            .and_then(|bucket_cache| bucket_cache.samples.get(series_id))
+    ) -> Option<Arc<Vec<Sample>>> {
+        let bc = self.cache.get(bucket)?;
+        bc.samples.get(series_id).map(|v| Arc::clone(v.value()))
     }
 }
 
@@ -305,20 +477,40 @@ fn select_k_indices_with_heap(
 
 pub(crate) struct Evaluator<'reader, R: QueryReader> {
     reader: CachedQueryReader<'reader, R>,
+    concurrency: crate::promql::pipeline::PipelineConcurrency,
 }
 
-/// A wrapper around QueryReader that uses QueryReaderEvalCache for caching
+/// A wrapper around QueryReader that uses a shared QueryReaderEvalCache.
+///
+/// The cache is behind an `Arc` so that multiple `CachedQueryReader` instances
+/// (e.g. one per bucket task in the pipeline) can share the same query-scoped
+/// cache. All methods take `&self`; interior concurrency is provided by DashMap.
 pub(crate) struct CachedQueryReader<'reader, R: QueryReader> {
     reader: &'reader R,
-    cache: QueryReaderEvalCache,
+    cache: Arc<QueryReaderEvalCache>,
 }
 
 impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
     pub(crate) fn new(reader: &'reader R) -> Self {
         Self {
             reader,
-            cache: QueryReaderEvalCache::new(),
+            cache: Arc::new(QueryReaderEvalCache::new()),
         }
+    }
+
+    /// Create a CachedQueryReader that shares an existing cache.
+    pub(crate) fn with_shared_cache(reader: &'reader R, cache: Arc<QueryReaderEvalCache>) -> Self {
+        Self { reader, cache }
+    }
+
+    /// Access the underlying reader reference.
+    pub(crate) fn raw_reader(&self) -> &'reader R {
+        self.reader
+    }
+
+    /// Access the shared cache handle.
+    pub(crate) fn shared_cache(&self) -> &Arc<QueryReaderEvalCache> {
+        &self.cache
     }
 
     pub(crate) async fn list_buckets(&self) -> Result<Vec<TimeBucket>> {
@@ -326,53 +518,37 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
     }
 
     pub(crate) async fn forward_index(
-        &mut self,
+        &self,
         bucket: &TimeBucket,
         series_ids: &[SeriesId],
     ) -> Result<Arc<dyn ForwardIndexLookup + Send + Sync + 'static>> {
         let mut series_ids = Vec::from(series_ids);
         series_ids.sort();
-        // Check cache first
         if let Some(cached_data) = self.cache.get_forward_index(bucket, &series_ids) {
-            Ok(cached_data)
-        } else {
-            // Load from underlying reader
-            let forward_index = self.reader.forward_index(bucket, &series_ids).await?;
-
-            self.cache
-                .cache_forward_index(*bucket, series_ids.clone(), forward_index);
-
-            Ok(self
-                .cache
-                .get_forward_index(bucket, &series_ids)
-                .expect("unreachable"))
+            self.cache.stats.record_cache_hit(ReadPathKind::Metadata);
+            return Ok(cached_data);
         }
+
+        // Delegate to a free function so the semaphore `.await` does not
+        // hold `&self` (and therefore `&'reader R`) in the future state.
+        // This avoids higher-ranked lifetime `Send` issues with the
+        // recursive `evaluate_expr` return type.
+        cached_forward_index_miss(self.reader, Arc::clone(&self.cache), *bucket, series_ids).await
     }
 
     pub(crate) async fn inverted_index(
-        &mut self,
+        &self,
         bucket: &TimeBucket,
         terms: &[Label],
     ) -> Result<Arc<dyn InvertedIndexLookup + Send + Sync + 'static>> {
         let mut terms = terms.to_vec();
-        // Sort by canonical Label ordering (name, then value) for cache key consistency
         terms.sort();
-        // Check cache first
         if let Some(cached_result) = self.cache.get_inverted_index(bucket, &terms) {
+            self.cache.stats.record_cache_hit(ReadPathKind::Metadata);
             return Ok(cached_result);
         }
 
-        // Load from underlying reader
-        let inverted_index = self.reader.inverted_index(bucket, &terms).await?;
-
-        // Cache the result
-        self.cache
-            .cache_inverted_index(*bucket, terms.clone(), inverted_index);
-
-        Ok(self
-            .cache
-            .get_inverted_index(bucket, &terms)
-            .expect("unreachable"))
+        cached_inverted_index_miss(self.reader, Arc::clone(&self.cache), *bucket, terms).await
     }
 
     pub(crate) async fn all_inverted_index(
@@ -391,42 +567,131 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
     }
 
     pub(crate) async fn samples(
-        &mut self,
+        &self,
         bucket: &TimeBucket,
         series_id: SeriesId,
+        metric_name: &str,
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<Sample>> {
-        // Check cache first
         if let Some(cached_samples) = self.cache.get_samples(bucket, &series_id) {
-            // Filter cached samples by requested time range
-            let filtered: Vec<Sample> = cached_samples
-                .iter()
-                .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
-                .cloned()
-                .collect();
-            return Ok(filtered);
+            self.cache.stats.record_cache_hit(ReadPathKind::Sample);
+            return Ok(filter_samples_in_range(&cached_samples, start_ms, end_ms));
         }
 
-        // Not in cache, load from underlying reader with wide bounds to cache the whole bucket
-        let samples = self
-            .reader
-            .samples(bucket, series_id, i64::MIN, i64::MAX)
-            .await?;
-
-        // Cache the full sample set
-        self.cache
-            .cache_samples(*bucket, series_id, samples.clone());
-
-        // Filter by requested time range
-        let filtered: Vec<Sample> = samples
-            .iter()
-            .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
-            .cloned()
-            .collect();
-
-        Ok(filtered)
+        cached_samples_miss(
+            self.reader,
+            Arc::clone(&self.cache),
+            *bucket,
+            series_id,
+            metric_name,
+            start_ms,
+            end_ms,
+        )
+        .await
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cache-miss read helpers (free functions)
+//
+// These are free functions rather than methods on `CachedQueryReader` so that
+// the semaphore `.await` does not hold `&CachedQueryReader<'reader, R>` in
+// the generated future state.  Holding that reference across an await point
+// triggers a "Send is not general enough" error for the `'reader` lifetime
+// when the future is stored inside `Pin<Box<dyn Future + Send>>` in the
+// recursive `evaluate_expr` return type.  By taking `reader: &R` and
+// `cache: Arc<QueryReaderEvalCache>` as separate parameters the generated
+// future's Send bound depends only on `&R` (fine, `R: Sync`) and owned
+// `Arc` values.
+// ---------------------------------------------------------------------------
+
+async fn cached_forward_index_miss<R: QueryReader>(
+    reader: &R,
+    cache: Arc<QueryReaderEvalCache>,
+    bucket: TimeBucket,
+    series_ids: Vec<SeriesId>,
+) -> Result<Arc<dyn ForwardIndexLookup + Send + Sync + 'static>> {
+    let _permit = cache
+        .acquire_permit(ReadPathKind::Metadata)
+        .await
+        .map_err(|e| crate::error::Error::Internal(e.to_string()))?;
+
+    // Post-permit recheck: another task may have populated while we waited.
+    if let Some(cached_data) = cache.get_forward_index(&bucket, &series_ids) {
+        cache.stats.record_cache_hit(ReadPathKind::Metadata);
+        return Ok(cached_data);
+    }
+
+    cache.stats.record_cache_miss(ReadPathKind::Metadata);
+    let forward_index = reader.forward_index(&bucket, &series_ids).await?;
+
+    cache.cache_forward_index(bucket, series_ids.clone(), forward_index);
+
+    Ok(cache
+        .get_forward_index(&bucket, &series_ids)
+        .expect("unreachable"))
+}
+
+async fn cached_inverted_index_miss<R: QueryReader>(
+    reader: &R,
+    cache: Arc<QueryReaderEvalCache>,
+    bucket: TimeBucket,
+    terms: Vec<Label>,
+) -> Result<Arc<dyn InvertedIndexLookup + Send + Sync + 'static>> {
+    let _permit = cache
+        .acquire_permit(ReadPathKind::Metadata)
+        .await
+        .map_err(|e| crate::error::Error::Internal(e.to_string()))?;
+
+    if let Some(cached_result) = cache.get_inverted_index(&bucket, &terms) {
+        cache.stats.record_cache_hit(ReadPathKind::Metadata);
+        return Ok(cached_result);
+    }
+
+    cache.stats.record_cache_miss(ReadPathKind::Metadata);
+    let inverted_index = reader.inverted_index(&bucket, &terms).await?;
+
+    cache.cache_inverted_index(bucket, terms.clone(), inverted_index);
+
+    Ok(cache
+        .get_inverted_index(&bucket, &terms)
+        .expect("unreachable"))
+}
+
+async fn cached_samples_miss<R: QueryReader>(
+    reader: &R,
+    cache: Arc<QueryReaderEvalCache>,
+    bucket: TimeBucket,
+    series_id: SeriesId,
+    metric_name: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Vec<Sample>> {
+    let _permit = cache
+        .acquire_permit(ReadPathKind::Sample)
+        .await
+        .map_err(|e| crate::error::Error::Internal(e.to_string()))?;
+
+    // Post-permit recheck.
+    if let Some(cached_samples) = cache.get_samples(&bucket, &series_id) {
+        cache.stats.record_cache_hit(ReadPathKind::Sample);
+        return Ok(filter_samples_in_range(&cached_samples, start_ms, end_ms));
+    }
+
+    cache.stats.record_cache_miss(ReadPathKind::Sample);
+
+    // Cache the full bucket on a miss so later overlapping range-query
+    // steps and sibling selector evaluations can slice locally without
+    // paying for another storage read.
+    let samples = reader
+        .samples(&bucket, series_id, metric_name, i64::MIN, i64::MAX)
+        .await?;
+
+    cache.cache_samples(bucket, series_id, samples);
+
+    let cached = cache.get_samples(&bucket, &series_id).expect("just cached");
+    Ok(filter_samples_in_range(&cached, start_ms, end_ms))
 }
 
 #[derive(Debug)]
@@ -744,11 +1009,20 @@ fn preload_ranges_inner(
 
 impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     pub(crate) fn new(reader: &'reader R) -> Self {
+        Self::with_concurrency(
+            reader,
+            crate::promql::pipeline::PipelineConcurrency::default(),
+        )
+    }
+
+    pub(crate) fn with_concurrency(
+        reader: &'reader R,
+        concurrency: crate::promql::pipeline::PipelineConcurrency,
+    ) -> Self {
+        let cache = Arc::new(QueryReaderEvalCache::with_concurrency(&concurrency));
         Self {
-            reader: CachedQueryReader {
-                reader,
-                cache: QueryReaderEvalCache::new(),
-            },
+            reader: CachedQueryReader::with_shared_cache(reader, cache),
+            concurrency,
         }
     }
 
@@ -905,6 +1179,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         query_end: Timestamp,
         evaluation_ts: Timestamp,
     ) -> EvalResult<ExprResult> {
+        use crate::promql::pipeline::{self, QueryPlan};
+
         let vector_selector = &matrix_selector.vs;
         let range = matrix_selector.range;
 
@@ -917,78 +1193,20 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             evaluation_ts,
         )?;
 
-        // Example where this matters:
-        //   sum_over_time(metric[100s] @ 100 offset 50s)
-        //   → adjusted_eval_ts = 50s
-        //   → start = 50s - 100s = -50s (before UNIX_EPOCH!)
-        //
-        // NOTE: Prometheus represents timestamps internally as int64 milliseconds
-        // and allows negative timestamps (times before UNIX_EPOCH).
-        // See: https://github.com/prometheus/prometheus/blob/main/model/timestamp/timestamp.go
-        let end_ms = adjusted_eval_ts.as_millis();
-        let start_ms = end_ms - (range.as_millis() as i64);
+        let buckets = self.reader.list_buckets().await?;
+        let plan = QueryPlan::for_matrix(
+            adjusted_eval_ts.as_millis(),
+            range.as_millis() as i64,
+            buckets,
+        );
 
-        // order buckets in chronological order
-        let mut buckets = self.reader.list_buckets().await?;
-        buckets.sort_by(|a, b| a.start.cmp(&b.start));
-
-        // Group samples by series (using sorted label vector as key since HashMap doesn't impl Hash)
-        let mut series_map: SeriesMap = HashMap::new();
-
-        for bucket in buckets {
-            // Check if bucket overlaps with our time range
-            let bucket_start_ms = (bucket.start as i64) * 60 * 1000; // Convert minutes to milliseconds
-            let bucket_end_ms = bucket_start_ms + (bucket.size_in_mins() as i64) * 60 * 1000;
-            if bucket_end_ms < start_ms || bucket_start_ms > end_ms {
-                continue;
-            }
-
-            let candidates =
-                evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
-                    .await
-                    .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
-
-            if candidates.is_empty() {
-                continue;
-            }
-
-            let candidates_vec: Vec<_> = candidates.into_iter().collect();
-            let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
-
-            for series_id in candidates_vec {
-                let series_spec = match forward_index_view.get_spec(&series_id) {
-                    Some(spec) => spec,
-                    None => {
-                        return Err(EvaluationError::InternalError(format!(
-                            "Series {} not found in bucket {:?}",
-                            series_id, bucket
-                        )));
-                    }
-                };
-
-                let sample_data = self
-                    .reader
-                    .samples(&bucket, series_id, start_ms, end_ms)
-                    .await?;
-
-                let mut labels_key: Vec<Label> = series_spec.labels.clone();
-                // Sort by canonical Label ordering (name, then value) for series grouping
-                labels_key.sort();
-
-                let values = series_map.entry(labels_key).or_default();
-                for sample in sample_data {
-                    values.push(sample);
-                }
-            }
-        }
-
-        let mut range_vector = Vec::new();
-        for (labels, values) in series_map {
-            let labels = self.labels_to_hashmap(&labels);
-            range_vector.push(EvalSamples { values, labels });
-        }
-
-        Ok(ExprResult::RangeVector(range_vector))
+        pipeline::execute_selector_pipeline(
+            self.reader.raw_reader(),
+            self.reader.shared_cache(),
+            &plan,
+            vector_selector,
+        )
+        .await
     }
 
     async fn evaluate_subquery(
@@ -1105,161 +1323,18 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         let mut range_vector = Vec::new();
         for (labels, values) in series_map {
-            let labels = self.labels_to_hashmap(&labels);
+            let labels = crate::promql::pipeline::labels_to_hashmap(&labels);
             range_vector.push(EvalSamples { values, labels });
         }
 
         Ok(ExprResult::RangeVector(range_vector))
     }
 
-    /// Computes time alignment and range boundaries for subquery evaluation.
-    ///
-    /// Aligns the start time to step boundaries using floor division to ensure
-    /// consistent evaluation points. Extends the range backwards to include
-    /// lookback for the first step.
-    fn compute_subquery_plan(
-        subquery_start_ms: i64,
-        subquery_end_ms: i64,
-        step_ms: i64,
-        lookback_delta_ms: i64,
-    ) -> (i64, i64, i64, usize) {
-        let div = subquery_start_ms.div_euclid(step_ms);
-        let mut aligned_start_ms = div * step_ms;
-        if aligned_start_ms <= subquery_start_ms {
-            aligned_start_ms += step_ms;
-        }
-
-        let expected_steps = ((subquery_end_ms - aligned_start_ms) / step_ms) as usize + 1;
-        let range_start_ms = aligned_start_ms - lookback_delta_ms;
-        let range_end_ms = subquery_end_ms;
-
-        (
-            aligned_start_ms,
-            range_start_ms,
-            range_end_ms,
-            expected_steps,
-        )
-    }
-
-    /// Fetches and normalizes samples for all matching series across all buckets.
-    ///
-    /// Consolidates multi-bucket fetching, merging, sorting, and deduplication.
-    /// This avoids redundant selector evaluations by fetching all samples in the
-    /// range once instead of evaluating per-step.
-    async fn fetch_series_samples(
-        &mut self,
-        vector_selector: &VectorSelector,
-        range_start_ms: i64,
-        range_end_ms: i64,
-    ) -> EvalResult<HashMap<SeriesFingerprint, (HashMap<String, String>, Vec<Sample>)>> {
-        let mut buckets = self.reader.list_buckets().await?;
-        buckets.sort_by(|a, b| b.start.cmp(&a.start));
-
-        let mut series_samples = HashMap::new();
-
-        for bucket in buckets {
-            let candidates =
-                evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
-                    .await
-                    .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
-
-            if candidates.is_empty() {
-                continue;
-            }
-
-            let candidates_vec: Vec<_> = candidates.into_iter().collect();
-            let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
-
-            for series_id in candidates_vec {
-                let Some(series_spec) = forward_index_view.get_spec(&series_id) else {
-                    continue;
-                };
-
-                let fingerprint = self.compute_fingerprint(&series_spec.labels);
-
-                let samples = self
-                    .reader
-                    .samples(&bucket, series_id, range_start_ms, range_end_ms)
-                    .await?;
-
-                if samples.is_empty() {
-                    continue;
-                }
-
-                let entry = series_samples.entry(fingerprint).or_insert_with(|| {
-                    let labels = self.labels_to_hashmap(&series_spec.labels);
-                    (labels, Vec::new())
-                });
-
-                entry.1.extend(samples);
-            }
-        }
-
-        for (_fp, (_labels, samples)) in series_samples.iter_mut() {
-            samples.sort_by_key(|s| s.timestamp_ms);
-            samples.dedup_by_key(|s| s.timestamp_ms);
-        }
-
-        Ok(series_samples)
-    }
-
-    /// Buckets samples into step-aligned time windows using a sliding window algorithm.
-    ///
-    /// Uses O(samples + steps) complexity instead of O(samples × steps) by maintaining
-    /// a monotonic pointer through sorted samples. For each step, finds the most recent
-    /// sample within the lookback window. Uses > (not >=) for start boundary to match
-    /// Prometheus staleness semantics.
-    fn bucket_series_samples(
-        series_samples: HashMap<SeriesFingerprint, (HashMap<String, String>, Vec<Sample>)>,
-        aligned_start_ms: i64,
-        subquery_end_ms: i64,
-        step_ms: i64,
-        lookback_delta_ms: i64,
-        expected_steps: usize,
-    ) -> Vec<EvalSamples> {
-        let mut range_vector = Vec::with_capacity(series_samples.len());
-
-        for (_fingerprint, (labels, samples)) in series_samples {
-            let mut step_samples = Vec::with_capacity(expected_steps);
-            let mut i = 0usize;
-            let mut last_valid: Option<&Sample> = None;
-
-            for current_step_ms in (aligned_start_ms..=subquery_end_ms).step_by(step_ms as usize) {
-                let lookback_start_ms = current_step_ms - lookback_delta_ms;
-
-                while i < samples.len() && samples[i].timestamp_ms <= current_step_ms {
-                    last_valid = Some(&samples[i]);
-                    i += 1;
-                }
-
-                if let Some(sample) = last_valid
-                    && sample.timestamp_ms > lookback_start_ms
-                {
-                    step_samples.push(Sample {
-                        timestamp_ms: current_step_ms,
-                        value: sample.value,
-                    });
-                }
-            }
-
-            if !step_samples.is_empty() {
-                range_vector.push(EvalSamples {
-                    values: step_samples,
-                    labels,
-                });
-            }
-        }
-
-        range_vector
-    }
-
     /// Fast path for VectorSelector subqueries using range-based evaluation.
     ///
     /// Instead of evaluating the selector once per step (O(steps × series × index_lookup)),
     /// this fetches all samples in the range once and buckets them into steps
-    /// (O(series × samples_in_range + samples + steps)). Achieves 113× speedup for
-    /// typical workloads by eliminating redundant selector evaluations and using
-    /// a sliding window algorithm for bucketing.
+    /// (O(series × samples_in_range + samples + steps)).
     async fn evaluate_subquery_vector_selector(
         &mut self,
         vector_selector: &VectorSelector,
@@ -1268,28 +1343,24 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         step_ms: i64,
         lookback_delta_ms: i64,
     ) -> EvalResult<ExprResult> {
-        let (aligned_start_ms, range_start_ms, range_end_ms, expected_steps) =
-            Self::compute_subquery_plan(
-                subquery_start_ms,
-                subquery_end_ms,
-                step_ms,
-                lookback_delta_ms,
-            );
+        use crate::promql::pipeline::{self, QueryPlan};
 
-        let series_samples = self
-            .fetch_series_samples(vector_selector, range_start_ms, range_end_ms)
-            .await?;
-
-        let range_vector = Self::bucket_series_samples(
-            series_samples,
-            aligned_start_ms,
+        let buckets = self.reader.list_buckets().await?;
+        let plan = QueryPlan::for_subquery_vector_selector(
+            subquery_start_ms,
             subquery_end_ms,
             step_ms,
             lookback_delta_ms,
-            expected_steps,
+            buckets,
         );
 
-        Ok(ExprResult::RangeVector(range_vector))
+        pipeline::execute_selector_pipeline(
+            self.reader.raw_reader(),
+            self.reader.shared_cache(),
+            &plan,
+            vector_selector,
+        )
+        .await
     }
 
     async fn evaluate_vector_selector(
@@ -1300,6 +1371,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         evaluation_ts: Timestamp,
         lookback_delta_ms: i64,
     ) -> EvalResult<ExprResult> {
+        use crate::promql::pipeline::{self, QueryPlan};
+
         // Apply time modifiers (offset and @)
         let adjusted_eval_ts = self.apply_time_modifiers(
             vector_selector.at.as_ref(),
@@ -1309,75 +1382,17 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             evaluation_ts,
         )?;
 
-        let end_ms = adjusted_eval_ts.as_millis();
-        let start_ms = end_ms - lookback_delta_ms;
+        let buckets = self.reader.list_buckets().await?;
+        let plan =
+            QueryPlan::for_instant_vector(adjusted_eval_ts.as_millis(), lookback_delta_ms, buckets);
 
-        // Get all buckets and sort by start time in reverse order (newest first)
-        let mut buckets = self.reader.list_buckets().await?;
-        buckets.sort_by(|a, b| b.start.cmp(&a.start)); // newest first
-
-        let mut series_with_results: HashSet<SeriesFingerprint> = HashSet::new();
-        let mut samples = Vec::new();
-
-        // Iterate through buckets in reverse time order (newest first)
-        for bucket in buckets {
-            // Find matching series in this bucket
-            let candidates =
-                evaluate_selector_with_reader(&mut self.reader, bucket, vector_selector)
-                    .await
-                    .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
-
-            if candidates.is_empty() {
-                continue;
-            }
-
-            // Batch load forward index for all candidates upfront
-            let candidates_vec: Vec<_> = candidates.into_iter().collect();
-            let forward_index_view = self.reader.forward_index(&bucket, &candidates_vec).await?;
-
-            for series_id in candidates_vec {
-                // Get series spec from forward index view (batched lookup)
-                let series_spec = match forward_index_view.get_spec(&series_id) {
-                    Some(spec) => spec,
-                    None => {
-                        return Err(EvaluationError::InternalError(format!(
-                            "Series {} not found in bucket {:?}",
-                            series_id, bucket
-                        )));
-                    }
-                };
-                let fingerprint = self.compute_fingerprint(&series_spec.labels);
-
-                // Skip if we already found a sample for this series in a newer bucket
-                if series_with_results.contains(&fingerprint) {
-                    continue;
-                }
-
-                // Read samples from this bucket within the lookback window
-                let sample_data = self
-                    .reader
-                    .samples(&bucket, series_id, start_ms, end_ms)
-                    .await?;
-
-                // Find the best (latest) point in the time range
-                if let Some(best_sample) = sample_data.last() {
-                    // Convert attributes to labels HashMap
-                    let labels = self.labels_to_hashmap(&series_spec.labels);
-
-                    samples.push(EvalSample {
-                        timestamp_ms: best_sample.timestamp_ms,
-                        value: best_sample.value,
-                        labels,
-                        drop_name: false,
-                    });
-
-                    // Mark this series fingerprint as found so we don't add it again from older buckets
-                    series_with_results.insert(fingerprint);
-                }
-            }
-        }
-
-        Ok(ExprResult::InstantVector(samples))
+        pipeline::execute_selector_pipeline(
+            self.reader.raw_reader(),
+            self.reader.shared_cache(),
+            &plan,
+            vector_selector,
+        )
+        .await
     }
 
     /// Apply offset and @ modifiers to adjust the evaluation time.
@@ -1432,28 +1447,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         }
 
         Ok(Timestamp::from_millis(adjusted_time_ms))
-    }
-
-    /// Convert labels to HashMap
-    fn labels_to_hashmap(&self, labels: &[Label]) -> HashMap<String, String> {
-        labels
-            .iter()
-            .map(|label| (label.name.clone(), label.value.clone()))
-            .collect()
-    }
-
-    /// Compute fingerprint from labels (simple hash for deduplication)
-    fn compute_fingerprint(&self, labels: &[Label]) -> SeriesFingerprint {
-        // Use a simple hash of sorted labels
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        let mut sorted_labels: Vec<_> = labels.iter().collect();
-        sorted_labels.sort_by(|a, b| a.name.cmp(&b.name));
-        for label in sorted_labels {
-            label.name.hash(&mut hasher);
-            label.value.hash(&mut hasher);
-        }
-        hasher.finish() as SeriesFingerprint
     }
 
     async fn evaluate_call(

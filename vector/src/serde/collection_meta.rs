@@ -48,12 +48,17 @@ use bytes::{Bytes, BytesMut};
 /// This is set at collection creation and cannot be changed afterward.
 ///
 /// - **L2**: Euclidean distance. Lower values = more similar.
+/// - **Cosine**: Cosine similarity. Vectors are normalized at ingest time and L2 distance
+///   is used for clustering and search.
 /// - **DotProduct**: Dot product. Higher values = more similar. Requires normalized vectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum DistanceMetric {
     /// Euclidean (L2) distance: sqrt(sum((a\[i\] - b\[i\])²))
     L2 = 0,
+    /// Cosine similarity via normalization: vectors are L2-normalized at ingest,
+    /// then L2 distance is used for search.
+    Cosine = 1,
     /// Dot product: sum(a\[i\] * b\[i\])
     DotProduct = 2,
 }
@@ -62,10 +67,18 @@ impl DistanceMetric {
     pub fn from_byte(byte: u8) -> Result<Self, EncodingError> {
         match byte {
             0 => Ok(DistanceMetric::L2),
+            1 => Ok(DistanceMetric::Cosine),
             2 => Ok(DistanceMetric::DotProduct),
             _ => Err(EncodingError {
                 message: format!("Invalid distance metric: {}", byte),
             }),
+        }
+    }
+
+    /// Normalize the vector in place if this metric requires it.
+    pub fn normalize_if_needed(self, v: &mut [f32]) {
+        if self == DistanceMetric::Cosine {
+            crate::math::distance::l2_normalize_vector(v);
         }
     }
 }
@@ -338,7 +351,11 @@ mod tests {
 
     #[test]
     fn should_preserve_all_distance_metrics() {
-        for metric in [DistanceMetric::L2, DistanceMetric::DotProduct] {
+        for metric in [
+            DistanceMetric::L2,
+            DistanceMetric::Cosine,
+            DistanceMetric::DotProduct,
+        ] {
             // given
             let value = CollectionMetaValue::new(128, metric, 2048, vec![]);
 

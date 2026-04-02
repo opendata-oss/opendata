@@ -258,11 +258,19 @@ impl TimeBucketScoped for InvertedIndexKey {
     }
 }
 
-/// TimeSeries key
+/// TimeSeries key — metric-name-prefixed layout.
+///
+/// Physical key: `<prefix, bucket, metric_name, series_id>`
+///
+/// The metric name is encoded with a terminated-bytes delimiter so that keys
+/// sort by `(bucket, metric_name, series_id)`. This groups all sample records
+/// for the same metric together in storage, improving locality for single-metric
+/// PromQL range queries on the cold path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeSeriesKey {
     pub time_bucket: BucketStart,
     pub bucket_size: BucketSize,
+    pub metric_name: String,
     pub series_id: SeriesId,
 }
 
@@ -273,12 +281,14 @@ impl TimeSeriesKey {
             .prefix_with_bucket_size(self.bucket_size)
             .write_to(&mut buf);
         buf.extend_from_slice(&self.time_bucket.to_be_bytes());
+        terminated_bytes::serialize(self.metric_name.as_bytes(), &mut buf);
         buf.extend_from_slice(&self.series_id.to_be_bytes());
         buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 3 + 4 + 4 {
+        // Minimum: 3 (prefix) + 4 (bucket) + 1 (terminated empty metric_name = just 0x00) + 4 (series_id)
+        if buf.len() < 3 + 4 + 1 + 4 {
             return Err(EncodingError {
                 message: "Buffer too short for TimeSeriesKey".to_string(),
             });
@@ -298,10 +308,24 @@ impl TimeSeriesKey {
         })?;
 
         let time_bucket = u32::from_be_bytes([buf[3], buf[4], buf[5], buf[6]]);
-        let series_id = u32::from_be_bytes([buf[7], buf[8], buf[9], buf[10]]);
+
+        let mut slice = &buf[7..];
+        let metric_name_bytes = terminated_bytes::deserialize(&mut slice)?;
+        let metric_name =
+            String::from_utf8(metric_name_bytes.to_vec()).map_err(|e| EncodingError {
+                message: format!("Invalid UTF-8 in metric_name: {}", e),
+            })?;
+
+        if slice.len() < 4 {
+            return Err(EncodingError {
+                message: "Buffer too short for series_id in TimeSeriesKey".to_string(),
+            });
+        }
+        let series_id = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
 
         Ok(TimeSeriesKey {
             time_bucket,
+            metric_name,
             series_id,
             bucket_size,
         })
@@ -395,6 +419,7 @@ mod tests {
         // given
         let key = TimeSeriesKey {
             time_bucket: 12345,
+            metric_name: "http_requests_total".to_string(),
             series_id: 99,
             bucket_size: 4,
         };
@@ -405,6 +430,62 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn should_encode_and_decode_time_series_key_with_empty_metric_name() {
+        let key = TimeSeriesKey {
+            time_bucket: 12345,
+            metric_name: "".to_string(),
+            series_id: 7,
+            bucket_size: 1,
+        };
+
+        let encoded = key.encode();
+        let decoded = TimeSeriesKey::decode(&encoded).unwrap();
+
+        assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn should_sort_time_series_keys_by_bucket_then_metric_then_series() {
+        // Keys with the same bucket should sort by metric name, then series id
+        let key_a = TimeSeriesKey {
+            time_bucket: 100,
+            metric_name: "cpu_usage".to_string(),
+            series_id: 2,
+            bucket_size: 1,
+        };
+        let key_b = TimeSeriesKey {
+            time_bucket: 100,
+            metric_name: "cpu_usage".to_string(),
+            series_id: 10,
+            bucket_size: 1,
+        };
+        let key_c = TimeSeriesKey {
+            time_bucket: 100,
+            metric_name: "memory_usage".to_string(),
+            series_id: 1,
+            bucket_size: 1,
+        };
+        let key_d = TimeSeriesKey {
+            time_bucket: 200,
+            metric_name: "cpu_usage".to_string(),
+            series_id: 1,
+            bucket_size: 1,
+        };
+
+        let enc_a = key_a.encode();
+        let enc_b = key_b.encode();
+        let enc_c = key_c.encode();
+        let enc_d = key_d.encode();
+
+        // Same bucket, same metric: series_id ordering
+        assert!(enc_a < enc_b, "cpu_usage/2 < cpu_usage/10");
+        // Same bucket, different metric: alphabetical
+        assert!(enc_b < enc_c, "cpu_usage < memory_usage");
+        // Different bucket: bucket ordering dominates
+        assert!(enc_c < enc_d, "bucket 100 < bucket 200");
     }
 
     #[test]

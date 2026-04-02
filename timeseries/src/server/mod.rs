@@ -1,4 +1,6 @@
 mod http;
+#[cfg(feature = "otel")]
+pub(crate) mod ingest_consumer;
 pub(crate) mod metrics;
 mod middleware;
 #[cfg(feature = "otel")]

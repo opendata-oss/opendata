@@ -5,6 +5,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::util::Result;
+#[cfg(feature = "otel")]
+use common::ObjectStoreConfig;
 use common::storage::config::StorageConfig;
 use serde::{Deserialize, Deserializer};
 use slatedb::config::DbReaderOptions;
@@ -36,6 +38,9 @@ pub struct PrometheusConfig {
     pub scrape_configs: Vec<ScrapeConfig>,
     #[serde(default)]
     pub otel: OtelServerConfig,
+    #[cfg(feature = "otel")]
+    #[serde(default)]
+    pub ingest_consumer: Option<IngestConsumerConfig>,
     #[serde(default)]
     pub storage: StorageConfig,
     /// Flush interval in seconds for persisting data to storage.
@@ -106,6 +111,8 @@ impl Default for PrometheusConfig {
             global: GlobalConfig::default(),
             scrape_configs: Vec::new(),
             otel: OtelServerConfig::default(),
+            #[cfg(feature = "otel")]
+            ingest_consumer: None,
             storage: StorageConfig::default(),
             flush_interval_secs: default_flush_interval_secs(),
             read_only: false,
@@ -135,6 +142,44 @@ impl Default for OtelServerConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// Configuration for the ingest consumer background task.
+#[cfg(feature = "otel")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct IngestConsumerConfig {
+    /// Object store where the ingest queue lives.
+    pub object_store: ObjectStoreConfig,
+
+    /// Manifest path matching the ingestor's `manifest_path`.
+    #[serde(default = "default_ingest_manifest_path")]
+    pub manifest_path: String,
+
+    /// Poll interval when the queue is empty (e.g. "100ms", "1s").
+    #[serde(
+        default = "default_poll_interval",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub poll_interval: Duration,
+}
+
+#[cfg(feature = "otel")]
+fn default_ingest_manifest_path() -> String {
+    "ingest/manifest".to_string()
+}
+
+#[cfg(feature = "otel")]
+fn default_poll_interval() -> Duration {
+    Duration::from_secs(1)
+}
+
+#[cfg(feature = "otel")]
+fn deserialize_duration<'de, D>(deserializer: D) -> std::result::Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    parse_duration(&s).map_err(serde::de::Error::custom)
 }
 
 /// Global configuration defaults.
@@ -420,5 +465,44 @@ reader:
         );
         assert_eq!(config.cache_capacity, 200);
         assert!(!config.reader.skip_wal_replay);
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn should_parse_ingest_consumer_poll_interval() {
+        // given
+        let yaml = r#"
+ingest_consumer:
+  object_store:
+    type: InMemory
+  manifest_path: ingest/manifest
+  poll_interval: 250ms
+"#;
+
+        // when
+        let config: PrometheusConfig = serde_yaml::from_str(yaml).unwrap();
+
+        // then
+        let consumer = config.ingest_consumer.unwrap();
+        assert_eq!(consumer.poll_interval, Duration::from_millis(250));
+        assert_eq!(consumer.manifest_path, "ingest/manifest");
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn should_use_default_ingest_consumer_poll_interval() {
+        // given
+        let yaml = r#"
+ingest_consumer:
+  object_store:
+    type: InMemory
+"#;
+
+        // when
+        let config: PrometheusConfig = serde_yaml::from_str(yaml).unwrap();
+
+        // then
+        let consumer = config.ingest_consumer.unwrap();
+        assert_eq!(consumer.poll_interval, Duration::from_secs(1));
     }
 }

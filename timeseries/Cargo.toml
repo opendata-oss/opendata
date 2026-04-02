@@ -30,7 +30,7 @@ http-server = [
 ]
 testing = []
 remote-write = ["http-server", "dep:prost", "dep:snap"]
-otel = ["dep:opentelemetry-proto", "dep:prost"]
+otel = ["dep:opentelemetry-proto", "dep:prost", "dep:ingest"]
 bench-internals = []
 
 [dependencies]
@@ -53,6 +53,7 @@ serde_yaml.workspace = true
 slatedb.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tower = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
 tracing.workspace = true
@@ -71,6 +72,7 @@ rust-embed = { version = "8", features = ["mime-guess"] }
 tsz = "0.1"
 
 # Optional dependencies for remote-write and otel features
+ingest = { workspace = true, optional = true }
 opentelemetry-proto = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }

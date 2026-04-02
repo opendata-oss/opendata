@@ -23,11 +23,15 @@ const EPOCH_SIZE: usize = 8;
 const VERSION_SIZE: usize = 2;
 const FOOTER_SIZE: usize = ENTRIES_COUNT_SIZE + SEQUENCE_SIZE + EPOCH_SIZE + VERSION_SIZE;
 
+/// Per-range metadata attached to a batch by the ingestor.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Metadata {
-    pub(crate) start_index: u32,
-    pub(crate) ingestion_time_ms: i64,
-    pub(crate) payload: Bytes,
+pub struct Metadata {
+    /// Index of the first entry in the batch that this metadata range covers.
+    pub start_index: u32,
+    /// Wall-clock ingestion time in milliseconds since the Unix epoch.
+    pub ingestion_time_ms: i64,
+    /// Opaque metadata payload supplied by the caller of [`Ingestor::ingest`](crate::Ingestor::ingest).
+    pub payload: Bytes,
 }
 
 #[derive(Debug, Clone)]
