@@ -101,13 +101,14 @@ impl QueryReader for ReaderQueryReader {
         &self,
         bucket: &TimeBucket,
         series_id: SeriesId,
+        metric_name: &str,
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<Sample>> {
         let mini = self.mini_readers.get(bucket).ok_or_else(|| {
             crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
         })?;
-        mini.samples(series_id, start_ms, end_ms).await
+        mini.samples(series_id, metric_name, start_ms, end_ms).await
     }
 }
 

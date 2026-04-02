@@ -836,6 +836,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         &self,
         bucket: &TimeBucket,
         series_id: SeriesId,
+        metric_name: &str,
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<Sample>> {
@@ -856,6 +857,7 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
             Arc::clone(&self.cache),
             *bucket,
             series_id,
+            metric_name,
             start_ms,
             end_ms,
         )
@@ -943,6 +945,7 @@ async fn cached_samples_miss<R: QueryReader>(
     cache: Arc<QueryReaderEvalCache>,
     bucket: TimeBucket,
     series_id: SeriesId,
+    metric_name: &str,
     start_ms: i64,
     end_ms: i64,
 ) -> Result<Vec<Sample>> {
@@ -970,7 +973,7 @@ async fn cached_samples_miss<R: QueryReader>(
     // steps and sibling selector evaluations can slice locally without
     // paying for another storage read.
     let samples = reader
-        .samples(&bucket, series_id, i64::MIN, i64::MAX)
+        .samples(&bucket, series_id, metric_name, i64::MIN, i64::MAX)
         .await?;
 
     cache.cache_samples(bucket, series_id, samples);

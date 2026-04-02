@@ -80,12 +80,14 @@ impl BucketQueryReader for MiniQueryReader {
     async fn samples(
         &self,
         series_id: SeriesId,
+        metric_name: &str,
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<Sample>> {
         let storage_key = TimeSeriesKey {
             time_bucket: self.bucket.start,
             bucket_size: self.bucket.size,
+            metric_name: metric_name.to_string(),
             series_id,
         };
         let record = self.snapshot.get(storage_key.encode()).await?;

@@ -376,15 +376,17 @@ The value schema stores the posting list of series IDs.
 
 ### `TimeSeries` (`RecordType::TimeSeries` = `0x05`)
 
-The time series record type is used to store the actual values of a timestamp.
-It uses the same key structure as the forward index except for the record type.
+The time series record type is used to store the actual sample values.
+The key includes the metric name so that sample records for the same metric
+are grouped together in storage, improving read locality for single-metric
+PromQL range queries on the cold path.
 
 **Key Layout:**
 ```
-┌─────────┬──────────────┬─────────────┬──────────────┐
-│ version │  record_tag  │ time_bucket │  series_id   │
-│ 1 byte  │   8 bits     │   4 bytes   │   4 bytes    │
-└─────────┴──────────────┴─────────────┴──────────────┘
+┌─────────┬──────────────┬─────────────┬─────────────────────────┬──────────────┐
+│ version │  record_tag  │ time_bucket │      metric_name        │  series_id   │
+│ 1 byte  │   8 bits     │   4 bytes   │  terminated bytes (var) │   4 bytes    │
+└─────────┴──────────────┴─────────────┴─────────────────────────┴──────────────┘
 ```
 
 **Key Fields:**
@@ -393,6 +395,9 @@ It uses the same key structure as the forward index except for the record type.
   - `bits 7-4` (u4): Record type (`0x05` for `TimeSeries`)
   - `bits 3-0` (u4): Bucket size in hours
 - `time_bucket` (u32): The number of minutes since the UNIX epoch
+- `metric_name` (variable): The `__name__` label value, encoded with a
+  `0x00`-terminated byte encoding so that it sorts lexicographically and
+  delimits cleanly from the trailing `series_id`
 - `series_id` (u32): The series ID, unique within the time bucket
 
 **Value Schema:**
@@ -526,3 +531,4 @@ This was rejected in favor of separate deployments per namespace:
 |------------|-------------|
 | 2025-12-17 | Initial draft |
 | 2026-01-18 | Updated InvertedIndex key encoding: attribute uses terminated bytes, value uses raw UTF-8 (backward incompatible) |
+| 2026-04-01 | Added metric_name to TimeSeries key: layout changed from `<bucket, series_id>` to `<bucket, metric_name, series_id>` for storage locality (backward incompatible, #349) |

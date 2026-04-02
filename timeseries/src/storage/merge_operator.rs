@@ -114,6 +114,7 @@ mod tests {
         TimeSeriesKey {
             time_bucket: 1000,
             bucket_size: 1,
+            metric_name: "test_metric".to_string(),
             series_id: 42,
         }
         .encode()
