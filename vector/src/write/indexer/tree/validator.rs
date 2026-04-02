@@ -14,10 +14,10 @@ use bytes::Bytes;
 use common::storage::StorageSnapshot;
 use common::storage::in_memory::InMemoryStorage;
 use common::{Record, SequenceAllocator, Storage, StorageRead};
+use log::info;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use log::info;
 use tracing::debug;
 
 pub(crate) async fn validate(
@@ -357,15 +357,18 @@ fn validate_state_matches_storage(
 
         match centroid_cache.posting(centroid_id, u64::MAX) {
             Some(cached_posting) => {
-                let cached_posting = cached_posting.iter()
-                    .map(|p| p.id()).collect::<HashSet<_>>();
-                let storage_posting = storage_posting.iter()
-                    .map(|p| p.id()).collect::<HashSet<_>>();
+                let cached_posting = cached_posting
+                    .iter()
+                    .map(|p| p.id())
+                    .collect::<HashSet<_>>();
+                let storage_posting = storage_posting
+                    .iter()
+                    .map(|p| p.id())
+                    .collect::<HashSet<_>>();
                 if cached_posting != storage_posting {
                     return Err(Error::Internal(format!(
                         "cached posting list for centroid {}/{} does not match storage {:?} {:?}",
-                        centroid.level, centroid_id,
-                        storage_posting, cached_posting
+                        centroid.level, centroid_id, storage_posting, cached_posting
                     )));
                 }
             }

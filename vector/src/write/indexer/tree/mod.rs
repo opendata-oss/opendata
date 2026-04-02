@@ -30,8 +30,11 @@ pub(crate) struct IndexerStats {
     pub(crate) inserts: usize,
     pub(crate) updates: usize,
     pub(crate) merges: HashMap<u16, usize>,
+    pub(crate) splits: HashMap<u16, usize>,
+    pub(crate) reassignments: HashMap<u16, usize>,
 }
 
+#[derive(Debug)]
 pub(crate) struct IndexerOpts {
     pub(crate) dimensions: usize,
     pub(crate) distance_metric: DistanceMetric,
@@ -58,6 +61,7 @@ pub(crate) struct Indexer {
 
 impl Indexer {
     pub(crate) fn new(opts: IndexerOpts, state: VectorIndexState) -> Self {
+        info!("create indexer with opts: {:?}", opts);
         Self {
             opts: Arc::new(opts),
             state,
@@ -129,6 +133,7 @@ impl Indexer {
             let reassign_after_merge_count = self
                 .reassign_vectors(&snapshot, snapshot_epoch, &mut delta, reassigns)
                 .await?;
+            *stats.reassignments.entry(level).or_default() += reassign_after_merge_count;
             debug!(
                 parent: &update_span,
                 op = "reassign_vectors_after_merge",
@@ -155,6 +160,7 @@ impl Indexer {
                     reassignment_count = result.reassignments.len(),
                     "completed"
                 );
+                *stats.splits.entry(level).or_default() += result.splits.len();
                 if result.splits.is_empty() {
                     break;
                 }
@@ -162,6 +168,7 @@ impl Indexer {
                 let reassign_after_split_count = self
                     .reassign_vectors(&snapshot, snapshot_epoch, &mut delta, result.reassignments)
                     .await?;
+                *stats.reassignments.entry(level).or_default() += reassign_after_split_count;
                 debug!(
                     parent: &update_span,
                     op = "reassign_vectors_after_split",
@@ -214,11 +221,9 @@ impl Indexer {
     pub(crate) async fn validate(&self, snapshot: Arc<dyn StorageSnapshot>) {
         #[cfg(debug_assertions)]
         {
-            validate_tree_index(
-                snapshot,
-                &self.state,
-                self.opts.dimensions
-            ).await.expect("validation failed");
+            validate_tree_index(snapshot, &self.state, self.opts.dimensions)
+                .await
+                .expect("validation failed");
         }
     }
 

@@ -104,9 +104,7 @@ impl VectorDbFlusher {
             .map_err(|e| e.to_string())?;
 
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
-        self.indexer
-            .validate(snapshot.clone())
-            .await;
+        self.indexer.validate(snapshot.clone()).await;
         let stored_reader = StoredCentroidReader::new(
             self.opts.dimensions as usize,
             snapshot.clone(),

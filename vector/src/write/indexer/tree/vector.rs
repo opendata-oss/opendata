@@ -251,7 +251,11 @@ impl ReassignVectors {
         if self.reassignments.is_empty() {
             return Ok(0);
         }
-        let ids = self.reassignments.iter().map(|r| r.vector_id).collect::<HashSet<_>>();
+        let ids = self
+            .reassignments
+            .iter()
+            .map(|r| r.vector_id)
+            .collect::<HashSet<_>>();
         assert_eq!(ids.len(), self.reassignments.len());
         let (resolved, resolved_centroids) = {
             let view = VectorIndexView::new(delta, state, &self.snapshot, self.snapshot_epoch);
