@@ -52,9 +52,11 @@
 //! - Example: 10M vectors → 10K-100K centroids → 3-25 chunks
 //! - Higher ratios improve recall at the cost of memory
 
-use super::{Encode, EncodingError, decode_fixed_element_array, encode_fixed_element_array, Decode};
-use bytes::{Bytes, BytesMut};
+use super::{
+    Decode, Encode, EncodingError, decode_fixed_element_array, encode_fixed_element_array,
+};
 use crate::serde::vector_id::VectorId;
+use bytes::{Bytes, BytesMut};
 
 /// A single centroid entry with its ID and vector.
 ///
@@ -287,7 +289,10 @@ mod tests {
 
         // then
         assert_eq!(decoded.entries.len(), 1);
-        assert_eq!(decoded.entries[0].centroid_id, VectorId::legacy_centroid_id(42));
+        assert_eq!(
+            decoded.entries[0].centroid_id,
+            VectorId::legacy_centroid_id(42)
+        );
         assert_eq!(decoded.entries[0].vector, vector);
     }
 
@@ -301,8 +306,18 @@ mod tests {
         ]);
 
         // when / then
-        assert_eq!(value.get_centroid(VectorId::legacy_centroid_id(20)).unwrap().centroid_id, VectorId::legacy_centroid_id(20));
-        assert!(value.get_centroid(VectorId::legacy_centroid_id(99)).is_none());
+        assert_eq!(
+            value
+                .get_centroid(VectorId::legacy_centroid_id(20))
+                .unwrap()
+                .centroid_id,
+            VectorId::legacy_centroid_id(20)
+        );
+        assert!(
+            value
+                .get_centroid(VectorId::legacy_centroid_id(99))
+                .is_none()
+        );
     }
 
     #[test]
@@ -320,8 +335,17 @@ mod tests {
         let decoded = CentroidChunkValue::decode_from_bytes(&encoded, dimensions).unwrap();
 
         // then
-        assert_eq!(decoded.entries[0].centroid_id, VectorId::legacy_centroid_id(100));
-        assert_eq!(decoded.entries[1].centroid_id, VectorId::legacy_centroid_id(200));
-        assert_eq!(decoded.entries[2].centroid_id, VectorId::legacy_centroid_id(0x00FF_FFFF_FFFF_FFFF));
+        assert_eq!(
+            decoded.entries[0].centroid_id,
+            VectorId::legacy_centroid_id(100)
+        );
+        assert_eq!(
+            decoded.entries[1].centroid_id,
+            VectorId::legacy_centroid_id(200)
+        );
+        assert_eq!(
+            decoded.entries[2].centroid_id,
+            VectorId::legacy_centroid_id(0x00FF_FFFF_FFFF_FFFF)
+        );
     }
 }

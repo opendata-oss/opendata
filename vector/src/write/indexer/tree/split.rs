@@ -1,8 +1,9 @@
 use crate::math::{distance, heuristics, kmeans};
 use crate::serde::centroid_info::CentroidInfoValue;
+use crate::serde::vector_id::VectorId;
 use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::tree::IndexerOpts;
-use crate::write::indexer::tree::centroids::{batch_search_centroids_in_level, TreeLevel};
+use crate::write::indexer::tree::centroids::{TreeLevel, batch_search_centroids_in_level};
 use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use crate::{DistanceMetric, Result};
@@ -14,7 +15,6 @@ use rayon::iter::ParallelIterator;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::task::spawn_blocking;
-use crate::serde::vector_id::VectorId;
 
 const MAX_SPLITS: usize = usize::MAX;
 
@@ -24,7 +24,7 @@ pub(crate) struct ReassignVector {
     pub(crate) vector: Vec<f32>,
     pub(crate) current_centroid: VectorId,
     // the level of the centroids that this should be reassigned from/to
-    pub(crate) level: TreeLevel
+    pub(crate) level: TreeLevel,
 }
 
 impl ReassignVector {
@@ -32,7 +32,7 @@ impl ReassignVector {
         vector_id: VectorId,
         vector: Vec<f32>,
         current_centroid: VectorId,
-        level: TreeLevel
+        level: TreeLevel,
     ) -> Self {
         assert_eq!(vector_id.level() + 1, current_centroid.level());
         assert_eq!(level.level(), current_centroid.level());
@@ -40,7 +40,7 @@ impl ReassignVector {
             vector_id,
             vector,
             current_centroid,
-            level
+            level,
         }
     }
 }
@@ -258,9 +258,7 @@ impl SplitCentroids {
             );
 
             // delete old centroid and its posting entries
-            delta
-                .search_index
-                .delete_centroids(vec![result.c]);
+            delta.search_index.delete_centroids(vec![result.c]);
             if result.c_info.parent_vector_id.is_centroid() {
                 assert_eq!(
                     self.level.next_level_up().level(),
@@ -297,19 +295,17 @@ impl SplitCentroids {
                             c_id,
                             entry.vector.clone(),
                             result.c_info.parent_vector_id,
-                            self.level.next_level_up()
-                        )
+                            self.level.next_level_up(),
+                        ),
                     );
                 } else {
                     delta.search_index.add_to_root(c_id, entry.vector.clone());
                 }
                 // add all posting entries for the new centroid
                 for p in new_centroid.postings() {
-                    delta.search_index.add_to_posting(
-                        c_id,
-                        p.id(),
-                        p.vector().to_vec(),
-                    );
+                    delta
+                        .search_index
+                        .add_to_posting(c_id, p.id(), p.vector().to_vec());
                     if !self.level.is_leaf() {
                         // if this is a non-leaf level, then the posting vectors are centroids,
                         // and their parent ref needs to be updated
@@ -319,7 +315,7 @@ impl SplitCentroids {
                                 self.level.next_level_down().level(),
                                 p.vector().to_vec(),
                                 c_id,
-                            )
+                            ),
                         )
                     }
                 }
@@ -503,12 +499,7 @@ impl SplitCentroid {
                 }
                 let vector = p.vector().to_vec();
 
-                reassignments.push(ReassignVector::new(
-                    p.id(),
-                    vector,
-                    *neighbour_id,
-                    level,
-                ));
+                reassignments.push(ReassignVector::new(p.id(), vector, *neighbour_id, level));
             }
         }
         reassignments

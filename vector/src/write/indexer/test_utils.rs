@@ -2,6 +2,7 @@ use crate::hnsw::build_centroid_graph;
 use crate::model::AttributeValue;
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::collection_meta::DistanceMetric;
+use crate::serde::vector_id::VectorId;
 use crate::storage::merge_operator::VectorDbMergeOperator;
 use crate::write::delta::VectorWrite;
 use crate::write::indexer::IndexerOpts;
@@ -11,7 +12,6 @@ use common::storage::in_memory::InMemoryStorage;
 use common::{SequenceAllocator, Storage, StorageRead};
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::serde::vector_id::VectorId;
 
 pub struct IndexerOpTestHarness {
     pub storage: Arc<dyn Storage>,

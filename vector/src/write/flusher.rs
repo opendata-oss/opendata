@@ -141,10 +141,12 @@ mod tests {
     };
     use crate::serde::posting_list::{Posting, PostingListValue, PostingUpdate};
     use crate::serde::vector_data::VectorDataValue;
+    use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
     use crate::storage::merge_operator::VectorDbMergeOperator;
     use crate::write::delta::VectorDbDeltaView;
     use crate::write::delta::VectorWrite;
     use crate::write::indexer::tree::IndexerOpts;
+    use crate::write::indexer::tree::centroids::TreeDepth;
     use crate::write::indexer::tree::centroids::{
         AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex,
         StoredCentroidReader,
@@ -158,6 +160,14 @@ mod tests {
     use std::sync::Mutex;
 
     const DIMS: usize = 3;
+
+    fn leaf_centroid_id(id: u64) -> VectorId {
+        VectorId::centroid_id(1, id)
+    }
+
+    fn data_id(id: u64) -> VectorId {
+        VectorId::data_vector_id(id)
+    }
 
     /// Create an InMemoryStorage with the vector merge operator.
     fn create_storage() -> Arc<dyn Storage> {
@@ -188,13 +198,13 @@ mod tests {
             .put(vec![
                 Record::new(
                     CentroidsKey::new().encode(),
-                    CentroidsValue::new(1).encode_to_bytes(),
+                    CentroidsValue::new(3).encode_to_bytes(),
                 )
                 .into(),
                 Record::new(
-                    PostingListKey::new(0).encode(),
+                    PostingListKey::new(ROOT_VECTOR_ID).encode(),
                     PostingListValue::from_posting_updates(vec![PostingUpdate::append(
-                        1,
+                        leaf_centroid_id(1),
                         vec![0.0; DIMS],
                     )])
                     .unwrap()
@@ -202,12 +212,12 @@ mod tests {
                 )
                 .into(),
                 Record::new(
-                    CentroidInfoKey::new(1).encode(),
-                    CentroidInfoValue::new(0, vec![0.0; DIMS], None).encode_to_bytes(),
+                    CentroidInfoKey::new(leaf_centroid_id(1)).encode(),
+                    CentroidInfoValue::new(1, vec![0.0; DIMS], ROOT_VECTOR_ID).encode_to_bytes(),
                 )
                 .into(),
                 Record::new(
-                    CentroidStatsKey::new(0, 1).encode(),
+                    CentroidStatsKey::new(leaf_centroid_id(1)).encode(),
                     CentroidStatsValue::new(0).encode_to_bytes(),
                 )
                 .into(),
@@ -215,16 +225,21 @@ mod tests {
             .await
             .unwrap();
         let centroid_cache = AllCentroidsCacheWriter::new(
-            Arc::new(PostingList::from(vec![Posting::new(1, vec![0.0; DIMS])]))
-                as Arc<dyn IntoTreePostingList>,
+            Arc::new(PostingList::from(vec![Posting::new(
+                leaf_centroid_id(1),
+                vec![0.0; DIMS],
+            )])) as Arc<dyn IntoTreePostingList>,
             vec![],
         );
         let state = VectorIndexState::new(
             HashMap::new(),
-            crate::serde::centroids::CentroidsValue::new(1),
+            crate::serde::centroids::CentroidsValue::new(3),
             1,
-            HashMap::from([(1, CentroidInfoValue::new(0, vec![0.0; DIMS], None))]),
-            HashMap::from([(0, HashMap::from([(1, 0)]))]),
+            HashMap::from([(
+                leaf_centroid_id(1),
+                CentroidInfoValue::new(1, vec![0.0; DIMS], ROOT_VECTOR_ID),
+            )]),
+            HashMap::from([(1, HashMap::from([(leaf_centroid_id(1), 0)]))]),
             seq_block_key,
             seq_block,
             centroid_seq_block_key,
@@ -237,8 +252,11 @@ mod tests {
             &cache,
             StoredCentroidReader::new(DIMS, snapshot.clone(), 0),
         ));
-        let query_centroid_index =
-            Arc::new(LeveledCentroidIndex::new(1, DistanceMetric::L2, reader));
+        let query_centroid_index = Arc::new(LeveledCentroidIndex::new(
+            TreeDepth::of(3),
+            DistanceMetric::L2,
+            reader,
+        ));
 
         let config = Config {
             dimensions: DIMS as u16,
@@ -316,7 +334,7 @@ mod tests {
                 common::serde::encoding::decode_u64(&mut slice).unwrap()
             };
             // Check vector data record exists and has the right external_id
-            let data_key = VectorDataKey::new(internal_id).encode();
+            let data_key = VectorDataKey::new(data_id(internal_id)).encode();
             let data_record = storage
                 .get(data_key)
                 .await

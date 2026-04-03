@@ -1,15 +1,15 @@
 use crate::Result;
 use crate::serde::centroid_info::CentroidInfoValue;
+use crate::serde::vector_id::VectorId;
 use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::tree::IndexerOpts;
+use crate::write::indexer::tree::centroids::{TreeDepth, TreeLevel};
 use crate::write::indexer::tree::posting_list::PostingList;
 use crate::write::indexer::tree::split::ReassignVector;
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use common::StorageRead;
 use futures::future::BoxFuture;
 use std::sync::Arc;
-use crate::serde::vector_id::VectorId;
-use crate::write::indexer::tree::centroids::{TreeDepth, TreeLevel};
 
 struct MergeCentroid {
     c: VectorId,
@@ -68,7 +68,10 @@ impl MergeCentroids {
             let posting_fut = view.posting_list(c, self.opts.dimensions);
             let c_info = view
                 .centroid(c)
-                .expect(&format!("merge@{}: unexpected missing centroid {}", self.level, c))
+                .expect(&format!(
+                    "merge@{}: unexpected missing centroid {}",
+                    self.level, c
+                ))
                 .clone();
             to_resolve.push(Box::pin(async move {
                 Ok(MergeCentroid {
@@ -89,9 +92,7 @@ impl MergeCentroids {
         let total_moved = resolved.iter().map(|m| m.postings.len()).sum();
         let mut reassignments = Vec::with_capacity(total_moved);
         for merge in resolved {
-            delta
-                .search_index
-                .delete_centroids(vec![merge.c]);
+            delta.search_index.delete_centroids(vec![merge.c]);
             if merge.c_info.parent_vector_id.is_centroid() {
                 assert_eq!(
                     self.level.next_level_up().level(),
@@ -117,7 +118,7 @@ impl MergeCentroids {
                     p.id(),
                     p.vector().to_vec(),
                     merge.c,
-                    self.level
+                    self.level,
                 ));
             }
         }

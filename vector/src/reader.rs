@@ -12,7 +12,10 @@ use crate::model::{Query, ReaderConfig, SearchOptions, SearchResult};
 use crate::query_engine::{QueryEngine, QueryEngineOptions};
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
-use crate::write::indexer::tree::centroids::{AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex, StoredCentroidReader, TreeDepth};
+use crate::write::indexer::tree::centroids::{
+    AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex,
+    StoredCentroidReader, TreeDepth,
+};
 use crate::write::indexer::tree::posting_list::{IntoTreePostingList, PostingList};
 use async_trait::async_trait;
 use common::StorageSemantics;

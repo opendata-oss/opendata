@@ -18,6 +18,7 @@ use crate::model::{
     attributes_to_map,
 };
 use crate::query_engine::{QueryEngine, QueryEngineOptions};
+use crate::serde::Decode;
 use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::centroids::CentroidsValue;
@@ -26,13 +27,17 @@ use crate::serde::key::{
     SeqBlockKey,
 };
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
+use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
 use crate::write::delta::{VectorDbWrite, VectorDbWriteDelta, VectorWrite};
 use crate::write::flusher::VectorDbFlusher;
 use crate::write::indexer::tree::Indexer;
 use crate::write::indexer::tree::IndexerOpts;
-use crate::write::indexer::tree::centroids::{AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex, StoredCentroidReader, TreeDepth, LEAF_LEVEL};
+use crate::write::indexer::tree::centroids::{
+    AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LEAF_LEVEL, LeveledCentroidIndex,
+    StoredCentroidReader, TreeDepth,
+};
 use crate::write::indexer::tree::posting_list::{IntoTreePostingList, PostingList};
 use crate::write::indexer::tree::state::VectorIndexState;
 use async_trait::async_trait;
@@ -44,8 +49,6 @@ use common::{StorageBuilder, StorageSemantics};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use crate::serde::Decode;
-use crate::serde::vector_id::{VectorId, ROOT_VECTOR_ID};
 
 pub(crate) const WRITE_CHANNEL: &str = "write";
 
@@ -819,6 +822,7 @@ mod tests {
     use crate::serde::collection_meta::DistanceMetric;
     use crate::serde::key::{IdDictionaryKey, VectorDataKey};
     use crate::serde::vector_data::VectorDataValue;
+    use crate::serde::vector_id::VectorId;
     use common::StorageConfig;
     use opendata_macros::storage_test;
     use std::time::Duration;
@@ -843,6 +847,10 @@ mod tests {
 
     fn create_test_centroids(dimensions: usize) -> Vec<Vec<f32>> {
         vec![vec![1.0; dimensions]]
+    }
+
+    fn data_id(id: u64) -> VectorId {
+        VectorId::data_vector_id(id + 1)
     }
 
     #[tokio::test]
@@ -884,11 +892,11 @@ mod tests {
         // then - verify records exist in storage
         // Check VectorData records (now contain external_id, vector, and metadata)
         // Vector IDs are allocated independently from centroid IDs.
-        let vec1_data_key = VectorDataKey::new(0).encode();
+        let vec1_data_key = VectorDataKey::new(data_id(0)).encode();
         let vec1_data = storage.get(vec1_data_key).await.unwrap();
         assert!(vec1_data.is_some());
 
-        let vec2_data_key = VectorDataKey::new(1).encode();
+        let vec2_data_key = VectorDataKey::new(data_id(1)).encode();
         let vec2_data = storage.get(vec2_data_key).await.unwrap();
         assert!(vec2_data.is_some());
 
@@ -926,7 +934,7 @@ mod tests {
         // then - verify new vector data
         // Vector IDs are allocated independently from centroid IDs, so the first write
         // gets ID 0 and the upsert gets ID 1.
-        let vec_data_key = VectorDataKey::new(1).encode(); // New internal ID
+        let vec_data_key = VectorDataKey::new(data_id(1)).encode(); // New internal ID
         let vec_data = storage.get(vec_data_key).await.unwrap();
         assert!(vec_data.is_some());
         let decoded = VectorDataValue::decode_from_bytes(&vec_data.unwrap().value, 3).unwrap();

@@ -31,11 +31,11 @@
 //! - Output remains sorted by id
 
 use super::{Decode, Encode, EncodingError};
+use crate::serde::vector_id::VectorId;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
-use crate::serde::vector_id::VectorId;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Posting {
@@ -590,6 +590,57 @@ mod tests {
         VectorId::data_vector_id(id)
     }
 
+    trait CompatId {
+        fn into_vector_id(self) -> VectorId;
+    }
+
+    impl CompatId for u64 {
+        fn into_vector_id(self) -> VectorId {
+            id(self)
+        }
+    }
+
+    impl CompatId for VectorId {
+        fn into_vector_id(self) -> VectorId {
+            self
+        }
+    }
+
+    struct PostingUpdate;
+
+    impl PostingUpdate {
+        fn append(id_num: impl CompatId, vector: Vec<f32>) -> super::PostingUpdate {
+            super::PostingUpdate::append(id_num.into_vector_id(), vector)
+        }
+
+        fn delete(id_num: impl CompatId) -> super::PostingUpdate {
+            super::PostingUpdate::delete(id_num.into_vector_id())
+        }
+
+        fn decode(
+            buf: &mut &[u8],
+            dimensions: usize,
+        ) -> Result<super::PostingUpdate, EncodingError> {
+            super::PostingUpdate::decode(buf, dimensions)
+        }
+
+        fn encoded_size_append(dimensions: usize) -> usize {
+            super::PostingUpdate::encoded_size_append(dimensions)
+        }
+
+        fn encoded_size_delete() -> usize {
+            super::PostingUpdate::encoded_size_delete()
+        }
+    }
+
+    struct Posting;
+
+    impl Posting {
+        fn new(id_num: impl CompatId, vector: Vec<f32>) -> super::Posting {
+            super::Posting::new(id_num.into_vector_id(), vector)
+        }
+    }
+
     #[test]
     fn should_encode_and_decode_posting_list_with_appends() {
         // given
@@ -641,7 +692,7 @@ mod tests {
         // then
         assert!(update.is_append());
         assert!(!update.is_delete());
-        assert_eq!(update.id(), 42);
+        assert_eq!(update.id(), id(42));
         assert_eq!(update.vector().unwrap(), &[1.0, 2.0]);
     }
 
@@ -653,7 +704,7 @@ mod tests {
         // then
         assert!(!update.is_append());
         assert!(update.is_delete());
-        assert_eq!(update.id(), 42);
+        assert_eq!(update.id(), id(42));
     }
 
     #[test]
@@ -754,7 +805,10 @@ mod tests {
         // then - delete entry not in result, sorted by id
         assert_eq!(
             postings,
-            vec![Posting::new(id(1), vec![1.0]), Posting::new(id(2), vec![2.0])]
+            vec![
+                Posting::new(id(1), vec![1.0]),
+                Posting::new(id(2), vec![2.0])
+            ]
         );
     }
 
@@ -780,9 +834,9 @@ mod tests {
 
         // then - all 3 unique ids preserved in sorted order
         assert_eq!(decoded.len(), 3);
-        assert_eq!(decoded.postings[0].id(), 1);
-        assert_eq!(decoded.postings[1].id(), 2);
-        assert_eq!(decoded.postings[2].id(), 3);
+        assert_eq!(decoded.postings[0].id(), id(1));
+        assert_eq!(decoded.postings[1].id(), id(2));
+        assert_eq!(decoded.postings[2].id(), id(3));
     }
 
     #[test]
@@ -808,9 +862,9 @@ mod tests {
         // then - id 1 is now a delete, id 2 unchanged, sorted order
         assert_eq!(decoded.len(), 2);
         assert!(decoded.postings[0].is_delete());
-        assert_eq!(decoded.postings[0].id(), 1);
+        assert_eq!(decoded.postings[0].id(), id(1));
         assert!(decoded.postings[1].is_append());
-        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[1].id(), id(2));
     }
 
     #[test]
@@ -835,9 +889,9 @@ mod tests {
 
         // then - id 1 has new vector, id 2 unchanged, sorted order
         assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded.postings[0].id(), 1);
+        assert_eq!(decoded.postings[0].id(), id(1));
         assert_eq!(decoded.postings[0].vector().unwrap(), &[100.0, 200.0]);
-        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[1].id(), id(2));
         assert_eq!(decoded.postings[1].vector().unwrap(), &[3.0, 4.0]);
     }
 
@@ -860,8 +914,8 @@ mod tests {
 
         // then - new entries are preserved in sorted order
         assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded.postings[0].id(), 1);
-        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[0].id(), id(1));
+        assert_eq!(decoded.postings[1].id(), id(2));
     }
 
     #[test]
@@ -883,8 +937,8 @@ mod tests {
 
         // then - existing entries are preserved in sorted order
         assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded.postings[0].id(), 1);
-        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[0].id(), id(1));
+        assert_eq!(decoded.postings[1].id(), id(2));
     }
 
     #[test]
@@ -927,11 +981,11 @@ mod tests {
 
         // then - all entries in sorted order: 1, 2, 3, 4, 5
         assert_eq!(decoded.len(), 5);
-        assert_eq!(decoded.postings[0].id(), 1);
-        assert_eq!(decoded.postings[1].id(), 2);
-        assert_eq!(decoded.postings[2].id(), 3);
-        assert_eq!(decoded.postings[3].id(), 4);
-        assert_eq!(decoded.postings[4].id(), 5);
+        assert_eq!(decoded.postings[0].id(), id(1));
+        assert_eq!(decoded.postings[1].id(), id(2));
+        assert_eq!(decoded.postings[2].id(), id(3));
+        assert_eq!(decoded.postings[3].id(), id(4));
+        assert_eq!(decoded.postings[4].id(), id(5));
     }
 
     #[test]
@@ -951,11 +1005,11 @@ mod tests {
 
         // then - postings are sorted by id
         assert_eq!(value.len(), 5);
-        assert_eq!(value.postings[0].id(), 1);
-        assert_eq!(value.postings[1].id(), 2);
-        assert_eq!(value.postings[2].id(), 3);
-        assert_eq!(value.postings[3].id(), 4);
-        assert_eq!(value.postings[4].id(), 5);
+        assert_eq!(value.postings[0].id(), id(1));
+        assert_eq!(value.postings[1].id(), id(2));
+        assert_eq!(value.postings[2].id(), id(3));
+        assert_eq!(value.postings[3].id(), id(4));
+        assert_eq!(value.postings[4].id(), id(5));
     }
 
     #[test]
@@ -975,9 +1029,9 @@ mod tests {
 
         // then - decoded postings are in id order
         assert_eq!(decoded.len(), 3);
-        assert_eq!(decoded.postings[0].id(), 1);
-        assert_eq!(decoded.postings[1].id(), 2);
-        assert_eq!(decoded.postings[2].id(), 3);
+        assert_eq!(decoded.postings[0].id(), id(1));
+        assert_eq!(decoded.postings[1].id(), id(2));
+        assert_eq!(decoded.postings[2].id(), id(3));
     }
 
     #[test]
@@ -1007,12 +1061,12 @@ mod tests {
 
         // then - result is in sorted order
         assert_eq!(decoded.len(), 5);
-        assert_eq!(decoded.postings[0].id(), 10);
-        assert_eq!(decoded.postings[1].id(), 20);
-        assert_eq!(decoded.postings[2].id(), 30);
+        assert_eq!(decoded.postings[0].id(), id(10));
+        assert_eq!(decoded.postings[1].id(), id(20));
+        assert_eq!(decoded.postings[2].id(), id(30));
         assert_eq!(decoded.postings[2].vector().unwrap(), &[300.0]); // new value won
-        assert_eq!(decoded.postings[3].id(), 40);
-        assert_eq!(decoded.postings[4].id(), 50);
+        assert_eq!(decoded.postings[3].id(), id(40));
+        assert_eq!(decoded.postings[4].id(), id(50));
     }
 
     #[test]
@@ -1036,11 +1090,11 @@ mod tests {
 
         // then - all 5 postings present in sorted order
         assert_eq!(merged.len(), 5);
-        assert_eq!(merged.postings[0].id(), 1);
-        assert_eq!(merged.postings[1].id(), 2);
-        assert_eq!(merged.postings[2].id(), 3);
-        assert_eq!(merged.postings[3].id(), 4);
-        assert_eq!(merged.postings[4].id(), 5);
+        assert_eq!(merged.postings[0].id(), id(1));
+        assert_eq!(merged.postings[1].id(), id(2));
+        assert_eq!(merged.postings[2].id(), id(3));
+        assert_eq!(merged.postings[3].id(), id(4));
+        assert_eq!(merged.postings[4].id(), id(5));
     }
 
     #[test]
@@ -1061,10 +1115,10 @@ mod tests {
 
         // then - ID 2 has the value from p0 (the newer operand)
         assert_eq!(merged.len(), 3);
-        assert_eq!(merged.postings[0].id(), 1);
-        assert_eq!(merged.postings[1].id(), 2);
+        assert_eq!(merged.postings[0].id(), id(1));
+        assert_eq!(merged.postings[1].id(), id(2));
         assert_eq!(merged.postings[1].vector().unwrap(), &[200.0]);
-        assert_eq!(merged.postings[2].id(), 3);
+        assert_eq!(merged.postings[2].id(), id(3));
     }
 
     #[test]
@@ -1083,11 +1137,11 @@ mod tests {
 
         // then - ID 2 is a delete (from the newer operand)
         assert_eq!(merged.len(), 3);
-        assert_eq!(merged.postings[0].id(), 1);
+        assert_eq!(merged.postings[0].id(), id(1));
         assert!(merged.postings[0].is_append());
-        assert_eq!(merged.postings[1].id(), 2);
+        assert_eq!(merged.postings[1].id(), id(2));
         assert!(merged.postings[1].is_delete());
-        assert_eq!(merged.postings[2].id(), 3);
+        assert_eq!(merged.postings[2].id(), id(3));
         assert!(merged.postings[2].is_append());
     }
 
@@ -1107,7 +1161,7 @@ mod tests {
 
         // then - newest (p0) wins
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged.postings[0].id(), 5);
+        assert_eq!(merged.postings[0].id(), id(5));
         assert_eq!(merged.postings[0].vector().unwrap(), &[500.0]);
     }
 
@@ -1126,8 +1180,8 @@ mod tests {
 
         // then - non-empty entries preserved
         assert_eq!(merged.len(), 2);
-        assert_eq!(merged.postings[0].id(), 1);
-        assert_eq!(merged.postings[1].id(), 2);
+        assert_eq!(merged.postings[0].id(), id(1));
+        assert_eq!(merged.postings[1].id(), id(2));
     }
 
     #[test]
@@ -1148,10 +1202,10 @@ mod tests {
 
         // then - only appends, in sorted order (delete for id 3 is filtered out)
         assert_eq!(posting_list.len(), 4);
-        assert_eq!(posting_list[0].id(), 1);
-        assert_eq!(posting_list[1].id(), 2);
-        assert_eq!(posting_list[2].id(), 4);
-        assert_eq!(posting_list[3].id(), 5);
+        assert_eq!(posting_list[0].id(), id(1));
+        assert_eq!(posting_list[1].id(), id(2));
+        assert_eq!(posting_list[2].id(), id(4));
+        assert_eq!(posting_list[3].id(), id(5));
     }
 
     #[test]
@@ -1182,13 +1236,13 @@ mod tests {
 
         // then - id 2 has value from op2 (newest), all 4 ids present
         assert_eq!(decoded.len(), 4);
-        assert_eq!(decoded.postings[0].id(), 1);
+        assert_eq!(decoded.postings[0].id(), id(1));
         assert_eq!(decoded.postings[0].vector().unwrap(), &[10.0]);
-        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[1].id(), id(2));
         assert_eq!(decoded.postings[1].vector().unwrap(), &[2000.0]);
-        assert_eq!(decoded.postings[2].id(), 3);
+        assert_eq!(decoded.postings[2].id(), id(3));
         assert_eq!(decoded.postings[2].vector().unwrap(), &[30.0]);
-        assert_eq!(decoded.postings[3].id(), 4);
+        assert_eq!(decoded.postings[3].id(), id(4));
         assert_eq!(decoded.postings[3].vector().unwrap(), &[40.0]);
     }
 
@@ -1216,10 +1270,10 @@ mod tests {
 
         // then - all 4 ids present in sorted order
         assert_eq!(decoded.len(), 4);
-        assert_eq!(decoded.postings[0].id(), 1);
-        assert_eq!(decoded.postings[1].id(), 2);
-        assert_eq!(decoded.postings[2].id(), 3);
-        assert_eq!(decoded.postings[3].id(), 4);
+        assert_eq!(decoded.postings[0].id(), id(1));
+        assert_eq!(decoded.postings[1].id(), id(2));
+        assert_eq!(decoded.postings[2].id(), id(3));
+        assert_eq!(decoded.postings[3].id(), id(4));
     }
 
     #[test]
@@ -1278,11 +1332,11 @@ mod tests {
 
         // then - id 2 is a delete (from newer operand)
         assert_eq!(decoded.len(), 3);
-        assert_eq!(decoded.postings[0].id(), 1);
+        assert_eq!(decoded.postings[0].id(), id(1));
         assert!(decoded.postings[0].is_append());
-        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[1].id(), id(2));
         assert!(decoded.postings[1].is_delete());
-        assert_eq!(decoded.postings[2].id(), 3);
+        assert_eq!(decoded.postings[2].id(), id(3));
         assert!(decoded.postings[2].is_append());
     }
 }

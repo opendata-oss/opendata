@@ -4,6 +4,7 @@ use crate::model::{FieldSelection, Filter, Query, SearchOptions, SearchResult};
 use crate::serde::collection_meta::DistanceMetric;
 use crate::serde::posting_list::PostingList;
 use crate::serde::vector_data::VectorDataValue;
+use crate::serde::vector_id::VectorId;
 use crate::storage::VectorDbStorageReadExt;
 use crate::write::indexer::tree::centroids::{LeveledCentroidIndex, search_centroids};
 use crate::write::indexer::tree::posting_list::Posting;
@@ -14,7 +15,6 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 use tracing::debug;
-use crate::serde::vector_id::VectorId;
 
 /// The subset of configuration needed by the query engine.
 #[derive(Debug, Clone)]
@@ -500,8 +500,13 @@ mod tests {
     use crate::db::{VectorDb, VectorDbRead};
     use crate::model::{Config, Query, VECTOR_FIELD_NAME, Vector};
     use crate::serde::collection_meta::DistanceMetric;
+    use crate::serde::vector_id::VectorId;
     use crate::write::indexer::tree::posting_list::Posting;
     use common::{StorageBuilder, StorageConfig};
+
+    fn data_id(id: u64) -> VectorId {
+        VectorId::data_vector_id(id)
+    }
 
     fn create_config(dimensions: u16, metric: DistanceMetric) -> Config {
         Config {
@@ -544,10 +549,10 @@ mod tests {
         let query = [0.0, 0.0, 0.0];
         let engine = db.query_engine();
         let all_centroids = vec![
-            Posting::new(1, vec![1.0, 0.0, 0.0]),
-            Posting::new(2, vec![1.4, 0.0, 0.0]),
-            Posting::new(3, vec![2.0, 0.0, 0.0]),
-            Posting::new(4, vec![5.0, 0.0, 0.0]),
+            Posting::new(data_id(1), vec![1.0, 0.0, 0.0]),
+            Posting::new(data_id(2), vec![1.4, 0.0, 0.0]),
+            Posting::new(data_id(3), vec![2.0, 0.0, 0.0]),
+            Posting::new(data_id(4), vec![5.0, 0.0, 0.0]),
         ];
 
         // when
@@ -555,8 +560,8 @@ mod tests {
 
         // then
         assert_eq!(pruned.len(), 2);
-        assert_eq!(pruned[0], 1); // closest
-        assert_eq!(pruned[1], 2); // within threshold
+        assert_eq!(pruned[0], data_id(1)); // closest
+        assert_eq!(pruned[1], data_id(2)); // within threshold
     }
 
     #[tokio::test]
@@ -574,8 +579,8 @@ mod tests {
         let query = [0.0, 0.0, 0.0];
         let engine = db.query_engine();
         let all_centroids = vec![
-            Posting::new(1, vec![1.0, 0.0, 0.0]),
-            Posting::new(2, vec![100.0, 0.0, 0.0]),
+            Posting::new(data_id(1), vec![1.0, 0.0, 0.0]),
+            Posting::new(data_id(2), vec![100.0, 0.0, 0.0]),
         ];
 
         // when
@@ -608,16 +613,16 @@ mod tests {
         let engine = db.query_engine();
         // pass centroids in reverse distance order: far, medium, close
         let ids = vec![
-            Posting::new(1, vec![5.0, 0.0, 0.0]),
-            Posting::new(3, vec![3.0, 0.0, 0.0]),
-            Posting::new(2, vec![1.0, 0.0, 0.0]),
+            Posting::new(data_id(1), vec![5.0, 0.0, 0.0]),
+            Posting::new(data_id(3), vec![3.0, 0.0, 0.0]),
+            Posting::new(data_id(2), vec![1.0, 0.0, 0.0]),
         ];
 
         // when
         let result = engine.prune_centroids(&ids, &query);
 
         // then - sorted by ascending distance: c1 (1.0), c2 (3.0), c0 (5.0)
-        assert_eq!(result, vec![2, 3, 1]);
+        assert_eq!(result, vec![data_id(2), data_id(3), data_id(1)]);
     }
 
     // --- Search tests ---

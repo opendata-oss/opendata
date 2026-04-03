@@ -35,8 +35,8 @@
 //! Metadata index cleanup happens during LIRE maintenance.
 
 use super::{Decode, Encode, EncodingError};
-use bytes::{Bytes, BytesMut};
 use crate::serde::vector_id::VectorId;
+use bytes::{Bytes, BytesMut};
 
 /// IdDictionary value storing the internal vector ID for an external ID.
 ///

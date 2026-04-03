@@ -1,7 +1,7 @@
-use std::fmt::{Debug, Display, Formatter};
+use crate::serde::{Decode, Encode};
 use bytes::{BufMut, BytesMut};
 use common::serde::encoding::EncodingError;
-use crate::serde::{Decode, Encode};
+use std::fmt::{Debug, Display, Formatter};
 
 const NUMBER_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
 const LEVEL_MASK: u64 = 0xFF00_0000_0000_0000;
@@ -16,7 +16,7 @@ pub(crate) const ROOT_VECTOR_ID: VectorId = VectorId {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct VectorId {
-    id: u64
+    id: u64,
 }
 
 impl Display for VectorId {
@@ -48,7 +48,7 @@ impl VectorId {
         assert_ne!(level, 0xFF);
         assert_eq!(number & LEVEL_MASK, 0);
         let raw = ((level as u64) << (64 - 8)) | number;
-        let vector_id = VectorId{ id: raw };
+        let vector_id = VectorId { id: raw };
         assert_eq!(vector_id.level(), level);
         assert_eq!(vector_id.number(), number);
         assert_ne!(vector_id.number(), ROOT_ID_NUM);
@@ -110,9 +110,9 @@ impl Decode for VectorId {
 
 #[cfg(test)]
 mod tests {
-    use bytes::BytesMut;
-    use crate::serde::{Decode, Encode};
     use crate::serde::vector_id::VectorId;
+    use crate::serde::{Decode, Encode};
+    use bytes::BytesMut;
 
     #[test]
     fn test_id_should_return_level() {
@@ -141,7 +141,10 @@ mod tests {
 
         // then:
         assert_eq!(decoded, id);
-        assert_eq!(encoded.as_ref(), &[0x03, 0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56]);
+        assert_eq!(
+            encoded.as_ref(),
+            &[0x03, 0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56]
+        );
     }
 
     #[test]

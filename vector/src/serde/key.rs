@@ -2,12 +2,14 @@
 //!
 //! All keys use big-endian encoding for lexicographic ordering.
 
-use super::{EncodingError, FieldValue, KEY_VERSION, RecordKey, RecordType, SUBSYSTEM, Encode, Decode};
+use super::{
+    Decode, Encode, EncodingError, FieldValue, KEY_VERSION, RecordKey, RecordType, SUBSYSTEM,
+};
+use crate::serde::vector_id::VectorId;
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
 use common::serde::key_prefix::KeyPrefix;
 use common::serde::terminated_bytes;
-use crate::serde::vector_id::VectorId;
 
 /// CollectionMeta key - singleton record storing collection schema.
 ///

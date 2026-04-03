@@ -11,10 +11,10 @@ use crate::write::indexer::tree::vector::{ReassignVectors, WriteVectors};
 use common::StorageRead;
 use common::storage::RecordOp;
 use common::storage::StorageSnapshot;
+use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use futures::StreamExt;
 use tracing::{debug, debug_span, info};
 
 pub(crate) mod centroids;
@@ -118,7 +118,7 @@ impl Indexer {
         stats.updates = updates;
 
         let depth = TreeDepth::of(self.state.centroids_meta().depth);
-        let mut next_level= TreeLevel::leaf(depth);
+        let mut next_level = TreeLevel::leaf(depth);
         loop {
             let level = next_level;
             if level.is_root() {
@@ -155,8 +155,7 @@ impl Indexer {
 
             let mut split_round = 0usize;
             loop {
-                let split =
-                    SplitCentroids::new(&self.opts, level, &snapshot, snapshot_epoch);
+                let split = SplitCentroids::new(&self.opts, level, &snapshot, snapshot_epoch);
                 let split_start = Instant::now();
                 let result = split.execute(&self.state, &mut delta).await?;
                 debug!(

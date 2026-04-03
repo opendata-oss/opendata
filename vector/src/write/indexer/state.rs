@@ -8,6 +8,7 @@ use crate::serde::posting_list::{
     PostingList, PostingListValue, PostingUpdate, merge_decoded_posting_lists,
 };
 use crate::serde::vector_data::{Field, VectorDataValue};
+use crate::serde::vector_id::VectorId;
 use crate::storage::{VectorDbStorageReadExt, record};
 use bytes::Bytes;
 use common::sequence::AllocatedSeqBlock;
@@ -17,7 +18,6 @@ use futures::future::BoxFuture;
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use crate::serde::vector_id::VectorId;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CentroidChunkManager {
@@ -173,7 +173,8 @@ impl VectorIndexDelta {
         }
         let centroid = CentroidEntry::new(id, vector);
         self.centroid_count_deltas.insert(centroid.centroid_id, 0);
-        self.new_centroids.insert(centroid.centroid_id, centroid.clone());
+        self.new_centroids
+            .insert(centroid.centroid_id, centroid.clone());
         centroid
     }
 
@@ -185,7 +186,12 @@ impl VectorIndexDelta {
         self.deleted_centroids.extend(centroids);
     }
 
-    pub(crate) fn add_to_posting(&mut self, centroid_id: VectorId, vector_id: VectorId, vector: Vec<f32>) {
+    pub(crate) fn add_to_posting(
+        &mut self,
+        centroid_id: VectorId,
+        vector_id: VectorId,
+        vector: Vec<f32>,
+    ) {
         self.current_posting.insert(vector_id, centroid_id);
         self.posting_updates
             .entry(centroid_id)
@@ -410,7 +416,9 @@ impl<'a> VectorIndexView<'a> {
     pub(crate) fn centroid_graph(&self) -> Arc<DirtyCentroidGraph> {
         Arc::new(DirtyCentroidGraph {
             new_centroids: self.delta.new_centroids.clone(),
-            deleted_centroids: self.delta.deleted_centroids
+            deleted_centroids: self
+                .delta
+                .deleted_centroids
                 .iter()
                 .map(|c| c.id())
                 .collect(),
@@ -458,6 +466,14 @@ mod tests {
 
     const DIMS: usize = 2;
 
+    fn centroid_id(id: u64) -> VectorId {
+        VectorId::legacy_centroid_id(id)
+    }
+
+    fn data_id(id: u64) -> VectorId {
+        VectorId::data_vector_id(id)
+    }
+
     /// Create storage + state for an empty db with one centroid (ID 1000) at the origin.
     async fn setup() -> (Arc<dyn Storage>, VectorIndexState) {
         setup_with_centroids(vec![CentroidEntry::new(1000, vec![0.0; DIMS])]).await
@@ -473,7 +489,8 @@ mod tests {
         let allocator = SequenceAllocator::load(storage.as_ref(), seq_key)
             .await
             .unwrap();
-        let counts: HashMap<VectorId, u64> = centroids.iter().map(|c| (c.centroid_id, 0u64)).collect();
+        let counts: HashMap<VectorId, u64> =
+            centroids.iter().map(|c| (c.centroid_id, 0u64)).collect();
         let graph = build_centroid_graph(centroids, DistanceMetric::L2).unwrap();
         let centroid_graph: Arc<dyn CentroidGraph> = Arc::from(graph);
         let (key, block) = allocator.freeze();
@@ -547,7 +564,9 @@ mod tests {
 
         // then
         assert_eq!(
-            state.centroid_graph.get_centroid_vector(entry.centroid_id.id()),
+            state
+                .centroid_graph
+                .get_centroid_vector(entry.centroid_id.id()),
             Some(vec![1.0, 0.0])
         );
         assert_eq!(*state.centroid_counts().get(&entry.centroid_id).unwrap(), 0);
@@ -567,13 +586,10 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut delta = VectorIndexDelta::new(&state);
         let entry = delta.add_centroid(vec![1.0, 0.0]);
-        delta.add_to_posting(entry.centroid_id, 10, vec![1.0, 0.0]);
+        delta.add_to_posting(entry.centroid_id, data_id(10), vec![1.0, 0.0]);
         storage.apply(delta.freeze(&mut state)).await.unwrap();
         // verify stats exist before deletion
-        let stats = storage
-            .get_centroid_stats(entry.centroid_id)
-            .await
-            .unwrap();
+        let stats = storage.get_centroid_stats(entry.centroid_id).await.unwrap();
         assert_eq!(stats.num_vectors, 1);
 
         // when
@@ -591,10 +607,7 @@ mod tests {
         assert!(!state.centroid_counts().contains_key(&entry.centroid_id));
         let deletions = storage.get_deleted_vectors().await.unwrap();
         assert!(deletions.contains(entry.centroid_id.id()));
-        let stats = storage
-            .get_centroid_stats(entry.centroid_id)
-            .await
-            .unwrap();
+        let stats = storage.get_centroid_stats(entry.centroid_id).await.unwrap();
         assert_eq!(stats.num_vectors, 0, "centroid stats should be deleted");
         assert!(
             storage
@@ -612,22 +625,25 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut delta = VectorIndexDelta::new(&state);
 
-        delta.add_to_posting(VectorId::legacy_centroid_id(1000), VectorId::data_vector_id(10), vec![1.0, 0.0]);
-        delta.add_to_posting(1000, 11, vec![0.0, 1.0]);
+        delta.add_to_posting(centroid_id(1000), data_id(10), vec![1.0, 0.0]);
+        delta.add_to_posting(centroid_id(1000), data_id(11), vec![0.0, 1.0]);
         storage.apply(delta.freeze(&mut state)).await.unwrap();
 
         // state
-        assert_eq!(*state.centroid_counts().get(&1000).unwrap(), 2);
+        assert_eq!(*state.centroid_counts().get(&centroid_id(1000)).unwrap(), 2);
 
         // storage: posting list
-        let posting = storage.get_posting_list(1000, DIMS).await.unwrap();
+        let posting = storage
+            .get_posting_list(centroid_id(1000), DIMS)
+            .await
+            .unwrap();
         assert_eq!(posting.len(), 2);
-        let ids: HashSet<u64> = posting.iter().map(|p| p.id()).collect();
-        assert!(ids.contains(&10));
-        assert!(ids.contains(&11));
+        let ids: HashSet<VectorId> = posting.iter().map(|p| p.id()).collect();
+        assert!(ids.contains(&data_id(10)));
+        assert!(ids.contains(&data_id(11)));
 
         // storage: centroid stats
-        let stats = storage.get_centroid_stats(0, 1000).await.unwrap();
+        let stats = storage.get_centroid_stats(centroid_id(1000)).await.unwrap();
         assert_eq!(stats.num_vectors, 2);
     }
 
@@ -639,21 +655,21 @@ mod tests {
         let mut delta = VectorIndexDelta::new(&state);
 
         // add two, remove one — all in the same delta
-        delta.add_to_posting(1000, 10, vec![1.0, 0.0]);
-        delta.add_to_posting(1000, 11, vec![0.0, 1.0]);
-        delta.remove_from_posting(1000, 10);
+        delta.add_to_posting(centroid_id(1000), data_id(10), vec![1.0, 0.0]);
+        delta.add_to_posting(centroid_id(1000), data_id(11), vec![0.0, 1.0]);
+        delta.remove_from_posting(centroid_id(1000), data_id(10));
         let ops = delta.freeze(&mut state);
 
         // state: net count = 1
-        assert_eq!(*state.centroid_counts().get(&1000).unwrap(), 1);
+        assert_eq!(*state.centroid_counts().get(&centroid_id(1000)).unwrap(), 1);
 
         // ops: posting merge and stats merge are present
-        let posting_key = PostingListKey::new(1000).encode();
+        let posting_key = PostingListKey::new(centroid_id(1000)).encode();
         assert!(
             ops.iter()
                 .any(|op| matches!(op, RecordOp::Merge(r) if r.record.key == posting_key))
         );
-        let stats_key = crate::serde::key::CentroidStatsKey::new(0, 1000).encode();
+        let stats_key = crate::serde::key::CentroidStatsKey::new(centroid_id(1000)).encode();
         assert!(
             ops.iter()
                 .any(|op| matches!(op, RecordOp::Merge(r) if r.record.key == stats_key))
@@ -670,17 +686,17 @@ mod tests {
         delta.add_to_inverted_index(
             "color".to_string(),
             FieldValue::String("red".to_string()),
-            10,
+            data_id(10),
         );
         delta.add_to_inverted_index(
             "color".to_string(),
             FieldValue::String("red".to_string()),
-            11,
+            data_id(11),
         );
         delta.add_to_inverted_index(
             "color".to_string(),
             FieldValue::String("blue".to_string()),
-            12,
+            data_id(12),
         );
         storage.apply(delta.freeze(&mut state)).await.unwrap();
 
@@ -711,15 +727,20 @@ mod tests {
         .await;
 
         let mut delta = VectorIndexDelta::new(&state);
-        delta.delete_centroids(vec![1000]);
+        delta.delete_centroids(vec![centroid_id(1000)]);
         let new_entry = delta.add_centroid(vec![1.0, 0.0]);
         delta.freeze(&mut state);
 
-        assert!(state.centroid_graph.get_centroid_vector(1000).is_none());
         assert!(
             state
                 .centroid_graph
-                .get_centroid_vector(new_entry.centroid_id)
+                .get_centroid_vector(centroid_id(1000).id())
+                .is_none()
+        );
+        assert!(
+            state
+                .centroid_graph
+                .get_centroid_vector(new_entry.centroid_id.id())
                 .is_some()
         );
     }
@@ -732,12 +753,12 @@ mod tests {
 
         // Write some stats first
         let mut delta = VectorIndexDelta::new(&state);
-        delta.add_to_posting(1000, 10, vec![1.0, 0.0]);
-        delta.add_to_posting(1000, 11, vec![0.0, 1.0]);
+        delta.add_to_posting(centroid_id(1000), data_id(10), vec![1.0, 0.0]);
+        delta.add_to_posting(centroid_id(1000), data_id(11), vec![0.0, 1.0]);
         storage.apply(delta.freeze(&mut state)).await.unwrap();
         assert_eq!(
             storage
-                .get_centroid_stats(0, 1000)
+                .get_centroid_stats(centroid_id(1000))
                 .await
                 .unwrap()
                 .num_vectors,
@@ -746,11 +767,11 @@ mod tests {
 
         // when — delete the centroid
         let mut delta = VectorIndexDelta::new(&state);
-        delta.delete_centroids(vec![1000]);
+        delta.delete_centroids(vec![centroid_id(1000)]);
         let ops = delta.freeze(&mut state);
 
         // then — should NOT have a stats merge (no point updating stats for deleted centroid)
-        let stats_key = crate::serde::key::CentroidStatsKey::new(0, 1000).encode();
+        let stats_key = crate::serde::key::CentroidStatsKey::new(centroid_id(1000)).encode();
         assert!(
             !ops.iter()
                 .any(|op| matches!(op, RecordOp::Merge(r) if r.record.key == stats_key))
@@ -766,7 +787,7 @@ mod tests {
         storage.apply(ops).await.unwrap();
         assert_eq!(
             storage
-                .get_centroid_stats(0, 1000)
+                .get_centroid_stats(centroid_id(1000))
                 .await
                 .unwrap()
                 .num_vectors,
@@ -882,7 +903,12 @@ mod tests {
         assert_eq!(data.vector_field(), &[1.0, 0.0]);
 
         // Unknown ID returns None
-        assert!(view.vector_data(9999, DIMS).await.unwrap().is_none());
+        assert!(
+            view.vector_data(data_id(9999), DIMS)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     // ---- posting_list ----
@@ -893,22 +919,26 @@ mod tests {
 
         // Write postings to storage
         let mut delta = VectorIndexDelta::new(&state);
-        delta.add_to_posting(1000, 10, vec![1.0, 0.0]);
+        delta.add_to_posting(centroid_id(1000), data_id(10), vec![1.0, 0.0]);
         storage.apply(delta.freeze(&mut state)).await.unwrap();
 
         // New delta adds another posting
         let mut delta = VectorIndexDelta::new(&state);
-        delta.add_to_posting(1000, 11, vec![0.0, 1.0]);
+        delta.add_to_posting(centroid_id(1000), data_id(11), vec![0.0, 1.0]);
 
         let snapshot = storage.snapshot().await.unwrap();
         let view = VectorIndexView::new(&delta, &state, snapshot);
 
         // Should see both: 10 from storage, 11 from delta
-        let posting = view.posting_list(1000, DIMS).unwrap().await.unwrap();
+        let posting = view
+            .posting_list(centroid_id(1000), DIMS)
+            .unwrap()
+            .await
+            .unwrap();
         assert_eq!(posting.len(), 2);
-        let ids: HashSet<u64> = posting.iter().map(|p| p.id()).collect();
-        assert!(ids.contains(&10));
-        assert!(ids.contains(&11));
+        let ids: HashSet<VectorId> = posting.iter().map(|p| p.id()).collect();
+        assert!(ids.contains(&data_id(10)));
+        assert!(ids.contains(&data_id(11)));
     }
 
     // ---- last_written_posting ----
@@ -918,18 +948,21 @@ mod tests {
         let (storage, state) = setup().await;
 
         let mut delta = VectorIndexDelta::new(&state);
-        delta.add_to_posting(1000, 10, vec![1.0, 0.0]);
+        delta.add_to_posting(centroid_id(1000), data_id(10), vec![1.0, 0.0]);
         // Move vector 10 to a different centroid within the same delta
-        delta.remove_from_posting(1000, 10);
-        delta.add_to_posting(2000, 10, vec![1.0, 0.0]);
+        delta.remove_from_posting(centroid_id(1000), data_id(10));
+        delta.add_to_posting(centroid_id(2000), data_id(10), vec![1.0, 0.0]);
 
         let snapshot = storage.snapshot().await.unwrap();
         let view = VectorIndexView::new(&delta, &state, snapshot);
 
         // Should reflect the latest posting in the delta
-        assert_eq!(view.last_written_posting(10), Some(2000));
+        assert_eq!(
+            view.last_written_posting(data_id(10)),
+            Some(centroid_id(2000))
+        );
         // Unknown vector returns None
-        assert_eq!(view.last_written_posting(99), None);
+        assert_eq!(view.last_written_posting(data_id(99)), None);
     }
 
     // ---- centroid_counts ----
@@ -940,21 +973,21 @@ mod tests {
 
         // Add postings to state via a prior delta (centroid 1000 gets count=2)
         let mut delta = VectorIndexDelta::new(&state);
-        delta.add_to_posting(1000, 10, vec![1.0, 0.0]);
-        delta.add_to_posting(1000, 11, vec![0.0, 1.0]);
+        delta.add_to_posting(centroid_id(1000), data_id(10), vec![1.0, 0.0]);
+        delta.add_to_posting(centroid_id(1000), data_id(11), vec![0.0, 1.0]);
         storage.apply(delta.freeze(&mut state)).await.unwrap();
-        assert_eq!(*state.centroid_counts().get(&1000).unwrap(), 2);
+        assert_eq!(*state.centroid_counts().get(&centroid_id(1000)).unwrap(), 2);
 
         // New delta adds one more posting
         let mut delta = VectorIndexDelta::new(&state);
-        delta.add_to_posting(1000, 12, vec![0.5, 0.5]);
+        delta.add_to_posting(centroid_id(1000), data_id(12), vec![0.5, 0.5]);
 
         let snapshot = storage.snapshot().await.unwrap();
         let view = VectorIndexView::new(&delta, &state, snapshot);
 
         // Should be state(2) + delta(+1) = 3
         let counts = view.centroid_counts();
-        assert_eq!(*counts.get(&1000).unwrap(), 3);
+        assert_eq!(*counts.get(&centroid_id(1000)).unwrap(), 3);
     }
 
     // ---- centroid_graph (DirtyCentroidGraph) ----
@@ -969,7 +1002,7 @@ mod tests {
 
         let mut delta = VectorIndexDelta::new(&state);
         // Delete centroid 1000, add a new one at [0, 1]
-        delta.delete_centroids(vec![1000]);
+        delta.delete_centroids(vec![centroid_id(1000)]);
         let new_c = delta.add_centroid(vec![0.0, 1.0]);
 
         let snapshot = storage.snapshot().await.unwrap();
@@ -977,10 +1010,10 @@ mod tests {
         let graph = view.centroid_graph();
 
         // Deleted centroid should not be found
-        assert!(graph.centroid(1000).is_none());
+        assert!(graph.centroid(centroid_id(1000)).is_none());
 
         // Existing centroid should still be found
-        assert!(graph.centroid(1001).is_some());
+        assert!(graph.centroid(centroid_id(1001)).is_some());
 
         // New centroid should be found
         assert!(graph.centroid(new_c.centroid_id).is_some());
@@ -991,6 +1024,6 @@ mod tests {
 
         // Search near [0, 1] should find new centroid, not deleted one
         let results = graph.search(&[0.0, 0.9], 1);
-        assert_eq!(results[0], new_c.centroid_id);
+        assert_eq!(results[0], new_c.centroid_id.id());
     }
 }

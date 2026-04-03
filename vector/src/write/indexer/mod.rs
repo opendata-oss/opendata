@@ -10,6 +10,7 @@ mod vector;
 use crate::DistanceMetric;
 use crate::Result;
 use crate::hnsw::CentroidGraph;
+use crate::serde::vector_id::VectorId;
 use crate::write::delta::VectorWrite;
 use crate::write::indexer::merge::MergeCentroids;
 use crate::write::indexer::split::SplitCentroids;
@@ -22,7 +23,6 @@ use common::storage::RecordOp;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::debug;
-use crate::serde::vector_id::VectorId;
 
 const INDEXING_ROUNDS: usize = 1;
 

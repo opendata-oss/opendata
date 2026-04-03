@@ -4,10 +4,13 @@ use crate::model::VECTOR_FIELD_NAME;
 use crate::serde::FieldValue;
 use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::vector_data::VectorDataValue;
+use crate::serde::vector_id::VectorId;
 use crate::write::delta::VectorWrite;
 use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::tree::IndexerOpts;
-use crate::write::indexer::tree::centroids::{LeveledCentroidIndex, batch_search_centroids, batch_search_centroids_in_level, TreeLevel};
+use crate::write::indexer::tree::centroids::{
+    LeveledCentroidIndex, TreeLevel, batch_search_centroids, batch_search_centroids_in_level,
+};
 use crate::write::indexer::tree::split::ReassignVector;
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use common::StorageRead;
@@ -18,7 +21,6 @@ use rayon::iter::ParallelIterator;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::trace;
-use crate::serde::vector_id::VectorId;
 
 /// An upsert where we need to resolve the old vector data from storage.
 struct ResolvedUpsert {
@@ -276,13 +278,9 @@ impl ReassignVectors {
                 .iter()
                 .map(|r| (r.vector_id, r.vector.as_slice()))
                 .collect();
-            let assignments = batch_search_centroids_in_level(
-                &centroid_index,
-                1,
-                ann_search_batch,
-                self.level,
-            )
-                .await?;
+            let assignments =
+                batch_search_centroids_in_level(&centroid_index, 1, ann_search_batch, self.level)
+                    .await?;
 
             // determine which vectors actually need a new assignment
             let reassignments: Vec<_> = self
@@ -315,16 +313,18 @@ impl ReassignVectors {
                 self.snapshot_epoch,
                 state,
                 delta,
-                reassignments
-            ).await
+                reassignments,
+            )
+            .await
         } else {
             Self::execute_centroid_reassignments(
                 &self.snapshot,
                 self.snapshot_epoch,
                 state,
                 delta,
-                reassignments
-            ).await
+                reassignments,
+            )
+            .await
         }
     }
 
@@ -333,14 +333,17 @@ impl ReassignVectors {
         snapshot_epoch: u64,
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta,
-        reassignments: Vec<VerifiedVectorReassignment>
+        reassignments: Vec<VerifiedVectorReassignment>,
     ) -> Result<usize> {
         let resolved = {
             let view = VectorIndexView::new(delta, state, snapshot, snapshot_epoch);
             reassignments
                 .into_iter()
                 .map(|r| ResolvedCentroidReassignment {
-                    data: view.centroid(r.reassignment.vector_id).cloned().expect("unexpected missing centroid"),
+                    data: view
+                        .centroid(r.reassignment.vector_id)
+                        .cloned()
+                        .expect("unexpected missing centroid"),
                     reassignment: r.reassignment,
                     new_centroid: r.new_centroid,
                 })
@@ -348,10 +351,9 @@ impl ReassignVectors {
         };
         let nreassigned = resolved.len();
         for mut r in resolved {
-            delta.search_index.remove_from_posting(
-                r.reassignment.current_centroid,
-                r.reassignment.vector_id,
-            );
+            delta
+                .search_index
+                .remove_from_posting(r.reassignment.current_centroid, r.reassignment.vector_id);
             delta.search_index.add_to_posting(
                 r.new_centroid,
                 r.reassignment.vector_id,
@@ -371,7 +373,7 @@ impl ReassignVectors {
         snapshot_epoch: u64,
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta,
-        reassignments: Vec<VerifiedVectorReassignment>
+        reassignments: Vec<VerifiedVectorReassignment>,
     ) -> Result<usize> {
         let resolved = {
             let view = VectorIndexView::new(delta, state, &snapshot, snapshot_epoch);
@@ -399,10 +401,9 @@ impl ReassignVectors {
         let nreassigned = resolved.len();
         for r in resolved {
             trace!("old data: {:?}", r.data);
-            delta.search_index.remove_from_posting(
-                r.reassignment.current_centroid,
-                r.reassignment.vector_id,
-            );
+            delta
+                .search_index
+                .remove_from_posting(r.reassignment.current_centroid, r.reassignment.vector_id);
             delta.search_index.add_to_posting(
                 r.new_centroid,
                 r.reassignment.vector_id,

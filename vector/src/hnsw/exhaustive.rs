@@ -317,7 +317,10 @@ fn build_centroid_index(centroids: &[CentroidEntry]) -> Result<HashMap<u64, usiz
     let mut centroid_to_idx = HashMap::with_capacity(centroids.len());
 
     for (idx, centroid) in centroids.iter().enumerate() {
-        if centroid_to_idx.insert(centroid.centroid_id.id(), idx).is_some() {
+        if centroid_to_idx
+            .insert(centroid.centroid_id.id(), idx)
+            .is_some()
+        {
             return Err(Error::InvalidInput(format!(
                 "Duplicate centroid id: {}",
                 centroid.centroid_id

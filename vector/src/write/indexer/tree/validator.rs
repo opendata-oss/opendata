@@ -5,6 +5,7 @@ use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::centroids::CentroidsValue;
 use crate::serde::key::{CentroidInfoKey, CentroidStatsKey, CentroidsKey, PostingListKey};
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
+use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
 use crate::write::indexer::tree::centroids::{AllCentroidsCacheWriter, CentroidCache};
@@ -19,7 +20,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
-use crate::serde::vector_id::{VectorId, ROOT_VECTOR_ID};
 
 pub(crate) async fn validate(
     snapshot: Arc<dyn StorageSnapshot>,
@@ -280,7 +280,9 @@ fn validate_reachability(
 
     let stale_postings = centroid_postings
         .keys()
-        .filter(|centroid_id| **centroid_id != ROOT_VECTOR_ID && !reachable_centroids.contains(centroid_id))
+        .filter(|centroid_id| {
+            **centroid_id != ROOT_VECTOR_ID && !reachable_centroids.contains(centroid_id)
+        })
         .copied()
         .collect::<BTreeSet<_>>();
     if !stale_postings.is_empty() {
@@ -434,8 +436,17 @@ fn flatten_state_counts(
 mod tests {
     use super::*;
     use crate::serde::collection_meta::DistanceMetric;
+    use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
 
     const DIMS: usize = 2;
+
+    fn centroid_id(level: u8, id: u64) -> VectorId {
+        VectorId::centroid_id(level, id)
+    }
+
+    fn root_posting_id(id: u64) -> VectorId {
+        centroid_id(1, id)
+    }
 
     #[tokio::test]
     async fn should_validate_consistent_root_only_tree() {
@@ -443,18 +454,18 @@ mod tests {
         let root = vec![(1, vec![1.0, 0.0]), (2, vec![0.0, 1.0])];
         write_tree(
             &storage,
-            1,
+            3,
             root.clone(),
             vec![
-                (1, CentroidInfoValue::new(0, vec![1.0, 0.0], None)),
-                (2, CentroidInfoValue::new(0, vec![0.0, 1.0], None)),
+                (1, CentroidInfoValue::new(1, vec![1.0, 0.0], ROOT_VECTOR_ID)),
+                (2, CentroidInfoValue::new(1, vec![0.0, 1.0], ROOT_VECTOR_ID)),
             ],
-            vec![((0, 1), 0), ((0, 2), 0)],
+            vec![((1, 1), 0), ((1, 2), 0)],
             vec![],
         )
         .await;
         let snapshot = storage.snapshot().await.unwrap();
-        let state = create_state(storage.clone(), snapshot.clone(), 1, root, vec![]).await;
+        let state = create_state(storage.clone(), snapshot.clone(), 3, root, vec![]).await;
 
         let result = validate(snapshot, &state, DIMS).await;
 
@@ -467,19 +478,19 @@ mod tests {
         let root = vec![(1, vec![1.0, 0.0]), (2, vec![0.0, 1.0])];
         write_tree(
             &storage,
-            1,
+            3,
             root.clone(),
             vec![
-                (1, CentroidInfoValue::new(0, vec![1.0, 0.0], None)),
-                (2, CentroidInfoValue::new(0, vec![0.0, 1.0], None)),
-                (3, CentroidInfoValue::new(0, vec![2.0, 2.0], None)),
+                (1, CentroidInfoValue::new(1, vec![1.0, 0.0], ROOT_VECTOR_ID)),
+                (2, CentroidInfoValue::new(1, vec![0.0, 1.0], ROOT_VECTOR_ID)),
+                (3, CentroidInfoValue::new(1, vec![2.0, 2.0], ROOT_VECTOR_ID)),
             ],
-            vec![((0, 1), 0), ((0, 2), 0), ((0, 3), 0)],
+            vec![((1, 1), 0), ((1, 2), 0), ((1, 3), 0)],
             vec![],
         )
         .await;
         let snapshot = storage.snapshot().await.unwrap();
-        let state = create_state(storage.clone(), snapshot.clone(), 1, root, vec![]).await;
+        let state = create_state(storage.clone(), snapshot.clone(), 3, root, vec![]).await;
 
         let result = validate(snapshot, &state, DIMS).await;
 
@@ -515,7 +526,7 @@ mod tests {
         let (seq_block_key, seq_block) = id_allocator.freeze();
         let (centroid_seq_block_key, centroid_seq_block) = centroid_id_allocator.freeze();
 
-        let centroids: HashMap<u64, CentroidInfoValue> = snapshot
+        let centroids: HashMap<VectorId, CentroidInfoValue> = snapshot
             .scan_all_centroid_info()
             .await
             .unwrap()
@@ -526,31 +537,30 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .fold(
-                HashMap::new(),
-                |mut counts, ((level, centroid_id), value)| {
-                    counts
-                        .entry(level as u16)
-                        .or_insert_with(HashMap::new)
-                        .insert(centroid_id, value.num_vectors as u64);
-                    counts
-                },
-            );
+            .fold(HashMap::new(), |mut counts, (centroid_id, value)| {
+                counts
+                    .entry(centroid_id.level())
+                    .or_insert_with(HashMap::new)
+                    .insert(centroid_id, value.num_vectors as u64);
+                counts
+            });
         let centroid_cache = AllCentroidsCacheWriter::new(
             Arc::new(
                 root.into_iter()
-                    .map(|(id, vector)| Posting::new(id, vector))
+                    .map(|(id, vector)| Posting::new(root_posting_id(id), vector))
                     .collect::<PostingList>(),
             ) as Arc<dyn IntoTreePostingList>,
             centroid_postings
                 .into_iter()
-                .map(|(centroid_id, postings)| {
+                .map(|(centroid_num, postings)| {
                     (
-                        centroid_id,
+                        root_posting_id(centroid_num),
                         Arc::new(
                             postings
                                 .into_iter()
-                                .map(|(id, vector)| Posting::new(id, vector))
+                                .map(|(id, vector)| {
+                                    Posting::new(VectorId::data_vector_id(id), vector)
+                                })
                                 .collect::<PostingList>(),
                         ) as Arc<dyn IntoTreePostingList>,
                     )
@@ -596,7 +606,7 @@ mod tests {
         );
         ops.push(
             Record::new(
-                PostingListKey::new(0).encode(),
+                PostingListKey::new(ROOT_VECTOR_ID).encode(),
                 posting_list_value(root).encode_to_bytes(),
             )
             .into(),
@@ -604,16 +614,16 @@ mod tests {
         for (centroid_id, value) in centroid_info {
             ops.push(
                 Record::new(
-                    CentroidInfoKey::new(centroid_id).encode(),
+                    CentroidInfoKey::new(root_posting_id(centroid_id)).encode(),
                     value.encode_to_bytes(),
                 )
                 .into(),
             );
         }
-        for ((level, centroid_id), count) in centroid_stats {
+        for ((level, centroid_num), count) in centroid_stats {
             ops.push(
                 Record::new(
-                    CentroidStatsKey::new(level, centroid_id).encode(),
+                    CentroidStatsKey::new(centroid_id(level, centroid_num)).encode(),
                     CentroidStatsValue::new(count).encode_to_bytes(),
                 )
                 .into(),
@@ -622,7 +632,7 @@ mod tests {
         for (centroid_id, postings) in centroid_postings {
             ops.push(
                 Record::new(
-                    PostingListKey::new(centroid_id).encode(),
+                    PostingListKey::new(root_posting_id(centroid_id)).encode(),
                     posting_list_value(postings).encode_to_bytes(),
                 )
                 .into(),
@@ -635,7 +645,7 @@ mod tests {
         PostingListValue::from_posting_updates(
             postings
                 .into_iter()
-                .map(|(id, vector)| PostingUpdate::append(id, vector))
+                .map(|(id, vector)| PostingUpdate::append(root_posting_id(id), vector))
                 .collect(),
         )
         .unwrap()

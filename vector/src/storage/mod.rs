@@ -2,13 +2,11 @@ use async_trait::async_trait;
 use common::{BytesRange, StorageRead};
 
 use crate::error::{Error, Result};
-use std::ops::Bound::Included;
-use bytes::{BufMut, BytesMut};
+use crate::serde::Decode;
 use crate::serde::centroid_chunk::CentroidChunkValue;
 use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::centroids::CentroidsValue;
-use crate::serde::Decode;
 use crate::serde::deletions::DeletionsValue;
 use crate::serde::key::{
     CentroidChunkKey, CentroidInfoKey, CentroidStatsKey, CentroidsKey, DeletionsKey,
@@ -17,7 +15,9 @@ use crate::serde::key::{
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::PostingListValue;
 use crate::serde::vector_data::VectorDataValue;
-use crate::serde::vector_id::{VectorId, ROOT_VECTOR_ID};
+use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
+use bytes::{BufMut, BytesMut};
+use std::ops::Bound::Included;
 
 pub(crate) mod merge_operator;
 pub(crate) mod record;
@@ -335,7 +335,10 @@ mod tests {
         storage.apply(vec![op]).await.unwrap();
 
         // then - read
-        let result = storage.get_vector_data(VectorId::data_vector_id(42), 3).await.unwrap();
+        let result = storage
+            .get_vector_data(VectorId::data_vector_id(42), 3)
+            .await
+            .unwrap();
         assert!(result.is_some());
         let data = result.unwrap();
         assert_eq!(data.vector_field(), values.as_slice());

@@ -1,10 +1,10 @@
 use crate::Result;
 use crate::write::indexer::tree::IndexerOpts;
+use crate::write::indexer::tree::centroids::SearchResult;
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use common::StorageRead;
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::write::indexer::tree::centroids::{SearchResult};
 
 pub(crate) struct SplitRoot {
     opts: Arc<IndexerOpts>,
@@ -62,8 +62,7 @@ impl SplitRoot {
                     .centroid(posting.id())
                     .expect("unexpected missing centroid")
                     .clone();
-                let root_search = centroid_index
-                    .search_root(posting.vector(), 1);
+                let root_search = centroid_index.search_root(posting.vector(), 1);
                 let SearchResult::Ann(root_search) = root_search else {
                     panic!("root should always be in cache")
                 };

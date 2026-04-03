@@ -1,6 +1,7 @@
 use crate::db::VectorDb;
 use crate::error::{Error, Result};
 use crate::model::Config;
+use crate::serde::vector_id::VectorId;
 use crate::storage::merge_operator::VectorDbMergeOperator;
 use crate::write::indexer::tree::Indexer;
 use crate::write::indexer::tree::validator::validate as validate_tree_index;
@@ -8,7 +9,6 @@ use common::Storage;
 use common::{StorageBuilder, StorageSemantics};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use crate::serde::vector_id::VectorId;
 
 /// Administrative entry point for vector index maintenance.
 ///

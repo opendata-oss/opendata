@@ -1,8 +1,8 @@
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
+use crate::serde::vector_id::VectorId;
 use std::collections::{HashMap, HashSet};
 use std::iter::FromIterator;
 use std::sync::Arc;
-use crate::serde::vector_id::VectorId;
 
 #[derive(Clone)]
 pub(crate) struct Posting {
@@ -23,7 +23,12 @@ impl Posting {
         }
     }
 
-    fn from_shared_buffer(id: VectorId, buffer: Arc<Vec<f32>>, offset: usize, length: usize) -> Self {
+    fn from_shared_buffer(
+        id: VectorId,
+        buffer: Arc<Vec<f32>>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
         Self {
             id,
             buffer,
@@ -285,7 +290,10 @@ mod tests {
 
         // then
         let collected: Vec<_> = postings.iter().map(|posting| posting.id()).collect();
-        assert_eq!(collected, vec![VectorId::data_vector_id(1), VectorId::data_vector_id(2)]);
+        assert_eq!(
+            collected,
+            vec![VectorId::data_vector_id(1), VectorId::data_vector_id(2)]
+        );
         assert!(Arc::ptr_eq(
             &postings.postings[0].buffer,
             &postings.postings[1].buffer
@@ -335,8 +343,8 @@ mod tests {
 
         // when
         let updated = postings.update_and_flatten(vec![
-            PostingUpdate::delete(1),
-            PostingUpdate::append(3, vec![3.0, 0.0]),
+            PostingUpdate::delete(VectorId::data_vector_id(1)),
+            PostingUpdate::append(VectorId::data_vector_id(3), vec![3.0, 0.0]),
         ]);
 
         // then
@@ -344,7 +352,13 @@ mod tests {
             .iter()
             .map(|posting| (posting.id(), posting.vector().to_vec()))
             .collect();
-        assert_eq!(collected, vec![(2, vec![2.0, 0.0]), (3, vec![3.0, 0.0])]);
+        assert_eq!(
+            collected,
+            vec![
+                (VectorId::data_vector_id(2), vec![2.0, 0.0]),
+                (VectorId::data_vector_id(3), vec![3.0, 0.0])
+            ]
+        );
         assert!(Arc::ptr_eq(
             &updated.postings[0].buffer,
             &updated.postings[1].buffer
@@ -358,10 +372,10 @@ mod tests {
 
         // when
         let updated = postings.update_in_place(vec![
-            PostingUpdate::append(2, vec![20.0, 0.0]),
-            PostingUpdate::delete(2),
-            PostingUpdate::delete(3),
-            PostingUpdate::append(3, vec![30.0, 0.0]),
+            PostingUpdate::append(VectorId::data_vector_id(2), vec![20.0, 0.0]),
+            PostingUpdate::delete(VectorId::data_vector_id(2)),
+            PostingUpdate::delete(VectorId::data_vector_id(3)),
+            PostingUpdate::append(VectorId::data_vector_id(3), vec![30.0, 0.0]),
         ]);
 
         // then
@@ -369,6 +383,12 @@ mod tests {
             .iter()
             .map(|posting| (posting.id(), posting.vector().to_vec()))
             .collect();
-        assert_eq!(collected, vec![(1, vec![1.0, 0.0]), (3, vec![30.0, 0.0])]);
+        assert_eq!(
+            collected,
+            vec![
+                (VectorId::data_vector_id(1), vec![1.0, 0.0]),
+                (VectorId::data_vector_id(3), vec![30.0, 0.0])
+            ]
+        );
     }
 }

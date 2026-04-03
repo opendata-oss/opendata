@@ -14,8 +14,8 @@
 //! ```
 
 use super::{Decode, Encode, EncodingError, decode_array, encode_array};
+use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
 use bytes::{BufMut, Bytes, BytesMut};
-use crate::serde::vector_id::{VectorId, ROOT_VECTOR_ID};
 
 /// Per-centroid metadata value.
 #[derive(Debug, Clone, PartialEq)]

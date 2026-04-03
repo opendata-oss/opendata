@@ -10,20 +10,23 @@ use crate::serde::key::{
 };
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_data::{Field, VectorDataValue};
+use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
 use crate::storage::{VectorDbStorageReadExt, record};
-use crate::write::indexer::tree::centroids::{AllCentroidsCache, AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, CentroidReader, LeveledCentroidIndex, MaybeCached, StoredCentroidReader, TreeDepth, TreeLevel};
+use crate::write::indexer::tree::centroids::{
+    AllCentroidsCache, AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache,
+    CentroidReader, LeveledCentroidIndex, MaybeCached, StoredCentroidReader, TreeDepth, TreeLevel,
+};
 use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use bytes::Bytes;
 use common::sequence::AllocatedSeqBlock;
 use common::storage::RecordOp;
 use common::{Record, SequenceAllocator, StorageRead};
 use futures::future::BoxFuture;
+use log::info;
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use log::info;
 use tracing::debug;
-use crate::serde::vector_id::{VectorId, ROOT_VECTOR_ID};
 
 /// In-memory preserved state of vector index
 pub(crate) struct VectorIndexState {
@@ -215,10 +218,7 @@ impl SearchIndexDelta {
         }
     }
 
-    pub(crate) fn promote_root(
-        &mut self,
-        new_root_centroids: Vec<Vec<f32>>,
-    ) -> TreeLevel {
+    pub(crate) fn promote_root(&mut self, new_root_centroids: Vec<Vec<f32>>) -> TreeLevel {
         self.centroids_meta.depth += 1;
         let depth = TreeDepth::of(self.centroids_meta.depth);
         let new_level = TreeLevel::root(depth).next_level_down();
@@ -232,7 +232,12 @@ impl SearchIndexDelta {
             assert_eq!(p.id().level(), depth.max_inner_level())
         }
         self.root_centroid_count = new_root_postings.len() as u64;
-        self.root = Some(new_root_postings.into_iter().map(|posting| posting.into()).collect());
+        self.root = Some(
+            new_root_postings
+                .into_iter()
+                .map(|posting| posting.into())
+                .collect(),
+        );
         new_level
     }
 
@@ -285,11 +290,7 @@ impl SearchIndexDelta {
         if let Some(seq_alloc_put) = seq_alloc_put {
             self.ops.push(RecordOp::Put(seq_alloc_put.into()));
         }
-        let centroid = CentroidInfoValue::new(
-            level.level(),
-            vector,
-            parent
-        );
+        let centroid = CentroidInfoValue::new(level.level(), vector, parent);
         let deltas = self
             .centroid_count_deltas
             .entry(id.level())
@@ -663,11 +664,10 @@ impl<'a> VectorIndexView<'a> {
     }
 
     pub(crate) fn root_posting_list(&self, dimensions: usize) -> MaybeCached<Arc<PostingList>> {
-        self.centroid_reader(dimensions).read_root()
-            .map(|p| {
-                assert!(!p.is_empty());
-                p
-            })
+        self.centroid_reader(dimensions).read_root().map(|p| {
+            assert!(!p.is_empty());
+            p
+        })
     }
 
     pub(crate) fn posting_list(

@@ -1,6 +1,7 @@
 use crate::math::{distance, heuristics, kmeans};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::posting_list::{Posting, PostingList};
+use crate::serde::vector_id::VectorId;
 use crate::write::indexer::IndexerOpts;
 use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::state::{
@@ -14,7 +15,6 @@ use rayon::iter::ParallelIterator;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::task::spawn_blocking;
-use crate::serde::vector_id::VectorId;
 
 const MAX_SPLITS: usize = usize::MAX;
 
@@ -383,6 +383,7 @@ impl SplitCentroid {
 mod tests {
     use super::*;
     use crate::serde::centroid_chunk::CentroidEntry;
+    use crate::serde::vector_id::VectorId;
     use crate::storage::VectorDbStorageReadExt;
     use crate::write::indexer::IndexerOpts;
     use crate::write::indexer::test_utils::IndexerOpTestHarness;
@@ -406,6 +407,14 @@ mod tests {
 
     const CENTROID_A: u64 = 100;
     const CENTROID_B: u64 = 101;
+
+    fn centroid_id(id: u64) -> VectorId {
+        VectorId::legacy_centroid_id(id)
+    }
+
+    fn data_id(id: u64) -> VectorId {
+        VectorId::data_vector_id(id)
+    }
 
     #[tokio::test]
     async fn should_split_centroid_and_create_new_centroids_in_storage() {
@@ -454,7 +463,11 @@ mod tests {
         // then — only A should split (6 vectors >= threshold 4), not B (2 vectors)
         assert_eq!(result.splits.len(), 1);
         let summary = &result.splits[0];
-        assert_eq!(summary.c, CENTROID_A, "should have split centroid A");
+        assert_eq!(
+            summary.c,
+            centroid_id(CENTROID_A),
+            "should have split centroid A"
+        );
         assert_eq!(summary.new_centroids.len(), 2);
         let ops = delta.freeze(&mut h.state);
         h.storage.apply(ops).await.unwrap();
@@ -497,7 +510,8 @@ mod tests {
             all_posted_ids, a_ids,
             "all 6 of A's vectors should be distributed across the two new centroids"
         );
-        let reassign_ids: HashSet<u64> = result.reassignments.iter().map(|r| r.vector_id).collect();
+        let reassign_ids: HashSet<VectorId> =
+            result.reassignments.iter().map(|r| r.vector_id).collect();
         assert!(
             reassign_ids.contains(&id_b1),
             "b1 should be in reassignment set from neighbour heuristic"
@@ -576,7 +590,8 @@ mod tests {
         let result = split.execute(&h.state, &mut delta).await.unwrap();
 
         assert_eq!(result.splits.len(), 1);
-        let reassign_ids: HashSet<u64> = result.reassignments.iter().map(|r| r.vector_id).collect();
+        let reassign_ids: HashSet<VectorId> =
+            result.reassignments.iter().map(|r| r.vector_id).collect();
         assert!(
             reassign_ids.contains(&id_b1),
             "b1 should be reassigned via neighbour search"
@@ -586,7 +601,7 @@ mod tests {
             .iter()
             .find(|r| r.vector_id == id_b1)
             .unwrap();
-        assert_eq!(b1_reassign.current_centroid, CENTROID_B);
+        assert_eq!(b1_reassign.current_centroid, centroid_id(CENTROID_B));
     }
 
     #[tokio::test]
@@ -627,7 +642,11 @@ mod tests {
         let deletions = h.storage.get_deleted_vectors().await.unwrap();
         assert!(deletions.contains(CENTROID_A), "A should be deleted");
         assert!(!deletions.contains(CENTROID_B), "B should not be deleted");
-        let posting_b = h.storage.get_posting_list(CENTROID_B, DIMS).await.unwrap();
+        let posting_b = h
+            .storage
+            .get_posting_list(centroid_id(CENTROID_B), DIMS)
+            .await
+            .unwrap();
         assert_eq!(posting_b.len(), 2, "B's postings should be untouched");
     }
 
@@ -682,18 +701,18 @@ mod tests {
         let view = VectorIndexView::new(&delta, &h.state, snapshot);
         let centroid_graph = view.centroid_graph();
 
-        let postings: HashMap<u64, PostingList> = HashMap::from([(
-            CENTROID_ID,
+        let postings: HashMap<VectorId, PostingList> = HashMap::from([(
+            centroid_id(CENTROID_ID),
             vec![
-                Posting::new(1, vec![0.9, 0.1]),
-                Posting::new(2, vec![0.8, 0.2]),
-                Posting::new(3, vec![0.1, 0.9]),
-                Posting::new(4, vec![0.2, 0.8]),
+                Posting::new(data_id(1), vec![0.9, 0.1]),
+                Posting::new(data_id(2), vec![0.8, 0.2]),
+                Posting::new(data_id(3), vec![0.1, 0.9]),
+                Posting::new(data_id(4), vec![0.2, 0.8]),
             ],
         )]);
 
         let split = SplitCentroid {
-            c: CENTROID_ID,
+            c: centroid_id(CENTROID_ID),
             neighbours: vec![],
             centroid_graph,
             dimensions: DIMS,
@@ -701,23 +720,23 @@ mod tests {
         };
         let result = split.execute(Arc::new(postings));
 
-        assert_eq!(result.c, CENTROID_ID);
-        let c0_ids: HashSet<u64> = result.c_0.postings().iter().map(|p| p.id()).collect();
-        let c1_ids: HashSet<u64> = result.c_1.postings().iter().map(|p| p.id()).collect();
+        assert_eq!(result.c, centroid_id(CENTROID_ID));
+        let c0_ids: HashSet<VectorId> = result.c_0.postings().iter().map(|p| p.id()).collect();
+        let c1_ids: HashSet<VectorId> = result.c_1.postings().iter().map(|p| p.id()).collect();
         assert_eq!(c0_ids.len() + c1_ids.len(), 4);
         assert!(c0_ids.is_disjoint(&c1_ids));
-        let cluster_a = if c0_ids.contains(&1) {
+        let cluster_a = if c0_ids.contains(&data_id(1)) {
             &c0_ids
         } else {
             &c1_ids
         };
-        let cluster_b = if c0_ids.contains(&3) {
+        let cluster_b = if c0_ids.contains(&data_id(3)) {
             &c0_ids
         } else {
             &c1_ids
         };
-        assert!(cluster_a.contains(&1) && cluster_a.contains(&2));
-        assert!(cluster_b.contains(&3) && cluster_b.contains(&4));
+        assert!(cluster_a.contains(&data_id(1)) && cluster_a.contains(&data_id(2)));
+        assert!(cluster_b.contains(&data_id(3)) && cluster_b.contains(&data_id(4)));
     }
 
     #[tokio::test]
@@ -731,18 +750,18 @@ mod tests {
         let c_vector = vec![0.0, 0.0];
         let c0_vector = vec![1.0, 0.0];
         let c1_vector = vec![0.0, 1.0];
-        let passing = Posting::new(10, vec![0.1, 0.1]);
-        let failing = Posting::new(11, vec![0.9, 0.1]);
+        let passing = Posting::new(data_id(10), vec![0.1, 0.1]);
+        let failing = Posting::new(data_id(11), vec![0.9, 0.1]);
 
         let split = SplitCentroid {
-            c: CENTROID_ID,
+            c: centroid_id(CENTROID_ID),
             neighbours: vec![],
             centroid_graph,
             dimensions: DIMS,
             distance_metric: DistanceMetric::L2,
         };
         let reassignments = split.compute_split_reassignments(
-            CENTROID_ID,
+            centroid_id(CENTROID_ID),
             &[passing, failing],
             &c_vector,
             &c0_vector,
@@ -750,8 +769,8 @@ mod tests {
         );
 
         assert_eq!(reassignments.len(), 1);
-        assert_eq!(reassignments[0].vector_id, 10);
-        assert_eq!(reassignments[0].current_centroid, CENTROID_ID);
+        assert_eq!(reassignments[0].vector_id, data_id(10));
+        assert_eq!(reassignments[0].current_centroid, centroid_id(CENTROID_ID));
     }
 
     #[tokio::test]
@@ -765,15 +784,15 @@ mod tests {
         let c_vector = vec![0.5, 0.5];
         let c0_vector = vec![1.0, 0.0];
         let c1_vector = vec![0.0, 1.0];
-        let neighbour_id: u64 = 99;
-        let passing = Posting::new(20, vec![0.9, 0.1]);
-        let failing = Posting::new(21, vec![0.5, 0.5]);
+        let neighbour_id = centroid_id(99);
+        let passing = Posting::new(data_id(20), vec![0.9, 0.1]);
+        let failing = Posting::new(data_id(21), vec![0.5, 0.5]);
 
-        let mut postings: HashMap<u64, PostingList> = HashMap::new();
+        let mut postings: HashMap<VectorId, PostingList> = HashMap::new();
         postings.insert(neighbour_id, vec![passing, failing]);
 
         let split = SplitCentroid {
-            c: CENTROID_ID,
+            c: centroid_id(CENTROID_ID),
             neighbours: vec![neighbour_id],
             centroid_graph,
             dimensions: DIMS,
@@ -783,7 +802,7 @@ mod tests {
             split.compute_neighbour_reassignments(&c_vector, &c0_vector, &c1_vector, &postings);
 
         assert_eq!(reassignments.len(), 1);
-        assert_eq!(reassignments[0].vector_id, 20);
+        assert_eq!(reassignments[0].vector_id, data_id(20));
         assert_eq!(reassignments[0].current_centroid, neighbour_id);
     }
 }
