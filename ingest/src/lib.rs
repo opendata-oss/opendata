@@ -11,4 +11,4 @@ pub use config::{CollectorConfig, IngestorConfig};
 pub use error::{Error, Result};
 pub use ingestor::{DurabilityWatcher, Ingestor, WriteHandle};
 pub use model::CompressionType;
-pub use queue::Metadata;
+pub use queue::{ManifestEntry, ManifestView, Metadata, parse_manifest};

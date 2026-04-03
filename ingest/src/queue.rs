@@ -788,6 +788,49 @@ impl QueueConsumer {
     }
 }
 
+/// A single entry in the manifest.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManifestEntry {
+    pub sequence: u64,
+    pub location: String,
+    pub metadata: Vec<Metadata>,
+}
+
+/// Read-only view of a parsed ingest queue manifest.
+#[derive(Debug, Clone)]
+pub struct ManifestView {
+    pub epoch: u64,
+    pub next_sequence: u64,
+    entries: Vec<ManifestEntry>,
+}
+
+impl ManifestView {
+    /// Return all entries in the manifest.
+    pub fn entries(&self) -> &[ManifestEntry] {
+        &self.entries
+    }
+}
+
+/// Parse a manifest from its binary representation.
+pub fn parse_manifest(data: Bytes) -> Result<ManifestView> {
+    let manifest = Manifest::from_bytes(data)?;
+    let entries = manifest
+        .iter()
+        .map(|r| {
+            r.map(|e| ManifestEntry {
+                sequence: e.sequence,
+                location: e.location,
+                metadata: e.metadata,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ManifestView {
+        epoch: manifest.epoch,
+        next_sequence: manifest.next_sequence,
+        entries,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
