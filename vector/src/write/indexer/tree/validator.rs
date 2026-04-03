@@ -505,7 +505,7 @@ mod tests {
         assert_eq!(
             result,
             Err(Error::Internal(
-                "stale centroid info entries found: {3}".to_string()
+                "stale centroid info entries found: {1:3}".to_string()
             ))
         );
     }
