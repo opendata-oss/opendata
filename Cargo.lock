@@ -2512,11 +2512,14 @@ dependencies = [
 name = "opendata-ingest"
 version = "0.1.3"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
+ "clap",
  "futures",
  "metrics",
  "opendata-common",
  "serde",
+ "serde_json",
  "serde_with",
  "slatedb",
  "tokio",
