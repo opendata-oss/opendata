@@ -21,9 +21,10 @@ use crate::serde::key::{
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_data::{Field, VectorDataValue};
+use crate::serde::vector_id::VectorId;
 
 /// Create a RecordOp to update the IdDictionary mapping.
-pub fn put_id_dictionary(external_id: &str, internal_id: u64) -> RecordOp {
+pub fn put_id_dictionary(external_id: &str, internal_id: VectorId) -> RecordOp {
     let key = IdDictionaryKey::new(external_id).encode();
     let mut value_buf = BytesMut::with_capacity(8);
     internal_id.encode(&mut value_buf);
@@ -42,7 +43,7 @@ pub fn delete_id_dictionary(external_id: &str) -> RecordOp {
 /// The `attributes` must include a "vector" field with the embedding values.
 #[allow(dead_code)]
 pub fn put_vector_data(
-    internal_id: u64,
+    internal_id: VectorId,
     external_id: &str,
     attributes: &[(String, AttributeValue)],
 ) -> RecordOp {
@@ -56,13 +57,13 @@ pub fn put_vector_data(
 }
 
 /// Create a RecordOp to delete vector data.
-pub fn delete_vector_data(internal_id: u64) -> RecordOp {
+pub fn delete_vector_data(internal_id: VectorId) -> RecordOp {
     let key = VectorDataKey::new(internal_id).encode();
     RecordOp::Delete(key)
 }
 
 /// Create a RecordOp to merge posting updates into a posting list.
-pub fn merge_posting_list(centroid_id: u64, postings: Vec<PostingUpdate>) -> Result<RecordOp> {
+pub fn merge_posting_list(centroid_id: VectorId, postings: Vec<PostingUpdate>) -> Result<RecordOp> {
     let key = PostingListKey::new(centroid_id).encode();
     let value = PostingListValue::from_posting_updates(postings)?.encode_to_bytes();
     Ok(RecordOp::Merge(Record::new(key, value).into()))
@@ -95,8 +96,8 @@ pub fn delete_centroid_chunk(chunk_id: u32) -> RecordOp {
 
 /// Create a RecordOp to merge a vector count delta into centroid stats.
 #[allow(dead_code)]
-pub fn merge_centroid_stats(level: u8, centroid_id: u64, delta: i32) -> RecordOp {
-    let key = CentroidStatsKey::new(level, centroid_id).encode();
+pub fn merge_centroid_stats(centroid_id: VectorId, delta: i32) -> RecordOp {
+    let key = CentroidStatsKey::new(centroid_id).encode();
     let value = CentroidStatsValue::new(delta).encode_to_bytes();
     RecordOp::Merge(Record::new(key, value).into())
 }

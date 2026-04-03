@@ -2,17 +2,18 @@ use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use std::collections::{HashMap, HashSet};
 use std::iter::FromIterator;
 use std::sync::Arc;
+use crate::serde::vector_id::VectorId;
 
 #[derive(Clone)]
 pub(crate) struct Posting {
-    id: u64,
+    id: VectorId,
     buffer: Arc<Vec<f32>>,
     offset: usize,
     length: usize,
 }
 
 impl Posting {
-    pub(crate) fn new(id: u64, vector: Vec<f32>) -> Self {
+    pub(crate) fn new(id: VectorId, vector: Vec<f32>) -> Self {
         let length = vector.len();
         Self {
             id,
@@ -22,7 +23,7 @@ impl Posting {
         }
     }
 
-    fn from_shared_buffer(id: u64, buffer: Arc<Vec<f32>>, offset: usize, length: usize) -> Self {
+    fn from_shared_buffer(id: VectorId, buffer: Arc<Vec<f32>>, offset: usize, length: usize) -> Self {
         Self {
             id,
             buffer,
@@ -31,7 +32,7 @@ impl Posting {
         }
     }
 
-    pub(crate) fn id(&self) -> u64 {
+    pub(crate) fn id(&self) -> VectorId {
         self.id
     }
 
@@ -99,7 +100,7 @@ impl PostingList {
             return self.clone();
         }
 
-        let updated_ids: HashSet<u64> = updates.iter().map(PostingUpdate::id).collect();
+        let updated_ids: HashSet<VectorId> = updates.iter().map(PostingUpdate::id).collect();
         let mut postings = self
             .postings
             .iter()
@@ -124,7 +125,7 @@ impl PostingList {
             return self.flatten();
         }
 
-        let updated_ids: HashSet<u64> = updates.iter().map(PostingUpdate::id).collect();
+        let updated_ids: HashSet<VectorId> = updates.iter().map(PostingUpdate::id).collect();
         let retained = self
             .postings
             .iter()
@@ -146,7 +147,7 @@ impl PostingList {
         )
     }
 
-    fn from_vectors(vectors: Vec<(u64, &[f32])>) -> Self {
+    fn from_vectors(vectors: Vec<(VectorId, &[f32])>) -> Self {
         let total_len = vectors.iter().map(|(_, vector)| vector.len()).sum();
         let mut buffer = Vec::with_capacity(total_len);
         let mut offsets = Vec::with_capacity(vectors.len());
@@ -266,7 +267,7 @@ mod tests {
     fn posting_list(entries: Vec<(u64, Vec<f32>)>) -> PostingList {
         entries
             .into_iter()
-            .map(|(id, vector)| Posting::new(id, vector))
+            .map(|(id, vector)| Posting::new(VectorId::data_vector_id(id), vector))
             .collect()
     }
 
@@ -274,8 +275,8 @@ mod tests {
     fn should_convert_posting_list_value_into_flattened_postings() {
         // given
         let value = PostingListValue::from_posting_updates(vec![
-            PostingUpdate::append(1, vec![1.0, 2.0]),
-            PostingUpdate::append(2, vec![3.0, 4.0]),
+            PostingUpdate::append(VectorId::data_vector_id(1), vec![1.0, 2.0]),
+            PostingUpdate::append(VectorId::data_vector_id(2), vec![3.0, 4.0]),
         ])
         .unwrap();
 
@@ -284,7 +285,7 @@ mod tests {
 
         // then
         let collected: Vec<_> = postings.iter().map(|posting| posting.id()).collect();
-        assert_eq!(collected, vec![1, 2]);
+        assert_eq!(collected, vec![VectorId::data_vector_id(1), VectorId::data_vector_id(2)]);
         assert!(Arc::ptr_eq(
             &postings.postings[0].buffer,
             &postings.postings[1].buffer
@@ -303,8 +304,8 @@ mod tests {
 
         // when
         let updated = postings.update_in_place(vec![
-            PostingUpdate::delete(2),
-            PostingUpdate::append(4, vec![4.0, 0.0]),
+            PostingUpdate::delete(VectorId::data_vector_id(2)),
+            PostingUpdate::append(VectorId::data_vector_id(4), vec![4.0, 0.0]),
         ]);
 
         // then
@@ -315,9 +316,9 @@ mod tests {
         assert_eq!(
             collected,
             vec![
-                (1, vec![1.0, 0.0]),
-                (3, vec![3.0, 0.0]),
-                (4, vec![4.0, 0.0])
+                (VectorId::data_vector_id(1), vec![1.0, 0.0]),
+                (VectorId::data_vector_id(3), vec![3.0, 0.0]),
+                (VectorId::data_vector_id(4), vec![4.0, 0.0])
             ]
         );
         assert!(Arc::ptr_eq(&untouched_buffer, &updated.postings[0].buffer));

@@ -16,11 +16,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task;
 use tracing::{debug, trace};
+use crate::serde::vector_id::VectorId;
 
 /// An upsert where we need to resolve the old vector data from storage.
 struct ResolvedUpsert {
     write: VectorWrite,
-    old: (u64, VectorDataValue),
+    old: (VectorId, VectorDataValue),
 }
 
 pub(crate) struct WriteVectors {
@@ -113,6 +114,7 @@ impl WriteVectors {
                         insert.external_id
                     ))
                 })?;
+            let centroid = VectorId::legacy_centroid_id(centroid);
             let vector_id = delta.add_vector(&insert.external_id, &insert.attributes);
             delta.add_to_posting(centroid, vector_id, insert.values.clone());
             for (attr_name, attr_value) in &insert.attributes {
@@ -137,6 +139,7 @@ impl WriteVectors {
                         upsert.write.external_id
                     ))
                 })?;
+            let centroid = VectorId::legacy_centroid_id(centroid);
             let (old_vector_id, _old_vector_data) = upsert.old;
             delta.delete_vector(old_vector_id);
             // todo: delete from old postings and inverted index
@@ -192,13 +195,13 @@ impl WriteVectors {
 
 struct VerifiedVectorReassignment {
     reassignment: ReassignVector,
-    centroid: u64,
+    centroid: VectorId,
 }
 
 struct ResolvedVectorReassignment {
     reassignment: ReassignVector,
     data: VectorDataValue,
-    centroid: u64,
+    centroid: VectorId,
 }
 
 pub(crate) struct ReassignVectors {
@@ -248,6 +251,7 @@ impl ReassignVectors {
                     .search(&r.vector, 1)
                     .first()
                     .expect("no centroids");
+                let closest_centroid = VectorId::legacy_centroid_id(closest_centroid);
                 if closest_centroid == r.current_centroid {
                     None
                 } else {

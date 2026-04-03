@@ -130,7 +130,7 @@ impl ExhaustiveCentroidGraphInner {
         let mut scored = self.score_graph_centroids(query, exclude);
         scored.extend(include.iter().map(|entry| {
             (
-                entry.centroid_id,
+                entry.centroid_id.id(),
                 compute_distance(query, &entry.vector, self.distance_metric),
             )
         }));
@@ -154,7 +154,7 @@ impl ExhaustiveCentroidGraphInner {
             )));
         }
 
-        if self.centroid_to_idx.contains_key(&entry.centroid_id) {
+        if self.centroid_to_idx.contains_key(&entry.centroid_id.id()) {
             return Err(Error::InvalidInput(format!(
                 "Centroid {} already exists in graph",
                 entry.centroid_id
@@ -162,9 +162,9 @@ impl ExhaustiveCentroidGraphInner {
         }
 
         let idx = self.centroid_ids.len();
-        self.centroid_ids.push(entry.centroid_id);
+        self.centroid_ids.push(entry.centroid_id.id());
         self.centroid_vectors.extend_from_slice(&entry.vector);
-        self.centroid_to_idx.insert(entry.centroid_id, idx);
+        self.centroid_to_idx.insert(entry.centroid_id.id(), idx);
         Ok(())
     }
 
@@ -240,7 +240,7 @@ impl ExhaustiveCentroidGraphInner {
 
         for entry in include {
             let distance = compute_distance(query, &entry.vector, self.distance_metric);
-            Self::update_best_candidate(&mut best, entry.centroid_id, distance);
+            Self::update_best_candidate(&mut best, entry.centroid_id.id(), distance);
         }
 
         best.map(|(centroid_id, _)| centroid_id)
@@ -317,7 +317,7 @@ fn build_centroid_index(centroids: &[CentroidEntry]) -> Result<HashMap<u64, usiz
     let mut centroid_to_idx = HashMap::with_capacity(centroids.len());
 
     for (idx, centroid) in centroids.iter().enumerate() {
-        if centroid_to_idx.insert(centroid.centroid_id, idx).is_some() {
+        if centroid_to_idx.insert(centroid.centroid_id.id(), idx).is_some() {
             return Err(Error::InvalidInput(format!(
                 "Duplicate centroid id: {}",
                 centroid.centroid_id
@@ -333,7 +333,7 @@ fn flatten_centroids(centroids: &[CentroidEntry], dimensions: usize) -> (Vec<u64
     let mut centroid_vectors = Vec::with_capacity(centroids.len() * dimensions);
 
     for centroid in centroids {
-        centroid_ids.push(centroid.centroid_id);
+        centroid_ids.push(centroid.centroid_id.id());
         centroid_vectors.extend_from_slice(&centroid.vector);
     }
 

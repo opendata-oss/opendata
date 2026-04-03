@@ -113,9 +113,9 @@ impl UsearchCentroidGraph {
             index
                 .add(key, &centroid.vector)
                 .map_err(|e| Error::Internal(e.to_string()))?;
-            key_to_centroid.insert(key, centroid.centroid_id);
-            centroid_to_key.insert(centroid.centroid_id, key);
-            centroid_vectors.insert(centroid.centroid_id, centroid.vector.clone());
+            key_to_centroid.insert(key, centroid.centroid_id.id());
+            centroid_to_key.insert(centroid.centroid_id.id(), key);
+            centroid_vectors.insert(centroid.centroid_id.id(), centroid.vector.clone());
         }
 
         let next_key = centroids.len() as u64;
@@ -242,7 +242,7 @@ impl UsearchCentroidGraphInner {
         // Compute distances for include centroids (not in the graph)
         for entry in include {
             let dist = self.compute_distance(query, &entry.vector);
-            candidates.push((entry.centroid_id, dist));
+            candidates.push((entry.centroid_id.id(), dist));
         }
 
         // Sort by distance ascending and take top k
@@ -267,10 +267,10 @@ impl UsearchCentroidGraphInner {
             .add(key, &entry.vector)
             .map_err(|e| Error::Internal(e.to_string()))?;
 
-        self.key_to_centroid.insert(key, entry.centroid_id);
-        self.centroid_to_key.insert(entry.centroid_id, key);
+        self.key_to_centroid.insert(key, entry.centroid_id.id());
+        self.centroid_to_key.insert(entry.centroid_id.id(), key);
         self.centroid_vectors
-            .insert(entry.centroid_id, entry.vector.clone());
+            .insert(entry.centroid_id.id(), entry.vector.clone());
 
         Ok(())
     }

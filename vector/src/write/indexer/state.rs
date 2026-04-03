@@ -17,6 +17,7 @@ use futures::future::BoxFuture;
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use crate::serde::vector_id::VectorId;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CentroidChunkManager {
@@ -70,8 +71,8 @@ impl CentroidChunkManager {
 
 /// In-memory preserved state of vector index
 pub(crate) struct VectorIndexState {
-    dictionary: HashMap<String, u64>,
-    centroid_counts: HashMap<u64, u64>,
+    dictionary: HashMap<String, VectorId>,
+    centroid_counts: HashMap<VectorId, u64>,
     centroid_graph: Arc<dyn CentroidGraph>,
     sequence_block_key: Bytes,
     sequence_block: AllocatedSeqBlock,
@@ -80,8 +81,8 @@ pub(crate) struct VectorIndexState {
 
 impl VectorIndexState {
     pub(crate) fn new(
-        dictionary: HashMap<String, u64>,
-        centroid_counts: HashMap<u64, u64>,
+        dictionary: HashMap<String, VectorId>,
+        centroid_counts: HashMap<VectorId, u64>,
         centroid_graph: Arc<dyn CentroidGraph>,
         sequence_block_key: Bytes,
         sequence_block: AllocatedSeqBlock,
@@ -97,26 +98,26 @@ impl VectorIndexState {
         }
     }
 
-    fn dictionary(&self) -> &HashMap<String, u64> {
+    fn dictionary(&self) -> &HashMap<String, VectorId> {
         &self.dictionary
     }
 
-    fn centroid_counts(&self) -> &HashMap<u64, u64> {
+    fn centroid_counts(&self) -> &HashMap<VectorId, u64> {
         &self.centroid_counts
     }
 }
 
 pub(crate) struct VectorIndexDelta {
-    new_centroids: HashMap<u64, CentroidEntry>,
-    deleted_centroids: HashSet<u64>,
-    centroid_count_deltas: HashMap<u64, i64>,
-    posting_updates: HashMap<u64, Vec<PostingUpdate>>,
+    new_centroids: HashMap<VectorId, CentroidEntry>,
+    deleted_centroids: HashSet<VectorId>,
+    centroid_count_deltas: HashMap<VectorId, i64>,
+    posting_updates: HashMap<VectorId, Vec<PostingUpdate>>,
     inverted_index_updates: HashMap<Bytes, RoaringTreemap>,
-    dictionary_updates: HashMap<String, u64>,
-    vector_updates: HashMap<u64, VectorDataValue>,
-    vector_deletes: HashSet<u64>,
+    dictionary_updates: HashMap<String, VectorId>,
+    vector_updates: HashMap<VectorId, VectorDataValue>,
+    vector_deletes: HashSet<VectorId>,
     id_allocator: SequenceAllocator,
-    current_posting: HashMap<u64, u64>,
+    current_posting: HashMap<VectorId, VectorId>,
     ops: Vec<RecordOp>,
 }
 
@@ -144,11 +145,12 @@ impl VectorIndexDelta {
         &mut self,
         external_id: &str,
         attributes: &[(String, AttributeValue)],
-    ) -> u64 {
+    ) -> VectorId {
         let (vector_id, seq_alloc_put) = self.id_allocator.allocate_one();
         if let Some(seq_alloc_put) = seq_alloc_put {
             self.ops.push(RecordOp::Put(seq_alloc_put.into()));
         }
+        let vector_id = VectorId::data_vector_id(vector_id);
         let fields: Vec<Field> = attributes
             .iter()
             .map(|(name, value)| Field::new(name, value.clone().into()))
@@ -160,7 +162,7 @@ impl VectorIndexDelta {
         vector_id
     }
 
-    pub(crate) fn delete_vector(&mut self, vector_id: u64) {
+    pub(crate) fn delete_vector(&mut self, vector_id: VectorId) {
         self.vector_deletes.insert(vector_id);
     }
 
@@ -170,12 +172,12 @@ impl VectorIndexDelta {
             self.ops.push(RecordOp::Put(seq_alloc_put.into()));
         }
         let centroid = CentroidEntry::new(id, vector);
-        self.centroid_count_deltas.insert(id, 0);
-        self.new_centroids.insert(id, centroid.clone());
+        self.centroid_count_deltas.insert(centroid.centroid_id, 0);
+        self.new_centroids.insert(centroid.centroid_id, centroid.clone());
         centroid
     }
 
-    pub(crate) fn delete_centroids(&mut self, centroids: Vec<u64>) {
+    pub(crate) fn delete_centroids(&mut self, centroids: Vec<VectorId>) {
         for c in &centroids {
             self.centroid_count_deltas.remove(c);
             self.new_centroids.remove(c);
@@ -183,7 +185,7 @@ impl VectorIndexDelta {
         self.deleted_centroids.extend(centroids);
     }
 
-    pub(crate) fn add_to_posting(&mut self, centroid_id: u64, vector_id: u64, vector: Vec<f32>) {
+    pub(crate) fn add_to_posting(&mut self, centroid_id: VectorId, vector_id: VectorId, vector: Vec<f32>) {
         self.current_posting.insert(vector_id, centroid_id);
         self.posting_updates
             .entry(centroid_id)
@@ -193,7 +195,7 @@ impl VectorIndexDelta {
         *c += 1;
     }
 
-    pub(crate) fn remove_from_posting(&mut self, centroid_id: u64, vector_id: u64) {
+    pub(crate) fn remove_from_posting(&mut self, centroid_id: VectorId, vector_id: VectorId) {
         if self.current_posting.get(&vector_id).cloned() == Some(centroid_id) {
             self.current_posting.remove(&vector_id);
         }
@@ -209,14 +211,14 @@ impl VectorIndexDelta {
         &mut self,
         field_name: String,
         field_value: FieldValue,
-        vector_id: u64,
+        vector_id: VectorId,
     ) {
         let key = crate::serde::key::MetadataIndexKey::new(field_name, field_value).encode();
         #[allow(clippy::unwrap_or_default)]
         self.inverted_index_updates
             .entry(key)
             .or_insert_with(RoaringTreemap::new)
-            .insert(vector_id);
+            .insert(vector_id.id());
     }
 
     pub(crate) fn freeze(self, state: &mut VectorIndexState) -> Vec<RecordOp> {
@@ -253,7 +255,7 @@ impl VectorIndexDelta {
         // Delete centroids from graph before adding new ones so new centroids
         // are not connected to deleted centroids.
         for &centroid_id in &deleted_centroids {
-            let _ = state.centroid_graph.remove_centroid(centroid_id);
+            let _ = state.centroid_graph.remove_centroid(centroid_id.id());
         }
         for entry in new_centroids.values() {
             let _ = state.centroid_graph.add_centroid(entry);
@@ -299,7 +301,7 @@ impl VectorIndexDelta {
         // Centroid stats deltas (skip deleted centroids)
         for (&centroid_id, &delta) in &centroid_count_deltas {
             if !deleted_centroids.contains(&centroid_id) && delta != 0 {
-                ops.push(record::merge_centroid_stats(0, centroid_id, delta as i32));
+                ops.push(record::merge_centroid_stats(centroid_id, delta as i32));
             }
         }
 
@@ -314,7 +316,7 @@ impl VectorIndexDelta {
         if !deleted_centroids.is_empty() {
             let bitmap = deleted_centroids
                 .iter()
-                .copied()
+                .map(|c| c.id())
                 .collect::<RoaringTreemap>();
             let op = record::merge_deleted_vectors(bitmap)
                 .expect("failure to construct deleted vectors row");
@@ -325,7 +327,7 @@ impl VectorIndexDelta {
         for &centroid_id in &deleted_centroids {
             let posting_key = PostingListKey::new(centroid_id).encode();
             ops.push(RecordOp::Delete(posting_key));
-            let stats_key = crate::serde::key::CentroidStatsKey::new(0, centroid_id).encode();
+            let stats_key = crate::serde::key::CentroidStatsKey::new(centroid_id).encode();
             ops.push(RecordOp::Delete(stats_key));
         }
 
@@ -352,7 +354,7 @@ impl<'a> VectorIndexView<'a> {
         }
     }
 
-    pub(crate) fn vector_id(&self, external_id: &str) -> Option<u64> {
+    pub(crate) fn vector_id(&self, external_id: &str) -> Option<VectorId> {
         if let Some(id) = self.delta.dictionary_updates.get(external_id) {
             return Some(*id);
         }
@@ -361,7 +363,7 @@ impl<'a> VectorIndexView<'a> {
 
     pub(crate) fn posting_list(
         &self,
-        centroid_id: u64,
+        centroid_id: VectorId,
         dimensions: usize,
     ) -> Result<BoxFuture<'static, Result<PostingList>>> {
         let mut all_postings = Vec::with_capacity(2);
@@ -377,7 +379,7 @@ impl<'a> VectorIndexView<'a> {
 
     pub(crate) fn vector_data(
         &self,
-        vector_id: u64,
+        vector_id: VectorId,
         dimensions: usize,
     ) -> BoxFuture<'static, Result<Option<VectorDataValue>>> {
         if self.delta.vector_deletes.contains(&vector_id) {
@@ -392,11 +394,11 @@ impl<'a> VectorIndexView<'a> {
     }
 
     /// The last written posting for the vector in this delta only
-    pub(crate) fn last_written_posting(&self, vector_id: u64) -> Option<u64> {
+    pub(crate) fn last_written_posting(&self, vector_id: VectorId) -> Option<VectorId> {
         self.delta.current_posting.get(&vector_id).cloned()
     }
 
-    pub(crate) fn centroid_counts(&self) -> HashMap<u64, u64> {
+    pub(crate) fn centroid_counts(&self) -> HashMap<VectorId, u64> {
         let mut counts = self.state.centroid_counts().clone();
         for (&k, &v) in self.delta.centroid_count_deltas.iter() {
             let base_count = counts.entry(k).or_insert(0);
@@ -408,14 +410,17 @@ impl<'a> VectorIndexView<'a> {
     pub(crate) fn centroid_graph(&self) -> Arc<DirtyCentroidGraph> {
         Arc::new(DirtyCentroidGraph {
             new_centroids: self.delta.new_centroids.clone(),
-            deleted_centroids: self.delta.deleted_centroids.clone(),
+            deleted_centroids: self.delta.deleted_centroids
+                .iter()
+                .map(|c| c.id())
+                .collect(),
             inner: self.state.centroid_graph.clone(),
         })
     }
 }
 
 pub(crate) struct DirtyCentroidGraph {
-    new_centroids: HashMap<u64, CentroidEntry>,
+    new_centroids: HashMap<VectorId, CentroidEntry>,
     deleted_centroids: HashSet<u64>,
     inner: Arc<dyn CentroidGraph>,
 }
@@ -427,15 +432,15 @@ impl DirtyCentroidGraph {
             .search_with_include_exclude(query, k, &include, &self.deleted_centroids)
     }
 
-    pub(crate) fn centroid(&self, centroid_id: u64) -> Option<CentroidEntry> {
-        if self.deleted_centroids.contains(&centroid_id) {
+    pub(crate) fn centroid(&self, centroid_id: VectorId) -> Option<CentroidEntry> {
+        if self.deleted_centroids.contains(&centroid_id.id()) {
             None
         } else if let Some(c) = self.new_centroids.get(&centroid_id) {
             Some(c.clone())
         } else {
             self.inner
-                .get_centroid_vector(centroid_id)
-                .map(|v| CentroidEntry::new(centroid_id, v))
+                .get_centroid_vector(centroid_id.id())
+                .map(|v| CentroidEntry::new(centroid_id.id(), v))
         }
     }
 }
@@ -468,7 +473,7 @@ mod tests {
         let allocator = SequenceAllocator::load(storage.as_ref(), seq_key)
             .await
             .unwrap();
-        let counts: HashMap<u64, u64> = centroids.iter().map(|c| (c.centroid_id, 0u64)).collect();
+        let counts: HashMap<VectorId, u64> = centroids.iter().map(|c| (c.centroid_id, 0u64)).collect();
         let graph = build_centroid_graph(centroids, DistanceMetric::L2).unwrap();
         let centroid_graph: Arc<dyn CentroidGraph> = Arc::from(graph);
         let (key, block) = allocator.freeze();
@@ -542,7 +547,7 @@ mod tests {
 
         // then
         assert_eq!(
-            state.centroid_graph.get_centroid_vector(entry.centroid_id),
+            state.centroid_graph.get_centroid_vector(entry.centroid_id.id()),
             Some(vec![1.0, 0.0])
         );
         assert_eq!(*state.centroid_counts().get(&entry.centroid_id).unwrap(), 0);
@@ -566,7 +571,7 @@ mod tests {
         storage.apply(delta.freeze(&mut state)).await.unwrap();
         // verify stats exist before deletion
         let stats = storage
-            .get_centroid_stats(0, entry.centroid_id)
+            .get_centroid_stats(entry.centroid_id)
             .await
             .unwrap();
         assert_eq!(stats.num_vectors, 1);
@@ -580,14 +585,14 @@ mod tests {
         assert!(
             state
                 .centroid_graph
-                .get_centroid_vector(entry.centroid_id)
+                .get_centroid_vector(entry.centroid_id.id())
                 .is_none()
         );
         assert!(!state.centroid_counts().contains_key(&entry.centroid_id));
         let deletions = storage.get_deleted_vectors().await.unwrap();
-        assert!(deletions.contains(entry.centroid_id));
+        assert!(deletions.contains(entry.centroid_id.id()));
         let stats = storage
-            .get_centroid_stats(0, entry.centroid_id)
+            .get_centroid_stats(entry.centroid_id)
             .await
             .unwrap();
         assert_eq!(stats.num_vectors, 0, "centroid stats should be deleted");
@@ -607,7 +612,7 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut delta = VectorIndexDelta::new(&state);
 
-        delta.add_to_posting(1000, 10, vec![1.0, 0.0]);
+        delta.add_to_posting(VectorId::legacy_centroid_id(1000), VectorId::data_vector_id(10), vec![1.0, 0.0]);
         delta.add_to_posting(1000, 11, vec![0.0, 1.0]);
         storage.apply(delta.freeze(&mut state)).await.unwrap();
 

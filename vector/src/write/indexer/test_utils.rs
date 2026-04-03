@@ -11,6 +11,7 @@ use common::storage::in_memory::InMemoryStorage;
 use common::{SequenceAllocator, Storage, StorageRead};
 use std::collections::HashMap;
 use std::sync::Arc;
+use crate::serde::vector_id::VectorId;
 
 pub struct IndexerOpTestHarness {
     pub storage: Arc<dyn Storage>,
@@ -36,7 +37,7 @@ impl IndexerOpTestHarness {
         let allocator = SequenceAllocator::load(storage.as_ref(), seq_key)
             .await
             .unwrap();
-        let centroid_counts: HashMap<u64, u64> =
+        let centroid_counts: HashMap<VectorId, u64> =
             centroids.iter().map(|c| (c.centroid_id, 0u64)).collect();
         let graph = build_centroid_graph(centroids, DistanceMetric::L2).unwrap();
         let centroid_graph: Arc<dyn crate::hnsw::CentroidGraph> = Arc::from(graph);

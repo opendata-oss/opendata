@@ -15,17 +15,19 @@
 
 use super::{Decode, Encode, EncodingError, decode_array, encode_array};
 use bytes::{BufMut, Bytes, BytesMut};
+use crate::serde::vector_id::{VectorId, ROOT_VECTOR_ID};
 
 /// Per-centroid metadata value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CentroidInfoValue {
     pub level: u8,
     pub vector: Vec<f32>,
-    pub parent_vector_id: Option<u64>,
+    pub parent_vector_id: VectorId,
 }
 
 impl CentroidInfoValue {
-    pub fn new(level: u8, vector: Vec<f32>, parent_vector_id: Option<u64>) -> Self {
+    pub fn new(level: u8, vector: Vec<f32>, parent_vector_id: VectorId) -> Self {
+        assert!(parent_vector_id.level() == level + 1 || parent_vector_id == ROOT_VECTOR_ID);
         Self {
             level,
             vector,
@@ -49,13 +51,7 @@ impl Encode for CentroidInfoValue {
     fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(self.level);
         encode_array(&self.vector, buf);
-        match self.parent_vector_id {
-            Some(parent_vector_id) => {
-                buf.put_u8(1);
-                buf.put_u64_le(parent_vector_id);
-            }
-            None => buf.put_u8(0),
-        }
+        self.parent_vector_id.encode(buf);
     }
 }
 
@@ -83,36 +79,8 @@ impl Decode for CentroidInfoValue {
                 ),
             });
         }
-        let has_parent = buf[0];
         *buf = &buf[1..];
-
-        let parent_vector_id = match has_parent {
-            0 => None,
-            1 => {
-                if buf.len() < 8 {
-                    return Err(EncodingError {
-                        message: format!(
-                            "Buffer too short for CentroidInfoValue parent_vector_id: expected 8 bytes, got {}",
-                            buf.len()
-                        ),
-                    });
-                }
-                let parent_vector_id = u64::from_le_bytes([
-                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-                ]);
-                *buf = &buf[8..];
-                Some(parent_vector_id)
-            }
-            _ => {
-                return Err(EncodingError {
-                    message: format!(
-                        "Invalid CentroidInfoValue parent flag: expected 0 or 1, got {}",
-                        has_parent
-                    ),
-                });
-            }
-        };
-
+        let parent_vector_id = VectorId::decode(buf)?;
         Ok(Self {
             level,
             vector,
@@ -128,7 +96,7 @@ mod tests {
     #[test]
     fn should_encode_and_decode_centroid_info_with_parent() {
         // given
-        let value = CentroidInfoValue::new(2, vec![1.0, 2.0, 3.0], Some(99));
+        let value = CentroidInfoValue::new(2, vec![1.0, 2.0, 3.0], VectorId::centroid_id(1, 123));
 
         // when
         let encoded = value.encode_to_bytes();
@@ -139,9 +107,9 @@ mod tests {
     }
 
     #[test]
-    fn should_encode_and_decode_centroid_info_without_parent() {
+    fn should_encode_and_decode_centroid_info_with_root_parent() {
         // given
-        let value = CentroidInfoValue::new(3, vec![4.0, 5.0], None);
+        let value = CentroidInfoValue::new(3, vec![4.0, 5.0], ROOT_VECTOR_ID);
 
         // when
         let encoded = value.encode_to_bytes();
@@ -154,7 +122,7 @@ mod tests {
     #[test]
     fn should_encode_and_decode_high_dimensional_centroid_info() {
         // given
-        let value = CentroidInfoValue::new(7, vec![0.0, 1.0, 2.0, 3.0, 4.0], Some(10));
+        let value = CentroidInfoValue::new(7, vec![0.0, 1.0, 2.0, 3.0, 4.0], ROOT_VECTOR_ID);
 
         // when
         let encoded = value.encode_to_bytes();

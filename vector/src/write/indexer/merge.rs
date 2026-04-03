@@ -7,9 +7,10 @@ use crate::write::indexer::state::{VectorIndexDelta, VectorIndexState, VectorInd
 use common::StorageRead;
 use futures::future::BoxFuture;
 use std::sync::Arc;
+use crate::serde::vector_id::VectorId;
 
 struct MergeCentroid {
-    c: u64,
+    c: VectorId,
     postings: PostingList,
 }
 

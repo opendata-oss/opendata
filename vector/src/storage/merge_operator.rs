@@ -150,6 +150,7 @@ mod tests {
     use crate::serde::posting_list::{PostingListValue, PostingUpdate};
     use common::storage::MergeOperator;
     use rstest::rstest;
+    use crate::serde::vector_id::VectorId;
 
     /// Helper to create a test key for Deletions
     fn create_deletions_key() -> Bytes {
@@ -158,7 +159,7 @@ mod tests {
 
     /// Helper to create a test key for PostingList
     fn create_posting_list_key() -> Bytes {
-        PostingListKey::new(1).encode()
+        PostingListKey::new(VectorId::data_vector_id(1)).encode()
     }
 
     /// Helper to create a test key for MetadataIndex
@@ -355,12 +356,12 @@ mod tests {
         let operator = VectorDbMergeOperator::new(2);
         let key = create_posting_list_key();
 
-        let existing_postings = vec![PostingUpdate::append(1, vec![1.0, 2.0])];
+        let existing_postings = vec![PostingUpdate::append(VectorId::data_vector_id(1), vec![1.0, 2.0])];
         let existing_value = PostingListValue::from_posting_updates(existing_postings)
             .expect("unexpected error creating posting updates")
             .encode_to_bytes();
 
-        let new_postings = vec![PostingUpdate::append(2, vec![3.0, 4.0])];
+        let new_postings = vec![PostingUpdate::append(VectorId::data_vector_id(2), vec![3.0, 4.0])];
         let new_value = PostingListValue::from_posting_updates(new_postings)
             .expect("unexpected error creating posting updates")
             .encode_to_bytes();
@@ -402,7 +403,7 @@ mod tests {
     ) {
         // given
         let operator = VectorDbMergeOperator::new(3);
-        let key = CentroidStatsKey::new(0, 1).encode();
+        let key = CentroidStatsKey::new(VectorId::centroid_id(1, 1)).encode();
         let existing_value = CentroidStatsValue::new(existing_count).encode_to_bytes();
         let new_value = CentroidStatsValue::new(new_count).encode_to_bytes();
 
@@ -452,7 +453,7 @@ mod tests {
     fn should_route_merge_batch_centroid_stats() {
         // given
         let operator = VectorDbMergeOperator::new(3);
-        let key = CentroidStatsKey::new(0, 1).encode();
+        let key = CentroidStatsKey::new(VectorId::centroid_id(1, 1)).encode();
         let existing = CentroidStatsValue::new(10).encode_to_bytes();
         let op0 = CentroidStatsValue::new(5).encode_to_bytes();
         let op1 = CentroidStatsValue::new(-3).encode_to_bytes();

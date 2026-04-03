@@ -2,11 +2,12 @@
 //!
 //! All keys use big-endian encoding for lexicographic ordering.
 
-use super::{EncodingError, FieldValue, KEY_VERSION, RecordKey, RecordType, SUBSYSTEM};
+use super::{EncodingError, FieldValue, KEY_VERSION, RecordKey, RecordType, SUBSYSTEM, Encode, Decode};
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
 use common::serde::key_prefix::KeyPrefix;
 use common::serde::terminated_bytes;
+use crate::serde::vector_id::VectorId;
 
 /// CollectionMeta key - singleton record storing collection schema.
 ///
@@ -160,7 +161,7 @@ impl CentroidChunkKey {
 /// Key layout: `[subsystem | version | tag | centroid_id:u64-BE]` (11 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostingListKey {
-    pub centroid_id: u64,
+    pub centroid_id: VectorId,
 }
 
 impl RecordKey for PostingListKey {
@@ -168,14 +169,15 @@ impl RecordKey for PostingListKey {
 }
 
 impl PostingListKey {
-    pub fn new(centroid_id: u64) -> Self {
+    pub fn new(centroid_id: VectorId) -> Self {
+        assert!(centroid_id.is_centroid() || centroid_id.is_root());
         Self { centroid_id }
     }
 
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(11);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
-        buf.put_u64(self.centroid_id); // Big-endian
+        self.centroid_id.encode(&mut buf);
         buf.freeze()
     }
 
@@ -186,9 +188,8 @@ impl PostingListKey {
             });
         }
         validate_key_prefix::<Self>(buf)?;
-        let centroid_id = u64::from_be_bytes([
-            buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10],
-        ]);
+        let mut suffix = &buf[3..];
+        let centroid_id = VectorId::decode(&mut suffix)?;
         Ok(PostingListKey { centroid_id })
     }
 
@@ -274,7 +275,7 @@ impl IdDictionaryKey {
 /// Key layout: `[subsystem | version | tag | vector_id:u64-BE]` (11 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorDataKey {
-    pub vector_id: u64,
+    pub vector_id: VectorId,
 }
 
 impl RecordKey for VectorDataKey {
@@ -282,14 +283,15 @@ impl RecordKey for VectorDataKey {
 }
 
 impl VectorDataKey {
-    pub fn new(vector_id: u64) -> Self {
+    pub fn new(vector_id: VectorId) -> Self {
+        assert!(vector_id.is_data_vector());
         Self { vector_id }
     }
 
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(11);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
-        buf.put_u64(self.vector_id); // Big-endian
+        self.vector_id.encode(&mut buf);
         buf.freeze()
     }
 
@@ -300,9 +302,7 @@ impl VectorDataKey {
             });
         }
         validate_key_prefix::<Self>(buf)?;
-        let vector_id = u64::from_be_bytes([
-            buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10],
-        ]);
+        let vector_id = VectorId::decode(&mut &buf[3..])?;
         Ok(VectorDataKey { vector_id })
     }
 
@@ -444,8 +444,7 @@ impl CentroidSeqBlockKey {
 /// Key layout: `[subsystem | version | tag | level:u8 | centroid_id:u64-BE]` (12 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CentroidStatsKey {
-    pub level: u8,
-    pub centroid_id: u64,
+    pub centroid_id: VectorId,
 }
 
 impl RecordKey for CentroidStatsKey {
@@ -453,15 +452,15 @@ impl RecordKey for CentroidStatsKey {
 }
 
 impl CentroidStatsKey {
-    pub fn new(level: u8, centroid_id: u64) -> Self {
-        Self { level, centroid_id }
+    pub fn new(centroid_id: VectorId) -> Self {
+        assert!(centroid_id.is_centroid());
+        Self { centroid_id }
     }
 
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(12);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
-        buf.put_u8(self.level);
-        buf.put_u64(self.centroid_id); // Big-endian
+        self.centroid_id.encode(&mut buf);
         buf.freeze()
     }
 
@@ -472,11 +471,8 @@ impl CentroidStatsKey {
             });
         }
         validate_key_prefix::<Self>(buf)?;
-        let level = buf[3];
-        let centroid_id = u64::from_be_bytes([
-            buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
-        ]);
-        Ok(CentroidStatsKey { level, centroid_id })
+        let centroid_id = VectorId::decode(&mut &buf[3..])?;
+        Ok(CentroidStatsKey { centroid_id })
     }
 }
 
@@ -485,7 +481,7 @@ impl CentroidStatsKey {
 /// Key layout: `[subsystem | version | tag | centroid_id:u64-BE]` (11 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CentroidInfoKey {
-    pub centroid_id: u64,
+    pub centroid_id: VectorId,
 }
 
 impl RecordKey for CentroidInfoKey {
@@ -493,14 +489,15 @@ impl RecordKey for CentroidInfoKey {
 }
 
 impl CentroidInfoKey {
-    pub fn new(centroid_id: u64) -> Self {
+    pub fn new(centroid_id: VectorId) -> Self {
+        assert!(centroid_id.is_centroid());
         Self { centroid_id }
     }
 
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(11);
         Self::RECORD_TYPE.prefix().write_to(&mut buf);
-        buf.put_u64(self.centroid_id);
+        self.centroid_id.encode(&mut buf);
         buf.freeze()
     }
 
@@ -511,9 +508,7 @@ impl CentroidInfoKey {
             });
         }
         validate_key_prefix::<Self>(buf)?;
-        let centroid_id = u64::from_be_bytes([
-            buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10],
-        ]);
+        let centroid_id = VectorId::decode(&mut &buf[3..])?;
         Ok(CentroidInfoKey { centroid_id })
     }
 
@@ -595,7 +590,7 @@ mod tests {
     #[test]
     fn should_encode_and_decode_posting_list_key() {
         // given
-        let key = PostingListKey::new(123);
+        let key = PostingListKey::new(VectorId::centroid_id(1, 123));
 
         // when
         let encoded = key.encode();
@@ -665,7 +660,7 @@ mod tests {
     #[test]
     fn should_encode_and_decode_vector_data_key() {
         // given
-        let key = VectorDataKey::new(0xDEADBEEF_CAFEBABE);
+        let key = VectorDataKey::new(VectorId::data_vector_id(0x00DEADBEEF_CAFEBA));
 
         // when
         let encoded = key.encode();
@@ -679,9 +674,9 @@ mod tests {
     #[test]
     fn should_preserve_vector_data_key_ordering() {
         // given
-        let key1 = VectorDataKey::new(1);
-        let key2 = VectorDataKey::new(2);
-        let key3 = VectorDataKey::new(u64::MAX);
+        let key1 = VectorDataKey::new(VectorId::data_vector_id(1));
+        let key2 = VectorDataKey::new(VectorId::data_vector_id(2));
+        let key3 = VectorDataKey::new(VectorId::data_vector_id(0x00FF_FFFF_FFFF_FFFF));
 
         // when
         let encoded1 = key1.encode();
@@ -824,7 +819,7 @@ mod tests {
     #[test]
     fn should_encode_and_decode_centroid_stats_key() {
         // given
-        let key = CentroidStatsKey::new(3, 42);
+        let key = CentroidStatsKey::new(VectorId::centroid_id(3, 42));
 
         // when
         let encoded = key.encode();
@@ -838,9 +833,9 @@ mod tests {
     #[test]
     fn should_preserve_centroid_stats_key_ordering() {
         // given
-        let key1 = CentroidStatsKey::new(0, 1);
-        let key2 = CentroidStatsKey::new(0, 2);
-        let key3 = CentroidStatsKey::new(1, 1);
+        let key1 = CentroidStatsKey::new(VectorId::centroid_id(1, 1));
+        let key2 = CentroidStatsKey::new(VectorId::centroid_id(1, 2));
+        let key3 = CentroidStatsKey::new(VectorId::centroid_id(2, 1));
 
         // when
         let encoded1 = key1.encode();
@@ -855,7 +850,7 @@ mod tests {
     #[test]
     fn should_encode_and_decode_centroid_info_key() {
         // given
-        let key = CentroidInfoKey::new(42);
+        let key = CentroidInfoKey::new(VectorId::centroid_id(1, 123));
 
         // when
         let encoded = key.encode();
@@ -869,9 +864,9 @@ mod tests {
     #[test]
     fn should_preserve_centroid_info_key_ordering() {
         // given
-        let key1 = CentroidInfoKey::new(1);
-        let key2 = CentroidInfoKey::new(2);
-        let key3 = CentroidInfoKey::new(u64::MAX);
+        let key1 = CentroidInfoKey::new(VectorId::centroid_id(1, 1));
+        let key2 = CentroidInfoKey::new(VectorId::centroid_id(1, 2));
+        let key3 = CentroidInfoKey::new(VectorId::centroid_id(1, 0x00FF_FFFF_FFFF_FFFF));
 
         // when
         let encoded1 = key1.encode();

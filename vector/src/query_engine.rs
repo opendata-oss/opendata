@@ -14,6 +14,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 use tracing::debug;
+use crate::serde::vector_id::VectorId;
 
 /// The subset of configuration needed by the query engine.
 #[derive(Debug, Clone)]
@@ -99,7 +100,7 @@ impl QueryEngine {
 
         // Brute-force: compute distance from query to every live centroid
         let centroid_candidates = self.search_centroids(&query.vector, usize::MAX).await?;
-        let centroid_ids: Vec<u64> = centroid_candidates
+        let centroid_ids: Vec<VectorId> = centroid_candidates
             .iter()
             .take(nprobe)
             .map(|posting| posting.id())
@@ -197,7 +198,7 @@ impl QueryEngine {
     ///
     /// Returns the pruned centroid IDs. If pruning is disabled (`None`), returns
     /// the input unchanged.
-    pub(crate) fn prune_centroids(&self, centroid_ids: &[Posting], query: &[f32]) -> Vec<u64> {
+    pub(crate) fn prune_centroids(&self, centroid_ids: &[Posting], query: &[f32]) -> Vec<VectorId> {
         let epsilon = match self.options.query_pruning_factor {
             Some(e) => e,
             None => return centroid_ids.iter().map(|posting| posting.id()).collect(),
@@ -206,7 +207,7 @@ impl QueryEngine {
         let metric = self.options.distance_metric;
 
         // Compute raw distance (lower = closer) from query to each centroid.
-        let mut scored: Vec<(u64, f32)> = centroid_ids
+        let mut scored: Vec<(VectorId, f32)> = centroid_ids
             .iter()
             .map(|posting| {
                 (
@@ -249,7 +250,7 @@ impl QueryEngine {
     /// against the query vector. Returns per-centroid sorted candidate lists.
     async fn load_and_score(
         &self,
-        centroid_ids: &[u64],
+        centroid_ids: &[VectorId],
         query: &[f32],
     ) -> Result<Vec<Vec<ScoredCandidate>>> {
         let dimensions = self.options.dimensions as usize;
@@ -392,7 +393,7 @@ impl QueryEngine {
         let mut candidates = RoaringTreemap::new();
         for list in sorted_lists.iter() {
             for candidate in list {
-                candidates.insert(candidate.internal_id);
+                candidates.insert(candidate.internal_id.id());
             }
         }
 
@@ -401,7 +402,7 @@ impl QueryEngine {
 
         // Filter each list
         for list in sorted_lists.iter_mut() {
-            list.retain(|c| allowed.contains(c.internal_id));
+            list.retain(|c| allowed.contains(c.internal_id.id()));
         }
 
         Ok(())
@@ -466,7 +467,7 @@ impl QueryEngine {
 }
 
 struct ScoredCandidate {
-    internal_id: u64,
+    internal_id: VectorId,
     distance: distance::VectorDistance,
 }
 

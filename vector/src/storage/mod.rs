@@ -3,11 +3,12 @@ use common::{BytesRange, StorageRead};
 
 use crate::error::{Error, Result};
 use std::ops::Bound::Included;
-
+use bytes::{BufMut, BytesMut};
 use crate::serde::centroid_chunk::CentroidChunkValue;
 use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::centroids::CentroidsValue;
+use crate::serde::Decode;
 use crate::serde::deletions::DeletionsValue;
 use crate::serde::key::{
     CentroidChunkKey, CentroidInfoKey, CentroidStatsKey, CentroidsKey, DeletionsKey,
@@ -16,6 +17,7 @@ use crate::serde::key::{
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::PostingListValue;
 use crate::serde::vector_data::VectorDataValue;
+use crate::serde::vector_id::{VectorId, ROOT_VECTOR_ID};
 
 pub(crate) mod merge_operator;
 pub(crate) mod record;
@@ -39,18 +41,13 @@ pub(crate) struct CentroidScanResult {
 #[async_trait]
 pub(crate) trait VectorDbStorageReadExt: StorageRead {
     /// Look up internal ID from external ID in the ID dictionary.
-    #[allow(dead_code)]
-    async fn lookup_internal_id(&self, external_id: &str) -> Result<Option<u64>> {
+    async fn lookup_internal_id(&self, external_id: &str) -> Result<Option<VectorId>> {
         let key = IdDictionaryKey::new(external_id).encode();
         let record = self.get(key).await?;
         match record {
             Some(record) => {
                 let mut slice = record.value.as_ref();
-                let internal_id = common::serde::encoding::decode_u64(&mut slice).map_err(|e| {
-                    Error::Encoding(format!(
-                        "failed to decode internal ID from ID dictionary: {e}"
-                    ))
-                })?;
+                let internal_id = VectorId::decode(&mut slice)?;
                 Ok(Some(internal_id))
             }
             None => Ok(None),
@@ -60,10 +57,9 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     /// Load a vector's data by internal ID.
     ///
     /// Requires dimensions to decode the vector field.
-    #[allow(dead_code)]
     async fn get_vector_data(
         &self,
-        internal_id: u64,
+        internal_id: VectorId,
         dimensions: usize,
     ) -> Result<Option<VectorDataValue>> {
         let key = VectorDataKey::new(internal_id).encode();
@@ -78,7 +74,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     }
 
     async fn get_root_posting_list(&self, dimensions: usize) -> Result<PostingListValue> {
-        self.get_posting_list(0, dimensions).await
+        self.get_posting_list(ROOT_VECTOR_ID, dimensions).await
     }
 
     async fn get_centroids_meta(&self) -> Result<Option<CentroidsValue>> {
@@ -90,7 +86,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         }
     }
 
-    async fn get_centroid_info(&self, centroid_id: u64) -> Result<Option<CentroidInfoValue>> {
+    async fn get_centroid_info(&self, centroid_id: VectorId) -> Result<Option<CentroidInfoValue>> {
         let key = CentroidInfoKey::new(centroid_id).encode();
         let record = self.get(key).await?;
         match record {
@@ -104,11 +100,17 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     /// Requires dimensions to decode the embedded vector data.
     async fn get_posting_list(
         &self,
-        centroid_id: u64,
+        centroid_id: VectorId,
         dimensions: usize,
     ) -> Result<PostingListValue> {
         let key = PostingListKey::new(centroid_id).encode();
-        let key_next = PostingListKey::new(centroid_id + 1).encode();
+        // this is a hack to use a scan to read a single posting list to force slatedb to
+        // load the data from all underlying sorted runs in parallel
+        let mut key_next = BytesMut::with_capacity(key.len() + 1);
+        key_next.put(key.as_ref());
+        key_next.put_u8(0);
+        let key_next = key_next.freeze();
+        assert!(key < key_next);
         let record = self
             .scan(BytesRange::new(Included(key.clone()), Included(key_next)))
             .await?;
@@ -159,9 +161,8 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     /// Load centroid stats (vector count) for a centroid.
     ///
     /// Returns a zero count if no stats exist yet.
-    #[allow(dead_code)]
-    async fn get_centroid_stats(&self, level: u8, centroid_id: u64) -> Result<CentroidStatsValue> {
-        let key = CentroidStatsKey::new(level, centroid_id).encode();
+    async fn get_centroid_stats(&self, centroid_id: VectorId) -> Result<CentroidStatsValue> {
+        let key = CentroidStatsKey::new(centroid_id).encode();
         let record = self.get(key).await?;
         match record {
             Some(record) => {
@@ -178,7 +179,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     ///
     /// Returns a list of `(level, centroid_id)` to accumulated vector count.
     #[allow(dead_code)]
-    async fn scan_all_centroid_stats(&self) -> Result<Vec<((u8, u64), CentroidStatsValue)>> {
+    async fn scan_all_centroid_stats(&self) -> Result<Vec<(VectorId, CentroidStatsValue)>> {
         let mut prefix_buf = bytes::BytesMut::with_capacity(3);
         crate::serde::RecordType::CentroidStats
             .prefix()
@@ -194,13 +195,13 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
             let value = CentroidStatsValue::decode_from_bytes(&record.value).map_err(|e| {
                 Error::Encoding(format!("failed to decode CentroidStatsValue: {e}"))
             })?;
-            stats.push(((key.level, key.centroid_id), value));
+            stats.push((key.centroid_id, value));
         }
 
         Ok(stats)
     }
 
-    async fn scan_all_centroid_info(&self) -> Result<Vec<(u64, CentroidInfoValue)>> {
+    async fn scan_all_centroid_info(&self) -> Result<Vec<(VectorId, CentroidInfoValue)>> {
         let mut prefix_buf = bytes::BytesMut::with_capacity(3);
         crate::serde::RecordType::CentroidInfo
             .prefix()
@@ -222,7 +223,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     async fn scan_all_posting_lists(
         &self,
         dimensions: usize,
-    ) -> Result<Vec<(u64, PostingListValue)>> {
+    ) -> Result<Vec<(VectorId, PostingListValue)>> {
         let mut prefix_buf = bytes::BytesMut::with_capacity(3);
         crate::serde::RecordType::PostingList
             .prefix()
@@ -329,11 +330,11 @@ mod tests {
         ];
 
         // when - write
-        let op = record::put_vector_data(42, "vec-1", &attributes);
+        let op = record::put_vector_data(VectorId::data_vector_id(42), "vec-1", &attributes);
         storage.apply(vec![op]).await.unwrap();
 
         // then - read
-        let result = storage.get_vector_data(42, 3).await.unwrap();
+        let result = storage.get_vector_data(VectorId::data_vector_id(42), 3).await.unwrap();
         assert!(result.is_some());
         let data = result.unwrap();
         assert_eq!(data.vector_field(), values.as_slice());
@@ -346,9 +347,10 @@ mod tests {
     async fn should_read_empty_posting_list_when_not_exists() {
         // given
         let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let centroid_id = VectorId::centroid_id(1, 1);
 
         // when
-        let result = storage.get_posting_list(1, 3).await.unwrap();
+        let result = storage.get_posting_list(centroid_id, 3).await.unwrap();
 
         // then
         assert!(result.is_empty());
@@ -372,7 +374,7 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
 
         // when - write
-        let op = record::put_id_dictionary("vec-1", 42);
+        let op = record::put_id_dictionary("vec-1", VectorId::data_vector_id(42));
         storage.apply(vec![op]).await.unwrap();
 
         // then - read using IdDictionary directly
@@ -387,20 +389,21 @@ mod tests {
         let merge_op = Arc::new(VectorDbMergeOperator::new(3));
         let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::with_merge_operator(merge_op));
         let postings = vec![
-            PostingUpdate::append(1, vec![1.0, 2.0, 3.0]),
-            PostingUpdate::append(2, vec![4.0, 5.0, 6.0]),
+            PostingUpdate::append(VectorId::data_vector_id(1), vec![1.0, 2.0, 3.0]),
+            PostingUpdate::append(VectorId::data_vector_id(2), vec![4.0, 5.0, 6.0]),
         ];
+        let centroid_id = VectorId::centroid_id(1, 1);
 
         // when - write
-        let op = record::merge_posting_list(1, postings).unwrap();
+        let op = record::merge_posting_list(centroid_id, postings).unwrap();
         storage.apply(vec![op]).await.unwrap();
 
         // then - read
-        let result = storage.get_posting_list(1, 3).await.unwrap();
+        let result = storage.get_posting_list(centroid_id, 3).await.unwrap();
         let result: PostingList = result.into();
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].id(), 1);
-        assert_eq!(result[1].id(), 2);
+        assert_eq!(result[0].id(), VectorId::data_vector_id(1));
+        assert_eq!(result[1].id(), VectorId::data_vector_id(2));
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@ use common::storage::RecordOp;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::debug;
+use crate::serde::vector_id::VectorId;
 
 const INDEXING_ROUNDS: usize = 1;
 
@@ -55,8 +56,8 @@ impl Indexer {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         opts: IndexerOpts,
-        dictionary: HashMap<String, u64>,
-        centroid_counts: HashMap<u64, u64>,
+        dictionary: HashMap<String, VectorId>,
+        centroid_counts: HashMap<VectorId, u64>,
         centroid_graph: Arc<dyn CentroidGraph>,
         sequence_block_key: Bytes,
         sequence_block: AllocatedSeqBlock,
