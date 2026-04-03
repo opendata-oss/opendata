@@ -78,7 +78,7 @@ impl VectorDbReader {
             .into_iter()
             .filter_map(|(centroid_id, posting_list)| {
                 centroids.get(&centroid_id).and_then(|centroid| {
-                    if centroid.level > 0 {
+                    if centroid.level > 1 {
                         Some((
                             centroid_id,
                             Arc::new(PostingList::from_value(posting_list))
