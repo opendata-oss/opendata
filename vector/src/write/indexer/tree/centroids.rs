@@ -761,6 +761,10 @@ impl AllCentroidsCacheWriter {
         }
 
         for centroid_id in new_centroids {
+            if centroid_id.level() == LEAF_LEVEL {
+                // don't cache leaf level centroids
+                continue;
+            }
             assert!(centroid_id.is_centroid());
             inner.postings.insert(
                 *centroid_id,
@@ -772,6 +776,10 @@ impl AllCentroidsCacheWriter {
         }
 
         for (centroid_id, updates) in centroid_postings {
+            if centroid_id.level() == LEAF_LEVEL {
+                // don't cache leaf level centroids
+                continue;
+            }
             assert!(centroid_id.is_centroid());
             let posting_list = inner
                 .postings

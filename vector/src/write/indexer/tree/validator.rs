@@ -8,7 +8,7 @@ use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
-use crate::write::indexer::tree::centroids::{AllCentroidsCacheWriter, CentroidCache};
+use crate::write::indexer::tree::centroids::{AllCentroidsCacheWriter, CentroidCache, TreeDepth, TreeLevel, LEAF_LEVEL};
 use crate::write::indexer::tree::posting_list::{IntoTreePostingList, Posting, PostingList};
 use crate::write::indexer::tree::state::VectorIndexState;
 use bytes::Bytes;
@@ -94,7 +94,8 @@ fn validate_root(
     reachable_counts: &mut HashMap<(u8, VectorId), u64>,
 ) -> Result<()> {
     info!("validate root");
-    let root_level = centroids_meta.depth.saturating_sub(1);
+    let depth = TreeDepth::of(centroids_meta.depth);
+    let root_level = TreeLevel::root(depth);
     let mut root_children = HashSet::new();
     for posting in root_posting_list.iter() {
         if !root_children.insert(posting.id()) {
@@ -113,11 +114,12 @@ fn validate_root(
             posting.id(),
             centroid,
             posting.vector(),
-            root_level,
+            root_level.next_level_down(),
             ROOT_VECTOR_ID,
             reachable_centroids,
         )?;
         validate_centroid_subtree(
+            root_level.next_level_down(),
             posting.id(),
             centroid,
             centroid_info,
@@ -132,6 +134,7 @@ fn validate_root(
 }
 
 fn validate_centroid_subtree(
+    level: TreeLevel,
     centroid_id: VectorId,
     centroid: &CentroidInfoValue,
     centroid_info: &HashMap<VectorId, CentroidInfoValue>,
@@ -141,6 +144,7 @@ fn validate_centroid_subtree(
     reachable_counts: &mut HashMap<(u8, VectorId), u64>,
 ) -> Result<()> {
     info!("validate centroid {} subtree", centroid_id);
+    assert_eq!(level.level(), centroid_id.level());
     let posting_list = centroid_postings
         .get(&centroid_id)
         .cloned()
@@ -168,11 +172,11 @@ fn validate_centroid_subtree(
         )));
     }
 
-    if centroid.level == 0 {
+    if centroid.level == LEAF_LEVEL {
         return Ok(());
     }
 
-    let expected_child_level = centroid.level - 1;
+    let expected_child_level = level.next_level_down();
     let mut child_ids = HashSet::new();
     for child in posting_list.iter() {
         if !child_ids.insert(child.id()) {
@@ -200,6 +204,7 @@ fn validate_centroid_subtree(
             reachable_centroids,
         )?;
         validate_centroid_subtree(
+            expected_child_level,
             child.id(),
             child_info,
             centroid_info,
@@ -216,11 +221,11 @@ fn validate_centroid_reference(
     centroid_id: VectorId,
     centroid: &CentroidInfoValue,
     vector: &[f32],
-    expected_level: u8,
+    expected_level: TreeLevel,
     expected_parent: VectorId,
     reachable_centroids: &mut HashSet<VectorId>,
 ) -> Result<()> {
-    if centroid.level != expected_level {
+    if centroid.level != expected_level.level() {
         return Err(Error::Internal(format!(
             "centroid {} has level {}, expected {}",
             centroid_id, centroid.level, expected_level
@@ -360,6 +365,7 @@ fn validate_state_matches_storage(
 
         match centroid_cache.posting(centroid_id, u64::MAX) {
             Some(cached_posting) => {
+                assert!(centroid_id.level() > 1);
                 let cached_posting = cached_posting
                     .iter()
                     .map(|p| p.id())
@@ -377,10 +383,12 @@ fn validate_state_matches_storage(
             }
             None if storage_posting.is_empty() => {}
             None => {
-                return Err(Error::Internal(format!(
-                    "centroid cache is missing internal centroid {}/{}",
-                    centroid.level, centroid_id
-                )));
+                if centroid_id.level() > 1 {
+                    return Err(Error::Internal(format!(
+                        "centroid cache is missing internal centroid {}/{}",
+                        centroid.level, centroid_id
+                    )));
+                }
             }
         }
     }

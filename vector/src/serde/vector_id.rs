@@ -35,7 +35,6 @@ impl VectorId {
     pub fn data_vector_id(number: u64) -> Self {
         let vector_id = VectorId { id: number };
         assert_eq!(vector_id.level(), 0);
-        assert_ne!(vector_id.number(), ROOT_ID_NUM);
         vector_id
     }
 
