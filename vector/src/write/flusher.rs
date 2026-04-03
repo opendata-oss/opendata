@@ -158,6 +158,7 @@ mod tests {
     use common::{Record, SequenceAllocator, Storage};
     use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
+    use crate::serde::Decode;
 
     const DIMS: usize = 3;
 
@@ -331,10 +332,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing dictionary entry for {ext_id}"));
             let internal_id = {
                 let mut slice = dict_record.value.as_ref();
-                common::serde::encoding::decode_u64(&mut slice).unwrap()
+                VectorId::decode(&mut slice).unwrap()
             };
             // Check vector data record exists and has the right external_id
-            let data_key = VectorDataKey::new(data_id(internal_id)).encode();
+            let data_key = VectorDataKey::new(internal_id).encode();
             let data_record = storage
                 .get(data_key)
                 .await
@@ -346,7 +347,7 @@ mod tests {
         }
 
         // then — all internal IDs should be unique (10 distinct vectors written)
-        let posting_ids: HashSet<u64> = internal_ids.iter().copied().collect();
+        let posting_ids: HashSet<_> = internal_ids.iter().copied().collect();
         assert_eq!(posting_ids.len(), 10);
     }
 

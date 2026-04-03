@@ -159,7 +159,7 @@ mod tests {
 
     /// Helper to create a test key for PostingList
     fn create_posting_list_key() -> Bytes {
-        PostingListKey::new(VectorId::data_vector_id(1)).encode()
+        PostingListKey::new(VectorId::centroid_id(1, 1)).encode()
     }
 
     /// Helper to create a test key for MetadataIndex

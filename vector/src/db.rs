@@ -850,7 +850,7 @@ mod tests {
     }
 
     fn data_id(id: u64) -> VectorId {
-        VectorId::data_vector_id(id + 1)
+        VectorId::data_vector_id(id)
     }
 
     #[tokio::test]

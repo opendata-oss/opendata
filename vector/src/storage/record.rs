@@ -8,7 +8,7 @@ use bytes::BytesMut;
 use common::Record;
 use common::storage::RecordOp;
 use roaring::RoaringTreemap;
-
+use tracing::debug;
 use crate::model::AttributeValue;
 use crate::serde::Encode;
 use crate::serde::centroid_chunk::{CentroidChunkValue, CentroidEntry};
@@ -25,10 +25,13 @@ use crate::serde::vector_id::VectorId;
 
 /// Create a RecordOp to update the IdDictionary mapping.
 pub fn put_id_dictionary(external_id: &str, internal_id: VectorId) -> RecordOp {
+    debug!("put_id_dictionary {} {}", external_id, internal_id);
     let key = IdDictionaryKey::new(external_id).encode();
     let mut value_buf = BytesMut::with_capacity(8);
     internal_id.encode(&mut value_buf);
-    RecordOp::Put(Record::new(key, value_buf.freeze()).into())
+    let value = value_buf.freeze();
+    debug!("put_id_dictionary {:?} {:?}", key, value);
+    RecordOp::Put(Record::new(key, value).into())
 }
 
 /// Create a RecordOp to delete an IdDictionary mapping.
