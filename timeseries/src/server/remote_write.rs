@@ -238,22 +238,16 @@ pub async fn handle_remote_write(
     // Ingest samples into the TSDB
     match state.tsdb.ingest_samples(samples).await {
         Ok(()) => {
-            // Increment successful ingestion counter
-            state
-                .metrics
-                .remote_write_samples_ingested
-                .inc_by(total_samples as u64);
+            metrics::counter!(super::metrics::REMOTE_WRITE_SAMPLES_INGESTED)
+                .increment(total_samples as u64);
             tracing::debug!("Successfully ingested remote write request");
 
             // Return 204 No Content on success (as per spec: empty response body)
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => {
-            // Increment failed ingestion counter
-            state
-                .metrics
-                .remote_write_samples_failed
-                .inc_by(total_samples as u64);
+            metrics::counter!(super::metrics::REMOTE_WRITE_SAMPLES_FAILED)
+                .increment(total_samples as u64);
             tracing::error!("Failed to ingest remote write request: {}", e);
             Err(e.into())
         }

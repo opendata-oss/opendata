@@ -116,8 +116,13 @@ async fn test_ready() {
 #[tokio::test]
 async fn test_metrics() {
     let (app, _) = setup().await;
-    let req = Request::get("/metrics").body(Body::empty()).unwrap();
 
+    // Send a warmup request so the middleware records at least one counter value.
+    // metrics-rs only renders metrics that have been recorded.
+    let warmup = Request::get("/-/healthy").body(Body::empty()).unwrap();
+    let _ = app.clone().oneshot(warmup).await.unwrap();
+
+    let req = Request::get("/metrics").body(Body::empty()).unwrap();
     let resp = app.oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);

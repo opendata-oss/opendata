@@ -105,7 +105,7 @@ pub(crate) fn build_router(
         .route("/query", get(handle_ui_index))
         .route("/{*path}", get(handle_ui))
         .layer(TracingLayer::new())
-        .layer(MetricsLayer::new(metrics))
+        .layer(MetricsLayer::new())
         .with_state(state)
 }
 
@@ -131,21 +131,23 @@ impl TimeSeriesHttpServer {
 
     /// Run the HTTP server
     pub(crate) async fn run(self) {
-        // Create metrics registry and register storage engine metrics
-        let mut metrics = Metrics::new();
+        // Install the metrics-rs recorder and create the rendering handle
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        // Install globally — if a recorder is already installed (e.g. tests), this is a no-op
+        let _ = metrics::set_global_recorder(recorder);
+
+        // Create metrics container with optional storage engine metrics
+        let mut metrics = Metrics::new(handle);
         if let Some(storage) = &self.storage {
-            storage.register_metrics(metrics.registry_mut());
+            storage.register_metrics(metrics.storage_registry_mut());
         }
         let metrics = Arc::new(metrics);
 
         // Start the scraper if there are scrape configs (requires read-write mode)
         if !self.config.prometheus_config.scrape_configs.is_empty() {
             if let Some(tsdb) = self.tsdb.as_tsdb() {
-                let scraper = Arc::new(Scraper::new(
-                    tsdb,
-                    self.config.prometheus_config.clone(),
-                    metrics.clone(),
-                ));
+                let scraper = Arc::new(Scraper::new(tsdb, self.config.prometheus_config.clone()));
                 scraper.run();
                 tracing::info!(
                     "Started scraper with {} job(s)",

@@ -27,6 +27,8 @@ http-server = [
     "dep:tower-http",
     "dep:clap",
     "dep:prometheus-client",
+    "dep:metrics",
+    "dep:metrics-exporter-prometheus",
 ]
 testing = []
 remote-write = ["http-server", "dep:prost", "dep:snap"]
@@ -61,6 +63,8 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 blake3 = "1.8.2"
+metrics = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
 mime_guess = "2"
 prometheus-client = { version = "0.22", optional = true }
 promql-parser = "0.8"
@@ -114,3 +118,8 @@ required-features = ["otel"]
 [[example]]
 name = "query_bench"
 required-features = ["http-server"]
+
+[[example]]
+name = "ingest_produce"
+required-features = ["otel"]
+doc = false

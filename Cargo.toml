@@ -64,6 +64,7 @@ dashu-float = "0.4"
 snap = "1"
 criterion = "0.5"
 metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
 zstd = "0.13"
 tempfile = "3"
 opendata-macros = { path = "./macros" }
