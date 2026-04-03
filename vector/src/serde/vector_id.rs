@@ -10,6 +10,10 @@ pub(crate) const ROOT_VECTOR_ID: VectorId = VectorId {
     id: 0xFF00_0000_0000_0000,
 };
 
+// TODO: have a separate NodeId, CentroidId, and VectorId
+//   have Into fns for each. Conversion to CentroidId and VectorId validates the levels
+//   use the right terminology (node vs centroid vs vector in variable names)
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct VectorId {
     id: u64
@@ -61,6 +65,10 @@ impl VectorId {
 
     pub fn is_root(&self) -> bool {
         self == &ROOT_VECTOR_ID
+    }
+
+    pub fn is_tree_node(&self) -> bool {
+        self.is_centroid() || self.is_root()
     }
 
     pub fn is_centroid(&self) -> bool {

@@ -12,6 +12,92 @@ use rayon::prelude::IntoParallelIterator;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
+use crate::serde::vector_id::{VectorId, ROOT_VECTOR_ID};
+
+pub(crate) const ROOT_LEVEL: u8 = 0xFF;
+pub(crate) const LEAF_LEVEL: u8 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct TreeDepth {
+    val: u8
+}
+
+impl TreeDepth {
+    pub(crate) fn of(val: u8) -> Self {
+        assert!(val >= 3, "trees always have at least 3 levels (root, leaf, data vectors)");
+        Self { val }
+    }
+
+    pub(crate) fn val(&self) -> u8 {
+        self.val
+    }
+
+    pub(crate) fn max_inner_level(&self) -> u8 {
+        self.val - 2
+    }
+
+    pub(crate) fn promote(&self) -> TreeDepth {
+        TreeDepth::of(self.val + 1)
+    }
+}
+
+/// wrapper type for inner level to prevent direct enum instantiation
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct InnerLevel {
+    level: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum TreeLevel {
+    Root,
+    Inner(InnerLevel)
+}
+
+impl TreeLevel {
+    pub(crate) fn leaf() -> Self {
+        Self::Inner(InnerLevel{ level: 1 })
+    }
+
+    pub(crate) fn inner(level: u8, depth: TreeDepth) -> Self {
+        assert!(level > 0);
+        assert!(level <= depth.max_inner_level());
+        Self::Inner(InnerLevel{ level })
+    }
+
+    pub(crate) fn next_level_up(&self, depth: TreeDepth) -> Self {
+        match self {
+            TreeLevel::Root => {
+                panic!("no level up from root")
+            }
+            TreeLevel::Inner(l) => {
+                let max_inner_level = depth.max_inner_level();
+                assert!(l.level <= max_inner_level);
+                if l.level == max_inner_level {
+                    Self::Root
+                } else {
+                    Self::inner(l.level + 1, depth)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn next_level_down(&self, depth: TreeDepth) -> Self {
+        match self {
+            TreeLevel::Root => Self::inner(depth.max_inner_level(), depth),
+            TreeLevel::Inner(l) => {
+                assert!(l.level > 0);
+                Self::inner(l.level - 1, depth)
+            }
+        }
+    }
+
+    pub(crate) fn level(&self) -> u8 {
+        match self {
+            TreeLevel::Root => ROOT_LEVEL,
+            TreeLevel::Inner(l) => l.level
+        }
+    }
+}
 
 pub(crate) enum MaybeCached<T> {
     Value(T),
@@ -49,18 +135,18 @@ impl<T> Into<MaybeCached<T>> for BoxFuture<'static, Result<T>> {
 
 pub(crate) struct BlockedCentroidSearch {
     /// The level the reads are for
-    level: u16,
+    level: TreeLevel,
     /// Centroid postings that were already cached at this level
-    found: Vec<(u64, Arc<PostingList>)>,
+    found: Vec<(VectorId, Arc<PostingList>)>,
     /// Centroid postings that need to be read
-    reads: Vec<(u64, BoxFuture<'static, Result<(u64, Arc<PostingList>)>>)>,
+    reads: Vec<(VectorId, BoxFuture<'static, Result<(VectorId, Arc<PostingList>)>>)>,
 }
 
 impl BlockedCentroidSearch {
     pub(crate) fn new(
-        level: u16,
-        found: Vec<(u64, Arc<PostingList>)>,
-        reads: Vec<(u64, BoxFuture<'static, Result<(u64, Arc<PostingList>)>>)>,
+        level: TreeLevel,
+        found: Vec<(VectorId, Arc<PostingList>)>,
+        reads: Vec<(VectorId, BoxFuture<'static, Result<(VectorId, Arc<PostingList>)>>)>,
     ) -> Self {
         Self {
             level,
@@ -69,10 +155,8 @@ impl BlockedCentroidSearch {
         }
     }
 
-    pub(crate) fn start(
-        self,
-    ) -> (
-        Vec<(u64, BoxFuture<'static, Result<(u64, Arc<PostingList>)>>)>,
+    pub(crate) fn start(self) -> (
+        Vec<(VectorId, BoxFuture<'static, Result<(VectorId, Arc<PostingList>)>>)>,
         InFlightBlockedCentroidSearch,
     ) {
         let reads = self.reads;
@@ -88,15 +172,15 @@ impl BlockedCentroidSearch {
 
 pub(crate) struct InFlightBlockedCentroidSearch {
     /// The level the reads are for
-    level: u16,
+    level: TreeLevel,
     /// Centroid postings that were already cached at this level
-    found: Vec<(u64, Arc<PostingList>)>,
+    found: Vec<(VectorId, Arc<PostingList>)>,
     /// Centroid postings that need to be read
-    reads: Vec<u64>,
+    reads: Vec<VectorId>,
 }
 
 impl InFlightBlockedCentroidSearch {
-    pub(crate) fn finish(self, read: &HashMap<u64, Arc<PostingList>>) -> ResumableCentroidSearch {
+    pub(crate) fn finish(self, read: &HashMap<VectorId, Arc<PostingList>>) -> ResumableCentroidSearch {
         let read = self
             .reads
             .into_iter()
@@ -112,15 +196,18 @@ impl InFlightBlockedCentroidSearch {
 
 pub(crate) struct ResumableCentroidSearch {
     /// The level the reads are for
-    level: u16,
+    level: TreeLevel,
     /// Centroid postings that were already cached at this level
-    found: Vec<(u64, Arc<PostingList>)>,
+    found: Vec<(VectorId, Arc<PostingList>)>,
     /// Centroid postings that need to be read
-    read: Vec<(u64, Arc<PostingList>)>,
+    read: Vec<(VectorId, Arc<PostingList>)>,
 }
 
 impl ResumableCentroidSearch {
-    fn all_found(level: u16, found: Vec<(u64, Arc<PostingList>)>) -> Self {
+    fn all_found(level: TreeLevel, found: Vec<(VectorId, Arc<PostingList>)>) -> Self {
+        for f in &found {
+            assert_eq!(level.level(), f.0.level())
+        }
         Self {
             level,
             found,
@@ -148,25 +235,25 @@ pub(crate) trait CentroidIndex {
 pub(crate) trait CentroidReader: Send + Sync {
     fn read_root(&self) -> MaybeCached<Arc<PostingList>>;
 
-    fn read_postings(&self, centroid_id: u64) -> MaybeCached<Arc<PostingList>>;
+    fn read_postings(&self, centroid_id: VectorId) -> MaybeCached<Arc<PostingList>>;
 }
 
 pub(crate) trait CentroidCache: Send + Sync {
-    fn root(&self, _epoch: u64) -> Option<Arc<PostingList>> {
-        None
+    fn root(&self, epoch: u64) -> Option<Arc<PostingList>> {
+        self.posting(ROOT_VECTOR_ID, epoch)
     }
 
-    fn posting(&self, centroid_id: u64, epoch: u64) -> Option<Arc<PostingList>> {
+    fn posting(&self, centroid_id: VectorId, epoch: u64) -> Option<Arc<PostingList>> {
         self.postings(&[centroid_id], epoch).first().cloned()
     }
 
-    fn postings(&self, _centroid_ids: &[u64], _epoch: u64) -> Vec<Arc<PostingList>> {
+    fn postings(&self, _centroid_ids: &[VectorId], _epoch: u64) -> Vec<Arc<PostingList>> {
         Vec::new()
     }
 }
 
 pub(crate) struct LeveledCentroidIndex<'a> {
-    depth: u16,
+    depth: TreeDepth,
     beam: usize,
     distance_metric: DistanceMetric,
     reader: Arc<dyn CentroidReader + 'a>,
@@ -174,7 +261,7 @@ pub(crate) struct LeveledCentroidIndex<'a> {
 
 impl<'a> LeveledCentroidIndex<'a> {
     pub(crate) fn new(
-        depth: u16,
+        depth: TreeDepth,
         distance_metric: DistanceMetric,
         reader: Arc<dyn CentroidReader + 'a>,
     ) -> Self {
@@ -189,7 +276,7 @@ impl<'a> LeveledCentroidIndex<'a> {
 
 impl<'a> CentroidIndex for LeveledCentroidIndex<'a> {
     fn search(&self, query: &[f32], k: usize) -> SearchResult {
-        self.search_up_to_level(query, k, 0)
+        self.search_up_to_level(query, k, TreeLevel::leaf())
     }
 
     fn resume_search(
@@ -198,7 +285,7 @@ impl<'a> CentroidIndex for LeveledCentroidIndex<'a> {
         k: usize,
         postings: ResumableCentroidSearch,
     ) -> SearchResult {
-        self.resume_search_up_to_level(query, k, 0, postings)
+        self.resume_search_up_to_level(query, k, TreeLevel::leaf(), postings)
     }
 }
 
@@ -269,41 +356,46 @@ impl<'a> LeveledCentroidIndex<'a> {
         ranked.into_iter().map(|rp| rp.posting.clone()).collect()
     }
 
-    pub(crate) fn search_root(&self, query: &[f32], k: usize) -> Vec<Posting> {
-        let MaybeCached::Value(root) = self.reader.read_root() else {
-            panic!("LeveledCentroidIndex::search_root() couldn't find root");
-        };
-        Self::score_and_rank(query, &[root], k, self.distance_metric)
+    pub(crate) fn search_root(&self, query: &[f32], k: usize) -> SearchResult {
+        self.search_up_to_level(query, k, TreeLevel::Root)
     }
 
-    fn search_up_to_level(&self, query: &[f32], k: usize, level: u16) -> SearchResult {
-        let this_level = self.depth - 1;
-        assert!(level <= this_level);
-        if level == this_level {
-            return SearchResult::Ann(self.search_root(query, k));
+    fn search_up_to_level(&self, query: &[f32], k: usize, level: TreeLevel) -> SearchResult {
+        let root = self.reader.read_root();
+        match root {
+            MaybeCached::Value(root) => {
+                self.resume_search_up_to_level(
+                    query,
+                    k,
+                    TreeLevel::Root,
+                    ResumableCentroidSearch::all_found(
+                        TreeLevel::Root,
+                        vec![(ROOT_VECTOR_ID, root)]
+                    ),
+                )
+            }
+            MaybeCached::Future(fut) => {
+                SearchResult::ReadsRequired(
+                    BlockedCentroidSearch::new(
+                        TreeLevel::Root,
+                        vec![],
+                        vec![(
+                            ROOT_VECTOR_ID,
+                            Box::pin(async move { fut.await.map(|p| (ROOT_VECTOR_ID, p)) })
+                        )],
+                    )
+                )
+            }
         }
-        let beam = self.beam.max(k);
-        let next_centroids = self
-            .search_root(query, beam)
-            .into_iter()
-            .map(|posting| posting.id())
-            .collect();
-        self.search_up_to_level_with_centroids_at_inner_level(
-            query,
-            k,
-            level,
-            this_level - 1,
-            next_centroids,
-        )
     }
 
     fn search_up_to_level_with_centroids_at_inner_level(
         &self,
         query: &[f32],
         k: usize,
-        level: u16,
-        inner_level: u16,
-        centroids: Vec<u64>,
+        level: TreeLevel,
+        inner_level: TreeLevel,
+        centroids: Vec<VectorId>,
     ) -> SearchResult {
         let posting_futs: Vec<_> = centroids
             .iter()
@@ -340,7 +432,7 @@ impl<'a> LeveledCentroidIndex<'a> {
         &self,
         query: &[f32],
         k: usize,
-        level: u16,
+        level: TreeLevel,
         postings: ResumableCentroidSearch,
     ) -> SearchResult {
         let all_postings = postings
@@ -369,7 +461,7 @@ impl<'a> LeveledCentroidIndex<'a> {
                 query,
                 k,
                 level,
-                postings.level - 1,
+                postings.level.next_level_down(self.depth),
                 next_centroids,
             )
         }
@@ -423,16 +515,10 @@ impl StoredCentroidReader {
 
 impl CentroidReader for StoredCentroidReader {
     fn read_root(&self) -> MaybeCached<Arc<PostingList>> {
-        let snapshot = self.snapshot.clone();
-        let dimensions = self.dimensions;
-        MaybeCached::Future(Box::pin(async move {
-            Ok(Arc::new(PostingList::from_value(
-                snapshot.get_root_posting_list(dimensions).await?,
-            )))
-        }))
+        self.read_postings(ROOT_VECTOR_ID)
     }
 
-    fn read_postings(&self, centroid_id: u64) -> MaybeCached<Arc<PostingList>> {
+    fn read_postings(&self, centroid_id: VectorId) -> MaybeCached<Arc<PostingList>> {
         let snapshot = self.snapshot.clone();
         let dimensions = self.dimensions;
         MaybeCached::Future(Box::pin(async move {
@@ -467,7 +553,7 @@ impl CentroidReader for CachedCentroidReader {
         }
     }
 
-    fn read_postings(&self, centroid_id: u64) -> MaybeCached<Arc<PostingList>> {
+    fn read_postings(&self, centroid_id: VectorId) -> MaybeCached<Arc<PostingList>> {
         if let Some(postings) = self.cache.posting(centroid_id, self.inner.epoch) {
             MaybeCached::Value(postings)
         } else {
@@ -487,20 +573,11 @@ pub(crate) struct AllCentroidsCache {
 }
 
 impl CentroidCache for AllCentroidsCache {
-    fn root(&self, epoch: u64) -> Option<Arc<PostingList>> {
-        let root = self.inner.lock().expect("lock poisoned").root();
-        if epoch < root.written_epoch {
-            None
-        } else {
-            Some(root.posting_list.clone())
-        }
-    }
-
-    fn posting(&self, centroid_id: u64, epoch: u64) -> Option<Arc<PostingList>> {
+    fn posting(&self, centroid_id: VectorId, epoch: u64) -> Option<Arc<PostingList>> {
         self.postings(&[centroid_id], epoch).into_iter().next()
     }
 
-    fn postings(&self, centroid_ids: &[u64], epoch: u64) -> Vec<Arc<PostingList>> {
+    fn postings(&self, centroid_ids: &[VectorId], epoch: u64) -> Vec<Arc<PostingList>> {
         self.inner
             .lock()
             .expect("lock poisoned")
@@ -524,15 +601,12 @@ pub(crate) struct AllCentroidsCacheWriter {
 impl AllCentroidsCacheWriter {
     pub(crate) fn new(
         root_posting_list: Arc<dyn IntoTreePostingList>,
-        centroid_postings: Vec<(u64, Arc<dyn IntoTreePostingList>)>,
+        centroid_postings: Vec<(VectorId, Arc<dyn IntoTreePostingList>)>,
     ) -> Self {
-        let root = WrittenPostingList {
-            written_epoch: 0,
-            posting_list: Arc::new(root_posting_list.clone_into_tree()),
-        };
         let postings = centroid_postings
             .into_iter()
             .map(|(centroid_id, posting_list)| {
+                assert!(centroid_id.is_centroid());
                 (
                     centroid_id,
                     WrittenPostingList {
@@ -541,8 +615,17 @@ impl AllCentroidsCacheWriter {
                     },
                 )
             })
+            .chain(vec![
+                (
+                    ROOT_VECTOR_ID,
+                    WrittenPostingList {
+                        written_epoch: 0,
+                        posting_list: Arc::new(root_posting_list.clone_into_tree()),
+                    }
+                )
+            ].into_iter())
             .collect();
-        let inner = Arc::new(Mutex::new(AllCentroidsCacheInner { root, postings }));
+        let inner = Arc::new(Mutex::new(AllCentroidsCacheInner { postings }));
         Self { inner }
     }
 
@@ -551,8 +634,9 @@ impl AllCentroidsCacheWriter {
         epoch: u64,
         root: Option<Vec<PostingUpdate>>,
         root_updates: Vec<PostingUpdate>,
-        centroid_postings: Vec<(u64, Vec<PostingUpdate>)>,
-        deleted_centroids: &HashSet<u64>,
+        new_centroids: &HashSet<VectorId>,
+        centroid_postings: Vec<(VectorId, Vec<PostingUpdate>)>,
+        deleted_centroids: &HashSet<VectorId>,
     ) {
         fn apply_updates(
             posting_list: Option<&Arc<PostingList>>,
@@ -573,25 +657,46 @@ impl AllCentroidsCacheWriter {
             let root = if let Some(root) = root {
                 apply_updates(None, root)
             } else {
-                inner.root.posting_list.clone()
+                inner.postings
+                    .get(&ROOT_VECTOR_ID)
+                    .expect("missing root in cache")
+                    .posting_list
+                    .clone()
             };
             let root = if root_updates.is_empty() {
                 root
             } else {
                 apply_updates(Some(&root), root_updates)
             };
-            inner.root = WrittenPostingList {
-                posting_list: root,
-                written_epoch: epoch,
-            };
+            inner.postings.insert(
+                ROOT_VECTOR_ID,
+                WrittenPostingList {
+                    posting_list: root,
+                    written_epoch: epoch,
+                }
+            );
+        }
+
+        for centroid_id in new_centroids {
+            assert!(centroid_id.is_centroid());
+            inner.postings.insert(
+                *centroid_id,
+                WrittenPostingList {
+                    posting_list: Arc::new(PostingList::empty()),
+                    written_epoch: epoch,
+                }
+            );
         }
 
         for (centroid_id, updates) in centroid_postings {
+            assert!(centroid_id.is_centroid());
             let posting_list = inner
                 .postings
                 .get(&centroid_id)
-                .map(|p| p.posting_list.clone());
-            let posting_list = apply_updates(posting_list.as_ref(), updates);
+                .expect(&format!("unexpected missing centroid {:?}", centroid_id))
+                .posting_list
+                .clone();
+            let posting_list = apply_updates(Some(&posting_list), updates);
             inner.postings.insert(
                 centroid_id,
                 WrittenPostingList {
@@ -602,6 +707,7 @@ impl AllCentroidsCacheWriter {
         }
 
         for centroid_id in deleted_centroids {
+            assert!(centroid_id.is_centroid());
             inner.postings.remove(&centroid_id);
         }
     }
@@ -614,23 +720,17 @@ impl AllCentroidsCacheWriter {
 }
 
 struct AllCentroidsCacheInner {
-    root: WrittenPostingList,
-    postings: HashMap<u64, WrittenPostingList>,
+    postings: HashMap<VectorId, WrittenPostingList>,
 }
 
 impl AllCentroidsCacheInner {
     pub(crate) fn new(
-        root: WrittenPostingList,
-        postings: HashMap<u64, WrittenPostingList>,
+        postings: HashMap<VectorId, WrittenPostingList>,
     ) -> Self {
-        Self { root, postings }
+        Self { postings }
     }
 
-    pub(crate) fn root(&self) -> WrittenPostingList {
-        self.root.clone()
-    }
-
-    pub(crate) fn postings(&self, centroids: &[u64]) -> Vec<WrittenPostingList> {
+    pub(crate) fn postings(&self, centroids: &[VectorId]) -> Vec<WrittenPostingList> {
         centroids
             .iter()
             .filter_map(|c| self.postings.get(c))
@@ -655,14 +755,14 @@ pub(crate) async fn batch_search_centroids<K: Hash + Eq + Sized + Send + Sync>(
     k: usize,
     queries: Vec<(K, &[f32])>,
 ) -> Result<HashMap<K, Vec<Posting>>> {
-    batch_search_centroids_up_to_level(index, k, queries, 0).await
+    batch_search_centroids_up_to_level(index, k, queries, TreeLevel::leaf()).await
 }
 
 pub(crate) async fn batch_search_centroids_up_to_level<K: Hash + Eq + Sized + Send + Sync>(
     index: &LeveledCentroidIndex<'_>,
     k: usize,
     queries: Vec<(K, &[f32])>,
-    level: u16,
+    level: TreeLevel,
 ) -> Result<HashMap<K, Vec<Posting>>> {
     let mut results = HashMap::with_capacity(queries.len());
     let queries: Vec<(K, &[f32], Option<ResumableCentroidSearch>)> = queries
@@ -738,9 +838,9 @@ mod tests {
         // given
         let postings = Arc::new(
             vec![
-                Posting::new(10, vec![1.0, 0.0]),
-                Posting::new(11, vec![0.0, 1.0]),
-                Posting::new(12, vec![3.0, 0.0]),
+                Posting::new(vector_id(1, 10), vec![1.0, 0.0]),
+                Posting::new(vector_id(1, 11), vec![0.0, 1.0]),
+                Posting::new(vector_id(1, 12), vec![3.0, 0.0]),
             ]
             .into_iter()
             .collect(),
@@ -751,7 +851,7 @@ mod tests {
             LeveledCentroidIndex::score_and_rank(&[0.9, 0.1], &[postings], 2, DistanceMetric::L2);
 
         // then
-        assert_eq!(ranked_ids(&ranked), vec![10, 11]);
+        assert_eq!(ranked_ids(&ranked), vec![vector_id(1, 10), vector_id(1, 11)]);
     }
 
     #[test]
@@ -759,13 +859,13 @@ mod tests {
         // given
         let postings_a = Arc::new(
             vec![
-                Posting::new(10, vec![1.0, 0.0]),
-                Posting::new(11, vec![0.0, 1.0]),
+                Posting::new(vector_id(1, 10), vec![1.0, 0.0]),
+                Posting::new(vector_id(1, 11), vec![0.0, 1.0]),
             ]
             .into_iter()
             .collect(),
         );
-        let postings_b = Arc::new(vec![Posting::new(10, vec![1.0, 0.0])].into_iter().collect());
+        let postings_b = Arc::new(vec![Posting::new(VectorId::centroid_id(1, 10), vec![1.0, 0.0])].into_iter().collect());
 
         // when
         let ranked = LeveledCentroidIndex::score_and_rank(
@@ -776,48 +876,57 @@ mod tests {
         );
 
         // then
-        assert_eq!(ranked_ids(&ranked), vec![10, 11]);
+        assert_eq!(ranked_ids(&ranked), vec![vector_id(1, 10), vector_id(1, 11)]);
     }
 
-    const ROOT_POSTING_ID: u64 = 0;
     const DIMS: usize = 2;
 
-    fn posting_list(postings: Vec<(u64, Vec<f32>)>) -> Arc<PostingList> {
+    fn vector_id(level: u8, id: u64) -> VectorId {
+        if level == ROOT_LEVEL {
+            ROOT_VECTOR_ID
+        } else if level > 0 {
+            VectorId::centroid_id(level, id)
+        } else {
+            VectorId::data_vector_id(id)
+        }
+    }
+
+    fn posting_list(postings: Vec<(u8, u64, Vec<f32>)>) -> Arc<PostingList> {
         Arc::new(
             postings
                 .into_iter()
-                .map(|(id, vector)| Posting::new(id, vector))
+                .map(|(level, id, vector)| Posting::new(vector_id(level, id), vector))
                 .collect(),
         )
     }
 
-    fn posting_list_value(postings: Vec<(u64, Vec<f32>)>) -> PostingListValue {
+    fn posting_list_value(postings: Vec<(u8, u64, Vec<f32>)>) -> PostingListValue {
         PostingListValue::from_posting_updates(
             postings
                 .into_iter()
-                .map(|(id, vector)| PostingUpdate::append(id, vector))
+                .map(|(level, id, vector)| PostingUpdate::append(vector_id(level, id), vector))
                 .collect(),
         )
         .unwrap()
     }
 
-    fn assert_posting_list_eq(actual: Arc<PostingList>, expected: Vec<(u64, Vec<f32>)>) {
+    fn assert_posting_list_eq(actual: Arc<PostingList>, expected: Vec<(u8, u64, Vec<f32>)>) {
         let expected = posting_list(expected);
         assert_eq!(actual.as_ref(), expected.as_ref());
     }
 
-    fn ranked_ids(ranked: &[Posting]) -> Vec<u64> {
+    fn ranked_ids(ranked: &[Posting]) -> Vec<VectorId> {
         ranked.iter().map(|posting| posting.id()).collect()
     }
 
-    fn empty_deleted_centroids() -> HashSet<u64> {
+    fn empty_deleted_centroids() -> HashSet<VectorId> {
         HashSet::new()
     }
 
     async fn put_posting_list(
         storage: &Arc<dyn Storage>,
-        centroid_id: u64,
-        postings: Vec<(u64, Vec<f32>)>,
+        centroid_id: VectorId,
+        postings: Vec<(u8, u64, Vec<f32>)>,
     ) -> Arc<PostingList> {
         let key = PostingListKey::new(centroid_id).encode();
         let value = posting_list_value(postings);
@@ -830,20 +939,17 @@ mod tests {
     }
 
     fn cached_index(
-        depth: u16,
+        depth: TreeDepth,
         storage: Arc<dyn Storage>,
         root: Arc<PostingList>,
-        postings: HashMap<u64, Arc<PostingList>>,
+        postings: HashMap<VectorId, Arc<PostingList>>,
         distance_metric: DistanceMetric,
     ) -> LeveledCentroidIndex<'static> {
         let cache: Arc<dyn CentroidCache> = Arc::new(AllCentroidsCache {
             inner: Arc::new(Mutex::new(AllCentroidsCacheInner::new(
-                WrittenPostingList {
-                    posting_list: root,
-                    written_epoch: 0,
-                },
                 postings
                     .into_iter()
+                    .chain(vec![(ROOT_VECTOR_ID, root)].into_iter())
                     .map(|(centroid_id, posting_list)| {
                         (
                             centroid_id,
@@ -862,10 +968,10 @@ mod tests {
     }
 
     struct TestTree {
-        depth: u16,
+        depth: TreeDepth,
         storage: Arc<dyn Storage>,
         root: Arc<PostingList>,
-        postings_by_level: HashMap<u16, HashMap<u64, Arc<PostingList>>>,
+        postings_by_level: HashMap<u8, HashMap<VectorId, Arc<PostingList>>>,
     }
 
     impl TestTree {
@@ -875,7 +981,7 @@ mod tests {
 
         fn index_with_cached_postings(
             &self,
-            cached_postings: Vec<u64>,
+            cached_postings: Vec<VectorId>,
         ) -> LeveledCentroidIndex<'static> {
             let postings = cached_postings
                 .into_iter()
@@ -893,13 +999,13 @@ mod tests {
             )
         }
 
-        fn posting(&self, centroid_id: u64) -> Option<Arc<PostingList>> {
+        fn posting(&self, centroid_id: VectorId) -> Option<Arc<PostingList>> {
             self.postings_by_level
                 .values()
                 .find_map(|postings| postings.get(&centroid_id).cloned())
         }
 
-        fn all_posting_ids(&self) -> Vec<u64> {
+        fn all_posting_ids(&self) -> Vec<VectorId> {
             self.postings_by_level
                 .values()
                 .flat_map(|postings| postings.keys().copied())
@@ -907,25 +1013,26 @@ mod tests {
         }
 
         fn exhaustive_search(&self, query: &[f32], k: usize) -> Vec<Posting> {
-            self.exhaustive_search_up_to_level(query, k, 0)
+            self.exhaustive_search_up_to_level(query, k, TreeLevel::leaf())
         }
 
         fn exhaustive_search_up_to_level(
             &self,
             query: &[f32],
             k: usize,
-            target_level: u16,
+            target_level: TreeLevel,
         ) -> Vec<Posting> {
-            assert!(target_level < self.depth);
+            assert!(target_level == TreeLevel::Root
+                || target_level.level() <= self.depth.max_inner_level());
 
-            let mut current_level = self.depth - 1;
+            let mut current_level = TreeLevel::Root;
             let mut current_postings = vec![self.root.clone()];
 
-            while current_level > target_level {
-                let next_level = current_level - 1;
+            while current_level != target_level {
+                let next_level = current_level.next_level_down(self.depth);
                 let level_postings = self
                     .postings_by_level
-                    .get(&next_level)
+                    .get(&next_level.level())
                     .expect("missing posting lists for level");
                 let mut next_postings = Vec::new();
                 for posting_list in &current_postings {
@@ -948,76 +1055,64 @@ mod tests {
     }
 
     async fn build_tree(
-        depth: u16,
-        root: Vec<(u64, Vec<f32>)>,
-        postings_by_level: Vec<(u16, Vec<(u64, Vec<(u64, Vec<f32>)>)>)>,
+        depth: u8,
+        root: Vec<(u8, u64, Vec<f32>)>,
+        postings_by_level: Vec<(u8, Vec<((u8, u64), Vec<(u8, u64, Vec<f32>)>)>)>,
     ) -> TestTree {
         let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
-        let root = put_posting_list(&storage, ROOT_POSTING_ID, root).await;
+        let root = put_posting_list(&storage, ROOT_VECTOR_ID, root).await;
         let mut tree_postings = HashMap::new();
         for (level, postings) in postings_by_level {
             let mut level_postings = HashMap::with_capacity(postings.len());
-            for (centroid_id, posting) in postings {
+            for ((level, cid), posting) in postings {
+                let centroid_id = vector_id(level, cid);
                 let posting = put_posting_list(&storage, centroid_id, posting).await;
                 level_postings.insert(centroid_id, posting);
             }
             tree_postings.insert(level, level_postings);
         }
         TestTree {
-            depth,
+            depth: TreeDepth::of(depth),
             storage,
             root,
             postings_by_level: tree_postings,
         }
     }
 
-    async fn root_only_tree() -> TestTree {
+    async fn one_inner_level_tree() -> TestTree {
         build_tree(
-            1,
-            vec![
-                (10, vec![1.0, 0.0]),
-                (11, vec![0.0, 1.0]),
-                (12, vec![3.0, 0.0]),
-            ],
-            vec![],
-        )
-        .await
-    }
-
-    async fn two_level_tree() -> TestTree {
-        build_tree(
-            2,
-            vec![(100, vec![10.0, 0.0]), (200, vec![0.0, 10.0])],
+            3,
+            vec![(1, 100, vec![10.0, 0.0]), (1, 200, vec![0.0, 10.0])],
             vec![(
-                0,
+                1,
                 vec![
-                    (100, vec![(10, vec![1.0, 0.0]), (11, vec![2.0, 0.0])]),
-                    (200, vec![(20, vec![0.0, 1.0]), (21, vec![0.0, 2.0])]),
+                    ((1, 100), vec![(0, 10, vec![1.0, 0.0]), (0, 11, vec![2.0, 0.0])]),
+                    ((1, 200), vec![(0, 20, vec![0.0, 1.0]), (0, 21, vec![0.0, 2.0])]),
                 ],
             )],
         )
         .await
     }
 
-    async fn three_level_tree() -> TestTree {
+    async fn two_inner_level_tree() -> TestTree {
         build_tree(
-            3,
-            vec![(1000, vec![10.0, 0.0]), (2000, vec![0.0, 10.0])],
+            4,
+            vec![(2, 1000, vec![10.0, 0.0]), (2, 2000, vec![0.0, 10.0])],
             vec![
                 (
-                    1,
+                    2,
                     vec![
-                        (1000, vec![(100, vec![5.0, 0.0]), (101, vec![6.0, 0.0])]),
-                        (2000, vec![(200, vec![0.0, 5.0]), (201, vec![0.0, 6.0])]),
+                        ((2, 1000), vec![(1, 100, vec![5.0, 0.0]), (1, 101, vec![6.0, 0.0])]),
+                        ((2, 2000), vec![(1, 200, vec![0.0, 5.0]), (1, 201, vec![0.0, 6.0])]),
                     ],
                 ),
                 (
-                    0,
+                    1,
                     vec![
-                        (100, vec![(10, vec![1.0, 0.0]), (11, vec![2.0, 0.0])]),
-                        (101, vec![(12, vec![3.0, 0.0]), (13, vec![4.0, 0.0])]),
-                        (200, vec![(20, vec![0.0, 1.0]), (21, vec![0.0, 2.0])]),
-                        (201, vec![(22, vec![0.0, 3.0]), (23, vec![0.0, 4.0])]),
+                        ((1, 100), vec![(0, 10, vec![1.0, 0.0]), (0, 11, vec![2.0, 0.0])]),
+                        ((1, 101), vec![(0, 12, vec![3.0, 0.0]), (0, 13, vec![4.0, 0.0])]),
+                        ((1, 200), vec![(0, 20, vec![0.0, 1.0]), (0, 21, vec![0.0, 2.0])]),
+                        ((1, 201), vec![(0, 22, vec![0.0, 3.0]), (0, 23, vec![0.0, 4.0])]),
                     ],
                 ),
             ],
@@ -1025,17 +1120,17 @@ mod tests {
         .await
     }
 
-    async fn wide_two_level_tree(width: u64) -> TestTree {
+    async fn wide_one_inner_level_tree(width: u64) -> TestTree {
         let root = (0..width)
-            .map(|offset| (1000 + offset, vec![offset as f32, 0.0]))
+            .map(|offset| (1, 1000 + offset, vec![offset as f32, 0.0]))
             .collect();
         let postings = vec![(
-            0,
+            1,
             (0..width)
                 .map(|offset| {
                     let centroid_id = 1000 + offset;
                     let leaf_id = 10_000 + offset;
-                    (centroid_id, vec![(leaf_id, vec![offset as f32, 0.0])])
+                    ((1, centroid_id), vec![(0, leaf_id, vec![offset as f32, 0.0])])
                 })
                 .collect(),
         )];
@@ -1053,9 +1148,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_search_root_only_tree() {
+    async fn should_search_one_inner_level_tree() {
         // given
-        let tree = root_only_tree().await;
+        let tree = one_inner_level_tree().await;
         let index = tree.fully_cached_index();
         let expected = tree.exhaustive_search(&[0.9, 0.1], 2);
 
@@ -1067,23 +1162,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_search_two_level_tree() {
+    async fn should_search_two_inner_level_tree() {
         // given
-        let tree = two_level_tree().await;
-        let index = tree.fully_cached_index();
-        let expected = tree.exhaustive_search(&[0.9, 0.1], 2);
-
-        // when
-        let ranked = search_centroids(&index, &[0.9, 0.1], 2).await.unwrap();
-
-        // then
-        assert_eq!(ranked, expected);
-    }
-
-    #[tokio::test]
-    async fn should_search_three_level_tree() {
-        // given
-        let tree = three_level_tree().await;
+        let tree = two_inner_level_tree().await;
         let index = tree.fully_cached_index();
         let expected = tree.exhaustive_search(&[0.9, 0.1], 2);
 
@@ -1097,12 +1178,12 @@ mod tests {
     #[tokio::test]
     async fn should_search_up_to_root() {
         // given
-        let tree = two_level_tree().await;
+        let tree = one_inner_level_tree().await;
         let index = tree.fully_cached_index();
-        let expected = tree.exhaustive_search_up_to_level(&[0.9, 0.1], 1, 1);
+        let expected = tree.exhaustive_search_up_to_level(&[0.9, 0.1], 1, TreeLevel::Root);
 
         // when
-        let SearchResult::Ann(ranked) = index.search_up_to_level(&[0.9, 0.1], 1, 1) else {
+        let SearchResult::Ann(ranked) = index.search_up_to_level(&[0.9, 0.1], 1, TreeLevel::Root) else {
             panic!("search should complete with all centroids cached");
         };
 
@@ -1113,12 +1194,13 @@ mod tests {
     #[tokio::test]
     async fn should_search_up_to_level() {
         // given
-        let tree = three_level_tree().await;
+        let tree = two_inner_level_tree().await;
         let index = tree.fully_cached_index();
-        let expected = tree.exhaustive_search_up_to_level(&[5.1, 0.0], 2, 1);
+        let level = TreeLevel::inner(2, tree.depth);
+        let expected = tree.exhaustive_search_up_to_level(&[5.1, 0.0], 2, level);
 
         // when
-        let SearchResult::Ann(ranked) = index.search_up_to_level(&[5.1, 0.0], 2, 1) else {
+        let SearchResult::Ann(ranked) = index.search_up_to_level(&[5.1, 0.0], 2, level) else {
             panic!("search should complete with all centroids cached");
         };
 
@@ -1129,7 +1211,7 @@ mod tests {
     #[tokio::test]
     async fn should_resume_search_from_level_when_no_centroids_cached() {
         // given
-        let tree = two_level_tree().await;
+        let tree = one_inner_level_tree().await;
         let index = tree.index_with_cached_postings(vec![]);
         let expected = tree.exhaustive_search(&[0.9, 0.1], 2);
 
@@ -1151,8 +1233,8 @@ mod tests {
     #[tokio::test]
     async fn should_resume_search_from_level_when_some_centroids_cached() {
         // given
-        let tree = two_level_tree().await;
-        let index = tree.index_with_cached_postings(vec![100]);
+        let tree = one_inner_level_tree().await;
+        let index = tree.index_with_cached_postings(vec![vector_id(1, 100)]);
         let expected = tree.exhaustive_search(&[0.9, 0.1], 2);
 
         // when
@@ -1161,7 +1243,7 @@ mod tests {
         };
         assert_eq!(reads.found.len(), 1);
         assert_eq!(reads.reads.len(), 1);
-        assert_eq!(reads.reads[0].0, 200);
+        assert_eq!(reads.reads[0].0, vector_id(1, 200));
         let postings = finish_reads(reads).await;
         let SearchResult::Ann(ranked) = index.resume_search(&[0.9, 0.1], 2, postings) else {
             panic!("resume should finish the search");
@@ -1174,9 +1256,9 @@ mod tests {
     #[tokio::test]
     async fn should_use_beam_width_when_searching() {
         // given
-        let tree = wide_two_level_tree(101).await;
-        let index = tree.index_with_cached_postings(vec![1000]);
-        let expected = tree.exhaustive_search_up_to_level(&[0.0, 0.0], 100, 1);
+        let tree = wide_one_inner_level_tree(101).await;
+        let index = tree.index_with_cached_postings(vec![vector_id(1, 1000)]);
+        let expected = tree.exhaustive_search_up_to_level(&[0.0, 0.0], 100, TreeLevel::Root);
         let mut expected = ranked_ids(&expected);
         expected.sort_unstable();
 
@@ -1201,8 +1283,10 @@ mod tests {
     #[tokio::test]
     async fn should_batch_search_centroids() {
         // given
-        let tree = three_level_tree().await;
-        let index = tree.index_with_cached_postings(vec![1000, 100]);
+        let tree = two_inner_level_tree().await;
+        let index = tree.index_with_cached_postings(
+            vec![vector_id(2, 1000), vector_id(1, 100)]
+        );
         let q0 = [0.9, 0.1];
         let q1 = [0.1, 0.9];
         let expected_x = tree.exhaustive_search(&q0, 2);
@@ -1221,16 +1305,17 @@ mod tests {
     #[tokio::test]
     async fn should_batch_search_centroids_up_to_level() {
         // given
-        let tree = three_level_tree().await;
+        let tree = two_inner_level_tree().await;
         let index = tree.fully_cached_index();
         let q0 = [5.1, 0.0];
         let q1 = [0.0, 5.1];
-        let expected_x = tree.exhaustive_search_up_to_level(&q0, 2, 1);
-        let expected_y = tree.exhaustive_search_up_to_level(&q1, 2, 1);
+        let level = TreeLevel::inner(2, tree.depth);
+        let expected_x = tree.exhaustive_search_up_to_level(&q0, 2, level);
+        let expected_y = tree.exhaustive_search_up_to_level(&q1, 2, level);
 
         // when
         let results =
-            batch_search_centroids_up_to_level(&index, 2, vec![("x", &q0), ("y", &q1)], 1)
+            batch_search_centroids_up_to_level(&index, 2, vec![("x", &q0), ("y", &q1)], level)
                 .await
                 .unwrap();
 
@@ -1243,7 +1328,7 @@ mod tests {
     fn should_update_cached_root_posting() {
         // given
         let writer = AllCentroidsCacheWriter::new(
-            posting_list(vec![(1, vec![1.0, 0.0]), (2, vec![2.0, 0.0])]),
+            posting_list(vec![(1, 1, vec![1.0, 0.0]), (1, 2, vec![2.0, 0.0])]),
             vec![],
         );
 
@@ -1252,9 +1337,10 @@ mod tests {
             5,
             None,
             vec![
-                PostingUpdate::delete(1),
-                PostingUpdate::append(3, vec![3.0, 0.0]),
+                PostingUpdate::delete(vector_id(1, 1)),
+                PostingUpdate::append(vector_id(1, 3), vec![3.0, 0.0]),
             ],
+            &([vector_id(1, 3)].into_iter().collect()),
             vec![],
             &empty_deleted_centroids(),
         );
@@ -1264,7 +1350,7 @@ mod tests {
         assert!(cache.root(4).is_none());
         assert_posting_list_eq(
             cache.root(5).expect("root should be cached"),
-            vec![(2, vec![2.0, 0.0]), (3, vec![3.0, 0.0])],
+            vec![(1, 2, vec![2.0, 0.0]), (1, 3, vec![3.0, 0.0])],
         );
     }
 
@@ -1272,7 +1358,7 @@ mod tests {
     fn should_overwrite_cached_root_with_new_root() {
         // given
         let writer = AllCentroidsCacheWriter::new(
-            posting_list(vec![(1, vec![1.0, 0.0]), (2, vec![2.0, 0.0])]),
+            posting_list(vec![(1, 1, vec![1.0, 0.0]), (1, 2, vec![2.0, 0.0])]),
             vec![],
         );
 
@@ -1280,10 +1366,11 @@ mod tests {
         writer.update_postings(
             5,
             Some(vec![
-                PostingUpdate::append(10, vec![10.0, 0.0]),
-                PostingUpdate::append(11, vec![11.0, 0.0]),
+                PostingUpdate::append(vector_id(2, 10), vec![10.0, 0.0]),
+                PostingUpdate::append(vector_id(2, 11), vec![11.0, 0.0]),
             ]),
             vec![],
+            &HashSet::new(),
             vec![],
             &empty_deleted_centroids(),
         );
@@ -1292,26 +1379,27 @@ mod tests {
         let cache = writer.cache();
         assert_posting_list_eq(
             cache.root(5).expect("root should be cached"),
-            vec![(10, vec![10.0, 0.0]), (11, vec![11.0, 0.0])],
+            vec![(2, 10, vec![10.0, 0.0]), (2, 11, vec![11.0, 0.0])],
         );
     }
 
     #[test]
     fn should_apply_updates_to_new_root() {
         // given
-        let writer = AllCentroidsCacheWriter::new(posting_list(vec![(1, vec![1.0, 0.0])]), vec![]);
+        let writer = AllCentroidsCacheWriter::new(posting_list(vec![(1, 1, vec![1.0, 0.0])]), vec![]);
 
         // when
         writer.update_postings(
             5,
             Some(vec![
-                PostingUpdate::append(10, vec![10.0, 0.0]),
-                PostingUpdate::append(11, vec![11.0, 0.0]),
+                PostingUpdate::append(vector_id(1, 10), vec![10.0, 0.0]),
+                PostingUpdate::append(vector_id(1, 11), vec![11.0, 0.0]),
             ]),
             vec![
-                PostingUpdate::delete(10),
-                PostingUpdate::append(12, vec![12.0, 0.0]),
+                PostingUpdate::delete(vector_id(1, 10)),
+                PostingUpdate::append(vector_id(1, 12), vec![12.0, 0.0]),
             ],
+            &HashSet::new(),
             vec![],
             &empty_deleted_centroids(),
         );
@@ -1320,7 +1408,7 @@ mod tests {
         let cache = writer.cache();
         assert_posting_list_eq(
             cache.root(5).expect("root should be cached"),
-            vec![(11, vec![11.0, 0.0]), (12, vec![12.0, 0.0])],
+            vec![(1, 11, vec![11.0, 0.0]), (1, 12, vec![12.0, 0.0])],
         );
     }
 
@@ -1334,11 +1422,12 @@ mod tests {
             5,
             None,
             vec![],
+            &([vector_id(1, 100)].into_iter().collect()),
             vec![(
-                100,
+                vector_id(1, 100),
                 vec![
-                    PostingUpdate::append(1, vec![1.0, 0.0]),
-                    PostingUpdate::append(2, vec![2.0, 0.0]),
+                    PostingUpdate::append(vector_id(0, 1), vec![1.0, 0.0]),
+                    PostingUpdate::append(vector_id(0, 2), vec![2.0, 0.0]),
                 ],
             )],
             &empty_deleted_centroids(),
@@ -1347,8 +1436,8 @@ mod tests {
         // then
         let cache = writer.cache();
         assert_posting_list_eq(
-            cache.posting(100, 5).expect("centroid should be cached"),
-            vec![(1, vec![1.0, 0.0]), (2, vec![2.0, 0.0])],
+            cache.posting(vector_id(1, 100), 5).expect("centroid should be cached"),
+            vec![(0, 1, vec![1.0, 0.0]), (0, 2, vec![2.0, 0.0])],
         );
     }
 
@@ -1358,8 +1447,8 @@ mod tests {
         let writer = AllCentroidsCacheWriter::new(
             posting_list(vec![]),
             vec![(
-                100,
-                posting_list(vec![(1, vec![1.0, 0.0]), (2, vec![2.0, 0.0])]),
+                vector_id(1, 100),
+                posting_list(vec![(0, 1, vec![1.0, 0.0]), (0, 2, vec![2.0, 0.0])]),
             )],
         );
 
@@ -1368,11 +1457,12 @@ mod tests {
             5,
             None,
             vec![],
+            &HashSet::new(),
             vec![(
-                100,
+                vector_id(1, 100),
                 vec![
-                    PostingUpdate::delete(1),
-                    PostingUpdate::append(3, vec![3.0, 0.0]),
+                    PostingUpdate::delete(vector_id(0, 1)),
+                    PostingUpdate::append(vector_id(0, 3), vec![3.0, 0.0]),
                 ],
             )],
             &empty_deleted_centroids(),
@@ -1381,8 +1471,8 @@ mod tests {
         // then
         let cache = writer.cache();
         assert_posting_list_eq(
-            cache.posting(100, 5).expect("centroid should be cached"),
-            vec![(2, vec![2.0, 0.0]), (3, vec![3.0, 0.0])],
+            cache.posting(vector_id(1, 100), 5).expect("centroid should be cached"),
+            vec![(0, 2, vec![2.0, 0.0]), (0, 3, vec![3.0, 0.0])],
         );
     }
 
@@ -1396,13 +1486,14 @@ mod tests {
             5,
             None,
             vec![],
+            &([vector_id(1, 100)].into_iter().collect()),
             vec![(
-                100,
+                vector_id(1, 100),
                 vec![
-                    PostingUpdate::append(1, vec![1.0, 0.0]),
-                    PostingUpdate::append(2, vec![2.0, 0.0]),
-                    PostingUpdate::delete(1),
-                    PostingUpdate::append(3, vec![3.0, 0.0]),
+                    PostingUpdate::append(vector_id(0, 1), vec![1.0, 0.0]),
+                    PostingUpdate::append(vector_id(0, 2), vec![2.0, 0.0]),
+                    PostingUpdate::delete(vector_id(0, 1)),
+                    PostingUpdate::append(vector_id(0, 3), vec![3.0, 0.0]),
                 ],
             )],
             &empty_deleted_centroids(),
@@ -1411,8 +1502,8 @@ mod tests {
         // then
         let cache = writer.cache();
         assert_posting_list_eq(
-            cache.posting(100, 5).expect("centroid should be cached"),
-            vec![(2, vec![2.0, 0.0]), (3, vec![3.0, 0.0])],
+            cache.posting(vector_id(1, 100), 5).expect("centroid should be cached"),
+            vec![(0, 2, vec![2.0, 0.0]), (0, 3, vec![3.0, 0.0])],
         );
     }
 }

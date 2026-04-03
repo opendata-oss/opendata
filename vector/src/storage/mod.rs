@@ -103,6 +103,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         centroid_id: VectorId,
         dimensions: usize,
     ) -> Result<PostingListValue> {
+        assert!(centroid_id.is_tree_node());
         let key = PostingListKey::new(centroid_id).encode();
         // this is a hack to use a scan to read a single posting list to force slatedb to
         // load the data from all underlying sorted runs in parallel
