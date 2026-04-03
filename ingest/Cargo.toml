@@ -22,6 +22,7 @@ serde_with.workspace = true
 slatedb.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+metrics.workspace = true
 tracing.workspace = true
 ulid.workspace = true
 zstd.workspace = true

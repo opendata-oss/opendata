@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use common::clock::Clock;
@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::IngestorConfig;
 use crate::error::{Error, Result};
+use crate::metric_names;
 use crate::model::{CompressionType, encode_batch};
 use crate::queue::{Metadata, QueueProducer};
 use crate::util::millis;
@@ -231,7 +232,13 @@ impl BatchWriterTask {
     }
 
     async fn write_and_enqueue(&self, entries: Vec<Bytes>, metadata: Vec<Metadata>) -> Result<()> {
+        let start = Instant::now();
+        let raw_bytes: u64 = entries.iter().map(|e| e.len() as u64).sum();
+        let entry_count = entries.len() as u64;
+
         let payload = encode_batch(&entries, self.batch_compression)?;
+        let written_bytes = payload.len() as u64;
+
         let id = ulid::Ulid::new();
         let path = Path::from(format!("{}/{}.batch", self.data_path_prefix, id));
         self.object_store
@@ -240,6 +247,13 @@ impl BatchWriterTask {
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         self.producer.enqueue(path.to_string(), metadata).await?;
+
+        metrics::counter!(metric_names::BATCHES_FLUSHED).increment(1);
+        metrics::counter!(metric_names::ENTRIES_FLUSHED).increment(entry_count);
+        metrics::counter!(metric_names::BYTES_FLUSHED).increment(raw_bytes);
+        metrics::counter!(metric_names::BYTES_WRITTEN).increment(written_bytes);
+        metrics::histogram!(metric_names::FLUSH_DURATION_SECONDS)
+            .record(start.elapsed().as_secs_f64());
 
         Ok(())
     }
@@ -348,6 +362,7 @@ impl Ingestor {
         object_store: Arc<dyn ObjectStore>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
+        metric_names::describe_ingestor_metrics();
         let writer = BatchWriter::new(object_store, &config, clock.clone());
         Ok(Self { writer, clock })
     }

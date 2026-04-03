@@ -2,6 +2,7 @@ mod collector;
 mod config;
 mod error;
 mod ingestor;
+mod metric_names;
 mod model;
 mod queue;
 mod util;

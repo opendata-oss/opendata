@@ -579,22 +579,27 @@ impl ManifestStore {
 struct ConflictCounter {
     write_count: AtomicU64,
     conflict_count: AtomicU64,
+    role: &'static str,
 }
 
 impl ConflictCounter {
-    fn new() -> Self {
+    fn new(role: &'static str) -> Self {
         Self {
             write_count: AtomicU64::new(0),
             conflict_count: AtomicU64::new(0),
+            role,
         }
     }
 
     fn record_write(&self) {
         self.write_count.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!(crate::metric_names::MANIFEST_WRITES, "role" => self.role).increment(1);
     }
 
     fn record_conflict(&self) {
         self.conflict_count.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!(crate::metric_names::MANIFEST_CONFLICTS, "role" => self.role)
+            .increment(1);
     }
 
     fn conflict_rate(&self) -> f64 {
@@ -626,7 +631,7 @@ impl QueueProducer {
                 object_store,
                 manifest_path,
             },
-            counter: ConflictCounter::new(),
+            counter: ConflictCounter::new("producer"),
         }
     }
 
@@ -684,7 +689,7 @@ impl QueueConsumer {
                 manifest_path,
             },
             epoch: AtomicU64::new(UNINITIALIZED_EPOCH),
-            counter: ConflictCounter::new(),
+            counter: ConflictCounter::new("consumer"),
             queue_len: AtomicU64::new(0),
         }
     }
