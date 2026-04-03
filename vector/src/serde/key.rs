@@ -467,7 +467,7 @@ impl CentroidStatsKey {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 12 {
+        if buf.len() < 11 {
             return Err(EncodingError {
                 message: "Buffer too short for CentroidStatsKey".to_string(),
             });
@@ -829,7 +829,7 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 12);
+        assert_eq!(encoded.len(), 11);
     }
 
     #[test]
