@@ -20,7 +20,7 @@ COPY . .
 
 # Build the timeseries binary with remote-write feature in release mode
 # Use --locked to ensure reproducible builds from Cargo.lock
-RUN cargo build --release --locked --manifest-path timeseries/Cargo.toml --features remote-write
+RUN cargo build --release --locked --manifest-path timeseries/Cargo.toml --features remote-write,otel
 
 # Runtime stage
 # Pin to multi-arch manifest list digest for reproducible builds (supports amd64/arm64)
