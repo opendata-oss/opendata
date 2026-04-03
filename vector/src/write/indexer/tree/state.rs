@@ -238,6 +238,7 @@ impl SearchIndexDelta {
                 .map(|posting| posting.into())
                 .collect(),
         );
+        self.root_updates = Vec::new();
         new_level
     }
 

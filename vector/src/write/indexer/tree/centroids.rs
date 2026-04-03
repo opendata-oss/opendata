@@ -14,6 +14,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
+use log::{debug, info};
 
 pub(crate) const ROOT_LEVEL: u8 = 0xFF;
 pub(crate) const LEAF_LEVEL: u8 = 1;
@@ -370,6 +371,7 @@ impl<'a> CentroidIndex for LeveledCentroidIndex<'a> {
 
 impl<'a> LeveledCentroidIndex<'a> {
     fn score_and_rank(
+        postings_level: TreeLevel,
         query: &[f32],
         postings: &[Arc<PostingList>],
         k: usize,
@@ -384,6 +386,7 @@ impl<'a> LeveledCentroidIndex<'a> {
             let mut ranked = Vec::new();
             for posting_list in postings {
                 for posting in posting_list.iter() {
+                    assert_eq!(posting.id().level(), postings_level.level());
                     if !seen.insert(posting.id()) {
                         continue;
                     }
@@ -402,6 +405,7 @@ impl<'a> LeveledCentroidIndex<'a> {
 
         for posting_list in postings {
             for posting in posting_list.iter() {
+                assert_eq!(posting.id().level(), postings_level.level());
                 let distance = compute_distance(query, posting.vector(), distance_metric);
                 let candidate = RankedPosting {
                     posting: &posting,
@@ -436,7 +440,9 @@ impl<'a> LeveledCentroidIndex<'a> {
     }
 
     pub(crate) fn search_root(&self, query: &[f32], k: usize) -> SearchResult {
-        self.search_in_level(query, k, TreeLevel::root(self.depth).next_level_down())
+        let level = TreeLevel::root(self.depth).next_level_down();
+        debug!("search_root: in level {}", level);
+        self.search_in_level(query, k, level)
     }
 
     fn search_in_level(&self, query: &[f32], k: usize, target_level: TreeLevel) -> SearchResult {
@@ -517,13 +523,12 @@ impl<'a> LeveledCentroidIndex<'a> {
             .map(|(_, p)| p.clone())
             .chain(postings.read.iter().map(|(_, p)| p.clone()))
             .collect::<Vec<_>>();
-        if postings.level.level() == ROOT_LEVEL {
-            // root should never be empty
-            assert!(!all_postings.is_empty());
-        }
+        // postings should never be empty
+        assert!(!all_postings.is_empty());
         // the postings at a given level hold vector ids for the next level down
         if postings.level.next_level_down() == target_level {
             SearchResult::Ann(Self::score_and_rank(
+                target_level,
                 query,
                 &all_postings,
                 k,
@@ -534,7 +539,7 @@ impl<'a> LeveledCentroidIndex<'a> {
             // then call search_up_to_level_with_centroids_at_inner_level
             let beam = self.beam.max(k);
             let next_centroids =
-                Self::score_and_rank(query, &all_postings, beam, self.distance_metric)
+                Self::score_and_rank(postings.level.next_level_down(), query, &all_postings, beam, self.distance_metric)
                     .into_iter()
                     .map(|posting| posting.id())
                     .collect();
@@ -926,6 +931,7 @@ mod tests {
     #[test]
     fn should_score_and_rank_l2_postings() {
         // given
+        let target_level = TreeLevel::leaf(TreeDepth::of(3));
         let postings = Arc::new(
             vec![
                 Posting::new(vector_id(1, 10), vec![1.0, 0.0]),
@@ -938,7 +944,7 @@ mod tests {
 
         // when
         let ranked =
-            LeveledCentroidIndex::score_and_rank(&[0.9, 0.1], &[postings], 2, DistanceMetric::L2);
+            LeveledCentroidIndex::score_and_rank(target_level, &[0.9, 0.1], &[postings], 2, DistanceMetric::L2);
 
         // then
         assert_eq!(
@@ -950,6 +956,7 @@ mod tests {
     #[test]
     fn should_deduplicate_ids_and_keep_best_score() {
         // given
+        let target_level = TreeLevel::leaf(TreeDepth::of(3));
         let postings_a = Arc::new(
             vec![
                 Posting::new(vector_id(1, 10), vec![1.0, 0.0]),
@@ -966,6 +973,7 @@ mod tests {
 
         // when
         let ranked = LeveledCentroidIndex::score_and_rank(
+            target_level,
             &[0.9, 0.1],
             &[postings_a, postings_b],
             2,
@@ -1155,7 +1163,7 @@ mod tests {
                 current_level = next_level;
             }
 
-            LeveledCentroidIndex::score_and_rank(query, &current_postings, k, DistanceMetric::L2)
+            LeveledCentroidIndex::score_and_rank(target_level, query, &current_postings, k, DistanceMetric::L2)
         }
     }
 
