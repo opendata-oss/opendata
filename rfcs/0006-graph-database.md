@@ -13,7 +13,7 @@ This RFC defines the storage model for a labeled property graph (LPG) database b
 [Grafeo](https://github.com/GrafeoDB/grafeo) (v0.5.30) as its query engine, implementing Grafeo's
 `GraphStore` and `GraphStoreMut` traits over SlateDB's ordered key-value interface.
 
-The design maps graph primitives — nodes, edges, labels, properties, and adjacency — to SlateDB
+The design maps graph primitives — nodes, edges, labels, properties, and adjacency, to SlateDB
 records using the standard 3-byte key prefix. Two storage layouts are supported: **Individual**
 (one KV row per property/adjacency entry) and **Merged** (packed values with merge-operator-based
 updates). Concurrency control is delegated to SlateDB's built-in transaction support.
@@ -73,8 +73,8 @@ The storage design must support:
 
 ### Architecture Overview
 
-Each graph database instance corresponds to a single SlateDB instance. All graph data — entities,
-properties, indexes, catalog, and metadata — are stored as key-value pairs in the LSM tree.
+Each graph database instance corresponds to a single SlateDB instance. All graph data, entities,
+properties, indexes, catalog, and metadata, are stored as key-value pairs in the LSM tree.
 Grafeo's query engine operates on a `GraphStorage` adapter that translates trait method calls into
 SlateDB reads and writes.
 
@@ -82,24 +82,24 @@ SlateDB reads and writes.
 via `tokio::task::block_in_place`.
 
 ```
-┌─────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────┐
 │              OpenData Graph (per database)               │
 │                                                          │
 │  Grafeo Query Engine                                     │
 │    GQL Parser → Binder → Optimizer → Executor            │
-│    Operates on GraphStore / GraphStoreMut trait objects   │
+│    Operates on GraphStore / GraphStoreMut trait objects  │
 │                          │                               │
 │  GraphStorage Adapter                                    │
-│    Implements GraphStore (reads) + GraphStoreMut (writes) │
+│    Implements GraphStore (reads) + GraphStoreMut (writes)│
 │    In-memory: Catalog cache, Statistics                  │
 │                          │                               │
 │  Record Layout                                           │
-│    NodeRecord(0x10)  EdgeRecord(0x20)  Properties(0x30/40)│
-│    Adjacency(0x50/60) LabelIndex(0x70) PropIndex(0x80)   │
-│    Catalog(0x90)  Metadata(0xE0)  SeqBlock(0xF0)         │
+│   NodeRecord(0x10)  EdgeRecord(0x20)  Properties(0x30/40)│
+│   Adjacency(0x50/60) LabelIndex(0x70) PropIndex(0x80)    │
+│   Catalog(0x90)  Metadata(0xE0)  SeqBlock(0xF0)          │
 │                          │                               │
 │  SlateDB (LSM KV Store)                                  │
-└─────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────┘
 ```
 
 ### Storage Layout Strategies
@@ -347,16 +347,16 @@ profile, `cargo bench --bench layout_comparison`.
 
 **Observations:**
 
-- **Traversal is the dominant win for Merged.** Neighbor lookups at 1000 edges are 41×
+- **Traversal is the dominant win for Merged:** Neighbor lookups at 1000 edges are 41×
   faster in-memory because one packed value replaces a 1000-key prefix scan. On SlateDB
   the gap narrows (~15%) since the scan is I/O-bound, but Merged still wins.
-- **Property reads favor Merged** at 10 properties per node (1 get + decode vs 11 gets).
+- **Property reads favor Merged:** at 10 properties per node (1 get + decode vs 11 gets).
   The advantage grows with property count.
-- **Single-property writes favor Individual** — a direct `put()` avoids merge-operand
+- **Single-property writes favor Individual:** a direct `put()` avoids merge-operand
   encoding (0.9 µs vs 1.6 µs in-memory). On SlateDB the difference is within noise.
 - **Edge creation is comparable.** Merged adds merge-operand overhead (~30% in-memory)
   but on SlateDB both layouts are I/O-bound at ~5.5 ms for 100 edges.
-- **Bulk insert is layout-insensitive on SlateDB** — both complete 100 nodes + 300 edges
+- **Bulk insert is layout-insensitive on SlateDB:** both complete 100 nodes + 300 edges
   in ~22 ms, dominated by WAL/memtable costs.
 
 **Recommendation:** Use Individual for small graphs or write-heavy workloads with few
