@@ -12,10 +12,7 @@ use crate::model::{Query, ReaderConfig, SearchOptions, SearchResult};
 use crate::query_engine::{QueryEngine, QueryEngineOptions};
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
-use crate::write::indexer::tree::centroids::{
-    AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex,
-    StoredCentroidReader,
-};
+use crate::write::indexer::tree::centroids::{AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex, StoredCentroidReader, TreeDepth};
 use crate::write::indexer::tree::posting_list::{IntoTreePostingList, PostingList};
 use async_trait::async_trait;
 use common::StorageSemantics;
@@ -100,7 +97,7 @@ impl VectorDbReader {
             StoredCentroidReader::new(dimensions, storage.clone(), 0),
         ));
         let centroid_index = Arc::new(LeveledCentroidIndex::new(
-            centroids_meta.expect("checked above").depth as u16,
+            TreeDepth::of(centroids_meta.expect("checked above").depth),
             config.distance_metric,
             reader,
         ));

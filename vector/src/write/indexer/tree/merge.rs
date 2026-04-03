@@ -8,17 +8,18 @@ use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, Vec
 use common::StorageRead;
 use futures::future::BoxFuture;
 use std::sync::Arc;
+use crate::serde::vector_id::VectorId;
+use crate::write::indexer::tree::centroids::{TreeDepth, TreeLevel};
 
 struct MergeCentroid {
-    c: u64,
+    c: VectorId,
     c_info: CentroidInfoValue,
     postings: Arc<PostingList>,
 }
 
 pub(crate) struct MergeCentroids {
     opts: Arc<IndexerOpts>,
-    level: u16,
-    depth: u16,
+    level: TreeLevel,
     snapshot: Arc<dyn StorageRead>,
     snapshot_epoch: u64,
 }
@@ -26,15 +27,13 @@ pub(crate) struct MergeCentroids {
 impl MergeCentroids {
     pub(crate) fn new(
         opts: &Arc<IndexerOpts>,
-        level: u16,
-        depth: u16,
+        level: TreeLevel,
         snapshot: &Arc<dyn StorageRead>,
         snapshot_epoch: u64,
     ) -> Self {
         Self {
             opts: opts.clone(),
             level,
-            depth,
             snapshot: snapshot.clone(),
             snapshot_epoch,
         }
@@ -69,7 +68,7 @@ impl MergeCentroids {
             let posting_fut = view.posting_list(c, self.opts.dimensions);
             let c_info = view
                 .centroid(c)
-                .expect(&format!("unexpected missing centroid {}/{}", self.level, c))
+                .expect(&format!("merge@{}: unexpected missing centroid {}", self.level, c))
                 .clone();
             to_resolve.push(Box::pin(async move {
                 Ok(MergeCentroid {
@@ -92,36 +91,34 @@ impl MergeCentroids {
         for merge in resolved {
             delta
                 .search_index
-                .delete_centroids(self.level, vec![merge.c]);
-            if let Some(parent) = merge.c_info.parent_vector_id {
-                assert!(
-                    self.level + 1 < self.depth,
-                    "unexpected parent for c({}) level({}) depth({})",
+                .delete_centroids(vec![merge.c]);
+            if merge.c_info.parent_vector_id.is_centroid() {
+                assert_eq!(
+                    self.level.next_level_up().level(),
+                    merge.c_info.parent_vector_id.level(),
+                    "unexpected parent for c({}): {}",
                     merge.c,
-                    self.level,
-                    self.depth
+                    merge.c_info.parent_vector_id
                 );
                 delta
                     .search_index
-                    .remove_from_posting(self.level + 1, parent, merge.c);
+                    .remove_from_posting(merge.c_info.parent_vector_id, merge.c);
             } else {
-                assert_eq!(
-                    self.level + 1,
-                    self.depth,
-                    "unexpected missing parent for c({}) level({}) depth({})",
+                assert!(merge.c_info.parent_vector_id.is_root());
+                assert!(
+                    self.level.next_level_up().is_root(),
+                    "unexpected root parent for c({})",
                     merge.c,
-                    self.level,
-                    self.depth
                 );
                 delta.search_index.remove_from_root(merge.c);
             }
             for p in merge.postings.iter() {
-                reassignments.push(ReassignVector {
-                    level: self.level,
-                    vector_id: p.id(),
-                    vector: p.vector().to_vec(),
-                    current_centroid: merge.c,
-                })
+                reassignments.push(ReassignVector::new(
+                    p.id(),
+                    p.vector().to_vec(),
+                    merge.c,
+                    self.level
+                ));
             }
         }
 

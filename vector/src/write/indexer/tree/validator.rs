@@ -19,6 +19,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
+use crate::serde::vector_id::{VectorId, ROOT_VECTOR_ID};
 
 pub(crate) async fn validate(
     snapshot: Arc<dyn StorageSnapshot>,
@@ -38,7 +39,7 @@ pub(crate) async fn validate(
 
     let root_posting_list =
         PostingList::from_value(snapshot.get_root_posting_list(dimensions).await?);
-    let centroid_info: HashMap<u64, CentroidInfoValue> = snapshot
+    let centroid_info: HashMap<VectorId, CentroidInfoValue> = snapshot
         .scan_all_centroid_info()
         .await?
         .into_iter()
@@ -86,11 +87,11 @@ pub(crate) async fn validate(
 fn validate_root(
     centroids_meta: &CentroidsValue,
     root_posting_list: &PostingList,
-    centroid_info: &HashMap<u64, CentroidInfoValue>,
-    centroid_counts: &HashMap<(u8, u64), u64>,
-    centroid_postings: &HashMap<u64, PostingList>,
-    reachable_centroids: &mut HashSet<u64>,
-    reachable_counts: &mut HashMap<(u8, u64), u64>,
+    centroid_info: &HashMap<VectorId, CentroidInfoValue>,
+    centroid_counts: &HashMap<(u8, VectorId), u64>,
+    centroid_postings: &HashMap<VectorId, PostingList>,
+    reachable_centroids: &mut HashSet<VectorId>,
+    reachable_counts: &mut HashMap<(u8, VectorId), u64>,
 ) -> Result<()> {
     info!("validate root");
     let root_level = centroids_meta.depth.saturating_sub(1);
@@ -113,7 +114,7 @@ fn validate_root(
             centroid,
             posting.vector(),
             root_level,
-            None,
+            ROOT_VECTOR_ID,
             reachable_centroids,
         )?;
         validate_centroid_subtree(
@@ -131,13 +132,13 @@ fn validate_root(
 }
 
 fn validate_centroid_subtree(
-    centroid_id: u64,
+    centroid_id: VectorId,
     centroid: &CentroidInfoValue,
-    centroid_info: &HashMap<u64, CentroidInfoValue>,
-    centroid_counts: &HashMap<(u8, u64), u64>,
-    centroid_postings: &HashMap<u64, PostingList>,
-    reachable_centroids: &mut HashSet<u64>,
-    reachable_counts: &mut HashMap<(u8, u64), u64>,
+    centroid_info: &HashMap<VectorId, CentroidInfoValue>,
+    centroid_counts: &HashMap<(u8, VectorId), u64>,
+    centroid_postings: &HashMap<VectorId, PostingList>,
+    reachable_centroids: &mut HashSet<VectorId>,
+    reachable_counts: &mut HashMap<(u8, VectorId), u64>,
 ) -> Result<()> {
     info!("validate centroid {} subtree", centroid_id);
     let posting_list = centroid_postings
@@ -195,7 +196,7 @@ fn validate_centroid_subtree(
             child_info,
             child.vector(),
             expected_child_level,
-            Some(centroid_id),
+            centroid_id,
             reachable_centroids,
         )?;
         validate_centroid_subtree(
@@ -212,12 +213,12 @@ fn validate_centroid_subtree(
 }
 
 fn validate_centroid_reference(
-    centroid_id: u64,
+    centroid_id: VectorId,
     centroid: &CentroidInfoValue,
     vector: &[f32],
     expected_level: u8,
-    expected_parent: Option<u64>,
-    reachable_centroids: &mut HashSet<u64>,
+    expected_parent: VectorId,
+    reachable_centroids: &mut HashSet<VectorId>,
 ) -> Result<()> {
     if centroid.level != expected_level {
         return Err(Error::Internal(format!(
@@ -247,11 +248,11 @@ fn validate_centroid_reference(
 }
 
 fn validate_reachability(
-    centroid_info: &HashMap<u64, CentroidInfoValue>,
-    centroid_counts: &HashMap<(u8, u64), u64>,
-    centroid_postings: &HashMap<u64, PostingList>,
-    reachable_centroids: &HashSet<u64>,
-    reachable_counts: &HashMap<(u8, u64), u64>,
+    centroid_info: &HashMap<VectorId, CentroidInfoValue>,
+    centroid_counts: &HashMap<(u8, VectorId), u64>,
+    centroid_postings: &HashMap<VectorId, PostingList>,
+    reachable_centroids: &HashSet<VectorId>,
+    reachable_counts: &HashMap<(u8, VectorId), u64>,
 ) -> Result<()> {
     let stale_centroids = centroid_info
         .keys()
@@ -279,7 +280,7 @@ fn validate_reachability(
 
     let stale_postings = centroid_postings
         .keys()
-        .filter(|centroid_id| **centroid_id != 0 && !reachable_centroids.contains(centroid_id))
+        .filter(|centroid_id| **centroid_id != ROOT_VECTOR_ID && !reachable_centroids.contains(centroid_id))
         .copied()
         .collect::<BTreeSet<_>>();
     if !stale_postings.is_empty() {
@@ -296,9 +297,9 @@ fn validate_state_matches_storage(
     state: &VectorIndexState,
     centroids_meta: &CentroidsValue,
     root_posting_list: &PostingList,
-    centroid_info: &HashMap<u64, CentroidInfoValue>,
-    centroid_counts: &HashMap<(u8, u64), u64>,
-    centroid_postings: &HashMap<u64, PostingList>,
+    centroid_info: &HashMap<VectorId, CentroidInfoValue>,
+    centroid_counts: &HashMap<(u8, VectorId), u64>,
+    centroid_postings: &HashMap<VectorId, PostingList>,
 ) -> Result<()> {
     if state.centroids_meta() != centroids_meta {
         return Err(Error::Internal(format!(
@@ -385,16 +386,16 @@ fn validate_state_matches_storage(
     Ok(())
 }
 
-async fn load_centroid_counts(snapshot: &dyn StorageRead) -> Result<HashMap<(u8, u64), u64>> {
+async fn load_centroid_counts(snapshot: &dyn StorageRead) -> Result<HashMap<(u8, VectorId), u64>> {
     let mut counts = HashMap::new();
-    for ((level, centroid_id), value) in snapshot.scan_all_centroid_stats().await? {
+    for (centroid_id, value) in snapshot.scan_all_centroid_stats().await? {
         if value.num_vectors < 0 {
             return Err(Error::Internal(format!(
-                "negative centroid count for level {}/{}: {}",
-                level, centroid_id, value.num_vectors
+                "negative centroid count for level {}: {}",
+                centroid_id, value.num_vectors
             )));
         }
-        counts.insert((level, centroid_id), value.num_vectors as u64);
+        counts.insert((centroid_id.level(), centroid_id), value.num_vectors as u64);
     }
     Ok(counts)
 }
@@ -402,7 +403,7 @@ async fn load_centroid_counts(snapshot: &dyn StorageRead) -> Result<HashMap<(u8,
 async fn load_centroid_postings(
     snapshot: &dyn StorageRead,
     dimensions: usize,
-) -> Result<HashMap<u64, PostingList>> {
+) -> Result<HashMap<VectorId, PostingList>> {
     Ok(snapshot
         .scan_all_posting_lists(dimensions)
         .await?
@@ -412,8 +413,8 @@ async fn load_centroid_postings(
 }
 
 fn flatten_state_counts(
-    centroid_counts: &HashMap<u16, HashMap<u64, u64>>,
-) -> HashMap<(u8, u64), u64> {
+    centroid_counts: &HashMap<u8, HashMap<VectorId, u64>>,
+) -> HashMap<(u8, VectorId), u64> {
     centroid_counts
         .iter()
         .flat_map(|(&level, counts)| {

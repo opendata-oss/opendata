@@ -112,7 +112,7 @@ impl VectorDbFlusher {
         );
         let cached_reader = CachedCentroidReader::new(&index_outputs.centroid_cache, stored_reader);
         let query_centroid_index = LeveledCentroidIndex::new(
-            index_outputs.centroid_tree_depth as u16,
+            index_outputs.centroid_tree_depth,
             self.opts.distance_metric,
             Arc::new(cached_reader),
         );

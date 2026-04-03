@@ -1,11 +1,10 @@
 use crate::Result;
 use crate::write::indexer::tree::IndexerOpts;
-use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use common::StorageRead;
-use log::info;
 use std::collections::HashMap;
 use std::sync::Arc;
+use crate::write::indexer::tree::centroids::{SearchResult};
 
 pub(crate) struct SplitRoot {
     opts: Arc<IndexerOpts>,
@@ -40,26 +39,16 @@ impl SplitRoot {
         let original_root_postings = view.root_posting_list(self.opts.dimensions).get().await?;
         let root_vecs: Vec<_> = original_root_postings
             .iter()
-            .map(|p| (p.id(), p.vector()))
+            .map(|p| (p.id().id(), p.vector()))
             .collect();
         let clustering = crate::math::kmeans::for_metric(self.opts.distance_metric);
         // todo: change from 2-means to kmeans to support efficient splits of large roots
         let new_root_centroids = clustering.two_means(&root_vecs, self.opts.dimensions);
         let new_root_centroids = vec![new_root_centroids.0, new_root_centroids.1];
-        let mut tree_meta = view.centroids_meta().clone();
 
         drop(view);
 
-        tree_meta.depth += 1;
-        let new_level = tree_meta.depth as u16 - 1;
-        let mut new_root_postings = PostingList::with_capacity(new_root_centroids.len());
-        for new_c_vec in new_root_centroids {
-            let (new_c_id, new_c) = delta.search_index.add_centroid(new_level, new_c_vec, None);
-            info!("writing new root centroid {}/{}", new_level, new_c_id);
-            new_root_postings.push(Posting::new(new_c_id, new_c.vector))
-        }
-        delta.search_index.set_root(new_root_postings);
-        delta.search_index.set_centroids_meta(tree_meta.clone());
+        let new_level = delta.search_index.promote_root(new_root_centroids);
 
         // assign all the existing root centroid vecs to the new centroids
         let updates_for_original_root_postings = {
@@ -73,18 +62,23 @@ impl SplitRoot {
                     .centroid(posting.id())
                     .expect("unexpected missing centroid")
                     .clone();
-                let root_search = centroid_index.search_root(posting.vector(), 1);
+                let root_search = centroid_index
+                    .search_root(posting.vector(), 1);
+                let SearchResult::Ann(root_search) = root_search else {
+                    panic!("root should always be in cache")
+                };
                 let root_c = root_search.first().expect("unexpected missing centroid");
-                original_c.parent_vector_id = Some(root_c.id());
+                assert_eq!(root_c.id().level(), new_level.level());
+                original_c.parent_vector_id = root_c.id();
                 updates_for_original_root_postings.insert(posting.id(), original_c);
             }
             updates_for_original_root_postings
         };
 
+        // connect original root centroids back to new root
         for (original_c_id, entry) in updates_for_original_root_postings {
             delta.search_index.add_to_posting(
-                new_level,
-                entry.parent_vector_id.expect("unreachable"),
+                entry.parent_vector_id,
                 original_c_id,
                 entry.vector.clone(),
             );

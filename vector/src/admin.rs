@@ -8,6 +8,7 @@ use common::Storage;
 use common::{StorageBuilder, StorageSemantics};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use crate::serde::vector_id::VectorId;
 
 /// Administrative entry point for vector index maintenance.
 ///
@@ -67,11 +68,11 @@ impl VectorDbAdmin {
         let depth = state.centroids_meta().depth as u16;
         out.push_str(&format!("root count={}\n", state.root_centroid_count()));
 
-        let mut by_level: BTreeMap<u16, Vec<(u64, u64)>> = BTreeMap::new();
+        let mut by_level: BTreeMap<u16, Vec<(VectorId, u64)>> = BTreeMap::new();
         for (&centroid_id, centroid) in state.centroids() {
             let count = state
                 .centroid_counts()
-                .get(&(centroid.level as u16))
+                .get(&(centroid.level))
                 .and_then(|counts| counts.get(&centroid_id))
                 .copied()
                 .unwrap_or(0);

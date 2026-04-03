@@ -32,10 +32,7 @@ use crate::write::delta::{VectorDbWrite, VectorDbWriteDelta, VectorWrite};
 use crate::write::flusher::VectorDbFlusher;
 use crate::write::indexer::tree::Indexer;
 use crate::write::indexer::tree::IndexerOpts;
-use crate::write::indexer::tree::centroids::{
-    AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex,
-    StoredCentroidReader,
-};
+use crate::write::indexer::tree::centroids::{AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex, StoredCentroidReader, TreeDepth, LEAF_LEVEL};
 use crate::write::indexer::tree::posting_list::{IntoTreePostingList, PostingList};
 use crate::write::indexer::tree::state::VectorIndexState;
 use async_trait::async_trait;
@@ -47,14 +44,16 @@ use common::{StorageBuilder, StorageSemantics};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use crate::serde::Decode;
+use crate::serde::vector_id::{VectorId, ROOT_VECTOR_ID};
 
 pub(crate) const WRITE_CHANNEL: &str = "write";
 
 pub(crate) struct LoadedTreeIndex {
     centroids_meta: CentroidsValue,
     root_centroid_count: u64,
-    centroids: HashMap<u64, CentroidInfoValue>,
-    centroid_counts: HashMap<u16, HashMap<u64, u64>>,
+    centroids: HashMap<VectorId, CentroidInfoValue>,
+    centroid_counts: HashMap<u8, HashMap<VectorId, u64>>,
     centroid_cache: AllCentroidsCacheWriter,
     query_centroid_index: Arc<LeveledCentroidIndex<'static>>,
     num_leaf_centroids: usize,
@@ -321,7 +320,8 @@ impl VectorDb {
             if let Some(seq_alloc_put) = seq_alloc_put {
                 ops.push(common::storage::RecordOp::Put(seq_alloc_put.into()));
             }
-            let centroid_info = CentroidInfoValue::new(0, vector.clone(), None);
+            let centroid_id = VectorId::centroid_id(1, centroid_id);
+            let centroid_info = CentroidInfoValue::new(1, vector.clone(), ROOT_VECTOR_ID);
             ops.push(common::storage::RecordOp::Put(
                 Record::new(
                     CentroidInfoKey::new(centroid_id).encode(),
@@ -331,7 +331,7 @@ impl VectorDb {
             ));
             ops.push(common::storage::RecordOp::Put(
                 Record::new(
-                    CentroidStatsKey::new(0, centroid_id).encode(),
+                    CentroidStatsKey::new(centroid_id).encode(),
                     CentroidStatsValue::new(0).encode_to_bytes(),
                 )
                 .into(),
@@ -342,13 +342,13 @@ impl VectorDb {
         ops.push(common::storage::RecordOp::Put(
             Record::new(
                 CentroidsKey::new().encode(),
-                CentroidsValue::new(1).encode_to_bytes(),
+                CentroidsValue::new(3).encode_to_bytes(),
             )
             .into(),
         ));
         ops.push(common::storage::RecordOp::Put(
             Record::new(
-                PostingListKey::new(0).encode(),
+                PostingListKey::new(ROOT_VECTOR_ID).encode(),
                 PostingListValue::from_posting_updates(root_postings)?.encode_to_bytes(),
             )
             .into(),
@@ -369,24 +369,28 @@ impl VectorDb {
             .ok_or_else(|| Error::Storage("missing centroid tree metadata".to_string()))?;
         let root_posting_list =
             PostingList::from_value(snapshot.get_root_posting_list(dimensions).await?);
-        let centroids: HashMap<u64, CentroidInfoValue> = snapshot
+        let centroids: HashMap<VectorId, CentroidInfoValue> = snapshot
             .scan_all_centroid_info()
             .await?
             .into_iter()
             .collect();
         let centroid_counts = Self::load_centroid_counts_from_storage(snapshot.as_ref()).await?;
         let num_leaf_centroids = centroid_counts
-            .get(&0)
+            .get(&1)
             .map(HashMap::len)
             .unwrap_or_default();
-        // todo: this needs to scan all centroid posting lists, not those in level 0
         let centroid_postings = snapshot
             .scan_all_posting_lists(dimensions)
             .await?
             .into_iter()
             .filter_map(|(centroid_id, posting_list)| {
+                if centroid_id == ROOT_VECTOR_ID {
+                    return None;
+                }
                 centroids.get(&centroid_id).and_then(|centroid| {
-                    if centroid.level > 0 {
+                    if centroid.level > LEAF_LEVEL {
+                        // only load postings for inner centroids (we don't want to load the
+                        // leaf level which holds all the data vector refs)
                         Some((
                             centroid_id,
                             Arc::new(PostingList::from_value(posting_list))
@@ -408,7 +412,7 @@ impl VectorDb {
             StoredCentroidReader::new(dimensions, snapshot, snapshot_epoch),
         ));
         let ann_index = Arc::new(LeveledCentroidIndex::new(
-            centroids_meta.depth as u16,
+            TreeDepth::of(centroids_meta.depth),
             distance_metric,
             reader,
         ));
@@ -464,7 +468,7 @@ impl VectorDb {
     /// Load ID dictionary entries from storage into a HashMap.
     pub(crate) async fn load_dictionary_from_storage(
         snapshot: &dyn StorageRead,
-    ) -> Result<HashMap<String, u64>> {
+    ) -> Result<HashMap<String, VectorId>> {
         // Create prefix for all IdDictionary records
         let mut prefix_buf = bytes::BytesMut::with_capacity(3);
         crate::serde::RecordType::IdDictionary
@@ -484,12 +488,7 @@ impl VectorDb {
 
             // Decode the value to get internal_id
             let mut slice = record.value.as_ref();
-            let internal_id = common::serde::encoding::decode_u64(&mut slice).map_err(|e| {
-                Error::Encoding(format!(
-                    "failed to decode internal ID from ID dictionary: {e}"
-                ))
-            })?;
-
+            let internal_id = VectorId::decode(&mut slice)?;
             dictionary.insert(external_id, internal_id);
         }
 
@@ -502,12 +501,12 @@ impl VectorDb {
     /// for each centroid.
     pub(crate) async fn load_centroid_counts_from_storage(
         snapshot: &dyn StorageRead,
-    ) -> Result<HashMap<u16, HashMap<u64, u64>>> {
+    ) -> Result<HashMap<u8, HashMap<VectorId, u64>>> {
         let stats = snapshot.scan_all_centroid_stats().await?;
         let mut counts = HashMap::new();
-        for ((level, centroid_id), value) in stats {
+        for (centroid_id, value) in stats {
             counts
-                .entry(level as u16)
+                .entry(centroid_id.level())
                 .or_insert_with(HashMap::new)
                 .insert(centroid_id, value.num_vectors.max(0) as u64);
         }

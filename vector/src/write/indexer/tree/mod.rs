@@ -1,7 +1,7 @@
 use crate::DistanceMetric;
 use crate::Result;
 use crate::write::delta::VectorWrite;
-use crate::write::indexer::tree::centroids::CentroidCache;
+use crate::write::indexer::tree::centroids::{CentroidCache, TreeDepth, TreeLevel};
 use crate::write::indexer::tree::merge::MergeCentroids;
 use crate::write::indexer::tree::root::SplitRoot;
 use crate::write::indexer::tree::split::{ReassignVector, SplitCentroids};
@@ -14,6 +14,7 @@ use common::storage::StorageSnapshot;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
+use futures::StreamExt;
 use tracing::{debug, debug_span, info};
 
 pub(crate) mod centroids;
@@ -29,9 +30,9 @@ mod vector;
 pub(crate) struct IndexerStats {
     pub(crate) inserts: usize,
     pub(crate) updates: usize,
-    pub(crate) merges: HashMap<u16, usize>,
-    pub(crate) splits: HashMap<u16, usize>,
-    pub(crate) reassignments: HashMap<u16, usize>,
+    pub(crate) merges: HashMap<TreeLevel, usize>,
+    pub(crate) splits: HashMap<TreeLevel, usize>,
+    pub(crate) reassignments: HashMap<TreeLevel, usize>,
 }
 
 #[derive(Debug)]
@@ -51,7 +52,7 @@ pub(crate) struct IndexUpdateResults {
     pub(crate) stats: IndexerStats,
     pub(crate) centroid_cache: Arc<dyn CentroidCache>,
     pub(crate) leaf_centroids: usize,
-    pub(crate) centroid_tree_depth: usize,
+    pub(crate) centroid_tree_depth: TreeDepth,
 }
 
 pub(crate) struct Indexer {
@@ -116,16 +117,21 @@ impl Indexer {
         stats.inserts = inserts;
         stats.updates = updates;
 
-        let depth = self.state.centroids_meta().depth as u16;
-        for level in 0..depth {
-            let merge = MergeCentroids::new(&self.opts, level, depth, &snapshot, snapshot_epoch);
+        let depth = TreeDepth::of(self.state.centroids_meta().depth);
+        let mut next_level= TreeLevel::leaf(depth);
+        loop {
+            let level = next_level;
+            if level.is_root() {
+                break;
+            }
+            next_level = level.next_level_up();
+            let merge = MergeCentroids::new(&self.opts, level, &snapshot, snapshot_epoch);
             let merge_start = Instant::now();
             let (reassigns, merge_count) = merge.execute(&self.state, &mut delta).await?;
             debug!(
                 parent: &update_span,
                 op = "merge_centroids",
-                level,
-                depth,
+                level = &format!("{}", level),
                 elapsed_ms = elapsed_ms(merge_start),
                 merge_count,
                 reassignment_count = reassigns.len(),
@@ -141,7 +147,7 @@ impl Indexer {
             debug!(
                 parent: &update_span,
                 op = "reassign_vectors_after_merge",
-                level,
+                level = &format!("{}", level),
                 elapsed_ms = elapsed_ms(reassign_after_merge_start),
                 reassigned_count = reassign_after_merge_count,
                 "completed"
@@ -150,14 +156,13 @@ impl Indexer {
             let mut split_round = 0usize;
             loop {
                 let split =
-                    SplitCentroids::new(&self.opts, level, depth, &snapshot, snapshot_epoch);
+                    SplitCentroids::new(&self.opts, level, &snapshot, snapshot_epoch);
                 let split_start = Instant::now();
                 let result = split.execute(&self.state, &mut delta).await?;
                 debug!(
                     parent: &update_span,
                     op = "split_centroids",
-                    level,
-                    depth,
+                    level = &format!("{}", level),
                     split_round,
                     elapsed_ms = elapsed_ms(split_start),
                     split_count = result.splits.len(),
@@ -176,7 +181,7 @@ impl Indexer {
                 debug!(
                     parent: &update_span,
                     op = "reassign_vectors_after_split",
-                    level,
+                    level = &format!("{}", level),
                     split_round,
                     elapsed_ms = elapsed_ms(reassign_after_split_start),
                     reassigned_count = reassign_after_split_count,
@@ -218,7 +223,7 @@ impl Indexer {
             stats,
             centroid_cache: self.query_centroid_cache(),
             leaf_centroids: self.leaf_centroid_count(),
-            centroid_tree_depth: self.state.centroids_meta().depth as usize,
+            centroid_tree_depth: TreeDepth::of(self.state.centroids_meta().depth),
         })
     }
 
@@ -241,12 +246,19 @@ impl Indexer {
         let total_reassign_count = reassigns.len();
         let reassign_start = Instant::now();
         let mut total_reassigned = 0;
-        let mut reassigns_by_level: HashMap<u16, Vec<ReassignVector>> = HashMap::new();
+        let mut reassigns_by_level: HashMap<TreeLevel, Vec<ReassignVector>> = HashMap::new();
         for r in reassigns {
             let entry = reassigns_by_level.entry(r.level).or_default();
             entry.push(r);
         }
-        for level in (0..self.state.centroids_meta().depth as u16).rev() {
+        let depth = TreeDepth::of(self.state.centroids_meta().depth);
+        let mut next_level = TreeLevel::leaf(depth);
+        loop {
+            let level = next_level;
+            if level.is_root() {
+                break;
+            }
+            next_level = next_level.next_level_up();
             let Some(reassigns) = reassigns_by_level.remove(&level) else {
                 continue;
             };
@@ -257,7 +269,7 @@ impl Indexer {
             let reassigned = reassign.execute(&self.state, delta).await?;
             total_reassigned += reassigned;
             debug!(
-                level,
+                level = &format!("{}", level),
                 snapshot_epoch,
                 requested_reassignments = level_reassign_count,
                 reassigned_count = reassigned,

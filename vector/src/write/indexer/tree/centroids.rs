@@ -10,6 +10,7 @@ use futures::future::BoxFuture;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::IntoParallelIterator;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 use crate::serde::vector_id::{VectorId, ROOT_VECTOR_ID};
@@ -20,6 +21,12 @@ pub(crate) const LEAF_LEVEL: u8 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TreeDepth {
     val: u8
+}
+
+impl Display for TreeDepth {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.val)
+    }
 }
 
 impl TreeDepth {
@@ -45,55 +52,106 @@ impl TreeDepth {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct InnerLevel {
     level: u8,
+    depth: TreeDepth
+}
+
+/// wrapper type for root level to prevent direct enum instantiation
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct RootLevel {
+    depth: TreeDepth
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum TreeLevel {
-    Root,
+    Root(RootLevel),
     Inner(InnerLevel)
 }
 
+impl Display for TreeLevel {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TreeLevel::Root(rl) => write!(f, "{}.root", rl.depth),
+            TreeLevel::Inner(l) => write!(f, "{}.{}", l.depth, l.level)
+        }
+    }
+}
+
 impl TreeLevel {
-    pub(crate) fn leaf() -> Self {
-        Self::Inner(InnerLevel{ level: 1 })
+    pub(crate) fn of(level: u8, depth: TreeDepth) -> Self {
+        assert!(level >= LEAF_LEVEL);
+        if level == ROOT_LEVEL {
+            TreeLevel::root(depth)
+        } else {
+            TreeLevel::inner(level, depth)
+        }
+    }
+
+    pub(crate) fn root(depth: TreeDepth) -> Self {
+        Self::Root(RootLevel { depth })
+    }
+
+    pub(crate) fn leaf(depth: TreeDepth) -> Self {
+        Self::Inner(InnerLevel{ level: LEAF_LEVEL, depth })
     }
 
     pub(crate) fn inner(level: u8, depth: TreeDepth) -> Self {
         assert!(level > 0);
         assert!(level <= depth.max_inner_level());
-        Self::Inner(InnerLevel{ level })
+        Self::Inner(InnerLevel{ level, depth })
     }
 
-    pub(crate) fn next_level_up(&self, depth: TreeDepth) -> Self {
+    pub(crate) fn is_inner(&self) -> bool {
+        matches!(*self, TreeLevel::Inner(_))
+    }
+
+    pub(crate) fn is_leaf(&self) -> bool {
         match self {
-            TreeLevel::Root => {
+            TreeLevel::Root(_) => false,
+            TreeLevel::Inner(l) => l.level == LEAF_LEVEL
+        }
+    }
+
+    pub(crate) fn is_root(&self) -> bool {
+        matches!(*self, TreeLevel::Root(_))
+    }
+
+    fn depth(&self) -> TreeDepth {
+        match self {
+            TreeLevel::Root(rl) => rl.depth,
+            TreeLevel::Inner(l) => l.depth,
+        }
+    }
+
+    pub(crate) fn next_level_up(&self) -> Self {
+        match self {
+            TreeLevel::Root(_) => {
                 panic!("no level up from root")
             }
             TreeLevel::Inner(l) => {
-                let max_inner_level = depth.max_inner_level();
+                let max_inner_level = l.depth.max_inner_level();
                 assert!(l.level <= max_inner_level);
                 if l.level == max_inner_level {
-                    Self::Root
+                    Self::root(l.depth)
                 } else {
-                    Self::inner(l.level + 1, depth)
+                    Self::inner(l.level + 1, l.depth)
                 }
             }
         }
     }
 
-    pub(crate) fn next_level_down(&self, depth: TreeDepth) -> Self {
+    pub(crate) fn next_level_down(&self) -> Self {
         match self {
-            TreeLevel::Root => Self::inner(depth.max_inner_level(), depth),
+            TreeLevel::Root(rl) => Self::inner(rl.depth.max_inner_level(), rl.depth),
             TreeLevel::Inner(l) => {
-                assert!(l.level > 0);
-                Self::inner(l.level - 1, depth)
+                assert!(l.level > LEAF_LEVEL);
+                Self::inner(l.level - 1, l.depth)
             }
         }
     }
 
     pub(crate) fn level(&self) -> u8 {
         match self {
-            TreeLevel::Root => ROOT_LEVEL,
+            TreeLevel::Root(_) => ROOT_LEVEL,
             TreeLevel::Inner(l) => l.level
         }
     }
@@ -233,6 +291,7 @@ pub(crate) trait CentroidIndex {
 }
 
 pub(crate) trait CentroidReader: Send + Sync {
+    // TODO: get rid of this and root() from CentroidCache
     fn read_root(&self) -> MaybeCached<Arc<PostingList>>;
 
     fn read_postings(&self, centroid_id: VectorId) -> MaybeCached<Arc<PostingList>>;
@@ -276,7 +335,7 @@ impl<'a> LeveledCentroidIndex<'a> {
 
 impl<'a> CentroidIndex for LeveledCentroidIndex<'a> {
     fn search(&self, query: &[f32], k: usize) -> SearchResult {
-        self.search_up_to_level(query, k, TreeLevel::leaf())
+        self.search_in_level(query, k, TreeLevel::leaf(self.depth))
     }
 
     fn resume_search(
@@ -285,7 +344,7 @@ impl<'a> CentroidIndex for LeveledCentroidIndex<'a> {
         k: usize,
         postings: ResumableCentroidSearch,
     ) -> SearchResult {
-        self.resume_search_up_to_level(query, k, TreeLevel::leaf(), postings)
+        self.resume_search_in_level(query, k, TreeLevel::leaf(self.depth), postings)
     }
 }
 
@@ -357,19 +416,20 @@ impl<'a> LeveledCentroidIndex<'a> {
     }
 
     pub(crate) fn search_root(&self, query: &[f32], k: usize) -> SearchResult {
-        self.search_up_to_level(query, k, TreeLevel::Root)
+        self.search_in_level(query, k, TreeLevel::root(self.depth).next_level_down())
     }
 
-    fn search_up_to_level(&self, query: &[f32], k: usize, level: TreeLevel) -> SearchResult {
+    fn search_in_level(&self, query: &[f32], k: usize, target_level: TreeLevel) -> SearchResult {
+        assert_eq!(target_level.depth(), self.depth);
         let root = self.reader.read_root();
         match root {
             MaybeCached::Value(root) => {
-                self.resume_search_up_to_level(
+                self.resume_search_in_level(
                     query,
                     k,
-                    TreeLevel::Root,
+                    target_level,
                     ResumableCentroidSearch::all_found(
-                        TreeLevel::Root,
+                        TreeLevel::root(self.depth),
                         vec![(ROOT_VECTOR_ID, root)]
                     ),
                 )
@@ -377,7 +437,7 @@ impl<'a> LeveledCentroidIndex<'a> {
             MaybeCached::Future(fut) => {
                 SearchResult::ReadsRequired(
                     BlockedCentroidSearch::new(
-                        TreeLevel::Root,
+                        TreeLevel::root(self.depth),
                         vec![],
                         vec![(
                             ROOT_VECTOR_ID,
@@ -389,14 +449,15 @@ impl<'a> LeveledCentroidIndex<'a> {
         }
     }
 
-    fn search_up_to_level_with_centroids_at_inner_level(
+    fn search_inner_level(
         &self,
         query: &[f32],
         k: usize,
-        level: TreeLevel,
+        target_level: TreeLevel,
         inner_level: TreeLevel,
         centroids: Vec<VectorId>,
     ) -> SearchResult {
+        assert_eq!(target_level.depth(), self.depth);
         let posting_futs: Vec<_> = centroids
             .iter()
             .map(|&c| (c, self.reader.read_postings(c)))
@@ -417,10 +478,10 @@ impl<'a> LeveledCentroidIndex<'a> {
             }
         }
         if reads.is_empty() {
-            self.resume_search_up_to_level(
+            self.resume_search_in_level(
                 query,
                 k,
-                level,
+                target_level,
                 ResumableCentroidSearch::all_found(inner_level, found),
             )
         } else {
@@ -428,20 +489,26 @@ impl<'a> LeveledCentroidIndex<'a> {
         }
     }
 
-    fn resume_search_up_to_level(
+    fn resume_search_in_level(
         &self,
         query: &[f32],
         k: usize,
-        level: TreeLevel,
+        target_level: TreeLevel,
         postings: ResumableCentroidSearch,
     ) -> SearchResult {
+        assert_eq!(target_level.depth(), self.depth);
         let all_postings = postings
             .found
             .iter()
             .map(|(_, p)| p.clone())
             .chain(postings.read.iter().map(|(_, p)| p.clone()))
             .collect::<Vec<_>>();
-        if postings.level == level {
+        if postings.level.level() == ROOT_LEVEL {
+            // root should never be empty
+            assert!(!all_postings.is_empty());
+        }
+        // the postings at a given level hold vector ids for the next level down
+        if postings.level.next_level_down() == target_level {
             SearchResult::Ann(Self::score_and_rank(
                 query,
                 &all_postings,
@@ -457,11 +524,11 @@ impl<'a> LeveledCentroidIndex<'a> {
                     .into_iter()
                     .map(|posting| posting.id())
                     .collect();
-            self.search_up_to_level_with_centroids_at_inner_level(
+            self.search_inner_level(
                 query,
                 k,
-                level,
-                postings.level.next_level_down(self.depth),
+                target_level,
+                postings.level.next_level_down(),
                 next_centroids,
             )
         }
@@ -755,10 +822,10 @@ pub(crate) async fn batch_search_centroids<K: Hash + Eq + Sized + Send + Sync>(
     k: usize,
     queries: Vec<(K, &[f32])>,
 ) -> Result<HashMap<K, Vec<Posting>>> {
-    batch_search_centroids_up_to_level(index, k, queries, TreeLevel::leaf()).await
+    batch_search_centroids_in_level(index, k, queries, TreeLevel::leaf(index.depth)).await
 }
 
-pub(crate) async fn batch_search_centroids_up_to_level<K: Hash + Eq + Sized + Send + Sync>(
+pub(crate) async fn batch_search_centroids_in_level<K: Hash + Eq + Sized + Send + Sync>(
     index: &LeveledCentroidIndex<'_>,
     k: usize,
     queries: Vec<(K, &[f32])>,
@@ -779,9 +846,9 @@ pub(crate) async fn batch_search_centroids_up_to_level<K: Hash + Eq + Sized + Se
             .into_par_iter()
             .map(|(key, q, ip)| {
                 let result = if let Some(ip) = ip {
-                    index.resume_search_up_to_level(&q, k, level, ip)
+                    index.resume_search_in_level(&q, k, level, ip)
                 } else {
-                    index.search_up_to_level(&q, k, level)
+                    index.search_in_level(&q, k, level)
                 };
                 (key, q, result)
             })
@@ -1013,7 +1080,7 @@ mod tests {
         }
 
         fn exhaustive_search(&self, query: &[f32], k: usize) -> Vec<Posting> {
-            self.exhaustive_search_up_to_level(query, k, TreeLevel::leaf())
+            self.exhaustive_search_up_to_level(query, k, TreeLevel::leaf(self.depth))
         }
 
         fn exhaustive_search_up_to_level(
@@ -1022,14 +1089,14 @@ mod tests {
             k: usize,
             target_level: TreeLevel,
         ) -> Vec<Posting> {
-            assert!(target_level == TreeLevel::Root
+            assert!(target_level == TreeLevel::root(self.depth)
                 || target_level.level() <= self.depth.max_inner_level());
 
-            let mut current_level = TreeLevel::Root;
+            let mut current_level = TreeLevel::root(self.depth);
             let mut current_postings = vec![self.root.clone()];
 
             while current_level != target_level {
-                let next_level = current_level.next_level_down(self.depth);
+                let next_level = current_level.next_level_down();
                 let level_postings = self
                     .postings_by_level
                     .get(&next_level.level())
@@ -1180,10 +1247,10 @@ mod tests {
         // given
         let tree = one_inner_level_tree().await;
         let index = tree.fully_cached_index();
-        let expected = tree.exhaustive_search_up_to_level(&[0.9, 0.1], 1, TreeLevel::Root);
+        let expected = tree.exhaustive_search_up_to_level(&[0.9, 0.1], 1, TreeLevel::root(tree.depth));
 
         // when
-        let SearchResult::Ann(ranked) = index.search_up_to_level(&[0.9, 0.1], 1, TreeLevel::Root) else {
+        let SearchResult::Ann(ranked) = index.search_in_level(&[0.9, 0.1], 1, TreeLevel::root(tree.depth)) else {
             panic!("search should complete with all centroids cached");
         };
 
@@ -1200,7 +1267,7 @@ mod tests {
         let expected = tree.exhaustive_search_up_to_level(&[5.1, 0.0], 2, level);
 
         // when
-        let SearchResult::Ann(ranked) = index.search_up_to_level(&[5.1, 0.0], 2, level) else {
+        let SearchResult::Ann(ranked) = index.search_in_level(&[5.1, 0.0], 2, level) else {
             panic!("search should complete with all centroids cached");
         };
 
@@ -1258,7 +1325,7 @@ mod tests {
         // given
         let tree = wide_one_inner_level_tree(101).await;
         let index = tree.index_with_cached_postings(vec![vector_id(1, 1000)]);
-        let expected = tree.exhaustive_search_up_to_level(&[0.0, 0.0], 100, TreeLevel::Root);
+        let expected = tree.exhaustive_search_up_to_level(&[0.0, 0.0], 100, TreeLevel::root(tree.depth));
         let mut expected = ranked_ids(&expected);
         expected.sort_unstable();
 
@@ -1315,7 +1382,7 @@ mod tests {
 
         // when
         let results =
-            batch_search_centroids_up_to_level(&index, 2, vec![("x", &q0), ("y", &q1)], level)
+            batch_search_centroids_in_level(&index, 2, vec![("x", &q0), ("y", &q1)], level)
                 .await
                 .unwrap();
 

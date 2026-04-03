@@ -2,7 +2,7 @@ use crate::math::{distance, heuristics, kmeans};
 use crate::serde::centroid_info::CentroidInfoValue;
 use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::tree::IndexerOpts;
-use crate::write::indexer::tree::centroids::batch_search_centroids_up_to_level;
+use crate::write::indexer::tree::centroids::{batch_search_centroids_in_level, TreeLevel};
 use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use crate::{DistanceMetric, Result};
@@ -14,15 +14,35 @@ use rayon::iter::ParallelIterator;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::task::spawn_blocking;
+use crate::serde::vector_id::VectorId;
 
 const MAX_SPLITS: usize = usize::MAX;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReassignVector {
-    pub(crate) vector_id: u64,
+    pub(crate) vector_id: VectorId,
     pub(crate) vector: Vec<f32>,
-    pub(crate) current_centroid: u64,
-    pub(crate) level: u16,
+    pub(crate) current_centroid: VectorId,
+    // the level of the centroids that this should be reassigned from/to
+    pub(crate) level: TreeLevel
+}
+
+impl ReassignVector {
+    pub(crate) fn new(
+        vector_id: VectorId,
+        vector: Vec<f32>,
+        current_centroid: VectorId,
+        level: TreeLevel
+    ) -> Self {
+        assert_eq!(vector_id.level() + 1, current_centroid.level());
+        assert_eq!(level.level(), current_centroid.level());
+        Self {
+            vector_id,
+            vector,
+            current_centroid,
+            level
+        }
+    }
 }
 
 pub(crate) struct SplitPostings {
@@ -48,7 +68,7 @@ impl SplitPostings {
 }
 
 struct SplitResult {
-    c: u64,
+    c: VectorId,
     c_info: CentroidInfoValue,
     c_0: SplitPostings,
     c_1: SplitPostings,
@@ -60,9 +80,9 @@ struct SplitResult {
 #[derive(Debug)]
 pub(crate) struct SplitSummary {
     #[allow(dead_code)]
-    pub(crate) c: u64,
+    pub(crate) c: VectorId,
     #[allow(dead_code)]
-    pub(crate) new_centroids: Vec<(u64, CentroidInfoValue)>,
+    pub(crate) new_centroids: Vec<(VectorId, CentroidInfoValue)>,
 }
 
 #[derive(Debug)]
@@ -77,26 +97,23 @@ pub(crate) struct SplitCentroids {
     opts: Arc<IndexerOpts>,
     snapshot: Arc<dyn StorageRead>,
     snapshot_epoch: u64,
-    level: u16,
-    depth: u16,
+    level: TreeLevel,
     max_splits: usize,
 }
 
 impl SplitCentroids {
     pub(crate) fn new(
         opts: &Arc<IndexerOpts>,
-        level: u16,
-        depth: u16,
+        level: TreeLevel,
         snapshot: &Arc<dyn StorageRead>,
         snapshot_epoch: u64,
     ) -> Self {
-        Self::new_with_max_splits(opts, level, depth, snapshot, snapshot_epoch, MAX_SPLITS)
+        Self::new_with_max_splits(opts, level, snapshot, snapshot_epoch, MAX_SPLITS)
     }
 
     fn new_with_max_splits(
         opts: &Arc<IndexerOpts>,
-        level: u16,
-        depth: u16,
+        level: TreeLevel,
         snapshot: &Arc<dyn StorageRead>,
         snapshot_epoch: u64,
         max_splits: usize,
@@ -104,7 +121,6 @@ impl SplitCentroids {
         Self {
             opts: opts.clone(),
             level,
-            depth,
             snapshot: snapshot.clone(),
             snapshot_epoch,
             max_splits,
@@ -127,7 +143,7 @@ impl SplitCentroids {
                 .collect();
             to_split.sort_by(|a, b| b.1.cmp(&a.1));
             to_split.truncate(self.max_splits);
-            let to_split: Vec<u64> = to_split.into_iter().map(|(k, _v)| k).collect();
+            let to_split: Vec<VectorId> = to_split.into_iter().map(|(k, _v)| k).collect();
             if to_split.is_empty() {
                 return Ok(SplitCentroidsResult {
                     splits: vec![],
@@ -161,7 +177,7 @@ impl SplitCentroids {
             let centroid_index =
                 view.centroid_index(self.opts.dimensions, self.opts.distance_metric);
             let neighbours_by_centroid = if self.opts.split_search_neighbourhood > 0 {
-                batch_search_centroids_up_to_level(
+                batch_search_centroids_in_level(
                     &centroid_index,
                     self.opts.split_search_neighbourhood + 1,
                     to_split
@@ -202,7 +218,7 @@ impl SplitCentroids {
                 let read_fut = view.posting_list(c, self.opts.dimensions);
                 posting_reads.push(
                     Box::pin(async move { read_fut.get().await.map(|p| (c, p)) })
-                        as BoxFuture<'static, Result<(u64, Arc<PostingList>)>>,
+                        as BoxFuture<'static, Result<(VectorId, Arc<PostingList>)>>,
                 );
             }
             let results = AsyncBatchDriver::execute(posting_reads).await;
@@ -244,14 +260,19 @@ impl SplitCentroids {
             // delete old centroid and its posting entries
             delta
                 .search_index
-                .delete_centroids(self.level, vec![result.c]);
-            if let Some(parent) = result.c_info.parent_vector_id {
-                assert!(self.level + 1 < self.depth);
+                .delete_centroids(vec![result.c]);
+            if result.c_info.parent_vector_id.is_centroid() {
+                assert_eq!(
+                    self.level.next_level_up().level(),
+                    result.c_info.parent_vector_id.level()
+                );
+                assert!(!self.level.next_level_up().is_root());
                 delta
                     .search_index
-                    .remove_from_posting(self.level + 1, parent, result.c);
+                    .remove_from_posting(result.c_info.parent_vector_id, result.c);
             } else {
-                assert_eq!(self.level + 1, self.depth);
+                result.c_info.parent_vector_id.is_root();
+                assert!(self.level.next_level_up().is_root());
                 delta.search_index.remove_from_root(result.c);
             }
 
@@ -264,21 +285,20 @@ impl SplitCentroids {
                     new_centroid.centroid_vec().to_vec(),
                     result.c_info.parent_vector_id,
                 );
-                if let Some(parent) = result.c_info.parent_vector_id {
+                if result.c_info.parent_vector_id.is_centroid() {
                     delta.search_index.add_to_posting(
-                        self.level + 1,
-                        parent,
+                        result.c_info.parent_vector_id,
                         c_id,
                         entry.vector.clone(),
                     );
                     reassignments.insert(
                         c_id,
-                        ReassignVector {
-                            vector_id: c_id,
-                            vector: entry.vector.clone(),
-                            current_centroid: parent,
-                            level: self.level + 1,
-                        },
+                        ReassignVector::new(
+                            c_id,
+                            entry.vector.clone(),
+                            result.c_info.parent_vector_id,
+                            self.level.next_level_up()
+                        )
                     );
                 } else {
                     delta.search_index.add_to_root(c_id, entry.vector.clone());
@@ -286,19 +306,20 @@ impl SplitCentroids {
                 // add all posting entries for the new centroid
                 for p in new_centroid.postings() {
                     delta.search_index.add_to_posting(
-                        self.level,
                         c_id,
                         p.id(),
                         p.vector().to_vec(),
                     );
-                    if self.level > 0 {
+                    if !self.level.is_leaf() {
+                        // if this is a non-leaf level, then the posting vectors are centroids,
+                        // and their parent ref needs to be updated
                         delta.search_index.update_centroid(
                             p.id(),
-                            CentroidInfoValue {
-                                level: (self.level - 1) as u8,
-                                vector: p.vector().to_vec(),
-                                parent_vector_id: Some(c_id),
-                            },
+                            CentroidInfoValue::new(
+                                self.level.next_level_down().level(),
+                                p.vector().to_vec(),
+                                c_id,
+                            )
                         )
                     }
                 }
@@ -331,16 +352,16 @@ impl SplitCentroids {
 }
 
 struct SplitCentroid {
-    c: u64,
+    c: VectorId,
     c_info: CentroidInfoValue,
-    neighbours: Vec<u64>,
+    neighbours: Vec<VectorId>,
     distance_metric: DistanceMetric,
     dimensions: usize,
-    level: u16,
+    level: TreeLevel,
 }
 
 impl SplitCentroid {
-    fn execute(self, postings: Arc<HashMap<u64, Arc<PostingList>>>) -> SplitResult {
+    fn execute(self, postings: Arc<HashMap<VectorId, Arc<PostingList>>>) -> SplitResult {
         let c_postings = postings
             .get(&self.c)
             .expect("unexpected missing postings for c");
@@ -349,7 +370,7 @@ impl SplitCentroid {
             "tried to split centroid {} with less than 2 postings",
             self.c
         );
-        let c_vectors: Vec<(u64, Vec<f32>)> = c_postings
+        let c_vectors: Vec<(VectorId, Vec<f32>)> = c_postings
             .iter()
             .map(|p| (p.id(), p.vector().to_vec()))
             .collect();
@@ -357,9 +378,10 @@ impl SplitCentroid {
         // Run two_means clustering to find new centroids
         let c_vector_refs: Vec<(u64, &[f32])> = c_vectors
             .iter()
-            .map(|(id, v)| (*id, v.as_slice()))
+            .map(|(id, v)| (id.id(), v.as_slice()))
             .collect();
         let clustering = kmeans::for_metric(self.distance_metric);
+        // todo: why does 2means need the vector IDs?
         let (c0_vector, c1_vector) = clustering.two_means(&c_vector_refs, self.dimensions);
         // Assign each vector to closer centroid
         let mut c0_postings = PostingList::with_capacity(c_vectors.len());
@@ -417,12 +439,12 @@ impl SplitCentroid {
 
     fn compute_split_reassignments(
         &self,
-        centroid_id: u64,
+        centroid_id: VectorId,
         postings: &PostingList,
         c_vector: &[f32],
         c0_vector: &[f32],
         c1_vector: &[f32],
-        level: u16,
+        level: TreeLevel,
     ) -> Vec<ReassignVector> {
         // use the heuristic for c's vectors from the spfresh paper to cheaply determine if
         // a vector may need reassignment. If it may, then check in the centroid graph for
@@ -439,12 +461,12 @@ impl SplitCentroid {
             ) {
                 continue;
             }
-            reassignments.push(ReassignVector {
-                vector_id: p.id(),
-                vector: p.vector().to_vec(),
-                current_centroid: centroid_id,
+            reassignments.push(ReassignVector::new(
+                p.id(),
+                p.vector().to_vec(),
+                centroid_id,
                 level,
-            })
+            ));
         }
         reassignments
     }
@@ -454,8 +476,8 @@ impl SplitCentroid {
         c_vector: &[f32],
         c0_vector: &[f32],
         c1_vector: &[f32],
-        postings: &HashMap<u64, Arc<PostingList>>,
-        level: u16,
+        postings: &HashMap<VectorId, Arc<PostingList>>,
+        level: TreeLevel,
     ) -> Vec<ReassignVector> {
         let mut reassignments: Vec<ReassignVector> = Vec::new();
 
@@ -481,12 +503,12 @@ impl SplitCentroid {
                 }
                 let vector = p.vector().to_vec();
 
-                reassignments.push(ReassignVector {
-                    vector_id: p.id(),
+                reassignments.push(ReassignVector::new(
+                    p.id(),
                     vector,
-                    current_centroid: *neighbour_id,
+                    *neighbour_id,
                     level,
-                });
+                ));
             }
         }
         reassignments
