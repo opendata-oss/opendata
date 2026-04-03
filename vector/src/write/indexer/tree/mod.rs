@@ -15,7 +15,7 @@ use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, debug_span, info};
+use tracing::{debug, debug_span, error, info};
 
 pub(crate) mod centroids;
 mod merge;
@@ -77,7 +77,7 @@ impl Indexer {
         self.state
             .centroids()
             .values()
-            .filter(|centroid| centroid.level == 0)
+            .filter(|centroid| centroid.level == 1)
             .count()
     }
 
@@ -155,6 +155,15 @@ impl Indexer {
 
             let mut split_round = 0usize;
             loop {
+                if split_round >= 1000 {
+                    error!(
+                        msg = "splits seem to be in infinite loop",
+                        level = &format!("{}", level),
+                        state = &format!("{:?}", &self.state),
+                        delta = &format!("{:?}", &delta)
+                    );
+                    panic!("split infinite loop");
+                }
                 let split = SplitCentroids::new(&self.opts, level, &snapshot, snapshot_epoch);
                 let split_start = Instant::now();
                 let result = split.execute(&self.state, &mut delta).await?;

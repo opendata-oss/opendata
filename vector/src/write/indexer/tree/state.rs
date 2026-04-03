@@ -29,6 +29,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 /// In-memory preserved state of vector index
+#[derive(Debug)]
 pub(crate) struct VectorIndexState {
     dictionary: HashMap<String, VectorId>,
     centroids_meta: CentroidsValue,
@@ -94,6 +95,7 @@ impl VectorIndexState {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct ForwardIndexDelta {
     dictionary_updates: HashMap<String, VectorId>,
     vector_updates: HashMap<VectorId, VectorDataValue>,
@@ -180,6 +182,7 @@ impl ForwardIndexDelta {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct SearchIndexDelta {
     centroids_meta: CentroidsValue,
     upserted_centroids: HashMap<VectorId, CentroidInfoValue>,
@@ -510,6 +513,7 @@ impl SearchIndexDelta {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct VectorIndexDelta {
     pub(crate) forward_index: ForwardIndexDelta,
     pub(crate) search_index: SearchIndexDelta,

@@ -8,7 +8,9 @@ use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
-use crate::write::indexer::tree::centroids::{AllCentroidsCacheWriter, CentroidCache, TreeDepth, TreeLevel, LEAF_LEVEL};
+use crate::write::indexer::tree::centroids::{
+    AllCentroidsCacheWriter, CentroidCache, LEAF_LEVEL, TreeDepth, TreeLevel,
+};
 use crate::write::indexer::tree::posting_list::{IntoTreePostingList, Posting, PostingList};
 use crate::write::indexer::tree::state::VectorIndexState;
 use bytes::Bytes;

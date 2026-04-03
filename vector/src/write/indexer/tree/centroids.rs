@@ -8,13 +8,13 @@ use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::tree::posting_list::{IntoTreePostingList, Posting, PostingList};
 use common::StorageRead;
 use futures::future::BoxFuture;
+use log::{debug, info};
 use rayon::iter::ParallelIterator;
 use rayon::prelude::IntoParallelIterator;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
-use log::{debug, info};
 
 pub(crate) const ROOT_LEVEL: u8 = 0xFF;
 pub(crate) const LEAF_LEVEL: u8 = 1;
@@ -538,11 +538,16 @@ impl<'a> LeveledCentroidIndex<'a> {
             // find the top beam postings at this level and search at the next level
             // then call search_up_to_level_with_centroids_at_inner_level
             let beam = self.beam.max(k);
-            let next_centroids =
-                Self::score_and_rank(postings.level.next_level_down(), query, &all_postings, beam, self.distance_metric)
-                    .into_iter()
-                    .map(|posting| posting.id())
-                    .collect();
+            let next_centroids = Self::score_and_rank(
+                postings.level.next_level_down(),
+                query,
+                &all_postings,
+                beam,
+                self.distance_metric,
+            )
+            .into_iter()
+            .map(|posting| posting.id())
+            .collect();
             self.search_inner_level(
                 query,
                 k,
@@ -648,7 +653,7 @@ impl CentroidReader for CachedCentroidReader {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct WrittenPostingList {
     posting_list: Arc<PostingList>,
     written_epoch: u64,
@@ -680,6 +685,7 @@ impl CentroidCache for AllCentroidsCache {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct AllCentroidsCacheWriter {
     inner: Arc<Mutex<AllCentroidsCacheInner>>,
 }
@@ -816,6 +822,7 @@ impl AllCentroidsCacheWriter {
     }
 }
 
+#[derive(Debug)]
 struct AllCentroidsCacheInner {
     postings: HashMap<VectorId, WrittenPostingList>,
 }
@@ -943,8 +950,13 @@ mod tests {
         );
 
         // when
-        let ranked =
-            LeveledCentroidIndex::score_and_rank(target_level, &[0.9, 0.1], &[postings], 2, DistanceMetric::L2);
+        let ranked = LeveledCentroidIndex::score_and_rank(
+            target_level,
+            &[0.9, 0.1],
+            &[postings],
+            2,
+            DistanceMetric::L2,
+        );
 
         // then
         assert_eq!(
@@ -1131,8 +1143,7 @@ mod tests {
             target_level: TreeLevel,
         ) -> Vec<Posting> {
             assert!(
-                target_level.level() >= 1
-                    && target_level.level() <= self.depth.max_inner_level()
+                target_level.level() >= 1 && target_level.level() <= self.depth.max_inner_level()
             );
 
             let mut current_level = TreeLevel::root(self.depth);
@@ -1163,7 +1174,13 @@ mod tests {
                 current_level = next_level;
             }
 
-            LeveledCentroidIndex::score_and_rank(target_level, query, &current_postings, k, DistanceMetric::L2)
+            LeveledCentroidIndex::score_and_rank(
+                target_level,
+                query,
+                &current_postings,
+                k,
+                DistanceMetric::L2,
+            )
         }
     }
 
@@ -1320,13 +1337,14 @@ mod tests {
         // given
         let tree = one_inner_level_tree().await;
         let index = tree.fully_cached_index();
-        let expected =
-            tree.exhaustive_search_in_level(&[0.9, 0.1], 1, TreeLevel::root(tree.depth).next_level_down());
+        let expected = tree.exhaustive_search_in_level(
+            &[0.9, 0.1],
+            1,
+            TreeLevel::root(tree.depth).next_level_down(),
+        );
 
         // when
-        let SearchResult::Ann(ranked) =
-            index.search_root(&[0.9, 0.1], 1)
-        else {
+        let SearchResult::Ann(ranked) = index.search_root(&[0.9, 0.1], 1) else {
             panic!("search should complete with all centroids cached");
         };
 
@@ -1401,8 +1419,11 @@ mod tests {
         // given
         let tree = wide_two_inner_level_tree(101).await;
         let index = tree.index_with_cached_postings(vec![vector_id(2, 1000)]);
-        let expected =
-            tree.exhaustive_search_in_level(&[0.0, 0.0], 100, TreeLevel::root(tree.depth).next_level_down());
+        let expected = tree.exhaustive_search_in_level(
+            &[0.0, 0.0],
+            100,
+            TreeLevel::root(tree.depth).next_level_down(),
+        );
         let mut expected = ranked_ids(&expected);
         expected.sort_unstable();
 
