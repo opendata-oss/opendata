@@ -95,7 +95,7 @@ impl Decode for VectorId {
         if buf.len() < 8 {
             return Err(EncodingError {
                 message: format!(
-                    "Buffer too short for IdDictionaryValue: need 8 bytes, have {}",
+                    "Buffer too short for VectorId: need 8 bytes, have {}",
                     buf.len()
                 ),
             });

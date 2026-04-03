@@ -71,15 +71,6 @@ impl Decode for CentroidInfoValue {
 
         let vector = decode_array(buf)?;
 
-        if buf.is_empty() {
-            return Err(EncodingError {
-                message: format!(
-                    "Buffer too short for CentroidInfoValue parent flag: expected at least 1 byte, got {}",
-                    buf.len()
-                ),
-            });
-        }
-        *buf = &buf[1..];
         let parent_vector_id = VectorId::decode(buf)?;
         Ok(Self {
             level,
@@ -96,7 +87,7 @@ mod tests {
     #[test]
     fn should_encode_and_decode_centroid_info_with_parent() {
         // given
-        let value = CentroidInfoValue::new(2, vec![1.0, 2.0, 3.0], VectorId::centroid_id(1, 123));
+        let value = CentroidInfoValue::new(1, vec![1.0, 2.0, 3.0], VectorId::centroid_id(2, 123));
 
         // when
         let encoded = value.encode_to_bytes();
