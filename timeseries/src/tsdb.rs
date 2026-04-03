@@ -323,6 +323,7 @@ pub(crate) async fn evaluate_range(
 
     let mut series_map: HashMap<Labels, Vec<(i64, f64)>> = HashMap::new();
     let mut evaluator = Evaluator::with_concurrency(reader, concurrency);
+    let rp_before = evaluator.read_path_stats();
     let mut current_time = start;
 
     while current_time <= end {
@@ -363,6 +364,30 @@ pub(crate) async fn evaluate_range(
 
         current_time += step;
     }
+
+    let stats = evaluator.stats();
+    let rp_delta = evaluator.read_path_stats().delta_since(&rp_before);
+    tracing::trace!(
+        step_count = stats.step_count,
+        bucket_list_reuses = stats.bucket_list_reuses,
+        bucket_list_init_attempts = stats.bucket_list_init_attempts,
+        selector_hits = stats.selector_hits,
+        selector_misses = stats.selector_misses,
+        series_meta_hits = stats.series_meta_hits,
+        series_meta_misses = stats.series_meta_misses,
+        sample_slice_ops = stats.sample_slice_ops,
+        sample_slice_binary_search_ops = stats.sample_slice_binary_search_ops,
+        label_map_materializations = stats.label_map_materializations,
+        forward_index_hits = rp_delta.forward_index_hits,
+        forward_index_misses = rp_delta.forward_index_misses,
+        inverted_index_hits = rp_delta.inverted_index_hits,
+        inverted_index_misses = rp_delta.inverted_index_misses,
+        sample_hits = rp_delta.sample_hits,
+        sample_misses = rp_delta.sample_misses,
+        metadata_permit_wait_ns = rp_delta.metadata_permit_wait_ns,
+        sample_permit_wait_ns = rp_delta.sample_permit_wait_ns,
+        "range query eval stats"
+    );
 
     Ok(series_map
         .into_iter()

@@ -15,7 +15,7 @@ use crate::index::ForwardIndexLookup;
 use crate::model::{Label, Sample, SeriesFingerprint, SeriesId, TimeBucket};
 use crate::promql::evaluator::{
     CachedQueryReader, EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult,
-    QueryReaderEvalCache,
+    QueryReaderEvalCache, SelectorCacheKey, SeriesMeta,
 };
 use crate::promql::selector::evaluate_selector_with_reader;
 use crate::query::QueryReader;
@@ -24,6 +24,7 @@ use futures::{StreamExt, TryStreamExt};
 use promql_parser::parser::VectorSelector;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
@@ -74,20 +75,30 @@ impl QueryPlan {
     /// All matching series in the bucket become explicit sample work items.
     /// Instant selectors rely on `shape_instant_results` to enforce newest-wins
     /// across buckets, so planning does not prune cross-bucket duplicates here.
-    fn build_work(&self, metadata: &BucketMetadata) -> EvalResult<BucketSampleWork> {
+    fn build_work(
+        &self,
+        metadata: &BucketMetadata,
+        cache: &QueryReaderEvalCache,
+    ) -> EvalResult<BucketSampleWork> {
         let strict = !matches!(self.path_kind, QueryPathKind::SubqueryVectorSelector { .. });
-        build_bucket_sample_work(self, metadata, strict)
+        build_bucket_sample_work(self, metadata, strict, cache)
     }
 
     /// Shape all loaded bucket data into the final ExprResult for this path.
-    fn shape(&self, all_bucket_data: &[BucketSampleData]) -> ExprResult {
+    fn shape(
+        &self,
+        all_bucket_data: &[BucketSampleData],
+        stats: &crate::promql::evaluator::EvalStats,
+    ) -> ExprResult {
         match &self.path_kind {
             QueryPathKind::InstantVector { .. } => {
-                ExprResult::InstantVector(shape_instant_results(all_bucket_data))
+                ExprResult::InstantVector(shape_instant_results(all_bucket_data, stats))
             }
-            QueryPathKind::Matrix => ExprResult::RangeVector(shape_matrix_results(all_bucket_data)),
+            QueryPathKind::Matrix => {
+                ExprResult::RangeVector(shape_matrix_results(all_bucket_data, stats))
+            }
             QueryPathKind::SubqueryVectorSelector { .. } => {
-                ExprResult::RangeVector(shape_subquery_results(all_bucket_data, self))
+                ExprResult::RangeVector(shape_subquery_results(all_bucket_data, self, stats))
             }
         }
     }
@@ -106,7 +117,7 @@ pub(crate) struct BucketMetadata {
 pub(crate) struct SeriesWorkItem {
     pub series_id: SeriesId,
     pub fingerprint: SeriesFingerprint,
-    pub labels: Vec<Label>,
+    pub labels: Arc<[Label]>,
     pub metric_name: String,
 }
 
@@ -121,7 +132,7 @@ pub(crate) struct BucketSampleWork {
 /// Loaded samples for one series.
 pub(crate) struct LoadedSeriesSamples {
     pub fingerprint: SeriesFingerprint,
-    pub labels: Vec<Label>,
+    pub labels: Arc<[Label]>,
     pub samples: Vec<Sample>,
 }
 
@@ -250,20 +261,47 @@ fn compute_subquery_alignment(
 /// Resolve metadata for a single bucket: run selector, load forward index.
 ///
 /// Returns `None` if no candidate series match the selector in this bucket.
+/// Consults the selector-result cache before invoking the full selector path.
 pub(crate) async fn resolve_bucket_metadata<R: QueryReader>(
     reader: &CachedQueryReader<'_, R>,
     bucket: TimeBucket,
     selector: &VectorSelector,
 ) -> EvalResult<Option<BucketMetadata>> {
-    let candidates = evaluate_selector_with_reader(reader, bucket, selector)
-        .await
-        .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+    let selector_key = SelectorCacheKey::from_selector(selector);
+    let cache = reader.shared_cache();
 
-    if candidates.is_empty() {
+    let candidates_vec: Vec<SeriesId> =
+        if let Some(cached) = cache.get_selector_result(&bucket, &selector_key) {
+            cache
+                .stats
+                .selector_hits
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            cached.to_vec()
+        } else {
+            cache
+                .stats
+                .selector_misses
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            let candidates = evaluate_selector_with_reader(reader, bucket, selector)
+                .await
+                .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+
+            if candidates.is_empty() {
+                // Cache empty result so repeated steps skip the selector entirely
+                cache.cache_selector_result(bucket, selector_key, Arc::from([]));
+                return Ok(None);
+            }
+
+            let mut vec: Vec<_> = candidates.into_iter().collect();
+            vec.sort();
+            cache.cache_selector_result(bucket, selector_key, Arc::from(vec.as_slice()));
+            vec
+        };
+
+    if candidates_vec.is_empty() {
         return Ok(None);
     }
 
-    let candidates_vec: Vec<_> = candidates.into_iter().collect();
     let forward_index = reader.forward_index(&bucket, &candidates_vec).await?;
 
     Ok(Some(BucketMetadata {
@@ -282,14 +320,33 @@ pub(crate) async fn resolve_bucket_metadata<R: QueryReader>(
 /// When `strict` is true, a candidate series ID missing from the forward index
 /// is an error (instant and matrix paths). When false, missing specs are
 /// silently skipped (subquery path, matching existing `fetch_series_samples`).
+///
+/// Uses the query-scoped `SeriesMeta` cache to avoid recomputing fingerprints
+/// and re-cloning labels across repeated steps.
 pub(crate) fn build_bucket_sample_work(
     plan: &QueryPlan,
     metadata: &BucketMetadata,
     strict: bool,
+    cache: &QueryReaderEvalCache,
 ) -> EvalResult<BucketSampleWork> {
     let mut series = Vec::with_capacity(metadata.candidates.len());
 
     for &series_id in &metadata.candidates {
+        // Check SeriesMeta cache first
+        if let Some(meta) = cache.get_series_meta(&metadata.bucket, &series_id) {
+            cache
+                .stats
+                .series_meta_hits
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            series.push(SeriesWorkItem {
+                series_id,
+                fingerprint: meta.fingerprint,
+                labels: meta.canonical_labels,
+                metric_name: meta.metric_name,
+            });
+            continue;
+        }
+
         let spec = match metadata.forward_index.get_spec(&series_id) {
             Some(spec) => spec,
             None if strict => {
@@ -301,18 +358,35 @@ pub(crate) fn build_bucket_sample_work(
             None => continue,
         };
 
-        let fingerprint = compute_fingerprint(&spec.labels);
-        let metric_name = spec
-            .labels
+        cache
+            .stats
+            .series_meta_misses
+            .fetch_add(1, AtomicOrdering::Relaxed);
+
+        let mut canonical = spec.labels.clone();
+        canonical.sort();
+        let fingerprint = compute_fingerprint(&canonical);
+        let canonical_labels: Arc<[Label]> = Arc::from(canonical);
+        let metric_name = canonical_labels
             .iter()
             .find(|l| l.name == "__name__")
             .map(|l| l.value.clone())
             .unwrap_or_default();
 
+        cache.cache_series_meta(
+            metadata.bucket,
+            series_id,
+            SeriesMeta {
+                fingerprint,
+                canonical_labels: Arc::clone(&canonical_labels),
+                metric_name: metric_name.clone(),
+            },
+        );
+
         series.push(SeriesWorkItem {
             series_id,
             fingerprint,
-            labels: spec.labels.clone(),
+            labels: canonical_labels,
             metric_name,
         });
     }
@@ -434,7 +508,10 @@ pub(crate) async fn load_bucket_samples<R: QueryReader>(
 /// Takes the latest sample per fingerprint. Bucket data should already be in
 /// newest-first order (from `QueryPlan::for_instant_vector`). A fingerprint
 /// dedup pass ensures within-bucket duplicates are also handled.
-pub(crate) fn shape_instant_results(all_bucket_data: &[BucketSampleData]) -> Vec<EvalSample> {
+pub(crate) fn shape_instant_results(
+    all_bucket_data: &[BucketSampleData],
+    stats: &crate::promql::evaluator::EvalStats,
+) -> Vec<EvalSample> {
     let mut seen: HashSet<SeriesFingerprint> = HashSet::new();
     let mut results = Vec::new();
 
@@ -444,6 +521,9 @@ pub(crate) fn shape_instant_results(all_bucket_data: &[BucketSampleData]) -> Vec
                 continue;
             }
             if let Some(best) = series.samples.last() {
+                stats
+                    .label_map_materializations
+                    .fetch_add(1, AtomicOrdering::Relaxed);
                 results.push(EvalSample {
                     timestamp_ms: best.timestamp_ms,
                     value: best.value,
@@ -461,24 +541,31 @@ pub(crate) fn shape_instant_results(all_bucket_data: &[BucketSampleData]) -> Vec
 /// Shape loaded data for matrix selector.
 ///
 /// Merges all samples per series (keyed by sorted label vector) across all
-/// buckets. Bucket data should be in chronological order.
-pub(crate) fn shape_matrix_results(all_bucket_data: &[BucketSampleData]) -> Vec<EvalSamples> {
-    let mut series_map: HashMap<Vec<Label>, Vec<Sample>> = HashMap::new();
+/// buckets. Bucket data should be in chronological order. Labels from
+/// SeriesMeta are already canonically sorted, so no re-sort is needed.
+pub(crate) fn shape_matrix_results(
+    all_bucket_data: &[BucketSampleData],
+    stats: &crate::promql::evaluator::EvalStats,
+) -> Vec<EvalSamples> {
+    let mut series_map: HashMap<Arc<[Label]>, Vec<Sample>> = HashMap::new();
 
     for bd in all_bucket_data {
         for series in &bd.series_data {
-            let mut key = series.labels.clone();
-            key.sort();
-            let values = series_map.entry(key).or_default();
+            let values = series_map.entry(Arc::clone(&series.labels)).or_default();
             values.extend(series.samples.iter().cloned());
         }
     }
 
     series_map
         .into_iter()
-        .map(|(labels, values)| EvalSamples {
-            values,
-            labels: labels_to_hashmap(&labels),
+        .map(|(labels, values)| {
+            stats
+                .label_map_materializations
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            EvalSamples {
+                values,
+                labels: labels_to_hashmap(&labels),
+            }
         })
         .collect()
 }
@@ -490,6 +577,7 @@ pub(crate) fn shape_matrix_results(all_bucket_data: &[BucketSampleData]) -> Vec<
 pub(crate) fn shape_subquery_results(
     all_bucket_data: &[BucketSampleData],
     plan: &QueryPlan,
+    stats: &crate::promql::evaluator::EvalStats,
 ) -> Vec<EvalSamples> {
     let (aligned_start_ms, step_ms, lookback_delta_ms, expected_steps) = match &plan.path_kind {
         QueryPathKind::SubqueryVectorSelector {
@@ -507,12 +595,12 @@ pub(crate) fn shape_subquery_results(
     };
 
     // Merge by fingerprint
-    let mut merged: HashMap<SeriesFingerprint, (Vec<Label>, Vec<Sample>)> = HashMap::new();
+    let mut merged: HashMap<SeriesFingerprint, (Arc<[Label]>, Vec<Sample>)> = HashMap::new();
     for bd in all_bucket_data {
         for series in &bd.series_data {
             let entry = merged
                 .entry(series.fingerprint)
-                .or_insert_with(|| (series.labels.clone(), Vec::new()));
+                .or_insert_with(|| (Arc::clone(&series.labels), Vec::new()));
             entry.1.extend(series.samples.iter().cloned());
         }
     }
@@ -551,6 +639,9 @@ pub(crate) fn shape_subquery_results(
         }
 
         if !step_samples.is_empty() {
+            stats
+                .label_map_materializations
+                .fetch_add(1, AtomicOrdering::Relaxed);
             range_vector.push(EvalSamples {
                 values: step_samples,
                 labels: labels_to_hashmap(&labels),
@@ -717,12 +808,12 @@ async fn execute_metadata_stage_job<R: QueryReader>(
     };
 
     let metadata_start = Instant::now();
-    let cached = CachedQueryReader::with_shared_cache(reader, cache);
+    let cached = CachedQueryReader::with_shared_cache(reader, Arc::clone(&cache));
     let metadata = resolve_bucket_metadata(&cached, job.bucket, selector).await?;
     timing.metadata_resolve_ms = metadata_start.elapsed().as_secs_f64() * 1000.0;
 
     let work = match metadata {
-        Some(metadata) => Some(plan.build_work(&metadata)?),
+        Some(metadata) => Some(plan.build_work(&metadata, &cache)?),
         None => None,
     };
 
@@ -862,28 +953,30 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
 
     // -- Phase: ShapeSamples --
     let t_shape = Instant::now();
-    let result = plan.shape(&all_bucket_data);
+    let result = plan.shape(&all_bucket_data, &cache.stats);
     let shape_ms = t_shape.elapsed().as_secs_f64() * 1000.0;
 
     let timings =
         PipelineTimings::from_bucket_timings(&bucket_timings, pipeline_elapsed_ms, shape_ms);
 
     let stats_delta = cache.snapshot_stats().delta_since(&stats_before);
-    tracing::debug!(
+    tracing::trace!(
         path = plan.path_kind.name(),
         buckets = plan.buckets.len(),
         pipeline_wall_ms = timings.pipeline_wall_ms,
         metadata_resolve_sum_ms = timings.metadata_resolve_sum_ms,
         metadata_stage_queue_wait_sum_ms = timings.metadata_queue_wait_sum_ms,
         metadata_bucket_count = timings.metadata_bucket_count,
-        metadata_cache_hits = stats_delta.metadata_cache_hits,
-        metadata_cache_misses = stats_delta.metadata_cache_misses,
+        forward_index_hits = stats_delta.forward_index_hits,
+        forward_index_misses = stats_delta.forward_index_misses,
+        inverted_index_hits = stats_delta.inverted_index_hits,
+        inverted_index_misses = stats_delta.inverted_index_misses,
         metadata_permit_wait_sum_ms = stats_delta.metadata_permit_wait_ns as f64 / 1_000_000.0,
         sample_load_sum_ms = timings.sample_load_sum_ms,
         sample_stage_queue_wait_sum_ms = timings.sample_queue_wait_sum_ms,
         sample_bucket_count = timings.sample_bucket_count,
-        sample_cache_hits = stats_delta.sample_cache_hits,
-        sample_cache_misses = stats_delta.sample_cache_misses,
+        sample_hits = stats_delta.sample_hits,
+        sample_misses = stats_delta.sample_misses,
         sample_permit_wait_sum_ms = stats_delta.sample_permit_wait_ns as f64 / 1_000_000.0,
         shape_ms = timings.shape_samples_ms,
         "pipeline phase timings"
@@ -925,6 +1018,11 @@ pub(crate) fn compute_fingerprint(labels: &[Label]) -> SeriesFingerprint {
 mod tests {
     use super::*;
     use crate::model::{Label, Sample, TimeBucket};
+    use crate::promql::evaluator::EvalStats;
+
+    fn test_stats() -> EvalStats {
+        EvalStats::new()
+    }
 
     fn label(name: &str, value: &str) -> Label {
         Label::new(name, value)
@@ -941,7 +1039,7 @@ mod tests {
     ) -> LoadedSeriesSamples {
         LoadedSeriesSamples {
             fingerprint,
-            labels,
+            labels: Arc::from(labels),
             samples,
         }
     }
@@ -1063,7 +1161,8 @@ mod tests {
             },
         ];
 
-        let results = shape_instant_results(&bucket_data);
+        let stats = test_stats();
+        let results = shape_instant_results(&bucket_data, &stats);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].value, 1.0); // newest bucket wins
         assert_eq!(results[0].timestamp_ms, 100);
@@ -1083,7 +1182,8 @@ mod tests {
             )],
         }];
 
-        let results = shape_instant_results(&bucket_data);
+        let stats = test_stats();
+        let results = shape_instant_results(&bucket_data, &stats);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].value, 3.0); // latest sample
     }
@@ -1098,7 +1198,8 @@ mod tests {
             series_data: vec![make_loaded(fp, labels_a, vec![])], // no samples
         }];
 
-        let results = shape_instant_results(&bucket_data);
+        let stats = test_stats();
+        let results = shape_instant_results(&bucket_data, &stats);
         assert!(results.is_empty());
     }
 
@@ -1123,7 +1224,8 @@ mod tests {
             },
         ];
 
-        let results = shape_matrix_results(&bucket_data);
+        let stats = test_stats();
+        let results = shape_matrix_results(&bucket_data, &stats);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].values.len(), 3);
     }
@@ -1156,7 +1258,8 @@ mod tests {
             },
         };
 
-        let results = shape_subquery_results(&bucket_data, &plan);
+        let stats = test_stats();
+        let results = shape_subquery_results(&bucket_data, &plan, &stats);
         assert_eq!(results.len(), 1);
         let values = &results[0].values;
         assert_eq!(values.len(), 3);
@@ -1208,7 +1311,8 @@ mod tests {
             },
         };
 
-        let results = shape_subquery_results(&bucket_data, &plan);
+        let stats = test_stats();
+        let results = shape_subquery_results(&bucket_data, &plan, &stats);
         assert_eq!(results.len(), 1);
         // After merge+dedup: samples at t=10, t=15, t=20
         // Step 10: sample at t=10, value=1.0
@@ -1259,7 +1363,8 @@ mod tests {
 
         let plan = QueryPlan::for_instant_vector(100_000, 60_000, vec![TimeBucket::hour(100)]);
 
-        let work = build_bucket_sample_work(&plan, &metadata, true).unwrap();
+        let cache = QueryReaderEvalCache::new();
+        let work = build_bucket_sample_work(&plan, &metadata, true, &cache).unwrap();
         assert_eq!(work.series.len(), 2);
     }
 
@@ -1288,7 +1393,8 @@ mod tests {
 
         let plan = QueryPlan::for_instant_vector(100_000, 60_000, vec![TimeBucket::hour(100)]);
 
-        let result = build_bucket_sample_work(&plan, &metadata, true);
+        let cache = QueryReaderEvalCache::new();
+        let result = build_bucket_sample_work(&plan, &metadata, true, &cache);
         assert!(result.is_err(), "strict mode should error on missing spec");
     }
 
@@ -1323,7 +1429,8 @@ mod tests {
             vec![TimeBucket::hour(100)],
         );
 
-        let work = build_bucket_sample_work(&plan, &metadata, false).unwrap();
+        let cache = QueryReaderEvalCache::new();
+        let work = build_bucket_sample_work(&plan, &metadata, false, &cache).unwrap();
         assert_eq!(
             work.series.len(),
             1,
@@ -1662,6 +1769,7 @@ mod tests {
     /// and supports per-bucket and per-series delays.
     struct CountingQueryReader<R: crate::query::QueryReader> {
         inner: R,
+        list_buckets_calls: std::sync::atomic::AtomicUsize,
         forward_index_calls: std::sync::atomic::AtomicUsize,
         inverted_index_calls: std::sync::atomic::AtomicUsize,
         samples_calls: std::sync::atomic::AtomicUsize,
@@ -1686,6 +1794,7 @@ mod tests {
         fn new(inner: R) -> Self {
             Self {
                 inner,
+                list_buckets_calls: std::sync::atomic::AtomicUsize::new(0),
                 forward_index_calls: std::sync::atomic::AtomicUsize::new(0),
                 inverted_index_calls: std::sync::atomic::AtomicUsize::new(0),
                 samples_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -1718,6 +1827,11 @@ mod tests {
             self.per_series_sample_delays
                 .insert((bucket, series_id), delay);
             self
+        }
+
+        fn list_buckets_count(&self) -> usize {
+            self.list_buckets_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn forward_index_count(&self) -> usize {
@@ -1772,6 +1886,8 @@ mod tests {
     #[async_trait::async_trait]
     impl<R: crate::query::QueryReader> crate::query::QueryReader for CountingQueryReader<R> {
         async fn list_buckets(&self) -> crate::util::Result<Vec<TimeBucket>> {
+            self.list_buckets_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.list_buckets().await
         }
 
@@ -2109,6 +2225,222 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // Phase 2: Cache extension tests
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn should_cache_bucket_list_across_range_query_steps() {
+        // End-to-end test: list_buckets() on the underlying reader should be
+        // called exactly once across all steps of a range query.
+        use crate::model::MetricType;
+        use crate::query::test_utils::MockMultiBucketQueryReaderBuilder;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let labels = vec![label("__name__", "cpu"), label("host", "a")];
+        let mut builder = MockMultiBucketQueryReaderBuilder::new();
+        builder.add_sample(
+            TimeBucket::hour(100),
+            labels,
+            MetricType::Gauge,
+            sample(6_100_000, 1.0),
+        );
+        let reader = CountingQueryReader::new(builder.build());
+
+        let expr = promql_parser::parser::parse("cpu").unwrap();
+        let start = UNIX_EPOCH + Duration::from_millis(6_100_000);
+        let end = UNIX_EPOCH + Duration::from_millis(6_340_000);
+        let step = Duration::from_secs(60);
+        let stmt = promql_parser::parser::EvalStmt {
+            expr,
+            start,
+            end,
+            interval: step,
+            lookback_delta: Duration::from_secs(300),
+        };
+
+        let concurrency = PipelineConcurrency::default();
+        let results = crate::tsdb::evaluate_range(&reader, stmt, concurrency)
+            .await
+            .unwrap();
+
+        assert!(!results.is_empty(), "should produce results");
+        assert_eq!(
+            reader.list_buckets_count(),
+            1,
+            "list_buckets() should be called once across all range-query steps"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_cache_selector_results_and_stop_inverted_index_calls() {
+        use crate::model::MetricType;
+        use crate::query::test_utils::MockQueryReaderBuilder;
+
+        let bucket = TimeBucket::hour(0);
+        let mut builder = MockQueryReaderBuilder::new(bucket);
+        builder.add_sample(
+            vec![Label::metric_name("m"), label("env", "prod")],
+            MetricType::Gauge,
+            Sample::new(1000, 1.0),
+        );
+        let reader = CountingQueryReader::new(builder.build());
+        let cache = Arc::new(QueryReaderEvalCache::new());
+
+        let selector: VectorSelector = VectorSelector {
+            name: Some("m".to_string()),
+            matchers: promql_parser::label::Matchers::empty(),
+            offset: None,
+            at: None,
+        };
+
+        // First call: should hit underlying inverted_index
+        let cached_reader = CachedQueryReader::with_shared_cache(&reader, Arc::clone(&cache));
+        let _meta1 = resolve_bucket_metadata(&cached_reader, bucket, &selector)
+            .await
+            .unwrap();
+        let inv_after_first = reader.inverted_index_count();
+        assert!(inv_after_first > 0, "first call should hit inverted index");
+
+        // Second call: selector cache hit — no new inverted_index call
+        let cached_reader = CachedQueryReader::with_shared_cache(&reader, Arc::clone(&cache));
+        let _meta2 = resolve_bucket_metadata(&cached_reader, bucket, &selector)
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.inverted_index_count(),
+            inv_after_first,
+            "second call should not invoke inverted_index — selector cache should serve it"
+        );
+    }
+
+    #[test]
+    fn should_cache_series_meta_and_share_label_arcs() {
+        use crate::index::{ForwardIndex, SeriesSpec};
+        use crate::model::MetricType;
+
+        let forward_index = ForwardIndex {
+            series: dashmap::DashMap::new(),
+        };
+        forward_index.series.insert(
+            0,
+            SeriesSpec {
+                labels: vec![label("__name__", "m"), label("env", "prod")],
+                metric_type: Some(MetricType::Gauge),
+                unit: None,
+            },
+        );
+
+        let metadata = BucketMetadata {
+            bucket: TimeBucket::hour(100),
+            candidates: vec![0],
+            forward_index: Arc::new(forward_index),
+        };
+        let plan = QueryPlan::for_instant_vector(100_000, 60_000, vec![TimeBucket::hour(100)]);
+        let cache = QueryReaderEvalCache::new();
+
+        // First call: populates the SeriesMeta cache from the forward index
+        let work1 = build_bucket_sample_work(&plan, &metadata, true, &cache).unwrap();
+
+        // Second call: should reuse the cached SeriesMeta — same Arc pointer
+        let work2 = build_bucket_sample_work(&plan, &metadata, true, &cache).unwrap();
+
+        // Verify the labels are the same Arc allocation (pointer equality)
+        assert!(
+            Arc::ptr_eq(&work1.series[0].labels, &work2.series[0].labels),
+            "second call should reuse the same Arc<[Label]> from SeriesMeta cache"
+        );
+        assert_eq!(work1.series[0].fingerprint, work2.series[0].fingerprint);
+    }
+
+    #[test]
+    fn should_slice_cached_samples_with_binary_search() {
+        let cache = QueryReaderEvalCache::new();
+        let bucket = TimeBucket::hour(0);
+
+        // Cache sorted samples
+        let samples: Vec<Sample> = (0..100).map(|i| Sample::new(i * 1000, i as f64)).collect();
+        cache.cache_samples(bucket, 0, samples);
+
+        let cached = cache.get_samples(&bucket, &0).unwrap();
+        let stats = &cache.stats;
+
+        // Slice [10_000, 20_000] → timestamps 11000..=20000
+        let sliced =
+            crate::promql::evaluator::slice_samples_binary_search(&cached, 10_000, 20_000, stats);
+        assert_eq!(sliced.len(), 10);
+        assert_eq!(sliced[0].timestamp_ms, 11_000);
+        assert_eq!(sliced[9].timestamp_ms, 20_000);
+
+        let snap = stats.snapshot();
+        assert!(snap.sample_slice_binary_search_ops > 0);
+    }
+
+    #[test]
+    fn should_use_same_selector_cache_key_for_offset_and_at_variants() {
+        use promql_parser::parser::AtModifier;
+
+        let base = VectorSelector {
+            name: Some("m".to_string()),
+            matchers: promql_parser::label::Matchers::empty(),
+            offset: None,
+            at: None,
+        };
+
+        let with_offset = VectorSelector {
+            offset: Some(promql_parser::parser::Offset::Pos(
+                std::time::Duration::from_secs(300),
+            )),
+            ..base.clone()
+        };
+
+        let with_at = VectorSelector {
+            at: Some(AtModifier::At(std::time::UNIX_EPOCH)),
+            ..base.clone()
+        };
+
+        let k1 = SelectorCacheKey::from_selector(&base);
+        let k2 = SelectorCacheKey::from_selector(&with_offset);
+        let k3 = SelectorCacheKey::from_selector(&with_at);
+        assert_eq!(k1, k2, "offset should not affect selector cache key");
+        assert_eq!(k1, k3, "@ modifier should not affect selector cache key");
+    }
+
+    #[test]
+    fn should_produce_same_selector_cache_key_for_reordered_matchers() {
+        use promql_parser::label::{MatchOp, Matcher, Matchers};
+
+        let m_a = Matcher {
+            op: MatchOp::Equal,
+            name: "env".to_string(),
+            value: "prod".to_string(),
+        };
+        let m_b = Matcher {
+            op: MatchOp::Equal,
+            name: "env".to_string(),
+            value: "staging".to_string(),
+        };
+
+        let sel_ab = VectorSelector {
+            name: Some("m".to_string()),
+            matchers: Matchers::new(vec![m_a.clone(), m_b.clone()]),
+            offset: None,
+            at: None,
+        };
+        let sel_ba = VectorSelector {
+            name: Some("m".to_string()),
+            matchers: Matchers::new(vec![m_b, m_a]),
+            offset: None,
+            at: None,
+        };
+
+        assert_eq!(
+            SelectorCacheKey::from_selector(&sel_ab),
+            SelectorCacheKey::from_selector(&sel_ba),
+            "matcher order should not affect cache key"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Phase 2 tests: cache-miss read-site concurrency control
     // -----------------------------------------------------------------------
@@ -2202,17 +2534,14 @@ mod tests {
         );
 
         // Verify stats
-        let stats = &cache.stats;
+        let stats = &cache.read_path_stats;
         assert!(
-            stats
-                .sample_cache_hits
-                .load(std::sync::atomic::Ordering::Relaxed)
-                > 0,
+            stats.sample_hits.load(std::sync::atomic::Ordering::Relaxed) > 0,
             "should record sample cache hits on second run"
         );
         assert!(
             stats
-                .sample_cache_misses
+                .sample_misses
                 .load(std::sync::atomic::Ordering::Relaxed)
                 > 0,
             "should record sample cache misses on first run"
@@ -2548,26 +2877,32 @@ mod tests {
         use crate::promql::evaluator::ReadPathStatsSnapshot;
 
         let before = ReadPathStatsSnapshot {
-            metadata_cache_hits: 2,
-            metadata_cache_misses: 1,
-            sample_cache_hits: 10,
-            sample_cache_misses: 3,
+            forward_index_hits: 1,
+            forward_index_misses: 0,
+            inverted_index_hits: 1,
+            inverted_index_misses: 1,
+            sample_hits: 10,
+            sample_misses: 3,
             metadata_permit_wait_ns: 100,
             sample_permit_wait_ns: 200,
         };
         let after = ReadPathStatsSnapshot {
-            metadata_cache_hits: 5,
-            metadata_cache_misses: 2,
-            sample_cache_hits: 15,
-            sample_cache_misses: 3,
+            forward_index_hits: 3,
+            forward_index_misses: 1,
+            inverted_index_hits: 2,
+            inverted_index_misses: 1,
+            sample_hits: 15,
+            sample_misses: 3,
             metadata_permit_wait_ns: 150,
             sample_permit_wait_ns: 200,
         };
         let delta = after.delta_since(&before);
-        assert_eq!(delta.metadata_cache_hits, 3);
-        assert_eq!(delta.metadata_cache_misses, 1);
-        assert_eq!(delta.sample_cache_hits, 5);
-        assert_eq!(delta.sample_cache_misses, 0);
+        assert_eq!(delta.forward_index_hits, 2);
+        assert_eq!(delta.forward_index_misses, 1);
+        assert_eq!(delta.inverted_index_hits, 1);
+        assert_eq!(delta.inverted_index_misses, 0);
+        assert_eq!(delta.sample_hits, 5);
+        assert_eq!(delta.sample_misses, 0);
         assert_eq!(delta.metadata_permit_wait_ns, 50);
         assert_eq!(delta.sample_permit_wait_ns, 0);
     }
@@ -2609,7 +2944,7 @@ mod tests {
             .unwrap();
         let delta1 = cache.snapshot_stats().delta_since(&snap1);
         assert!(
-            delta1.sample_cache_misses > 0,
+            delta1.sample_misses > 0,
             "first invocation should have sample misses"
         );
 
@@ -2621,11 +2956,11 @@ mod tests {
             .unwrap();
         let delta2 = cache.snapshot_stats().delta_since(&snap2);
         assert_eq!(
-            delta2.sample_cache_misses, 0,
+            delta2.sample_misses, 0,
             "second invocation should have zero sample misses (all hits)"
         );
         assert!(
-            delta2.sample_cache_hits > 0,
+            delta2.sample_hits > 0,
             "second invocation should have sample hits"
         );
     }

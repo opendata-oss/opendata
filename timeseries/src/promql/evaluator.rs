@@ -46,12 +46,95 @@ impl From<crate::error::Error> for EvaluationError {
 
 pub(crate) type EvalResult<T> = std::result::Result<T, EvaluationError>;
 
+// ---------------------------------------------------------------------------
+// Query-scoped evaluation statistics
+// ---------------------------------------------------------------------------
+
+/// Shared, atomically-updated counters for a single query evaluation.
+///
+/// One instance is created per `QueryReaderEvalCache` and shared (via `Arc`)
+/// across all `CachedQueryReader` clones in the pipeline. Every counter uses
+/// relaxed ordering because we only need a consistent snapshot *after* the
+/// query completes, not inter-counter ordering during execution.
+pub(crate) struct EvalStats {
+    pub step_count: AtomicU64,
+    /// Accesses that found the bucket list already initialized.
+    pub bucket_list_reuses: AtomicU64,
+    /// Accesses that arrived before the bucket list was initialized.
+    /// Under concurrency, multiple callers may increment this even though
+    /// only one performs the actual storage read (single-flight via OnceCell).
+    pub bucket_list_init_attempts: AtomicU64,
+    pub selector_hits: AtomicU64,
+    pub selector_misses: AtomicU64,
+    pub series_meta_hits: AtomicU64,
+    pub series_meta_misses: AtomicU64,
+    pub sample_slice_ops: AtomicU64,
+    pub sample_slice_binary_search_ops: AtomicU64,
+    pub label_map_materializations: AtomicU64,
+}
+
+impl EvalStats {
+    pub(crate) fn new() -> Self {
+        Self {
+            step_count: AtomicU64::new(0),
+            bucket_list_reuses: AtomicU64::new(0),
+            bucket_list_init_attempts: AtomicU64::new(0),
+            selector_hits: AtomicU64::new(0),
+            selector_misses: AtomicU64::new(0),
+            series_meta_hits: AtomicU64::new(0),
+            series_meta_misses: AtomicU64::new(0),
+            sample_slice_ops: AtomicU64::new(0),
+            sample_slice_binary_search_ops: AtomicU64::new(0),
+            label_map_materializations: AtomicU64::new(0),
+        }
+    }
+}
+
+/// A point-in-time snapshot of evaluation statistics (plain integers).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct EvalStatsSnapshot {
+    pub step_count: u64,
+    pub bucket_list_reuses: u64,
+    pub bucket_list_init_attempts: u64,
+    pub selector_hits: u64,
+    pub selector_misses: u64,
+    pub series_meta_hits: u64,
+    pub series_meta_misses: u64,
+    pub sample_slice_ops: u64,
+    pub sample_slice_binary_search_ops: u64,
+    pub label_map_materializations: u64,
+}
+
+impl EvalStats {
+    /// Take a consistent snapshot of all counters.
+    pub(crate) fn snapshot(&self) -> EvalStatsSnapshot {
+        EvalStatsSnapshot {
+            step_count: self.step_count.load(AtomicOrdering::Relaxed),
+            bucket_list_reuses: self.bucket_list_reuses.load(AtomicOrdering::Relaxed),
+            bucket_list_init_attempts: self.bucket_list_init_attempts.load(AtomicOrdering::Relaxed),
+            selector_hits: self.selector_hits.load(AtomicOrdering::Relaxed),
+            selector_misses: self.selector_misses.load(AtomicOrdering::Relaxed),
+            series_meta_hits: self.series_meta_hits.load(AtomicOrdering::Relaxed),
+            series_meta_misses: self.series_meta_misses.load(AtomicOrdering::Relaxed),
+            sample_slice_ops: self.sample_slice_ops.load(AtomicOrdering::Relaxed),
+            sample_slice_binary_search_ops: self
+                .sample_slice_binary_search_ops
+                .load(AtomicOrdering::Relaxed),
+            label_map_materializations: self
+                .label_map_materializations
+                .load(AtomicOrdering::Relaxed),
+        }
+    }
+}
+
 struct QueryReaderBucketEvalCache {
     forward_index_cache:
         dashmap::DashMap<Vec<SeriesId>, Arc<dyn ForwardIndexLookup + Send + Sync + 'static>>,
     inverted_index_cache:
         dashmap::DashMap<Vec<Label>, Arc<dyn InvertedIndexLookup + Send + Sync + 'static>>,
     samples: dashmap::DashMap<SeriesId, Arc<Vec<Sample>>>,
+    selector_cache: dashmap::DashMap<SelectorCacheKey, Arc<[SeriesId]>>,
+    series_meta_cache: dashmap::DashMap<SeriesId, SeriesMeta>,
 }
 
 impl QueryReaderBucketEvalCache {
@@ -60,15 +143,59 @@ impl QueryReaderBucketEvalCache {
             forward_index_cache: dashmap::DashMap::new(),
             inverted_index_cache: dashmap::DashMap::new(),
             samples: dashmap::DashMap::new(),
+            selector_cache: dashmap::DashMap::new(),
+            series_meta_cache: dashmap::DashMap::new(),
         }
     }
 }
 
-/// Distinguishes metadata reads (inverted/forward index) from sample reads
-/// for permit acquisition and stat recording.
+// ---------------------------------------------------------------------------
+// Selector cache key
+// ---------------------------------------------------------------------------
+
+/// Cache key for selector results. Excludes `offset` and `@` modifiers since
+/// those affect the time window but not which series match.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SelectorCacheKey {
+    name: Option<String>,
+    matchers: Vec<MatcherKey>,
+}
+
+/// Stable cache identity for a single label matcher.
+///
+/// Uses an integer discriminant for the operator instead of Debug formatting,
+/// and includes the full (name, op, value) tuple in the sort key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct MatcherKey {
+    name: String,
+    /// 0 = Equal, 1 = NotEqual, 2 = Re, 3 = NotRe
+    op: u8,
+    value: String,
+}
+
+impl MatcherKey {
+    fn from_matcher(m: &promql_parser::label::Matcher) -> Self {
+        use promql_parser::label::MatchOp;
+        let op = match &m.op {
+            MatchOp::Equal => 0,
+            MatchOp::NotEqual => 1,
+            MatchOp::Re(_) => 2,
+            MatchOp::NotRe(_) => 3,
+        };
+        Self {
+            name: m.name.clone(),
+            op,
+            value: m.value.clone(),
+        }
+    }
+}
+
+/// Distinguishes the three read-path categories for permit acquisition and
+/// stat recording.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ReadPathKind {
-    Metadata,
+    ForwardIndex,
+    InvertedIndex,
     Sample,
 }
 
@@ -78,10 +205,12 @@ pub(crate) enum ReadPathKind {
 /// in `CachedQueryReader`. They are cheap to read at pipeline end for the
 /// debug log line and carry no per-request allocation.
 pub(crate) struct ReadPathStats {
-    pub metadata_cache_hits: AtomicU64,
-    pub metadata_cache_misses: AtomicU64,
-    pub sample_cache_hits: AtomicU64,
-    pub sample_cache_misses: AtomicU64,
+    pub forward_index_hits: AtomicU64,
+    pub forward_index_misses: AtomicU64,
+    pub inverted_index_hits: AtomicU64,
+    pub inverted_index_misses: AtomicU64,
+    pub sample_hits: AtomicU64,
+    pub sample_misses: AtomicU64,
     pub metadata_permit_wait_ns: AtomicU64,
     pub sample_permit_wait_ns: AtomicU64,
 }
@@ -89,10 +218,12 @@ pub(crate) struct ReadPathStats {
 impl ReadPathStats {
     fn new() -> Self {
         Self {
-            metadata_cache_hits: AtomicU64::new(0),
-            metadata_cache_misses: AtomicU64::new(0),
-            sample_cache_hits: AtomicU64::new(0),
-            sample_cache_misses: AtomicU64::new(0),
+            forward_index_hits: AtomicU64::new(0),
+            forward_index_misses: AtomicU64::new(0),
+            inverted_index_hits: AtomicU64::new(0),
+            inverted_index_misses: AtomicU64::new(0),
+            sample_hits: AtomicU64::new(0),
+            sample_misses: AtomicU64::new(0),
             metadata_permit_wait_ns: AtomicU64::new(0),
             sample_permit_wait_ns: AtomicU64::new(0),
         }
@@ -100,32 +231,39 @@ impl ReadPathStats {
 
     fn record_cache_hit(&self, kind: ReadPathKind) {
         match kind {
-            ReadPathKind::Metadata => {
-                self.metadata_cache_hits
+            ReadPathKind::ForwardIndex => {
+                self.forward_index_hits
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            ReadPathKind::InvertedIndex => {
+                self.inverted_index_hits
                     .fetch_add(1, AtomicOrdering::Relaxed);
             }
             ReadPathKind::Sample => {
-                self.sample_cache_hits.fetch_add(1, AtomicOrdering::Relaxed);
+                self.sample_hits.fetch_add(1, AtomicOrdering::Relaxed);
             }
         }
     }
 
     fn record_cache_miss(&self, kind: ReadPathKind) {
         match kind {
-            ReadPathKind::Metadata => {
-                self.metadata_cache_misses
+            ReadPathKind::ForwardIndex => {
+                self.forward_index_misses
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            ReadPathKind::InvertedIndex => {
+                self.inverted_index_misses
                     .fetch_add(1, AtomicOrdering::Relaxed);
             }
             ReadPathKind::Sample => {
-                self.sample_cache_misses
-                    .fetch_add(1, AtomicOrdering::Relaxed);
+                self.sample_misses.fetch_add(1, AtomicOrdering::Relaxed);
             }
         }
     }
 
     fn record_permit_wait(&self, kind: ReadPathKind, wait_ns: u64) {
         match kind {
-            ReadPathKind::Metadata => {
+            ReadPathKind::ForwardIndex | ReadPathKind::InvertedIndex => {
                 self.metadata_permit_wait_ns
                     .fetch_add(wait_ns, AtomicOrdering::Relaxed);
             }
@@ -139,10 +277,12 @@ impl ReadPathStats {
     /// Capture a point-in-time snapshot of all counters.
     pub(crate) fn snapshot(&self) -> ReadPathStatsSnapshot {
         ReadPathStatsSnapshot {
-            metadata_cache_hits: self.metadata_cache_hits.load(AtomicOrdering::Relaxed),
-            metadata_cache_misses: self.metadata_cache_misses.load(AtomicOrdering::Relaxed),
-            sample_cache_hits: self.sample_cache_hits.load(AtomicOrdering::Relaxed),
-            sample_cache_misses: self.sample_cache_misses.load(AtomicOrdering::Relaxed),
+            forward_index_hits: self.forward_index_hits.load(AtomicOrdering::Relaxed),
+            forward_index_misses: self.forward_index_misses.load(AtomicOrdering::Relaxed),
+            inverted_index_hits: self.inverted_index_hits.load(AtomicOrdering::Relaxed),
+            inverted_index_misses: self.inverted_index_misses.load(AtomicOrdering::Relaxed),
+            sample_hits: self.sample_hits.load(AtomicOrdering::Relaxed),
+            sample_misses: self.sample_misses.load(AtomicOrdering::Relaxed),
             metadata_permit_wait_ns: self.metadata_permit_wait_ns.load(AtomicOrdering::Relaxed),
             sample_permit_wait_ns: self.sample_permit_wait_ns.load(AtomicOrdering::Relaxed),
         }
@@ -152,10 +292,12 @@ impl ReadPathStats {
 /// Point-in-time snapshot of read-path counters, used for computing deltas.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReadPathStatsSnapshot {
-    pub metadata_cache_hits: u64,
-    pub metadata_cache_misses: u64,
-    pub sample_cache_hits: u64,
-    pub sample_cache_misses: u64,
+    pub forward_index_hits: u64,
+    pub forward_index_misses: u64,
+    pub inverted_index_hits: u64,
+    pub inverted_index_misses: u64,
+    pub sample_hits: u64,
+    pub sample_misses: u64,
     pub metadata_permit_wait_ns: u64,
     pub sample_permit_wait_ns: u64,
 }
@@ -164,18 +306,20 @@ impl ReadPathStatsSnapshot {
     /// Compute the delta between this snapshot and an earlier one.
     pub(crate) fn delta_since(&self, earlier: &ReadPathStatsSnapshot) -> ReadPathStatsSnapshot {
         ReadPathStatsSnapshot {
-            metadata_cache_hits: self
-                .metadata_cache_hits
-                .saturating_sub(earlier.metadata_cache_hits),
-            metadata_cache_misses: self
-                .metadata_cache_misses
-                .saturating_sub(earlier.metadata_cache_misses),
-            sample_cache_hits: self
-                .sample_cache_hits
-                .saturating_sub(earlier.sample_cache_hits),
-            sample_cache_misses: self
-                .sample_cache_misses
-                .saturating_sub(earlier.sample_cache_misses),
+            forward_index_hits: self
+                .forward_index_hits
+                .saturating_sub(earlier.forward_index_hits),
+            forward_index_misses: self
+                .forward_index_misses
+                .saturating_sub(earlier.forward_index_misses),
+            inverted_index_hits: self
+                .inverted_index_hits
+                .saturating_sub(earlier.inverted_index_hits),
+            inverted_index_misses: self
+                .inverted_index_misses
+                .saturating_sub(earlier.inverted_index_misses),
+            sample_hits: self.sample_hits.saturating_sub(earlier.sample_hits),
+            sample_misses: self.sample_misses.saturating_sub(earlier.sample_misses),
             metadata_permit_wait_ns: self
                 .metadata_permit_wait_ns
                 .saturating_sub(earlier.metadata_permit_wait_ns),
@@ -186,23 +330,45 @@ impl ReadPathStatsSnapshot {
     }
 }
 
-/// Filter samples by time range: `(start_ms, end_ms]`.
-fn filter_samples_in_range(samples: &[Sample], start_ms: i64, end_ms: i64) -> Vec<Sample> {
-    samples
-        .iter()
-        .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
-        .cloned()
-        .collect()
+impl SelectorCacheKey {
+    /// Build a cache key from a VectorSelector, ignoring offset and @ modifiers.
+    pub(crate) fn from_selector(selector: &promql_parser::parser::VectorSelector) -> Self {
+        let mut matchers: Vec<_> = selector
+            .matchers
+            .matchers
+            .iter()
+            .map(MatcherKey::from_matcher)
+            .collect();
+        matchers.sort();
+        Self {
+            name: selector.name.clone(),
+            matchers,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Series metadata (fingerprint + canonical labels)
+// ---------------------------------------------------------------------------
+
+/// Precomputed per-series metadata, cached at (bucket, series_id) scope.
+#[derive(Debug, Clone)]
+pub(crate) struct SeriesMeta {
+    pub fingerprint: crate::model::SeriesFingerprint,
+    pub canonical_labels: Arc<[Label]>,
+    pub metric_name: String,
 }
 
 pub(crate) struct QueryReaderEvalCache {
     cache: dashmap::DashMap<TimeBucket, QueryReaderBucketEvalCache>,
+    bucket_list: tokio::sync::OnceCell<Vec<TimeBucket>>,
+    pub(crate) stats: Arc<EvalStats>,
     /// Limits concurrent cache-miss metadata reads (inverted_index, forward_index).
     pub(crate) metadata_semaphore: Arc<tokio::sync::Semaphore>,
     /// Limits concurrent cache-miss sample reads.
     pub(crate) sample_semaphore: Arc<tokio::sync::Semaphore>,
     /// Atomic counters for read-path observability.
-    pub(crate) stats: ReadPathStats,
+    pub(crate) read_path_stats: ReadPathStats,
 }
 
 impl QueryReaderEvalCache {
@@ -221,15 +387,17 @@ impl QueryReaderEvalCache {
     ) -> Self {
         Self {
             cache: dashmap::DashMap::new(),
+            bucket_list: tokio::sync::OnceCell::new(),
+            stats: Arc::new(EvalStats::new()),
             metadata_semaphore: Arc::new(tokio::sync::Semaphore::new(concurrency.metadata.max(1))),
             sample_semaphore: Arc::new(tokio::sync::Semaphore::new(concurrency.samples.max(1))),
-            stats: ReadPathStats::new(),
+            read_path_stats: ReadPathStats::new(),
         }
     }
 
     /// Capture a point-in-time snapshot of all read-path counters.
     pub(crate) fn snapshot_stats(&self) -> ReadPathStatsSnapshot {
-        self.stats.snapshot()
+        self.read_path_stats.snapshot()
     }
 
     /// Acquire a read permit for the given path kind, recording wait time.
@@ -242,7 +410,9 @@ impl QueryReaderEvalCache {
         kind: ReadPathKind,
     ) -> EvalResult<tokio::sync::OwnedSemaphorePermit> {
         let sem = match kind {
-            ReadPathKind::Metadata => Arc::clone(&self.metadata_semaphore),
+            ReadPathKind::ForwardIndex | ReadPathKind::InvertedIndex => {
+                Arc::clone(&self.metadata_semaphore)
+            }
             ReadPathKind::Sample => Arc::clone(&self.sample_semaphore),
         };
         let wait_start = std::time::Instant::now();
@@ -250,7 +420,7 @@ impl QueryReaderEvalCache {
             .acquire_owned()
             .await
             .map_err(|_| EvaluationError::InternalError("read permit semaphore closed".into()))?;
-        self.stats
+        self.read_path_stats
             .record_permit_wait(kind, wait_start.elapsed().as_nanos() as u64);
         Ok(permit)
     }
@@ -326,6 +496,62 @@ impl QueryReaderEvalCache {
         let bc = self.cache.get(bucket)?;
         bc.samples.get(series_id).map(|v| Arc::clone(v.value()))
     }
+
+    // -- bucket list cache --
+    //
+    // The bucket list is query-scoped and immutable: the set of buckets a
+    // QueryReader covers never changes within a query. A OnceCell gives
+    // single-flight initialization (one reader call, concurrent waiters
+    // block), unlike the DashMap caches above which need many entries
+    // keyed by (bucket, series_ids) or (bucket, terms).
+
+    /// Expose the OnceCell so `CachedQueryReader::list_buckets` can call
+    /// `get_or_try_init` on it.
+    pub(crate) fn bucket_list_once(&self) -> &tokio::sync::OnceCell<Vec<TimeBucket>> {
+        &self.bucket_list
+    }
+
+    // -- selector result cache --
+
+    pub(crate) fn cache_selector_result(
+        &self,
+        bucket: TimeBucket,
+        key: SelectorCacheKey,
+        result: Arc<[SeriesId]>,
+    ) {
+        let bc = self.get_or_create_bucket(&bucket);
+        bc.selector_cache.insert(key, result);
+    }
+
+    pub(crate) fn get_selector_result(
+        &self,
+        bucket: &TimeBucket,
+        key: &SelectorCacheKey,
+    ) -> Option<Arc<[SeriesId]>> {
+        let bc = self.cache.get(bucket)?;
+        bc.selector_cache.get(key).map(|v| Arc::clone(v.value()))
+    }
+
+    // -- series meta cache --
+
+    pub(crate) fn cache_series_meta(
+        &self,
+        bucket: TimeBucket,
+        series_id: SeriesId,
+        meta: SeriesMeta,
+    ) {
+        let bc = self.get_or_create_bucket(&bucket);
+        bc.series_meta_cache.insert(series_id, meta);
+    }
+
+    pub(crate) fn get_series_meta(
+        &self,
+        bucket: &TimeBucket,
+        series_id: &SeriesId,
+    ) -> Option<SeriesMeta> {
+        let bc = self.cache.get(bucket)?;
+        bc.series_meta_cache.get(series_id).map(|v| v.clone())
+    }
 }
 
 /// A cached forward index lookup that wraps cached data
@@ -362,6 +588,28 @@ impl InvertedIndexLookup for CachedInvertedIndex {
         // but we need to implement it for the trait
         Vec::new()
     }
+}
+
+/// Slice a sorted sample vector using binary search (partition_point).
+///
+/// Returns samples where `timestamp_ms > start_ms && timestamp_ms <= end_ms`.
+/// The input vector must be sorted by `timestamp_ms` (ascending).
+pub(crate) fn slice_samples_binary_search(
+    samples: &[Sample],
+    start_ms: i64,
+    end_ms: i64,
+    stats: &EvalStats,
+) -> Vec<Sample> {
+    stats.sample_slice_ops.fetch_add(1, AtomicOrdering::Relaxed);
+    stats
+        .sample_slice_binary_search_ops
+        .fetch_add(1, AtomicOrdering::Relaxed);
+
+    // Find first index where timestamp_ms > start_ms
+    let lo = samples.partition_point(|s| s.timestamp_ms <= start_ms);
+    // Find first index where timestamp_ms > end_ms
+    let hi = samples.partition_point(|s| s.timestamp_ms <= end_ms);
+    samples[lo..hi].to_vec()
 }
 
 // ToDo(cadonna): Add histogram samples
@@ -514,7 +762,22 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
     }
 
     pub(crate) async fn list_buckets(&self) -> Result<Vec<TimeBucket>> {
-        self.reader.list_buckets().await
+        let stats = &self.cache.stats;
+        let cell = self.cache.bucket_list_once();
+        if cell.initialized() {
+            stats
+                .bucket_list_reuses
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            return Ok(cell.get().unwrap().clone());
+        }
+        stats
+            .bucket_list_init_attempts
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        let reader = self.reader;
+        let buckets = cell
+            .get_or_try_init(|| async { reader.list_buckets().await })
+            .await?;
+        Ok(buckets.clone())
     }
 
     pub(crate) async fn forward_index(
@@ -525,7 +788,9 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         let mut series_ids = Vec::from(series_ids);
         series_ids.sort();
         if let Some(cached_data) = self.cache.get_forward_index(bucket, &series_ids) {
-            self.cache.stats.record_cache_hit(ReadPathKind::Metadata);
+            self.cache
+                .read_path_stats
+                .record_cache_hit(ReadPathKind::ForwardIndex);
             return Ok(cached_data);
         }
 
@@ -544,7 +809,9 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         let mut terms = terms.to_vec();
         terms.sort();
         if let Some(cached_result) = self.cache.get_inverted_index(bucket, &terms) {
-            self.cache.stats.record_cache_hit(ReadPathKind::Metadata);
+            self.cache
+                .read_path_stats
+                .record_cache_hit(ReadPathKind::InvertedIndex);
             return Ok(cached_result);
         }
 
@@ -575,8 +842,15 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         end_ms: i64,
     ) -> Result<Vec<Sample>> {
         if let Some(cached_samples) = self.cache.get_samples(bucket, &series_id) {
-            self.cache.stats.record_cache_hit(ReadPathKind::Sample);
-            return Ok(filter_samples_in_range(&cached_samples, start_ms, end_ms));
+            self.cache
+                .read_path_stats
+                .record_cache_hit(ReadPathKind::Sample);
+            return Ok(slice_samples_binary_search(
+                &cached_samples,
+                start_ms,
+                end_ms,
+                &self.cache.stats,
+            ));
         }
 
         cached_samples_miss(
@@ -613,17 +887,21 @@ async fn cached_forward_index_miss<R: QueryReader>(
     series_ids: Vec<SeriesId>,
 ) -> Result<Arc<dyn ForwardIndexLookup + Send + Sync + 'static>> {
     let _permit = cache
-        .acquire_permit(ReadPathKind::Metadata)
+        .acquire_permit(ReadPathKind::ForwardIndex)
         .await
         .map_err(|e| crate::error::Error::Internal(e.to_string()))?;
 
     // Post-permit recheck: another task may have populated while we waited.
     if let Some(cached_data) = cache.get_forward_index(&bucket, &series_ids) {
-        cache.stats.record_cache_hit(ReadPathKind::Metadata);
+        cache
+            .read_path_stats
+            .record_cache_hit(ReadPathKind::ForwardIndex);
         return Ok(cached_data);
     }
 
-    cache.stats.record_cache_miss(ReadPathKind::Metadata);
+    cache
+        .read_path_stats
+        .record_cache_miss(ReadPathKind::ForwardIndex);
     let forward_index = reader.forward_index(&bucket, &series_ids).await?;
 
     cache.cache_forward_index(bucket, series_ids.clone(), forward_index);
@@ -640,16 +918,20 @@ async fn cached_inverted_index_miss<R: QueryReader>(
     terms: Vec<Label>,
 ) -> Result<Arc<dyn InvertedIndexLookup + Send + Sync + 'static>> {
     let _permit = cache
-        .acquire_permit(ReadPathKind::Metadata)
+        .acquire_permit(ReadPathKind::InvertedIndex)
         .await
         .map_err(|e| crate::error::Error::Internal(e.to_string()))?;
 
     if let Some(cached_result) = cache.get_inverted_index(&bucket, &terms) {
-        cache.stats.record_cache_hit(ReadPathKind::Metadata);
+        cache
+            .read_path_stats
+            .record_cache_hit(ReadPathKind::InvertedIndex);
         return Ok(cached_result);
     }
 
-    cache.stats.record_cache_miss(ReadPathKind::Metadata);
+    cache
+        .read_path_stats
+        .record_cache_miss(ReadPathKind::InvertedIndex);
     let inverted_index = reader.inverted_index(&bucket, &terms).await?;
 
     cache.cache_inverted_index(bucket, terms.clone(), inverted_index);
@@ -675,11 +957,18 @@ async fn cached_samples_miss<R: QueryReader>(
 
     // Post-permit recheck.
     if let Some(cached_samples) = cache.get_samples(&bucket, &series_id) {
-        cache.stats.record_cache_hit(ReadPathKind::Sample);
-        return Ok(filter_samples_in_range(&cached_samples, start_ms, end_ms));
+        cache.read_path_stats.record_cache_hit(ReadPathKind::Sample);
+        return Ok(slice_samples_binary_search(
+            &cached_samples,
+            start_ms,
+            end_ms,
+            &cache.stats,
+        ));
     }
 
-    cache.stats.record_cache_miss(ReadPathKind::Sample);
+    cache
+        .read_path_stats
+        .record_cache_miss(ReadPathKind::Sample);
 
     // Cache the full bucket on a miss so later overlapping range-query
     // steps and sibling selector evaluations can slice locally without
@@ -691,7 +980,12 @@ async fn cached_samples_miss<R: QueryReader>(
     cache.cache_samples(bucket, series_id, samples);
 
     let cached = cache.get_samples(&bucket, &series_id).expect("just cached");
-    Ok(filter_samples_in_range(&cached, start_ms, end_ms))
+    Ok(slice_samples_binary_search(
+        &cached,
+        start_ms,
+        end_ms,
+        &cache.stats,
+    ))
 }
 
 #[derive(Debug)]
@@ -1015,6 +1309,16 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         )
     }
 
+    /// Take a point-in-time snapshot of the query-scoped evaluation statistics.
+    pub(crate) fn stats(&self) -> EvalStatsSnapshot {
+        self.reader.cache.stats.snapshot()
+    }
+
+    /// Take a point-in-time snapshot of the read-path statistics.
+    pub(crate) fn read_path_stats(&self) -> ReadPathStatsSnapshot {
+        self.reader.cache.snapshot_stats()
+    }
+
     pub(crate) fn with_concurrency(
         reader: &'reader R,
         concurrency: crate::promql::pipeline::PipelineConcurrency,
@@ -1027,6 +1331,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     }
 
     pub(crate) async fn evaluate(&mut self, stmt: EvalStmt) -> EvalResult<ExprResult> {
+        self.reader
+            .cache
+            .stats
+            .step_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
+
         if stmt.start != stmt.end {
             return Err(EvaluationError::InternalError(format!(
                 "evaluation must always be done at an instant.got start({:?}), end({:?})",
@@ -5825,5 +6135,204 @@ mod tests {
             // Empty
             assert_eq!(normalize_ranges(vec![]), vec![]);
         }
+    }
+
+    // -------------------------------------------------------------------
+    // EvalStats instrumentation tests
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn should_snapshot_zero_eval_stats_before_query() {
+        let bucket = TimeBucket::hour(0);
+        let builder = MockQueryReaderBuilder::new(bucket);
+        let reader = builder.build();
+        let evaluator = Evaluator::new(&reader);
+        let snap = evaluator.stats();
+        assert_eq!(snap, EvalStatsSnapshot::default());
+    }
+
+    #[tokio::test]
+    async fn should_report_eval_stats_through_evaluate_range() {
+        // Routes through tsdb::evaluate_range so the test name matches
+        // the code path actually exercised.
+        let bucket = TimeBucket::hour(0);
+        let mut builder = MockQueryReaderBuilder::new(bucket);
+
+        for series_idx in 0..2 {
+            let labels = vec![
+                Label::metric_name("m"),
+                Label::new("env", format!("env_{series_idx}")),
+            ];
+            for t in 1..=3 {
+                builder.add_sample(
+                    labels.clone(),
+                    MetricType::Gauge,
+                    Sample::new(t * 1000, t as f64),
+                );
+            }
+        }
+        let reader = builder.build();
+
+        let expr = promql_parser::parser::parse("m").unwrap();
+        let stmt = EvalStmt {
+            expr,
+            start: UNIX_EPOCH + Duration::from_secs(1),
+            end: UNIX_EPOCH + Duration::from_secs(3),
+            interval: Duration::from_secs(1),
+            lookback_delta: Duration::from_secs(300),
+        };
+
+        let concurrency = crate::promql::pipeline::PipelineConcurrency::default();
+        let results = crate::tsdb::evaluate_range(&reader, stmt, concurrency)
+            .await
+            .unwrap();
+
+        // Verify query correctness: 2 series across 3 steps
+        assert_eq!(results.len(), 2, "should have 2 series");
+        for rs in &results {
+            assert_eq!(rs.samples.len(), 3, "each series should have 3 steps");
+        }
+    }
+
+    #[tokio::test]
+    async fn should_move_expected_counters_across_range_query_steps() {
+        // Companion to the above: uses the Evaluator directly so we can
+        // call stats() and verify the counters that evaluate_range would
+        // emit in its tracing::debug! summary.
+        let bucket = TimeBucket::hour(0);
+        let mut builder = MockQueryReaderBuilder::new(bucket);
+
+        for series_idx in 0..2 {
+            let labels = vec![
+                Label::metric_name("m"),
+                Label::new("env", format!("env_{series_idx}")),
+            ];
+            for t in 1..=3 {
+                builder.add_sample(
+                    labels.clone(),
+                    MetricType::Gauge,
+                    Sample::new(t * 1000, t as f64),
+                );
+            }
+        }
+        let reader = builder.build();
+
+        let mut evaluator = Evaluator::new(&reader);
+        for step_secs in 1..=3 {
+            let eval_time = UNIX_EPOCH + Duration::from_secs(step_secs);
+            let stmt = EvalStmt {
+                expr: promql_parser::parser::parse("m").unwrap(),
+                start: eval_time,
+                end: eval_time,
+                interval: Duration::from_secs(0),
+                lookback_delta: Duration::from_secs(300),
+            };
+            evaluator.evaluate(stmt).await.expect("evaluate failed");
+        }
+
+        let snap = evaluator.stats();
+        assert_eq!(snap.step_count, 3);
+        // Bucket list: 1 init + 2 reuses
+        assert_eq!(snap.bucket_list_init_attempts, 1);
+        assert_eq!(snap.bucket_list_reuses, 2);
+        // Selector: 1 miss + 2 hits
+        assert_eq!(snap.selector_misses, 1);
+        assert_eq!(snap.selector_hits, 2);
+        // Binary search slicing used on every sample access
+        assert!(snap.sample_slice_binary_search_ops > 0);
+        // Labels materialized at shaping boundary
+        assert!(snap.label_map_materializations > 0);
+
+        // Read-path counters are now tracked separately in ReadPathStats
+        let rp = evaluator.read_path_stats();
+        assert!(rp.sample_hits + rp.sample_misses > 0);
+        assert!(rp.forward_index_hits + rp.forward_index_misses > 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Shared canonical labels tests
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn should_preserve_label_values_through_range_query() {
+        // End-to-end correctness: a range query with shared canonical
+        // labels through evaluate_range produces correct output labels.
+        let bucket = TimeBucket::hour(0);
+        let mut builder = MockQueryReaderBuilder::new(bucket);
+
+        let labels = vec![
+            Label::metric_name("m"),
+            Label::new("env", "prod"),
+            Label::new("region", "us"),
+        ];
+        for t in 1..=3 {
+            builder.add_sample(
+                labels.clone(),
+                MetricType::Gauge,
+                Sample::new(t * 1000, t as f64 * 10.0),
+            );
+        }
+        let reader = builder.build();
+
+        let expr = promql_parser::parser::parse("m").unwrap();
+        let stmt = EvalStmt {
+            expr,
+            start: UNIX_EPOCH + Duration::from_secs(1),
+            end: UNIX_EPOCH + Duration::from_secs(3),
+            interval: Duration::from_secs(1),
+            lookback_delta: Duration::from_secs(10),
+        };
+
+        let concurrency = crate::promql::pipeline::PipelineConcurrency::default();
+        let results = crate::tsdb::evaluate_range(&reader, stmt, concurrency)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let series_labels = &results[0].labels;
+        assert_eq!(series_labels.get("env"), Some("prod"));
+        assert_eq!(series_labels.get("region"), Some("us"));
+    }
+
+    #[tokio::test]
+    async fn should_count_label_materializations_at_shaping_boundary() {
+        use crate::promql::pipeline;
+
+        let bucket = TimeBucket::hour(0);
+        let mut builder = MockQueryReaderBuilder::new(bucket);
+        builder.add_sample(
+            vec![Label::metric_name("m"), Label::new("env", "prod")],
+            MetricType::Gauge,
+            Sample::new(1000, 1.0),
+        );
+        let reader = builder.build();
+        let cache = Arc::new(crate::promql::evaluator::QueryReaderEvalCache::new());
+
+        // Materializations should be zero before any shaping occurs
+        assert_eq!(cache.stats.snapshot().label_map_materializations, 0);
+
+        let selector = promql_parser::parser::VectorSelector {
+            name: Some("m".to_string()),
+            matchers: promql_parser::label::Matchers::empty(),
+            offset: None,
+            at: None,
+        };
+        let plan = pipeline::QueryPlan::for_instant_vector(2000, 5000, vec![bucket]);
+
+        let result = pipeline::execute_selector_pipeline(&reader, &cache, &plan, &selector)
+            .await
+            .unwrap();
+
+        let samples = result
+            .into_instant_vector()
+            .expect("expected instant vector");
+        assert_eq!(samples.len(), 1);
+
+        // Shaping should have materialized exactly 1 label map (1 series)
+        assert_eq!(
+            cache.stats.snapshot().label_map_materializations,
+            1,
+            "shaping should materialize one label map per unique series in the result"
+        );
     }
 }
