@@ -157,10 +157,17 @@ impl Indexer {
             loop {
                 let view = VectorIndexView::new(&delta, &self.state, &snapshot, snapshot_epoch);
                 if split_round >= 1000 {
+                    let counts = view.centroid_counts(level);
+                    let mut counts = counts.into_iter().collect::<Vec<_>>();
+                    counts.sort();
+                    let ncounts = counts.len();
+                    let back = ncounts - 100;
                     error!(
                         msg = "splits seem to be in infinite loop",
                         level = &format!("{}", level),
-                        counts = &format!("{:?}", &view.centroid_counts(level)),
+                        ncentroids = ncounts,
+                        counts_back = &format!("{:?}", &counts[back..]),
+                        counts_front = &format!("{:?}", &counts[..100],
                     );
                     panic!("split infinite loop");
                 }
