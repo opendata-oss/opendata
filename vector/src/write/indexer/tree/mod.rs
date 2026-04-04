@@ -5,7 +5,7 @@ use crate::write::indexer::tree::centroids::{CentroidCache, TreeDepth, TreeLevel
 use crate::write::indexer::tree::merge::MergeCentroids;
 use crate::write::indexer::tree::root::SplitRoot;
 use crate::write::indexer::tree::split::{ReassignVector, SplitCentroids};
-use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState};
+use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use crate::write::indexer::tree::validator::validate as validate_tree_index;
 use crate::write::indexer::tree::vector::{ReassignVectors, WriteVectors};
 use common::StorageRead;
@@ -155,12 +155,12 @@ impl Indexer {
 
             let mut split_round = 0usize;
             loop {
+                let view = VectorIndexView::new(&delta, &self.state, &snapshot, snapshot_epoch);
                 if split_round >= 1000 {
                     error!(
                         msg = "splits seem to be in infinite loop",
                         level = &format!("{}", level),
-                        state = &format!("{:?}", &self.state),
-                        delta = &format!("{:?}", &delta)
+                        counts = &format!("{:?}", &view.centroid_counts(level)),
                     );
                     panic!("split infinite loop");
                 }
