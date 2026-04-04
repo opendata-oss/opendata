@@ -1,7 +1,8 @@
 use crate::DistanceMetric;
 use crate::Result;
+use crate::serde::vector_id::VectorId;
 use crate::write::delta::VectorWrite;
-use crate::write::indexer::tree::centroids::{CentroidCache, TreeDepth, TreeLevel};
+use crate::write::indexer::tree::centroids::{CentroidCache, LEAF_LEVEL, TreeDepth, TreeLevel};
 use crate::write::indexer::tree::merge::MergeCentroids;
 use crate::write::indexer::tree::root::SplitRoot;
 use crate::write::indexer::tree::split::{ReassignVector, SplitCentroids};
@@ -33,6 +34,8 @@ pub(crate) struct IndexerStats {
     pub(crate) merges: HashMap<TreeLevel, usize>,
     pub(crate) splits: HashMap<TreeLevel, usize>,
     pub(crate) reassignments: HashMap<TreeLevel, usize>,
+    pub(crate) largest_centroids: HashMap<TreeLevel, Vec<(VectorId, u64)>>,
+    pub(crate) smallest_centroids: HashMap<TreeLevel, Vec<(VectorId, u64)>>,
 }
 
 #[derive(Debug)]
@@ -83,6 +86,43 @@ impl Indexer {
 
     fn query_centroid_cache(&self) -> Arc<dyn CentroidCache> {
         Arc::new(self.state.centroid_cache()) as Arc<dyn CentroidCache>
+    }
+
+    fn compute_centroid_size_stats(
+        &self,
+    ) -> (
+        HashMap<TreeLevel, Vec<(VectorId, u64)>>,
+        HashMap<TreeLevel, Vec<(VectorId, u64)>>,
+    ) {
+        let depth = TreeDepth::of(self.state.centroids_meta().depth);
+        let mut largest = HashMap::new();
+        let mut smallest = HashMap::new();
+
+        for level in LEAF_LEVEL..=depth.max_inner_level() {
+            let tree_level = TreeLevel::inner(level, depth);
+            let mut counts = self
+                .state
+                .centroid_counts()
+                .get(&level)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<Vec<_>>();
+
+            counts.sort_by(|(a_id, a_count), (b_id, b_count)| {
+                b_count.cmp(a_count).then_with(|| a_id.cmp(b_id))
+            });
+            let top = counts.iter().take(10).copied().collect::<Vec<_>>();
+            largest.insert(tree_level, top);
+
+            counts.sort_by(|(a_id, a_count), (b_id, b_count)| {
+                a_count.cmp(b_count).then_with(|| a_id.cmp(b_id))
+            });
+            let bottom = counts.iter().take(10).copied().collect::<Vec<_>>();
+            smallest.insert(tree_level, bottom);
+        }
+
+        (largest, smallest)
     }
 
     pub(crate) async fn update_index(
@@ -239,6 +279,9 @@ impl Indexer {
             record_op_count = ops.len(),
             "completed"
         );
+        let (largest_centroids, smallest_centroids) = self.compute_centroid_size_stats();
+        stats.largest_centroids = largest_centroids;
+        stats.smallest_centroids = smallest_centroids;
         info!(
             parent: &update_span,
             elapsed_ms = elapsed_ms(update_start),

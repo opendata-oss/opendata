@@ -79,10 +79,7 @@ struct SplitResult {
 
 #[derive(Debug)]
 pub(crate) enum SplitError {
-    ImbalancedClusters {
-        c: VectorId,
-        count: u64,
-    },
+    ImbalancedClusters { c: VectorId, count: u64 },
 }
 
 #[derive(Debug)]
@@ -422,7 +419,10 @@ impl SplitCentroid {
         }
 
         if c0_postings.is_empty() || c1_postings.is_empty() {
-            return Err(SplitError::ImbalancedClusters { c: self.c, count: self.count });
+            return Err(SplitError::ImbalancedClusters {
+                c: self.c,
+                count: self.count,
+            });
         }
 
         // Compute reassignments
