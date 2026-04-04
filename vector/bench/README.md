@@ -54,6 +54,115 @@ tar xzf sift.tar.gz --strip-components=1
 # Expected files: sift_base.fvecs, sift_query.fvecs, sift_groundtruth.ivecs
 ```
 
+### SIFT10M, SIFT50M, SIFT100M, and SIFT1B
+
+These benchmark entries use the BIGANN SIFT1B dataset:
+
+- `sift10m`
+- `sift50m`
+- `sift100m`
+- `sift1b`
+
+All four use the same base and query files:
+
+- `bigann/bigann_base.bvecs`
+- `bigann/bigann_query.bvecs`
+
+They differ only in:
+
+- how many base vectors the benchmark ingests
+- which ground-truth file is used
+
+The benchmark reads `bvecs` directly, so unlike DEEP you do **not** need to convert the base/query files.
+
+Expected layout:
+
+```text
+vector/bench/data/bigann/
+├── bigann_base.bvecs
+├── bigann_query.bvecs
+├── bigann_groundtruth_10M.ivecs
+├── bigann_groundtruth_50M.ivecs
+├── bigann_groundtruth_100M.ivecs
+└── bigann_groundtruth_1B.ivecs
+```
+
+Run these commands from the **workspace root**.
+
+```bash
+mkdir -p vector/bench/data/bigann
+
+curl -L -o vector/bench/data/bigann/bigann_base.bvecs.gz \
+  ftp://ftp.irisa.fr/local/texmex/corpus/bigann_base.bvecs.gz
+
+curl -L -o vector/bench/data/bigann/bigann_query.bvecs.gz \
+  ftp://ftp.irisa.fr/local/texmex/corpus/bigann_query.bvecs.gz
+
+curl -L -o vector/bench/data/bigann/bigann_gnd.tar.gz \
+  ftp://ftp.irisa.fr/local/texmex/corpus/bigann_gnd.tar.gz
+
+gzip -dc vector/bench/data/bigann/bigann_base.bvecs.gz \
+  > vector/bench/data/bigann/bigann_base.bvecs
+
+gzip -dc vector/bench/data/bigann/bigann_query.bvecs.gz \
+  > vector/bench/data/bigann/bigann_query.bvecs
+
+mkdir -p /tmp/bigann_gnd_extract
+tar xzf vector/bench/data/bigann/bigann_gnd.tar.gz -C /tmp/bigann_gnd_extract
+
+cp /tmp/bigann_gnd_extract/gnd/idx_10M.ivecs \
+  vector/bench/data/bigann/bigann_groundtruth_10M.ivecs
+
+cp /tmp/bigann_gnd_extract/gnd/idx_50M.ivecs \
+  vector/bench/data/bigann/bigann_groundtruth_50M.ivecs
+
+cp /tmp/bigann_gnd_extract/gnd/idx_100M.ivecs \
+  vector/bench/data/bigann/bigann_groundtruth_100M.ivecs
+
+cp /tmp/bigann_gnd_extract/gnd/idx_1000M.ivecs \
+  vector/bench/data/bigann/bigann_groundtruth_1B.ivecs
+
+ls -lh vector/bench/data/bigann
+```
+
+Then choose whichever dataset you want in your benchmark config.
+
+For `sift10m`:
+
+```toml
+[[params.recall]]
+dataset = "sift10m"
+```
+
+For `sift50m`:
+
+```toml
+[[params.recall]]
+dataset = "sift50m"
+```
+
+For `sift100m`:
+
+```toml
+[[params.recall]]
+dataset = "sift100m"
+```
+
+For `sift1b`:
+
+```toml
+[[params.recall]]
+dataset = "sift1b"
+```
+
+Notes:
+
+- `sift10m` ingests the first 10,000,000 vectors from `bigann_base.bvecs`.
+- `sift50m` ingests the first 50,000,000 vectors from `bigann_base.bvecs`.
+- `sift100m` ingests the first 100,000,000 vectors from `bigann_base.bvecs`.
+- `sift1b` ingests the full `bigann_base.bvecs`.
+- BIGANN is large. `bigann_base.bvecs.gz` is about 91 GB compressed on IRISA and expands substantially when decompressed.
+
 ### DEEP10M and DEEP1B
 
 96 dimensions, L2 distance, `fvecs` format. These benchmark entries expect local DEEP vectors converted into the same

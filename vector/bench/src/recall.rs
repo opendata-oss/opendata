@@ -13,17 +13,21 @@
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use bencher::{Bench, Benchmark, Params, Summary};
 use common::StorageBuilder;
 use common::storage::factory::{FoyerCache, FoyerCacheOptions};
+use tokio::sync::mpsc;
 use vector::{
     Config, DistanceMetric, Query, SearchOptions, SearchResult, Vector, VectorDb, VectorDbRead,
 };
 
 const DEFAULT_NUM_QUERIES: usize = 100;
+const BASE_VECTOR_CHUNK_SIZE: usize = 1_000_000;
+const INGEST_WRITE_BATCH_SIZE: usize = 10;
 
 fn load_vector_config(path: &str) -> Config {
     let contents =
@@ -51,6 +55,102 @@ fn data_dir() -> PathBuf {
 }
 
 // -- Vector file readers ------------------------------------------------------
+
+struct VectorFileBatchReader {
+    reader: BufReader<File>,
+    format: VecFormat,
+    dimensions: usize,
+    remaining: Option<usize>,
+    normalize: bool,
+}
+
+impl VectorFileBatchReader {
+    fn open(
+        path: &Path,
+        format: VecFormat,
+        dimensions: usize,
+        max_vectors: Option<usize>,
+        normalize: bool,
+    ) -> anyhow::Result<Self> {
+        let file =
+            File::open(path).unwrap_or_else(|e| panic!("failed to open {}: {}", path.display(), e));
+        Ok(Self {
+            reader: BufReader::new(file),
+            format,
+            dimensions,
+            remaining: max_vectors,
+            normalize,
+        })
+    }
+
+    fn read_batch(&mut self, max_rows: usize) -> anyhow::Result<Option<Vec<Vec<f32>>>> {
+        if self.remaining == Some(0) {
+            return Ok(None);
+        }
+
+        let batch_cap = self.remaining.unwrap_or(max_rows).min(max_rows);
+        let mut rows = Vec::with_capacity(batch_cap);
+        while rows.len() < batch_cap {
+            let Some(mut values) = self.read_vector()? else {
+                break;
+            };
+            if self.normalize {
+                normalize_vec(&mut values);
+            }
+            rows.push(values);
+            if let Some(remaining) = &mut self.remaining {
+                *remaining -= 1;
+                if *remaining == 0 {
+                    break;
+                }
+            }
+        }
+
+        if rows.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(rows))
+        }
+    }
+
+    fn read_vector(&mut self) -> anyhow::Result<Option<Vec<f32>>> {
+        let Some(dim) = read_dim_prefix(&mut self.reader)? else {
+            return Ok(None);
+        };
+        if dim != self.dimensions {
+            anyhow::bail!(
+                "dimension mismatch while streaming vectors: expected {}, got {}",
+                self.dimensions,
+                dim
+            );
+        }
+
+        match self.format {
+            VecFormat::Fvecs => {
+                let mut values = vec![0f32; dim];
+                let byte_slice = unsafe {
+                    std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, dim * 4)
+                };
+                self.reader.read_exact(byte_slice)?;
+                Ok(Some(values))
+            }
+            VecFormat::Bvecs => {
+                let mut bytes = vec![0u8; dim];
+                self.reader.read_exact(&mut bytes)?;
+                Ok(Some(bytes.into_iter().map(|v| v as f32).collect()))
+            }
+        }
+    }
+}
+
+fn read_dim_prefix(reader: &mut impl Read) -> anyhow::Result<Option<usize>> {
+    let mut dim_buf = [0u8; 4];
+    match reader.read_exact(&mut dim_buf) {
+        Ok(()) => Ok(Some(u32::from_le_bytes(dim_buf) as usize)),
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
 
 fn read_fvecs(path: &Path) -> Vec<Vec<f32>> {
     let file =
@@ -148,46 +248,6 @@ fn recall_at_k(results: &[SearchResult], ground_truth: &[i32], k: usize) -> f64 
     found as f64 / k as f64
 }
 
-fn brute_force_top_k(
-    query: &[f32],
-    base: &[Vec<f32>],
-    k: usize,
-    metric: DistanceMetric,
-) -> Vec<i32> {
-    let mut scored: Vec<(usize, f32)> = base
-        .iter()
-        .enumerate()
-        .map(|(idx, vector)| {
-            let score = match metric {
-                DistanceMetric::L2 => query
-                    .iter()
-                    .zip(vector.iter())
-                    .map(|(a, b)| (a - b) * (a - b))
-                    .sum(),
-                DistanceMetric::DotProduct => -query
-                    .iter()
-                    .zip(vector.iter())
-                    .map(|(a, b)| a * b)
-                    .sum::<f32>(),
-            };
-            (idx, score)
-        })
-        .collect();
-
-    scored.sort_by(|(a_idx, a_score), (b_idx, b_score)| {
-        a_score
-            .partial_cmp(b_score)
-            .unwrap()
-            .then_with(|| a_idx.cmp(b_idx))
-    });
-
-    scored
-        .into_iter()
-        .take(k)
-        .map(|(idx, _)| idx as i32)
-        .collect()
-}
-
 fn percentile(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
@@ -236,30 +296,88 @@ struct Dataset {
 }
 
 impl Dataset {
-    /// Load base vectors, respecting `format`, `max_vectors`, and `normalize`.
-    fn load_base_vectors(&self, data_dir: &Path) -> Vec<Vec<f32>> {
-        let path = data_dir.join(self.base_file);
-        let mut vecs = match self.format {
-            VecFormat::Fvecs => {
-                let vecs = read_fvecs(&path);
-                match self.max_vectors {
-                    Some(n) => vecs.into_iter().take(n).collect(),
-                    None => vecs,
+    fn base_path(&self, data_dir: &Path) -> PathBuf {
+        data_dir.join(self.base_file)
+    }
+
+    fn query_path(&self, data_dir: &Path) -> PathBuf {
+        data_dir.join(self.query_file)
+    }
+
+    fn estimated_base_vector_count(&self, data_dir: &Path) -> anyhow::Result<usize> {
+        let path = self.base_path(data_dir);
+        let bytes = std::fs::metadata(&path)?.len() as usize;
+        let record_size = match self.format {
+            VecFormat::Fvecs => 4 + self.dimensions as usize * 4,
+            VecFormat::Bvecs => 4 + self.dimensions as usize,
+        };
+        if bytes % record_size != 0 {
+            anyhow::bail!(
+                "file size {} for {} is not a multiple of record size {}",
+                bytes,
+                path.display(),
+                record_size
+            );
+        }
+        let total = bytes / record_size;
+        Ok(self.max_vectors.map_or(total, |n| n.min(total)))
+    }
+
+    fn spawn_base_vector_stream(
+        &self,
+        data_dir: &Path,
+        batch_size: usize,
+    ) -> anyhow::Result<(
+        mpsc::Receiver<anyhow::Result<Option<Vec<Vec<f32>>>>>,
+        thread::JoinHandle<()>,
+    )> {
+        let path = self.base_path(data_dir);
+        let format = self.format;
+        let dimensions = self.dimensions as usize;
+        let max_vectors = self.max_vectors;
+        let normalize = self.normalize;
+        let (tx, rx) = mpsc::channel(1);
+
+        let handle = thread::spawn(move || {
+            let mut reader = match VectorFileBatchReader::open(
+                &path,
+                format,
+                dimensions,
+                max_vectors,
+                normalize,
+            ) {
+                Ok(reader) => reader,
+                Err(err) => {
+                    let _ = tx.blocking_send(Err(err));
+                    return;
+                }
+            };
+
+            loop {
+                match reader.read_batch(batch_size) {
+                    Ok(Some(batch)) => {
+                        if tx.blocking_send(Ok(Some(batch))).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = tx.blocking_send(Ok(None));
+                        return;
+                    }
+                    Err(err) => {
+                        let _ = tx.blocking_send(Err(err));
+                        return;
+                    }
                 }
             }
-            VecFormat::Bvecs => read_bvecs(&path, self.max_vectors),
-        };
-        if self.normalize {
-            for v in &mut vecs {
-                normalize_vec(v);
-            }
-        }
-        vecs
+        });
+
+        Ok((rx, handle))
     }
 
     /// Load query vectors, respecting `format` and `normalize`.
     fn load_query_vectors(&self, data_dir: &Path) -> Vec<Vec<f32>> {
-        let path = data_dir.join(self.query_file);
+        let path = self.query_path(data_dir);
         let mut vecs = match self.format {
             VecFormat::Fvecs => read_fvecs(&path)
                 .into_iter()
@@ -661,31 +779,64 @@ impl Benchmark for RecallBenchmark {
         if skip {
             println!("  Skipping ingest (VECTOR_BENCH_SKIP_INGEST=1)");
         } else {
-            println!("  Loading {} base vectors...", dataset.name);
-            let base_vectors = dataset.load_base_vectors(&data);
+            num_vectors = dataset.estimated_base_vector_count(&data)? as u64;
             println!(
-                "  Loaded {} base vectors (dim={})",
-                base_vectors.len(),
-                dataset.dimensions
+                "  Streaming {} base vectors for {} (dim={}) in chunks of {}",
+                num_vectors, dataset.name, dataset.dimensions, BASE_VECTOR_CHUNK_SIZE
             );
-            num_vectors = base_vectors.len() as u64;
+            let (mut stream, reader_thread) =
+                dataset.spawn_base_vector_stream(&data, BASE_VECTOR_CHUNK_SIZE)?;
+            let Some(first_message) = stream.recv().await else {
+                anyhow::bail!("base vector stream closed before yielding any data");
+            };
+            let Some(mut base_vectors) = first_message? else {
+                anyhow::bail!("dataset {} has no base vectors to ingest", dataset.name);
+            };
 
             let ingest_start = std::time::Instant::now();
-            let batch_size = 10;
-            let num_batches = base_vectors.len().div_ceil(batch_size);
-            for (batch_idx, chunk) in base_vectors.chunks(batch_size).enumerate() {
-                let batch: Vec<Vector> = chunk
-                    .iter()
-                    .enumerate()
-                    .map(|(i, values)| {
-                        let index = batch_idx * batch_size + i;
-                        Vector::new(index.to_string(), values.clone())
-                    })
-                    .collect();
-                db.write(batch).await?;
-                if (batch_idx + 1) % 10_000 == 0 {
-                    println!("  Written batch {}/{}", batch_idx + 1, num_batches);
+            let num_batches = (num_vectors as usize).div_ceil(INGEST_WRITE_BATCH_SIZE);
+            let mut batch_idx = 0usize;
+            let mut vector_offset = 0usize;
+            loop {
+                println!(
+                    "  Loaded chunk: {} vectors ({} / {})",
+                    base_vectors.len(),
+                    vector_offset + base_vectors.len(),
+                    num_vectors
+                );
+                for (chunk_idx, chunk) in base_vectors.chunks(INGEST_WRITE_BATCH_SIZE).enumerate() {
+                    let batch: Vec<Vector> = chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(i, values)| {
+                            let index = vector_offset + chunk_idx * INGEST_WRITE_BATCH_SIZE + i;
+                            Vector::new(index.to_string(), values.clone())
+                        })
+                        .collect();
+                    db.write(batch).await?;
+                    batch_idx += 1;
+                    if batch_idx.is_multiple_of(10_000) {
+                        println!("  Written batch {}/{}", batch_idx, num_batches);
+                    }
                 }
+                vector_offset += base_vectors.len();
+                let Some(message) = stream.recv().await else {
+                    break;
+                };
+                let Some(next_batch) = message? else {
+                    break;
+                };
+                base_vectors = next_batch;
+            }
+            reader_thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("base vector streaming thread panicked"))?;
+            if vector_offset != num_vectors as usize {
+                anyhow::bail!(
+                    "streamed {} vectors but expected {}",
+                    vector_offset,
+                    num_vectors
+                );
             }
             db.flush().await?;
             ingest_secs = Some(ingest_start.elapsed().as_secs_f64());
