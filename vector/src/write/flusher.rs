@@ -131,6 +131,7 @@ impl VectorDbFlusher {
 mod tests {
     use super::*;
     use crate::model::AttributeValue;
+    use crate::serde::Decode;
     use crate::serde::centroid_info::CentroidInfoValue;
     use crate::serde::centroid_stats::CentroidStatsValue;
     use crate::serde::centroids::CentroidsValue;
@@ -158,7 +159,6 @@ mod tests {
     use common::{Record, SequenceAllocator, Storage};
     use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
-    use crate::serde::Decode;
 
     const DIMS: usize = 3;
 

@@ -93,6 +93,11 @@ pub fn build_centroid_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serde::vector_id::VectorId;
+
+    fn raw_centroid_id(id: u64) -> u64 {
+        VectorId::legacy_centroid_id(id).id()
+    }
 
     #[test]
     fn should_work_through_trait_interface() {
@@ -111,7 +116,7 @@ mod tests {
 
         let results = graph.search(&[0.9, 0.1, 0.1], 1);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0], 1);
+        assert_eq!(results[0], raw_centroid_id(1));
     }
 
     #[test]
@@ -130,6 +135,6 @@ mod tests {
 
         let results = graph.search(&[0.9, 0.1], 1);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0], 1);
+        assert_eq!(results[0], raw_centroid_id(1));
     }
 }

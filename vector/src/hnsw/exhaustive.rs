@@ -346,6 +346,11 @@ fn flatten_centroids(centroids: &[CentroidEntry], dimensions: usize) -> (Vec<u64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serde::vector_id::VectorId;
+
+    fn raw_centroid_id(id: u64) -> u64 {
+        VectorId::legacy_centroid_id(id).id()
+    }
 
     #[test]
     fn should_build_and_search_l2_graph() {
@@ -361,7 +366,7 @@ mod tests {
         let results = graph.search(&[0.9, 0.1, 0.1], 1);
 
         // then
-        assert_eq!(results, vec![1]);
+        assert_eq!(results, vec![raw_centroid_id(1)]);
     }
 
     #[test]
@@ -378,7 +383,7 @@ mod tests {
         let results = graph.search(&[1.0, 0.0], 2);
 
         // then
-        assert_eq!(results, vec![1, 2]);
+        assert_eq!(results, vec![raw_centroid_id(1), raw_centroid_id(2)]);
     }
 
     #[test]
@@ -474,7 +479,7 @@ mod tests {
 
         // then
         assert_eq!(graph.len(), 3);
-        assert_eq!(results, vec![3]);
+        assert_eq!(results, vec![raw_centroid_id(3)]);
     }
 
     #[test]
@@ -488,13 +493,13 @@ mod tests {
         let graph = ExhaustiveCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
 
         // when
-        graph.remove_centroid(2).unwrap();
+        graph.remove_centroid(raw_centroid_id(2)).unwrap();
         let results = graph.search(&[0.0, 0.9, 0.0], 2);
 
         // then
         assert_eq!(graph.len(), 2);
         assert_eq!(results.len(), 2);
-        assert!(!results.contains(&2));
+        assert!(!results.contains(&raw_centroid_id(2)));
     }
 
     #[test]
@@ -510,9 +515,15 @@ mod tests {
         .unwrap();
 
         // when / then
-        assert_eq!(graph.get_centroid_vector(1), Some(vec![1.0, 0.0]));
-        assert_eq!(graph.get_centroid_vector(2), Some(vec![0.0, 1.0]));
-        assert_eq!(graph.get_centroid_vector(99), None);
+        assert_eq!(
+            graph.get_centroid_vector(raw_centroid_id(1)),
+            Some(vec![1.0, 0.0])
+        );
+        assert_eq!(
+            graph.get_centroid_vector(raw_centroid_id(2)),
+            Some(vec![0.0, 1.0])
+        );
+        assert_eq!(graph.get_centroid_vector(raw_centroid_id(99)), None);
     }
 
     #[test]
@@ -550,7 +561,7 @@ mod tests {
         let results = graph.search(&[0.0, 0.0], 1);
 
         // then
-        assert_eq!(results, vec![3]);
+        assert_eq!(results, vec![raw_centroid_id(3)]);
     }
 
     #[test]
@@ -565,14 +576,14 @@ mod tests {
             DistanceMetric::L2,
         )
         .unwrap();
-        let exclude = HashSet::from([1]);
+        let exclude = HashSet::from([raw_centroid_id(1)]);
 
         // when
         let results = graph.search_with_include_exclude(&[0.9, 0.1, 0.0], 1, &[], &exclude);
 
         // then
         assert_eq!(results.len(), 1);
-        assert_ne!(results[0], 1);
+        assert_ne!(results[0], raw_centroid_id(1));
     }
 
     #[test]
@@ -593,7 +604,7 @@ mod tests {
             graph.search_with_include_exclude(&[0.5, 0.5], 1, &[&include], &HashSet::new());
 
         // then
-        assert_eq!(results, vec![99]);
+        assert_eq!(results, vec![raw_centroid_id(99)]);
     }
 
     #[test]
@@ -613,6 +624,6 @@ mod tests {
         ids.sort_unstable();
 
         // then
-        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(ids, vec![raw_centroid_id(1), raw_centroid_id(2)]);
     }
 }

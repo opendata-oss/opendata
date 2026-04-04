@@ -4,11 +4,6 @@
 //! requiring a storage reference, since they only encode keys and values.
 
 use crate::error::Result;
-use bytes::BytesMut;
-use common::Record;
-use common::storage::RecordOp;
-use roaring::RoaringTreemap;
-use tracing::debug;
 use crate::model::AttributeValue;
 use crate::serde::Encode;
 use crate::serde::centroid_chunk::{CentroidChunkValue, CentroidEntry};
@@ -22,6 +17,11 @@ use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_data::{Field, VectorDataValue};
 use crate::serde::vector_id::VectorId;
+use bytes::BytesMut;
+use common::Record;
+use common::storage::RecordOp;
+use roaring::RoaringTreemap;
+use tracing::debug;
 
 /// Create a RecordOp to update the IdDictionary mapping.
 pub fn put_id_dictionary(external_id: &str, internal_id: VectorId) -> RecordOp {

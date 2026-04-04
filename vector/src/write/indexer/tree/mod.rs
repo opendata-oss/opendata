@@ -167,7 +167,7 @@ impl Indexer {
                         level = &format!("{}", level),
                         ncentroids = ncounts,
                         counts_back = &format!("{:?}", &counts[back..]),
-                        counts_front = &format!("{:?}", &counts[..100],
+                        counts_front = &format!("{:?}", &counts[..100]),
                     );
                     panic!("split infinite loop");
                 }
