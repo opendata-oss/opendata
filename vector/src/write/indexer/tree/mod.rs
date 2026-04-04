@@ -158,7 +158,7 @@ impl Indexer {
                 let view = VectorIndexView::new(&delta, &self.state, &snapshot, snapshot_epoch);
                 if split_round >= 1000 {
                     let counts = view.centroid_counts(level);
-                    let mut counts = counts.into_iter().collect::<Vec<_>>();
+                    let mut counts = counts.into_iter().map(|(cid, c)| (c, cid)).collect::<Vec<_>>();
                     counts.sort();
                     let ncounts = counts.len();
                     let back = ncounts - 100;
