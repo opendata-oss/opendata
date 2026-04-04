@@ -30,3 +30,5 @@ target
 
 # Vector test datasets
 vector/tests/data/sift100k/*vecs
+
+.claude/

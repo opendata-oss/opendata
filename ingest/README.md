@@ -123,6 +123,49 @@ Exactly-once delivery is achievable when the caller atomically writes both the b
 
 On the ingestor side, callers that track progress and re-ingest unacknowledged entries achieve at-least-once delivery.
 
+## CLI
+
+A companion CLI is included for inspecting ingest state. Install with:
+
+```bash
+cargo install opendata-ingest --features cli
+```
+
+### `manifest dump`
+
+Deserializes a manifest file to JSON:
+
+```bash
+opendata-ingest manifest dump /path/to/manifest
+```
+
+```json
+{
+  "version": 1,
+  "epoch": 0,
+  "next_sequence": 3,
+  "entries": [
+    {
+      "sequence": 0,
+      "location": "ingest/01J5T4R3.batch",
+      "metadata": [
+        {
+          "start_index": 0,
+          "ingestion_time_ms": 1712345678000,
+          "payload_base64": "bXktbWV0YWRhdGE="
+        }
+      ]
+    }
+  ]
+}
+```
+
+Pipe through `jq` for filtering:
+
+```bash
+opendata-ingest manifest dump /path/to/manifest | jq '.entries | length'
+```
+
 ## Data batch format
 
 Each batch is a compact binary file with an optionally compressed block of length-prefixed records followed by a fixed-size footer:

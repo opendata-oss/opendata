@@ -187,6 +187,7 @@ async fn sift100k_recall() {
     let config = Config {
         dimensions: 128,
         distance_metric: DistanceMetric::L2,
+        split_search_neighbourhood: 0,
         split_threshold_vectors: 150,
         merge_threshold_vectors: 50,
         ..Default::default()

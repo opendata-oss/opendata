@@ -579,22 +579,27 @@ impl ManifestStore {
 struct ConflictCounter {
     write_count: AtomicU64,
     conflict_count: AtomicU64,
+    role: &'static str,
 }
 
 impl ConflictCounter {
-    fn new() -> Self {
+    fn new(role: &'static str) -> Self {
         Self {
             write_count: AtomicU64::new(0),
             conflict_count: AtomicU64::new(0),
+            role,
         }
     }
 
     fn record_write(&self) {
         self.write_count.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!(crate::metric_names::MANIFEST_WRITES, "role" => self.role).increment(1);
     }
 
     fn record_conflict(&self) {
         self.conflict_count.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!(crate::metric_names::MANIFEST_CONFLICTS, "role" => self.role)
+            .increment(1);
     }
 
     fn conflict_rate(&self) -> f64 {
@@ -626,7 +631,7 @@ impl QueueProducer {
                 object_store,
                 manifest_path,
             },
-            counter: ConflictCounter::new(),
+            counter: ConflictCounter::new("producer"),
         }
     }
 
@@ -684,7 +689,7 @@ impl QueueConsumer {
                 manifest_path,
             },
             epoch: AtomicU64::new(UNINITIALIZED_EPOCH),
-            counter: ConflictCounter::new(),
+            counter: ConflictCounter::new("consumer"),
             queue_len: AtomicU64::new(0),
         }
     }
@@ -786,6 +791,49 @@ impl QueueConsumer {
     pub fn conflict_rate(&self) -> f64 {
         self.counter.conflict_rate()
     }
+}
+
+/// A single entry in the manifest.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManifestEntry {
+    pub sequence: u64,
+    pub location: String,
+    pub metadata: Vec<Metadata>,
+}
+
+/// Read-only view of a parsed ingest queue manifest.
+#[derive(Debug, Clone)]
+pub struct ManifestView {
+    pub epoch: u64,
+    pub next_sequence: u64,
+    entries: Vec<ManifestEntry>,
+}
+
+impl ManifestView {
+    /// Return all entries in the manifest.
+    pub fn entries(&self) -> &[ManifestEntry] {
+        &self.entries
+    }
+}
+
+/// Parse a manifest from its binary representation.
+pub fn parse_manifest(data: Bytes) -> Result<ManifestView> {
+    let manifest = Manifest::from_bytes(data)?;
+    let entries = manifest
+        .iter()
+        .map(|r| {
+            r.map(|e| ManifestEntry {
+                sequence: e.sequence,
+                location: e.location,
+                metadata: e.metadata,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ManifestView {
+        epoch: manifest.epoch,
+        next_sequence: manifest.next_sequence,
+        entries,
+    })
 }
 
 #[cfg(test)]

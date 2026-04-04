@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -8,6 +9,7 @@ use slatedb::object_store::path::Path;
 
 use crate::config::CollectorConfig;
 use crate::error::{Error, Result};
+use crate::metric_names as m;
 use crate::model::decode_batch;
 use crate::queue::{Metadata, QueueConsumer, QueueEntry};
 
@@ -51,6 +53,7 @@ impl Collector {
     /// This is useful when you need to share an object store instance
     /// between an [`Ingestor`](crate::Ingestor) and a `Collector` (e.g. in tests).
     pub fn with_object_store(config: CollectorConfig, object_store: Arc<dyn ObjectStore>) -> Self {
+        crate::metric_names::describe_collector_metrics();
         let consumer = QueueConsumer::with_object_store(config.manifest_path, object_store.clone());
         Self {
             consumer,
@@ -85,8 +88,22 @@ impl Collector {
             None => self.consumer.peek().await?,
             Some(seq) => self.consumer.read(seq.wrapping_add(1)).await?,
         };
+        metrics::gauge!(m::QUEUE_LENGTH).set(self.consumer.len() as f64);
         match queue_entry {
-            Some(entry) => self.fetch_batch(entry).await,
+            Some(entry) => {
+                let batch = self.fetch_batch(entry).await?;
+                if let Some(ref b) = batch
+                    && let Some(last_meta) = b.metadata.last()
+                {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    let lag_s = (now_ms - last_meta.ingestion_time_ms) as f64 / 1000.0;
+                    metrics::gauge!(m::COLLECTOR_LAG_SECONDS).set(lag_s.max(0.0));
+                }
+                Ok(batch)
+            }
             None => Ok(None),
         }
     }
@@ -95,6 +112,7 @@ impl Collector {
         &self,
         queue_entry: crate::queue::QueueEntry,
     ) -> Result<Option<CollectedBatch>> {
+        let start = Instant::now();
         let path = Path::from(queue_entry.location.as_str());
         let data = self
             .object_store
@@ -105,7 +123,13 @@ impl Collector {
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
 
+        let data_len = data.len() as u64;
         let entries = decode_batch(data)?;
+
+        metrics::counter!(m::BATCHES_COLLECTED).increment(1);
+        metrics::counter!(m::ENTRIES_COLLECTED).increment(entries.len() as u64);
+        metrics::counter!(m::BYTES_COLLECTED).increment(data_len);
+        metrics::histogram!(m::FETCH_DURATION_SECONDS).record(start.elapsed().as_secs_f64());
 
         Ok(Some(CollectedBatch {
             entries,
@@ -133,6 +157,7 @@ impl Collector {
         }
         self.last_acked_sequence = Some(sequence);
         self.ack_count += 1;
+        metrics::counter!(m::ACKS).increment(1);
         if self.ack_count.is_multiple_of(DEQUEUE_INTERVAL) {
             let dequeued = self.consumer.dequeue(sequence).await?;
             delete_dequeued_batches(self.object_store.clone(), dequeued);
@@ -175,9 +200,12 @@ fn delete_dequeued_batches(object_store: Arc<dyn ObjectStore>, entries: Vec<Queu
         return;
     }
     tokio::spawn(async move {
+        let start = Instant::now();
         let locations = stream::iter(entries.iter().map(|e| Ok(Path::from(e.location.as_str()))));
         let mut results = object_store.delete_stream(locations.boxed());
         let mut i = 0;
+        let mut deleted = 0u64;
+        let mut failed = 0u64;
         while let Some(result) = results.next().await {
             if let Err(e) = result {
                 tracing::warn!(
@@ -185,9 +213,15 @@ fn delete_dequeued_batches(object_store: Arc<dyn ObjectStore>, entries: Vec<Queu
                     error = %e,
                     "failed to delete ingested data batch"
                 );
+                failed += 1;
+            } else {
+                deleted += 1;
             }
             i += 1;
         }
+        metrics::counter!(m::GC_FILES_DELETED).increment(deleted);
+        metrics::counter!(m::GC_FILES_FAILED).increment(failed);
+        metrics::histogram!(m::GC_DURATION_SECONDS).record(start.elapsed().as_secs_f64());
     });
 }
 
