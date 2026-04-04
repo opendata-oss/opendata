@@ -78,6 +78,14 @@ struct SplitResult {
 }
 
 #[derive(Debug)]
+pub(crate) enum SplitError {
+    ImbalancedClusters {
+        c: VectorId,
+        count: u64,
+    },
+}
+
+#[derive(Debug)]
 pub(crate) struct SplitSummary {
     #[allow(dead_code)]
     pub(crate) c: VectorId,
@@ -88,6 +96,7 @@ pub(crate) struct SplitSummary {
 #[derive(Debug)]
 pub(crate) struct SplitCentroidsResult {
     pub(crate) splits: Vec<SplitSummary>,
+    pub(crate) imbalanced: Vec<(VectorId, u64)>,
     pub(crate) reassignments: Vec<ReassignVector>,
     pub(crate) candidates_evaluated: usize,
     pub(crate) candidates_returned: usize,
@@ -143,10 +152,10 @@ impl SplitCentroids {
                 .collect();
             to_split.sort_by(|a, b| b.1.cmp(&a.1));
             to_split.truncate(self.max_splits);
-            let to_split: Vec<VectorId> = to_split.into_iter().map(|(k, _v)| k).collect();
             if to_split.is_empty() {
                 return Ok(SplitCentroidsResult {
                     splits: vec![],
+                    imbalanced: Vec::new(),
                     reassignments: Vec::new(),
                     candidates_evaluated: 0,
                     candidates_returned: 0,
@@ -155,14 +164,15 @@ impl SplitCentroids {
             // initialize the set of postings to fetch with the split centroids
             let mut postings_to_retrive =
                 HashSet::with_capacity(to_split.len() * (1 + self.opts.split_search_neighbourhood));
-            postings_to_retrive.extend(to_split.clone());
+            postings_to_retrive.extend(to_split.iter().map(|(c, _count)| *c));
 
             // resolve centroids to full info
             let to_split: Vec<_> = to_split
                 .into_iter()
-                .map(|c| {
+                .map(|(c, count)| {
                     (
                         c,
+                        count,
                         view.centroid(c)
                             .expect(&format!(
                                 "unexpected missing centroid {} at level: {}",
@@ -182,7 +192,7 @@ impl SplitCentroids {
                     self.opts.split_search_neighbourhood + 1,
                     to_split
                         .iter()
-                        .map(|(c, c_info)| (*c, c_info.vector.as_slice()))
+                        .map(|(c, _count, c_info)| (*c, c_info.vector.as_slice()))
                         .collect(),
                     self.level,
                 )
@@ -193,7 +203,7 @@ impl SplitCentroids {
 
             // initialize split tasks
             let mut splits = Vec::with_capacity(to_split.len());
-            for (c, c_info) in to_split {
+            for (c, count, c_info) in to_split {
                 let neighbours = neighbours_by_centroid
                     .get(&c)
                     .cloned()
@@ -204,6 +214,7 @@ impl SplitCentroids {
                 postings_to_retrive.extend(neighbours.clone());
                 splits.push(SplitCentroid {
                     c,
+                    count,
                     c_info,
                     neighbours,
                     dimensions: self.opts.dimensions,
@@ -235,7 +246,11 @@ impl SplitCentroids {
         let results: Vec<_> = spawn_blocking(move || {
             splits
                 .into_par_iter()
-                .map(|split| split.execute(postings.clone()))
+                .map(|split| {
+                    let c = split.c;
+                    let count = split.count;
+                    split.execute(postings.clone())
+                })
                 .collect()
         })
         .await
@@ -244,9 +259,17 @@ impl SplitCentroids {
         // update delta
         let mut total_candidates_evaluated = 0usize;
         let mut total_candidates_returned = 0usize;
+        let mut imbalanced = Vec::new();
         let mut reassignments = HashMap::new();
         let mut splits = Vec::with_capacity(results.len());
         for result in results {
+            let result = match result {
+                Ok(result) => result,
+                Err(SplitError::ImbalancedClusters { c, count }) => {
+                    imbalanced.push((c, count));
+                    continue;
+                }
+            };
             total_candidates_evaluated += result.candidates_evaluated;
             total_candidates_returned += result.candidates_returned;
             // track reassignments
@@ -340,6 +363,7 @@ impl SplitCentroids {
         let reassignments: Vec<_> = reassignments.values().cloned().collect();
         Ok(SplitCentroidsResult {
             splits,
+            imbalanced,
             reassignments,
             candidates_evaluated: total_candidates_evaluated,
             candidates_returned: total_candidates_returned,
@@ -349,6 +373,7 @@ impl SplitCentroids {
 
 struct SplitCentroid {
     c: VectorId,
+    count: u64,
     c_info: CentroidInfoValue,
     neighbours: Vec<VectorId>,
     distance_metric: DistanceMetric,
@@ -357,7 +382,10 @@ struct SplitCentroid {
 }
 
 impl SplitCentroid {
-    fn execute(self, postings: Arc<HashMap<VectorId, Arc<PostingList>>>) -> SplitResult {
+    fn execute(
+        self,
+        postings: Arc<HashMap<VectorId, Arc<PostingList>>>,
+    ) -> std::result::Result<SplitResult, SplitError> {
         let c_postings = postings
             .get(&self.c)
             .expect("unexpected missing postings for c");
@@ -393,6 +421,10 @@ impl SplitCentroid {
             }
         }
 
+        if c0_postings.is_empty() || c1_postings.is_empty() {
+            return Err(SplitError::ImbalancedClusters { c: self.c, count: self.count });
+        }
+
         // Compute reassignments
         // Count all candidates evaluated before heuristic filtering
         let split_candidates = c_postings.len();
@@ -422,7 +454,7 @@ impl SplitCentroid {
         ));
 
         let candidates_returned = reassignments.len();
-        SplitResult {
+        Ok(SplitResult {
             c: self.c,
             c_info: self.c_info,
             c_0: SplitPostings::new(c0_vector, c0_postings),
@@ -430,7 +462,7 @@ impl SplitCentroid {
             reassign_vectors: reassignments,
             candidates_evaluated,
             candidates_returned,
-        }
+        })
     }
 
     fn compute_split_reassignments(

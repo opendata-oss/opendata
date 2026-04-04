@@ -15,7 +15,7 @@ use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, debug_span, error, info};
+use tracing::{debug, debug_span, error, info, warn};
 
 pub(crate) mod centroids;
 mod merge;
@@ -158,7 +158,10 @@ impl Indexer {
                 let view = VectorIndexView::new(&delta, &self.state, &snapshot, snapshot_epoch);
                 if split_round >= 1000 {
                     let counts = view.centroid_counts(level);
-                    let mut counts = counts.into_iter().map(|(cid, c)| (c, cid)).collect::<Vec<_>>();
+                    let mut counts = counts
+                        .into_iter()
+                        .map(|(cid, c)| (c, cid))
+                        .collect::<Vec<_>>();
                     counts.sort();
                     let ncounts = counts.len();
                     let back = ncounts - 100;
@@ -174,6 +177,16 @@ impl Indexer {
                 let split = SplitCentroids::new(&self.opts, level, &snapshot, snapshot_epoch);
                 let split_start = Instant::now();
                 let result = split.execute(&self.state, &mut delta).await?;
+                if !result.imbalanced.is_empty() {
+                    warn!(
+                        parent: &update_span,
+                        op = "split_centroids_imbalanced",
+                        level = &format!("{}", level),
+                        split_round,
+                        imbalanced = ?result.imbalanced,
+                        "kmeans produced imbalanced clusters"
+                    );
+                }
                 debug!(
                     parent: &update_span,
                     op = "split_centroids",
