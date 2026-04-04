@@ -706,7 +706,6 @@ impl Benchmark for RecallBenchmark {
         let mut ingest_secs = None;
         let mut num_vectors = 0u64;
 
-
         let base_vectors = dataset.load_base_vectors(&data);
         validate_deep10m_ground_truth(&dataset, &queries, &ground_truth, &base_vectors, k)?;
 

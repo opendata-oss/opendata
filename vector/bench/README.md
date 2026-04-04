@@ -73,7 +73,8 @@ Important:
 
 - `deep10m` and `deep1b` do **not** use the same ground-truth file.
 - For `deep10m`, use the Yandex 10M debug subset files together:
-  `base.10M.fbin`, `query.public.10K.fbin`, and `groundtruth.public.10K.ibin`.
+  `base.10M.fbin` and `query.public.10K.fbin`, then generate ground truth locally with
+  `gen_deep_groundtruth`.
 - For `deep1b`, use the Yandex full-dataset files together:
   `base.1B.fbin`, `query.public.10K.fbin`, and `groundtruth.public.10K.ibin`.
 - Do **not** mix the Yandex 10M debug subset with `matsui528/deep1b_gt`.
@@ -90,9 +91,9 @@ This setup intentionally uses:
 
 - `base.10M.fbin` from Yandex for the base vectors
 - `query.public.10K.fbin` from Yandex for the queries
-- `groundtruth.public.10K.ibin` from Yandex for the ground truth
+- `gen_deep_groundtruth` to generate the ground truth locally
 
-That keeps the base, query, and ground truth files from the same source.
+That avoids relying on a questionable prepublished `deep10m` ground-truth pairing.
 
 ```bash
 mkdir -p vector/bench/data/deep
@@ -102,9 +103,6 @@ curl -L -o vector/bench/data/deep/base.10M.fbin \
 
 curl -L -o vector/bench/data/deep/query.public.10K.fbin \
   https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/query.public.10K.fbin
-
-curl -L -o vector/bench/data/deep/groundtruth.public.10K.ibin \
-  https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/groundtruth.public.10K.ibin
 
 python3 - <<'PY'
 from pathlib import Path
@@ -130,28 +128,16 @@ def fbin_to_fvecs(src: Path, dst: Path) -> None:
         out["vec"][start:end] = data[start:end]
     out.flush()
 
-def ibin_to_ivecs(src: Path, dst: Path) -> None:
-    with src.open("rb") as f:
-        n = int(np.fromfile(f, dtype=np.uint32, count=1)[0])
-        d = int(np.fromfile(f, dtype=np.uint32, count=1)[0])
-    data = np.memmap(src, dtype=np.int32, mode="r", offset=8, shape=(n, d))
-    out = np.memmap(
-        dst,
-        dtype=np.dtype([("dim", "<i4"), ("vec", "<i4", (d,))]),
-        mode="w+",
-        shape=(n,),
-    )
-    chunk = 100_000
-    for start in range(0, n, chunk):
-        end = min(start + chunk, n)
-        out["dim"][start:end] = d
-        out["vec"][start:end] = data[start:end]
-    out.flush()
-
 fbin_to_fvecs(root / "base.10M.fbin", root / "deep_base.fvecs")
 fbin_to_fvecs(root / "query.public.10K.fbin", root / "deep_query.fvecs")
-ibin_to_ivecs(root / "groundtruth.public.10K.ibin", root / "deep_groundtruth_10M.ivecs")
 PY
+
+cargo run -p opendata-vector --release --bin gen_deep_groundtruth -- \
+  --base-fbin vector/bench/data/deep/base.10M.fbin \
+  --query-fbin vector/bench/data/deep/query.public.10K.fbin \
+  --output-ivecs vector/bench/data/deep/deep_groundtruth_10M.ivecs \
+  --top-k 100 \
+  --distance-metric l2
 
 ls -lh vector/bench/data/deep
 ```
