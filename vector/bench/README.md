@@ -69,32 +69,42 @@ vector/bench/data/deep/
 └── deep_groundtruth_1B.ivecs
 ```
 
-Recommended sources:
+Important:
 
-- Download the DEEP1B base/query data from the [Yandex billion-scale ANN benchmark resources](https://research.yandex.com/blog/benchmarks-for-billion-scale-similarity-search).
-- For `deep10m`, use the first 10M base vectors from the DEEP1B base set and a matching top-k ground truth file.
-- For `deep1b`, use the full DEEP1B base set and the corresponding top-k ground truth file.
+- `deep10m` and `deep1b` do **not** use the same ground-truth file.
+- For `deep10m`, use the Yandex 10M debug subset files together:
+  `base.10M.fbin`, `query.public.10K.fbin`, and `groundtruth.public.10K.ibin`.
+- For `deep1b`, use the Yandex full-dataset files together:
+  `base.1B.fbin`, `query.public.10K.fbin`, and `groundtruth.public.10K.ibin`.
+- Do **not** mix the Yandex 10M debug subset with `matsui528/deep1b_gt`.
+- The benchmark now runs a brute-force sanity check for `deep10m` before ingest. If that check fails, your DEEP files
+  do not match each other.
 
-Notes:
-
-- The benchmark expects **all vectors in `fvecs` format** and **ground truth in `ivecs` format**.
-- If your source files are in another binary format, convert them before running the benchmark.
-- `deep10m` and `deep1b` share the same `deep_base.fvecs` and `deep_query.fvecs`; `deep10m` simply ingests the first
-  10M vectors and uses `deep_groundtruth_10M.ivecs`.
+The benchmark expects **all vectors in `fvecs` format** and **ground truth in `ivecs` format**.
 
 #### Copy-paste setup for `deep10m`
 
+Run these commands from the **workspace root**. Do not `cd` into `vector/bench/data/deep` first.
+
+This setup intentionally uses:
+
+- `base.10M.fbin` from Yandex for the base vectors
+- `query.public.10K.fbin` from Yandex for the queries
+- `groundtruth.public.10K.ibin` from Yandex for the ground truth
+
+That keeps the base, query, and ground truth files from the same source.
+
 ```bash
 mkdir -p vector/bench/data/deep
-cd vector/bench/data/deep
 
-curl -L -o base.10M.fbin \
+curl -L -o vector/bench/data/deep/base.10M.fbin \
   https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/base.10M.fbin
-curl -L -o query.public.10K.fbin \
+
+curl -L -o vector/bench/data/deep/query.public.10K.fbin \
   https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/query.public.10K.fbin
-curl -L -o gt.zip \
-  https://github.com/matsui528/deep1b_gt/releases/download/v0.1.0/gt.zip
-unzip -o gt.zip deep10M_groundtruth.ivecs
+
+curl -L -o vector/bench/data/deep/groundtruth.public.10K.ibin \
+  https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/groundtruth.public.10K.ibin
 
 python3 - <<'PY'
 from pathlib import Path
@@ -120,10 +130,30 @@ def fbin_to_fvecs(src: Path, dst: Path) -> None:
         out["vec"][start:end] = data[start:end]
     out.flush()
 
+def ibin_to_ivecs(src: Path, dst: Path) -> None:
+    with src.open("rb") as f:
+        n = int(np.fromfile(f, dtype=np.uint32, count=1)[0])
+        d = int(np.fromfile(f, dtype=np.uint32, count=1)[0])
+    data = np.memmap(src, dtype=np.int32, mode="r", offset=8, shape=(n, d))
+    out = np.memmap(
+        dst,
+        dtype=np.dtype([("dim", "<i4"), ("vec", "<i4", (d,))]),
+        mode="w+",
+        shape=(n,),
+    )
+    chunk = 100_000
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        out["dim"][start:end] = d
+        out["vec"][start:end] = data[start:end]
+    out.flush()
+
 fbin_to_fvecs(root / "base.10M.fbin", root / "deep_base.fvecs")
 fbin_to_fvecs(root / "query.public.10K.fbin", root / "deep_query.fvecs")
-(root / "deep10M_groundtruth.ivecs").rename(root / "deep_groundtruth_10M.ivecs")
+ibin_to_ivecs(root / "groundtruth.public.10K.ibin", root / "deep_groundtruth_10M.ivecs")
 PY
+
+ls -lh vector/bench/data/deep
 ```
 
 Then run:
@@ -132,26 +162,41 @@ Then run:
 cargo run -p vector-bench --release -- --config bench.toml
 ```
 
-with a `[[params.recall]]` entry like:
+with:
 
 ```toml
 [[params.recall]]
 dataset = "deep10m"
 ```
 
+If the files are aligned correctly, the benchmark will print:
+
+```text
+deep10m sanity check passed for query 0
+```
+
+before ingestion starts.
+
 #### Copy-paste setup for `deep1b`
 
-This is the same flow, but the base file is much larger, around 388 GB just for `base.1B.fbin`.
+Run these commands from the **workspace root**. `base.1B.fbin` alone is around 388 GB.
+
+This setup intentionally uses:
+
+- `base.1B.fbin` from Yandex for the base vectors
+- `query.public.10K.fbin` from Yandex for the queries
+- `groundtruth.public.10K.ibin` from Yandex for the ground truth
 
 ```bash
 mkdir -p vector/bench/data/deep
-cd vector/bench/data/deep
 
-curl -L -o base.1B.fbin \
+curl -L -o vector/bench/data/deep/base.1B.fbin \
   https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/base.1B.fbin
-curl -L -o query.public.10K.fbin \
+
+curl -L -o vector/bench/data/deep/query.public.10K.fbin \
   https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/query.public.10K.fbin
-curl -L -o groundtruth.public.10K.ibin \
+
+curl -L -o vector/bench/data/deep/groundtruth.public.10K.ibin \
   https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/groundtruth.public.10K.ibin
 
 python3 - <<'PY'
@@ -200,7 +245,29 @@ fbin_to_fvecs(root / "base.1B.fbin", root / "deep_base.fvecs")
 fbin_to_fvecs(root / "query.public.10K.fbin", root / "deep_query.fvecs")
 ibin_to_ivecs(root / "groundtruth.public.10K.ibin", root / "deep_groundtruth_1B.ivecs")
 PY
+
+ls -lh vector/bench/data/deep
 ```
+
+#### Smaller DEEP subset for a quick smoke test
+
+The smallest public DEEP subset with matching published ground truth that I found is `deep1M`, from
+`matsui528/deep1b_gt`.
+
+Source: <https://github.com/matsui528/deep1b_gt>
+
+That repo publishes:
+
+- `deep1M_groundtruth.ivecs`
+- a `download_deep1b.py` helper
+- a `pickup_vecs.py` helper to build `deep1M_base.fvecs` from the first 1M base vectors
+
+There does not appear to be a standard public `deep100K` package with matching ground truth. If you want exactly
+100K, the practical approach is to start from `deep1M`, take the first 100K base vectors, and recompute exact ground
+truth locally for that 100K subset.
+
+The current benchmark does not have a built-in `deep1m` dataset entry, but `deep1M` is the best public DEEP
+smoke-test-sized subset I found.
 
 ### Upstash Wikipedia BGE-M3
 
