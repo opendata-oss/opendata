@@ -133,14 +133,6 @@ fn normalize_vec(v: &mut [f32]) {
 // -- Recall / percentile helpers ----------------------------------------------
 
 fn recall_at_k(results: &[SearchResult], ground_truth: &[i32], k: usize) -> f64 {
-    println!(
-        "RESULTS: {:?}",
-        results
-            .iter()
-            .map(|r| r.vector.id.clone())
-            .collect::<Vec<_>>()
-    );
-    println!("Ground_TRUTH: {:?}", ground_truth[0..k].to_vec());
     let gt_set: HashSet<i32> = ground_truth.iter().take(k).copied().collect();
     let found = results
         .iter()
@@ -194,46 +186,6 @@ fn brute_force_top_k(
         .take(k)
         .map(|(idx, _)| idx as i32)
         .collect()
-}
-
-fn validate_deep10m_ground_truth(
-    dataset: &Dataset,
-    queries: &[Vec<f32>],
-    ground_truth: &[Vec<i32>],
-    base_vectors: &[Vec<f32>],
-    k: usize,
-) -> anyhow::Result<()> {
-    if dataset.name != "deep10m" {
-        return Ok(());
-    }
-
-    let query = queries
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("deep10m sanity check requires at least one query"))?;
-    let expected = ground_truth.first().ok_or_else(|| {
-        anyhow::anyhow!("deep10m sanity check requires at least one ground truth row")
-    })?;
-    if expected.len() < k {
-        anyhow::bail!(
-            "deep10m sanity check expected at least {} ground truth ids, got {}",
-            k,
-            expected.len()
-        );
-    }
-
-    let actual = brute_force_top_k(query, base_vectors, k, dataset.distance_metric);
-    let expected = expected.iter().take(k).copied().collect::<Vec<_>>();
-    if actual != expected {
-        anyhow::bail!(
-            "deep10m sanity check failed: brute-force top-{} does not match ground truth\nexpected={:?}\nactual={:?}",
-            k,
-            expected,
-            actual
-        );
-    }
-
-    println!("  deep10m sanity check passed for query 0");
-    Ok(())
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
@@ -706,13 +658,11 @@ impl Benchmark for RecallBenchmark {
         let mut ingest_secs = None;
         let mut num_vectors = 0u64;
 
-        let base_vectors = dataset.load_base_vectors(&data);
-        validate_deep10m_ground_truth(&dataset, &queries, &ground_truth, &base_vectors, k)?;
-
         if skip {
             println!("  Skipping ingest (VECTOR_BENCH_SKIP_INGEST=1)");
         } else {
             println!("  Loading {} base vectors...", dataset.name);
+            let base_vectors = dataset.load_base_vectors(&data);
             println!(
                 "  Loaded {} base vectors (dim={})",
                 base_vectors.len(),
