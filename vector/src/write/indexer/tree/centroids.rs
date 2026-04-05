@@ -8,13 +8,14 @@ use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::tree::posting_list::{IntoTreePostingList, Posting, PostingList};
 use common::StorageRead;
 use futures::future::BoxFuture;
-use log::{debug, info};
+use tracing::{debug, info};
 use rayon::iter::ParallelIterator;
 use rayon::prelude::IntoParallelIterator;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 // TODO: move to vector id module
 pub(crate) const ROOT_LEVEL: u8 = 0xFF;
@@ -858,7 +859,16 @@ pub(crate) async fn batch_search_centroids<K: Hash + Eq + Sized + Send + Sync>(
     k: usize,
     queries: Vec<(K, &[f32])>,
 ) -> Result<HashMap<K, Vec<Posting>>> {
-    batch_search_centroids_in_level(index, k, queries, TreeLevel::leaf(index.depth)).await
+    let t = Instant::now();
+    let nqueries = queries.len();
+    let result = batch_search_centroids_in_level(index, k, queries, TreeLevel::leaf(index.depth)).await;
+    debug!(
+        op = "batch_search_centroids_in_level",
+        k = k,
+        queries = nqueries,
+        duration_ms = t.elapsed().as_millis() as u64,
+    );
+    result
 }
 
 pub(crate) async fn batch_search_centroids_in_level<K: Hash + Eq + Sized + Send + Sync>(
@@ -878,6 +888,7 @@ pub(crate) async fn batch_search_centroids_in_level<K: Hash + Eq + Sized + Send 
             break;
         };
         // find results / intermediate results
+        let t = Instant::now();
         let intermediate = remaining
             .into_par_iter()
             .map(|(key, q, ip)| {
@@ -889,6 +900,10 @@ pub(crate) async fn batch_search_centroids_in_level<K: Hash + Eq + Sized + Send 
                 (key, q, result)
             })
             .collect::<Vec<_>>();
+        debug!(
+            op = "batch_search_centroids_in_level/search_in_level",
+            duration_ms = t.elapsed().as_millis() as u64,
+        );
         let mut posting_reads = HashMap::new();
         let mut pending = Vec::with_capacity(intermediate.len());
         // separate finished results from intermediate posting reads
@@ -910,7 +925,13 @@ pub(crate) async fn batch_search_centroids_in_level<K: Hash + Eq + Sized + Send 
             break;
         }
         let posting_reads = posting_reads.into_values().collect::<Vec<_>>();
+        let t = Instant::now();
         let posting_reads = AsyncBatchDriver::execute(posting_reads).await;
+        debug!(
+            op = "batch_search_centroids_in_level/execute reads",
+            reads = posting_reads.len(),
+            duration_ms = t.elapsed().as_millis() as u64,
+        );
         let mut postings = HashMap::with_capacity(posting_reads.len());
         for pr in posting_reads {
             let (centroid, pl) = pr?;

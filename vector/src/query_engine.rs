@@ -14,6 +14,7 @@ use roaring::RoaringTreemap;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::debug;
 
 /// The subset of configuration needed by the query engine.
@@ -150,11 +151,13 @@ impl QueryEngine {
 
         // 2. Search HNSW for nearest centroids
         let num_centroids = nprobe;
+        let t = Instant::now();
         let centroid_candidates = self.search_centroids(&query.vector, num_centroids).await?;
         debug!(
-            "searched for {} centroids, found: {}",
+            "searched for {} centroids, found: {}, elapsed_ms: {:?}",
             num_centroids,
-            centroid_candidates.len()
+            centroid_candidates.len(),
+            t.elapsed().as_millis()
         );
 
         if centroid_candidates.is_empty() {
@@ -336,11 +339,17 @@ impl QueryEngine {
             }
 
             // Resolve forward index lookups for the batch concurrently.
+            let t = Instant::now();
             let futures: Vec<_> = batch
                 .iter()
                 .map(|sr| self.storage.get_vector_data(sr.internal_id, dimensions))
                 .collect();
             let loaded = futures::future::join_all(futures).await;
+            let elapsed = t.elapsed();
+            debug!(
+                op = "query/resolve_top_k/load",
+                elapsed_ms = elapsed.as_millis() as u64,
+            );
 
             for (sr, vector_data) in batch.iter().zip(loaded) {
                 let Some(vector_data) = vector_data? else {
