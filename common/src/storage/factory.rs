@@ -153,9 +153,10 @@ impl StorageBuilder {
 /// This struct holds non-serializable runtime configuration for `DbReader`.
 /// Unlike `StorageBuilder`, it only exposes options relevant to readers
 /// (currently just block cache).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct StorageReaderRuntime {
     pub(crate) block_cache: Option<Arc<dyn DbCache>>,
+    pub(crate) object_store: Option<Arc<dyn ObjectStore>>,
 }
 
 impl StorageReaderRuntime {
@@ -173,6 +174,11 @@ impl StorageReaderRuntime {
     /// This option only affects SlateDB storage; it is ignored for in-memory storage.
     pub fn with_block_cache(mut self, cache: Arc<dyn DbCache>) -> Self {
         self.block_cache = Some(cache);
+        self
+    }
+
+    pub fn with_object_store(mut self, object_store: Arc<dyn ObjectStore>) -> Self {
+        self.object_store = Some(object_store);
         self
     }
 }
@@ -288,7 +294,11 @@ pub async fn create_storage_read(
             Ok(Arc::new(storage))
         }
         StorageConfig::SlateDb(slate_config) => {
-            let object_store = create_object_store(&slate_config.object_store)?;
+            let object_store = if let Some(object_store) = &runtime.object_store {
+                object_store.clone()
+            }  else {
+                create_object_store(&slate_config.object_store)?
+            };
 
             let mut options = reader_options;
             if let Some(op) = semantics.merge_operator {

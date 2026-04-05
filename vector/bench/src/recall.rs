@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use bencher::{Bench, Benchmark, Params, Summary};
-use common::StorageBuilder;
+use common::{create_object_store, StorageBuilder, StorageReaderRuntime};
 use common::StorageConfig;
 use common::storage::config::SlateDbStorageConfig;
 use common::storage::factory::{FoyerCache, FoyerCacheOptions};
@@ -914,8 +914,19 @@ impl Benchmark for RecallBenchmark {
         println!("start cold reader phase");
         let cold_query_latency = bench.histogram("cold_query_latency_us");
         let mut cold_latencies_us = Vec::with_capacity(queries.len());
+        let object_store = match &reader_config.storage {
+            StorageConfig::SlateDb(slate_config) => {
+                println!("CREATE STATIC OBJECT STORE");
+                Some(create_object_store(&slate_config.object_store)?)
+            },
+            _ => None
+        };
+        let mut runtime = StorageReaderRuntime::default();
+        if let Some(object_store) = object_store {
+            runtime = runtime.with_object_store(object_store);
+        }
         for query in queries.iter().take(10) {
-            let reader = VectorDbReader::open(reader_config.clone()).await?;
+            let reader = VectorDbReader::open_with_runtime(reader_config.clone(), runtime.clone()).await?;
             let t = std::time::Instant::now();
             let q = Query::new(query.clone()).with_limit(k);
             let _ = reader
