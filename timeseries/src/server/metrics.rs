@@ -43,7 +43,7 @@ fn describe_metrics() {
 /// Uses `metrics-rs` for recording (callers use `metrics::counter!()` etc.)
 /// and `metrics-exporter-prometheus` for rendering. A separate
 /// `prometheus_client::Registry` is kept for storage engine metrics that are
-/// registered via the [`common::StorageRead::register_metrics`] bridge.
+/// registered via the `common::StorageRead::register_metrics` bridge.
 pub struct Metrics {
     handle: PrometheusHandle,
     storage_registry: Registry,
