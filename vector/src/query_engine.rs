@@ -139,6 +139,7 @@ impl QueryEngine {
         query: &Query,
         options: SearchOptions,
     ) -> Result<Vec<SearchResult>> {
+        let t = Instant::now();
         let nprobe = options.nprobe.unwrap_or_else(|| query.limit.clamp(10, 100));
         // 1. Validate query dimensions
         if query.vector.len() != self.options.dimensions as usize {
@@ -188,6 +189,7 @@ impl QueryEngine {
         // 6. K-way merge and resolve top-k forward index lookups
         let mut results = self.resolve_top_k(sorted_lists, query.limit).await?;
         Self::apply_field_selection(&mut results, &query.include_fields);
+        debug!(op = "search_with_options", elapsed_ms = t.elapsed().as_millis());
         Ok(results)
     }
 
