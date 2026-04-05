@@ -19,10 +19,13 @@ use std::thread;
 
 use bencher::{Bench, Benchmark, Params, Summary};
 use common::StorageBuilder;
+use common::StorageConfig;
+use common::storage::config::SlateDbStorageConfig;
 use common::storage::factory::{FoyerCache, FoyerCacheOptions};
 use tokio::sync::mpsc;
 use vector::{
-    Config, DistanceMetric, Query, SearchOptions, SearchResult, Vector, VectorDb, VectorDbRead,
+    Config, DistanceMetric, Query, ReaderConfig, SearchOptions, SearchResult, Vector, VectorDb,
+    VectorDbRead, VectorDbReader,
 };
 
 const DEFAULT_NUM_QUERIES: usize = 100;
@@ -36,6 +39,12 @@ fn load_vector_config(path: &str) -> Config {
         .unwrap_or_else(|e| panic!("failed to parse {}: {}", path, e));
     println!("  Vector config: {:?}", config);
     config
+}
+
+fn load_storage_config(path: &str) -> StorageConfig {
+    let contents =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {}: {}", path, e));
+    serde_yaml::from_str(&contents).unwrap_or_else(|e| panic!("failed to parse {}: {}", path, e))
 }
 
 fn skip_ingest() -> bool {
@@ -286,6 +295,10 @@ struct Dataset {
     /// Path to a YAML file with vector `Config` overrides. When set, the config
     /// from this file is used instead of constructing one from dataset fields.
     vector_config: Option<String>,
+    /// Optional path to a YAML file with a separate StorageConfig for cold-reader
+    /// queries. When both writer and reader storage are SlateDb, the reader uses
+    /// the writer's data path/object store and the override's settings/cache.
+    reader_storage_config: Option<String>,
     /// File format for base and query vectors.
     format: VecFormat,
     /// Maximum number of base vectors to ingest. `None` = all.
@@ -375,6 +388,28 @@ impl Dataset {
         Ok((rx, handle))
     }
 
+    fn resolve_reader_storage_config(
+        &self,
+        writer_storage: &StorageConfig,
+    ) -> anyhow::Result<StorageConfig> {
+        let Some(path) = &self.reader_storage_config else {
+            return Ok(writer_storage.clone());
+        };
+
+        let override_storage = load_storage_config(path);
+        match (writer_storage, override_storage) {
+            (StorageConfig::SlateDb(writer), StorageConfig::SlateDb(reader)) => {
+                Ok(StorageConfig::SlateDb(SlateDbStorageConfig {
+                    path: writer.path.clone(),
+                    object_store: writer.object_store.clone(),
+                    settings_path: reader.settings_path,
+                    block_cache: reader.block_cache,
+                }))
+            }
+            (_, storage) => Ok(storage),
+        }
+    }
+
     /// Load query vectors, respecting `format` and `normalize`.
     fn load_query_vectors(&self, data_dir: &Path) -> Vec<Vec<f32>> {
         let path = self.query_path(data_dir);
@@ -450,6 +485,9 @@ impl From<&Dataset> for Params {
         if let Some(ref path) = d.vector_config {
             p.insert("vector_config", path.clone());
         }
+        if let Some(ref path) = d.reader_storage_config {
+            p.insert("reader_storage_config", path.clone());
+        }
         p
     }
 }
@@ -504,6 +542,10 @@ impl From<Params> for Dataset {
                 .get("vector_config")
                 .map(|s| s.to_string())
                 .or_else(|| default.vector_config.clone()),
+            reader_storage_config: p
+                .get("reader_storage_config")
+                .map(|s| s.to_string())
+                .or_else(|| default.reader_storage_config.clone()),
             normalize: default.normalize,
         }
     }
@@ -524,6 +566,7 @@ const SIFT1M: Dataset = Dataset {
     block_cache_bytes: Some(1073741824),
     data_dir: None,
     vector_config: None,
+    reader_storage_config: None,
     format: VecFormat::Fvecs,
     max_vectors: None,
     normalize: false,
@@ -544,6 +587,7 @@ const COHERE1M: Dataset = Dataset {
     block_cache_bytes: None,
     data_dir: None,
     vector_config: None,
+    reader_storage_config: None,
     format: VecFormat::Fvecs,
     max_vectors: None,
     normalize: true,
@@ -564,6 +608,7 @@ const DEEP10M: Dataset = Dataset {
     block_cache_bytes: None,
     data_dir: None,
     vector_config: None,
+    reader_storage_config: None,
     format: VecFormat::Fvecs,
     max_vectors: Some(10_000_000),
     normalize: false,
@@ -584,6 +629,7 @@ const DEEP1B: Dataset = Dataset {
     block_cache_bytes: None,
     data_dir: None,
     vector_config: None,
+    reader_storage_config: None,
     format: VecFormat::Fvecs,
     max_vectors: None,
     normalize: false,
@@ -604,6 +650,7 @@ const WIKIPEDIA_BGE_M3_EN: Dataset = Dataset {
     block_cache_bytes: None,
     data_dir: None,
     vector_config: None,
+    reader_storage_config: None,
     format: VecFormat::Fvecs,
     max_vectors: None,
     normalize: false,
@@ -627,6 +674,7 @@ const SIFT10M: Dataset = Dataset {
     block_cache_bytes: None,
     data_dir: None,
     vector_config: None,
+    reader_storage_config: None,
     format: VecFormat::Bvecs,
     max_vectors: Some(10_000_000),
     normalize: false,
@@ -647,6 +695,7 @@ const SIFT50M: Dataset = Dataset {
     block_cache_bytes: None,
     data_dir: None,
     vector_config: None,
+    reader_storage_config: None,
     format: VecFormat::Bvecs,
     max_vectors: Some(50_000_000),
     normalize: false,
@@ -667,6 +716,7 @@ const SIFT100M: Dataset = Dataset {
     block_cache_bytes: None,
     data_dir: None,
     vector_config: None,
+    reader_storage_config: None,
     format: VecFormat::Bvecs,
     max_vectors: Some(100_000_000),
     normalize: false,
@@ -687,6 +737,7 @@ const SIFT1B: Dataset = Dataset {
     block_cache_bytes: None,
     data_dir: None,
     vector_config: None,
+    reader_storage_config: None,
     format: VecFormat::Bvecs,
     max_vectors: None,
     normalize: false,
@@ -770,6 +821,14 @@ impl Benchmark for RecallBenchmark {
             sb = sb.map_slatedb(|db| db.with_db_cache(std::sync::Arc::new(cache)));
             println!("  Block cache: {} bytes", bytes);
         }
+        let reader_storage = dataset.resolve_reader_storage_config(&config.storage)?;
+        let reader_config = ReaderConfig {
+            storage: reader_storage,
+            dimensions: config.dimensions,
+            distance_metric: config.distance_metric,
+            query_pruning_factor: config.query_pruning_factor,
+            metadata_fields: config.metadata_fields.clone(),
+        };
         let db = VectorDb::open_with_storage(config, sb).await?;
 
         // -- Ingest -----------------------------------------------------------
@@ -849,10 +908,42 @@ impl Benchmark for RecallBenchmark {
         }
         println!("  Num centroids: {}", db.num_centroids());
 
-        // -- Query & measure recall -------------------------------------------
-        println!("start warmup");
-        let query_latency = bench.histogram("cold_query_latency_us");
+        // -- Cold reader queries ----------------------------------------------
+        println!("start cold reader phase");
+        let cold_query_latency = bench.histogram("cold_query_latency_us");
         let mut cold_latencies_us = Vec::with_capacity(queries.len());
+        for query in queries.iter() {
+            let t = std::time::Instant::now();
+            let reader = VectorDbReader::open(reader_config.clone()).await?;
+            let q = Query::new(query.clone()).with_limit(k);
+            let _ = reader
+                .search_with_options(
+                    &q,
+                    SearchOptions {
+                        nprobe: Some(dataset.nprobe),
+                    },
+                )
+                .await?;
+            let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
+            cold_query_latency.record(elapsed_us);
+            cold_latencies_us.push(elapsed_us);
+        }
+        cold_latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let cold_p50 = percentile(&cold_latencies_us, 50.0);
+        let cold_p90 = percentile(&cold_latencies_us, 90.0);
+        let cold_p99 = percentile(&cold_latencies_us, 99.0);
+        println!(
+            "  cold reader p50 = {:.2} ms, p90 = {:.2} ms, p99 = {:.2} ms",
+            cold_p50 / 1000.0,
+            cold_p90 / 1000.0,
+            cold_p99 / 1000.0
+        );
+        println!("end cold reader phase");
+
+        // -- Warmup -----------------------------------------------------------
+        println!("start warmup");
+        let warm_query_latency = bench.histogram("warm_query_latency_us");
+        let mut warm_latencies_us = Vec::with_capacity(queries.len());
         for query in queries.iter() {
             let t = std::time::Instant::now();
             let q = Query::new(query.clone()).with_limit(k);
@@ -865,12 +956,12 @@ impl Benchmark for RecallBenchmark {
                 )
                 .await?;
             let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
-            query_latency.record(elapsed_us);
-            cold_latencies_us.push(elapsed_us);
+            warm_query_latency.record(elapsed_us);
+            warm_latencies_us.push(elapsed_us);
         }
-        cold_latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let p90 = percentile(&cold_latencies_us, 90.0);
-        println!("p90 = {:.2}", p90 / 1000.0);
+        warm_latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let warm_p90 = percentile(&warm_latencies_us, 90.0);
+        println!("warm p90 = {:.2}", warm_p90 / 1000.0);
         println!("end warmup");
 
         let query_latency = bench.histogram("query_latency_us");
@@ -920,6 +1011,9 @@ impl Benchmark for RecallBenchmark {
             .add("qps", qps)
             .add("num_queries", queries.len() as f64)
             .add("num_centroids", db.num_centroids() as f64)
+            .add("cold_p50_latency_us", cold_p50)
+            .add("cold_p90_latency_us", cold_p90)
+            .add("cold_p99_latency_us", cold_p99)
             .add("p50_latency_us", p50)
             .add("p90_latency_us", p90)
             .add("p99_latency_us", p99);

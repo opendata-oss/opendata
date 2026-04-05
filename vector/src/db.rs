@@ -46,6 +46,7 @@ use common::SequenceAllocator;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};
 use common::storage::{Storage, StorageRead, StorageSnapshot};
 use common::{StorageBuilder, StorageSemantics};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -476,19 +477,15 @@ impl VectorDb {
         let range = common::BytesRange::prefix(prefix);
         let records = snapshot.scan(range).await?;
 
-        let mut dictionary = HashMap::new();
-        for record in records {
-            // Decode the key to get external_id
-            let key = crate::serde::key::IdDictionaryKey::decode(&record.key)?;
-            let external_id = key.external_id.clone();
-
-            // Decode the value to get internal_id
-            let mut slice = record.value.as_ref();
-            let internal_id = VectorId::decode(&mut slice)?;
-            dictionary.insert(external_id, internal_id);
-        }
-
-        Ok(dictionary)
+        records
+            .into_par_iter()
+            .map(|record| {
+                let key = crate::serde::key::IdDictionaryKey::decode(&record.key)?;
+                let mut slice = record.value.as_ref();
+                let internal_id = VectorId::decode(&mut slice)?;
+                Ok((key.external_id, internal_id))
+            })
+            .collect()
     }
 
     /// Load centroid counts from storage into a HashMap.

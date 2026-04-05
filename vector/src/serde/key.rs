@@ -2,16 +2,16 @@
 //!
 //! All keys use big-endian encoding for lexicographic ordering.
 
-use std::ops::Bound::{Excluded, Included};
 use super::{
     Decode, Encode, EncodingError, FieldValue, KEY_VERSION, RecordKey, RecordType, SUBSYSTEM,
 };
-use crate::serde::vector_id::{VectorId, ROOT_VECTOR_ID};
+use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
+use crate::write::indexer::tree::centroids::LEAF_LEVEL;
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
 use common::serde::key_prefix::KeyPrefix;
 use common::serde::terminated_bytes;
-use crate::write::indexer::tree::centroids::LEAF_LEVEL;
+use std::ops::Bound::{Excluded, Included};
 
 /// CollectionMeta key - singleton record storing collection schema.
 ///
