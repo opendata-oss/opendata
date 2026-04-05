@@ -168,8 +168,7 @@ impl QueryEngine {
         let original_ncentroids = centroid_candidates.len();
         let centroid_ids = self.prune_centroids(&centroid_candidates, &query.vector);
         debug!(
-            "query: {:?}, before pruning: {} centroids, after dynamic pruning: {} centroids",
-            query.vector,
+            "before pruning: {} centroids, after dynamic pruning: {} centroids",
             original_ncentroids,
             centroid_ids.len()
         );
@@ -260,6 +259,7 @@ impl QueryEngine {
         let metric = self.options.distance_metric;
         let query_vec: Vec<f32> = query.to_vec();
 
+        let t = Instant::now();
         let mut handles = Vec::with_capacity(centroid_ids.len());
         for &cid in centroid_ids {
             let snap = self.storage.clone();
@@ -283,6 +283,8 @@ impl QueryEngine {
         }
 
         let results = futures::future::join_all(handles).await;
+        let elapsed = t.elapsed();
+        debug!(op = "search/load_and_score/load", elapsed_ms = elapsed.as_millis());
         let mut sorted_lists: Vec<Vec<ScoredCandidate>> = Vec::with_capacity(results.len());
         for result in results {
             let scored =
