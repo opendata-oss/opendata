@@ -19,6 +19,7 @@ mod storage;
 mod test_utils;
 mod timeseries;
 mod tsdb;
+mod tsdb_metrics;
 mod util;
 
 use std::sync::Arc;

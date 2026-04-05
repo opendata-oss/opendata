@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeBounds;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use common::Storage;
@@ -22,6 +22,7 @@ use crate::promql::evaluator::{CachedQueryReader, Evaluator, ExprResult, compute
 use crate::promql::selector::evaluate_selector_with_reader;
 use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::OpenTsdbStorageReadExt;
+use crate::tsdb_metrics;
 use crate::util::Result;
 
 /// Compute the disjoint preload ranges for bucket discovery.
@@ -115,6 +116,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         time: Option<std::time::SystemTime>,
         opts: &QueryOptions,
     ) -> std::result::Result<QueryValue, QueryError> {
+        let start = Instant::now();
         let expr = promql_parser::parser::parse(query)
             .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
 
@@ -140,7 +142,13 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
         let concurrency = crate::promql::pipeline::PipelineConcurrency::from(opts);
-        evaluate_instant(&reader, stmt, query_time, concurrency).await
+        let result = evaluate_instant(&reader, stmt, query_time, concurrency).await;
+
+        metrics::counter!(tsdb_metrics::TSDB_QUERIES, "type" => "instant").increment(1);
+        metrics::histogram!(tsdb_metrics::TSDB_QUERY_DURATION_SECONDS, "type" => "instant")
+            .record(start.elapsed().as_secs_f64());
+
+        result
     }
 
     /// Evaluate a range PromQL query, returning typed `RangeSample`s.
@@ -152,6 +160,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         step: Duration,
         opts: &QueryOptions,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
+        let timer_start = Instant::now();
         let expr = promql_parser::parser::parse(query)
             .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
 
@@ -176,7 +185,13 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
         let concurrency = crate::promql::pipeline::PipelineConcurrency::from(opts);
-        evaluate_range(&reader, stmt, concurrency).await
+        let result = evaluate_range(&reader, stmt, concurrency).await;
+
+        metrics::counter!(tsdb_metrics::TSDB_QUERIES, "type" => "range").increment(1);
+        metrics::histogram!(tsdb_metrics::TSDB_QUERY_DURATION_SECONDS, "type" => "range")
+            .record(timer_start.elapsed().as_secs_f64());
+
+        result
     }
 
     /// Discover series matching any of the given selectors.
@@ -774,6 +789,8 @@ impl Tsdb {
         // Record final metrics on the main span
         tracing::Span::current().record("total_samples", total_samples);
         tracing::Span::current().record("buckets_touched", buckets_touched);
+
+        metrics::counter!(tsdb_metrics::TSDB_SAMPLES_INGESTED).increment(total_samples as u64);
 
         tracing::debug!(
             total_samples = total_samples,

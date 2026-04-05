@@ -7,6 +7,7 @@ use common::storage::{Storage, StorageSnapshot};
 
 use crate::delta::{FrozenTsdbDelta, TsdbWriteDelta};
 use crate::storage::OpenTsdbStorageExt;
+use crate::tsdb_metrics;
 
 /// Flusher implementation for the timeseries write coordinator.
 ///
@@ -26,6 +27,9 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         if frozen.is_empty() {
             return self.storage.snapshot().await.map_err(|e| e.to_string());
         }
+
+        let new_series_count = frozen.series_dict_delta.len() as u64;
+        let start = std::time::Instant::now();
 
         let mut ops = Vec::new();
         ops.push(
@@ -71,8 +75,23 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
             );
         }
 
-        self.storage.apply(ops).await.map_err(|e| e.to_string())?;
+        let result = self.storage.apply(ops).await.map_err(|e| e.to_string());
+        let elapsed = start.elapsed().as_secs_f64();
 
+        match &result {
+            Ok(_) => {
+                ::metrics::counter!(tsdb_metrics::TSDB_FLUSH_TOTAL, "status" => "success")
+                    .increment(1);
+                ::metrics::counter!(tsdb_metrics::TSDB_SERIES_CREATED).increment(new_series_count);
+            }
+            Err(_) => {
+                ::metrics::counter!(tsdb_metrics::TSDB_FLUSH_TOTAL, "status" => "error")
+                    .increment(1);
+            }
+        }
+        ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_DURATION_SECONDS).record(elapsed);
+
+        result?;
         self.storage.snapshot().await.map_err(|e| e.to_string())
     }
 

@@ -36,6 +36,7 @@ fn describe_metrics() {
         REMOTE_WRITE_SAMPLES_FAILED,
         "Total number of samples that failed to ingest via remote write"
     );
+    crate::tsdb_metrics::describe_engine_metrics();
 }
 
 /// Container for metrics rendering.

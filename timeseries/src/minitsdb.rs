@@ -246,7 +246,10 @@ impl MiniTsdb {
 
 fn map_write_error(e: WriteError) -> Error {
     match e {
-        WriteError::Backpressure(_) => Error::Backpressure,
+        WriteError::Backpressure(_) => {
+            metrics::counter!(crate::tsdb_metrics::TSDB_BACKPRESSURE).increment(1);
+            Error::Backpressure
+        }
         WriteError::TimeoutError(_) => Error::Backpressure,
         WriteError::Shutdown => Error::Internal("Write coordinator shut down".to_string()),
         WriteError::ApplyError(_, msg) => Error::Internal(msg),
