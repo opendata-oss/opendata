@@ -175,6 +175,8 @@ eval instant at 30m increase(http_requests_total[30m])
 
 clear
 
+resume
+
 # Tests for rate().
 load 5m
 	testcounter_reset_middle_total	0+27x4 0+27x5
@@ -236,6 +238,44 @@ eval instant at 50m rate(testcounter_zero_cutoff_total[20m])
 	{start="5m"} 0.6
 
 clear
+
+# Tests for right-side extrapolation threshold.
+# Calculates rates over different ranges with varying durations
+# from sample end to range end.
+# We start by creating 6 samples at 5m intervals: 0m, 5m, 10m, ..., 25m,
+# with respective values 0, 60, 120, ..., 300.
+load 5m
+	testrate_right_clamp_total	0+60x5
+
+# The average duration between these samples is 300s and so the threshold
+# is 300 * 1.1 = 330s, i.e. we need to check if the duration from
+# sample end to range end is above or below this value in order to
+# determine how to extrapolate.
+# The increase of the samples is 300 and so the rate over the samples is
+# 300 / (25m*60s) = 0.2.
+
+# First calculate the rate over the range [0m, 50m].
+# Duration from sample end to range end is 50m-25m=1500s >= 330s.
+# Since this duration exceeds the threshold, it is assumed that samples
+# stopped and so extrapolation is limited to half the average duration
+# between samples (=150s). Therefore, the total increase of samples over
+# the range is sample_increase + extrapolated_increase = 300+(0.2*150)=330
+# and so rate over the range = 330 / (50m*60s) = 0.11.
+eval instant at 50m rate(testrate_right_clamp_total[50m])
+	{} 0.11
+
+# Next calculate the rate over the range [0m, 30m].
+# Duration from sample end to range end is 30m-25m=300s < 330s, so we
+# extrapolate to the range end. Therefore, the extrapolated increase is
+# 0.2 * 300 = 60, and so rate over the range is
+# (sample_increase + extrapolated_increase) / range
+# = (300 + 60) / (30m*60s) = 0.2.
+eval instant at 30m rate(testrate_right_clamp_total[30m])
+	{} 0.2
+
+clear
+
+ignore
 
 # Tests for irate().
 load 5m

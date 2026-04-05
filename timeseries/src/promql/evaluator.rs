@@ -625,6 +625,8 @@ pub struct EvalSample {
 pub struct EvalSamples {
     pub(crate) values: Vec<Sample>,
     pub(crate) labels: HashMap<String, String>,
+    pub(crate) range_ms: i64,
+    pub(crate) range_end_ms: i64,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1634,7 +1636,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let mut range_vector = Vec::new();
         for (labels, values) in series_map {
             let labels = crate::promql::pipeline::labels_to_hashmap(&labels);
-            range_vector.push(EvalSamples { values, labels });
+            range_vector.push(EvalSamples {
+                values,
+                labels,
+                range_ms,
+                range_end_ms: subquery_end_ms,
+            });
         }
 
         Ok(ExprResult::RangeVector(range_vector))
