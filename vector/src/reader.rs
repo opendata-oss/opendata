@@ -13,14 +13,13 @@ use crate::query_engine::{QueryEngine, QueryEngineOptions};
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
 use crate::write::indexer::tree::centroids::{
-    AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex,
+    CentroidCache, LeveledCentroidIndex,
     StoredCentroidReader, TreeDepth,
 };
-use crate::write::indexer::tree::posting_list::{IntoTreePostingList, PostingList};
+use crate::write::indexer::tree::posting_list::{IntoTreePostingList};
 use async_trait::async_trait;
 use common::StorageSemantics;
 use common::storage::factory::{StorageReaderRuntime, create_storage_read};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Read-only client for querying a vector database.
@@ -65,40 +64,9 @@ impl VectorDbReader {
                     .to_string(),
             ));
         }
-        let root_posting_list =
-            PostingList::from_value(storage.get_root_posting_list(dimensions).await?);
-        let centroids: HashMap<_, _> = storage
-            .scan_all_centroid_info()
-            .await?
-            .into_iter()
-            .collect();
-        let centroid_postings = storage
-            .scan_all_posting_lists(dimensions)
-            .await?
-            .into_iter()
-            .filter_map(|(centroid_id, posting_list)| {
-                centroids.get(&centroid_id).and_then(|centroid| {
-                    if centroid.level > 1 {
-                        Some((
-                            centroid_id,
-                            Arc::new(PostingList::from_value(posting_list))
-                                as Arc<dyn IntoTreePostingList>,
-                        ))
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
-        let centroid_cache = AllCentroidsCacheWriter::new(
-            Arc::new(root_posting_list) as Arc<dyn IntoTreePostingList>,
-            centroid_postings,
+        let reader = Arc::new(
+            StoredCentroidReader::new(dimensions, storage.clone(), 0)
         );
-        let cache = Arc::new(centroid_cache.cache()) as Arc<dyn CentroidCache>;
-        let reader = Arc::new(CachedCentroidReader::new(
-            &cache,
-            StoredCentroidReader::new(dimensions, storage.clone(), 0),
-        ));
         let centroid_index = Arc::new(LeveledCentroidIndex::new(
             TreeDepth::of(centroids_meta.expect("checked above").depth),
             config.distance_metric,
