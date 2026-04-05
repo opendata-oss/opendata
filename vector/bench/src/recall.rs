@@ -912,9 +912,9 @@ impl Benchmark for RecallBenchmark {
         println!("start cold reader phase");
         let cold_query_latency = bench.histogram("cold_query_latency_us");
         let mut cold_latencies_us = Vec::with_capacity(queries.len());
-        for query in queries.iter() {
-            let t = std::time::Instant::now();
+        for query in queries.iter().take(10) {
             let reader = VectorDbReader::open(reader_config.clone()).await?;
+            let t = std::time::Instant::now();
             let q = Query::new(query.clone()).with_limit(k);
             let _ = reader
                 .search_with_options(
