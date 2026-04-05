@@ -818,7 +818,9 @@ impl Benchmark for RecallBenchmark {
                 max_capacity: bytes,
                 ..Default::default()
             });
-            sb = sb.map_slatedb(|db| db.with_db_cache(std::sync::Arc::new(cache)));
+            sb = sb.map_slatedb(|db|
+                db.with_db_cache(std::sync::Arc::new(cache))
+            );
             println!("  Block cache: {} bytes", bytes);
         }
         let reader_storage = dataset.resolve_reader_storage_config(&config.storage)?;
