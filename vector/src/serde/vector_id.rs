@@ -54,6 +54,10 @@ impl VectorId {
         vector_id
     }
 
+    pub(crate) fn encode_level_prefix(buf: &mut BytesMut, level: u8) {
+        buf.put_u8(level);
+    }
+
     pub fn level(&self) -> u8 {
         (self.id >> (64 - 8)) as u8
     }

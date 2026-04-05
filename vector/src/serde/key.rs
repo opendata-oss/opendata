@@ -2,14 +2,16 @@
 //!
 //! All keys use big-endian encoding for lexicographic ordering.
 
+use std::ops::Bound::{Excluded, Included};
 use super::{
     Decode, Encode, EncodingError, FieldValue, KEY_VERSION, RecordKey, RecordType, SUBSYSTEM,
 };
-use crate::serde::vector_id::VectorId;
+use crate::serde::vector_id::{VectorId, ROOT_VECTOR_ID};
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
 use common::serde::key_prefix::KeyPrefix;
 use common::serde::terminated_bytes;
+use crate::write::indexer::tree::centroids::LEAF_LEVEL;
 
 /// CollectionMeta key - singleton record storing collection schema.
 ///
@@ -174,6 +176,19 @@ impl PostingListKey {
     pub fn new(centroid_id: VectorId) -> Self {
         assert!(centroid_id.is_centroid() || centroid_id.is_root());
         Self { centroid_id }
+    }
+
+    pub(crate) fn encode_prefix_for_level(level: u8) -> Bytes {
+        let mut buf = BytesMut::with_capacity(4);
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
+        VectorId::encode_level_prefix(&mut buf, level);
+        buf.freeze()
+    }
+
+    pub(crate) fn inner_level_bytes_range() -> BytesRange {
+        let start_buf = Self::encode_prefix_for_level(LEAF_LEVEL + 1);
+        let end_buf = Self::new(ROOT_VECTOR_ID).encode();
+        BytesRange::new(Included(start_buf), Excluded(end_buf))
     }
 
     pub fn encode(&self) -> Bytes {
@@ -600,6 +615,32 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn should_construct_correct_inner_level_range() {
+        // given/when:
+        let max_num: u64 = 0x00FF_FFFF_FFFF_FFFF;
+        let min_num: u64 = 1;
+        let range = PostingListKey::inner_level_bytes_range();
+
+        // then: assert leaf centroids don't fall in range
+        for num in [max_num, 12345, min_num] {
+            let vid = VectorId::centroid_id(1, num);
+            let key = PostingListKey::new(vid);
+            assert!(!range.contains(&key.encode()));
+        }
+        // then: assert root does not fall in range
+        let key = PostingListKey::new(ROOT_VECTOR_ID);
+        assert!(!range.contains(&key.encode()));
+        // then: assert inner centroids fall in range
+        for l in 2..10 {
+            for num in [max_num, 12345, min_num] {
+                let vid = VectorId::centroid_id(l, num);
+                let key = PostingListKey::new(vid);
+                assert!(range.contains(&key.encode()));
+            }
+        }
     }
 
     #[test]

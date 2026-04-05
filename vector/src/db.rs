@@ -383,25 +383,18 @@ impl VectorDb {
             .map(HashMap::len)
             .unwrap_or_default();
         let centroid_postings = snapshot
-            .scan_all_posting_lists(dimensions)
+            .scan_all_inner_posting_lists(dimensions)
             .await?
             .into_iter()
             .filter_map(|(centroid_id, posting_list)| {
-                if centroid_id == ROOT_VECTOR_ID {
-                    return None;
-                }
-                centroids.get(&centroid_id).and_then(|centroid| {
-                    if centroid.level > LEAF_LEVEL {
-                        // only load postings for inner centroids (we don't want to load the
-                        // leaf level which holds all the data vector refs)
-                        Some((
-                            centroid_id,
-                            Arc::new(PostingList::from_value(posting_list))
-                                as Arc<dyn IntoTreePostingList>,
-                        ))
-                    } else {
-                        None
-                    }
+                assert_ne!(centroid_id, ROOT_VECTOR_ID);
+                centroids.get(&centroid_id).map(|centroid| {
+                    assert!(centroid.level > LEAF_LEVEL);
+                    (
+                        centroid_id,
+                        Arc::new(PostingList::from_value(posting_list))
+                            as Arc<dyn IntoTreePostingList>,
+                    )
                 })
             })
             .collect();

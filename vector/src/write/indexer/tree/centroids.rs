@@ -16,6 +16,7 @@ use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
+// TODO: move to vector id module
 pub(crate) const ROOT_LEVEL: u8 = 0xFF;
 pub(crate) const LEAF_LEVEL: u8 = 1;
 

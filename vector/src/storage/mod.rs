@@ -243,6 +243,21 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         Ok(posting_lists)
     }
 
+    async fn scan_all_inner_posting_lists(
+        &self,
+        dimensions: usize,
+    ) -> Result<Vec<(VectorId, PostingListValue)>> {
+        let records = self.scan(PostingListKey::inner_level_bytes_range()).await?;
+
+        let mut posting_lists = Vec::with_capacity(records.len());
+        for record in records {
+            let key = PostingListKey::decode(&record.key)?;
+            let value = PostingListValue::decode_from_bytes(&record.value, dimensions)?;
+            posting_lists.push((key.centroid_id, value));
+        }
+        Ok(posting_lists)
+    }
+
     /// Load a metadata index entry for a specific field/value pair.
     ///
     /// Returns a bitmap of vector IDs that have the given value for the field.
