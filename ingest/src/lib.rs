@@ -1,6 +1,7 @@
 mod collector;
 mod config;
 mod error;
+mod gc;
 mod ingestor;
 mod model;
 mod queue;
