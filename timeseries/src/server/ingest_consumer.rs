@@ -230,7 +230,7 @@ async fn process_entry(
         .convert(&request)
         .map_err(|e| format!("OtelConverter failed: {e}"))?;
 
-    tsdb.ingest_samples(series)
+    tsdb.ingest_samples(series, None)
         .await
         .map_err(|e| format!("tsdb ingest failed: {e}"))?;
 

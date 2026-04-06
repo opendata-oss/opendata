@@ -137,7 +137,40 @@ impl TimeSeriesDb {
     /// # }
     /// ```
     pub async fn write(&self, series: Vec<Series>) -> Result<()> {
-        self.tsdb.ingest_samples(series).await
+        self.tsdb.ingest_samples(series, None).await
+    }
+
+    /// Writes one or more time series, waiting up to `timeout` for space in
+    /// the write queue.
+    ///
+    /// Behaves identically to [`write`](Self::write) but will wait up to
+    /// `timeout` when the write queue is full instead of failing immediately.
+    /// If the timeout elapses before space becomes available, an error is
+    /// returned and no samples are ingested.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use timeseries::{TimeSeriesDb, Config, Series};
+    /// # use common::StorageConfig;
+    /// # use std::time::Duration;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+    /// # let ts = TimeSeriesDb::open(config).await?;
+    /// let series = vec![
+    ///     Series::builder("cpu_usage")
+    ///         .label("host", "server1")
+    ///         .sample(1700000000000, 0.75)
+    ///         .build(),
+    /// ];
+    ///
+    /// ts.write_timeout(series, Duration::from_secs(30)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn write_timeout(&self, series: Vec<Series>, timeout: Duration) -> Result<()> {
+        self.tsdb.ingest_samples(series, Some(timeout)).await
     }
 
     // ── Read / Query API (RFC 0003) ──────────────────────────────────
