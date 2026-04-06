@@ -468,8 +468,14 @@ fn validate_exact_posting_list_match(
     storage_posting: &PostingList,
     cached_posting: &PostingList,
 ) -> Result<()> {
-    info!("cached: {:?}", cached_posting.iter().map(|p| p.id()).collect::<Vec<_>>());
-    info!("root: {:?}", storage_posting.iter().map(|p| p.id()).collect::<Vec<_>>());
+    info!(
+        "cached: {:?}",
+        cached_posting.iter().map(|p| p.id()).collect::<Vec<_>>()
+    );
+    info!(
+        "root: {:?}",
+        storage_posting.iter().map(|p| p.id()).collect::<Vec<_>>()
+    );
     if storage_posting.len() != cached_posting.len() {
         return Err(Error::Internal(format!(
             "posting list length mismatch for {}: storage={}, cache={}",
@@ -479,13 +485,9 @@ fn validate_exact_posting_list_match(
         )));
     }
 
-    let mut storage_posting = storage_posting.iter()
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut storage_posting = storage_posting.iter().cloned().collect::<Vec<_>>();
     storage_posting.sort_by(|a, b| a.id().cmp(&b.id()));
-    let mut cached_posting = cached_posting.iter()
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut cached_posting = cached_posting.iter().cloned().collect::<Vec<_>>();
     cached_posting.sort_by(|a, b| a.id().cmp(&b.id()));
 
     for (storage, cached) in storage_posting.iter().zip(cached_posting.iter()) {

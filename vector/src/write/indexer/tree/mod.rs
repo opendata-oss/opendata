@@ -292,7 +292,10 @@ impl Indexer {
             "completed"
         );
         let root = self.state.centroid_cache().root(u64::MAX).unwrap();
-        info!("root: {:?}", root.iter().map(|p| p.id()).collect::<Vec<_>>());
+        info!(
+            "root: {:?}",
+            root.iter().map(|p| p.id()).collect::<Vec<_>>()
+        );
         let root_sz = self.state.centroid_cache().root(u64::MAX).unwrap().len();
         info!("ROOT SIZE: {}", root_sz);
         Ok(IndexUpdateResults {

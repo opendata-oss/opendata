@@ -40,6 +40,7 @@ use crate::write::indexer::tree::centroids::{
 };
 use crate::write::indexer::tree::posting_list::{IntoTreePostingList, PostingList};
 use crate::write::indexer::tree::state::VectorIndexState;
+use crate::write::indexer::tree::validator::validate_state_and_storage_consistent;
 use async_trait::async_trait;
 use common::Record;
 use common::SequenceAllocator;
@@ -50,7 +51,6 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use crate::write::indexer::tree::validator::validate_state_and_storage_consistent;
 
 pub(crate) const WRITE_CHANNEL: &str = "write";
 
@@ -765,8 +765,10 @@ impl VectorDb {
     pub async fn validate_cache(&self) {
         validate_state_and_storage_consistent(
             &self.last_applied_snapshot.lock().expect("lock_poisoned"),
-            self.config.dimensions as usize
-        ).await.expect("validation failed");
+            self.config.dimensions as usize,
+        )
+        .await
+        .expect("validation failed");
     }
 
     /// Create a QueryEngine from the current snapshot for executing queries.

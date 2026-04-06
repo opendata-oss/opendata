@@ -447,21 +447,22 @@ pub(crate) fn merge_batch_posting_list(
         priority: usize,
     }
 
-    let peek_entry = |buf: &[u8], append_size: usize, delete_size: usize| -> Option<(VectorId, usize)> {
-        if buf.is_empty() {
-            return None;
-        }
-        assert!(buf.len() >= delete_size);
-        let entry_type = buf[0];
-        let mut id_buf = &buf[1..];
-        let id = VectorId::decode(&mut id_buf).expect("failed to decode vector id");
-        let entry_size = if entry_type == POSTING_UPDATE_TYPE_APPEND_BYTE {
-            append_size
-        } else {
-            delete_size
+    let peek_entry =
+        |buf: &[u8], append_size: usize, delete_size: usize| -> Option<(VectorId, usize)> {
+            if buf.is_empty() {
+                return None;
+            }
+            assert!(buf.len() >= delete_size);
+            let entry_type = buf[0];
+            let mut id_buf = &buf[1..];
+            let id = VectorId::decode(&mut id_buf).expect("failed to decode vector id");
+            let entry_size = if entry_type == POSTING_UPDATE_TYPE_APPEND_BYTE {
+                append_size
+            } else {
+                delete_size
+            };
+            Some((id, entry_size))
         };
-        Some((id, entry_size))
-    };
 
     // Heap entry: (id, Reverse(priority), cursor_index)
     // BinaryHeap is max-heap, so we use Reverse for id (want smallest first)
