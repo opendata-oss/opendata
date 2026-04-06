@@ -189,7 +189,10 @@ impl QueryEngine {
         // 6. K-way merge and resolve top-k forward index lookups
         let mut results = self.resolve_top_k(sorted_lists, query.limit).await?;
         Self::apply_field_selection(&mut results, &query.include_fields);
-        debug!(op = "search_with_options", elapsed_ms = t.elapsed().as_millis());
+        debug!(
+            op = "search_with_options",
+            elapsed_ms = t.elapsed().as_millis()
+        );
         Ok(results)
     }
 
@@ -286,7 +289,10 @@ impl QueryEngine {
 
         let results = futures::future::join_all(handles).await;
         let elapsed = t.elapsed();
-        debug!(op = "search/load_and_score/load", elapsed_ms = elapsed.as_millis());
+        debug!(
+            op = "search/load_and_score/load",
+            elapsed_ms = elapsed.as_millis()
+        );
         let mut sorted_lists: Vec<Vec<ScoredCandidate>> = Vec::with_capacity(results.len());
         for result in results {
             let scored =

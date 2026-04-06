@@ -1,5 +1,6 @@
 use crate::Error;
 use crate::Result;
+use crate::db::LastAppliedSnapshot;
 use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::centroids::CentroidsValue;
@@ -83,6 +84,33 @@ pub(crate) async fn validate(
         stats_count = centroid_counts.len(),
         "completed"
     );
+    Ok(())
+}
+
+pub(crate) async fn validate_state_and_storage_consistent(
+    last_applied_snapshot: &LastAppliedSnapshot,
+    dimensions: usize,
+) -> Result<()> {
+    let snapshot = last_applied_snapshot.snapshot.clone();
+    let _centroids_meta = snapshot
+        .get_centroids_meta()
+        .await?
+        .ok_or_else(|| Error::Internal("missing centroid tree metadata".to_string()))?;
+    let storage_root = PostingList::from_value(snapshot.get_root_posting_list(dimensions).await?);
+    let cached_root = last_applied_snapshot
+        .centroid_cache
+        .root(u64::MAX)
+        .ok_or_else(|| {
+            Error::Internal("centroid cache is missing the root posting list".to_string())
+        })?;
+    validate_exact_posting_list_match(ROOT_VECTOR_ID, &storage_root, cached_root.as_ref())?;
+
+    let centroid_postings = load_centroid_postings(snapshot.as_ref(), dimensions).await?;
+    validate_cached_subtree(
+        last_applied_snapshot.centroid_cache.as_ref(),
+        &centroid_postings,
+        &storage_root,
+    )?;
     Ok(())
 }
 
@@ -398,6 +426,80 @@ fn validate_state_matches_storage(
     Ok(())
 }
 
+fn validate_cached_subtree(
+    centroid_cache: &dyn CentroidCache,
+    centroid_postings: &HashMap<VectorId, PostingList>,
+    posting_list: &PostingList,
+) -> Result<()> {
+    for posting in posting_list.iter() {
+        let centroid_id = posting.id();
+        if centroid_id.level() == LEAF_LEVEL {
+            if centroid_cache.posting(centroid_id, u64::MAX).is_some() {
+                return Err(Error::Internal(format!(
+                    "leaf centroid {} should not be present in centroid cache",
+                    centroid_id
+                )));
+            }
+            continue;
+        }
+
+        let storage_posting = centroid_postings.get(&centroid_id).ok_or_else(|| {
+            Error::Internal(format!(
+                "storage is missing posting list for cached centroid {}",
+                centroid_id
+            ))
+        })?;
+        let cached_posting = centroid_cache
+            .posting(centroid_id, u64::MAX)
+            .ok_or_else(|| {
+                Error::Internal(format!(
+                    "centroid cache is missing internal centroid {}",
+                    centroid_id
+                ))
+            })?;
+        validate_exact_posting_list_match(centroid_id, storage_posting, cached_posting.as_ref())?;
+        validate_cached_subtree(centroid_cache, centroid_postings, storage_posting)?;
+    }
+    Ok(())
+}
+
+fn validate_exact_posting_list_match(
+    centroid_id: VectorId,
+    storage_posting: &PostingList,
+    cached_posting: &PostingList,
+) -> Result<()> {
+    info!("cached: {:?}", cached_posting.iter().map(|p| p.id()).collect::<Vec<_>>());
+    info!("root: {:?}", storage_posting.iter().map(|p| p.id()).collect::<Vec<_>>());
+    if storage_posting.len() != cached_posting.len() {
+        return Err(Error::Internal(format!(
+            "posting list length mismatch for {}: storage={}, cache={}",
+            centroid_id,
+            storage_posting.len(),
+            cached_posting.len()
+        )));
+    }
+
+    let mut storage_posting = storage_posting.iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    storage_posting.sort_by(|a, b| a.id().cmp(&b.id()));
+    let mut cached_posting = cached_posting.iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    cached_posting.sort_by(|a, b| a.id().cmp(&b.id()));
+
+    for (storage, cached) in storage_posting.iter().zip(cached_posting.iter()) {
+        if storage != cached {
+            return Err(Error::Internal(format!(
+                "posting list mismatch for {}: storage={:?}, cache={:?}",
+                centroid_id, storage, cached
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 async fn load_centroid_counts(snapshot: &dyn StorageRead) -> Result<HashMap<(u8, VectorId), u64>> {
     let mut counts = HashMap::new();
     for (centroid_id, value) in snapshot.scan_all_centroid_stats().await? {
@@ -445,8 +547,12 @@ fn flatten_state_counts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::LastAppliedSnapshot;
     use crate::serde::collection_meta::DistanceMetric;
     use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
+    use crate::write::indexer::tree::centroids::{
+        CachedCentroidReader, CentroidCache, LeveledCentroidIndex, StoredCentroidReader,
+    };
 
     const DIMS: usize = 2;
 
@@ -454,8 +560,8 @@ mod tests {
         VectorId::centroid_id(level, id)
     }
 
-    fn root_posting_id(id: u64) -> VectorId {
-        centroid_id(1, id)
+    fn root_posting_id(depth: u8, id: u64) -> VectorId {
+        centroid_id(TreeDepth::of(depth).max_inner_level(), id)
     }
 
     #[tokio::test]
@@ -512,6 +618,109 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn should_validate_cached_root_and_internal_centroids_against_storage() {
+        let storage = create_storage();
+        let root = vec![(10, vec![1.0, 0.0]), (11, vec![0.0, 1.0])];
+        write_tree(
+            &storage,
+            4,
+            root.clone(),
+            vec![
+                (
+                    10,
+                    CentroidInfoValue::new(2, vec![1.0, 0.0], ROOT_VECTOR_ID),
+                ),
+                (
+                    11,
+                    CentroidInfoValue::new(2, vec![0.0, 1.0], ROOT_VECTOR_ID),
+                ),
+                (
+                    20,
+                    CentroidInfoValue::new(1, vec![1.0, 1.0], centroid_id(2, 10)),
+                ),
+                (
+                    21,
+                    CentroidInfoValue::new(1, vec![1.0, 2.0], centroid_id(2, 10)),
+                ),
+                (
+                    22,
+                    CentroidInfoValue::new(1, vec![2.0, 1.0], centroid_id(2, 11)),
+                ),
+            ],
+            vec![
+                ((2, 10), 2),
+                ((2, 11), 1),
+                ((1, 20), 0),
+                ((1, 21), 0),
+                ((1, 22), 0),
+            ],
+            vec![
+                (10, vec![(20, vec![1.0, 1.0]), (21, vec![1.0, 2.0])]),
+                (11, vec![(22, vec![2.0, 1.0])]),
+            ],
+        )
+        .await;
+        let snapshot = storage.snapshot().await.unwrap();
+        let cache = build_last_applied_snapshot(
+            storage.clone(),
+            snapshot.clone(),
+            4,
+            root,
+            vec![
+                (10, vec![(20, vec![1.0, 1.0]), (21, vec![1.0, 2.0])]),
+                (11, vec![(22, vec![2.0, 1.0])]),
+            ],
+        )
+        .await;
+
+        let result = validate_state_and_storage_consistent(&cache, DIMS).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn should_reject_when_cached_internal_posting_differs_from_storage() {
+        let storage = create_storage();
+        let root = vec![(10, vec![1.0, 0.0])];
+        write_tree(
+            &storage,
+            4,
+            root.clone(),
+            vec![
+                (
+                    10,
+                    CentroidInfoValue::new(2, vec![1.0, 0.0], ROOT_VECTOR_ID),
+                ),
+                (
+                    20,
+                    CentroidInfoValue::new(1, vec![1.0, 1.0], centroid_id(2, 10)),
+                ),
+            ],
+            vec![((2, 10), 1), ((1, 20), 0)],
+            vec![(10, vec![(20, vec![1.0, 1.0])])],
+        )
+        .await;
+        let snapshot = storage.snapshot().await.unwrap();
+        let cache = build_last_applied_snapshot(
+            storage.clone(),
+            snapshot.clone(),
+            4,
+            root,
+            vec![(10, vec![(21, vec![9.0, 9.0])])],
+        )
+        .await;
+
+        let result = validate_state_and_storage_consistent(&cache, DIMS).await;
+
+        assert_eq!(
+            result,
+            Err(Error::Internal(
+                "posting list mismatch for 2:10: storage=Posting { id: 1:20, vector: [1.0, 1.0] }, cache=Posting { id: 1:21, vector: [9.0, 9.0] }".to_string()
+            ))
+        );
+    }
+
     fn create_storage() -> Arc<dyn Storage> {
         Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
             VectorDbMergeOperator::new(DIMS),
@@ -557,14 +766,14 @@ mod tests {
         let centroid_cache = AllCentroidsCacheWriter::new(
             Arc::new(
                 root.into_iter()
-                    .map(|(id, vector)| Posting::new(root_posting_id(id), vector))
+                    .map(|(id, vector)| Posting::new(root_posting_id(depth, id), vector))
                     .collect::<PostingList>(),
             ) as Arc<dyn IntoTreePostingList>,
             centroid_postings
                 .into_iter()
                 .map(|(centroid_num, postings)| {
                     (
-                        root_posting_id(centroid_num),
+                        root_posting_id(depth, centroid_num),
                         Arc::new(
                             postings
                                 .into_iter()
@@ -598,6 +807,54 @@ mod tests {
         )
     }
 
+    async fn build_last_applied_snapshot(
+        _storage: Arc<dyn Storage>,
+        snapshot: Arc<dyn StorageSnapshot>,
+        depth: u8,
+        root: Vec<(u64, Vec<f32>)>,
+        centroid_postings: Vec<(u64, Vec<(u64, Vec<f32>)>)>,
+    ) -> LastAppliedSnapshot {
+        let centroid_cache = AllCentroidsCacheWriter::new(
+            Arc::new(
+                root.clone()
+                    .into_iter()
+                    .map(|(id, vector)| Posting::new(root_posting_id(depth, id), vector))
+                    .collect::<PostingList>(),
+            ) as Arc<dyn IntoTreePostingList>,
+            centroid_postings
+                .into_iter()
+                .map(|(centroid_num, postings)| {
+                    (
+                        root_posting_id(depth, centroid_num),
+                        Arc::new(
+                            postings
+                                .into_iter()
+                                .map(|(id, vector)| Posting::new(centroid_id(1, id), vector))
+                                .collect::<PostingList>(),
+                        ) as Arc<dyn IntoTreePostingList>,
+                    )
+                })
+                .collect(),
+        );
+        let query_cache = Arc::new(centroid_cache.cache());
+        let stored_reader = StoredCentroidReader::new(DIMS, snapshot.clone(), 0);
+        let cached_reader = CachedCentroidReader::new(
+            &(query_cache.clone() as Arc<dyn CentroidCache>),
+            stored_reader,
+        );
+        let centroid_index = LeveledCentroidIndex::new(
+            TreeDepth::of(depth),
+            DistanceMetric::L2,
+            Arc::new(cached_reader),
+        );
+        LastAppliedSnapshot {
+            snapshot,
+            centroid_cache: query_cache,
+            centroid_index: Arc::new(centroid_index),
+            centroid_count: 0,
+        }
+    }
+
     async fn write_tree(
         storage: &Arc<dyn Storage>,
         depth: u8,
@@ -617,14 +874,14 @@ mod tests {
         ops.push(
             Record::new(
                 PostingListKey::new(ROOT_VECTOR_ID).encode(),
-                posting_list_value(root).encode_to_bytes(),
+                posting_list_value(TreeDepth::of(depth).max_inner_level(), root).encode_to_bytes(),
             )
             .into(),
         );
-        for (centroid_id, value) in centroid_info {
+        for (centroid_num, value) in centroid_info {
             ops.push(
                 Record::new(
-                    CentroidInfoKey::new(root_posting_id(centroid_id)).encode(),
+                    CentroidInfoKey::new(centroid_id(value.level, centroid_num)).encode(),
                     value.encode_to_bytes(),
                 )
                 .into(),
@@ -642,8 +899,8 @@ mod tests {
         for (centroid_id, postings) in centroid_postings {
             ops.push(
                 Record::new(
-                    PostingListKey::new(root_posting_id(centroid_id)).encode(),
-                    posting_list_value(postings).encode_to_bytes(),
+                    PostingListKey::new(root_posting_id(depth, centroid_id)).encode(),
+                    posting_list_value(1, postings).encode_to_bytes(),
                 )
                 .into(),
             );
@@ -651,11 +908,11 @@ mod tests {
         storage.put(ops).await.unwrap();
     }
 
-    fn posting_list_value(postings: Vec<(u64, Vec<f32>)>) -> PostingListValue {
+    fn posting_list_value(level: u8, postings: Vec<(u64, Vec<f32>)>) -> PostingListValue {
         PostingListValue::from_posting_updates(
             postings
                 .into_iter()
-                .map(|(id, vector)| PostingUpdate::append(root_posting_id(id), vector))
+                .map(|(id, vector)| PostingUpdate::append(centroid_id(level, id), vector))
                 .collect(),
         )
         .unwrap()

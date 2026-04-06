@@ -15,9 +15,9 @@ pub use slatedb::db_cache::CachedEntry;
 use slatedb::db_cache::DbCache;
 pub use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
+use slatedb::object_store::limit::LimitStore;
 use slatedb::object_store::{self, ObjectStore};
 pub use slatedb::{CompactorBuilder, DbBuilder};
-use slatedb::object_store::limit::LimitStore;
 use tracing::info;
 
 /// Builder for creating storage instances from configuration.
@@ -296,7 +296,7 @@ pub async fn create_storage_read(
         StorageConfig::SlateDb(slate_config) => {
             let object_store = if let Some(object_store) = &runtime.object_store {
                 object_store.clone()
-            }  else {
+            } else {
                 create_object_store(&slate_config.object_store)?
             };
 

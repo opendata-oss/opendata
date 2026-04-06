@@ -2,7 +2,9 @@ use crate::DistanceMetric;
 use crate::Result;
 use crate::serde::vector_id::VectorId;
 use crate::write::delta::VectorWrite;
-use crate::write::indexer::tree::centroids::{CentroidCache, LEAF_LEVEL, TreeDepth, TreeLevel};
+use crate::write::indexer::tree::centroids::{
+    AllCentroidsCache, CentroidCache, LEAF_LEVEL, TreeDepth, TreeLevel,
+};
 use crate::write::indexer::tree::merge::MergeCentroids;
 use crate::write::indexer::tree::root::SplitRoot;
 use crate::write::indexer::tree::split::{ReassignVector, SplitCentroids};
@@ -53,7 +55,7 @@ pub(crate) struct IndexerOpts {
 pub(crate) struct IndexUpdateResults {
     pub(crate) ops: Vec<RecordOp>,
     pub(crate) stats: IndexerStats,
-    pub(crate) centroid_cache: Arc<dyn CentroidCache>,
+    pub(crate) centroid_cache: Arc<AllCentroidsCache>,
     pub(crate) leaf_centroids: usize,
     pub(crate) centroid_tree_depth: TreeDepth,
 }
@@ -84,8 +86,8 @@ impl Indexer {
             .count()
     }
 
-    fn query_centroid_cache(&self) -> Arc<dyn CentroidCache> {
-        Arc::new(self.state.centroid_cache()) as Arc<dyn CentroidCache>
+    fn query_centroid_cache(&self) -> Arc<AllCentroidsCache> {
+        Arc::new(self.state.centroid_cache())
     }
 
     fn compute_centroid_size_stats(
@@ -289,6 +291,10 @@ impl Indexer {
             stats = format!("{:?}", stats),
             "completed"
         );
+        let root = self.state.centroid_cache().root(u64::MAX).unwrap();
+        info!("root: {:?}", root.iter().map(|p| p.id()).collect::<Vec<_>>());
+        let root_sz = self.state.centroid_cache().root(u64::MAX).unwrap().len();
+        info!("ROOT SIZE: {}", root_sz);
         Ok(IndexUpdateResults {
             ops,
             stats,

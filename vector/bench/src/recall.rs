@@ -18,10 +18,10 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use bencher::{Bench, Benchmark, Params, Summary};
-use common::{create_object_store, StorageBuilder, StorageReaderRuntime};
 use common::StorageConfig;
 use common::storage::config::SlateDbStorageConfig;
 use common::storage::factory::{FoyerCache, FoyerCacheOptions};
+use common::{StorageBuilder, StorageReaderRuntime, create_object_store};
 use tokio::sync::mpsc;
 use vector::{
     Config, DistanceMetric, Query, ReaderConfig, SearchOptions, SearchResult, Vector, VectorDb,
@@ -818,9 +818,7 @@ impl Benchmark for RecallBenchmark {
                 max_capacity: bytes,
                 ..Default::default()
             });
-            sb = sb.map_slatedb(|db|
-                db.with_db_cache(std::sync::Arc::new(cache))
-            );
+            sb = sb.map_slatedb(|db| db.with_db_cache(std::sync::Arc::new(cache)));
             println!("  Block cache: {} bytes", bytes);
         }
         let reader_storage = dataset.resolve_reader_storage_config(&config.storage)?;
@@ -918,15 +916,16 @@ impl Benchmark for RecallBenchmark {
             StorageConfig::SlateDb(slate_config) => {
                 println!("CREATE STATIC OBJECT STORE");
                 Some(create_object_store(&slate_config.object_store)?)
-            },
-            _ => None
+            }
+            _ => None,
         };
         let mut runtime = StorageReaderRuntime::default();
         if let Some(object_store) = object_store {
             runtime = runtime.with_object_store(object_store);
         }
         for query in queries.iter().take(10) {
-            let reader = VectorDbReader::open_with_runtime(reader_config.clone(), runtime.clone()).await?;
+            let reader =
+                VectorDbReader::open_with_runtime(reader_config.clone(), runtime.clone()).await?;
             let t = std::time::Instant::now();
             let q = Query::new(query.clone()).with_limit(k);
             let _ = reader

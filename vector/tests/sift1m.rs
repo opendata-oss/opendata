@@ -223,6 +223,9 @@ async fn sift100k_recall() {
     db.flush().await.expect("failed to flush");
     println!("Ingested all base vectors");
 
+    db.validate_cache().await;
+    println!("validated cache");
+
     // Query and measure recall using first 1000 queries
     let nqueries = 100;
     let queries: Vec<Vec<f32>> = read_fvecs(&data_dir.join("query.fvecs"))

@@ -35,8 +35,8 @@ use crate::write::flusher::VectorDbFlusher;
 use crate::write::indexer::tree::Indexer;
 use crate::write::indexer::tree::IndexerOpts;
 use crate::write::indexer::tree::centroids::{
-    AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LEAF_LEVEL, LeveledCentroidIndex,
-    StoredCentroidReader, TreeDepth,
+    AllCentroidsCache, AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LEAF_LEVEL,
+    LeveledCentroidIndex, StoredCentroidReader, TreeDepth,
 };
 use crate::write::indexer::tree::posting_list::{IntoTreePostingList, PostingList};
 use crate::write::indexer::tree::state::VectorIndexState;
@@ -50,6 +50,7 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use crate::write::indexer::tree::validator::validate_state_and_storage_consistent;
 
 pub(crate) const WRITE_CHANNEL: &str = "write";
 
@@ -118,6 +119,7 @@ pub trait VectorDbRead {
 pub(crate) struct LastAppliedSnapshot {
     pub(crate) snapshot: Arc<dyn StorageSnapshot>,
     pub(crate) centroid_index: Arc<LeveledCentroidIndex<'static>>,
+    pub(crate) centroid_cache: Arc<AllCentroidsCache>,
     pub(crate) centroid_count: usize,
 }
 
@@ -242,6 +244,7 @@ impl VectorDb {
         .await?;
         let last_applied_snapshot = Arc::new(Mutex::new(LastAppliedSnapshot {
             snapshot: snapshot.clone(),
+            centroid_cache: Arc::new(loaded_tree.centroid_cache.cache()),
             centroid_index: loaded_tree.query_centroid_index,
             centroid_count: loaded_tree.num_leaf_centroids,
         }));
@@ -757,6 +760,13 @@ impl VectorDb {
             .lock()
             .expect("lock_poisoned")
             .centroid_count
+    }
+
+    pub async fn validate_cache(&self) {
+        validate_state_and_storage_consistent(
+            &self.last_applied_snapshot.lock().expect("lock_poisoned"),
+            self.config.dimensions as usize
+        ).await.expect("validation failed");
     }
 
     /// Create a QueryEngine from the current snapshot for executing queries.

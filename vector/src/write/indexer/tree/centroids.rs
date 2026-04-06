@@ -8,7 +8,6 @@ use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::tree::posting_list::{IntoTreePostingList, Posting, PostingList};
 use common::StorageRead;
 use futures::future::BoxFuture;
-use tracing::{debug, info};
 use rayon::iter::ParallelIterator;
 use rayon::prelude::IntoParallelIterator;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -16,6 +15,7 @@ use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tracing::{debug, info};
 
 // TODO: move to vector id module
 pub(crate) const ROOT_LEVEL: u8 = 0xFF;
@@ -861,7 +861,8 @@ pub(crate) async fn batch_search_centroids<K: Hash + Eq + Sized + Send + Sync>(
 ) -> Result<HashMap<K, Vec<Posting>>> {
     let t = Instant::now();
     let nqueries = queries.len();
-    let result = batch_search_centroids_in_level(index, k, queries, TreeLevel::leaf(index.depth)).await;
+    let result =
+        batch_search_centroids_in_level(index, k, queries, TreeLevel::leaf(index.depth)).await;
     debug!(
         op = "batch_search_centroids_in_level",
         k = k,

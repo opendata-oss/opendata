@@ -1,7 +1,7 @@
 use crate::db::LastAppliedSnapshot;
 use crate::write::delta::{VectorDbDeltaView, VectorDbWriteDelta};
 use crate::write::indexer::tree::centroids::{
-    CachedCentroidReader, LeveledCentroidIndex, StoredCentroidReader,
+    CachedCentroidReader, CentroidCache, LeveledCentroidIndex, StoredCentroidReader,
 };
 use crate::write::indexer::tree::{IndexUpdateResults, Indexer};
 use crate::{Config, DistanceMetric};
@@ -110,7 +110,10 @@ impl VectorDbFlusher {
             snapshot.clone(),
             snapshot_epoch,
         );
-        let cached_reader = CachedCentroidReader::new(&index_outputs.centroid_cache, stored_reader);
+        let cached_reader = CachedCentroidReader::new(
+            &(index_outputs.centroid_cache.clone() as Arc<dyn CentroidCache>),
+            stored_reader,
+        );
         let query_centroid_index = LeveledCentroidIndex::new(
             index_outputs.centroid_tree_depth,
             self.opts.distance_metric,
@@ -118,6 +121,7 @@ impl VectorDbFlusher {
         );
         *self.last_applied_snapshot.lock().expect("lock poisoned") = LastAppliedSnapshot {
             snapshot: snapshot.clone(),
+            centroid_cache: index_outputs.centroid_cache,
             centroid_index: Arc::new(query_centroid_index),
             centroid_count: index_outputs.leaf_centroids,
         };
@@ -147,11 +151,11 @@ mod tests {
     use crate::write::delta::VectorDbDeltaView;
     use crate::write::delta::VectorWrite;
     use crate::write::indexer::tree::IndexerOpts;
-    use crate::write::indexer::tree::centroids::TreeDepth;
     use crate::write::indexer::tree::centroids::{
         AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex,
         StoredCentroidReader,
     };
+    use crate::write::indexer::tree::centroids::{CentroidReader, TreeDepth};
     use crate::write::indexer::tree::posting_list::{IntoTreePostingList, PostingList};
     use crate::write::indexer::tree::state::VectorIndexState;
     use common::coordinator::Flusher;
@@ -247,10 +251,10 @@ mod tests {
             centroid_seq_block,
             centroid_cache,
         );
-        let cache = Arc::new(state.centroid_cache()) as Arc<dyn CentroidCache>;
+        let cache = Arc::new(state.centroid_cache());
         let snapshot = storage.snapshot().await.unwrap();
         let reader = Arc::new(CachedCentroidReader::new(
-            &cache,
+            &(cache.clone() as Arc<dyn CentroidCache>),
             StoredCentroidReader::new(DIMS, snapshot.clone(), 0),
         ));
         let query_centroid_index = Arc::new(LeveledCentroidIndex::new(
@@ -285,6 +289,7 @@ mod tests {
             indexer,
             Arc::new(Mutex::new(LastAppliedSnapshot {
                 snapshot,
+                centroid_cache: cache,
                 centroid_index: query_centroid_index,
                 centroid_count: 1,
             })),
