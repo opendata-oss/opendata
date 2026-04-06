@@ -194,6 +194,7 @@ async fn process_batch(tsdb: &Tsdb, converter: &OtelConverter, batch: &Collected
     for (idx, entry) in batch.entries.iter().enumerate() {
         let metadata = find_metadata_for_entry(&batch.metadata, idx as u32);
         if let Err(reason) = process_entry(tsdb, converter, entry, metadata).await {
+            metrics::counter!(crate::tsdb_metrics::TSDB_INGEST_ENTRIES_SKIPPED).increment(1);
             tracing::warn!(
                 sequence = batch.sequence,
                 entry_index = idx,
@@ -229,7 +230,7 @@ async fn process_entry(
         .convert(&request)
         .map_err(|e| format!("OtelConverter failed: {e}"))?;
 
-    tsdb.ingest_samples(series)
+    tsdb.ingest_samples(series, None)
         .await
         .map_err(|e| format!("tsdb ingest failed: {e}"))?;
 

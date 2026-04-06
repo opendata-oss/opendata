@@ -56,6 +56,7 @@ mod storage;
 #[cfg(test)]
 mod test_utils;
 mod tsdb;
+mod tsdb_metrics;
 mod util;
 
 #[cfg(feature = "bench-internals")]

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeBounds;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use common::Storage;
@@ -22,6 +22,7 @@ use crate::promql::evaluator::{CachedQueryReader, Evaluator, ExprResult, compute
 use crate::promql::selector::evaluate_selector_with_reader;
 use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::OpenTsdbStorageReadExt;
+use crate::tsdb_metrics;
 use crate::util::Result;
 
 /// Compute the disjoint preload ranges for bucket discovery.
@@ -115,6 +116,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         time: Option<std::time::SystemTime>,
         opts: &QueryOptions,
     ) -> std::result::Result<QueryValue, QueryError> {
+        let start = Instant::now();
         let expr = promql_parser::parser::parse(query)
             .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
 
@@ -140,7 +142,13 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
         let concurrency = crate::promql::pipeline::PipelineConcurrency::from(opts);
-        evaluate_instant(&reader, stmt, query_time, concurrency).await
+        let result = evaluate_instant(&reader, stmt, query_time, concurrency).await;
+
+        metrics::counter!(tsdb_metrics::TSDB_QUERIES, "type" => "instant").increment(1);
+        metrics::histogram!(tsdb_metrics::TSDB_QUERY_DURATION_SECONDS, "type" => "instant")
+            .record(start.elapsed().as_secs_f64());
+
+        result
     }
 
     /// Evaluate a range PromQL query, returning typed `RangeSample`s.
@@ -152,6 +160,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         step: Duration,
         opts: &QueryOptions,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
+        let timer_start = Instant::now();
         let expr = promql_parser::parser::parse(query)
             .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
 
@@ -176,7 +185,13 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
         let concurrency = crate::promql::pipeline::PipelineConcurrency::from(opts);
-        evaluate_range(&reader, stmt, concurrency).await
+        let result = evaluate_range(&reader, stmt, concurrency).await;
+
+        metrics::counter!(tsdb_metrics::TSDB_QUERIES, "type" => "range").increment(1);
+        metrics::histogram!(tsdb_metrics::TSDB_QUERY_DURATION_SECONDS, "type" => "range")
+            .record(timer_start.elapsed().as_secs_f64());
+
+        result
     }
 
     /// Discover series matching any of the given selectors.
@@ -676,6 +691,10 @@ impl Tsdb {
 
     /// Ingest series into the TSDB.
     /// Each series is split by time bucket based on sample timestamps.
+    ///
+    /// If `timeout` is provided, each bucket batch will wait up to the given
+    /// duration for space in the write queue. Otherwise, writes fail
+    /// immediately if the queue is full.
     #[tracing::instrument(
         level = "debug",
         skip_all,
@@ -685,7 +704,11 @@ impl Tsdb {
             buckets_touched = tracing::field::Empty
         )
     )]
-    pub(crate) async fn ingest_samples(&self, series_list: Vec<Series>) -> Result<()> {
+    pub(crate) async fn ingest_samples(
+        &self,
+        series_list: Vec<Series>,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
         let mut bucket_series_map: HashMap<TimeBucket, Vec<Series>> = HashMap::new();
         let mut total_samples = 0;
 
@@ -761,7 +784,7 @@ impl Tsdb {
                     return Err(err);
                 }
             };
-            mini.ingest_batch(&series_list).await?;
+            mini.ingest_batch(&series_list, timeout).await?;
 
             tracing::debug!(
                 bucket = ?bucket,
@@ -774,6 +797,8 @@ impl Tsdb {
         // Record final metrics on the main span
         tracing::Span::current().record("total_samples", total_samples);
         tracing::Span::current().record("buckets_touched", buckets_touched);
+
+        metrics::counter!(tsdb_metrics::TSDB_SAMPLES_INGESTED).increment(total_samples as u64);
 
         tracing::debug!(
             total_samples = total_samples,
@@ -937,9 +962,13 @@ impl TsdbEngine {
 
     // ── Write methods (error in read-only mode) ──
 
-    pub(crate) async fn ingest_samples(&self, series_list: Vec<Series>) -> Result<()> {
+    pub(crate) async fn ingest_samples(
+        &self,
+        series_list: Vec<Series>,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
         match self {
-            Self::ReadWrite(tsdb) => tsdb.ingest_samples(series_list).await,
+            Self::ReadWrite(tsdb) => tsdb.ingest_samples(series_list, timeout).await,
             Self::ReadOnly(_) => Err(crate::error::Error::InvalidInput(
                 "write operations are not supported in read-only mode".to_string(),
             )),
@@ -1468,7 +1497,7 @@ mod tests {
             create_sample("http_requests", vec![("env", "prod")], 4_000_000, 42.0),
             create_sample("http_requests", vec![("env", "staging")], 4_000_000, 10.0),
         ];
-        tsdb.ingest_samples(series).await.unwrap();
+        tsdb.ingest_samples(series, None).await.unwrap();
         tsdb.flush().await.unwrap();
         tsdb
     }
@@ -1703,7 +1732,9 @@ mod tests {
         // Same series in two different buckets
         let series1 = create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0);
         let series2 = create_sample("cpu", vec![("host", "a")], 7_500_000, 2.0);
-        tsdb.ingest_samples(vec![series1, series2]).await.unwrap();
+        tsdb.ingest_samples(vec![series1, series2], None)
+            .await
+            .unwrap();
         tsdb.flush().await.unwrap();
 
         let results = tsdb.find_series(&["cpu"], 0, i64::MAX).await.unwrap();
@@ -1785,7 +1816,7 @@ mod tests {
         let mut series = create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0);
         series.description = Some("CPU usage".to_string());
         series.unit = Some("percent".to_string());
-        tsdb.ingest_samples(vec![series]).await.unwrap();
+        tsdb.ingest_samples(vec![series], None).await.unwrap();
 
         let results = tsdb.find_metadata(None).await.unwrap();
 
@@ -1909,7 +1940,9 @@ mod tests {
         // Same series in two different buckets
         let series1 = create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0);
         let series2 = create_sample("cpu", vec![("host", "a")], 7_500_000, 2.0);
-        tsdb.ingest_samples(vec![series1, series2]).await.unwrap();
+        tsdb.ingest_samples(vec![series1, series2], None)
+            .await
+            .unwrap();
         tsdb.flush().await.unwrap();
 
         let results = tsdb.find_labels(None, 0, i64::MAX).await.unwrap();
@@ -1934,7 +1967,9 @@ mod tests {
         // Same series in two different buckets
         let series1 = create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0);
         let series2 = create_sample("cpu", vec![("host", "a")], 7_500_000, 2.0);
-        tsdb.ingest_samples(vec![series1, series2]).await.unwrap();
+        tsdb.ingest_samples(vec![series1, series2], None)
+            .await
+            .unwrap();
         tsdb.flush().await.unwrap();
 
         let results = tsdb
@@ -1953,10 +1988,13 @@ mod tests {
     async fn find_metadata_should_filter_by_metric(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
 
-        tsdb.ingest_samples(vec![
-            create_sample("cpu", vec![], 4_000_000, 1.0),
-            create_sample("mem", vec![], 4_000_000, 2.0),
-        ])
+        tsdb.ingest_samples(
+            vec![
+                create_sample("cpu", vec![], 4_000_000, 1.0),
+                create_sample("mem", vec![], 4_000_000, 2.0),
+            ],
+            None,
+        )
         .await
         .unwrap();
 
@@ -1972,7 +2010,7 @@ mod tests {
     async fn eval_query_range_rejects_zero_step(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
 
-        tsdb.ingest_samples(vec![create_sample("cpu", vec![], 1_000_000, 1.0)])
+        tsdb.ingest_samples(vec![create_sample("cpu", vec![], 1_000_000, 1.0)], None)
             .await
             .unwrap();
         tsdb.flush().await.unwrap();

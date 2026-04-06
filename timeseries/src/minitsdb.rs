@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig, WriteError};
@@ -172,6 +173,9 @@ impl MiniTsdb {
     }
 
     /// Ingest a batch of series with samples in a single operation.
+    ///
+    /// If `timeout` is provided, waits up to the given duration for space in the
+    /// write queue. Otherwise, fails immediately when the queue is full.
     #[tracing::instrument(
         level = "debug",
         skip_all,
@@ -181,7 +185,11 @@ impl MiniTsdb {
             total_samples = series_list.iter().map(|s| s.samples.len()).sum::<usize>()
         )
     )]
-    pub(crate) async fn ingest_batch(&self, series_list: &[Series]) -> Result<()> {
+    pub(crate) async fn ingest_batch(
+        &self,
+        series_list: &[Series],
+        timeout: Option<Duration>,
+    ) -> Result<()> {
         let total_samples = series_list.iter().map(|s| s.samples.len()).sum::<usize>();
 
         tracing::debug!(
@@ -192,10 +200,16 @@ impl MiniTsdb {
         );
 
         let handle = self.write_coordinator.handle(WRITE_CHANNEL);
-        let mut write_handle = handle
-            .try_write(series_list.to_vec())
-            .await
-            .map_err(|e| map_write_error(e.discard_inner()))?;
+        let mut write_handle = match timeout {
+            Some(t) => handle
+                .write_timeout(series_list.to_vec(), t)
+                .await
+                .map_err(|e| map_write_error(e.discard_inner()))?,
+            None => handle
+                .try_write(series_list.to_vec())
+                .await
+                .map_err(|e| map_write_error(e.discard_inner()))?,
+        };
 
         write_handle
             .wait(Durability::Applied)
@@ -214,7 +228,7 @@ impl MiniTsdb {
 
     /// Ingest a single series with samples.
     pub(crate) async fn ingest(&self, series: &Series) -> Result<()> {
-        self.ingest_batch(std::slice::from_ref(series)).await
+        self.ingest_batch(std::slice::from_ref(series), None).await
     }
 
     /// Flush pending data to the storage memtable (not yet durable).
@@ -246,11 +260,167 @@ impl MiniTsdb {
 
 fn map_write_error(e: WriteError) -> Error {
     match e {
-        WriteError::Backpressure(_) => Error::Backpressure,
+        WriteError::Backpressure(_) => {
+            metrics::counter!(crate::tsdb_metrics::TSDB_BACKPRESSURE).increment(1);
+            Error::Backpressure
+        }
         WriteError::TimeoutError(_) => Error::Backpressure,
         WriteError::Shutdown => Error::Internal("Write coordinator shut down".to_string()),
         WriteError::ApplyError(_, msg) => Error::Internal(msg),
         WriteError::FlushError(msg) => Error::Storage(msg),
         WriteError::Internal(msg) => Error::Internal(msg),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Label, Sample, Series};
+
+    /// Create a MiniTsdb with a custom queue capacity.
+    async fn load_with_config(
+        bucket: TimeBucket,
+        storage: Arc<dyn Storage>,
+        queue_capacity: usize,
+    ) -> MiniTsdb {
+        let snapshot = storage.snapshot().await.unwrap();
+
+        let mut series_dict = HashMap::new();
+        let next_series_id = snapshot
+            .load_series_dictionary(&bucket, |fingerprint, series_id| {
+                series_dict.insert(fingerprint, series_id);
+            })
+            .await
+            .unwrap();
+
+        let context = TsdbContext {
+            bucket,
+            series_dict: Arc::new(series_dict),
+            next_series_id,
+        };
+
+        let flusher = TsdbFlusher {
+            storage: storage.clone(),
+        };
+
+        let initial_snapshot: Arc<dyn StorageSnapshot> = storage.snapshot().await.unwrap();
+
+        let config = WriteCoordinatorConfig {
+            queue_capacity,
+            ..Default::default()
+        };
+
+        let mut write_coordinator = WriteCoordinator::new(
+            config,
+            vec![WRITE_CHANNEL.to_string()],
+            context,
+            initial_snapshot,
+            flusher,
+        );
+        write_coordinator.start();
+
+        MiniTsdb {
+            bucket,
+            write_coordinator,
+        }
+    }
+
+    fn test_series(name: &str, ts: i64, value: f64) -> Series {
+        Series::new(
+            name,
+            vec![Label::new("host", "server1")],
+            vec![Sample::new(ts, value)],
+        )
+    }
+
+    async fn test_storage() -> Arc<dyn Storage> {
+        use crate::storage::merge_operator::OpenTsdbMergeOperator;
+        use common::{StorageBuilder, StorageConfig, StorageSemantics};
+
+        StorageBuilder::new(&StorageConfig::InMemory)
+            .await
+            .unwrap()
+            .with_semantics(
+                StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
+            )
+            .build()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn should_succeed_ingest_batch_with_timeout_when_queue_has_space() {
+        // given - queue has space (capacity=1)
+        let bucket = TimeBucket::hour(60);
+        let storage = test_storage().await;
+        let mini = load_with_config(bucket, storage, 1).await;
+
+        // when
+        let s1 = vec![test_series("cpu", 3_700_000, 1.0)];
+        let result = mini
+            .ingest_batch(&s1, Some(Duration::from_millis(50)))
+            .await;
+
+        // then
+        assert!(result.is_ok(), "expected success, got {:?}", result);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn should_fail_ingest_batch_when_timeout_too_short_for_drain() {
+        // given - queue_capacity=2, coordinator paused
+        let bucket = TimeBucket::hour(60);
+        let storage = test_storage().await;
+        let mini = load_with_config(bucket, storage, 2).await;
+
+        let pause = mini.write_coordinator.pause_handle(WRITE_CHANNEL);
+        pause.pause();
+
+        // fill the queue
+        let handle = mini.write_coordinator.handle(WRITE_CHANNEL);
+        let _wh1 = handle
+            .try_write(vec![test_series("cpu", 3_700_000, 1.0)])
+            .await
+            .unwrap();
+        let _wh2 = handle
+            .try_write(vec![test_series("cpu", 3_700_001, 2.0)])
+            .await
+            .unwrap();
+
+        // verify immediate reject with no timeout
+        let s3 = vec![test_series("cpu", 3_700_002, 3.0)];
+        let result = mini.ingest_batch(&s3, None).await;
+        assert!(
+            matches!(result, Err(Error::Backpressure)),
+            "expected Backpressure with no timeout, got {:?}",
+            result
+        );
+
+        // unpause after 200ms
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            pause.unpause();
+        });
+
+        // when - 10ms timeout is too short, queue is still full
+        let result = mini
+            .ingest_batch(&s3, Some(Duration::from_millis(10)))
+            .await;
+
+        // then
+        assert!(
+            matches!(result, Err(Error::Backpressure)),
+            "expected Backpressure with short timeout, got {:?}",
+            result
+        );
+
+        // when - 5s timeout is long enough to wait for the delayed unpause
+        let result = mini.ingest_batch(&s3, Some(Duration::from_secs(5))).await;
+
+        // then
+        assert!(
+            result.is_ok(),
+            "expected success with long timeout, got {:?}",
+            result
+        );
     }
 }

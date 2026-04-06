@@ -321,7 +321,7 @@ mod tests {
                 .sample(1700000001000, 101.0)
                 .build(),
         ];
-        tsdb.ingest_samples(series).await.unwrap();
+        tsdb.ingest_samples(series, None).await.unwrap();
         tsdb.flush().await.unwrap();
 
         // Open reader on the same storage
@@ -362,7 +362,7 @@ mod tests {
                 .sample(1700000000000, 0.75)
                 .build(),
         ];
-        tsdb.ingest_samples(series).await.unwrap();
+        tsdb.ingest_samples(series, None).await.unwrap();
         tsdb.flush().await.unwrap();
 
         let reader = TimeSeriesDbReader::from_storage(storage);
@@ -420,7 +420,7 @@ mod tests {
                 .sample(1700000000000, 1.0)
                 .build(),
         ];
-        tsdb.ingest_samples(series).await.unwrap();
+        tsdb.ingest_samples(series, None).await.unwrap();
         tsdb.flush().await.unwrap();
 
         // Open reader
@@ -441,7 +441,7 @@ mod tests {
                 .sample(1700000002000, 2.0)
                 .build(),
         ];
-        tsdb.ingest_samples(more_series).await.unwrap();
+        tsdb.ingest_samples(more_series, None).await.unwrap();
         tsdb.flush().await.unwrap();
 
         // Reader sees newly written data (InMemory storage shares state)
@@ -471,7 +471,7 @@ mod tests {
                 .sample(1700000060000, 160.0)
                 .build(),
         ];
-        tsdb.ingest_samples(series).await.unwrap();
+        tsdb.ingest_samples(series, None).await.unwrap();
         tsdb.flush().await.unwrap();
 
         let reader = TimeSeriesDbReader::from_storage(storage);
@@ -693,7 +693,7 @@ mod tests {
                 .sample(1700000060000, 5.0)
                 .build(),
         ];
-        tsdb.ingest_samples(series).await.unwrap();
+        tsdb.ingest_samples(series, None).await.unwrap();
         tsdb.flush().await.unwrap();
 
         let reader = TimeSeriesDbReader::from_storage(storage.clone());
@@ -754,7 +754,7 @@ mod tests {
                 .sample(1700000000000, 100.0)
                 .build(),
         ];
-        tsdb.ingest_samples(series).await.unwrap();
+        tsdb.ingest_samples(series, None).await.unwrap();
         tsdb.flush().await.unwrap();
 
         let reader = TimeSeriesDbReader::from_storage(storage);

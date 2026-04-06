@@ -119,7 +119,7 @@ pub async fn handle_otel_metrics(
     tracing::Span::current().record("series_count", series.len());
     tracing::Span::current().record("samples_count", total_samples);
 
-    state.tsdb.ingest_samples(series).await?;
+    state.tsdb.ingest_samples(series, None).await?;
 
     let response = ExportMetricsServiceResponse {
         partial_success: None,
