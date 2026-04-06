@@ -236,7 +236,7 @@ pub async fn handle_remote_write(
     );
 
     // Ingest samples into the TSDB
-    match state.tsdb.ingest_samples(samples).await {
+    match state.tsdb.ingest_samples(samples, None).await {
         Ok(()) => {
             metrics::counter!(super::metrics::REMOTE_WRITE_SAMPLES_INGESTED)
                 .increment(total_samples as u64);

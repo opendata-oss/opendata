@@ -45,7 +45,7 @@ pub struct TestTsdb {
 impl TestTsdb {
     /// Ingest series into the TSDB (production ingestion path).
     pub async fn ingest_samples(&self, series: Vec<Series>) {
-        self.inner.ingest_samples(series).await.unwrap();
+        self.inner.ingest_samples(series, None).await.unwrap();
     }
 
     /// Flush all dirty buckets to storage.
