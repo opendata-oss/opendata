@@ -447,15 +447,14 @@ pub(crate) fn merge_batch_posting_list(
         priority: usize,
     }
 
-    let peek_entry = |buf: &[u8], append_size: usize, delete_size: usize| -> Option<(u64, usize)> {
+    let peek_entry = |buf: &[u8], append_size: usize, delete_size: usize| -> Option<(VectorId, usize)> {
         if buf.is_empty() {
             return None;
         }
         assert!(buf.len() >= delete_size);
         let entry_type = buf[0];
-        let id = u64::from_le_bytes([
-            buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
-        ]);
+        let mut id_buf = &buf[1..];
+        let id = VectorId::decode(&mut id_buf).expect("failed to decode vector id");
         let entry_size = if entry_type == POSTING_UPDATE_TYPE_APPEND_BYTE {
             append_size
         } else {
@@ -469,7 +468,7 @@ pub(crate) fn merge_batch_posting_list(
     // and raw priority (want largest/newest to win on ties).
     #[derive(Eq, PartialEq)]
     struct HeapEntry {
-        id: u64,
+        id: VectorId,
         priority: usize,
         cursor_idx: usize,
         entry_size: usize,
@@ -865,6 +864,49 @@ mod tests {
         assert_eq!(decoded.postings[0].id(), id(1));
         assert!(decoded.postings[1].is_append());
         assert_eq!(decoded.postings[1].id(), id(2));
+    }
+
+    #[test]
+    fn should_merge_with_multiple_deletes_masking_old_append() {
+        // given - existing has append, new has delete for same id
+        let existing_postings = vec![
+            PostingUpdate::append(VectorId::centroid_id(2, 4496), vec![1.0, 2.0]),
+            PostingUpdate::append(VectorId::centroid_id(2, 4497), vec![3.0, 4.0]),
+        ];
+        let existing_value = PostingListValue::from_posting_updates(existing_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
+
+        let new_postings = vec![
+            PostingUpdate::delete(VectorId::centroid_id(2, 4496)),
+            PostingUpdate::delete(VectorId::centroid_id(2, 4497)),
+            PostingUpdate::append(VectorId::centroid_id(2, 4728), vec![4.0, 5.0]),
+            PostingUpdate::append(VectorId::centroid_id(2, 4729), vec![4.0, 5.0]),
+            PostingUpdate::append(VectorId::centroid_id(2, 4730), vec![4.0, 5.0]),
+            PostingUpdate::append(VectorId::centroid_id(2, 4731), vec![4.0, 5.0]),
+        ];
+        let new_value = PostingListValue::from_posting_updates(new_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
+
+        // when
+        let merged = merge_batch_posting_list(None, &[existing_value, new_value], 2);
+        let decoded = PostingListValue::decode_from_bytes(&merged, 2).unwrap();
+
+        // then - id 1/2 is now a delete, id 3 unchanged, sorted order
+        assert_eq!(decoded.len(), 6);
+        assert_eq!(decoded.postings[0].id(), VectorId::centroid_id(2, 4496));
+        assert!(decoded.postings[0].is_delete());
+        assert_eq!(decoded.postings[1].id(), VectorId::centroid_id(2, 4497));
+        assert!(decoded.postings[1].is_delete());
+        assert_eq!(decoded.postings[2].id(), VectorId::centroid_id(2, 4728));
+        assert!(decoded.postings[2].is_append());
+        assert_eq!(decoded.postings[3].id(), VectorId::centroid_id(2, 4729));
+        assert!(decoded.postings[3].is_append());
+        assert_eq!(decoded.postings[4].id(), VectorId::centroid_id(2, 4730));
+        assert!(decoded.postings[4].is_append());
+        assert_eq!(decoded.postings[5].id(), VectorId::centroid_id(2, 4731));
+        assert!(decoded.postings[5].is_append());
     }
 
     #[test]
