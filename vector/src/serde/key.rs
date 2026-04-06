@@ -6,7 +6,7 @@ use super::{
     Decode, Encode, EncodingError, FieldValue, KEY_VERSION, RecordKey, RecordType, SUBSYSTEM,
 };
 use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
-use crate::write::indexer::tree::centroids::LEAF_LEVEL;
+use crate::serde::vector_id::LEAF_LEVEL;
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
 use common::serde::key_prefix::KeyPrefix;

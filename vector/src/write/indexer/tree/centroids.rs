@@ -1,8 +1,8 @@
 use crate::Result;
-use crate::math::distance::{VectorDistance, compute_distance};
+use crate::math::distance::{compute_distance, VectorDistance};
 use crate::serde::collection_meta::DistanceMetric;
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
-use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
+use crate::serde::vector_id::{VectorId, LEAF_LEVEL, ROOT_LEVEL, ROOT_VECTOR_ID};
 use crate::storage::VectorDbStorageReadExt;
 use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::tree::posting_list::{IntoTreePostingList, Posting, PostingList};
@@ -15,11 +15,7 @@ use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::{debug, info};
-
-// TODO: move to vector id module
-pub(crate) const ROOT_LEVEL: u8 = 0xFF;
-pub(crate) const LEAF_LEVEL: u8 = 1;
+use tracing::{debug};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TreeDepth {

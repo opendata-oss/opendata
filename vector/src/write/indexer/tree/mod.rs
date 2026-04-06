@@ -1,9 +1,9 @@
 use crate::DistanceMetric;
 use crate::Result;
-use crate::serde::vector_id::VectorId;
+use crate::serde::vector_id::{VectorId, LEAF_LEVEL};
 use crate::write::delta::VectorWrite;
 use crate::write::indexer::tree::centroids::{
-    AllCentroidsCache, CentroidCache, LEAF_LEVEL, TreeDepth, TreeLevel,
+    AllCentroidsCache, CentroidCache, TreeDepth, TreeLevel,
 };
 use crate::write::indexer::tree::merge::MergeCentroids;
 use crate::write::indexer::tree::root::SplitRoot;

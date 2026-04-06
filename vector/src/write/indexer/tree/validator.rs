@@ -6,11 +6,11 @@ use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::centroids::CentroidsValue;
 use crate::serde::key::{CentroidInfoKey, CentroidStatsKey, CentroidsKey, PostingListKey};
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
-use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
+use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId, LEAF_LEVEL};
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
 use crate::write::indexer::tree::centroids::{
-    AllCentroidsCacheWriter, CentroidCache, LEAF_LEVEL, TreeDepth, TreeLevel,
+    AllCentroidsCacheWriter, CentroidCache, TreeDepth, TreeLevel,
 };
 use crate::write::indexer::tree::posting_list::{IntoTreePostingList, Posting, PostingList};
 use crate::write::indexer::tree::state::VectorIndexState;

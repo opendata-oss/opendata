@@ -27,7 +27,7 @@ use crate::serde::key::{
     SeqBlockKey,
 };
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
-use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
+use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId, LEAF_LEVEL};
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
 use crate::write::delta::{VectorDbWrite, VectorDbWriteDelta, VectorWrite};
@@ -35,7 +35,7 @@ use crate::write::flusher::VectorDbFlusher;
 use crate::write::indexer::tree::Indexer;
 use crate::write::indexer::tree::IndexerOpts;
 use crate::write::indexer::tree::centroids::{
-    AllCentroidsCache, AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LEAF_LEVEL,
+    AllCentroidsCache, AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache,
     LeveledCentroidIndex, StoredCentroidReader, TreeDepth,
 };
 use crate::write::indexer::tree::posting_list::{IntoTreePostingList, PostingList};

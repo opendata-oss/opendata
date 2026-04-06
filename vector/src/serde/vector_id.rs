@@ -9,6 +9,8 @@ pub(crate) const ROOT_ID_NUM: u64 = 0;
 pub(crate) const ROOT_VECTOR_ID: VectorId = VectorId {
     id: 0xFF00_0000_0000_0000,
 };
+pub(crate) const ROOT_LEVEL: u8 = 0xFF;
+pub(crate) const LEAF_LEVEL: u8 = 1;
 
 // TODO: have a separate NodeId, CentroidId, and VectorId
 //   have Into fns for each. Conversion to CentroidId and VectorId validates the levels
