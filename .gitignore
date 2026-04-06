@@ -30,3 +30,7 @@ target
 
 # Vector test datasets
 vector/tests/data/sift100k/*vecs
+
+# misc AI tooling 
+.claude/
+.tuicrignore

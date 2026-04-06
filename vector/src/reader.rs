@@ -9,7 +9,7 @@ use crate::Vector;
 use crate::db::VectorDbRead;
 use crate::error::{Error, Result};
 use crate::hnsw::{CentroidGraph, build_centroid_graph};
-use crate::model::{Query, ReaderConfig, SearchResult};
+use crate::model::{Query, ReaderConfig, SearchOptions, SearchResult};
 use crate::query_engine::{QueryEngine, QueryEngineOptions};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::storage::VectorDbStorageReadExt;
@@ -92,12 +92,12 @@ impl VectorDbReader {
 
 #[async_trait]
 impl VectorDbRead for VectorDbReader {
-    async fn search(&self, query: &Query) -> Result<Vec<SearchResult>> {
-        self.query_engine.search(query).await
-    }
-
-    async fn search_with_nprobe(&self, query: &Query, nprobe: usize) -> Result<Vec<SearchResult>> {
-        self.query_engine.search_with_nprobe(query, nprobe).await
+    async fn search_with_options(
+        &self,
+        query: &Query,
+        options: SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
+        self.query_engine.search_with_options(query, options).await
     }
 
     async fn get(&self, id: &str) -> Result<Option<Vector>> {

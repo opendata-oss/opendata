@@ -1,6 +1,6 @@
 [package]
 name = "opendata-timeseries"
-version = "0.1.10"
+version = "0.1.12"
 edition.workspace = true
 description = "Prometheus-compatible time series database built on SlateDB"
 license = "MIT"
@@ -27,10 +27,11 @@ http-server = [
     "dep:tower-http",
     "dep:clap",
     "dep:prometheus-client",
+    "dep:metrics-exporter-prometheus",
 ]
 testing = []
 remote-write = ["http-server", "dep:prost", "dep:snap"]
-otel = ["dep:opentelemetry-proto", "dep:prost"]
+otel = ["dep:opentelemetry-proto", "dep:prost", "dep:ingest"]
 bench-internals = []
 
 [dependencies]
@@ -53,6 +54,7 @@ serde_yaml.workspace = true
 slatedb.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tower = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
 tracing.workspace = true
@@ -60,6 +62,8 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 blake3 = "1.8.2"
+metrics.workspace = true
+metrics-exporter-prometheus = { workspace = true, optional = true }
 mime_guess = "2"
 prometheus-client = { version = "0.22", optional = true }
 promql-parser = "0.8"
@@ -71,6 +75,7 @@ rust-embed = { version = "8", features = ["mime-guess"] }
 tsz = "0.1"
 
 # Optional dependencies for remote-write and otel features
+ingest = { workspace = true, optional = true }
 opentelemetry-proto = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
@@ -112,3 +117,8 @@ required-features = ["otel"]
 [[example]]
 name = "query_bench"
 required-features = ["http-server"]
+
+[[example]]
+name = "ingest_produce"
+required-features = ["otel"]
+doc = false

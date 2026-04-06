@@ -12,20 +12,20 @@
 //! - Flusher applies ops atomically to storage
 
 use crate::VectorDbReader;
-use crate::batched::delta::VectorDbWriteDelta;
-use crate::batched::flusher::VectorDbFlusher;
-use crate::batched::indexer::{Indexer, IndexerOpts};
-use crate::delta::{VectorDbWrite, VectorWrite};
 use crate::error::{Error, Result};
 use crate::hnsw::{CentroidGraph, build_centroid_graph};
 use crate::model::{
-    AttributeValue, Config, Query, SearchResult, VECTOR_FIELD_NAME, Vector, attributes_to_map,
+    AttributeValue, Config, Query, SearchOptions, SearchResult, VECTOR_FIELD_NAME, Vector,
+    attributes_to_map,
 };
 use crate::query_engine::{QueryEngine, QueryEngineOptions};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::key::SeqBlockKey;
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
+use crate::write::delta::{VectorDbWrite, VectorDbWriteDelta, VectorWrite};
+use crate::write::flusher::VectorDbFlusher;
+use crate::write::indexer::{Indexer, IndexerOpts};
 use async_trait::async_trait;
 use common::SequenceAllocator;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};
@@ -40,6 +40,13 @@ pub(crate) const WRITE_CHANNEL: &str = "write";
 /// Trait for querying the vector db
 #[async_trait]
 pub trait VectorDbRead {
+    /// Convenience method that calls [`search_with_options`](Self::search_with_options)
+    /// with default options.
+    async fn search(&self, query: &Query) -> Result<Vec<SearchResult>> {
+        self.search_with_options(query, SearchOptions::default())
+            .await
+    }
+
     /// Search for k-nearest neighbors to a query vector.
     ///
     /// This implements the SPANN-style query algorithm:
@@ -50,6 +57,7 @@ pub trait VectorDbRead {
     ///
     /// # Arguments
     /// * `query` - search query
+    /// * `options` - search options
     ///
     /// # Returns
     /// Vector of SearchResults sorted by similarity (best first)
@@ -58,9 +66,11 @@ pub trait VectorDbRead {
     /// Returns an error if:
     /// - Query dimensions don't match collection dimensions
     /// - Storage read fails
-    async fn search(&self, query: &Query) -> Result<Vec<SearchResult>>;
-
-    async fn search_with_nprobe(&self, query: &Query, nprobe: usize) -> Result<Vec<SearchResult>>;
+    async fn search_with_options(
+        &self,
+        query: &Query,
+        options: SearchOptions,
+    ) -> Result<Vec<SearchResult>>;
 
     /// Retrieve a vector record by its external ID.
     ///
@@ -509,6 +519,10 @@ impl VectorDb {
             )));
         }
 
+        // Normalize vector if metric requires it.
+        let mut values = values;
+        self.config.distance_metric.normalize_if_needed(&mut values);
+
         // Validate attributes against schema (if schema is defined)
         if !self.config.metadata_fields.is_empty() {
             self.validate_attributes(&attributes)?;
@@ -648,12 +662,14 @@ impl VectorDb {
 
 #[async_trait]
 impl VectorDbRead for VectorDb {
-    async fn search(&self, query: &Query) -> Result<Vec<SearchResult>> {
-        self.query_engine().search(query).await
-    }
-
-    async fn search_with_nprobe(&self, query: &Query, nprobe: usize) -> Result<Vec<SearchResult>> {
-        self.query_engine().search_with_nprobe(query, nprobe).await
+    async fn search_with_options(
+        &self,
+        query: &Query,
+        options: SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
+        self.query_engine()
+            .search_with_options(query, options)
+            .await
     }
 
     async fn get(&self, id: &str) -> Result<Option<Vector>> {
@@ -674,10 +690,14 @@ mod tests {
     use std::time::Duration;
 
     fn create_test_config() -> Config {
+        create_test_config_with_metric(DistanceMetric::L2)
+    }
+
+    fn create_test_config_with_metric(metric: DistanceMetric) -> Config {
         Config {
             storage: StorageConfig::InMemory,
             dimensions: 3,
-            distance_metric: DistanceMetric::L2,
+            distance_metric: metric,
             flush_interval: Duration::from_secs(60),
             split_threshold_vectors: 10_000,
             merge_threshold_vectors: 200,
@@ -966,6 +986,198 @@ mod tests {
                 e
             ),
             Ok(_) => panic!("expected error when no centroids provided"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_normalize_vector_on_prepare_write_for_cosine() {
+        // given
+        let config = create_test_config_with_metric(DistanceMetric::Cosine);
+        let db = VectorDb::open(config).await.unwrap();
+        let vector = Vector::new("vec", vec![3.0, 4.0, 0.0]);
+
+        // when
+        let result = db.prepare_vector_write(vector).unwrap();
+
+        // then - vector should be L2-normalized (3/5, 4/5, 0)
+        let norm: f32 = result.values.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-6,
+            "expected unit vector, got norm {}",
+            norm
+        );
+        assert!((result.values[0] - 0.6).abs() < 1e-6);
+        assert!((result.values[1] - 0.8).abs() < 1e-6);
+        assert!((result.values[2] - 0.0).abs() < 1e-6);
+
+        // attributes should retain the original unnormalized vector
+        let attr_vec = result
+            .attributes
+            .iter()
+            .find(|(k, _)| k == VECTOR_FIELD_NAME)
+            .map(|(_, v)| v);
+        match attr_vec {
+            Some(AttributeValue::Vector(v)) => {
+                assert_eq!(*v, vec![3.0, 4.0, 0.0]);
+            }
+            other => panic!("expected Vector attribute, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_keep_zero_vector_unchanged_for_cosine() {
+        // given
+        let config = create_test_config_with_metric(DistanceMetric::Cosine);
+        let db = VectorDb::open(config).await.unwrap();
+        let vector = Vector::new("vec-zero", vec![0.0, 0.0, 0.0]);
+
+        // when
+        let result = db.prepare_vector_write(vector).unwrap();
+
+        // then - zero vector stays zero (no division by zero)
+        assert_eq!(result.values, vec![0.0, 0.0, 0.0]);
+
+        // attributes should retain the original vector
+        let attr_vec = result
+            .attributes
+            .iter()
+            .find(|(k, _)| k == VECTOR_FIELD_NAME)
+            .map(|(_, v)| v);
+        match attr_vec {
+            Some(AttributeValue::Vector(v)) => {
+                assert_eq!(*v, vec![0.0, 0.0, 0.0]);
+            }
+            other => panic!("expected Vector attribute, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_preserve_already_normalized_vector_for_cosine() {
+        // given
+        let config = create_test_config_with_metric(DistanceMetric::Cosine);
+        let db = VectorDb::open(config).await.unwrap();
+        let v = vec![
+            1.0 / 3.0_f32.sqrt(),
+            1.0 / 3.0_f32.sqrt(),
+            1.0 / 3.0_f32.sqrt(),
+        ];
+        let vector = Vector::new("vec-unit", v.clone());
+
+        // when
+        let result = db.prepare_vector_write(vector).unwrap();
+
+        // then - already-normalized vector should be essentially unchanged
+        for (actual, expected) in result.values.iter().zip(v.iter()) {
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "expected {}, got {}",
+                expected,
+                actual
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn should_reject_wrong_dimensions_for_cosine() {
+        // given
+        let config = create_test_config_with_metric(DistanceMetric::Cosine);
+        let db = VectorDb::open(config).await.unwrap();
+        let vector = Vector::new("vec-bad", vec![1.0, 2.0]); // 2 dims instead of 3
+
+        // when
+        let result = db.prepare_vector_write(vector);
+
+        // then
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("dimension mismatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn should_return_normalized_values_with_correct_id_for_cosine() {
+        // given
+        let config = create_test_config_with_metric(DistanceMetric::Cosine);
+        let db = VectorDb::open(config).await.unwrap();
+        let vector = Vector::new("my-id", vec![0.0, 5.0, 0.0]);
+
+        // when
+        let result = db.prepare_vector_write(vector).unwrap();
+
+        // then
+        assert_eq!(result.external_id, "my-id");
+        assert!((result.values[0] - 0.0).abs() < 1e-6);
+        assert!((result.values[1] - 1.0).abs() < 1e-6);
+        assert!((result.values[2] - 0.0).abs() < 1e-6);
+
+        // attributes should retain the original unnormalized vector
+        let attr_vec = result
+            .attributes
+            .iter()
+            .find(|(k, _)| k == VECTOR_FIELD_NAME)
+            .map(|(_, v)| v);
+        match attr_vec {
+            Some(AttributeValue::Vector(v)) => {
+                assert_eq!(*v, vec![0.0, 5.0, 0.0]);
+            }
+            other => panic!("expected Vector attribute, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_not_normalize_vector_on_prepare_write_for_l2() {
+        // given
+        let config = create_test_config(); // L2 metric
+        let db = VectorDb::open(config).await.unwrap();
+        let vector = Vector::new("vec-l2", vec![3.0, 4.0, 0.0]);
+
+        // when
+        let result = db.prepare_vector_write(vector).unwrap();
+
+        // then - values should be unchanged
+        assert_eq!(result.values, vec![3.0, 4.0, 0.0]);
+
+        // attributes should also be unchanged
+        let attr_vec = result
+            .attributes
+            .iter()
+            .find(|(k, _)| k == VECTOR_FIELD_NAME)
+            .map(|(_, v)| v);
+        match attr_vec {
+            Some(AttributeValue::Vector(v)) => {
+                assert_eq!(*v, vec![3.0, 4.0, 0.0]);
+            }
+            other => panic!("expected Vector attribute, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_not_normalize_vector_on_prepare_write_for_dot_product() {
+        // given
+        let config = create_test_config_with_metric(DistanceMetric::DotProduct);
+        let db = VectorDb::open(config).await.unwrap();
+        let vector = Vector::new("vec-dot", vec![3.0, 4.0, 0.0]);
+
+        // when
+        let result = db.prepare_vector_write(vector).unwrap();
+
+        // then - values should be unchanged
+        assert_eq!(result.values, vec![3.0, 4.0, 0.0]);
+
+        // attributes should also be unchanged
+        let attr_vec = result
+            .attributes
+            .iter()
+            .find(|(k, _)| k == VECTOR_FIELD_NAME)
+            .map(|(_, v)| v);
+        match attr_vec {
+            Some(AttributeValue::Vector(v)) => {
+                assert_eq!(*v, vec![3.0, 4.0, 0.0]);
+            }
+            other => panic!("expected Vector attribute, got {:?}", other),
         }
     }
 }

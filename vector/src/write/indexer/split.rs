@@ -1,13 +1,12 @@
-use crate::batched::indexer::IndexerOpts;
-use crate::batched::indexer::drivers::AsyncBatchDriver;
-use crate::batched::indexer::state::{
-    DirtyCentroidGraph, VectorIndexDelta, VectorIndexState, VectorIndexView,
-};
-use crate::lire::commands::SplitPostings;
-use crate::lire::{heuristics, kmeans};
+use crate::math::{distance, heuristics, kmeans};
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::posting_list::{Posting, PostingList};
-use crate::{DistanceMetric, Result, distance};
+use crate::write::indexer::IndexerOpts;
+use crate::write::indexer::drivers::AsyncBatchDriver;
+use crate::write::indexer::state::{
+    DirtyCentroidGraph, VectorIndexDelta, VectorIndexState, VectorIndexView,
+};
+use crate::{DistanceMetric, Result};
 use common::StorageRead;
 use futures::future::BoxFuture;
 use rayon::iter::IntoParallelIterator;
@@ -25,11 +24,35 @@ pub(crate) struct ReassignVector {
     pub(crate) current_centroid: u64,
 }
 
+pub(crate) struct SplitPostings {
+    centroid_vec: Vec<f32>,
+    postings: PostingList,
+}
+
+impl SplitPostings {
+    pub(crate) fn new(centroid_vec: Vec<f32>, postings: PostingList) -> Self {
+        Self {
+            centroid_vec,
+            postings,
+        }
+    }
+
+    pub(crate) fn centroid_vec(&self) -> &[f32] {
+        &self.centroid_vec
+    }
+
+    pub(crate) fn postings(self) -> PostingList {
+        self.postings
+    }
+}
+
 struct SplitResult {
     c: u64,
     c_0: SplitPostings,
     c_1: SplitPostings,
     reassign_vectors: Vec<ReassignVector>,
+    candidates_evaluated: usize,
+    candidates_returned: usize,
 }
 
 #[derive(Debug)]
@@ -44,6 +67,8 @@ pub(crate) struct SplitSummary {
 pub(crate) struct SplitCentroidsResult {
     pub(crate) splits: Vec<SplitSummary>,
     pub(crate) reassignments: Vec<ReassignVector>,
+    pub(crate) candidates_evaluated: usize,
+    pub(crate) candidates_returned: usize,
 }
 
 pub(crate) struct SplitCentroids {
@@ -91,6 +116,8 @@ impl SplitCentroids {
             return Ok(SplitCentroidsResult {
                 splits: vec![],
                 reassignments: Vec::new(),
+                candidates_evaluated: 0,
+                candidates_returned: 0,
             });
         }
 
@@ -146,9 +173,13 @@ impl SplitCentroids {
         .expect("unexpected join error");
 
         // update delta
+        let mut total_candidates_evaluated = 0usize;
+        let mut total_candidates_returned = 0usize;
         let mut reassignments = HashMap::new();
         let mut splits = Vec::with_capacity(results.len());
         for result in results {
+            total_candidates_evaluated += result.candidates_evaluated;
+            total_candidates_returned += result.candidates_returned;
             // track reassignments
             reassignments.extend(
                 result
@@ -181,6 +212,8 @@ impl SplitCentroids {
         Ok(SplitCentroidsResult {
             splits,
             reassignments,
+            candidates_evaluated: total_candidates_evaluated,
+            candidates_returned: total_candidates_returned,
         })
     }
 }
@@ -230,6 +263,16 @@ impl SplitCentroid {
         }
 
         // Compute reassignments
+        // Count all candidates evaluated before heuristic filtering
+        let split_candidates = c_postings.len();
+        let neighbour_candidates: usize = self
+            .neighbours
+            .iter()
+            .filter_map(|n| postings.get(n))
+            .map(|p| p.len())
+            .sum();
+        let candidates_evaluated = split_candidates + neighbour_candidates;
+
         let mut reassignments = Vec::with_capacity(c0_postings.len() + c1_postings.len());
         let c_vector = self
             .centroid_graph
@@ -249,11 +292,14 @@ impl SplitCentroid {
             postings.as_ref(),
         ));
 
+        let candidates_returned = reassignments.len();
         SplitResult {
             c: self.c,
             c_0: SplitPostings::new(c0_vector, c0_postings),
             c_1: SplitPostings::new(c1_vector, c1_postings),
             reassign_vectors: reassignments,
+            candidates_evaluated,
+            candidates_returned,
         }
     }
 
@@ -334,10 +380,10 @@ impl SplitCentroid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batched::indexer::IndexerOpts;
-    use crate::batched::indexer::test_utils::IndexerOpTestHarness;
     use crate::serde::centroid_chunk::CentroidEntry;
     use crate::storage::VectorDbStorageReadExt;
+    use crate::write::indexer::IndexerOpts;
+    use crate::write::indexer::test_utils::IndexerOpTestHarness;
     use common::StorageRead;
 
     const DIMS: usize = 2;

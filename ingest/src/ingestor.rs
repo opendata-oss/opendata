@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use common::clock::Clock;
@@ -10,7 +10,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::IngestorConfig;
 use crate::error::{Error, Result};
-use crate::model::encode_batch;
+use crate::metric_names;
+use crate::model::{CompressionType, encode_batch};
 use crate::queue::{Metadata, QueueProducer};
 use crate::util::millis;
 
@@ -151,6 +152,7 @@ struct BatchWriterTask {
     data_path_prefix: String,
     flush_interval: Duration,
     flush_size_bytes: usize,
+    batch_compression: CompressionType,
     batch: Batch,
     clock: Arc<dyn Clock>,
 }
@@ -162,6 +164,7 @@ impl BatchWriterTask {
         data_path_prefix: String,
         flush_interval: Duration,
         flush_size_bytes: usize,
+        batch_compression: CompressionType,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
@@ -170,6 +173,7 @@ impl BatchWriterTask {
             data_path_prefix,
             flush_interval,
             flush_size_bytes,
+            batch_compression,
             batch: Batch::new(),
             clock,
         }
@@ -228,7 +232,13 @@ impl BatchWriterTask {
     }
 
     async fn write_and_enqueue(&self, entries: Vec<Bytes>, metadata: Vec<Metadata>) -> Result<()> {
-        let payload = encode_batch(&entries);
+        let start = Instant::now();
+        let raw_bytes: u64 = entries.iter().map(|e| e.len() as u64).sum();
+        let entry_count = entries.len() as u64;
+
+        let payload = encode_batch(&entries, self.batch_compression)?;
+        let written_bytes = payload.len() as u64;
+
         let id = ulid::Ulid::new();
         let path = Path::from(format!("{}/{}.batch", self.data_path_prefix, id));
         self.object_store
@@ -237,6 +247,13 @@ impl BatchWriterTask {
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         self.producer.enqueue(path.to_string(), metadata).await?;
+
+        metrics::counter!(metric_names::BATCHES_FLUSHED).increment(1);
+        metrics::counter!(metric_names::ENTRIES_FLUSHED).increment(entry_count);
+        metrics::counter!(metric_names::BYTES_FLUSHED).increment(raw_bytes);
+        metrics::counter!(metric_names::BYTES_WRITTEN).increment(written_bytes);
+        metrics::histogram!(metric_names::FLUSH_DURATION_SECONDS)
+            .record(start.elapsed().as_secs_f64());
 
         Ok(())
     }
@@ -252,24 +269,21 @@ struct BatchWriter {
 impl BatchWriter {
     fn new(
         object_store: Arc<dyn ObjectStore>,
-        queue_manifest_path: String,
-        data_path_prefix: String,
-        flush_interval: Duration,
-        flush_size_bytes: usize,
-        max_buffered_inputs: usize,
+        config: &IngestorConfig,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        let (sender, receiver) = mpsc::channel(max_buffered_inputs);
+        let (sender, receiver) = mpsc::channel(config.max_buffered_inputs);
         let producer = Arc::new(QueueProducer::with_object_store(
-            queue_manifest_path,
+            config.manifest_path.clone(),
             object_store.clone(),
         ));
         let mut task = BatchWriterTask::new(
             object_store,
             producer.clone(),
-            data_path_prefix,
-            flush_interval,
-            flush_size_bytes,
+            config.data_path_prefix.clone(),
+            config.flush_interval,
+            config.flush_size_bytes,
+            config.batch_compression,
             clock,
         );
         let shutdown = CancellationToken::new();
@@ -334,29 +348,22 @@ pub struct Ingestor {
 impl Ingestor {
     /// Create a new ingestor from the given configuration and clock.
     pub fn new(config: IngestorConfig, clock: Arc<dyn Clock>) -> Result<Self> {
-        let object_store_config = match &config.storage {
-            common::StorageConfig::InMemory => common::storage::config::ObjectStoreConfig::InMemory,
-            common::StorageConfig::SlateDb(c) => c.object_store.clone(),
-        };
-        let object_store = common::storage::factory::create_object_store(&object_store_config)
+        let object_store = common::storage::factory::create_object_store(&config.object_store)
             .map_err(|e| Error::Storage(e.to_string()))?;
         Self::with_object_store(config, object_store, clock)
     }
 
-    fn with_object_store(
+    /// Create a new ingestor using a pre-built object store.
+    ///
+    /// This is useful when you need to share an object store instance
+    /// between an `Ingestor` and a [`Collector`](crate::Collector) (e.g. in tests).
+    pub fn with_object_store(
         config: IngestorConfig,
         object_store: Arc<dyn ObjectStore>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
-        let writer = BatchWriter::new(
-            object_store,
-            config.manifest_path,
-            config.data_path_prefix,
-            config.flush_interval,
-            config.flush_size_bytes,
-            config.max_buffered_inputs,
-            clock.clone(),
-        );
+        metric_names::describe_ingestor_metrics();
+        let writer = BatchWriter::new(object_store, &config, clock.clone());
         Ok(Self { writer, clock })
     }
 
@@ -410,7 +417,7 @@ mod tests {
     use crate::model::decode_batch;
     use crate::queue::{Manifest, QueueEntry};
     use bytes::Bytes;
-    use common::StorageConfig;
+    use common::ObjectStoreConfig;
     use common::clock::{MockClock, SystemClock};
     use slatedb::object_store::ObjectStore;
     use slatedb::object_store::memory::InMemory;
@@ -425,12 +432,13 @@ mod tests {
 
     fn test_config() -> IngestorConfig {
         IngestorConfig {
-            storage: StorageConfig::InMemory,
+            object_store: ObjectStoreConfig::InMemory,
             data_path_prefix: "test-ingest".to_string(),
             manifest_path: "test/manifest".to_string(),
             flush_interval: Duration::from_hours(24),
             flush_size_bytes: 64 * 1024 * 1024,
             max_buffered_inputs: 1000,
+            batch_compression: CompressionType::None,
         }
     }
 

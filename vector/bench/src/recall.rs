@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 use bencher::{Bench, Benchmark, Params, Summary};
 use common::StorageBuilder;
 use common::storage::factory::{FoyerCache, FoyerCacheOptions};
-use vector::{Config, DistanceMetric, Query, SearchResult, Vector, VectorDb, VectorDbRead};
+use vector::{
+    Config, DistanceMetric, Query, SearchOptions, SearchResult, Vector, VectorDb, VectorDbRead,
+};
 
 const DEFAULT_NUM_QUERIES: usize = 100;
 
@@ -120,14 +122,6 @@ fn read_bvecs(path: &Path, limit: Option<usize>) -> Vec<Vec<f32>> {
     vectors
 }
 
-/// L2-normalize a vector in place.
-fn normalize_vec(v: &mut [f32]) {
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        v.iter_mut().for_each(|x| *x /= norm);
-    }
-}
-
 // -- Recall / percentile helpers ----------------------------------------------
 
 fn recall_at_k(results: &[SearchResult], ground_truth: &[i32], k: usize) -> f64 {
@@ -188,16 +182,13 @@ struct Dataset {
     format: VecFormat,
     /// Maximum number of base vectors to ingest. `None` = all.
     max_vectors: Option<usize>,
-    /// Whether to L2-normalize vectors before ingestion and query.
-    /// Used for datasets that originally use cosine similarity.
-    normalize: bool,
 }
 
 impl Dataset {
-    /// Load base vectors, respecting `format`, `max_vectors`, and `normalize`.
+    /// Load base vectors, respecting `format` and `max_vectors`.
     fn load_base_vectors(&self, data_dir: &Path) -> Vec<Vec<f32>> {
         let path = data_dir.join(self.base_file);
-        let mut vecs = match self.format {
+        match self.format {
             VecFormat::Fvecs => {
                 let vecs = read_fvecs(&path);
                 match self.max_vectors {
@@ -206,37 +197,26 @@ impl Dataset {
                 }
             }
             VecFormat::Bvecs => read_bvecs(&path, self.max_vectors),
-        };
-        if self.normalize {
-            for v in &mut vecs {
-                normalize_vec(v);
-            }
         }
-        vecs
     }
 
-    /// Load query vectors, respecting `format` and `normalize`.
+    /// Load query vectors, respecting `format`.
     fn load_query_vectors(&self, data_dir: &Path) -> Vec<Vec<f32>> {
         let path = data_dir.join(self.query_file);
-        let mut vecs = match self.format {
+        match self.format {
             VecFormat::Fvecs => read_fvecs(&path)
                 .into_iter()
                 .take(self.num_queries)
                 .collect(),
             VecFormat::Bvecs => read_bvecs(&path, Some(self.num_queries)),
-        };
-        if self.normalize {
-            for v in &mut vecs {
-                normalize_vec(v);
-            }
         }
-        vecs
     }
 }
 
 fn distance_metric_to_str(m: DistanceMetric) -> &'static str {
     match m {
         DistanceMetric::L2 => "l2",
+        DistanceMetric::Cosine => "cosine",
         DistanceMetric::DotProduct => "dot_product",
     }
 }
@@ -244,6 +224,7 @@ fn distance_metric_to_str(m: DistanceMetric) -> &'static str {
 fn str_to_distance_metric(s: &str) -> DistanceMetric {
     match s {
         "l2" => DistanceMetric::L2,
+        "cosine" => DistanceMetric::Cosine,
         "dot_product" => DistanceMetric::DotProduct,
         _ => panic!("unknown distance metric: {}", s),
     }
@@ -344,7 +325,6 @@ impl From<Params> for Dataset {
                 .get("vector_config")
                 .map(|s| s.to_string())
                 .or_else(|| default.vector_config.clone()),
-            normalize: default.normalize,
         }
     }
 }
@@ -366,13 +346,12 @@ const SIFT1M: Dataset = Dataset {
     vector_config: None,
     format: VecFormat::Fvecs,
     max_vectors: None,
-    normalize: false,
 };
 
 const COHERE1M: Dataset = Dataset {
     name: "cohere1m",
     dimensions: 768,
-    distance_metric: DistanceMetric::L2,
+    distance_metric: DistanceMetric::Cosine,
     base_file: "cohere/cohere_base.fvecs",
     query_file: "cohere/cohere_query.fvecs",
     ground_truth_file: "cohere/cohere_groundtruth.ivecs",
@@ -386,7 +365,6 @@ const COHERE1M: Dataset = Dataset {
     vector_config: None,
     format: VecFormat::Fvecs,
     max_vectors: None,
-    normalize: true,
 };
 
 // BigANN / SIFT1B variants — all share the same base and query files but
@@ -409,7 +387,6 @@ const SIFT10M: Dataset = Dataset {
     vector_config: None,
     format: VecFormat::Bvecs,
     max_vectors: Some(10_000_000),
-    normalize: false,
 };
 
 const SIFT50M: Dataset = Dataset {
@@ -429,7 +406,6 @@ const SIFT50M: Dataset = Dataset {
     vector_config: None,
     format: VecFormat::Bvecs,
     max_vectors: Some(50_000_000),
-    normalize: false,
 };
 
 const SIFT100M: Dataset = Dataset {
@@ -449,7 +425,6 @@ const SIFT100M: Dataset = Dataset {
     vector_config: None,
     format: VecFormat::Bvecs,
     max_vectors: Some(100_000_000),
-    normalize: false,
 };
 
 const SIFT1B: Dataset = Dataset {
@@ -469,7 +444,6 @@ const SIFT1B: Dataset = Dataset {
     vector_config: None,
     format: VecFormat::Bvecs,
     max_vectors: None,
-    normalize: false,
 };
 
 const ALL_DATASETS: &[&Dataset] = &[&SIFT1M, &COHERE1M, &SIFT10M, &SIFT50M, &SIFT100M, &SIFT1B];
@@ -592,7 +566,14 @@ impl Benchmark for RecallBenchmark {
         for query in queries.iter() {
             let t = std::time::Instant::now();
             let q = Query::new(query.clone()).with_limit(k);
-            let _ = db.search_with_nprobe(&q, dataset.nprobe).await?;
+            let _ = db
+                .search_with_options(
+                    &q,
+                    SearchOptions {
+                        nprobe: Some(dataset.nprobe),
+                    },
+                )
+                .await?;
             let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
             query_latency.record(elapsed_us);
             cold_latencies_us.push(elapsed_us);
@@ -610,7 +591,14 @@ impl Benchmark for RecallBenchmark {
         for (i, query) in queries.iter().enumerate() {
             let t = std::time::Instant::now();
             let q = Query::new(query.clone()).with_limit(k);
-            let results = db.search_with_nprobe(&q, dataset.nprobe).await?;
+            let results = db
+                .search_with_options(
+                    &q,
+                    SearchOptions {
+                        nprobe: Some(dataset.nprobe),
+                    },
+                )
+                .await?;
             let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
             query_latency.record(elapsed_us);
             latencies_us.push(elapsed_us);

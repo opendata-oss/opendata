@@ -606,12 +606,23 @@ pub struct QueryOptions {
     ///
     /// Defaults to 5 minutes (the Prometheus staleness delta).
     pub lookback_delta: Duration,
+
+    /// Maximum number of concurrent cache-miss metadata reads (inverted index
+    /// and forward index) during query pipeline execution. Cache hits are free
+    /// and do not consume a permit.
+    pub metadata_concurrency: usize,
+
+    /// Maximum number of concurrent cache-miss sample reads during query
+    /// pipeline execution. Cache hits are free and do not consume a permit.
+    pub sample_concurrency: usize,
 }
 
 impl Default for QueryOptions {
     fn default() -> Self {
         Self {
             lookback_delta: Duration::from_secs(5 * 60),
+            metadata_concurrency: 4,
+            sample_concurrency: 4,
         }
     }
 }

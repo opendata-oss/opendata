@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeBounds;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use common::Storage;
@@ -22,6 +22,7 @@ use crate::promql::evaluator::{CachedQueryReader, Evaluator, ExprResult, compute
 use crate::promql::selector::evaluate_selector_with_reader;
 use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::OpenTsdbStorageReadExt;
+use crate::tsdb_metrics;
 use crate::util::Result;
 
 /// Compute the disjoint preload ranges for bucket discovery.
@@ -59,10 +60,10 @@ async fn get_matching_series<R: QueryReader>(
 ) -> std::result::Result<HashSet<SeriesId>, String> {
     let mut all_series = HashSet::new();
 
-    let mut cached_reader = CachedQueryReader::new(reader);
+    let cached_reader = CachedQueryReader::new(reader);
     for selector_str in matches {
         let selector = parse_selector(selector_str)?;
-        let series = evaluate_selector_with_reader(&mut cached_reader, bucket, &selector)
+        let series = evaluate_selector_with_reader(&cached_reader, bucket, &selector)
             .await
             .map_err(|e| e.to_string())?;
         all_series.extend(series);
@@ -115,6 +116,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         time: Option<std::time::SystemTime>,
         opts: &QueryOptions,
     ) -> std::result::Result<QueryValue, QueryError> {
+        let start = Instant::now();
         let expr = promql_parser::parser::parse(query)
             .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
 
@@ -139,7 +141,14 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         let ranges = preload_ranges(&stmt, lookback_start_secs, query_time_secs);
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
-        evaluate_instant(&reader, stmt, query_time).await
+        let concurrency = crate::promql::pipeline::PipelineConcurrency::from(opts);
+        let result = evaluate_instant(&reader, stmt, query_time, concurrency).await;
+
+        metrics::counter!(tsdb_metrics::TSDB_QUERIES, "type" => "instant").increment(1);
+        metrics::histogram!(tsdb_metrics::TSDB_QUERY_DURATION_SECONDS, "type" => "instant")
+            .record(start.elapsed().as_secs_f64());
+
+        result
     }
 
     /// Evaluate a range PromQL query, returning typed `RangeSample`s.
@@ -151,6 +160,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         step: Duration,
         opts: &QueryOptions,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
+        let timer_start = Instant::now();
         let expr = promql_parser::parser::parse(query)
             .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
 
@@ -174,7 +184,14 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
         let reader = self.make_query_reader_for_ranges(&ranges).await?;
 
-        evaluate_range(&reader, stmt).await
+        let concurrency = crate::promql::pipeline::PipelineConcurrency::from(opts);
+        let result = evaluate_range(&reader, stmt, concurrency).await;
+
+        metrics::counter!(tsdb_metrics::TSDB_QUERIES, "type" => "range").increment(1);
+        metrics::histogram!(tsdb_metrics::TSDB_QUERY_DURATION_SECONDS, "type" => "range")
+            .record(timer_start.elapsed().as_secs_f64());
+
+        result
     }
 
     /// Discover series matching any of the given selectors.
@@ -263,8 +280,9 @@ pub(crate) async fn evaluate_instant(
     reader: &impl QueryReader,
     stmt: EvalStmt,
     query_time: std::time::SystemTime,
+    concurrency: crate::promql::pipeline::PipelineConcurrency,
 ) -> std::result::Result<QueryValue, QueryError> {
-    let mut evaluator = Evaluator::new(reader);
+    let mut evaluator = Evaluator::with_concurrency(reader, concurrency);
     let result = evaluator.evaluate(stmt).await?;
 
     match result {
@@ -305,6 +323,7 @@ pub(crate) async fn evaluate_instant(
 pub(crate) async fn evaluate_range(
     reader: &impl QueryReader,
     stmt: EvalStmt,
+    concurrency: crate::promql::pipeline::PipelineConcurrency,
 ) -> std::result::Result<Vec<RangeSample>, QueryError> {
     let start = stmt.start;
     let end = stmt.end;
@@ -318,7 +337,8 @@ pub(crate) async fn evaluate_range(
     }
 
     let mut series_map: HashMap<Labels, Vec<(i64, f64)>> = HashMap::new();
-    let mut evaluator = Evaluator::new(reader);
+    let mut evaluator = Evaluator::with_concurrency(reader, concurrency);
+    let rp_before = evaluator.read_path_stats();
     let mut current_time = start;
 
     while current_time <= end {
@@ -359,6 +379,30 @@ pub(crate) async fn evaluate_range(
 
         current_time += step;
     }
+
+    let stats = evaluator.stats();
+    let rp_delta = evaluator.read_path_stats().delta_since(&rp_before);
+    tracing::trace!(
+        step_count = stats.step_count,
+        bucket_list_reuses = stats.bucket_list_reuses,
+        bucket_list_init_attempts = stats.bucket_list_init_attempts,
+        selector_hits = stats.selector_hits,
+        selector_misses = stats.selector_misses,
+        series_meta_hits = stats.series_meta_hits,
+        series_meta_misses = stats.series_meta_misses,
+        sample_slice_ops = stats.sample_slice_ops,
+        sample_slice_binary_search_ops = stats.sample_slice_binary_search_ops,
+        label_map_materializations = stats.label_map_materializations,
+        forward_index_hits = rp_delta.forward_index_hits,
+        forward_index_misses = rp_delta.forward_index_misses,
+        inverted_index_hits = rp_delta.inverted_index_hits,
+        inverted_index_misses = rp_delta.inverted_index_misses,
+        sample_hits = rp_delta.sample_hits,
+        sample_misses = rp_delta.sample_misses,
+        metadata_permit_wait_ns = rp_delta.metadata_permit_wait_ns,
+        sample_permit_wait_ns = rp_delta.sample_permit_wait_ns,
+        "range query eval stats"
+    );
 
     Ok(series_map
         .into_iter()
@@ -647,6 +691,10 @@ impl Tsdb {
 
     /// Ingest series into the TSDB.
     /// Each series is split by time bucket based on sample timestamps.
+    ///
+    /// If `timeout` is provided, each bucket batch will wait up to the given
+    /// duration for space in the write queue. Otherwise, writes fail
+    /// immediately if the queue is full.
     #[tracing::instrument(
         level = "debug",
         skip_all,
@@ -656,7 +704,11 @@ impl Tsdb {
             buckets_touched = tracing::field::Empty
         )
     )]
-    pub(crate) async fn ingest_samples(&self, series_list: Vec<Series>) -> Result<()> {
+    pub(crate) async fn ingest_samples(
+        &self,
+        series_list: Vec<Series>,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
         let mut bucket_series_map: HashMap<TimeBucket, Vec<Series>> = HashMap::new();
         let mut total_samples = 0;
 
@@ -732,7 +784,7 @@ impl Tsdb {
                     return Err(err);
                 }
             };
-            mini.ingest_batch(&series_list).await?;
+            mini.ingest_batch(&series_list, timeout).await?;
 
             tracing::debug!(
                 bucket = ?bucket,
@@ -745,6 +797,8 @@ impl Tsdb {
         // Record final metrics on the main span
         tracing::Span::current().record("total_samples", total_samples);
         tracing::Span::current().record("buckets_touched", buckets_touched);
+
+        metrics::counter!(tsdb_metrics::TSDB_SAMPLES_INGESTED).increment(total_samples as u64);
 
         tracing::debug!(
             total_samples = total_samples,
@@ -796,6 +850,148 @@ impl TsdbReadEngine for Tsdb {
 
     async fn make_query_reader_for_ranges(&self, ranges: &[(i64, i64)]) -> Result<TsdbQueryReader> {
         self.query_reader_for_ranges(ranges).await
+    }
+}
+
+// ── TsdbEngine: unified read/write or read-only dispatch ────────────
+
+/// Wraps either a read-write [`Tsdb`] or a read-only [`crate::reader::TimeSeriesDbReader`],
+/// dispatching read methods to the inner engine and rejecting writes in
+/// read-only mode.
+pub(crate) enum TsdbEngine {
+    ReadWrite(Arc<Tsdb>),
+    ReadOnly(Arc<crate::reader::TimeSeriesDbReader>),
+}
+
+impl TsdbEngine {
+    /// Returns `true` when the engine is read-only.
+    pub(crate) fn is_read_only(&self) -> bool {
+        matches!(self, Self::ReadOnly(_))
+    }
+
+    /// Returns a clone of the inner `Arc<Tsdb>` if this is a read-write engine.
+    pub(crate) fn as_tsdb(&self) -> Option<Arc<Tsdb>> {
+        match self {
+            Self::ReadWrite(tsdb) => Some(tsdb.clone()),
+            Self::ReadOnly(_) => None,
+        }
+    }
+
+    // ── Read methods (dispatch to inner engine) ──
+
+    pub(crate) async fn eval_query(
+        &self,
+        query: &str,
+        time: Option<SystemTime>,
+        opts: &QueryOptions,
+    ) -> std::result::Result<QueryValue, QueryError> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.eval_query(query, time, opts).await,
+            Self::ReadOnly(reader) => reader.eval_query(query, time, opts).await,
+        }
+    }
+
+    pub(crate) async fn eval_query_range(
+        &self,
+        query: &str,
+        range: impl RangeBounds<SystemTime>,
+        step: Duration,
+        opts: &QueryOptions,
+    ) -> std::result::Result<Vec<RangeSample>, QueryError> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.eval_query_range(query, range, step, opts).await,
+            Self::ReadOnly(reader) => {
+                eval_query_range_bounds(reader.as_ref(), query, range, step, opts).await
+            }
+        }
+    }
+
+    pub(crate) async fn find_series(
+        &self,
+        matchers: &[&str],
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<Labels>, QueryError> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.find_series(matchers, start_secs, end_secs).await,
+            Self::ReadOnly(reader) => reader.find_series(matchers, start_secs, end_secs).await,
+        }
+    }
+
+    pub(crate) async fn find_labels(
+        &self,
+        matchers: Option<&[&str]>,
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.find_labels(matchers, start_secs, end_secs).await,
+            Self::ReadOnly(reader) => reader.find_labels(matchers, start_secs, end_secs).await,
+        }
+    }
+
+    pub(crate) async fn find_label_values(
+        &self,
+        label_name: &str,
+        matchers: Option<&[&str]>,
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        match self {
+            Self::ReadWrite(tsdb) => {
+                tsdb.find_label_values(label_name, matchers, start_secs, end_secs)
+                    .await
+            }
+            Self::ReadOnly(reader) => {
+                reader
+                    .find_label_values(label_name, matchers, start_secs, end_secs)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn find_metadata(
+        &self,
+        metric: Option<&str>,
+    ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.find_metadata(metric).await,
+            Self::ReadOnly(_) => Ok(vec![]),
+        }
+    }
+
+    // ── Write methods (error in read-only mode) ──
+
+    pub(crate) async fn ingest_samples(
+        &self,
+        series_list: Vec<Series>,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.ingest_samples(series_list, timeout).await,
+            Self::ReadOnly(_) => Err(crate::error::Error::InvalidInput(
+                "write operations are not supported in read-only mode".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) async fn flush(&self) -> Result<()> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.flush().await,
+            Self::ReadOnly(_) => Ok(()),
+        }
+    }
+}
+
+impl From<Arc<Tsdb>> for TsdbEngine {
+    fn from(tsdb: Arc<Tsdb>) -> Self {
+        Self::ReadWrite(tsdb)
+    }
+}
+
+impl From<Arc<crate::reader::TimeSeriesDbReader>> for TsdbEngine {
+    fn from(reader: Arc<crate::reader::TimeSeriesDbReader>) -> Self {
+        Self::ReadOnly(reader)
     }
 }
 
@@ -864,13 +1060,14 @@ impl QueryReader for TsdbQueryReader {
         &self,
         bucket: &TimeBucket,
         series_id: SeriesId,
+        metric_name: &str,
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<Sample>> {
         let mini = self.mini_readers.get(bucket).ok_or_else(|| {
             crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
         })?;
-        mini.samples(series_id, start_ms, end_ms).await
+        mini.samples(series_id, metric_name, start_ms, end_ms).await
     }
 }
 
@@ -1300,7 +1497,7 @@ mod tests {
             create_sample("http_requests", vec![("env", "prod")], 4_000_000, 42.0),
             create_sample("http_requests", vec![("env", "staging")], 4_000_000, 10.0),
         ];
-        tsdb.ingest_samples(series).await.unwrap();
+        tsdb.ingest_samples(series, None).await.unwrap();
         tsdb.flush().await.unwrap();
         tsdb
     }
@@ -1350,6 +1547,7 @@ mod tests {
 
         let narrow = QueryOptions {
             lookback_delta: std::time::Duration::from_secs(10),
+            ..Default::default()
         };
         let results = tsdb
             .eval_query("http_requests", Some(query_time), &narrow)
@@ -1380,6 +1578,7 @@ mod tests {
 
         let narrow = QueryOptions {
             lookback_delta: std::time::Duration::from_secs(10),
+            ..Default::default()
         };
         let results = tsdb
             .eval_query_range("http_requests", start..=end, step, &narrow)
@@ -1533,7 +1732,9 @@ mod tests {
         // Same series in two different buckets
         let series1 = create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0);
         let series2 = create_sample("cpu", vec![("host", "a")], 7_500_000, 2.0);
-        tsdb.ingest_samples(vec![series1, series2]).await.unwrap();
+        tsdb.ingest_samples(vec![series1, series2], None)
+            .await
+            .unwrap();
         tsdb.flush().await.unwrap();
 
         let results = tsdb.find_series(&["cpu"], 0, i64::MAX).await.unwrap();
@@ -1615,7 +1816,7 @@ mod tests {
         let mut series = create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0);
         series.description = Some("CPU usage".to_string());
         series.unit = Some("percent".to_string());
-        tsdb.ingest_samples(vec![series]).await.unwrap();
+        tsdb.ingest_samples(vec![series], None).await.unwrap();
 
         let results = tsdb.find_metadata(None).await.unwrap();
 
@@ -1739,7 +1940,9 @@ mod tests {
         // Same series in two different buckets
         let series1 = create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0);
         let series2 = create_sample("cpu", vec![("host", "a")], 7_500_000, 2.0);
-        tsdb.ingest_samples(vec![series1, series2]).await.unwrap();
+        tsdb.ingest_samples(vec![series1, series2], None)
+            .await
+            .unwrap();
         tsdb.flush().await.unwrap();
 
         let results = tsdb.find_labels(None, 0, i64::MAX).await.unwrap();
@@ -1764,7 +1967,9 @@ mod tests {
         // Same series in two different buckets
         let series1 = create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0);
         let series2 = create_sample("cpu", vec![("host", "a")], 7_500_000, 2.0);
-        tsdb.ingest_samples(vec![series1, series2]).await.unwrap();
+        tsdb.ingest_samples(vec![series1, series2], None)
+            .await
+            .unwrap();
         tsdb.flush().await.unwrap();
 
         let results = tsdb
@@ -1783,10 +1988,13 @@ mod tests {
     async fn find_metadata_should_filter_by_metric(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
 
-        tsdb.ingest_samples(vec![
-            create_sample("cpu", vec![], 4_000_000, 1.0),
-            create_sample("mem", vec![], 4_000_000, 2.0),
-        ])
+        tsdb.ingest_samples(
+            vec![
+                create_sample("cpu", vec![], 4_000_000, 1.0),
+                create_sample("mem", vec![], 4_000_000, 2.0),
+            ],
+            None,
+        )
         .await
         .unwrap();
 
@@ -1802,7 +2010,7 @@ mod tests {
     async fn eval_query_range_rejects_zero_step(storage: Arc<dyn Storage>) {
         let tsdb = Tsdb::new(storage);
 
-        tsdb.ingest_samples(vec![create_sample("cpu", vec![], 1_000_000, 1.0)])
+        tsdb.ingest_samples(vec![create_sample("cpu", vec![], 1_000_000, 1.0)], None)
             .await
             .unwrap();
         tsdb.flush().await.unwrap();
@@ -1817,5 +2025,145 @@ mod tests {
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), QueryError::InvalidQuery(_)));
+    }
+
+    /// End-to-end test: Ingestor → IngestConsumer → Tsdb → query.
+    ///
+    /// Runs the real consumer poll loop (metadata validation, ack/flush) and
+    /// shuts it down gracefully via [`ConsumerHandle`].
+    #[cfg(all(feature = "otel", feature = "http-server"))]
+    #[tokio::test]
+    async fn should_ingest_via_consumer_and_query_back() {
+        use bytes::Bytes;
+        use opentelemetry_proto::tonic::{
+            collector::metrics::v1::ExportMetricsServiceRequest,
+            common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value},
+            metrics::v1::{
+                Gauge, Metric, NumberDataPoint, ScopeMetrics, metric, number_data_point,
+            },
+            resource::v1::Resource,
+        };
+        use prost::Message;
+
+        use slatedb::object_store::ObjectStore;
+        use slatedb::object_store::memory::InMemory;
+
+        // given — shared in-memory object store for ingestor and consumer
+        let obj_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let manifest = "ingest/manifest".to_string();
+
+        // Build an OTLP gauge: cpu_temperature{host="server1"} = 72.5 at t=3_900s
+        let ts_nanos = 3_900_000_000_000u64; // 3900s in nanos
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![opentelemetry_proto::tonic::metrics::v1::ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: Some(InstrumentationScope {
+                        name: "test".to_string(),
+                        version: "1.0".to_string(),
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                    }),
+                    metrics: vec![Metric {
+                        name: "cpu_temperature".to_string(),
+                        description: String::new(),
+                        unit: String::new(),
+                        metadata: vec![],
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                attributes: vec![KeyValue {
+                                    key: "host".to_string(),
+                                    value: Some(AnyValue {
+                                        value: Some(any_value::Value::StringValue(
+                                            "server1".to_string(),
+                                        )),
+                                    }),
+                                }],
+                                start_time_unix_nano: 0,
+                                time_unix_nano: ts_nanos,
+                                value: Some(number_data_point::Value::AsDouble(72.5)),
+                                exemplars: vec![],
+                                flags: 0,
+                            }],
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let proto_bytes = request.encode_to_vec();
+
+        // Metadata: version=1, signal_type=metrics(1), encoding=otlp_proto(1), reserved=0
+        let metadata = Bytes::from_static(&[1, 1, 1, 0]);
+
+        // Produce via Ingestor
+        let ingestor_config = ingest::IngestorConfig {
+            object_store: common::ObjectStoreConfig::InMemory,
+            data_path_prefix: "ingest".to_string(),
+            manifest_path: manifest.clone(),
+            flush_interval: Duration::from_millis(10),
+            flush_size_bytes: 64 * 1024 * 1024,
+            max_buffered_inputs: 1000,
+            batch_compression: ingest::CompressionType::None,
+        };
+        let ingestor = ingest::Ingestor::with_object_store(
+            ingestor_config,
+            obj_store.clone(),
+            Arc::new(common::clock::SystemClock),
+        )
+        .unwrap();
+        ingestor
+            .ingest(vec![Bytes::from(proto_bytes)], metadata)
+            .await
+            .unwrap();
+        ingestor.close().await.unwrap();
+
+        // Start the real IngestConsumer against the shared object store
+        let tsdb = Arc::new(Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(
+            Arc::new(OpenTsdbMergeOperator),
+        ))));
+        let converter = Arc::new(crate::otel::OtelConverter::new(
+            crate::otel::OtelConfig::default(),
+        ));
+        let consumer_config = crate::promql::config::IngestConsumerConfig {
+            object_store: common::ObjectStoreConfig::InMemory,
+            manifest_path: manifest,
+            poll_interval: Duration::from_millis(10),
+        };
+        let consumer = Arc::new(crate::server::ingest_consumer::IngestConsumer::new(
+            tsdb.clone(),
+            converter,
+            consumer_config,
+        ));
+        let handle = consumer.run_with_object_store(obj_store).await.unwrap();
+
+        // Wait for the consumer to process the batch
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Graceful shutdown — flushes pending acks
+        handle.shutdown().await;
+
+        tsdb.flush().await.unwrap();
+
+        // when — query back
+        let query_time = UNIX_EPOCH + Duration::from_secs(3900);
+        let opts = QueryOptions::default();
+        let result = tsdb
+            .eval_query("cpu_temperature", Some(query_time), &opts)
+            .await
+            .unwrap();
+
+        // then
+        let samples = match result {
+            QueryValue::Vector(s) => s,
+            other => panic!("expected Vector, got {:?}", other),
+        };
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].value, 72.5);
+        assert_eq!(samples[0].labels.get("host"), Some("server1"));
     }
 }

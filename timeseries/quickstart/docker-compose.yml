@@ -8,7 +8,7 @@ services:
     ports:
       - "9090:9090"
     volumes:
-      - ./config/prometheus.yaml:/app/prometheus.yaml
+      - ./config/prometheus.yaml:/app/prometheus.yaml:z
       - timeseries-data:/app/data
     environment:
       - RUST_LOG=info
@@ -52,8 +52,8 @@ services:
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./config/grafana-provisioning:/etc/grafana/provisioning
-      - ./dashboards:/var/lib/grafana/dashboards
+      - ./config/grafana-provisioning:/etc/grafana/provisioning:z
+      - ./dashboards:/var/lib/grafana/dashboards:z
     depends_on:
       timeseries-server:
         condition: service_healthy

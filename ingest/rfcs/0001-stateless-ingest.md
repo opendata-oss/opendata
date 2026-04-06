@@ -220,6 +220,11 @@ pub struct IngestorConfig {
   ///
   /// Defaults to 1000.
   pub max_buffered_inputs: usize,
+
+  /// Compression algorithm applied to the record block in data batches.
+  ///
+  /// Defaults to `None` (uncompressed).
+  pub batch_compression: CompressionType,
 }
 ```
 The queue manifest takes the name specified in `manifest_path`.
@@ -259,26 +264,56 @@ Method `close()` flushes unflushed entries and terminates the ingestor.
 ### Data Batch Format
 
 A data batch is the unit of data that an ingestor flushes to object storage.
-Each batch is a compact binary file that contains a sequence of length-prefixed records followed by a fixed-size footer:
+Each batch is a compact binary file that contains an optionally compressed block of
+length-prefixed records followed by a fixed-size footer:
 
 ```ascii
-┌──────────────────────────────────┐
-│  record 0: [len: u32 LE][data]   │
-│  record 1: [len: u32 LE][data]   │
-│  ...                             │
-│  record N: [len: u32 LE][data]   │
-├──────────────────────────────────┤
-│  footer (6 bytes, fixed):        │
-│    record_count : u32 LE         │
-│    version      : u16 LE         │
-└──────────────────────────────────┘
+┌──────────────────────────────────────────┐
+│  compressed record block (variable):     │
+│    record 0: [len: u32 LE][data]         │
+│    record 1: [len: u32 LE][data]         │
+│    ...                                   │
+│    record N: [len: u32 LE][data]         │
+├──────────────────────────────────────────┤
+│  footer (7 bytes, fixed):                │
+│    compression_type : u8                 │
+│    record_count     : u32 LE             │
+│    version          : u16 LE  (= 1)     │
+└──────────────────────────────────────────┘
 ```
 
 Each record stores one opaque byte entry preceded by its length as a little-endian `u32`.
 Records are written in ingestion order.
-The footer is always the last 6 bytes of the file: a little-endian `u32` record count followed by a little-endian `u16` version.
+The footer is always the last 7 bytes of the file and is never compressed.
 The current version is `1`.
-The footer allows a reader to verify the record count and detect format changes.
+
+#### Compression
+
+The `compression_type` byte in the footer indicates how the record block is compressed:
+
+| Value  | Algorithm | Notes |
+|--------|-----------|-------|
+| `0x00` | None      | Record block is stored uncompressed |
+| `0x01` | ZSTD      | Record block is compressed with Zstandard at level 3 |
+| `0x02`–`0xFF` | Reserved | For future algorithms (e.g., LZ4, Snappy) |
+
+```rust
+#[repr(u8)]
+pub enum CompressionType {
+    None = 0,
+    Zstd = 1,
+}
+```
+
+When compression is enabled, the ingestor first serializes all records into a contiguous buffer
+of length-prefixed entries, then compresses that buffer as a single unit.
+The compressed bytes are written to the batch file followed by the uncompressed footer.
+
+On the read side, the collector reads the footer to determine the compression type,
+decompresses the record block if needed, and then parses the length-prefixed entries as usual.
+
+Compression is configured per-ingestor via the `batch_compression` field in `IngestorConfig`
+(see below). The default is `None` (uncompressed).
 
 The semantics of the entries are defined by the database that consumes the data.
 The ingest module does not interpret the entries; it preserves them as-is.
@@ -331,12 +366,26 @@ The queue manifest takes the name specified in `manifest_path`.
 
 The collector internally creates a queue consumer and an object store client from the configuration.
 
-A `CollectedBatch` contains the deserialized entries, the sequence number, and the location of the batch:
+A `CollectedBatch` contains the deserialized entries, the sequence number, the location of the batch,
+and the per-range metadata items attached by the ingestor(s):
 ```rust
 pub struct CollectedBatch {
     pub entries: Vec<Bytes>,
     pub sequence: u64,
     pub location: String,
+    pub metadata: Vec<Metadata>,
+}
+```
+
+The `Metadata` struct exposes the per-range metadata that ingestors attach to each batch:
+```rust
+pub struct Metadata {
+    /// Index of the first entry in the batch that this metadata range covers.
+    pub start_index: u32,
+    /// Wall-clock ingestion time in milliseconds since the Unix epoch.
+    pub ingestion_time_ms: i64,
+    /// Opaque metadata payload supplied by the caller of `Ingestor::ingest`.
+    pub payload: Bytes,
 }
 ```
 
@@ -505,6 +554,8 @@ None at this time.
 | 2026-03-11 | Replaced max_unflushed_bytes with max_buffered_inputs using a bounded channel |
 | 2026-03-11 | Changed queue metadata to per-range format with start_index and ingestion_time per metadata item |
 | 2026-03-11 | Replaced IngestEntry with ingest(entries: Vec\<Bytes\>, metadata: Bytes) |
+| 2026-03-30 | Added native compression support to data batch format |
+| 2026-03-30 | Added metadata field to CollectedBatch and documented public Metadata struct |
 | 2026-04-06 | Added Garbage Collection section; collector no longer deletes batch files directly |
 
 

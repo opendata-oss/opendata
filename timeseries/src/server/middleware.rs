@@ -3,36 +3,46 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::http::{Request, Response};
+use axum::http::{Method, Request, Response};
 use tower::{Layer, Service};
 
-use super::metrics::{HttpLabels, HttpLabelsWithStatus, HttpMethod, Metrics};
+use super::metrics::{HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_IN_FLIGHT, HTTP_REQUESTS_TOTAL};
 
 /// RAII guard that decrements the in-flight gauge on drop, ensuring the gauge
 /// is always decremented even if the request future is cancelled or errors.
 struct InFlightGuard {
-    metrics: Arc<Metrics>,
+    in_flight: Arc<AtomicI64>,
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.metrics.http_requests_in_flight.dec();
+        let prev = self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        metrics::gauge!(HTTP_REQUESTS_IN_FLIGHT).set((prev - 1) as f64);
     }
 }
 
 /// Layer that wraps services with metrics collection.
 #[derive(Clone)]
 pub struct MetricsLayer {
-    metrics: Arc<Metrics>,
+    in_flight: Arc<AtomicI64>,
 }
 
 impl MetricsLayer {
-    pub fn new(metrics: Arc<Metrics>) -> Self {
-        Self { metrics }
+    pub fn new() -> Self {
+        Self {
+            in_flight: Arc::new(AtomicI64::new(0)),
+        }
+    }
+
+    /// Return the current in-flight request count (for testing).
+    #[cfg(test)]
+    pub fn in_flight(&self) -> i64 {
+        self.in_flight.load(Ordering::Relaxed)
     }
 }
 
@@ -42,7 +52,7 @@ impl<S> Layer<S> for MetricsLayer {
     fn layer(&self, inner: S) -> Self::Service {
         MetricsService {
             inner,
-            metrics: self.metrics.clone(),
+            in_flight: self.in_flight.clone(),
         }
     }
 }
@@ -51,7 +61,7 @@ impl<S> Layer<S> for MetricsLayer {
 #[derive(Clone)]
 pub struct MetricsService<S> {
     inner: S,
-    metrics: Arc<Metrics>,
+    in_flight: Arc<AtomicI64>,
 }
 
 impl<S, ResBody> Service<Request<Body>> for MetricsService<S>
@@ -69,13 +79,14 @@ where
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
-        let method = HttpMethod::from(request.method());
+        let method = method_label(request.method());
         let endpoint = normalize_endpoint(request.uri().path());
-        let metrics = self.metrics.clone();
+        let in_flight = self.in_flight.clone();
 
-        metrics.http_requests_in_flight.inc();
+        let val = in_flight.fetch_add(1, Ordering::Relaxed);
+        metrics::gauge!(HTTP_REQUESTS_IN_FLIGHT).set((val + 1) as f64);
         let _guard = InFlightGuard {
-            metrics: metrics.clone(),
+            in_flight: in_flight.clone(),
         };
         let start = Instant::now();
         let future = self.inner.call(request);
@@ -83,27 +94,39 @@ where
         Box::pin(async move {
             let _guard = _guard; // move guard into the future so it drops when the future completes
             let response = future.await?;
-            let status = response.status().as_u16();
+            let status = response.status().as_u16().to_string();
             let duration = start.elapsed().as_secs_f64();
 
-            // Record request count
-            metrics
-                .http_requests_total
-                .get_or_create(&HttpLabelsWithStatus {
-                    method: method.clone(),
-                    endpoint: endpoint.clone(),
-                    status,
-                })
-                .inc();
+            metrics::counter!(
+                HTTP_REQUESTS_TOTAL,
+                "method" => method.clone(),
+                "endpoint" => endpoint.clone(),
+                "status" => status,
+            )
+            .increment(1);
 
-            // Record request latency
-            metrics
-                .http_request_duration_seconds
-                .get_or_create(&HttpLabels { method, endpoint })
-                .observe(duration);
+            metrics::histogram!(
+                HTTP_REQUEST_DURATION_SECONDS,
+                "method" => method,
+                "endpoint" => endpoint,
+            )
+            .record(duration);
 
             Ok(response)
         })
+    }
+}
+
+fn method_label(method: &Method) -> String {
+    match *method {
+        Method::GET => "GET".to_string(),
+        Method::POST => "POST".to_string(),
+        Method::PUT => "PUT".to_string(),
+        Method::DELETE => "DELETE".to_string(),
+        Method::PATCH => "PATCH".to_string(),
+        Method::HEAD => "HEAD".to_string(),
+        Method::OPTIONS => "OPTIONS".to_string(),
+        _ => "OTHER".to_string(),
     }
 }
 
@@ -222,75 +245,66 @@ mod tests {
     #[tokio::test]
     async fn should_decrement_in_flight_gauge_after_successful_request() {
         // given
-        let metrics = Arc::new(Metrics::new());
-        let mut service = MetricsService {
-            inner: service_fn(|_req: Request<Body>| async {
-                Ok::<_, std::convert::Infallible>(
-                    Response::builder().status(200).body(Body::empty()).unwrap(),
-                )
-            }),
-            metrics: metrics.clone(),
-        };
+        let layer = MetricsLayer::new();
+        let mut service = layer.layer(service_fn(|_req: Request<Body>| async {
+            Ok::<_, std::convert::Infallible>(
+                Response::builder().status(200).body(Body::empty()).unwrap(),
+            )
+        }));
 
-        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+        assert_eq!(layer.in_flight(), 0);
 
         // when
         let future = service.call(test_request("/test"));
-        assert_eq!(metrics.http_requests_in_flight.get(), 1);
+        assert_eq!(layer.in_flight(), 1);
         let response = future.await.unwrap();
 
         // then
         assert_eq!(response.status().as_u16(), 200);
-        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+        assert_eq!(layer.in_flight(), 0);
     }
 
     #[tokio::test]
     async fn should_decrement_in_flight_gauge_when_inner_service_errors() {
         // given
-        let metrics = Arc::new(Metrics::new());
-        let mut service = MetricsService {
-            inner: service_fn(|_req: Request<Body>| async {
-                Err::<Response<Body>, _>(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionReset,
-                    "connection reset",
-                ))
-            }),
-            metrics: metrics.clone(),
-        };
+        let layer = MetricsLayer::new();
+        let mut service = layer.layer(service_fn(|_req: Request<Body>| async {
+            Err::<Response<Body>, _>(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset",
+            ))
+        }));
 
-        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+        assert_eq!(layer.in_flight(), 0);
 
         // when
         let future = service.call(test_request("/test"));
-        assert_eq!(metrics.http_requests_in_flight.get(), 1);
+        assert_eq!(layer.in_flight(), 1);
         let result = future.await;
 
         // then
         assert!(result.is_err());
-        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+        assert_eq!(layer.in_flight(), 0);
     }
 
     #[tokio::test]
     async fn should_decrement_in_flight_gauge_when_future_is_cancelled() {
         // given — a service that never completes (simulates a long-poll)
-        let metrics = Arc::new(Metrics::new());
-        let mut service = MetricsService {
-            inner: service_fn(|_req: Request<Body>| {
-                std::future::pending::<Result<Response<Body>, std::convert::Infallible>>()
-            }),
-            metrics: metrics.clone(),
-        };
+        let layer = MetricsLayer::new();
+        let mut service = layer.layer(service_fn(|_req: Request<Body>| {
+            std::future::pending::<Result<Response<Body>, std::convert::Infallible>>()
+        }));
 
-        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+        assert_eq!(layer.in_flight(), 0);
 
         // when — call returns a future (gauge incremented), then drop it
         let future = service.call(test_request("/api/v1/query"));
-        assert_eq!(metrics.http_requests_in_flight.get(), 1);
+        assert_eq!(layer.in_flight(), 1);
 
         drop(future);
 
         // then — gauge must return to zero despite the future never completing
-        assert_eq!(metrics.http_requests_in_flight.get(), 0);
+        assert_eq!(layer.in_flight(), 0);
     }
 
     #[test]

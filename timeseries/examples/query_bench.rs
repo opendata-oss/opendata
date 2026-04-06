@@ -14,7 +14,10 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use clap::Parser;
-use timeseries::{ReaderConfig, TimeSeriesDbReader};
+use common::StorageConfig;
+use serde::{Deserialize, Deserializer};
+use slatedb::config::DbReaderOptions;
+use timeseries::TimeSeriesDbReader;
 
 /// Dashboard queries to benchmark.
 const QUERIES: &[(&str, &str)] = &[
@@ -65,7 +68,7 @@ const QUERIES: &[(&str, &str)] = &[
 #[derive(Parser)]
 #[command(about = "Benchmark PromQL queries using TimeSeriesDbReader")]
 struct Args {
-    /// Path to ReaderConfig YAML file.
+    /// Path to benchmark config YAML file.
     #[arg(long, default_value = "OpenDataTimeSeries.yaml")]
     config: String,
 
@@ -78,6 +81,58 @@ struct Args {
     step_secs: u64,
 }
 
+#[derive(Deserialize)]
+struct BenchConfig {
+    storage: StorageConfig,
+    #[serde(
+        default = "default_reader_options",
+        deserialize_with = "deserialize_reader_options"
+    )]
+    reader: DbReaderOptions,
+    #[serde(default = "default_cache_capacity")]
+    cache_capacity: u64,
+}
+
+fn default_reader_options() -> DbReaderOptions {
+    DbReaderOptions {
+        skip_wal_replay: true,
+        ..DbReaderOptions::default()
+    }
+}
+
+fn default_cache_capacity() -> u64 {
+    50
+}
+
+fn deserialize_reader_options<'de, D>(
+    deserializer: D,
+) -> std::result::Result<DbReaderOptions, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let overrides = serde_yaml::Value::deserialize(deserializer)?;
+    let mut defaults =
+        serde_yaml::to_value(default_reader_options()).map_err(serde::de::Error::custom)?;
+    merge_yaml_value(&mut defaults, overrides);
+    serde_yaml::from_value(defaults).map_err(serde::de::Error::custom)
+}
+
+fn merge_yaml_value(base: &mut serde_yaml::Value, overrides: serde_yaml::Value) {
+    match (base, overrides) {
+        (serde_yaml::Value::Mapping(base_map), serde_yaml::Value::Mapping(overrides_map)) => {
+            for (key, value) in overrides_map {
+                match base_map.get_mut(&key) {
+                    Some(existing) => merge_yaml_value(existing, value),
+                    None => {
+                        base_map.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base_slot, override_value) => *base_slot = override_value,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
@@ -85,9 +140,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let config_str = std::fs::read_to_string(&args.config)?;
-    let config: ReaderConfig = serde_yaml::from_str(&config_str)?;
+    let config: BenchConfig = serde_yaml::from_str(&config_str)?;
 
-    let reader = TimeSeriesDbReader::open(config).await?;
+    let reader =
+        TimeSeriesDbReader::open(config.storage, config.reader, config.cache_capacity).await?;
 
     let now = SystemTime::now();
     let range_start = now - Duration::from_secs(args.range_secs);

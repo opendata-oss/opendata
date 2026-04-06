@@ -1,5 +1,5 @@
-use crate::batched::delta::{VectorDbDeltaView, VectorDbWriteDelta};
-use crate::batched::indexer::Indexer;
+use crate::write::delta::{VectorDbDeltaView, VectorDbWriteDelta};
+use crate::write::indexer::Indexer;
 use async_trait::async_trait;
 use common::Storage;
 use common::coordinator::Flusher;
@@ -44,7 +44,7 @@ impl Flusher<VectorDbWriteDelta> for VectorDbFlusher {
         }
 
         // do indexing work — this mutates in-memory index state
-        let updates = self
+        let (updates, _stats) = self
             .indexer
             .update_index(frozen.writes.clone(), self.last_snapshot.clone())
             .await
@@ -83,9 +83,6 @@ impl VectorDbFlusher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batched::delta::VectorDbDeltaView;
-    use crate::batched::indexer::{Indexer, IndexerOpts};
-    use crate::delta::VectorWrite;
     use crate::hnsw::build_centroid_graph;
     use crate::model::AttributeValue;
     use crate::serde::centroid_chunk::CentroidEntry;
@@ -93,6 +90,9 @@ mod tests {
     use crate::serde::key::{IdDictionaryKey, VectorDataKey};
     use crate::serde::vector_data::VectorDataValue;
     use crate::storage::merge_operator::VectorDbMergeOperator;
+    use crate::write::delta::VectorDbDeltaView;
+    use crate::write::delta::VectorWrite;
+    use crate::write::indexer::{Indexer, IndexerOpts};
     use common::coordinator::Flusher;
     use common::storage::in_memory::{FailingStorage, InMemoryStorage};
     use common::{SequenceAllocator, Storage};

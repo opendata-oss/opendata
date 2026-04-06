@@ -1,13 +1,13 @@
 use crate::Error::Internal;
 use crate::Result;
-use crate::batched::indexer::IndexerOpts;
-use crate::batched::indexer::drivers::AsyncBatchDriver;
-use crate::batched::indexer::split::ReassignVector;
-use crate::batched::indexer::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
-use crate::delta::VectorWrite;
 use crate::model::VECTOR_FIELD_NAME;
 use crate::serde::FieldValue;
 use crate::serde::vector_data::VectorDataValue;
+use crate::write::delta::VectorWrite;
+use crate::write::indexer::IndexerOpts;
+use crate::write::indexer::drivers::AsyncBatchDriver;
+use crate::write::indexer::split::ReassignVector;
+use crate::write::indexer::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use common::StorageRead;
 use futures::future::BoxFuture;
 use rayon::iter::IntoParallelIterator;
@@ -42,13 +42,14 @@ impl WriteVectors {
         }
     }
 
+    /// Returns (inserts, updates) counts.
     pub(crate) async fn execute(
         self,
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta,
-    ) -> Result<()> {
+    ) -> Result<(usize, usize)> {
         if self.writes.is_empty() {
-            return Ok(());
+            return Ok((0, 0));
         }
         let view = VectorIndexView::new(delta, state, self.snapshot.clone());
 
@@ -98,6 +99,9 @@ impl WriteVectors {
             upserts.push(result?);
         }
         drop(view);
+
+        let insert_count = inserts.len();
+        let update_count = upserts.len();
 
         // Apply inserts to delta (no old data to clean up)
         for insert in inserts {
@@ -149,12 +153,12 @@ impl WriteVectors {
                 delta.add_to_inverted_index(attr_name.clone(), field_value, vector_id);
             }
         }
-        Ok(())
+        Ok((insert_count, update_count))
     }
 
     fn assign_centroids(
         writes: Vec<(String, Vec<f32>)>,
-        centroid_graph: Arc<crate::batched::indexer::state::DirtyCentroidGraph>,
+        centroid_graph: Arc<crate::write::indexer::state::DirtyCentroidGraph>,
     ) -> Result<HashMap<String, u64>> {
         let assignments: Vec<_> = writes
             .into_par_iter()
@@ -216,13 +220,14 @@ impl ReassignVectors {
         }
     }
 
+    /// Returns the number of vectors actually reassigned.
     pub(crate) async fn execute(
         mut self,
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         if self.reassignments.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let view = VectorIndexView::new(delta, state, self.snapshot);
         let centroid_graph = view.centroid_graph();
@@ -275,23 +280,24 @@ impl ReassignVectors {
         drop(view);
 
         // execute the reassignments
+        let reassigned = resolved.len();
         for r in resolved {
             debug!("old data: {:?}", r.data);
             delta.remove_from_posting(r.reassignment.current_centroid, r.reassignment.vector_id);
             delta.add_to_posting(r.centroid, r.reassignment.vector_id, r.reassignment.vector);
         }
-        Ok(())
+        Ok(reassigned)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batched::indexer::test_utils::IndexerOpTestHarness;
     use crate::model::AttributeValue;
     use crate::serde::collection_meta::DistanceMetric;
     use crate::serde::vector_data::Field;
     use crate::storage::VectorDbStorageReadExt;
+    use crate::write::indexer::test_utils::IndexerOpTestHarness;
     use std::collections::HashSet;
 
     const DIMS: usize = 3;

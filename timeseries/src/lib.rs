@@ -56,6 +56,7 @@ mod storage;
 #[cfg(test)]
 mod test_utils;
 mod tsdb;
+mod tsdb_metrics;
 mod util;
 
 #[cfg(feature = "bench-internals")]
@@ -77,7 +78,9 @@ mod timeseries;
 // Public re-exports
 #[cfg(feature = "bench-internals")]
 pub use bench_api::SubqueryLabelCacheHarness;
-pub use config::{Config, ReaderConfig};
+#[cfg(feature = "bench-internals")]
+pub use bench_api::WarmRangeQueryHarness;
+pub use config::Config;
 pub use error::{Error, QueryError, Result};
 pub use model::{
     InstantSample, Label, Labels, MetricMetadata, MetricType, QueryOptions, QueryValue,

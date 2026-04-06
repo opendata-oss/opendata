@@ -1,216 +1,110 @@
 //! Prometheus metrics for the timeseries server.
 
-use axum::http::Method;
-use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
-use prometheus_client::metrics::counter::Counter;
-use prometheus_client::metrics::family::Family;
-use prometheus_client::metrics::gauge::Gauge;
-use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
+use metrics_exporter_prometheus::PrometheusHandle;
 use prometheus_client::registry::Registry;
 
-/// Labels for scrape metrics.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct ScrapeLabels {
-    pub job: String,
-    pub instance: String,
+// ── Metric name constants ──
+
+pub(crate) const HTTP_REQUESTS_TOTAL: &str = "http_requests_total";
+pub(crate) const HTTP_REQUEST_DURATION_SECONDS: &str = "http_request_duration_seconds";
+pub(crate) const HTTP_REQUESTS_IN_FLIGHT: &str = "http_requests_in_flight";
+pub(crate) const SCRAPE_SAMPLES_SCRAPED: &str = "scrape_samples_scraped";
+pub(crate) const SCRAPE_SAMPLES_FAILED: &str = "scrape_samples_failed";
+pub(crate) const REMOTE_WRITE_SAMPLES_INGESTED: &str = "remote_write_samples_ingested_total";
+pub(crate) const REMOTE_WRITE_SAMPLES_FAILED: &str = "remote_write_samples_failed_total";
+
+fn describe_metrics() {
+    metrics::describe_counter!(HTTP_REQUESTS_TOTAL, "Total number of HTTP requests");
+    metrics::describe_histogram!(
+        HTTP_REQUEST_DURATION_SECONDS,
+        "HTTP request latency in seconds"
+    );
+    metrics::describe_gauge!(
+        HTTP_REQUESTS_IN_FLIGHT,
+        "Number of HTTP requests currently being processed"
+    );
+    metrics::describe_counter!(
+        SCRAPE_SAMPLES_SCRAPED,
+        "Number of samples scraped per target"
+    );
+    metrics::describe_counter!(SCRAPE_SAMPLES_FAILED, "Number of failed samples per target");
+    metrics::describe_counter!(
+        REMOTE_WRITE_SAMPLES_INGESTED,
+        "Total number of samples successfully ingested via remote write"
+    );
+    metrics::describe_counter!(
+        REMOTE_WRITE_SAMPLES_FAILED,
+        "Total number of samples that failed to ingest via remote write"
+    );
+    crate::tsdb_metrics::describe_engine_metrics();
 }
 
-/// Labels for HTTP request metrics.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct HttpLabelsWithStatus {
-    pub method: HttpMethod,
-    pub endpoint: String,
-    pub status: u16,
-}
-
-/// HTTP method label value.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
-pub enum HttpMethod {
-    Get,
-    Post,
-    Put,
-    Delete,
-    Patch,
-    Head,
-    Options,
-    Other,
-}
-
-impl From<&Method> for HttpMethod {
-    fn from(method: &Method) -> Self {
-        match *method {
-            Method::GET => HttpMethod::Get,
-            Method::POST => HttpMethod::Post,
-            Method::PUT => HttpMethod::Put,
-            Method::DELETE => HttpMethod::Delete,
-            Method::PATCH => HttpMethod::Patch,
-            Method::HEAD => HttpMethod::Head,
-            Method::OPTIONS => HttpMethod::Options,
-            _ => HttpMethod::Other,
-        }
-    }
-}
-
-/// Labels for HTTP request latency histogram (without status, since status is unknown at start).
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct HttpLabels {
-    pub method: HttpMethod,
-    pub endpoint: String,
-}
-
-/// Container for all Prometheus metrics.
+/// Container for metrics rendering.
+///
+/// Uses `metrics-rs` for recording (callers use `metrics::counter!()` etc.)
+/// and `metrics-exporter-prometheus` for rendering. A separate
+/// `prometheus_client::Registry` is kept for storage engine metrics that are
+/// registered via the `common::StorageRead::register_metrics` bridge.
 pub struct Metrics {
-    registry: Registry,
-
-    /// Counter of samples successfully scraped.
-    pub scrape_samples_scraped: Family<ScrapeLabels, Counter>,
-
-    /// Counter of failed samples.
-    pub scrape_samples_failed: Family<ScrapeLabels, Counter>,
-
-    /// Counter of HTTP requests.
-    pub http_requests_total: Family<HttpLabelsWithStatus, Counter>,
-
-    /// Histogram of HTTP request latency in seconds.
-    pub http_request_duration_seconds: Family<HttpLabels, Histogram>,
-
-    /// Gauge of currently in-flight requests.
-    pub http_requests_in_flight: Gauge,
-
-    /// Counter of samples successfully ingested via remote write.
-    pub remote_write_samples_ingested: Counter,
-
-    /// Counter of samples that failed to ingest via remote write.
-    pub remote_write_samples_failed: Counter,
-}
-
-impl Default for Metrics {
-    fn default() -> Self {
-        Self::new()
-    }
+    handle: PrometheusHandle,
+    storage_registry: Registry,
 }
 
 impl Metrics {
-    /// Create a new metrics registry with all metrics registered.
-    pub fn new() -> Self {
-        let mut registry = Registry::default();
-
-        // Scrape samples scraped counter
-        let scrape_samples_scraped = Family::<ScrapeLabels, Counter>::default();
-        registry.register(
-            "scrape_samples_scraped",
-            "Number of samples scraped per target",
-            scrape_samples_scraped.clone(),
-        );
-
-        // Scrape samples failed counter
-        let scrape_samples_failed = Family::<ScrapeLabels, Counter>::default();
-        registry.register(
-            "scrape_samples_failed",
-            "Number of failed samples per target",
-            scrape_samples_failed.clone(),
-        );
-
-        // HTTP requests total counter
-        let http_requests_total = Family::<HttpLabelsWithStatus, Counter>::default();
-        registry.register(
-            "http_requests_total",
-            "Total number of HTTP requests",
-            http_requests_total.clone(),
-        );
-
-        // HTTP request duration histogram (buckets from 1ms to ~8s)
-        let http_request_duration_seconds =
-            Family::<HttpLabels, Histogram>::new_with_constructor(|| {
-                Histogram::new(exponential_buckets(0.001, 2.0, 14))
-            });
-        registry.register(
-            "http_request_duration_seconds",
-            "HTTP request latency in seconds",
-            http_request_duration_seconds.clone(),
-        );
-
-        // In-flight requests gauge
-        let http_requests_in_flight = Gauge::default();
-        registry.register(
-            "http_requests_in_flight",
-            "Number of HTTP requests currently being processed",
-            http_requests_in_flight.clone(),
-        );
-
-        // Remote write samples ingested counter
-        let remote_write_samples_ingested = Counter::default();
-        registry.register(
-            "remote_write_samples_ingested_total",
-            "Total number of samples successfully ingested via remote write",
-            remote_write_samples_ingested.clone(),
-        );
-
-        // Remote write samples failed counter
-        let remote_write_samples_failed = Counter::default();
-        registry.register(
-            "remote_write_samples_failed_total",
-            "Total number of samples that failed to ingest via remote write",
-            remote_write_samples_failed.clone(),
-        );
-
+    /// Create a new metrics instance and install the global recorder.
+    ///
+    /// Only the first call per process installs the recorder; subsequent calls
+    /// (e.g. in tests) reuse the existing one but get their own handle.
+    pub fn new(handle: PrometheusHandle) -> Self {
+        describe_metrics();
         Self {
-            registry,
-            scrape_samples_scraped,
-            scrape_samples_failed,
-            http_requests_total,
-            http_request_duration_seconds,
-            http_requests_in_flight,
-            remote_write_samples_ingested,
-            remote_write_samples_failed,
+            handle,
+            storage_registry: Registry::default(),
         }
     }
 
-    /// Returns a mutable reference to the underlying Prometheus registry.
+    /// Returns a mutable reference to the storage engine Prometheus registry.
     ///
-    /// Use this to register additional metrics (e.g. storage engine metrics)
-    /// before wrapping `Metrics` in an `Arc`.
-    pub fn registry_mut(&mut self) -> &mut Registry {
-        &mut self.registry
+    /// Use this to register SlateDB / storage-level metrics before wrapping
+    /// `Metrics` in an `Arc`.
+    pub fn storage_registry_mut(&mut self) -> &mut Registry {
+        &mut self.storage_registry
     }
 
     /// Encode all metrics to Prometheus text format.
+    ///
+    /// Combines `metrics-rs` output (via the exporter handle) with any
+    /// storage engine metrics registered in the `prometheus_client` registry.
     pub fn encode(&self) -> String {
-        let mut buffer = String::new();
-        prometheus_client::encoding::text::encode(&mut buffer, &self.registry)
-            .expect("encoding metrics should not fail");
-        buffer
+        let mut output = self.handle.render();
+        let mut storage_buf = String::new();
+        prometheus_client::encoding::text::encode(&mut storage_buf, &self.storage_registry)
+            .expect("encoding storage metrics should not fail");
+        output.push_str(&storage_buf);
+        output
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics_exporter_prometheus::PrometheusBuilder;
 
     #[test]
-    fn should_create_default_metrics() {
-        // given/when
-        let metrics = Metrics::new();
-
-        // then
-        let encoded = metrics.encode();
-        assert!(encoded.contains("# HELP scrape_samples_scraped"));
-        assert!(encoded.contains("# HELP http_requests_total"));
-        assert!(encoded.contains("# HELP http_request_duration_seconds"));
-        assert!(encoded.contains("# HELP http_requests_in_flight"));
-        assert!(encoded.contains("# HELP remote_write_samples_ingested_total"));
-        assert!(encoded.contains("# HELP remote_write_samples_failed_total"));
-    }
-
-    #[test]
-    fn should_convert_http_method_to_label() {
+    fn should_create_metrics_and_encode() {
         // given
-        let method = Method::GET;
+        let builder = PrometheusBuilder::new();
+        let recorder = builder.build_recorder();
+        let handle = recorder.handle();
 
         // when
-        let label = HttpMethod::from(&method);
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!("test_counter").increment(1);
+        });
+        let metrics = Metrics::new(handle);
+        let encoded = metrics.encode();
 
         // then
-        assert!(matches!(label, HttpMethod::Get));
+        assert!(encoded.contains("test_counter"));
     }
 }

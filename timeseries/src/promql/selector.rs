@@ -60,7 +60,7 @@ fn parse_limited_regex(pattern: &str) -> std::result::Result<Vec<String>, String
 
 /// Find candidate series IDs using a QueryReader
 async fn find_candidates_with_reader<'reader, R: QueryReader>(
-    reader: &mut CachedQueryReader<'reader, R>,
+    reader: &CachedQueryReader<'reader, R>,
     bucket: &crate::model::TimeBucket,
     selector: &VectorSelector,
 ) -> Result<Vec<SeriesId>> {
@@ -177,7 +177,7 @@ async fn find_candidates_with_reader<'reader, R: QueryReader>(
 /// Evaluates a PromQL vector selector using a QueryReader.
 /// This is the core implementation that can be tested independently.
 pub(crate) async fn evaluate_selector_with_reader<'reader, R: QueryReader>(
-    reader: &mut CachedQueryReader<'reader, R>,
+    reader: &CachedQueryReader<'reader, R>,
     bucket: crate::model::TimeBucket,
     selector: &VectorSelector,
 ) -> Result<HashSet<SeriesId>> {
@@ -928,8 +928,8 @@ mod tests {
             offset: None,
             at: None,
         };
-        let mut cached_reader = CachedQueryReader::new(&reader);
-        let result = evaluate_selector_with_reader(&mut cached_reader, bucket, &selector)
+        let cached_reader = CachedQueryReader::new(&reader);
+        let result = evaluate_selector_with_reader(&cached_reader, bucket, &selector)
             .await
             .unwrap();
 
@@ -1036,8 +1036,8 @@ mod tests {
             offset: None,
             at: None,
         };
-        let mut cached_reader = CachedQueryReader::new(&reader);
-        let result = evaluate_selector_with_reader(&mut cached_reader, bucket, &selector)
+        let cached_reader = CachedQueryReader::new(&reader);
+        let result = evaluate_selector_with_reader(&cached_reader, bucket, &selector)
             .await
             .unwrap();
 
@@ -1115,8 +1115,8 @@ mod tests {
             offset: None,
             at: None,
         };
-        let mut cached_reader = CachedQueryReader::new(&reader);
-        let result = evaluate_selector_with_reader(&mut cached_reader, bucket, &selector)
+        let cached_reader = CachedQueryReader::new(&reader);
+        let result = evaluate_selector_with_reader(&cached_reader, bucket, &selector)
             .await
             .unwrap();
 
@@ -1384,8 +1384,8 @@ mod tests {
             offset: None,
             at: None,
         };
-        let mut cached_reader = CachedQueryReader::new(&reader);
-        let result = evaluate_selector_with_reader(&mut cached_reader, bucket, &selector)
+        let cached_reader = CachedQueryReader::new(&reader);
+        let result = evaluate_selector_with_reader(&cached_reader, bucket, &selector)
             .await
             .unwrap();
 

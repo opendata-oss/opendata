@@ -267,6 +267,13 @@ impl Default for Config {
     }
 }
 
+/// Options for search operations.
+#[derive(Debug, Clone, Default)]
+pub struct SearchOptions {
+    /// Number of centroids to probe during search.
+    pub nprobe: Option<usize>,
+}
+
 /// Configuration for a read-only vector database client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReaderConfig {
