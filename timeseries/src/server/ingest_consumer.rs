@@ -1,6 +1,7 @@
 //! Background ingest consumer that reads OTLP metrics from an ingest queue.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use ingest::{CollectedBatch, Collector, Metadata};
@@ -94,6 +95,9 @@ impl IngestConsumer {
         let collector_config = ingest::CollectorConfig {
             object_store: self.config.object_store.clone(),
             manifest_path: self.config.manifest_path.clone(),
+            data_path_prefix: "ingest".to_string(),
+            gc_interval: Duration::from_secs(300),
+            gc_grace_period: Duration::from_secs(600),
         };
         let collector = Collector::new(collector_config)?;
         self.start(collector).await
@@ -110,6 +114,9 @@ impl IngestConsumer {
         let collector_config = ingest::CollectorConfig {
             object_store: self.config.object_store.clone(),
             manifest_path: self.config.manifest_path.clone(),
+            data_path_prefix: "ingest".to_string(),
+            gc_interval: Duration::from_secs(300),
+            gc_grace_period: Duration::from_secs(600),
         };
         let collector = Collector::with_object_store(collector_config, object_store);
         self.start(collector).await
