@@ -4,7 +4,7 @@ use std::{
     time::SystemTime,
 };
 
-use futures::StreamExt;
+use futures::{StreamExt, stream};
 use slatedb::object_store::{ObjectStore, path::Path};
 use tokio_util::sync::CancellationToken;
 
@@ -47,6 +47,8 @@ impl GarbageCollector {
         let prefix = Path::from(format!("{}/", self.config.data_path_prefix));
         let mut list_stream = self.object_store.list(Some(&prefix));
 
+        // collect deletion candidates
+        let mut to_delete: Vec<Path> = Vec::new();
         while let Some(result) = list_stream.next().await {
             let meta =
                 result.map_err(|e| Error::Storage(format!("Failed to list objects: {}", e)))?;
@@ -77,15 +79,19 @@ impl GarbageCollector {
                 continue;
             }
 
-            self.object_store
-                .delete(&meta.location)
-                .await
-                .map_err(|e| {
-                    Error::Storage(format!(
-                        "Failed to delete object {:?}: {}",
-                        meta.location, e
-                    ))
-                })?;
+            to_delete.push(meta.location);
+        }
+
+        // bulk delete all candidates
+        if !to_delete.is_empty() {
+            tracing::debug!(count = to_delete.len(), "GC deleting orphaned batch files");
+            let locations = stream::iter(to_delete.iter().cloned().map(Ok));
+            let mut results = self.object_store.delete_stream(locations.boxed());
+            while let Some(result) = results.next().await {
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, "GC failed to delete batch file");
+                }
+            }
         }
 
         Ok(())
