@@ -16,6 +16,11 @@ pub(crate) const LEAF_LEVEL: u8 = 1;
 //   have Into fns for each. Conversion to CentroidId and VectorId validates the levels
 //   use the right terminology (node vs centroid vs vector in variable names)
 
+/// Internal ID for vectors. Can reference either a data vector, a centroid vector, or the centroid
+/// tree root. The ID is a 64-bit identifier where the highest byte specifies the level in the
+/// centroid tree that holds the vector, and the lower 56 bits specify a sequence number. Sequence
+/// numbers must be unique within a level. Data vectors have level 0. Centroid vectors have level
+/// 1-254, with level 1 being referred to as the "leaf". The root uses level 255.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct VectorId {
     id: u64,

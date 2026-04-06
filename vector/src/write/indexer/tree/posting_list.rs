@@ -4,6 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::iter::FromIterator;
 use std::sync::Arc;
 
+/// An in-memory format for posting lists optimized for exhaustive ANN search over all postings
+/// This format lays out all vectors in a flat buffer, and tracks offsets in the buffer from
+/// individual postings. The format still allows postings to be added incrementally by allowing
+/// each posting to hold its own reference to `Arc<Vec<f32>>`.
 #[derive(Clone)]
 pub(crate) struct Posting {
     id: VectorId,

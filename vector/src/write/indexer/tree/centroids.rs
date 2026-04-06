@@ -1,3 +1,47 @@
+//! Types for traversal of the ANN vector search tree. The indexer builds a search tree designed
+//! to support incremental maintenance as vectors are ingested, and lazy partial loading at search
+//! time to allow for fast warm and cold queries. The tree is made up of levels. Each level stores
+//! vectors. The vectors stored at a given level are the centroids of clusters of vectors at the
+//! next level. At the top is a single root node. At the bottom are the indexed data vectors.
+//! The level immediately above the data vectors, called the leaf, holds the centroids whose
+//! postings reference the data vectors.
+//!
+//! Each level represents a sampling of the full space represented by the data vectors. As vectors
+//! are ingested, the indexer traverses the tree from the bottom up and runs LIRE at each level
+//! to maintain a high quality search index at each level. It first adds each data vector to its
+//! posting in the leaf centroids, then executes splits/merges of leaf centroids (level 1). These
+//! splits and  merges mutate the postings at level 2. The indexer then executes splits/merges at
+//! level 2, and so on. Eventually, it reaches the root. If the root becomes too large the indexer
+//! splits it by adding a new level of centroids and writing a new root. The figure below depicts
+//! an example 4-level tree:
+//!
+//! ```text
+//!               root (255.0)                                      Vector/Centroid ID:
+//!               ┌────────────────────────────────────┐      2.1000 => Level 2, Id 1000
+//!  Level: Root  │2.1000:<vector>,2.1001:<vector>,... │
+//!               └────────────────────────────────────┘
+//!
+//!                2.1000                                 2.1001
+//!               ┌────────────────────────────────────┐ ┌────────────────────────────────────┐
+//!    Level: 2   │1.100:<vector>,1.101:<vector>,...   │ │1.200:<vector>,1.201:<vector>,...   │  ...
+//!               └────────────────────────────────────┘ └────────────────────────────────────┘
+//!
+//!                1.100                                  1.101
+//!               ┌────────────────────────────────────┐ ┌────────────────────────────────────┐
+//!    Level: 1   │0.10:<vector>,0.11:<vector>,...     │ │0.20:<vector>,0.21:<vector>,...     │  ...
+//!               └────────────────────────────────────┘ └────────────────────────────────────┘
+//!
+//!
+//!               ┌────────────────────────────────────────────────────────────────────────────────┐
+//!  Level: Data  │                   Data Vectors (0.10, 0.11, 0.20, 0.21, ...)                   │
+//!               └────────────────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! Search proceeds from the root down. At each level, search finds the B nearest vectors to the
+//! search query, and reads their postings to seed the search at the next level down. B is called
+//! the "beam" width.
+//!
+
 use crate::Result;
 use crate::math::distance::{compute_distance, VectorDistance};
 use crate::serde::collection_meta::DistanceMetric;
@@ -17,6 +61,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{debug};
 
+/// Represents a tree depth of some number of levels. Trees always have at least
+/// 3 levels - a root that references centroids, a level of leaf centroids that reference,
+/// data vectors, and a level of data vectors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TreeDepth {
     val: u8,
@@ -29,6 +76,8 @@ impl Display for TreeDepth {
 }
 
 impl TreeDepth {
+    /// Creates a TreeDepth of the provided number of levels. Panics if the number of levels
+    /// is less than 3.
     pub(crate) fn of(val: u8) -> Self {
         assert!(
             val >= 3,
@@ -37,32 +86,31 @@ impl TreeDepth {
         Self { val }
     }
 
-    pub(crate) fn val(&self) -> u8 {
-        self.val
-    }
-
+    /// Returns the highest level that contains centroids
     pub(crate) fn max_inner_level(&self) -> u8 {
         self.val - 2
     }
-
-    pub(crate) fn promote(&self) -> TreeDepth {
-        TreeDepth::of(self.val + 1)
-    }
 }
 
-/// wrapper type for inner level to prevent direct enum instantiation
+/// Wrapper type for inner level to prevent direct TreeLevel instantiation
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct InnerLevel {
     level: u8,
     depth: TreeDepth,
 }
 
-/// wrapper type for root level to prevent direct enum instantiation
+/// Wrapper type for root level to prevent direct TreeLevel instantiation
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct RootLevel {
     depth: TreeDepth,
 }
 
+/// Represents a level in a tree with a given depth. The represented level can either
+/// be the root, or an inner level. Inner levels contain centroid vectors that either
+/// reference centroids at the next inner level, or data vectors. The inner level that
+/// contains centroids whose postings reference data vectors is referred to as the leaf
+/// level. When we say a level L "contains" X that means that the posting lists at the
+/// level immediately above L reference X.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum TreeLevel {
     Root(RootLevel),
@@ -79,6 +127,8 @@ impl Display for TreeLevel {
 }
 
 impl TreeLevel {
+    /// Returns an instance of TreeLevel for the given level within a tree of the given
+    /// depth. The level must represent either centroids or the tree root.
     pub(crate) fn of(level: u8, depth: TreeDepth) -> Self {
         assert!(level >= LEAF_LEVEL);
         if level == ROOT_LEVEL {
@@ -88,10 +138,14 @@ impl TreeLevel {
         }
     }
 
+    /// Returns an instance of TreeLevel representing the root of a tree with the given
+    /// depth.
     pub(crate) fn root(depth: TreeDepth) -> Self {
         Self::Root(RootLevel { depth })
     }
 
+    /// Returns an instance of TreeLevel representing the level containing the leaf centroids
+    /// of a tree with the given depth.
     pub(crate) fn leaf(depth: TreeDepth) -> Self {
         Self::Inner(InnerLevel {
             level: LEAF_LEVEL,
@@ -99,16 +153,22 @@ impl TreeLevel {
         })
     }
 
+    /// Returns an instance of TreeLevel representing a level containing centroids within
+    /// a tree with the given depth.
     pub(crate) fn inner(level: u8, depth: TreeDepth) -> Self {
         assert!(level > 0);
         assert!(level <= depth.max_inner_level());
         Self::Inner(InnerLevel { level, depth })
     }
 
+    /// Returns true if this instance represents an inner level (one containing centroid
+    /// vectors).
     pub(crate) fn is_inner(&self) -> bool {
         matches!(*self, TreeLevel::Inner(_))
     }
 
+    /// Returns true if this instance represents the leaf level (the level that contains
+    /// centroids that directly reference data vectors).
     pub(crate) fn is_leaf(&self) -> bool {
         match self {
             TreeLevel::Root(_) => false,
@@ -116,6 +176,7 @@ impl TreeLevel {
         }
     }
 
+    /// Returns true if this instance represents the root level
     pub(crate) fn is_root(&self) -> bool {
         matches!(*self, TreeLevel::Root(_))
     }
@@ -127,6 +188,8 @@ impl TreeLevel {
         }
     }
 
+    /// Returns the next level up from this level. If this level is the highest inner level,
+    /// then this returns the root level. This fn panics if called with the root level.
     pub(crate) fn next_level_up(&self) -> Self {
         match self {
             TreeLevel::Root(_) => {
@@ -144,6 +207,8 @@ impl TreeLevel {
         }
     }
 
+    /// Returns the next level down from this level. This fn panics if called with the
+    /// leaf level.
     pub(crate) fn next_level_down(&self) -> Self {
         match self {
             TreeLevel::Root(rl) => Self::inner(rl.depth.max_inner_level(), rl.depth),
@@ -154,6 +219,7 @@ impl TreeLevel {
         }
     }
 
+    /// Returns the level number
     pub(crate) fn level(&self) -> u8 {
         match self {
             TreeLevel::Root(_) => ROOT_LEVEL,
@@ -162,8 +228,12 @@ impl TreeLevel {
     }
 }
 
+/// A value that may be cached by the centroid cache.
 pub(crate) enum MaybeCached<T> {
+    /// A value that was found in cache
     Value(T),
+    /// A value that was not found in cache. The contained future should be executed to
+    /// get the value
     Future(BoxFuture<'static, Result<T>>),
 }
 
@@ -177,6 +247,8 @@ impl<T> MaybeCached<T> {
 }
 
 impl<T: 'static> MaybeCached<T> {
+    /// Returns an instance of MaybeCached whose value is the result of applying the specified
+    /// transformation to an instance of MaybeCached
     pub(crate) fn map<O>(
         self,
         mapper: impl FnOnce(T) -> O + Send + Sync + 'static,
@@ -196,6 +268,8 @@ impl<T> Into<MaybeCached<T>> for BoxFuture<'static, Result<T>> {
     }
 }
 
+/// A search that is blocked because postings need to be loaded from storage. Holds the state
+/// required to resume search, along with the reads that need to be executed against storage.
 pub(crate) struct BlockedCentroidSearch {
     /// The level the reads are for
     level: TreeLevel,
@@ -224,6 +298,8 @@ impl BlockedCentroidSearch {
         }
     }
 
+    /// Called to convert this instance to an InFlightBlockedCentroidSearch when executing
+    /// the contained reads.
     pub(crate) fn start(
         self,
     ) -> (
@@ -244,6 +320,7 @@ impl BlockedCentroidSearch {
     }
 }
 
+/// A search for which posting reads are in-flight.
 pub(crate) struct InFlightBlockedCentroidSearch {
     /// The level the reads are for
     level: TreeLevel,
@@ -271,6 +348,7 @@ impl InFlightBlockedCentroidSearch {
     }
 }
 
+/// A centroid search that can be resumed after loading postings from storage
 pub(crate) struct ResumableCentroidSearch {
     /// The level the reads are for
     level: TreeLevel,
@@ -293,14 +371,28 @@ impl ResumableCentroidSearch {
     }
 }
 
+/// The result of a search in the centroid index.
 pub(crate) enum SearchResult {
+    /// Represents a search that is blocked because postings must be loaded from storage
     ReadsRequired(BlockedCentroidSearch),
+    /// A successfully completed search
     Ann(Vec<Posting>),
 }
 
+/// Trait for a CentroidIndex that finds the nearest K centroids to a given query vector.
+/// Searches either complete successfully or return `ReadRequired` indicating that the index
+/// requires postings to be loaded from storage to proceed. The interface is structured this way
+/// (as opposed to allowing the impl to itself issue blocking reads) for 2 reasons. First, it
+/// allows the caller to take control of scheduling the reads so they can deduplicate, rate limit,
+/// etc. Second, it allows the index to hold references while still allowing posting reads to run
+/// on spawned tasks (which much have static lifetime). This is important for allowing reads of
+/// a dirty index when building up the index delta.
+#[allow(dead_code)]
 pub(crate) trait CentroidIndex {
+    /// Search for the nearest K leaf centroids to a query vector.
     fn search(&self, query: &[f32], k: usize) -> SearchResult;
 
+    /// Resume a search that previously returned `ReadsRequired`.
     fn resume_search(
         &self,
         query: &[f32],
@@ -309,27 +401,36 @@ pub(crate) trait CentroidIndex {
     ) -> SearchResult;
 }
 
+/// Trait that wraps loading of posting lists
 pub(crate) trait CentroidReader: Send + Sync {
-    // TODO: get rid of this and root() from CentroidCache
+    /// Read the root posting list.
     fn read_root(&self) -> MaybeCached<Arc<PostingList>>;
 
+    /// Read the posting list for a given centroid.
     fn read_postings(&self, centroid_id: VectorId) -> MaybeCached<Arc<PostingList>>;
 }
 
+/// Trait for the centroid cache which holds centroid postings in-memory. All reads are epoch
+/// aligned.
 pub(crate) trait CentroidCache: Send + Sync {
+    /// Return the cached root as of the specified writer epoch
     fn root(&self, epoch: u64) -> Option<Arc<PostingList>> {
         self.posting(ROOT_VECTOR_ID, epoch)
     }
 
+    /// Return a cached posting as of the specified writer epoch
     fn posting(&self, centroid_id: VectorId, epoch: u64) -> Option<Arc<PostingList>> {
         self.postings(&[centroid_id], epoch).first().cloned()
     }
 
+    /// Return cached postings as of the specified writer epoch
     fn postings(&self, _centroid_ids: &[VectorId], _epoch: u64) -> Vec<Arc<PostingList>> {
         Vec::new()
     }
 }
 
+
+/// Implementation of CentroidIndex that searches centroids stored in a LIRE tree
 pub(crate) struct LeveledCentroidIndex<'a> {
     depth: TreeDepth,
     beam: usize,
@@ -345,6 +446,7 @@ impl<'a> LeveledCentroidIndex<'a> {
     ) -> Self {
         Self {
             depth,
+            // todo: make this configurable
             beam: 100,
             distance_metric,
             reader,
@@ -657,6 +759,8 @@ struct WrittenPostingList {
     written_epoch: u64,
 }
 
+/// A cache that holds all posting lists for non-leaf centroids (level > 1) in-memory. Used when
+/// running VectorDb (the reader-writer process).
 pub(crate) struct AllCentroidsCache {
     inner: Arc<Mutex<AllCentroidsCacheInner>>,
 }
@@ -717,10 +821,12 @@ impl AllCentroidsCacheWriter {
                 .into_iter(),
             )
             .collect();
-        let inner = Arc::new(Mutex::new(AllCentroidsCacheInner { postings }));
+        let inner = Arc::new(Mutex::new(AllCentroidsCacheInner::new(postings)));
         Self { inner }
     }
 
+    /// Called by `SearchIndexDelta` when freezing to update the cache with changes from an
+    /// indexing round.
     pub(crate) fn update_postings(
         &self,
         epoch: u64,
@@ -826,7 +932,7 @@ struct AllCentroidsCacheInner {
 }
 
 impl AllCentroidsCacheInner {
-    pub(crate) fn new(postings: HashMap<VectorId, WrittenPostingList>) -> Self {
+    fn new(postings: HashMap<VectorId, WrittenPostingList>) -> Self {
         Self { postings }
     }
 
@@ -868,6 +974,10 @@ pub(crate) async fn batch_search_centroids<K: Hash + Eq + Sized + Send + Sync>(
     result
 }
 
+/// Search a batch of queries in a given level of the centroid tree. This fn drives
+/// the main search loop for the tree. It takes a batch of queries, then in a loop,
+/// searches the index, loads any missing postings, and then resumes until all searches
+/// complete.
 pub(crate) async fn batch_search_centroids_in_level<K: Hash + Eq + Sized + Send + Sync>(
     index: &LeveledCentroidIndex<'_>,
     k: usize,
@@ -953,6 +1063,67 @@ mod tests {
     use common::storage::in_memory::InMemoryStorage;
     use common::{Record, Storage, StorageRead};
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn test_should_get_max_inner_level_from_tree_depth() {
+        assert_eq!(TreeDepth::of(5).max_inner_level(), 3);
+    }
+
+    #[test]
+    fn test_should_get_next_level_down_from_root() {
+        let depth = TreeDepth::of(5);
+        assert_eq!(
+            TreeLevel::root(depth).next_level_down(),
+            TreeLevel::of(3, depth)
+        );
+    }
+
+    #[test]
+    fn test_should_get_next_level_down() {
+        let depth = TreeDepth::of(5);
+        assert_eq!(
+            TreeLevel::of(3, depth).next_level_down(),
+            TreeLevel::of(2, depth)
+        );
+    }
+
+    #[test]
+    fn test_should_get_next_level_up_from_max_inner_level() {
+        let depth = TreeDepth::of(5);
+        assert_eq!(
+            TreeLevel::of(3, depth).next_level_up(),
+            TreeLevel::root(depth)
+        );
+    }
+
+    #[test]
+    fn test_should_get_next_level_up() {
+        let depth = TreeDepth::of(5);
+        assert_eq!(
+            TreeLevel::of(2, depth).next_level_up(),
+            TreeLevel::of(3, depth)
+        );
+    }
+
+    #[test]
+    fn test_should_categorize_level_correctly() {
+        let depth = TreeDepth::of(5);
+
+        let root = TreeLevel::root(depth);
+        assert!(root.is_root());
+        assert!(!root.is_leaf());
+        assert!(!root.is_inner());
+
+        let inner = TreeLevel::of(3, depth);
+        assert!(!root.is_root());
+        assert!(!root.is_leaf());
+        assert!(root.is_inner());
+
+        let inner = TreeLevel::leaf(depth);
+        assert!(!root.is_root());
+        assert!(root.is_leaf());
+        assert!(root.is_inner());
+    }
 
     #[test]
     fn should_score_and_rank_l2_postings() {
