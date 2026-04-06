@@ -38,6 +38,7 @@ pub struct Collector {
     object_store: Arc<dyn ObjectStore>,
     ack_count: u64,
     last_acked_sequence: Option<u64>,
+    last_fetched_sequence: Option<u64>,
 }
 
 impl Collector {
@@ -60,19 +61,22 @@ impl Collector {
             object_store,
             ack_count: 0,
             last_acked_sequence: None,
+            last_fetched_sequence: None,
         }
     }
 
     /// Initialize the consumer by fencing any previous consumer instance.
     ///
     /// If `last_acked_sequence` is `Some(seq)`, the collector resumes after that
-    /// sequence — the next call to [`next_batch`](Self::next_batch) will read
-    /// sequence `seq + 1`. If `None`, the collector peeks the queue to discover
-    /// the first available entry and positions itself just before it.
+    /// sequence. Both the ack cursor and fetch cursor are positioned there, so
+    /// the next call to [`next_batch`](Self::next_batch) will read sequence
+    /// `seq + 1`. If `None`, the collector peeks the queue to discover the first
+    /// available entry and positions itself just before it.
     pub async fn initialize(&mut self, last_acked_sequence: Option<u64>) -> Result<()> {
         self.consumer.initialize().await?;
         if let Some(seq) = last_acked_sequence {
             self.last_acked_sequence = Some(seq);
+            self.last_fetched_sequence = Some(seq);
             self.flush().await?;
         }
         Ok(())
@@ -80,18 +84,20 @@ impl Collector {
 
     /// Read the next data batch from object storage.
     ///
-    /// If no batch has been acked yet, peeks the earliest entry in the queue.
-    /// Otherwise, reads the entry with sequence `last_acked_sequence + 1`.
+    /// If no batch has been fetched yet, peeks the earliest entry in the queue.
+    /// Otherwise, reads the entry with sequence `last_fetched_sequence + 1`.
     /// Returns `None` if no matching entry is available.
     pub async fn next_batch(&mut self) -> Result<Option<CollectedBatch>> {
-        let queue_entry = match self.last_acked_sequence {
+        let queue_entry = match self.last_fetched_sequence {
             None => self.consumer.peek().await?,
             Some(seq) => self.consumer.read(seq.wrapping_add(1)).await?,
         };
         metrics::gauge!(m::QUEUE_LENGTH).set(self.consumer.len() as f64);
         match queue_entry {
             Some(entry) => {
+                let sequence = entry.sequence;
                 let batch = self.fetch_batch(entry).await?;
+                self.last_fetched_sequence = Some(sequence);
                 if let Some(ref b) = batch
                     && let Some(last_meta) = b.metadata.last()
                 {
@@ -374,6 +380,36 @@ mod tests {
         assert_eq!(batch.location, "batches/second");
         assert_eq!(batch.sequence, 1);
         assert_eq!(batch.entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn should_next_batch_advance_before_previous_batch_is_acked() {
+        // given
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector) = make_collector(&store, test_collector_config());
+        collector.initialize(None).await.unwrap();
+
+        let entries = test_entries();
+        write_batch(&store, "batches/first", &entries).await;
+        write_batch(&store, "batches/second", &entries).await;
+        producer
+            .enqueue("batches/first".to_string(), vec![])
+            .await
+            .unwrap();
+        producer
+            .enqueue("batches/second".to_string(), vec![])
+            .await
+            .unwrap();
+
+        // when
+        let first = collector.next_batch().await.unwrap().unwrap();
+        let second = collector.next_batch().await.unwrap().unwrap();
+
+        // then
+        assert_eq!(first.location, "batches/first");
+        assert_eq!(first.sequence, 0);
+        assert_eq!(second.location, "batches/second");
+        assert_eq!(second.sequence, 1);
     }
 
     #[tokio::test]
