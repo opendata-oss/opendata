@@ -6,6 +6,7 @@ use bytes::Bytes;
 use ingest::{CollectedBatch, Collector, Metadata};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use prost::Message;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -20,6 +21,9 @@ const METADATA_VERSION: u8 = 1;
 const SIGNAL_TYPE_METRICS: u8 = 1;
 const PAYLOAD_ENCODING_OTLP_PROTO: u8 = 1;
 const METADATA_LEN: usize = 4;
+const PREFETCH_BATCH_BUFFER: usize = 1;
+const ACK_SEQUENCE_BUFFER: usize = 1;
+const MAX_ERROR_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug)]
 struct IngestMetadata {
@@ -149,44 +153,168 @@ async fn poll_loop(
     tsdb: Arc<Tsdb>,
     converter: Arc<OtelConverter>,
     poll_interval: std::time::Duration,
-    mut collector: Collector,
+    collector: Collector,
     cancel: CancellationToken,
 ) {
+    let (batch_tx, mut batch_rx) = mpsc::channel(PREFETCH_BATCH_BUFFER);
+    let (ack_tx, ack_rx) = mpsc::channel(ACK_SEQUENCE_BUFFER);
+    let collector_join = tokio::spawn(collector_loop(
+        collector,
+        poll_interval,
+        cancel.clone(),
+        batch_tx,
+        ack_rx,
+    ));
+
+    // Consumer loop: process one prefetched batch at a time and send its
+    // sequence back for acknowledgement once processing completes, because the
+    // collector stays owned by the producer task and all collector access must
+    // remain serialized through that single owner.
     loop {
-        tokio::select! {
+        let batch = tokio::select! {
             _ = cancel.cancelled() => break,
-            result = collector.next_batch() => {
-                match result {
-                    Ok(Some(batch)) => {
-                        process_batch(&tsdb, &converter, &batch).await;
-                        if let Err(e) = collector.ack(batch.sequence).await {
-                            tracing::error!(
-                                sequence = batch.sequence,
-                                "Failed to ack batch: {e}"
-                            );
-                        }
-                    }
-                    Ok(None) => {
-                        tokio::select! {
-                            _ = cancel.cancelled() => break,
-                            _ = sleep(poll_interval) => {}
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to read next batch: {e}");
-                        tokio::select! {
-                            _ = cancel.cancelled() => break,
-                            _ = sleep(poll_interval) => {}
-                        }
-                    }
-                }
+            maybe_batch = batch_rx.recv() => match maybe_batch {
+                Some(batch) => batch,
+                None => break,
             }
+        };
+
+        let sequence = batch.sequence;
+        process_batch(&tsdb, &converter, &batch).await;
+
+        if let Err(e) = ack_tx.send(sequence).await {
+            tracing::error!(sequence, "Failed to send ack to collector task: {e}");
+            break;
+        }
+
+        if cancel.is_cancelled() {
+            break;
         }
     }
 
     tracing::info!("Ingest consumer shutting down, flushing pending acks...");
+    drop(ack_tx);
+    if let Err(e) = collector_join.await {
+        tracing::error!("Collector task panicked: {e}");
+    }
+}
+
+async fn collector_loop(
+    mut collector: Collector,
+    poll_interval: std::time::Duration,
+    cancel: CancellationToken,
+    batch_tx: mpsc::Sender<CollectedBatch>,
+    mut ack_rx: mpsc::Receiver<u64>,
+) {
+    let mut error_backoff = poll_interval;
+
+    // Producer loop:
+    // 1. drain any ready ack
+    // 2. fetch immediately when the batch channel has room
+    // 3. otherwise wait for the next useful event
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+
+        match ack_rx.try_recv() {
+            Ok(sequence) => {
+                ack_sequence(&mut collector, sequence).await;
+                continue;
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+            Err(mpsc::error::TryRecvError::Empty) => {}
+        }
+
+        let mut wait_delay = None;
+
+        if batch_tx.capacity() > 0 {
+            match collector.next_batch().await {
+                Ok(Some(batch)) => {
+                    error_backoff = poll_interval;
+                    if let Err(e) = batch_tx.send(batch).await {
+                        tracing::error!("Failed to send batch to consumer task: {e}");
+                        break;
+                    }
+                    continue;
+                }
+                Ok(None) => {
+                    error_backoff = poll_interval;
+                    wait_delay = Some(poll_interval);
+                }
+                Err(e) => {
+                    tracing::error!(retry_in = ?error_backoff, "Failed to read next batch: {e}");
+                    wait_delay = Some(error_backoff);
+                    error_backoff = error_backoff
+                        .checked_mul(2)
+                        .unwrap_or(MAX_ERROR_RETRY_BACKOFF)
+                        .min(MAX_ERROR_RETRY_BACKOFF);
+                }
+            }
+        }
+
+        match wait_for_work(&cancel, &mut ack_rx, &batch_tx, wait_delay, &mut collector).await {
+            WaitOutcome::Wake => {}
+            WaitOutcome::Stop => break,
+        }
+    }
+
+    drain_pending_acks(&mut collector, &mut ack_rx).await;
+
     if let Err(e) = collector.close().await {
         tracing::error!("Failed to flush collector on shutdown: {e}");
+    }
+}
+
+enum WaitOutcome {
+    Wake,
+    Stop,
+}
+
+async fn wait_for_work(
+    cancel: &CancellationToken,
+    ack_rx: &mut mpsc::Receiver<u64>,
+    batch_tx: &mpsc::Sender<CollectedBatch>,
+    delay: Option<std::time::Duration>,
+    collector: &mut Collector,
+) -> WaitOutcome {
+    let wait_for_capacity = batch_tx.capacity() == 0;
+    let mut timer = delay.map(|delay| Box::pin(sleep(delay)));
+    let timer_enabled = timer.is_some();
+
+    tokio::select! {
+        _ = cancel.cancelled() => WaitOutcome::Stop,
+        ack = ack_rx.recv() => match ack {
+            Some(sequence) => {
+                ack_sequence(collector, sequence).await;
+                WaitOutcome::Wake
+            }
+            None => WaitOutcome::Stop,
+        },
+        permit = batch_tx.reserve(), if wait_for_capacity => match permit {
+            Ok(permit) => {
+                drop(permit);
+                WaitOutcome::Wake
+            }
+            Err(_) => WaitOutcome::Stop,
+        },
+        _ = async {
+            if let Some(timer) = timer.as_mut() {
+                timer.await;
+            }
+        }, if timer_enabled => WaitOutcome::Wake,
+    }
+}
+
+async fn drain_pending_acks(collector: &mut Collector, ack_rx: &mut mpsc::Receiver<u64>) {
+    while let Ok(sequence) = ack_rx.try_recv() {
+        ack_sequence(collector, sequence).await;
+    }
+}
+
+async fn ack_sequence(collector: &mut Collector, sequence: u64) {
+    if let Err(e) = collector.ack(sequence).await {
+        tracing::error!(sequence, "Failed to ack batch: {e}");
     }
 }
 
