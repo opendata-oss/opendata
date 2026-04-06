@@ -246,6 +246,7 @@ impl SearchIndexDelta {
     }
 
     pub(crate) fn add_to_root(&mut self, centroid_id: VectorId, vector: Vec<f32>) {
+        debug!("adding new root centroid {:?}", centroid_id);
         let depth = TreeDepth::of(self.centroids_meta.depth);
         assert_eq!(depth.max_inner_level(), centroid_id.level());
         assert!(centroid_id.is_centroid());
@@ -257,6 +258,7 @@ impl SearchIndexDelta {
     }
 
     pub(crate) fn remove_from_root(&mut self, centroid_id: VectorId) {
+        debug!("removing root centroid {:?}", centroid_id);
         let depth = TreeDepth::of(self.centroids_meta.depth);
         assert_eq!(depth.max_inner_level(), centroid_id.level());
         self.root_updates
@@ -455,7 +457,8 @@ impl SearchIndexDelta {
                 .expect("root postings should always encode")
                 .encode_to_bytes();
             output_ops.push(RecordOp::Put(Record::new(key, value).into()));
-        } else if !root_updates.is_empty() {
+        }
+        if !root_updates.is_empty() {
             let op = record::merge_posting_list(ROOT_VECTOR_ID, root_updates)
                 .expect("root posting updates should encode");
             output_ops.push(op);
