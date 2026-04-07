@@ -438,11 +438,18 @@ The garbage collector runs as a background task within the collector process. On
      not yet enqueued in the manifest.
    - Its ULID timestamp is **older than the configured grace period** relative to the
      current wall-clock time. This provides an additional safety margin against race
-     conditions with in-flight producer writes.
+     conditions with in-flight producer writes. It is possible that there is a gap
+     between updating the manifest after a batch file has been uploaded. In that case
+     we might mistakenly assume the file is orphaned since it is not present in the manifest.
    - Its filename matches the expected `{ULID}.batch` format. Non-batch files are skipped.
 4. **Bulk-deletes** all eligible files using a streaming delete. Individual delete failures
    are logged as warnings but do not abort the cycle — the files will be retried on the
    next GC pass.
+
+If the manifest is empty, but there are orphaned files in object storage the garbage collector
+will still clean up the files. Since we iterate over the orphaned files and check if the 
+garbage collection conditions hold. An orphaned file will not be referenced by the manifest
+and will eventually be older than the grace period and thus be eligble for deletion.
 
 The manifest snapshot is read without epoch-based fencing since the garbage collector is a
 read-only observer of the manifest and does not modify it.
