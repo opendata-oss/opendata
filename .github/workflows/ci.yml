@@ -10,6 +10,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      vector: ${{ steps.filter.outputs.vector }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            vector:
+              - 'common/**'
+              - 'macros/**'
+              - 'vector/**'
+              - '.github/**'
+              - '*'
+
   test:
     runs-on: ubuntu-latest
 
@@ -30,16 +47,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+      - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -62,6 +70,8 @@ jobs:
         run: cargo test --doc --all
 
   quickstart-vector-smoke-test:
+    needs: changes
+    if: needs.changes.outputs.vector == 'true'
     runs-on: ubuntu-latest
 
     steps:
