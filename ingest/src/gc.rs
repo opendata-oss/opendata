@@ -37,7 +37,6 @@ impl GarbageCollector {
         // take snapshot of manifest
         let manifest = self.read_manifest_snapshot().await?;
 
-
         // if the oldest location is none it means the manifest is empty so there is nothing to collect then
         if manifest.oldest_location.is_none() {
             return Ok(());
