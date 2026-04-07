@@ -1,14 +1,10 @@
-use std::{
-    collections::{BTreeSet, HashSet},
-    sync::Arc,
-    time::SystemTime,
-};
+use std::{collections::HashSet, sync::Arc, time::SystemTime};
 
 use futures::{StreamExt, stream};
 use slatedb::object_store::{ObjectStore, path::Path};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Error, config::GarbageCollectorConfig, queue::ManifestStore};
+use crate::{Error, config::GarbageCollectorConfig, metric_names as m, queue::ManifestStore};
 
 pub(crate) struct GarbageCollector {
     manifest_store: ManifestStore,
@@ -34,6 +30,8 @@ impl GarbageCollector {
     }
 
     async fn collect_once(&self, now: SystemTime) -> Result<(), Error> {
+        let start = std::time::Instant::now();
+
         // take snapshot of manifest
         let manifest = self.read_manifest_snapshot().await?;
 
@@ -55,11 +53,6 @@ impl GarbageCollector {
 
             let path_str = meta.location.to_string();
 
-            // skip if referenced in the manifest — still needs to be consumed
-            if manifest.locations.contains(&path_str) {
-                continue;
-            }
-
             // extract ULID timestamp from filename; skip non-.batch / non-ULID files
             let file_ts = match Self::extract_ulid_timestamp(&path_str) {
                 Some(ts) => ts,
@@ -79,20 +72,35 @@ impl GarbageCollector {
                 continue;
             }
 
+            // skip if referenced in the manifest — still needs to be consumed
+            if manifest.locations.contains(&path_str) {
+                continue;
+            }
+
             to_delete.push(meta.location);
         }
 
         // bulk delete all candidates
+        let mut deleted: u64 = 0;
+        let mut failed: u64 = 0;
         if !to_delete.is_empty() {
             tracing::debug!(count = to_delete.len(), "GC deleting orphaned batch files");
             let locations = stream::iter(to_delete.iter().cloned().map(Ok));
             let mut results = self.object_store.delete_stream(locations.boxed());
             while let Some(result) = results.next().await {
-                if let Err(e) = result {
-                    tracing::warn!(error = %e, "GC failed to delete batch file");
+                match result {
+                    Ok(_) => deleted += 1,
+                    Err(e) => {
+                        failed += 1;
+                        tracing::warn!(error = %e, "GC failed to delete batch file");
+                    }
                 }
             }
         }
+
+        metrics::counter!(m::GC_FILES_DELETED).increment(deleted);
+        metrics::counter!(m::GC_FILES_FAILED).increment(failed);
+        metrics::histogram!(m::GC_DURATION_SECONDS).record(start.elapsed().as_secs_f64());
 
         Ok(())
     }
@@ -100,6 +108,7 @@ impl GarbageCollector {
     pub(crate) async fn collect(self, shutdown: CancellationToken) {
         loop {
             tokio::select! {
+                biased;
                 _ = shutdown.cancelled() => {
                     tracing::info!("garbage collector shutting down");
                     return;
@@ -121,23 +130,23 @@ impl GarbageCollector {
     }
 
     async fn read_manifest_snapshot(&self) -> Result<ManifestSnapshot, Error> {
-        // read manifest
         let result = self.manifest_store.read().await?;
 
-        // read in manifest entries sorting them lexicographically, first by u64 and then by String if equal
-        let sorted_locations: BTreeSet<(u64, String)> =
-            BTreeSet::from_iter(result.0.iter().map(|entry| {
-                let entry = entry.unwrap();
-                (entry.sequence, entry.location)
-            }));
+        let mut locations = HashSet::new();
+        let mut oldest_location: Option<String> = None;
+        let mut oldest_ts: Option<SystemTime> = None;
 
-        // get the location with the smallest sequence number that is in the manifest
-        let oldest_location = sorted_locations.first().map(|location| location.1.clone());
+        for entry in result.0.iter() {
+            let entry = entry.unwrap();
+            locations.insert(entry.location.clone());
 
-        let locations: HashSet<String> = sorted_locations
-            .iter()
-            .map(|entry| entry.1.clone())
-            .collect();
+            if let Some(ts) = Self::extract_ulid_timestamp(&entry.location)
+                && oldest_ts.is_none_or(|old| ts < old)
+            {
+                oldest_ts = Some(ts);
+                oldest_location = Some(entry.location);
+            }
+        }
 
         Ok(ManifestSnapshot {
             locations,
