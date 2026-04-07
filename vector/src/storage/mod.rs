@@ -14,6 +14,7 @@ use crate::serde::key::{
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::PostingListValue;
 use crate::serde::vector_data::VectorDataValue;
+use crate::serde::vector_id::IntoLegacyVectorId;
 
 pub(crate) mod merge_operator;
 pub(crate) mod record;
@@ -81,9 +82,10 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     #[allow(dead_code)]
     async fn get_posting_list(
         &self,
-        centroid_id: u64,
+        centroid_id: impl IntoLegacyVectorId,
         dimensions: usize,
     ) -> Result<PostingListValue> {
+        let centroid_id = centroid_id.into_id();
         let key = PostingListKey::new(centroid_id).encode();
         let key_next = PostingListKey::new(centroid_id + 1).encode();
         let record = self
@@ -284,7 +286,7 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
 
         // when
-        let result = storage.get_posting_list(1, 3).await.unwrap();
+        let result = storage.get_posting_list(1u64, 3).await.unwrap();
 
         // then
         assert!(result.is_empty());
@@ -332,7 +334,7 @@ mod tests {
         storage.apply(vec![op]).await.unwrap();
 
         // then - read
-        let result = storage.get_posting_list(1, 3).await.unwrap();
+        let result = storage.get_posting_list(1u64, 3).await.unwrap();
         let result: PostingList = result.into();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].id(), 1);
