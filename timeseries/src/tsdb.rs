@@ -5,7 +5,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use common::Storage;
-use futures::TryStreamExt;
+use futures::stream;
+use futures::{StreamExt, TryStreamExt};
 use moka::future::Cache;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 use tokio::sync::RwLock;
@@ -18,8 +19,10 @@ use crate::model::{
     InstantSample, Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Sample,
     Series, SeriesId, TimeBucket,
 };
-use crate::promql::evaluator::{CachedQueryReader, Evaluator, ExprResult, compute_preload_ranges};
-use crate::promql::selector::evaluate_selector_with_reader;
+use crate::promql::evaluator::{
+    Evaluator, ExprResult, QueryReaderEvalCache, compute_preload_ranges,
+};
+use crate::promql::pipeline::{METADATA_STAGE_READAHEAD, resolve_metadata_parallel};
 use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::tsdb_metrics;
@@ -43,51 +46,21 @@ pub(crate) fn preload_ranges(
     }
 }
 
-/// Parse a match[] selector string into a VectorSelector
-fn parse_selector(selector: &str) -> std::result::Result<VectorSelector, String> {
-    let expr = promql_parser::parser::parse(selector).map_err(|e| e.to_string())?;
-    match expr {
-        Expr::VectorSelector(vs) => Ok(vs),
-        _ => Err("Expected a vector selector".to_string()),
-    }
-}
-
-/// Get all series IDs matching any of the given selectors (UNION)
-async fn get_matching_series<R: QueryReader>(
-    reader: &R,
-    bucket: TimeBucket,
-    matches: &[String],
-) -> std::result::Result<HashSet<SeriesId>, String> {
-    let mut all_series = HashSet::new();
-
-    let cached_reader = CachedQueryReader::new(reader);
-    for selector_str in matches {
-        let selector = parse_selector(selector_str)?;
-        let series = evaluate_selector_with_reader(&cached_reader, bucket, &selector)
-            .await
-            .map_err(|e| e.to_string())?;
-        all_series.extend(series);
-    }
-
-    Ok(all_series)
-}
-
-/// Get all series across multiple buckets, with fingerprint-based deduplication
-async fn get_matching_series_multi_bucket<R: QueryReader>(
-    reader: &R,
-    buckets: &[TimeBucket],
-    matches: &[String],
-) -> std::result::Result<HashMap<TimeBucket, HashSet<SeriesId>>, String> {
-    let mut bucket_series_map = HashMap::new();
-
-    for &bucket in buckets {
-        let series = get_matching_series(reader, bucket, matches).await?;
-        if !series.is_empty() {
-            bucket_series_map.insert(bucket, series);
-        }
-    }
-
-    Ok(bucket_series_map)
+/// Parse multiple match[] selector strings into VectorSelectors.
+fn parse_selectors(matchers: &[&str]) -> std::result::Result<Vec<VectorSelector>, QueryError> {
+    matchers
+        .iter()
+        .map(|s| {
+            let expr = promql_parser::parser::parse(s)
+                .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
+            match expr {
+                Expr::VectorSelector(vs) => Ok(vs),
+                _ => Err(QueryError::InvalidQuery(
+                    "Expected a vector selector".to_string(),
+                )),
+            }
+        })
+        .collect()
 }
 
 // ── TsdbReadEngine trait ─────────────────────────────────────────────────
@@ -411,8 +384,8 @@ pub(crate) async fn evaluate_range(
 }
 
 /// Discover series matching any of the given selectors.
-pub(crate) async fn discover_series(
-    reader: &impl QueryReader,
+pub(crate) async fn discover_series<R: QueryReader>(
+    reader: &R,
     matchers: &[&str],
 ) -> std::result::Result<Vec<Labels>, QueryError> {
     if matchers.is_empty() {
@@ -426,20 +399,13 @@ pub(crate) async fn discover_series(
         return Ok(vec![]);
     }
 
-    let matches: Vec<String> = matchers.iter().map(|s| s.to_string()).collect();
-    let bucket_series_map = get_matching_series_multi_bucket(reader, &buckets, &matches)
-        .await
-        .map_err(QueryError::InvalidQuery)?;
+    let selectors = parse_selectors(matchers)?;
+    let cache = Arc::new(QueryReaderEvalCache::new());
+    let metadata = resolve_metadata_parallel(reader, &cache, &buckets, &selectors).await?;
 
     let mut unique_series: HashSet<Labels> = HashSet::new();
-
-    for (bucket, series_ids) in bucket_series_map {
-        let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-        if series_ids_vec.is_empty() {
-            continue;
-        }
-        let forward_index = reader.forward_index(&bucket, &series_ids_vec).await?;
-        for (_id, spec) in forward_index.all_series() {
+    for bm in metadata {
+        for (_id, spec) in bm.forward_index.all_series() {
             let mut sorted_labels = spec.labels.clone();
             sorted_labels.sort();
             unique_series.insert(Labels::new(sorted_labels));
@@ -452,8 +418,8 @@ pub(crate) async fn discover_series(
 }
 
 /// Discover label names, optionally filtered by matchers.
-pub(crate) async fn discover_labels(
-    reader: &impl QueryReader,
+pub(crate) async fn discover_labels<R: QueryReader>(
+    reader: &R,
     matchers: Option<&[&str]>,
 ) -> std::result::Result<Vec<String>, QueryError> {
     let buckets = reader.list_buckets().await?;
@@ -465,18 +431,12 @@ pub(crate) async fn discover_labels(
 
     match matchers {
         Some(matches) if !matches.is_empty() => {
-            let matches: Vec<String> = matches.iter().map(|s| s.to_string()).collect();
-            let bucket_series_map = get_matching_series_multi_bucket(reader, &buckets, &matches)
-                .await
-                .map_err(QueryError::InvalidQuery)?;
+            let selectors = parse_selectors(matches)?;
+            let cache = Arc::new(QueryReaderEvalCache::new());
+            let metadata = resolve_metadata_parallel(reader, &cache, &buckets, &selectors).await?;
 
-            for (bucket, series_ids) in bucket_series_map {
-                let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-                if series_ids_vec.is_empty() {
-                    continue;
-                }
-                let forward_index = reader.forward_index(&bucket, &series_ids_vec).await?;
-                for (_id, spec) in forward_index.all_series() {
+            for bm in metadata {
+                for (_id, spec) in bm.forward_index.all_series() {
                     for attr in &spec.labels {
                         label_names.insert(attr.name.clone());
                     }
@@ -484,8 +444,13 @@ pub(crate) async fn discover_labels(
             }
         }
         _ => {
-            for bucket in buckets {
-                let inverted_index = reader.all_inverted_index(&bucket).await?;
+            let width = buckets.len().clamp(1, METADATA_STAGE_READAHEAD);
+            let results: Vec<_> = stream::iter(buckets)
+                .map(|bucket| async move { reader.all_inverted_index(&bucket).await })
+                .buffer_unordered(width)
+                .try_collect()
+                .await?;
+            for inverted_index in results {
                 for attr in inverted_index.all_keys() {
                     label_names.insert(attr.name);
                 }
@@ -499,8 +464,8 @@ pub(crate) async fn discover_labels(
 }
 
 /// Discover values for a specific label, optionally filtered by matchers.
-pub(crate) async fn discover_label_values(
-    reader: &impl QueryReader,
+pub(crate) async fn discover_label_values<R: QueryReader>(
+    reader: &R,
     label_name: &str,
     matchers: Option<&[&str]>,
 ) -> std::result::Result<Vec<String>, QueryError> {
@@ -513,18 +478,12 @@ pub(crate) async fn discover_label_values(
 
     match matchers {
         Some(matches) if !matches.is_empty() => {
-            let matches: Vec<String> = matches.iter().map(|s| s.to_string()).collect();
-            let bucket_series_map = get_matching_series_multi_bucket(reader, &buckets, &matches)
-                .await
-                .map_err(QueryError::InvalidQuery)?;
+            let selectors = parse_selectors(matches)?;
+            let cache = Arc::new(QueryReaderEvalCache::new());
+            let metadata = resolve_metadata_parallel(reader, &cache, &buckets, &selectors).await?;
 
-            for (bucket, series_ids) in bucket_series_map {
-                let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-                if series_ids_vec.is_empty() {
-                    continue;
-                }
-                let forward_index = reader.forward_index(&bucket, &series_ids_vec).await?;
-                for (_id, spec) in forward_index.all_series() {
+            for bm in metadata {
+                for (_id, spec) in bm.forward_index.all_series() {
                     for attr in &spec.labels {
                         if attr.name == label_name {
                             values.insert(attr.value.clone());
@@ -534,8 +493,13 @@ pub(crate) async fn discover_label_values(
             }
         }
         _ => {
-            for bucket in buckets {
-                let label_vals = reader.label_values(&bucket, label_name).await?;
+            let width = buckets.len().clamp(1, METADATA_STAGE_READAHEAD);
+            let results: Vec<_> = stream::iter(buckets)
+                .map(|bucket| async move { reader.label_values(&bucket, label_name).await })
+                .buffer_unordered(width)
+                .try_collect()
+                .await?;
+            for label_vals in results {
                 values.extend(label_vals);
             }
         }
