@@ -353,7 +353,9 @@ if a new collector starts and calls `initialize()`, any previous collector's sub
 
 The `last_acked_sequence` parameter controls where the collector starts reading:
 - `None` — start from the earliest available entry in the queue.
-- `Some(seq)` — resume after sequence `seq`, so the next call to `next_batch()` reads sequence `seq + 1`.
+- `Some(seq)` — resume after sequence `seq`, so the collector positions both its
+  acknowledged position and its internal read position at `seq`. The next call
+  to `next_batch()` reads sequence `seq + 1`.
 
 The configurations for the collector are:
 ```rust
@@ -391,14 +393,17 @@ pub struct Metadata {
 
 By calling `next_batch()` the collector reads the next data batch from object storage via the
 queue consumer, deserializes the entries, and returns them as a `CollectedBatch`.
-On the first call (when no batch has been acked yet), it peeks the earliest entry in the queue.
-On subsequent calls, it reads the entry with sequence `last_acked_sequence + 1`.
-If no entries are available, `None` is returned.
+The collector maintains an internal read cursor that advances in ingestion order.
+On the first call (when no batch has been fetched yet), it peeks the earliest entry
+in the queue. On subsequent calls, it reads the entry immediately following the last
+successfully fetched sequence. If no entries are available, `None` is returned.
 
 By calling `ack(sequence)` the caller confirms that the batch with the given sequence number
 has been fully processed. Acks must be in order — acking a sequence that is not immediately
 after the last acked sequence returns an error. To amortize the cost of manifest writes,
 the collector batches acks and only calls `dequeue()` on the queue consumer every 100 acks.
+This acknowledged position is tracked separately from the internal read cursor so the
+collector can read ahead while still preserving in-order acknowledgements and resume semantics.
 The `dequeue()` call removes acknowledged entries from the queue manifest but does not delete
 the corresponding data batch files from object storage. Deletion of batch files is handled
 exclusively by the garbage collector (see below).
@@ -557,6 +562,5 @@ None at this time.
 | 2026-03-30 | Added native compression support to data batch format |
 | 2026-03-30 | Added metadata field to CollectedBatch and documented public Metadata struct |
 | 2026-04-06 | Added Garbage Collection section; collector no longer deletes batch files directly |
-
 
 
