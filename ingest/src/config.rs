@@ -111,39 +111,6 @@ fn default_flush_size_bytes() -> usize {
 fn default_max_buffered_inputs() -> usize {
     1000
 }
-/// Configuration for the [Garbage Collector](crate::GarbageCollector)
-///
-/// Controls how often garbage collection runs and which files are elligble for deletion
-#[serde_as]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GarbageCollectorConfig {
-    /// Path to the queue manifest in object storage.
-    ///
-    /// Defaults to `"ingest/manifest"`.
-    #[serde(default = "default_manifest_path")]
-    pub manifest_path: String,
-
-    /// Path prefix for data batch objects in object storage.
-    ///
-    /// Defaults to `"ingest"`.
-    #[serde(default = "default_data_path_prefix")]
-    pub data_path_prefix: String,
-
-    /// How often garbage collection runs
-    ///
-    /// Defaults to 5 min
-    #[serde_as(as = "DurationMilliSeconds<u64>")]
-    #[serde(default = "default_gc_interval")]
-    pub gc_interval: Duration,
-
-    /// Minimum age before an unreferenced file is considered ready to be deleted from object storage
-    ///
-    /// Defaults to 10 min
-    #[serde_as(as = "DurationMilliSeconds<u64>")]
-    #[serde(default = "default_gc_grace_period")]
-    pub gc_grace_period: Duration,
-}
-
 fn default_gc_interval() -> Duration {
     Duration::from_mins(5)
 }
