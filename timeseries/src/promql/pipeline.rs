@@ -20,7 +20,7 @@ use crate::promql::evaluator::{
 use crate::promql::selector::evaluate_selector_with_reader;
 use crate::query::QueryReader;
 use futures::stream;
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use promql_parser::parser::VectorSelector;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -258,50 +258,87 @@ fn compute_subquery_alignment(
 // Phase 2: Metadata resolution
 // ---------------------------------------------------------------------------
 
+/// Evaluate a single selector for a bucket, returning matching series IDs.
+///
+/// Consults the selector-result cache before invoking the full selector path.
+async fn resolve_selector_candidates<R: QueryReader>(
+    reader: &CachedQueryReader<'_, R>,
+    bucket: TimeBucket,
+    selector: &VectorSelector,
+) -> EvalResult<Vec<SeriesId>> {
+    let selector_key = SelectorCacheKey::from_selector(selector);
+    let cache = reader.shared_cache();
+
+    if let Some(cached) = cache.get_selector_result(&bucket, &selector_key) {
+        cache
+            .stats
+            .selector_hits
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        return Ok(cached.to_vec());
+    }
+
+    cache
+        .stats
+        .selector_misses
+        .fetch_add(1, AtomicOrdering::Relaxed);
+    let candidates = evaluate_selector_with_reader(reader, bucket, selector)
+        .await
+        .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+
+    if candidates.is_empty() {
+        cache.cache_selector_result(bucket, selector_key, Arc::from([]));
+        return Ok(vec![]);
+    }
+
+    let mut vec: Vec<_> = candidates.into_iter().collect();
+    vec.sort();
+    cache.cache_selector_result(bucket, selector_key, Arc::from(vec.as_slice()));
+    Ok(vec)
+}
+
 /// Resolve metadata for a single bucket: run selector, load forward index.
 ///
 /// Returns `None` if no candidate series match the selector in this bucket.
-/// Consults the selector-result cache before invoking the full selector path.
 pub(crate) async fn resolve_bucket_metadata<R: QueryReader>(
     reader: &CachedQueryReader<'_, R>,
     bucket: TimeBucket,
     selector: &VectorSelector,
 ) -> EvalResult<Option<BucketMetadata>> {
-    let selector_key = SelectorCacheKey::from_selector(selector);
-    let cache = reader.shared_cache();
-
-    let candidates_vec: Vec<SeriesId> =
-        if let Some(cached) = cache.get_selector_result(&bucket, &selector_key) {
-            cache
-                .stats
-                .selector_hits
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            cached.to_vec()
-        } else {
-            cache
-                .stats
-                .selector_misses
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            let candidates = evaluate_selector_with_reader(reader, bucket, selector)
-                .await
-                .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
-
-            if candidates.is_empty() {
-                // Cache empty result so repeated steps skip the selector entirely
-                cache.cache_selector_result(bucket, selector_key, Arc::from([]));
-                return Ok(None);
-            }
-
-            let mut vec: Vec<_> = candidates.into_iter().collect();
-            vec.sort();
-            cache.cache_selector_result(bucket, selector_key, Arc::from(vec.as_slice()));
-            vec
-        };
-
+    let candidates_vec = resolve_selector_candidates(reader, bucket, selector).await?;
     if candidates_vec.is_empty() {
         return Ok(None);
     }
 
+    let forward_index = reader.forward_index(&bucket, &candidates_vec).await?;
+
+    Ok(Some(BucketMetadata {
+        bucket,
+        candidates: candidates_vec,
+        forward_index,
+    }))
+}
+
+/// Resolve metadata for a single bucket using multiple selectors (OR).
+///
+/// Each selector is evaluated independently (with caching); series IDs are
+/// unioned across all selectors, then the forward index is loaded once for
+/// the combined set.
+pub(crate) async fn resolve_bucket_metadata_multi<R: QueryReader>(
+    reader: &CachedQueryReader<'_, R>,
+    bucket: TimeBucket,
+    selectors: &[VectorSelector],
+) -> EvalResult<Option<BucketMetadata>> {
+    let mut all_candidates: HashSet<SeriesId> = HashSet::new();
+    for selector in selectors {
+        let candidates = resolve_selector_candidates(reader, bucket, selector).await?;
+        all_candidates.extend(candidates);
+    }
+    if all_candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let mut candidates_vec: Vec<_> = all_candidates.into_iter().collect();
+    candidates_vec.sort();
     let forward_index = reader.forward_index(&bucket, &candidates_vec).await?;
 
     Ok(Some(BucketMetadata {
@@ -698,7 +735,7 @@ impl From<&crate::model::QueryOptions> for PipelineConcurrency {
 /// many bucket metadata jobs are polled concurrently by `buffer_unordered`.
 /// The *real* cache-miss read limit is the `metadata_semaphore` on the
 /// shared `QueryReaderEvalCache`.
-const METADATA_STAGE_READAHEAD: usize = 32;
+pub(crate) const METADATA_STAGE_READAHEAD: usize = 32;
 
 /// Maximum coordinator-level readahead for the sample stage.
 ///
@@ -714,11 +751,16 @@ struct BucketTaskTiming {
     sample_load_ms: f64,
 }
 
-/// One bucket waiting to be processed by the metadata worker pool.
-struct MetadataStageJob {
-    idx: usize,
-    bucket: TimeBucket,
-    queued_at: Instant,
+/// One item yielded by [`metadata_stream`] per bucket.
+pub(crate) struct MetadataStreamItem {
+    /// Which bucket this item corresponds to.
+    pub bucket: TimeBucket,
+    /// Resolved metadata, or `None` if no series matched.
+    pub metadata: Option<BucketMetadata>,
+    /// Time this bucket spent waiting for a `buffer_unordered` worker slot.
+    pub queue_wait_ms: f64,
+    /// Time spent resolving metadata (selector eval + forward index load).
+    pub resolve_ms: f64,
 }
 
 /// One bucket whose metadata has been resolved and is ready for sample loading.
@@ -791,36 +833,83 @@ impl PipelineTimings {
     }
 }
 
-/// Execute one metadata-stage job.
+/// Stream that resolves metadata across buckets in parallel.
 ///
-/// A metadata worker dequeues a bucket, resolves selector metadata for it, and
-/// packages explicit sample work for the sample stage.
-async fn execute_metadata_stage_job<R: QueryReader>(
+/// Uses `buffer_unordered(METADATA_STAGE_READAHEAD)` for cross-bucket
+/// parallelism and a shared `CachedQueryReader` for caching and
+/// semaphore-based backpressure. Yields one [`MetadataStreamItem`] per
+/// bucket with timing and optional metadata.
+///
+/// Both the PromQL selector pipeline and the discovery endpoints
+/// (`/api/v1/series`, `/api/v1/labels`, `/api/v1/label/*/values`)
+/// build on this stream. The pipeline chains it with sample loading;
+/// discovery functions collect it.
+pub(crate) fn metadata_stream<'a, R: QueryReader>(
+    reader: &'a R,
+    cache: &'a Arc<QueryReaderEvalCache>,
+    buckets: &'a [TimeBucket],
+    selectors: &'a [VectorSelector],
+) -> impl Stream<Item = EvalResult<MetadataStreamItem>> + 'a {
+    let stream_start = Instant::now();
+    let width = buckets.len().clamp(1, METADATA_STAGE_READAHEAD);
+    stream::iter(buckets.iter().copied())
+        .map(move |bucket| {
+            let cached = CachedQueryReader::with_shared_cache(reader, Arc::clone(cache));
+            async move {
+                let queue_wait_ms = stream_start.elapsed().as_secs_f64() * 1000.0;
+                let resolve_start = Instant::now();
+                let metadata = resolve_bucket_metadata_multi(&cached, bucket, selectors).await?;
+                let resolve_ms = resolve_start.elapsed().as_secs_f64() * 1000.0;
+                Ok(MetadataStreamItem {
+                    bucket,
+                    metadata,
+                    queue_wait_ms,
+                    resolve_ms,
+                })
+            }
+        })
+        .buffer_unordered(width)
+}
+
+/// Resolve metadata across all buckets in parallel, collecting results.
+///
+/// Convenience wrapper over [`metadata_stream`] that filters out empty
+/// buckets and collects into a `Vec`.
+pub(crate) async fn resolve_metadata_parallel<R: QueryReader>(
     reader: &R,
-    cache: Arc<QueryReaderEvalCache>,
+    cache: &Arc<QueryReaderEvalCache>,
+    buckets: &[TimeBucket],
+    selectors: &[VectorSelector],
+) -> EvalResult<Vec<BucketMetadata>> {
+    metadata_stream(reader, cache, buckets, selectors)
+        .try_filter_map(|item| async { Ok(item.metadata) })
+        .try_collect()
+        .await
+}
+
+/// Convert a resolved [`MetadataStreamItem`] into a [`SampleStageItem`].
+///
+/// Metadata resolution and timing are handled by [`metadata_stream`];
+/// this function packages the result into sample-stage work.
+fn build_sample_stage_item(
+    item: MetadataStreamItem,
+    idx: usize,
     plan: &QueryPlan,
-    selector: &VectorSelector,
-    job: MetadataStageJob,
+    cache: &QueryReaderEvalCache,
 ) -> EvalResult<SampleStageItem> {
-    let mut timing = BucketTaskTiming {
-        metadata_queue_wait_ms: job.queued_at.elapsed().as_secs_f64() * 1000.0,
-        ..Default::default()
-    };
-
-    let metadata_start = Instant::now();
-    let cached = CachedQueryReader::with_shared_cache(reader, Arc::clone(&cache));
-    let metadata = resolve_bucket_metadata(&cached, job.bucket, selector).await?;
-    timing.metadata_resolve_ms = metadata_start.elapsed().as_secs_f64() * 1000.0;
-
-    let work = match metadata {
-        Some(metadata) => Some(plan.build_work(&metadata, &cache)?),
+    let work = match item.metadata {
+        Some(metadata) => Some(plan.build_work(&metadata, cache)?),
         None => None,
     };
 
     Ok(SampleStageItem {
-        idx: job.idx,
+        idx,
         work,
-        timing,
+        timing: BucketTaskTiming {
+            metadata_queue_wait_ms: item.queue_wait_ms,
+            metadata_resolve_ms: item.resolve_ms,
+            ..Default::default()
+        },
         queued_at: Instant::now(),
     })
 }
@@ -854,16 +943,16 @@ async fn execute_sample_stage_job<R: QueryReader>(
 
 /// Execute the shared selector pipeline for all evaluator-backed query paths.
 ///
-/// Orchestrates: resolve metadata -> build work -> load samples -> shape results.
-/// Branching on `QueryPathKind` handles the behavioral differences between
-/// instant vector selectors, matrix selectors, and subquery fast paths.
+/// Orchestrates: resolve metadata -> build work -> load samples -> shape
+/// results. Branching on `QueryPathKind` handles the behavioral differences
+/// between instant vector selectors, matrix selectors, and subquery fast
+/// paths.
 ///
 /// Concurrency model:
-/// - One `MetadataStageJob` is created per bucket.
-/// - `buffer_unordered(metadata_stage_width)` forms the metadata worker pool
-///   (sized by `METADATA_STAGE_READAHEAD`, not the public concurrency knob).
-/// - As each metadata worker finishes, it forwards a `SampleStageItem` into a
-///   bounded channel.
+/// - [`metadata_stream`] resolves bucket metadata in parallel via
+///   `buffer_unordered(METADATA_STAGE_READAHEAD)`.
+/// - As each bucket's metadata resolves, a `SampleStageItem` is forwarded
+///   into a bounded channel (only for buckets with matching series).
 /// - `buffer_unordered(sample_stage_width)` forms the sample worker pool
 ///   (sized by `SAMPLE_STAGE_READAHEAD`).
 /// - Within each bucket, `load_bucket_samples` uses a bounded
@@ -883,42 +972,30 @@ pub(crate) async fn execute_selector_pipeline<R: QueryReader>(
     let pipeline_start = Instant::now();
     let stats_before = cache.snapshot_stats();
 
-    // Coordinator widths are internal scheduling constants. The public
-    // concurrency knobs (metadata / samples) only size the read-permit
-    // semaphores on the shared cache; these widths and the per-bucket sample
-    // window bound resident pipeline work and can become the tighter limit.
     let num_buckets = plan.buckets.len();
-    let metadata_stage_width = num_buckets.clamp(1, METADATA_STAGE_READAHEAD);
     let sample_stage_width = num_buckets.clamp(1, SAMPLE_STAGE_READAHEAD);
 
-    let metadata_jobs: Vec<_> = plan
+    // Map bucket → plan index so we can reassemble results in plan order
+    // after the unordered metadata stream completes each bucket.
+    let bucket_idx: HashMap<TimeBucket, usize> = plan
         .buckets
         .iter()
         .enumerate()
-        .map(|(idx, &bucket)| MetadataStageJob {
-            idx,
-            bucket,
-            queued_at: pipeline_start,
-        })
+        .map(|(i, &b)| (b, i))
         .collect();
 
     let (sample_tx, sample_rx) = mpsc::channel(sample_stage_width);
 
+    let selectors = std::slice::from_ref(selector);
     let metadata_stage = {
-        let metadata_cache = cache.clone();
         async move {
-            stream::iter(metadata_jobs)
-                .map(|job| {
-                    let job_cache = metadata_cache.clone();
-                    async move {
-                        execute_metadata_stage_job(reader, job_cache, plan, selector, job).await
-                    }
-                })
-                .buffer_unordered(metadata_stage_width)
+            metadata_stream(reader, cache, &plan.buckets, selectors)
                 .try_for_each(|item| {
                     let sample_tx = sample_tx.clone();
+                    let idx = bucket_idx[&item.bucket];
+                    let stage_item = build_sample_stage_item(item, idx, plan, cache);
                     async move {
-                        sample_tx.send(item).await.map_err(|_| {
+                        sample_tx.send(stage_item?).await.map_err(|_| {
                             EvaluationError::InternalError("sample work queue closed".into())
                         })
                     }
