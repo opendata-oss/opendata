@@ -6,6 +6,9 @@ pub(crate) mod state;
 pub(crate) mod test_utils;
 mod vector;
 
+#[allow(dead_code)]
+pub(crate) mod tree;
+
 use crate::DistanceMetric;
 use crate::Result;
 use crate::hnsw::CentroidGraph;

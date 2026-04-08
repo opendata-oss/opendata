@@ -12,6 +12,8 @@ pub mod metadata_index;
 pub mod posting_list;
 pub mod vector_bitmap;
 pub mod vector_data;
+#[allow(dead_code)]
+pub mod vector_id;
 
 use bytes::BytesMut;
 

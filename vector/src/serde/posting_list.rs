@@ -31,9 +31,11 @@
 //! - Output remains sorted by id
 
 use super::EncodingError;
+use crate::serde::vector_id::IntoLegacyVectorId;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Posting {
@@ -66,7 +68,9 @@ impl From<PostingListValue> for PostingList {
             .filter_map(|posting| {
                 assert!(seen.insert(posting.id()));
                 match posting {
-                    PostingUpdate::Append { id, vector } => Some(Posting::new(id, vector)),
+                    PostingUpdate::Append { id, vector } => {
+                        Some(Posting::new(id, Vec::clone(vector.as_ref())))
+                    }
                     PostingUpdate::Delete { .. } => None,
                 }
             })
@@ -91,7 +95,7 @@ pub enum PostingUpdate {
         /// Internal vector ID.
         id: u64,
         /// The full vector data.
-        vector: Vec<f32>,
+        vector: Arc<Vec<f32>>,
     },
     Delete {
         /// Internal vector ID
@@ -101,13 +105,16 @@ pub enum PostingUpdate {
 
 impl PostingUpdate {
     /// Create a new append posting update.
-    pub fn append(id: u64, vector: Vec<f32>) -> Self {
-        Self::Append { id, vector }
+    pub(crate) fn append(id: impl IntoLegacyVectorId, vector: Vec<f32>) -> Self {
+        Self::Append {
+            id: id.into_id(),
+            vector: Arc::new(vector),
+        }
     }
 
     /// Create a new delete posting update.
-    pub fn delete(id: u64) -> Self {
-        Self::Delete { id }
+    pub(crate) fn delete(id: impl IntoLegacyVectorId) -> Self {
+        Self::Delete { id: id.into_id() }
     }
 
     /// Returns true if this is an append operation.
@@ -144,7 +151,7 @@ impl PostingUpdate {
             Self::Append { id, vector } => {
                 buf.put_u8(POSTING_UPDATE_TYPE_APPEND_BYTE);
                 buf.put_u64_le(*id);
-                for &val in vector {
+                for &val in vector.as_ref() {
                     buf.put_f32_le(val);
                 }
             }
@@ -190,7 +197,10 @@ impl PostingUpdate {
                 vector.push(buf.get_f32_le());
             }
 
-            Ok(PostingUpdate::Append { id, vector })
+            Ok(PostingUpdate::Append {
+                id,
+                vector: Arc::new(vector),
+            })
         } else if posting_type == POSTING_UPDATE_TYPE_DELETE_BYTE {
             Ok(PostingUpdate::Delete { id })
         } else {
@@ -243,7 +253,7 @@ impl PostingUpdate {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PostingListValue {
     /// List of posting updates (appends or deletes).
-    postings: Vec<PostingUpdate>,
+    pub(crate) postings: Vec<PostingUpdate>,
 }
 
 impl PostingListValue {

@@ -3,6 +3,7 @@
 //! All keys use big-endian encoding for lexicographic ordering.
 
 use super::{EncodingError, FieldValue, KEY_VERSION, RecordKey, RecordType, SUBSYSTEM};
+use crate::serde::vector_id::IntoLegacyVectorId;
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
 use common::serde::key_prefix::KeyPrefix;
@@ -130,8 +131,10 @@ impl RecordKey for PostingListKey {
 }
 
 impl PostingListKey {
-    pub fn new(centroid_id: u64) -> Self {
-        Self { centroid_id }
+    pub(crate) fn new(centroid_id: impl IntoLegacyVectorId) -> Self {
+        Self {
+            centroid_id: centroid_id.into_id(),
+        }
     }
 
     pub fn encode(&self) -> Bytes {
