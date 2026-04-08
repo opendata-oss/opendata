@@ -129,7 +129,6 @@ pub(crate) struct LastAppliedSnapshot {
 /// and metadata index maintenance automatically.
 pub struct VectorDb {
     config: Config,
-    #[allow(dead_code)]
     storage: Arc<dyn Storage>,
 
     /// The WriteCoordinator itself (stored to keep it alive).

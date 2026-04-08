@@ -1,4 +1,3 @@
-use crate::Result;
 use crate::model::{AttributeValue, MetadataFieldSpec, VECTOR_FIELD_NAME};
 use crate::serde::FieldType;
 use crate::serde::centroid_info::CentroidInfoValue;
@@ -331,10 +330,4 @@ fn assert_attributes_conform_to_schema(
         assert_eq!(spec.field_type, FieldType::String);
         assert!(matches!(value, AttributeValue::String(_)));
     }
-}
-
-#[allow(dead_code)]
-pub async fn validate_harness(harness: &IndexerOpTestHarness) -> Result<()> {
-    let snapshot = harness.storage.snapshot().await.unwrap();
-    validator::validate(snapshot, &harness.state, harness.dimensions).await
 }

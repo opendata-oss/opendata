@@ -193,15 +193,6 @@ impl PostingList {
     }
 }
 
-impl From<Vec<crate::serde::posting_list::Posting>> for PostingList {
-    fn from(value: Vec<crate::serde::posting_list::Posting>) -> Self {
-        value
-            .into_iter()
-            .map(|posting| Posting::new(posting.id(), posting.vector().to_vec()))
-            .collect()
-    }
-}
-
 impl FromIterator<Posting> for PostingList {
     fn from_iter<T: IntoIterator<Item = Posting>>(iter: T) -> Self {
         Self {
