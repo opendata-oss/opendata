@@ -10,7 +10,7 @@ use crate::write::delta::VectorWrite;
 use crate::write::indexer::tree::centroids::AllCentroidsCacheWriter;
 use crate::write::indexer::tree::posting_list::PostingList;
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState};
-use crate::write::indexer::tree::{IndexerOpts, vector::WriteVectors};
+use crate::write::indexer::tree::{IndexerOpts, validator, vector::WriteVectors};
 use common::storage::in_memory::InMemoryStorage;
 use common::{SequenceAllocator, Storage, StorageRead};
 use std::collections::HashMap;
@@ -270,8 +270,6 @@ impl IndexerOpTestHarnessBuilder {
 pub struct IndexerOpTestHarness {
     pub storage: Arc<dyn Storage>,
     pub state: VectorIndexState,
-    // TODO: clean me up
-    #[allow(dead_code)]
     dimensions: usize,
     vector_schema: Vec<MetadataFieldSpec>,
 }
@@ -299,13 +297,10 @@ impl IndexerOpTestHarness {
     }
 
     pub async fn validate(&self) {
-        // TODO: clean me up
-        /*
         let snapshot = self.storage.snapshot().await.unwrap();
         validator::validate(snapshot, &self.state, self.dimensions)
             .await
             .unwrap();
-         */
     }
 }
 
@@ -339,9 +334,7 @@ fn assert_attributes_conform_to_schema(
 }
 
 #[allow(dead_code)]
-pub async fn validate_harness(_harness: &IndexerOpTestHarness) -> Result<()> {
-    // TODO: clean me up
-    /*let snapshot = harness.storage.snapshot().await.unwrap();
-    validator::validate(snapshot, &harness.state, harness.dimensions).await*/
-    Ok(())
+pub async fn validate_harness(harness: &IndexerOpTestHarness) -> Result<()> {
+    let snapshot = harness.storage.snapshot().await.unwrap();
+    validator::validate(snapshot, &harness.state, harness.dimensions).await
 }

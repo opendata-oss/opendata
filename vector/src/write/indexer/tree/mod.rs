@@ -18,6 +18,8 @@ use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, Vec
 use crate::write::indexer::tree::vector::{ReassignVectors, WriteVectors};
 use common::StorageRead;
 use common::storage::RecordOp;
+#[cfg(debug_assertions)]
+use common::storage::StorageSnapshot;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -31,6 +33,7 @@ mod split;
 pub(crate) mod state;
 #[cfg(test)]
 pub(crate) mod test_utils;
+pub(crate) mod validator;
 mod vector;
 
 #[derive(Debug, Default)]
@@ -76,8 +79,6 @@ impl Indexer {
         }
     }
 
-    // TODO: clean me up
-    #[allow(dead_code)]
     pub(crate) fn state(&self) -> &VectorIndexState {
         &self.state
     }
@@ -311,6 +312,13 @@ impl Indexer {
             leaf_centroids: self.leaf_centroid_count(),
             centroid_tree_depth: TreeDepth::of(self.state.centroids_meta().depth),
         })
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) async fn validate(&self, snapshot: Arc<dyn StorageSnapshot>) {
+        validator::validate(snapshot, &self.state, self.opts.dimensions)
+            .await
+            .expect("validation failed");
     }
 
     async fn reassign_vectors(

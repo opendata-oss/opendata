@@ -93,6 +93,14 @@ impl Flusher<VectorDbWriteDelta> for VectorDbFlusher {
 }
 
 impl VectorDbFlusher {
+    #[allow(unused_variables)]
+    async fn validate(&self, snapshot: Arc<dyn StorageSnapshot>) {
+        #[cfg(debug_assertions)]
+        {
+            self.indexer.validate(snapshot).await;
+        }
+    }
+
     async fn apply_and_snapshot(
         &mut self,
         index_outputs: IndexUpdateResults,
@@ -104,6 +112,7 @@ impl VectorDbFlusher {
             .map_err(|e| e.to_string())?;
 
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
+        self.validate(snapshot.clone()).await;
         let stored_reader = StoredCentroidReader::new(
             self.opts.dimensions as usize,
             snapshot.clone(),

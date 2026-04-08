@@ -13,17 +13,24 @@
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use bencher::{Bench, Benchmark, Params, Summary};
-use common::StorageBuilder;
+use common::StorageConfig;
+use common::storage::config::SlateDbStorageConfig;
 use common::storage::factory::{FoyerCache, FoyerCacheOptions};
+use common::{StorageBuilder, StorageReaderRuntime, create_object_store};
+use tokio::sync::mpsc;
 use vector::{
-    Config, DistanceMetric, Query, SearchOptions, SearchResult, Vector, VectorDb, VectorDbRead,
+    Config, DistanceMetric, Query, ReaderConfig, SearchOptions, SearchResult, Vector, VectorDb,
+    VectorDbRead, VectorDbReader,
 };
 
 const DEFAULT_NUM_QUERIES: usize = 100;
+const BASE_VECTOR_CHUNK_SIZE: usize = 1_000_000;
+const INGEST_WRITE_BATCH_SIZE: usize = 10;
 
 fn load_vector_config(path: &str) -> Config {
     let contents =
@@ -32,6 +39,12 @@ fn load_vector_config(path: &str) -> Config {
         .unwrap_or_else(|e| panic!("failed to parse {}: {}", path, e));
     println!("  Vector config: {:?}", config);
     config
+}
+
+fn load_storage_config(path: &str) -> StorageConfig {
+    let contents =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {}: {}", path, e));
+    serde_yaml::from_str(&contents).unwrap_or_else(|e| panic!("failed to parse {}: {}", path, e))
 }
 
 fn skip_ingest() -> bool {
@@ -50,7 +63,111 @@ fn data_dir() -> PathBuf {
         .join("bench/data")
 }
 
+/// normalize a vector to the unit hypersphere
+fn normalize_vec(v: &mut [f32]) {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        v.iter_mut().for_each(|x| *x /= norm);
+    }
+}
+
 // -- Vector file readers ------------------------------------------------------
+
+struct VectorFileBatchReader {
+    reader: BufReader<File>,
+    format: VecFormat,
+    dimensions: usize,
+    remaining: Option<usize>,
+    normalize: bool,
+}
+
+impl VectorFileBatchReader {
+    fn open(
+        path: &Path,
+        format: VecFormat,
+        dimensions: usize,
+        max_vectors: Option<usize>,
+        normalize: bool,
+    ) -> anyhow::Result<Self> {
+        let file =
+            File::open(path).unwrap_or_else(|e| panic!("failed to open {}: {}", path.display(), e));
+        Ok(Self {
+            reader: BufReader::new(file),
+            format,
+            dimensions,
+            remaining: max_vectors,
+            normalize,
+        })
+    }
+
+    fn read_batch(&mut self, max_rows: usize) -> anyhow::Result<Option<Vec<Vec<f32>>>> {
+        if self.remaining == Some(0) {
+            return Ok(None);
+        }
+
+        let batch_cap = self.remaining.unwrap_or(max_rows).min(max_rows);
+        let mut rows = Vec::with_capacity(batch_cap);
+        while rows.len() < batch_cap {
+            let Some(mut values) = self.read_vector()? else {
+                break;
+            };
+            if self.normalize {
+                normalize_vec(&mut values);
+            }
+            rows.push(values);
+            if let Some(remaining) = &mut self.remaining {
+                *remaining -= 1;
+                if *remaining == 0 {
+                    break;
+                }
+            }
+        }
+
+        if rows.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(rows))
+        }
+    }
+
+    fn read_vector(&mut self) -> anyhow::Result<Option<Vec<f32>>> {
+        let Some(dim) = read_dim_prefix(&mut self.reader)? else {
+            return Ok(None);
+        };
+        if dim != self.dimensions {
+            anyhow::bail!(
+                "dimension mismatch while streaming vectors: expected {}, got {}",
+                self.dimensions,
+                dim
+            );
+        }
+
+        match self.format {
+            VecFormat::Fvecs => {
+                let mut values = vec![0f32; dim];
+                let byte_slice = unsafe {
+                    std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, dim * 4)
+                };
+                self.reader.read_exact(byte_slice)?;
+                Ok(Some(values))
+            }
+            VecFormat::Bvecs => {
+                let mut bytes = vec![0u8; dim];
+                self.reader.read_exact(&mut bytes)?;
+                Ok(Some(bytes.into_iter().map(|v| v as f32).collect()))
+            }
+        }
+    }
+}
+
+fn read_dim_prefix(reader: &mut impl Read) -> anyhow::Result<Option<usize>> {
+    let mut dim_buf = [0u8; 4];
+    match reader.read_exact(&mut dim_buf) {
+        Ok(()) => Ok(Some(u32::from_le_bytes(dim_buf) as usize)),
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
 
 fn read_fvecs(path: &Path) -> Vec<Vec<f32>> {
     let file =
@@ -178,31 +295,123 @@ struct Dataset {
     /// Path to a YAML file with vector `Config` overrides. When set, the config
     /// from this file is used instead of constructing one from dataset fields.
     vector_config: Option<String>,
+    /// Optional path to a YAML file with a separate StorageConfig for cold-reader
+    /// queries. When both writer and reader storage are SlateDb, the reader uses
+    /// the writer's data path/object store and the override's settings/cache.
+    reader_storage_config: Option<String>,
     /// File format for base and query vectors.
     format: VecFormat,
     /// Maximum number of base vectors to ingest. `None` = all.
     max_vectors: Option<usize>,
+    normalize: bool,
 }
 
 impl Dataset {
-    /// Load base vectors, respecting `format` and `max_vectors`.
-    fn load_base_vectors(&self, data_dir: &Path) -> Vec<Vec<f32>> {
-        let path = data_dir.join(self.base_file);
-        match self.format {
-            VecFormat::Fvecs => {
-                let vecs = read_fvecs(&path);
-                match self.max_vectors {
-                    Some(n) => vecs.into_iter().take(n).collect(),
-                    None => vecs,
+    fn base_path(&self, data_dir: &Path) -> PathBuf {
+        data_dir.join(self.base_file)
+    }
+
+    fn query_path(&self, data_dir: &Path) -> PathBuf {
+        data_dir.join(self.query_file)
+    }
+
+    fn estimated_base_vector_count(&self, data_dir: &Path) -> anyhow::Result<usize> {
+        let path = self.base_path(data_dir);
+        let bytes = std::fs::metadata(&path)?.len() as usize;
+        let record_size = match self.format {
+            VecFormat::Fvecs => 4 + self.dimensions as usize * 4,
+            VecFormat::Bvecs => 4 + self.dimensions as usize,
+        };
+        if !bytes.is_multiple_of(record_size) {
+            anyhow::bail!(
+                "file size {} for {} is not a multiple of record size {}",
+                bytes,
+                path.display(),
+                record_size
+            );
+        }
+        let total = bytes / record_size;
+        Ok(self.max_vectors.map_or(total, |n| n.min(total)))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn spawn_base_vector_stream(
+        &self,
+        data_dir: &Path,
+        batch_size: usize,
+    ) -> anyhow::Result<(
+        mpsc::Receiver<anyhow::Result<Option<Vec<Vec<f32>>>>>,
+        thread::JoinHandle<()>,
+    )> {
+        let path = self.base_path(data_dir);
+        let format = self.format;
+        let dimensions = self.dimensions as usize;
+        let max_vectors = self.max_vectors;
+        let normalize = self.normalize;
+        let (tx, rx) = mpsc::channel(1);
+
+        let handle = thread::spawn(move || {
+            let mut reader = match VectorFileBatchReader::open(
+                &path,
+                format,
+                dimensions,
+                max_vectors,
+                normalize,
+            ) {
+                Ok(reader) => reader,
+                Err(err) => {
+                    let _ = tx.blocking_send(Err(err));
+                    return;
+                }
+            };
+
+            loop {
+                match reader.read_batch(batch_size) {
+                    Ok(Some(batch)) => {
+                        if tx.blocking_send(Ok(Some(batch))).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = tx.blocking_send(Ok(None));
+                        return;
+                    }
+                    Err(err) => {
+                        let _ = tx.blocking_send(Err(err));
+                        return;
+                    }
                 }
             }
-            VecFormat::Bvecs => read_bvecs(&path, self.max_vectors),
+        });
+
+        Ok((rx, handle))
+    }
+
+    fn resolve_reader_storage_config(
+        &self,
+        writer_storage: &StorageConfig,
+    ) -> anyhow::Result<StorageConfig> {
+        let Some(path) = &self.reader_storage_config else {
+            return Ok(writer_storage.clone());
+        };
+
+        let override_storage = load_storage_config(path);
+        match (writer_storage, override_storage) {
+            (StorageConfig::SlateDb(writer), StorageConfig::SlateDb(reader)) => {
+                Ok(StorageConfig::SlateDb(SlateDbStorageConfig {
+                    path: writer.path.clone(),
+                    object_store: writer.object_store.clone(),
+                    settings_path: reader.settings_path,
+                    block_cache: reader.block_cache,
+                }))
+            }
+            (_, storage) => Ok(storage),
         }
     }
 
     /// Load query vectors, respecting `format`.
     fn load_query_vectors(&self, data_dir: &Path) -> Vec<Vec<f32>> {
-        let path = data_dir.join(self.query_file);
+        let path = self.query_path(data_dir);
         match self.format {
             VecFormat::Fvecs => read_fvecs(&path)
                 .into_iter()
@@ -271,6 +480,9 @@ impl From<&Dataset> for Params {
         if let Some(ref path) = d.vector_config {
             p.insert("vector_config", path.clone());
         }
+        if let Some(ref path) = d.reader_storage_config {
+            p.insert("reader_storage_config", path.clone());
+        }
         p
     }
 }
@@ -325,6 +537,11 @@ impl From<Params> for Dataset {
                 .get("vector_config")
                 .map(|s| s.to_string())
                 .or_else(|| default.vector_config.clone()),
+            reader_storage_config: p
+                .get("reader_storage_config")
+                .map(|s| s.to_string())
+                .or_else(|| default.reader_storage_config.clone()),
+            normalize: default.normalize,
         }
     }
 }
@@ -344,8 +561,10 @@ const SIFT1M: Dataset = Dataset {
     block_cache_bytes: Some(1073741824),
     data_dir: None,
     vector_config: None,
+    reader_storage_config: None,
     format: VecFormat::Fvecs,
     max_vectors: None,
+    normalize: false,
 };
 
 const COHERE1M: Dataset = Dataset {
@@ -363,8 +582,73 @@ const COHERE1M: Dataset = Dataset {
     block_cache_bytes: None,
     data_dir: None,
     vector_config: None,
+    reader_storage_config: None,
     format: VecFormat::Fvecs,
     max_vectors: None,
+    normalize: false,
+};
+
+const DEEP10M: Dataset = Dataset {
+    name: "deep10m",
+    dimensions: 96,
+    distance_metric: DistanceMetric::L2,
+    base_file: "deep/deep_base.fvecs",
+    query_file: "deep/deep_query.fvecs",
+    ground_truth_file: "deep/deep_groundtruth_10M.ivecs",
+    split_threshold: 1500,
+    merge_threshold: 500,
+    query_pruning_factor: Some(0.5),
+    nprobe: 100,
+    num_queries: DEFAULT_NUM_QUERIES,
+    block_cache_bytes: None,
+    data_dir: None,
+    vector_config: None,
+    reader_storage_config: None,
+    format: VecFormat::Fvecs,
+    max_vectors: Some(10_000_000),
+    normalize: false,
+};
+
+const DEEP1B: Dataset = Dataset {
+    name: "deep1b",
+    dimensions: 96,
+    distance_metric: DistanceMetric::L2,
+    base_file: "deep/deep_base.fvecs",
+    query_file: "deep/deep_query.fvecs",
+    ground_truth_file: "deep/deep_groundtruth_1B.ivecs",
+    split_threshold: 1500,
+    merge_threshold: 500,
+    query_pruning_factor: Some(0.5),
+    nprobe: 100,
+    num_queries: DEFAULT_NUM_QUERIES,
+    block_cache_bytes: None,
+    data_dir: None,
+    vector_config: None,
+    reader_storage_config: None,
+    format: VecFormat::Fvecs,
+    max_vectors: None,
+    normalize: false,
+};
+
+const WIKIPEDIA_BGE_M3_EN: Dataset = Dataset {
+    name: "wikipedia_bge_m3_en",
+    dimensions: 1024,
+    distance_metric: DistanceMetric::DotProduct,
+    base_file: "wikipedia-bge-m3/en/base.fvecs",
+    query_file: "wikipedia-bge-m3/en/query.fvecs",
+    ground_truth_file: "wikipedia-bge-m3/en/groundtruth.ivecs",
+    split_threshold: 1500,
+    merge_threshold: 500,
+    query_pruning_factor: Some(0.5),
+    nprobe: 100,
+    num_queries: DEFAULT_NUM_QUERIES,
+    block_cache_bytes: None,
+    data_dir: None,
+    vector_config: None,
+    reader_storage_config: None,
+    format: VecFormat::Fvecs,
+    max_vectors: None,
+    normalize: false,
 };
 
 // BigANN / SIFT1B variants — all share the same base and query files but
@@ -385,8 +669,10 @@ const SIFT10M: Dataset = Dataset {
     block_cache_bytes: None,
     data_dir: None,
     vector_config: None,
+    reader_storage_config: None,
     format: VecFormat::Bvecs,
     max_vectors: Some(10_000_000),
+    normalize: false,
 };
 
 const SIFT50M: Dataset = Dataset {
@@ -404,8 +690,10 @@ const SIFT50M: Dataset = Dataset {
     block_cache_bytes: None,
     data_dir: None,
     vector_config: None,
+    reader_storage_config: None,
     format: VecFormat::Bvecs,
     max_vectors: Some(50_000_000),
+    normalize: false,
 };
 
 const SIFT100M: Dataset = Dataset {
@@ -423,8 +711,10 @@ const SIFT100M: Dataset = Dataset {
     block_cache_bytes: None,
     data_dir: None,
     vector_config: None,
+    reader_storage_config: None,
     format: VecFormat::Bvecs,
     max_vectors: Some(100_000_000),
+    normalize: false,
 };
 
 const SIFT1B: Dataset = Dataset {
@@ -442,11 +732,23 @@ const SIFT1B: Dataset = Dataset {
     block_cache_bytes: None,
     data_dir: None,
     vector_config: None,
+    reader_storage_config: None,
     format: VecFormat::Bvecs,
     max_vectors: None,
+    normalize: false,
 };
 
-const ALL_DATASETS: &[&Dataset] = &[&SIFT1M, &COHERE1M, &SIFT10M, &SIFT50M, &SIFT100M, &SIFT1B];
+const ALL_DATASETS: &[&Dataset] = &[
+    &SIFT1M,
+    &COHERE1M,
+    &DEEP10M,
+    &DEEP1B,
+    &WIKIPEDIA_BGE_M3_EN,
+    &SIFT10M,
+    &SIFT50M,
+    &SIFT100M,
+    &SIFT1B,
+];
 
 fn lookup_dataset(name: &str) -> Option<&'static Dataset> {
     ALL_DATASETS.iter().find(|d| d.name == name).copied()
@@ -514,39 +816,81 @@ impl Benchmark for RecallBenchmark {
             sb = sb.map_slatedb(|db| db.with_db_cache(std::sync::Arc::new(cache)));
             println!("  Block cache: {} bytes", bytes);
         }
+        let reader_storage = dataset.resolve_reader_storage_config(&config.storage)?;
+        let reader_config = ReaderConfig {
+            storage: reader_storage,
+            dimensions: config.dimensions,
+            distance_metric: config.distance_metric,
+            query_pruning_factor: config.query_pruning_factor,
+            metadata_fields: config.metadata_fields.clone(),
+        };
         let db = VectorDb::open_with_storage(config, sb).await?;
 
         // -- Ingest -----------------------------------------------------------
         let mut ingest_secs = None;
         let mut num_vectors = 0u64;
+
         if skip {
             println!("  Skipping ingest (VECTOR_BENCH_SKIP_INGEST=1)");
         } else {
-            println!("  Loading {} base vectors...", dataset.name);
-            let base_vectors = dataset.load_base_vectors(&data);
+            num_vectors = dataset.estimated_base_vector_count(&data)? as u64;
             println!(
-                "  Loaded {} base vectors (dim={})",
-                base_vectors.len(),
-                dataset.dimensions
+                "  Streaming {} base vectors for {} (dim={}) in chunks of {}",
+                num_vectors, dataset.name, dataset.dimensions, BASE_VECTOR_CHUNK_SIZE
             );
-            num_vectors = base_vectors.len() as u64;
+            let (mut stream, reader_thread) =
+                dataset.spawn_base_vector_stream(&data, BASE_VECTOR_CHUNK_SIZE)?;
+            let Some(first_message) = stream.recv().await else {
+                anyhow::bail!("base vector stream closed before yielding any data");
+            };
+            let Some(mut base_vectors) = first_message? else {
+                anyhow::bail!("dataset {} has no base vectors to ingest", dataset.name);
+            };
 
             let ingest_start = std::time::Instant::now();
-            let batch_size = 10;
-            let num_batches = base_vectors.len().div_ceil(batch_size);
-            for (batch_idx, chunk) in base_vectors.chunks(batch_size).enumerate() {
-                let batch: Vec<Vector> = chunk
-                    .iter()
-                    .enumerate()
-                    .map(|(i, values)| {
-                        let index = batch_idx * batch_size + i;
-                        Vector::new(index.to_string(), values.clone())
-                    })
-                    .collect();
-                db.write(batch).await?;
-                if (batch_idx + 1) % 10_000 == 0 {
-                    println!("  Written batch {}/{}", batch_idx + 1, num_batches);
+            let num_batches = (num_vectors as usize).div_ceil(INGEST_WRITE_BATCH_SIZE);
+            let mut batch_idx = 0usize;
+            let mut vector_offset = 0usize;
+            loop {
+                println!(
+                    "  Loaded chunk: {} vectors ({} / {})",
+                    base_vectors.len(),
+                    vector_offset + base_vectors.len(),
+                    num_vectors
+                );
+                for (chunk_idx, chunk) in base_vectors.chunks(INGEST_WRITE_BATCH_SIZE).enumerate() {
+                    let batch: Vec<Vector> = chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(i, values)| {
+                            let index = vector_offset + chunk_idx * INGEST_WRITE_BATCH_SIZE + i;
+                            Vector::new(index.to_string(), values.clone())
+                        })
+                        .collect();
+                    db.write(batch).await?;
+                    batch_idx += 1;
+                    if batch_idx.is_multiple_of(10_000) {
+                        println!("  Written batch {}/{}", batch_idx, num_batches);
+                    }
                 }
+                vector_offset += base_vectors.len();
+                let Some(message) = stream.recv().await else {
+                    break;
+                };
+                let Some(next_batch) = message? else {
+                    break;
+                };
+                base_vectors = next_batch;
+            }
+            reader_thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("base vector streaming thread panicked"))?;
+            if vector_offset != num_vectors as usize {
+                anyhow::bail!(
+                    "streamed {} vectors but expected {}",
+                    vector_offset,
+                    num_vectors
+                );
             }
             db.flush().await?;
             ingest_secs = Some(ingest_start.elapsed().as_secs_f64());
@@ -559,10 +903,54 @@ impl Benchmark for RecallBenchmark {
         }
         println!("  Num centroids: {}", db.num_centroids());
 
-        // -- Query & measure recall -------------------------------------------
-        println!("start warmup");
-        let query_latency = bench.histogram("cold_query_latency_us");
+        // -- Cold reader queries ----------------------------------------------
+        println!("start cold reader phase");
+        let cold_query_latency = bench.histogram("cold_query_latency_us");
         let mut cold_latencies_us = Vec::with_capacity(queries.len());
+        let object_store = match &reader_config.storage {
+            StorageConfig::SlateDb(slate_config) => {
+                println!("CREATE STATIC OBJECT STORE");
+                Some(create_object_store(&slate_config.object_store)?)
+            }
+            _ => None,
+        };
+        let mut runtime = StorageReaderRuntime::default();
+        if let Some(object_store) = object_store {
+            runtime = runtime.with_object_store(object_store);
+        }
+        for query in queries.iter().take(10) {
+            let reader =
+                VectorDbReader::open_with_runtime(reader_config.clone(), runtime.clone()).await?;
+            let t = std::time::Instant::now();
+            let q = Query::new(query.clone()).with_limit(k);
+            let _ = reader
+                .search_with_options(
+                    &q,
+                    SearchOptions {
+                        nprobe: Some(dataset.nprobe),
+                    },
+                )
+                .await?;
+            let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
+            cold_query_latency.record(elapsed_us);
+            cold_latencies_us.push(elapsed_us);
+        }
+        cold_latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let cold_p50 = percentile(&cold_latencies_us, 50.0);
+        let cold_p90 = percentile(&cold_latencies_us, 90.0);
+        let cold_p99 = percentile(&cold_latencies_us, 99.0);
+        println!(
+            "  cold reader p50 = {:.2} ms, p90 = {:.2} ms, p99 = {:.2} ms",
+            cold_p50 / 1000.0,
+            cold_p90 / 1000.0,
+            cold_p99 / 1000.0
+        );
+        println!("end cold reader phase");
+
+        // -- Warmup -----------------------------------------------------------
+        println!("start warmup");
+        let warm_query_latency = bench.histogram("warm_query_latency_us");
+        let mut warm_latencies_us = Vec::with_capacity(queries.len());
         for query in queries.iter() {
             let t = std::time::Instant::now();
             let q = Query::new(query.clone()).with_limit(k);
@@ -575,12 +963,12 @@ impl Benchmark for RecallBenchmark {
                 )
                 .await?;
             let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
-            query_latency.record(elapsed_us);
-            cold_latencies_us.push(elapsed_us);
+            warm_query_latency.record(elapsed_us);
+            warm_latencies_us.push(elapsed_us);
         }
-        cold_latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let p90 = percentile(&cold_latencies_us, 90.0);
-        println!("p90 = {:.2}", p90 / 1000.0);
+        warm_latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let warm_p90 = percentile(&warm_latencies_us, 90.0);
+        println!("warm p90 = {:.2}", warm_p90 / 1000.0);
         println!("end warmup");
 
         let query_latency = bench.histogram("query_latency_us");
@@ -630,6 +1018,9 @@ impl Benchmark for RecallBenchmark {
             .add("qps", qps)
             .add("num_queries", queries.len() as f64)
             .add("num_centroids", db.num_centroids() as f64)
+            .add("cold_p50_latency_us", cold_p50)
+            .add("cold_p90_latency_us", cold_p90)
+            .add("cold_p99_latency_us", cold_p99)
             .add("p50_latency_us", p50)
             .add("p90_latency_us", p90)
             .add("p99_latency_us", p99);

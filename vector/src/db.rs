@@ -118,8 +118,6 @@ pub trait VectorDbRead {
 pub(crate) struct LastAppliedSnapshot {
     pub(crate) snapshot: Arc<dyn StorageSnapshot>,
     pub(crate) centroid_index: Arc<LeveledCentroidIndex<'static>>,
-    // TODO: clean me up
-    #[allow(dead_code)]
     pub(crate) centroid_cache: Arc<AllCentroidsCache>,
     pub(crate) centroid_count: usize,
 }
@@ -761,6 +759,20 @@ impl VectorDb {
             .lock()
             .expect("lock_poisoned")
             .centroid_count
+    }
+
+    pub async fn validate_cache(&self) {
+        let las = self
+            .last_applied_snapshot
+            .lock()
+            .expect("lock_poisoned")
+            .clone();
+        crate::write::indexer::tree::validator::validate_state_and_storage_consistent(
+            &las,
+            self.config.dimensions as usize,
+        )
+        .await
+        .expect("validation failed");
     }
 
     /// Create a QueryEngine from the current snapshot for executing queries.

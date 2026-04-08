@@ -224,7 +224,6 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         Ok(centroids)
     }
 
-    #[allow(dead_code)]
     async fn scan_all_posting_lists(
         &self,
         dimensions: usize,

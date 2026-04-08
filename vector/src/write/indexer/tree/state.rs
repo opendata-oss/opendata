@@ -83,8 +83,6 @@ impl VectorIndexState {
         &self.centroid_counts
     }
 
-    // TODO: clean me up
-    #[allow(dead_code)]
     pub(crate) fn root_centroid_count(&self) -> u64 {
         self.root_centroid_count
     }

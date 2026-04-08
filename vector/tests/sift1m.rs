@@ -224,8 +224,7 @@ async fn sift100k_recall() {
     db.flush().await.expect("failed to flush");
     println!("Ingested all base vectors");
 
-    // TODO: clean me up
-    // db.validate_cache().await;
+    db.validate_cache().await;
     println!("validated cache");
 
     // Query and measure recall using first 1000 queries
