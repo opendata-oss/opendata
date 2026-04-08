@@ -6,7 +6,7 @@ use slatedb::object_store::ObjectStore;
 use slatedb::object_store::path::Path;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{CollectorConfig, GarbageCollectorConfig};
+use crate::config::CollectorConfig;
 use crate::error::{Error, Result};
 use crate::gc::GarbageCollector;
 use crate::metric_names as m;
@@ -37,7 +37,7 @@ pub struct Collector {
     consumer: QueueConsumer,
     object_store: Arc<dyn ObjectStore>,
     gc_shutdown: CancellationToken,
-    gc_handle: Option<tokio::task::JoinHandle<()>>,
+    gc_handle: tokio::task::JoinHandle<()>,
     ack_count: u64,
     last_acked_sequence: Option<u64>,
     last_fetched_sequence: Option<u64>,
@@ -45,56 +45,48 @@ pub struct Collector {
 
 impl Collector {
     /// Create a new collector from the given configuration.
-    pub fn new(config: CollectorConfig) -> Result<Self> {
+    ///
+    /// Initializes the queue consumer (fencing any previous instance) and spawns
+    /// the garbage collector. If `last_acked_sequence` is `Some(seq)`, the
+    /// collector resumes after that sequence; if `None`, it discovers the first
+    /// available entry.
+    pub async fn new(
+        config: CollectorConfig,
+        last_acked_sequence: Option<u64>,
+    ) -> Result<Self> {
         let object_store = common::storage::factory::create_object_store(&config.object_store)
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(Self::with_object_store(config, object_store))
+        Self::with_object_store(config, object_store, last_acked_sequence).await
     }
 
-    pub fn with_object_store(config: CollectorConfig, object_store: Arc<dyn ObjectStore>) -> Self {
+    pub async fn with_object_store(
+        config: CollectorConfig,
+        object_store: Arc<dyn ObjectStore>,
+        last_acked_sequence: Option<u64>,
+    ) -> Result<Self> {
         crate::metric_names::describe_collector_metrics();
         let consumer =
             QueueConsumer::with_object_store(config.manifest_path.clone(), object_store.clone());
 
-        let gc_shutdown = CancellationToken::new();
-        let gc = GarbageCollector::new(
-            GarbageCollectorConfig {
-                manifest_path: config.manifest_path,
-                data_path_prefix: config.data_path_prefix,
-                gc_interval: config.gc_interval,
-                gc_grace_period: config.gc_grace_period,
-            },
-            object_store.clone(),
-        );
-        let shutdown = gc_shutdown.clone();
-        let gc_handle = tokio::spawn(gc.collect(shutdown));
+        // Fence previous consumers and position the cursor before spawning GC.
+        consumer.initialize().await?;
+        if let Some(seq) = last_acked_sequence {
+            consumer.dequeue(seq).await?;
+        }
 
-        Self {
+        let gc_shutdown = CancellationToken::new();
+        let gc = GarbageCollector::new(config, object_store.clone());
+        let gc_handle = tokio::spawn(gc.collect(gc_shutdown.clone()));
+
+        Ok(Self {
             consumer,
             object_store,
             ack_count: 0,
-            last_acked_sequence: None,
+            last_acked_sequence,
             gc_shutdown,
-            gc_handle: Some(gc_handle),
-            last_fetched_sequence: None,
-        }
-    }
-
-    /// Initialize the consumer by fencing any previous consumer instance.
-    ///
-    /// If `last_acked_sequence` is `Some(seq)`, the collector resumes after that
-    /// sequence. Both the ack cursor and fetch cursor are positioned there, so
-    /// the next call to [`next_batch`](Self::next_batch) will read sequence
-    /// `seq + 1`. If `None`, the collector peeks the queue to discover the first
-    /// available entry and positions itself just before it.
-    pub async fn initialize(&mut self, last_acked_sequence: Option<u64>) -> Result<()> {
-        self.consumer.initialize().await?;
-        if let Some(seq) = last_acked_sequence {
-            self.last_acked_sequence = Some(seq);
-            self.last_fetched_sequence = Some(seq);
-            self.flush().await?;
-        }
-        Ok(())
+            gc_handle,
+            last_fetched_sequence: last_acked_sequence,
+        })
     }
 
     /// Read the next data batch from object storage.
@@ -197,9 +189,7 @@ impl Collector {
     pub async fn close(mut self) -> Result<()> {
         self.flush().await?;
         self.gc_shutdown.cancel();
-        if let Some(handle) = self.gc_handle.take() {
-            let _ = handle.await;
-        }
+        let _ = self.gc_handle.await;
         Ok(())
     }
 
@@ -253,21 +243,23 @@ mod tests {
         store.put(&path, PutPayload::from(payload)).await.unwrap();
     }
 
-    fn make_collector(
+    async fn make_collector(
         store: &Arc<dyn ObjectStore>,
         config: CollectorConfig,
+        last_acked_sequence: Option<u64>,
     ) -> (QueueProducer, Collector) {
         let producer =
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
-        let collector = Collector::with_object_store(config, store.clone());
+        let collector = Collector::with_object_store(config, store.clone(), last_acked_sequence)
+            .await
+            .unwrap();
         (producer, collector)
     }
 
     #[tokio::test]
     async fn should_collect_enqueued_batch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (producer, mut collector) = make_collector(&store, test_collector_config());
-        collector.initialize(None).await.unwrap();
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
 
         let entries = test_entries();
         let location = "batches/batch-001";
@@ -287,8 +279,7 @@ mod tests {
     #[tokio::test]
     async fn should_collect_metadata_from_queue_entry() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (producer, mut collector) = make_collector(&store, test_collector_config());
-        collector.initialize(None).await.unwrap();
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
 
         let entries = test_entries();
         let location = "batches/batch-meta";
@@ -317,8 +308,7 @@ mod tests {
     #[tokio::test]
     async fn should_return_none_when_queue_empty() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (_producer, mut collector) = make_collector(&store, test_collector_config());
-        collector.initialize(None).await.unwrap();
+        let (_producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
 
         let result = collector.next_batch().await.unwrap();
         assert!(result.is_none());
@@ -327,8 +317,7 @@ mod tests {
     #[tokio::test]
     async fn should_ack_batch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (producer, mut collector) = make_collector(&store, test_collector_config());
-        collector.initialize(None).await.unwrap();
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
 
         let entries = test_entries();
         let location = "batches/batch-002";
@@ -350,8 +339,7 @@ mod tests {
     #[tokio::test]
     async fn should_next_batch_return_batch_after_last_acked() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (producer, mut collector) = make_collector(&store, test_collector_config());
-        collector.initialize(None).await.unwrap();
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
 
         let entries = test_entries();
         write_batch(&store, "batches/first", &entries).await;
@@ -378,8 +366,7 @@ mod tests {
     async fn should_next_batch_advance_before_previous_batch_is_acked() {
         // given
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (producer, mut collector) = make_collector(&store, test_collector_config());
-        collector.initialize(None).await.unwrap();
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
 
         let entries = test_entries();
         write_batch(&store, "batches/first", &entries).await;
@@ -407,8 +394,7 @@ mod tests {
     #[tokio::test]
     async fn should_next_batch_return_none_when_no_more_entries() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (producer, mut collector) = make_collector(&store, test_collector_config());
-        collector.initialize(None).await.unwrap();
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
 
         let entries = test_entries();
         write_batch(&store, "batches/first", &entries).await;
@@ -427,8 +413,7 @@ mod tests {
     #[tokio::test]
     async fn should_resume_from_last_acked_sequence() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (producer, mut collector) = make_collector(&store, test_collector_config());
-        collector.initialize(Some(0)).await.unwrap();
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), Some(0)).await;
 
         let entries = test_entries();
         write_batch(&store, "batches/first", &entries).await;
@@ -451,8 +436,7 @@ mod tests {
     #[tokio::test]
     async fn should_reject_out_of_order_ack() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (producer, mut collector) = make_collector(&store, test_collector_config());
-        collector.initialize(None).await.unwrap();
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
 
         let entries = test_entries();
         write_batch(&store, "batches/first", &entries).await;
@@ -477,8 +461,7 @@ mod tests {
     #[tokio::test]
     async fn should_batch_dequeue_calls() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (producer, mut collector) = make_collector(&store, test_collector_config());
-        collector.initialize(None).await.unwrap();
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
 
         let entries = test_entries();
         // Enqueue DEQUEUE_INTERVAL + 1 entries
@@ -510,8 +493,7 @@ mod tests {
     #[tokio::test]
     async fn should_flush_pending_acks() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (producer, mut collector) = make_collector(&store, test_collector_config());
-        collector.initialize(None).await.unwrap();
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
 
         let entries = test_entries();
         write_batch(&store, "batches/first", &entries).await;
@@ -540,8 +522,7 @@ mod tests {
     #[tokio::test]
     async fn should_close_flush_and_consume() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (producer, mut collector) = make_collector(&store, test_collector_config());
-        collector.initialize(None).await.unwrap();
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
 
         let entries = test_entries();
         write_batch(&store, "batches/first", &entries).await;
@@ -555,8 +536,7 @@ mod tests {
         collector.close().await.unwrap();
 
         // After close, entries should be dequeued
-        let (_, mut collector2) = make_collector(&store, test_collector_config());
-        collector2.initialize(None).await.unwrap();
+        let (_, mut collector2) = make_collector(&store, test_collector_config(), None).await;
         let result = collector2.next_batch().await.unwrap();
         assert!(result.is_none());
     }
@@ -564,8 +544,7 @@ mod tests {
     #[tokio::test]
     async fn should_fence_previous_collector() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (producer, mut collector1) = make_collector(&store, test_collector_config());
-        collector1.initialize(None).await.unwrap();
+        let (producer, mut collector1) = make_collector(&store, test_collector_config(), None).await;
 
         let entries = test_entries();
         write_batch(&store, "batches/first", &entries).await;
@@ -575,8 +554,7 @@ mod tests {
             .unwrap();
 
         // Second collector fences the first
-        let (_, mut collector2) = make_collector(&store, test_collector_config());
-        collector2.initialize(None).await.unwrap();
+        let (_, mut collector2) = make_collector(&store, test_collector_config(), None).await;
 
         // First collector should get a Fenced error
         let result = collector1.next_batch().await;
@@ -586,8 +564,7 @@ mod tests {
     #[tokio::test]
     async fn should_iterate_multiple_sequential_batches() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (producer, mut collector) = make_collector(&store, test_collector_config());
-        collector.initialize(None).await.unwrap();
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
 
         let entries = test_entries();
         let locations = ["batches/a", "batches/b", "batches/c"];
@@ -610,7 +587,7 @@ mod tests {
     #[tokio::test]
     async fn should_initialize_none_with_pre_existing_entries() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (producer, _) = make_collector(&store, test_collector_config());
+        let (producer, _) = make_collector(&store, test_collector_config(), None).await;
 
         // Enqueue and dequeue placeholder entries to advance the sequence counter
         let entries = test_entries();
@@ -620,8 +597,7 @@ mod tests {
             producer.enqueue(loc, vec![]).await.unwrap();
         }
         // Use a temporary collector to dequeue placeholders
-        let (_, mut tmp_collector) = make_collector(&store, test_collector_config());
-        tmp_collector.initialize(None).await.unwrap();
+        let (_, mut tmp_collector) = make_collector(&store, test_collector_config(), None).await;
         for _ in 0..5 {
             let batch = tmp_collector.next_batch().await.unwrap().unwrap();
             tmp_collector.ack(batch.sequence).await.unwrap();
@@ -636,8 +612,7 @@ mod tests {
             .unwrap();
 
         // New collector with initialize(None) should find this entry
-        let (_, mut collector) = make_collector(&store, test_collector_config());
-        collector.initialize(None).await.unwrap();
+        let (_, mut collector) = make_collector(&store, test_collector_config(), None).await;
 
         let batch = collector.next_batch().await.unwrap().unwrap();
         assert_eq!(batch.location, "batches/pre-existing");
@@ -647,7 +622,7 @@ mod tests {
     #[tokio::test]
     async fn should_initialize_with_sequence_dequeue_already_processed() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (producer, _) = make_collector(&store, test_collector_config());
+        let (producer, _) = make_collector(&store, test_collector_config(), None).await;
 
         let entries = test_entries();
         write_batch(&store, "batches/first", &entries).await;
@@ -662,8 +637,7 @@ mod tests {
             .unwrap();
 
         // Simulate restart: new collector resumes after sequence 0
-        let (_, mut collector) = make_collector(&store, test_collector_config());
-        collector.initialize(Some(0)).await.unwrap();
+        let (_, mut collector) = make_collector(&store, test_collector_config(), Some(0)).await;
 
         // The flush in initialize should have dequeued entries through sequence 0
         assert_eq!(collector.len(), 1);
