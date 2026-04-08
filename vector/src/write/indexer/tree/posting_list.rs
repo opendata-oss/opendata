@@ -1,5 +1,5 @@
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
-use crate::serde::vector_id::{IntoNewVectorId, VectorId};
+use crate::serde::vector_id::VectorId;
 use std::collections::{HashMap, HashSet};
 use std::iter::FromIterator;
 use std::sync::Arc;
@@ -109,11 +109,7 @@ impl PostingList {
             return self.clone();
         }
 
-        let updated_ids: HashSet<VectorId> = updates
-            .iter()
-            .map(PostingUpdate::id)
-            .map(IntoNewVectorId::into_new_id)
-            .collect();
+        let updated_ids: HashSet<VectorId> = updates.iter().map(PostingUpdate::id).collect();
         let mut postings = self
             .postings
             .iter()
@@ -122,7 +118,7 @@ impl PostingList {
             .collect::<Vec<_>>();
         postings.extend(updates.into_iter().filter_map(|update| match update {
             PostingUpdate::Append { id, vector } => Some(Posting::from_shared_buffer(
-                id.into_new_id(),
+                id,
                 vector.clone(),
                 0,
                 vector.len(),
@@ -138,18 +134,14 @@ impl PostingList {
             return self.flatten();
         }
 
-        let updated_ids: HashSet<VectorId> = updates
-            .iter()
-            .map(PostingUpdate::id)
-            .map(IntoNewVectorId::into_new_id)
-            .collect();
+        let updated_ids: HashSet<VectorId> = updates.iter().map(PostingUpdate::id).collect();
         let retained = self
             .postings
             .iter()
             .filter(|posting| !updated_ids.contains(&posting.id))
             .map(|posting| (posting.id, posting.vector()));
         let appended = updates.iter().filter_map(|update| match update {
-            PostingUpdate::Append { id, vector } => Some(((*id).into_new_id(), vector.as_slice())),
+            PostingUpdate::Append { id, vector } => Some((*id, vector.as_slice())),
             PostingUpdate::Delete { .. } => None,
         });
         Self::from_vectors(retained.chain(appended).collect())
@@ -192,9 +184,7 @@ impl PostingList {
             .filter_map(|posting| {
                 assert!(seen.insert(posting.id()));
                 match posting {
-                    PostingUpdate::Append { id, vector } => {
-                        Some((IntoNewVectorId::into_new_id(*id), vector.as_slice()))
-                    }
+                    PostingUpdate::Append { id, vector } => Some((*id, vector.as_slice())),
                     PostingUpdate::Delete { .. } => None,
                 }
             })
@@ -207,7 +197,7 @@ impl From<Vec<crate::serde::posting_list::Posting>> for PostingList {
     fn from(value: Vec<crate::serde::posting_list::Posting>) -> Self {
         value
             .into_iter()
-            .map(|posting| Posting::new(posting.id().into_new_id(), posting.vector().to_vec()))
+            .map(|posting| Posting::new(posting.id(), posting.vector().to_vec()))
             .collect()
     }
 }
@@ -241,22 +231,6 @@ impl<'a> IntoIterator for &'a PostingList {
 impl PartialEq for PostingList {
     fn eq(&self, other: &Self) -> bool {
         self.postings == other.postings
-    }
-}
-
-pub(crate) trait IntoTreePostingList: Send + Sync {
-    fn clone_into_tree(&self) -> PostingList;
-}
-
-impl IntoTreePostingList for PostingList {
-    fn clone_into_tree(&self) -> PostingList {
-        self.clone()
-    }
-}
-
-impl IntoTreePostingList for Vec<crate::serde::posting_list::Posting> {
-    fn clone_into_tree(&self) -> PostingList {
-        self.clone().into()
     }
 }
 

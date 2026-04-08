@@ -1,17 +1,20 @@
 mod drivers;
+#[allow(dead_code)]
 mod merge;
+#[allow(dead_code)]
 mod split;
+#[allow(dead_code)]
 pub(crate) mod state;
 #[cfg(test)]
 pub(crate) mod test_utils;
-mod vector;
-
-#[allow(dead_code)]
 pub(crate) mod tree;
+#[allow(dead_code)]
+mod vector;
 
 use crate::DistanceMetric;
 use crate::Result;
 use crate::hnsw::CentroidGraph;
+use crate::serde::vector_id::VectorId;
 use crate::write::delta::VectorWrite;
 use crate::write::indexer::merge::MergeCentroids;
 use crate::write::indexer::split::SplitCentroids;
@@ -25,9 +28,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::debug;
 
+#[allow(dead_code)]
 const INDEXING_ROUNDS: usize = 1;
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub(crate) struct IndexerStats {
     pub(crate) inserts: usize,
     pub(crate) updates: usize,
@@ -45,9 +50,11 @@ pub(crate) struct IndexerOpts {
     pub(crate) split_threshold_vectors: usize,
     pub(crate) split_search_neighbourhood: usize,
     pub(crate) indexed_fields: HashSet<String>,
+    #[allow(dead_code)]
     pub(crate) chunk_target: usize,
 }
 
+#[allow(dead_code)]
 pub(crate) struct Indexer {
     opts: Arc<IndexerOpts>,
     state: VectorIndexState,
@@ -55,10 +62,11 @@ pub(crate) struct Indexer {
 
 impl Indexer {
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub(crate) fn new(
         opts: IndexerOpts,
-        dictionary: HashMap<String, u64>,
-        centroid_counts: HashMap<u64, u64>,
+        dictionary: HashMap<String, VectorId>,
+        centroid_counts: HashMap<VectorId, u64>,
         centroid_graph: Arc<dyn CentroidGraph>,
         sequence_block_key: Bytes,
         sequence_block: AllocatedSeqBlock,
@@ -84,6 +92,7 @@ impl Indexer {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn update_index(
         &mut self,
         updates: Vec<VectorWrite>,

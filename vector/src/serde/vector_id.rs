@@ -49,15 +49,15 @@ impl VectorId {
         Self::centroid_id(1, number)
     }
 
-    pub fn centroid_id(level: u8, number: u64) -> Self {
-        assert_ne!(level, 0);
-        assert_ne!(level, 0xFF);
-        assert_eq!(number & LEVEL_MASK, 0);
+    pub const fn centroid_id(level: u8, number: u64) -> Self {
+        assert!(level != 0);
+        assert!(level != 0xFF);
+        assert!((number & LEVEL_MASK) == 0);
         let raw = ((level as u64) << (64 - 8)) | number;
         let vector_id = VectorId { id: raw };
-        assert_eq!(vector_id.level(), level);
-        assert_eq!(vector_id.number(), number);
-        assert_ne!(vector_id.number(), ROOT_ID_NUM);
+        assert!(vector_id.level() == level);
+        assert!(vector_id.number() == number);
+        assert!(vector_id.number() != ROOT_ID_NUM);
         vector_id
     }
 
@@ -65,7 +65,7 @@ impl VectorId {
         buf.put_u8(level);
     }
 
-    pub fn level(&self) -> u8 {
+    pub const fn level(&self) -> u8 {
         (self.id >> (64 - 8)) as u8
     }
 
@@ -85,7 +85,7 @@ impl VectorId {
         self.level() > 0 && !self.is_root()
     }
 
-    fn number(&self) -> u64 {
+    const fn number(&self) -> u64 {
         self.id & NUMBER_MASK
     }
 
@@ -115,47 +115,6 @@ impl Decode for VectorId {
         ]);
         *buf = &buf[8..];
         Ok(Self { id: raw })
-    }
-}
-
-/// temporary bridge converters between VectorId and u64. We will remove once the codebase
-/// is switched over to VectorId
-pub(crate) trait IntoLegacyVectorId: Send + Sync + 'static {
-    fn into_id(self) -> u64;
-}
-
-impl IntoLegacyVectorId for VectorId {
-    fn into_id(self) -> u64 {
-        self.id
-    }
-}
-
-impl IntoLegacyVectorId for u64 {
-    fn into_id(self) -> u64 {
-        self
-    }
-}
-
-#[cfg(test)]
-impl IntoLegacyVectorId for i32 {
-    fn into_id(self) -> u64 {
-        self as u64
-    }
-}
-
-impl From<u64> for VectorId {
-    fn from(id: u64) -> Self {
-        Self { id }
-    }
-}
-
-pub(crate) trait IntoNewVectorId {
-    fn into_new_id(self) -> VectorId;
-}
-
-impl IntoNewVectorId for u64 {
-    fn into_new_id(self) -> VectorId {
-        VectorId { id: self }
     }
 }
 

@@ -52,7 +52,10 @@
 //! - Example: 10M vectors → 10K-100K centroids → 3-25 chunks
 //! - Higher ratios improve recall at the cost of memory
 
-use super::{Encode, EncodingError, decode_fixed_element_array, encode_fixed_element_array};
+use super::{
+    Decode, Encode, EncodingError, decode_fixed_element_array, encode_fixed_element_array,
+};
+use crate::serde::vector_id::VectorId;
 use bytes::{Bytes, BytesMut};
 
 /// A single centroid entry with its ID and vector.
@@ -70,7 +73,7 @@ pub struct CentroidEntry {
     /// This ID is used as the key suffix in `PostingListKey` to look up the
     /// vector IDs assigned to this cluster. ID 0 is reserved for the deleted
     /// vectors bitmap.
-    pub centroid_id: u64,
+    pub(crate) centroid_id: VectorId,
     /// Centroid vector with `dimensions` elements (from `CollectionMeta`).
     ///
     /// This is the representative vector for the cluster, typically computed
@@ -82,7 +85,8 @@ pub struct CentroidEntry {
 impl CentroidEntry {
     pub fn new(centroid_id: u64, vector: Vec<f32>) -> Self {
         Self {
-            centroid_id,
+            // only the old indexer uses CentroidEntry - just always default to 1
+            centroid_id: VectorId::legacy_centroid_id(centroid_id),
             vector,
         }
     }
@@ -95,7 +99,7 @@ impl CentroidEntry {
 
 impl Encode for CentroidEntry {
     fn encode(&self, buf: &mut BytesMut) {
-        buf.extend_from_slice(&self.centroid_id.to_le_bytes());
+        self.centroid_id.encode(buf);
         encode_fixed_element_array(&self.vector, buf);
     }
 }
@@ -115,10 +119,7 @@ pub fn decode_centroid_entry(
         });
     }
 
-    let centroid_id = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    *buf = &buf[8..];
+    let centroid_id = VectorId::decode(buf)?;
 
     let vector_size = dimensions * 4;
     if buf.len() < vector_size {
@@ -235,7 +236,8 @@ impl CentroidChunkValue {
     }
 
     /// Find a centroid by ID.
-    pub fn get_centroid(&self, centroid_id: u64) -> Option<&CentroidEntry> {
+    #[allow(dead_code)]
+    pub(crate) fn get_centroid(&self, centroid_id: VectorId) -> Option<&CentroidEntry> {
         self.entries.iter().find(|e| e.centroid_id == centroid_id)
     }
 }
@@ -288,7 +290,10 @@ mod tests {
 
         // then
         assert_eq!(decoded.entries.len(), 1);
-        assert_eq!(decoded.entries[0].centroid_id, 42);
+        assert_eq!(
+            decoded.entries[0].centroid_id,
+            VectorId::legacy_centroid_id(42)
+        );
         assert_eq!(decoded.entries[0].vector, vector);
     }
 
@@ -302,8 +307,18 @@ mod tests {
         ]);
 
         // when / then
-        assert_eq!(value.get_centroid(20).unwrap().centroid_id, 20);
-        assert!(value.get_centroid(99).is_none());
+        assert_eq!(
+            value
+                .get_centroid(VectorId::legacy_centroid_id(20))
+                .unwrap()
+                .centroid_id,
+            VectorId::legacy_centroid_id(20)
+        );
+        assert!(
+            value
+                .get_centroid(VectorId::legacy_centroid_id(99))
+                .is_none()
+        );
     }
 
     #[test]
@@ -313,7 +328,7 @@ mod tests {
         let value = CentroidChunkValue::new(vec![
             CentroidEntry::new(100, vec![1.0, 2.0]),
             CentroidEntry::new(200, vec![3.0, 4.0]),
-            CentroidEntry::new(u64::MAX, vec![5.0, 6.0]),
+            CentroidEntry::new(0x00FF_FFFF_FFFF_FFFF, vec![5.0, 6.0]),
         ]);
 
         // when
@@ -321,8 +336,17 @@ mod tests {
         let decoded = CentroidChunkValue::decode_from_bytes(&encoded, dimensions).unwrap();
 
         // then
-        assert_eq!(decoded.entries[0].centroid_id, 100);
-        assert_eq!(decoded.entries[1].centroid_id, 200);
-        assert_eq!(decoded.entries[2].centroid_id, u64::MAX);
+        assert_eq!(
+            decoded.entries[0].centroid_id,
+            VectorId::legacy_centroid_id(100)
+        );
+        assert_eq!(
+            decoded.entries[1].centroid_id,
+            VectorId::legacy_centroid_id(200)
+        );
+        assert_eq!(
+            decoded.entries[2].centroid_id,
+            VectorId::legacy_centroid_id(0x00FF_FFFF_FFFF_FFFF)
+        );
     }
 }

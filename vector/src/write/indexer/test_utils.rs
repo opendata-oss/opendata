@@ -2,6 +2,7 @@ use crate::hnsw::build_centroid_graph;
 use crate::model::AttributeValue;
 use crate::serde::centroid_chunk::CentroidEntry;
 use crate::serde::collection_meta::DistanceMetric;
+use crate::serde::vector_id::VectorId;
 use crate::storage::merge_operator::VectorDbMergeOperator;
 use crate::write::delta::VectorWrite;
 use crate::write::indexer::IndexerOpts;
@@ -36,7 +37,7 @@ impl IndexerOpTestHarness {
         let allocator = SequenceAllocator::load(storage.as_ref(), seq_key)
             .await
             .unwrap();
-        let centroid_counts: HashMap<u64, u64> =
+        let centroid_counts: HashMap<VectorId, u64> =
             centroids.iter().map(|c| (c.centroid_id, 0u64)).collect();
         let graph = build_centroid_graph(centroids, DistanceMetric::L2).unwrap();
         let centroid_graph: Arc<dyn crate::hnsw::CentroidGraph> = Arc::from(graph);

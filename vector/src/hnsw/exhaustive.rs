@@ -130,7 +130,7 @@ impl ExhaustiveCentroidGraphInner {
         let mut scored = self.score_graph_centroids(query, exclude);
         scored.extend(include.iter().map(|entry| {
             (
-                entry.centroid_id,
+                entry.centroid_id.id(),
                 compute_distance(query, &entry.vector, self.distance_metric),
             )
         }));
@@ -154,7 +154,7 @@ impl ExhaustiveCentroidGraphInner {
             )));
         }
 
-        if self.centroid_to_idx.contains_key(&entry.centroid_id) {
+        if self.centroid_to_idx.contains_key(&entry.centroid_id.id()) {
             return Err(Error::InvalidInput(format!(
                 "Centroid {} already exists in graph",
                 entry.centroid_id
@@ -162,9 +162,9 @@ impl ExhaustiveCentroidGraphInner {
         }
 
         let idx = self.centroid_ids.len();
-        self.centroid_ids.push(entry.centroid_id);
+        self.centroid_ids.push(entry.centroid_id.id());
         self.centroid_vectors.extend_from_slice(&entry.vector);
-        self.centroid_to_idx.insert(entry.centroid_id, idx);
+        self.centroid_to_idx.insert(entry.centroid_id.id(), idx);
         Ok(())
     }
 
@@ -240,7 +240,7 @@ impl ExhaustiveCentroidGraphInner {
 
         for entry in include {
             let distance = compute_distance(query, &entry.vector, self.distance_metric);
-            Self::update_best_candidate(&mut best, entry.centroid_id, distance);
+            Self::update_best_candidate(&mut best, entry.centroid_id.id(), distance);
         }
 
         best.map(|(centroid_id, _)| centroid_id)
@@ -317,7 +317,10 @@ fn build_centroid_index(centroids: &[CentroidEntry]) -> Result<HashMap<u64, usiz
     let mut centroid_to_idx = HashMap::with_capacity(centroids.len());
 
     for (idx, centroid) in centroids.iter().enumerate() {
-        if centroid_to_idx.insert(centroid.centroid_id, idx).is_some() {
+        if centroid_to_idx
+            .insert(centroid.centroid_id.id(), idx)
+            .is_some()
+        {
             return Err(Error::InvalidInput(format!(
                 "Duplicate centroid id: {}",
                 centroid.centroid_id
@@ -333,7 +336,7 @@ fn flatten_centroids(centroids: &[CentroidEntry], dimensions: usize) -> (Vec<u64
     let mut centroid_vectors = Vec::with_capacity(centroids.len() * dimensions);
 
     for centroid in centroids {
-        centroid_ids.push(centroid.centroid_id);
+        centroid_ids.push(centroid.centroid_id.id());
         centroid_vectors.extend_from_slice(&centroid.vector);
     }
 
@@ -343,6 +346,11 @@ fn flatten_centroids(centroids: &[CentroidEntry], dimensions: usize) -> (Vec<u64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serde::vector_id::VectorId;
+
+    fn raw_centroid_id(id: u64) -> u64 {
+        VectorId::legacy_centroid_id(id).id()
+    }
 
     #[test]
     fn should_build_and_search_l2_graph() {
@@ -358,7 +366,7 @@ mod tests {
         let results = graph.search(&[0.9, 0.1, 0.1], 1);
 
         // then
-        assert_eq!(results, vec![1]);
+        assert_eq!(results, vec![raw_centroid_id(1)]);
     }
 
     #[test]
@@ -375,7 +383,7 @@ mod tests {
         let results = graph.search(&[1.0, 0.0], 2);
 
         // then
-        assert_eq!(results, vec![1, 2]);
+        assert_eq!(results, vec![raw_centroid_id(1), raw_centroid_id(2)]);
     }
 
     #[test]
@@ -471,7 +479,7 @@ mod tests {
 
         // then
         assert_eq!(graph.len(), 3);
-        assert_eq!(results, vec![3]);
+        assert_eq!(results, vec![raw_centroid_id(3)]);
     }
 
     #[test]
@@ -485,13 +493,13 @@ mod tests {
         let graph = ExhaustiveCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
 
         // when
-        graph.remove_centroid(2).unwrap();
+        graph.remove_centroid(raw_centroid_id(2)).unwrap();
         let results = graph.search(&[0.0, 0.9, 0.0], 2);
 
         // then
         assert_eq!(graph.len(), 2);
         assert_eq!(results.len(), 2);
-        assert!(!results.contains(&2));
+        assert!(!results.contains(&raw_centroid_id(2)));
     }
 
     #[test]
@@ -507,9 +515,15 @@ mod tests {
         .unwrap();
 
         // when / then
-        assert_eq!(graph.get_centroid_vector(1), Some(vec![1.0, 0.0]));
-        assert_eq!(graph.get_centroid_vector(2), Some(vec![0.0, 1.0]));
-        assert_eq!(graph.get_centroid_vector(99), None);
+        assert_eq!(
+            graph.get_centroid_vector(raw_centroid_id(1)),
+            Some(vec![1.0, 0.0])
+        );
+        assert_eq!(
+            graph.get_centroid_vector(raw_centroid_id(2)),
+            Some(vec![0.0, 1.0])
+        );
+        assert_eq!(graph.get_centroid_vector(raw_centroid_id(99)), None);
     }
 
     #[test]
@@ -547,7 +561,7 @@ mod tests {
         let results = graph.search(&[0.0, 0.0], 1);
 
         // then
-        assert_eq!(results, vec![3]);
+        assert_eq!(results, vec![raw_centroid_id(3)]);
     }
 
     #[test]
@@ -562,14 +576,14 @@ mod tests {
             DistanceMetric::L2,
         )
         .unwrap();
-        let exclude = HashSet::from([1]);
+        let exclude = HashSet::from([raw_centroid_id(1)]);
 
         // when
         let results = graph.search_with_include_exclude(&[0.9, 0.1, 0.0], 1, &[], &exclude);
 
         // then
         assert_eq!(results.len(), 1);
-        assert_ne!(results[0], 1);
+        assert_ne!(results[0], raw_centroid_id(1));
     }
 
     #[test]
@@ -590,7 +604,7 @@ mod tests {
             graph.search_with_include_exclude(&[0.5, 0.5], 1, &[&include], &HashSet::new());
 
         // then
-        assert_eq!(results, vec![99]);
+        assert_eq!(results, vec![raw_centroid_id(99)]);
     }
 
     #[test]
@@ -610,6 +624,6 @@ mod tests {
         ids.sort_unstable();
 
         // then
-        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(ids, vec![raw_centroid_id(1), raw_centroid_id(2)]);
     }
 }

@@ -3,7 +3,9 @@
 //! This module implements the key/value encoding scheme defined in RFC 0001.
 
 pub mod centroid_chunk;
+pub mod centroid_info;
 pub mod centroid_stats;
+pub mod centroids;
 pub mod collection_meta;
 pub mod deletions;
 pub mod id_dictionary;
@@ -12,8 +14,7 @@ pub mod metadata_index;
 pub mod posting_list;
 pub mod vector_bitmap;
 pub mod vector_data;
-#[allow(dead_code)]
-pub mod vector_id;
+pub(crate) mod vector_id;
 
 use bytes::BytesMut;
 
@@ -42,6 +43,9 @@ pub enum RecordType {
     MetadataIndex = 0x07,
     SeqBlock = 0x08,
     CentroidStats = 0x09,
+    Centroids = 0x0A,
+    CentroidInfo = 0x0B,
+    CentroidSeqBlock = 0x0C,
 }
 
 impl RecordType {
@@ -62,6 +66,9 @@ impl RecordType {
             0x07 => Ok(RecordType::MetadataIndex),
             0x08 => Ok(RecordType::SeqBlock),
             0x09 => Ok(RecordType::CentroidStats),
+            0x0A => Ok(RecordType::Centroids),
+            0x0B => Ok(RecordType::CentroidInfo),
+            0x0C => Ok(RecordType::CentroidSeqBlock),
             _ => Err(EncodingError {
                 message: format!("Invalid record type: 0x{:02x}", id),
             }),
@@ -710,6 +717,9 @@ mod tests {
             RecordType::MetadataIndex,
             RecordType::SeqBlock,
             RecordType::CentroidStats,
+            RecordType::Centroids,
+            RecordType::CentroidInfo,
+            RecordType::CentroidSeqBlock,
         ];
 
         for record_type in types {

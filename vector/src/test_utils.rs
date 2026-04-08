@@ -119,6 +119,11 @@ pub fn create_centroid_entries(vectors: Vec<Vec<f32>>) -> Vec<CentroidEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serde::vector_id::VectorId;
+
+    fn centroid_id(id: u64) -> VectorId {
+        VectorId::legacy_centroid_id(id)
+    }
 
     #[test]
     fn should_generate_random_unit_vectors() {
@@ -182,9 +187,9 @@ mod tests {
 
         // then
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].centroid_id, 1);
-        assert_eq!(entries[1].centroid_id, 2);
-        assert_eq!(entries[2].centroid_id, 3);
+        assert_eq!(entries[0].centroid_id, centroid_id(1));
+        assert_eq!(entries[1].centroid_id, centroid_id(2));
+        assert_eq!(entries[2].centroid_id, centroid_id(3));
         assert_eq!(entries[0].vector, vec![1.0, 2.0]);
         assert_eq!(entries[1].vector, vec![3.0, 4.0]);
         assert_eq!(entries[2].vector, vec![5.0, 6.0]);
