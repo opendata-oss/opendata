@@ -45,10 +45,6 @@ impl VectorId {
         vector_id
     }
 
-    pub fn legacy_centroid_id(number: u64) -> Self {
-        Self::centroid_id(1, number)
-    }
-
     pub const fn centroid_id(level: u8, number: u64) -> Self {
         assert!(level != 0);
         assert!(level != 0xFF);

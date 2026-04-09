@@ -7,6 +7,7 @@ use super::{
 };
 use crate::serde::vector_id::LEAF_LEVEL;
 use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
+#[allow(unused_imports)]
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
 use common::serde::key_prefix::KeyPrefix;
@@ -38,44 +39,6 @@ impl CollectionMetaKey {
         }
         validate_key_prefix::<Self>(buf)?;
         Ok(CollectionMetaKey)
-    }
-}
-
-/// Deletions key - singleton record storing deleted vector IDs bitmap.
-///
-/// Key layout: `[subsystem | version | tag]` (3 bytes)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeletionsKey;
-
-impl RecordKey for DeletionsKey {
-    const RECORD_TYPE: RecordType = RecordType::Deletions;
-}
-
-impl DeletionsKey {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(3);
-        Self::RECORD_TYPE.prefix().write_to(&mut buf);
-        buf.freeze()
-    }
-
-    pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 3 {
-            return Err(EncodingError {
-                message: "Buffer too short for DeletionsKey".to_string(),
-            });
-        }
-        validate_key_prefix::<Self>(buf)?;
-        Ok(DeletionsKey)
-    }
-}
-
-impl Default for DeletionsKey {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -114,49 +77,6 @@ impl CentroidsKey {
 impl Default for CentroidsKey {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// CentroidChunk key - stores a chunk of cluster centroids.
-///
-/// Key layout: `[subsystem | version | tag | chunk_id:u32-BE]` (7 bytes)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CentroidChunkKey {
-    pub chunk_id: u32,
-}
-
-impl RecordKey for CentroidChunkKey {
-    const RECORD_TYPE: RecordType = RecordType::CentroidChunk;
-}
-
-impl CentroidChunkKey {
-    pub fn new(chunk_id: u32) -> Self {
-        Self { chunk_id }
-    }
-
-    pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(7);
-        Self::RECORD_TYPE.prefix().write_to(&mut buf);
-        buf.put_u32(self.chunk_id); // Big-endian
-        buf.freeze()
-    }
-
-    pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 7 {
-            return Err(EncodingError {
-                message: "Buffer too short for CentroidChunkKey".to_string(),
-            });
-        }
-        validate_key_prefix::<Self>(buf)?;
-        let chunk_id = u32::from_be_bytes([buf[3], buf[4], buf[5], buf[6]]);
-        Ok(CentroidChunkKey { chunk_id })
-    }
-
-    /// Returns a range covering all centroid chunk keys.
-    pub fn all_chunks_range() -> BytesRange {
-        let mut buf = BytesMut::with_capacity(3);
-        Self::RECORD_TYPE.prefix().write_to(&mut buf);
-        BytesRange::prefix(buf.freeze())
     }
 }
 
@@ -577,37 +497,6 @@ mod tests {
     }
 
     #[test]
-    fn should_encode_and_decode_centroid_chunk_key() {
-        // given
-        let key = CentroidChunkKey::new(42);
-
-        // when
-        let encoded = key.encode();
-        let decoded = CentroidChunkKey::decode(&encoded).unwrap();
-
-        // then
-        assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 7);
-    }
-
-    #[test]
-    fn should_preserve_centroid_chunk_key_ordering() {
-        // given
-        let key1 = CentroidChunkKey::new(1);
-        let key2 = CentroidChunkKey::new(2);
-        let key3 = CentroidChunkKey::new(100);
-
-        // when
-        let encoded1 = key1.encode();
-        let encoded2 = key2.encode();
-        let encoded3 = key3.encode();
-
-        // then
-        assert!(encoded1 < encoded2);
-        assert!(encoded2 < encoded3);
-    }
-
-    #[test]
     fn should_encode_and_decode_posting_list_key() {
         // given
         let key = PostingListKey::new(VectorId::centroid_id(1, 123));
@@ -644,19 +533,6 @@ mod tests {
                 assert!(range.contains(&key.encode()));
             }
         }
-    }
-
-    #[test]
-    fn should_encode_and_decode_deletions_key() {
-        // given
-        let key = DeletionsKey::new();
-
-        // when
-        let encoded = key.encode();
-        let decoded = DeletionsKey::decode(&encoded).unwrap();
-
-        // then
-        assert_eq!(decoded, key);
     }
 
     #[test]

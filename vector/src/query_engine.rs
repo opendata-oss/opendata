@@ -2,12 +2,11 @@ use crate::error::{Error, Result};
 use crate::math::distance;
 use crate::model::{FieldSelection, Filter, Query, SearchOptions, SearchResult};
 use crate::serde::collection_meta::DistanceMetric;
-use crate::serde::posting_list::PostingList;
 use crate::serde::vector_data::VectorDataValue;
 use crate::serde::vector_id::VectorId;
 use crate::storage::VectorDbStorageReadExt;
 use crate::write::indexer::tree::centroids::{LeveledCentroidIndex, search_centroids};
-use crate::write::indexer::tree::posting_list::Posting;
+use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use crate::{Attribute, Vector};
 use common::storage::StorageRead;
 use roaring::RoaringTreemap;
@@ -283,8 +282,8 @@ impl QueryEngine {
             let snap = self.storage.clone();
             let q = query_vec.clone();
             handles.push(tokio::spawn(async move {
-                let posting_list: PostingList =
-                    snap.get_posting_list(cid, dimensions).await?.into();
+                let posting_list =
+                    PostingList::from_value(snap.get_posting_list(cid, dimensions).await?);
                 let mut scored: Vec<ScoredCandidate> = posting_list
                     .iter()
                     .map(|posting| {

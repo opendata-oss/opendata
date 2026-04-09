@@ -36,7 +36,6 @@ extern crate core;
 pub mod admin;
 pub mod db;
 pub(crate) mod error;
-pub mod hnsw;
 pub mod math;
 pub mod model;
 pub(crate) mod query_engine;

@@ -152,7 +152,7 @@ mod tests {
         CentroidInfoKey, CentroidStatsKey, CentroidsKey, IdDictionaryKey, PostingListKey,
         VectorDataKey,
     };
-    use crate::serde::posting_list::{Posting, PostingListValue, PostingUpdate};
+    use crate::serde::posting_list::{PostingListValue, PostingUpdate};
     use crate::serde::vector_data::VectorDataValue;
     use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
     use crate::storage::merge_operator::VectorDbMergeOperator;
@@ -164,7 +164,7 @@ mod tests {
         AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache, LeveledCentroidIndex,
         StoredCentroidReader,
     };
-    use crate::write::indexer::tree::posting_list::PostingList;
+    use crate::write::indexer::tree::posting_list::{Posting, PostingList};
     use crate::write::indexer::tree::state::VectorIndexState;
     use common::coordinator::Flusher;
     use common::storage::in_memory::{FailingStorage, InMemoryStorage};
@@ -234,7 +234,7 @@ mod tests {
             .await
             .unwrap();
         let centroid_cache = AllCentroidsCacheWriter::new(
-            Arc::new(PostingList::from(vec![Posting::new(
+            Arc::new(PostingList::from_iter(vec![Posting::new(
                 leaf_centroid_id(1),
                 vec![0.0; DIMS],
             )])),
