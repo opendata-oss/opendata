@@ -58,6 +58,7 @@ pub struct IngestorConfig {
 /// Configuration for a [`Collector`](crate::Collector).
 ///
 /// Controls where the queue manifest and data batches are read from.
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectorConfig {
     /// Determines where and how ingest data is read. See [`ObjectStoreConfig`].
@@ -68,6 +69,27 @@ pub struct CollectorConfig {
     /// Defaults to `"ingest/manifest"`.
     #[serde(default = "default_manifest_path")]
     pub manifest_path: String,
+
+    /// Path prefix for data batch objects in object storage.
+    ///
+    /// Must match the ingestor's `data_path_prefix`. Defaults to `"ingest"`.
+    #[serde(default = "default_data_path_prefix")]
+    pub data_path_prefix: String,
+
+    /// How often garbage collection runs.
+    ///
+    /// Defaults to 5 minutes.
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
+    #[serde(default = "default_gc_interval")]
+    pub gc_interval: Duration,
+
+    /// Minimum age of an unreferenced batch file before it is eligible for
+    /// deletion by the garbage collector.
+    ///
+    /// Defaults to 10 minutes.
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
+    #[serde(default = "default_gc_grace_period")]
+    pub gc_grace_period: Duration,
 }
 
 fn default_data_path_prefix() -> String {
@@ -88,4 +110,11 @@ fn default_flush_size_bytes() -> usize {
 
 fn default_max_buffered_inputs() -> usize {
     1000
+}
+fn default_gc_interval() -> Duration {
+    Duration::from_mins(5)
+}
+
+fn default_gc_grace_period() -> Duration {
+    Duration::from_mins(10)
 }
