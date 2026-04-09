@@ -49,7 +49,7 @@ use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_id::{LEAF_LEVEL, ROOT_LEVEL, ROOT_VECTOR_ID, VectorId};
 use crate::storage::VectorDbStorageReadExt;
 use crate::write::indexer::drivers::AsyncBatchDriver;
-use crate::write::indexer::tree::posting_list::{IntoTreePostingList, Posting, PostingList};
+use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use common::StorageRead;
 use futures::future::BoxFuture;
 use rayon::iter::ParallelIterator;
@@ -784,8 +784,8 @@ pub(crate) struct AllCentroidsCacheWriter {
 
 impl AllCentroidsCacheWriter {
     pub(crate) fn new(
-        root_posting_list: Arc<dyn IntoTreePostingList>,
-        centroid_postings: Vec<(VectorId, Arc<dyn IntoTreePostingList>)>,
+        root_posting_list: Arc<PostingList>,
+        centroid_postings: Vec<(VectorId, Arc<PostingList>)>,
     ) -> Self {
         let postings = centroid_postings
             .into_iter()
@@ -796,7 +796,7 @@ impl AllCentroidsCacheWriter {
                     centroid_id,
                     WrittenPostingList {
                         written_epoch: 0,
-                        posting_list: Arc::new(posting_list.clone_into_tree()),
+                        posting_list: posting_list.clone(),
                     },
                 )
             })
@@ -804,7 +804,7 @@ impl AllCentroidsCacheWriter {
                 ROOT_VECTOR_ID,
                 WrittenPostingList {
                     written_epoch: 0,
-                    posting_list: Arc::new(root_posting_list.clone_into_tree()),
+                    posting_list: root_posting_list.clone(),
                 },
             )])
             .collect();

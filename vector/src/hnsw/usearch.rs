@@ -114,9 +114,9 @@ impl UsearchCentroidGraph {
             index
                 .add(key, &centroid.vector)
                 .map_err(|e| Error::Internal(e.to_string()))?;
-            key_to_centroid.insert(key, centroid.centroid_id);
-            centroid_to_key.insert(centroid.centroid_id, key);
-            centroid_vectors.insert(centroid.centroid_id, centroid.vector.clone());
+            key_to_centroid.insert(key, centroid.centroid_id.id());
+            centroid_to_key.insert(centroid.centroid_id.id(), key);
+            centroid_vectors.insert(centroid.centroid_id.id(), centroid.vector.clone());
         }
 
         let next_key = centroids.len() as u64;
@@ -243,7 +243,7 @@ impl UsearchCentroidGraphInner {
         // Compute distances for include centroids (not in the graph)
         for entry in include {
             let dist = self.compute_distance(query, &entry.vector);
-            candidates.push((entry.centroid_id, dist));
+            candidates.push((entry.centroid_id.id(), dist));
         }
 
         // Sort by distance ascending and take top k
@@ -270,10 +270,10 @@ impl UsearchCentroidGraphInner {
             .add(key, &entry.vector)
             .map_err(|e| Error::Internal(e.to_string()))?;
 
-        self.key_to_centroid.insert(key, entry.centroid_id);
-        self.centroid_to_key.insert(entry.centroid_id, key);
+        self.key_to_centroid.insert(key, entry.centroid_id.id());
+        self.centroid_to_key.insert(entry.centroid_id.id(), key);
         self.centroid_vectors
-            .insert(entry.centroid_id, entry.vector.clone());
+            .insert(entry.centroid_id.id(), entry.vector.clone());
 
         Ok(())
     }
@@ -308,6 +308,11 @@ impl UsearchCentroidGraphInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serde::vector_id::VectorId;
+
+    fn raw_centroid_id(id: u64) -> u64 {
+        VectorId::legacy_centroid_id(id).id()
+    }
 
     #[test]
     fn should_build_and_search_l2_graph() {
@@ -325,7 +330,7 @@ mod tests {
 
         // then
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0], 1);
+        assert_eq!(results[0], raw_centroid_id(1));
     }
 
     #[test]
@@ -346,7 +351,7 @@ mod tests {
 
         // then
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0], 3); // Closest
+        assert_eq!(results[0], raw_centroid_id(3)); // Closest
     }
 
     #[test]
@@ -421,7 +426,7 @@ mod tests {
         // then - graph has 3 centroids and can find the new one
         assert_eq!(graph.len(), 3);
         let results = graph.search(&[0.0, 0.0, 0.9], 1);
-        assert_eq!(results[0], 3);
+        assert_eq!(results[0], raw_centroid_id(3));
     }
 
     #[test]
@@ -435,13 +440,16 @@ mod tests {
         let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
 
         // when - remove centroid 2
-        graph.remove_centroid(2).unwrap();
+        graph.remove_centroid(raw_centroid_id(2)).unwrap();
 
         // then - graph has 2 centroids and search near [0, 1, 0] returns 1 or 3
         assert_eq!(graph.len(), 2);
         let results = graph.search(&[0.0, 0.9, 0.0], 2);
         assert_eq!(results.len(), 2);
-        assert!(!results.contains(&2), "removed centroid should not appear");
+        assert!(
+            !results.contains(&raw_centroid_id(2)),
+            "removed centroid should not appear"
+        );
     }
 
     #[test]
@@ -455,7 +463,7 @@ mod tests {
         let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
 
         // when - remove centroid 1, add centroid 4
-        graph.remove_centroid(1).unwrap();
+        graph.remove_centroid(raw_centroid_id(1)).unwrap();
         graph
             .add_centroid(&CentroidEntry::new(4, vec![0.5, 0.5]))
             .unwrap();
@@ -463,7 +471,7 @@ mod tests {
         // then
         assert_eq!(graph.len(), 3);
         let results = graph.search(&[0.5, 0.5], 1);
-        assert_eq!(results[0], 4);
+        assert_eq!(results[0], raw_centroid_id(4));
     }
 
     #[test]
@@ -476,9 +484,15 @@ mod tests {
         let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
 
         // when/then
-        assert_eq!(graph.get_centroid_vector(1), Some(vec![1.0, 0.0, 0.0]));
-        assert_eq!(graph.get_centroid_vector(2), Some(vec![0.0, 1.0, 0.0]));
-        assert_eq!(graph.get_centroid_vector(99), None);
+        assert_eq!(
+            graph.get_centroid_vector(raw_centroid_id(1)),
+            Some(vec![1.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            graph.get_centroid_vector(raw_centroid_id(2)),
+            Some(vec![0.0, 1.0, 0.0])
+        );
+        assert_eq!(graph.get_centroid_vector(raw_centroid_id(99)), None);
     }
 
     #[test]
@@ -491,11 +505,14 @@ mod tests {
         graph
             .add_centroid(&CentroidEntry::new(2, vec![0.0, 1.0]))
             .unwrap();
-        assert_eq!(graph.get_centroid_vector(2), Some(vec![0.0, 1.0]));
+        assert_eq!(
+            graph.get_centroid_vector(raw_centroid_id(2)),
+            Some(vec![0.0, 1.0])
+        );
 
         // when - remove centroid
-        graph.remove_centroid(2).unwrap();
-        assert_eq!(graph.get_centroid_vector(2), None);
+        graph.remove_centroid(raw_centroid_id(2)).unwrap();
+        assert_eq!(graph.get_centroid_vector(raw_centroid_id(2)), None);
     }
 
     // ---- search_with_include_exclude ----
@@ -509,14 +526,18 @@ mod tests {
             CentroidEntry::new(3, vec![0.0, 0.0, 1.0]),
         ];
         let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
-        let exclude = HashSet::from([1]);
+        let exclude = HashSet::from([raw_centroid_id(1)]);
 
         // when - search near centroid 1 but exclude it
         let results = graph.search_with_include_exclude(&[0.9, 0.1, 0.0], 1, &[], &exclude);
 
         // then - should return centroid 2 or 3, not 1
         assert_eq!(results.len(), 1);
-        assert_ne!(results[0], 1, "excluded centroid should not appear");
+        assert_ne!(
+            results[0],
+            raw_centroid_id(1),
+            "excluded centroid should not appear"
+        );
     }
 
     #[test]
@@ -535,7 +556,7 @@ mod tests {
 
         // then - centroid 99 should be the closest
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0], 99);
+        assert_eq!(results[0], raw_centroid_id(99));
     }
 
     #[test]
@@ -547,7 +568,7 @@ mod tests {
             CentroidEntry::new(3, vec![0.0, 0.0, 1.0]),
         ];
         let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::L2).unwrap();
-        let exclude = HashSet::from([1]);
+        let exclude = HashSet::from([raw_centroid_id(1)]);
         let include_entry = CentroidEntry::new(99, vec![0.9, 0.1, 0.0]);
 
         // when - query near [1,0,0], exclude centroid 1 (the nearest graph centroid),
@@ -557,8 +578,8 @@ mod tests {
 
         // then - should include 99 and one of 2/3, but not 1
         assert_eq!(results.len(), 2);
-        assert!(results.contains(&99));
-        assert!(!results.contains(&1));
+        assert!(results.contains(&raw_centroid_id(99)));
+        assert!(!results.contains(&raw_centroid_id(1)));
     }
 
     #[test]
@@ -575,7 +596,7 @@ mod tests {
 
         // then - same as regular search
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0], 1);
+        assert_eq!(results[0], raw_centroid_id(1));
     }
 
     #[test]
@@ -591,8 +612,8 @@ mod tests {
 
         // then - 99 should be first (closer), 1 second
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0], 99);
-        assert_eq!(results[1], 1);
+        assert_eq!(results[0], raw_centroid_id(99));
+        assert_eq!(results[1], raw_centroid_id(1));
 
         // when - query at [0.9, 0.1] — closer to graph centroid 1
         let results =
@@ -600,8 +621,8 @@ mod tests {
 
         // then - 1 should be first (closer), 99 second
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0], 1);
-        assert_eq!(results[1], 99);
+        assert_eq!(results[0], raw_centroid_id(1));
+        assert_eq!(results[1], raw_centroid_id(99));
     }
 
     /// Helper to normalize a vector to unit length (simulating ingest-time normalization).
@@ -626,7 +647,7 @@ mod tests {
 
         // then
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0], 1);
+        assert_eq!(results[0], 1u64 << 56 | 1u64);
     }
 
     #[test]
@@ -646,10 +667,10 @@ mod tests {
 
         // then - ordered by angular similarity
         assert_eq!(results.len(), 4);
-        assert_eq!(results[0], 2);
-        assert_eq!(results[1], 1);
-        assert_eq!(results[2], 4);
-        assert_eq!(results[3], 3);
+        assert_eq!(results[0], 1u64 << 56 | 2);
+        assert_eq!(results[1], 1u64 << 56 | 1);
+        assert_eq!(results[2], 1u64 << 56 | 4);
+        assert_eq!(results[3], 1u64 << 56 | 3);
     }
 
     #[test]
@@ -668,7 +689,7 @@ mod tests {
         // then
         assert_eq!(graph.len(), 3);
         let results = graph.search(&normalize(&[0.0, 0.0, 0.9]), 1);
-        assert_eq!(results[0], 3);
+        assert_eq!(results[0], 1u64 << 56 | 3);
     }
 
     #[test]
@@ -682,12 +703,12 @@ mod tests {
         let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::Cosine).unwrap();
 
         // when - remove centroid 2
-        graph.remove_centroid(2).unwrap();
+        graph.remove_centroid(1u64 << 56 | 2).unwrap();
 
         // then - centroid 2 should not appear in results
         assert_eq!(graph.len(), 2);
         let results = graph.search(&normalize(&[0.0, 1.0, 0.0]), 3);
         assert_eq!(results.len(), 2);
-        assert!(!results.contains(&2));
+        assert!(!results.contains(&(1u64 << 56 | 2)));
     }
 }

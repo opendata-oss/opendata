@@ -30,8 +30,8 @@
 //! - Merge performs a sort-merge, keeping the newer entry when ids match
 //! - Output remains sorted by id
 
-use super::EncodingError;
-use crate::serde::vector_id::IntoLegacyVectorId;
+use super::{Decode, Encode, EncodingError};
+use crate::serde::vector_id::VectorId;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
@@ -39,16 +39,23 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Posting {
-    id: u64,
-    vector: Vec<f32>,
+    id: VectorId,
+    vector: Arc<Vec<f32>>,
 }
 
 impl Posting {
-    pub(crate) fn new(id: u64, vector: Vec<f32>) -> Self {
+    pub(crate) fn new(id: VectorId, vector: Vec<f32>) -> Self {
+        Self {
+            id,
+            vector: Arc::new(vector),
+        }
+    }
+
+    fn new_arc(id: VectorId, vector: Arc<Vec<f32>>) -> Self {
         Self { id, vector }
     }
 
-    pub(crate) fn id(&self) -> u64 {
+    pub(crate) fn id(&self) -> VectorId {
         self.id
     }
 
@@ -68,9 +75,7 @@ impl From<PostingListValue> for PostingList {
             .filter_map(|posting| {
                 assert!(seen.insert(posting.id()));
                 match posting {
-                    PostingUpdate::Append { id, vector } => {
-                        Some(Posting::new(id, Vec::clone(vector.as_ref())))
-                    }
+                    PostingUpdate::Append { id, vector } => Some(Posting::new_arc(id, vector)),
                     PostingUpdate::Delete { .. } => None,
                 }
             })
@@ -89,46 +94,48 @@ pub(crate) const POSTING_UPDATE_TYPE_DELETE_BYTE: u8 = 0x1;
 /// Each entry represents either an append or delete operation on a vector
 /// within a centroid's posting list.
 #[derive(Debug, Clone, PartialEq)]
-pub enum PostingUpdate {
+pub(crate) enum PostingUpdate {
     /// The type of update: Append or Delete.
     Append {
         /// Internal vector ID.
-        id: u64,
+        id: VectorId,
         /// The full vector data.
         vector: Arc<Vec<f32>>,
     },
     Delete {
         /// Internal vector ID
-        id: u64,
+        id: VectorId,
     },
 }
 
 impl PostingUpdate {
     /// Create a new append posting update.
-    pub(crate) fn append(id: impl IntoLegacyVectorId, vector: Vec<f32>) -> Self {
+    pub(crate) fn append(id: VectorId, vector: Vec<f32>) -> Self {
         Self::Append {
-            id: id.into_id(),
+            id,
             vector: Arc::new(vector),
         }
     }
 
     /// Create a new delete posting update.
-    pub(crate) fn delete(id: impl IntoLegacyVectorId) -> Self {
-        Self::Delete { id: id.into_id() }
+    pub(crate) fn delete(id: VectorId) -> Self {
+        Self::Delete { id }
     }
 
     /// Returns true if this is an append operation.
-    pub fn is_append(&self) -> bool {
+    #[allow(dead_code)]
+    pub(crate) fn is_append(&self) -> bool {
         matches!(self, Self::Append { .. })
     }
 
     /// Returns true if this is a delete operation.
-    pub fn is_delete(&self) -> bool {
+    #[allow(dead_code)]
+    pub(crate) fn is_delete(&self) -> bool {
         matches!(self, Self::Delete { .. })
     }
 
     /// Returns the vector ID.
-    pub fn id(&self) -> u64 {
+    pub(crate) fn id(&self) -> VectorId {
         match self {
             Self::Append { id, .. } => *id,
             Self::Delete { id } => *id,
@@ -136,7 +143,8 @@ impl PostingUpdate {
     }
 
     /// Returns the vector data if this is an Append, None if Delete.
-    pub fn vector(&self) -> Option<&[f32]> {
+    #[allow(dead_code)]
+    pub(crate) fn vector(&self) -> Option<&[f32]> {
         match self {
             Self::Append { vector, .. } => Some(vector.as_slice()),
             Self::Delete { .. } => None,
@@ -146,18 +154,18 @@ impl PostingUpdate {
     /// Encode this posting update to bytes.
     ///
     /// Format: type (1 byte) + id (8 bytes LE) + vector (N*4 bytes, each f32 LE)
-    pub fn encode(&self, buf: &mut BytesMut) {
+    pub(crate) fn encode(&self, buf: &mut BytesMut) {
         match self {
             Self::Append { id, vector } => {
                 buf.put_u8(POSTING_UPDATE_TYPE_APPEND_BYTE);
-                buf.put_u64_le(*id);
-                for &val in vector.as_ref() {
+                id.encode(buf);
+                for &val in vector.as_slice() {
                     buf.put_f32_le(val);
                 }
             }
             Self::Delete { id } => {
                 buf.put_u8(POSTING_UPDATE_TYPE_DELETE_BYTE);
-                buf.put_u64_le(*id);
+                id.encode(buf);
             }
         }
     }
@@ -165,7 +173,7 @@ impl PostingUpdate {
     /// Decode a posting update from bytes.
     ///
     /// Requires knowing the dimensions to determine vector size for Append entries.
-    pub fn decode(buf: &mut impl Buf, dimensions: usize) -> Result<Self, EncodingError> {
+    pub fn decode(buf: &mut &[u8], dimensions: usize) -> Result<Self, EncodingError> {
         let min_size = 1 + 8; // type + id
         if buf.remaining() < min_size {
             return Err(EncodingError {
@@ -178,7 +186,7 @@ impl PostingUpdate {
         }
 
         let posting_type = buf.get_u8();
-        let id = buf.get_u64_le();
+        let id = VectorId::decode(buf)?;
 
         if posting_type == POSTING_UPDATE_TYPE_APPEND_BYTE {
             let vector_size = dimensions * 4;
@@ -211,11 +219,13 @@ impl PostingUpdate {
     }
 
     /// Returns the encoded size in bytes for an Append entry with given dimensionality.
+    #[cfg(test)]
     pub fn encoded_size_append(dimensions: usize) -> usize {
         1 + 8 + (dimensions * 4) // type + id + vector
     }
 
     /// Returns the encoded size in bytes for a Delete entry.
+    #[cfg(test)]
     pub fn encoded_size_delete() -> usize {
         1 + 8 // type + id
     }
@@ -225,6 +235,15 @@ impl PostingUpdate {
         match self {
             PostingUpdate::Append { vector, .. } => 1 + 8 + (vector.len() * 4),
             PostingUpdate::Delete { .. } => 1 + 8,
+        }
+    }
+}
+
+impl From<Posting> for PostingUpdate {
+    fn from(value: Posting) -> Self {
+        Self::Append {
+            id: value.id,
+            vector: value.vector,
         }
     }
 }
@@ -251,14 +270,14 @@ impl PostingUpdate {
 /// +--------+----------+----------------------------------+
 /// ```
 #[derive(Debug, Clone, PartialEq)]
-pub struct PostingListValue {
+pub(crate) struct PostingListValue {
     /// List of posting updates (appends or deletes).
     pub(crate) postings: Vec<PostingUpdate>,
 }
 
 impl PostingListValue {
     /// Create an empty posting list.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             postings: Vec::new(),
         }
@@ -271,7 +290,7 @@ impl PostingListValue {
     /// the last occurrence wins (last-write-wins). This supports the case
     /// where a vector is appended to a posting list and then deleted within
     /// the same delta (e.g. during split reassignment).
-    pub fn from_posting_updates(
+    pub(crate) fn from_posting_updates(
         posting_updates: Vec<PostingUpdate>,
     ) -> Result<Self, EncodingError> {
         // Deduplicate by id, keeping the last occurrence (most recent operation).
@@ -291,22 +310,25 @@ impl PostingListValue {
     }
 
     /// Returns the number of posting updates.
-    pub fn len(&self) -> usize {
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
         self.postings.len()
     }
 
     /// Returns true if the posting list is empty.
-    pub fn is_empty(&self) -> bool {
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.postings.is_empty()
     }
 
     /// Returns an iterator over the posting updates.
-    pub fn iter(&self) -> impl Iterator<Item = &PostingUpdate> {
+    #[allow(dead_code)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &PostingUpdate> {
         self.postings.iter()
     }
 
     /// Encode to bytes (variable-length entries).
-    pub fn encode_to_bytes(&self) -> Bytes {
+    pub(crate) fn encode_to_bytes(&self) -> Bytes {
         if self.postings.is_empty() {
             return Bytes::new();
         }
@@ -324,7 +346,7 @@ impl PostingListValue {
     /// Decode from bytes (variable-length entries).
     ///
     /// Requires knowing the dimensions to determine vector size for Append entries.
-    pub fn decode_from_bytes(buf: &[u8], dimensions: usize) -> Result<Self, EncodingError> {
+    pub(crate) fn decode_from_bytes(buf: &[u8], dimensions: usize) -> Result<Self, EncodingError> {
         if buf.is_empty() {
             return Ok(PostingListValue::new());
         }
@@ -433,29 +455,29 @@ pub(crate) fn merge_batch_posting_list(
         priority: usize,
     }
 
-    let peek_entry = |buf: &[u8], append_size: usize, delete_size: usize| -> Option<(u64, usize)> {
-        if buf.is_empty() {
-            return None;
-        }
-        assert!(buf.len() >= delete_size);
-        let entry_type = buf[0];
-        let id = u64::from_le_bytes([
-            buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
-        ]);
-        let entry_size = if entry_type == POSTING_UPDATE_TYPE_APPEND_BYTE {
-            append_size
-        } else {
-            delete_size
+    let peek_entry =
+        |buf: &[u8], append_size: usize, delete_size: usize| -> Option<(VectorId, usize)> {
+            if buf.is_empty() {
+                return None;
+            }
+            assert!(buf.len() >= delete_size);
+            let entry_type = buf[0];
+            let mut id_buf = &buf[1..];
+            let id = VectorId::decode(&mut id_buf).expect("failed to decode vector id");
+            let entry_size = if entry_type == POSTING_UPDATE_TYPE_APPEND_BYTE {
+                append_size
+            } else {
+                delete_size
+            };
+            Some((id, entry_size))
         };
-        Some((id, entry_size))
-    };
 
     // Heap entry: (id, Reverse(priority), cursor_index)
     // BinaryHeap is max-heap, so we use Reverse for id (want smallest first)
     // and raw priority (want largest/newest to win on ties).
     #[derive(Eq, PartialEq)]
     struct HeapEntry {
-        id: u64,
+        id: VectorId,
         priority: usize,
         cursor_idx: usize,
         entry_size: usize,
@@ -572,12 +594,68 @@ mod tests {
         assert!(decoded.is_empty());
     }
 
+    fn id(id: u64) -> VectorId {
+        VectorId::data_vector_id(id)
+    }
+
+    trait CompatId {
+        fn into_vector_id(self) -> VectorId;
+    }
+
+    impl CompatId for u64 {
+        fn into_vector_id(self) -> VectorId {
+            id(self)
+        }
+    }
+
+    impl CompatId for VectorId {
+        fn into_vector_id(self) -> VectorId {
+            self
+        }
+    }
+
+    struct PostingUpdate;
+
+    impl PostingUpdate {
+        fn append(id_num: impl CompatId, vector: Vec<f32>) -> super::PostingUpdate {
+            super::PostingUpdate::append(id_num.into_vector_id(), vector)
+        }
+
+        fn delete(id_num: impl CompatId) -> super::PostingUpdate {
+            super::PostingUpdate::delete(id_num.into_vector_id())
+        }
+
+        fn decode(
+            buf: &mut &[u8],
+            dimensions: usize,
+        ) -> Result<super::PostingUpdate, EncodingError> {
+            super::PostingUpdate::decode(buf, dimensions)
+        }
+
+        fn encoded_size_append(dimensions: usize) -> usize {
+            super::PostingUpdate::encoded_size_append(dimensions)
+        }
+
+        fn encoded_size_delete() -> usize {
+            super::PostingUpdate::encoded_size_delete()
+        }
+    }
+
+    struct Posting;
+
+    impl Posting {
+        #[allow(clippy::new_ret_no_self)]
+        fn new(id_num: impl CompatId, vector: Vec<f32>) -> super::Posting {
+            super::Posting::new(id_num.into_vector_id(), vector)
+        }
+    }
+
     #[test]
     fn should_encode_and_decode_posting_list_with_appends() {
         // given
         let postings = vec![
-            PostingUpdate::append(1, vec![1.0, 2.0, 3.0]),
-            PostingUpdate::append(2, vec![4.0, 5.0, 6.0]),
+            PostingUpdate::append(id(1), vec![1.0, 2.0, 3.0]),
+            PostingUpdate::append(id(2), vec![4.0, 5.0, 6.0]),
         ];
         let value = PostingListValue::from_posting_updates(postings)
             .expect("unexpected error creating posting updates");
@@ -589,17 +667,17 @@ mod tests {
         // then
         assert_eq!(decoded.len(), 2);
         assert!(decoded.postings[0].is_append());
-        assert_eq!(decoded.postings[0].id(), 1);
+        assert_eq!(decoded.postings[0].id(), id(1));
         assert_eq!(decoded.postings[0].vector().unwrap(), &[1.0, 2.0, 3.0]);
         assert!(decoded.postings[1].is_append());
-        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[1].id(), id(2));
         assert_eq!(decoded.postings[1].vector().unwrap(), &[4.0, 5.0, 6.0]);
     }
 
     #[test]
     fn should_encode_and_decode_posting_list_with_deletes() {
         // given
-        let postings = vec![PostingUpdate::delete(1), PostingUpdate::delete(2)];
+        let postings = vec![PostingUpdate::delete(id(1)), PostingUpdate::delete(id(2))];
         let value = PostingListValue::from_posting_updates(postings)
             .expect("unexpected error creating posting updates");
 
@@ -610,9 +688,9 @@ mod tests {
         // then
         assert_eq!(decoded.len(), 2);
         assert!(decoded.postings[0].is_delete());
-        assert_eq!(decoded.postings[0].id(), 1);
+        assert_eq!(decoded.postings[0].id(), id(1));
         assert!(decoded.postings[1].is_delete());
-        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[1].id(), id(2));
     }
 
     #[test]
@@ -623,7 +701,7 @@ mod tests {
         // then
         assert!(update.is_append());
         assert!(!update.is_delete());
-        assert_eq!(update.id(), 42);
+        assert_eq!(update.id(), id(42));
         assert_eq!(update.vector().unwrap(), &[1.0, 2.0]);
     }
 
@@ -635,13 +713,13 @@ mod tests {
         // then
         assert!(!update.is_append());
         assert!(update.is_delete());
-        assert_eq!(update.id(), 42);
+        assert_eq!(update.id(), id(42));
     }
 
     #[test]
     fn should_encode_and_decode_single_posting_update() {
         // given
-        let update = PostingUpdate::append(12345, vec![1.5, 2.5, 3.5, 4.5]);
+        let update = PostingUpdate::append(id(12345), vec![1.5, 2.5, 3.5, 4.5]);
         let mut buf = BytesMut::new();
         update.encode(&mut buf);
 
@@ -651,7 +729,7 @@ mod tests {
 
         // then
         assert!(decoded.is_append());
-        assert_eq!(decoded.id(), 12345);
+        assert_eq!(decoded.id(), id(12345));
         assert_eq!(decoded.vector().unwrap(), &[1.5, 2.5, 3.5, 4.5]);
     }
 
@@ -712,8 +790,8 @@ mod tests {
         assert_eq!(
             postings,
             vec![
-                Posting::new(1, vec![1.0]),
-                Posting::new(2, vec![2.0]),
+                Posting::new(id(1), vec![1.0]),
+                Posting::new(id(2), vec![2.0]),
                 Posting::new(3, vec![3.0])
             ]
         );
@@ -736,7 +814,10 @@ mod tests {
         // then - delete entry not in result, sorted by id
         assert_eq!(
             postings,
-            vec![Posting::new(1, vec![1.0]), Posting::new(2, vec![2.0])]
+            vec![
+                Posting::new(id(1), vec![1.0]),
+                Posting::new(id(2), vec![2.0])
+            ]
         );
     }
 
@@ -762,9 +843,9 @@ mod tests {
 
         // then - all 3 unique ids preserved in sorted order
         assert_eq!(decoded.len(), 3);
-        assert_eq!(decoded.postings[0].id(), 1);
-        assert_eq!(decoded.postings[1].id(), 2);
-        assert_eq!(decoded.postings[2].id(), 3);
+        assert_eq!(decoded.postings[0].id(), id(1));
+        assert_eq!(decoded.postings[1].id(), id(2));
+        assert_eq!(decoded.postings[2].id(), id(3));
     }
 
     #[test]
@@ -790,9 +871,52 @@ mod tests {
         // then - id 1 is now a delete, id 2 unchanged, sorted order
         assert_eq!(decoded.len(), 2);
         assert!(decoded.postings[0].is_delete());
-        assert_eq!(decoded.postings[0].id(), 1);
+        assert_eq!(decoded.postings[0].id(), id(1));
         assert!(decoded.postings[1].is_append());
-        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[1].id(), id(2));
+    }
+
+    #[test]
+    fn should_merge_with_multiple_deletes_masking_old_append() {
+        // given - existing has append, new has delete for same id
+        let existing_postings = vec![
+            PostingUpdate::append(VectorId::centroid_id(2, 4496), vec![1.0, 2.0]),
+            PostingUpdate::append(VectorId::centroid_id(2, 4497), vec![3.0, 4.0]),
+        ];
+        let existing_value = PostingListValue::from_posting_updates(existing_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
+
+        let new_postings = vec![
+            PostingUpdate::delete(VectorId::centroid_id(2, 4496)),
+            PostingUpdate::delete(VectorId::centroid_id(2, 4497)),
+            PostingUpdate::append(VectorId::centroid_id(2, 4728), vec![4.0, 5.0]),
+            PostingUpdate::append(VectorId::centroid_id(2, 4729), vec![4.0, 5.0]),
+            PostingUpdate::append(VectorId::centroid_id(2, 4730), vec![4.0, 5.0]),
+            PostingUpdate::append(VectorId::centroid_id(2, 4731), vec![4.0, 5.0]),
+        ];
+        let new_value = PostingListValue::from_posting_updates(new_postings)
+            .expect("unexpected error creating posting updates")
+            .encode_to_bytes();
+
+        // when
+        let merged = merge_batch_posting_list(None, &[existing_value, new_value], 2);
+        let decoded = PostingListValue::decode_from_bytes(&merged, 2).unwrap();
+
+        // then - id 1/2 is now a delete, id 3 unchanged, sorted order
+        assert_eq!(decoded.len(), 6);
+        assert_eq!(decoded.postings[0].id(), VectorId::centroid_id(2, 4496));
+        assert!(decoded.postings[0].is_delete());
+        assert_eq!(decoded.postings[1].id(), VectorId::centroid_id(2, 4497));
+        assert!(decoded.postings[1].is_delete());
+        assert_eq!(decoded.postings[2].id(), VectorId::centroid_id(2, 4728));
+        assert!(decoded.postings[2].is_append());
+        assert_eq!(decoded.postings[3].id(), VectorId::centroid_id(2, 4729));
+        assert!(decoded.postings[3].is_append());
+        assert_eq!(decoded.postings[4].id(), VectorId::centroid_id(2, 4730));
+        assert!(decoded.postings[4].is_append());
+        assert_eq!(decoded.postings[5].id(), VectorId::centroid_id(2, 4731));
+        assert!(decoded.postings[5].is_append());
     }
 
     #[test]
@@ -817,9 +941,9 @@ mod tests {
 
         // then - id 1 has new vector, id 2 unchanged, sorted order
         assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded.postings[0].id(), 1);
+        assert_eq!(decoded.postings[0].id(), id(1));
         assert_eq!(decoded.postings[0].vector().unwrap(), &[100.0, 200.0]);
-        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[1].id(), id(2));
         assert_eq!(decoded.postings[1].vector().unwrap(), &[3.0, 4.0]);
     }
 
@@ -842,8 +966,8 @@ mod tests {
 
         // then - new entries are preserved in sorted order
         assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded.postings[0].id(), 1);
-        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[0].id(), id(1));
+        assert_eq!(decoded.postings[1].id(), id(2));
     }
 
     #[test]
@@ -865,8 +989,8 @@ mod tests {
 
         // then - existing entries are preserved in sorted order
         assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded.postings[0].id(), 1);
-        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[0].id(), id(1));
+        assert_eq!(decoded.postings[1].id(), id(2));
     }
 
     #[test]
@@ -909,11 +1033,11 @@ mod tests {
 
         // then - all entries in sorted order: 1, 2, 3, 4, 5
         assert_eq!(decoded.len(), 5);
-        assert_eq!(decoded.postings[0].id(), 1);
-        assert_eq!(decoded.postings[1].id(), 2);
-        assert_eq!(decoded.postings[2].id(), 3);
-        assert_eq!(decoded.postings[3].id(), 4);
-        assert_eq!(decoded.postings[4].id(), 5);
+        assert_eq!(decoded.postings[0].id(), id(1));
+        assert_eq!(decoded.postings[1].id(), id(2));
+        assert_eq!(decoded.postings[2].id(), id(3));
+        assert_eq!(decoded.postings[3].id(), id(4));
+        assert_eq!(decoded.postings[4].id(), id(5));
     }
 
     #[test]
@@ -933,11 +1057,11 @@ mod tests {
 
         // then - postings are sorted by id
         assert_eq!(value.len(), 5);
-        assert_eq!(value.postings[0].id(), 1);
-        assert_eq!(value.postings[1].id(), 2);
-        assert_eq!(value.postings[2].id(), 3);
-        assert_eq!(value.postings[3].id(), 4);
-        assert_eq!(value.postings[4].id(), 5);
+        assert_eq!(value.postings[0].id(), id(1));
+        assert_eq!(value.postings[1].id(), id(2));
+        assert_eq!(value.postings[2].id(), id(3));
+        assert_eq!(value.postings[3].id(), id(4));
+        assert_eq!(value.postings[4].id(), id(5));
     }
 
     #[test]
@@ -957,9 +1081,9 @@ mod tests {
 
         // then - decoded postings are in id order
         assert_eq!(decoded.len(), 3);
-        assert_eq!(decoded.postings[0].id(), 1);
-        assert_eq!(decoded.postings[1].id(), 2);
-        assert_eq!(decoded.postings[2].id(), 3);
+        assert_eq!(decoded.postings[0].id(), id(1));
+        assert_eq!(decoded.postings[1].id(), id(2));
+        assert_eq!(decoded.postings[2].id(), id(3));
     }
 
     #[test]
@@ -989,12 +1113,12 @@ mod tests {
 
         // then - result is in sorted order
         assert_eq!(decoded.len(), 5);
-        assert_eq!(decoded.postings[0].id(), 10);
-        assert_eq!(decoded.postings[1].id(), 20);
-        assert_eq!(decoded.postings[2].id(), 30);
+        assert_eq!(decoded.postings[0].id(), id(10));
+        assert_eq!(decoded.postings[1].id(), id(20));
+        assert_eq!(decoded.postings[2].id(), id(30));
         assert_eq!(decoded.postings[2].vector().unwrap(), &[300.0]); // new value won
-        assert_eq!(decoded.postings[3].id(), 40);
-        assert_eq!(decoded.postings[4].id(), 50);
+        assert_eq!(decoded.postings[3].id(), id(40));
+        assert_eq!(decoded.postings[4].id(), id(50));
     }
 
     #[test]
@@ -1018,11 +1142,11 @@ mod tests {
 
         // then - all 5 postings present in sorted order
         assert_eq!(merged.len(), 5);
-        assert_eq!(merged.postings[0].id(), 1);
-        assert_eq!(merged.postings[1].id(), 2);
-        assert_eq!(merged.postings[2].id(), 3);
-        assert_eq!(merged.postings[3].id(), 4);
-        assert_eq!(merged.postings[4].id(), 5);
+        assert_eq!(merged.postings[0].id(), id(1));
+        assert_eq!(merged.postings[1].id(), id(2));
+        assert_eq!(merged.postings[2].id(), id(3));
+        assert_eq!(merged.postings[3].id(), id(4));
+        assert_eq!(merged.postings[4].id(), id(5));
     }
 
     #[test]
@@ -1043,10 +1167,10 @@ mod tests {
 
         // then - ID 2 has the value from p0 (the newer operand)
         assert_eq!(merged.len(), 3);
-        assert_eq!(merged.postings[0].id(), 1);
-        assert_eq!(merged.postings[1].id(), 2);
+        assert_eq!(merged.postings[0].id(), id(1));
+        assert_eq!(merged.postings[1].id(), id(2));
         assert_eq!(merged.postings[1].vector().unwrap(), &[200.0]);
-        assert_eq!(merged.postings[2].id(), 3);
+        assert_eq!(merged.postings[2].id(), id(3));
     }
 
     #[test]
@@ -1065,11 +1189,11 @@ mod tests {
 
         // then - ID 2 is a delete (from the newer operand)
         assert_eq!(merged.len(), 3);
-        assert_eq!(merged.postings[0].id(), 1);
+        assert_eq!(merged.postings[0].id(), id(1));
         assert!(merged.postings[0].is_append());
-        assert_eq!(merged.postings[1].id(), 2);
+        assert_eq!(merged.postings[1].id(), id(2));
         assert!(merged.postings[1].is_delete());
-        assert_eq!(merged.postings[2].id(), 3);
+        assert_eq!(merged.postings[2].id(), id(3));
         assert!(merged.postings[2].is_append());
     }
 
@@ -1089,7 +1213,7 @@ mod tests {
 
         // then - newest (p0) wins
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged.postings[0].id(), 5);
+        assert_eq!(merged.postings[0].id(), id(5));
         assert_eq!(merged.postings[0].vector().unwrap(), &[500.0]);
     }
 
@@ -1108,8 +1232,8 @@ mod tests {
 
         // then - non-empty entries preserved
         assert_eq!(merged.len(), 2);
-        assert_eq!(merged.postings[0].id(), 1);
-        assert_eq!(merged.postings[1].id(), 2);
+        assert_eq!(merged.postings[0].id(), id(1));
+        assert_eq!(merged.postings[1].id(), id(2));
     }
 
     #[test]
@@ -1130,10 +1254,10 @@ mod tests {
 
         // then - only appends, in sorted order (delete for id 3 is filtered out)
         assert_eq!(posting_list.len(), 4);
-        assert_eq!(posting_list[0].id(), 1);
-        assert_eq!(posting_list[1].id(), 2);
-        assert_eq!(posting_list[2].id(), 4);
-        assert_eq!(posting_list[3].id(), 5);
+        assert_eq!(posting_list[0].id(), id(1));
+        assert_eq!(posting_list[1].id(), id(2));
+        assert_eq!(posting_list[2].id(), id(4));
+        assert_eq!(posting_list[3].id(), id(5));
     }
 
     #[test]
@@ -1164,13 +1288,13 @@ mod tests {
 
         // then - id 2 has value from op2 (newest), all 4 ids present
         assert_eq!(decoded.len(), 4);
-        assert_eq!(decoded.postings[0].id(), 1);
+        assert_eq!(decoded.postings[0].id(), id(1));
         assert_eq!(decoded.postings[0].vector().unwrap(), &[10.0]);
-        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[1].id(), id(2));
         assert_eq!(decoded.postings[1].vector().unwrap(), &[2000.0]);
-        assert_eq!(decoded.postings[2].id(), 3);
+        assert_eq!(decoded.postings[2].id(), id(3));
         assert_eq!(decoded.postings[2].vector().unwrap(), &[30.0]);
-        assert_eq!(decoded.postings[3].id(), 4);
+        assert_eq!(decoded.postings[3].id(), id(4));
         assert_eq!(decoded.postings[3].vector().unwrap(), &[40.0]);
     }
 
@@ -1198,10 +1322,10 @@ mod tests {
 
         // then - all 4 ids present in sorted order
         assert_eq!(decoded.len(), 4);
-        assert_eq!(decoded.postings[0].id(), 1);
-        assert_eq!(decoded.postings[1].id(), 2);
-        assert_eq!(decoded.postings[2].id(), 3);
-        assert_eq!(decoded.postings[3].id(), 4);
+        assert_eq!(decoded.postings[0].id(), id(1));
+        assert_eq!(decoded.postings[1].id(), id(2));
+        assert_eq!(decoded.postings[2].id(), id(3));
+        assert_eq!(decoded.postings[3].id(), id(4));
     }
 
     #[test]
@@ -1260,11 +1384,11 @@ mod tests {
 
         // then - id 2 is a delete (from newer operand)
         assert_eq!(decoded.len(), 3);
-        assert_eq!(decoded.postings[0].id(), 1);
+        assert_eq!(decoded.postings[0].id(), id(1));
         assert!(decoded.postings[0].is_append());
-        assert_eq!(decoded.postings[1].id(), 2);
+        assert_eq!(decoded.postings[1].id(), id(2));
         assert!(decoded.postings[1].is_delete());
-        assert_eq!(decoded.postings[2].id(), 3);
+        assert_eq!(decoded.postings[2].id(), id(3));
         assert!(decoded.postings[2].is_append());
     }
 }

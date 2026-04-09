@@ -35,6 +35,7 @@
 //! Metadata index cleanup happens during LIRE maintenance.
 
 use super::{Decode, Encode, EncodingError};
+use crate::serde::vector_id::VectorId;
 use bytes::{Bytes, BytesMut};
 
 /// IdDictionary value storing the internal vector ID for an external ID.
@@ -56,27 +57,28 @@ use bytes::{Bytes, BytesMut};
 /// - **Get by external ID**: Point lookup to resolve external → internal mapping
 /// - **Get by internal ID**: Use `VectorMeta` which stores the reverse mapping
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdDictionaryValue {
-    /// Internal vector ID (system-assigned, monotonically increasing).
+pub(crate) struct IdDictionaryValue {
+    /// Internal vector ID (system-assigned).
     ///
     /// This ID is used in `VectorData`, `VectorMeta`, posting lists, and
     /// metadata indexes. It's allocated from `SeqBlock` using block-based
     /// allocation for crash safety.
-    pub vector_id: u64,
+    pub(crate) vector_id: VectorId,
 }
 
 impl IdDictionaryValue {
-    pub fn new(vector_id: u64) -> Self {
+    pub(crate) fn new(vector_id: VectorId) -> Self {
+        assert!(vector_id.is_data_vector());
         Self { vector_id }
     }
 
-    pub fn encode_to_bytes(&self) -> Bytes {
+    pub(crate) fn encode_to_bytes(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(8);
         self.vector_id.encode(&mut buf);
         buf.freeze()
     }
 
-    pub fn decode_from_bytes(buf: &[u8]) -> Result<Self, EncodingError> {
+    pub(crate) fn decode_from_bytes(buf: &[u8]) -> Result<Self, EncodingError> {
         if buf.len() < 8 {
             return Err(EncodingError {
                 message: format!(
@@ -86,7 +88,7 @@ impl IdDictionaryValue {
             });
         }
         let mut slice = buf;
-        let vector_id = u64::decode(&mut slice)?;
+        let vector_id = VectorId::decode(&mut slice)?;
         Ok(IdDictionaryValue { vector_id })
     }
 }
@@ -98,7 +100,7 @@ mod tests {
     #[test]
     fn should_encode_and_decode_id_dictionary_value() {
         // given
-        let value = IdDictionaryValue::new(12345);
+        let value = IdDictionaryValue::new(VectorId::data_vector_id(12345));
 
         // when
         let encoded = value.encode_to_bytes();
@@ -112,7 +114,7 @@ mod tests {
     #[test]
     fn should_encode_and_decode_max_value() {
         // given
-        let value = IdDictionaryValue::new(u64::MAX);
+        let value = IdDictionaryValue::new(VectorId::data_vector_id(0x00FF_FFFF_FFFF_FFFF));
 
         // when
         let encoded = value.encode_to_bytes();

@@ -88,7 +88,7 @@ impl From<DeserializeError> for SequenceError {
 /// Result type alias for sequence allocation operations.
 pub type SequenceResult<T> = std::result::Result<T, SequenceError>;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AllocatedSeqBlock {
     current_block: Option<SeqBlock>,
     next_sequence: u64,
@@ -130,6 +130,7 @@ impl AllocatedSeqBlock {
 /// # Thread Safety
 ///
 /// This struct is not inherently thread safe. It should be owned by a single writing task
+#[derive(Debug)]
 pub struct SequenceAllocator {
     key: Bytes,
     block: AllocatedSeqBlock,

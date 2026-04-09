@@ -148,6 +148,7 @@ mod tests {
     };
     use crate::serde::metadata_index::MetadataIndexValue;
     use crate::serde::posting_list::{PostingListValue, PostingUpdate};
+    use crate::serde::vector_id::VectorId;
     use common::storage::MergeOperator;
     use rstest::rstest;
 
@@ -158,7 +159,7 @@ mod tests {
 
     /// Helper to create a test key for PostingList
     fn create_posting_list_key() -> Bytes {
-        PostingListKey::new(1).encode()
+        PostingListKey::new(VectorId::centroid_id(1, 1)).encode()
     }
 
     /// Helper to create a test key for MetadataIndex
@@ -355,12 +356,18 @@ mod tests {
         let operator = VectorDbMergeOperator::new(2);
         let key = create_posting_list_key();
 
-        let existing_postings = vec![PostingUpdate::append(1, vec![1.0, 2.0])];
+        let existing_postings = vec![PostingUpdate::append(
+            VectorId::data_vector_id(1),
+            vec![1.0, 2.0],
+        )];
         let existing_value = PostingListValue::from_posting_updates(existing_postings)
             .expect("unexpected error creating posting updates")
             .encode_to_bytes();
 
-        let new_postings = vec![PostingUpdate::append(2, vec![3.0, 4.0])];
+        let new_postings = vec![PostingUpdate::append(
+            VectorId::data_vector_id(2),
+            vec![3.0, 4.0],
+        )];
         let new_value = PostingListValue::from_posting_updates(new_postings)
             .expect("unexpected error creating posting updates")
             .encode_to_bytes();
@@ -402,7 +409,7 @@ mod tests {
     ) {
         // given
         let operator = VectorDbMergeOperator::new(3);
-        let key = CentroidStatsKey::new(1).encode();
+        let key = CentroidStatsKey::new(VectorId::centroid_id(1, 1)).encode();
         let existing_value = CentroidStatsValue::new(existing_count).encode_to_bytes();
         let new_value = CentroidStatsValue::new(new_count).encode_to_bytes();
 
@@ -452,7 +459,7 @@ mod tests {
     fn should_route_merge_batch_centroid_stats() {
         // given
         let operator = VectorDbMergeOperator::new(3);
-        let key = CentroidStatsKey::new(1).encode();
+        let key = CentroidStatsKey::new(VectorId::centroid_id(1, 1)).encode();
         let existing = CentroidStatsValue::new(10).encode_to_bytes();
         let op0 = CentroidStatsValue::new(5).encode_to_bytes();
         let op1 = CentroidStatsValue::new(-3).encode_to_bytes();
@@ -483,9 +490,18 @@ mod tests {
         // then
         let decoded = CentroidChunkValue::decode_from_bytes(&merged, dimensions).unwrap();
         assert_eq!(decoded.entries.len(), 3);
-        assert_eq!(decoded.entries[0].centroid_id, 1);
-        assert_eq!(decoded.entries[1].centroid_id, 2);
-        assert_eq!(decoded.entries[2].centroid_id, 3);
+        assert_eq!(
+            decoded.entries[0].centroid_id,
+            VectorId::legacy_centroid_id(1)
+        );
+        assert_eq!(
+            decoded.entries[1].centroid_id,
+            VectorId::legacy_centroid_id(2)
+        );
+        assert_eq!(
+            decoded.entries[2].centroid_id,
+            VectorId::legacy_centroid_id(3)
+        );
         assert_eq!(decoded.entries[0].vector, vec![1.0, 2.0]);
         assert_eq!(decoded.entries[1].vector, vec![3.0, 4.0]);
         assert_eq!(decoded.entries[2].vector, vec![5.0, 6.0]);
@@ -508,9 +524,18 @@ mod tests {
         // then
         let decoded = CentroidChunkValue::decode_from_bytes(&merged, dimensions).unwrap();
         assert_eq!(decoded.entries.len(), 3);
-        assert_eq!(decoded.entries[0].centroid_id, 1);
-        assert_eq!(decoded.entries[1].centroid_id, 2);
-        assert_eq!(decoded.entries[2].centroid_id, 3);
+        assert_eq!(
+            decoded.entries[0].centroid_id,
+            VectorId::legacy_centroid_id(1)
+        );
+        assert_eq!(
+            decoded.entries[1].centroid_id,
+            VectorId::legacy_centroid_id(2)
+        );
+        assert_eq!(
+            decoded.entries[2].centroid_id,
+            VectorId::legacy_centroid_id(3)
+        );
         assert_eq!(decoded.entries[0].vector, vec![1.0, 2.0]);
         assert_eq!(decoded.entries[1].vector, vec![3.0, 4.0]);
         assert_eq!(decoded.entries[2].vector, vec![5.0, 6.0]);
@@ -533,8 +558,14 @@ mod tests {
         // then
         let decoded = CentroidChunkValue::decode_from_bytes(&merged, dimensions).unwrap();
         assert_eq!(decoded.entries.len(), 2);
-        assert_eq!(decoded.entries[0].centroid_id, 1);
-        assert_eq!(decoded.entries[1].centroid_id, 2);
+        assert_eq!(
+            decoded.entries[0].centroid_id,
+            VectorId::legacy_centroid_id(1)
+        );
+        assert_eq!(
+            decoded.entries[1].centroid_id,
+            VectorId::legacy_centroid_id(2)
+        );
         assert_eq!(decoded.entries[0].vector, vec![1.0, 2.0]);
         assert_eq!(decoded.entries[1].vector, vec![3.0, 4.0]);
     }
