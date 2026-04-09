@@ -1,15 +1,17 @@
-use std::{collections::HashSet, sync::Arc, time::SystemTime};
+use std::{collections::HashSet, sync::Arc, time::{Duration, SystemTime}};
 
 use futures::{StreamExt, stream};
 use slatedb::object_store::{ObjectStore, path::Path};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Error, config::GarbageCollectorConfig, metric_names as m, queue::ManifestStore};
+use crate::{Error, metric_names as m, queue::ManifestStore};
 
 pub(crate) struct GarbageCollector {
     manifest_store: ManifestStore,
     object_store: Arc<dyn ObjectStore>,
-    config: GarbageCollectorConfig,
+    data_path_prefix: String,
+    gc_interval: Duration,
+    gc_grace_period: Duration,
 }
 
 struct ManifestSnapshot {
@@ -18,14 +20,22 @@ struct ManifestSnapshot {
 }
 
 impl GarbageCollector {
-    pub(crate) fn new(config: GarbageCollectorConfig, object_store: Arc<dyn ObjectStore>) -> Self {
+    pub(crate) fn new(
+        manifest_path: String,
+        data_path_prefix: String,
+        gc_interval: Duration,
+        gc_grace_period: Duration,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Self {
         Self {
             manifest_store: ManifestStore {
                 object_store: object_store.clone(),
-                manifest_path: config.manifest_path.clone(),
+                manifest_path,
             },
-            object_store: object_store.clone(),
-            config,
+            object_store,
+            data_path_prefix,
+            gc_interval,
+            gc_grace_period,
         }
     }
 
@@ -36,7 +46,7 @@ impl GarbageCollector {
         let manifest = self.read_manifest_snapshot().await?;
 
         // list files currently in object store
-        let prefix = Path::from(format!("{}/", self.config.data_path_prefix));
+        let prefix = Path::from(format!("{}/", self.data_path_prefix));
         let mut list_stream = self.object_store.list(Some(&prefix));
 
         // collect deletion candidates
@@ -62,7 +72,7 @@ impl GarbageCollector {
 
             // skip if younger than the grace period
             let age = now.duration_since(file_ts).unwrap_or_default();
-            if age < self.config.gc_grace_period {
+            if age < self.gc_grace_period {
                 continue;
             }
 
@@ -107,7 +117,7 @@ impl GarbageCollector {
                     tracing::info!("garbage collector shutting down");
                     return;
                 }
-                _ = tokio::time::sleep(self.config.gc_interval) => {
+                _ = tokio::time::sleep(self.gc_interval) => {
                     if let Err(e) = self.collect_once(SystemTime::now()).await {
                         tracing::warn!(error = %e, "garbage collection cycle failed");
                     }
@@ -130,7 +140,7 @@ impl GarbageCollector {
         let mut oldest_location_ts: Option<SystemTime> = None;
 
         for entry in result.0.iter() {
-            let entry = entry.unwrap();
+            let entry = entry?;
             locations.insert(entry.location.clone());
 
             if let Some(ts) = Self::extract_ulid_timestamp(&entry.location)
@@ -150,10 +160,11 @@ impl GarbageCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::GarbageCollectorConfig;
+    use crate::config::CollectorConfig;
     use crate::model::encode_batch;
     use crate::queue::QueueProducer;
     use bytes::Bytes;
+    use common::ObjectStoreConfig;
     use slatedb::object_store::PutPayload;
     use slatedb::object_store::memory::InMemory;
     use std::time::Duration;
@@ -161,8 +172,9 @@ mod tests {
     const TEST_MANIFEST_PATH: &str = "test/manifest";
     const TEST_DATA_PREFIX: &str = "ingest";
 
-    fn test_gc_config() -> GarbageCollectorConfig {
-        GarbageCollectorConfig {
+    fn make_config() -> CollectorConfig {
+        CollectorConfig {
+            object_store: ObjectStoreConfig::InMemory,
             manifest_path: TEST_MANIFEST_PATH.to_string(),
             data_path_prefix: TEST_DATA_PREFIX.to_string(),
             gc_interval: Duration::from_secs(1),
@@ -170,8 +182,14 @@ mod tests {
         }
     }
 
-    fn make_gc(store: &Arc<dyn ObjectStore>, config: GarbageCollectorConfig) -> GarbageCollector {
-        GarbageCollector::new(config, store.clone())
+    fn make_gc(store: &Arc<dyn ObjectStore>, config: CollectorConfig) -> GarbageCollector {
+        GarbageCollector::new(
+            config.manifest_path,
+            config.data_path_prefix,
+            config.gc_interval,
+            config.gc_grace_period,
+            store.clone(),
+        )
     }
 
     fn make_producer(store: &Arc<dyn ObjectStore>) -> QueueProducer {
@@ -198,7 +216,7 @@ mod tests {
     #[tokio::test]
     async fn should_delete_orphaned_batch_files() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let gc = make_gc(&store, test_gc_config());
+        let gc = make_gc(&store, make_config());
 
         // Write an old orphaned batch file (not in manifest)
         let old_path = batch_path_from_ts(1000);
@@ -214,7 +232,7 @@ mod tests {
     #[tokio::test]
     async fn should_not_delete_referenced_batch_files() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let gc = make_gc(&store, test_gc_config());
+        let gc = make_gc(&store, make_config());
         let producer = make_producer(&store);
 
         // Write a batch file and enqueue it in the manifest
@@ -231,9 +249,9 @@ mod tests {
     #[tokio::test]
     async fn should_not_delete_files_within_grace_period() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let config = GarbageCollectorConfig {
+        let config = CollectorConfig {
             gc_grace_period: Duration::from_secs(600),
-            ..test_gc_config()
+            ..make_config()
         };
         let gc = make_gc(&store, config);
 
@@ -252,7 +270,7 @@ mod tests {
     #[tokio::test]
     async fn should_not_delete_files_newer_than_oldest_manifest_entry() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let gc = make_gc(&store, test_gc_config());
+        let gc = make_gc(&store, make_config());
         let producer = make_producer(&store);
 
         // Enqueue a batch at ts=5000 (this becomes the oldest manifest entry)
@@ -279,7 +297,7 @@ mod tests {
     #[tokio::test]
     async fn should_skip_non_batch_files() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let gc = make_gc(&store, test_gc_config());
+        let gc = make_gc(&store, make_config());
 
         // Write files without .batch suffix under the data prefix
         let txt_path = format!("{}/somefile.txt", TEST_DATA_PREFIX);
@@ -298,7 +316,7 @@ mod tests {
     #[tokio::test]
     async fn should_delete_older_orphans_but_keep_referenced() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let gc = make_gc(&store, test_gc_config());
+        let gc = make_gc(&store, make_config());
         let producer = make_producer(&store);
 
         // Enqueue a batch at ts=5000 (oldest manifest entry)
@@ -346,9 +364,9 @@ mod tests {
     #[tokio::test]
     async fn should_shutdown_collect_loop_on_cancel() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let config = GarbageCollectorConfig {
+        let config = CollectorConfig {
             gc_interval: Duration::from_secs(3600), // very long so it won't fire
-            ..test_gc_config()
+            ..make_config()
         };
         let gc = make_gc(&store, config);
 
