@@ -33,8 +33,8 @@
 use super::{Decode, Encode, EncodingError};
 use crate::serde::vector_id::VectorId;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::cmp::{Ordering};
-use std::collections::{BinaryHeap};
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 /// Byte value for append posting type in encoded format.
@@ -469,8 +469,8 @@ pub(crate) fn merge_batch_posting_list(
 
 #[cfg(test)]
 mod tests {
-    use crate::write::indexer::tree::posting_list::PostingList;
     use super::*;
+    use crate::write::indexer::tree::posting_list::PostingList;
 
     #[test]
     fn should_encode_and_decode_empty_posting_list() {
@@ -538,7 +538,7 @@ mod tests {
         #[allow(clippy::new_ret_no_self)]
         fn new(
             id_num: impl CompatId,
-            vector: Vec<f32>
+            vector: Vec<f32>,
         ) -> crate::write::indexer::tree::posting_list::Posting {
             crate::write::indexer::tree::posting_list::Posting::new(id_num.into_vector_id(), vector)
         }

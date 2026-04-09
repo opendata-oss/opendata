@@ -7,8 +7,8 @@ use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::centroids::CentroidsValue;
 use crate::serde::id_dictionary::IdDictionaryValue;
 use crate::serde::key::{
-    CentroidInfoKey, CentroidStatsKey, CentroidsKey,
-    IdDictionaryKey, MetadataIndexKey, PostingListKey, VectorDataKey,
+    CentroidInfoKey, CentroidStatsKey, CentroidsKey, IdDictionaryKey, MetadataIndexKey,
+    PostingListKey, VectorDataKey,
 };
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::PostingListValue;
@@ -249,10 +249,10 @@ mod tests {
     use crate::serde::posting_list::PostingUpdate;
     use crate::storage::merge_operator::VectorDbMergeOperator;
     use crate::storage::record;
+    use crate::write::indexer::tree::posting_list::PostingList;
     use common::Storage;
     use common::storage::in_memory::InMemoryStorage;
     use std::sync::Arc;
-    use crate::write::indexer::tree::posting_list::PostingList;
 
     #[tokio::test]
     async fn should_read_and_write_vector_data() {

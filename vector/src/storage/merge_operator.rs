@@ -114,9 +114,7 @@ mod tests {
     use super::*;
     use crate::serde::FieldValue;
     use crate::serde::deletions::DeletionsValue;
-    use crate::serde::key::{
-        CentroidStatsKey, IdDictionaryKey, MetadataIndexKey, PostingListKey,
-    };
+    use crate::serde::key::{CentroidStatsKey, IdDictionaryKey, MetadataIndexKey, PostingListKey};
     use crate::serde::metadata_index::MetadataIndexValue;
     use crate::serde::posting_list::{PostingListValue, PostingUpdate};
     use crate::serde::vector_id::VectorId;

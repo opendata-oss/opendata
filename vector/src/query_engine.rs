@@ -282,9 +282,8 @@ impl QueryEngine {
             let snap = self.storage.clone();
             let q = query_vec.clone();
             handles.push(tokio::spawn(async move {
-                let posting_list = PostingList::from_value(
-                    snap.get_posting_list(cid, dimensions).await?
-                );
+                let posting_list =
+                    PostingList::from_value(snap.get_posting_list(cid, dimensions).await?);
                 let mut scored: Vec<ScoredCandidate> = posting_list
                     .iter()
                     .map(|posting| {

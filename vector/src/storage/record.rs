@@ -5,10 +5,9 @@
 
 use crate::error::Result;
 use crate::model::AttributeValue;
+use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::id_dictionary::IdDictionaryValue;
-use crate::serde::key::{
-    CentroidStatsKey, IdDictionaryKey, PostingListKey, VectorDataKey,
-};
+use crate::serde::key::{CentroidStatsKey, IdDictionaryKey, PostingListKey, VectorDataKey};
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_data::{Field, VectorDataValue};
@@ -17,7 +16,6 @@ use common::Record;
 use common::storage::RecordOp;
 use roaring::RoaringTreemap;
 use tracing::debug;
-use crate::serde::centroid_stats::CentroidStatsValue;
 
 /// Create a RecordOp to update the IdDictionary mapping.
 pub fn put_id_dictionary(external_id: &str, internal_id: VectorId) -> RecordOp {
