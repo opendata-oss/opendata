@@ -99,11 +99,11 @@ impl IngestConsumer {
         let collector_config = ingest::CollectorConfig {
             object_store: self.config.object_store.clone(),
             manifest_path: self.config.manifest_path.clone(),
-            data_path_prefix: "ingest".to_string(),
-            gc_interval: Duration::from_secs(300),
-            gc_grace_period: Duration::from_secs(600),
+            data_path_prefix: self.config.data_path_prefix.clone(),
+            gc_interval: self.config.gc_interval,
+            gc_grace_period: self.config.gc_grace_period,
         };
-        let collector = Collector::new(collector_config)?;
+        let collector = Collector::new(collector_config, None).await?;
         self.start(collector).await
     }
 
@@ -118,20 +118,18 @@ impl IngestConsumer {
         let collector_config = ingest::CollectorConfig {
             object_store: self.config.object_store.clone(),
             manifest_path: self.config.manifest_path.clone(),
-            data_path_prefix: "ingest".to_string(),
-            gc_interval: Duration::from_secs(300),
-            gc_grace_period: Duration::from_secs(600),
+            data_path_prefix: self.config.data_path_prefix.clone(),
+            gc_interval: self.config.gc_interval,
+            gc_grace_period: self.config.gc_grace_period,
         };
-        let collector = Collector::with_object_store(collector_config, object_store);
+        let collector = Collector::with_object_store(collector_config, object_store, None).await?;
         self.start(collector).await
     }
 
     async fn start(
         self: &Arc<Self>,
-        mut collector: Collector,
+        collector: Collector,
     ) -> Result<ConsumerHandle, ingest::Error> {
-        collector.initialize(None).await?;
-
         tracing::info!(
             manifest_path = %self.config.manifest_path,
             poll_interval = ?self.config.poll_interval,

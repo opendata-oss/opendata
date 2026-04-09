@@ -161,6 +161,24 @@ pub struct IngestConsumerConfig {
         deserialize_with = "deserialize_duration"
     )]
     pub poll_interval: Duration,
+
+    /// Path prefix for data batch objects in object storage.
+    #[serde(default = "default_data_path_prefix")]
+    pub data_path_prefix: String,
+
+    /// How often the garbage collector runs (e.g. "5m", "300s").
+    #[serde(
+        default = "default_gc_interval",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub gc_interval: Duration,
+
+    /// Minimum age before an unreferenced batch file is deleted (e.g. "10m", "600s").
+    #[serde(
+        default = "default_gc_grace_period",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub gc_grace_period: Duration,
 }
 
 #[cfg(feature = "otel")]
@@ -171,6 +189,21 @@ fn default_ingest_manifest_path() -> String {
 #[cfg(feature = "otel")]
 fn default_poll_interval() -> Duration {
     Duration::from_secs(1)
+}
+
+#[cfg(feature = "otel")]
+fn default_data_path_prefix() -> String {
+    "ingest".to_string()
+}
+
+#[cfg(feature = "otel")]
+fn default_gc_interval() -> Duration {
+    Duration::from_secs(300)
+}
+
+#[cfg(feature = "otel")]
+fn default_gc_grace_period() -> Duration {
+    Duration::from_secs(600)
 }
 
 #[cfg(feature = "otel")]

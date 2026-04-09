@@ -2097,6 +2097,9 @@ mod tests {
             object_store: common::ObjectStoreConfig::InMemory,
             manifest_path: manifest,
             poll_interval: Duration::from_millis(10),
+            data_path_prefix: "ingest".to_string(),
+            gc_interval: Duration::from_secs(300),
+            gc_grace_period: Duration::from_secs(600),
         };
         let consumer = Arc::new(crate::server::ingest_consumer::IngestConsumer::new(
             tsdb.clone(),
