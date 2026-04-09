@@ -8,12 +8,13 @@ use crate::serde::centroids::CentroidsValue;
 use crate::serde::id_dictionary::IdDictionaryValue;
 use crate::serde::key::{
     CentroidInfoKey, CentroidStatsKey, CentroidsKey, IdDictionaryKey, MetadataIndexKey,
-    PostingListKey, VectorDataKey,
+    PostingListKey, VectorDataKey, VectorIndexDataKey,
 };
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::PostingListValue;
 use crate::serde::vector_data::VectorDataValue;
 use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
+use crate::serde::vector_index_data::VectorIndexDataValue;
 use bytes::{BufMut, BytesMut};
 use std::ops::Bound::Included;
 
@@ -55,6 +56,21 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         match record {
             Some(record) => {
                 let value = VectorDataValue::decode_from_bytes(&record.value, dimensions)?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn get_vector_index_data(
+        &self,
+        internal_id: VectorId,
+    ) -> Result<Option<VectorIndexDataValue>> {
+        let key = VectorIndexDataKey::new(internal_id).encode();
+        let record = self.get(key).await?;
+        match record {
+            Some(record) => {
+                let value = VectorIndexDataValue::decode_from_bytes(&record.value)?;
                 Ok(Some(value))
             }
             None => Ok(None),
@@ -313,6 +329,29 @@ mod tests {
         let record = storage.get(key).await.unwrap();
         let value = IdDictionaryValue::decode_from_bytes(&record.unwrap().value).unwrap();
         assert_eq!(value.vector_id, id);
+    }
+
+    #[tokio::test]
+    async fn should_write_and_read_vector_index_data() {
+        // given
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let vector_id = VectorId::data_vector_id(42);
+        let postings = vec![VectorId::centroid_id(1, 7)];
+        let value = VectorIndexDataValue::new(
+            postings.clone(),
+            vec![crate::serde::vector_data::Field::string(
+                "indexed_color",
+                "blue",
+            )],
+        );
+
+        // when
+        let op = record::put_vector_index_data(vector_id, value.clone());
+        storage.apply(vec![op]).await.unwrap();
+
+        // then
+        let result = storage.get_vector_index_data(vector_id).await.unwrap();
+        assert_eq!(result, Some(value));
     }
 
     #[tokio::test]

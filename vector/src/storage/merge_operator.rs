@@ -4,6 +4,7 @@
 //! record type encoded in the key.
 
 use crate::serde::centroid_stats::CentroidStatsValue;
+use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::merge_batch_posting_list;
 use crate::serde::{EncodingError, KEY_VERSION, RecordType, SUBSYSTEM};
 use bytes::Bytes;
@@ -17,7 +18,7 @@ use std::io::Cursor;
 /// Currently supports:
 /// - Deletions: Unions RoaringTreemaps for deleted vector tracking
 /// - PostingList: Deduplicates by id, keeping only the last update per id
-/// - MetadataIndex: Unions RoaringTreemaps for metadata filtering
+/// - MetadataIndex: Merges included/excluded bitmaps with newer writes taking precedence
 pub struct VectorDbMergeOperator {
     dimensions: usize,
 }
@@ -36,11 +37,8 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
             RecordType::from_prefix(prefix).expect("Failed to get record type from record tag");
 
         match record_type {
-            RecordType::MetadataIndex => {
-                // Deletions and MetadataIndex use RoaringTreemap and merge via union
-                merge_batch_roaring_treemap(existing_value, operands)
-                    .expect("Failed to batch merge RoaringTreemap")
-            }
+            RecordType::MetadataIndex => merge_batch_metadata_index(existing_value, operands)
+                .expect("Failed to batch merge MetadataIndexValue"),
             RecordType::PostingList => {
                 merge_batch_posting_list(existing_value, operands, self.dimensions)
             }
@@ -52,6 +50,43 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
             }
         }
     }
+}
+
+fn merge_metadata_index_pair(
+    newer: MetadataIndexValue,
+    older: MetadataIndexValue,
+) -> MetadataIndexValue {
+    let mut included = newer.included.clone();
+    let mut old_included = older.included.clone();
+    old_included.difference_with(&newer.excluded);
+    included.union_with(&old_included);
+
+    let mut excluded = newer.excluded.clone();
+    let mut old_excluded = older.excluded.clone();
+    old_excluded.difference_with(&newer.included);
+    excluded.union_with(&old_excluded);
+
+    let mut merged = MetadataIndexValue { included, excluded };
+    merged.make_mutually_exclusive();
+    merged
+}
+
+fn merge_batch_metadata_index(
+    existing: Option<Bytes>,
+    operands: &[Bytes],
+) -> Result<Bytes, EncodingError> {
+    let mut merged = if let Some(existing) = existing {
+        MetadataIndexValue::decode_from_bytes(&existing)?
+    } else {
+        MetadataIndexValue::new()
+    };
+
+    for operand in operands {
+        let newer = MetadataIndexValue::decode_from_bytes(operand)?;
+        merged = merge_metadata_index_pair(newer, merged);
+    }
+
+    merged.encode_to_bytes()
 }
 
 /// Batch merge RoaringTreemap values by unioning all treemaps at once.
@@ -243,7 +278,7 @@ mod tests {
             .unwrap();
 
         // when
-        let merged = merge_batch_roaring_treemap(Some(existing_value), &[new_value]).unwrap();
+        let merged = merge_batch_metadata_index(Some(existing_value), &[new_value]).unwrap();
         let decoded = MetadataIndexValue::decode_from_bytes(&merged).unwrap();
 
         // then
@@ -252,7 +287,8 @@ mod tests {
             expected_bitmap.insert(id);
         }
         assert_eq!(
-            decoded.vector_ids, expected_bitmap,
+            decoded.effective_vector_ids(),
+            expected_bitmap,
             "Failed test case: {}",
             description
         );
@@ -283,7 +319,7 @@ mod tests {
 
         // then - verify the merge actually happened (union)
         let decoded = MetadataIndexValue::decode_from_bytes(&merged).unwrap();
-        assert_eq!(decoded.vector_ids.len(), 4);
+        assert_eq!(decoded.len(), 4);
     }
 
     #[test]
@@ -532,6 +568,35 @@ mod tests {
             expected.insert(id);
         }
         let decoded = MetadataIndexValue::decode_from_bytes(&merged).unwrap();
-        assert_eq!(decoded.vector_ids, expected);
+        assert_eq!(decoded.effective_vector_ids(), expected);
+    }
+
+    #[test]
+    fn should_merge_metadata_index_with_newer_exclusions_taking_precedence() {
+        // given
+        let older = MetadataIndexValue::from_treemap({
+            let mut bm = RoaringTreemap::new();
+            bm.insert(1);
+            bm.insert(2);
+            bm
+        });
+        let mut newer = MetadataIndexValue::new();
+        newer.exclude_vector(2);
+        newer.include_vector(3);
+
+        // when
+        let merged = merge_batch_metadata_index(
+            Some(older.encode_to_bytes().unwrap()),
+            &[newer.encode_to_bytes().unwrap()],
+        )
+        .unwrap();
+        let decoded = MetadataIndexValue::decode_from_bytes(&merged).unwrap();
+
+        // then
+        let mut expected = RoaringTreemap::new();
+        expected.insert(1);
+        expected.insert(3);
+        assert_eq!(decoded.effective_vector_ids(), expected);
+        assert!(decoded.excluded.contains(2));
     }
 }

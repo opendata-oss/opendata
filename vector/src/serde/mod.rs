@@ -14,6 +14,7 @@ pub mod posting_list;
 pub mod vector_bitmap;
 pub mod vector_data;
 pub(crate) mod vector_id;
+pub mod vector_index_data;
 
 use bytes::BytesMut;
 
@@ -38,6 +39,7 @@ pub enum RecordType {
     PostingList = 0x04,
     IdDictionary = 0x05,
     VectorData = 0x06,
+    VectorIndexData = 0x0D,
     MetadataIndex = 0x07,
     SeqBlock = 0x08,
     CentroidStats = 0x09,
@@ -59,6 +61,7 @@ impl RecordType {
             0x04 => Ok(RecordType::PostingList),
             0x05 => Ok(RecordType::IdDictionary),
             0x06 => Ok(RecordType::VectorData),
+            0x0D => Ok(RecordType::VectorIndexData),
             0x07 => Ok(RecordType::MetadataIndex),
             0x08 => Ok(RecordType::SeqBlock),
             0x09 => Ok(RecordType::CentroidStats),
