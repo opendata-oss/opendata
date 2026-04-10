@@ -135,8 +135,8 @@ A SPANN-style vector database has the following storage components:
 
 #### ANN Index
 
-The heart of the system is the ANN index which supports fast navigation to vectors near a query
-vector. The ANN index is a search tree designed to support fast navigation to relevant vectors,
+The heart of the system is the ANN index which supports fast ANN (approximate nearest neighbour) 
+search. The ANN index is a search tree designed to support fast navigation to vectors near a query,
 incremental updates as vectors are ingested, and lazy partial loading at search time to allow
 for fast cold queries.
 
@@ -156,26 +156,26 @@ process are detailed in RFC-0005.
 
 The figure below depicts an example 4-level tree:
 ```ascii
-               root (255.0)                                      Vector/Centroid ID:
-               ┌────────────────────────────────────┐      2.1000 => Level 2, Id 1000
-  Level: Root  │2.1000:<vector>,2.1001:<vector>,... │
-               └────────────────────────────────────┘
-
-                2.1000                                 2.1001
-               ┌────────────────────────────────────┐ ┌────────────────────────────────────┐
-    Level: 2   │1.100:<vector>,1.101:<vector>,...   │ │1.200:<vector>,1.201:<vector>,...   │  ...
-               └────────────────────────────────────┘ └────────────────────────────────────┘
-
-                1.100                                  1.101
-               ┌────────────────────────────────────┐ ┌────────────────────────────────────┐
-    Level: 1   │0.10:<vector>,0.11:<vector>,...     │ │0.20:<vector>,0.21:<vector>,...     │  ...
-               └────────────────────────────────────┘ └────────────────────────────────────┘
-
-
-               ┌────────────────────────────────────────────────────────────────────────────────┐
-  Level: Data  │                   Data Vectors (0.10, 0.11, 0.20, 0.21, ...)                   │
-               └────────────────────────────────────────────────────────────────────────────────┘
- ```
+                     root (255.0)                                      Centroid ID:                     
+  Level: Root       ┌────────────────────────────────────┐      2.1000 => Level 2, Id 1000              
+(~100 centroids)    │2.1000:<vector>,2.1001:<vector>,... │                                              
+                    └────────────────────────────────────┘                                              
+                                                                                                        
+                     2.1000                                 2.1001                                      
+    Level: 2        ┌────────────────────────────────────┐ ┌────────────────────────────────────┐       
+(~10K centroids)    │1.100:<vector>,1.101:<vector>,...   │ │1.200:<vector>,1.201:<vector>,...   │  ...  
+                    └────────────────────────────────────┘ └────────────────────────────────────┘       
+                                                                                                        
+                     1.100                                  1.101                                       
+   Level: 1         ┌────────────────────────────────────┐ ┌────────────────────────────────────┐       
+(~1M centroids)     │0.10:<vector>,0.11:<vector>,...     │ │0.20:<vector>,0.21:<vector>,...     │  ...  
+                    └────────────────────────────────────┘ └────────────────────────────────────┘       
+                                                                                                        
+                                                                                                        
+  Level: Data       ┌────────────────────────────────────────────────────────────────────────────────┐  
+(~100M vectors)     │                   Data Vectors (0.10, 0.11, 0.20, 0.21, ...)                   │  
+                    └────────────────────────────────────────────────────────────────────────────────┘  
+```
 
 Search in the index proceeds from the root down. At each level, search finds the B nearest vectors
 to the search query, and reads their postings to seed the search at the next level down. B is called
@@ -864,7 +864,7 @@ clean centroid postings and inverted index bitmaps. We haven't found the added i
 bottleneck during indexing since processing large batches lets us drive lots of parallel reads to
 local SSD. This approach also adds space amplification as we track deleted vectors in each relevant
 bitmap in the inverted index. In practice this should just be a few bits per vector. We can revisit
-the globabl bitmap approach if its a problem.
+the global bitmap approach if its a problem.
 
 ### Graph-Based Index for Centroids
 
@@ -898,7 +898,7 @@ Future RFCs will address:
 
 - **LIRE rebalancing**: Split/merge thresholds, boundary vector reassignment, consistency guarantees
 - **Hot buffer**: In-memory HNSW for recent vectors before SPANN assignment
-- **Quantization**: Scalar (int8) and product quantization for memory-efficient search
+- **Quantization**: Scalar (int8) and/or binary quantization for faster and memory-efficient search
 - **Distributed search**: Namespace placement, cross-node aggregation, replication
 - **Range index optimization**: The current `MetadataIndex` evaluates range predicates by OR-ing
   bitmaps for matching values, which is expensive for high-cardinality numeric fields (e.g.,
@@ -906,10 +906,6 @@ Future RFCs will address:
   range scans.
 - **Filter selectivity statistics**: Store per-field cardinality, total vector count, and bitmap
   size estimates to enable smarter query planning (pre-filter vs post-filter vs hybrid).
-- **Tombstone cleanup**: Deleted vector IDs accumulate in posting lists and metadata indexes
-  (the deleted bitmap filters them at query time, but stale IDs waste space and slow scans).
-  A cleanup mechanism is needed to periodically rewrite these structures and clear the deleted
-  bitmap.
 
 ## Updates
 
@@ -918,6 +914,8 @@ Future RFCs will address:
 | 2026-01-07 | Initial draft                                                        |
 | 2026-01-24 | Store full vectors in postings. Store all attributes in `VectorData` |
 |            | and drop `VectorMeta`                                                |
+| 2026-04-10 | Update to reflect ANN tree and batched ingest                        |
+
 
 ## References
 
