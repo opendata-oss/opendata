@@ -4,6 +4,7 @@
 
 **Authors**:
 
+- [Rohan_Desai](https://github.com/rodesai)
 - [Almog Gavra](https://github.com/agavra)
 - [Bruno Cadonna](https://github.com/cadonna)
 
@@ -45,7 +46,7 @@ design must support:
 
 - Compaction/retention policies and LIRE rebalancing mechanics
 - Query execution and search algorithm details
-- Quantization strategies (PQ, SQ)
+- Quantization strategies
 - Distributed/sharded deployment
 
 ## Design
@@ -62,33 +63,37 @@ index structures are stored as key-value pairs in the LSM tree.
 │   ┌─────────────────────────────────────────────────────┐   │
 │   │                  Write Path                         │   │
 │   │                                                     │   │
-│   │   1. Vector written to WAL (durability)             │   │
-│   │   2. External ID looked up / allocated internal ID  │   │
-│   │   3. Assigned to nearest centroid(s)                │   │
-│   │   4. Posting lists updated via merge operator       │   │
-│   │   5. Vector data + metadata + dictionary written    │   │
+│   │   1. Validate and write vector to write coordinator │   │
+│   │   2. Index batches of vectors during flush:         │   │
+│   │     a. Allocate internal ID in dictionary           │   │
+│   │     b. Assign to nearest centroid(s)                │   │
+│   │     c. Update postings via merge operator           │   │
+│   │     d. Update inverted index for indexed fields     │   │
 │   └─────────────────────────────────────────────────────┘   │
 │                                                             │
 │   ┌─────────────────────────────────────────────────────┐   │
 │   │              Global SPANN Index                     │   │
 │   │                                                     │   │
-│   │   Centroids:     [chunk 0] [chunk 1] ... [chunk N]  │   │
-│   │                  (loaded into HNSW for navigation)  │   │
-│   │                                                     │   │
-│   │   Posting Lists: centroid_id →                      │   │
+│   │   Centroids:     centroid tree depth                │   │
+│   │   Posting Lists: vector_id →                        │   │
 │   │                  [(vector_id, f32[dimensions])]     │   │
-│   │                                                     │   │
+│   │   Centroid Info: vector_id →                        │   │
+│   │                   level + f32[dimensions]           │   │
+│   │                   + parent vector_ids               │   │
+│   │   Centroid Stats: vector_id → postings count        │   │
 │   └─────────────────────────────────────────────────────┘   │
 │                                                             │
 │   ┌─────────────────────────────────────────────────────┐   │
 │   │                  Vector Storage                     │   │
 │   │                                                     │   │
-│   │   IdDictionary:  external_id → internal vector_id   │   │
-│   │   VectorData:    vector_id →                        │   │
-│   │                  external_id + metadata             │   │
-│   │                    + f32[dimensions]                │   │
+│   │   IdDictionary:    external_id → internal vector_id │   │
+│   │   VectorData:      vector_id →                      │   │
+│   │                    external_id + metadata           │   │
+│   │                      + f32[dimensions]              │   │
+│   │   VectorIndexData: vector_id → indexed fields       │   │
+│   │                      + centroids                    │   │
 │   │   MetadataIndex: (field, value) → vector IDs        │   │
-│   │   Deletions:     deleted vector IDs                 │   │
+│   │                      + deleted vector IDs           │   │
 │   └─────────────────────────────────────────────────────┘   │
 │                                                             │
 │   ┌─────────────────────────────────────────────────────┐   │
@@ -103,8 +108,7 @@ index structures are stored as key-value pairs in the LSM tree.
 │   ┌─────────────────────────────────────────────────────┐   │
 │   │              Compaction Filters (background)        │   │
 │   │                                                     │   │
-│   │   - Clean up deleted vectors                        │   │
-│   │   - Clean up Deletions                              │   │
+│   │   - Clean up deleted vectors from inverted index    │   │
 │   └─────────────────────────────────────────────────────┘   │
 │                                                             │
 │   Storage: SlateDB (LSM KV Store)                           │
@@ -114,28 +118,77 @@ index structures are stored as key-value pairs in the LSM tree.
 
 ### Background on the Ingest/Query Path
 
-This RFC focuses on storage design, but understanding the ingest/query paths motivates the storage model.
+This RFC focuses on storage design, but understanding the ingest/query paths motivates the
+storage model.
 
-#### Query
-
-A vector database query has two components:
+A vector database query has two capabilities:
 
 - **Vector similarity search**: Find vectors closest to a query vector
 - **Metadata filtering**: Restrict results to vectors matching predicate filters
 
-A SPANN-style vector database has four storage components:
+A SPANN-style vector database has the following storage components:
 
-- **Centroid index**: In-memory structure (e.g., HNSW) over cluster centroids for fast navigation to
-  relevant posting lists
-- **Posting lists**: On-disk lists mapping each centroid to the vectors in its cluster
+- **ANN index**: Tree of cluster centroids for fast navigation to the referenced vectors are
+  centroids at the next inner level.
 - **Vector data**: Vector data (id, metadata, and dimensions) keyed by vector ID
 - **Metadata index**: Inverted index mapping metadata field/value pairs to vector IDs
 
-To illustrate, here's how the query
+#### ANN Index
+
+The heart of the system is the ANN index which supports fast navigation to vectors near a query
+vector. The ANN index is a search tree designed to support fast navigation to relevant vectors,
+incremental updates as vectors are ingested, and lazy partial loading at search time to allow
+for fast cold queries.
+
+The tree is made up of levels. Each level stores vectors. The vectors stored at a given level
+are the centroids of clusters of vectors at the next level. At the top is a single root node. At
+the bottom are the indexed data vectors. The level immediately above the data vectors, called
+the leaf, holds the centroids whose postings reference the data vectors.
+
+Each level represents a sampling of the full space represented by the data vectors. As vectors
+are ingested, the db traverses the tree from the bottom up and runs LIRE at each level
+to maintain a high quality search index at each level. It first adds each data vector to its
+posting in the leaf centroids, then executes splits/merges of leaf centroids (level 1). These
+splits and  merges mutate the postings at level 2. The indexer then executes splits/merges at
+level 2, and so on. Eventually, it reaches the root. If the root becomes too large the indexer
+splits it by adding a new level of centroids and writing a new root. The details of the indexing
+process are detailed in RFC-0005.
+
+The figure below depicts an example 4-level tree:
+```ascii
+               root (255.0)                                      Vector/Centroid ID:
+               ┌────────────────────────────────────┐      2.1000 => Level 2, Id 1000
+  Level: Root  │2.1000:<vector>,2.1001:<vector>,... │
+               └────────────────────────────────────┘
+
+                2.1000                                 2.1001
+               ┌────────────────────────────────────┐ ┌────────────────────────────────────┐
+    Level: 2   │1.100:<vector>,1.101:<vector>,...   │ │1.200:<vector>,1.201:<vector>,...   │  ...
+               └────────────────────────────────────┘ └────────────────────────────────────┘
+
+                1.100                                  1.101
+               ┌────────────────────────────────────┐ ┌────────────────────────────────────┐
+    Level: 1   │0.10:<vector>,0.11:<vector>,...     │ │0.20:<vector>,0.21:<vector>,...     │  ...
+               └────────────────────────────────────┘ └────────────────────────────────────┘
+
+
+               ┌────────────────────────────────────────────────────────────────────────────────┐
+  Level: Data  │                   Data Vectors (0.10, 0.11, 0.20, 0.21, ...)                   │
+               └────────────────────────────────────────────────────────────────────────────────┘
+ ```
+
+Search in the index proceeds from the root down. At each level, search finds the B nearest vectors
+to the search query, and reads their postings to seed the search at the next level down. B is called
+the "beam" width.
+
+#### Query
+
+Queries use the ANN index along with the metadata index to execute filtered ANN search. To
+illustrate, here's how the query
 `find top-10 similar to query_vec where category="shoes" and price < 50` is served:
 
-1. Search the centroid index to find the k nearest centroids to `query_vec`
-2. Load posting lists for those centroids from disk
+1. Search the ANN index to find the k nearest leaf centroids to `query_vec`
+2. Load posting lists for those centroids from storage
 3. Intersect candidate vector IDs with the metadata filter `{category="shoes", price < 50}` using
    the inverted index
 4. Compute exact distances for remaining candidates
@@ -143,35 +196,30 @@ To illustrate, here's how the query
 
 #### Ingest
 
-Vector db is designed to support high volume ingest by minimizing the overhead of handling
-writes. The high level approach is to minimize what needs to be read to handle a write, doing logical
-read-modify-write i/os as SlateDB merges, and to batch many such writes together into a single SlateDB `WriteBatch`.
-Every datum that must be read to handle a write adds overhead from potential i/o in the critical section,
-navigating the LSM tree, and deserialization. Batching amortizes the final write i/o over multiple logical writes.
+High volume ingest to vector presents a few challenges. Of note, (1) writes typically require
+updating large entities like centroid and metadata index posting lists by adding new vectors,
+(2) updates require reading some of the old data to know what index state needs to be cleaned up,
+and (3) each write can result in multiple downstream ANN index maintenance operations (e.g.
+centroid splits/merges, reassignments, etc). The details of the latter are covered in a later RFC.
 
-**Write Batching:**
-
-Naive use of merge operators hurts read performance—each read must deserialize and merge all
-pending entries. Conversely, read-modify-write avoids merge overhead but adds write overhead
-(deserialize, modify, reserialize on every insert) as discussed above.
-
-The solution is a two-layer approach: buffer writes in memory and merge them there (e.g. operating on
-`RoaringTreemap` directly for the meta index), then flush the merged buffer using SlateDB merge operators (operating
-on `Bytes`). For example, 100 vector inserts across 10 centroids produce 10 SlateDB merges instead of
-100. Both layers use the same merge logic (e.g. treemap OR / AND-NOT for the meta index).
-
-Trade-offs:
-
-- Requires a custom in-memory buffer (essentially a memtable)
-- Writes are not immediately visible during the buffer interval
-- For queryable buffers, a separate WAL and atomic flush protocol would be needed (out of scope)
+Vector addresses these challenges by:
+1. Decoupling indexing from writes and indexing large batches of writes at a time. This allows
+   for driving high i/o parallelism when indexing requires reads, and amortizes some of the
+   index maintenance work over many vectors.
+1. Doing logical read-modify-writes of large values like centroid postings and inverted indexes as
+   SlateDB merges. Further, as another benefit of the aforementioned batching, vector applies
+   many such writes together in a single SlateDB `WriteBatch` to reduce merge overhead within
+   SlateDB and instead do the merges directly within the batch. Generally, merges done by SlateDB
+   are more expensive as they require deserializing to the Vector in-memory model, applying the
+   merge, and then reserializing.
 
 **Delete Operation:**
 
-Deleting a vector requires 3 atomic operations via `WriteBatch`: (1) add vector ID to the
-deleted bitmap, (2) tombstone the vector data, (3) tombstone the `IdDictionary` entry.
-Metadata index and postings cleanup happens during compaction and LIRE maintenance. These details
-are left to a future RFC.
+Deleting a vector requires the following atomic operations via `WriteBatch`:
+1. tombstone the vector data
+1. tombstone the `IdDictionary` entry.
+1. mark the vector as deleted in its centroid posting
+1. mark the vector as deleted in its metadata index entries
 
 ### Record Layout
 
@@ -182,14 +230,32 @@ Key identifiers used in this RFC:
 
 - `vector_id` (u64): Internal vector identifier, system-assigned, unique within the namespace
 - `external_id` (string): User-provided identifier, max 64 bytes, maps to internal vector_id
-- `centroid_id` (u32): Cluster centroid identifier
-- `chunk_id` (u32): Centroid chunk identifier
 
-### External and Internal IDs
+### External ID and Vector ID
 
 Users provide **external IDs**—arbitrary strings up to 64 bytes—to identify their vectors. The
-system maintains an `IdDictionary` that maps each external ID to a system-assigned **internal ID**
-(u64). Internal IDs are used in all index structures (posting lists, metadata indexes) because:
+system maintains an `IdDictionary` that maps each external ID to a system-assigned **Vector ID**
+(u64). Vector IDs are also used for centroid vectors in the ANN index.
+
+Each Vector ID is made up of 2 parts. The upper 8 bits specify the level at which the vector is
+present in the ANN tree. Data vectors always have their level byte set to 0. Leaf centroids
+have their level byte set to 1, and so on. The root always has its level byte set to `0xFF`. The
+lower 56 bits specify an ID number. We allocate sequential ID numbers for data vectors from a
+sequence allocator, and sequential ID numbers for centroids from another allocator. Encoding the
+vector's level is mostly ergonomic - its very clear from inspecting the id whether we're dealing
+with a data vector or centroid, and at what level of the tree. This allows for clearer logging and
+invariant checking throughout the indexer. It also allows for having a single ID for vectors thats
+usable in bitmaps.
+
+```ascii
+Vector ID
+┌───────────────┬─────────────────────────────────────────────────────────────────────────┐
+│ANN Tree Level │              ID Number (monotonically increasing, 56 bits)              │
+│   (8-bits)    │                                                                         │
+└───────────────┴─────────────────────────────────────────────────────────────────────────┘
+```
+
+Vector IDs are used in all index structures (posting lists, metadata indexes) because:
 
 1. Fixed-width u64 keys enable efficient bitmap operations (RoaringTreemap)
 2. Monotonically increasing IDs improve bitmap compression (sequential IDs cluster well)
@@ -199,46 +265,32 @@ system maintains an `IdDictionary` that maps each external ID to a system-assign
 
 When inserting a vector with an external ID that already exists:
 
-1. Look up the existing internal ID from `IdDictionary`
-2. Delete the old vector: add internal ID to deleted bitmap, tombstone `VectorData`
-3. Allocate a new internal ID
-4. Write new vector data and postings with the new internal ID
-5. Update `IdDictionary` to point to the new internal ID
-
-This "delete old + insert new" approach allows updates to be ingested cheaply by simply updating
-the deletion bitmap and tombstoning `VectorData`. The only lookup required on the ingest path is
-into the ID dictionary, which can reside in memory. At the same time, reads of postings can quickly
-filter updated vectors by consulting the deletion bitmap.
+1. Look up the existing vector ID from `IdDictionary`
+2. Delete the old vector: tombstone `VectorData` and `VectorIndexData`
+3. Clean up the old vector from centroid and metadata index postings
+4. Allocate a new vector ID
+5. Write new vector data and postings with the new internal ID
+6. Update `IdDictionary` to point to the new internal ID
 
 ### Block-Based ID Allocation
 
-Internal vector IDs are allocated from a monotonically increasing counter using block-based
-allocation (similar to the Log RFC's sequence allocation). Rather than persisting the counter after
-every insert, the writer pre-allocates a block of IDs and records the allocation in a `SeqBlock`
-record.
-
-**Allocation procedure:**
-
-1. On initialization, read the `SeqBlock` record to get the last allocated range `[base, base+size)`
-2. Allocate a new block starting at `base + size` and write a new `SeqBlock` before processing
-3. During normal operation, assign IDs from the current block, incrementing after each insert
-4. When the current block is exhausted, allocate a new block and write an updated `SeqBlock`
-
-**Recovery:**
-
-On crash recovery, read the `SeqBlock` and allocate a fresh block starting after the previous range.
-Any IDs allocated but not used before the crash are skipped. This may create gaps in the ID space,
-but monotonicity is preserved.
-
-**Block sizing:**
-
-Block size is an implementation detail balancing write amplification (larger blocks reduce
-`SeqBlock` write frequency) against ID space efficiency (smaller blocks waste fewer IDs on crash).
+Each vector IDs is allocated from a monotonically increasing counter using block-based
+allocation (see
+[RFC-0002: Block-Based Sequence Allocation](https://github.com/opendata-oss/opendata/blob/main/rfcs/0002-seq-block.md))
 
 ### Standard Key Prefix
 
-All records use a standard 2-byte prefix: a single `u8` for the record version and another `u8` for
-the record tag. The record tag encodes the record type in the high 4 bits.
+All records use a standard 3-byte prefix: a single `u8` for the subsystem, a `u8` for the key
+format version, and a `u8` for the record tag. The record tag encodes the record type in the high
+4 bits.
+
+```
+key prefix byte layout:
+┌───────────┬─────────┬────────────┐
+│ subsystem │ version │ record_tag │
+│  1 byte   │ 1 byte  │   1 byte   │
+└───────────┴─────────┴────────────┘
+```
 
 ```
 record_tag byte layout:
@@ -263,6 +315,7 @@ with future schema changes that may require sub-type discrimination.
 - `FixedElementArray<T>`: Serialized elements back-to-back with no count prefix;
 - `RoaringTreemap`: Roaring treemap serialization format for compressed u64 integer sets (64-bit
   extension of Roaring bitmap).
+- `Vector ID`: The encoded u64 vector ID. For vector ID we always encode as big-endian.
 
 **Key Encodings** (big-endian for lexicographic ordering):
 
@@ -275,17 +328,20 @@ maintain lexicographic ordering for range scans.
 
 ### Record Type Reference
 
-| ID     | Name             | Description                                                |
-|--------|------------------|------------------------------------------------------------|
-| `0x00` | *(reserved)*     | Reserved for future use                                    |
-| `0x01` | `CollectionMeta` | Global schema: dimensions, distance metric, field specs    |
-| `0x02` | `Deletions`      | Bitmap of deleted vector IDs                               |
-| `0x03` | `CentroidChunk`  | Stores a chunk of cluster centroids for SPANN navigation   |
-| `0x04` | `PostingList`    | Maps centroid IDs to vector IDs in that cluster            |
-| `0x05` | `IdDictionary`   | Maps external string IDs to internal u64 vector IDs        |
-| `0x06` | `VectorData`     | Stores vector and metadata key-value pairs for each vector |
-| `0x07` | `MetadataIndex`  | Inverted index mapping metadata values to vector IDs       |
-| `0x08` | `SeqBlock`       | Stores sequence allocation state for internal ID gen       |
+| ID     | Name               | Description                                                 |
+|--------|--------------------|-------------------------------------------------------------|
+| `0x00` | *(reserved)*       | Reserved for future use                                     |
+| `0x01` | `CollectionMeta`   | Global schema: dimensions, distance metric, field specs     |
+| `0x02` | `PostingList`      | Maps centroid IDs to vector IDs in that cluster             |
+| `0x03` | `IdDictionary`     | Maps external string IDs to internal u64 vector IDs         |
+| `0x04` | `VectorData`       | Stores vector and metadata kvpairs for each vector          |
+| `0x05` | `MetadataIndex`    | Inverted index mapping metadata values to vector IDs        |
+| `0x06` | `SeqBlock`         | Stores sequence allocation state for data Vector ID gen     |
+| `0x07` | `CentroidStats`    | Stores centroid posting counts                              |
+| `0x08` | `Centroids`        | Stores metadata about the ANN tree                          |
+| `0x09` | `CentroidInfo`     | Stores metadata about a centroid (vector, parent centroid)  |
+| `0x0a` | `CentroidSeqBlock` | Stores sequence allocation state for centroid Vector ID gen |
+| `0x0b` | `VectorIndexData`  | Stores centroid + indexed metadata kv pairs for each vector |
 
 ## Record Definitions & Schemas
 
@@ -297,12 +353,13 @@ that defines the structure all vectors in the namespace must conform to.
 **Key Layout:**
 
 ```
-┌─────────┬─────────────┐
-│ version │ record_tag  │
-│ 1 byte  │   1 byte    │
-└─────────┴─────────────┘
+┌───────────┬─────────┬────────────┐
+│ subsystem │ version │ record_tag │
+│  1 byte   │ 1 byte  │   1 byte   │
+└───────────┴─────────┴────────────┘
 ```
 
+- `subsystem` (u8): Vector subsystem identifier (currently `0x02`)
 - `version` (u8): Key format version (currently `0x01`)
 - `record_tag` (u8): Record type `0x01` in high nibble, reserved `0x0` in low nibble
 
@@ -315,7 +372,6 @@ that defines the structure all vectors in the namespace must conform to.
 │  schema_version:    u32                                        │
 │  dimensions:        u16                                        │
 │  distance_metric:   u8   (0=L2, 1=cosine, 2=dot_product)       │
-│  chunk_target:      u16  (centroids per chunk, default 4096)   │
 │  metadata_fields:   Array<MetadataFieldSpec>                   │
 │                                                                │
 │  MetadataFieldSpec                                             │
@@ -332,7 +388,6 @@ that defines the structure all vectors in the namespace must conform to.
 - `schema_version`: Monotonically increasing version number, incremented on metadata field changes
 - `dimensions`: Fixed dimensionality for all vectors in the collection (immutable after creation)
 - `distance_metric`: Distance function used for similarity computation (immutable after creation)
-- `chunk_target`: Number of centroids per chunk (immutable after creation, default 4096)
 - `metadata_fields`: Schema for metadata fields, including which fields are indexed for filtering
 
 **Schema Evolution:**
@@ -347,119 +402,24 @@ collection). Supported evolutions:
 
 Unsupported changes (require creating a new collection):
 
-- Changing `dimensions`, `distance_metric`, or `chunk_target`
+- Changing `dimensions` or `distance_metric`
 - Removing metadata fields or changing their types
 - Disabling indexing on a field (index entries would become stale)
 
-### `Deletions` (`RecordType::Deletions` = `0x02`)
+### `PostingList` (`RecordType::PostingList` = `0x02`)
 
-Stores a bitmap of deleted vectors. This bitmap is consulted when evaluating postings to filter out
-deleted vectors (either via a delete or an update). This will also be used during compaction to clean
-deleted vectors from postings, but these details are left to a future RFC.
-
-**Key Layout:**
-
-```
-┌─────────┬─────────────┐
-│ version │ record_tag  │
-│ 1 byte  │   1 byte    │
-└─────────┴─────────────┘
-```
-
-**Value Schema:**
-
-```
-┌───────────────────────────────────────────────────────────────┐
-│                    DeletionsValue                             │
-├───────────────────────────────────────────────────────────────┤
-│  vector_ids: RoaringTreeMap                                   │
-└───────────────────────────────────────────────────────────────┘
-```
-
-**Structure:**
-
-- `RoaringTreeMap` efficiently compresses the set of deleted vectors while allowing fast lookup
-
-### `CentroidChunk` (`RecordType::CentroidChunk` = `0x03`)
-
-Stores a chunk of cluster centroids for the namespace. During search, these centroids are loaded
-into memory and indexed (typically with HNSW) for fast navigation. Centroids are split across
-multiple records to enable efficient partial loading—only touched chunks are read from disk and
-cached.
+Maps a vector ID `V_centroid` to the list of vector IDs assigned to the cluster represented by
+V_centroid. During search, posting lists for the nearest leaf (level=1) centroids are loaded and
+their vectors evaluated.
 
 **Key Layout:**
 
 ```
-┌─────────┬─────────────┬──────────┐
-│ version │ record_tag  │ chunk_id │
-│ 1 byte  │   1 byte    │ 4 bytes  │
-└─────────┴─────────────┴──────────┘
+┌───────────┬─────────┬────────────┬──────────────┐
+│ subsystem │ version │ record_tag │  vector_id   │
+│  1 byte   │ 1 byte  │   1 byte   │   8 bytes    │
+└───────────┴─────────┴────────────┴──────────────┘
 ```
-
-- `chunk_id` (u32): Identifies the chunk within the namespace, starting from 0
-
-**Why Chunking?** All centroid chunks are fully scanned on startup (`scan(version|0x02|*)`) to load
-the HNSW graph—the `chunk_id` exists solely to give each chunk a distinct record key. Storing one
-centroid per key would explode the number of keys fetched on startup, increasing latency. Future
-work could add hierarchy to page centroids in/out by chunk, but that is out of scope here.
-
-**Centroid ID Addressing:**
-
-Every centroid carries an explicit `centroid_id` stored alongside its vector inside the chunk payload.
-IDs start at 1 and are never reassigned once issued. Chunks simply group centroids for locality; their
-position no longer derives the ID.
-
-**Value Schema:**
-
-```
-┌───────────────────────────────────────────────────────────────┐
-│                    CentroidChunkValue                         │
-├───────────────────────────────────────────────────────────────┤
-│  centroid_count:  u32 (<= CHUNK_TARGET)                       │
-│  entries:        Array<CentroidEntry>                         │
-│                                                               │
-│  CentroidEntry                                                │
-│  ┌──────────────────────────────────────────────────────────┐ │
-│  │  centroid_id: u32 (stable identifier)                    │ │
-│  │  vector:      FixedElementArray<f32>                     │ │
-│  │               (dimensions elements)                      │ │
-│  └──────────────────────────────────────────────────────────┘ │
-└───────────────────────────────────────────────────────────────┘
-```
-
-**Structure:**
-
-- Each chunk stores up to `CHUNK_TARGET` centroids (≈25 MB per chunk at 1536 dims with default 4096)
-- Each centroid persists its own `centroid_id`, allowing chunks to be rewritten or reordered without
-  renumbering posting lists
-- `CHUNK_TARGET` is stored in `CollectionMeta` and is immutable after collection creation
-- Separate records per chunk enable SlateDB block-level caching and partial reads
-- Dimensionality obtained from `CollectionMeta`
-- Centroid ratio is configurable; typical values range from 0.1-1% of vectors (e.g., 10K-100K
-  centroids for 10M vectors). Higher ratios improve recall at the cost of memory.
-
-### `PostingList` (`RecordType::PostingList` = `0x04`)
-
-Maps a centroid ID to the list of vector IDs assigned to that cluster. During search, posting lists
-for the nearest centroids are loaded and their vectors evaluated. Boundary vectors (near multiple
-centroids) may appear in multiple posting lists to improve recall.
-
-**Key Layout:**
-
-```
-┌─────────┬─────────────┬──────────────┐
-│ version │ record_tag  │ centroid_id  │
-│ 1 byte  │   1 byte    │   4 bytes    │
-└─────────┴─────────────┴──────────────┘
-```
-
-**Stability & LIRE maintenance:**
-
-- New centroids created during splits receive freshly allocated IDs and are appended to the relevant
-  `CentroidChunk` records (chunks may be rewritten to accommodate the new entry).
-- When two centroids merge, the “retiring” centroid ID is tombstoned, but the identifier is never reused.  
-- Posting lists are rewritten only for the centroids whose IDs actually change (new split children);
-  all other posting list keys stay stable, avoiding cascading renumbering across the tree.
 
 **Value Schema:**
 
@@ -472,7 +432,7 @@ centroids) may appear in multiple posting lists to improve recall.
 │  Posting                                                       │
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │  type:        u8 (0x0 => Append, 0x1 => Delete)          │  │
-|  |  id:          u64                                        │  │ 
+|  |  id:          u64                                        │  │
 │  │  vector:      FixedElementArray<f32>                     │  │
 │  │               (dimensions elements)                      │  │
 │  └──────────────────────────────────────────────────────────┘  │
@@ -481,27 +441,25 @@ centroids) may appear in multiple posting lists to improve recall.
 
 **Structure:**
 
-- The value is a simple array of mutations to the posting. The mutations are ordered by vector id. 
+- The value is a simple array of mutations to the posting. The mutations are ordered by vector id.
 - Each entry specifies a mutation type. 0x0 indicates the vector is added, 0x1 indicates its deleted.
 - Posting lists are balanced by the hierarchical clustering algorithm (target size configurable,
-  e.g., 10-100 vectors)
-- LIRE maintenance splits oversized postings and merges undersized ones
-- It's expected that posting lists will be relatively small. Practical evaluation of SPANN has found that it is optimal
-  to maintain one centroid for ~10 vectors. We also expect Vector to have a high ingestion rate and modest query rate.
-  So we optimize for a structure that can be efficiently updated. The small size means that it should be relatively
-  cheap to intersect with the inverted index at query time.
+  e.g., 50-150 vectors)
+- It's expected that posting lists will be relatively small. Our evaluation of SPFresh has found
+  that it is optimal to maintain one centroid for ~100 vectors. We also expect Vector to have a
+  high ingestion rate and modest query rate. So we optimize for a structure that can be
+  efficiently updated. The small size means that it should be relatively cheap to intersect with
+  the inverted index at query time.
 
 **Merge Operators:**
 
 Posting lists use SlateDB merge operators to avoid read-modify-write amplification:
 
 - New vectors are added to a posting as a new merge value with all elements of type Append
-- Vectors removed by LIRE (or in the future, deletion) are removed from a posting as a new merge value with all
+- Vectors removed by LIRE or deletion are removed from a posting as a new merge value with
   elements of type Delete
-- Merge of 2 values with elements of the same type is a simple buffer concatenation.
-- Merge of a value with Appends with a value with Deletes requires filtering.
 
-### `IdDictionary` (`RecordType::IdDictionary` = `0x05`)
+### `IdDictionary` (`RecordType::IdDictionary` = `0x03`)
 
 Maps user-provided external IDs to internal vector IDs. Enables arbitrary string identifiers while
 maintaining compact u64 internal IDs for efficient bitmap operations.
@@ -509,10 +467,10 @@ maintaining compact u64 internal IDs for efficient bitmap operations.
 **Key Layout:**
 
 ```
-┌─────────┬─────────────┬─────────────────┐
-│ version │ record_tag  │   external_id   │
-│ 1 byte  │   1 byte    │ TerminatedBytes │
-└─────────┴─────────────┴─────────────────┘
+┌───────────┬─────────┬────────────┬─────────────────┐
+│ subsystem │ version │ record_tag │   external_id   │
+│  1 byte   │ 1 byte  │   1 byte   │ TerminatedBytes │
+└───────────┴─────────┴────────────┴─────────────────┘
 ```
 
 - `external_id`: User-provided identifier (max 64 bytes)
@@ -523,19 +481,19 @@ maintaining compact u64 internal IDs for efficient bitmap operations.
 ┌────────────────────────────────────────────────────────────────┐
 │                     IdDictionaryValue                          │
 ├────────────────────────────────────────────────────────────────┤
-│  vector_id:  u64  (internal vector identifier)                 │
+│  vector_id:  VectorId  (internal vector identifier)            │
 └────────────────────────────────────────────────────────────────┘
 ```
 
 **Structure:**
 
 - External IDs are encoded using `TerminatedBytes` for correct lexicographic ordering
-- Value is a single u64 internal vector ID (8 bytes, little-endian)
+- Value is the encoded Vector ID.
 - On upsert, the dictionary entry is updated to point to the new internal ID (old entry tombstoned,
   new entry written)
 - During delete, the dictionary entry is tombstoned along with vector data/metadata
 
-### `VectorData` (`RecordType::VectorData` = `0x06`)
+### `VectorData` (`RecordType::VectorData` = `0x04`)
 
 Stores metadata key-value pairs associated with a vector, including the external ID for reverse
 lookup, and the actual vector data.
@@ -543,10 +501,10 @@ lookup, and the actual vector data.
 **Key Layout:**
 
 ```
-┌─────────┬─────────────┬────────────┐
-│ version │ record_tag  │ vector_id  │
-│ 1 byte  │   1 byte    │  8 bytes   │
-└─────────┴─────────────┴────────────┘
+┌───────────┬─────────┬────────────┬────────────┐
+│ subsystem │ version │ record_tag │ vector_id  │
+│  1 byte   │ 1 byte  │   1 byte   │  8 bytes   │
+└───────────┴─────────┴────────────┴────────────┘
 ```
 
 - `vector_id` (u64): Internal identifier for the vector (system-assigned)
@@ -582,19 +540,79 @@ lookup, and the actual vector data.
 - Metadata fields serialized in ascending lexicographic order by `field_name`
 - Field schema defined in `CollectionMeta`; unknown field names are rejected at write time
 
-### `MetadataIndex` (`RecordType::MetadataIndex` = `0x07`)
+### `VectorIndexData` (`RecordType::VectorIndexData` = `0x05`)
 
-Inverted index mapping metadata field/value pairs to the set of vectors with that value. Enables
-efficient filtering during hybrid queries. Only fields marked as `indexed=true` in `CollectionMeta`
-have index entries.
+Stores the subset of per-vector state needed to maintain secondary indexes during upserts,
+deletes, and reassignments. This record allows the indexer to remove a vector from its old
+centroid posting(s) and old metadata index entries without reading the full `VectorData` record.
+We store the indexed fields in both `VectorIndexData` and `VectorData`. We opt to duplicate these
+fields to allow for efficiently reading the required data at indexing and query times, at the cost
+of added storage. We expect the indexed fields to be small relative to the vector and non-indexed
+fields.
 
 **Key Layout:**
 
 ```
-┌─────────┬─────────────┬─────────────────┬────────────────────┐
-│ version │ record_tag  │      field      │    value_term      │
-│ 1 byte  │   1 byte    │ TerminatedBytes │ MetadataTerm bytes │
-└─────────┴─────────────┴─────────────────┴────────────────────┘
+┌───────────┬─────────┬────────────┬────────────┐
+│ subsystem │ version │ record_tag │ vector_id  │
+│  1 byte   │ 1 byte  │   1 byte   │  8 bytes   │
+└───────────┴─────────┴────────────┴────────────┘
+```
+
+- `vector_id`: Internal identifier for the data vector. `VectorIndexData` is only valid for level-0
+  data vectors.
+
+**Value Schema:**
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                    VectorIndexDataValue                                │
+├────────────────────────────────────────────────────────────────────────┤
+│  postings:       Array<VectorId>                                       │
+│  indexed_fields: Array<Field>                                          │
+│                                                                        │
+│  Field                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │  field_name:  Utf8                                               │  │
+│  │  value:       FieldValue                                         │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**Structure:**
+
+- `postings` stores the centroid IDs of the posting lists that currently contain the vector. In
+  the current implementation this array always has a single centroid ID, but it is encoded as
+  an array to leave room for future replication / multi-posting assignment.
+- Every `postings` entry must be a centroid `VectorId`.
+- `indexed_fields` stores only the metadata fields from `VectorData` whose
+  `CollectionMeta.metadata_fields[i].indexed` flag is true.
+- `indexed_fields` are serialized in ascending lexicographic order by `field_name`.
+
+**Write / Update Semantics:**
+
+- On insert, `VectorIndexData` is written alongside `VectorData`, using the vector's assigned leaf
+  centroid in `postings` and the vector's indexed metadata fields in `indexed_fields`.
+- On upsert, the old `VectorIndexData` is read first. Its `postings` are used to remove the old
+  vector ID from centroid postings, and its `indexed_fields` are used to exclude the old vector ID
+  from metadata indexes. A new `VectorIndexData` record is then written for the new vector ID.
+- During leaf-centroid splits and vector reassignments, the vector's `postings` are rewritten to
+  its new centroid assignment while preserving `indexed_fields`.
+- On delete, `VectorIndexData` is tombstoned along with `VectorData` and the `IdDictionary` entry.
+
+### `MetadataIndex` (`RecordType::MetadataIndex` = `0x06`)
+
+Inverted index mapping metadata field/value pairs to the vectors currently matching that value.
+Enables efficient filtering during hybrid queries. Only fields marked as `indexed=true` in
+`CollectionMeta` have index entries.
+
+**Key Layout:**
+
+```
+┌───────────┬─────────┬────────────┬─────────────────┬────────────────────┐
+│ subsystem │ version │ record_tag │      field      │    value_term      │
+│  1 byte   │ 1 byte  │   1 byte   │ TerminatedBytes │ MetadataTerm bytes │
+└───────────┴─────────┴────────────┴─────────────────┴────────────────────┘
 ```
 
 **Key Fields:**
@@ -625,23 +643,34 @@ sortable encodings (sign-bit flip + big-endian) to enable efficient range scans.
 ┌────────────────────────────────────────────────────────────────┐
 │                    MetadataIndexValue                          │
 ├────────────────────────────────────────────────────────────────┤
-│  vector_ids:  RoaringTreemap                                   │
+│  included:  VectorBitmap                                       │
+│  excluded:  VectorBitmap                                       │
 └────────────────────────────────────────────────────────────────┘
 ```
 
 **Structure:**
 
-- Roaring treemap provides efficient compression and set intersection for u64 IDs
-- During filtered search, treemaps for multiple predicates are intersected before vector evaluation
-- SlateDB prefix encoding compresses common field name prefixes
-- Updates use merge operators (same pattern as `PostingList`): treemap OR to add, treemap AND-NOT to
-  remove
+- `included` contains vector IDs that should be treated as present for this field/value pair.
+- `excluded` contains vector IDs that should be treated as removed for this field/value pair.
+- Both fields use `VectorBitmap`, which wraps a `RoaringTreemap` for compressed storage and
+  efficient set operations over `VectorId`s.
+- During query execution, the effective result set is `included - excluded`.
+- During filtered search, effective bitmaps for multiple predicates are intersected before exact
+  vector evaluation.
 
-**Known Limitation:** Range predicates (e.g., `price < 100`) require OR-ing treemaps for all matching
-values. This works well for low-cardinality fields and exact-match filters but is expensive for
-high-cardinality numeric fields. See Future Considerations for planned improvements.
+**Write / Update Semantics:**
 
-### `SeqBlock` (`RecordType::SeqBlock` = `0x08`)
+- On insert, for each indexed field `(name, value)`, the vector ID is added to the `included`
+  bitmap of that metadata index entry.
+- On delete, for each indexed field previously associated with the vector, the vector ID is added
+  to the `excluded` bitmap of that metadata index entry.
+- On upsert, the old vector ID is excluded from the old indexed field/value pairs and the new
+  vector ID is included in the new indexed field/value pairs. This allows upserts to be applied
+  as append-only merges without first rewriting the full bitmap.
+- The vector's indexed field/value pairs are stored in `VectorIndexData` so the indexer can clean
+  up the old metadata index entries during upsert or reassignment without reading `VectorData`.
+
+### `SeqBlock` (`RecordType::SeqBlock` = `0x07`)
 
 Stores the sequence allocation state for internal vector ID generation. This is a singleton record
 used for block-based sequence allocation (see "Block-Based ID Allocation").
@@ -649,10 +678,10 @@ used for block-based sequence allocation (see "Block-Based ID Allocation").
 **Key Layout:**
 
 ```
-┌─────────┬─────────────┐
-│ version │ record_tag  │
-│ 1 byte  │   1 byte    │
-└─────────┴─────────────┘
+┌───────────┬─────────┬────────────┐
+│ subsystem │ version │ record_tag │
+│  1 byte   │ 1 byte  │   1 byte   │
+└───────────┴─────────┴────────────┘
 ```
 
 The key contains only the version and record tag—no additional fields. This ensures exactly one
@@ -677,37 +706,174 @@ The key contains only the version and record tag—no additional fields. This en
 - The allocated range is `[base_sequence, base_sequence + block_size)`
 - On crash recovery, allocate a fresh block starting at `base_sequence + block_size`
 
-## Query Execution Overview
+### `CentroidStats` (`RecordType::CentroidStats` = `0x08`)
 
-### Pure ANN Search (no filters)
+Stores the current posting count for a centroid. The tree indexer uses this count to decide when a
+centroid should be split or merged.
 
-```
-1. Load global centroid index into memory (cached on startup)
-2. Search centroid HNSW for k nearest centroids to query vector
-3. Load posting lists for those centroids
-4. Load deleted bitmap (centroid_id = 0), subtract from candidates
-5. For each vector_id in filtered candidates:
-   - Load vector data
-   - Compute exact distance
-6. Return top-k by distance
-```
-
-### Filtered Search
+**Key Layout:**
 
 ```
-1. Load deleted bitmap (centroid_id = 0)
-2. Estimate filter selectivity (implementation-defined heuristic)
-3. If filter is highly selective (< 1% of vectors):
-   - Pre-filter: intersect metadata index bitmaps, subtract deleted
-   - Load vectors for matching IDs, compute distances
-4. If filter is loose (> 50% of vectors):
-   - Post-filter: run ANN search, filter results
-5. Otherwise:
-   - Hybrid: search centroids, intersect posting list with filter bitmap, subtract deleted
-6. Return top-k by distance
+┌───────────┬─────────┬────────────┬──────────────┐
+│ subsystem │ version │ record_tag │ centroid_id  │
+│  1 byte   │ 1 byte  │   1 byte   │   8 bytes    │
+└───────────┴─────────┴────────────┴──────────────┘
 ```
+
+- `centroid_id`: Centroid `VectorId`.
+
+**Value Schema:**
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                     CentroidStatsValue                         │
+├────────────────────────────────────────────────────────────────┤
+│  num_vectors: i32                                              │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Structure:**
+
+- `num_vectors` is the current number of entries in the centroid's posting list.
+- Counts are deleted when the centroid is deleted.
+
+### `Centroids` (`RecordType::Centroids` = `0x09`)
+
+Singleton metadata describing the current shape of the centroid tree.
+
+**Key Layout:**
+
+```
+┌───────────┬─────────┬────────────┐
+│ subsystem │ version │ record_tag │
+│  1 byte   │ 1 byte  │   1 byte   │
+└───────────┴─────────┴────────────┘
+```
+
+The key contains only the version and record tag, so there is exactly one `Centroids` record per
+collection.
+
+**Value Schema:**
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                       CentroidsValue                           │
+├────────────────────────────────────────────────────────────────┤
+│  depth: u8                                                     │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Structure:**
+
+- `depth` is the number of levels in the ANN tree.
+- Data vectors are always level `0`.
+- Leaf centroids are level `1`.
+- Higher centroid levels increase upward.
+
+### `CentroidInfo` (`RecordType::CentroidInfo` = `0x0a`)
+
+Stores the durable metadata for a single centroid.
+
+**Key Layout:**
+
+```
+┌───────────┬─────────┬────────────┬──────────────┐
+│ subsystem │ version │ record_tag │ centroid_id  │
+│  1 byte   │ 1 byte  │   1 byte   │   8 bytes    │
+└───────────┴─────────┴────────────┴──────────────┘
+```
+
+- `centroid_id`: Centroid `VectorId`. Centroid IDs are globally unique across all centroid levels.
+
+**Value Schema:**
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        CentroidInfoValue                               │
+├────────────────────────────────────────────────────────────────────────┤
+│  level:            u8                                                  │
+│  vector:           Array<f32>                                          │
+│  parent_vector_id: VectorId                                            │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**Structure:**
+
+- `level` is the centroid's level in the ANN tree.
+- `vector` is the centroid vector.
+- `parent_vector_id` is either:
+  - the centroid's parent centroid at level `level + 1`, or
+  - the distinguished root `VectorId` when the centroid is attached directly to the root posting.
+- When a centroid is split, merged, or reassigned to a new parent, its `CentroidInfo` is rewritten.
+- When a centroid is deleted, its `CentroidInfo` row is deleted atomically with its posting list
+  and `CentroidStats`.
+
+### `CentroidSeqBlock` (`RecordType::CentroidSeqBlock` = `0x0b`)
+
+Stores the sequence allocation state for centroid ID generation.
+
+**Key Layout:**
+
+```
+┌───────────┬─────────┬────────────┐
+│ subsystem │ version │ record_tag │
+│  1 byte   │ 1 byte  │   1 byte   │
+└───────────┴─────────┴────────────┘
+```
+
+The key contains only the version and record tag, so there is exactly one `CentroidSeqBlock`
+record per collection.
+
+**Value Schema:**
+
+`CentroidSeqBlock` uses the shared `SeqBlock` value type:
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                         SeqBlock                               │
+├────────────────────────────────────────────────────────────────┤
+│  base_sequence: u64                                            │
+│  block_size:    u64                                            │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Structure:**
+
+- This sequence block allocates the lower 56-bit numeric portion of centroid `VectorId`s.
+- The centroid level is supplied separately by the indexer when constructing a centroid `VectorId`.
+- The allocated range is `[base_sequence, base_sequence + block_size)`.
+- `SeqBlock` storage and crash-recovery semantics are the same as for data-vector `SeqBlock`, but
+  centroid allocation is tracked separately so data-vector IDs and centroid IDs do not contend for
+  the same allocator.
 
 ## Alternatives
+
+### Deletions Vector
+
+Earlier iterations of the design tracked all deleted vectors in a global deletions bitmap. The
+benefit of this approach is that it allows for very cheap upserts/deletes. Deleting a vector
+simply requires adding it to the deletions bitmap. On the other hand, this approach pushes cost
+/complexity to other places in the system. It's difficult to clear entries from the bitmap. This
+would likely require a custom compaction filter in SlateDB. Even then, we'd need some way to clear
+the in-memory bitmap once compaction has finished and the db has loaded the latest slatedb manifest.
+It's also difficult to use it to clear entries from inverted index postings. We could also do 
+this from a compaction filter, but the filter would also have to load the bitmap.
+
+To keep things simple, we've opted to instead load the required data at indexing time to let us
+clean centroid postings and inverted index bitmaps. We haven't found the added i/os to be a major
+bottleneck during indexing since processing large batches lets us drive lots of parallel reads to
+local SSD. This approach also adds space amplification as we track deleted vectors in each relevant
+bitmap in the inverted index. In practice this should just be a few bits per vector. We can revisit
+the globabl bitmap approach if its a problem.
+
+### Graph-Based Index for Centroids
+
+Rejected in favor of the ANN tree. The graph-based index had 2 problems:
+1. It's very expensive to load, as all centroids need to be read and then built into a single
+   HNSW graph. This can take 10s of seconds - 10+ minutes for large dbs. The tree allows us to
+   load the index lazily/incrementally.
+2. HNSW is not robust in the presence of deletions as occurs during LIRE. Deletions sever edges
+   in the graph which hurts centroid recall, which in turn hurts query recall.
 
 ### Graph-Based Index (HNSW) for Full Dataset
 
@@ -720,11 +886,6 @@ for centroids), (2) poor disk I/O patterns (random pointer-chasing vs sequential
 An earlier design used immutable segments, each with its own centroid index. Rejected due to:
 (1) query latency from searching N indexes and merging, (2) complexity of segment-scoped IDs,
 and (3) expensive index rebuilds during compaction vs incremental LIRE maintenance.
-
-### Per-Vector Tombstone Records
-
-Rejected because deletions map naturally to the posting list structure—the deleted set is just
-another posting list (centroid_id = 0). Loading one bitmap is cheaper than per-vector tombstones.
 
 ### Hierarchical Namespace Prefix
 
