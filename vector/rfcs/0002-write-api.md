@@ -400,29 +400,6 @@ impl VectorDb {
 }
 ```
 
-### Write Path
-
-When `write()` is called, the following operations occur:
-
-1. **Validation**: Check that all vectors have the correct dimensions and valid attributes
-2. **For each vector**:
-    - Look up the external ID in `IdDictionary`
-    - If found (upsert case):
-        - Tombstone old `VectorData` records
-    - Allocate a new internal ID using block-based sequence allocation (see `SeqBlock` in storage RFC)
-    - Write `VectorData` record with the embedding values (keyed by new internal ID) and attributes
-    - Update or create `IdDictionary` entry mapping external ID → new internal ID
-    - Update `MetadataIndex` entries via merge operators for indexed fields
-    - Assign to nearest centroid(s) and update `PostingList` via merge operators
-3. **Return**: Success after buffering (or after flush if `await_durable`)
-
-### Delete Path
-
-When `delete()` is called:
-
-1. **Look up internal IDs**: For each external ID, look up the internal ID in `IdDictionary`
-2. **Tombstone records**: `VectorData`, and `IdDictionary` records are tombstoned
-
 ## Alternatives
 
 ### Upsert Semantics
