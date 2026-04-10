@@ -231,8 +231,13 @@ pub async fn handle_metrics(State(state): State<AppState>) -> String {
 /// Handle GET /-/healthy
 ///
 /// Returns 200 OK if the service is running.
-pub async fn handle_healthy() -> (axum::http::StatusCode, &'static str) {
-    (axum::http::StatusCode::OK, "OK")
+pub async fn handle_healthy(
+    State(state): State<AppState>,
+) -> (axum::http::StatusCode, &'static str) {
+    match state.log.as_ref().status().await {
+        Ok(_) => (axum::http::StatusCode::OK, "OK"),
+        Err(_) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Not Ready"),
+    }
 }
 
 /// Handle GET /-/ready
@@ -265,10 +270,14 @@ mod tests {
 
     #[tokio::test]
     async fn should_return_ok_for_healthy() {
+        let log = Arc::new(LogDb::open(test_config()).await.unwrap());
+        let metrics = Arc::new(Metrics::new());
+        let state = AppState { log, metrics };
         // given/when
-        let (status, body) = handle_healthy().await;
+        let (status, body) = handle_healthy(State(state)).await;
 
         // then
+        // should return OK in case of InMemory Log backend
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "OK");
     }
@@ -388,6 +397,10 @@ mod tests {
             }
 
             async fn flush(&self) -> common::StorageResult<()> {
+                self.check_failure()
+            }
+
+            async fn status(&self) -> common::StorageResult<()> {
                 self.check_failure()
             }
         }

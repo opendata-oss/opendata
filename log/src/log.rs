@@ -311,6 +311,14 @@ impl LogDb {
         Ok(())
     }
 
+    /// Fetch status from the underlying storage.
+    pub async fn status(&self) -> Result<()> {
+        self.storage
+            .status()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))
+    }
+
     /// Creates a LogDb from an existing storage implementation.
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn common::Storage>) -> Result<Self> {

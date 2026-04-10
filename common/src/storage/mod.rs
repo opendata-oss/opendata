@@ -368,4 +368,7 @@ pub trait Storage: StorageRead {
     /// `DbStatus::durable_seq`. For in-memory storage, writes are immediately
     /// "durable" so the watermark matches the latest written seqnum.
     fn subscribe_durable(&self) -> tokio::sync::watch::Receiver<u64>;
+
+    /// Returns the status of the storage engine.
+    async fn status(&self) -> StorageResult<()>;
 }

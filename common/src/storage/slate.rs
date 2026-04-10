@@ -343,6 +343,15 @@ impl Storage for SlateDbStorage {
         self.db.flush().await.map_err(StorageError::from_storage)?;
         Ok(())
     }
+
+    async fn status(&self) -> StorageResult<()> {
+        // fetch status from slatedb
+        let mut status = self.db.as_ref().subscribe();
+        status
+            .changed()
+            .await
+            .map_err(|e| StorageError::Storage(e.to_string()))
+    }
 }
 
 impl From<Ttl> for slatedb::config::Ttl {
