@@ -659,9 +659,19 @@ async fn handle_healthy() -> (StatusCode, &'static str) {
 }
 
 /// Handle /-/ready endpoint - returns 200 OK if service is ready to serve requests
-async fn handle_ready(State(_state): State<AppState>) -> (StatusCode, &'static str) {
+async fn handle_ready(State(state): State<AppState>) -> (StatusCode, String) {
     // Service is ready if it's running (TSDB is initialized in AppState)
-    (StatusCode::OK, "OK")
+    if let Some(tsdb) = state.tsdb.as_tsdb() {
+        match tsdb.as_ref().status().await {
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Ok(_) => (StatusCode::OK, "OK".to_string()),
+        }
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Tsdb not initialized".to_string(),
+        )
+    }
 }
 
 /// Handle /-/flush endpoint - flushes buffered data to durable storage

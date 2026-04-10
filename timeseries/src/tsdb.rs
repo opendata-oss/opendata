@@ -1233,6 +1233,14 @@ impl Tsdb {
 
         Ok(entries)
     }
+
+    pub(crate) async fn status(&self) -> Result<()> {
+        self.storage
+            .as_ref()
+            .status()
+            .await
+            .map_err(|e| crate::error::Error::Storage(e.to_string()))
+    }
 }
 
 #[async_trait]
