@@ -135,7 +135,7 @@ A SPANN-style vector database has the following storage components:
 
 #### ANN Index
 
-The heart of the system is the ANN index which supports fast ANN (approximate nearest neighbour) 
+The heart of the system is the ANN index which supports fast ANN (approximate nearest neighbour)
 search. The ANN index is a search tree designed to support fast navigation to vectors near a query,
 incremental updates as vectors are ingested, and lazy partial loading at search time to allow
 for fast cold queries.
@@ -156,30 +156,39 @@ process are detailed in RFC-0005.
 
 The figure below depicts an example 4-level tree:
 ```ascii
-                     root (255.0)                                      Centroid ID:                     
-  Level: Root       ┌────────────────────────────────────┐      2.1000 => Level 2, Id 1000              
-(~100 centroids)    │2.1000:<vector>,2.1001:<vector>,... │                                              
-                    └────────────────────────────────────┘                                              
-                                                                                                        
-                     2.1000                                 2.1001                                      
-    Level: 2        ┌────────────────────────────────────┐ ┌────────────────────────────────────┐       
-(~10K centroids)    │1.100:<vector>,1.101:<vector>,...   │ │1.200:<vector>,1.201:<vector>,...   │  ...  
-                    └────────────────────────────────────┘ └────────────────────────────────────┘       
-                                                                                                        
-                     1.100                                  1.101                                       
-   Level: 1         ┌────────────────────────────────────┐ ┌────────────────────────────────────┐       
-(~1M centroids)     │0.10:<vector>,0.11:<vector>,...     │ │0.20:<vector>,0.21:<vector>,...     │  ...  
-                    └────────────────────────────────────┘ └────────────────────────────────────┘       
-                                                                                                        
-                                                                                                        
-  Level: Data       ┌────────────────────────────────────────────────────────────────────────────────┐  
-(~100M vectors)     │                   Data Vectors (0.10, 0.11, 0.20, 0.21, ...)                   │  
-                    └────────────────────────────────────────────────────────────────────────────────┘  
+                     root (255.0)                                      Centroid ID:
+  Level: Root       ┌────────────────────────────────────┐      2.1000 => Level 2, Id 1000
+(~100 centroids)    │2.1000:<vector>,2.1001:<vector>,... │
+                    └────────────────────────────────────┘
+
+                     2.1000                                 2.1001
+    Level: 2        ┌────────────────────────────────────┐ ┌────────────────────────────────────┐
+(~10K centroids)    │1.100:<vector>,1.101:<vector>,...   │ │1.200:<vector>,1.201:<vector>,...   │  ...
+                    └────────────────────────────────────┘ └────────────────────────────────────┘
+
+                     1.100                                  1.101
+   Level: 1         ┌────────────────────────────────────┐ ┌────────────────────────────────────┐
+(~1M centroids)     │0.10:<vector>,0.11:<vector>,...     │ │0.20:<vector>,0.21:<vector>,...     │  ...
+                    └────────────────────────────────────┘ └────────────────────────────────────┘
+
+
+  Level: Data       ┌────────────────────────────────────────────────────────────────────────────────┐
+(~100M vectors)     │                   Data Vectors (0.10, 0.11, 0.20, 0.21, ...)                   │
+                    └────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 Search in the index proceeds from the root down. At each level, search finds the B nearest vectors
 to the search query, and reads their postings to seed the search at the next level down. B is called
-the "beam" width.
+the "beam" width. For a tree with N levels (internal levels [N-2..1]), beam width B, and query with
+vector Q for the top K centroids:
+
+1. Load the root and read the postings into set P (each entry is a centroid ID and vector). Let
+   `current_level` be N-2.
+2. While `current_level > 1`:
+   1. Find the B closest centroids in P to Q
+   2. Clear P and load the postings for B into P
+   3. Let `current_level` be `current_level - 1`
+3. Return the K closest centroids in P
 
 #### Query
 
@@ -856,7 +865,7 @@ simply requires adding it to the deletions bitmap. On the other hand, this appro
 /complexity to other places in the system. It's difficult to clear entries from the bitmap. This
 would likely require a custom compaction filter in SlateDB. Even then, we'd need some way to clear
 the in-memory bitmap once compaction has finished and the db has loaded the latest slatedb manifest.
-It's also difficult to use it to clear entries from inverted index postings. We could also do 
+It's also difficult to use it to clear entries from inverted index postings. We could also do
 this from a compaction filter, but the filter would also have to load the bitmap.
 
 To keep things simple, we've opted to instead load the required data at indexing time to let us
