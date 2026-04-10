@@ -4,7 +4,7 @@
 
 **Authors**:
 
-- [Rohan_Desai](https://github.com/rodesai)
+- [Rohan Desai](https://github.com/rodesai)
 - [Almog Gavra](https://github.com/agavra)
 - [Bruno Cadonna](https://github.com/cadonna)
 
