@@ -113,31 +113,25 @@ pub(crate) fn build_router(
 pub(crate) struct TimeSeriesHttpServer {
     tsdb: Arc<TsdbEngine>,
     config: ServerConfig,
-    storage: Option<Arc<dyn common::Storage>>,
+    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 }
 
 impl TimeSeriesHttpServer {
     pub(crate) fn new(
         tsdb: Arc<TsdbEngine>,
         config: ServerConfig,
-        storage: Option<Arc<dyn common::Storage>>,
+        metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     ) -> Self {
         Self {
             tsdb,
             config,
-            storage,
+            metrics_handle,
         }
     }
 
     /// Run the HTTP server
     pub(crate) async fn run(self) {
-        // Install the metrics-rs recorder and create the rendering handle
-        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        // Install globally — if a recorder is already installed (e.g. tests), this is a no-op
-        let _ = metrics::set_global_recorder(recorder);
-
-        let metrics = Arc::new(Metrics::new(handle));
+        let metrics = Arc::new(Metrics::new(self.metrics_handle));
 
         // Start the scraper if there are scrape configs (requires read-write mode)
         if !self.config.prometheus_config.scrape_configs.is_empty() {

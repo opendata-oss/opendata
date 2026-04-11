@@ -20,22 +20,26 @@ use crate::LogDb;
 pub struct LogServer {
     log: Arc<LogDb>,
     config: LogServerConfig,
+    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 }
 
 impl LogServer {
     /// Create a new log server.
-    pub fn new(log: Arc<LogDb>, config: LogServerConfig) -> Self {
-        Self { log, config }
+    pub fn new(
+        log: Arc<LogDb>,
+        config: LogServerConfig,
+        metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    ) -> Self {
+        Self {
+            log,
+            config,
+            metrics_handle,
+        }
     }
 
     /// Run the HTTP server.
     pub async fn run(self) {
-        // Install the metrics-rs recorder for slatedb metrics
-        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let _ = metrics::set_global_recorder(recorder);
-
-        let metrics = Arc::new(Metrics::with_metrics_rs_handle(Some(handle)));
+        let metrics = Arc::new(Metrics::with_metrics_rs_handle(Some(self.metrics_handle)));
 
         // Create app state
         let state = AppState {
