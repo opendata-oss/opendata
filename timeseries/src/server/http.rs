@@ -137,12 +137,7 @@ impl TimeSeriesHttpServer {
         // Install globally — if a recorder is already installed (e.g. tests), this is a no-op
         let _ = metrics::set_global_recorder(recorder);
 
-        // Create metrics container with optional storage engine metrics
-        let mut metrics = Metrics::new(handle);
-        if let Some(storage) = &self.storage {
-            storage.register_metrics(metrics.storage_registry_mut());
-        }
-        let metrics = Arc::new(metrics);
+        let metrics = Arc::new(Metrics::new(handle));
 
         // Start the scraper if there are scrape configs (requires read-write mode)
         if !self.config.prometheus_config.scrape_configs.is_empty() {

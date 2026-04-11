@@ -2,6 +2,7 @@ pub mod config;
 pub mod factory;
 pub mod in_memory;
 pub mod loader;
+pub mod metrics_recorder;
 pub mod slate;
 pub mod util;
 
@@ -365,12 +366,4 @@ pub trait Storage: StorageRead {
     /// `DbStatus::durable_seq`. For in-memory storage, writes are immediately
     /// "durable" so the watermark matches the latest written seqnum.
     fn subscribe_durable(&self) -> tokio::sync::watch::Receiver<u64>;
-
-    /// Registers storage engine metrics into the given Prometheus registry.
-    ///
-    /// The default implementation is a no-op. Storage backends that expose
-    /// internal metrics (e.g., SlateDB) override this to register gauges
-    /// that read live values on each scrape.
-    #[cfg(feature = "metrics")]
-    fn register_metrics(&self, _registry: &mut prometheus_client::registry::Registry) {}
 }

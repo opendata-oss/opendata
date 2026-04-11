@@ -30,10 +30,12 @@ impl LogServer {
 
     /// Run the HTTP server.
     pub async fn run(self) {
-        // Create metrics registry and register storage engine metrics
-        let mut metrics = Metrics::new();
-        self.log.register_metrics(metrics.registry_mut());
-        let metrics = Arc::new(metrics);
+        // Install the metrics-rs recorder for slatedb metrics
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _ = metrics::set_global_recorder(recorder);
+
+        let metrics = Arc::new(Metrics::with_metrics_rs_handle(Some(handle)));
 
         // Create app state
         let state = AppState {

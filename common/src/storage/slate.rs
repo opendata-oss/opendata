@@ -10,37 +10,13 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
+use slatedb::IterationOrder;
 use slatedb::config::ScanOptions;
 use slatedb::{
     Db, DbIterator, DbReader, DbSnapshot, MergeOperator as SlateDbMergeOperator,
     MergeOperatorError, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
 };
 use tokio::sync::watch;
-
-/// Thin wrapper that exposes a SlateDB [`ReadableStat`] as a Prometheus gauge.
-///
-/// Instead of snapshotting stats into an intermediate representation and
-/// refreshing gauges, this reads the live atomic value on each encode/scrape.
-#[cfg(feature = "metrics")]
-#[derive(Debug)]
-struct ReadableStatGauge(std::sync::Arc<dyn slatedb::stats::ReadableStat>);
-
-#[cfg(feature = "metrics")]
-impl prometheus_client::encoding::EncodeMetric for ReadableStatGauge {
-    fn encode(
-        &self,
-        mut encoder: prometheus_client::encoding::MetricEncoder,
-    ) -> Result<(), std::fmt::Error> {
-        encoder.encode_gauge(&self.0.get())
-    }
-
-    fn metric_type(&self) -> prometheus_client::metrics::MetricType {
-        match self.0.metric_type() {
-            slatedb::stats::MetricType::Counter => prometheus_client::metrics::MetricType::Counter,
-            slatedb::stats::MetricType::Gauge => prometheus_client::metrics::MetricType::Gauge,
-        }
-    }
-}
 
 /// Adapter that wraps our `MergeOperator` trait to implement SlateDB's `MergeOperator` trait.
 ///
@@ -86,6 +62,7 @@ fn default_scan_options() -> ScanOptions {
         read_ahead_bytes: 1024 * 1024,
         cache_blocks: true,
         max_fetch_tasks: 4,
+        order: IterationOrder::Ascending,
     }
 }
 
@@ -341,38 +318,6 @@ impl Storage for SlateDbStorage {
         self.db.close().await.map_err(StorageError::from_storage)?;
         Ok(())
     }
-
-    #[cfg(feature = "metrics")]
-    fn register_metrics(&self, registry: &mut prometheus_client::registry::Registry) {
-        let stat_registry = self.db.metrics();
-        let mut seen = std::collections::HashSet::new();
-        for name in stat_registry.names() {
-            if let Some(stat) = stat_registry.lookup(name) {
-                let sanitized: String = name
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '_' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                let prom_name = format!("slatedb_{sanitized}");
-                if !seen.insert(prom_name.clone()) {
-                    tracing::warn!(
-                        "Duplicate metric name after sanitization: {prom_name:?} (from {name:?}, skipped)"
-                    );
-                    continue;
-                }
-                registry.register(
-                    &prom_name,
-                    format!("SlateDB {name}"),
-                    ReadableStatGauge(stat),
-                );
-            }
-        }
-    }
 }
 
 impl From<Ttl> for slatedb::config::Ttl {
@@ -451,7 +396,7 @@ mod tests {
     use super::*;
     use crate::BytesRange;
     use slatedb::DbBuilder;
-    use slatedb::config::{DbReaderOptions, Settings};
+    use slatedb::config::Settings;
     use slatedb::object_store::memory::InMemory;
     use slatedb_common::clock::MockSystemClock;
 
@@ -477,9 +422,7 @@ mod tests {
         storage.flush().await.unwrap();
 
         // Create reader and verify data
-        let reader = DbReader::open(path, object_store, None, Default::default())
-            .await
-            .unwrap();
+        let reader = DbReader::builder(path, object_store).build().await.unwrap();
         let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
 
         let record = storage_reader.get(Bytes::from("key1")).await.unwrap();
@@ -519,9 +462,7 @@ mod tests {
         storage.flush().await.unwrap();
 
         // Create reader and scan data
-        let reader = DbReader::open(path, object_store, None, Default::default())
-            .await
-            .unwrap();
+        let reader = DbReader::builder(path, object_store).build().await.unwrap();
         let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
 
         let mut iter = storage_reader
@@ -563,9 +504,7 @@ mod tests {
         storage.flush().await.unwrap();
 
         // Create reader while writer is still open - this should NOT cause fencing error
-        let reader = DbReader::open(path, object_store, None, Default::default())
-            .await
-            .unwrap();
+        let reader = DbReader::builder(path, object_store).build().await.unwrap();
         let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
 
         // Reader can read the data
@@ -586,7 +525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_expire_records_based_on_ttl() {
+    async fn should_set_expire_ts_based_on_ttl() {
         // given - storage configured with a 30 second default TTL
         let object_store = Arc::new(InMemory::new());
         let path = "/test/ttl_db";
@@ -627,28 +566,17 @@ mod tests {
             .await
             .unwrap();
 
-        // then - all three keys are present at time=0
-        assert!(storage.get(Bytes::from("key1")).await.unwrap().is_some());
-        assert!(storage.get(Bytes::from("key2")).await.unwrap().is_some());
-        assert!(storage.get(Bytes::from("key3")).await.unwrap().is_some());
+        // then - key1 has expire_ts = 20_000 (time=0 + 20s TTL)
+        let kv1 = storage.db.get_key_value(b"key1").await.unwrap().unwrap();
+        assert_eq!(kv1.expire_ts, Some(20_000));
 
-        // when - advance to 25 seconds
-        clock.set(25_000);
+        // then - key2 has expire_ts = 30_000 (time=0 + 30s default TTL)
+        let kv2 = storage.db.get_key_value(b"key2").await.unwrap().unwrap();
+        assert_eq!(kv2.expire_ts, Some(30_000));
 
-        // then - key1 (20s TTL) expired; key2 (30s default) and key3 (no expiry) still present
-        assert!(storage.get(Bytes::from("key1")).await.unwrap().is_none());
-        assert!(storage.get(Bytes::from("key2")).await.unwrap().is_some());
-        assert!(storage.get(Bytes::from("key3")).await.unwrap().is_some());
-
-        // when - advance to 35 seconds
-        clock.set(35_000);
-
-        // then - key1 and key2 expired; key3 (no expiry) still present with correct value
-        assert!(storage.get(Bytes::from("key1")).await.unwrap().is_none());
-        assert!(storage.get(Bytes::from("key2")).await.unwrap().is_none());
-        let record = storage.get(Bytes::from("key3")).await.unwrap();
-        assert!(record.is_some());
-        assert_eq!(record.unwrap().value, Bytes::from("value3"));
+        // then - key3 has no expire_ts (NoExpiry)
+        let kv3 = storage.db.get_key_value(b"key3").await.unwrap().unwrap();
+        assert_eq!(kv3.expire_ts, None);
 
         storage.close().await.unwrap();
     }
@@ -672,7 +600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_expire_merge_records_based_on_ttl() {
+    async fn should_set_expire_ts_on_merge_records_based_on_ttl() {
         // given - storage configured with a 30 second default TTL and a merge operator
         let object_store = Arc::new(InMemory::new());
         let path = "/test/merge_ttl_db";
@@ -716,52 +644,20 @@ mod tests {
             .await
             .unwrap();
 
-        // then - all three keys are present at time=0
-        assert_eq!(
-            storage
-                .get(Bytes::from("key1"))
-                .await
-                .unwrap()
-                .unwrap()
-                .value,
-            Bytes::from("v1")
-        );
-        assert_eq!(
-            storage
-                .get(Bytes::from("key2"))
-                .await
-                .unwrap()
-                .unwrap()
-                .value,
-            Bytes::from("v2")
-        );
-        assert_eq!(
-            storage
-                .get(Bytes::from("key3"))
-                .await
-                .unwrap()
-                .unwrap()
-                .value,
-            Bytes::from("v3")
-        );
+        // then - key1 has expire_ts = 20_000 (time=0 + 20s TTL)
+        let kv1 = storage.db.get_key_value(b"key1").await.unwrap().unwrap();
+        assert_eq!(kv1.value, Bytes::from("v1"));
+        assert_eq!(kv1.expire_ts, Some(20_000));
 
-        // when - advance to 25 seconds
-        clock.set(25_000);
+        // then - key2 has expire_ts = 30_000 (time=0 + 30s default TTL)
+        let kv2 = storage.db.get_key_value(b"key2").await.unwrap().unwrap();
+        assert_eq!(kv2.value, Bytes::from("v2"));
+        assert_eq!(kv2.expire_ts, Some(30_000));
 
-        // then - key1 (20s TTL) expired; key2 (30s default) and key3 (no expiry) still present
-        assert!(storage.get(Bytes::from("key1")).await.unwrap().is_none());
-        assert!(storage.get(Bytes::from("key2")).await.unwrap().is_some());
-        assert!(storage.get(Bytes::from("key3")).await.unwrap().is_some());
-
-        // when - advance to 35 seconds
-        clock.set(35_000);
-
-        // then - key1 and key2 expired; key3 (no expiry) still present with correct value
-        assert!(storage.get(Bytes::from("key1")).await.unwrap().is_none());
-        assert!(storage.get(Bytes::from("key2")).await.unwrap().is_none());
-        let record = storage.get(Bytes::from("key3")).await.unwrap();
-        assert!(record.is_some());
-        assert_eq!(record.unwrap().value, Bytes::from("v3"));
+        // then - key3 has no expire_ts (NoExpiry)
+        let kv3 = storage.db.get_key_value(b"key3").await.unwrap().unwrap();
+        assert_eq!(kv3.value, Bytes::from("v3"));
+        assert_eq!(kv3.expire_ts, None);
 
         storage.close().await.unwrap();
     }
@@ -778,13 +674,11 @@ mod tests {
         key: &str,
         merge_op: Option<Arc<dyn SlateDbMergeOperator + Send + Sync>>,
     ) -> bool {
-        let options = DbReaderOptions {
-            merge_operator: merge_op,
-            ..Default::default()
-        };
-        let reader = DbReader::open(path, object_store, None, options)
-            .await
-            .unwrap();
+        let mut builder = DbReader::builder(path, object_store);
+        if let Some(op) = merge_op {
+            builder = builder.with_merge_operator(op);
+        }
+        let reader = builder.build().await.unwrap();
         let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
         storage_reader
             .get(Bytes::from(key.to_owned()))
@@ -980,64 +874,5 @@ mod tests {
         );
 
         storage.close().await.unwrap();
-    }
-}
-
-#[cfg(all(test, feature = "metrics"))]
-mod metrics_tests {
-    use super::ReadableStatGauge;
-    use prometheus_client::encoding::EncodeMetric;
-    use slatedb::stats::{MetricType as SlateMetricType, ReadableStat};
-    use std::sync::Arc;
-
-    #[derive(Debug)]
-    struct MockStat {
-        metric_type: SlateMetricType,
-    }
-
-    impl ReadableStat for MockStat {
-        fn get(&self) -> i64 {
-            0
-        }
-
-        fn metric_type(&self) -> SlateMetricType {
-            self.metric_type
-        }
-    }
-
-    #[test]
-    fn should_return_counter_when_slate_metric_type_is_counter() {
-        // given
-        let stat = Arc::new(MockStat {
-            metric_type: SlateMetricType::Counter,
-        });
-        let gauge = ReadableStatGauge(stat);
-
-        // when
-        let result = gauge.metric_type();
-
-        // then
-        assert!(matches!(
-            result,
-            prometheus_client::metrics::MetricType::Counter,
-        ));
-    }
-
-    #[test]
-    fn should_return_gauge_when_slate_metric_type_is_gauge() {
-        // given
-        let stat = Arc::new(MockStat {
-            metric_type: SlateMetricType::Gauge,
-        });
-        let gauge = ReadableStatGauge(stat);
-
-        // when
-        let result = gauge.metric_type();
-
-        // then
-        assert!(matches!(
-            result,
-            prometheus_client::metrics::MetricType::Gauge,
-        ));
     }
 }
