@@ -59,7 +59,7 @@ use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Represents a tree depth of some number of levels. Trees always have at least
 /// 3 levels - a root that references centroids, a level of leaf centroids that reference,
@@ -493,8 +493,8 @@ impl<'a> LeveledCentroidIndex<'a> {
             return ranked.into_iter().map(|rp| rp.posting.clone()).collect();
         }
 
-        let mut ranked = BinaryHeap::with_capacity(k);
-        let mut heap_ids = HashSet::with_capacity(k);
+        let mut ranked = Vec::new();
+        let mut scored_ids = HashSet::with_capacity(k);
 
         for posting_list in postings {
             for posting in posting_list.iter() {
@@ -502,31 +502,43 @@ impl<'a> LeveledCentroidIndex<'a> {
                 let distance = compute_distance(query, posting.vector(), distance_metric);
                 let candidate = RankedPosting { posting, distance };
 
-                if heap_ids.contains(&candidate.posting.id()) {
+                if scored_ids.contains(&candidate.posting.id()) {
                     continue;
                 }
 
-                if ranked.len() < k {
-                    heap_ids.insert(candidate.posting.id());
-                    ranked.push(candidate);
-                    continue;
-                }
-
-                let Some(worst) = ranked.peek() else {
-                    continue;
-                };
-                if candidate < *worst {
-                    let removed = ranked.pop().expect("heap should be non-empty");
-                    heap_ids.remove(&removed.posting.id());
-                    heap_ids.insert(candidate.posting.id());
-                    ranked.push(candidate);
-                }
+                scored_ids.insert(candidate.posting.id());
+                ranked.push(candidate);
             }
         }
 
-        let mut ranked = ranked.into_vec();
         ranked.sort_unstable();
-        ranked.into_iter().map(|rp| rp.posting.clone()).collect()
+        let mut ann: Vec<RankedPosting> = Vec::new();
+        // pruning phase
+        for rp in ranked {
+            let mut accept = true;
+            for other_rp in &ann {
+                let dist_rp_other_rp = compute_distance(
+                    other_rp.posting.vector(),
+                    rp.posting.vector(),
+                    distance_metric,
+                );
+                if dist_rp_other_rp < rp.distance {
+                    accept = false;
+                    break;
+                }
+            }
+            if accept {
+                ann.push(rp);
+            }
+            if ann.len() >= k {
+                break;
+            }
+        }
+        if ann.len() < k {
+            warn!("pruned too many vectors")
+        }
+
+        ann.into_iter().map(|rp| rp.posting.clone()).collect()
     }
 
     pub(crate) fn search_root(&self, query: &[f32], k: usize) -> SearchResult {
