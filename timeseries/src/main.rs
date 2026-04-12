@@ -67,6 +67,12 @@ async fn main() {
         PrometheusConfig::default()
     };
 
+    // Install the metrics-rs recorder early so that slatedb metrics registered
+    // during StorageBuilder::build() are captured by the prometheus exporter.
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+    let _ = metrics::set_global_recorder(recorder);
+
     // Create storage based on configuration
     tracing::info!(
         "Creating storage with config: {:?}",
@@ -74,7 +80,7 @@ async fn main() {
     );
 
     let read_only = prometheus_config.read_only;
-    let (tsdb, storage) = if read_only {
+    let tsdb = if read_only {
         // Read-only mode: open a non-fencing reader.
         let reader = TimeSeriesDbReader::open(
             prometheus_config.storage.clone(),
@@ -88,7 +94,7 @@ async fn main() {
         });
         let engine: Arc<TsdbEngine> = Arc::new(Arc::new(reader).into());
         tracing::info!("Opened storage in read-only mode");
-        (engine, None)
+        engine
     } else {
         // Read-write mode: open full storage + Tsdb
         let merge_operator = Arc::new(OpenTsdbMergeOperator);
@@ -106,8 +112,7 @@ async fn main() {
                 std::process::exit(1);
             });
         tracing::info!("Storage created successfully");
-        let engine: Arc<TsdbEngine> = Arc::new(Arc::new(Tsdb::new(storage.clone())).into());
-        (engine, Some(storage))
+        Arc::new(Arc::new(Tsdb::new(storage)).into())
     };
 
     // Create server configuration
@@ -117,7 +122,7 @@ async fn main() {
     };
 
     // Create and run server
-    let server = TimeSeriesHttpServer::new(tsdb, config, storage);
+    let server = TimeSeriesHttpServer::new(tsdb, config, metrics_handle);
 
     tracing::info!(
         "Starting timeseries {} server on port {}...",

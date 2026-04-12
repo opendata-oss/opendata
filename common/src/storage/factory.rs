@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use super::config::{BlockCacheConfig, ObjectStoreConfig, StorageConfig};
 use super::in_memory::InMemoryStorage;
+use super::metrics_recorder::MetricsRsRecorder;
 use super::slate::{SlateDbStorage, SlateDbStorageReader};
 use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
 use slatedb::DbReader;
@@ -134,6 +135,7 @@ impl StorageBuilder {
             }
             StorageBuilderInner::SlateDb(db_builder) => {
                 let mut db_builder = *db_builder;
+                db_builder = db_builder.with_metrics_recorder(Arc::new(MetricsRsRecorder));
                 if let Some(op) = self.semantics.merge_operator {
                     let adapter = SlateDbStorage::merge_operator_adapter(op);
                     db_builder = db_builder.with_merge_operator(Arc::new(adapter));
@@ -297,27 +299,22 @@ pub async fn create_storage_read(
                 create_object_store(&slate_config.object_store)?
             };
 
-            let mut options = reader_options;
+            let mut builder = DbReader::builder(slate_config.path.clone(), object_store)
+                .with_options(reader_options)
+                .with_metrics_recorder(Arc::new(MetricsRsRecorder));
             if let Some(op) = semantics.merge_operator {
                 let adapter = SlateDbStorage::merge_operator_adapter(op);
-                options.merge_operator = Some(Arc::new(adapter));
+                builder = builder.with_merge_operator(Arc::new(adapter));
             }
             // Prefer runtime-provided cache, fall back to config
             if let Some(cache) = runtime.block_cache {
-                options.block_cache = Some(cache);
+                builder = builder.with_db_cache(cache);
             } else if let Some(cache) =
                 create_block_cache_from_config(&slate_config.block_cache).await?
             {
-                options.block_cache = Some(cache);
+                builder = builder.with_db_cache(cache);
             }
-            let reader = DbReader::open(
-                slate_config.path.clone(),
-                object_store,
-                None, // checkpoint_id - use latest state
-                options,
-            )
-            .await
-            .map_err(|e| {
+            let reader = builder.build().await.map_err(|e| {
                 StorageError::Storage(format!("Failed to create SlateDB reader: {}", e))
             })?;
             Ok(Arc::new(SlateDbStorageReader::new(Arc::new(reader))))

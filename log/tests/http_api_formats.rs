@@ -749,8 +749,22 @@ async fn test_scan_follow_at_poll_boundary_returns_empty() {
 // SlateDB Metrics Tests
 // ============================================================================
 
+/// Install a global metrics-rs recorder once for the entire test process.
+fn global_prometheus_handle() -> metrics_exporter_prometheus::PrometheusHandle {
+    use std::sync::OnceLock;
+    static HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
+    HANDLE
+        .get_or_init(|| {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _ = metrics::set_global_recorder(recorder);
+            handle
+        })
+        .clone()
+}
+
 /// Setup a test app backed by SlateDB (in-memory object store) so that
-/// the StatRegistry is populated with real metrics.
+/// slatedb metrics are populated via the MetricsRsRecorder bridge.
 async fn setup_slatedb_test_app() -> Router {
     use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig};
 
@@ -764,10 +778,9 @@ async fn setup_slatedb_test_app() -> Router {
         ..Default::default()
     };
 
+    let handle = global_prometheus_handle();
     let log = Arc::new(LogDb::open(config).await.expect("Failed to open log"));
-    let mut metrics = Metrics::new();
-    log.register_metrics(metrics.registry_mut());
-    let metrics = Arc::new(metrics);
+    let metrics = Arc::new(Metrics::with_metrics_rs_handle(Some(handle)));
 
     let state = AppState {
         log: log.clone(),
@@ -813,7 +826,17 @@ fn parse_metric_value(metrics_text: &str, metric_name: &str) -> i64 {
     let line = metrics_text
         .lines()
         .find(|line| line.starts_with(&format!("{metric_name} ")))
-        .unwrap_or_else(|| panic!("{metric_name} metric line not found"));
+        .unwrap_or_else(|| {
+            let relevant: Vec<&str> = metrics_text
+                .lines()
+                .filter(|l| l.contains(metric_name))
+                .collect();
+            panic!(
+                "{metric_name} metric line not found. \
+                 Lines containing the name:\n{}",
+                relevant.join("\n")
+            )
+        });
     line.split_whitespace()
         .last()
         .unwrap()
