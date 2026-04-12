@@ -15,7 +15,6 @@ pub use slatedb::db_cache::CachedEntry;
 use slatedb::db_cache::DbCache;
 pub use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
-use slatedb::object_store::limit::LimitStore;
 use slatedb::object_store::{self, ObjectStore};
 pub use slatedb::{CompactorBuilder, DbBuilder};
 use tracing::info;
@@ -241,8 +240,6 @@ pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn 
                 .map_err(|e| {
                     StorageError::Storage(format!("Failed to create AWS S3 store: {}", e))
                 })?;
-            println!("CREATE OBJECT STORE WITH IO LIMIT");
-            let store = LimitStore::new(store, 100);
             Ok(Arc::new(store))
         }
         ObjectStoreConfig::Local(local_config) => {
