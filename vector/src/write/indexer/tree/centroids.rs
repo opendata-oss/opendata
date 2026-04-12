@@ -516,15 +516,17 @@ impl<'a> LeveledCentroidIndex<'a> {
         // pruning phase
         for rp in ranked {
             let mut accept = true;
-            for other_rp in &ann {
-                let dist_rp_other_rp = compute_distance(
-                    other_rp.posting.vector(),
-                    rp.posting.vector(),
-                    distance_metric,
-                );
-                if dist_rp_other_rp < rp.distance {
-                    accept = false;
-                    break;
+            if ann.len() > (0.75 * k as f32) as usize {
+                for other_rp in &ann {
+                    let dist_rp_other_rp = compute_distance(
+                        other_rp.posting.vector(),
+                        rp.posting.vector(),
+                        distance_metric,
+                    );
+                    if dist_rp_other_rp < rp.distance {
+                        accept = false;
+                        break;
+                    }
                 }
             }
             if accept {
