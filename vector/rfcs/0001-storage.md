@@ -881,8 +881,9 @@ Rejected in favor of the ANN tree. The graph-based index had 2 problems:
 1. It's very expensive to load, as all centroids need to be read and then built into a single
    HNSW graph. This can take 10s of seconds - 10+ minutes for large dbs. The tree allows us to
    load the index lazily/incrementally.
-2. HNSW is not robust in the presence of deletions as occurs during LIRE. Deletions sever edges
-   in the graph which hurts centroid recall, which in turn hurts query recall.
+2. HNSW is not robust in the presence of deletions as occurs during LIRE (see section 3.3: 
+   https://arxiv.org/pdf/2105.09613). Deletions sever edges in the graph which hurts centroid 
+   recall, which in turn hurts query recall.
 
 ### Graph-Based Index (HNSW) for Full Dataset
 
