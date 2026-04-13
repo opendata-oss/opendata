@@ -597,10 +597,24 @@ entire centroids during search.
 
 ### Vamana Graph (DiskANN Approach)
 
-TODO:
-- requires more hops (adds latency) even when much of db is in cache. still, would probably
-  work well enough for search once things are cached locally
-- very expensive to build (requires some sort of LSM type of structure)
+A common alternative to a tree index is to use an index that stores a neighbourhood graph of 
+vectors. Graph indexes typically yield better recall with better performance if all vectors are in 
+memory, as they require evaluating much fewer candidates. However, graph indexes are expensive 
+to build (especially incrementally), and are a poor fit for disk-resident indexes as traversing 
+the graph requires multiple hops. There are three common graph algorithms: NSG, HNSW, and Vamana.
+Of these, Vamana is designed specifically for on-disk indexes (see
+[DiskANN](https://suhasjs.github.io/files/diskann_neurips19.pdf)). It builds a flat graph with 
+minimal diameter, so searches require fewer round trips than HNSW/NSG. There has also been work 
+done to allow live updates to a Vamana graph (see [FreshDiskA](https://arxiv.org/abs/2105.09613)).
+At a high level, this works very similarly to an LSM tree. New writes go to an in-memory 
+structure, and then this is merged into the on-disk Vamana graph once it becomes too large. We 
+reject this approach because:
+- Though its designed to require fewer round trips than HNSW, it still requires multiple round 
+  trips to evaluate a query. A tree structure lets us do this in a single round trip once the 
+  tree is in cache.
+- The bigger drawback is the LSM-style approach to live writes. Merges are very expensive and 
+  require scanning the entire graph. SPFresh has been shown to allow for much higher ingest 
+  rates while preserving high recall.
 
 ### In-line Indexer
 
