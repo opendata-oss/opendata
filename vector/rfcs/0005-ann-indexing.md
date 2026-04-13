@@ -366,10 +366,13 @@ possible. The apply phase is serial and applies the results of the computation t
 
 #### WriteVectors
 
-Inputs:
+`WriteVectors` takes a batch of writes to vector and applies them to the db by writing forward
+indexes, and updating centroid postings and inverted index postings in the search index.
+
+**Inputs**
 - `writes`: The set of writes to be applied to the db. 
 
-Computation:
+**Computation**
 - First compact the batch so the last write for each `external_id` wins. This prevents multiple
   writes to the same logical vector in a single indexing round from doing redundant work.
 - For all writes, compute the target centroid assignment by running ANN search against the current
@@ -378,7 +381,7 @@ Computation:
   - the centroid posting(s) currently containing the old vector ID
   - the indexed field/value pairs that currently contain the old vector ID in the metadata index
 
-Apply:
+**Apply**
 - Allocate a new level-0 `VectorId` in `ForwardIndexDelta`
 - Write the new `VectorData`
 - Add the vector to its assigned leaf centroid posting
@@ -395,17 +398,22 @@ Apply:
 
 #### MergeCentroids
 
-Inputs:
+`MergeCentroids` looks for centroids in a given level that are smaller than
+`merge_threshold_vectors` and removes them. Note that no replacement centroid is written during 
+this step. All moved vectors or child centroids are reassigned by the follow-on 
+`ReassignVectors` operation.
+
+**Inputs**
 - `level`: level in the tree to merge centroids.
 
-Computation:
+**Computation**
 - Select all centroids at `level` whose posting count is strictly less than 
   `merge_threshold_vectors`.
 - For each centroid selected for merge:
   - read its `CentroidInfo`
   - read its posting list from the view
 
-Apply:
+**Apply**
 - For each centroid being merged:
   - delete the centroid from the search-index delta
   - remove the centroid from its parent posting
@@ -413,18 +421,20 @@ Apply:
     - if the parent is the root, remove it from the root posting
   - for every posting entry contained in the removed centroid, add to `reassign_set` 
 
-Returns:
+**Returns**
 - `reassign_set`
-
-Note that no replacement centroid is written during this step. All moved vectors or child 
-centroids are reassigned by the follow-on `ReassignVectors` operation.
 
 #### SplitCentroids
 
-Inputs:
+`SplitCentroids` looks for centroids in a given level that are larger than 
+`split_threshold_vectors` and then splits them by running 2-means over the vectors in each 
+centroid's cluster. It writes the new centroids and postings to the delta, and returns the set 
+of vectors that may need to be reassigned.
+
+**Inputs**
 - `level`: level in the tree to split centroids
 
-Computation:
+**Computation**
 - Read centroid counts for `level`, select all centroids whose posting count is greater than or
   equal to `split_threshold_vectors`. 
 - For each centroid selected for split:
@@ -441,7 +451,7 @@ Computation:
   - compute a reassignment candidate set using the 2 LIRE heuristics
   - return both the new split postings and the reassignment candidates
 
-Apply:
+**Apply**
 - Initialize `reassign_set`
 - For each split:
   - delete the old centroid from the search-index delta
@@ -461,16 +471,21 @@ Apply:
 - Collect all reassignment candidates from the split heuristics and from newly added non-root child
   centroids into `reassign_set`
 
-Returns:
+**Returns**
 - `reassign_set`
 - Number of splits executed 
 
 #### ReassignVectors
 
-Inputs:
+`ReassignVectors` takes a set of vectors that may need to be reassigned, and reassigns them if 
+required. For each vector it first computes its current nearest centroid and then filters out 
+any centroids that are already assigned to that centroid. Then, it applies the reassignments to 
+the delta.
+
+**Inputs**
 - `level`: level whose members are being reassigned
 
-Computation:
+**Computation**
 - Run ANN search within the specified `level`, requesting the top-1 centroid for each candidate
   vector.
 - Keep only the candidates whose nearest centroid differs from their current centroid. These are
@@ -482,7 +497,7 @@ Computation:
   - **Inner level**:
     - resolve each moved child centroid's current `CentroidInfo`
 
-Apply:
+**Apply**
 - **Leaf level reassignment (data vectors)**
   - Remove the vector from its old leaf centroid posting
   - Add the vector to the new leaf centroid posting
@@ -494,14 +509,17 @@ Apply:
 
 #### SplitRoot
 
-Computation:
+`SplitRoot` splits the root into a new level of the tree if its larger than 
+`root_threshold_vectors`.
+
+**Computation**
 - If the current root posting count is less than `root_threshold_vectors`, the operation is a no-op.
 - Otherwise:
   - read the full root posting list
   - run 2-means over the root centroid vectors to produce two new centroid vectors for a new
     top internal level
 
-Apply:
+**Apply**
 - Increment the tree depth in `Centroids`
 - Allocate the 2 new centroids at the new level and replace root postings with these centroids
 - For each original root centroid:
