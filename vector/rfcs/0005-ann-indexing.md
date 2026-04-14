@@ -8,30 +8,30 @@
 
 ## Summary
 
-This RFC details the design for OpenData-Vector’s ANN index maintenance using a cluster 
-rebalancing protocol based on the LIRE (Lightweight Incremental Rebalancing) protocol described 
+This RFC details the design for OpenData-Vector’s ANN index maintenance using a cluster
+rebalancing protocol based on the LIRE (Lightweight Incremental Rebalancing) protocol described
 in https://arxiv.org/pdf/2410.14452.
 
 ## Motivation
 
 OpenData Vector supports vector search using a SPANN-style IVF index. Data vectors are grouped into
-clusters. Each cluster is represented by a centroid vector and the associated data vectors are 
-stored in a posting list. TopK search first finds the centroids closest to the query vector, and 
-then loads the associated postings to generate a list of candidate data vectors. The db then 
+clusters. Each cluster is represented by a centroid vector and the associated data vectors are
+stored in a posting list. TopK search first finds the centroids closest to the query vector, and
+then loads the associated postings to generate a list of candidate data vectors. The db then
 ranks the candidates by distance and returns the top K candidates.
 
 Vector started with a naive implementation that uses a static set of centroids. This is fine for
-a static set of data vectors, but falls apart as vectors are inserted and updated. With a static 
-set of centroids, the associated postings will grow unbounded, and/or become increasingly 
+a static set of data vectors, but falls apart as vectors are inserted and updated. With a static
+set of centroids, the associated postings will grow unbounded, and/or become increasingly
 imbalanced. This reduces query throughput and drives up the average and tail latency required to
 achieve good recall, respectively, as queries need to load more data and evaluate more vectors.
 
 To maintain throughput and latency in the presence of writes, the db needs some process to maintain
 centroids with appropriately sized clusters.
 
-There are 2 well-known approaches to this problem. The first approach is to periodically 
-recompute the set of centroids. This approach has a number of drawbacks. It’s very expensive as 
-it requires sampling the data vectors and recomputing centroids. It’s hard to run in the 
+There are 2 well-known approaches to this problem. The first approach is to periodically
+recompute the set of centroids. This approach has a number of drawbacks. It’s very expensive as
+it requires sampling the data vectors and recomputing centroids. It’s hard to run in the
 presence of concurrent writes, as the index needs to be computed while new data is being added. 
 It’s also wasteful as it recomputes centroids for parts of the data set that may be well-clustered.
 
@@ -82,7 +82,7 @@ into clusters with another layer of centroids, up to a fixed root.
 
 ## High Level Description of LIRE
 
-Let's assume a flat centroid structure for nwo. LIRE aims to do the following:
+Let's assume a flat centroid structure for now. LIRE aims to do the following:
 1. Keep each centroid’s cluster size in number of vectors within some range `[minClusterVectors, 
    maxClusterVectors]`.
 2. Make a best effort to respect nearest neighbour posting assignment (NPA): each data vector V 
@@ -127,7 +127,7 @@ level level 2 and the old level level 1. So now we have 2 layers of centroids - 
 level 1, and 2 (or some K) new centroids at level 2. Each level 1 centroid is assigned to a level 2
 centroid's cluster. When level 1 centroids are split/merged, they are added to/removed from clusters
 in level 2. As the size of level 1 grows, the postings in level 2 grow, so we run LIRE in level 2
-to balance the size of the level 2 clusters. And so on until there are 10 level 2 centroids, at
+to balance the size of the level 2 clusters. And so on until there are N level 2 centroids, at
 which time we split the root again.
 
 The result is a tree where each level represents an exponentially larger sampling of the full space 
@@ -149,8 +149,12 @@ size of the neighbourhood that’s searched when evaluating reassignments after 
 On the other hand, implementation or synchronization bugs can cause the index to become 
 permanently degraded. We want Vector to ensure that:
 1. Vectors are never dropped from the index (so every vector should be assigned to a posting)
-2. Preserve NPA - so each vector should be assigned to its nearest neighbour (as defined by the 
-   centroid index).
+2. Make a best effort to preserve NPA - so each vector should be assigned to its nearest neighbour 
+   (as defined by the centroid index). This is best-effort as the centroid index itself is 
+   approximate, and we can't afford to scan all vectors for possible reassignment after splits. 
+   The best we can do is ensure that all vectors are assigned to the nearest centroid returned 
+   by the ANN index when inserting and reassigning, and that we consider the configured 
+   neighbourhood for reassignment after splitting.
 3. Reads always observe the index in a state that preserves the above 2 properties.
 
 We will achieve this by doing indexing in batches decoupled from ingest and query. Ingest appends
@@ -159,8 +163,9 @@ don't become durable until the indexer processes them. In the future, we can wri
 WAL first for lower-latency durability. The indexer picks up batches of writes and indexes them.
 The output of indexing is an atomic `WriteBatch` that always advances the db between snapshots
 that preserve properties (1) and (2) from above. Reads always read from one of these snapshots to 
-ensure property (3). To support low-latency read-your-writes we can allow reads to observe vectors
-from the in-memory queue that have write epochs newer than the read snapshot.
+ensure property (3). To support low-latency read-your-writes we will allow reads to observe writes
+from the in-memory deltas that have write epochs newer than the read snapshot and factor these 
+into search results.
 
 The indexer itself has discrete control and execution paths. Control is always serial on a 
 single async task, while execution of actual indexing work can be parallelized for high throughput.
@@ -553,7 +558,9 @@ com/kegumingxin422/FCBC). This should reduce indexing overhead by reducing the f
 
 SPANN and SPfresh replicate boundary vectors to nearby clusters to improve recall with fewer 
 nprobes at the cost of additional indexing and space overhead. It should be straightforward to 
-add this ability to the current indexer.
+add this ability to the current indexer. It's probably worth configuring this differently for 
+different levels of the tree. For higher levels we can replicate more to boost recall with less 
+cost.
 
 **Quantization**
 
@@ -564,34 +571,37 @@ intrinsics (e.g. AVX). RabitQ seems to be the SOTA here for high-dim vectors.
 
 **Trigger Split on Data Size**
 
-It’s probably worth triggering splits when the actual physical cost of reading a
-posting (e.g. its size) becomes too high. This can happen even if posting lists
-are short if a posting has lots of vectors moving out of it and SlateDB
-compaction has not sufficiently merged the entries. In these cases it may be
-worth either triggering a split or just rewriting the posting from the
-rebalancer. To do this we’d need to be able to measure the actual data size read
-when reading a posting, which would require some extension of the merge operator
-and/or SlateDB’s read API to be able to report this back to the user.
+It’s probably worth triggering splits when the actual physical cost of reading a posting (e.g. 
+its size) becomes too high. This can happen even if posting lists  are short if a posting has 
+lots of vectors moving out of it and SlateDB compaction has not sufficiently merged the entries.
+In these cases it may be worth either triggering a split or just rewriting the posting from the
+rebalancer. To do this we’d need to be able to measure the actual data size read when reading a 
+posting, which would require some extension of the merge operator and/or SlateDB’s read API to 
+be able to report this back to the user.
 
 **Active Recall Measurement**
 
-We should try to actively/continuously measure the recall that the db is
-achieving. The main challenge is computing the denominator for recall, which
-requires an exhaustive search of the whole db. One idea is to sample a set of N
-vectors from the data set, and actively maintain the top K closest neighbours as
-data is ingested. We can then measure recall by querying against the vectors in
-N. We can periodically rotate the set of sampled vectors by re-initializing the
+We should try to actively/continuously measure the recall that the db is achieving. The main 
+challenge is computing the denominator for recall, which requires an exhaustive search of the 
+whole db. One idea is to sample a set of N vectors from the data set, and actively maintain the 
+top K closest neighbours as data is ingested. We can then measure recall by querying against the 
+vectors in N. We can periodically rotate the set of sampled vectors by re-initializing the
 Top K with an exhaustive search (e.g. hourly or daily).
 
 **Native Filtering**
 
-It’s a documented problem that it’s difficult to achieve high recall for queries
-that include filters. The naive approach (taken by opendata) is to iterate over
-postings and just prune vectors that don’t match the filter. This works, but
-causes lots of wasted work as its common for many centroids to not have any
-vectors that match the filter. TurboPuffer solves this by tracking the centroids
-that contain vectors matching filters in its inverted index, and then pruning
+It’s a documented problem that it’s difficult to achieve high recall for queries that include 
+filters. The naive approach (taken by opendata) is to iterate over postings and just prune 
+vectors that don’t match the filter. This works, but causes lots of wasted work as its common 
+for many centroids to not have any vectors that match the filter. TurboPuffer solves this by 
+tracking the centroids that contain vectors matching filters in its inverted index, and then pruning
 entire centroids during search.
+
+**Fine-Grained Tuning of NProbe/Cluster Size**
+
+It may be worth playing with different nprobe or cluster sizes for different levels of the tree. 
+At a high level, it may be worth configuring larger clusters and/or higher nprobe for higher 
+levels to improve recall at those levels.
 
 ## Alternatives
 
@@ -618,7 +628,19 @@ reject this approach because:
 
 ### In-line Indexer
 
-TODO (this was the old approach that we threw out)
+A previous iteration of this RFC (see https://github.com/opendata-oss/opendata/pull/132) 
+proposed maintaining the index in-line with ongoing writes. So vectors would be added to the index
+as part of the main write delta, and then LIRE maintenance would occur in the background but apply
+changes by routing messages through the main write task. This approach had a number of drawbacks.
+The main drawbacks were that it:
+(1) Relied on a complex synchronization protocol to ensure the desired correctness properties
+(2) Tightly coupled indexing with ingest which makes the overall architecture less flexible.
+(3) Put throughput-limiting operations on the serial write path. In our initial version this
+limited throughput for larger dbs as centroid assignment was serialized on the write task. This 
+also makes it hard to do things like handle updates and (in the future) synchronize the metadata 
+index with the ann index, and implement boundary replication as all these features require reading
+from storage. By using a decoupled batch indexer we can easily parallelize these heavy operations 
+over a large write batch.
 
 ### Shrink Tree
 
@@ -628,30 +650,27 @@ overhead to search. This doesn't seem like a major problem but we can revisit if
 
 ## Appendix: Reassignment Filter Heuristic
 
-LIRE uses the following heuristic to determine the vectors that may need to be
-reassigned when splitting a centroid `C` into `C_0` and `C_1`.
+LIRE uses the following heuristic to determine the vectors that may need to be reassigned when 
+splitting a centroid `C` into `C_0` and `C_1`.
 
-For every vector `V` assigned to `C_0` or `C_1`, compare the distance from `V`
-to `C`. If it is closer to `C` than it’s new centroid, then it’s possible some
-neighbour is a better centroid, so add it to `R`.
+For every vector `V` assigned to `C_0` or `C_1`, compare the distance from `V` to `C`. If it is 
+closer to `C` than it’s new centroid, then it’s possible some  neighbour is a better centroid, 
+so add it to `R`.
 
-Find the nearest `N` neighbouring centroids of `C`. `N` is configurable. For
-every vector `V` assigned to a neighbor `C_n`, compare the distance to `C` vs
-the distance to `C_0` and `C_1`. If either `C_0` or `C_1` are closer, then add
-it to `R`. Logically, this means that at least one of the new centroids are
-moving closer to `V`, so `V` might need to be reassigned. You might wonder why
-not just compare the distance between `V->C_0`/`V->C_1` vs `V->C_n`. This is
-because you don’t necessarily know `C_n`. In the authors’ implementation of
-SPfresh, each data vector is replicated to multiple neighbouring centroids. So
-`C_n` may not be the “true” centroid of `V`. The heuristic just tells you
-whether it’s possible that the newly created centroids could be a better
-centroid for `V` than its current centroid.
+Find the nearest `N` neighbouring centroids of `C`. `N` is configurable. For every vector `V` 
+assigned to a neighbor `C_n`, compare the distance to `C` vs the distance to `C_0` and `C_1`. If 
+either `C_0` or `C_1` are closer, then add it to `R`. Logically, this means that at least one of 
+the new centroids are moving closer to `V`, so `V` might need to be reassigned. You might wonder why
+not just compare the distance between `V->C_0`/`V->C_1` vs `V->C_n`. This is because you don’t 
+necessarily know `C_n`. In the authors’ implementation of SPfresh, each data vector is 
+replicated to multiple neighbouring centroids. So `C_n` may not be the “true” centroid of `V`. 
+The heuristic just tells you whether it’s possible that the newly created centroids could be a 
+better centroid for `V` than its current centroid.
 
 ## References
 
 1. **SPANN: Highly-efficient Billion-scale Approximate Nearest Neighbor Search**
-   Chen et al., NeurIPS 2021.
-   [Paper](https://arxiv.org/abs/2111.08566)
+   Chen et al., NeurIPS 2021. [Paper](https://arxiv.org/abs/2111.08566)
    — Foundational work on disk-based ANN with cluster centroids and posting lists.
 
 2. **SPFresh: Incremental In-Place Update for Billion-Scale Vector Search**
@@ -660,4 +679,6 @@ centroid for `V` than its current centroid.
    [PDF](https://www.microsoft.com/en-us/research/wp-content/uploads/2023/08/SPFresh_SOSP.pdf)
    — LIRE rebalancing protocol for maintaining index quality with updates.
 
-
+3. **TurboPuffer: ANN v3: 200ms p99 query latency over 100 billion vectors**
+   - Describes a similar centroid tree architecture for ANN index
+   https://turbopuffer.com/blog/ann-v3

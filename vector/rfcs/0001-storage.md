@@ -230,6 +230,13 @@ Deleting a vector requires the following atomic operations via `WriteBatch`:
 1. mark the vector as deleted in its centroid posting
 1. mark the vector as deleted in its metadata index entries
 
+Note that marking the vector deleted in centroid postings and metadata index entries don't 
+result in the vector automatically being removed by SlateDB as the merge operator preserves 
+these tombstones to ensure they cover references to the vector in earlier rows. The tombstones 
+can be safely removed once the row marking the vector as deleted has been merged into the lowest
+SR. To handle this we will use a custom compaction filter that removes deleted vectors from 
+centroid postings and metadata index entries after a compaction into SR 0.
+
 ### Record Layout
 
 Record keys are built by concatenating big-endian binary tokens. Lexicographical ordering of keys
