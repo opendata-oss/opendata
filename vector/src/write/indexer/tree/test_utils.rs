@@ -3,6 +3,7 @@ use crate::serde::FieldType;
 use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::centroids::CentroidsValue;
 use crate::serde::key::{CentroidSeqBlockKey, SeqBlockKey};
+use crate::serde::vector_data::Field;
 use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
 use crate::storage::merge_operator::VectorDbMergeOperator;
 use crate::write::delta::VectorWrite;
@@ -191,6 +192,18 @@ impl IndexerOpTestHarnessBuilder {
                         let vector_id = delta.forward_index.add_vector(
                             &data_vector.external_id,
                             &self.make_attributes(&data_vector.vector, &data_vector.field_values),
+                        );
+                        delta.forward_index.update_vector_index_data(
+                            vector_id,
+                            vec![*centroid_id],
+                            self.vector_schema
+                                .iter()
+                                .zip(&data_vector.field_values)
+                                .filter(|(field_spec, _)| field_spec.indexed)
+                                .map(|(field_spec, field_value)| {
+                                    Field::string(field_spec.name.clone(), field_value.clone())
+                                })
+                                .collect(),
                         );
                         delta.search_index.add_to_posting(
                             *centroid_id,
