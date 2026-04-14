@@ -6,7 +6,6 @@ pub mod centroid_info;
 pub mod centroid_stats;
 pub mod centroids;
 pub mod collection_meta;
-pub mod deletions;
 pub mod id_dictionary;
 pub mod key;
 pub mod metadata_index;

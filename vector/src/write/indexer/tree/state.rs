@@ -7,7 +7,6 @@ use crate::serde::centroids::CentroidsValue;
 use crate::serde::collection_meta::DistanceMetric;
 use crate::serde::key::{
     CentroidInfoKey, CentroidStatsKey, CentroidsKey, PostingListKey, VectorDataKey,
-    VectorIndexDataKey,
 };
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
@@ -29,6 +28,7 @@ use log::info;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::debug;
+use crate::storage::record::put_vector_index_data;
 
 /// In-memory preserved state of vector index
 #[derive(Debug)]
@@ -196,9 +196,7 @@ impl ForwardIndexDelta {
         }
 
         for (vector_id, value) in vector_index_updates {
-            let key = VectorIndexDataKey::new(vector_id).encode();
-            let encoded = value.encode_to_bytes();
-            output_ops.push(RecordOp::Put(Record::new(key, encoded).into()));
+            output_ops.push(put_vector_index_data(vector_id, value));
         }
 
         // Vector data deletes
@@ -681,6 +679,7 @@ impl<'a> VectorIndexView<'a> {
         self.state.dictionary().get(external_id).cloned()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn vector_data(
         &self,
         vector_id: VectorId,
