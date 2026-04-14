@@ -108,7 +108,6 @@ fn merge_batch_centroid_stats(existing: Option<Bytes>, operands: &[Bytes]) -> By
 
 #[cfg(test)]
 mod tests {
-    use roaring::RoaringTreemap;
     use super::*;
     use crate::serde::FieldValue;
     use crate::serde::key::{CentroidStatsKey, IdDictionaryKey, MetadataIndexKey, PostingListKey};
@@ -116,6 +115,7 @@ mod tests {
     use crate::serde::posting_list::{PostingListValue, PostingUpdate};
     use crate::serde::vector_id::VectorId;
     use common::storage::MergeOperator;
+    use roaring::RoaringTreemap;
     use rstest::rstest;
 
     /// Helper to create a test key for PostingList

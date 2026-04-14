@@ -13,6 +13,7 @@ use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_data::{Field, VectorDataValue};
 use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
 use crate::serde::vector_index_data::VectorIndexDataValue;
+use crate::storage::record::put_vector_index_data;
 use crate::storage::{VectorDbStorageReadExt, record};
 use crate::write::indexer::tree::centroids::{
     AllCentroidsCache, AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache,
@@ -28,7 +29,6 @@ use log::info;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::debug;
-use crate::storage::record::put_vector_index_data;
 
 /// In-memory preserved state of vector index
 #[derive(Debug)]
