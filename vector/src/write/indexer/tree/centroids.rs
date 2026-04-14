@@ -53,7 +53,7 @@ use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use common::StorageRead;
 use futures::future::BoxFuture;
 use rayon::iter::ParallelIterator;
-use rayon::prelude::IntoParallelIterator;
+use rayon::prelude::{IntoParallelIterator, ParallelSlice};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
@@ -463,6 +463,38 @@ impl<'a> CentroidIndex for LeveledCentroidIndex<'a> {
 }
 
 impl<'a> LeveledCentroidIndex<'a> {
+    fn score<'postings>(
+        postings_level: TreeLevel,
+        query: &[f32],
+        postings: &'postings [Arc<PostingList>],
+        distance_metric: DistanceMetric,
+    ) -> HashMap<VectorId, RankedPosting<'postings>> {
+        let postings_by_id = postings
+            .into_iter()
+            .flat_map(|pl| pl.iter())
+            .map(|p| (p.id(), p))
+            .collect::<HashMap<_, _>>();
+        postings_by_id
+            .into_values()
+            .collect::<Vec<_>>()
+            .par_chunks(100)
+            .flat_map(|posting_list| {
+                let mut ranked = Vec::with_capacity(postings.len());
+                for posting in posting_list.iter() {
+                    assert_eq!(posting.id().level(), postings_level.level());
+                    ranked.push((
+                        posting.id(),
+                        RankedPosting {
+                            posting,
+                            distance: compute_distance(query, posting.vector(), distance_metric),
+                        }
+                    ));
+                }
+                ranked
+            })
+            .collect::<HashMap<_, _>>()
+    }
+
     fn score_and_rank(
         postings_level: TreeLevel,
         query: &[f32],
@@ -475,52 +507,25 @@ impl<'a> LeveledCentroidIndex<'a> {
         }
 
         if k == usize::MAX {
-            let mut seen = HashSet::new();
-            let mut ranked = Vec::new();
-            for posting_list in postings {
-                for posting in posting_list.iter() {
-                    assert_eq!(posting.id().level(), postings_level.level());
-                    if !seen.insert(posting.id()) {
-                        continue;
-                    }
-                    ranked.push(RankedPosting {
-                        posting,
-                        distance: compute_distance(query, posting.vector(), distance_metric),
-                    });
-                }
-            }
+            let scored = Self::score(postings_level, query, postings, distance_metric);
+            let mut ranked = scored.into_values().collect::<Vec<_>>();
             ranked.sort_unstable();
             return ranked.into_iter().map(|rp| rp.posting.clone()).collect();
         }
 
         let mut ranked = BinaryHeap::with_capacity(k);
-        let mut heap_ids = HashSet::with_capacity(k);
-
-        for posting_list in postings {
-            for posting in posting_list.iter() {
-                assert_eq!(posting.id().level(), postings_level.level());
-                let distance = compute_distance(query, posting.vector(), distance_metric);
-                let candidate = RankedPosting { posting, distance };
-
-                if heap_ids.contains(&candidate.posting.id()) {
-                    continue;
-                }
-
-                if ranked.len() < k {
-                    heap_ids.insert(candidate.posting.id());
-                    ranked.push(candidate);
-                    continue;
-                }
-
-                let Some(worst) = ranked.peek() else {
-                    continue;
-                };
-                if candidate < *worst {
-                    let removed = ranked.pop().expect("heap should be non-empty");
-                    heap_ids.remove(&removed.posting.id());
-                    heap_ids.insert(candidate.posting.id());
-                    ranked.push(candidate);
-                }
+        let scored = Self::score(postings_level, query, postings, distance_metric);
+        for candidate in scored.into_values() {
+            if ranked.len() < k {
+                ranked.push(candidate);
+                continue;
+            }
+            let Some(worst) = ranked.peek() else {
+                continue;
+            };
+            if candidate < *worst {
+                let removed = ranked.pop().expect("heap should be non-empty");
+                ranked.push(candidate);
             }
         }
 
