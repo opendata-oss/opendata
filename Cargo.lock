@@ -2575,6 +2575,7 @@ dependencies = [
  "foyer",
  "futures",
  "metrics",
+ "mixtrics",
  "opendata-macros",
  "proptest",
  "serde",
