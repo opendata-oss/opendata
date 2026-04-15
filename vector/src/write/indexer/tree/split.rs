@@ -260,6 +260,51 @@ impl SplitCentroids {
         .await
         .expect("unexpected join error");
 
+        let indexed_data_by_vector = if self.level.is_leaf() {
+            let vector_ids: HashSet<_> = results
+                .iter()
+                .filter_map(|result| result.as_ref().ok())
+                .flat_map(|result| {
+                    result
+                        .c_0
+                        .postings
+                        .iter()
+                        .chain(result.c_1.postings.iter())
+                        .map(|p| p.id())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let view = VectorIndexView::new(delta, state, &self.snapshot, self.snapshot_epoch);
+            let mut reads = Vec::with_capacity(vector_ids.len());
+            for vector_id in vector_ids {
+                let fut = view.vector_index_data(vector_id);
+                reads.push(Box::pin(async move {
+                    Ok((
+                        vector_id,
+                        fut.await?.unwrap_or_else(|| {
+                            panic!("missing vector index data for {}", vector_id)
+                        }),
+                    ))
+                })
+                    as BoxFuture<
+                        'static,
+                        Result<(
+                            VectorId,
+                            crate::serde::vector_index_data::VectorIndexDataValue,
+                        )>,
+                    >);
+            }
+            let results = AsyncBatchDriver::execute(reads).await;
+            let mut indexed_data = HashMap::with_capacity(results.len());
+            for result in results {
+                let (vector_id, index_data) = result?;
+                indexed_data.insert(vector_id, index_data);
+            }
+            indexed_data
+        } else {
+            HashMap::new()
+        };
+
         // update delta
         let mut total_candidates_evaluated = 0usize;
         let mut total_candidates_returned = 0usize;
@@ -333,7 +378,16 @@ impl SplitCentroids {
                     delta
                         .search_index
                         .add_to_posting(c_id, p.id(), p.vector().to_vec());
-                    if !self.level.is_leaf() {
+                    if self.level.is_leaf() {
+                        let index_data = indexed_data_by_vector.get(&p.id()).unwrap_or_else(|| {
+                            panic!("missing prefetched vector index data for {}", p.id())
+                        });
+                        delta.forward_index.update_vector_index_data(
+                            p.id(),
+                            vec![c_id],
+                            index_data.indexed_fields.clone(),
+                        );
+                    } else {
                         // if this is a non-leaf level, then the posting vectors are centroids,
                         // and their parent ref needs to be updated
                         delta.search_index.update_centroid(

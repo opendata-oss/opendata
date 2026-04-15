@@ -40,6 +40,7 @@ pub(crate) enum QueryPathKind {
     Matrix,
     /// Subquery vector-selector fast path. Merge, sort/dedup, step-bucket.
     SubqueryVectorSelector {
+        range_ms: i64,
         aligned_start_ms: i64,
         step_ms: i64,
         lookback_delta_ms: i64,
@@ -94,9 +95,12 @@ impl QueryPlan {
             QueryPathKind::InstantVector { .. } => {
                 ExprResult::InstantVector(shape_instant_results(all_bucket_data, stats))
             }
-            QueryPathKind::Matrix => {
-                ExprResult::RangeVector(shape_matrix_results(all_bucket_data, stats))
-            }
+            QueryPathKind::Matrix => ExprResult::RangeVector(shape_matrix_results(
+                all_bucket_data,
+                self.sample_end_ms - self.sample_start_ms,
+                self.sample_end_ms,
+                stats,
+            )),
             QueryPathKind::SubqueryVectorSelector { .. } => {
                 ExprResult::RangeVector(shape_subquery_results(all_bucket_data, self, stats))
             }
@@ -211,12 +215,14 @@ impl QueryPlan {
                 step_ms,
                 lookback_delta_ms,
             );
+        let range_ms = subquery_end_ms - subquery_start_ms;
         buckets.sort_by(|a, b| b.start.cmp(&a.start)); // newest first
         QueryPlan {
             sample_start_ms: range_start_ms,
             sample_end_ms: range_end_ms,
             buckets,
             path_kind: QueryPathKind::SubqueryVectorSelector {
+                range_ms,
                 aligned_start_ms,
                 step_ms,
                 lookback_delta_ms,
@@ -582,6 +588,8 @@ pub(crate) fn shape_instant_results(
 /// SeriesMeta are already canonically sorted, so no re-sort is needed.
 pub(crate) fn shape_matrix_results(
     all_bucket_data: &[BucketSampleData],
+    range_ms: i64,
+    range_end_ms: i64,
     stats: &crate::promql::evaluator::EvalStats,
 ) -> Vec<EvalSamples> {
     let mut series_map: HashMap<Arc<[Label]>, Vec<Sample>> = HashMap::new();
@@ -602,6 +610,8 @@ pub(crate) fn shape_matrix_results(
             EvalSamples {
                 values,
                 labels: labels_to_hashmap(&labels),
+                range_ms,
+                range_end_ms,
             }
         })
         .collect()
@@ -616,20 +626,23 @@ pub(crate) fn shape_subquery_results(
     plan: &QueryPlan,
     stats: &crate::promql::evaluator::EvalStats,
 ) -> Vec<EvalSamples> {
-    let (aligned_start_ms, step_ms, lookback_delta_ms, expected_steps) = match &plan.path_kind {
-        QueryPathKind::SubqueryVectorSelector {
-            aligned_start_ms,
-            step_ms,
-            lookback_delta_ms,
-            expected_steps,
-        } => (
-            *aligned_start_ms,
-            *step_ms,
-            *lookback_delta_ms,
-            *expected_steps,
-        ),
-        _ => return Vec::new(),
-    };
+    let (range_ms, aligned_start_ms, step_ms, lookback_delta_ms, expected_steps) =
+        match &plan.path_kind {
+            QueryPathKind::SubqueryVectorSelector {
+                range_ms,
+                aligned_start_ms,
+                step_ms,
+                lookback_delta_ms,
+                expected_steps,
+            } => (
+                *range_ms,
+                *aligned_start_ms,
+                *step_ms,
+                *lookback_delta_ms,
+                *expected_steps,
+            ),
+            _ => return Vec::new(),
+        };
 
     // Merge by fingerprint
     let mut merged: HashMap<SeriesFingerprint, (Arc<[Label]>, Vec<Sample>)> = HashMap::new();
@@ -682,6 +695,8 @@ pub(crate) fn shape_subquery_results(
             range_vector.push(EvalSamples {
                 values: step_samples,
                 labels: labels_to_hashmap(&labels),
+                range_ms,
+                range_end_ms: subquery_end_ms,
             });
         }
     }
@@ -1178,11 +1193,13 @@ mod tests {
         let plan = QueryPlan::for_subquery_vector_selector(15, 55, 10, 20, buckets);
         match &plan.path_kind {
             QueryPathKind::SubqueryVectorSelector {
+                range_ms,
                 aligned_start_ms,
                 step_ms,
                 lookback_delta_ms,
                 expected_steps,
             } => {
+                assert_eq!(*range_ms, 40);
                 assert_eq!(*aligned_start_ms, 20);
                 assert_eq!(*step_ms, 10);
                 assert_eq!(*lookback_delta_ms, 20);
@@ -1302,7 +1319,7 @@ mod tests {
         ];
 
         let stats = test_stats();
-        let results = shape_matrix_results(&bucket_data, &stats);
+        let results = shape_matrix_results(&bucket_data, 100_000_000, 100_000_000, &stats);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].values.len(), 3);
     }
@@ -1328,6 +1345,7 @@ mod tests {
             sample_end_ms: 30,
             buckets: vec![],
             path_kind: QueryPathKind::SubqueryVectorSelector {
+                range_ms: 30,
                 aligned_start_ms: 10,
                 step_ms: 10,
                 lookback_delta_ms: 10,
@@ -1381,6 +1399,7 @@ mod tests {
             sample_end_ms: 20,
             buckets: vec![],
             path_kind: QueryPathKind::SubqueryVectorSelector {
+                range_ms: 20,
                 aligned_start_ms: 10,
                 step_ms: 10,
                 lookback_delta_ms: 10,
