@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use super::config::{BlockCacheConfig, ObjectStoreConfig, StorageConfig};
 use super::in_memory::InMemoryStorage;
-use super::metrics_recorder::MetricsRsRecorder;
+use super::metrics_recorder::{MetricsRsRecorder, MixtricsBridge as MetricsRsRegistry};
 use super::slate::{SlateDbStorage, SlateDbStorageReader};
 use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
 use slatedb::DbReader;
@@ -348,6 +348,7 @@ async fn create_block_cache_from_config(
 
             let cache = HybridCacheBuilder::new()
                 .with_name("slatedb_block_cache")
+                .with_metrics_registry(Box::new(MetricsRsRegistry))
                 .memory(memory_capacity)
                 .with_weighter(|_, v: &CachedEntry| v.size())
                 .storage(Engine::large())
