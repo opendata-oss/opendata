@@ -232,7 +232,6 @@ posting in the leaf centroids, then executes splits/merges of leaf centroids (le
 splits and  merges mutate the postings at level 2. The indexer then executes splits/merges at
 level 2, and so on. Eventually, it reaches the root. If the root becomes too large the indexer
 splits it by adding a new level of centroids and writing a new root.
-process are detailed in RFC-0005.
 
 The figure below depicts an example 4-level tree:
 
