@@ -1,7 +1,7 @@
 # Use cargo-chef for dependency caching
 # Pin to multi-arch manifest list digest for reproducible builds (supports amd64/arm64)
-# To update: docker manifest inspect lukemathwalker/cargo-chef:latest-rust-1.89
-FROM lukemathwalker/cargo-chef:latest-rust-1.89@sha256:abbe80c8000f4e1b6969b4d84d5ec7ad86616be7e6322ba0e3b451c2eee6f280 AS chef
+# To update: docker manifest inspect lukemathwalker/cargo-chef:latest-rust-1.94
+FROM lukemathwalker/cargo-chef:latest-rust-1.94@sha256:d5a1cca12f21de999e5b221b5c6ff5635080f4b8d5e58053241ff169e0fc60f6 AS chef
 WORKDIR /app
 
 FROM chef AS planner
