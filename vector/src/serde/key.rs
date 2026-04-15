@@ -253,6 +253,44 @@ impl VectorDataKey {
     }
 }
 
+/// VectorIndexData key - stores durable posting assignments for a data vector.
+///
+/// Key layout: `[subsystem | version | tag | vector_id:u64-BE]` (11 bytes)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorIndexDataKey {
+    pub(crate) vector_id: VectorId,
+}
+
+impl RecordKey for VectorIndexDataKey {
+    const RECORD_TYPE: RecordType = RecordType::VectorIndexData;
+}
+
+impl VectorIndexDataKey {
+    pub(crate) fn new(vector_id: VectorId) -> Self {
+        assert!(vector_id.is_data_vector());
+        Self { vector_id }
+    }
+
+    pub(crate) fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(11);
+        Self::RECORD_TYPE.prefix().write_to(&mut buf);
+        self.vector_id.encode(&mut buf);
+        buf.freeze()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < 11 {
+            return Err(EncodingError {
+                message: "Buffer too short for VectorIndexDataKey".to_string(),
+            });
+        }
+        validate_key_prefix::<Self>(buf)?;
+        let vector_id = VectorId::decode(&mut &buf[3..])?;
+        Ok(VectorIndexDataKey { vector_id })
+    }
+}
+
 /// MetadataIndex key - inverted index mapping metadata values to vector IDs.
 ///
 /// Key layout: `[subsystem | version | tag | field:TerminatedBytes | value:FieldValue]` (variable)
@@ -608,6 +646,20 @@ mod tests {
         // then
         assert!(encoded1 < encoded2);
         assert!(encoded2 < encoded3);
+    }
+
+    #[test]
+    fn should_encode_and_decode_vector_index_data_key() {
+        // given
+        let key = VectorIndexDataKey::new(VectorId::data_vector_id(0x00AB_CDEF_0123_4567));
+
+        // when
+        let encoded = key.encode();
+        let decoded = VectorIndexDataKey::decode(&encoded).unwrap();
+
+        // then
+        assert_eq!(decoded, key);
+        assert_eq!(encoded.len(), 11);
     }
 
     #[test]

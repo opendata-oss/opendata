@@ -1,10 +1,14 @@
 use crate::Error::Internal;
 use crate::Result;
+use crate::model::AttributeValue;
 use crate::model::VECTOR_FIELD_NAME;
 use crate::serde::FieldValue;
 use crate::serde::centroid_info::CentroidInfoValue;
+use crate::serde::vector_data::Field;
+#[cfg(test)]
 use crate::serde::vector_data::VectorDataValue;
 use crate::serde::vector_id::VectorId;
+use crate::serde::vector_index_data::VectorIndexDataValue;
 use crate::write::delta::VectorWrite;
 use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::tree::IndexerOpts;
@@ -22,7 +26,7 @@ use tracing::trace;
 /// An upsert where we need to resolve the old vector data from storage.
 struct ResolvedUpsert {
     write: VectorWrite,
-    old: (VectorId, VectorDataValue),
+    old: (VectorId, VectorIndexDataValue),
 }
 
 pub(crate) struct WriteVectors {
@@ -81,11 +85,14 @@ impl WriteVectors {
                     inserts.push(w);
                     continue;
                 };
-                // Upsert — need to read old vector data from storage
-                let data_fut = view.vector_data(old_vector_id, self.opts.dimensions);
+                // Upsert — need to read old index data from storage so we can remove from postings.
+                let index_data_fut = view.vector_index_data(old_vector_id);
                 upsert_futures.push(Box::pin(async move {
-                    let old_data = data_fut.await?.ok_or_else(|| {
-                        Internal(format!("missing vector data for id {}", old_vector_id))
+                    let old_data = index_data_fut.await?.ok_or_else(|| {
+                        Internal(format!(
+                            "missing vector index data for id {}",
+                            old_vector_id
+                        ))
                     })?;
                     Ok(ResolvedUpsert {
                         write: w,
@@ -125,6 +132,11 @@ impl WriteVectors {
             delta
                 .search_index
                 .add_to_posting(centroid, vector_id, insert.values.clone());
+            delta.forward_index.update_vector_index_data(
+                vector_id,
+                vec![centroid],
+                Self::collect_indexed_fields(&self.opts, &insert.attributes),
+            );
             for (attr_name, attr_value) in &insert.attributes {
                 if attr_name == VECTOR_FIELD_NAME {
                     continue;
@@ -149,15 +161,31 @@ impl WriteVectors {
                         upsert.write.external_id
                     ))
                 })?;
-            let (old_vector_id, _old_vector_data) = upsert.old;
+            let (old_vector_id, old_vector_index_data) = upsert.old;
             delta.forward_index.delete_vector(old_vector_id);
-            // todo: delete from old postings and inverted index
+            for old_centroid in old_vector_index_data.postings {
+                delta
+                    .search_index
+                    .remove_from_posting(old_centroid, old_vector_id);
+            }
+            for field in old_vector_index_data.indexed_fields {
+                delta.search_index.remove_from_inverted_index(
+                    field.field_name,
+                    field.value,
+                    old_vector_id,
+                );
+            }
             let vector_id = delta
                 .forward_index
                 .add_vector(&upsert.write.external_id, &upsert.write.attributes);
             delta
                 .search_index
                 .add_to_posting(centroid, vector_id, upsert.write.values.clone());
+            delta.forward_index.update_vector_index_data(
+                vector_id,
+                vec![centroid],
+                Self::collect_indexed_fields(&self.opts, &upsert.write.attributes),
+            );
             for (attr_name, attr_value) in &upsert.write.attributes {
                 if attr_name == VECTOR_FIELD_NAME {
                     continue;
@@ -172,6 +200,17 @@ impl WriteVectors {
             }
         }
         Ok((insert_count, update_count))
+    }
+
+    fn collect_indexed_fields(
+        opts: &IndexerOpts,
+        attributes: &[(String, AttributeValue)],
+    ) -> Vec<Field> {
+        attributes
+            .iter()
+            .filter(|(name, _)| name != VECTOR_FIELD_NAME && opts.indexed_fields.contains(name))
+            .map(|(name, value)| Field::new(name.clone(), value.clone().into()))
+            .collect()
     }
 
     async fn assign_centroids(
@@ -205,7 +244,7 @@ struct VerifiedVectorReassignment {
 
 struct ResolvedVectorReassignment {
     reassignment: ReassignVector,
-    data: VectorDataValue,
+    index_data: VectorIndexDataValue,
     new_centroid: VectorId,
 }
 
@@ -365,7 +404,7 @@ impl ReassignVectors {
     }
 
     async fn execute_vector_reassignments(
-        opts: &IndexerOpts,
+        _opts: &IndexerOpts,
         snapshot: &Arc<dyn StorageRead>,
         snapshot_epoch: u64,
         state: &VectorIndexState,
@@ -374,15 +413,14 @@ impl ReassignVectors {
     ) -> Result<usize> {
         let resolved = {
             let view = VectorIndexView::new(delta, state, snapshot, snapshot_epoch);
-            // pull the old vector data so we can update inverted indexes
+            // pull the current index data so we can persist the new centroid assignment
             let mut to_resolve = Vec::with_capacity(reassignments.len());
             for r in reassignments {
-                let data_fut = view.vector_data(r.reassignment.vector_id, opts.dimensions);
+                let index_data_fut = view.vector_index_data(r.reassignment.vector_id);
                 to_resolve.push(Box::pin(async move {
                     Ok(ResolvedVectorReassignment {
                         reassignment: r.reassignment,
-                        // TODO: this will panic on update - we need to delete vector from old posting
-                        data: data_fut.await?.expect("missing vector data"),
+                        index_data: index_data_fut.await?.expect("missing vector index data"),
                         new_centroid: r.new_centroid,
                     })
                 })
@@ -397,14 +435,31 @@ impl ReassignVectors {
         };
         let nreassigned = resolved.len();
         for r in resolved {
-            trace!("old data: {:?}", r.data);
+            trace!("old index data: {:?}", r.index_data);
+            assert_eq!(
+                r.index_data.postings.len(),
+                1,
+                "expected exactly one posting for reassigned vector {}",
+                r.reassignment.vector_id
+            );
+            let old_centroid = r.index_data.postings[0];
+            assert_eq!(
+                old_centroid, r.reassignment.current_centroid,
+                "reassignment current centroid disagrees with vector index data for {}",
+                r.reassignment.vector_id
+            );
             delta
                 .search_index
-                .remove_from_posting(r.reassignment.current_centroid, r.reassignment.vector_id);
+                .remove_from_posting(old_centroid, r.reassignment.vector_id);
             delta.search_index.add_to_posting(
                 r.new_centroid,
                 r.reassignment.vector_id,
                 r.reassignment.vector,
+            );
+            delta.forward_index.update_vector_index_data(
+                r.reassignment.vector_id,
+                vec![r.new_centroid],
+                r.index_data.indexed_fields,
             );
         }
         Ok(nreassigned)

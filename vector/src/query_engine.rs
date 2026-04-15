@@ -454,13 +454,13 @@ impl QueryEngine {
                 Filter::Eq(field, value) => {
                     let field_value: crate::serde::FieldValue = value.clone().into();
                     let bitmap = storage.get_metadata_index(field, field_value).await?;
-                    Ok(bitmap.vector_ids)
+                    Ok(bitmap.effective_vector_ids())
                 }
                 Filter::Neq(field, value) => {
                     let field_value: crate::serde::FieldValue = value.clone().into();
                     let bitmap = storage.get_metadata_index(field, field_value).await?;
                     let mut result = candidates.clone();
-                    result -= &bitmap.vector_ids;
+                    result -= &bitmap.effective_vector_ids();
                     Ok(result)
                 }
                 Filter::In(field, values) => {
@@ -468,7 +468,7 @@ impl QueryEngine {
                     for value in values {
                         let field_value: crate::serde::FieldValue = value.clone().into();
                         let bitmap = storage.get_metadata_index(field, field_value).await?;
-                        result |= &bitmap.vector_ids;
+                        result |= &bitmap.effective_vector_ids();
                     }
                     Ok(result)
                 }
