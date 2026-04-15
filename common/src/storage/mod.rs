@@ -236,6 +236,18 @@ pub trait StorageRead: Send + Sync {
         }
         Ok(records)
     }
+
+    /// Closes the storage, releasing any resources.
+    ///
+    /// This method should be called before dropping the storage to ensure
+    /// proper cleanup. For SlateDB, this releases the database fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if resource shutdown fails.
+    async fn close(&self) -> StorageResult<()> {
+        Ok(())
+    }
 }
 
 /// A point-in-time snapshot of the storage layer.
@@ -348,16 +360,6 @@ pub trait Storage: StorageRead {
     ///
     /// Returns an error if durability cannot be established.
     async fn flush(&self) -> StorageResult<()>;
-
-    /// Closes the storage, releasing any resources.
-    ///
-    /// This method should be called before dropping the storage to ensure
-    /// proper cleanup. For SlateDB, this releases the database fence.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if resource shutdown fails.
-    async fn close(&self) -> StorageResult<()>;
 
     /// Subscribes to the durable sequence watermark.
     ///

@@ -237,6 +237,12 @@ impl TimeSeriesDbReader {
         find_labels_in_range(self, matchers, range).await
     }
 
+    /// Closes the underlying storage reader, flushing any caches to disk.
+    pub async fn close(&self) -> Result<()> {
+        self.storage.close().await?;
+        Ok(())
+    }
+
     /// Returns the set of values for a given label name.
     pub async fn label_values(
         &self,

@@ -622,7 +622,7 @@ impl Tsdb {
         Ok(())
     }
 
-    pub(crate) async fn close(self) -> Result<()> {
+    pub(crate) async fn close(&self) -> Result<()> {
         self.flush().await?;
         self.storage.close().await?;
         Ok(())
@@ -918,6 +918,13 @@ impl TsdbEngine {
         match self {
             Self::ReadWrite(tsdb) => tsdb.flush().await,
             Self::ReadOnly(_) => Ok(()),
+        }
+    }
+
+    pub(crate) async fn close(&self) -> Result<()> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.close().await,
+            Self::ReadOnly(reader) => reader.close().await,
         }
     }
 }

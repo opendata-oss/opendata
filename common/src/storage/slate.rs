@@ -152,6 +152,13 @@ impl StorageRead for SlateDbStorage {
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
     }
+
+    async fn close(&self) -> StorageResult<()> {
+        // Stop durable bridge first so no status subscriber outlives DB close.
+        self.durable_bridge_abort.abort();
+        self.db.close().await.map_err(StorageError::from_storage)?;
+        Ok(())
+    }
 }
 
 pub(super) struct SlateDbIterator {
@@ -311,13 +318,6 @@ impl Storage for SlateDbStorage {
         self.db.flush().await.map_err(StorageError::from_storage)?;
         Ok(())
     }
-
-    async fn close(&self) -> StorageResult<()> {
-        // Stop durable bridge first so no status subscriber outlives DB close.
-        self.durable_bridge_abort.abort();
-        self.db.close().await.map_err(StorageError::from_storage)?;
-        Ok(())
-    }
 }
 
 impl From<Ttl> for slatedb::config::Ttl {
@@ -388,6 +388,13 @@ impl StorageRead for SlateDbStorageReader {
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
+    }
+
+    async fn close(&self) -> StorageResult<()> {
+        self.reader
+            .close()
+            .await
+            .map_err(StorageError::from_storage)
     }
 }
 

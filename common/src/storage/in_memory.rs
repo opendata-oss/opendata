@@ -442,11 +442,6 @@ impl Storage for InMemoryStorage {
         }
         Ok(())
     }
-
-    async fn close(&self) -> StorageResult<()> {
-        // No-op for in-memory storage
-        Ok(())
-    }
 }
 
 /// Injected failure that fires either once or on every call.
@@ -634,10 +629,6 @@ impl super::Storage for FailingStorage {
     async fn flush(&self) -> super::StorageResult<()> {
         check_failure(&self.fail_flush)?;
         self.inner.flush().await
-    }
-
-    async fn close(&self) -> super::StorageResult<()> {
-        self.inner.close().await
     }
 }
 

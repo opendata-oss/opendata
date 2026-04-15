@@ -210,10 +210,10 @@ impl TimeSeriesHttpServer {
             handle.shutdown().await;
         }
 
-        // Flush TSDB on shutdown to persist any buffered data
-        tracing::info!("Flushing TSDB before shutdown...");
-        if let Err(e) = self.tsdb.flush().await {
-            tracing::error!("Failed to flush TSDB on shutdown: {}", e);
+        // Close TSDB on shutdown to flush buffered data and release resources
+        tracing::info!("Closing TSDB before shutdown...");
+        if let Err(e) = self.tsdb.close().await {
+            tracing::error!("Failed to close TSDB on shutdown: {}", e);
         }
 
         tracing::info!("Server shut down gracefully");
