@@ -1017,18 +1017,17 @@ fn counter_increase_correction(values: &[Sample]) -> f64 {
     correction
 }
 
-/// Computes extrapolated rate for a series as per Prometheus logic.
+/// Computes extrapolated increase for a series as per Prometheus logic.
 ///
 /// If the sample start/end is sufficiently close to the range start/end (less than 110% of the
-/// average duration between samples), then the rate is extrapolated all the way to the range start/end.
-/// Otherwise, it is assumed that the samples stopped (or became constant) and the rate is only
+/// average duration between samples), then the increase is extrapolated all the way to the range start/end.
+/// Otherwise, it is assumed that the samples stopped (or became constant) and the increase is only
 /// extrapolated by half of the average duration between samples.
-fn extrapolated_rate(series: &EvalSamples) -> Option<f64> {
+fn extrapolated_increase(series: &EvalSamples) -> Option<f64> {
     if series.values.len() < 2 {
         return None;
     }
 
-    let range_seconds = series.range_ms as f64 / 1000.0;
     let range_start = series.range_end_ms - series.range_ms;
     let range_end = series.range_end_ms;
 
@@ -1068,9 +1067,7 @@ fn extrapolated_rate(series: &EvalSamples) -> Option<f64> {
         duration_to_end = avg_duration_between_samples / 2.0;
     }
 
-    let factor = (time_diff_seconds + duration_to_start + duration_to_end)
-        / time_diff_seconds
-        / range_seconds;
+    let factor = (time_diff_seconds + duration_to_start + duration_to_end) / time_diff_seconds;
 
     result *= factor;
     Some(result)
@@ -1085,10 +1082,11 @@ impl PromQLFunction for RateFunction {
         let mut result = Vec::with_capacity(samples.len());
 
         for sample_series in samples {
-            if let Some(rate) = extrapolated_rate(&sample_series) {
+            if let Some(increase) = extrapolated_increase(&sample_series) {
+                let range_seconds = sample_series.range_ms as f64 / 1000.0;
                 result.push(EvalSample {
                     timestamp_ms: eval_timestamp_ms,
-                    value: rate,
+                    value: increase / range_seconds,
                     labels: sample_series.labels,
                     drop_name: false,
                 });
