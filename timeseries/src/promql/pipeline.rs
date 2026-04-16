@@ -454,7 +454,7 @@ pub(crate) fn build_bucket_sample_work(
 /// this local window can be the tighter limit, so observed sample parallelism
 /// may be lower than `sample_concurrency` even though the semaphore remains
 /// the query-global I/O ceiling.
-const PER_BUCKET_SAMPLE_READAHEAD: usize = 8;
+const PER_BUCKET_SAMPLE_READAHEAD: usize = 64;
 
 /// Load samples for all series in a bucket sample work item.
 ///
