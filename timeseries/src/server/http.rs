@@ -187,6 +187,22 @@ impl TimeSeriesHttpServer {
             handle
         };
 
+        // Start the cache warmer if configured
+        let warmer_handle =
+            self.config
+                .prometheus_config
+                .cache_warmer
+                .as_ref()
+                .map(|warmer_config| {
+                    let storage = self.tsdb.storage_read();
+                    tracing::info!(
+                        warm_range = ?warmer_config.warm_range,
+                        include_samples = warmer_config.include_samples,
+                        "Starting cache warmer"
+                    );
+                    super::cache_warmer::start(storage, warmer_config.clone())
+                });
+
         // Build router with metrics middleware
         let app = build_router(
             self.tsdb.clone(),
@@ -207,6 +223,12 @@ impl TimeSeriesHttpServer {
         #[cfg(feature = "otel")]
         if let Some(handle) = consumer_handle {
             tracing::info!("Shutting down ingest consumer...");
+            handle.shutdown().await;
+        }
+
+        // Stop the cache warmer before closing storage
+        if let Some(handle) = warmer_handle {
+            tracing::info!("Shutting down cache warmer...");
             handle.shutdown().await;
         }
 

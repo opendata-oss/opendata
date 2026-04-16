@@ -59,6 +59,10 @@ pub struct PrometheusConfig {
     /// Maximum number of bucket readers to cache in memory.
     #[serde(default = "default_cache_capacity")]
     pub cache_capacity: u64,
+    /// Startup cache warmer configuration. Scans recent buckets on startup
+    /// to pre-populate the block cache. Enabled by default (24h, with samples).
+    #[serde(default = "default_cache_warmer")]
+    pub cache_warmer: Option<CacheWarmerConfig>,
 }
 
 fn default_flush_interval_secs() -> u64 {
@@ -118,6 +122,7 @@ impl Default for PrometheusConfig {
             read_only: false,
             reader: default_reader_options(),
             cache_capacity: default_cache_capacity(),
+            cache_warmer: default_cache_warmer(),
         }
     }
 }
@@ -206,13 +211,43 @@ fn default_gc_grace_period() -> Duration {
     Duration::from_secs(600)
 }
 
-#[cfg(feature = "otel")]
 fn deserialize_duration<'de, D>(deserializer: D) -> std::result::Result<Duration, D::Error>
 where
     D: Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
     parse_duration(&s).map_err(serde::de::Error::custom)
+}
+
+/// Configuration for the startup cache warmer.
+///
+/// When present, the server scans recent time bucket key ranges on startup
+/// to pre-populate the block cache. This is a temporary workaround until
+/// SlateDB's CacheManager is available.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CacheWarmerConfig {
+    /// How far back to warm (e.g., "6h", "24h"). Defaults to 24h.
+    #[serde(
+        default = "default_warm_range",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub warm_range: Duration,
+
+    /// Whether to warm timeseries sample data in addition to metadata.
+    /// Defaults to true.
+    #[serde(default = "default_true")]
+    pub include_samples: bool,
+}
+
+fn default_warm_range() -> Duration {
+    Duration::from_hours(24)
+}
+
+fn default_cache_warmer() -> Option<CacheWarmerConfig> {
+    Some(CacheWarmerConfig {
+        warm_range: default_warm_range(),
+        include_samples: true,
+    })
 }
 
 /// Global configuration defaults.

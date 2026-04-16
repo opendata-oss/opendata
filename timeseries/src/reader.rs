@@ -144,7 +144,7 @@ impl QueryReader for ReaderQueryReader {
 /// let result = reader.query("rate(http_requests_total[5m])", None).await?;
 /// ```
 pub struct TimeSeriesDbReader {
-    storage: Arc<dyn StorageRead>,
+    pub(crate) storage: Arc<dyn StorageRead>,
     /// LRU cache for read-only query buckets.
     query_cache: Cache<TimeBucket, Arc<MiniQueryReader>>,
 }
