@@ -667,8 +667,6 @@ it does something similar to the following procedure:
 
 1. **Validate query dimensions** against configured dimensions
 2. **Search centroids** for nearest centroids
-   - Expands search by 10-100x (at least 10, at most 100 centroids)
-   - This expansion improves recall for approximate nearest neighbor search
 3. **Load posting lists** for identified centroids to get candidate vector IDs
 4. **Apply metadata filter** (if provided):
    - For each filter predicate, load metadata index entries
@@ -722,20 +720,6 @@ Following the `LogReader` pattern from the log module:
   snapshot but are independent objects
 
 ## Performance Considerations
-
-### Metadata Filtering
-
-Filters are applied **after** centroid search to candidate vectors. This means:
-
-- **Efficient for selective filters**: If the filter eliminates many candidates, less vector
-  scoring is needed
-- **Less efficient for broad filters**: If the filter keeps most candidates, the overhead may not
-  justify the benefit
-- **Trade-off**: Applying filters before centroid search would require scanning all metadata
-  indexes, which is expensive for large collections
-
-Future optimization: For highly selective filters on frequently-queried fields, consider
-filter-first strategies.
 
 ### Field Selection
 
