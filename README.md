@@ -26,7 +26,7 @@ layout and optimizations.
 
 # OpenData Databases
 
-- **[Timeseries](timeseries/README.md)**: Object-store-native timeseries. Prometheus remote-write compatible.
+- **[Timeseries](timeseries/README.md)**: Object-store-native timeseries. Prometheus remote-write compatible. Accepts OpenTelemetry metrics.
 - **[Log](log/README.md)**: Event streaming with a replayable log per key.
 - **[Vector](vector/README.md)**: SPANN-style ANN search. Centroids in memory, posting lists on disk.
 - **[KeyValue](keyvalue/README.md)**: Object-store-native key-value database.
