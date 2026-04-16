@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::storage::factory::OwnedHybridCache;
 use crate::storage::{MergeOptions, PutOptions};
 use crate::{
     BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult, Ttl,
@@ -17,6 +18,7 @@ use slatedb::{
     MergeOperatorError, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
 };
 use tokio::sync::watch;
+use tracing::warn;
 
 /// Adapter that wraps our `MergeOperator` trait to implement SlateDB's `MergeOperator` trait.
 ///
@@ -74,11 +76,24 @@ pub struct SlateDbStorage {
     pub(super) db: Arc<Db>,
     durable_tx: watch::Sender<u64>,
     durable_bridge_abort: tokio::task::AbortHandle,
+    // TODO(slatedb 0.13): remove once DbCache exposes a close() hook and
+    // SlateDb::close() drives cache shutdown itself.
+    managed_cache: Option<OwnedHybridCache>,
 }
 
 impl SlateDbStorage {
     /// Creates a new SlateDbStorage instance wrapping the given SlateDB database.
     pub fn new(db: Arc<Db>) -> Self {
+        Self::new_with_managed_cache(db, None)
+    }
+
+    /// Creates a new SlateDbStorage that will explicitly close the given foyer
+    /// hybrid cache during [`StorageRead::close`]. See [`OwnedHybridCache`] for
+    /// why this exists.
+    pub(crate) fn new_with_managed_cache(
+        db: Arc<Db>,
+        managed_cache: Option<OwnedHybridCache>,
+    ) -> Self {
         let slate_rx = db.subscribe();
         let (durable_tx, _) = watch::channel(slate_rx.borrow().durable_seq);
         let task = tokio::spawn({
@@ -98,6 +113,7 @@ impl SlateDbStorage {
             db,
             durable_tx,
             durable_bridge_abort: task.abort_handle(),
+            managed_cache,
         }
     }
 
@@ -157,6 +173,15 @@ impl StorageRead for SlateDbStorage {
         // Stop durable bridge first so no status subscriber outlives DB close.
         self.durable_bridge_abort.abort();
         self.db.close().await.map_err(StorageError::from_storage)?;
+        // Close the cache after SlateDB so no inserts race the flushers. Log
+        // and swallow errors: cache flush failures only cost cache warmth, not
+        // durability, and we'd rather not fail shutdown over it.
+        // TODO(slatedb 0.13): remove once DbCache owns its close lifecycle.
+        if let Some(cache) = &self.managed_cache
+            && let Err(e) = cache.close().await
+        {
+            warn!(error = ?e, "foyer hybrid cache close failed");
+        }
         Ok(())
     }
 }
@@ -352,12 +377,27 @@ impl From<MergeOptions> for slatedb::config::MergeOptions {
 /// allowing multiple readers to coexist with a single writer.
 pub struct SlateDbStorageReader {
     reader: Arc<DbReader>,
+    // TODO(slatedb 0.13): remove once DbCache exposes a close() hook and
+    // DbReader::close() drives cache shutdown itself.
+    managed_cache: Option<OwnedHybridCache>,
 }
 
 impl SlateDbStorageReader {
     /// Creates a new SlateDbStorageReader wrapping the given DbReader.
     pub fn new(reader: Arc<DbReader>) -> Self {
-        Self { reader }
+        Self::new_with_managed_cache(reader, None)
+    }
+
+    /// Creates a reader that will explicitly close the given foyer hybrid
+    /// cache during [`StorageRead::close`].
+    pub(crate) fn new_with_managed_cache(
+        reader: Arc<DbReader>,
+        managed_cache: Option<OwnedHybridCache>,
+    ) -> Self {
+        Self {
+            reader,
+            managed_cache,
+        }
     }
 }
 
@@ -394,7 +434,15 @@ impl StorageRead for SlateDbStorageReader {
         self.reader
             .close()
             .await
-            .map_err(StorageError::from_storage)
+            .map_err(StorageError::from_storage)?;
+        // Close the cache after the reader so no inserts race the flushers.
+        // TODO(slatedb 0.13): remove once DbCache owns its close lifecycle.
+        if let Some(cache) = &self.managed_cache
+            && let Err(e) = cache.close().await
+        {
+            warn!(error = ?e, "foyer hybrid cache close failed");
+        }
+        Ok(())
     }
 }
 

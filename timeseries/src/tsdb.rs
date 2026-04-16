@@ -515,7 +515,7 @@ pub(crate) async fn discover_label_values<R: QueryReader>(
 /// Tsdb manages multiple MiniTsdb instances (one per time bucket) and provides
 /// a unified QueryReader interface that merges results across buckets.
 pub(crate) struct Tsdb {
-    pub(crate) storage: Arc<dyn Storage>,
+    storage: Arc<dyn Storage>,
 
     /// TTI cache (15 min idle) for buckets being actively ingested into.
     /// Also used during queries so that unflushed data is visible.
@@ -537,6 +537,12 @@ impl Tsdb {
             ingest_cache,
             metadata_catalog: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Returns a read handle to the underlying storage, for background tasks
+    /// like the cache warmer.
+    pub(crate) fn storage_read(&self) -> Arc<dyn StorageRead> {
+        self.storage.clone() as Arc<dyn StorageRead>
     }
 
     /// Get or create a MiniTsdb for ingestion into a specific bucket.
@@ -812,8 +818,8 @@ impl TsdbEngine {
     /// like the cache warmer.
     pub(crate) fn storage_read(&self) -> Arc<dyn StorageRead> {
         match self {
-            Self::ReadWrite(tsdb) => tsdb.storage.clone() as Arc<dyn StorageRead>,
-            Self::ReadOnly(reader) => reader.storage.clone(),
+            Self::ReadWrite(tsdb) => tsdb.storage_read(),
+            Self::ReadOnly(reader) => reader.storage_read(),
         }
     }
 

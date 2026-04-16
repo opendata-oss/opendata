@@ -13,12 +13,29 @@ use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
 use slatedb::DbReader;
 use slatedb::config::Settings;
 pub use slatedb::db_cache::CachedEntry;
-use slatedb::db_cache::DbCache;
 pub use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
+use slatedb::db_cache::{CachedKey, DbCache};
 use slatedb::object_store::{self, ObjectStore};
 pub use slatedb::{CompactorBuilder, DbBuilder};
 use tracing::info;
+
+/// Handle to a foyer hybrid cache that we own and must close explicitly on
+/// shutdown. Cloneable because foyer's `HybridCache` is Arc-backed.
+///
+/// TODO(slatedb 0.13): remove this and the surrounding plumbing. SlateDB 0.13
+/// adds a `close()` hook to the `DbCache` trait and drives cache shutdown from
+/// `Db::close()` / `DbReader::close()`, so callers won't need to hold a side
+/// handle to the hybrid cache just to close it deterministically.
+pub(crate) type OwnedHybridCache = foyer::HybridCache<CachedKey, CachedEntry>;
+
+/// Block cache we constructed internally — keep the `HybridCache` handle so
+/// we can call `close().await` from `StorageRead::close()` instead of relying
+/// on foyer's Drop-based close, which races the runtime shutdown.
+struct ManagedBlockCache {
+    db_cache: Arc<dyn DbCache>,
+    hybrid: OwnedHybridCache,
+}
 
 /// Builder for creating storage instances from configuration.
 ///
@@ -52,6 +69,7 @@ use tracing::info;
 pub struct StorageBuilder {
     inner: StorageBuilderInner,
     semantics: StorageSemantics,
+    managed_cache: Option<OwnedHybridCache>,
 }
 
 enum StorageBuilderInner {
@@ -67,6 +85,7 @@ impl StorageBuilder {
     /// InMemory configs it stores a sentinel so that `build()` returns an
     /// `InMemoryStorage`.
     pub async fn new(config: &StorageConfig) -> StorageResult<Self> {
+        let mut managed_cache: Option<OwnedHybridCache> = None;
         let inner = match config {
             StorageConfig::InMemory => StorageBuilderInner::InMemory,
             StorageConfig::SlateDb(slate_config) => {
@@ -86,10 +105,11 @@ impl StorageBuilder {
                 );
                 let mut db_builder =
                     DbBuilder::new(slate_config.path.clone(), object_store).with_settings(settings);
-                if let Some(cache) =
+                if let Some(managed) =
                     create_block_cache_from_config(&slate_config.block_cache).await?
                 {
-                    db_builder = db_builder.with_db_cache(cache);
+                    db_builder = db_builder.with_db_cache(managed.db_cache);
+                    managed_cache = Some(managed.hybrid);
                 }
                 StorageBuilderInner::SlateDb(Box::new(db_builder))
             }
@@ -97,6 +117,7 @@ impl StorageBuilder {
         Ok(Self {
             inner,
             semantics: StorageSemantics::default(),
+            managed_cache,
         })
     }
 
@@ -143,7 +164,10 @@ impl StorageBuilder {
                 let db = db_builder.build().await.map_err(|e| {
                     StorageError::Storage(format!("Failed to create SlateDB: {}", e))
                 })?;
-                Ok(Arc::new(SlateDbStorage::new(Arc::new(db))))
+                Ok(Arc::new(SlateDbStorage::new_with_managed_cache(
+                    Arc::new(db),
+                    self.managed_cache,
+                )))
             }
         }
     }
@@ -306,26 +330,36 @@ pub async fn create_storage_read(
                 let adapter = SlateDbStorage::merge_operator_adapter(op);
                 builder = builder.with_merge_operator(Arc::new(adapter));
             }
-            // Prefer runtime-provided cache, fall back to config
+            // Prefer runtime-provided cache, fall back to config. The
+            // runtime-provided cache is owned by the caller, so we don't hold
+            // a handle to close it on shutdown.
+            let mut managed_cache: Option<OwnedHybridCache> = None;
             if let Some(cache) = runtime.block_cache {
                 builder = builder.with_db_cache(cache);
-            } else if let Some(cache) =
+            } else if let Some(managed) =
                 create_block_cache_from_config(&slate_config.block_cache).await?
             {
-                builder = builder.with_db_cache(cache);
+                builder = builder.with_db_cache(managed.db_cache);
+                managed_cache = Some(managed.hybrid);
             }
             let reader = builder.build().await.map_err(|e| {
                 StorageError::Storage(format!("Failed to create SlateDB reader: {}", e))
             })?;
-            Ok(Arc::new(SlateDbStorageReader::new(Arc::new(reader))))
+            Ok(Arc::new(SlateDbStorageReader::new_with_managed_cache(
+                Arc::new(reader),
+                managed_cache,
+            )))
         }
     }
 }
 
-/// Creates a block cache from the serializable config, if present.
+/// Creates a block cache from the serializable config, if present. Returns
+/// both the `DbCache` trait object handed to SlateDB and a `HybridCache`
+/// handle the caller keeps so it can close the cache deterministically on
+/// shutdown.
 async fn create_block_cache_from_config(
     config: &Option<BlockCacheConfig>,
-) -> StorageResult<Option<Arc<dyn DbCache>>> {
+) -> StorageResult<Option<ManagedBlockCache>> {
     let Some(config) = config else {
         return Ok(None);
     };
@@ -407,9 +441,12 @@ async fn create_block_cache_from_config(
                 "hybrid block cache enabled"
             );
 
-            Ok(Some(
-                Arc::new(FoyerHybridCache::new_with_cache(cache)) as Arc<dyn DbCache>
-            ))
+            let db_cache =
+                Arc::new(FoyerHybridCache::new_with_cache(cache.clone())) as Arc<dyn DbCache>;
+            Ok(Some(ManagedBlockCache {
+                db_cache,
+                hybrid: cache,
+            }))
         }
     }
 }

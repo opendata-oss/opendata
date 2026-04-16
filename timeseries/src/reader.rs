@@ -144,7 +144,7 @@ impl QueryReader for ReaderQueryReader {
 /// let result = reader.query("rate(http_requests_total[5m])", None).await?;
 /// ```
 pub struct TimeSeriesDbReader {
-    pub(crate) storage: Arc<dyn StorageRead>,
+    storage: Arc<dyn StorageRead>,
     /// LRU cache for read-only query buckets.
     query_cache: Cache<TimeBucket, Arc<MiniQueryReader>>,
 }
@@ -184,6 +184,12 @@ impl TimeSeriesDbReader {
             storage,
             query_cache,
         }
+    }
+
+    /// Returns a read handle to the underlying storage, for background tasks
+    /// like the cache warmer.
+    pub(crate) fn storage_read(&self) -> Arc<dyn StorageRead> {
+        self.storage.clone()
     }
 
     /// Get a cached bucket reader, loading from storage if needed.
