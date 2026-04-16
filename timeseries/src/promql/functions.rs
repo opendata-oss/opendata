@@ -722,6 +722,7 @@ impl FunctionRegistry {
         );
 
         // Range vector functions
+        functions.insert("increase".to_string(), Box::new(IncreaseFunction));
         functions.insert("rate".to_string(), Box::new(RateFunction));
         functions.insert("sum_over_time".to_string(), Box::new(SumOverTimeFunction));
         functions.insert("avg_over_time".to_string(), Box::new(AvgOverTimeFunction));
@@ -1071,6 +1072,29 @@ fn extrapolated_increase(series: &EvalSamples) -> Option<f64> {
 
     result *= factor;
     Some(result)
+}
+
+/// Increase function: total increase for counters over the range.
+struct IncreaseFunction;
+
+impl PromQLFunction for IncreaseFunction {
+    fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<Vec<EvalSample>> {
+        let samples = arg.into_range_vector()?;
+        let mut result = Vec::with_capacity(samples.len());
+
+        for sample_series in samples {
+            if let Some(increase) = extrapolated_increase(&sample_series) {
+                result.push(EvalSample {
+                    timestamp_ms: eval_timestamp_ms,
+                    value: increase,
+                    labels: sample_series.labels,
+                    drop_name: false,
+                });
+            }
+        }
+
+        Ok(result)
+    }
 }
 
 /// Rate function: calculates per-second rate of change for range vectors
@@ -3159,10 +3183,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn should_skip_series_with_insufficient_samples() {
+    #[rstest]
+    #[case::rate("rate")]
+    #[case::increase("increase")]
+    fn should_skip_series_with_insufficient_samples(#[case] func_name: &str) {
         let registry = FunctionRegistry::new();
-        let func = registry.get_range_function("rate").unwrap();
+        let func = registry.get_range_function(func_name).unwrap();
 
         // Create sample series with only one point
         let samples = vec![create_eval_samples_with_range(
@@ -3447,11 +3473,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn should_skip_zero_interval_series_in_rate() {
+    #[rstest]
+    #[case::rate("rate")]
+    #[case::increase("increase")]
+    fn should_skip_zero_interval_series(#[case] func_name: &str) {
         // given
         let registry = FunctionRegistry::new();
-        let func = registry.get_range_function("rate").unwrap();
+        let func = registry.get_range_function(func_name).unwrap();
 
         // Two samples at the same timestamp (sampled_interval = 0), so series skipped
         let samples = vec![create_eval_samples_with_range(
@@ -3466,6 +3494,313 @@ mod tests {
 
         // then
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn should_apply_increase_function() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("increase").unwrap();
+
+        let mut labels = HashMap::new();
+        labels.insert("job".to_string(), "test".to_string());
+
+        // Create sample series with increasing counter values
+        let samples = vec![create_eval_samples_with_range(
+            vec![
+                (1000, 100.0), // t=1s, value=100
+                (2000, 110.0), // t=2s, value=110
+                (3000, 125.0), // t=3s, value=125
+            ],
+            labels.clone(),
+            2000,
+            3000,
+        )];
+
+        // 2s range, samples sit exactly at the window edges.
+        // increase = 125 - 100 = 25
+        // No extrapolation needed (samples at boundaries).
+        let result = func.apply(samples, 3000).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 25.0);
+        assert_eq!(result[0].timestamp_ms, 3000);
+        assert_eq!(result[0].labels, labels);
+    }
+
+    #[test]
+    fn should_handle_counter_reset_in_increase() {
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("increase").unwrap();
+
+        // Create sample series with counter reset (value goes down)
+        let samples = vec![create_eval_samples_with_range(
+            vec![
+                (1000, 100.0), // t=1s, value=100
+                (2000, 50.0),  // t=2s, value=50 (counter reset)
+            ],
+            HashMap::new(),
+            1000,
+            2000,
+        )];
+
+        // 1s range, samples sit exactly at the window edges.
+        // increase = (50 - 100) + 100 = 50 (counter reset correction)
+        let result = func.apply(samples, 2000).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 50.0);
+    }
+
+    #[test]
+    fn should_handle_multiple_counter_resets_in_increase() {
+        // given
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("increase").unwrap();
+
+        // Sequence: [1, 5, 2, 4, 1, 3, 6] with 1s intervals and two resets
+        let samples = vec![create_eval_samples_with_range(
+            vec![
+                (1000, 1.0),
+                (2000, 5.0),
+                (3000, 2.0),
+                (4000, 4.0),
+                (5000, 1.0),
+                (6000, 3.0),
+                (7000, 6.0),
+            ],
+            HashMap::new(),
+            6000,
+            7000,
+        )];
+
+        // when
+        // 6s range, samples sit exactly at the window edges.
+        // increase = (6 - 1) + 5 + 4 = 14
+        let result = func.apply(samples, 7000).unwrap();
+
+        // then
+        assert_eq!(result.len(), 1);
+        assert!(
+            (result[0].value - 14.0).abs() < 1e-10,
+            "expected 14.0, got {}",
+            result[0].value
+        );
+    }
+
+    #[rstest]
+    // In all cases, the samples are (1s, 10), (2s, 20), (3s, 30), (4s, 40).
+    // Sample interval is 3s ([1s, 4s]) and raw increase is 40 - 10 = 30.
+    // Extrapolation threshold = avg_duration_between_samples * 1.1 = 1.1s
+    // Counter zero-point: duration_to_zero = first / rate = 10.0 / 10.0 = 1.0s
+    //
+    // Case 1: Window [0s, 4s].
+    // duration_to_start = 1s (< 1.1 => extrapolate to boundary)
+    // duration_to_end = 0s
+    // duration_to_zero (1.0) == duration_to_start (1.0), so no change to duration_to_start
+    // factor = (3.0 + 1.0 + 0.0) / 3.0 = 4/3
+    // result = 30.0 * (4/3) = 40.0
+    #[case::start_only(4000, 4000, 40.0)]
+    // Case 2: Window [1s, 5s].
+    // duration_to_start = 0s
+    // duration_to_end = 5 - 4 = 1s (< 1.1 => extrapolate to boundary)
+    // factor = (3.0 + 0.0 + 1.0) / 3.0 = 4/3
+    // result = 30.0 * (4/3) = 40.0
+    #[case::end_only(4000, 5000, 40.0)]
+    // Case 3: Window [0s, 5s].
+    // duration_to_start = 1s (< 1.1 => extrapolate to boundary)
+    // duration_to_end = 5 - 4 = 1s (< 1.1 => extrapolate to boundary)
+    // duration_to_zero (1.0) == duration_to_start (1.0), so no change to duration_to_start
+    // factor = (3.0 + 1.0 + 1.0) / 3.0 = 5/3
+    // result = 30.0 * (5/3) = 50.0
+    #[case::both_sides(5000, 5000, 50.0)]
+    fn should_extrapolate_increase_to_window_boundaries(
+        #[case] range_ms: i64,
+        #[case] range_end_ms: i64,
+        #[case] expected: f64,
+    ) {
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("increase").unwrap();
+
+        // given
+        let samples = vec![create_eval_samples_with_range(
+            vec![(1000, 10.0), (2000, 20.0), (3000, 30.0), (4000, 40.0)],
+            HashMap::new(),
+            range_ms,
+            range_end_ms,
+        )];
+
+        // when
+        let result = func.apply(samples, range_end_ms).unwrap();
+
+        // then
+        assert_eq!(result.len(), 1);
+        assert!(
+            (result[0].value - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            result[0].value
+        );
+    }
+
+    #[rstest]
+    // In all cases, the samples are (4s, 10), (5s, 20), (6s, 30)
+    // Sample interval is 2s ([4s, 6s]) and raw increase is 30 - 10 = 20.
+    // Extrapolation threshold = avg_duration_between_samples * 1.1 = 1.1s.
+    // Clamped extrapolation duration = 1.0s / 2 = 0.5s.
+    // Counter zero-point: duration_to_zero = first / rate = 10.0 / 10.0 = 1.0s
+    //
+    // Case 1: Window [0s, 7s].
+    // duration_to_start = 4s (> 1.1 => extrapolate to 0.5s)
+    // duration_to_end = 1s (< 1.1 => extrapolate to boundary)
+    // duration_to_zero (1s) > 0.5, so no change to clamped extrapolation duration
+    // factor = (2.0 + 0.5 + 1.0) / 2.0 = 3.5 / 2.0 = 1.75
+    // result = 20.0 * 1.75 = 35.0
+    #[case::start_clamped_end_extrapolated(7000, 7000, 35.0)]
+    // Case 2: Window [3s, 10s].
+    // duration_to_start = 1s (< 1.1 => extrapolate to boundary)
+    // duration_to_end = 4s (> 1.1 => extrapolate to 0.5s)
+    // duration_to_zero (1s) == duration_to_start, so no change to duration_to_start
+    // factor = (2.0 + 1.0 + 0.5) / 2.0 = 3.5 / 2.0 = 1.75
+    // result = 20.0 * 1.75 = 35.0
+    #[case::end_clamped_start_extrapolated(7000, 10000, 35.0)]
+    // Case 3: Window [0s, 10s].
+    // duration_to_start = 4s (> 1.1 => extrapolate to 0.5s)
+    // duration_to_end = 4s (> 1.1 => extrapolate to 0.5s)
+    // duration_to_zero (1s) > 0.5, so no change to clamped extrapolation duration
+    // factor = (2.0 + 0.5 + 0.5) / 2.0 = 3.0 / 2.0 = 1.5
+    // result = 20.0 * 1.5 = 30.0
+    #[case::both_sides_clamped(10000, 10000, 30.0)]
+    // Case 4: Window [0s, 6s].
+    // duration_to_start = 4s (> 1.1 => extrapolate to 0.5s)
+    // duration_to_end = 0s (exactly at boundary, no extrapolation)
+    // duration_to_zero (1s) > 0.5, so no change to clamped extrapolation duration
+    // factor = (2.0 + 0.5 + 0.0) / 2.0 = 2.5 / 2.0 = 1.25
+    // result = 20.0 * 1.25 = 25.0
+    #[case::start_clamped_end_at_boundary(6000, 6000, 25.0)]
+    // Case 5: Window [4s, 10s].
+    // duration_to_start = 0s (exactly at boundary, no extrapolation)
+    // duration_to_end = 4s (> 1.1 => extrapolate to 0.5s)
+    // factor = (2.0 + 0.0 + 0.5) / 2.0 = 2.5 / 2.0 = 1.25
+    // result = 20.0 * 1.25 = 25.0
+    #[case::start_at_boundary_end_clamped(6000, 10000, 25.0)]
+    fn should_limit_extrapolation_in_increase_when_samples_far_from_boundary(
+        #[case] range_ms: i64,
+        #[case] range_end_ms: i64,
+        #[case] expected: f64,
+    ) {
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("increase").unwrap();
+
+        let samples = vec![create_eval_samples_with_range(
+            vec![(4000, 10.0), (5000, 20.0), (6000, 30.0)],
+            HashMap::new(),
+            range_ms,
+            range_end_ms,
+        )];
+
+        // when
+        let result = func.apply(samples, range_end_ms).unwrap();
+
+        // then
+        assert_eq!(result.len(), 1);
+        assert!(
+            (result[0].value - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            result[0].value
+        );
+    }
+
+    #[test]
+    fn should_extrapolate_increase_with_counter_reset() {
+        // given
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("increase").unwrap();
+
+        let samples = vec![create_eval_samples_with_range(
+            vec![
+                (1000, 10.0),
+                (2000, 20.0),
+                (3000, 5.0), // counter reset
+                (4000, 15.0),
+            ],
+            HashMap::new(),
+            5000,
+            5000,
+        )];
+
+        // when
+        // Window: [0s, 5s], eval at 5s
+        let result = func.apply(samples, 5000).unwrap();
+
+        // then
+        assert_eq!(result.len(), 1);
+
+        // Counter reset correction: increase = (15 - 10) + 20 = 25
+        // sampled interval = 3s, avg_duration_between_samples = 1s, threshold = 1.1s
+        // duration_to_start = 1.0s (< 1.1, extrapolate to boundary)
+        // duration_to_end = 1.0s (< 1.1, extrapolate to boundary)
+        // Counter zero-point: duration_to_zero = 3.0 * (10.0 / 25.0) = 1.2s
+        // duration_to_zero (1.2) > duration_to_start (1.0), so no change to duration_to_start
+        // factor = (3.0 + 1.0 + 1.0) / 3.0 = 5/3
+        // result = 25.0 * (5/3) = 125/3
+        let expected = 125.0 / 3.0;
+        assert!(
+            (result[0].value - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            result[0].value
+        );
+    }
+
+    #[rstest]
+    // In both cases, the samples are (1s, 1.0), (4s, 10.0)
+    // Sample interval is 3s ([1s, 4s]) and raw increase is 10 - 1 = 9.
+    // Extrapolation threshold = avg_duration_between_samples * 1.1 = 3.3s.
+    // Clamped extrapolation duration = 3.0s / 2 = 1.5s.
+    // Counter zero-point: duration_to_zero = first / rate = 1.0 / 3.0 = (1/3)s
+    //
+    // Case 1: Window [0s, 4s] - test zero guard fires when start extrapolated to boundary
+    // duration_to_start = 1s (< 3.3 => extrapolate to boundary)
+    // duration_to_end = 0s (exactly at boundary, no extrapolation)
+    // duration_to_zero (1/3) < 1, so limit extrapolation to (1/3)s
+    // factor = (3.0 + (1/3) + 0.0) / 3.0 = 10/9
+    // result = 9.0 * (10/9) = 10.0
+    #[case::start_extrapolated(4000, 4000, 10.0)]
+    // Case 2: Window [-5s, 4s] - test zero guard clamps when start extrapolated to avg_duration / 2
+    // duration_to_start = 9s (> 3.3 => extrapolate to 1.5s)
+    // duration_to_end = 0s (exactly at boundary, no extrapolation)
+    // duration_to_zero (1/3) < 1.5, so limit extrapolation to (1/3)s
+    // factor = (3.0 + (1/3) + 0.0) / 3.0 = 10/9
+    // result = 9.0 * (10/9) = 10.0
+    #[case::start_clamped(9000, 4000, 10.0)]
+    fn should_apply_increase_zero_point_counter_guard(
+        #[case] range_ms: i64,
+        #[case] range_end_ms: i64,
+        #[case] expected: f64,
+    ) {
+        // given
+        let registry = FunctionRegistry::new();
+        let func = registry.get_range_function("increase").unwrap();
+
+        let samples = vec![create_eval_samples_with_range(
+            vec![(1000, 1.0), (4000, 10.0)],
+            HashMap::new(),
+            range_ms,
+            range_end_ms,
+        )];
+
+        // when
+        let result = func.apply(samples, range_end_ms).unwrap();
+
+        // then
+        assert_eq!(result.len(), 1);
+        assert!(
+            (result[0].value - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            result[0].value
+        );
     }
 
     // Property-based tests using proptest

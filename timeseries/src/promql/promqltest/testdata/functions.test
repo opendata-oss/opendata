@@ -134,6 +134,8 @@ eval instant at 15m changes(x[20m])
 
 clear
 
+resume
+
 # Tests for increase().
 load 5m
 	http_requests_total{path="/foo"}	0+10x10
@@ -174,8 +176,6 @@ eval instant at 30m increase(http_requests_total[30m])
     {path="/foo"} 7
 
 clear
-
-resume
 
 # Tests for rate().
 load 5m
