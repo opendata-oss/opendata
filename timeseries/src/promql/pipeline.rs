@@ -162,7 +162,7 @@ impl QueryPlan {
     ) -> Self {
         let end_ms = adjusted_eval_ts_ms;
         let start_ms = end_ms - lookback_delta_ms;
-        buckets.sort_by(|a, b| b.start.cmp(&a.start)); // newest first
+        buckets.sort_by_key(|b| std::cmp::Reverse(b.start)); // newest first
         QueryPlan {
             sample_start_ms: start_ms,
             sample_end_ms: end_ms,
@@ -182,7 +182,7 @@ impl QueryPlan {
     ) -> Self {
         let end_ms = adjusted_eval_ts_ms;
         let start_ms = end_ms - range_ms;
-        buckets.sort_by(|a, b| a.start.cmp(&b.start)); // chronological
+        buckets.sort_by_key(|a| a.start); // chronological
         buckets.retain(|bucket| {
             let bucket_start_ms = (bucket.start as i64) * 60 * 1000;
             let bucket_end_ms = bucket_start_ms + (bucket.size_in_mins() as i64) * 60 * 1000;
@@ -216,7 +216,7 @@ impl QueryPlan {
                 lookback_delta_ms,
             );
         let range_ms = subquery_end_ms - subquery_start_ms;
-        buckets.sort_by(|a, b| b.start.cmp(&a.start)); // newest first
+        buckets.sort_by_key(|b| std::cmp::Reverse(b.start)); // newest first
         QueryPlan {
             sample_start_ms: range_start_ms,
             sample_end_ms: range_end_ms,

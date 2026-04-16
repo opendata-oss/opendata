@@ -158,7 +158,7 @@ impl SplitCentroids {
                 .into_iter()
                 .filter(|(_k, v)| *v >= self.opts.split_threshold_vectors as u64)
                 .collect();
-            to_split.sort_by(|a, b| b.1.cmp(&a.1));
+            to_split.sort_by_key(|b| std::cmp::Reverse(b.1));
             to_split.truncate(self.max_splits);
             if to_split.is_empty() {
                 return Ok(SplitCentroidsResult {
