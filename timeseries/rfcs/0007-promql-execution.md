@@ -1,61 +1,82 @@
-# RFC 007: PromQL Execution Engine
+# RFC 0007: PromQL Execution Engine — Requirements & Architecture
 
 **Status**: Draft
-**Authors**: [Almog Gavra](https://github.com/agavra)
+**Authors**: Almog Gavra <almog@responsive.dev>
 
 ## Summary
 
-This RFC proposes a rewrite of the core query execution pipeline:
-
-- **Columnar**: sample values flow between operators in dense `f64` batches paired with a
-  validity bitset for absent samples, instead of per-series `Vec<Sample>`s.
-- **Step-major**: query intermediate state is a 2D grid indexed by (step, series), stored row by row
-  so all series at one step are contiguous in memory. Aggregations and binary ops walk that row.
-  Contrast this with the existing series-major representation, where the data is indexed by 
-  (series, step).
-- **Pull-based operator pipeline**: a parent operator polls its child for the next batch, which
-  pipelines I/O and CPU instead of materialising intermediate results.
-- **Explicit logical and physical planning**: the logical tree is rewritable (what `EXPLAIN`
-  prints); the physical tree is what the executor runs.
+Rewrite the PromQL evaluation path — from HTTP entry through storage access — as a **columnar,
+step-major, pull-based operator pipeline**. The current implementation (`promql/evaluator.rs`,
+`promql/pipeline.rs`) is a row-oriented AST interpreter that re-walks the tree per step. The
+prototype on `full_hot_opt_prototype` demonstrates a 2x-shape fast path that pre-materializes
+samples into `StepBlock`s; it is correct in principle but grafted onto the old path, resulting in
+duplicate entry points, hardcoded aggregation ops, and no fallback design. This RFC defines the
+contracts and shape of a single, unified engine that replaces both.
 
 ## Motivation
 
-There are the following problems in the original implementation:
+Concrete problems in the current code (`main`):
 
-1. **Per-Step Repeated Work:** the implementation loops on every step during the query’s effective
-   range and re-runs the evaluator evaluation. This pipeline does not properly amortize repeated
-   work like label hashing, metadata lookups and per-series iteration. We papered over some of this
-   using intra-query caches, but this fix was imperfect.
-2. **Row-Oriented Computation:** the data model stored samples keyed by label. This meant that
-   each step evaluation would binary search for the closest matching sample (in the step’s
-   neighborhood according to lookback window), and perform an indexed array lookup. This not only
-   repeats work that is unnecessary for every step of evaluation it also is extremely inefficient
-   for memory cache lines.
-3. **Concurrency Is Implicit:** there is parallelism encoded within the data fetching using the
-   semaphores, but the actual computation is serial and there is no easy way to speed that up.
-4. **No Physical Planning Stage:** this not only makes it difficult to hook in optimizations like
-   projection pushdown or range coalescing into SlateDB if/when we support that but it also makes it
-   harder in the future for us to add things like a fan-out, multi-node query engine.
+1. **Per-step AST re-evaluation.** `tsdb.rs:317` loops `while current_time <= end` and re-runs
+   `evaluator.evaluate()` per step. Selector pipeline repeats; label hashing, metadata lookups,
+   and per-series iteration all amortize poorly.
+2. **Row-oriented data.** `EvalSample { timestamp, value, labels: HashMap<String,String> }` carries
+   a heap-allocated label map per sample. Binary ops and aggregations allocate per step.
+3. **Unclear pipeline boundary.** Selector caching lives in `evaluator.rs::SelectorCacheKey`,
+   orchestration in `pipeline.rs::resolve_selector_candidates`. Fingerprint computation duplicated.
+4. **Hot-path prototype is a special case.** `detect_fast_path_shape` matches exactly
+   `VectorSelector` or `Aggregate(Sum|Avg|Min|Max|Count)(VectorSelector)`. Everything else falls
+   through to the old path. No shared abstractions.
+5. **No physical plan.** There is nowhere to hook optimizations (projection pushdown into storage,
+   common-subexpression elimination, step-batch coalescing) or distributed rewrite.
+6. **Concurrency is implicit.** `metadata_semaphore`/`sample_semaphore` serialize I/O inside a
+   query but there is no per-operator parallelism.
 
-The new proposed pipeline brings `timeseries` closer to the SOTA implementation for query
-evaluation.
+The rewrite should make the fast-path behavior the *only* path, and extend it uniformly to every
+PromQL construct.
 
 ## Goals
 
-- One execution model for instant and range queries
-- Columnar, step-major data flow from storage to result
-- Explicit physical plan with a small and testable operator set
-- Pipelined execution with async operators so we can stream a single query and saturate both CPU and
-  I/O
+- One execution model for instant and range queries, all expression types.
+- Columnar, step-batched data flow from storage to result.
+- Explicit physical plan with a small, testable operator set.
+- Pluggable storage contract that can push down selector, time range, and step hints.
+- Per-operator async streaming so a single query can saturate CPU and I/O.
+- Memory-accounted; large queries degrade gracefully rather than OOM.
 
 ## Non-Goals
 
-- Distributed execution
-- Cost-based optimizations
-- PromQL language extensions
-- Native Histograms
+- Distributed execution across nodes (design the contract so it's addable later; don't build it).
+- Cost-based optimization (rule-based only for now).
+- PromQL language extensions.
+- Reworking the storage layer itself (SlateDB, inverted/forward indexes, Gorilla decoding).
+- **Native histograms.** v1 handles floats only. Mixed float/histogram series and histogram
+  aggregation are out of scope and would extend the batch ABI in a follow-up RFC.
+- Writer-side metadata propagation or cache warming (warmer was removed in the prototype; revisit
+  separately).
 
-## Architecture
+## Prior Art
+
+**VictoriaMetrics** — flat step-major columnar. `timeseries{Values[N], Timestamps[N]}` with one
+shared timestamp slice per scope. A unified rollup abstraction collapses every windowed function
+(`rate`, `*_over_time`, ...) into one two-pointer driver. AST-level optimizer, no plan IR.
+
+**Prometheus stock** — row-major, per-step AST walk. Fully materializes selectors before stepping.
+Single-goroutine per query. The anti-example.
+
+**thanos-io/promql-engine** — pull-based Volcano operators over "step vectors". `Series()` is
+pre-computed per operator so aggregate state is dense-array indexed, not map-keyed. Separate
+exchange operators (`coalesce`, `concurrent`, `remote_exec`).
+
+**DataFusion / DuckDB** — pull-based async streams over typed batches; schema fixed at plan time.
+Ref-counted Arrow buffers for zero-copy slicing. Explicit pipeline-breaker vs pipelineable
+operator distinction.
+
+**Biggest borrows**: VM's rollup abstraction, thanos-io's pre-computed schema + pull-based
+operators, DataFusion's operator-trait shape. **Biggest avoid**: Prometheus' step-major loop
+around a recursive evaluator; monolithic `eval.go`-style match tables.
+
+## Architecture Overview
 
 ```
 HTTP / embedded API
@@ -66,7 +87,7 @@ HTTP / embedded API
 └──────┬────────────┘
        ▼
 ┌───────────────────┐     AST rewrites: constant fold, label pushdown,
-│    Logical Plan   │     CSE
+│    Logical Plan   │     CSE, distributed markers (future)
 │    + Optimizer    │
 └──────┬────────────┘
        ▼
@@ -84,104 +105,13 @@ HTTP / embedded API
 └───────────────────┘
 ```
 
-The EXPLAIN examples below walk a concrete query through the planning half of the pipeline.
+Every stage is a separate module with a crisp contract. Today all of this is tangled inside
+`evaluator.rs` + `pipeline.rs`.
 
-## Planning Stage
+## Core Data Model
 
-Planning is split into three passes with a hard boundary between logical and physical:
-
-1. `Expr → LogicalPlan` — binding: lowers the parser AST into a typed logical tree, attaching
-   query-level context (step grid, lookback, storage handles).
-2. `LogicalPlan → LogicalPlan` — optimization: a rewritable pass for constant folding, CSE,
-   label pushdown, etc. The current optimizer is intentionally minimal.
-3. `LogicalPlan → PhysicalPlan` — compilation: resolves storage, binds the series roster, and
-   emits the operator tree the executor runs.
-
-Everything that wants to inspect, modify, or explain a query touches `LogicalPlan`; once we
-cross into physical, the tree is opaque and only the executor talks to it.
-
-We introduce a dedicated logical plan instead of reusing the AST module we depend on because it
-allows us to attach information such as the query’s timestamps and reinterpret concepts in more
-structure form. The conversion is pretty minor, though it also enables us to power `EXPLAIN`
-queries.
-
-The physical plan is a tree of `Operators` that are each individually testable and have the same
-input/output types (defined below).
-
-## Physical Plan Execution
-
-### Operator Trait
-
-Every node in the physical tree implements `Operator`. It is pull-based and object-safe so the
-planner can build `Box<dyn Operator>` trees without monomorphising over every combination.
-
-```rust
-pub trait Operator: Send {
-    fn schema(&self) -> &OperatorSchema;
-    fn next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<StepBatch, QueryError>>>;
-}
-```
-
-- `schema()` is callable before any `next()` so downstream operators can size buffers and
-  precompute state up front.
-- `next()` returning `Ready(None)` is terminal — callers must not poll again.
-- Each operator owns its own iteration cursor, which is how e.g. `VectorSelectorOp` knows which
-  slice of its resolved series/step tile to emit on each call.
-
-The executor drives the query by polling the root operator in a loop until it yields `None`.
-
-Range-vector producers (`MatrixSelectorOp`, `SubqueryOp`) use a parallel trait, `WindowStream`,
-whose `poll_windows` returns a `MatrixWindowBatch` instead of a `StepBatch`. `RollupOp` is the
-only consumer. See [Range-Vector Batches](#range-vector-batches).
-
-### Core Data Model
-
-Operators communicate exclusively through `StepBatch`: a contiguous range of output steps for a
-contiguous chunk of series, stored columnar. Every operator's `next()` returns a `StepBatch`;
-nothing else crosses an operator boundary. This data model gives us two major benefits:
-
-1. It is columnar with a step-major, series-minor format which allows us to quickly compute
-   aggregations within a single time-step.
-2. It is chunked, allowing us to pipeline and stripe execution across both dimensions (time and
-   labels).
-
-```
-StepBatch  (step_range = 2..6, series_range = 1..4)
-──────────────────────────────────────────────────────────────────
-
-step_timestamps: Arc<[i64]>      series: Arc<SeriesSchema>
-┌──────┐                         ┌────────────────┐
-│ t₀   │                         │ 0: {job=api}   │
-│ t₁   │                         ├────────────────┤
-├──────┤ ◄─ step_range.start=2   │ 1: {job=web}   │ ◄─ series_range.start=1
-│ t₂   │                         │ 2: {job=db}    │
-│ t₃   │                         │ 3: {job=cache} │
-│ t₄   │                         ├────────────────┤
-│ t₅   │                         │ 4: {job=edge}  │ ◄─ series_range.end=4
-├──────┤ ◄─ step_range.end=6     │ 5: {job=lb}    │
-│ t₆   │                         └────────────────┘
-│ t₇   │                         (fixed at plan time)
-└──────┘
-
-           web         db          cache
-         ┌──────────┬──────────┬──────────┐
-    t₂   │ 12.3  ✓  │  —    ✗  │  7.1  ✓  │
-         ├──────────┼──────────┼──────────┤
-    t₃   │ 12.9  ✓  │ 44.0  ✓  │  7.4  ✓  │
-         ├──────────┼──────────┼──────────┤
-    t₄   │ 13.1  ✓  │ 45.2  ✓  │  —    ✗  │
-         ├──────────┼──────────┼──────────┤
-    t₅   │ 13.4  ✓  │ 46.0  ✓  │  7.8  ✓  │
-         └──────────┴──────────┴──────────┘
-```
-
-Each batch is a rectangle of `K series × N steps`. Default `N ≈ 64`, `K ≈ 512` giving a ~256 KB
-working set that stays in L2. Both step-wise ops (`sum by` across series at one step) and time-wise
-ops (`rate` across steps of one series) have cache-friendly traversal. Operators that need the other
-axis insert a `Rechunk` breaker.
-
-Here is the actual struct. Note that we use validity bitsets to distinguish between 0/null
-values.
+The universal on-the-wire shape between operators is a **StepBatch**: a contiguous range of
+output steps for a contiguous chunk of series, columnar.
 
 ```rust
 struct StepBatch {
@@ -200,360 +130,258 @@ struct StepBatch {
 }
 ```
 
-The `SeriesSchema` is constant for the lifetime of a single query. It is built once and contains
-the full roster of series that the query touches, allowing operators to reference them by index
-instead of re-hashing labels. Series are indexed globally by fingerprint across all buckets the
-query touches — identical labels in two buckets collapse to one entry.
+Histograms are deliberately out of scope for v1 (see Non-Goals). When added, this struct
+becomes an enum with a `Float`/`Histogram`/`Mixed` discriminant, or the column layout splits
+into parallel float and histogram arrays mirroring Prometheus' `FPoint`/`HPoint` split.
+
+**Shape choice.** Each batch is a rectangle of `K series × N steps`. Default `N ≈ 64`,
+`K ≈ 512` giving a ~256 KB working set that stays in L2. Both step-wise ops (`sum by` across
+series at one step) and time-wise ops (`rate` across steps of one series) have cache-friendly
+traversal. Operators that need the other axis insert a `Rechunk` breaker.
+
+**Series schema is plan-time, with one named exception.** Each operator exposes
+`fn series(&self) -> SchemaRef` before `next()` is called. `SchemaRef` is
+`Static(Arc<SeriesSchema>)` for every operator except `count_values`, whose output labelset is
+derived from runtime sample values (see `promqltest/testdata/aggregators.test:480`).
+`count_values` returns `Deferred` — a pipeline-breaker that drains its child, discovers the
+output labelset, then emits with a fixed schema for the rest of execution. Downstream operators
+treat `Deferred` as "schema known after my child's first batch." This is the only PromQL
+construct with value-dependent output labels; `label_replace`/`label_join` are deterministic
+from input labels and do not need this mechanism.
+
+This unlocks dense-array aggregation state keyed by `series_idx: u32` rather than
+`HashMap<Labels, State>`. Group maps for `sum by (label)` are computed once in the physical plan.
+
+**Timestamps shared.** `step_timestamps` is one `Arc<[i64]>` per query, pointer-copied into every
+batch. Mirrors VictoriaMetrics' design; eliminates per-batch timestamp allocation.
+
+**Instant queries are a range of one step.** No separate code path; the executor treats instant as
+`steps.len() == 1`. Removes the `InstantVector` vs `RangeVector` duality that bleeds through the
+current code.
+
+## Operator Taxonomy
+
+Small, fixed set. Each operator is a `trait Operator` that pulls from children.
+
+| Operator | Role | Breaking |
+|---|---|---|
+| `VectorSelector` | Leaf. Opens storage cursor; one sample per series per step via lookback. | No |
+| `MatrixSelector` | Leaf. Sliding lookback window per step for rollup functions. | No |
+| `Rollup` | Unified range-function driver (rate, increase, `*_over_time`, ...). | No |
+| `InstantFn` | Pointwise scalar functions (abs, ln, clamp, histogram_quantile, ...). | No |
+| `Binary` | Vector/vector or vector/scalar binop. Pre-computed series matching. | No |
+| `Aggregate` | sum/avg/min/max/count/stddev/topk/bottomk/quantile by labels. | partial |
+| `Subquery` | Re-grids child onto inner step; feeds outer MatrixSelector semantics. | Yes |
+| `Rechunk` | Transposes series-major ↔ step-major when ops need the other axis. | Yes |
+| `CountValues` | Data-dependent schema. Drains child, emits with runtime-derived labelset. | Yes |
+| `Concurrent` | Producer/consumer decoupling with a bounded mpsc channel. | No |
+| `Coalesce` | Fan-in: merges parallel child streams that share schema. | No |
+
+`Aggregate` with `topk`/`bottomk`/`quantile` buffers a whole step before emitting; `sum`/`avg`/etc.
+are streaming. Group maps and series matching are computed at plan time and reused for every
+batch — both are invariant across steps.
+
+Explicitly *not* operators: HTTP marshaling, caching (handled at query-entry boundary),
+result shape (`QueryValue`) construction.
+
+## Storage Contract
+
+Replaces the current `QueryReader` trait. **Storage is PromQL-unaware** — it resolves selectors
+to series metadata and streams raw samples over an absolute time range. Lookback delta, `@`,
+`offset`, step alignment, and rollup semantics all live in the operators (`VectorSelector`,
+`MatrixSelector`, `Rollup`). A previous draft pushed step-grid and `func` hints into the source;
+that was a soundness hole — `@ start()`/`@ end()` inside subqueries and range queries
+(see current special-case handling at `evaluator.rs:5988`) would require re-implementing the
+evaluator inside every storage backend. The source's job is bytes → samples.
 
 ```rust
-struct SeriesSchema {
-    // Parallel arrays indexed by `series_idx: u32`. Length = total series in the query.
-    labels: Arc<[Labels]>,                // one Labels per series
-    fingerprints: Arc<[u128]>,            // stable cross-bucket fingerprint per series
+trait SeriesSource {
+    // Resolve selector → series metadata. Streamed per bucket. Includes a
+    // cardinality estimate up front so the planner can reject oversized
+    // queries before materializing sample state.
+    fn resolve(&self, selector: &VectorSelector, time_range: TimeRange)
+        -> impl Stream<Item = Result<ResolvedSeriesChunk>>;
+
+    fn estimate_cardinality(&self, selector: &VectorSelector, time_range: TimeRange)
+        -> impl Future<Output = Result<CardinalityEstimate>>;
+
+    // Stream raw samples for a resolved series set over an absolute time
+    // range. No step, no lookback, no rollup. One series id → dense column.
+    fn samples(&self, hint: SampleHint) -> impl Stream<Item = Result<SampleBatch>>;
+}
+
+struct SampleHint {
+    series: Arc<[ResolvedSeriesRef]>,
+    time_range: TimeRange,                // inclusive-exclusive, absolute ms
+    // No step, lookback, @, offset, or func. Those are executor concerns.
 }
 ```
 
-### Range-Vector Batches
+**Contract (caller → source):**
+- `series` is the complete set after selector resolution; source does not widen.
+- `time_range` is the absolute ms window the caller needs; it already accounts for the maximum
+  lookback / offset / subquery shift applied by the downstream operator.
 
-`StepBatch` holds one `f64` per `(step, series)` cell, which is the right shape for instant
-vectors but can't represent a range vector (which is a *list* of samples per cell). Range-vector
-producers — `MatrixSelectorOp` and `SubqueryOp` — emit a different envelope,
-`MatrixWindowBatch`, and communicate through the parallel `WindowStream` trait introduced above.
+**Contract (source → caller):**
+- Output batches carry a `series_range` covering a contiguous slice of the input series.
+- Samples are returned in timestamp order per series, with exact timestamps (no re-alignment).
+- Stale markers are preserved as `STALE_NAN`; the caller distinguishes them.
 
-`RollupOp` is the only consumer: it pairs with a range-vector child and reduces each window
-down to a single float per cell, re-emitting as a `StepBatch`. Since PromQL has no grammar
-that returns a raw range vector, `MatrixWindowBatch` never escapes to the result layer.
+**Optional pushdown, v2+.** Once v1 is measured, we may introduce a narrowly-scoped second
+method like `samples_rollup(hint, RollupKind, StepGrid)` for cases where the backend can
+compute rate/increase/avg_over_time cheaper than the executor (e.g., pre-aggregated downsamples).
+This must never replace the raw `samples()` path — it is a best-effort optimization the executor
+can fall back from.
 
-```
-StepBatch cell            MatrixWindowBatch cell
-───────────────────       ──────────────────────────────
-one f64 + validity        {offset, len} into flat (ts, val) pool
+The existing `BucketQueryReader` stays as an internal implementation detail of a `SeriesSource`
+that bridges to the per-bucket storage model. Cross-bucket stitching happens inside the source,
+not in the executor.
 
-  ─ values grid ─           ─ cells grid ─        ─ flat sample pool ─
-  ┌──┬──┬──┐                ┌──┬──┬──┐            [t0 t1 t2 t3 t4 ...]
-  │ 1│ 2│ 3│                │L1│L0│L2│            [v0 v1 v2 v3 v4 ...]
-  ├──┼──┼──┤                ├──┼──┼──┤
-  │ 4│ 5│ 6│                │L1│L1│L0│
-  └──┴──┴──┘                └──┴──┴──┘
-```
+## Execution Model
 
-`MatrixWindowBatch` carries the same `step_timestamps` / `series` / `step_range` / `series_range`
-header as `StepBatch`, plus three flat columns (`timestamps`, `values`, `cells`) and an optional
-`effective_times` slice for `@` / `offset` folding.
-
-**Known limitation.** A query whose root expression returns a range vector can't be answered
-today; the root operator is a `StepBatch` producer. Supporting this would require generalising
-the root's output type or reshaping `MatrixWindowBatch` at the result boundary; noted as future
-work.
-
-### Data Source / Storage API
-
-Storage talks to the engine through the `SeriesSource` trait:
+**Pull-based async streams.** Each operator implements:
 
 ```rust
-pub trait SeriesSource: Send + Sync {
-    fn resolve(
-        &self,
-        selector: &VectorSelector,
-        time_range: TimeRange,
-    ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send;
-
-    fn samples(
-        &self,
-        request: SamplesRequest,
-    ) -> impl Stream<Item = Result<SampleBatch, QueryError>> + Send;
+trait Operator: Send {
+    fn schema(&self) -> &OperatorSchema;   // series + step grid, known before execution
+    fn next(&mut self, cx: &mut Context) -> Poll<Option<Result<StepBatch>>>;
 }
 ```
 
-Both methods return `futures::Stream`s. A selector typically spans multiple storage buckets, and
-streaming lets the engine fan out across buckets and pipeline per-bucket results without waiting
-for the slowest one.
+**Single query drives the tree.** The executor pulls from root; inner ops pull from children.
+Back-pressure is implicit (downstream stops pulling). For I/O-bound leaves, the optimizer inserts
+`Concurrent` wrappers that spawn a task and return batches via a bounded channel.
 
-`resolve` is effectively an inverted-index lookup (matcher → series ids) followed by forward-index
-hydration (series id → labels, metric name), producing one chunk per storage bucket:
+**Parallelism.** Per-query parallelism comes from two sources:
+- `Concurrent` operators — decouple async I/O from evaluation.
+- `Coalesce` — run `N` copies of a subplan in parallel over disjoint series chunks (vertical
+  sharding within a single query), merging their outputs.
 
-```rust
-pub struct ResolvedSeriesChunk {
-    pub bucket_id: u64,
-    pub labels: Arc<[Labels]>,
-    pub series: Arc<[ResolvedSeriesRef]>,
-}
+The physical planner decides where to insert these based on series cardinality estimates. No
+implicit spawn-per-series; work is explicit.
 
-pub struct ResolvedSeriesRef {
-    pub bucket_id: u64,
-    pub series_id: u32,
-    pub metric_name: Arc<str>,
-}
-```
+**Memory accounting covers all per-query state**, not just `StepBatch` allocations. Every
+structure whose size scales with series cardinality or step count must reserve before
+allocating:
 
-The trait is deliberately PromQL-unaware: lookback deltas, offsets, step alignment, and rollup
-windows live in the leaf operators (`VectorSelector`, `MatrixSelector`), not in storage.
+- Series roster (`Arc<SeriesSchema>`) and per-series sample blocks built during Plan.
+- Group maps and binary-match tables computed at plan time from series labels.
+- Pipeline-breaker buffers (topk, quantile, `Rechunk`, `CountValues`).
+- Per-batch value/validity columns (the original scope).
 
-Storage is accessed both during planning and execution. In the planning phase,
-`build_physical_plan` walks the logical tree and, for each selector, calls `resolve(..)` and
-drains the resulting stream into the plan-time series roster (`Arc<SeriesSchema>`). This is the
-*only* place series identity is resolved; after this, operators index series by `u32` slot.
-`resolve` runs eagerly and synchronously with respect to physical-plan construction, so the
-planning time includes metadata latency.
+**Fail-fast cardinality gate.** Before materializing sample blocks, the planner calls
+`SeriesSource::estimate_cardinality()` for each selector. If `sum(resolved_series × steps)`
+exceeds a configurable threshold, the query rejects with `QueryError::TooLarge` before any
+heavy allocation. This catches the common "accidental high-cardinality match" case without
+waiting for the reservation to trip mid-execution.
 
-At execution time, `VectorSelector` and `MatrixSelector` call `samples(..)` with the
-pre-resolved series list and the absolute time window they need. `SampleBatch`es arrive on the
-returned stream and the leaf reshapes them into `StepBatch`es that the rest of the tree polls.
-No other operator communicates with the storage layer.
-
-### Concurrency & Parallelism
-
-There are a few areas where we can introduce parallelism and concurrency:
-
-**Inside the storage fetching.** Selectors typically span multiple storage buckets, and within a
-bucket the per-series reads are independent, so fan-out is safe at both granularities. The
-implementation uses a buffered stream with max concurrency 32 for both metadata and sample
-streams; the bound applies to whichever granularity the source chose to split work at. These
-constants mirror v1's `METADATA_STAGE_READAHEAD` / `SAMPLE_STAGE_READAHEAD` so observed
-concurrency is comparable.
-
-**Pipelining operator execution.** A selector leaf produces I/O-bound batches but downstream ops are
-CPU-bound. `ConcurrentOp` decouples them: the child runs on a spawned tokio task and pushes into a
-bounded mpsc channel (default bound = 4), giving implicit back-pressure since if the consumer
-stalls, the child blocks on `send`. The physical planner inserts one wrapper per selector leaf whose
-resolved series count is ≥ 64.
-
-**Vertical sharding.** We defer using the `Coalesce` operator in the initial implementation but the
-wiring is stubbed in `parallelism` and `coalesce_max_shards` defaults to `0`. Needs end-to-end
-correctness work (per-series independence above the leaf isn't free) before it's turned on.
-
-**No global permit layer.** v1 had a separate `QueryReaderEvalCache` metadata/sample semaphore
-throttling real I/O independent of scheduler readahead. v2 collapses that: the cross-bucket
-constants above are both scheduler and I/O ceiling. If we later find storage backends that need
-hard global throttling, it goes inside the `SeriesSource` implementation —
-`ObjectStore::LimitStore` already provides this out of the box and is the preferred knob,
-keeping the throttle at the storage layer instead of adding an engine-level semaphore.
-
-## Operators
-
-Each operator is a `trait Operator` that pulls from children when they are ready for their next
-batch of work (pulling is a blocking operation). Some operators are breaking, which means that any
-child operators must complete fully before they complete. Most queries will not have any breaking
-operators.
-
-| **Operator**     | **Role**                                                                  | **Breaking** |
-|------------------|---------------------------------------------------------------------------|--------------|
-| `VectorSelector` | Leaf. Opens storage cursor; one sample per series per step via lookback.  | No           |
-| `MatrixSelector` | Leaf. Sliding lookback window per step for rollup functions.              | No           |
-| `Rollup`         | Unified range-function driver (rate, increase, `*_over_time`, ...).       | No           |
-| `InstantFn`      | Pointwise scalar functions (abs, ln, clamp, histogram_quantile, ...).     | No           |
-| `Binary`         | Vector/vector or vector/scalar binop. Pre-computed series matching.       | No           |
-| `Aggregate`      | sum/avg/min/max/count/stddev/topk/bottomk/quantile by labels.             | Yes          |
-| `Subquery`       | Re-grids child onto inner step; feeds outer MatrixSelector semantics. See [Subquery](#subquery). | Yes          |
-| `Rechunk`        | Transposes series-major ↔ step-major when ops need the other axis.        | Yes          |
-| `CountValues`    | Data-dependent schema. Drains child, emits with runtime-derived labelset. | Yes          |
-| `Concurrent`     | Producer/consumer decoupling with a bounded mpsc channel.                 | No           |
-| `Coalesce`       | Fan-in: merges parallel child streams that share schema.                  | No           |
-
-`Aggregate` is a full breaker: a single group's members may span multiple child batches, so it
-drains the child before emitting. Series matching (for binary ops and aggregations) is resolved
-at plan time via a `GroupMap` keyed by the grouping labels and reused for every batch since the
-mapping is invariant across steps. A natural future improvement is to hash-partition series by
-group so `Aggregate` can emit per-group as soon as a group fills — see
-[Coalesce and Rechunk](#coalesce-and-rechunk) for the partitioning strategy.
-
-### Subquery
-
-Range functions like `rate` and `avg_over_time` normally operate on a stretch of raw samples
-straight from storage. A subquery lets you feed them the output of any expression instead: the
-syntax `expr[range:step]` means "evaluate `expr` every `step` over the last `range` and hand
-that block back as if it were a range vector." This is the only way to apply a range function
-to a computed expression. Some common shapes:
-
-- `avg_over_time(rate(http_requests[1m])[5m:10s])` — per-second rate sampled every 10 s for
-  the last 5 min, then averaged.
-- `max_over_time(sum(foo)[1h:1m])` — `sum(foo)` is one value per step, not a time series, so
-  `max_over_time` can't take it directly; the subquery turns it back into a series.
-- `quantile_over_time(0.99, probe_latency[1d:5m])` — p99 over a day of 5-minute samples.
-
-The cost model is the main thing to understand. For each outer step, the engine runs the inner
-expression across every inner step in the range window. A `[5m:10s]` subquery is 30 inner
-evaluations per outer step, and a range query with hundreds of outer steps multiplies that.
-The engine does no sharing across outer steps today even though consecutive windows overlap by
-`range - step`; this is a natural point for optimization later (e.g. sharing overlapping data 
-point fetches across multiple outer steps).
-
-`SubqueryOp` is a breaker: the whole inner range must land before the outer operator produces
-its first value, so a range query with a subquery at the root can't stream results as outer
-steps complete.
-
-v1 evaluates each inner step serially. The natural extension is `Coalesce`-based partitioning
-across inner steps once the sharding story lands.
-
-### Coalesce and Rechunk
-
-Both operators live in the `LogicalPlan` enum but are not yet inserted by the planner
-(`coalesce_max_shards` defaults to `0`; a `Rechunk` in a lowered plan errors today). They're
-reserved for future work:
-
-- **Vertical sharding via `Coalesce`.** A *shard* here is a disjoint subset of the query's work
-  — typically a slice of the resolved series roster, but a shard could equally be a subset of
-  the step grid (time-axis sharding is not planned for v1 but the operator generalises).
-  Shards run the same subplan in parallel and `Coalesce` merges at the first common ancestor.
-  Needs per-series-independence guarantees above the leaf before it's safe to turn on.
-
-  For aggregations the planner will push the grouping schema down to the vector selectors (e.g.
-  `sum by (container)` shards on `container`), so each shard owns a disjoint set of groups and
-  the final `Coalesce` does a trivial merge. High-cardinality groupings will be capped per
-  partition to avoid fragmenting the plan.
-- **Partial-then-final aggregation.** Shards compute partial aggregates; `Coalesce` streams
-  them into a final combine. Trivial for `sum`/`count`, harder for `topk`/`quantile`.
-- **Series-major consumers via `Rechunk`.** A future SIMD'd `*_over_time` or cross-step
-  cache-locality pass gets a `Rechunk` inserted below it to swap the axis from step-major to
-  series-major.
-- **Multi-node execution.** `Coalesce` generalises to a network-edge exchange; `Rechunk`
-  handles any tile-size renegotiation at the shard boundary.
+**Reservation enforcement.** All allocating calls go through
+`MemoryReservation::try_grow(bytes)`, returning `QueryError::MemoryLimit` on exceed. No
+spilling in v1.
 
 ## Caching & Per-Query State
 
-All caching in v2 is intra-query. Each query builds its own state during Plan, consults it during
-Execution, and drops it on completion. This keeps the memory story trivial (everything rolls up to
-the query's `MemoryReservation`) and sidesteps the cross-query contention problem.
+Two layers with different concurrency contracts. Do not reuse `QueryReaderEvalCache` as-is —
+its `DashMap`-per-axis design pays for cross-query contention it never sees (cache is
+re-allocated per query at `tsdb.rs:403,435,482`) and forces lock-striped maps on read paths
+where ownership can be explicit.
 
-There are two categories of per-query state with different concurrency contracts:
+**1. Per-query state — striped by plan, not by lock.**
+Built during the Plan phase, frozen before Execution. No concurrent maps in the hot path.
 
-**Frozen State:** Built by `build_physical_plan` and handed to operators as `Arc<…>`, never
-mutated during execution. This is the series roster — the resolved `SeriesSchema` produced by
-draining `SeriesSource::resolve(..)` streams. Indexed by `series_idx: u32`; labels, fingerprint,
-and bucket membership baked in. Operators use the index for dense-array state (group maps,
-binary-match tables) compiled once from the roster at plan time.
+- **Series roster**: `Arc<SeriesSchema>` indexed by `series_idx: u32`. Contains labels,
+  fingerprint, bucket membership. Populated once; read-only thereafter.
+- **Sample blocks**: `Arc<[Arc<Vec<Sample>>]>` indexed by `series_idx` (with per-bucket inner
+  dim as needed). Loaded during Plan via fan-out across disjoint `(bucket, series_id)` keys —
+  writers never collide, so a transient `Vec<(SeriesKey, OnceCell<...>)>` or a collector
+  pattern suffices; no `DashMap` required.
+- **Execution ownership**: when the planner inserts a `Coalesce` with K children, each child
+  receives a disjoint `series_range`. Children never read each other's slices. `Concurrent`
+  likewise owns a single child's output channel.
 
-**Index Cache:** A concurrent cache scoped to `build_physical_plan` only. It deduplicates index
-lookups during resolution because `resolve` fan-out (cross-bucket × per-key, up to 1024 in-flight
-gets) would otherwise issue the same `(bucket, term)` or `(bucket, series_id)` fetch multiple
-times from parallel tasks. Once the planner has hydrated the roster and metric names, the cache
-is dropped before execution begins. Execution-time operators only touch the storage indexes
-indirectly through pre-resolved handles (`ResolvedSeriesRef`), which keeps a clean plan-vs-
-execute boundary for a future distributed executor.
+This is the morsel-ownership pattern (DuckDB, DataFusion): work partitions map 1:1 to state
+partitions, making locks unnecessary in steady state.
 
-The current `SubqueryOp` violates this boundary by re-invoking the planner synchronously during
-execution; cleanup is tracked as follow-up work.
+**2. Cross-query cache — long-lived, concurrent, keyed on canonical plan.**
+Deferred to v2 but the contract is established now so v1 types don't have to change:
 
-## Introspection: EXPLAIN and Trace
+- **Metadata cache**: resolved series sets, forward/inverted index lookups. Shared across
+  queries, keyed by `(bucket, CanonicalSelector)`. This is the *only* layer that justifies
+  `DashMap` (or a sharded `RwLock<HashMap>`): write contention is real because two queries
+  can miss the same key simultaneously. Use `moka`-style async single-flight to avoid
+  duplicate backing reads on a miss.
+- **Rollup result cache**: post-rollup `StepBatch`es keyed by `(plan_subtree_hash,
+  step_range, series_range)`. Enables suffix-stitching for Grafana-style repeat queries.
+  Single-flight on miss. Same concurrency story as metadata cache.
 
-Every query endpoint accepts two opt-in flags that surface the planner and executor internals without
-changing the result shape.
+`SeriesSource` exposes both caches via a single handle; the Plan phase consults them and
+writes results into the per-query frozen state. Execution sees only `Arc`s.
 
-**`?explain=true`** short-circuits evaluation and returns a three-stage dry run: unoptimised logical,
-optimised logical, and a pure description of the physical tree the planner would build. No operators
-are instantiated and no storage I/O is issued. Add `?pretty=true` to get a DataFusion-style indented
-text tree instead of the JSON `ExplainResult`.
+No "hot path fast path" flag. Single plan, single execution model, two cache tiers with
+explicit concurrency semantics.
 
-**`?trace=true`** runs the query normally and attaches a structured trace to the response. The
-physical planner inserts a transparent `TracingOperator` around each concrete operator; per-op poll
-time is recorded without the operator knowing. Storage I/O is bucketed separately (`SamplesFetch`,
-`Deserialize`, `ForwardIndexFetch`, inverted-index fetch) and attributed to the currently-polling
-operator via a thread-local node id. The same spans are emitted to `tracing` whenever `RUST_LOG`
-allows, so out-of-band log capture works without the flag.
+## Concurrency Model
 
-```
-GET /api/v1/query?query=sum(rate(http_requests_total[5m]))&explain=true&pretty=true
-GET /api/v1/query_range?query=...&start=...&end=...&step=15s&trace=true
-```
+- **Per query**: one async task drives the root. Operators run inline on that task unless wrapped
+  in `Concurrent`.
+- **Per `Concurrent`**: one spawned tokio task per wrapped subplan, bounded mpsc channel to
+  downstream.
+- **Global**: existing `-search.max_concurrent_requests` equivalent (not yet present) caps total
+  in-flight queries; metadata/sample concurrency limits continue to live inside `SeriesSource`.
 
-### Example `?explain=true&pretty=true` output
+## Error Handling & Observability
 
-The three stages render in order (unoptimised logical, optimised logical, physical). Children
-indent two spaces and `[k=v, ...]` args are sorted alphabetically.
+- **Errors**: structured `QueryError` propagated through the stream; first error short-circuits.
+  No panics on bad user input.
+- **Annotations**: PromQL non-fatal warnings ride alongside batches in a `Annotations` sidecar
+  (same shape as Prometheus).
+- **Tracing**: every operator has a `tracing::Span`. One `INFO` event per query with plan
+  fingerprint, series cardinality, step count, wall time, memory high-water mark.
+- **Metrics**: per-operator latency, rows-produced, memory-reserved, cache hit rate.
 
-**Bare instant selector** — `foo`:
+## Migration Strategy
 
-```
-=== logical (unoptimized) ===
-VectorSelector [lookbackMs=300000, matcher=foo]
-=== logical (optimized) ===
-VectorSelector [lookbackMs=300000, matcher=foo]
-=== physical ===
-ConcurrentOp [channelBound=4, concurrentGate=series_count >= 64]
-  VectorSelectorOp [lookbackMs=300000, matcher=foo]
-```
-
-**Range-vector selector + rollup** — `rate(foo[5m])`:
-
-```
-=== logical (unoptimized) ===
-Rollup [kind=Rate]
-  MatrixSelector [matcher=foo, rangeMs=300000]
-=== logical (optimized) ===
-Rollup [kind=Rate]
-  MatrixSelector [matcher=foo, rangeMs=300000]
-=== physical ===
-ConcurrentOp [channelBound=4, concurrentGate=series_count >= 64]
-  RollupOp [kind=Rate]
-    MatrixSelectorOp [matcher=foo, rangeMs=300000]
-```
-
-**Aggregation with grouping** — `sum by (job)(foo)`:
-
-```
-=== logical (unoptimized) ===
-Aggregate [grouping={"axis":"by","labels":["job"]}, kind=Sum]
-  VectorSelector [lookbackMs=300000, matcher=foo]
-=== logical (optimized) ===
-Aggregate [grouping={"axis":"by","labels":["job"]}, kind=Sum]
-  VectorSelector [lookbackMs=300000, matcher=foo]
-=== physical ===
-AggregateOp [grouping={"axis":"by","labels":["job"]}, kind=Sum]
-  ConcurrentOp [channelBound=4, concurrentGate=series_count >= 64]
-    VectorSelectorOp [lookbackMs=300000, matcher=foo]
-```
-
-Note that `ConcurrentOp` wraps the leaf, not the aggregate — parallelism is introduced at the
-data source.
-
-**Subquery under a rollup** — `avg_over_time(rate(foo[1m])[5m:1m])`:
-
-```
-=== logical (unoptimized) ===
-Rollup [kind=AvgOverTime]
-  Subquery [rangeMs=300000, stepMs=60000]
-    Rollup [kind=Rate]
-      MatrixSelector [matcher=foo, rangeMs=60000]
-=== logical (optimized) ===
-Rollup [kind=AvgOverTime]
-  Subquery [rangeMs=300000, stepMs=60000]
-    Rollup [kind=Rate]
-      MatrixSelector [matcher=foo, rangeMs=60000]
-=== physical ===
-RollupOp [kind=AvgOverTime]
-  SubqueryOp [rangeMs=300000, stepMs=60000]
-    ConcurrentOp [channelBound=4, concurrentGate=series_count >= 64]
-      RollupOp [kind=Rate]
-        MatrixSelectorOp [matcher=foo, rangeMs=60000]
-```
-
-The optimised and unoptimised logical stages match on these canonical queries because none
-triggers the current rewrite set; the separation exists so future rewrites (constant folding,
-CSE, label pushdown) appear as a visible diff between the two stages.
-
-## Testing Strategy
-
-Tests are layered to match the architecture: each operator is verified in isolation, the planner is
-pinned with snapshots, and full-pipeline behaviour is exercised by scenarios and HTTP e2e tests.
-
-| Layer            | Location                          | What it covers                                                         |
-|------------------|-----------------------------------|------------------------------------------------------------------------|
-| Operator unit    | `operators/*.rs` `#[cfg(test)]`   | One operator vs. mock child / source; state edges, validity, memory.   |
-| Planner golden   | `plan/explain.rs`                 | Snapshots logical → optimised → physical trees for canonical queries.  |
-| Stress scenario  | `testing/columnar_stress.rs`      | Multi-bucket synthetic load (~1k–18k series) vs. precomputed `Oracle`. |
-| HTTP end-to-end  | `tests/http_server.rs`            | Drives `/api/v1/query{,_range}` through the full stack.                |
-| Microbenchmarks  | `benches/v2_engine_micorbench.rs` | Criterion benches on a `WarmRangeQueryHarness`.                        |
-| Manual Testing   | `N/A`                             | Ran queries with ?explain=true and ?trace=true                         |
-
-**Known gap.** The `rate()` portion of the range-query stress scenario has a ~1.5× inflation at
-bucket boundaries, pointing at cross-bucket counter handling. Instant probes and the count/sum
-portions of the same scenario pass. Tracked for a dedicated fix pass rather than blocking this RFC.
+- Delete `evaluator.rs` and `pipeline.rs` wholesale at the end. No compatibility layer, no
+  `if hot_path` branch.
+- Keep `selector.rs` (inverted-index matcher logic) as-is; it is reusable.
+- Retain wire types (`QueryValue`, `InstantSample`, `RangeSample`, `Labels`) so the HTTP/embedded
+  boundary is unchanged.
+- Do **not** reuse `QueryReaderEvalCache`. Its per-query `DashMap`s solve contention that does
+  not exist inside a single query. Plan-time ownership (above) replaces it for per-query state;
+  the deferred cross-query cache is a separate design.
+- `promqltest` golden tests (`promql/promqltest/`) are the correctness oracle — the new engine
+  must pass them before the old one is deleted.
 
 ## Alternatives Considered
 
-1. Use `Arrow` as the `StepBatch` representation. This was tempting since it would give us SIMD
-   vectorized computations for the aggregations, but the dependency is significant and adds real
-   compile-time scope for a relatively simple usage of it.
-2. Use `DataFusion` for the query planning. There are too many PromQL-specific concepts (lookback
-   deltas, offsets, step-aligned rollups) that don’t clearly map to Data Fusion, so the integration
-   cost and dependency weight make it less tempting.
+- **Extend the prototype's fast path to more query shapes.** Rejected: fast-path detection becomes
+  a growing match table. Same end state as VictoriaMetrics' monolithic `eval.go`.
+- **Keep AST interpreter, add step batching only at selector leaves.** Rejected: intermediate
+  types stay row-major; binary/aggregate operators remain the bottleneck.
+- **Adopt thanos-io/promql-engine's design verbatim (port to Rust).** Rejected: their step-vector
+  shape is one timestamp wide; we want batched step ranges to amortize async overhead and fit
+  Rust's `Stream` polling model. We also have tighter control over the storage contract than
+  they do (they target an external `Querier`).
+- **Use DataFusion as the engine, translate PromQL to DataFusion logical plan.** Rejected:
+  PromQL-specific semantics (lookback delta, stale markers, `@`/`offset`, step-alignment of
+  rollups) don't cleanly embed. Integration cost outweighs reuse.
+
+## Open Questions
+
+1. **Batch shape defaults.** `N=64 × K=512` is a guess anchored in L2 sizing; needs measurement
+   across representative workloads (high cardinality vs wide time range).
+2. **Subquery scoping.** Subqueries shift the step grid for their inner plan. Does `Subquery`
+   produce its own `MemoryReservation` scope (independent budget per inner plan), or share the
+   parent's?
+3. **Native histograms.** Deliberately out of v1 scope. `ColumnBlock::Float` only. Histogram
+   support (including mixed float/histogram series) is a separate RFC that extends the batch ABI.
+4. **Cache key canonicalization.** What fingerprint for a plan subtree is cheap and stable across
+   logically-equivalent expressions (e.g., `a+b` vs `b+a` under commutative ops)?
+5. **Cardinality estimate fidelity.** `SeriesSource::estimate_cardinality()` must be cheap
+   (sub-millisecond) to be worth calling before resolve. How tight does the bound need to be —
+   is per-bucket series-count summation enough, or do we need a matcher-aware estimate?
+6. **Spilling vs rejecting large queries.** v1 rejects on memory limit; is spill worth the
+   complexity in v2?
+7. **Writer-side queryability.** Today `Tsdb` and `TimeSeriesDbReader` both implement
+   `TsdbReadEngine`. Does the new engine need both, or can we unify them behind
+   `SeriesSource`?
