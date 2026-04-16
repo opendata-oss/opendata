@@ -539,6 +539,12 @@ impl Tsdb {
         }
     }
 
+    /// Returns a read handle to the underlying storage, for background tasks
+    /// like the cache warmer.
+    pub(crate) fn storage_read(&self) -> Arc<dyn StorageRead> {
+        self.storage.clone() as Arc<dyn StorageRead>
+    }
+
     /// Get or create a MiniTsdb for ingestion into a specific bucket.
     #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) async fn get_or_create_for_ingest(
@@ -806,6 +812,15 @@ impl TsdbEngine {
     /// Returns `true` when the engine is read-only.
     pub(crate) fn is_read_only(&self) -> bool {
         matches!(self, Self::ReadOnly(_))
+    }
+
+    /// Returns a read handle to the underlying storage, for background tasks
+    /// like the cache warmer.
+    pub(crate) fn storage_read(&self) -> Arc<dyn StorageRead> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.storage_read(),
+            Self::ReadOnly(reader) => reader.storage_read(),
+        }
     }
 
     /// Returns a clone of the inner `Arc<Tsdb>` if this is a read-write engine.

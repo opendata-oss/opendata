@@ -62,6 +62,20 @@ pub enum BlockCacheConfig {
     FoyerHybrid(FoyerHybridCacheConfig),
 }
 
+/// Write policy for foyer's hybrid cache.
+///
+/// Controls when entries are written to the disk tier.
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FoyerWritePolicy {
+    /// Write to disk when an entry is inserted into the memory cache.
+    /// Ensures every cached block is also persisted to the disk tier.
+    #[default]
+    WriteOnInsertion,
+    /// Write to disk only when an entry is evicted from the memory cache.
+    /// This is foyer's default policy.
+    WriteOnEviction,
+}
+
 /// Configuration for foyer's hybrid (memory + disk) block cache.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FoyerHybridCacheConfig {
@@ -71,6 +85,37 @@ pub struct FoyerHybridCacheConfig {
     pub disk_capacity: u64,
     /// Path for the on-disk cache directory.
     pub disk_path: String,
+    /// Write policy for the hybrid cache. Default: `WriteOnInsertion`.
+    #[serde(default)]
+    pub write_policy: FoyerWritePolicy,
+    /// Number of flush threads for the large engine. Default: 4.
+    #[serde(default = "default_flushers")]
+    pub flushers: usize,
+    /// Buffer pool size in bytes for the large engine flush pipeline.
+    /// Each flusher double-buffers, so actual allocation is ~2x this value.
+    /// Default: `memory_capacity / 32` (computed at build time when absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_pool_size: Option<u64>,
+    /// Submit queue size threshold in bytes. Entries are dropped when
+    /// the queue exceeds this limit. Default: 1 GiB.
+    #[serde(default = "default_submit_queue_size_threshold")]
+    pub submit_queue_size_threshold: u64,
+}
+
+fn default_flushers() -> usize {
+    4
+}
+
+fn default_submit_queue_size_threshold() -> u64 {
+    1024 * 1024 * 1024 // 1 GiB
+}
+
+impl FoyerHybridCacheConfig {
+    /// Returns the effective buffer pool size: explicit value if set,
+    /// otherwise `memory_capacity / 32`.
+    pub fn effective_buffer_pool_size(&self) -> u64 {
+        self.buffer_pool_size.unwrap_or(self.memory_capacity / 32)
+    }
 }
 
 impl Default for SlateDbStorageConfig {
@@ -302,11 +347,79 @@ block_cache:
                         assert_eq!(foyer.memory_capacity, 8589934592);
                         assert_eq!(foyer.disk_capacity, 150323855360);
                         assert_eq!(foyer.disk_path, "/mnt/nvme/block-cache");
+                        // new fields should get defaults
+                        assert_eq!(foyer.write_policy, FoyerWritePolicy::WriteOnInsertion);
+                        assert_eq!(foyer.flushers, 4);
+                        assert!(foyer.buffer_pool_size.is_none());
+                        assert_eq!(foyer.submit_queue_size_threshold, 1024 * 1024 * 1024);
+                        // effective buffer pool = memory_capacity / 32
+                        assert_eq!(foyer.effective_buffer_pool_size(), 8589934592 / 32);
                     }
                 }
             }
             _ => panic!("Expected SlateDb config"),
         }
+    }
+
+    #[test]
+    fn should_deserialize_block_cache_with_explicit_engine_options() {
+        // given
+        let yaml = r#"
+type: SlateDb
+path: data
+object_store:
+  type: InMemory
+block_cache:
+  type: FoyerHybrid
+  memory_capacity: 4294967296
+  disk_capacity: 10737418240
+  disk_path: /mnt/nvme/cache
+  write_policy: WriteOnEviction
+  flushers: 2
+  buffer_pool_size: 134217728
+  submit_queue_size_threshold: 536870912
+"#;
+
+        // when
+        let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
+
+        // then
+        match config {
+            StorageConfig::SlateDb(slate_config) => {
+                let cache = slate_config.block_cache.expect("block_cache should be set");
+                match cache {
+                    BlockCacheConfig::FoyerHybrid(foyer) => {
+                        assert_eq!(foyer.write_policy, FoyerWritePolicy::WriteOnEviction);
+                        assert_eq!(foyer.flushers, 2);
+                        assert_eq!(foyer.buffer_pool_size, Some(134217728));
+                        assert_eq!(foyer.submit_queue_size_threshold, 536870912);
+                        // explicit value overrides derivation
+                        assert_eq!(foyer.effective_buffer_pool_size(), 134217728);
+                    }
+                }
+            }
+            _ => panic!("Expected SlateDb config"),
+        }
+    }
+
+    #[test]
+    fn should_derive_buffer_pool_size_from_memory_capacity() {
+        // given
+        let config = FoyerHybridCacheConfig {
+            memory_capacity: 8 * 1024 * 1024 * 1024, // 8 GiB
+            disk_capacity: 100 * 1024 * 1024 * 1024,
+            disk_path: "/tmp/cache".to_string(),
+            write_policy: FoyerWritePolicy::default(),
+            flushers: 4,
+            buffer_pool_size: None,
+            submit_queue_size_threshold: 1024 * 1024 * 1024,
+        };
+
+        // when/then
+        assert_eq!(
+            config.effective_buffer_pool_size(),
+            256 * 1024 * 1024 // 256 MiB = 8 GiB / 32
+        );
     }
 
     #[test]

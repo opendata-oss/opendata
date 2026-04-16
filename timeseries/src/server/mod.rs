@@ -1,3 +1,4 @@
+pub(crate) mod cache_warmer;
 mod http;
 #[cfg(feature = "otel")]
 pub(crate) mod ingest_consumer;

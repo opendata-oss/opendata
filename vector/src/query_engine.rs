@@ -294,7 +294,7 @@ impl QueryEngine {
                         }
                     })
                     .collect();
-                scored.sort_unstable_by(|a, b| a.distance.cmp(&b.distance));
+                scored.sort_unstable_by_key(|a| a.distance);
                 Ok::<_, Error>(scored)
             }));
         }
