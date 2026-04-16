@@ -24,8 +24,8 @@ RUN cargo build --release --locked --manifest-path vector/Cargo.toml --features 
 
 # Runtime stage
 # Pin to multi-arch manifest list digest for reproducible builds (supports amd64/arm64)
-# To update: docker manifest inspect debian:bookworm-slim
-FROM debian:bookworm-slim@sha256:56ff6d36d4eb3db13a741b342ec466f121480b5edded42e4b7ee850ce7a418ee
+# To update: docker buildx imagetools inspect debian:trixie-slim
+FROM debian:trixie-slim@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a
 
 WORKDIR /app
 
