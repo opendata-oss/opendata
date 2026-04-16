@@ -54,6 +54,16 @@ pub enum QueryError {
         /// Configured limit the estimate exceeded.
         cell_limit: u64,
     },
+
+    /// Generic internal / storage-surface error. Used by the Phase 2
+    /// storage adapter to carry crate-level `Error` messages without
+    /// extending the public v2 surface with a storage-specific variant.
+    /// The Phase 5 wiring unit can retire this in favour of a more
+    /// structured shape (e.g. distinct `Storage` / `InvalidInput`
+    /// variants) once the bridging into `crate::error::QueryError` is
+    /// defined.
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 /// Per-query memory reservation.

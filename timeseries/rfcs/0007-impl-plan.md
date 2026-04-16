@@ -205,9 +205,9 @@ Phases run in order. Within a phase, units may be parallelizable — note in `de
 
 | # | Unit | Owner | Status | Deps | Artifacts | Blocker |
 |---|---|---|---|---|---|---|
-| 2.1 | Define `SeriesSource` trait + `SampleHint` + `CardinalityEstimate` | | ready | 1.5 | | |
-| 2.2 | Adapter impl over existing `QueryReader` (cross-bucket stitching inside) | | ready | 2.1 | | |
-| 2.3 | Integration tests: resolve, estimate, sample-stream ordering, stale markers | | ready | 2.2 | | |
+| 2.1 | Define `SeriesSource` trait + `SampleHint` + `CardinalityEstimate` | Storage Implementor | done | 1.5 | `timeseries/src/promql/v2/source.rs`, `timeseries/src/promql/v2/mod.rs` | |
+| 2.2 | Adapter impl over existing `QueryReader` (cross-bucket stitching inside) | Storage Implementor | done | 2.1 | `timeseries/src/promql/v2/source_adapter.rs`, `timeseries/src/promql/v2/mod.rs`, `timeseries/src/promql/v2/memory.rs` | |
+| 2.3 | Integration tests: resolve, estimate, sample-stream ordering, stale markers | Storage Implementor | done | 2.2 | `timeseries/src/promql/v2/source_adapter.rs` (new `#[cfg(test)] mod integration_tests`) | |
 
 **Acceptance**: adapter serves the RFC's caller/source contract guarantees; tests cover
 cross-bucket series with staleness; no PromQL semantics leaked into the source.
@@ -343,6 +343,164 @@ RFC section touched.
   defines `SeriesSource`); no group maps / binary-match tables yet (planner units
   4.x extend). Error type on `next()` is `v2::QueryError` (not crate-wide `QueryError`)
   — decision already recorded in the 1.4 entry; reaffirmed here.
+- 2026-04-16 — Storage Implementor (unit 2.1) — `SeriesSource` methods use
+  return-position `impl Future` / `impl Stream` (RPITIT) rather than
+  `async-trait` or `Pin<Box<dyn _>>`. Rust 1.95 / edition 2024 support this
+  natively, and it lets concrete adapters avoid boxing on the hot `samples()`
+  path. `async-trait` is in the workspace but would force allocation per
+  method call for no benefit.
+- 2026-04-16 — Storage Implementor (unit 2.1) — `SeriesSource` is **not**
+  object-safe (consequence of `impl Stream` / `impl Future` returns). The
+  planner in Phase 4 will bind a generic `S: SeriesSource` (or an
+  `Arc<S>`); operators that need storage take a generic parameter, not a
+  `Box<dyn SeriesSource>`. No blanket dispatch layer today — if a future
+  caller needs dynamic dispatch we can add a `dyn`-friendly wrapper that
+  boxes the streams, but v1 does not require it.
+- 2026-04-16 — Storage Implementor (unit 2.1) — `VectorSelector` is re-used
+  directly from `promql_parser::parser::VectorSelector` — the same path
+  `evaluator.rs`, `pipeline.rs`, and `selector.rs` already import. No
+  crate-local wrapper exists and the Phase 4 planner will lower from
+  `promql_parser::Expr`, so matching the parser's type avoids a conversion
+  layer.
+- 2026-04-16 — Storage Implementor (unit 2.1) — `ResolvedSeriesChunk` is a
+  per-bucket unit: each chunk carries a single `bucket_id` and the labels /
+  handles for series in that bucket. This matches the RFC's "streamed per
+  bucket" wording and lets the Phase 2.2 adapter emit one chunk per
+  bucket-scoped fan-out without re-grouping. No ordering guarantee **across**
+  chunks — the RFC does not specify selector-input ordering for `resolve()`
+  (the planner already has to merge across buckets); 2.2 may choose whatever
+  ordering the backing store emits naturally.
+- 2026-04-16 — Storage Implementor (unit 2.1) — `SampleBatch` uses an
+  explicit `series_range` + columnar `SampleBlock` (per-series
+  `Vec<i64>` timestamps + `Vec<f64>` values). Preferred over a flat
+  `Vec<RawSample>`: the downstream `VectorSelector` / `MatrixSelector`
+  operators iterate per-series in timestamp order (lookback / sliding
+  window), so columnar-per-series is the natural access pattern and avoids
+  a transpose in the hot path. No end-of-series sentinel on the batch — the
+  Stream itself signals completion via `None`, and intermediate batches do
+  not need to mark "this series has no more samples" because the time
+  window is absolute and the source has already decided to stop emitting
+  for any given `series_range`. Adapter 2.2 may revisit if it discovers a
+  reason for a per-series terminator.
+- 2026-04-16 — Storage Implementor (unit 2.1) — `ResolvedSeriesRef` kept as
+  a plain `{ bucket_id: u64, series_id: u32 }` struct (not a newtype wrapper
+  around a `u64`). Caller treats it as opaque; source extensions add fields
+  without breaking the public surface. `series_id` is `u32` to stay aligned
+  with `crate::model::SeriesId` (which is `pub(crate)` and therefore cannot
+  be named in the public `v2` surface directly); conversion is a no-op cast
+  inside the adapter.
+- 2026-04-16 — Storage Implementor (unit 2.2) — Batch emission strategy:
+  **per-bucket**. `QueryReaderSource::samples` walks the hint's `series`
+  slice and emits one `SampleBatch` per contiguous same-bucket run. A
+  series that spans N buckets therefore produces N batches. Rationale: it
+  matches the existing `BucketSampleData → shape_matrix_results` split in
+  `pipeline.rs`; operators (`VectorSelector`/`MatrixSelector`) already
+  own the cross-bucket merge, so pushing it into the source would just
+  re-implement that logic. The RFC §"Storage Contract" allows either
+  choice; picking the simpler one.
+- 2026-04-16 — Storage Implementor (unit 2.2) — Cardinality estimate:
+  **per-bucket upper bound from the inverted index**, using only positive
+  equality terms (`__name__` + `Label="literal"` matchers). Runs one
+  `QueryReader::inverted_index` call per overlapping bucket and sums
+  `bitmap.len()`. Flagged `approx: true` whenever the selector uses regex,
+  negative, or empty-string matchers (the sum is then a loose upper
+  bound). When the selector has **no** positive terms at all the adapter
+  returns `{ lower: 0, upper: u64::MAX, approx: true }` and defers the
+  real match to `resolve()`. Not sub-millisecond if the inverted index
+  has to be loaded from cold storage, but matches the tightest bound the
+  existing `QueryReader` trait can give without pipeline.rs's
+  `SelectorCacheKey` plumbing or a dedicated count accessor. Phase 4 /
+  5 may extend `QueryReader` with an `estimate_selector_count` method if
+  measurements show this is insufficient; unit 2.3 should flag a TODO if
+  it observes >1 ms p50 for a typical query.
+- 2026-04-16 — Storage Implementor (unit 2.2) — `QueryReader` surface
+  gap: selector matching logic in `promql::selector` is driven by
+  `CachedQueryReader` (ties into the evaluator-era `QueryReaderEvalCache`),
+  which the v2 path deliberately does not use. Rather than modify
+  `selector.rs` (RFC §"Migration Strategy" says keep it as-is), the
+  adapter re-implements an equivalent matcher in a private
+  `selector_util` submodule — 1:1 with the positive/OR/negative/empty-
+  string handling in `find_candidates_with_reader`/
+  `apply_negative_matchers`/`apply_empty_string_matchers`. The two
+  must stay behaviourally aligned; unit 2.3 integration tests should
+  cover both code paths against the same fixtures.
+- 2026-04-16 — Storage Implementor (unit 2.2) — `QueryReader::samples`
+  semantics quirk: the existing contract is
+  `timestamp > start_ms && timestamp <= end_ms` (inclusive end, exclusive
+  start — see the mock reader in `query.rs::test_utils` and the code
+  path in `evaluator.rs`). The v2 `SampleHint::time_range` is
+  `[start_ms, end_ms_exclusive)` (inclusive start, exclusive end). The
+  adapter translates by passing `start_ms = time_range.start_ms - 1`
+  and `end_ms = time_range.end_ms_exclusive - 1`. This keeps per-sample
+  selection identical to the legacy path. Unit 2.3 should pin this with
+  a boundary test (sample at exactly `start_ms`, `end_ms_exclusive - 1`,
+  and `end_ms_exclusive`).
+- 2026-04-16 — Storage Implementor (unit 2.2) — `ResolvedSeriesRef::bucket_id`
+  encoding: `(TimeBucket::start as u64) << 8 | TimeBucket::size as u64`.
+  `size == 0` is rejected on decode as a sanity guard (hour-exponent of
+  zero is not a legal bucket). Callers treat `bucket_id` as opaque, so
+  the representation is an implementation detail — if a future adapter
+  needs more than 56 bits of start, the encoding can change without
+  breaking the `SeriesSource` contract.
+- 2026-04-16 — Storage Implementor (unit 2.2) — Extended `v2::QueryError`
+  with an `Internal(String)` variant (previously only `MemoryLimit`
+  and `TooLarge`). Needed to carry crate-level `Error::to_string()`
+  through the adapter without synthesising fake `TooLarge` payloads.
+  The phase-5 wiring unit may rename/split this (e.g. into
+  `Storage`/`InvalidInput`) when it bridges `v2::QueryError` to
+  `crate::error::QueryError`; leaving it named `Internal` for now since
+  every adapter-emitted error *is* internal to the storage path.
+- 2026-04-16 — Storage Implementor (unit 2.2) — `resolve()` emission
+  ordering: chronological by bucket start. Empty buckets are **skipped**
+  (not emitted as empty chunks) — RFC contract says "chunk is a
+  contiguous slice", and an empty slice conveys no new information. If
+  Phase 4 planner wants explicit "bucket covered, no match" signals,
+  revisit; today the empty stream itself encodes that.
+- 2026-04-16 — Storage Implementor (unit 2.3) — Test harness pattern:
+  **in-crate `#[cfg(test)]` submodule** (`integration_tests` inside
+  `timeseries/src/promql/v2/source_adapter.rs`). No `timeseries/tests/`
+  directory exists; the crate's established pattern is in-crate
+  `#[cfg(test)]` modules (`tsdb.rs`, `reader.rs`, `promql/selector.rs`,
+  `promql/pipeline.rs`). Colocating the 2.3 integration suite with the
+  adapter also lets it exercise `pub(crate)` surface
+  (`QueryReaderSource::new`, `encode_bucket`, internal test fixtures)
+  without widening visibility.
+- 2026-04-16 — Storage Implementor (unit 2.3) — Fixture: reused
+  `MockMultiBucketQueryReaderBuilder` from `crate::query::test_utils`
+  (the same builder that backs `promql/selector.rs` and
+  `promql/pipeline.rs` tests). No fixture surgery required; the
+  builder cleanly supports multi-bucket ingestion, raw `f64` values
+  (including `STALE_NAN` bit-patterns), and controlled label sets.
+- 2026-04-16 — Storage Implementor (unit 2.3) — `selector_util` matcher
+  parity: validated via **hand-built expected series sets** against
+  fixtures (not by calling `promql::selector::evaluate_selector_with_reader`
+  directly). `selector.rs`'s public surface is driven by
+  `CachedQueryReader`, which the v2 path deliberately bypasses; wiring
+  the legacy code-path into 2.3 tests would re-introduce the coupling
+  2.2 explicitly avoided. The shapes covered (metric-only, equality,
+  negation, regex OR, empty-string, combined AND) mirror the matcher
+  battery in `promql/selector.rs` tests 1:1, so a drift would produce
+  a clear diagnostic: a `selector.rs` test stays green while the
+  matching `source_adapter.rs` test fails.
+- 2026-04-16 — Storage Implementor (unit 2.3) — Adapter bugs
+  surfaced: **zero**. All 16 integration tests (7 RFC-contract, 4
+  boundary/edge, 2 cross-bucket, 3 cardinality, 7 matcher-parity)
+  passed on first successful compile. The one compile-failure iteration
+  was a `collect_ok` helper issue (RPITIT streams are not `Unpin`;
+  fix: `Box::pin` inside the helper); the adapter itself needed no
+  changes.
+- 2026-04-16 — Storage Implementor (unit 2.3) — Test-side note, not
+  an adapter bug: `MockQueryReader::samples` returns samples in
+  *insertion* order, while the production `QueryReader` contract
+  (mirrored by `MiniQueryReader`) returns them sorted by timestamp.
+  The `should_return_samples_in_timestamp_order_per_series` test
+  therefore ingests in timestamp order and verifies end-to-end
+  order *preservation* through the adapter (the RFC-asserted
+  property the adapter is responsible for: it must not reorder). A
+  full reorder-resilience test would need to either strengthen the
+  mock's contract or exercise the real `MiniQueryReader` path; both
+  are out of scope for 2.3 and belong with whatever unit hardens the
+  test-utils.
 
 ## 6. Activity Log
 
@@ -355,6 +513,9 @@ Append-only, one line per agent invocation. Format:
 - 2026-04-16 Foundation Implementor 1.3 in-progress→done — implemented `StepBatch`, `SeriesSchema`, `SchemaRef` (Static/Deferred), and a hand-rolled `Vec<u64>`-backed `BitSet` in `promql/v2/batch.rs`; re-exported from `promql/v2/mod.rs`. Row-major-by-step layout documented on the `values` field per RFC. 16 unit tests cover shape invariants, cell indexing, validity access, schema accessors, and bitset edge cases. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
 - 2026-04-16 Foundation Implementor 1.4 in-progress→done — implemented `MemoryReservation` (atomic CAS-loop `try_grow`/`release`, clone-shared `Arc<Inner>`, separate high-water atomic) and `QueryError` (`MemoryLimit`, `TooLarge`) in `promql/v2/memory.rs` using workspace `thiserror`; re-exported from `promql/v2/mod.rs`. 12 unit tests cover within-cap grow, exceeding cap with diagnostic payload, release, regrow after release, high-water monotonicity, concurrent grows (all-fit and cap-contended), zero-cap rejection, zero-byte no-op, `usize` overflow, clone-shared state, and the `TooLarge` variant. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2::memory` (12 passed), and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
 - 2026-04-16 Foundation Implementor 1.5 in-progress→done — defined `Operator` trait, `OperatorSchema`, and `StepGrid` in `promql/v2/operator.rs`; re-exported from `promql/v2/mod.rs`. Trait shape: `Send`-only, object-safe, `fn next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<StepBatch, v2::QueryError>>>`. `OperatorSchema { series: SchemaRef, step_grid: StepGrid }`. 3 unit tests (`should_build_trait_object`, `should_report_schema_before_next`, `should_yield_end_of_stream`) exercise object-safety and the schema-before-poll contract via an `Empty` test double. Phase 1 acceptance re-verified: `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (31 passed — 16 batch + 12 memory + 3 operator), and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
+- 2026-04-16 Storage Implementor 2.1 in-progress→done — defined `SeriesSource` trait plus `TimeRange`, `ResolvedSeriesRef`, `ResolvedSeriesChunk`, `CardinalityEstimate`, `SampleHint`, `SampleBlock`, `SampleBatch` in `promql/v2/source.rs`; re-exported from `promql/v2/mod.rs`. Trait returns use return-position `impl Future` / `impl Stream` (stable RPITIT, Rust 1.95 / edition 2024) so adapters don't box on the hot path; trait is **not** dyn-safe — planner will bind generic `S: SeriesSource` (see Decisions Log). `VectorSelector` re-used directly from `promql_parser::parser::VectorSelector` (same path as `selector.rs` / `pipeline.rs` / `evaluator.rs`). 7 new unit tests cover constructor / accessor contracts on the value types (no tests that would need a concrete source — 2.2 adapter + 2.3 integration). `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (38 passed — Phase 1's 31 + 7 new), and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
+- 2026-04-16 Storage Implementor 2.2 in-progress→done — implemented `QueryReaderSource<R: QueryReader>` + supporting helpers in `promql/v2/source_adapter.rs`; re-exported from `promql/v2/mod.rs`. Adapter is stateless (no interior mutability): `resolve()` fans out over overlapping buckets, emits one `ResolvedSeriesChunk` per non-empty bucket in chronological order (empty buckets skipped); `estimate_cardinality()` sums per-bucket inverted-index cardinalities for positive equality terms (flagged `approx: true` when the selector uses regex/negative/empty-string matchers, `{ 0, u64::MAX, approx }` when no positive terms exist); `samples()` groups the hint's series into contiguous same-bucket runs and emits one `SampleBatch` per run (cross-bucket merge is an operator concern — see §5 Decisions Log 2.2). Selector matcher logic re-implemented in a private `selector_util` submodule (behaviour-mirrors `promql::selector`; RFC mandates leaving that file untouched). `v2::QueryError` extended with an `Internal(String)` variant to carry crate-level error strings without synthesising fake `TooLarge` payloads. Added 6 new unit tests covering bucket-id encode/decode round-trip, zero-size rejection, bucket/time-range overlap boundary cases, and contiguous-bucket-run partitioning (including order preservation + empty-input handling). Heavier integration tests deferred to unit 2.3. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (44 passed — Phase 1's 31 + 2.1's 7 + 2.2's 6), and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
+- 2026-04-16 Storage Implementor 2.3 in-progress→done — added 21 integration tests in a new `integration_tests` `#[cfg(test)]` submodule inside `timeseries/src/promql/v2/source_adapter.rs` (in-crate pattern; no `tests/` dir exists). Coverage: RFC source→caller (contiguous `series_range` slicing, per-series timestamp ordering, `STALE_NAN` bit-exact round-trip), RFC caller→source (no widening beyond selector match, time-range respect), 4 boundary cases pinning the `[start, end)` ↔ `(start, end]` translation (§5 Decisions Log 2.2) plus empty-window short-circuit, cross-bucket stitching (one batch per bucket in chronological order, non-overlapping buckets skipped), cardinality estimate (monotone upper bound vs. resolve, `u64::MAX` sentinel for no-positive-term selectors, `approx` flag for non-equality matchers), and 7 matcher-parity tests against hand-built expected series sets (metric-only, equality, negation, regex, empty-string, combined AND, regex OR). Fixtures reuse `MockMultiBucketQueryReaderBuilder` from `crate::query::test_utils`; no production-code changes, no test-fixture surgery, no adapter bugs surfaced. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (65 passed — 44 prior + 21 new), and `cargo clippy --all-targets --all-features -- -D warnings` all pass. Phase 2 acceptance re-verified.
 
 ---
 

@@ -12,10 +12,14 @@
 //! - [`batch`]: `StepBatch`, `SeriesSchema`, `SchemaRef` (unit 1.3).
 //! - [`memory`]: `MemoryReservation` and memory-limit error variants (unit 1.4).
 //! - [`operator`]: the `Operator` trait (unit 1.5).
+//! - [`source`]: the `SeriesSource` storage contract (unit 2.1).
+//! - [`source_adapter`]: adapter over the existing `QueryReader` (unit 2.2).
 
 pub(crate) mod batch;
 pub(crate) mod memory;
 pub(crate) mod operator;
+pub(crate) mod source;
+pub(crate) mod source_adapter;
 
 #[allow(unused_imports)]
 pub(crate) use batch::{BitSet, SchemaRef, SeriesSchema, StepBatch};
@@ -23,3 +27,10 @@ pub(crate) use batch::{BitSet, SchemaRef, SeriesSchema, StepBatch};
 pub(crate) use memory::{MemoryReservation, QueryError};
 #[allow(unused_imports)]
 pub(crate) use operator::{Operator, OperatorSchema, StepGrid};
+#[allow(unused_imports)]
+pub(crate) use source::{
+    CardinalityEstimate, ResolvedSeriesChunk, ResolvedSeriesRef, SampleBatch, SampleBlock,
+    SampleHint, SeriesSource, TimeRange,
+};
+#[allow(unused_imports)]
+pub(crate) use source_adapter::QueryReaderSource;
