@@ -29,6 +29,7 @@ http-server = [
     "dep:metrics-exporter-prometheus",
 ]
 testing = []
+promql-v2 = []
 remote-write = ["http-server", "dep:prost", "dep:snap"]
 otel = ["dep:opentelemetry-proto", "dep:prost", "dep:ingest"]
 bench-internals = []

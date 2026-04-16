@@ -11,3 +11,5 @@ pub(crate) mod response;
 pub(crate) mod scraper;
 pub(crate) mod selector;
 mod timestamp;
+#[cfg(feature = "promql-v2")]
+pub(crate) mod v2;
