@@ -1819,6 +1819,63 @@ mod tests {
         assert_eq!(outs[0].get(0, 1), Some(2.0));
     }
 
+    #[test]
+    fn should_aggregate_across_multiple_series_tile_batches_for_same_step_range() {
+        // given: the child emits two batches covering the SAME step range
+        // (0..2) but disjoint series tiles (0..3 then 3..5), mirroring the
+        // (step_tile × series_tile) emission pattern of `VectorSelectorOp`
+        // when the resolved roster exceeds the default series tile width.
+        // Every cell has value 1.0 — the correct total sum per step is 5.0.
+        let in_schema = mk_schema("in", 5);
+        let out_schema = mk_schema("out", 1);
+        let grid = mk_grid(2);
+
+        let batch_tile_a =
+            mk_batch_with_series_range(in_schema.clone(), 2, 0..3, vec![1.0; 6], vec![true; 6]);
+        let batch_tile_b =
+            mk_batch_with_series_range(in_schema.clone(), 2, 3..5, vec![1.0; 4], vec![true; 4]);
+
+        let child = MockOp::new(in_schema, grid, vec![batch_tile_a, batch_tile_b]);
+        let gmap = GroupMap::new(vec![Some(0); 5], 1);
+
+        // when
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Sum,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .expect("operator constructs");
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then: the aggregate must produce one logical answer per step — a
+        // single cell of 5.0 per step (one batch) or, if it emits multiple
+        // batches for the same step range, the values across those batches
+        // must *not* be partial per-tile sums that a downstream consumer
+        // would render as duplicate/arbitrary timestamps. Assert both the
+        // single-batch shape and the correct per-step total.
+        assert_eq!(
+            outs.len(),
+            1,
+            "expected a single output batch covering steps 0..2, got {}",
+            outs.len(),
+        );
+        let b = &outs[0];
+        assert_eq!(b.step_count(), 2);
+        assert_eq!(b.series_count(), 1);
+        assert_eq!(
+            b.get(0, 0),
+            Some(5.0),
+            "step 0 sum must be 5.0 (3 + 2 tiles)"
+        );
+        assert_eq!(
+            b.get(1, 0),
+            Some(5.0),
+            "step 1 sum must be 5.0 (3 + 2 tiles)"
+        );
+    }
+
     // ========================================================================
     // 3c.1 breaker tests — topk / bottomk / quantile
     // ========================================================================
