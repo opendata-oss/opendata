@@ -9,12 +9,12 @@ use crate::write::indexer::tree::centroids::{LeveledCentroidIndex, search_centro
 use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use crate::{Attribute, Vector};
 use common::storage::StorageRead;
+use common::tracing::{trace_instrument, trace_span};
 use roaring::RoaringTreemap;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
-use tracing::debug;
+use tracing::Instrument;
 
 /// The subset of configuration needed by the query engine.
 #[derive(Debug, Clone)]
@@ -144,12 +144,26 @@ impl QueryEngine {
         Ok(results)
     }
 
+    #[trace_instrument(
+        name = "search_with_options",
+        skip_all,
+        fields(
+            limit = query.limit,
+            has_filter = query.filter.is_some(),
+            nprobe = tracing::field::Empty,
+            n_centroids = tracing::field::Empty,
+            n_pruned_centroids = tracing::field::Empty,
+            n_results = tracing::field::Empty,
+        ),
+    )]
     pub(crate) async fn search_with_options(
         &self,
         query: &Query,
         options: SearchOptions,
     ) -> Result<Vec<SearchResult>> {
         let nprobe = options.nprobe.unwrap_or_else(|| query.limit.clamp(10, 100));
+        tracing::Span::current().record("nprobe", nprobe);
+
         // 1. Validate query dimensions
         if query.vector.len() != self.options.dimensions as usize {
             return Err(Error::InvalidInput(format!(
@@ -162,49 +176,35 @@ impl QueryEngine {
         // 2. Normalize query vector if required.
         let query_vector = self.normalize_query_if_needed(&query.vector);
 
-        // 3. Search HNSW for nearest centroids
-        let num_centroids = nprobe;
-        let t = Instant::now();
-        let centroid_candidates = self.search_centroids(&query_vector, num_centroids).await?;
-        debug!(
-            "searched for {} centroids, found: {}, elapsed_ms: {:?}",
-            num_centroids,
-            centroid_candidates.len(),
-            t.elapsed().as_millis()
-        );
+        // 3. Search centroid index for nearest centroids.
+        let centroid_candidates = self.search_centroids(&query_vector, nprobe).await?;
+        tracing::Span::current().record("n_centroids", centroid_candidates.len());
 
         if centroid_candidates.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 3. Dynamic pruning: skip posting lists whose centroids are far from query
-        let original_ncentroids = centroid_candidates.len();
+        // 4. Dynamic pruning: skip posting lists whose centroids are far from query.
         let centroid_ids = self.prune_centroids(&centroid_candidates, &query_vector);
-        debug!(
-            "before pruning: {} centroids, after dynamic pruning: {} centroids",
-            original_ncentroids,
-            centroid_ids.len()
-        );
+        tracing::Span::current().record("n_pruned_centroids", centroid_ids.len());
 
-        // 5. Load posting lists and score candidates
+        // 5. Load posting lists and score candidates.
         let mut sorted_lists = self.load_and_score(&centroid_ids, &query_vector).await?;
 
         if sorted_lists.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 6. Apply metadata filter (if provided)
+        // 6. Apply metadata filter (if provided).
         if let Some(filter) = &query.filter {
             Self::apply_filter(&mut sorted_lists, filter, self.storage.as_ref()).await?;
         }
 
-        // 7. K-way merge and resolve top-k forward index lookups
+        // 7. K-way merge and resolve top-k forward index lookups.
         let mut results = self.resolve_top_k(sorted_lists, query.limit).await?;
         Self::apply_field_selection(&mut results, &query.include_fields);
-        debug!(
-            op = "search_with_options",
-            elapsed_ms = t.elapsed().as_millis()
-        );
+
+        tracing::Span::current().record("n_results", results.len());
         Ok(results)
     }
 
@@ -217,6 +217,11 @@ impl QueryEngine {
     ///
     /// Returns the pruned centroid IDs. If pruning is disabled (`None`), returns
     /// the input unchanged.
+    #[trace_instrument(
+        name = "prune_centroids",
+        skip_all,
+        fields(n_in = centroid_ids.len()),
+    )]
     pub(crate) fn prune_centroids(&self, centroid_ids: &[Posting], query: &[f32]) -> Vec<VectorId> {
         let epsilon = match self.options.query_pruning_factor {
             Some(e) => e,
@@ -261,12 +266,18 @@ impl QueryEngine {
             .collect()
     }
 
+    #[trace_instrument(name = "search_centroids", skip_all, fields(k))]
     async fn search_centroids(&self, query: &[f32], k: usize) -> Result<Vec<Posting>> {
         search_centroids(self.centroid_index.as_ref(), query, k).await
     }
 
     /// Spawn a task per centroid to load its posting list and score all candidates
     /// against the query vector. Returns per-centroid sorted candidate lists.
+    #[trace_instrument(
+        name = "load_and_score",
+        skip_all,
+        fields(n_centroids = centroid_ids.len()),
+    )]
     async fn load_and_score(
         &self,
         centroid_ids: &[VectorId],
@@ -276,35 +287,38 @@ impl QueryEngine {
         let metric = self.options.distance_metric;
         let query_vec: Vec<f32> = query.to_vec();
 
-        let t = Instant::now();
         let mut handles = Vec::with_capacity(centroid_ids.len());
         for &cid in centroid_ids {
             let snap = self.storage.clone();
             let q = query_vec.clone();
-            handles.push(tokio::spawn(async move {
-                let posting_list =
-                    PostingList::from_value(snap.get_posting_list(cid, dimensions).await?);
-                let mut scored: Vec<ScoredCandidate> = posting_list
-                    .iter()
-                    .map(|posting| {
-                        let d = distance::compute_distance(&q, posting.vector(), metric);
-                        ScoredCandidate {
-                            internal_id: posting.id(),
-                            distance: d,
-                        }
-                    })
-                    .collect();
-                scored.sort_unstable_by_key(|a| a.distance);
-                Ok::<_, Error>(scored)
-            }));
+            let per_centroid_span = trace_span!(
+                "load_posting_list_and_score",
+                centroid_id = cid.id(),
+                n_scored = tracing::field::Empty,
+            );
+            handles.push(tokio::spawn(
+                async move {
+                    let posting_list =
+                        PostingList::from_value(snap.get_posting_list(cid, dimensions).await?);
+                    let mut scored: Vec<ScoredCandidate> = posting_list
+                        .iter()
+                        .map(|posting| {
+                            let d = distance::compute_distance(&q, posting.vector(), metric);
+                            ScoredCandidate {
+                                internal_id: posting.id(),
+                                distance: d,
+                            }
+                        })
+                        .collect();
+                    scored.sort_unstable_by_key(|a| a.distance);
+                    tracing::Span::current().record("n_scored", scored.len());
+                    Ok::<_, Error>(scored)
+                }
+                .instrument(per_centroid_span),
+            ));
         }
 
         let results = futures::future::join_all(handles).await;
-        let elapsed = t.elapsed();
-        debug!(
-            op = "search/load_and_score/load",
-            elapsed_ms = elapsed.as_millis()
-        );
         let mut sorted_lists: Vec<Vec<ScoredCandidate>> = Vec::with_capacity(results.len());
         for result in results {
             let scored =
@@ -320,6 +334,13 @@ impl QueryEngine {
     /// K-way merge the per-centroid sorted lists and resolve top-k forward
     /// index lookups. Only merges as far into the lists as needed to produce
     /// k results, deduplicating by `internal_id` along the way.
+    ///
+    /// Instrumentation has three sub-phases inside the top-level span:
+    /// 1. `seed_heap` — build the k-way merge heap from the input lists.
+    /// 2. `merge_candidates` — pop a batch of k unique candidates from the heap
+    ///    (the "final ranking" step — this is what produces the output order).
+    /// 3. `forward_index_read` — resolve the batch's vector data from storage.
+    #[trace_instrument(name = "resolve_top_k", skip_all, fields(k))]
     async fn resolve_top_k(
         &self,
         sorted_lists: Vec<Vec<ScoredCandidate>>,
@@ -328,13 +349,17 @@ impl QueryEngine {
         let dimensions = self.options.dimensions as usize;
 
         // Seed the min-heap with the first element of each sorted list.
-        let mut heap = BinaryHeap::new();
-        for list in sorted_lists {
-            let mut iter = list.into_iter();
-            if let Some(first) = iter.next() {
-                heap.push(Reverse(MergeEntry(first, iter)));
+        let n_lists = sorted_lists.len();
+        let mut heap = trace_span!("seed_heap", n_lists = n_lists).in_scope(|| {
+            let mut heap = BinaryHeap::new();
+            for list in sorted_lists {
+                let mut iter = list.into_iter();
+                if let Some(first) = iter.next() {
+                    heap.push(Reverse(MergeEntry(first, iter)));
+                }
             }
-        }
+            heap
+        });
 
         let mut results = Vec::with_capacity(k);
         let mut seen = HashSet::new();
@@ -342,36 +367,48 @@ impl QueryEngine {
         // Pop candidates from the heap in score order, batch-resolve k at a
         // time, and stop as soon as we have k results.
         loop {
-            // Drain up to k unique candidates from the merge heap.
-            let mut batch = Vec::with_capacity(k - results.len());
-            while batch.len() < k - results.len() {
-                let Some(Reverse(MergeEntry(candidate, mut iter))) = heap.pop() else {
-                    break;
-                };
-                if let Some(next) = iter.next() {
-                    heap.push(Reverse(MergeEntry(next, iter)));
+            // Drain up to k unique candidates from the merge heap — the
+            // "final ranking" phase. This is what decides the returned
+            // order; the forward-index read below just materializes the
+            // result payloads.
+            let need = k - results.len();
+            let merge_span = trace_span!(
+                "merge_candidates",
+                want = need,
+                picked = tracing::field::Empty,
+            );
+            let batch = merge_span.in_scope(|| {
+                let mut batch = Vec::with_capacity(need);
+                while batch.len() < need {
+                    let Some(Reverse(MergeEntry(candidate, mut iter))) = heap.pop() else {
+                        break;
+                    };
+                    if let Some(next) = iter.next() {
+                        heap.push(Reverse(MergeEntry(next, iter)));
+                    }
+                    if seen.insert(candidate.internal_id) {
+                        batch.push(candidate);
+                    }
                 }
-                if seen.insert(candidate.internal_id) {
-                    batch.push(candidate);
-                }
-            }
+                tracing::Span::current().record("picked", batch.len());
+                batch
+            });
 
             if batch.is_empty() {
                 break;
             }
 
             // Resolve forward index lookups for the batch concurrently.
-            let t = Instant::now();
-            let futures: Vec<_> = batch
-                .iter()
-                .map(|sr| self.storage.get_vector_data(sr.internal_id, dimensions))
-                .collect();
-            let loaded = futures::future::join_all(futures).await;
-            let elapsed = t.elapsed();
-            debug!(
-                op = "query/resolve_top_k/load",
-                elapsed_ms = elapsed.as_millis() as u64,
-            );
+            let load_span = trace_span!("forward_index_read", batch_size = batch.len());
+            let loaded = async {
+                let futures: Vec<_> = batch
+                    .iter()
+                    .map(|sr| self.storage.get_vector_data(sr.internal_id, dimensions))
+                    .collect();
+                futures::future::join_all(futures).await
+            }
+            .instrument(load_span)
+            .await;
 
             for (sr, vector_data) in batch.iter().zip(loaded) {
                 let Some(vector_data) = vector_data? else {
@@ -415,6 +452,7 @@ impl QueryEngine {
     ///
     /// Collects all candidate IDs into a bitmap, evaluates the filter against
     /// the inverted index, then retains only candidates that pass the filter.
+    #[trace_instrument(name = "apply_filter", skip_all)]
     async fn apply_filter(
         sorted_lists: &mut [Vec<ScoredCandidate>],
         filter: &Filter,

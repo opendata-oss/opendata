@@ -46,6 +46,7 @@ slatedb.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+ulid.workspace = true
 log = "0.4.29"
 rand = "0.8"
 

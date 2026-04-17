@@ -41,6 +41,17 @@ Block-based sequence allocator for crash-safe ID generation:
 
 Used by: `vector` (internal vector IDs), `log` (sequence numbers)
 
+### `src/tracing/` - Query Tracing Framework
+
+Shared tracing setup for all OpenData databases. Writes Chrome Trace Format
+JSON files viewable in [Perfetto](https://ui.perfetto.dev). See
+[src/tracing/README.md](src/tracing/README.md) for full usage.
+
+Key surface:
+- `init(TracingConfig) -> TracingGuard` — call once from `main()`
+- `TRACE_TARGET` — constant; all instrumented spans must use this target
+- `request_trace_span(trace_id)` — root span for per-request opt-in tracing
+
 ### Other Modules
 
 - `src/bytes.rs` - BytesRange utilities

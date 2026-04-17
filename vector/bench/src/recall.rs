@@ -823,6 +823,7 @@ impl Benchmark for RecallBenchmark {
             distance_metric: config.distance_metric,
             query_pruning_factor: config.query_pruning_factor,
             metadata_fields: config.metadata_fields.clone(),
+            tracing: Default::default(),
         };
         let db = VectorDb::open_with_storage(config, sb).await?;
 

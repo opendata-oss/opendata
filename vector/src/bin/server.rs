@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
 
+use common::tracing::{TracingGuard, init as init_tracing};
 use vector::VectorDb;
 use vector::VectorDbReader;
 use vector::server::{
@@ -43,20 +43,14 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
-    // Parse CLI arguments
+    // Parse CLI arguments first so we can read tracing config out of the YAML.
     let args = CliArgs::parse();
     let server_config = VectorServerConfig { port: args.port };
 
     match args.command {
         Command::Vector { config } => {
             let vector_config = load_vector_config(&config);
+            let _trace_guard = init_and_log_tracing(vector_config.tracing.clone());
             tracing::info!("Opening vector database with config: {:?}", vector_config);
             let metadata_fields = vector_config.metadata_fields.clone();
 
@@ -69,6 +63,7 @@ async fn main() {
         }
         Command::Reader { config } => {
             let reader_config = load_reader_config(&config);
+            let _trace_guard = init_and_log_tracing(reader_config.tracing.clone());
             tracing::info!(
                 "Opening vector database reader with config: {:?}",
                 reader_config
@@ -83,6 +78,16 @@ async fn main() {
             server.run().await;
         }
     }
+}
+
+/// Initialize tracing and, if trace capture is enabled, log the output path so
+/// operators can find the file.
+fn init_and_log_tracing(config: common::TracingConfig) -> TracingGuard {
+    let guard = init_tracing(config);
+    if let Some(path) = guard.output_path() {
+        tracing::info!(path = %path.display(), "tracing: chrome trace output enabled");
+    }
+    guard
 }
 
 #[cfg(test)]
