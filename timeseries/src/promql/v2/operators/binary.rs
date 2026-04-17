@@ -442,6 +442,107 @@ impl Drop for OutBuffers {
 }
 
 // ---------------------------------------------------------------------------
+// BufferedSide — drained full-grid scratch for the vector/vector path
+// ---------------------------------------------------------------------------
+
+/// Dense `(step_count × total_series_count)` buffer for one side of a
+/// vector/vector binary operation. Populated by absorbing every input
+/// batch from the child into the cell grid, regardless of the child's
+/// tile shape (step × series). Used for cross-tile matching — see
+/// [`BinaryOp::apply_vv`].
+///
+/// The grid is row-major by step: `values[step * total_series + series]`
+/// (matching `StepBatch`'s layout). `validity` runs parallel.
+///
+/// Memory is reserved up front from the shared reservation and released
+/// on drop; an undersize reservation surfaces `QueryError::MemoryLimit`
+/// at construction.
+struct BufferedSide {
+    reservation: MemoryReservation,
+    bytes: usize,
+    step_count: usize,
+    total_series: usize,
+    values: Vec<f64>,
+    validity: BitSet,
+    step_timestamps: Arc<[i64]>,
+}
+
+impl BufferedSide {
+    fn allocate(
+        reservation: &MemoryReservation,
+        step_count: usize,
+        total_series: usize,
+        step_timestamps: Arc<[i64]>,
+    ) -> Result<Self, QueryError> {
+        let cells = step_count.saturating_mul(total_series);
+        let bytes = out_bytes(cells);
+        reservation.try_grow(bytes)?;
+        Ok(Self {
+            reservation: reservation.clone(),
+            bytes,
+            step_count,
+            total_series,
+            values: vec![f64::NAN; cells],
+            validity: BitSet::with_len(cells),
+            step_timestamps,
+        })
+    }
+
+    /// Absorb one child batch into the grid using the batch's global
+    /// `(step_range, series_range)` as its destination; idempotent across
+    /// arbitrary child tiling (step × series) and interleaved emission.
+    fn absorb(&mut self, batch: &StepBatch) {
+        let step_count_in = batch.step_count();
+        let series_count_in = batch.series_count();
+        for step_off in 0..step_count_in {
+            let global_step = batch.step_range.start + step_off;
+            if global_step >= self.step_count {
+                continue;
+            }
+            let in_base = step_off * series_count_in;
+            let out_base = global_step * self.total_series;
+            for s in 0..series_count_in {
+                let in_cell = in_base + s;
+                if !batch.validity.get(in_cell) {
+                    continue;
+                }
+                let global_series = batch.series_range.start + s;
+                if global_series >= self.total_series {
+                    continue;
+                }
+                let out_cell = out_base + global_series;
+                self.values[out_cell] = batch.values[in_cell];
+                self.validity.set(out_cell);
+            }
+        }
+    }
+
+    /// Fetch `(step, global_series)` as `Option<f64>`: `Some(v)` iff the
+    /// cell was written by at least one absorbed batch.
+    #[inline]
+    fn get(&self, step: usize, global_series: usize) -> Option<f64> {
+        if step >= self.step_count || global_series >= self.total_series {
+            return None;
+        }
+        let cell = step * self.total_series + global_series;
+        if self.validity.get(cell) {
+            Some(self.values[cell])
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for BufferedSide {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.reservation.release(self.bytes);
+            self.bytes = 0;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BinaryOp — the operator
 // ---------------------------------------------------------------------------
 
@@ -456,6 +557,22 @@ pub struct BinaryOp<L: Operator, R: Operator> {
     shape: BinaryShape,
     reservation: MemoryReservation,
     schema: OperatorSchema,
+    /// Total series count of each side, captured at construction from
+    /// each child's static schema. Used to size the vector/vector buffer
+    /// grid; unused for scalar-involving shapes.
+    lhs_total_series: usize,
+    rhs_total_series: usize,
+    /// Buffered drain state for the vector/vector shape. Allocated lazily
+    /// on the first `next()` call (so construction doesn't reserve memory
+    /// for scalar shapes), absorbed into across child polls, and
+    /// consumed-exactly-once when both children hit EOS. `None` for
+    /// non-vector/vector shapes.
+    vv_lhs: Option<BufferedSide>,
+    vv_rhs: Option<BufferedSide>,
+    vv_lhs_done: bool,
+    vv_rhs_done: bool,
+    vv_any_batch: bool,
+    vv_emitted: bool,
     done: bool,
     errored: bool,
 }
@@ -481,6 +598,18 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
             rhs.schema().step_grid,
             "BinaryOp children must share a step grid",
         );
+        let lhs_total_series = lhs
+            .schema()
+            .series
+            .as_static()
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let rhs_total_series = rhs
+            .schema()
+            .series
+            .as_static()
+            .map(|s| s.len())
+            .unwrap_or(0);
         let schema = OperatorSchema::new(SchemaRef::Static(output_schema.clone()), grid);
         Self {
             lhs,
@@ -492,6 +621,14 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
             },
             reservation,
             schema,
+            lhs_total_series,
+            rhs_total_series,
+            vv_lhs: None,
+            vv_rhs: None,
+            vv_lhs_done: false,
+            vv_rhs_done: false,
+            vv_any_batch: false,
+            vv_emitted: false,
             done: false,
             errored: false,
         }
@@ -520,6 +657,14 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
             shape: BinaryShape::VectorScalar,
             reservation,
             schema,
+            lhs_total_series: 0,
+            rhs_total_series: 0,
+            vv_lhs: None,
+            vv_rhs: None,
+            vv_lhs_done: false,
+            vv_rhs_done: false,
+            vv_any_batch: false,
+            vv_emitted: false,
             done: false,
             errored: false,
         }
@@ -546,6 +691,14 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
             shape: BinaryShape::ScalarVector,
             reservation,
             schema,
+            lhs_total_series: 0,
+            rhs_total_series: 0,
+            vv_lhs: None,
+            vv_rhs: None,
+            vv_lhs_done: false,
+            vv_rhs_done: false,
+            vv_any_batch: false,
+            vv_emitted: false,
             done: false,
             errored: false,
         }
@@ -576,6 +729,14 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
             shape: BinaryShape::ScalarScalar,
             reservation,
             schema,
+            lhs_total_series: 0,
+            rhs_total_series: 0,
+            vv_lhs: None,
+            vv_rhs: None,
+            vv_lhs_done: false,
+            vv_rhs_done: false,
+            vv_any_batch: false,
+            vv_emitted: false,
             done: false,
             errored: false,
         }
@@ -619,10 +780,14 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
 
     fn apply(&self, lhs: StepBatch, rhs: StepBatch) -> Result<StepBatch, QueryError> {
         match &self.shape {
-            BinaryShape::VectorVector {
-                match_table,
-                output_schema,
-            } => self.apply_vv(lhs, rhs, match_table, output_schema),
+            BinaryShape::VectorVector { .. } => {
+                // Handled via the buffered vv path in `next()`; this arm
+                // is unreachable because `pull_both` is only invoked for
+                // scalar-involving shapes.
+                Err(QueryError::Internal(
+                    "Binary: vector/vector routed through per-batch apply".to_string(),
+                ))
+            }
             BinaryShape::VectorScalar => self.apply_vs(lhs, rhs, /* scalar_on_right = */ true),
             BinaryShape::ScalarVector => {
                 self.apply_vs(rhs, lhs, /* scalar_on_right = */ false)
@@ -631,25 +796,114 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
         }
     }
 
+    /// Drain both children into the vector/vector buffer grids, returning
+    /// `Poll::Ready(Ok(true))` once both sides have reached EOS. Allocates
+    /// the grids on first call. Returns `Poll::Pending` when either side
+    /// would block.
+    fn drain_vv(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool, QueryError>> {
+        if self.vv_lhs.is_none() {
+            let grid = self.schema.step_grid;
+            let step_timestamps: Arc<[i64]> = Arc::from(
+                (0..grid.step_count)
+                    .map(|i| grid.start_ms + (i as i64) * grid.step_ms)
+                    .collect::<Vec<_>>(),
+            );
+            match BufferedSide::allocate(
+                &self.reservation,
+                grid.step_count,
+                self.lhs_total_series,
+                step_timestamps.clone(),
+            ) {
+                Ok(side) => self.vv_lhs = Some(side),
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+            match BufferedSide::allocate(
+                &self.reservation,
+                grid.step_count,
+                self.rhs_total_series,
+                step_timestamps,
+            ) {
+                Ok(side) => self.vv_rhs = Some(side),
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+        }
+
+        // Poll each side independently until EOS. The loop below may
+        // surface Pending from either child; the caller's waker is
+        // registered by the child's poll, so we'll be re-invoked.
+        loop {
+            let mut progressed = false;
+            if !self.vv_lhs_done {
+                match self.lhs.next(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(None) => {
+                        self.vv_lhs_done = true;
+                        progressed = true;
+                    }
+                    Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err)),
+                    Poll::Ready(Some(Ok(batch))) => {
+                        if let Some(side) = self.vv_lhs.as_mut() {
+                            side.absorb(&batch);
+                        }
+                        self.vv_any_batch = true;
+                        progressed = true;
+                    }
+                }
+            }
+            if !self.vv_rhs_done {
+                match self.rhs.next(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(None) => {
+                        self.vv_rhs_done = true;
+                        progressed = true;
+                    }
+                    Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err)),
+                    Poll::Ready(Some(Ok(batch))) => {
+                        if let Some(side) = self.vv_rhs.as_mut() {
+                            side.absorb(&batch);
+                        }
+                        self.vv_any_batch = true;
+                        progressed = true;
+                    }
+                }
+            }
+            if self.vv_lhs_done && self.vv_rhs_done {
+                return Poll::Ready(Ok(true));
+            }
+            if !progressed {
+                return Poll::Ready(Ok(false));
+            }
+        }
+    }
+
     /// Vector/vector hot loop. `match_table` selects the per-output
     /// (lhs_idx, rhs_idx) pair; unmatched rows emit `validity = 0` cells.
+    ///
+    /// Buffers full lhs/rhs grids before emitting. Children may tile by
+    /// series (see `VectorSelectorOp` `series_chunk` default of 512) and
+    /// `match_table` indices are global over the children's full series
+    /// rosters — a cross-tile match (lhs in tile A, its paired rhs in
+    /// tile B) requires both sides fully resolved before the hot loop.
+    /// See RFC 0007 §4 unit 6.3.9: the prior per-batch path emitted one
+    /// partial output per paired tile with `series_range = 0..out_series`
+    /// and garbage cell values for any row that fell outside the paired
+    /// tile, causing downstream consumers to see duplicate-coverage
+    /// batches for the same step range.
     fn apply_vv(
         &self,
-        lhs: StepBatch,
-        rhs: StepBatch,
+        lhs: BufferedSide,
+        rhs: BufferedSide,
         match_table: &MatchTable,
         output_schema: &Arc<SeriesSchema>,
     ) -> Result<StepBatch, QueryError> {
-        let step_count = lhs.step_count();
+        let step_count = lhs.step_count;
         let out_series_count = match_table.len();
         let cell_count = step_count * out_series_count;
         let mut out = OutBuffers::allocate(&self.reservation, cell_count)?;
-        let lhs_series_count = lhs.series_count();
-        let rhs_series_count = rhs.series_count();
         let class = self.kind.class();
         let bool_mod = self.kind.bool_modifier();
 
-        // Resolve the (lhs_off, rhs_off) lookup per output row once, then
+        // Resolve the (lhs_idx, rhs_idx) lookup per output row once, then
         // loop over steps on the inside. For GroupRight, the map index is
         // RHS-indexed and the "many" side is RHS; for OneToOne and
         // GroupLeft it's LHS-indexed.
@@ -659,50 +913,25 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
         };
 
         for (out_row, mapped) in map.iter().enumerate() {
-            // Resolve the lhs / rhs batch-local offsets for this output
-            // row. `map[out_row]` may be None (unmatched).
-            let (lhs_off, rhs_off) = if scan_is_lhs {
-                // map is LHS-indexed; out_row IS lhs_off (for OneToOne /
-                // GroupLeft the output series set == LHS series set).
-                let lhs_off = out_row;
-                if lhs_off >= lhs_series_count {
-                    continue; // batch doesn't cover this series
-                }
-                match mapped {
-                    Some(rhs_idx) => {
-                        let rhs_off = *rhs_idx as usize;
-                        if rhs_off >= rhs_series_count {
-                            continue;
-                        }
-                        (Some(lhs_off), Some(rhs_off))
-                    }
-                    None => (Some(lhs_off), None),
-                }
+            // For OneToOne / GroupLeft the scan-side is LHS and
+            // `out_row` IS the lhs *global* series index. For
+            // GroupRight the scan-side is RHS and `out_row` IS the rhs
+            // global series index. `map[out_row]` may be None (no match
+            // found at planning time).
+            let (lhs_idx, rhs_idx) = if scan_is_lhs {
+                let lhs_idx = out_row;
+                let rhs_idx = mapped.map(|g| g as usize);
+                (Some(lhs_idx), rhs_idx)
             } else {
-                // GroupRight: map is RHS-indexed; out_row IS rhs_off.
-                let rhs_off = out_row;
-                if rhs_off >= rhs_series_count {
-                    continue;
-                }
-                match mapped {
-                    Some(lhs_idx) => {
-                        let lhs_off = *lhs_idx as usize;
-                        if lhs_off >= lhs_series_count {
-                            continue;
-                        }
-                        (Some(lhs_off), Some(rhs_off))
-                    }
-                    None => (None, Some(rhs_off)),
-                }
+                let rhs_idx = out_row;
+                let lhs_idx = mapped.map(|g| g as usize);
+                (lhs_idx, Some(rhs_idx))
             };
 
             for step_off in 0..step_count {
                 let out_idx = step_off * out_series_count + out_row;
-
-                // Read lhs/rhs cells for this (step, row). None means
-                // the batch doesn't have that side in this row.
-                let l_cell = lhs_off.and_then(|off| cell_of(&lhs, step_off, off));
-                let r_cell = rhs_off.and_then(|off| cell_of(&rhs, step_off, off));
+                let l_cell = lhs_idx.and_then(|idx| lhs.get(step_off, idx));
+                let r_cell = rhs_idx.and_then(|idx| rhs.get(step_off, idx));
 
                 self.write_cell(
                     class,
@@ -719,7 +948,7 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
         let (values, validity) = out.finish();
         Ok(StepBatch::new(
             lhs.step_timestamps.clone(),
-            lhs.step_range.clone(),
+            0..step_count,
             SchemaRef::Static(output_schema.clone()),
             0..out_series_count,
             values,
@@ -922,6 +1151,73 @@ impl<L: Operator, R: Operator> Operator for BinaryOp<L, R> {
         if self.done || self.errored {
             return Poll::Ready(None);
         }
+
+        // Vector/vector is a pipeline-breaker: drain both children into
+        // the full-grid buffers so cross-tile matches (lhs series in tile
+        // A paired with rhs series in tile B) can be resolved against
+        // a consistent snapshot (RFC 0007 §4 unit 6.3.9).
+        if matches!(self.shape, BinaryShape::VectorVector { .. }) {
+            if self.vv_emitted {
+                self.done = true;
+                return Poll::Ready(None);
+            }
+            match self.drain_vv(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(err)) => {
+                    self.errored = true;
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Ready(Ok(false)) => {
+                    // No progress in the last round and at least one side
+                    // is still live — should only be reachable via a bug
+                    // in child Pending signalling. Guard with an internal
+                    // error rather than spin.
+                    self.errored = true;
+                    return Poll::Ready(Some(Err(QueryError::Internal(
+                        "Binary: vv drain stalled with live children".to_string(),
+                    ))));
+                }
+                Poll::Ready(Ok(true)) => {}
+            }
+
+            self.vv_emitted = true;
+            if !self.vv_any_batch {
+                // No input from either side — emit no batch (matches the
+                // previous streaming behaviour on empty children and keeps
+                // `reshape_range` from seeing a zero-valued full grid).
+                self.done = true;
+                self.vv_lhs = None;
+                self.vv_rhs = None;
+                return Poll::Ready(None);
+            }
+
+            let (match_table, output_schema) = match &self.shape {
+                BinaryShape::VectorVector {
+                    match_table,
+                    output_schema,
+                } => (match_table.clone(), output_schema.clone()),
+                _ => unreachable!(),
+            };
+            let lhs_side = self.vv_lhs.take();
+            let rhs_side = self.vv_rhs.take();
+            let (lhs_side, rhs_side) = match (lhs_side, rhs_side) {
+                (Some(l), Some(r)) => (l, r),
+                _ => {
+                    self.errored = true;
+                    return Poll::Ready(Some(Err(QueryError::Internal(
+                        "Binary: vv buffers missing on drain completion".to_string(),
+                    ))));
+                }
+            };
+            return match self.apply_vv(lhs_side, rhs_side, &match_table, &output_schema) {
+                Ok(batch) => Poll::Ready(Some(Ok(batch))),
+                Err(err) => {
+                    self.errored = true;
+                    Poll::Ready(Some(Err(err)))
+                }
+            };
+        }
+
         match self.pull_both(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => {
@@ -1516,7 +1812,11 @@ mod tests {
 
     #[test]
     fn should_stitch_aligned_step_ranges_from_children() {
-        // given: two children each emitting a [0..2) then [2..4) batch
+        // given: two children each emitting a [0..2) then [2..4) batch.
+        // Under the RFC 0007 §4 unit 6.3.9 fix, vector/vector is now a
+        // pipeline-breaker: children are drained into a full-grid buffer
+        // and a single output batch covering 0..4 is emitted on EOS
+        // (correct for cross-tile matches; see module docs).
         let lschema = mk_schema("l", 1);
         let rschema = mk_schema("r", 1);
         let grid = StepGrid {
@@ -1564,14 +1864,14 @@ mod tests {
         );
         let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
 
-        // then: two output batches covering the same step ranges.
-        assert_eq!(outs.len(), 2);
-        assert_eq!(outs[0].step_range, 0..2);
+        // then: one output batch covering the full grid with correct
+        // per-(step, series) sums.
+        assert_eq!(outs.len(), 1);
+        assert_eq!(outs[0].step_range, 0..4);
         assert_eq!(outs[0].get(0, 0), Some(11.0));
         assert_eq!(outs[0].get(1, 0), Some(22.0));
-        assert_eq!(outs[1].step_range, 2..4);
-        assert_eq!(outs[1].get(0, 0), Some(33.0));
-        assert_eq!(outs[1].get(1, 0), Some(44.0));
+        assert_eq!(outs[0].get(2, 0), Some(33.0));
+        assert_eq!(outs[0].get(3, 0), Some(44.0));
     }
 
     #[test]
