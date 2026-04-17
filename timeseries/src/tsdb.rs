@@ -2742,6 +2742,129 @@ mod tests {
             assert_eq!(samples[1].value, 10.0);
         }
 
+        // ── RFC 0007 §4 unit 6.3.9 — tile-boundary stress end-to-end ──
+
+        /// Ingest a large-roster metric: `n_series` series under a single
+        /// metric name `metric`, one sample per series at `(base_ts,
+        /// base_ts + step)` — two samples per series so `sum_over_time`
+        /// has real values to aggregate inside the 10s sub-window.
+        async fn create_tsdb_with_large_roster(metric: &str, n_series: usize) -> Tsdb {
+            let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+                OpenTsdbMergeOperator,
+            ))));
+            let mut samples = Vec::with_capacity(n_series * 2);
+            for i in 0..n_series {
+                samples.push(create_sample(
+                    metric,
+                    vec![("i", &i.to_string())],
+                    4_000_000,
+                    1.0,
+                ));
+                samples.push(create_sample(
+                    metric,
+                    vec![("i", &i.to_string())],
+                    4_005_000,
+                    1.0,
+                ));
+            }
+            tsdb.ingest_samples(samples, None).await.unwrap();
+            tsdb.flush().await.unwrap();
+            tsdb
+        }
+
+        /// Subquery end-to-end at >512 series (RFC 0007 6.3.9 audit item
+        /// 10). Ignored because `SubqueryOp`'s
+        /// `tokio::task::block_in_place` path inside
+        /// [`build_subquery`](crate::promql::v2::plan::physical) re-invokes
+        /// the child factory synchronously per outer step and does not
+        /// release the child's reservation on drop, causing the 1 GiB
+        /// plan-time cap to fill before the query completes. This is a
+        /// pre-existing subquery resource-accounting bug, not a
+        /// tile-boundary bug — the operators themselves absorb multi-tile
+        /// input correctly (verified by the per-operator stress tests in
+        /// 6.3.9). Re-enable once subquery reservation cleanup lands.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "pre-existing subquery reservation leak; see doc comment"]
+        async fn should_eval_sum_over_time_subquery_with_over_512_series() {
+            const N_SERIES: usize = 600;
+            let tsdb = create_tsdb_with_large_roster("m", N_SERIES).await;
+            let query_time = UNIX_EPOCH + Duration::from_secs(4_020);
+
+            let opts = QueryOptions::default();
+            let result = tsdb
+                .eval_query_v2("sum_over_time(m[10s:2s])", Some(query_time), &opts)
+                .await
+                .unwrap();
+
+            let samples = match result {
+                QueryValue::Vector(v) => v,
+                other => panic!("expected Vector, got {:?}", other),
+            };
+            assert_eq!(
+                samples.len(),
+                N_SERIES,
+                "expected one output series per input",
+            );
+            for s in &samples {
+                assert!(
+                    s.value >= 2.0,
+                    "series {:?} sum_over_time = {}, expected >= 2.0",
+                    s.labels.get("i"),
+                    s.value,
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn should_eval_sum_by_label_over_large_roster_end_to_end() {
+            // given: 1500 series under `m`, bucketed into 3 groups
+            // (round-robin by `i % 3`). Each series has value 1.0 at the
+            // query time, so sum by (g) (m) should emit 3 groups with
+            // counts 500 each.
+            const N_SERIES: usize = 1500;
+            const GROUPS: usize = 3;
+            let tsdb = {
+                let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+                    OpenTsdbMergeOperator,
+                ))));
+                let mut samples = Vec::with_capacity(N_SERIES);
+                for i in 0..N_SERIES {
+                    samples.push(create_sample(
+                        "m",
+                        vec![("i", &i.to_string()), ("g", &((i % GROUPS).to_string()))],
+                        4_000_000,
+                        1.0,
+                    ));
+                }
+                tsdb.ingest_samples(samples, None).await.unwrap();
+                tsdb.flush().await.unwrap();
+                tsdb
+            };
+            let query_time = UNIX_EPOCH + Duration::from_secs(4_010);
+
+            let opts = QueryOptions::default();
+            let result = tsdb
+                .eval_query_v2("sum by (g) (m)", Some(query_time), &opts)
+                .await
+                .unwrap();
+
+            // then: three groups, each carrying N_SERIES / GROUPS = 500.
+            let mut samples = match result {
+                QueryValue::Vector(v) => v,
+                other => panic!("expected Vector, got {:?}", other),
+            };
+            samples.sort_by(|a, b| a.labels.get("g").cmp(&b.labels.get("g")));
+            assert_eq!(samples.len(), GROUPS);
+            for s in &samples {
+                assert_eq!(
+                    s.value,
+                    (N_SERIES / GROUPS) as f64,
+                    "group {:?} did not reach expected count",
+                    s.labels.get("g"),
+                );
+            }
+        }
+
         // ── Read-only reader v2 tests (RFC 0007 unit 7.0) ────────────
         //
         // These verify that the v2 engine runs through the

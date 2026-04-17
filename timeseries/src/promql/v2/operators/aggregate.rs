@@ -1092,11 +1092,11 @@ impl<C: Operator> AggregateOp<C> {
                 let heap = &mut self.heaps[group];
                 if heap.len() < k_usize {
                     heap.push(entry);
-                } else if let Some(worst) = heap.peek() {
-                    if entry.cmp(worst) == Ordering::Less {
-                        heap.pop();
-                        heap.push(entry);
-                    }
+                } else if let Some(worst) = heap.peek()
+                    && entry.cmp(worst) == Ordering::Less
+                {
+                    heap.pop();
+                    heap.push(entry);
                 }
             }
             let out_base = global_step * in_series_count;
@@ -2920,7 +2920,7 @@ mod tests {
         // step matrix and assert only global series 3, 4, 5 are selected.
         // Multiple output batches are allowed (one per input tile was the
         // old shape); the invariant checked is cell-level.
-        let mut valid = vec![None; 6];
+        let mut valid: [Option<f64>; 6] = [None; 6];
         for r in outs {
             let b = r.unwrap();
             for s in 0..b.series_count() {
@@ -2972,7 +2972,7 @@ mod tests {
         .unwrap();
         let outs: Vec<Result<StepBatch, QueryError>> = drive(&mut op);
 
-        let mut valid = vec![None; 6];
+        let mut valid: [Option<f64>; 6] = [None; 6];
         for r in outs {
             let b = r.unwrap();
             for s in 0..b.series_count() {

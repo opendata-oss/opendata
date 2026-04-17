@@ -381,14 +381,16 @@ mod tests {
         // valid with value 9.5. All other cells invalid.
         let mut vals_a = vec![f64::NAN; 2 * TILE];
         let mut valid_a = vec![false; 2 * TILE];
-        vals_a[0 * TILE + 3] = 7.0;
-        valid_a[0 * TILE + 3] = true;
+        // Step 0, tile-A local index 3 (global series 3).
+        vals_a[3] = 7.0;
+        valid_a[3] = true;
         let batch_a = mk_batch(schema.clone(), 0..2, 0..TILE, vals_a, valid_a);
 
         let mut vals_b = vec![f64::NAN; 2 * TILE];
         let mut valid_b = vec![false; 2 * TILE];
-        vals_b[1 * TILE + 488] = 9.5;
-        valid_b[1 * TILE + 488] = true;
+        // Step 1, tile-B local index 488 (global series 1000).
+        vals_b[TILE + 488] = 9.5;
+        valid_b[TILE + 488] = true;
         let batch_b = mk_batch(schema.clone(), 0..2, TILE..SERIES, vals_b, valid_b);
 
         let child = MockOp::new(schema, grid, vec![batch_a, batch_b]);
