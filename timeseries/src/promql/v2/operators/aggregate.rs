@@ -2602,4 +2602,172 @@ mod tests {
             .expect("quantile publishes a static schema");
         assert_eq!(static_schema.len(), 2);
     }
+
+    // ========================================================================
+    // 6.3.9 — breaker tile-boundary stress (topk / bottomk / quantile)
+    // ========================================================================
+
+    #[test]
+    fn should_select_topk_globally_across_multiple_series_tile_batches() {
+        // given: 6 input series in one group with values 1..=6, emitted
+        // as two series-tile batches (0..3 and 3..6) covering the same
+        // step range — same shape `VectorSelectorOp` produces when the
+        // roster exceeds the default 512-series tile. topk(3) must
+        // pick the three globally-largest (values 4, 5, 6), not the
+        // per-tile top-3.
+        let in_schema = mk_schema("in", 6);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let batch_a = mk_batch_with_series_range(
+            in_schema.clone(),
+            1,
+            0..3,
+            vec![1.0, 2.0, 3.0],
+            vec![true, true, true],
+        );
+        let batch_b = mk_batch_with_series_range(
+            in_schema.clone(),
+            1,
+            3..6,
+            vec![4.0, 5.0, 6.0],
+            vec![true, true, true],
+        );
+        let child = MockOp::new(in_schema, grid, vec![batch_a, batch_b]);
+        let gmap = GroupMap::new(vec![Some(0); 6], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Topk(3),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .expect("operator constructs");
+        let outs: Vec<Result<StepBatch, QueryError>> = drive(&mut op);
+
+        // then: reassemble the filter-shape output into a global series ×
+        // step matrix and assert only global series 3, 4, 5 are selected.
+        // Multiple output batches are allowed (one per input tile was the
+        // old shape); the invariant checked is cell-level.
+        let mut valid = vec![None; 6];
+        for r in outs {
+            let b = r.unwrap();
+            for s in 0..b.series_count() {
+                let gs = b.series_range.start + s;
+                if b.validity.get(s) {
+                    valid[gs] = Some(b.values[s]);
+                }
+            }
+        }
+        assert_eq!(valid[0], None, "series 0 not in top-3 globally");
+        assert_eq!(valid[1], None, "series 1 not in top-3 globally");
+        assert_eq!(valid[2], None, "series 2 not in top-3 globally");
+        assert_eq!(valid[3], Some(4.0));
+        assert_eq!(valid[4], Some(5.0));
+        assert_eq!(valid[5], Some(6.0));
+    }
+
+    #[test]
+    fn should_select_bottomk_globally_across_multiple_series_tile_batches() {
+        // given: same shape as the topk test; bottomk(3) must pick the
+        // three globally-smallest values (1, 2, 3 — all in tile A).
+        let in_schema = mk_schema("in", 6);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let batch_a = mk_batch_with_series_range(
+            in_schema.clone(),
+            1,
+            0..3,
+            vec![1.0, 2.0, 3.0],
+            vec![true, true, true],
+        );
+        let batch_b = mk_batch_with_series_range(
+            in_schema.clone(),
+            1,
+            3..6,
+            vec![4.0, 5.0, 6.0],
+            vec![true, true, true],
+        );
+        let child = MockOp::new(in_schema, grid, vec![batch_a, batch_b]);
+        let gmap = GroupMap::new(vec![Some(0); 6], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Bottomk(3),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<Result<StepBatch, QueryError>> = drive(&mut op);
+
+        let mut valid = vec![None; 6];
+        for r in outs {
+            let b = r.unwrap();
+            for s in 0..b.series_count() {
+                let gs = b.series_range.start + s;
+                if b.validity.get(s) {
+                    valid[gs] = Some(b.values[s]);
+                }
+            }
+        }
+        assert_eq!(valid[0], Some(1.0));
+        assert_eq!(valid[1], Some(2.0));
+        assert_eq!(valid[2], Some(3.0));
+        assert_eq!(valid[3], None);
+        assert_eq!(valid[4], None);
+        assert_eq!(valid[5], None);
+    }
+
+    #[test]
+    fn should_compute_quantile_globally_across_multiple_series_tile_batches() {
+        // given: 6 input series in one group, values 1..=6 split across
+        // two tiles. median (q=0.5) over 1..=6 = 3.5; a per-tile median
+        // path would compute 2.0 (tile A) and 5.0 (tile B) and emit two
+        // cells for the one group — wrong both in value and in
+        // duplicate-coverage.
+        let in_schema = mk_schema("in", 6);
+        let out_schema = mk_schema("out", 1);
+        let grid = mk_grid(1);
+        let batch_a = mk_batch_with_series_range(
+            in_schema.clone(),
+            1,
+            0..3,
+            vec![1.0, 2.0, 3.0],
+            vec![true, true, true],
+        );
+        let batch_b = mk_batch_with_series_range(
+            in_schema.clone(),
+            1,
+            3..6,
+            vec![4.0, 5.0, 6.0],
+            vec![true, true, true],
+        );
+        let child = MockOp::new(in_schema, grid, vec![batch_a, batch_b]);
+        let gmap = GroupMap::new(vec![Some(0); 6], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Quantile(0.5),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<Result<StepBatch, QueryError>> = drive(&mut op);
+
+        // then: exactly one output batch / one cell carrying the global
+        // median 3.5. Reducer-shape output (one cell per group per step).
+        let batches: Vec<StepBatch> = outs.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(
+            batches.len(),
+            1,
+            "expected one output batch covering one group-cell, got {}",
+            batches.len(),
+        );
+        let b = &batches[0];
+        assert_eq!(b.series_count(), 1);
+        assert_eq!(b.step_count(), 1);
+        assert_eq!(b.get(0, 0), Some(3.5));
+    }
 }
