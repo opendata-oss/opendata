@@ -270,7 +270,7 @@ return structurally-identical `QueryValue`s.
 | 6.3.6 | Small correctness cluster: topk tie-break, `by(__name__)`, `clamp(min>max)`, `topk(scalar(...), ...)`, binary `on()` schema | Architect | done | 6.2 | `timeseries/src/promql/v2/{operators/{aggregate,instant_fn}.rs,plan/{lowering,optimize,physical,cardinality}.rs,reshape.rs,plan/mod.rs,mod.rs}`, `timeseries/rfcs/0007-impl-plan.md` | |
 | 6.3.7 | Restore `timestamp()` source-sample semantics (StepBatch ABI extension) | Architect | done | 6.2 | `timeseries/src/promql/v2/batch.rs`, `timeseries/src/promql/v2/operators/{vector_selector,instant_fn}.rs`, `timeseries/src/promql/v2/reshape.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
 | 6.3.8 | Fix `MatrixSelectorOp` + `rate()` + `@` / `offset` window math (per-step effective-time threaded into `RollupOp`) | Architect | done | 6.2 | `timeseries/src/promql/v2/operators/{matrix_selector,subquery,rollup}.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
-| 6.3.9 | Stress-test every operator against `>series_chunk` (>512-series) inputs; fix any latent tile-boundary bugs surfaced | | ready | 6.3.8 | | Prod-observed aggregate tile-boundary bug (fixed in `a982d09`) surfaced an assumption that was only true for fixtures ≤512 series. Every operator that holds per-step state across batches (Topk / Bottomk / Quantile buffers, LabelManip dedup map, CountValues bucket keys, Binary match table, Rollup window math) has the same theoretical exposure: the K=512 default `series_chunk` means multi-tile batches for `>512` series are a legal shape the unit tests don't exercise today. For each operator: add a test that drives it with >512 series split across ≥2 tile batches per step range, assert results match the single-tile shape's output bit-for-bit. Follow the reproduction-first protocol (failing test committed before the fix). Fix any divergence surfaced. |
+| 6.3.9 | Stress-test every operator against `>series_chunk` (>512-series) inputs; fix any latent tile-boundary bugs surfaced | Operator Implementor | done | 6.3.8 | `timeseries/src/promql/v2/operators/{aggregate,binary,instant_fn,coercion,rechunk,concurrent,coalesce,label_manip,count_values,rollup}.rs`, `timeseries/src/tsdb.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
 
 **Acceptance**: zero failures on the unmodified `promqltest` corpus. Perf profile taken on a
 representative range query (e.g., `sum by (pod) (rate(http_requests_total[5m]))` over 6h) —
@@ -2011,6 +2011,51 @@ RFC section touched.
   `Rechunk` at plan time — a workaround, not a correctness fix. RFC
   sections touched: §4 state board only; no spec change.
 
+- 2026-04-17 — Operator Implementor (6.3.9 BinaryOp vv fix) —
+  Vector/vector `BinaryOp` paired child batches one-for-one and
+  indexed the match table by output row while using
+  `lhs_off = out_row` as the batch-local offset. Under `series_chunk
+  = 512` tiling of both sides, the second-tile batch (`series_range =
+  512..1024`) had its positional-0 row hold global series 512 but
+  be written at output row 0. The resulting batches declared
+  `series_range = 0..out_series_count` with only one tile of rows
+  actually filled; downstream consumers saw duplicate coverage.
+  Complicating factor: plan-time match tables for `on(label)` /
+  `ignoring(label)` can match a lhs series in tile A to an rhs series
+  in tile B, so even a per-tile "index-correcting" fix would lose
+  cross-tile matches. Fix: promote vv to a step-bounded breaker —
+  allocate `(lhs_total × step_count)` + `(rhs_total × step_count)`
+  grids on first poll, absorb every child batch regardless of tiling,
+  then emit a single full-grid output batch on EOS. Correct by
+  construction under arbitrary tile ordering. `VectorScalar` /
+  `ScalarVector` / `ScalarScalar` stay on the per-batch path — the
+  scalar side has exactly one series so has no tiling exposure.
+  Memory grows from per-output-batch to `(lhs_total + rhs_total) ×
+  step_count × (8 + 1/8) bytes`; oversize queries fail at first poll
+  with `MemoryLimit`. Alternative rejected: per-tile index correction
+  with output `series_range` = scan_batch.series_range — correct for
+  identity-match cases, broken for cross-tile on()/ignoring()
+  matches; ruled out after a quick proof. RFC sections touched: §4
+  state board only.
+
+- 2026-04-17 — Operator Implementor (6.3.9 breaker kinds fix) —
+  `AggregateOp` breaker kinds (`Topk`/`Bottomk`/`Quantile`) still
+  reset their per-group heap / sort buffer at the start of every
+  input batch and emitted one output batch per input batch. Under
+  `series_chunk = 512` tiling for rosters >512 series, topk/bottomk
+  selected the per-tile top-K instead of the global top-K, and
+  quantile emitted duplicate reducer-shape batches each computing
+  the quantile over one tile's values. Fix: mirror the streaming-
+  kinds pattern — allocate a full `(step_count ×
+  input_series_count)` values+validity grid at construction, absorb
+  every child batch idempotently, and on EOS run the per-step
+  selection / quantile against the whole grid. Output shape is now
+  one filter-shape (topk/bottomk) or reducer-shape (quantile) batch
+  covering the full input roster on EOS. Memory grows by
+  `step_count × input_series × (8 + 1/8) bytes` in addition to the
+  existing per-kind scratch; oversize queries fail construction with
+  `MemoryLimit`. RFC sections touched: §4 state board only.
+
 ## 6. Activity Log
 
 Append-only, one line per agent invocation. Format:
@@ -2058,6 +2103,7 @@ Append-only, one line per agent invocation. Format:
 - 2026-04-17 Architect 6.3.5 ready→done — fixed subquery inner-grid alignment (`plan/physical.rs::inner_grid`) to emit inner evaluation timestamps at absolute multiples of `inner_step_ms` within `(effective_t - range, effective_t]` rather than the previous forward-walk; empty-grid case (`range < step` with no aligned multiple) now correctly produces zero inner evaluations so the enclosing rollup emits `absent`. Threaded per-outer-step `effective_times: Arc<[i64]>` through `SubqueryOp` via a new `SubqueryOp::with_effective_times` constructor; `build_subquery` now precomputes effective times from `@` / `offset` and passes them in, so each outer step's inner window uses `(effective - range, effective]` instead of the raw outer timestamp. Added operator regression `should_use_effective_times_for_inner_window` and three planner regressions covering the `[50s:10s]` / `[1m:5m]` / `[30s:10s] offset 3s` alignment cases. Corpus: `should_pass_subquery_v2` now passes clean; `should_pass_at_modifier_v2` reduced to the three residual failures — #21 (matrix selector `rate + @`, tracked as new unit 6.3.8) and #33 / #41 (`timestamp()` source-sample semantics, still 6.3.7). Verification: `cargo fmt`; `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (327 passed); `cargo test -p opendata-timeseries --features promql-v2 promql::promqltest::v2_harness::tests::should_pass_subquery_v2`; `cargo clippy --all-targets --all-features -- -D warnings` clean.
 - 2026-04-17 Wiring Implementor 7.0 ready→done — lifted `eval_query_v2` / `eval_query_range_v2` onto the `TsdbReadEngine` trait as `#[cfg(feature = "promql-v2")]` default methods; both use `self.make_query_reader_for_ranges(...)`, so `Tsdb` and `TimeSeriesDbReader` get v2 for free without per-impl duplication. Made `execute_v2` generic over `R: QueryReader + Send + Sync + 'static` (the `QueryReaderSource` bound) so the same driver services both `TsdbQueryReader` and `ReaderQueryReader`. Deleted the inherent `Tsdb::eval_query_v2` / `eval_query_range_v2` — the trait defaults cover them, no call sites were pinned to the inherent method. Collapsed `TsdbEngine::eval_query_v2` / `eval_query_range_v2` to a two-arm dispatch on the trait method (previously the `ReadOnly` arm fell back to v1 and wrapped the result in `QueryValue::Matrix`); updated both doc comments accordingly. Added `v2_harness.rs` `use crate::tsdb::TsdbReadEngine` so the existing `tsdb.eval_query_v2(...)` / `eval_query_range_v2(...)` calls resolve through the trait. New tests in `tsdb::tests::v2_wiring_tests`: `should_eval_instant_query_v2_on_read_only_reader_returns_one_sample_per_series`, `should_eval_range_query_v2_on_read_only_reader_produces_samples_per_step`, `should_return_identical_results_for_read_write_and_read_only_paths_on_same_storage` (writer + reader parity over `rate(req_total[1m])`). Verification: `cargo fmt -p opendata-timeseries`; `cargo check -p opendata-timeseries` / `--features promql-v2` clean; `cargo test -p opendata-timeseries --lib` (724 passed); `cargo test -p opendata-timeseries --features promql-v2 --lib` (1079 passed, 2 ignored); `cargo test -p opendata-timeseries --features promql-v2 --lib promqltest::v2_harness` (11/11 fixtures green, 2 ignored perf smokes); `cargo clippy --all-targets --all-features -- -D warnings` clean.
 - 2026-04-17 Operator Implementor aggregate-tile-fix ready→done — streaming `AggregateOp` was treating each child batch as a complete `step × series` rectangle and emitting one partial output per batch; under the default `(step_tile × series_tile)` emission with `series_chunk = 512`, rosters over 512 series produced duplicate per-step output batches with partial sums, and `reshape_range` surfaced them as duplicate-timestamp samples (symptom: `sum by (applicationid)` values collapsing to a random subset's value at varying timestamps over 3h/24h windows). Fix: streaming kinds now buffer a `step_count × group_count` accumulator grid for the whole outer window, absorb every child batch regardless of tiling, and emit a single output batch on child-EOS; breaker kinds (`Topk`/`Bottomk`/`Quantile`) retained. Added failing-test reproduction first (`should_aggregate_across_multiple_series_tile_batches_for_same_step_range`), then the production-shape regression (`should_aggregate_many_series_through_default_tile_shape`, 1500 series × 3 groups × 4 steps × `series_chunk = 512`); updated the pre-existing `should_span_multiple_step_batches` → `_step_tile_batches` to use genuinely disjoint `step_range` tiles. Verification: `cargo fmt -p opendata-timeseries`; `cargo test -p opendata-timeseries --features promql-v2 --lib promql::v2::operators::aggregate` (33 passed); `cargo test -p opendata-timeseries --features promql-v2 --lib promqltest::v2_harness` (11/11 fixtures green, 2 ignored perf smokes); `cargo test -p opendata-timeseries --features promql-v2 --lib` (1081 passed); `cargo clippy --all-targets --all-features -- -D warnings` clean.
+- 2026-04-17 Operator Implementor 6.3.9 ready→done — audited all 10 operators in the taxonomy against `>series_chunk` (>512-series) tiled input; fixed 2 (BinaryOp vector/vector, AggregateOp breaker kinds Topk/Bottomk/Quantile) using the same step-bounded-breaker pattern as the streaming-aggregate fix; added 11 per-operator regression tests plus 1 end-to-end wiring test (`sum by (g) (m)` over 1500 series). Passing as-is under tiling: InstantFnOp, ScalarizeOp/TimeScalarOp, RechunkOp, ConcurrentOp, CoalesceOp, LabelManipOp, CountValuesOp, RollupOp — all either stateless per-batch or already drain cross-batch into a single-grid accumulator. Subquery end-to-end stress (`sum_over_time(m[10s:2s])` at 600 series) marked `#[ignore]` with a doc comment flagging a pre-existing `SubqueryOp` reservation leak (factory re-invoked synchronously per outer step via `block_in_place`, does not release child reservations on drop) — orthogonal to 6.3.9. Verification: `cargo fmt -p opendata-timeseries`; `cargo test -p opendata-timeseries --features promql-v2 --lib promql::v2` (343 passed); `cargo test -p opendata-timeseries --features promql-v2 --lib promqltest::v2_harness` (11/11 fixtures green, 2 ignored perf smokes); `cargo test -p opendata-timeseries --features promql-v2 --lib` (1094 passed, 3 ignored: 2 perf + new subquery stress); `cargo clippy --all-targets --all-features -- -D warnings` clean.
 
 ---
 
