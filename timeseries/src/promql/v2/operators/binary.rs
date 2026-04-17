@@ -1641,4 +1641,157 @@ mod tests {
         assert_eq!(b.get(0, 0), Some(50.0));
         assert_eq!(b.get(0, 1), Some(100.0));
     }
+
+    // ========================================================================
+    // tile-boundary stress (RFC 0007 6.3.9)
+    // ========================================================================
+
+    /// Build a batch over an arbitrary `series_range` slice of a `roster`
+    /// schema. Values are row-major; `values[step * series_count + s]`
+    /// holds the sample for `(step, series_range.start + s)`.
+    fn mk_tile_batch(
+        roster: Arc<SeriesSchema>,
+        step_count: usize,
+        series_range: std::ops::Range<usize>,
+        values: Vec<f64>,
+        validity: Vec<bool>,
+    ) -> StepBatch {
+        let series_count = series_range.len();
+        assert_eq!(values.len(), step_count * series_count);
+        assert_eq!(validity.len(), values.len());
+        let ts: Arc<[i64]> = Arc::from(
+            (0..step_count)
+                .map(|i| 1_000 + (i as i64) * 1_000)
+                .collect::<Vec<_>>(),
+        );
+        let mut bits = BitSet::with_len(validity.len());
+        for (i, &b) in validity.iter().enumerate() {
+            if b {
+                bits.set(i);
+            }
+        }
+        StepBatch::new(
+            ts,
+            0..step_count,
+            SchemaRef::Static(roster),
+            series_range,
+            values,
+            bits,
+        )
+    }
+
+    #[test]
+    fn should_apply_vector_vector_binary_across_multi_series_tile_batches() {
+        // given: vector/vector over 1024 matched series (identity match:
+        // lhs[i] ↔ rhs[i]) with both sides tiled into 2 × 512-series
+        // batches — this is exactly the shape the default
+        // `VectorSelectorOp` emits for rosters >512 series. Values are
+        // chosen so the correct per-cell answer is
+        // `value[step, series] = 1000 * step + series` (lhs) + same
+        // shifted to `10_000 * step + series` (rhs); add-combined sum per
+        // cell is therefore `11_000 * step + 2 * series`.
+        const SERIES: usize = 1024;
+        const TILE: usize = 512;
+        const STEP_COUNT: usize = 2;
+
+        let lschema = mk_schema("m", SERIES);
+        let rschema = mk_schema("m", SERIES);
+        let grid = mk_grid(STEP_COUNT);
+
+        let build_tile = |prefix_scale: f64, series_range: std::ops::Range<usize>| -> Vec<f64> {
+            let mut v = Vec::with_capacity(STEP_COUNT * series_range.len());
+            for step in 0..STEP_COUNT {
+                for s in series_range.clone() {
+                    v.push(prefix_scale * step as f64 + s as f64);
+                }
+            }
+            v
+        };
+
+        let lhs_a = mk_tile_batch(
+            lschema.clone(),
+            STEP_COUNT,
+            0..TILE,
+            build_tile(1_000.0, 0..TILE),
+            vec![true; STEP_COUNT * TILE],
+        );
+        let lhs_b = mk_tile_batch(
+            lschema.clone(),
+            STEP_COUNT,
+            TILE..SERIES,
+            build_tile(1_000.0, TILE..SERIES),
+            vec![true; STEP_COUNT * TILE],
+        );
+        let rhs_a = mk_tile_batch(
+            rschema.clone(),
+            STEP_COUNT,
+            0..TILE,
+            build_tile(10_000.0, 0..TILE),
+            vec![true; STEP_COUNT * TILE],
+        );
+        let rhs_b = mk_tile_batch(
+            rschema.clone(),
+            STEP_COUNT,
+            TILE..SERIES,
+            build_tile(10_000.0, TILE..SERIES),
+            vec![true; STEP_COUNT * TILE],
+        );
+
+        // OneToOne identity match: output row i pulls lhs[i] + rhs[i].
+        let match_table: Vec<Option<u32>> = (0..SERIES as u32).map(Some).collect();
+        let match_table = MatchTable::OneToOne(match_table);
+
+        let lhs = MockOp::new(lschema.clone(), grid, vec![lhs_a, lhs_b]);
+        let rhs = MockOp::new(rschema, grid, vec![rhs_a, rhs_b]);
+        let mut op = BinaryOp::new_vector_vector(
+            lhs,
+            rhs,
+            BinaryOpKind::Add,
+            match_table,
+            lschema,
+            MemoryReservation::new(1 << 20),
+        );
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then: reassemble a global (step, series) cell matrix from
+        // whatever batch shapes the op produced, then verify every cell
+        // equals the single-tile reference `11_000 * step + 2 * series`.
+        // Also verify no duplicate coverage: each global cell must be
+        // written exactly once.
+        let mut covered = vec![vec![false; SERIES]; STEP_COUNT];
+        let mut computed = vec![vec![f64::NAN; SERIES]; STEP_COUNT];
+        for batch in &outs {
+            let sc = batch.series_count();
+            for step_off in 0..batch.step_count() {
+                let gs = batch.step_range.start + step_off;
+                for so in 0..sc {
+                    let cell = step_off * sc + so;
+                    if !batch.validity.get(cell) {
+                        continue;
+                    }
+                    let global_series = batch.series_range.start + so;
+                    assert!(
+                        !covered[gs][global_series],
+                        "cell (step={gs}, series={global_series}) covered twice",
+                    );
+                    covered[gs][global_series] = true;
+                    computed[gs][global_series] = batch.values[cell];
+                }
+            }
+        }
+        for step in 0..STEP_COUNT {
+            for series in 0..SERIES {
+                let expected = 11_000.0 * step as f64 + 2.0 * series as f64;
+                assert!(
+                    covered[step][series],
+                    "missing cell (step={step}, series={series})",
+                );
+                assert!(
+                    (computed[step][series] - expected).abs() < 1e-9,
+                    "cell (step={step}, series={series}): expected {expected}, got {}",
+                    computed[step][series],
+                );
+            }
+        }
+    }
 }
