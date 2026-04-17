@@ -248,9 +248,9 @@ cardinality-gate rejects oversized queries before resolve.
 
 | # | Unit | Owner | Status | Deps | Artifacts | Blocker |
 |---|---|---|---|---|---|---|
-| 5.1 | New `Tsdb::eval_query_v2` / `eval_query_range_v2` entry points | | ready | 4.* | | |
-| 5.2 | Dispatch on `promql-v2` feature flag in HTTP handler | | ready | 5.1 | | |
-| 5.3 | Result shaping: `StepBatch` → `QueryValue` without copying labels twice | | ready | 5.1 | | |
+| 5.1 | New `Tsdb::eval_query_v2` / `eval_query_range_v2` entry points | Wiring Implementor | done | 4.* | `timeseries/src/tsdb.rs`, `timeseries/src/promql/v2/reshape.rs`, `timeseries/src/promql/v2/mod.rs` | |
+| 5.2 | Dispatch on `promql-v2` feature flag in HTTP handler | Wiring Implementor | done | 5.1 | `timeseries/src/server/http.rs`, `timeseries/src/tsdb.rs`, `timeseries/tests/http_server.rs` | |
+| 5.3 | Result shaping: `StepBatch` → `QueryValue` without copying labels twice | Wiring Implementor | done | 5.1 | `timeseries/src/promql/v2/reshape.rs` | |
 
 **Acceptance**: with flag off, everything behaves as on `main`. With flag on, simple queries
 return structurally-identical `QueryValue`s.
@@ -1598,6 +1598,171 @@ RFC section touched.
   DEFAULT_CHANNEL_BOUND }` — is used by `LoweringContext::new` /
   `for_instant`. Keeps the context as the single configuration
   surface; `build_physical_plan` signature unchanged.
+- 2026-04-16 — Wiring Implementor (unit 5.1) — **Memory cap default: 1 GiB**
+  (`DEFAULT_V2_MEMORY_CAP_BYTES = 1 << 30` in `tsdb.rs`). No crate-level
+  memory-cap config exists today; plumbing one through `QueryOptions` /
+  `TsdbConfig` is out of scope for 5.1. Revisit in 5.2 when the HTTP
+  handler gets a natural knob.
+- 2026-04-16 — Wiring Implementor (unit 5.1) — **`PlanError → QueryError`
+  mapping**. Parse/shape failures (`UnknownFunction`, `InvalidArgument`,
+  `InvalidTopLevelString`, `UnsupportedExpression`, `UnsupportedFeature`)
+  map to `QueryError::InvalidQuery` — the user wrote something the v2
+  engine refuses. Structural / runtime failures (`TooLarge`,
+  `MemoryLimit`, `SourceError`, `InvalidMatching`, `PhysicalPlanFailed`)
+  map to `QueryError::Execution`. The crate-level `QueryError` lacks
+  dedicated `MemoryLimit` / `TooLarge` variants, so the structured v2
+  payloads are rendered into the `Execution(String)` variant via
+  `thiserror` `Display`. The HTTP handler (unit 5.2) can parse these
+  strings or — preferably — extend `crate::error::QueryError` with
+  structured variants when the handler lands.
+- 2026-04-16 — Wiring Implementor (unit 5.1) — **Instant-vs-range dispatch
+  shape**. Single private `execute_v2(query, reader, ctx, is_instant)`
+  helper drives both paths: parse → lower → optimize → build_physical_plan
+  → loop `poll_fn(|cx| plan.root.next(cx))` → `reshape_instant` /
+  `reshape_range`. The `is_instant` bool gates only the reshape; the
+  operator pipeline is shape-agnostic per RFC §"Core Data Model"
+  ("Instant queries are a range of one step"). `eval_query_v2` sets
+  `LoweringContext::for_instant(at_ms, lookback_ms)`; `eval_query_range_v2`
+  uses `LoweringContext::new(start_ms, end_ms, step_ms, lookback_ms)`.
+  Signatures mirror v1 (`Option<SystemTime>` + `&QueryOptions`,
+  `impl RangeBounds<SystemTime> + Duration + &QueryOptions`) so phase 5.2
+  can A/B swap without reshaping call sites. Range returns `QueryValue`
+  (not `Vec<RangeSample>` like v1) because the plan root may emit a
+  `Scalar` over a range grid (e.g. `1+1`); phase 5.2 HTTP dispatch
+  collapses as needed.
+- 2026-04-16 — Wiring Implementor (unit 5.1) — **Reshape-placeholder
+  strategy (option a)**. Minimum viable reshape lives in a new
+  `timeseries/src/promql/v2/reshape.rs`: `reshape_instant(plan, batches)`
+  / `reshape_range(plan, batches)`. Both read labels from the emitted
+  `StepBatch::series: SchemaRef::Static` (works for deferred-schema roots
+  because `CountValuesOp` stamps the finalised roster on its emitted
+  batch per unit 3c.4). Invalid cells are elided — matches v1's "no
+  sample in lookback window = skip this series". Pure-scalar detection
+  uses the `ConstScalarOp` canonical shape: single-series roster with
+  empty labels. 4 unit tests cover instant/range/scalar/invalid paths.
+  Unit 5.3 can polish (avoid label double-clone, thread per-batch
+  buffers) without reshaping `tsdb.rs` call sites.
+- 2026-04-16 — Wiring Implementor (unit 5.1) — **`TimeSeriesDb` internals
+  touched**: reused `Tsdb::query_reader_for_ranges` (the existing
+  bucket-set reader builder) to feed `QueryReaderSource::new`. One
+  helper (`preload_ranges_for_v2`) re-parses the query to compute the
+  v1-style preload range — the v2 planner doesn't yet own a
+  `compute_preload_ranges` equivalent, and implementing one would pull
+  the phase-4 scope. Phase 5.3 or 7 can short-circuit the re-parse by
+  consulting the logical plan directly. No phase-2 API widening and no
+  operator / planner surface changes.
+- 2026-04-16 — Wiring Implementor (unit 5.1) — **Reader lifetime**.
+  `QueryReaderSource<R: QueryReader>` is built with `Arc::new(reader)`
+  per query, where `reader: TsdbQueryReader` comes from
+  `self.query_reader_for_ranges(...)`. `TsdbQueryReader` owns its data
+  (`HashMap<TimeBucket, MiniQueryReader>` — no borrowed handles into
+  `Tsdb`), so `Arc<TsdbQueryReader>` is `'static` and composes cleanly
+  with `build_physical_plan`'s `S: SeriesSource + Send + Sync + 'static`
+  bound. No adapter shim required.
+- 2026-04-16 — Wiring Implementor (unit 5.2) — **Dispatch point**.
+  Compile-time `#[cfg(feature = "promql-v2")]` / `#[cfg(not(feature = "promql-v2"))]`
+  gate lives directly in `server/http.rs` at three call sites —
+  `handle_query`, `handle_query_range`, and `handle_federate` (the last
+  re-uses the instant entry point per `selector` match). No new
+  abstraction layer, no runtime A/B, no query parameter.
+- 2026-04-16 — Wiring Implementor (unit 5.2) — **`TsdbEngine` gained
+  `eval_query_v2` / `eval_query_range_v2`** (both `#[cfg(feature =
+  "promql-v2")]`). `ReadWrite(Tsdb)` delegates to the 5.1 v2 entry
+  points; `ReadOnly(reader)` falls back to the v1 reader path because
+  v2 is not yet wired on `TimeSeriesDbReader` — that sits in phase 7
+  scope. Read-only fall-back for range wraps the v1 `Vec<RangeSample>`
+  in `QueryValue::Matrix` so the handler sees a uniform `QueryValue`
+  surface regardless of engine mode.
+- 2026-04-16 — Wiring Implementor (unit 5.2) — **Range wire-shape
+  adapter**. v1 `eval_query_range` returns `Vec<RangeSample>`; v2
+  `eval_query_range_v2` returns `QueryValue` (per 5.1 Decisions Log —
+  scalar over range grid). Added a local `query_value_to_range_samples`
+  helper in `server/http.rs` (gated on `promql-v2`): `Matrix` passes
+  through, `Scalar { ts, v }` fans into one anonymous series with one
+  sample at `ts` (mirrors v1's `evaluate_range` flattening for scalar
+  expressions), `Vector` defensively projects into single-step matrix
+  rows. The helper keeps the wire contract (`QueryRangeResponse.data.result:
+  Vec<MatrixSeries>`) bit-for-bit identical across the A/B.
+- 2026-04-16 — Wiring Implementor (unit 5.2) — **`QueryError` mapping
+  left unchanged**. Per 5.1, v2's structured `TooLarge` / `MemoryLimit`
+  / `InvalidMatching` / `PhysicalPlanFailed` variants are rendered into
+  `QueryError::Execution(String)` via `thiserror` `Display` before
+  reaching the handler; the handler already maps
+  `QueryError::Execution` → `errorType: "execution"` in
+  `query_error_response`. No handler-level branch needed. Introducing
+  dedicated `MemoryLimit` / `TooLarge` variants on
+  `crate::error::QueryError` (plus matching HTTP status codes per
+  Prometheus spec) is a candidate for a follow-up once phase 6 exposes
+  demand — keeping it out of 5.2 scope.
+- 2026-04-16 — Wiring Implementor (unit 5.2) — **Test-coverage shape**.
+  Integration tests live in `timeseries/tests/http_server.rs` (existing
+  `#![cfg(feature = "testing")]` file) inside a new
+  `#[cfg(feature = "promql-v2")] mod v2_dispatch` sub-module. 4 tests
+  exercise the compile-time dispatch via `tower::ServiceExt::oneshot`:
+  `should_dispatch_query_endpoint_to_v2_when_feature_enabled`,
+  `should_dispatch_query_range_endpoint_to_v2_when_feature_enabled`,
+  `should_return_scalar_via_range_adapter_when_query_is_constant`
+  (pins the `QueryValue::Scalar` → `Vec<RangeSample>` adapter), and
+  `should_map_v2_invalid_query_to_error_response` (pins the `PlanError::
+  UnknownFunction` → `QueryError::InvalidQuery` → `bad_data` HTTP
+  body). `cargo test -p opendata-timeseries --features testing,
+  http-server,promql-v2 --test http_server` runs 30 tests (26 pre-
+  existing + 4 new) green; `--features testing,http-server` still runs
+  26 green.
+- 2026-04-16 — Wiring Implementor (unit 5.3) — **Label-copy strategy**.
+  `Labels` is `Vec<Label>` (not `Arc`-shareable without modifying the
+  wire type); each `Labels::clone` allocates. The reshape clones each
+  output series' `Labels` from `Arc<SeriesSchema>` exactly once per
+  output series, never per step or per batch: `reshape_instant` sees
+  each series at most once (one step per instant batch); `reshape_range`
+  uses `BTreeMap<series_idx, (Labels, Vec<(i64, f64)>)>::or_insert_with`,
+  whose closure runs on first insert only. This matches the RFC's
+  "single clone at result-shape time" intent without touching the
+  `Labels` wire type. A zero-clone path would require making
+  `RangeSample::labels` / `InstantSample::labels` a shared handle —
+  outside 5.3's scope and a wire-type change the RFC forbids.
+- 2026-04-16 — Wiring Implementor (unit 5.3) — **Series ordering**.
+  v2 output series are ordered by the global `series_idx` stamped by
+  the planner. v1's `evaluate_range` (`tsdb.rs::evaluate_range`) returns
+  series in `HashMap<Labels, _>` iteration order — non-deterministic
+  across runs; v1's `evaluate_instant` preserves the evaluator's
+  emission order (roughly matcher-visit order). Neither is sorted by
+  label set. The Prometheus JSON wire shape (`QueryRangeResponse.data.
+  result: Vec<MatrixSeries>`) is an unordered array — clients don't
+  rely on order — so v2's deterministic `series_idx`-order is
+  structurally compatible. No v1-divergence observed that would block
+  Phase 6.
+- 2026-04-16 — Wiring Implementor (unit 5.3) — **Streaming vs collect**.
+  5.1's collected-batches approach (drain operator tree into
+  `Vec<StepBatch>`, reshape in a single pass) is retained. A streaming
+  reshape is possible — `reshape_range` could allocate per-series
+  accumulators up-front (size bounded by `step_count`) and push cells
+  as each batch arrives — but memory profile isn't on the phase-5
+  acceptance path and the BTreeMap-keyed aggregator reads cleaner.
+  Flagged as a future optimisation in the module docstring for Phase 7
+  / follow-up to pick up if benchmarking surfaces pressure.
+- 2026-04-16 — Wiring Implementor (unit 5.3) — **Defensive dimension
+  checks**. `StepBatch::new`'s invariant checks are `debug_assert!`s,
+  so release builds skip them. Added `check_batch_shape(batch)` in
+  reshape that validates `values.len()` / `validity.len()` /
+  `step_range` / `series_range` against the declared schema, returning
+  `ReshapeError` (which the wiring layer maps to
+  `QueryError::Execution`) rather than letting an index-out-of-bounds
+  panic propagate. Should never fire in practice — operators construct
+  batches via `StepBatch::new` — but it's the correct release-mode
+  defence.
+- 2026-04-16 — Wiring Implementor (unit 5.3) — **5.2's adapter remains
+  required**. Unit 5.2's `query_value_to_range_samples` still handles
+  the `QueryValue::Scalar` → `Vec<RangeSample>` fan-out for scalar
+  expressions (`1+1`, etc.) on a range grid. The polished reshape
+  emits `QueryValue::Matrix(vec![single anonymous RangeSample])` for
+  the scalar-over-range case (mirrors v1's `evaluate_range` semantics),
+  so the adapter's `Scalar` branch is unreachable in the `promql-v2`
+  path — *but* the 5.2 adapter also accepts the `ReadOnly(reader)` v1
+  fall-back path and the compile-time `#[cfg(not(feature = "promql-v2"))]`
+  branch, and the `Scalar` arm is cheap to keep for safety. Removing
+  it would require proving the reshape contract across all paths; not
+  worth the churn. Adapter kept unchanged.
 
 ## 6. Activity Log
 
@@ -1629,6 +1794,9 @@ Append-only, one line per agent invocation. Format:
 - 2026-04-16 Planner Implementor 4.3 in-progress→done — created `promql/v2/plan/physical.rs` (public `build_physical_plan<S: SeriesSource + Send + Sync + 'static>(LogicalPlan, &Arc<S>, MemoryReservation, &LoweringContext) -> Result<PhysicalPlan, PlanError>` entry point + `PhysicalPlan { root, output_schema, step_grid }`); registered `pub mod physical;` + re-exports in `promql/v2/plan/mod.rs` and `promql/v2/mod.rs`. Extended `PlanError` with four additive variants — `SourceError(String)`, `InvalidMatching(String)`, `MemoryLimit(String)`, `PhysicalPlanFailed(String)` — so the planner surface stays `QueryError`-free (§5 Decisions Log 4.3). Bottom-up walk: leaves call `source.resolve().try_collect()` into `Arc<SeriesSchema>` + parallel `Arc<[ResolvedSeriesRef]>` hint and wire a `VectorSelectorOp` / (inside `Rollup` branch) `MatrixSelectorOp` + `MatrixWindowSource` pair; intermediates bind every plan-time artifact the operator's constructor takes — `GroupMap` + reducer-/filter-shape `Arc<SeriesSchema>` for `AggregateOp`, `MatchTable` + output `Arc<SeriesSchema>` for vector/vector `BinaryOp` (arithmetic ops drop `__name__` via `preserves_metric_name` mirroring legacy `changes_metric_schema` at `evaluator.rs:2125-2127`; `on`/`ignoring` axis + `group_left`/`group_right`/`ManyToMany` cardinalities via `build_one_to_one`/`build_group_left`/`build_group_right`), `Option<GroupMap>` + `Arc<[Labels]>` for `CountValuesOp`, and a plan-time-probed `Arc<SeriesSchema>` + `ChildFactory` closure for `SubqueryOp` (§5 Decisions Log — factory re-invokes `build_node` synchronously via `tokio::task::block_in_place`; inner-schema assumed plan-time stable per RFC §"Core Data Model"). `CountValues`-composition restriction enforced via a `static_schema()` guard on every schema-sensitive parent: `SchemaRef::Deferred` children are rejected with `PlanError::InvalidMatching` (§5 — RFC §"Core Data Model" allows only root-positioned `count_values` in v1). Concrete generic operator structs (`BinaryOp<L, R>`, `InstantFnOp<C>`, `AggregateOp<C>`, `CountValuesOp<C>`) consume trait-object children via a transparent `BoxedOp(Box<dyn Operator + Send>)` newtype that forwards `schema()`/`next()`. Parser-type conversions (`plan_types::{Offset, AtModifier}` → `promql_parser::parser::{Offset, AtModifier}`) at leaf-operator boundaries via local `to_parser_*` helpers. **No operator-constructor API gaps surfaced** — every operator accepted exactly the shape the planner could build at plan time (§5). 14 new unit tests on an inline `MockSource` (mirrors the 3a.1 / 3b.1 pattern): `should_build_vector_selector_from_logical_plan`, `should_build_matrix_selector`, `should_compute_group_map_for_sum_by_label`, `should_compute_group_map_for_sum_without_label`, `should_output_input_schema_for_topk`, `should_output_group_schema_for_sum`, `should_compute_one_to_one_match_table`, `should_mark_unmatched_series_as_none_in_match_table`, `should_build_subquery_factory_producing_child_per_outer_step`, `should_propagate_source_resolve_error_as_plan_error`, `should_build_rollup_over_matrix_selector_end_to_end` (drives one poll of the built root), `should_build_nested_aggregate_of_rollup` (`sum by (pod) (rate(m[5s]))` via the real parser + 4.1 lowerer), `should_reject_count_values_under_schema_sensitive_parent`, `should_group_left_preserves_include_labels_from_one_side`. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (259 passed — 245 prior + 14 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
 - 2026-04-16 Planner Implementor 4.4 in-progress→done — created `promql/v2/plan/cardinality.rs` (`CardinalityLimits`, `enforce_cardinality_gate` async entry point) and registered the module in `promql/v2/plan/mod.rs`. Added `PlanError::TooLarge { estimated_cells: u64, limit: u64 }` variant to `plan/error.rs`; extended `LoweringContext` with a `cardinality_limits: CardinalityLimits` field + `with_cardinality_limits` chainable setter (kept `Copy` — see §5 Decisions Log). Wired the gate into `build_physical_plan` at the top of the function, before any `resolve` call. Default limit: 20,000,000 series×steps cells (§5). Gate walks the `LogicalPlan` bottom-up, collecting `VectorSelector` / `MatrixSelector` leaves; calls `SeriesSource::estimate_cardinality` per leaf; multiplies upper bound by the outer-grid `step_count`; sums and rejects when the running total exceeds the configured limit. Saturating arithmetic so `u64::MAX` sentinels from the adapter's "no-positive-matchers" escape hatch trip the gate immediately (§5). Subquery handling: outer-grid flavour per RFC verbatim wording (§5 documents the under-estimation vs. true subquery cost). `CountValues` gated on input cardinality as a lower bound per task spec. `Binary` / `Aggregate` / `Rollup` / `InstantFn` / `Rechunk` / `Concurrent` / `Coalesce` treated as transparent: sum their leaves. Wired via `LoweringContext` (not a new `build_physical_plan` argument) — the context already threads through the whole plan pipeline, and the limit is a plan-time configuration knob sharing that lifetime. 12 new unit tests on a scripted `MockSource` (for gate-only tests) and a `ResolvingSource` (for the integration / order-assertion tests): `should_default_cardinality_limits_to_twenty_million_cells`, `should_treat_zero_limit_as_disabled`, `should_accept_plan_within_limit`, `should_reject_plan_exceeding_limit`, `should_accumulate_cardinality_across_multiple_leaves` (Binary+Rollup pair), `should_multiply_by_step_count` (10 vs 100 steps), `should_report_estimated_cells_in_error`, `should_use_upper_bound_when_estimate_is_approx`, `should_bypass_gate_when_limit_is_zero_or_disabled`, `should_trip_gate_immediately_on_unbounded_sentinel`, `should_call_estimate_cardinality_before_resolve` (via `build_physical_plan`), `should_not_call_resolve_when_gate_rejects` (via `build_physical_plan`). `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (271 passed — 259 prior + 12 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
 - 2026-04-16 Planner Implementor 4.5 in-progress→done — created `promql/v2/plan/parallelism.rs` (`Parallelism` config struct with `concurrent_threshold_series` / `coalesce_max_shards` / `channel_bound` knobs; `ExchangeStats` test-observability shape; `should_wrap_concurrent` decision helper); registered in `plan/mod.rs` with `ExchangeStats` / `Parallelism` re-exports. Extended `LoweringContext` with a `parallelism: Parallelism` field + `with_parallelism` chainable setter (mirrors 4.4's `with_cardinality_limits`); defaults through `LoweringContext::new` / `for_instant`. Added `pub async fn build_physical_plan_with_stats(...) -> Result<(PhysicalPlan, ExchangeStats), PlanError>` as the test-observable entry point; the existing `build_physical_plan` delegates and discards the stats so production surface is unchanged. Exchange insertion inlined into `build_node` (option 1 from the unit brief): after constructing a `VectorSelectorOp` or `RollupOp(MatrixSelectorOp)` leaf, the new `maybe_wrap_concurrent` helper routes the child through `BoxedOp` (existing shim) and wraps in `ConcurrentOp` when the resolved series count ≥ `concurrent_threshold_series`. `MatrixSelectorOp` is not wrapped directly — its `Operator::next` is degenerate per §3a.2; wrapping the enclosing `RollupOp` preserves the async-decoupling contract at a slightly wider boundary (§5). **Coalesce deliberately skipped in v1** per the unit brief's recommendation — the safety envelope for per-series-independent operator chains isn't yet tracked by the planner, and shipping `Coalesce` without that check risks silent data-loss. The `coalesce_max_shards` knob ships (default `0`, disabled) so a future unit can flip it on without a public-surface break. Concurrent threshold default: **64 series** (`Parallelism::DEFAULT_CONCURRENT_THRESHOLD_SERIES`). 13 new unit tests: 5 in `parallelism.rs` (`should_use_default_parallelism_when_not_specified`, `should_wrap_when_series_count_meets_threshold`, `should_wrap_every_leaf_when_threshold_is_zero`, `should_disable_wrap_when_threshold_is_max`, `should_track_exchange_stats`) + 8 in `physical.rs` (`should_wrap_leaves_above_threshold_in_concurrent`, `should_not_wrap_leaves_below_threshold`, `should_leave_intermediate_operators_unwrapped`, `should_use_default_parallelism_when_not_specified`, `should_allow_disabling_concurrent_with_threshold_zero_or_max`, `should_respect_channel_bound`, `should_skip_coalesce_in_v1`, `should_wrap_rollup_leaf_above_threshold`). `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (284 passed — 271 prior + 13 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass. Phase 4 complete.
+- 2026-04-16 Wiring Implementor 5.1 in-progress→done — added `Tsdb::eval_query_v2` and `Tsdb::eval_query_range_v2` in `timeseries/src/tsdb.rs` (both `#[cfg(feature = "promql-v2")]`); created `timeseries/src/promql/v2/reshape.rs` with `reshape_instant` / `reshape_range` (plus a `ReshapeError` wrapper) and registered the module in `promql/v2/mod.rs`. Shared private `execute_v2(query, reader, ctx, is_instant)` drives parse → lower → optimize → build_physical_plan → `poll_fn(|cx| plan.root.next(cx))` loop → reshape; wrapped the reader through `Arc<QueryReaderSource<TsdbQueryReader>>` re-using the existing `Tsdb::query_reader_for_ranges` path. Memory cap default: **1 GiB** (`DEFAULT_V2_MEMORY_CAP_BYTES`, §5). `PlanError → crate::error::QueryError` mapping: parse/shape variants → `InvalidQuery`, structural/runtime variants → `Execution` (§5). `v2::QueryError → QueryError::Execution` for streaming errors. Pure-scalar detection uses the `ConstScalarOp` canonical shape (single-series roster, empty labels). Signatures mirror v1 so Phase 5.2 HTTP A/B swap is trivial; the v1 `eval_query` / `eval_query_range` methods and `TsdbReadEngine` trait are **untouched**. 7 new v2 wiring tests (inside a `#[cfg(feature = "promql-v2")] mod v2_wiring_tests` sub-module of `tsdb::tests`): `should_eval_instant_query_v2_selector_returns_one_sample_per_series`, `should_eval_range_query_v2_produces_samples_per_step`, `should_eval_rate_over_counter_v2_matches_expected_rate`, `should_reject_query_exceeding_cardinality_limit`, `should_propagate_memory_limit_at_exec_time`, `should_return_query_error_for_unknown_function`, `should_eval_sum_by_label_v2`. Plus 4 new reshape unit tests in `promql/v2/reshape.rs` (instant, elide-invalid, range, scalar). `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries` (724 passed — v1 path untouched), `cargo test -p opendata-timeseries --features promql-v2` (1019 passed), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (288 passed — 284 prior + 4 reshape), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
+- 2026-04-16 Wiring Implementor 5.2 in-progress→done — wired compile-time `#[cfg(feature = "promql-v2")]` dispatch inside `timeseries/src/server/http.rs` at `handle_query` / `handle_query_range` / `handle_federate`; added `TsdbEngine::eval_query_v2` + `TsdbEngine::eval_query_range_v2` (both gated, both fall back to v1 for `ReadOnly(reader)`); added a local `query_value_to_range_samples` adapter in the handler so the v2 `QueryValue` (including the `Scalar` range-grid case) projects cleanly onto the `Vec<RangeSample>` wire shape consumed by `range_result_to_response`. 4 new integration tests in `timeseries/tests/http_server.rs::v2_dispatch` behind `#[cfg(feature = "promql-v2")]` via `tower::ServiceExt::oneshot`: instant dispatch, range dispatch, scalar-range-adapter, `PlanError::UnknownFunction` → `bad_data`. `cargo check -p opendata-timeseries` / `--features promql-v2` / `--features http-server` / `--features http-server,promql-v2` all pass; `cargo test -p opendata-timeseries` (724 passed), `--features promql-v2` (1019 passed — unchanged from 5.1), `--features testing,http-server --test http_server` (26 passed), `--features testing,http-server,promql-v2 --test http_server` (30 passed = 26 prior + 4 new); `cargo fmt` and `cargo clippy --all-targets --all-features -- -D warnings` clean.
+- 2026-04-16 Wiring Implementor 5.3 in-progress→done — polished `timeseries/src/promql/v2/reshape.rs` end-to-end. Label-copy strategy: one `Labels::clone` per output series (instant — implicit via one-sample-per-valid-series; range — explicit via `BTreeMap<series_idx, (Labels, _)>::or_insert_with`), never per step or per batch (§5). Series ordering: deterministic by global `series_idx` (v1 range uses `HashMap<Labels, _>` iteration — non-deterministic; v1 instant uses evaluator emission order; Prometheus wire contract is unordered so v2's order is structurally compatible — §5). Defensive `check_batch_shape` guards values/validity length and range-end bounds in release builds, returning `ReshapeError` rather than panicking (covers 5.1 placeholder's gap where `debug_assert`s were the only safety net). Added explicit `step_count!=1` guard inside `reshape_instant`'s batch loop. Scalar-root range query now produces a single anonymous `RangeSample` with samples sorted by timestamp (batches may arrive out-of-order from Coalesce). 5.2's `query_value_to_range_samples` adapter is **still required** for the `Scalar` over range-grid case (§5). Streaming reshape noted as a future optimisation — collected-batches path retained for clarity. 10 new `should_*` tests (replaced 4 placeholder tests; 14 total): `should_reshape_instant_vector_dropping_invalid_cells`, `should_reshape_range_matrix_preserving_sparse_timestamps`, `should_reshape_scalar_root_for_instant_query`, `should_reshape_scalar_root_for_range_query`, `should_clone_labels_once_per_series_not_per_step`, `should_drop_series_with_no_valid_samples_in_range_query`, `should_handle_deferred_schema_from_count_values`, `should_return_empty_vector_when_no_batches`, `should_return_query_error_on_dimension_mismatch`, `should_return_query_error_on_deferred_batch_schema`, `should_preserve_step_timestamps_in_range_output`, `should_handle_multi_batch_range_query` (+ the 2 carried-over tests from 5.1's placeholder). No `tsdb.rs` signature changes. `cargo check -p opendata-timeseries` (no-feature / `promql-v2` / `http-server` / `http-server,promql-v2` — all clean); `cargo test -p opendata-timeseries --lib` (724 passed — unchanged); `cargo test -p opendata-timeseries --features promql-v2 --lib` (1029 passed = 1019 prior + 10 new); `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (298 passed = 288 prior + 14 new − 4 replaced); `cargo test -p opendata-timeseries --features testing,http-server,promql-v2 --test http_server` (30 passed — unchanged); `cargo fmt` + `cargo clippy --all-targets --all-features -- -D warnings` clean. Phase 5 complete.
 
 ---
 

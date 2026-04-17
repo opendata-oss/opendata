@@ -20,6 +20,7 @@ pub(crate) mod memory;
 pub(crate) mod operator;
 pub(crate) mod operators;
 pub(crate) mod plan;
+pub(crate) mod reshape;
 pub(crate) mod source;
 pub(crate) mod source_adapter;
 

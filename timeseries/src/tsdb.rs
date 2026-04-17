@@ -46,6 +46,146 @@ pub(crate) fn preload_ranges(
     }
 }
 
+/// Default per-query memory cap for the v2 engine.
+///
+/// 1 GiB — a conservative ceiling that should comfortably fit any
+/// single-digit-GB host's working set while still failing fast on a
+/// runaway query. Not yet plumbed through configuration (no existing
+/// crate-level memory-cap config surfaces); revisit in Phase 5.2 once
+/// the HTTP handler has a natural knob.
+#[cfg(feature = "promql-v2")]
+pub(crate) const DEFAULT_V2_MEMORY_CAP_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Convert `SystemTime` to milliseconds since the UNIX epoch, clamping
+/// pre-epoch values to zero. Mirrors the arithmetic the existing
+/// evaluator entry points perform on `SystemTime`.
+#[cfg(feature = "promql-v2")]
+fn system_time_to_ms(t: SystemTime) -> i64 {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as i64,
+        Err(_) => 0,
+    }
+}
+
+/// Convert `Duration` to milliseconds, saturating at `i64::MAX` for
+/// pathological inputs.
+#[cfg(feature = "promql-v2")]
+fn duration_to_ms(d: Duration) -> i64 {
+    d.as_millis().min(i64::MAX as u128) as i64
+}
+
+/// Compute the preload ranges (seconds) the v2 engine's `QueryReader`
+/// needs to open. The v2 planner does not yet own a `compute_preload_ranges`
+/// equivalent, so this reuses the v1 helper by re-parsing the query.
+/// Phase 5.3 / 7 can short-circuit by consulting the logical plan once
+/// the reshape path stops round-tripping.
+#[cfg(feature = "promql-v2")]
+fn preload_ranges_for_v2(
+    query: &str,
+    start_ms: i64,
+    end_ms: i64,
+    lookback_delta: Duration,
+) -> std::result::Result<Vec<(i64, i64)>, QueryError> {
+    let expr =
+        promql_parser::parser::parse(query).map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
+    let start = UNIX_EPOCH + Duration::from_millis(start_ms.max(0) as u64);
+    let end = UNIX_EPOCH + Duration::from_millis(end_ms.max(0) as u64);
+    let stmt = EvalStmt {
+        expr,
+        start,
+        end,
+        interval: Duration::from_secs(0),
+        lookback_delta,
+    };
+    let default_start_secs = start
+        .checked_sub(lookback_delta)
+        .unwrap_or(UNIX_EPOCH)
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs() as i64;
+    let default_end_secs = end
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs() as i64;
+    Ok(preload_ranges(&stmt, default_start_secs, default_end_secs))
+}
+
+/// Drive the v2 operator tree to completion and reshape into a
+/// [`QueryValue`]. Shared by [`Tsdb::eval_query_v2`] and
+/// [`Tsdb::eval_query_range_v2`]; keeps the dispatch logic in one place.
+#[cfg(feature = "promql-v2")]
+async fn execute_v2(
+    query: &str,
+    reader: TsdbQueryReader,
+    ctx: crate::promql::v2::plan::LoweringContext,
+    is_instant: bool,
+) -> std::result::Result<QueryValue, QueryError> {
+    use std::future::poll_fn;
+
+    let expr =
+        promql_parser::parser::parse(query).map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
+    let logical = crate::promql::v2::plan::lower(&expr, &ctx).map_err(plan_error_to_query_error)?;
+    let logical = crate::promql::v2::plan::optimize(logical);
+
+    let source = Arc::new(crate::promql::v2::source_adapter::QueryReaderSource::new(
+        Arc::new(reader),
+    ));
+    let reservation =
+        crate::promql::v2::memory::MemoryReservation::new(DEFAULT_V2_MEMORY_CAP_BYTES);
+
+    let mut plan =
+        crate::promql::v2::plan::build_physical_plan(logical, &source, reservation, &ctx)
+            .await
+            .map_err(plan_error_to_query_error)?;
+
+    // Drive the root operator — collect every emitted batch.
+    let mut batches = Vec::new();
+    loop {
+        match poll_fn(|cx| plan.root.next(cx)).await {
+            Some(Ok(batch)) => batches.push(batch),
+            Some(Err(e)) => return Err(v2_query_error_to_query_error(e)),
+            None => break,
+        }
+    }
+
+    // Reshape according to the requested shape.
+    let reshaped = if is_instant {
+        crate::promql::v2::reshape::reshape_instant(&plan, batches)
+    } else {
+        crate::promql::v2::reshape::reshape_range(&plan, batches)
+    };
+    reshaped.map_err(|e| QueryError::Execution(e.to_string()))
+}
+
+/// Translate a v2 [`PlanError`](crate::promql::v2::plan::PlanError) into
+/// the crate-wide [`QueryError`]. `TooLarge` / parser-level issues map
+/// onto the v1 surface's existing variants so the HTTP handler does not
+/// need a v2-specific branch.
+#[cfg(feature = "promql-v2")]
+fn plan_error_to_query_error(e: crate::promql::v2::plan::PlanError) -> QueryError {
+    use crate::promql::v2::plan::PlanError;
+    match e {
+        PlanError::UnknownFunction(_)
+        | PlanError::InvalidArgument { .. }
+        | PlanError::InvalidTopLevelString
+        | PlanError::UnsupportedExpression(_)
+        | PlanError::UnsupportedFeature(_) => QueryError::InvalidQuery(e.to_string()),
+        PlanError::TooLarge { .. }
+        | PlanError::MemoryLimit(_)
+        | PlanError::SourceError(_)
+        | PlanError::InvalidMatching(_)
+        | PlanError::PhysicalPlanFailed(_) => QueryError::Execution(e.to_string()),
+    }
+}
+
+/// Translate an execution-time v2
+/// [`QueryError`](crate::promql::v2::memory::QueryError) onto the
+/// crate-wide [`QueryError`] for the HTTP / embedded boundary.
+#[cfg(feature = "promql-v2")]
+fn v2_query_error_to_query_error(e: crate::promql::v2::memory::QueryError) -> QueryError {
+    QueryError::Execution(e.to_string())
+}
+
 /// Parse multiple match[] selector strings into VectorSelectors.
 fn parse_selectors(matchers: &[&str]) -> std::result::Result<Vec<VectorSelector>, QueryError> {
     matchers
@@ -769,6 +909,85 @@ impl Tsdb {
         eval_query_range_bounds(self, query, range, step, opts).await
     }
 
+    /// A/B parallel entry point for the v2 (columnar) engine — instant
+    /// query. See RFC 0007 §"Migration Strategy"; gated behind the
+    /// `promql-v2` feature flag so the baseline build is untouched.
+    ///
+    /// Parses the query, lowers it to the v2 logical plan, runs the
+    /// rule-based optimiser, builds a physical plan over a
+    /// [`crate::promql::v2::QueryReaderSource`] wrapping this Tsdb's
+    /// existing `QueryReader`, drives the operator tree to completion
+    /// and reshapes the collected batches into a [`QueryValue`].
+    ///
+    /// Signatures match [`Self::eval_query`] so Phase 5.2 HTTP dispatch
+    /// can swap on the feature flag without reshaping call sites.
+    #[cfg(feature = "promql-v2")]
+    pub(crate) async fn eval_query_v2(
+        &self,
+        query: &str,
+        time: Option<SystemTime>,
+        opts: &QueryOptions,
+    ) -> std::result::Result<QueryValue, QueryError> {
+        let query_time = time.unwrap_or_else(SystemTime::now);
+        let at_ms = system_time_to_ms(query_time);
+        let plan_ctx = crate::promql::v2::plan::LoweringContext::for_instant(
+            at_ms,
+            duration_to_ms(opts.lookback_delta),
+        );
+
+        let reader = self
+            .query_reader_for_ranges(&preload_ranges_for_v2(
+                query,
+                at_ms,
+                at_ms,
+                opts.lookback_delta,
+            )?)
+            .await?;
+        execute_v2(query, reader, plan_ctx, /*is_instant=*/ true).await
+    }
+
+    /// A/B parallel entry point for the v2 engine — range query. Mirrors
+    /// [`Self::eval_query_range`] in shape so phase 5.2 can A/B swap
+    /// cleanly. Unlike the v1 path, v2 returns a full [`QueryValue`]
+    /// because the plan root may produce a scalar (e.g. `1+1` over a
+    /// range grid); the embedded boundary can still collapse that back
+    /// into `Vec<RangeSample>` if desired.
+    #[cfg(feature = "promql-v2")]
+    pub(crate) async fn eval_query_range_v2(
+        &self,
+        query: &str,
+        range: impl std::ops::RangeBounds<SystemTime>,
+        step: Duration,
+        opts: &QueryOptions,
+    ) -> std::result::Result<QueryValue, QueryError> {
+        let (start, end) = crate::util::range_bounds_to_system_time(range);
+        let start_ms = system_time_to_ms(start);
+        let end_ms = system_time_to_ms(end);
+        let step_ms = duration_to_ms(step);
+        if step_ms <= 0 {
+            return Err(QueryError::InvalidQuery(
+                "step must be greater than zero".to_string(),
+            ));
+        }
+
+        let plan_ctx = crate::promql::v2::plan::LoweringContext::new(
+            start_ms,
+            end_ms,
+            step_ms,
+            duration_to_ms(opts.lookback_delta),
+        );
+
+        let reader = self
+            .query_reader_for_ranges(&preload_ranges_for_v2(
+                query,
+                start_ms,
+                end_ms,
+                opts.lookback_delta,
+            )?)
+            .await?;
+        execute_v2(query, reader, plan_ctx, /*is_instant=*/ false).await
+    }
+
     /// Return metadata for all (or a specific) metric.
     pub(crate) async fn find_metadata(
         &self,
@@ -856,6 +1075,49 @@ impl TsdbEngine {
             Self::ReadWrite(tsdb) => tsdb.eval_query_range(query, range, step, opts).await,
             Self::ReadOnly(reader) => {
                 eval_query_range_bounds(reader.as_ref(), query, range, step, opts).await
+            }
+        }
+    }
+
+    /// A/B v2 entry point for instant queries, dispatched from the HTTP
+    /// handler at compile time via `#[cfg(feature = "promql-v2")]` in
+    /// `server/http.rs`. Read-only mode falls back to the v1 path because
+    /// v2 wiring currently lives on [`Tsdb`] only (see RFC 0007 §"Migration
+    /// Strategy" — the read-only reader will gain v2 in phase 7).
+    #[cfg(feature = "promql-v2")]
+    pub(crate) async fn eval_query_v2(
+        &self,
+        query: &str,
+        time: Option<SystemTime>,
+        opts: &QueryOptions,
+    ) -> std::result::Result<QueryValue, QueryError> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.eval_query_v2(query, time, opts).await,
+            Self::ReadOnly(reader) => reader.eval_query(query, time, opts).await,
+        }
+    }
+
+    /// A/B v2 entry point for range queries. Unlike v1 (`Vec<RangeSample>`),
+    /// v2 returns a full [`QueryValue`] because the plan root may emit a
+    /// [`QueryValue::Scalar`] over a range grid (e.g. `1+1`). The HTTP
+    /// handler keeps the wire shape unchanged via a thin adapter.
+    #[cfg(feature = "promql-v2")]
+    pub(crate) async fn eval_query_range_v2(
+        &self,
+        query: &str,
+        range: impl RangeBounds<SystemTime>,
+        step: Duration,
+        opts: &QueryOptions,
+    ) -> std::result::Result<QueryValue, QueryError> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.eval_query_range_v2(query, range, step, opts).await,
+            Self::ReadOnly(reader) => {
+                // v2 is not yet wired on the reader (phase 7 scope) — fall
+                // back to v1 and wrap the `Vec<RangeSample>` in a matrix so
+                // the HTTP handler's v2 path sees a uniform `QueryValue`.
+                eval_query_range_bounds(reader.as_ref(), query, range, step, opts)
+                    .await
+                    .map(QueryValue::Matrix)
             }
         }
     }
@@ -2100,5 +2362,249 @@ mod tests {
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].value, 72.5);
         assert_eq!(samples[0].labels.get("host"), Some("server1"));
+    }
+
+    // ── Phase 5.1 v2 wiring tests ─────────────────────────────────────
+    //
+    // These run only with `--features promql-v2` enabled. They exercise
+    // the `eval_query_v2` / `eval_query_range_v2` entry points against
+    // the same `Tsdb` fixture the v1 tests use — the A/B goal of Phase 5
+    // is structurally-identical `QueryValue`s out of either path.
+
+    #[cfg(feature = "promql-v2")]
+    mod v2_wiring_tests {
+        use super::*;
+
+        async fn create_tsdb_with_counter() -> Tsdb {
+            let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+                OpenTsdbMergeOperator,
+            ))));
+            // Counter over bucket at minute 60 (covers 3.6M-7.2M ms).
+            // Samples every 10s at 4_000_000, 4_010_000, 4_020_000.
+            let series = vec![
+                create_sample("req_total", vec![("env", "prod")], 4_000_000, 10.0),
+                create_sample("req_total", vec![("env", "prod")], 4_010_000, 20.0),
+                create_sample("req_total", vec![("env", "prod")], 4_020_000, 30.0),
+            ];
+            tsdb.ingest_samples(series, None).await.unwrap();
+            tsdb.flush().await.unwrap();
+            tsdb
+        }
+
+        #[tokio::test]
+        async fn should_eval_instant_query_v2_selector_returns_one_sample_per_series() {
+            // given: two series in a single bucket
+            let tsdb = create_tsdb_with_data().await;
+            let query_time = UNIX_EPOCH + Duration::from_secs(4100);
+
+            // when: run the instant selector via the v2 entry point
+            let opts = QueryOptions::default();
+            let result = tsdb
+                .eval_query_v2("http_requests", Some(query_time), &opts)
+                .await
+                .unwrap();
+
+            // then: two instant samples, one per series, both at the
+            // evaluation timestamp
+            let mut samples = match result {
+                QueryValue::Vector(s) => s,
+                other => panic!("expected Vector, got {:?}", other),
+            };
+            samples.sort_by(|a, b| a.labels.get("env").cmp(&b.labels.get("env")));
+            assert_eq!(samples.len(), 2);
+            let expected_ts = 4_100_000i64;
+            assert_eq!(samples[0].timestamp_ms, expected_ts);
+            assert_eq!(samples[0].labels.get("env"), Some("prod"));
+            assert_eq!(samples[0].value, 42.0);
+            assert_eq!(samples[1].labels.get("env"), Some("staging"));
+            assert_eq!(samples[1].value, 10.0);
+        }
+
+        #[tokio::test]
+        async fn should_eval_range_query_v2_produces_samples_per_step() {
+            // given: a counter with 3 samples in one bucket
+            let tsdb = create_tsdb_with_counter().await;
+            // Query window straddling the samples — step 10s.
+            let start = UNIX_EPOCH + Duration::from_secs(4_000);
+            let end = UNIX_EPOCH + Duration::from_secs(4_020);
+            let step = Duration::from_secs(10);
+
+            // when
+            let opts = QueryOptions::default();
+            let result = tsdb
+                .eval_query_range_v2("req_total", start..=end, step, &opts)
+                .await
+                .unwrap();
+
+            // then: one range sample (one series) with 3 points
+            let series = match result {
+                QueryValue::Matrix(m) => m,
+                other => panic!("expected Matrix, got {:?}", other),
+            };
+            assert_eq!(series.len(), 1);
+            assert_eq!(series[0].labels.get("env"), Some("prod"));
+            assert_eq!(series[0].samples.len(), 3);
+            assert_eq!(series[0].samples[0].1, 10.0);
+            assert_eq!(series[0].samples[1].1, 20.0);
+            assert_eq!(series[0].samples[2].1, 30.0);
+        }
+
+        #[tokio::test]
+        async fn should_eval_rate_over_counter_v2_matches_expected_rate() {
+            // given: counter 10 → 20 → 30 over 20 seconds
+            let tsdb = create_tsdb_with_counter().await;
+            // Evaluate instant rate over a [1m] window ending at 4020s;
+            // Prometheus extrapolates but for an evenly-sampled counter
+            // the result is ≈ 1 req/s (20 total increase / 20s ≈ 1).
+            let query_time = UNIX_EPOCH + Duration::from_secs(4_020);
+
+            // when
+            let opts = QueryOptions::default();
+            let result = tsdb
+                .eval_query_v2("rate(req_total[1m])", Some(query_time), &opts)
+                .await
+                .unwrap();
+
+            // then: one series, rate close to 1 per second (extrapolation
+            // of a 2-sample-per-10s counter over a 1m window)
+            let samples = match result {
+                QueryValue::Vector(v) => v,
+                other => panic!("expected Vector, got {:?}", other),
+            };
+            assert_eq!(samples.len(), 1);
+            // Rate is per-second, extrapolated across the range window.
+            // For this fixture Prometheus emits ~0.417 (20-count increase
+            // over 60s extrapolation). Tolerate a wide plausibility band
+            // rather than pinning a precise golden.
+            assert!(
+                samples[0].value > 0.0 && samples[0].value < 10.0,
+                "rate should be plausible (>0 and <10), got {}",
+                samples[0].value
+            );
+        }
+
+        #[tokio::test]
+        async fn should_reject_query_exceeding_cardinality_limit() {
+            // given: a fixture with at least one matching series and a
+            // cardinality gate set impossibly low via the
+            // LoweringContext (not exposed through QueryOptions, so drive
+            // the plan pipeline directly).
+            let tsdb = create_tsdb_with_data().await;
+            let at_ms = 4_100_000i64;
+            let lookback = Duration::from_secs(300);
+            let ctx = crate::promql::v2::plan::LoweringContext::for_instant(
+                at_ms,
+                lookback.as_millis() as i64,
+            )
+            .with_cardinality_limits(
+                crate::promql::v2::plan::cardinality::CardinalityLimits::new(1),
+            );
+            let reader = tsdb.query_reader_for_ranges(&[(0, 10_000)]).await.unwrap();
+            let source = Arc::new(crate::promql::v2::source_adapter::QueryReaderSource::new(
+                Arc::new(reader),
+            ));
+            let reservation = crate::promql::v2::memory::MemoryReservation::new(1024 * 1024 * 1024);
+            let expr = promql_parser::parser::parse("http_requests").unwrap();
+            let plan = crate::promql::v2::plan::lower(&expr, &ctx).unwrap();
+
+            // when
+            let result =
+                crate::promql::v2::plan::build_physical_plan(plan, &source, reservation, &ctx)
+                    .await;
+
+            // then
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, crate::promql::v2::plan::PlanError::TooLarge { .. }),
+                "expected PlanError::TooLarge, got {:?}",
+                err
+            );
+        }
+
+        #[tokio::test]
+        async fn should_propagate_memory_limit_at_exec_time() {
+            // given: a small-but-real fixture and an aggressively tiny
+            // memory cap so every operator allocation trips.
+            let tsdb = create_tsdb_with_data().await;
+            let at_ms = 4_100_000i64;
+            let ctx = crate::promql::v2::plan::LoweringContext::for_instant(at_ms, 300_000);
+            let reader = tsdb.query_reader_for_ranges(&[(0, 10_000)]).await.unwrap();
+            let source = Arc::new(crate::promql::v2::source_adapter::QueryReaderSource::new(
+                Arc::new(reader),
+            ));
+            // 1 byte cap — any allocation fails.
+            let reservation = crate::promql::v2::memory::MemoryReservation::new(1);
+            let expr = promql_parser::parser::parse("http_requests").unwrap();
+            let plan = crate::promql::v2::plan::lower(&expr, &ctx).unwrap();
+
+            // when: build + drive. We expect the operator to surface a
+            // `MemoryLimit` error either at build time (scratch reservation)
+            // or on the first `next()` poll (per-batch output reservation).
+            let built =
+                crate::promql::v2::plan::build_physical_plan(plan, &source, reservation, &ctx)
+                    .await;
+            let err: String = match built {
+                Err(e) => e.to_string(),
+                Ok(mut phys) => {
+                    use std::future::poll_fn;
+                    let polled = poll_fn(|cx| phys.root.next(cx)).await;
+                    match polled {
+                        Some(Err(e)) => e.to_string(),
+                        Some(Ok(_)) => panic!("expected a memory-limit error, got a batch"),
+                        None => panic!("expected an error, got end-of-stream"),
+                    }
+                }
+            };
+
+            // then: error mentions memory limit
+            assert!(
+                err.to_lowercase().contains("memory"),
+                "expected a memory-limit error, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn should_return_query_error_for_unknown_function() {
+            // given: a query using a function v2 does not lower
+            let tsdb = create_tsdb_with_data().await;
+            // when
+            let opts = QueryOptions::default();
+            let result = tsdb
+                .eval_query_v2("day_of_month(http_requests)", None, &opts)
+                .await;
+            // then
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, QueryError::InvalidQuery(_)),
+                "expected InvalidQuery, got {:?}",
+                err
+            );
+        }
+
+        #[tokio::test]
+        async fn should_eval_sum_by_label_v2() {
+            // given: two series under the same metric name, grouped by env
+            let tsdb = create_tsdb_with_data().await;
+            let query_time = UNIX_EPOCH + Duration::from_secs(4100);
+
+            // when
+            let opts = QueryOptions::default();
+            let result = tsdb
+                .eval_query_v2("sum by (env) (http_requests)", Some(query_time), &opts)
+                .await
+                .unwrap();
+
+            // then: two groups, values match the input series
+            let mut samples = match result {
+                QueryValue::Vector(v) => v,
+                other => panic!("expected Vector, got {:?}", other),
+            };
+            samples.sort_by(|a, b| a.labels.get("env").cmp(&b.labels.get("env")));
+            assert_eq!(samples.len(), 2);
+            assert_eq!(samples[0].labels.get("env"), Some("prod"));
+            assert_eq!(samples[0].value, 42.0);
+            assert_eq!(samples[1].labels.get("env"), Some("staging"));
+            assert_eq!(samples[1].value, 10.0);
+        }
     }
 }

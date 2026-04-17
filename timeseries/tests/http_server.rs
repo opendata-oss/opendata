@@ -717,3 +717,131 @@ async fn test_slatedb_metrics_reflect_writes() {
         write_ops_after
     );
 }
+
+// ---------------------------------------------------------------------------
+// Unit 5.2 — HTTP handler dispatch on the `promql-v2` feature flag.
+//
+// These tests only compile-run with `--features promql-v2`. They exercise
+// the compile-time A/B boundary in `server/http.rs`: the handler calls
+// `eval_query_v2` / `eval_query_range_v2` when the flag is on, and the
+// range adapter reshapes `QueryValue` back to the `Vec<RangeSample>` wire
+// shape consumed by `range_result_to_response`.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "promql-v2")]
+mod v2_dispatch {
+    use super::*;
+
+    #[tokio::test]
+    async fn should_dispatch_query_endpoint_to_v2_when_feature_enabled() {
+        // given — v2 is a compile-time A/B; with the flag on `handle_query`
+        // should invoke the columnar engine and still return the v1 wire
+        // shape.
+        let (app, _) = setup_with_data().await;
+
+        // when
+        let uri = format!(
+            "/api/v1/query?query=http_requests_total&time={}",
+            SAMPLE_TS_SECS
+        );
+        let resp = app
+            .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // then
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed: QueryResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(parsed.status, "success");
+        let data = parsed.data.expect("query response has data");
+        match data.result {
+            QueryResultValue::Vector(v) => {
+                // Must resolve at least one of the two ingested series —
+                // proves the request reached the engine behind the v2
+                // dispatch. Exact series count depends on lookback
+                // semantics, which unit 5.2 does not rewire.
+                assert!(
+                    !v.is_empty(),
+                    "expected at least one http_requests_total series"
+                );
+            }
+            other => panic!("expected vector result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_dispatch_query_range_endpoint_to_v2_when_feature_enabled() {
+        // given — the range handler wraps `eval_query_range_v2` in an
+        // adapter that projects `QueryValue` back to `Vec<RangeSample>`.
+        let (app, _) = setup_with_data().await;
+
+        // when
+        let uri = format!(
+            "/api/v1/query_range?query=http_requests_total&start={}&end={}&step=60s",
+            SAMPLE_TS_SECS - 60,
+            SAMPLE_TS_SECS + 60,
+        );
+        let resp = app
+            .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // then
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed: QueryRangeResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(parsed.status, "success");
+        let data = parsed.data.expect("query_range response has data");
+        assert_eq!(data.result_type, "matrix");
+        assert!(!data.result.is_empty(), "expected at least one series");
+    }
+
+    #[tokio::test]
+    async fn should_return_scalar_via_range_adapter_when_query_is_constant() {
+        // given — v2 returns `QueryValue::Scalar` for a range-grid scalar
+        // (`1+1`); the HTTP adapter must collapse this into
+        // `Vec<RangeSample>` so the wire shape stays "matrix".
+        let (app, _) = setup().await;
+
+        // when
+        let uri = format!(
+            "/api/v1/query_range?query=1%2B1&start={}&end={}&step=60s",
+            SAMPLE_TS_SECS,
+            SAMPLE_TS_SECS + 120,
+        );
+        let resp = app
+            .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // then
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed: QueryRangeResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(parsed.status, "success");
+        let data = parsed.data.expect("response has data");
+        assert_eq!(data.result_type, "matrix");
+        assert_eq!(data.result.len(), 1, "scalar collapses to one series");
+    }
+
+    #[tokio::test]
+    async fn should_map_v2_invalid_query_to_error_response() {
+        // given — unknown PromQL functions are rejected by the v2 planner
+        // as `PlanError::UnknownFunction`, mapping to
+        // `QueryError::InvalidQuery` → bad_data HTTP body.
+        let (app, _) = setup().await;
+
+        // when — `does_not_exist` is not a real PromQL function; v2's
+        // lowerer rejects it before any IO.
+        let req = Request::get("/api/v1/query?query=does_not_exist(http_requests_total)&time=100")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let parsed: QueryResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.status, "error");
+        assert!(parsed.error_type.is_some());
+        assert!(parsed.data.is_none());
+    }
+}

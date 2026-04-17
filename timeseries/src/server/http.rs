@@ -313,20 +313,39 @@ async fn extract_params<T: serde::de::DeserializeOwned>(
 }
 
 /// Handle /api/v1/query
+///
+/// Query evaluation dispatches between the v1 (row-oriented) and v2
+/// (columnar) engines at **compile time** via `#[cfg(feature = "promql-v2")]`.
+/// Wire shape is unchanged across the A/B boundary: both paths return
+/// `QueryValue`.
 async fn handle_query(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let params: QueryParams = extract_params(request, &state).await?;
     let time = params.time.map(|s| parse_timestamp(&s)).transpose()?;
+    #[cfg(not(feature = "promql-v2"))]
     let result = state
         .tsdb
         .eval_query(&params.query, time, &QueryOptions::default())
+        .await;
+    #[cfg(feature = "promql-v2")]
+    let result = state
+        .tsdb
+        .eval_query_v2(&params.query, time, &QueryOptions::default())
         .await;
     Ok(Json(response::query_value_to_response(result)))
 }
 
 /// Handle /api/v1/query_range
+///
+/// See `handle_query` for the compile-time A/B rationale. v2's
+/// `eval_query_range_v2` returns `QueryValue` (not `Vec<RangeSample>` like
+/// v1) because a plan root may collapse to a scalar over a range grid
+/// (e.g. `1+1`). A thin adapter — local to this handler — projects the
+/// `QueryValue` back onto the `Vec<RangeSample>` wire contract that
+/// `range_result_to_response` expects, keeping the JSON response shape
+/// identical regardless of feature flag.
 async fn handle_query_range(
     State(state): State<AppState>,
     request: Request,
@@ -335,11 +354,48 @@ async fn handle_query_range(
     let start = parse_timestamp(&params.start)?;
     let end = parse_timestamp(&params.end)?;
     let step = parse_duration(&params.step)?;
+    #[cfg(not(feature = "promql-v2"))]
     let result = state
         .tsdb
         .eval_query_range(&params.query, start..=end, step, &QueryOptions::default())
         .await;
+    #[cfg(feature = "promql-v2")]
+    let result = state
+        .tsdb
+        .eval_query_range_v2(&params.query, start..=end, step, &QueryOptions::default())
+        .await
+        .and_then(query_value_to_range_samples);
     Ok(Json(response::range_result_to_response(result)))
+}
+
+/// Collapse a v2 [`QueryValue`] into the `Vec<RangeSample>` wire shape
+/// expected by the `/api/v1/query_range` response builder. Matrix results
+/// pass through; scalar results fan out into a single anonymous series
+/// with one sample at the query's evaluation timestamp (matches v1's
+/// range-scalar flattening in `evaluate_range`). Vector results shouldn't
+/// normally occur on a range grid, but are defensively converted into a
+/// single-step matrix if they do.
+#[cfg(feature = "promql-v2")]
+fn query_value_to_range_samples(
+    value: QueryValue,
+) -> Result<Vec<crate::model::RangeSample>, crate::error::QueryError> {
+    match value {
+        QueryValue::Matrix(series) => Ok(series),
+        QueryValue::Scalar {
+            timestamp_ms,
+            value,
+        } => Ok(vec![crate::model::RangeSample {
+            labels: crate::model::Labels::empty(),
+            samples: vec![(timestamp_ms, value)],
+        }]),
+        QueryValue::Vector(samples) => Ok(samples
+            .into_iter()
+            .map(|s| crate::model::RangeSample {
+                labels: s.labels,
+                samples: vec![(s.timestamp_ms, s.value)],
+            })
+            .collect()),
+    }
 }
 
 /// Handle /api/v1/series
@@ -453,15 +509,24 @@ async fn handle_federate(
     let mut body = String::new();
 
     for selector in &params.matches {
-        let result = state
+        // Federate dispatches through the same compile-time A/B boundary
+        // as `handle_query` so flipping `promql-v2` picks up every entry
+        // point uniformly.
+        #[cfg(not(feature = "promql-v2"))]
+        let eval = state
             .tsdb
             .eval_query(selector, None, &QueryOptions::default())
-            .await
-            .map_err(|e| match e {
-                crate::error::QueryError::InvalidQuery(msg) => Error::InvalidInput(msg),
-                crate::error::QueryError::Execution(msg) => Error::Internal(msg),
-                crate::error::QueryError::Timeout => Error::Internal("query timed out".to_string()),
-            })?;
+            .await;
+        #[cfg(feature = "promql-v2")]
+        let eval = state
+            .tsdb
+            .eval_query_v2(selector, None, &QueryOptions::default())
+            .await;
+        let result = eval.map_err(|e| match e {
+            crate::error::QueryError::InvalidQuery(msg) => Error::InvalidInput(msg),
+            crate::error::QueryError::Execution(msg) => Error::Internal(msg),
+            crate::error::QueryError::Timeout => Error::Internal("query timed out".to_string()),
+        })?;
 
         let samples = match result {
             QueryValue::Vector(s) => s,
