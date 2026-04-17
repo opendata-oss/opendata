@@ -54,7 +54,8 @@ toml = "0.8"
 tower = "0.5"
 tower-http = { version = "0.5", features = ["cors"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+tracing-chrome = "0.7"
 ulid = "1"
 uuid = "1.14.0"
 opentelemetry-proto = { version = "0.28", default-features = false, features = ["metrics", "gen-tonic-messages"] }

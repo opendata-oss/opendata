@@ -51,6 +51,7 @@ use crate::storage::VectorDbStorageReadExt;
 use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use common::StorageRead;
+use common::tracing::trace_span;
 use futures::future::BoxFuture;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::IntoParallelIterator;
@@ -58,7 +59,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use tracing::Instrument;
 use tracing::debug;
 
 /// Represents a tree depth of some number of levels. Trees always have at least
@@ -948,23 +949,29 @@ pub(crate) async fn batch_search_centroids<K: Hash + Eq + Sized + Send + Sync>(
     k: usize,
     queries: Vec<(K, &[f32])>,
 ) -> Result<HashMap<K, Vec<Posting>>> {
-    let t = Instant::now();
     let nqueries = queries.len();
-    let result =
-        batch_search_centroids_in_level(index, k, queries, TreeLevel::leaf(index.depth)).await;
-    debug!(
-        op = "batch_search_centroids_in_level",
+    let span = trace_span!(
+        "batch_search_centroids",
         k = k,
         queries = nqueries,
-        duration_ms = t.elapsed().as_millis() as u64,
+        depth = %index.depth,
     );
-    result
+    async move {
+        batch_search_centroids_in_level(index, k, queries, TreeLevel::leaf(index.depth)).await
+    }
+    .instrument(span)
+    .await
 }
 
 /// Search a batch of queries in a given level of the centroid tree. This fn drives
 /// the main search loop for the tree. It takes a batch of queries, then in a loop,
 /// searches the index, loads any missing postings, and then resumes until all searches
 /// complete.
+///
+/// Instrumentation: each outer-loop iteration is wrapped in a `centroid_level` span
+/// (an "overarching" per-level span) with child `score_level_postings` and
+/// `load_level_postings` spans so the Chrome trace shows the work at each tree
+/// level of the search.
 pub(crate) async fn batch_search_centroids_in_level<K: Hash + Eq + Sized + Send + Sync>(
     index: &LeveledCentroidIndex<'_>,
     k: usize,
@@ -977,55 +984,55 @@ pub(crate) async fn batch_search_centroids_in_level<K: Hash + Eq + Sized + Send 
         .map(|(k, queries)| (k, queries, None))
         .collect();
     let mut queries = Some(queries);
+    let mut iteration: u32 = 0;
     loop {
         let Some(remaining) = queries.take() else {
             break;
         };
-        // find results / intermediate results
-        let t = Instant::now();
-        let intermediate = remaining
-            .into_par_iter()
-            .map(|(key, q, ip)| {
-                let result = if let Some(ip) = ip {
-                    index.resume_search_in_level(q, k, level, ip)
-                } else {
-                    index.search_in_level(q, k, level)
-                };
-                (key, q, result)
-            })
-            .collect::<Vec<_>>();
-        debug!(
-            op = "batch_search_centroids_in_level/search_in_level",
-            duration_ms = t.elapsed().as_millis() as u64,
+        iteration += 1;
+
+        // The level being scored this iteration: taken from any query's
+        // resumable state (all queries in a batch advance together). For the
+        // very first iteration there is no state yet — we're about to fetch
+        // the root.
+        let current_level = remaining
+            .first()
+            .and_then(|(_, _, ip)| ip.as_ref().map(|s| format!("{}", s.level)))
+            .unwrap_or_else(|| "root".to_string());
+
+        let level_span = trace_span!(
+            "centroid_level",
+            iteration = iteration,
+            level = %current_level,
+            n_queries = remaining.len(),
         );
-        let mut posting_reads = HashMap::new();
-        let mut pending = Vec::with_capacity(intermediate.len());
-        // separate finished results from intermediate posting reads
-        for (key, q, result) in intermediate {
-            match result {
-                SearchResult::ReadsRequired(reads) => {
-                    let (reads, in_flight) = reads.start();
-                    for (centroid, fut) in reads {
-                        posting_reads.insert(centroid, fut);
-                    }
-                    pending.push((key, q, in_flight))
-                }
-                SearchResult::Ann(ann) => {
-                    results.insert(key, ann);
-                }
-            }
+
+        let (pending, posting_reads, finished) = score_and_partition(index, k, level, remaining)
+            .instrument(level_span.clone())
+            .await;
+        for (key, ann) in finished {
+            results.insert(key, ann);
         }
         if pending.is_empty() {
             break;
         }
-        let posting_reads = posting_reads.into_values().collect::<Vec<_>>();
-        let t = Instant::now();
-        let posting_reads = AsyncBatchDriver::execute(posting_reads).await;
-        debug!(
-            op = "batch_search_centroids_in_level/execute reads",
-            reads = posting_reads.len(),
-            duration_ms = t.elapsed().as_millis() as u64,
+
+        let load_level = pending
+            .first()
+            .map(|(_, _, ip)| format!("{}", ip.level))
+            .unwrap_or_default();
+        let n_reads = posting_reads.len();
+        let load_span = trace_span!(
+            "load_level_postings",
+            level = %load_level,
+            n_reads = n_reads,
         );
+
+        let posting_reads = posting_reads.into_values().collect::<Vec<_>>();
+        let posting_reads = AsyncBatchDriver::execute(posting_reads)
+            .instrument(load_span)
+            .instrument(level_span)
+            .await;
         let mut postings = HashMap::with_capacity(posting_reads.len());
         for pr in posting_reads {
             let (centroid, pl) = pr?;
@@ -1040,6 +1047,57 @@ pub(crate) async fn batch_search_centroids_in_level<K: Hash + Eq + Sized + Send 
         );
     }
     Ok(results)
+}
+
+/// Score the current batch of queries at `level` and partition the results
+/// into ones that are done (returned as `finished`) and ones that are blocked
+/// on further posting reads (returned as `pending` plus the de-duplicated
+/// `posting_reads` to run). Wrapped in its own span — this is the CPU-bound
+/// "scoring postings at this level" phase of centroid search.
+#[allow(clippy::type_complexity)]
+async fn score_and_partition<'a, K: Hash + Eq + Sized + Send + Sync>(
+    index: &LeveledCentroidIndex<'a>,
+    k: usize,
+    level: TreeLevel,
+    remaining: Vec<(K, &'a [f32], Option<ResumableCentroidSearch>)>,
+) -> (
+    Vec<(K, &'a [f32], InFlightBlockedCentroidSearch)>,
+    HashMap<VectorId, PostingListReadFuture>,
+    Vec<(K, Vec<Posting>)>,
+) {
+    let score_span = trace_span!("score_level_postings", n_queries = remaining.len());
+    let intermediate = score_span.in_scope(|| {
+        remaining
+            .into_par_iter()
+            .map(|(key, q, ip)| {
+                let result = if let Some(ip) = ip {
+                    index.resume_search_in_level(q, k, level, ip)
+                } else {
+                    index.search_in_level(q, k, level)
+                };
+                (key, q, result)
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let mut posting_reads = HashMap::new();
+    let mut pending = Vec::with_capacity(intermediate.len());
+    let mut finished = Vec::new();
+    for (key, q, result) in intermediate {
+        match result {
+            SearchResult::ReadsRequired(reads) => {
+                let (reads, in_flight) = reads.start();
+                for (centroid, fut) in reads {
+                    posting_reads.insert(centroid, fut);
+                }
+                pending.push((key, q, in_flight))
+            }
+            SearchResult::Ann(ann) => {
+                finished.push((key, ann));
+            }
+        }
+    }
+    (pending, posting_reads, finished)
 }
 
 #[cfg(test)]

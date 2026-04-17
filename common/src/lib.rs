@@ -5,7 +5,9 @@ pub mod display;
 pub mod sequence;
 pub mod serde;
 pub mod storage;
+pub mod tracing;
 
+pub use crate::tracing::TracingConfig;
 pub use bytes::BytesRange;
 pub use clock::Clock;
 pub use sequence::{DEFAULT_BLOCK_SIZE, SequenceAllocator, SequenceError, SequenceResult};
