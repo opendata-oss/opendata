@@ -365,6 +365,48 @@ mod tests {
     }
 
     #[test]
+    fn should_scalarize_over_512_series_split_across_tiles() {
+        // given: >512 series across two tile batches, each step has exactly
+        // one valid sample; mirrors the `VectorSelectorOp` default tiling
+        // with `series_chunk=512` for large rosters. ScalarizeOp must
+        // aggregate across tiles so each step sees one valid input and the
+        // output scalar equals that value.
+        const SERIES: usize = 1024;
+        const TILE: usize = 512;
+        let grid = mk_grid(2);
+        let schema = mk_schema(SERIES);
+
+        // Step 0: only series 3 (in tile A) valid with value 7.0.
+        // Step 1: only series 1000 (in tile B, local idx = 1000 - 512 = 488)
+        // valid with value 9.5. All other cells invalid.
+        let mut vals_a = vec![f64::NAN; 2 * TILE];
+        let mut valid_a = vec![false; 2 * TILE];
+        vals_a[0 * TILE + 3] = 7.0;
+        valid_a[0 * TILE + 3] = true;
+        let batch_a = mk_batch(schema.clone(), 0..2, 0..TILE, vals_a, valid_a);
+
+        let mut vals_b = vec![f64::NAN; 2 * TILE];
+        let mut valid_b = vec![false; 2 * TILE];
+        vals_b[1 * TILE + 488] = 9.5;
+        valid_b[1 * TILE + 488] = true;
+        let batch_b = mk_batch(schema.clone(), 0..2, TILE..SERIES, vals_b, valid_b);
+
+        let child = MockOp::new(schema, grid, vec![batch_a, batch_b]);
+        let mut op = ScalarizeOp::new(child, MemoryReservation::new(1 << 20));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // when
+        let batch = match op.next(&mut cx) {
+            Poll::Ready(Some(Ok(batch))) => batch,
+            other => panic!("unexpected poll result: {other:?}"),
+        };
+
+        // then
+        assert_eq!(batch.values, vec![7.0, 9.5]);
+    }
+
+    #[test]
     fn should_scalarize_across_multiple_series_tiles() {
         // given: exactly one valid sample per step, but split across two input
         // batches with different series tiles.

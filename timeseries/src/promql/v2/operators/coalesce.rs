@@ -442,6 +442,55 @@ mod tests {
     }
 
     #[test]
+    fn should_fan_in_over_512_series_split_across_children_with_tiles() {
+        // given: two children covering disjoint halves of a >512-series
+        // roster, each child emits its half across two series tiles of 256
+        // (mirroring `VectorSelectorOp` emission under `series_chunk=256`
+        // for a 1024-series roster handled by two shards).
+        const SERIES: usize = 1024;
+        const SHARD: usize = 512;
+        const TILE: usize = 256;
+        let schema = mk_schema(SERIES);
+        let grid = mk_grid(2);
+        let ts = mk_timestamps(2);
+
+        // Child A emits tiles [0..256) and [256..512).
+        let a1 = mk_batch(ts.clone(), schema.clone(), 0..2, 0..TILE, 1.0);
+        let a2 = mk_batch(ts.clone(), schema.clone(), 0..2, TILE..SHARD, 2.0);
+        // Child B emits tiles [512..768) and [768..1024).
+        let b1 = mk_batch(ts.clone(), schema.clone(), 0..2, SHARD..(SHARD + TILE), 3.0);
+        let b2 = mk_batch(
+            ts.clone(),
+            schema.clone(),
+            0..2,
+            (SHARD + TILE)..SERIES,
+            4.0,
+        );
+        let child_a = MockOp::ok_batches(schema.clone(), grid, vec![a1, a2]);
+        let child_b = MockOp::ok_batches(schema.clone(), grid, vec![b1, b2]);
+
+        // when
+        let out_schema = OperatorSchema::new(SchemaRef::Static(schema), grid);
+        let mut op = CoalesceOp::new(vec![Box::new(child_a), Box::new(child_b)], out_schema);
+        let outs: Vec<StepBatch> = drive_to_end(&mut op)
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        // then: every series in [0..1024) is covered exactly once across
+        // the forwarded tile batches — Coalesce just forwards, no merging.
+        assert_eq!(outs.len(), 4);
+        let mut covered = vec![false; SERIES];
+        for b in &outs {
+            for s in b.series_range.clone() {
+                assert!(!covered[s], "double coverage of series {s}");
+                covered[s] = true;
+            }
+        }
+        assert!(covered.iter().all(|&c| c), "missing series coverage");
+    }
+
+    #[test]
     fn should_continue_after_one_child_done_while_other_has_work() {
         // given: child A is already done, child B still has data.
         let schema = mk_schema(4);

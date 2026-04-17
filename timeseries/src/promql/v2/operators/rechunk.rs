@@ -986,6 +986,40 @@ mod tests {
     }
 
     #[test]
+    fn should_rechunk_across_multiple_series_tiles_over_512_series() {
+        // given: 1024 series × 2 steps delivered as three (step_tile ×
+        // series_tile) batches with the same 512-wide series chunk that
+        // `VectorSelectorOp` uses by default. Asking `RechunkOp` for a
+        // single tile covering the full grid exercises its scratch
+        // aggregation across multi-series-tile input.
+        const SERIES: usize = 1024;
+        const TILE: usize = 512;
+        let schema = mk_schema(SERIES);
+        let grid = mk_grid(2);
+        let ts = mk_timestamps(2);
+
+        let batch_a = mk_batch_tile(ts.clone(), schema.clone(), 0..2, 0..TILE);
+        let batch_b = mk_batch_tile(ts.clone(), schema.clone(), 0..2, TILE..SERIES);
+        let child = MockOp::new(schema, grid, vec![batch_a, batch_b]);
+
+        // when: rechunk to a single 2 × 1024 output tile.
+        let mut op = RechunkOp::new(child, 2, SERIES, MemoryReservation::new(1 << 20));
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then: one tile with deterministic values at every cell across
+        // both input tiles.
+        assert_eq!(outs.len(), 1);
+        let b = &outs[0];
+        assert_eq!(b.step_range, 0..2);
+        assert_eq!(b.series_range, 0..SERIES);
+        for step in 0..2 {
+            for series in 0..SERIES {
+                assert_eq!(b.get(step, series), Some(expected(step, series)));
+            }
+        }
+    }
+
+    #[test]
     fn should_handle_out_of_order_upstream_batches() {
         // given: upstream emits in reverse step order; scratch-based
         // ingest places each batch at its global (step, series) offset,

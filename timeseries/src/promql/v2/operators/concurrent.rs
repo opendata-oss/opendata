@@ -332,6 +332,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_forward_multi_series_tile_batches_over_512_series_unchanged() {
+        // given: >512 series split across two series-tile batches covering
+        // the same step range, mirroring `VectorSelectorOp`'s default
+        // `series_chunk=512` emission for rosters >512 series.
+        const SERIES: usize = 1024;
+        const TILE: usize = 512;
+        let schema = mk_schema(SERIES);
+        let grid = mk_grid(2);
+        let ts = mk_timestamps(2);
+        let batch_a = mk_batch(ts.clone(), schema.clone(), 0..2, 0..TILE, 1.0);
+        let batch_b = mk_batch(ts.clone(), schema.clone(), 0..2, TILE..SERIES, 2.0);
+        let child = MockOp::new(schema, grid, vec![batch_a, batch_b]);
+
+        // when
+        let mut op = ConcurrentOp::new(child, DEFAULT_CHANNEL_BOUND);
+        let outs = drive_async(&mut op).await;
+
+        // then: both tile batches forwarded verbatim (same series_range,
+        // same step_range) — Concurrent is a pure forwarder.
+        assert_eq!(outs.len(), 2);
+        let b0 = outs[0].as_ref().unwrap();
+        let b1 = outs[1].as_ref().unwrap();
+        assert_eq!(b0.series_range, 0..TILE);
+        assert_eq!(b1.series_range, TILE..SERIES);
+        assert_eq!(b0.values[0], 1.0);
+        assert_eq!(b1.values[0], 2.0);
+    }
+
+    #[tokio::test]
     async fn should_apply_backpressure_via_bounded_channel() {
         // given: a child emitting 10 batches, channel bound=1
         let schema = mk_schema(1);

@@ -1171,6 +1171,82 @@ mod tests {
     }
 
     // ========================================================================
+    // tile-boundary stress (RFC 0007 6.3.9)
+    // ========================================================================
+
+    /// Build one tile batch with an explicit `series_range` (not `0..N`).
+    fn mk_tile_batch(
+        step_timestamps: Vec<i64>,
+        total_series_count: usize,
+        series_range: std::ops::Range<usize>,
+        values: Vec<f64>,
+        validity: Vec<bool>,
+    ) -> StepBatch {
+        let step_count = step_timestamps.len();
+        let tile_series_count = series_range.len();
+        assert_eq!(values.len(), step_count * tile_series_count);
+        assert_eq!(validity.len(), values.len());
+        let schema = mk_schema(total_series_count);
+        let mut bits = BitSet::with_len(validity.len());
+        for (i, &b) in validity.iter().enumerate() {
+            if b {
+                bits.set(i);
+            }
+        }
+        StepBatch::new(
+            Arc::from(step_timestamps),
+            0..step_count,
+            SchemaRef::Static(schema),
+            series_range,
+            values,
+            bits,
+        )
+    }
+
+    #[test]
+    fn should_apply_instant_fn_across_multi_tile_inputs_over_512_series() {
+        // given: 1024 series split into two series-tile batches covering the
+        // same step range (mirroring `VectorSelectorOp`'s `series_chunk=512`
+        // emission for rosters >512 series).
+        const SERIES: usize = 1024;
+        const TILE: usize = 512;
+        let ts = vec![10_i64, 20_i64];
+        let schema = mk_operator_schema(&ts, 10, SERIES);
+
+        let vals_a: Vec<f64> = (0..(TILE * 2)).map(|i| -(i as f64)).collect();
+        let vals_b: Vec<f64> = (0..(TILE * 2)).map(|i| -((TILE + i / 2) as f64)).collect();
+        let batch_a = mk_tile_batch(ts.clone(), SERIES, 0..TILE, vals_a, vec![true; TILE * 2]);
+        let batch_b = mk_tile_batch(
+            ts.clone(),
+            SERIES,
+            TILE..SERIES,
+            vals_b,
+            vec![true; TILE * 2],
+        );
+        let child = MockChild::new(schema, vec![batch_a, batch_b]);
+
+        // when
+        let mut op = InstantFnOp::new(child, InstantFnKind::Abs, MemoryReservation::new(1 << 20));
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then: each output batch preserves its child's series_range and
+        // every cell is the abs of the input — invariant under tiling.
+        assert_eq!(outs.len(), 2, "InstantFn emits one output per input batch");
+        assert_eq!(outs[0].series_range, 0..TILE);
+        assert_eq!(outs[1].series_range, TILE..SERIES);
+        // Spot-check a handful of cells across both tiles.
+        assert_eq!(outs[0].get(0, 0), Some(0.0));
+        assert_eq!(outs[0].get(0, 1), Some(1.0));
+        assert_eq!(outs[0].get(1, TILE - 1), Some((TILE * 2 - 1) as f64));
+        // tile B: original vals_b[i] = -(TILE + i/2), so abs = TILE + i/2.
+        assert_eq!(outs[1].get(0, 0), Some(TILE as f64));
+        assert_eq!(
+            outs[1].get(1, TILE - 1),
+            Some((TILE + (TILE * 2 - 1) / 2) as f64)
+        );
+    }
+
+    // ========================================================================
     // end-to-end pipeline: VectorSelectorOp -> InstantFnOp(Abs)
     // ========================================================================
 
