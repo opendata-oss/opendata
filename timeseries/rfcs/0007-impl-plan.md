@@ -271,7 +271,7 @@ return structurally-identical `QueryValue`s.
 | 6.3.7 | Restore `timestamp()` source-sample semantics (StepBatch ABI extension) | Architect | done | 6.2 | `timeseries/src/promql/v2/batch.rs`, `timeseries/src/promql/v2/operators/{vector_selector,instant_fn}.rs`, `timeseries/src/promql/v2/reshape.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
 | 6.3.8 | Fix `MatrixSelectorOp` + `rate()` + `@` / `offset` window math (per-step effective-time threaded into `RollupOp`) | Architect | done | 6.2 | `timeseries/src/promql/v2/operators/{matrix_selector,subquery,rollup}.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
 | 6.3.9 | Stress-test every operator against `>series_chunk` (>512-series) inputs; fix any latent tile-boundary bugs surfaced | Operator Implementor | done | 6.3.8 | `timeseries/src/promql/v2/operators/{aggregate,binary,instant_fn,coercion,rechunk,concurrent,coalesce,label_manip,count_values,rollup}.rs`, `timeseries/src/tsdb.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
-| 6.3.10 | Fix `SubqueryOp` reservation leak across factory rebuilds (child-operator bytes accumulate across outer steps; flagged by 6.3.9's `#[ignore]`d subquery stress) | | ready | 6.3.9 | | `SubqueryOp::build_outer_step_batch` invokes the planner-supplied `ChildFactory` once per outer step, each call builds a fresh child sub-tree that reserves memory. The child is drained and dropped at end of scope, but some reservations held by the child (constructor-time scratch in `AggregateOp::new`, hint-series clones, inner physical-plan intermediate allocations) do not release on `Drop` — they were `try_grow`ed but never paired with `release`. Accumulates linearly with outer step count; trips the 1 GiB plan-time cap at ~600+ series × many outer steps. Reproduction test already committed under `#[ignore]` as `should_eval_sum_over_time_subquery_with_over_512_series`. |
+| 6.3.10 | Fix `SubqueryOp` reservation leak at the root cause (`plan::physical::resolve_leaf`'s unpaired `try_grow`) — NOT via scope-wrapper delta-release | | ready | 6.3.9 | | Leak: `resolve_leaf` at `physical.rs:360` calls `reservation.try_grow(label_bytes)` without a paired `release`. Harmless for top-level queries (reservation is dropped at query end) but linear in subquery because the factory rebuilds child plans reusing the same reservation. At ~600+ series × many outer steps trips the 1 GiB cap. **Previous attempt** (commits `c893024` + `b7a2ce4`, reverted in `8c4495a` + `596c446`) wrapped `SubqueryOp::build_outer_step_batch` with a `(reserved_after - reserved_before)` delta-release. This caused a production regression ("many aggregations return no data over long ranges") — suspected cause: `reservation.reserved()` is the global counter, and a `ConcurrentOp` running on another tokio worker during the factory's `block_in_place` can legitimately grow/shrink the counter inside the snapshot window, so the delta captures that operator's bytes and releases them, breaking downstream accounting. **Correct approach for this retry**: attach a `ReservedBytes` RAII guard to `ResolvedLeaf` that pairs its `try_grow` with a `release` in `Drop`, and store the guard on the operator that consumes the resolved roster (`VectorSelectorOp` / `MatrixSelectorOp`) so bytes are released when the operator is dropped at factory-scope exit. Do not touch `SubqueryOp`. Reproduction test in `timeseries/src/tsdb.rs::should_eval_sum_over_time_subquery_with_over_512_series` (currently ignored for a separate `samples()` perf reason; re-enable locally to verify). |
 
 **Acceptance**: zero failures on the unmodified `promqltest` corpus. Perf profile taken on a
 representative range query (e.g., `sum by (pod) (rate(http_requests_total[5m]))` over 6h) —
@@ -364,13 +364,24 @@ layouts) lives in git history — use `git log -- <path>` to retrieve it.
 
 ### 5.4 Open items needing follow-up
 
-- **`SubqueryOp` reservation leak.** Child factory is re-invoked synchronously
-  per outer step via `tokio::task::block_in_place`; memory reservations held
-  by the freshly-built child aren't released on drop. At ~600+ series × many
-  outer steps the 1 GiB plan-time cap fills before the query completes.
-  `SubqueryOp` itself is tile-safe; this is orthogonal resource accounting.
-  Tracked by the `#[ignore]`d `should_eval_sum_over_time_subquery_with_over_512_series`
-  test. **Owner for next unit.**
+- **`SubqueryOp` reservation leak (unit 6.3.10).** Root cause:
+  `plan::physical::resolve_leaf` at `physical.rs:360` calls
+  `reservation.try_grow(label_bytes)` without a paired `release`. Harmless
+  for top-level queries (reservation drops at query end) but linear in
+  subquery because the factory rebuilds child plans reusing the same
+  reservation; at ~600+ series × many outer steps trips the 1 GiB cap.
+  **First attempt** (`c893024` + `b7a2ce4`) wrapped
+  `SubqueryOp::build_outer_step_batch` with a `(reserved_after -
+  reserved_before)` delta-release and caused a production regression — many
+  aggregations returned no data over long ranges. Suspected cause:
+  `reservation.reserved()` is the global counter, and a `ConcurrentOp` on
+  another tokio worker during the factory's `block_in_place` can grow /
+  shrink the counter inside the snapshot window, so the delta captures
+  concurrent bytes and releases them, corrupting downstream accounting.
+  **Reverted** in `8c4495a` + `596c446`. Retry must fix at the source:
+  add a `ReservedBytes` RAII guard tied to the resolved schema's bytes so
+  `Drop` pairs the `try_grow` — no global-counter deltas, no interaction
+  with concurrent operators. **Owner for next unit.**
 - **Hardcoded limits, no runtime config.** Cardinality gate = 20M series×steps;
   memory cap = 1 GiB. Both require a rebuild to change. Phase 7 cleanup.
 - **`timestamp()` with scalar child.** `InstantFnKind::Timestamp` falls back to
@@ -445,6 +456,11 @@ lives in the git commits; use `git log --oneline --grep="RFC 0007"` to browse.
     `SubqueryOp` reservation leak (§5.4).
   - `6796b02` — v1/v2 criterion benches; `52ecac6` — cross-engine result
     parity check in the A/B smoke.
+  - 6.3.10 first attempt (`c893024` + `b7a2ce4`) reverted in `8c4495a` +
+    `596c446` after user reported aggregations returning no data over
+    long ranges in production. Scope-wrapper delta approach interacts
+    badly with `ConcurrentOp` on other tokio workers. Retry must fix
+    `resolve_leaf`'s unpaired `try_grow` at the source; see §5.4.
 
 ---
 
