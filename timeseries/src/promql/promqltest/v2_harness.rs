@@ -343,43 +343,119 @@ mod tests {
         let step = Duration::from_secs(step_secs);
         let opts = QueryOptions::default();
 
-        async fn measure<F, Fut, T>(label: &str, iters: usize, mut run: F) -> u128
+        async fn measure<F, Fut>(label: &str, iters: usize, mut run: F) -> (u128, Vec<RangeSample>)
         where
             F: FnMut() -> Fut,
-            Fut: std::future::Future<Output = T>,
-            T: 'static,
+            Fut: std::future::Future<Output = Vec<RangeSample>>,
         {
-            // Warmup.
-            let _ = run().await;
+            // Warmup (and capture the result for a correctness cross-check).
+            let reference = run().await;
             let mut samples: Vec<u128> = Vec::with_capacity(iters);
             for _ in 0..iters {
                 let t0 = std::time::Instant::now();
-                let _r = run().await;
+                let r = run().await;
                 samples.push(t0.elapsed().as_millis());
+                // Cheap invariants so a silently-empty implementation
+                // can't read as "fast". Full A/B equality is checked
+                // across engines below.
+                assert_eq!(
+                    r.len(),
+                    reference.len(),
+                    "{label} returned inconsistent row counts across iterations",
+                );
             }
             samples.sort();
             let median = samples[samples.len() / 2];
-            eprintln!("{label}: median={median} ms, samples={samples:?}");
-            median
+            eprintln!(
+                "{label}: median={median} ms, samples={samples:?}, rows={}",
+                reference.len()
+            );
+            (median, reference)
         }
 
-        let v1_median = measure("v1 (eval_query_range)   ", 5, || async {
+        let (v1_median, v1_result) = measure("v1 (eval_query_range)   ", 5, || async {
             tsdb.eval_query_range(query, start..=end, step, &opts)
                 .await
                 .expect("v1 range eval failed")
         })
         .await;
 
-        let v2_median = measure("v2 (eval_query_range_v2)", 5, || async {
+        let (v2_median, v2_result) = measure("v2 (eval_query_range_v2)", 5, || async {
             tsdb.eval_query_range_v2(query, start..=end, step, &opts)
                 .await
                 .expect("v2 range eval failed")
+                .into_matrix()
         })
         .await;
 
+        // Cross-engine correctness cross-check. The two engines can emit
+        // series in different orders and collapse step timestamps
+        // differently, so normalise before comparing: sort by labelset,
+        // sort each series' samples by timestamp, and bucket-compare
+        // values with a 1e-9 tolerance (rate extrapolation is not
+        // bit-identical across the two implementations).
+        fn normalise(mut matrix: Vec<RangeSample>) -> Vec<(String, Vec<(i64, f64)>)> {
+            let mut out: Vec<(String, Vec<(i64, f64)>)> = matrix
+                .drain(..)
+                .map(|s| {
+                    let mut pts: Vec<(i64, f64)> = s.samples;
+                    pts.sort_by_key(|&(t, _)| t);
+                    let mut pairs: Vec<(String, String)> = s
+                        .labels
+                        .iter()
+                        .map(|l| (l.name.clone(), l.value.clone()))
+                        .collect();
+                    pairs.sort();
+                    let key = pairs
+                        .into_iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    (key, pts)
+                })
+                .collect();
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            out
+        }
+
+        let v1_norm = normalise(v1_result);
+        let v2_norm = normalise(v2_result);
+        assert_eq!(
+            v1_norm.len(),
+            v2_norm.len(),
+            "v1 returned {} series, v2 returned {}",
+            v1_norm.len(),
+            v2_norm.len(),
+        );
+        for (a, b) in v1_norm.iter().zip(v2_norm.iter()) {
+            assert_eq!(a.0, b.0, "series labelsets diverge between engines");
+            assert_eq!(
+                a.1.len(),
+                b.1.len(),
+                "series {} sample count diverges: v1={} v2={}",
+                a.0,
+                a.1.len(),
+                b.1.len(),
+            );
+            for (p1, p2) in a.1.iter().zip(b.1.iter()) {
+                assert_eq!(p1.0, p2.0, "series {} timestamp mismatch", a.0);
+                let delta = (p1.1 - p2.1).abs();
+                let rel = delta / p1.1.abs().max(1e-12);
+                assert!(
+                    delta < 1e-9 || rel < 1e-9,
+                    "series {} @ {} value mismatch: v1={} v2={} (delta={})",
+                    a.0,
+                    p1.0,
+                    p1.1,
+                    p2.1,
+                    delta,
+                );
+            }
+        }
+
         let speedup = v1_median as f64 / v2_median.max(1) as f64;
         eprintln!(
-            "A/B {} steps × {} series: v1 {} ms / v2 {} ms ({:.2}× speedup)",
+            "A/B {} steps × {} series: v1 {} ms / v2 {} ms ({:.2}× speedup, results match)",
             num_steps,
             num_pods * num_instances,
             v1_median,
