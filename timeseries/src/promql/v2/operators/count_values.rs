@@ -1148,4 +1148,98 @@ mod tests {
         assert_eq!(value_labels(finalised, "version"), vec!["6"]);
         assert_eq!(b.get(0, 0), Some(2.0));
     }
+
+    fn mk_tile_batch(
+        schema: Arc<SeriesSchema>,
+        step_count: usize,
+        series_range: std::ops::Range<usize>,
+        values: Vec<f64>,
+        validity: Vec<bool>,
+    ) -> StepBatch {
+        let sc = series_range.len();
+        assert_eq!(values.len(), step_count * sc);
+        assert_eq!(validity.len(), values.len());
+        let ts: Arc<[i64]> =
+            Arc::from((0..step_count).map(|i| (i as i64) * 10).collect::<Vec<_>>());
+        let mut bits = BitSet::with_len(values.len());
+        for (i, &b) in validity.iter().enumerate() {
+            if b {
+                bits.set(i);
+            }
+        }
+        StepBatch::new(
+            ts,
+            0..step_count,
+            SchemaRef::Static(schema),
+            series_range,
+            values,
+            bits,
+        )
+    }
+
+    #[test]
+    fn should_count_values_across_multi_series_tile_batches_over_512_series() {
+        // given: 1024 input series emitted as two series-tile batches
+        // mirroring `VectorSelectorOp`'s default `series_chunk=512`
+        // emission. Values follow a round-robin: input `i` takes value
+        // `i % 3` (three distinct output buckets, each with ~341 or ~342
+        // contributors). CountValuesOp must bucket across tiles so the
+        // per-step counts sum over both tiles.
+        const INPUTS: usize = 1024;
+        const TILE: usize = 512;
+        const STEPS: usize = 1;
+
+        let in_schema = mk_input_schema(INPUTS);
+        let grid = mk_grid(STEPS);
+
+        let build_tile = |series_range: std::ops::Range<usize>| -> StepBatch {
+            let sc = series_range.len();
+            let mut values = Vec::with_capacity(STEPS * sc);
+            for _step in 0..STEPS {
+                for s in series_range.clone() {
+                    values.push((s % 3) as f64);
+                }
+            }
+            mk_tile_batch(
+                in_schema.clone(),
+                STEPS,
+                series_range,
+                values,
+                vec![true; STEPS * sc],
+            )
+        };
+        let batch_a = build_tile(0..TILE);
+        let batch_b = build_tile(TILE..INPUTS);
+        let child = MockOp::new(in_schema, grid, vec![batch_a, batch_b]);
+
+        // when
+        let mut op = CountValuesOp::new(
+            child,
+            "version",
+            None,
+            Arc::from(vec![Labels::empty()].into_boxed_slice()),
+            MemoryReservation::new(1 << 20),
+        );
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then: one output batch with three series (values 0, 1, 2).
+        // Counts: i in 0..1024 with i % 3 == 0 → 342; == 1 → 341; == 2
+        // → 341. Verify via finalised schema + per-bucket count.
+        assert_eq!(outs.len(), 1);
+        let b = &outs[0];
+        assert_eq!(b.series_count(), 3);
+        let finalised = op.finalized_schema().unwrap();
+        let labels = value_labels(finalised, "version");
+        let col_for = |v: &str| -> usize {
+            labels
+                .iter()
+                .position(|s| s == v)
+                .unwrap_or_else(|| panic!("no column for {v}, labels = {labels:?}"))
+        };
+        let count_for =
+            |modulus: usize| -> f64 { (0..INPUTS).filter(|i| i % 3 == modulus).count() as f64 };
+        assert_eq!(b.get(0, col_for("0")), Some(count_for(0)));
+        assert_eq!(b.get(0, col_for("1")), Some(count_for(1)));
+        assert_eq!(b.get(0, col_for("2")), Some(count_for(2)));
+    }
 }

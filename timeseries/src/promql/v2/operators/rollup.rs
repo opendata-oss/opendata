@@ -1444,4 +1444,92 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0], Err(QueryError::MemoryLimit { .. })));
     }
+
+    /// Build a tile [`MatrixWindowBatch`] over `series_range` in a roster
+    /// of `total_series`. `cells` is row-major across the tile.
+    fn build_window_tile(
+        step_timestamps: Vec<i64>,
+        total_series: usize,
+        series_range: std::ops::Range<usize>,
+        cells: Vec<Vec<(i64, f64)>>,
+    ) -> MatrixWindowBatch {
+        let step_count = step_timestamps.len();
+        let tile_sc = series_range.len();
+        assert_eq!(cells.len(), step_count * tile_sc);
+        let schema = mk_schema(total_series);
+
+        let mut timestamps = Vec::new();
+        let mut values = Vec::new();
+        let mut cell_idx = Vec::with_capacity(cells.len());
+        for samples in cells {
+            let offset = timestamps.len() as u32;
+            let len = samples.len() as u32;
+            for (t, v) in samples {
+                timestamps.push(t);
+                values.push(v);
+            }
+            cell_idx.push(CellIndex { offset, len });
+        }
+
+        let ts_arc: Arc<[i64]> = Arc::from(step_timestamps);
+        MatrixWindowBatch {
+            step_timestamps: ts_arc.clone(),
+            step_range: 0..step_count,
+            series: SchemaRef::Static(schema),
+            series_range,
+            timestamps,
+            values,
+            cells: cell_idx,
+            effective_times: None,
+        }
+    }
+
+    #[test]
+    fn should_reduce_multi_series_tile_window_batches_over_512_series() {
+        // given: `RollupOp` consumes `MatrixWindowBatch`es from its child
+        // `MatrixSelectorOp`, which tiles the same step range into
+        // per-512-series batches for rosters >512 series. Each input tile
+        // should round-trip to one output `StepBatch` tile with the same
+        // series_range — the operator is per-batch stateless.
+        const SERIES: usize = 1024;
+        const TILE: usize = 512;
+        let step_ts = vec![10_i64];
+        let schema = build_schema(step_ts.clone(), 10, SERIES);
+
+        // Each cell: one sample at t=10 with value = global series idx.
+        let mut cells_a: Vec<Vec<(i64, f64)>> = Vec::with_capacity(TILE);
+        for s in 0..TILE {
+            cells_a.push(vec![(10, s as f64)]);
+        }
+        let mut cells_b: Vec<Vec<(i64, f64)>> = Vec::with_capacity(TILE);
+        for s in TILE..SERIES {
+            cells_b.push(vec![(10, s as f64)]);
+        }
+        let tile_a = build_window_tile(step_ts.clone(), SERIES, 0..TILE, cells_a);
+        let tile_b = build_window_tile(step_ts, SERIES, TILE..SERIES, cells_b);
+
+        let mock = MockWindows::new(schema, vec![tile_a, tile_b]);
+
+        // when: sum_over_time emits the value as-is (one sample per cell).
+        let mut op = RollupOp::new(
+            mock,
+            RollupKind::SumOverTime,
+            10,
+            MemoryReservation::new(1 << 20),
+        );
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then: two output batches preserving the child's tile shape,
+        // each cell carrying the global series index it covers.
+        assert_eq!(outs.len(), 2);
+        assert_eq!(outs[0].series_range, 0..TILE);
+        assert_eq!(outs[1].series_range, TILE..SERIES);
+        for s in 0..TILE {
+            assert_eq!(outs[0].get(0, s), Some(s as f64));
+        }
+        for s in 0..(SERIES - TILE) {
+            let global = TILE + s;
+            assert_eq!(outs[1].get(0, s), Some(global as f64));
+        }
+    }
 }

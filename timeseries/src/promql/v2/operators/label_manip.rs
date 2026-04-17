@@ -457,6 +457,112 @@ mod tests {
     }
 
     #[test]
+    fn should_merge_multi_series_tile_batches_over_512_series() {
+        // given: 1024 input series whose rewritten labels collapse into
+        // 3 output rows (`i % 3`), emitted across two series-tile batches
+        // mirroring `VectorSelectorOp`'s default `series_chunk=512`
+        // emission. Every input cell is valid with value equal to its
+        // input series index, so each output cell should carry the sum
+        // of the input indices whose `i % 3 == out_row` (but since only
+        // one input contributes per step in this shape, we stage the
+        // values so exactly one input per output row is valid per step
+        // — otherwise the "same labelset" guard rejects the merge).
+        const INPUTS: usize = 1024;
+        const TILE: usize = 512;
+        const GROUPS: usize = 3;
+        const STEPS: usize = 2;
+
+        // Pick one contributing input per (step, group). For step 0,
+        // contributors are series i where i == g; for step 1,
+        // contributors are series (GROUPS + g). All are within tile A.
+        // Tile B inputs are therefore all invalid — proves we don't
+        // drop or miscount tile-B cells.
+        let input_labels: Vec<Labels> = (0..INPUTS)
+            .map(|i| mk_labels(&[("__name__", "m"), ("i", &i.to_string())]))
+            .collect();
+        let input_schema = mk_schema(input_labels);
+        let output_schema = mk_schema(
+            (0..GROUPS)
+                .map(|g| mk_labels(&[("__name__", "m"), ("dst", &g.to_string())]))
+                .collect(),
+        );
+        // input_to_output[i] = i % 3
+        let mapping: Vec<u32> = (0..INPUTS as u32).map(|i| i % GROUPS as u32).collect();
+        let grid = mk_grid(STEPS);
+
+        let build_tile = |series_range: std::ops::Range<usize>| -> StepBatch {
+            let cells = STEPS * series_range.len();
+            let mut values = vec![0.0_f64; cells];
+            let mut validity = vec![false; cells];
+            // Step 0: input series g (for g in 0..GROUPS) contributes.
+            // Step 1: input series GROUPS + g contributes. Both fall in
+            // tile A ([0..TILE)) since GROUPS = 3 < TILE.
+            for g in 0..GROUPS {
+                for (step, src) in [(0_usize, g), (1_usize, GROUPS + g)] {
+                    if series_range.contains(&src) {
+                        let local = src - series_range.start;
+                        let cell = step * series_range.len() + local;
+                        values[cell] = (src as f64) + 1.0;
+                        validity[cell] = true;
+                    }
+                }
+            }
+            mk_batch_with_series_range(input_schema.clone(), STEPS, series_range, values, validity)
+        };
+
+        let batch_a = build_tile(0..TILE);
+        let batch_b = build_tile(TILE..INPUTS);
+        let child = MockOp::new(input_schema, grid, vec![batch_a, batch_b]);
+
+        // when
+        let mut op = LabelManipOp::new(
+            child,
+            Arc::from(mapping),
+            output_schema,
+            MemoryReservation::new(1 << 20),
+        );
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then: one merged output batch with the correct cells per group.
+        assert_eq!(outs.len(), 1);
+        let b = &outs[0];
+        assert_eq!(b.series_count(), GROUPS);
+        for g in 0..GROUPS {
+            assert_eq!(b.get(0, g), Some((g as f64) + 1.0));
+            assert_eq!(b.get(1, g), Some((GROUPS + g) as f64 + 1.0));
+        }
+    }
+
+    fn mk_batch_with_series_range(
+        schema: Arc<SeriesSchema>,
+        step_count: usize,
+        series_range: std::ops::Range<usize>,
+        values: Vec<f64>,
+        validity: Vec<bool>,
+    ) -> StepBatch {
+        let mut bits = BitSet::with_len(values.len());
+        for (index, valid) in validity.into_iter().enumerate() {
+            if valid {
+                bits.set(index);
+            }
+        }
+        let step_timestamps: Arc<[i64]> = Arc::from(
+            (0..step_count)
+                .map(|step| (step as i64) * 10)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        StepBatch::new(
+            step_timestamps,
+            0..step_count,
+            SchemaRef::Static(schema),
+            series_range,
+            values,
+            bits,
+        )
+    }
+
+    #[test]
     fn should_error_when_duplicate_output_labelsets_overlap_same_step() {
         // given
         let input_schema = mk_schema(vec![
