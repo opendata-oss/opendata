@@ -104,6 +104,11 @@ harness = false
 required-features = ["bench-internals"]
 
 [[bench]]
+name = "v2_engine_micorbench"
+harness = false
+required-features = ["bench-internals", "promql-v2"]
+
+[[bench]]
 name = "response_serialization"
 harness = false
 required-features = ["testing"]

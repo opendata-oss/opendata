@@ -1,4 +1,5 @@
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::model::{Label, MetricType, Sample, TimeBucket};
@@ -20,7 +21,7 @@ use promql_parser::parser::{EvalStmt, Expr, SubqueryExpr, VectorSelector};
 /// The query expression is parsed once at construction time so the measured
 /// loop only times evaluator execution.
 pub struct WarmRangeQueryHarness {
-    reader: crate::query::test_utils::MockQueryReader,
+    reader: Arc<crate::query::test_utils::MockQueryReader>,
     /// Pre-parsed expression, cloned into each `EvalStmt`.
     expr: Expr,
     start: SystemTime,
@@ -58,7 +59,7 @@ impl WarmRangeQueryHarness {
             promql_parser::parser::parse("bench_metric").expect("failed to parse bench query");
 
         Self {
-            reader,
+            reader: Arc::new(reader),
             expr,
             start: UNIX_EPOCH,
             end: UNIX_EPOCH + Duration::from_secs(range_secs),
@@ -96,7 +97,7 @@ impl WarmRangeQueryHarness {
             .expect("failed to parse bench query");
 
         Self {
-            reader,
+            reader: Arc::new(reader),
             expr,
             start: UNIX_EPOCH,
             end: UNIX_EPOCH + Duration::from_secs(range_secs),
@@ -118,7 +119,7 @@ impl WarmRangeQueryHarness {
         };
 
         let concurrency = PipelineConcurrency::default();
-        let result = crate::tsdb::evaluate_range(&self.reader, stmt, concurrency)
+        let result = crate::tsdb::evaluate_range(&*self.reader, stmt, concurrency)
             .await
             .map_err(|e| e.to_string())?;
         Ok(result.len())
@@ -128,6 +129,66 @@ impl WarmRangeQueryHarness {
     pub async fn run_iterations(&self, iterations: usize) -> Result<(), String> {
         for _ in 0..iterations {
             let result = self.run_once().await?;
+            black_box(result);
+        }
+        Ok(())
+    }
+
+    /// v2 analogue of [`Self::run_once`]. Drives the same pre-parsed `Expr`
+    /// through the columnar pipeline: lower → optimize → build physical
+    /// plan → poll root to completion. Parsing is kept outside the timed
+    /// path (same as the v1 variant) so the benchmark compares engine
+    /// cost, not parser cost.
+    #[cfg(feature = "promql-v2")]
+    pub async fn run_once_v2(&self) -> Result<usize, String> {
+        use crate::promql::v2;
+        use std::future::poll_fn;
+
+        let start_ms = self
+            .start
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_millis() as i64;
+        let end_ms = self
+            .end
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_millis() as i64;
+        let step_ms = self.step.as_millis() as i64;
+        let lookback_ms = self.lookback_delta.as_millis() as i64;
+
+        let ctx = v2::plan::LoweringContext::new(start_ms, end_ms, step_ms, lookback_ms);
+        let logical = v2::plan::lower(&self.expr, &ctx).map_err(|e| e.to_string())?;
+        let logical = v2::plan::optimize(logical);
+
+        let source = Arc::new(v2::source_adapter::QueryReaderSource::new(
+            self.reader.clone(),
+        ));
+        // 1 GiB reservation — mirrors the production `DEFAULT_V2_MEMORY_CAP_BYTES`.
+        let reservation = v2::memory::MemoryReservation::new(1024 * 1024 * 1024);
+
+        let mut plan = v2::plan::build_physical_plan(logical, &source, reservation, &ctx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut cell_count = 0usize;
+        loop {
+            match poll_fn(|cx| plan.root.next(cx)).await {
+                Some(Ok(batch)) => {
+                    cell_count = cell_count.saturating_add(batch.values.len());
+                }
+                Some(Err(e)) => return Err(e.to_string()),
+                None => break,
+            }
+        }
+        Ok(cell_count)
+    }
+
+    /// v2 analogue of [`Self::run_iterations`].
+    #[cfg(feature = "promql-v2")]
+    pub async fn run_iterations_v2(&self, iterations: usize) -> Result<(), String> {
+        for _ in 0..iterations {
+            let result = self.run_once_v2().await?;
             black_box(result);
         }
         Ok(())
