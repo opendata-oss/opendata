@@ -235,11 +235,11 @@ respects `MemoryReservation`; schema contract is explicit (Static vs Deferred).
 
 | # | Unit | Owner | Status | Deps | Artifacts | Blocker |
 |---|---|---|---|---|---|---|
-| 4.1 | Logical plan representation + AST → logical lowering | | ready | 3c.* | | |
-| 4.2 | Rule-based optimizer (constant fold, selector label pushdown, CSE if cheap) | | ready | 4.1 | | |
-| 4.3 | Physical planner: bind `SeriesSource`, resolve series schemas, build group maps | | ready | 4.1 | | |
-| 4.4 | Plan-time cardinality gate (`estimate_cardinality` → `QueryError::TooLarge`) | | ready | 4.3 | | |
-| 4.5 | Insertion of `Concurrent`/`Coalesce` based on series-count heuristics | | ready | 4.3 | | |
+| 4.1 | Logical plan representation + AST → logical lowering | Planner Implementor | done | 3c.* | `timeseries/src/promql/v2/plan/{mod,plan_types,error,lowering}.rs`, `timeseries/src/promql/v2/mod.rs` | |
+| 4.2 | Rule-based optimizer (constant fold, selector label pushdown, CSE if cheap) | Planner Implementor | done | 4.1 | `timeseries/src/promql/v2/plan/optimize.rs`, `timeseries/src/promql/v2/plan/mod.rs` | |
+| 4.3 | Physical planner: bind `SeriesSource`, resolve series schemas, build group maps | Planner Implementor | done | 4.1 | `timeseries/src/promql/v2/plan/physical.rs`, `timeseries/src/promql/v2/plan/mod.rs`, `timeseries/src/promql/v2/plan/error.rs`, `timeseries/src/promql/v2/mod.rs` | |
+| 4.4 | Plan-time cardinality gate (`estimate_cardinality` → `QueryError::TooLarge`) | Planner Implementor | done | 4.3 | `timeseries/src/promql/v2/plan/cardinality.rs`, `timeseries/src/promql/v2/plan/mod.rs`, `timeseries/src/promql/v2/plan/error.rs`, `timeseries/src/promql/v2/plan/lowering.rs`, `timeseries/src/promql/v2/plan/physical.rs` | |
+| 4.5 | Insertion of `Concurrent`/`Coalesce` based on series-count heuristics | Planner Implementor | done | 4.3 | `timeseries/src/promql/v2/plan/parallelism.rs`, `timeseries/src/promql/v2/plan/physical.rs`, `timeseries/src/promql/v2/plan/lowering.rs`, `timeseries/src/promql/v2/plan/mod.rs` | |
 
 **Acceptance**: small PromQL expressions produce expected plans in unit tests;
 cardinality-gate rejects oversized queries before resolve.
@@ -1232,6 +1232,372 @@ RFC section touched.
   and wiring a side-channel counter into the spawned task would require
   production-code changes just for the test. The order-preservation
   check is an adequate stand-in.
+- 2026-04-16 — Planner Implementor (unit 4.1) — `LoweringContext` shape:
+  `{ start_ms, end_ms, step_ms, lookback_delta_ms }`. `for_instant(t, lookback)`
+  helper sets `start == end == t` and `step_ms = 1` (a non-zero sentinel —
+  callers must gate division on `is_instant()`). Rationale: the physical
+  planner (unit 4.3) already has to distinguish instant from range queries
+  by `start == end` to choose step-batch tiling; a dedicated `Instant`
+  enum variant in the context would duplicate that check. `1` is safer
+  than `0` because downstream code that forgets the check blows up with
+  `val * 1` instead of a panicking divide. Prometheus' `-query.default-step`
+  of 1s is re-used as the default subquery step for instant queries where
+  the AST omits `step`.
+- 2026-04-16 — Planner Implementor (unit 4.1) — Unary minus representation:
+  `Unary(e)` lowers to `Binary { Mul, Scalar(-1.0), lower(e), matching: None }`.
+  No dedicated `LogicalPlan::Negate` variant. Rationale: every existing v2
+  operator path already handles scalar/vector `Mul` (§3b.3); adding a
+  first-class negate variant would duplicate the logic in a 4th place
+  (scalar/scalar, vector/vector, vector/scalar, and now negate). The
+  existing `evaluator.rs::Expr::Unary` arm is `todo!()` (never reached
+  by the legacy engine's test coverage) so there is no legacy behaviour
+  to match. The `-1.0 * foo` shape is also what Prometheus' own engine
+  emits internally. If the optimizer (unit 4.2) wants to fuse the
+  multiply into a specialised negate, it can pattern-match
+  `Binary { Mul, Scalar(-1.0), _, None }` at that point.
+- 2026-04-16 — Planner Implementor (unit 4.1) — Function-name coverage:
+  strict superset of what the operator kinds expose — every
+  `InstantFnKind` variant (29) and every `RollupKind` variant (17) has a
+  PromQL name entry in `instant_fn_kind_for` / `rollup_kind_for`. Gaps
+  vs. Prometheus that are **not** in our operator enums (and therefore
+  can't be lowered): `absent`, `absent_over_time`, `histogram_quantile`,
+  `scalar`, `vector`, `pi`, `time`, and the date/time extraction family
+  (`day_of_month`, `day_of_week`, `day_of_year`, `days_in_month`, `hour`,
+  `minute`, `month`, `year`). These surface as
+  `PlanError::UnknownFunction` from lowering. `histogram_quantile` is
+  explicitly out of scope per RFC §"Non-Goals" (native histograms); the
+  others are tracked in §5 Decisions Log 3b.2's exclusion list and will
+  require an `InstantFnKind` (or new schema-deferring operator, for
+  `absent`) extension before they can be added to the lowering table.
+  Flagged for Architect: no silent addition of operator variants.
+- 2026-04-16 — Planner Implementor (unit 4.1) — `rate(instant_vector)`
+  validation: the test builds the invalid AST manually (via
+  `Function::new(..)` with `ValueType::Matrix` arg_types) because
+  `promql_parser::parser::parse` itself rejects `rate(foo)` at parse
+  time with "expected type matrix in call to function 'rate', got
+  vector". The lowering guard still runs because optimizer passes (unit
+  4.2) could synthesise such a shape during rewrites, but the test
+  cannot exercise it from the string form. No user-visible impact.
+- 2026-04-16 — Planner Implementor (unit 4.1) — `BinaryMatching` is
+  `None` when neither `on`/`ignoring` nor `group_left`/`group_right` is
+  present. Rationale: the physical planner (unit 4.3) treats "no
+  matching record" as "default one-to-one on the full shared label
+  set", which is the PromQL default. Emitting an explicit
+  `BinaryMatching { axis: Ignoring, labels: [], cardinality: OneToOne }`
+  would force the planner to distinguish "user explicitly wrote
+  `ignoring()`" (which is the same semantics but has a parser record)
+  from "no modifier at all" — we'd rather do that distinction in one
+  place (the planner) than twice.
+- 2026-04-16 — Planner Implementor (unit 4.1) — Minimal clippy fix to
+  `plan_types.rs`: changed `labels.labels.iter().cloned().collect()` to
+  `labels.labels.to_vec()` in `labels_to_arc` (lint
+  `iter_cloned_collect`). The prior agent's file could not have passed
+  `cargo clippy --all-targets --all-features -- -D warnings` cleanly
+  as-written (the lint fires on stable); the one-line change preserves
+  behaviour exactly (`Vec<Label>` where `Label = String` is a slice).
+  Flagged per the "do not rewrite `plan_types.rs`" rule — this is a
+  clippy conformance fix, not a redesign.
+- 2026-04-16 — Planner Implementor (unit 4.2) — **CSE deferred to 4.3 /
+  v2.** The physical plan builds the operator tree as unique objects
+  (not a DAG), so structural dedup on the logical `LogicalPlan` tree
+  would not yield a shared computation today. RFC Open Question #4
+  (plan-subtree cache-key canonicalization) is unresolved; implementing
+  CSE prematurely risks picking the wrong equivalence relation (commuta-
+  tive reordering of `a+b` vs `b+a`, ignore-list normalisation, etc.).
+  Option (a) from the unit brief — skip entirely, revisit once DAG rep
+  exists.
+- 2026-04-16 — Planner Implementor (unit 4.2) — **Algebraic identities
+  dropped.** `x * 1 → x`, `x + 0 → x`, `x * 0 → 0`, etc. are correct for
+  pure scalar `x` but change NaN observability on vector branches:
+  `Scalar(0) * VectorSelector(foo)` with a NaN input cell must emit
+  `0 * NaN = NaN` under IEEE 754 (matches `BinaryOp::apply_arith` at
+  `operators/binary.rs:180-193`), but a naive `x * 0 → 0` rewrite would
+  replace the whole tree with `Scalar(0)` and lose the NaN. Task spec
+  rule "correctness > micro-optimizations" applies. The `* 1` / `+ 0`
+  rewrites are safer (no NaN change) but still change validity
+  semantics when the vector side is unmatched (`Binary` sets
+  `validity = 0` on unmatched cells; the identity rewrite would emit
+  valid cells from the vector side's raw validity, which may differ).
+  All five identities stay out of v1.
+- 2026-04-16 — Planner Implementor (unit 4.2) — **Fixpoint strategy:
+  iterate until unchanged, bounded by `MAX_PASSES = 4`.** Each pass
+  runs every rule once; rule bodies are themselves recursive bottom-up
+  so a single pass already reaches a local fixpoint per rule. The outer
+  loop exists only so rule *interactions* reach fixpoint (a rewrite by
+  rule A may expose an opportunity for rule B). In practice the
+  optimizer converges in 1-2 passes today; the bound is a safety net
+  for future rule additions. Equality check on the outer loop uses
+  structural `PartialEq` on `LogicalPlan` — cheap because the tree is
+  shallow and has no reference-identity-dependent nodes.
+- 2026-04-16 — Planner Implementor (unit 4.2) — **NaN-folding policy:
+  fold freely.** `NaN + 1` → `Scalar(NaN)` under the optimizer. This
+  matches both the legacy engine's `apply_binary_op`
+  (`evaluator.rs:2153-2177`, which simply returns `a + b` without
+  NaN-guarding) and the v2 `BinaryOp::apply_arith`
+  (`operators/binary.rs:180-193`). `NaN` is a normal `f64` at the plan
+  level — no distinction from "absent" here; absence is a `BitSet`
+  property of `StepBatch`, not a scalar-value concern. Folding
+  preserves bit-exact semantics with the runtime path.
+- 2026-04-16 — Planner Implementor (unit 4.2) — **Comparison folding
+  always safe on scalar/scalar** regardless of the `bool` modifier.
+  The legacy engine's `(Scalar, Scalar)` arm at `evaluator.rs:2109-
+  2112` calls `apply_binary_op` directly and wraps the result in
+  `ExprResult::Scalar` — `return_bool` is *not* consulted; scalar/
+  scalar comparisons always produce a scalar 1.0/0.0. PromQL itself
+  rejects `1 < 2` (without `bool`) at parse time ("comparisons between
+  scalars must use BOOL modifier"), but the optimizer must still
+  defend against a hand-built / synthesised AST (a future optimizer
+  pass could conceivably produce the shape by folding, though no
+  current rule does). The optimizer folds both shapes to the same
+  scalar. Corresponding test `should_fold_comparison_without_bool`
+  builds the `LogicalPlan` directly because the parser rejects the
+  source form.
+- 2026-04-16 — Planner Implementor (unit 4.2) — **Selector label
+  pushdown scope** narrowed to "redundant (name, op, value) dedup"
+  per the unit brief. The parser does not normalise duplicate
+  matchers (verified: `promql-parser-0.8.0/src/parser/production.rs`
+  emits them verbatim), so `{job="a", job="a"}` reaches the optimizer
+  with two matchers. The rule iterates `Matchers.matchers` preserving
+  first-occurrence order; `or_matchers` (the `{a="x" or a="y"}` AND-of-
+  ORs shape) is left untouched because dedup across OR branches would
+  change semantics when branches overlap. No context-driven matcher
+  invention (e.g. deriving matchers from an enclosing `on(...)` /
+  `ignoring(...)` clause) — task spec rule.
+- 2026-04-16 — Planner Implementor (unit 4.2) — **One minor clippy
+  collapse in `fold_constants`.** The binary-arm match uses a
+  let-chain (`if let (Scalar, Scalar) = ... && let Some(folded) = ...`)
+  rather than nested `if let`s. `clippy::collapsible_if` requires the
+  collapse; let-chains are stable as of Rust 1.88. Pure style, no
+  behaviour change.
+- 2026-04-16 — Planner Implementor (unit 4.3) — **`PlanError` extended
+  with four additive variants**: `SourceError(String)` for
+  `SeriesSource::resolve` failures; `InvalidMatching(String)` for
+  label-matching shape rejections (including schema-deferred children
+  under static-schema-sensitive parents — the v1 `count_values`
+  composition restriction); `MemoryLimit(String)` for plan-time
+  `try_grow` overages; and `PhysicalPlanFailed(String)` as the generic
+  binding-failure catch-all. `QueryError` payloads are rendered via
+  `to_string()` and not threaded through — the wiring unit (Phase 5)
+  owns the cross-layer translation, and `PlanError` remains a
+  `thiserror` leaf with no runtime-error dependency.
+- 2026-04-16 — Planner Implementor (unit 4.3) — **Group-map construction
+  algorithm.** `build_group_map(input_schema, AggregateGrouping)` walks
+  the input series once, projects each labelset onto the grouping key
+  (`By` keeps only listed labels, `Without` keeps everything except
+  listed labels AND `__name__`), sorts the projection, looks the key
+  up in a `HashMap<Vec<Label>, u32>` accumulator, and appends a new
+  group index when absent. Returns `GroupBuild { map, group_labels }`
+  where `group_labels[i]` is the sorted `Labels` for the i-th group.
+  `__name__` stripping on both `By` and `Without` matches Prometheus'
+  aggregate semantics (legacy `evaluator.rs:2262-2268`). `None`
+  slots in `input_to_group` are reserved for explicit planner "drop
+  this input" cases — not currently emitted but the shape supports
+  it.
+- 2026-04-16 — Planner Implementor (unit 4.3) — **Match-table
+  construction algorithm.** `build_match_table(lhs, rhs, matching,
+  include_name)` applies the matching projection per axis (`On` keeps
+  only listed labels; `Ignoring` keeps everything except listed
+  labels — both drop `__name__` for match-key purposes). For
+  `OneToOne` / `ManyToMany`: index RHS by matching key, walk LHS and
+  emit `Some(rhs_idx)` / `None`, output schema = LHS labels (minus
+  `__name__` when `include_name == false`). For `GroupLeft`: LHS is
+  many, one-row-per-LHS output with RHS-side `include(...)` labels
+  composed in via `compose_group_labels` (strips matching name from
+  many side then overlays one-side values for each include label).
+  `GroupRight` mirrors this with LHS/RHS swapped. `include_name` is
+  computed from `preserves_metric_name(op)` — arithmetic ops and
+  `bool`-modified comparisons drop `__name__`; everything else keeps
+  it (matches legacy `changes_metric_schema` at
+  `evaluator.rs:2125-2127` and surrounding `result_metric` helper).
+  Runtime duplicate-matching detection is deferred to the operator
+  — v1 tests don't exercise the corner, and the operator can emit
+  `validity = 0` for unmatched cells cleanly.
+- 2026-04-16 — Planner Implementor (unit 4.3) — **Subquery factory
+  design.** `build_subquery` probes the inner subtree once at plan
+  time to snapshot its output `Arc<SeriesSchema>` (v1 assumes plan-
+  time-stable inner schemas — the RFC's `count_values` composition
+  restriction is enforced upstream). The `ChildFactory` closure
+  captures `(source_arc, ctx, reservation, inner_plan.clone())` and
+  re-invokes `build_node` synchronously on each outer-step call via
+  `tokio::task::block_in_place` + `Handle::block_on`. When the
+  factory is called outside a tokio runtime (test paths), it spins
+  up a current-thread runtime per call. Two obvious follow-ups for
+  perf: (a) cache pre-built child sub-trees keyed on
+  `(TimeRange, step_ms)` when the inner plan is deterministic, and
+  (b) expose an `async` factory surface so re-planning composes with
+  the parent's task without a nested block_on. Neither matters for
+  v1 correctness, both are called out in `physical.rs` module docs.
+- 2026-04-16 — Planner Implementor (unit 4.3) — **CountValues
+  composition restriction.** Per RFC §"Core Data Model" the v1
+  planner only supports `count_values` at the root of the logical
+  plan (or under no schema-sensitive parent). `static_schema()`
+  checks each child operator's `SchemaRef` before calling
+  schema-consuming constructors (`AggregateOp`, `BinaryOp`
+  vector/vector, `InstantFnOp`); a `SchemaRef::Deferred` child
+  triggers `PlanError::InvalidMatching` with a descriptive message.
+  Test `should_reject_count_values_under_schema_sensitive_parent`
+  pins this. Lifting the restriction is a follow-up: the rechunk /
+  aggregate / binary operators would need a two-phase init path that
+  waits on the deferred child's first batch before binding their
+  own schema.
+- 2026-04-16 — Planner Implementor (unit 4.3) — **Operator constructor
+  artifacts that required plan-time computation**: `GroupMap` for
+  `AggregateOp::new` (all variants — streaming + `Topk`/`Bottomk`
+  filter-shape + `Quantile` reducer-shape); `MatchTable` +
+  `output_schema: Arc<SeriesSchema>` for
+  `BinaryOp::new_vector_vector`; `Option<GroupMap>` +
+  `group_labels: Arc<[Labels]>` for `CountValuesOp::new`;
+  `ChildFactory` + `series: Arc<SeriesSchema>` for `SubqueryOp::new`;
+  per-leaf `Arc<SeriesSchema>` + parallel
+  `Arc<[ResolvedSeriesRef]>` hint slice for `VectorSelectorOp::new`
+  / `MatrixSelectorOp::new`; `OperatorSchema` snapshot for
+  `MatrixWindowSource::new` (3b.1's integration wrapper). No API
+  gaps: every operator constructor accepted exactly the shape the
+  planner could build at plan time.
+- 2026-04-16 — Planner Implementor (unit 4.3) — **`BoxedOp` shim.**
+  `Box<dyn Operator + Send>` does not itself implement `Operator`
+  (the blanket impl would conflict with `Box<impl Operator>`), so
+  the planner wraps each child in a transparent `BoxedOp(Box<dyn
+  Operator + Send>)` newtype that forwards `schema()` / `next()` to
+  the inner box. Lets generic operator structs (`BinaryOp<L, R>`,
+  `AggregateOp<C>`, `InstantFnOp<C>`, `RollupOp<W>`) consume
+  trait-object children without turning themselves into `dyn`
+  consumers. Zero runtime cost — one extra indirection per poll,
+  already paid by the `dyn` dispatch.
+- 2026-04-16 — Planner Implementor (unit 4.3) — **Parser-type
+  conversions at operator boundaries.** `VectorSelectorOp` /
+  `MatrixSelectorOp` take `promql_parser::parser::{AtModifier,
+  Offset}` by value (their `EffectiveTimes::compute` consumes them
+  directly). The planner carries the simpler plan-time
+  `plan_types::{AtModifier, Offset}` shapes so the IR is cheap to
+  pattern-match and stable across refactors; local
+  `to_parser_at` / `to_parser_offset` helpers convert right before
+  the constructor call. `AtModifier::Value(ms)` maps to
+  `SystemTime::UNIX_EPOCH + Duration::from_millis(ms)`, clamping
+  negative ms to zero (pre-epoch `@` values are already rejected at
+  lowering time — see 4.1's `AtModifier::TryFrom` impl).
+- 2026-04-16 — Planner Implementor (unit 4.4) — **Default limit =
+  20,000,000 cells.** Rationale: the gate bounds `sum(series × steps)`
+  across leaves; 20M cells is roughly 2k series × 10k steps or 20k
+  series × 1k steps. Both comfortably fit a single-digit GB per-query
+  memory cap (float cell = 8 B + 1/8 B validity ≈ 180 MB worst case
+  for 20M). Tune per deployment via
+  `CardinalityLimits::new(max_series_x_steps)`. `0` explicitly
+  disables the gate (`CardinalityLimits::is_disabled`).
+- 2026-04-16 — Planner Implementor (unit 4.4) — **Subquery treatment:
+  outer-grid flavour (RFC verbatim).** RFC §"Execution Model" says
+  "`sum(resolved_series × steps)`". v1 implements that literally —
+  each leaf contributes `series × outer_step_count`, ignoring the
+  inner step multiplication a subquery actually performs. Real cost
+  for a subquery is `inner_step × outer_step × series` per leaf
+  inside the subquery; we undercount by `inner_step_count`. Chosen
+  deliberately: subqueries are rarely the dominant cardinality, the
+  RFC wording is unambiguous, and under-estimation lets the
+  reservation (unit 1.4) trip mid-exec if the inner plan truly
+  explodes. Flagged here so Phase 6 triage can revisit if a fixture
+  mis-behaves.
+- 2026-04-16 — Planner Implementor (unit 4.4) — **`u64::MAX` sentinel
+  trips the gate immediately (with any non-zero limit).** Unit 2.2's
+  adapter returns `series_upper_bound = u64::MAX` for selectors with
+  no positive matchers (the "real match deferred to resolve" escape
+  hatch). Multiplying by any positive step count saturates to
+  `u64::MAX`, which is `> limit` for any finite limit — so the gate
+  rejects immediately. The error payload carries `estimated_cells =
+  u64::MAX` which is an honest signal: "source could not bound this,
+  refusing to resolve blind." Caller who wants this through has to
+  disable the gate (`limit = 0`) — matches the defensive-by-default
+  posture.
+- 2026-04-16 — Planner Implementor (unit 4.4) — **Gate time-range is
+  `[0, i64::MAX)`.** The gate does not reproduce the physical
+  planner's lookback / `@` / offset folding (that lives in
+  `physical::selector_time_range`). For `estimate_cardinality` the
+  source only needs a time window to narrow by bucket overlap; a
+  maximal window is a safe upper bound (the estimate will include
+  buckets the real resolve might drop). Alternative: reuse
+  `selector_time_range` — rejected for v1 because it pulls grid / `@`
+  computation into the gate and complicates the tree walk for a
+  negligible tightening of the estimate.
+- 2026-04-16 — Planner Implementor (unit 4.4) — **Wired via
+  `LoweringContext.cardinality_limits`.** Added a
+  `cardinality_limits: CardinalityLimits` field on `LoweringContext`
+  (kept `Copy` — `CardinalityLimits` is a single `u64`) plus a
+  `with_cardinality_limits` chainable setter. `LoweringContext::new` /
+  `for_instant` default to `CardinalityLimits::default()`
+  (20M-cell cap). Chose this over extending the `build_physical_plan`
+  signature: callers already thread `LoweringContext` through the
+  whole plan pipeline (lowering / optimize / physical), and the limit
+  is a plan-time configuration knob sharing that lifetime. Extending
+  the signature would duplicate the context's role and churn every
+  call site.
+- 2026-04-16 — Planner Implementor (unit 4.5) — **Concurrent threshold
+  default: 64 series.** Matches the unit brief's suggestion. Low enough
+  that any non-trivial production selector (typical selectors match
+  thousands of series) ships with decoupled I/O, and high enough that
+  unit-test-scale selectors (handfuls of series) skip the wrap —
+  constructing a `ConcurrentOp` requires a live tokio runtime and small
+  queries don't benefit from the per-wrap task-spawn overhead. Exposed
+  as `Parallelism::DEFAULT_CONCURRENT_THRESHOLD_SERIES`. Knobs: `0` →
+  wrap every eligible leaf; `u64::MAX` → disable wrap entirely. Tune
+  per deployment once Phase 6 profiling has data.
+- 2026-04-16 — Planner Implementor (unit 4.5) — **Coalesce deliberately
+  skipped in v1** (recommendation in the unit brief's §Scope). RFC
+  §"Parallelism" frames `Coalesce` as "vertical sharding within a
+  single query", but the safety envelope is narrow: splitting a roster
+  into disjoint shards is only correct when every operator on the path
+  from leaf to the nearest `Aggregate`/`Binary` boundary is
+  per-series-independent. The v1 physical planner doesn't yet track
+  that predicate, and shipping `Coalesce` without it risks silent
+  data-loss on queries that look like they decompose but don't. The
+  `Parallelism::coalesce_max_shards` knob exists (defaults to `0`,
+  disabled) so a future unit can flip it on without a public-surface
+  break. `Concurrent` alone delivers the RFC's "per-operator async
+  streaming" intent; Phase 6 profiling will justify (or not) adding
+  `Coalesce` later. Phase 6 risk: v1 is "correct but possibly slow" on
+  very wide single-leaf queries — explicitly acceptable.
+- 2026-04-16 — Planner Implementor (unit 4.5) — **Insertion point:
+  inlined into `build_node`** (option 1 from the unit brief). After a
+  selector leaf resolves we know the concrete series count; wrapping
+  in place avoids a downcasting post-pass (option 2 — rejected
+  because `Box<dyn Operator>` has no reflection). A new private helper
+  `maybe_wrap_concurrent(op, series_count, ctx, stats)` does the
+  `should_wrap_concurrent` check and records the decision; on wrap it
+  routes the boxed child through the existing `BoxedOp` shim (which
+  already forwards `schema()`/`next()`) so `ConcurrentOp::new<C>`'s
+  `Operator + Send + 'static` bound is satisfied.
+- 2026-04-16 — Planner Implementor (unit 4.5) — **MatrixSelectorOp is
+  not wrappable directly** — its `Operator::next` is degenerate per
+  §3a.2 (the actual windows come from the `WindowStream` bridge). The
+  planner therefore wraps the **enclosing `RollupOp`** on the
+  `Rollup(MatrixSelector)` path instead: `RollupOp` owns the I/O leaf
+  and is a full `Operator`, so `ConcurrentOp(Box<RollupOp>)` preserves
+  the "decouple I/O from evaluation" contract at a slightly wider
+  boundary (rollup+leaf as one subplan). On the `VectorSelector` path
+  the leaf is wrapped directly. On the `Rollup(Subquery)` path no wrap
+  is inserted — subquery cardinality is the outer-grid's, not the
+  child's, and the subquery operator internally re-plans per outer
+  step; wrapping once outside would only parallelise the rollup, not
+  the re-planning. A future unit can revisit once Subquery profiling
+  shows the factory-call overhead dominates.
+- 2026-04-16 — Planner Implementor (unit 4.5) — **Observability via
+  `ExchangeStats` returned from a test-only entry point.** Tests can't
+  downcast `Box<dyn Operator>` back to `ConcurrentOp` to verify the
+  wrap decision, and extending the `Operator` trait with an
+  `is_concurrent` / `kind()` probe is forbidden (§3.5 strict scope).
+  Introduced `pub async fn build_physical_plan_with_stats(...) ->
+  Result<(PhysicalPlan, ExchangeStats), PlanError>` — production
+  callers use `build_physical_plan` and discard the stats; test
+  callers reach for the `_with_stats` variant and assert on
+  `concurrent_wrapped` / `concurrent_skipped` / `coalesce_inserted`.
+  The stats struct is trivially `Copy` and adds no runtime overhead on
+  the production path.
+- 2026-04-16 — Planner Implementor (unit 4.5) — **Wired via
+  `LoweringContext.parallelism`** (mirrors 4.4's wiring). Added a
+  `parallelism: Parallelism` field on `LoweringContext` with a
+  `with_parallelism` chainable setter; `Parallelism::default()` —
+  `{ threshold: 64, coalesce_max_shards: 0, channel_bound:
+  DEFAULT_CHANNEL_BOUND }` — is used by `LoweringContext::new` /
+  `for_instant`. Keeps the context as the single configuration
+  surface; `build_physical_plan` signature unchanged.
 
 ## 6. Activity Log
 
@@ -1258,6 +1624,11 @@ Append-only, one line per agent invocation. Format:
 - 2026-04-16 Operator Implementor 3c.3 in-progress→done — created `promql/v2/operators/rechunk.rs` (`RechunkOp<C: Operator>`); registered in `operators/mod.rs` (incl. `prelude`) and re-exported from `v2/mod.rs`. Pipeline-breaker that repackages upstream batches to a different `(target_step_chunk, target_series_chunk)` rectangle. Strategy (§5 Decisions Log): full-grid materialisation into a `(step_count × series_count)` scratch buffer + single-shot passthrough short-circuit when the first upstream batch already matches the target tile shape on a tile boundary (partial-tile/sliding materialisation deferred). Internal state machine: `Init → {Passthrough | Draining} → Emitting → Done`. Scratch is a `RAII` `Scratch` struct — `try_grow` once in `Init→Draining` for `step_count × series_count × (8 + 1/8)` bytes, `release` on `Drop` when state flips to `Done` (error short-circuit, end-of-stream after last tile, or operator drop). Per-tile outputs are NOT double-charged (already accounted for in scratch; summed cell count equals scratch size). Schema passes through unchanged from the child; `step_grid` is plan-time invariant across the pipeline. Out-of-order upstream emission is handled by placing cells at their global `(step_range.start + step_off, series_range.start + series_off)` offsets. `SchemaRef::Deferred` handling: `grid_series_count` falls back to 0 (v1 planner won't place Rechunk after `count_values`; §5 Decisions Log flags the gap). 12 new unit tests on hand-built `MockOp` upstreams cover passthrough, step-axis rechunk (wider tiles), series-axis rechunk (narrower tiles), both-axes rechunk, value+validity bit-for-bit preservation (incl. real-NaN vs absence), memory-cap rejection, memory-release-after-drain (reservation counter returns to pre-call value), upstream error propagation, static-schema contract, partial-tile at non-evenly-divisible grid edges, empty upstream, and out-of-order upstream batches. One surprise during implementation: the naive passthrough predicate ("end lands on target boundary OR grid edge") accepted a full-grid batch as a "matching tile" and emitted it as a single output — tightened to require the batch span to equal target chunk (or be a short partial tile at the grid edge). No `Operator` / `OperatorSchema` / `StepBatch` surface changes. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (189 passed — 177 prior + 12 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
 - 2026-04-16 Operator Implementor 3c.5 in-progress→done — created `promql/v2/operators/concurrent.rs` (`ConcurrentOp`, `DEFAULT_CHANNEL_BOUND = 4`) and `promql/v2/operators/coalesce.rs` (`CoalesceOp`); registered in `operators/mod.rs` (incl. `prelude`) and re-exported from `v2/mod.rs`. `ConcurrentOp` wraps a `Send + 'static` child in a `tokio::spawn`ed task that drives it via `std::future::poll_fn(|cx| child.next(cx)).await` and pushes `Result<StepBatch, QueryError>` into a bounded `tokio::sync::mpsc` channel (default bound = 4). Schema is snapshotted at construction (`Arc<OperatorSchema>` clone) so the trait's "schema() before first next()" invariant holds. Back-pressure is the mpsc bound itself — when downstream stops polling, producer `send` parks and the child awaits with it. `_task: JoinHandle` retained so drop cancels. No new deps (tokio already in workspace at `timeseries/Cargo.toml:56`). `CoalesceOp` holds `Vec<Box<dyn Operator + Send>>` + `Vec<bool>` done-flags + a cursor; `next()` does a cursor-advancing round-robin, emitting the first `Ready(Some)` encountered, skipping `Pending` to avoid starvation, and bubbling `Pending` only when every live child was pending in that round. No memory reservation at this layer (children own their batch bytes). Test strategy uses `#[tokio::test]` for `ConcurrentOp` (5 tests: forward-3-batches, error-propagation, close-on-EOS, schema-caching, back-pressure-via-bound-1) and a synchronous `noop_waker` driver for `CoalesceOp` (7 tests: disjoint-series fan-in, all-pending, all-exhausted, error-short-circuit, schema-passthrough, different-cadence, continue-when-one-done). Clippy flagged two `vec![false; N]`-in-test uses; tightened to fixed arrays. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (214 passed — 202 prior + 12 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass. Phase 3 acceptance criteria met for every unit.
 - 2026-04-16 Operator Implementor 3c.4 in-progress→done — created `promql/v2/operators/count_values.rs` (`CountValuesOp<C: Operator>`, `format_value_label` helper, private `BucketKey` / `BucketCounts` intermediate state); registered in `operators/mod.rs` (incl. `prelude`) and re-exported from `v2/mod.rs`. Deferred-schema pipeline-breaker implementing `count_values("label", expr)`: `schema()` returns `SchemaRef::Deferred` for the whole operator life; downstream reads the finalised `Arc<SeriesSchema>` either through an inherent `finalized_schema(&self) -> Option<&Arc<SeriesSchema>>` method (populated after the first `next()` drains and emits) or straight off the emitted `StepBatch`'s `SchemaRef::Static` handle — no `SchemaRef` extension required (§5 Decisions Log). Bucket keying on `(group: u32, value_bits: u64)` with `value_bits = f64::to_bits()` distinguishes `+0/-0` and NaN bit patterns in the intermediate map; label formatting collapses all NaNs to `"NaN"`. Value-to-label formatter mirrors Prometheus' `strconv.FormatFloat('f', -1, 64)` — `"NaN"` / `"+Inf"` / `"-Inf"` / `"-0"` special cases, finite non-zero through Rust's `f64::to_string` (shortest round-trip) — with a documented divergence note in §5 Decisions Log (no in-crate citation available: legacy engine does not implement `count_values`, and the `aggregators.test:480` goldens are ignored). Grouping via optional `GroupMap` (reused from 3b.4) + a parallel `Arc<[Labels]>` of group-label sets; emitted series carry the group labels (with any pre-existing `label_name=*` stripped to avoid duplicates, matching the "overwrite label with output" goldens at `aggregators.test:517,524`) composed with the new `{label_name=<formatted_value>}` entry. Emission: a single `StepBatch` covering the full outer grid × full output roster (downstream rechunking is a planner concern). Memory accounting: three reservations — per-bucket bytes (charged incrementally on `try_grow`), schema bytes (reserved up-front at roster finalisation), and per-batch `OutBuffers` (RAII via the same pattern as `aggregate.rs` / `rollup.rs`); all released on `Drop` / `finish()`. 13 new unit tests on hand-built `MockOp` upstreams: one-series-per-distinct-value, counts-per-step, `by`-grouping, `without`-grouping (per-input groups), deferred-schema pre-drain, finalised schema post-drain, NaN bit-pattern bucketing (two distinct NaN patterns emerge as two `{version="NaN"}` series), upstream error propagation, memory-cap rejection on first bucket insert, empty-child end-of-stream, format-label parity with the Prometheus reference table, idempotent EOS after emit, and `None`-group-assignment drop behaviour. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (202 passed — 189 prior + 13 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
+- 2026-04-16 Planner Implementor 4.1 in-progress→done — created `promql/v2/plan/mod.rs` (submodule declarations + public re-exports) and `promql/v2/plan/lowering.rs` (`lower`, `LoweringContext`, private `lower_call` / `lower_aggregate` / `lower_binary` dispatchers, `binary_op_kind` / `rollup_kind_for` / `instant_fn_kind_for` tables, `expect_number_literal` / `expect_string_literal` literal extractors, diagnostic helpers). `v2/mod.rs` extended with `pub(crate) mod plan;` + re-exports (`LogicalPlan`, `LoweringContext`, `lower`, `PlanError`, supporting types). `plan_types.rs` and `error.rs` untouched except for a one-line clippy-conformance fix in `plan_types.rs::labels_to_arc` (`iter().cloned().collect()` → `.to_vec()`; §5 Decisions Log 4.1 entry). Lowering contract: `VectorSelector` / `MatrixSelector` / `NumberLiteral` / `Subquery` / `Paren` / `Unary` map 1:1 to the IR; `Call` dispatches via name tables to `RollupKind` (17 variants — strict superset of legacy, flags rate-on-instant-vector as `InvalidArgument`) or `InstantFnKind` (29 variants, folds plan-time scalar args into `Round`/`Clamp`/`ClampMin`/`ClampMax`); `Aggregate` dispatches on `TokenType` (`T_SUM`/…/`T_TOPK`/`T_BOTTOMK`/`T_QUANTILE`/`T_COUNT_VALUES`), coercing `topk`/`bottomk`'s `k` to `i64` the same way `evaluator.rs::coerce_k_size` does; `Binary` threads the `bool` modifier into per-variant comparison kinds and emits `BinaryMatching` only when explicit matching/grouping modifiers are present (see §5 Decisions Log). Unary minus lowers to `Binary { Mul, Scalar(-1.0), child }` (§5). Function-name coverage is strict superset of operator enum variants; gaps vs. Prometheus (`absent`, `histogram_quantile`, `scalar`, `vector`, `pi`, `time`, date/time extractions) flagged in §5 Decisions Log and error with `PlanError::UnknownFunction` — no operator-variant additions. 18 new unit tests cover the required should_-prefixed battery plus unary-negative-clamp-bound folding and the `LoweringContext::for_instant` helper. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (232 passed — 214 prior + 18 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
+- 2026-04-16 Planner Implementor 4.2 in-progress→done — created `promql/v2/plan/optimize.rs` (public `optimize(LogicalPlan) -> LogicalPlan` entry point, private `apply_rules` / `fold_constants` / `apply_scalar_op` / `dedupe_vector_selector_matchers` / `dedupe_matchers`); added `pub mod optimize;` + `pub use optimize::optimize;` to `promql/v2/plan/mod.rs`. Rule set: (1) constant folding on `Binary { Scalar, op, Scalar }` covering the 7 arithmetic variants (`Add`/`Sub`/`Mul`/`Div`/`Mod`/`Pow`/`Atan2`) and all 6 comparison variants (`Eq`/`Ne`/`Gt`/`Lt`/`Gte`/`Lte`, both `bool` settings); (2) unary-minus-of-literal is covered for free by rule (1) because lowering emits `Binary { Mul, Scalar(-1), x }`; (3) redundant `(name, op, value)` matcher dedup on `VectorSelector` / `MatrixSelector` via `Matchers.matchers` walk preserving first-occurrence order (`or_matchers` untouched — cross-branch dedup would change set semantics). No CSE (§5 Decisions Log 4.2 — deferred to 4.3 / v2 post DAG representation); no algebraic identities (§5 — `0 * NaN = NaN` under IEEE 754 would break; task-spec correctness-over-micro-opt rule). Fixpoint: iterate `apply_rules` until `LogicalPlan::PartialEq` shows no change, bounded by `MAX_PASSES = 4` (§5 — converges in 1-2 passes today; bound is a safety net). NaN folding enabled and cited against legacy `evaluator.rs:2153-2177` + v2 `operators/binary.rs:180-193` — both compute `a + b` without NaN guarding. Comparison folding safe on scalar/scalar regardless of `bool` per legacy `evaluator.rs:2109-2112` (§5). 13 new unit tests cover the required `should_*` battery (scalar arithmetic, comparison with `bool`, comparison without `bool` — hand-built AST because the parser rejects the source form, unary-minus-of-literal, non-constant passthrough, duplicate matcher collapse, bare-selector passthrough, nested fold, identities-deferred, bounded fixpoint, NaN fold, fold-under-`InstantFn`, fold-under-`Aggregate`). No changes to `plan_types.rs` / `error.rs` / `lowering.rs` / any operator. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (245 passed — 232 prior + 13 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
+- 2026-04-16 Planner Implementor 4.3 in-progress→done — created `promql/v2/plan/physical.rs` (public `build_physical_plan<S: SeriesSource + Send + Sync + 'static>(LogicalPlan, &Arc<S>, MemoryReservation, &LoweringContext) -> Result<PhysicalPlan, PlanError>` entry point + `PhysicalPlan { root, output_schema, step_grid }`); registered `pub mod physical;` + re-exports in `promql/v2/plan/mod.rs` and `promql/v2/mod.rs`. Extended `PlanError` with four additive variants — `SourceError(String)`, `InvalidMatching(String)`, `MemoryLimit(String)`, `PhysicalPlanFailed(String)` — so the planner surface stays `QueryError`-free (§5 Decisions Log 4.3). Bottom-up walk: leaves call `source.resolve().try_collect()` into `Arc<SeriesSchema>` + parallel `Arc<[ResolvedSeriesRef]>` hint and wire a `VectorSelectorOp` / (inside `Rollup` branch) `MatrixSelectorOp` + `MatrixWindowSource` pair; intermediates bind every plan-time artifact the operator's constructor takes — `GroupMap` + reducer-/filter-shape `Arc<SeriesSchema>` for `AggregateOp`, `MatchTable` + output `Arc<SeriesSchema>` for vector/vector `BinaryOp` (arithmetic ops drop `__name__` via `preserves_metric_name` mirroring legacy `changes_metric_schema` at `evaluator.rs:2125-2127`; `on`/`ignoring` axis + `group_left`/`group_right`/`ManyToMany` cardinalities via `build_one_to_one`/`build_group_left`/`build_group_right`), `Option<GroupMap>` + `Arc<[Labels]>` for `CountValuesOp`, and a plan-time-probed `Arc<SeriesSchema>` + `ChildFactory` closure for `SubqueryOp` (§5 Decisions Log — factory re-invokes `build_node` synchronously via `tokio::task::block_in_place`; inner-schema assumed plan-time stable per RFC §"Core Data Model"). `CountValues`-composition restriction enforced via a `static_schema()` guard on every schema-sensitive parent: `SchemaRef::Deferred` children are rejected with `PlanError::InvalidMatching` (§5 — RFC §"Core Data Model" allows only root-positioned `count_values` in v1). Concrete generic operator structs (`BinaryOp<L, R>`, `InstantFnOp<C>`, `AggregateOp<C>`, `CountValuesOp<C>`) consume trait-object children via a transparent `BoxedOp(Box<dyn Operator + Send>)` newtype that forwards `schema()`/`next()`. Parser-type conversions (`plan_types::{Offset, AtModifier}` → `promql_parser::parser::{Offset, AtModifier}`) at leaf-operator boundaries via local `to_parser_*` helpers. **No operator-constructor API gaps surfaced** — every operator accepted exactly the shape the planner could build at plan time (§5). 14 new unit tests on an inline `MockSource` (mirrors the 3a.1 / 3b.1 pattern): `should_build_vector_selector_from_logical_plan`, `should_build_matrix_selector`, `should_compute_group_map_for_sum_by_label`, `should_compute_group_map_for_sum_without_label`, `should_output_input_schema_for_topk`, `should_output_group_schema_for_sum`, `should_compute_one_to_one_match_table`, `should_mark_unmatched_series_as_none_in_match_table`, `should_build_subquery_factory_producing_child_per_outer_step`, `should_propagate_source_resolve_error_as_plan_error`, `should_build_rollup_over_matrix_selector_end_to_end` (drives one poll of the built root), `should_build_nested_aggregate_of_rollup` (`sum by (pod) (rate(m[5s]))` via the real parser + 4.1 lowerer), `should_reject_count_values_under_schema_sensitive_parent`, `should_group_left_preserves_include_labels_from_one_side`. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (259 passed — 245 prior + 14 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
+- 2026-04-16 Planner Implementor 4.4 in-progress→done — created `promql/v2/plan/cardinality.rs` (`CardinalityLimits`, `enforce_cardinality_gate` async entry point) and registered the module in `promql/v2/plan/mod.rs`. Added `PlanError::TooLarge { estimated_cells: u64, limit: u64 }` variant to `plan/error.rs`; extended `LoweringContext` with a `cardinality_limits: CardinalityLimits` field + `with_cardinality_limits` chainable setter (kept `Copy` — see §5 Decisions Log). Wired the gate into `build_physical_plan` at the top of the function, before any `resolve` call. Default limit: 20,000,000 series×steps cells (§5). Gate walks the `LogicalPlan` bottom-up, collecting `VectorSelector` / `MatrixSelector` leaves; calls `SeriesSource::estimate_cardinality` per leaf; multiplies upper bound by the outer-grid `step_count`; sums and rejects when the running total exceeds the configured limit. Saturating arithmetic so `u64::MAX` sentinels from the adapter's "no-positive-matchers" escape hatch trip the gate immediately (§5). Subquery handling: outer-grid flavour per RFC verbatim wording (§5 documents the under-estimation vs. true subquery cost). `CountValues` gated on input cardinality as a lower bound per task spec. `Binary` / `Aggregate` / `Rollup` / `InstantFn` / `Rechunk` / `Concurrent` / `Coalesce` treated as transparent: sum their leaves. Wired via `LoweringContext` (not a new `build_physical_plan` argument) — the context already threads through the whole plan pipeline, and the limit is a plan-time configuration knob sharing that lifetime. 12 new unit tests on a scripted `MockSource` (for gate-only tests) and a `ResolvingSource` (for the integration / order-assertion tests): `should_default_cardinality_limits_to_twenty_million_cells`, `should_treat_zero_limit_as_disabled`, `should_accept_plan_within_limit`, `should_reject_plan_exceeding_limit`, `should_accumulate_cardinality_across_multiple_leaves` (Binary+Rollup pair), `should_multiply_by_step_count` (10 vs 100 steps), `should_report_estimated_cells_in_error`, `should_use_upper_bound_when_estimate_is_approx`, `should_bypass_gate_when_limit_is_zero_or_disabled`, `should_trip_gate_immediately_on_unbounded_sentinel`, `should_call_estimate_cardinality_before_resolve` (via `build_physical_plan`), `should_not_call_resolve_when_gate_rejects` (via `build_physical_plan`). `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (271 passed — 259 prior + 12 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
+- 2026-04-16 Planner Implementor 4.5 in-progress→done — created `promql/v2/plan/parallelism.rs` (`Parallelism` config struct with `concurrent_threshold_series` / `coalesce_max_shards` / `channel_bound` knobs; `ExchangeStats` test-observability shape; `should_wrap_concurrent` decision helper); registered in `plan/mod.rs` with `ExchangeStats` / `Parallelism` re-exports. Extended `LoweringContext` with a `parallelism: Parallelism` field + `with_parallelism` chainable setter (mirrors 4.4's `with_cardinality_limits`); defaults through `LoweringContext::new` / `for_instant`. Added `pub async fn build_physical_plan_with_stats(...) -> Result<(PhysicalPlan, ExchangeStats), PlanError>` as the test-observable entry point; the existing `build_physical_plan` delegates and discards the stats so production surface is unchanged. Exchange insertion inlined into `build_node` (option 1 from the unit brief): after constructing a `VectorSelectorOp` or `RollupOp(MatrixSelectorOp)` leaf, the new `maybe_wrap_concurrent` helper routes the child through `BoxedOp` (existing shim) and wraps in `ConcurrentOp` when the resolved series count ≥ `concurrent_threshold_series`. `MatrixSelectorOp` is not wrapped directly — its `Operator::next` is degenerate per §3a.2; wrapping the enclosing `RollupOp` preserves the async-decoupling contract at a slightly wider boundary (§5). **Coalesce deliberately skipped in v1** per the unit brief's recommendation — the safety envelope for per-series-independent operator chains isn't yet tracked by the planner, and shipping `Coalesce` without that check risks silent data-loss. The `coalesce_max_shards` knob ships (default `0`, disabled) so a future unit can flip it on without a public-surface break. Concurrent threshold default: **64 series** (`Parallelism::DEFAULT_CONCURRENT_THRESHOLD_SERIES`). 13 new unit tests: 5 in `parallelism.rs` (`should_use_default_parallelism_when_not_specified`, `should_wrap_when_series_count_meets_threshold`, `should_wrap_every_leaf_when_threshold_is_zero`, `should_disable_wrap_when_threshold_is_max`, `should_track_exchange_stats`) + 8 in `physical.rs` (`should_wrap_leaves_above_threshold_in_concurrent`, `should_not_wrap_leaves_below_threshold`, `should_leave_intermediate_operators_unwrapped`, `should_use_default_parallelism_when_not_specified`, `should_allow_disabling_concurrent_with_threshold_zero_or_max`, `should_respect_channel_bound`, `should_skip_coalesce_in_v1`, `should_wrap_rollup_leaf_above_threshold`). `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (284 passed — 271 prior + 13 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass. Phase 4 complete.
 
 ---
 

@@ -1,0 +1,1085 @@
+//! AST → [`LogicalPlan`] lowering (unit 4.1).
+//!
+//! The lowering pass walks a `promql_parser::parser::Expr` and produces the
+//! plan IR defined in [`super::plan_types`]. It does **not** resolve series,
+//! build group maps, or bind a `SeriesSource` — those are the physical
+//! planner's job (unit 4.3).
+//!
+//! # Contract
+//!
+//! - Pure function of `(Expr, LoweringContext)`. No I/O, no allocation beyond
+//!   what the plan IR itself requires.
+//! - Every recognised PromQL construct maps to exactly one [`LogicalPlan`]
+//!   variant; unknown shapes error with the appropriate [`PlanError`].
+//! - Function arguments that must be plan-time constants (e.g. `clamp`'s
+//!   bounds, `quantile_over_time`'s `q`, `topk`'s `k`) are folded into the
+//!   operator-kind enum at lowering time. Non-literal arguments in those
+//!   positions error with [`PlanError::InvalidArgument`].
+//!
+//! # Non-goals
+//!
+//! - Constant folding, CSE, selector label pushdown — those are unit 4.2.
+//! - Type-checking beyond what the operator enums enforce (e.g. ensuring a
+//!   `rate(_)` argument produces a matrix) — that is a best-effort
+//!   narrow check here; the physical planner (4.3) performs full typing.
+
+use std::sync::Arc;
+
+use promql_parser::parser;
+use promql_parser::parser::LabelModifier;
+use promql_parser::parser::token::{
+    T_ADD, T_ATAN2, T_AVG, T_BOTTOMK, T_COUNT, T_COUNT_VALUES, T_DIV, T_EQLC, T_GROUP, T_GTE,
+    T_GTR, T_LAND, T_LOR, T_LSS, T_LTE, T_LUNLESS, T_MAX, T_MIN, T_MOD, T_MUL, T_NEQ, T_POW,
+    T_QUANTILE, T_STDDEV, T_STDVAR, T_SUB, T_SUM, T_TOPK,
+};
+
+use crate::promql::v2::operators::aggregate::AggregateKind;
+use crate::promql::v2::operators::binary::BinaryOpKind;
+use crate::promql::v2::operators::instant_fn::InstantFnKind;
+use crate::promql::v2::operators::rollup::RollupKind;
+
+use super::error::PlanError;
+use super::plan_types::{
+    AggregateGrouping, AtModifier, BinaryMatching, Cardinality, LogicalPlan, MatchingAxis, Offset,
+};
+
+// ---------------------------------------------------------------------------
+// LoweringContext
+// ---------------------------------------------------------------------------
+
+/// Plan-time query parameters that affect lowering.
+///
+/// Supplied by the caller (unit 4.3 / 5 wiring) before `lower` is invoked.
+/// The `start_ms` / `end_ms` / `step_ms` triple defines the output step grid;
+/// `lookback_delta_ms` is threaded into [`LogicalPlan::VectorSelector`] so
+/// the physical planner can parameterise the operator without re-reading
+/// query state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoweringContext {
+    /// Inclusive query range start, absolute UTC milliseconds.
+    pub start_ms: i64,
+    /// Inclusive query range end, absolute UTC milliseconds. For instant
+    /// queries this equals `start_ms`.
+    pub end_ms: i64,
+    /// Output step in milliseconds. For instant queries this is a sentinel
+    /// (`1`); downstream code must not divide by this value without first
+    /// consulting [`Self::is_instant`].
+    pub step_ms: i64,
+    /// PromQL lookback window in milliseconds.
+    pub lookback_delta_ms: i64,
+    /// Limits consulted by the physical planner's fail-fast gates. Kept on
+    /// the lowering context so callers configure the whole plan pipeline
+    /// from a single struct; lowering itself ignores these fields.
+    pub cardinality_limits: super::cardinality::CardinalityLimits,
+    /// Exchange-operator insertion knobs (unit 4.5). Consulted by the
+    /// physical planner when wrapping I/O-bound leaves in `ConcurrentOp`.
+    /// Lowering ignores this field.
+    pub parallelism: super::parallelism::Parallelism,
+}
+
+impl LoweringContext {
+    /// Construct a range-query context.
+    pub fn new(start_ms: i64, end_ms: i64, step_ms: i64, lookback_delta_ms: i64) -> Self {
+        Self {
+            start_ms,
+            end_ms,
+            step_ms,
+            lookback_delta_ms,
+            cardinality_limits: super::cardinality::CardinalityLimits::default(),
+            parallelism: super::parallelism::Parallelism::default(),
+        }
+    }
+
+    /// Construct a context for an instant query at time `t_ms`. Step is set
+    /// to `1` (non-zero sentinel — downstream must not divide by it; the
+    /// physical planner treats `start == end` as an instant query).
+    pub fn for_instant(t_ms: i64, lookback_delta_ms: i64) -> Self {
+        Self {
+            start_ms: t_ms,
+            end_ms: t_ms,
+            step_ms: 1,
+            lookback_delta_ms,
+            cardinality_limits: super::cardinality::CardinalityLimits::default(),
+            parallelism: super::parallelism::Parallelism::default(),
+        }
+    }
+
+    /// Return a new context with the given cardinality limits. Chainable so
+    /// callers can keep construction compact:
+    /// `LoweringContext::new(...).with_cardinality_limits(limits)`.
+    pub fn with_cardinality_limits(
+        mut self,
+        limits: super::cardinality::CardinalityLimits,
+    ) -> Self {
+        self.cardinality_limits = limits;
+        self
+    }
+
+    /// Return a new context with the given exchange-operator insertion
+    /// knobs. Chainable; mirrors [`Self::with_cardinality_limits`].
+    pub fn with_parallelism(mut self, parallelism: super::parallelism::Parallelism) -> Self {
+        self.parallelism = parallelism;
+        self
+    }
+
+    /// `true` if `start_ms == end_ms` (a one-step query).
+    #[inline]
+    pub fn is_instant(&self) -> bool {
+        self.start_ms == self.end_ms
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+/// Lower a parsed PromQL expression into a [`LogicalPlan`].
+///
+/// See the module docs for the lowering rules.
+pub fn lower(expr: &parser::Expr, ctx: &LoweringContext) -> Result<LogicalPlan, PlanError> {
+    match expr {
+        parser::Expr::VectorSelector(vs) => Ok(LogicalPlan::VectorSelector {
+            selector: vs.clone(),
+            offset: offset_from_parser(vs.offset.as_ref()),
+            at: at_from_parser(vs.at.as_ref())?,
+            lookback_ms: Some(ctx.lookback_delta_ms),
+        }),
+        parser::Expr::MatrixSelector(ms) => Ok(LogicalPlan::MatrixSelector {
+            selector: ms.vs.clone(),
+            range_ms: ms.range.as_millis() as i64,
+            offset: offset_from_parser(ms.vs.offset.as_ref()),
+            at: at_from_parser(ms.vs.at.as_ref())?,
+        }),
+        parser::Expr::NumberLiteral(n) => Ok(LogicalPlan::Scalar(n.val)),
+        parser::Expr::StringLiteral(_) => Err(PlanError::InvalidTopLevelString),
+        parser::Expr::Paren(p) => lower(&p.expr, ctx),
+        parser::Expr::Unary(u) => {
+            // Represent `-expr` as `-1 * expr`. Preserves every downstream
+            // operator path (scalar/scalar folds via the binop; vector gets
+            // a pointwise multiply). Decision logged in §5.
+            let child = lower(&u.expr, ctx)?;
+            Ok(LogicalPlan::Binary {
+                op: BinaryOpKind::Mul,
+                lhs: Box::new(LogicalPlan::Scalar(-1.0)),
+                rhs: Box::new(child),
+                matching: None,
+            })
+        }
+        parser::Expr::Call(call) => lower_call(call, ctx),
+        parser::Expr::Aggregate(agg) => lower_aggregate(agg, ctx),
+        parser::Expr::Binary(b) => lower_binary(b, ctx),
+        parser::Expr::Subquery(sq) => {
+            // `step: Option<Duration>` — `None` means "use the global
+            // evaluation interval". For v1 that global interval is
+            // `ctx.step_ms` for range queries; instant queries default to
+            // 1000ms (same as Prometheus' `-query.default-step`).
+            let step_ms = match sq.step {
+                Some(s) => s.as_millis() as i64,
+                None => {
+                    if ctx.is_instant() {
+                        1000
+                    } else {
+                        ctx.step_ms
+                    }
+                }
+            };
+            Ok(LogicalPlan::Subquery {
+                child: Box::new(lower(&sq.expr, ctx)?),
+                range_ms: sq.range.as_millis() as i64,
+                step_ms,
+                offset: offset_from_parser(sq.offset.as_ref()),
+                at: at_from_parser(sq.at.as_ref())?,
+            })
+        }
+        parser::Expr::Extension(_) => Err(PlanError::UnsupportedFeature(
+            "Expr::Extension not supported".to_string(),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Offset / @ helpers
+// ---------------------------------------------------------------------------
+
+fn offset_from_parser(parser_offset: Option<&parser::Offset>) -> Offset {
+    match parser_offset {
+        None => Offset::Pos(0),
+        Some(o) => Offset::from(o),
+    }
+}
+
+fn at_from_parser(parser_at: Option<&parser::AtModifier>) -> Result<Option<AtModifier>, PlanError> {
+    match parser_at {
+        None => Ok(None),
+        Some(at) => AtModifier::try_from(at)
+            .map(Some)
+            .map_err(|msg| PlanError::UnsupportedFeature(msg.to_string())),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Function call dispatch (Rollup / InstantFn)
+// ---------------------------------------------------------------------------
+
+fn lower_call(call: &parser::Call, ctx: &LoweringContext) -> Result<LogicalPlan, PlanError> {
+    let name = call.func.name;
+    let args: &[Box<parser::Expr>] = &call.args.args;
+
+    // ---- Range-vector functions (→ Rollup) -----------------------------
+    if let Some(kind) = rollup_kind_for(name, args)? {
+        if args.is_empty() {
+            return Err(PlanError::InvalidArgument {
+                function: name.to_string(),
+                expected: "at least one argument".to_string(),
+                got: "no arguments".to_string(),
+            });
+        }
+        // For `quantile_over_time(q, v)` the matrix selector is args[1]; for
+        // every other rollup it is args[0].
+        let matrix_arg = match name {
+            "quantile_over_time" => &args[1],
+            _ => &args[0],
+        };
+        let child = lower(matrix_arg, ctx)?;
+        if !child.produces_matrix() {
+            return Err(PlanError::InvalidArgument {
+                function: name.to_string(),
+                expected: "range-vector (matrix) argument".to_string(),
+                got: describe_logical_plan(&child),
+            });
+        }
+        return Ok(LogicalPlan::Rollup {
+            kind,
+            child: Box::new(child),
+        });
+    }
+
+    // ---- Instant scalar functions (→ InstantFn) ------------------------
+    if let Some(kind) = instant_fn_kind_for(name, args)? {
+        // The value argument is always args[0] for every instant-fn we support
+        // (`round`, `clamp*`, `timestamp`, and every unary math / trig fn).
+        // Scalar plan-time bounds (e.g. clamp's `min`/`max`) live in later
+        // arg slots and are folded into the kind via `instant_fn_kind_for`.
+        if args.is_empty() {
+            return Err(PlanError::InvalidArgument {
+                function: name.to_string(),
+                expected: "one instant-vector argument".to_string(),
+                got: "no arguments".to_string(),
+            });
+        }
+        let child = lower(&args[0], ctx)?;
+        return Ok(LogicalPlan::InstantFn {
+            kind,
+            child: Box::new(child),
+        });
+    }
+
+    Err(PlanError::UnknownFunction(name.to_string()))
+}
+
+/// If `name` names a range-vector function, return the `RollupKind` to
+/// emit. `args` is inspected when the kind carries a plan-time scalar
+/// (`quantile_over_time`).
+fn rollup_kind_for(
+    name: &str,
+    args: &[Box<parser::Expr>],
+) -> Result<Option<RollupKind>, PlanError> {
+    let kind = match name {
+        "rate" => RollupKind::Rate,
+        "increase" => RollupKind::Increase,
+        "delta" => RollupKind::Delta,
+        "irate" => RollupKind::Irate,
+        "idelta" => RollupKind::Idelta,
+        "resets" => RollupKind::Resets,
+        "changes" => RollupKind::Changes,
+        "sum_over_time" => RollupKind::SumOverTime,
+        "avg_over_time" => RollupKind::AvgOverTime,
+        "min_over_time" => RollupKind::MinOverTime,
+        "max_over_time" => RollupKind::MaxOverTime,
+        "count_over_time" => RollupKind::CountOverTime,
+        "last_over_time" => RollupKind::LastOverTime,
+        "stddev_over_time" => RollupKind::StddevOverTime,
+        "stdvar_over_time" => RollupKind::StdvarOverTime,
+        "present_over_time" => RollupKind::PresentOverTime,
+        "quantile_over_time" => {
+            if args.len() != 2 {
+                return Err(PlanError::InvalidArgument {
+                    function: "quantile_over_time".to_string(),
+                    expected: "exactly two arguments (q, range-vector)".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            let q = expect_number_literal(&args[0], "quantile_over_time", "literal numeric `q`")?;
+            RollupKind::QuantileOverTime(q)
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(kind))
+}
+
+/// If `name` names a pointwise instant-vector function, return the
+/// `InstantFnKind` to emit. `args` is inspected for the `Round` / `Clamp*`
+/// scalar bounds.
+fn instant_fn_kind_for(
+    name: &str,
+    args: &[Box<parser::Expr>],
+) -> Result<Option<InstantFnKind>, PlanError> {
+    let kind = match name {
+        "abs" => InstantFnKind::Abs,
+        "ceil" => InstantFnKind::Ceil,
+        "floor" => InstantFnKind::Floor,
+        "exp" => InstantFnKind::Exp,
+        "ln" => InstantFnKind::Ln,
+        "log2" => InstantFnKind::Log2,
+        "log10" => InstantFnKind::Log10,
+        "sqrt" => InstantFnKind::Sqrt,
+        "sin" => InstantFnKind::Sin,
+        "cos" => InstantFnKind::Cos,
+        "tan" => InstantFnKind::Tan,
+        "asin" => InstantFnKind::Asin,
+        "acos" => InstantFnKind::Acos,
+        "atan" => InstantFnKind::Atan,
+        "sinh" => InstantFnKind::Sinh,
+        "cosh" => InstantFnKind::Cosh,
+        "tanh" => InstantFnKind::Tanh,
+        "asinh" => InstantFnKind::Asinh,
+        "acosh" => InstantFnKind::Acosh,
+        "atanh" => InstantFnKind::Atanh,
+        "deg" => InstantFnKind::Deg,
+        "rad" => InstantFnKind::Rad,
+        "sgn" => InstantFnKind::Sgn,
+        "timestamp" => InstantFnKind::Timestamp,
+        "round" => {
+            // `round(v)` or `round(v, to_nearest)`. `to_nearest` defaults to 1.
+            let to_nearest = if args.len() == 1 {
+                1.0
+            } else if args.len() == 2 {
+                expect_number_literal(&args[1], "round", "literal numeric `to_nearest`")?
+            } else {
+                return Err(PlanError::InvalidArgument {
+                    function: "round".to_string(),
+                    expected: "one or two arguments".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            };
+            InstantFnKind::Round { to_nearest }
+        }
+        "clamp" => {
+            if args.len() != 3 {
+                return Err(PlanError::InvalidArgument {
+                    function: "clamp".to_string(),
+                    expected: "exactly three arguments (v, min, max)".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            let min = expect_number_literal(&args[1], "clamp", "literal numeric `min`")?;
+            let max = expect_number_literal(&args[2], "clamp", "literal numeric `max`")?;
+            InstantFnKind::Clamp { min, max }
+        }
+        "clamp_min" => {
+            if args.len() != 2 {
+                return Err(PlanError::InvalidArgument {
+                    function: "clamp_min".to_string(),
+                    expected: "exactly two arguments (v, min)".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            let min = expect_number_literal(&args[1], "clamp_min", "literal numeric `min`")?;
+            InstantFnKind::ClampMin { min }
+        }
+        "clamp_max" => {
+            if args.len() != 2 {
+                return Err(PlanError::InvalidArgument {
+                    function: "clamp_max".to_string(),
+                    expected: "exactly two arguments (v, max)".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            let max = expect_number_literal(&args[1], "clamp_max", "literal numeric `max`")?;
+            InstantFnKind::ClampMax { max }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(kind))
+}
+
+/// Extract a numeric literal from a parser expression, erroring with
+/// `PlanError::InvalidArgument` if it is anything else.
+fn expect_number_literal(
+    expr: &parser::Expr,
+    function: &str,
+    expected: &str,
+) -> Result<f64, PlanError> {
+    match expr {
+        parser::Expr::NumberLiteral(n) => Ok(n.val),
+        // `-literal` parses as `Unary(NumberLiteral)`; fold into a negative
+        // literal here so planners can pass negative bounds.
+        parser::Expr::Unary(u) => match &*u.expr {
+            parser::Expr::NumberLiteral(n) => Ok(-n.val),
+            other => Err(PlanError::InvalidArgument {
+                function: function.to_string(),
+                expected: expected.to_string(),
+                got: describe_parser_expr(other),
+            }),
+        },
+        parser::Expr::Paren(p) => expect_number_literal(&p.expr, function, expected),
+        other => Err(PlanError::InvalidArgument {
+            function: function.to_string(),
+            expected: expected.to_string(),
+            got: describe_parser_expr(other),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate
+// ---------------------------------------------------------------------------
+
+fn lower_aggregate(
+    agg: &parser::AggregateExpr,
+    ctx: &LoweringContext,
+) -> Result<LogicalPlan, PlanError> {
+    let grouping = AggregateGrouping::from_label_modifier(agg.modifier.as_ref());
+    let child = lower(&agg.expr, ctx)?;
+
+    let op_id = agg.op.id();
+    match op_id {
+        T_SUM => Ok(aggregate_streaming(AggregateKind::Sum, child, grouping)),
+        T_AVG => Ok(aggregate_streaming(AggregateKind::Avg, child, grouping)),
+        T_MIN => Ok(aggregate_streaming(AggregateKind::Min, child, grouping)),
+        T_MAX => Ok(aggregate_streaming(AggregateKind::Max, child, grouping)),
+        T_COUNT => Ok(aggregate_streaming(AggregateKind::Count, child, grouping)),
+        T_STDDEV => Ok(aggregate_streaming(AggregateKind::Stddev, child, grouping)),
+        T_STDVAR => Ok(aggregate_streaming(AggregateKind::Stdvar, child, grouping)),
+        T_GROUP => Ok(aggregate_streaming(AggregateKind::Group, child, grouping)),
+        T_TOPK | T_BOTTOMK => {
+            let param = agg
+                .param
+                .as_deref()
+                .ok_or_else(|| PlanError::InvalidArgument {
+                    function: aggregate_op_name(op_id).to_string(),
+                    expected: "integer `k` parameter".to_string(),
+                    got: "missing parameter".to_string(),
+                })?;
+            let k_f =
+                expect_number_literal(param, aggregate_op_name(op_id), "literal numeric `k`")?;
+            // Match the existing engine at `evaluator.rs::coerce_k_size` — cast
+            // `f64 → i64` with `as`, accepting platform-defined overflow on
+            // very large inputs. `k < 1` is treated as "no selection" by the
+            // breaker operator; we do not reject it here.
+            let k = k_f as i64;
+            let kind = if op_id == T_TOPK {
+                AggregateKind::Topk(k)
+            } else {
+                AggregateKind::Bottomk(k)
+            };
+            Ok(LogicalPlan::Aggregate {
+                kind,
+                child: Box::new(child),
+                grouping,
+            })
+        }
+        T_QUANTILE => {
+            let param = agg
+                .param
+                .as_deref()
+                .ok_or_else(|| PlanError::InvalidArgument {
+                    function: "quantile".to_string(),
+                    expected: "numeric `q` parameter".to_string(),
+                    got: "missing parameter".to_string(),
+                })?;
+            let q = expect_number_literal(param, "quantile", "literal numeric `q`")?;
+            Ok(LogicalPlan::Aggregate {
+                kind: AggregateKind::Quantile(q),
+                child: Box::new(child),
+                grouping,
+            })
+        }
+        T_COUNT_VALUES => {
+            let param = agg
+                .param
+                .as_deref()
+                .ok_or_else(|| PlanError::InvalidArgument {
+                    function: "count_values".to_string(),
+                    expected: "string label name parameter".to_string(),
+                    got: "missing parameter".to_string(),
+                })?;
+            let label = expect_string_literal(param, "count_values")?;
+            Ok(LogicalPlan::CountValues {
+                label,
+                child: Box::new(child),
+                grouping,
+            })
+        }
+        _ => Err(PlanError::UnsupportedExpression(format!(
+            "unknown aggregate operator token id {op_id}"
+        ))),
+    }
+}
+
+fn aggregate_streaming(
+    kind: AggregateKind,
+    child: LogicalPlan,
+    grouping: AggregateGrouping,
+) -> LogicalPlan {
+    LogicalPlan::Aggregate {
+        kind,
+        child: Box::new(child),
+        grouping,
+    }
+}
+
+fn aggregate_op_name(op_id: u8) -> &'static str {
+    match op_id {
+        T_SUM => "sum",
+        T_AVG => "avg",
+        T_MIN => "min",
+        T_MAX => "max",
+        T_COUNT => "count",
+        T_STDDEV => "stddev",
+        T_STDVAR => "stdvar",
+        T_GROUP => "group",
+        T_TOPK => "topk",
+        T_BOTTOMK => "bottomk",
+        T_QUANTILE => "quantile",
+        T_COUNT_VALUES => "count_values",
+        _ => "<unknown>",
+    }
+}
+
+fn expect_string_literal(expr: &parser::Expr, function: &str) -> Result<String, PlanError> {
+    match expr {
+        parser::Expr::StringLiteral(s) => Ok(s.val.clone()),
+        parser::Expr::Paren(p) => expect_string_literal(&p.expr, function),
+        other => Err(PlanError::InvalidArgument {
+            function: function.to_string(),
+            expected: "string literal".to_string(),
+            got: describe_parser_expr(other),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Binary
+// ---------------------------------------------------------------------------
+
+fn lower_binary(bin: &parser::BinaryExpr, ctx: &LoweringContext) -> Result<LogicalPlan, PlanError> {
+    let op_id = bin.op.id();
+    let return_bool = bin
+        .modifier
+        .as_ref()
+        .map(|m| m.return_bool)
+        .unwrap_or(false);
+    let op = binary_op_kind(op_id, return_bool).ok_or_else(|| {
+        PlanError::UnsupportedExpression(format!("unknown binary operator token id {op_id}"))
+    })?;
+
+    let matching = binary_matching(bin.modifier.as_ref());
+
+    let lhs = lower(&bin.lhs, ctx)?;
+    let rhs = lower(&bin.rhs, ctx)?;
+
+    Ok(LogicalPlan::Binary {
+        op,
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+        matching,
+    })
+}
+
+fn binary_op_kind(op_id: u8, return_bool: bool) -> Option<BinaryOpKind> {
+    Some(match op_id {
+        T_ADD => BinaryOpKind::Add,
+        T_SUB => BinaryOpKind::Sub,
+        T_MUL => BinaryOpKind::Mul,
+        T_DIV => BinaryOpKind::Div,
+        T_MOD => BinaryOpKind::Mod,
+        T_POW => BinaryOpKind::Pow,
+        T_ATAN2 => BinaryOpKind::Atan2,
+        T_EQLC => BinaryOpKind::Eq {
+            bool_modifier: return_bool,
+        },
+        T_NEQ => BinaryOpKind::Ne {
+            bool_modifier: return_bool,
+        },
+        T_GTR => BinaryOpKind::Gt {
+            bool_modifier: return_bool,
+        },
+        T_LSS => BinaryOpKind::Lt {
+            bool_modifier: return_bool,
+        },
+        T_GTE => BinaryOpKind::Gte {
+            bool_modifier: return_bool,
+        },
+        T_LTE => BinaryOpKind::Lte {
+            bool_modifier: return_bool,
+        },
+        T_LAND => BinaryOpKind::And,
+        T_LOR => BinaryOpKind::Or,
+        T_LUNLESS => BinaryOpKind::Unless,
+        _ => return None,
+    })
+}
+
+fn binary_matching(modifier: Option<&parser::BinModifier>) -> Option<BinaryMatching> {
+    let modifier = modifier?;
+    // If there is neither an `on`/`ignoring` clause nor a `group_*` cardinality
+    // we leave `matching` as `None` — the physical planner will treat the
+    // default (implicit one-to-one on the full label set) without needing a
+    // BinaryMatching record.
+    if modifier.matching.is_none()
+        && matches!(modifier.card, parser::VectorMatchCardinality::OneToOne)
+    {
+        return None;
+    }
+    // Axis + labels come from the optional LabelModifier; fall back to
+    // `ignoring()` (empty) so set-operator cases where only `group_left` /
+    // `group_right` or `many_to_many` is specified still produce a record.
+    let (axis, labels) = match modifier.matching.as_ref() {
+        Some(LabelModifier::Include(ls)) => (MatchingAxis::On, labels_to_arc(ls)),
+        Some(LabelModifier::Exclude(ls)) => (MatchingAxis::Ignoring, labels_to_arc(ls)),
+        None => (MatchingAxis::Ignoring, Arc::from(Vec::<String>::new())),
+    };
+
+    let cardinality = match &modifier.card {
+        parser::VectorMatchCardinality::OneToOne => Cardinality::OneToOne,
+        parser::VectorMatchCardinality::ManyToOne(labels) => Cardinality::GroupLeft {
+            include: labels_to_arc(labels),
+        },
+        parser::VectorMatchCardinality::OneToMany(labels) => Cardinality::GroupRight {
+            include: labels_to_arc(labels),
+        },
+        parser::VectorMatchCardinality::ManyToMany => Cardinality::ManyToMany,
+    };
+
+    Some(BinaryMatching {
+        axis,
+        labels,
+        cardinality,
+    })
+}
+
+fn labels_to_arc(labels: &promql_parser::label::Labels) -> Arc<[String]> {
+    let mut v: Vec<String> = labels.labels.to_vec();
+    v.sort();
+    Arc::from(v)
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic helpers
+// ---------------------------------------------------------------------------
+
+fn describe_parser_expr(expr: &parser::Expr) -> String {
+    match expr {
+        parser::Expr::VectorSelector(_) => "instant-vector selector".to_string(),
+        parser::Expr::MatrixSelector(_) => "range-vector (matrix) selector".to_string(),
+        parser::Expr::NumberLiteral(n) => format!("number literal {}", n.val),
+        parser::Expr::StringLiteral(s) => format!("string literal \"{}\"", s.val),
+        parser::Expr::Call(c) => format!("call `{}`", c.func.name),
+        parser::Expr::Aggregate(a) => format!("aggregate `{}`", a.op),
+        parser::Expr::Binary(_) => "binary expression".to_string(),
+        parser::Expr::Paren(_) => "parenthesised expression".to_string(),
+        parser::Expr::Subquery(_) => "subquery".to_string(),
+        parser::Expr::Unary(_) => "unary expression".to_string(),
+        parser::Expr::Extension(_) => "extension node".to_string(),
+    }
+}
+
+fn describe_logical_plan(plan: &LogicalPlan) -> String {
+    match plan {
+        LogicalPlan::VectorSelector { .. } => "instant-vector".to_string(),
+        LogicalPlan::MatrixSelector { .. } => "range-vector (matrix)".to_string(),
+        LogicalPlan::Scalar(v) => format!("scalar {v}"),
+        LogicalPlan::InstantFn { .. } => "instant-vector (from instant fn)".to_string(),
+        LogicalPlan::Rollup { .. } => "instant-vector (from rollup)".to_string(),
+        LogicalPlan::Binary { .. } => "vector (from binary op)".to_string(),
+        LogicalPlan::Aggregate { .. } => "vector (from aggregate)".to_string(),
+        LogicalPlan::Subquery { .. } => "range-vector (from subquery)".to_string(),
+        LogicalPlan::Rechunk { .. } => "vector (from rechunk)".to_string(),
+        LogicalPlan::CountValues { .. } => "vector (from count_values)".to_string(),
+        LogicalPlan::Concurrent { .. } => "vector (from concurrent)".to_string(),
+        LogicalPlan::Coalesce { .. } => "vector (from coalesce)".to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const START_MS: i64 = 1_700_000_000_000;
+    const END_MS: i64 = 1_700_000_060_000;
+    const STEP_MS: i64 = 1_000;
+    const LOOKBACK_MS: i64 = 5 * 60 * 1000;
+
+    fn ctx() -> LoweringContext {
+        LoweringContext::new(START_MS, END_MS, STEP_MS, LOOKBACK_MS)
+    }
+
+    fn parse(input: &str) -> parser::Expr {
+        parser::parse(input).unwrap_or_else(|e| panic!("parse({input:?}) failed: {e}"))
+    }
+
+    #[test]
+    fn should_lower_vector_selector() {
+        // given: a bare vector selector
+        let expr = parse("http_requests_total{job=\"api\"}");
+        // when: lowered
+        let plan = lower(&expr, &ctx()).unwrap();
+        // then: it lowers to VectorSelector carrying the parser struct + ctx lookback
+        match plan {
+            LogicalPlan::VectorSelector {
+                selector,
+                offset,
+                at,
+                lookback_ms,
+            } => {
+                assert_eq!(selector.name.as_deref(), Some("http_requests_total"));
+                assert_eq!(offset, Offset::Pos(0));
+                assert_eq!(at, None);
+                assert_eq!(lookback_ms, Some(LOOKBACK_MS));
+            }
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_lower_matrix_selector_with_range() {
+        // given: a matrix selector with a 5m range
+        let expr = parse("http_requests_total[5m]");
+        // when: lowered
+        let plan = lower(&expr, &ctx()).unwrap();
+        // then: it lowers to MatrixSelector with range_ms = 5 * 60_000
+        match plan {
+            LogicalPlan::MatrixSelector {
+                selector,
+                range_ms,
+                offset,
+                at,
+            } => {
+                assert_eq!(selector.name.as_deref(), Some("http_requests_total"));
+                assert_eq!(range_ms, 5 * 60 * 1000);
+                assert_eq!(offset, Offset::Pos(0));
+                assert_eq!(at, None);
+            }
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_lower_number_literal_to_scalar() {
+        // given: a number literal
+        let expr = parse("42");
+        // when: lowered
+        let plan = lower(&expr, &ctx()).unwrap();
+        // then: it lowers to Scalar(42.0)
+        assert_eq!(plan, LogicalPlan::Scalar(42.0));
+    }
+
+    #[test]
+    fn should_lower_abs_as_instant_fn() {
+        // given: `abs(x)`
+        let expr = parse("abs(foo)");
+        // when: lowered
+        let plan = lower(&expr, &ctx()).unwrap();
+        // then: it becomes `InstantFn { Abs, VectorSelector(foo) }`
+        match plan {
+            LogicalPlan::InstantFn { kind, child } => {
+                assert_eq!(kind, InstantFnKind::Abs);
+                assert!(matches!(*child, LogicalPlan::VectorSelector { .. }));
+            }
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_lower_rate_as_rollup_over_matrix_selector() {
+        // given: `rate(foo[5m])`
+        let expr = parse("rate(foo[5m])");
+        // when: lowered
+        let plan = lower(&expr, &ctx()).unwrap();
+        // then: it becomes `Rollup { Rate, MatrixSelector(foo, 5m) }`
+        match plan {
+            LogicalPlan::Rollup { kind, child } => {
+                assert_eq!(kind, RollupKind::Rate);
+                match *child {
+                    LogicalPlan::MatrixSelector { range_ms, .. } => {
+                        assert_eq!(range_ms, 5 * 60 * 1000);
+                    }
+                    other => panic!("unexpected child: {other:?}"),
+                }
+            }
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_rate_on_instant_vector() {
+        // given: a manually-built `rate(foo)` AST — the parser itself rejects
+        // this at parse time, so we hand-build an `Expr::Call` carrying an
+        // instant-vector argument. This is the shape an (incorrect) later
+        // optimizer pass could produce, and the lowering layer must defend
+        // against it.
+        use promql_parser::label::Matchers;
+        use promql_parser::parser::value::ValueType;
+        use promql_parser::parser::{Call, Function, FunctionArgs, VectorSelector};
+        let inner = parser::Expr::VectorSelector(VectorSelector::new(
+            Some("foo".to_string()),
+            Matchers::empty(),
+        ));
+        // Synthesise a `rate` function signature directly — we need to bypass
+        // the parser's static typing check to exercise the lowering guard.
+        let func = Function::new("rate", vec![ValueType::Matrix], 0, ValueType::Vector, false);
+        let call = Call {
+            func,
+            args: FunctionArgs::new_args(inner),
+        };
+        let expr = parser::Expr::Call(call);
+        // when: lowered
+        let err = lower(&expr, &ctx()).unwrap_err();
+        // then: error is InvalidArgument for `rate`
+        match err {
+            PlanError::InvalidArgument { function, .. } => assert_eq!(function, "rate"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_lower_clamp_with_plan_time_constants() {
+        // given: `clamp(foo, 0, 10)`
+        let expr = parse("clamp(foo, 0, 10)");
+        // when: lowered
+        let plan = lower(&expr, &ctx()).unwrap();
+        // then: kind carries the folded scalar bounds
+        match plan {
+            LogicalPlan::InstantFn { kind, .. } => {
+                assert_eq!(
+                    kind,
+                    InstantFnKind::Clamp {
+                        min: 0.0,
+                        max: 10.0
+                    }
+                );
+            }
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_lower_sum_by_as_aggregate_streaming() {
+        // given: `sum by (pod) (foo)`
+        let expr = parse("sum by (pod) (foo)");
+        // when: lowered
+        let plan = lower(&expr, &ctx()).unwrap();
+        // then: Aggregate{Sum, By([pod]), child: VectorSelector}
+        match plan {
+            LogicalPlan::Aggregate {
+                kind,
+                child,
+                grouping,
+            } => {
+                assert_eq!(kind, AggregateKind::Sum);
+                assert!(matches!(*child, LogicalPlan::VectorSelector { .. }));
+                match grouping {
+                    AggregateGrouping::By(labels) => {
+                        assert_eq!(labels.as_ref(), &["pod".to_string()]);
+                    }
+                    other => panic!("unexpected grouping: {other:?}"),
+                }
+            }
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_lower_topk_as_aggregate_breaker() {
+        // given: `topk(5, foo)`
+        let expr = parse("topk(5, foo)");
+        // when: lowered
+        let plan = lower(&expr, &ctx()).unwrap();
+        // then: AggregateKind::Topk(5)
+        match plan {
+            LogicalPlan::Aggregate { kind, .. } => {
+                assert_eq!(kind, AggregateKind::Topk(5));
+            }
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_lower_count_values_specialized() {
+        // given: `count_values("version", foo)`
+        let expr = parse("count_values(\"version\", foo)");
+        // when: lowered
+        let plan = lower(&expr, &ctx()).unwrap();
+        // then: dedicated CountValues variant carries the label name
+        match plan {
+            LogicalPlan::CountValues { label, .. } => {
+                assert_eq!(label, "version");
+            }
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_lower_binary_with_matching() {
+        // given: `a + on(instance) b`
+        let expr = parse("a + on(instance) b");
+        // when: lowered
+        let plan = lower(&expr, &ctx()).unwrap();
+        // then: Binary with BinaryMatching { On, [instance], OneToOne }
+        match plan {
+            LogicalPlan::Binary {
+                op,
+                lhs: _,
+                rhs: _,
+                matching,
+            } => {
+                assert_eq!(op, BinaryOpKind::Add);
+                let m = matching.expect("matching present");
+                assert_eq!(m.axis, MatchingAxis::On);
+                assert_eq!(m.labels.as_ref(), &["instance".to_string()]);
+                assert!(matches!(m.cardinality, Cardinality::OneToOne));
+            }
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_lower_subquery_with_range_and_step() {
+        // given: `rate(foo[5m:30s])`
+        let expr = parse("rate(foo[5m:30s])");
+        // when: lowered
+        let plan = lower(&expr, &ctx()).unwrap();
+        // then: Rollup{Rate} over Subquery{range=5m, step=30s}
+        match plan {
+            LogicalPlan::Rollup { kind, child } => {
+                assert_eq!(kind, RollupKind::Rate);
+                match *child {
+                    LogicalPlan::Subquery {
+                        range_ms, step_ms, ..
+                    } => {
+                        assert_eq!(range_ms, 5 * 60 * 1000);
+                        assert_eq!(step_ms, 30 * 1000);
+                    }
+                    other => panic!("unexpected child: {other:?}"),
+                }
+            }
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_unwrap_parentheses() {
+        // given: `(foo)`
+        let expr = parse("(foo)");
+        // when: lowered
+        let plan = lower(&expr, &ctx()).unwrap();
+        // then: lowering strips the paren — direct VectorSelector
+        assert!(matches!(plan, LogicalPlan::VectorSelector { .. }));
+    }
+
+    #[test]
+    fn should_lower_unary_minus() {
+        // given: `-foo`
+        let expr = parse("-foo");
+        // when: lowered
+        let plan = lower(&expr, &ctx()).unwrap();
+        // then: Binary{Mul, Scalar(-1.0), VectorSelector}
+        match plan {
+            LogicalPlan::Binary {
+                op,
+                lhs,
+                rhs,
+                matching,
+            } => {
+                assert_eq!(op, BinaryOpKind::Mul);
+                assert_eq!(*lhs, LogicalPlan::Scalar(-1.0));
+                assert!(matches!(*rhs, LogicalPlan::VectorSelector { .. }));
+                assert!(matching.is_none());
+            }
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_unknown_function() {
+        // given: a function not in our lowering table
+        let expr = parse("histogram_quantile(0.9, foo)");
+        // when: lowered
+        let err = lower(&expr, &ctx()).unwrap_err();
+        // then: UnknownFunction
+        match err {
+            PlanError::UnknownFunction(name) => assert_eq!(name, "histogram_quantile"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_lower_nested_expression_e2e() {
+        // given: `sum by (pod) (rate(http_requests_total[5m]))`
+        let expr = parse("sum by (pod) (rate(http_requests_total[5m]))");
+        // when: lowered
+        let plan = lower(&expr, &ctx()).unwrap();
+        // then: the full Aggregate→Rollup→MatrixSelector chain is preserved
+        match plan {
+            LogicalPlan::Aggregate {
+                kind,
+                child,
+                grouping,
+            } => {
+                assert_eq!(kind, AggregateKind::Sum);
+                match grouping {
+                    AggregateGrouping::By(labels) => {
+                        assert_eq!(labels.as_ref(), &["pod".to_string()]);
+                    }
+                    other => panic!("unexpected grouping: {other:?}"),
+                }
+                match *child {
+                    LogicalPlan::Rollup {
+                        kind: rk,
+                        child: grandchild,
+                    } => {
+                        assert_eq!(rk, RollupKind::Rate);
+                        assert!(matches!(*grandchild, LogicalPlan::MatrixSelector { .. }));
+                    }
+                    other => panic!("unexpected Rollup child: {other:?}"),
+                }
+            }
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_fold_unary_negative_clamp_min_bound() {
+        // given: `clamp_min(foo, -1)` — the planner folds `-1` as a literal
+        let expr = parse("clamp_min(foo, -1)");
+        // when: lowered
+        let plan = lower(&expr, &ctx()).unwrap();
+        // then: kind carries `min = -1.0`
+        match plan {
+            LogicalPlan::InstantFn {
+                kind: InstantFnKind::ClampMin { min },
+                ..
+            } => {
+                assert_eq!(min, -1.0);
+            }
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_build_lowering_context_for_instant_query() {
+        // given: an instant-query helper
+        let ictx = LoweringContext::for_instant(12345, 60_000);
+        // when: the shape is inspected
+        // then: start == end and the query is flagged instant
+        assert_eq!(ictx.start_ms, 12345);
+        assert_eq!(ictx.end_ms, 12345);
+        assert!(ictx.is_instant());
+        assert_eq!(ictx.lookback_delta_ms, 60_000);
+    }
+}

@@ -19,6 +19,7 @@ pub(crate) mod batch;
 pub(crate) mod memory;
 pub(crate) mod operator;
 pub(crate) mod operators;
+pub(crate) mod plan;
 pub(crate) mod source;
 pub(crate) mod source_adapter;
 
@@ -52,6 +53,11 @@ pub(crate) use operators::rollup::{MatrixWindowSource, RollupKind, RollupOp, Win
 pub(crate) use operators::subquery::{ChildFactory, SubqueryOp};
 #[allow(unused_imports)]
 pub(crate) use operators::vector_selector::VectorSelectorOp;
+#[allow(unused_imports)]
+pub(crate) use plan::{
+    AggregateGrouping, AtModifier, BinaryMatching, Cardinality, LogicalPlan, LoweringContext,
+    MatchingAxis, Offset, PhysicalPlan, PlanError, build_physical_plan, lower,
+};
 #[allow(unused_imports)]
 pub(crate) use source::{
     CardinalityEstimate, ResolvedSeriesChunk, ResolvedSeriesRef, SampleBatch, SampleBlock,
