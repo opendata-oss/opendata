@@ -223,10 +223,10 @@ cross-bucket series with staleness; no PromQL semantics leaked into the source.
 | 3b.3 | `Binary` (vector/vector, vector/scalar, scalar/scalar) | Operator Implementor | done | 3a.1 | `timeseries/src/promql/v2/operators/binary.rs`, `timeseries/src/promql/v2/operators/mod.rs`, `timeseries/src/promql/v2/mod.rs` | |
 | 3b.4 | `Aggregate` streaming ops (sum/avg/min/max/count/stddev/stdvar/group) | Operator Implementor | done | 3a.1 | `timeseries/src/promql/v2/operators/aggregate.rs`, `timeseries/src/promql/v2/operators/mod.rs`, `timeseries/src/promql/v2/mod.rs` | |
 | 3c.1 | `Aggregate` breaker ops (topk/bottomk/quantile) | Operator Implementor | done | 3b.4 | `timeseries/src/promql/v2/operators/aggregate.rs` | |
-| 3c.2 | `Subquery` | | ready | 3a.2, 3b.1 | | |
-| 3c.3 | `Rechunk` breaker | | ready | 1.5 | | |
-| 3c.4 | `CountValues` (deferred-schema operator) | | ready | 3b.4 | | |
-| 3c.5 | `Concurrent` and `Coalesce` exchange operators | | ready | 1.5 | | |
+| 3c.2 | `Subquery` | Operator Implementor | done | 3a.2, 3b.1 | `timeseries/src/promql/v2/operators/subquery.rs`, `timeseries/src/promql/v2/operators/mod.rs`, `timeseries/src/promql/v2/mod.rs` | |
+| 3c.3 | `Rechunk` breaker | Operator Implementor | done | 1.5 | `timeseries/src/promql/v2/operators/rechunk.rs`, `timeseries/src/promql/v2/operators/mod.rs`, `timeseries/src/promql/v2/mod.rs` | |
+| 3c.4 | `CountValues` (deferred-schema operator) | Operator Implementor | done | 3b.4 | `timeseries/src/promql/v2/operators/count_values.rs`, `timeseries/src/promql/v2/operators/mod.rs`, `timeseries/src/promql/v2/mod.rs` | |
+| 3c.5 | `Concurrent` and `Coalesce` exchange operators | Operator Implementor | done | 1.5 | `timeseries/src/promql/v2/operators/concurrent.rs`, `timeseries/src/promql/v2/operators/coalesce.rs`, `timeseries/src/promql/v2/operators/mod.rs`, `timeseries/src/promql/v2/mod.rs` | |
 
 **Acceptance per unit**: operator has unit tests built on hand-constructed `StepBatch`es;
 respects `MemoryReservation`; schema contract is explicit (Static vs Deferred).
@@ -974,6 +974,264 @@ RFC section touched.
   the output schema it constructs; the operator validates via debug
   assertion. Internal struct gained `heaps`, `sort_bufs`, and
   renamed `accum_bytes` → `scratch_bytes`, but those are private.
+- 2026-04-16 — Operator Implementor (unit 3c.2) — **RFC Open Question
+  #2 resolved: subquery shares the parent `MemoryReservation`.** v1
+  subquery allocations (child sub-tree, per-outer-step scratch, emitted
+  `MatrixWindowBatch` buffers) all flow through the parent reservation.
+  A nested-budget scope per inner plan is deferred post-MVP: the
+  parent's cap already bounds total per-query bytes, and a nested
+  scope would complicate error attribution (which budget reports the
+  overage?) without solving any concrete v1 problem. Revisit if a
+  workload shows that a "wide" outer step can mask unbounded inner-plan
+  growth.
+- 2026-04-16 — Operator Implementor (unit 3c.2) — Factory shape:
+  `Box<dyn FnMut(TimeRange, i64) -> Result<Box<dyn Operator + Send>,
+  QueryError> + Send>` (type alias `ChildFactory`). Verified
+  `Operator` is dyn-safe as claimed (3a.1 already ships a
+  `should_build_trait_object` test and the subquery file compiles
+  `Box<dyn Operator + Send>` cleanly — no RPITIT / generic-method
+  friction). `FnMut` over `Fn` so the planner can carry mutable
+  plan-time state through the factory (e.g. a hashed child-schema
+  cache); `Send` so the operator composes with `Concurrent`
+  wrappers. `TimeRange` is inclusive-exclusive per the v2 storage
+  convention: `(outer_t - range, outer_t]` is encoded as
+  `[outer_t - range + 1, outer_t + 1)`.
+- 2026-04-16 — Operator Implementor (unit 3c.2) — Emission
+  granularity: **one `MatrixWindowBatch` per outer step** in v1. The
+  alternative (batching multiple outer steps into a single matrix
+  tile for downstream `Rollup` to amortise over) needs per-step
+  bookkeeping and a cross-step cell-index layout that the 3a.2
+  builder doesn't expose publicly; the added complexity is not
+  justified until profiling on the Phase 6 corpus shows per-step
+  emission is a bottleneck. Rollup / outer-subquery consumers see
+  one batch at a time; `step_range = [outer_step_idx,
+  outer_step_idx + 1)`.
+- 2026-04-16 — Operator Implementor (unit 3c.2) — `WindowStream`
+  reuse: `SubqueryOp` implements `WindowStream` directly (unlike
+  `MatrixSelectorOp`, which needs the `MatrixWindowSource` wrapper
+  because its `Operator::schema` is only reachable through the
+  `'static` trait impl). `SubqueryOp` is already `'static` by
+  design (no borrowed `SeriesSource`), so it drops into
+  `RollupOp<SubqueryOp>` with no wrapping — exactly the "drop-in for
+  an outer Rollup" contract the task spec described. Also satisfies
+  the `Operator` trait with a degenerate `next()` (matches 3a.2 —
+  matrix output cannot fit `StepBatch`'s single-float cell shape).
+- 2026-04-16 — Operator Implementor (unit 3c.2) — Child `Pending`
+  handling: v1 does **not** persist partial child state across
+  `windows()` polls. A single `windows()` invocation drains the
+  child for the current outer step; if the child yields `Pending`
+  mid-drain, we bubble `Pending` up and rebuild the child from the
+  factory on the next poll. This is the simplest correct thing — the
+  factory is idempotent in v1 (mock) and the real planner's factory
+  produces fresh operators per call anyway. A persistent state
+  machine (like 3a.2's `State::LoadingChunk`) can come later if
+  profiling shows the factory-rebuild overhead is material under
+  `Concurrent` back pressure.
+- 2026-04-16 — Operator Implementor (unit 3c.2) — Defensive sample
+  filtering: per-inner-step samples that fall outside the outer
+  window `(outer_t - range, outer_t]` are dropped while packing.
+  Nothing in the `Operator` contract guarantees the child respects
+  the range exactly (e.g. a child with its own lookback policy may
+  emit a step slightly outside), and the filter is cheap
+  (integer-compare per sample). `STALE_NAN` and validity=0 cells
+  are also dropped before packing — matches 3a.2's policy so
+  downstream `RollupOp` sees pre-filtered windows.
+- 2026-04-16 — Operator Implementor (unit 3c.3) — Strategy: **full
+  materialisation (option 1) + passthrough short-circuit (option 3)**.
+  Partial/sliding materialisation (option 2) deferred — the full-grid
+  scratch is plan-time bounded by `(step_count × series_count × 9
+  bytes)`, the planner only inserts `Rechunk` when shapes genuinely
+  differ (so the pathological case is self-excluded), and "correct
+  first, optimize on profile" keeps the v1 surface small. The
+  passthrough short-circuit peeks the first upstream batch: if its
+  shape already matches the target tile *and* starts on a tile
+  boundary, the operator re-emits upstream batches verbatim without
+  allocating scratch. First-batch-only probe — per-batch probing
+  would double the branch cost on the hot path and the planner
+  guarantees uniform upstream shape in this branch.
+- 2026-04-16 — Operator Implementor (unit 3c.3) — Passthrough predicate
+  subtlety: a batch spanning the *full grid* trivially has
+  `step_end == grid_step_count`, so the naive "match if end lands on
+  target chunk OR grid edge" formulation silently accepts one giant
+  batch as a "match" and emits it as a single tile — wrong when the
+  downstream expects smaller tiles. Tightened the predicate to
+  require the span to be exactly `target_chunk` (or shorter only at
+  the grid edge). Caught by `should_rechunk_along_both_axes` failing
+  on the first run; fix is one-liner in `batch_matches_target`.
+- 2026-04-16 — Operator Implementor (unit 3c.3) — Memory-release
+  ordering: scratch bytes reserved once in the `Init → Draining`
+  transition, held across the whole emit phase, released by
+  `Scratch::Drop` when the state flips to `Done` (either after the
+  last tile, on upstream error, or on operator drop). Per-tile
+  output `Vec<f64>`/`BitSet` allocations are *not* separately charged —
+  they sum to at most the scratch cell count (in practice equal, since
+  every cell ends up in exactly one tile), and double-charging would
+  roughly double the peak reservation for no correctness benefit.
+  This matches the RFC's "pipeline-breaker holds memory until drained"
+  contract. Underflow risk: zero — the single `try_grow(bytes)` is
+  paired with one `release(bytes)` inside `Scratch`, `Drop` is
+  idempotent via the `bytes = 0` sentinel. Verified by
+  `should_release_memory_after_drain`: reservation counter returns to
+  pre-call value after draining.
+- 2026-04-16 — Operator Implementor (unit 3c.3) — Out-of-order
+  upstream batches: supported. `ingest()` places each cell by its
+  *global* `(step_range.start + step_off, series_range.start +
+  series_off)`, so an upstream that emits `[2..4)` before `[0..2)`
+  (or any other scan order) produces the same scratch contents.
+  Upstream is free to choose its own emission order — the breaker
+  framing already assumes it will buffer the whole stream, and
+  absorbing out-of-order tiles costs no more than a natural scan.
+  Test `should_handle_out_of_order_upstream_batches` pins this.
+- 2026-04-16 — Operator Implementor (unit 3c.3) — `SchemaRef::Deferred`
+  handling: `grid_series_count()` falls back to `0`, which causes
+  `Rechunk` downstream of a deferred-schema operator (`count_values`,
+  unit 3c.4) to drain the child empty and emit nothing. v1 does not
+  place `Rechunk` after a deferred producer — the RFC's single
+  exception for deferred schemas is `count_values` itself, and the
+  planner doesn't re-shape its output. If a future unit needs
+  rechunk-after-deferred, the contract will need to extend: the
+  operator would have to wait on the child's first batch to bind the
+  roster before allocating scratch. Flagged here so the gap is
+  discoverable.
+- 2026-04-16 — Operator Implementor (unit 3c.4) — Schema-finalisation
+  strategy: picked **option 2** from the task prompt. `schema()` returns
+  `SchemaRef::Deferred` for the whole life of the operator; the
+  finalised `Arc<SeriesSchema>` is exposed via an inherent
+  `CountValuesOp::finalized_schema(&self) -> Option<&Arc<SeriesSchema>>`
+  method that returns `Some` after the first `next()` drains and emits.
+  No trait changes; `SchemaRef::Deferred` as currently defined in
+  `batch.rs` is sufficient — it only has to mean "I won't expose my
+  roster through `schema()`"; the concrete roster is threaded through a
+  separate channel. Downstream operators that need the binding (Phase 4
+  planner concern) will call `finalized_schema()` after pulling the
+  first batch, or read the batch's `SchemaRef::Static` directly since
+  `next()` stamps the emitted `StepBatch` with the newly-materialised
+  schema. No `SchemaRef` extension required.
+- 2026-04-16 — Operator Implementor (unit 3c.4) — Value-to-label
+  formatting: the existing Rust engine does **not** implement
+  `count_values` (goldens at `promqltest/testdata/aggregators.test:480`
+  are ignored, and a grep across `evaluator.rs` / `pipeline.rs` /
+  `functions.rs` returns zero hits for `count_values`/`CountValues`).
+  Target is therefore Prometheus' reference: Go's
+  `strconv.FormatFloat(v, 'f', -1, 64)` (shortest round-trip decimal).
+  Implemented as `format_value_label`: `NaN → "NaN"`, `±Inf →
+  "+Inf"/"-Inf"`, `-0.0 → "-0"`, and finite non-zero through Rust's
+  `f64::to_string` (which matches Go's `'f'/-1` for finite non-zero
+  values). A crate-local citation for parity will only exist once
+  Phase 6 unignores those fixtures; the current implementation is
+  tested bit-for-bit against the table in the module docs. If Phase 6
+  uncovers a corner case (very large `f64` switching to scientific
+  notation, tiny denormals printed with trailing zeros, etc.) the fix
+  is localised to `format_value_label`.
+- 2026-04-16 — Operator Implementor (unit 3c.4) — NaN bucket keying:
+  the intermediate map is keyed on `(group: u32, value_bits: u64)`
+  where `value_bits = f64::to_bits(v)`. Two consequences: (1) `+0.0`
+  and `-0.0` get separate buckets (both collapse to the same label
+  `"0"` / `"-0"` on output — distinct labels, so this is correct), and
+  (2) every NaN bit pattern gets a separate bucket even though they
+  all render to `"NaN"`. The second case is tested
+  (`should_distinguish_nan_and_value_by_bit_pattern`) and produces
+  multiple `{label="NaN"}` output series if the inputs carry multiple
+  NaN bit patterns. That is an edge-case divergence from Prometheus'
+  behaviour (Prometheus likely collapses all NaNs into one bucket
+  because `math.Float64bits` is not used as a map key there; they
+  key on the value directly via Go's `map[float64]`, which treats all
+  NaNs as non-equal to anything including themselves — so
+  Prometheus' map almost certainly cannot distinguish NaN-bearing
+  inputs at all, producing one NaN entry per NaN-bearing input).
+  The divergence is user-unobservable for typical queries (NaN is
+  rare in PromQL `count_values` arguments) and is flagged here so
+  Phase 6 can revisit if a golden fails.
+- 2026-04-16 — Operator Implementor (unit 3c.4) — Grouping interaction
+  with the deferred axis: the optional `GroupMap` governs the
+  *intermediate* group-keyed bucketing; the output schema is
+  `(group × distinct-value)` — length = sum over groups of the number
+  of distinct values that group observed (bounded above by
+  `group_count × distinct_values_total`). Group labels are supplied
+  by the planner as an `Arc<[Labels]>` parallel to the group map; the
+  operator composes each group's labels with the new
+  `{label_name=<formatted_value>}` entry (stripping any pre-existing
+  `label_name=*` from the group labels to avoid a duplicate entry,
+  which matches the goldens' "overwrite label with output" examples at
+  `aggregators.test:517` and `:524`). When `group_map` is `None`, the
+  operator synthesises one unit group; callers pass
+  `Arc::from(vec![Labels::empty()])` and the output labels carry only
+  the new `{label_name=...}` entry.
+- 2026-04-16 — Operator Implementor (unit 3c.4) — Emission shape: the
+  operator emits **exactly one** `StepBatch` covering the full outer
+  grid × full output roster. Rationale: (a) the breaker has already
+  materialised every count, so re-tiling costs allocations without
+  reducing peak memory; (b) downstream consumers are free to `Rechunk`
+  if they want smaller tiles, though the v1 planner doesn't insert
+  that. The emitted batch's `series` field is `SchemaRef::Static`
+  pointing at the finalised roster — so a downstream that reads the
+  batch directly gets the concrete schema without needing
+  `finalized_schema()`. `finalized_schema()` is the path for
+  downstream operators that look at schemas ahead of pulling the first
+  batch (Phase 4 planner binding).
+- 2026-04-16 — Operator Implementor (unit 3c.4) — Memory accounting:
+  three reservations. (1) Per-bucket `~64 B header + 4 B × step_count`
+  for the `HashMap` entry + per-step counts, charged incrementally
+  (`try_grow` per new bucket). (2) Schema bytes reserved up front at
+  roster-finalisation time, sized conservatively
+  (`series_count × (vec header + avg_labels × (Label + 32 B string tail)
+  + 16 B fingerprint)`). (3) Per-batch `OutBuffers` for
+  `values + validity`. All released on `Drop` (buckets + schema) or
+  `finish()` (output buffers). `should_respect_memory_reservation`
+  exercises the bucket-charge rejection path.
+- 2026-04-16 — Operator Implementor (unit 3c.5) — `Concurrent` mpsc bound
+  default: `DEFAULT_CHANNEL_BOUND = 4`. Rationale: matches the task-spec
+  suggestion; small enough that a pathological producer can't buffer many
+  un-consumed batches (each batch can be up to ~256 KB — 4 is ~1 MB
+  worst-case), large enough to keep a CPU-bound consumer fed through one
+  async round-trip under light contention. The planner (Phase 4.5) may
+  override per-subplan once profiling suggests a different sweet spot.
+- 2026-04-16 — Operator Implementor (unit 3c.5) — `Concurrent` spawn model:
+  **ambient `tokio::spawn`** (task-spec preference). `ConcurrentOp::new`
+  must be called from inside a tokio runtime; the spawned task is retained
+  on a `JoinHandle` field (`_task`) so dropping the operator aborts the
+  task via the runtime's cancellation-on-drop semantics (cooperative — the
+  task exits naturally when its `tx.send` observes receiver-drop). No
+  explicit `Handle` parameter; if Phase 5 wiring wants to pin spawns to a
+  specific executor, a `new_on(handle, child, bound)` alt-constructor can
+  be added non-breakingly.
+- 2026-04-16 — Operator Implementor (unit 3c.5) — `Concurrent` child-drive
+  loop: spawned task uses `poll_fn(|cx| child.next(cx)).await` per pull.
+  Clean under tokio's default waker, no manual `RawWaker` dance, no
+  `futures` dep. `Operator::next` takes `&mut self` and the task owns the
+  child by value (`'static` child lifetime), so no lifetime gymnastics —
+  matches the escalation-path prediction in the task spec.
+- 2026-04-16 — Operator Implementor (unit 3c.5) — `Coalesce` fairness:
+  **cursor-advancing round-robin** over all live children per `next()`
+  call. One round polls each un-exhausted child starting at the cursor;
+  first `Ready(Some)` wins and advances the cursor past the emitting
+  child. `Pending` children are skipped so one pending sibling can't
+  starve a ready one; `Ready(None)` marks the child done. If every live
+  child was `Pending` in the round, bubble `Pending`. If every child is
+  exhausted, emit `Ready(None)`. No merge-sorted-by-step: the RFC
+  contract says disjoint `series_range`s per child, so cross-child step
+  alignment is a planner guarantee — a consumer that needs one batch per
+  step across all series inserts a `Rechunk` downstream (planner's
+  concern, §3.4 scope).
+- 2026-04-16 — Operator Implementor (unit 3c.5) — `Coalesce` dyn-safety:
+  children held as `Vec<Box<dyn Operator + Send>>`. `Operator` trait is
+  already object-safe (3a.1 `should_build_trait_object` + 3c.2's
+  `ChildFactory` `Box<dyn Operator + Send>` both landed clean). No
+  friction; no generic parameter on `CoalesceOp` — the N children come
+  from the same planner fan-out and may be heterogeneous concrete types
+  (e.g. `Concurrent<VectorSelectorOp>` vs a bare `VectorSelectorOp`),
+  which dyn erasure resolves cleanly.
+- 2026-04-16 — Operator Implementor (unit 3c.5) — Back-pressure test
+  strategy (for `should_apply_backpressure_via_bounded_channel`): asserts
+  end-to-end order preservation across 10 producer sends with
+  `bound = 1`, plus a 10ms producer warmup sleep. If the channel weren't
+  bounded (or the producer didn't await on `send`), items could arrive
+  out of order or duplicated under buggy implementations. The test
+  weakens the stronger "counter inspection" assertion from the task
+  spec — `tokio::sync::mpsc::Sender` exposes no public in-flight counter,
+  and wiring a side-channel counter into the spawned task would require
+  production-code changes just for the test. The order-preservation
+  check is an adequate stand-in.
 
 ## 6. Activity Log
 
@@ -996,6 +1254,10 @@ Append-only, one line per agent invocation. Format:
 - 2026-04-16 Operator Implementor 3b.3 in-progress→done — created `promql/v2/operators/binary.rs` (`BinaryOp<L, R>`, `BinaryOpKind` with 16 variants incl. `bool`-modified comparisons, `MatchTable { OneToOne, GroupLeft, GroupRight }`, `BinaryShape`, `ConstScalarOp` scalar-as-operator helper); registered in `operators/mod.rs` and re-exported from `v2/mod.rs`. All three PromQL binary shapes fully supported: vector/vector (with pre-computed plan-time match table), vector/scalar + scalar/vector (scalar as degenerate 1-series child; distinct constructors preserve operand order), and scalar/scalar. `MatchTable` variants use a uniform `Vec<Option<u32>>` shape — `group_left`/`group_right` express "many" via the planner-built output schema having > 1 rows pointing at the same "one"-side index; no stubbed cardinality path. `bool` modifier encoded as a per-variant field on each comparison kind; filter-comparison semantics (drop false cells, pass through LHS value for true cells) match `evaluator.rs:1898-1923,2082-2094` bit-for-bit (§5 Decisions Log). Set ops `and`/`or`/`unless` implemented as strict v2 superset (legacy engine has no set-op support). Division-by-zero uses IEEE 754 (Prometheus-conformant; matches `promqltest/testdata/operators.test:108-118` goldens); documented divergence from legacy's NaN-forcing in §5. Memory: `OutBuffers` RAII guard routes values + validity through `MemoryReservation::try_grow`; input batches owned by children. Children must share step grid (planner guarantee); misalignment and mixed EOS are clean `QueryError::Internal`. 17 new unit tests on hand-built `MockOp` upstreams cover add V/V one-to-one, sub V/S, div S/S (IEEE 754 infinity), unmatched-rhs validity, filter vs `bool` comparison, pow/mod/atan2, and/or/unless set ops, upstream error propagation, memory cap, static-schema/match-table output, end-of-stream, aligned multi-batch stitching, plus `group_left` (shared RHS) and `group_right` (shared LHS) cases. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (138 passed — 121 prior + 17 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
 - 2026-04-16 Operator Implementor 3b.4 in-progress→done — created `promql/v2/operators/aggregate.rs` (`AggregateOp<C: Operator>`, `AggregateKind` with 8 streaming variants, `GroupMap`); registered in `operators/mod.rs` and re-exported from `v2/mod.rs` (and in `operators::prelude`). Streaming per-step reduction over planner-provided group map: one `Accumulator` struct per output group carries Kahan sum / Kahan-compensated Welford (mean + M2) / NaN-safe min-max lanes in parallel, updated once per valid input cell; the per-kind reducer reads only the lane it needs at step-finalise time, so the inner sweep is monomorphic regardless of `AggregateKind`. `GroupMap` uses `Vec<Option<u32>>` encoding (§5 Decisions Log — `None` = drop from aggregation; planner contract is `Some(g)` for the normal case). `AggregateKind` populated only with streaming variants (`Sum`/`Avg`/`Min`/`Max`/`Count`/`Stddev`/`Stdvar`/`Group`); 3c.1 extends with `Topk`/`Bottomk`/`Quantile` pipeline-breaker variants (single enum; planner dispatches streaming vs breaker operator based on variant). Validity semantics: groups with zero valid contributions emit `validity = 0` for every kind (including `Count`) — matches the legacy engine's structural "group doesn't exist" behaviour. Min/Max NaN policy: IEEE 754 minNum / maxNum — ignore NaN when any real value contributes, preserve NaN only for all-NaN groups (matches legacy `evaluator.rs:2489-2492` where `f64::min`/`f64::max` already behave this way; all-NaN corner differs cosmetically — legacy returns seed `±INFINITY`, v2 returns NaN). Memory: constructor reserves `group_count × sizeof(Accumulator)` scratch via `try_grow` (fails fast with `QueryError::MemoryLimit`) + per-batch `OutBuffers` RAII for the output `Vec<f64>` + `BitSet`. No changes to `Operator` / `OperatorSchema` / `StepGrid` / `StepBatch` surfaces — trait shape fit unmodified. 15 new unit tests on hand-built `MockOp` upstreams cover sum grouping, avg with invalid cells, NaN-safe min/max, count validity, Welford stddev/stdvar (population var=4 on 2,4,4,4,5,5,7,9), `Group`=1 when any input contributes, `validity=0` for every kind on empty groups, `by ()` single-group, `without ()` per-series-own-group, multi-batch stitching, memory cap rejection (constructor-time), static schema, upstream error propagation, child end-of-stream, and `None`-group-assignment drop behaviour. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (153 passed — 138 prior + 15 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
 - 2026-04-16 Operator Implementor 3c.1 in-progress→done — extended `promql/v2/operators/aggregate.rs` with `AggregateKind::Topk(i64)` / `Bottomk(i64)` / `Quantile(f64)` breaker variants; no new files, no re-export surgery (3b.4 already exposes `AggregateKind`/`AggregateOp`). `AggregateOp::new` signature unchanged — planner decides the output schema (§5 Decisions Log 3c.1): filter-shape (`input_series_count` rows) for topk/bottomk, reducer-shape (`group_count` rows) for quantile; operator debug-asserts per variant. Breaker dispatch routes through `reduce_batch_breaker` into `reduce_topk_or_bottomk` (bounded `BinaryHeap<KHeapEntry>` per group, one heap reused across steps) and `reduce_quantile` (per-group sort buffer reused across steps). Tie-break, K-out-of-range, NaN, and quantile-q-out-of-range semantics all cited against the legacy engine / `rollup_fns::quantile` — see §5 Decisions Log entries (deterministic first-seen wins on value ties per `evaluator.rs:687-694`; `k < 1` ⇒ empty output per `coerce_k_size` at `evaluator.rs:2249-2253`; NaN ranks "worst" in heap per `compare_k_values` at `evaluator.rs:652-662`; quantile out-of-range matches `rollup.rs::rollup_fns::quantile` bit-for-bit). Memory accounting renamed `accum_bytes` → `scratch_bytes`: streaming paths unchanged, topk/bottomk reserve `group_count × min(k, input_count) × sizeof(KHeapEntry)`, quantile reserves `input_count × 8 + group_count × sizeof(Vec<f64>)` — both conservative upper bounds. 13 new unit tests on hand-built `MockOp` upstreams: topk selection per group, bottomk selection, K≥group size (all valid selected), K=0 (nothing selected), negative K (empty), NaN-ignored-in-topk, deterministic-tiebreak-by-lower-index, quantile linear interpolation (q=0.25/0.5/0.75), quantile out-of-range (q<0 → -inf, q>1 → +inf), quantile per group (two independent groups), memory cap rejection on topk heap, input-schema passthrough for topk, groups-schema passthrough for quantile. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (166 passed — 153 prior + 13 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
+- 2026-04-16 Operator Implementor 3c.2 in-progress→done — created `promql/v2/operators/subquery.rs` (`SubqueryOp`, `ChildFactory` type alias); registered in `operators/mod.rs`, added to `operators::prelude`, and re-exported from `v2/mod.rs`. PromQL re-grid operator: owns a planner-supplied factory `Box<dyn FnMut(TimeRange, i64) -> Result<Box<dyn Operator + Send>, QueryError> + Send>` that materialises a fresh child sub-tree per outer step; drives the child to completion, drops samples outside the outer window / with validity=0 / STALE_NAN, packs per-series columns into a `MatrixWindowBatch` (one per outer step). `Operator::next` is degenerate (Ready(None)) per 3a.2 convention; consumers drive via `SubqueryOp::windows` / `WindowStream::poll_windows`. `SubqueryOp` implements `WindowStream` directly (unlike 3a.2's `MatrixSelectorOp` which needs `MatrixWindowSource`) so it drops into `RollupOp<SubqueryOp>` with no wrapper. Memory: shares parent `MemoryReservation` (§5 Decisions Log — RFC Open Question #2 resolved: nested scope deferred post-MVP); `WindowBuffers` RAII guard handles cell-index + sample allocation with the same grow/release pattern 3a.2 uses. `Operator` trait dyn-safety verified (no friction; already proven by 3a.1's `should_build_trait_object`). 11 new unit tests on a hand-built scripted-child mock cover inner-step re-gridding, one-batch-per-outer-step emission, factory-call-count-per-outer-step, `MatrixWindowBatch` cell packing for 2-series × 3-inner-step layout, end-of-stream idempotence, series-order preservation, invalid-cell + STALE_NAN skip, child error propagation, memory-limit rejection, static schema, and an end-to-end `RollupOp<SubqueryOp>` assembly emulating `rate(expr[3s:1s])` with hand-verified `rate = 100/s` arithmetic across two outer steps. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (177 passed — 166 prior + 11 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
+- 2026-04-16 Operator Implementor 3c.3 in-progress→done — created `promql/v2/operators/rechunk.rs` (`RechunkOp<C: Operator>`); registered in `operators/mod.rs` (incl. `prelude`) and re-exported from `v2/mod.rs`. Pipeline-breaker that repackages upstream batches to a different `(target_step_chunk, target_series_chunk)` rectangle. Strategy (§5 Decisions Log): full-grid materialisation into a `(step_count × series_count)` scratch buffer + single-shot passthrough short-circuit when the first upstream batch already matches the target tile shape on a tile boundary (partial-tile/sliding materialisation deferred). Internal state machine: `Init → {Passthrough | Draining} → Emitting → Done`. Scratch is a `RAII` `Scratch` struct — `try_grow` once in `Init→Draining` for `step_count × series_count × (8 + 1/8)` bytes, `release` on `Drop` when state flips to `Done` (error short-circuit, end-of-stream after last tile, or operator drop). Per-tile outputs are NOT double-charged (already accounted for in scratch; summed cell count equals scratch size). Schema passes through unchanged from the child; `step_grid` is plan-time invariant across the pipeline. Out-of-order upstream emission is handled by placing cells at their global `(step_range.start + step_off, series_range.start + series_off)` offsets. `SchemaRef::Deferred` handling: `grid_series_count` falls back to 0 (v1 planner won't place Rechunk after `count_values`; §5 Decisions Log flags the gap). 12 new unit tests on hand-built `MockOp` upstreams cover passthrough, step-axis rechunk (wider tiles), series-axis rechunk (narrower tiles), both-axes rechunk, value+validity bit-for-bit preservation (incl. real-NaN vs absence), memory-cap rejection, memory-release-after-drain (reservation counter returns to pre-call value), upstream error propagation, static-schema contract, partial-tile at non-evenly-divisible grid edges, empty upstream, and out-of-order upstream batches. One surprise during implementation: the naive passthrough predicate ("end lands on target boundary OR grid edge") accepted a full-grid batch as a "matching tile" and emitted it as a single output — tightened to require the batch span to equal target chunk (or be a short partial tile at the grid edge). No `Operator` / `OperatorSchema` / `StepBatch` surface changes. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (189 passed — 177 prior + 12 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
+- 2026-04-16 Operator Implementor 3c.5 in-progress→done — created `promql/v2/operators/concurrent.rs` (`ConcurrentOp`, `DEFAULT_CHANNEL_BOUND = 4`) and `promql/v2/operators/coalesce.rs` (`CoalesceOp`); registered in `operators/mod.rs` (incl. `prelude`) and re-exported from `v2/mod.rs`. `ConcurrentOp` wraps a `Send + 'static` child in a `tokio::spawn`ed task that drives it via `std::future::poll_fn(|cx| child.next(cx)).await` and pushes `Result<StepBatch, QueryError>` into a bounded `tokio::sync::mpsc` channel (default bound = 4). Schema is snapshotted at construction (`Arc<OperatorSchema>` clone) so the trait's "schema() before first next()" invariant holds. Back-pressure is the mpsc bound itself — when downstream stops polling, producer `send` parks and the child awaits with it. `_task: JoinHandle` retained so drop cancels. No new deps (tokio already in workspace at `timeseries/Cargo.toml:56`). `CoalesceOp` holds `Vec<Box<dyn Operator + Send>>` + `Vec<bool>` done-flags + a cursor; `next()` does a cursor-advancing round-robin, emitting the first `Ready(Some)` encountered, skipping `Pending` to avoid starvation, and bubbling `Pending` only when every live child was pending in that round. No memory reservation at this layer (children own their batch bytes). Test strategy uses `#[tokio::test]` for `ConcurrentOp` (5 tests: forward-3-batches, error-propagation, close-on-EOS, schema-caching, back-pressure-via-bound-1) and a synchronous `noop_waker` driver for `CoalesceOp` (7 tests: disjoint-series fan-in, all-pending, all-exhausted, error-short-circuit, schema-passthrough, different-cadence, continue-when-one-done). Clippy flagged two `vec![false; N]`-in-test uses; tightened to fixed arrays. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (214 passed — 202 prior + 12 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass. Phase 3 acceptance criteria met for every unit.
+- 2026-04-16 Operator Implementor 3c.4 in-progress→done — created `promql/v2/operators/count_values.rs` (`CountValuesOp<C: Operator>`, `format_value_label` helper, private `BucketKey` / `BucketCounts` intermediate state); registered in `operators/mod.rs` (incl. `prelude`) and re-exported from `v2/mod.rs`. Deferred-schema pipeline-breaker implementing `count_values("label", expr)`: `schema()` returns `SchemaRef::Deferred` for the whole operator life; downstream reads the finalised `Arc<SeriesSchema>` either through an inherent `finalized_schema(&self) -> Option<&Arc<SeriesSchema>>` method (populated after the first `next()` drains and emits) or straight off the emitted `StepBatch`'s `SchemaRef::Static` handle — no `SchemaRef` extension required (§5 Decisions Log). Bucket keying on `(group: u32, value_bits: u64)` with `value_bits = f64::to_bits()` distinguishes `+0/-0` and NaN bit patterns in the intermediate map; label formatting collapses all NaNs to `"NaN"`. Value-to-label formatter mirrors Prometheus' `strconv.FormatFloat('f', -1, 64)` — `"NaN"` / `"+Inf"` / `"-Inf"` / `"-0"` special cases, finite non-zero through Rust's `f64::to_string` (shortest round-trip) — with a documented divergence note in §5 Decisions Log (no in-crate citation available: legacy engine does not implement `count_values`, and the `aggregators.test:480` goldens are ignored). Grouping via optional `GroupMap` (reused from 3b.4) + a parallel `Arc<[Labels]>` of group-label sets; emitted series carry the group labels (with any pre-existing `label_name=*` stripped to avoid duplicates, matching the "overwrite label with output" goldens at `aggregators.test:517,524`) composed with the new `{label_name=<formatted_value>}` entry. Emission: a single `StepBatch` covering the full outer grid × full output roster (downstream rechunking is a planner concern). Memory accounting: three reservations — per-bucket bytes (charged incrementally on `try_grow`), schema bytes (reserved up-front at roster finalisation), and per-batch `OutBuffers` (RAII via the same pattern as `aggregate.rs` / `rollup.rs`); all released on `Drop` / `finish()`. 13 new unit tests on hand-built `MockOp` upstreams: one-series-per-distinct-value, counts-per-step, `by`-grouping, `without`-grouping (per-input groups), deferred-schema pre-drain, finalised schema post-drain, NaN bit-pattern bucketing (two distinct NaN patterns emerge as two `{version="NaN"}` series), upstream error propagation, memory-cap rejection on first bucket insert, empty-child end-of-stream, format-label parity with the Prometheus reference table, idempotent EOS after emit, and `None`-group-assignment drop behaviour. `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (202 passed — 189 prior + 13 new), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
 
 ---
 

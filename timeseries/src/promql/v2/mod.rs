@@ -35,11 +35,21 @@ pub(crate) use operators::binary::{
     BinaryOp, BinaryOpKind, BinaryShape, ConstScalarOp, MatchTable,
 };
 #[allow(unused_imports)]
+pub(crate) use operators::coalesce::CoalesceOp;
+#[allow(unused_imports)]
+pub(crate) use operators::concurrent::{ConcurrentOp, DEFAULT_CHANNEL_BOUND};
+#[allow(unused_imports)]
+pub(crate) use operators::count_values::CountValuesOp;
+#[allow(unused_imports)]
 pub(crate) use operators::instant_fn::{InstantFnKind, InstantFnOp};
 #[allow(unused_imports)]
 pub(crate) use operators::matrix_selector::{CellIndex, MatrixSelectorOp, MatrixWindowBatch};
 #[allow(unused_imports)]
+pub(crate) use operators::rechunk::RechunkOp;
+#[allow(unused_imports)]
 pub(crate) use operators::rollup::{MatrixWindowSource, RollupKind, RollupOp, WindowStream};
+#[allow(unused_imports)]
+pub(crate) use operators::subquery::{ChildFactory, SubqueryOp};
 #[allow(unused_imports)]
 pub(crate) use operators::vector_selector::VectorSelectorOp;
 #[allow(unused_imports)]
