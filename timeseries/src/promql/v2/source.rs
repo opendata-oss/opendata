@@ -6,12 +6,10 @@
 //!
 //! - [`TimeRange`]: inclusive-exclusive absolute ms window.
 //! - [`ResolvedSeriesRef`]: opaque handle minted by [`SeriesSource::resolve`]
-//!   and later threaded back into [`SampleHint::series`].
+//!   and later threaded back into [`SamplesRequest::series`].
 //! - [`ResolvedSeriesChunk`]: a contiguous slice of resolved series
 //!   metadata, streamed as selector resolution progresses.
-//! - [`CardinalityEstimate`]: the pre-resolve gate the planner uses to
-//!   reject oversized queries before materialising sample state.
-//! - [`SampleHint`] / [`SampleBatch`] / [`SampleBlock`]: the raw-sample
+//! - [`SamplesRequest`] / [`SampleBatch`] / [`SampleBlock`]: the raw-sample
 //!   fetch pair.
 //!
 //! The contract is deliberately PromQL-unaware. Lookback delta, `@`,
@@ -24,7 +22,6 @@
 //! existing per-bucket `QueryReader` fan-out lives in unit 2.2, and its
 //! integration tests in unit 2.3.
 
-use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -75,7 +72,7 @@ impl TimeRange {
 }
 
 /// Opaque handle the source hands out via [`SeriesSource::resolve`] and
-/// the caller later threads into [`SampleHint::series`].
+/// the caller later threads into [`SamplesRequest::series`].
 ///
 /// Conceptually a `(bucket, series_id)` pair — kept as a struct so the
 /// source can extend it (e.g. with a cross-bucket fingerprint cache
@@ -119,7 +116,7 @@ impl ResolvedSeriesRef {
 ///   grouping samples per bucket.
 ///
 /// The adapter in unit 2.2 extends this shape if it needs to carry
-/// additional per-series plan hints (e.g. fingerprints); keep the
+/// additional per-series plan requests (e.g. fingerprints); keep the
 /// minimum here.
 #[derive(Debug, Clone)]
 pub struct ResolvedSeriesChunk {
@@ -127,68 +124,21 @@ pub struct ResolvedSeriesChunk {
     pub bucket_id: u64,
     /// Labelsets, dense-indexed alongside [`Self::series`].
     pub labels: Arc<[Labels]>,
-    /// Opaque handles the caller threads back into [`SampleHint::series`].
+    /// Opaque handles the caller threads back into [`SamplesRequest::series`].
     pub series: Arc<[ResolvedSeriesRef]>,
-}
-
-/// Cardinality estimate returned by [`SeriesSource::estimate_cardinality`].
-///
-/// The planner multiplies `series_count_estimate() * steps` against the
-/// configured cell-limit and rejects with
-/// [`QueryError::TooLarge`](super::memory::QueryError::TooLarge) before
-/// any sample state is materialised (RFC 0007 §"Execution Model"
-/// "Fail-fast cardinality gate").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CardinalityEstimate {
-    /// Lower bound on the number of series the selector will resolve
-    /// to. `0` means "possibly none".
-    pub series_lower_bound: u64,
-    /// Upper bound on the number of series the selector will resolve
-    /// to. Used as the representative count unless the source flagged
-    /// the estimate as approximate and the lower bound is tighter.
-    pub series_upper_bound: u64,
-    /// `true` when the estimate is best-effort (e.g. derived from
-    /// per-bucket summary statistics rather than a precise matcher
-    /// evaluation). Callers that care about an upper bound should still
-    /// use [`Self::series_upper_bound`]; the flag tells observability
-    /// that the number is not authoritative.
-    pub approx: bool,
-}
-
-impl CardinalityEstimate {
-    /// Build an exact estimate where lower and upper bound match and the
-    /// result is not flagged approximate.
-    pub fn exact(series_count: u64) -> Self {
-        Self {
-            series_lower_bound: series_count,
-            series_upper_bound: series_count,
-            approx: false,
-        }
-    }
-
-    /// Representative series count for the planner's cardinality gate.
-    ///
-    /// Returns the upper bound (the conservative choice — rejecting a
-    /// query that would have fit is preferable to accepting a query
-    /// that will OOM). When the source flagged the estimate as
-    /// approximate the planner is still free to consult both bounds
-    /// directly.
-    pub fn series_count_estimate(&self) -> u64 {
-        self.series_upper_bound
-    }
 }
 
 /// Raw-sample fetch request.
 ///
 /// Carries the post-resolution series set and the absolute time window
 /// the caller needs. The source must **not** widen `series` and must
-/// **not** shift `time_range`. The hint intentionally does not carry
-/// step, lookback, `@`, offset, or rollup-function hints: pushdown was
+/// **not** shift `time_range`. The request intentionally does not carry
+/// step, lookback, `@`, offset, or rollup-function requests: pushdown was
 /// rejected for v1 because `@ start()`/`@ end()` inside subqueries
 /// would force every storage backend to re-implement evaluator
 /// semantics (RFC 0007 §"Storage Contract" and §5 Decisions Log).
 #[derive(Debug, Clone)]
-pub struct SampleHint {
+pub struct SamplesRequest {
     /// Complete post-resolution series set, matching handles the source
     /// previously emitted from [`SeriesSource::resolve`]. The caller
     /// owns the ordering; batches the source returns carry
@@ -200,8 +150,8 @@ pub struct SampleHint {
     pub time_range: TimeRange,
 }
 
-impl SampleHint {
-    /// Build a hint from a pre-resolved series slice and a time range.
+impl SamplesRequest {
+    /// Build a request from a pre-resolved series slice and a time range.
     pub fn new(series: Arc<[ResolvedSeriesRef]>, time_range: TimeRange) -> Self {
         Self { series, time_range }
     }
@@ -219,7 +169,7 @@ impl SampleHint {
 pub struct SampleBlock {
     /// Per-series timestamp columns. `timestamps[i]` and `values[i]`
     /// share a length. Indexed alongside [`SampleBatch::series_range`]:
-    /// block index `j` corresponds to `hint.series[series_range.start + j]`.
+    /// block index `j` corresponds to `request.series[series_range.start + j]`.
     pub timestamps: Vec<Vec<i64>>,
     /// Per-series value columns. Aligned with [`Self::timestamps`].
     pub values: Vec<Vec<f64>>,
@@ -244,15 +194,15 @@ impl SampleBlock {
 /// Raw-sample batch returned by [`SeriesSource::samples`].
 ///
 /// One batch covers a contiguous slice of the caller's series list and
-/// (implicitly) a contiguous sub-range of the hint's `time_range`.
+/// (implicitly) a contiguous sub-range of the request's `time_range`.
 /// Samples inside the batch are ordered per series in timestamp order,
 /// with exact source timestamps (no re-alignment). The batch size is
 /// the source's choice: the planner's allocator uses [`SampleBlock`]
 /// shape to size operator-side buffers.
 #[derive(Debug, Clone)]
 pub struct SampleBatch {
-    /// Slice into the original `SampleHint::series` covered by this
-    /// batch. `series_range.end <= hint.series.len()`.
+    /// Slice into the original `SamplesRequest::series` covered by this
+    /// batch. `series_range.end <= request.series.len()`.
     pub series_range: Range<usize>,
     /// Dense, per-series columnar samples (timestamps in ms, values as
     /// `f64`; stale markers preserved as `STALE_NAN`).
@@ -266,8 +216,6 @@ pub struct SampleBatch {
 ///
 /// - `resolve` streams series metadata; `series` in each chunk is a
 ///   contiguous slice the caller can append to a global roster.
-/// - `estimate_cardinality` is a cheap pre-resolve gate (RFC
-///   §"Execution Model" "Fail-fast cardinality gate").
 /// - `samples` streams raw samples for a post-resolution series set
 ///   and an absolute time window. The source must not widen the
 ///   series set and must not shift the window. Samples come back in
@@ -283,21 +231,12 @@ pub trait SeriesSource: Send + Sync {
     /// Resolve a selector to series metadata, streamed per bucket (or
     /// finer). The planner consumes the stream into a plan-time series
     /// roster; each [`ResolvedSeriesChunk`] carries the handles the
-    /// caller later threads back into [`SampleHint::series`].
+    /// caller later threads back into [`SamplesRequest::series`].
     fn resolve(
         &self,
         selector: &VectorSelector,
         time_range: TimeRange,
     ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send;
-
-    /// Estimate the series cardinality of a selector over a time range.
-    /// Must be cheap (sub-millisecond target) — the planner calls this
-    /// before `resolve` to fail-fast on oversized queries.
-    fn estimate_cardinality(
-        &self,
-        selector: &VectorSelector,
-        time_range: TimeRange,
-    ) -> impl Future<Output = Result<CardinalityEstimate, QueryError>> + Send;
 
     /// Stream raw samples for a pre-resolved series set over an
     /// absolute time window. No step, no lookback, no rollup. Samples
@@ -306,7 +245,7 @@ pub trait SeriesSource: Send + Sync {
     /// [`STALE_NAN`](crate::model::STALE_NAN).
     fn samples(
         &self,
-        hint: SampleHint,
+        request: SamplesRequest,
     ) -> impl Stream<Item = Result<SampleBatch, QueryError>> + Send;
 }
 
@@ -360,36 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn should_treat_cardinality_estimate_upper_bound_as_representative() {
-        // given: a range estimate
-        let est = CardinalityEstimate {
-            series_lower_bound: 100,
-            series_upper_bound: 250,
-            approx: true,
-        };
-
-        // when: ask for the representative count
-        let n = est.series_count_estimate();
-
-        // then: planner-facing count is the upper bound (conservative)
-        assert_eq!(n, 250);
-    }
-
-    #[test]
-    fn should_build_exact_cardinality_estimate_with_matching_bounds() {
-        // given: a known-precise count
-        // when: build an exact estimate
-        let est = CardinalityEstimate::exact(17);
-
-        // then: bounds collapse and the estimate is not flagged approx
-        assert_eq!(est.series_lower_bound, 17);
-        assert_eq!(est.series_upper_bound, 17);
-        assert!(!est.approx);
-        assert_eq!(est.series_count_estimate(), 17);
-    }
-
-    #[test]
-    fn should_build_sample_hint_from_resolved_series_and_time_range() {
+    fn should_build_sample_request_from_resolved_series_and_time_range() {
         // given: a caller-resolved series slice and an absolute window
         let series: Arc<[ResolvedSeriesRef]> = Arc::from(vec![
             ResolvedSeriesRef::new(1, 10),
@@ -397,14 +307,14 @@ mod tests {
         ]);
         let tr = TimeRange::new(0, 60_000);
 
-        // when: build the hint
-        let hint = SampleHint::new(series.clone(), tr);
+        // when: build the request
+        let request = SamplesRequest::new(series.clone(), tr);
 
-        // then: series slice and time range round-trip; hint is clone
-        assert_eq!(hint.series.len(), 2);
-        assert_eq!(hint.time_range, tr);
-        let cloned = hint.clone();
-        assert_eq!(cloned.series.len(), hint.series.len());
+        // then: series slice and time range round-trip; request is clone
+        assert_eq!(request.series.len(), 2);
+        assert_eq!(request.time_range, tr);
+        let cloned = request.clone();
+        assert_eq!(cloned.series.len(), request.series.len());
     }
 
     #[test]

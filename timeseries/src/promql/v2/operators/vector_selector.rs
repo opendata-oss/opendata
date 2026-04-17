@@ -69,7 +69,9 @@ use crate::promql::timestamp::Timestamp;
 use super::super::batch::{BitSet, SchemaRef, SeriesSchema, StepBatch};
 use super::super::memory::{MemoryReservation, QueryError};
 use super::super::operator::{Operator, OperatorSchema, StepGrid};
-use super::super::source::{ResolvedSeriesRef, SampleBatch, SampleHint, SeriesSource, TimeRange};
+use super::super::source::{
+    ResolvedSeriesRef, SampleBatch, SamplesRequest, SeriesSource, TimeRange,
+};
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -256,7 +258,7 @@ impl EffectiveTimes {
     }
 
     /// Minimum and maximum effective time across all steps. Used to size
-    /// the `SampleHint` time window so the source returns enough samples
+    /// the `SamplesRequest` time window so the source returns enough samples
     /// for every step's lookback window.
     fn time_range_with_lookback(&self, lookback_ms: i64) -> TimeRange {
         let mut min = i64::MAX;
@@ -310,9 +312,13 @@ impl ChunkSamples {
     }
 
     /// Absorb a `SampleBatch` whose `series_range` indexes into the flattened
-    /// chunk-local `SampleHint::series`. `hint_to_series[hint_idx]` resolves
+    /// chunk-local `SamplesRequest::series`. `request_to_series[request_idx]` resolves
     /// each sample column back onto the logical output series it belongs to.
-    fn absorb(&mut self, batch: SampleBatch, hint_to_series: &[usize]) -> Result<(), QueryError> {
+    fn absorb(
+        &mut self,
+        batch: SampleBatch,
+        request_to_series: &[usize],
+    ) -> Result<(), QueryError> {
         let mut total_new = 0usize;
         for col in batch.samples.timestamps.iter() {
             total_new = total_new.saturating_add(col.len());
@@ -328,8 +334,8 @@ impl ChunkSamples {
             .zip(batch.samples.values)
             .enumerate()
         {
-            let hint_idx = batch.series_range.start + block_idx;
-            let local_idx = hint_to_series[hint_idx];
+            let request_idx = batch.series_range.start + block_idx;
+            let local_idx = request_to_series[request_idx];
             // Append rather than replace — a series may span several
             // SampleBatches (one per bucket for cross-bucket series).
             self.timestamps[local_idx].append(&mut ts_col);
@@ -395,7 +401,7 @@ enum State<'a> {
 pub(crate) struct VectorSelectorOp<'a, S: SeriesSource + 'a> {
     // Plan-time inputs ------------------------------------------------------
     source: Arc<S>,
-    hint_series: Arc<[Arc<[ResolvedSeriesRef]>]>,
+    request_series: Arc<[Arc<[ResolvedSeriesRef]>]>,
     schema: OperatorSchema,
     step_timestamps: Arc<[i64]>,
     effective_times: EffectiveTimes,
@@ -416,7 +422,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
     /// * `series` — post-resolve series roster in the order the planner
     ///   wants samples to land. `schema.series` is a
     ///   [`SchemaRef::Static`] handle over the same roster.
-    /// * `hint_series` — parallel slice of per-logical-series opaque source
+    /// * `request_series` — parallel slice of per-logical-series opaque source
     ///   handle groups aligned with `schema.series`. A single logical series
     ///   may carry several bucket-local refs when the planner deduplicates the
     ///   resolved roster by fingerprint.
@@ -430,7 +436,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
     pub(crate) fn new(
         source: Arc<S>,
         series: Arc<SeriesSchema>,
-        hint_series: Arc<[Arc<[ResolvedSeriesRef]>]>,
+        request_series: Arc<[Arc<[ResolvedSeriesRef]>]>,
         grid: StepGrid,
         at: Option<AtModifier>,
         offset: Option<Offset>,
@@ -440,8 +446,8 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
     ) -> Self {
         assert_eq!(
             series.len(),
-            hint_series.len(),
-            "series roster and hint_series must be length-aligned",
+            request_series.len(),
+            "series roster and request_series must be length-aligned",
         );
         let step_timestamps: Arc<[i64]> = Arc::from(
             (0..grid.step_count)
@@ -453,7 +459,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
         let schema = OperatorSchema::new(SchemaRef::Static(series), grid);
         Self {
             source,
-            hint_series,
+            request_series,
             schema,
             step_timestamps,
             effective_times,
@@ -465,13 +471,15 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
     }
 
     fn total_series(&self) -> usize {
-        self.hint_series.len()
+        self.request_series.len()
     }
 
-    fn chunk_hint(&self, chunk_start: usize, chunk_end: usize) -> (SampleHint, Vec<usize>) {
+    fn chunk_request(&self, chunk_start: usize, chunk_end: usize) -> (SamplesRequest, Vec<usize>) {
         let mut flat: Vec<ResolvedSeriesRef> = Vec::new();
-        let mut hint_to_series: Vec<usize> = Vec::new();
-        for (series_off, series_refs) in self.hint_series[chunk_start..chunk_end].iter().enumerate()
+        let mut request_to_series: Vec<usize> = Vec::new();
+        for (series_off, series_refs) in self.request_series[chunk_start..chunk_end]
+            .iter()
+            .enumerate()
         {
             debug_assert!(
                 !series_refs.is_empty(),
@@ -479,13 +487,16 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
             );
             for sref in series_refs.iter() {
                 flat.push(*sref);
-                hint_to_series.push(series_off);
+                request_to_series.push(series_off);
             }
         }
         let window = self
             .effective_times
             .time_range_with_lookback(self.lookback_ms);
-        (SampleHint::new(Arc::from(flat), window), hint_to_series)
+        (
+            SamplesRequest::new(Arc::from(flat), window),
+            request_to_series,
+        )
     }
 
     fn start_chunk_load(&mut self, chunk_start: usize) -> State<'a>
@@ -494,17 +505,17 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
     {
         let chunk_end = (chunk_start + self.shape.series_chunk).min(self.total_series());
         let chunk_len = chunk_end - chunk_start;
-        let (hint, hint_to_series) = self.chunk_hint(chunk_start, chunk_end);
+        let (request, request_to_series) = self.chunk_request(chunk_start, chunk_end);
         let source = self.source.clone();
         let reservation = self.reservation.clone();
 
         let future = Box::pin(async move {
             let mut samples = ChunkSamples::new(reservation, chunk_len);
-            let stream = source.samples(hint);
+            let stream = source.samples(request);
             let mut stream: SampleStream<'_> = Box::pin(stream);
             while let Some(item) = stream.next().await {
                 let batch = item?;
-                samples.absorb(batch, &hint_to_series)?;
+                samples.absorb(batch, &request_to_series)?;
             }
             // Silence "unused variable" when chunk_start isn't read
             // by absorb — it's threaded into the state machine as an
@@ -714,14 +725,14 @@ mod tests {
     use std::time::Duration;
 
     use crate::model::{Label, Labels, STALE_NAN};
-    use crate::promql::v2::source::{CardinalityEstimate, ResolvedSeriesChunk, SampleBlock};
+    use crate::promql::v2::source::{ResolvedSeriesChunk, SampleBlock};
 
     // ---- mock source ----------------------------------------------------
 
     /// In-memory [`SeriesSource`] stub backed by per-series sample vectors.
     /// Bucket/series bookkeeping is deliberately trivial — the operator
     /// doesn't care about bucket IDs, it just threads them back from the
-    /// hint. All test series share `bucket_id = 1`.
+    /// request. All test series share `bucket_id = 1`.
     struct MockSource {
         /// Indexed by `series_id` (equal to the series' position in the
         /// roster). Each column is `(timestamps, values)`.
@@ -746,33 +757,26 @@ mod tests {
             stream::empty()
         }
 
-        fn estimate_cardinality(
-            &self,
-            _selector: &VectorSelector,
-            _time_range: TimeRange,
-        ) -> impl Future<Output = Result<CardinalityEstimate, QueryError>> + Send {
-            ready(Ok(CardinalityEstimate::exact(self.data.len() as u64)))
-        }
-
         fn samples(
             &self,
-            hint: SampleHint,
+            request: SamplesRequest,
         ) -> impl Stream<Item = Result<SampleBatch, QueryError>> + Send {
-            let mut block = SampleBlock::with_series_count(hint.series.len());
-            for (col_idx, sref) in hint.series.iter().enumerate() {
+            let mut block = SampleBlock::with_series_count(request.series.len());
+            for (col_idx, sref) in request.series.iter().enumerate() {
                 let col = &self.data[sref.series_id as usize];
                 // Honour the inclusive-exclusive time_range. The source
                 // contract says samples in `[start, end)` are returned
                 // in timestamp order.
                 for (t, v) in col.0.iter().zip(col.1.iter()) {
-                    if *t >= hint.time_range.start_ms && *t < hint.time_range.end_ms_exclusive {
+                    if *t >= request.time_range.start_ms && *t < request.time_range.end_ms_exclusive
+                    {
                         block.timestamps[col_idx].push(*t);
                         block.values[col_idx].push(*v);
                     }
                 }
             }
             stream::once(ready(Ok(SampleBatch {
-                series_range: 0..hint.series.len(),
+                series_range: 0..request.series.len(),
                 samples: block,
             })))
         }
@@ -799,7 +803,7 @@ mod tests {
         Arc::new(SeriesSchema::new(Arc::from(labels), Arc::from(fps)))
     }
 
-    fn mk_hint_series(n: usize) -> Arc<[Arc<[ResolvedSeriesRef]>]> {
+    fn mk_request_series(n: usize) -> Arc<[Arc<[ResolvedSeriesRef]>]> {
         Arc::from(
             (0..n)
                 .map(|i| {
@@ -858,11 +862,11 @@ mod tests {
     ) -> VectorSelectorOp<'static, MockSource> {
         let n = source.data.len();
         let schema = mk_schema(n);
-        let hint = mk_hint_series(n);
+        let request = mk_request_series(n);
         VectorSelectorOp::new(
             Arc::new(source),
             schema,
-            hint,
+            request,
             grid,
             at,
             offset,
@@ -938,7 +942,7 @@ mod tests {
             (vec![20], vec![2.0]),
         ]));
         let schema = mk_schema(1);
-        let hint_series: Arc<[Arc<[ResolvedSeriesRef]>]> = Arc::from(vec![Arc::from(vec![
+        let request_series: Arc<[Arc<[ResolvedSeriesRef]>]> = Arc::from(vec![Arc::from(vec![
             ResolvedSeriesRef::new(1, 0),
             ResolvedSeriesRef::new(2, 1),
         ])]);
@@ -947,7 +951,7 @@ mod tests {
         let mut op = VectorSelectorOp::new(
             source,
             schema,
-            hint_series,
+            request_series,
             grid,
             None,
             None,

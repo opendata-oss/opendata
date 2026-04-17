@@ -6,9 +6,9 @@
 //!   route through [`MemoryReservation::try_grow`] before allocating and call
 //!   [`MemoryReservation::release`] when the buffer is dropped.
 //! - [`QueryError`]: v2-local error type carrying structured diagnostics for
-//!   memory-limit and cardinality-gate rejections. Kept isolated from the
-//!   crate-level [`crate::error::QueryError`] for phase 1; integration with
-//!   the outer error surface happens in the phase-5 wiring unit.
+//!   memory-limit rejections. Kept isolated from the crate-level
+//!   [`crate::error::QueryError`] for phase 1; integration with the outer
+//!   error surface happens in the phase-5 wiring unit.
 //!
 //! See RFC 0007 §"Execution Model" (subsection "Memory accounting") and
 //! §"Error Handling & Observability".
@@ -39,20 +39,6 @@ pub enum QueryError {
         /// Bytes already reserved at the moment of the failing call
         /// (does not include `requested`).
         already_reserved: usize,
-    },
-
-    /// The planner's cardinality gate rejected the query before allocation.
-    /// Populated by the phase-4 planner; defined here to keep the error type
-    /// stable across units.
-    #[error(
-        "query too large: estimated {estimated_cells} cells exceeds limit \
-         {cell_limit} (series × steps)"
-    )]
-    TooLarge {
-        /// `sum(series × steps)` across selectors.
-        estimated_cells: u64,
-        /// Configured limit the estimate exceeded.
-        cell_limit: u64,
     },
 
     /// Generic internal / storage-surface error. Used by the Phase 2
@@ -475,21 +461,5 @@ mod tests {
 
         // then
         assert_eq!(b.reserved(), 250);
-    }
-
-    #[test]
-    fn should_expose_too_large_variant() {
-        // given: phase-4 planner surface — defined here so the type is stable
-        let err = QueryError::TooLarge {
-            estimated_cells: 1_000_000,
-            cell_limit: 100_000,
-        };
-
-        // when
-        let msg = format!("{err}");
-
-        // then
-        assert!(msg.contains("1000000"));
-        assert!(msg.contains("100000"));
     }
 }

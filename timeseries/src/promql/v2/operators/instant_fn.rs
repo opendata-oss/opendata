@@ -1254,13 +1254,13 @@ mod tests {
     fn should_apply_abs_over_vector_selector_pipeline() {
         use crate::promql::v2::operators::vector_selector::{BatchShape, VectorSelectorOp};
         use crate::promql::v2::source::{
-            CardinalityEstimate, ResolvedSeriesChunk, ResolvedSeriesRef, SampleBatch, SampleBlock,
-            SampleHint, SeriesSource, TimeRange,
+            ResolvedSeriesChunk, ResolvedSeriesRef, SampleBatch, SampleBlock, SamplesRequest,
+            SeriesSource, TimeRange,
         };
         use futures::Stream;
         use futures::stream::{self};
         use promql_parser::parser::VectorSelector;
-        use std::future::{Future, ready};
+        use std::future::ready;
 
         /// Sync-on-poll mock copied from the 3a.1 tests — single-batch,
         /// honours `(start, end]` via TimeRange's `[start, end)`
@@ -1278,30 +1278,24 @@ mod tests {
                 stream::empty()
             }
 
-            fn estimate_cardinality(
-                &self,
-                _selector: &VectorSelector,
-                _time_range: TimeRange,
-            ) -> impl Future<Output = Result<CardinalityEstimate, QueryError>> + Send {
-                ready(Ok(CardinalityEstimate::exact(self.data.len() as u64)))
-            }
-
             fn samples(
                 &self,
-                hint: SampleHint,
+                request: SamplesRequest,
             ) -> impl Stream<Item = Result<SampleBatch, QueryError>> + Send {
-                let mut block = SampleBlock::with_series_count(hint.series.len());
-                for (col_idx, sref) in hint.series.iter().enumerate() {
+                let mut block = SampleBlock::with_series_count(request.series.len());
+                for (col_idx, sref) in request.series.iter().enumerate() {
                     let col = &self.data[sref.series_id as usize];
                     for (t, v) in col.0.iter().zip(col.1.iter()) {
-                        if *t >= hint.time_range.start_ms && *t < hint.time_range.end_ms_exclusive {
+                        if *t >= request.time_range.start_ms
+                            && *t < request.time_range.end_ms_exclusive
+                        {
                             block.timestamps[col_idx].push(*t);
                             block.values[col_idx].push(*v);
                         }
                     }
                 }
                 stream::once(ready(Ok(SampleBatch {
-                    series_range: 0..hint.series.len(),
+                    series_range: 0..request.series.len(),
                     samples: block,
                 })))
             }
@@ -1316,7 +1310,7 @@ mod tests {
             ],
         });
         let schema = mk_schema(2);
-        let hint_series: Arc<[Arc<[ResolvedSeriesRef]>]> = Arc::from(vec![
+        let request_series: Arc<[Arc<[ResolvedSeriesRef]>]> = Arc::from(vec![
             Arc::from(vec![ResolvedSeriesRef::new(1, 0)]),
             Arc::from(vec![ResolvedSeriesRef::new(1, 1)]),
         ]);
@@ -1330,7 +1324,7 @@ mod tests {
         let selector = VectorSelectorOp::new(
             source,
             schema,
-            hint_series,
+            request_series,
             grid,
             None,
             None,

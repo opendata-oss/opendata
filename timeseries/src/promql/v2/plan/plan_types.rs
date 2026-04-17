@@ -269,6 +269,44 @@ pub enum LogicalPlan {
     /// Inserted by the physical planner (unit 4.5) when operators disagree
     /// on the preferred axis; present here so the IR is complete across
     /// rewrites.
+    ///
+    /// # Design note: exchange-shaped variants in the logical plan
+    ///
+    /// `Rechunk`, `Concurrent`, and `Coalesce` are physical concerns —
+    /// tile shape, parallelism, fan-in. Most query engines (DataFusion,
+    /// Spark Catalyst, DuckDB, thanos-io/promql-engine) keep variants
+    /// like these out of the logical plan and introduce them only in
+    /// the physical plan, so the logical plan stays an executor-agnostic
+    /// semantic description.
+    ///
+    /// We deliberately keep them in `LogicalPlan` for now because it is
+    /// the only enum IR in the system. `PhysicalPlan` (unit 4.3) is not
+    /// a parallel IR — its `root` is `Box<dyn Operator>`, a compiled,
+    /// type-erased operator tree you can only `.next()` against. There
+    /// is no physical-side `match` target, no `PartialEq`, no rewrite
+    /// surface. Physical-shaped variants therefore have nowhere else to
+    /// live and end up here by default.
+    ///
+    /// The cost: fields like `target_step_chunk` are specific to this
+    /// engine's tile model, the `LogicalPlan` is no longer an
+    /// executor-agnostic semantic description, and optimizer rules must
+    /// treat these variants as structurally transparent (the way an
+    /// AST-level pass would look past `Paren`).
+    ///
+    /// **Revisit when adding scatter-gather across timeseries nodes.**
+    /// Distributed execution wants a `RemoteExec`-shaped variant at
+    /// shard boundaries, and at that point the natural fix is to
+    /// introduce a second enum IR — `PhysicalPlanNode` or similar —
+    /// sitting between `LogicalPlan` and the dyn-`Operator` tree. It
+    /// would hold `Rechunk` / `Concurrent` / `Coalesce` / `RemoteExec`
+    /// and whatever runtime artifacts (compiled group maps, match
+    /// tables, resolved schemas) the operators need, giving us a
+    /// rewrite surface for physical decisions (coalesce placement,
+    /// remote pushdown) that does not exist today. `LogicalPlan` stays
+    /// semantic-only; the dyn-`Operator` tree stays the final compiled
+    /// form. Three phases instead of two — the shape Catalyst,
+    /// DataFusion, and DuckDB all settle on once physical rewrites
+    /// become load-bearing.
     Rechunk {
         child: Box<LogicalPlan>,
         target_step_chunk: usize,

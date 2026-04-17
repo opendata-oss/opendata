@@ -12,7 +12,6 @@
 //! - [`lowering`]: the `promql_parser::Expr` → [`LogicalPlan`] translation plus
 //!   its plan-time [`LoweringContext`].
 
-pub mod cardinality;
 pub mod error;
 pub mod lowering;
 pub mod optimize;
@@ -20,8 +19,6 @@ pub mod parallelism;
 pub mod physical;
 pub mod plan_types;
 
-#[allow(unused_imports)]
-pub use cardinality::{CardinalityLimits, enforce_cardinality_gate};
 pub use error::PlanError;
 pub use lowering::{LoweringContext, lower};
 #[allow(unused_imports)]

@@ -12,13 +12,6 @@
 //!   timestamp order). Operators perform the cross-bucket merge — same
 //!   split as the existing `BucketSampleData → shape_matrix_results`
 //!   pipeline.
-//! - Cardinality estimate: per-bucket **upper bound from the inverted
-//!   index**. Intersects only the positive (AND) equality terms of the
-//!   selector; negative / empty-string / regex matchers are ignored so
-//!   the result is always `≥` the true post-resolve count. Flagged
-//!   `approx: true` whenever the selector carries anything beyond plain
-//!   equality. When the selector has no positive terms the adapter
-//!   returns `(0, u64::MAX)` and defers the real match to `resolve`.
 //! - Selector matcher logic is re-implemented in [`selector_util`] rather
 //!   than pulled from `promql::selector` (which ties to the evaluator's
 //!   `CachedQueryReader`). Matches the source file's positive/OR/negative
@@ -28,7 +21,6 @@
 //! module.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -39,10 +31,11 @@ use promql_parser::parser::VectorSelector;
 use crate::model::{Label, Labels, Sample, SeriesId, TimeBucket};
 use crate::query::QueryReader;
 
+use super::index_cache::V2IndexCache;
 use super::memory::QueryError;
 use super::source::{
-    CardinalityEstimate, ResolvedSeriesChunk, ResolvedSeriesRef, SampleBatch, SampleBlock,
-    SampleHint, SeriesSource, TimeRange,
+    ResolvedSeriesChunk, ResolvedSeriesRef, SampleBatch, SampleBlock, SamplesRequest, SeriesSource,
+    TimeRange,
 };
 
 // ---------------------------------------------------------------------------
@@ -118,12 +111,18 @@ fn bucket_overlaps(bucket: TimeBucket, time_range: TimeRange) -> bool {
 /// is cached by the reader itself; the benefit is no interior mutability.
 pub(crate) struct QueryReaderSource<R: QueryReader> {
     reader: Arc<R>,
+    index_cache: Arc<V2IndexCache>,
 }
 
 impl<R: QueryReader> QueryReaderSource<R> {
-    /// Build an adapter around an `Arc<R>`.
+    /// Build an adapter around an `Arc<R>`. A fresh query-scoped index
+    /// cache is created alongside the adapter; it lives as long as the
+    /// adapter itself and is not shared across queries.
     pub(crate) fn new(reader: Arc<R>) -> Self {
-        Self { reader }
+        Self {
+            reader,
+            index_cache: Arc::new(V2IndexCache::new()),
+        }
     }
 }
 
@@ -134,26 +133,17 @@ impl<R: QueryReader + 'static> SeriesSource for QueryReaderSource<R> {
         time_range: TimeRange,
     ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send {
         let reader = self.reader.clone();
+        let index_cache = self.index_cache.clone();
         let selector = selector.clone();
-        resolve_stream(reader, selector, time_range)
-    }
-
-    fn estimate_cardinality(
-        &self,
-        selector: &VectorSelector,
-        time_range: TimeRange,
-    ) -> impl Future<Output = Result<CardinalityEstimate, QueryError>> + Send {
-        let reader = self.reader.clone();
-        let selector = selector.clone();
-        estimate_cardinality_inner(reader, selector, time_range)
+        resolve_stream(reader, index_cache, selector, time_range)
     }
 
     fn samples(
         &self,
-        hint: SampleHint,
+        request: SamplesRequest,
     ) -> impl Stream<Item = Result<SampleBatch, QueryError>> + Send {
         let reader = self.reader.clone();
-        samples_stream(reader, hint)
+        samples_stream(reader, request)
     }
 }
 
@@ -168,10 +158,11 @@ impl<R: QueryReader + 'static> SeriesSource for QueryReaderSource<R> {
 /// layer can parallelise across buckets when the planner chooses.
 fn resolve_stream<R: QueryReader + 'static>(
     reader: Arc<R>,
+    index_cache: Arc<V2IndexCache>,
     selector: VectorSelector,
     time_range: TimeRange,
 ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send {
-    async_stream_resolve(reader, selector, time_range)
+    async_stream_resolve(reader, index_cache, selector, time_range)
 }
 
 /// `async fn`-returning-`impl Stream` via `stream::unfold`. One yielded
@@ -181,6 +172,7 @@ fn resolve_stream<R: QueryReader + 'static>(
 /// skipping keeps the stream tidy).
 fn async_stream_resolve<R: QueryReader + 'static>(
     reader: Arc<R>,
+    index_cache: Arc<V2IndexCache>,
     selector: VectorSelector,
     time_range: TimeRange,
 ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send {
@@ -200,7 +192,7 @@ fn async_stream_resolve<R: QueryReader + 'static>(
         filtered.sort_by_key(|b| b.start);
 
         for bucket in filtered {
-            match resolve_one_bucket(reader.as_ref(), bucket, &selector).await {
+            match resolve_one_bucket(reader.as_ref(), &index_cache, bucket, &selector).await {
                 Ok(Some(chunk)) => out.push(Ok(chunk)),
                 Ok(None) => {}
                 Err(e) => {
@@ -218,10 +210,11 @@ fn async_stream_resolve<R: QueryReader + 'static>(
 /// series match (the caller suppresses the empty chunk).
 async fn resolve_one_bucket<R: QueryReader + ?Sized>(
     reader: &R,
+    index_cache: &V2IndexCache,
     bucket: TimeBucket,
     selector: &VectorSelector,
 ) -> Result<Option<ResolvedSeriesChunk>, QueryError> {
-    let candidates = selector_util::find_candidates(reader, &bucket, selector).await?;
+    let candidates = selector_util::find_candidates(reader, index_cache, &bucket, selector).await?;
     if candidates.is_empty() {
         return Ok(None);
     }
@@ -230,8 +223,8 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
     let needs_filter = selector_util::has_negative_matchers(selector)
         || selector_util::has_empty_string_matchers(selector);
 
-    let forward = reader
-        .forward_index(&bucket, &candidates)
+    let forward = index_cache
+        .forward_index(reader, &bucket, &candidates)
         .await
         .map_err(|e| internal_err(e.to_string()))?;
 
@@ -270,84 +263,22 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
 }
 
 // ---------------------------------------------------------------------------
-// estimate_cardinality()
-// ---------------------------------------------------------------------------
-
-/// Sum a cheap upper bound across overlapping buckets.
-///
-/// Strategy: for each bucket, intersect the selector's positive equality
-/// terms (metric name + `Label=value` matchers) on the inverted index
-/// and take the resulting bitmap's cardinality. This does **not** apply
-/// regex / negative / empty-string filters — the result is an upper
-/// bound. Flagged `approx: true` whenever the selector uses anything
-/// beyond plain equality (in which case the resolver may shrink the set),
-/// or when the selector has no positive terms at all (in which case we
-/// cannot even guess a tight bound without resolving).
-async fn estimate_cardinality_inner<R: QueryReader + 'static>(
-    reader: Arc<R>,
-    selector: VectorSelector,
-    time_range: TimeRange,
-) -> Result<CardinalityEstimate, QueryError> {
-    let positive_terms = selector_util::positive_equality_terms(&selector);
-    let approx = selector_util::has_non_equality_matchers(&selector);
-
-    if positive_terms.is_empty() {
-        // Cannot derive a cheap bound — planner should treat this as
-        // "unknown upper, must resolve". See §5 Decisions Log 2.2.
-        return Ok(CardinalityEstimate {
-            series_lower_bound: 0,
-            series_upper_bound: u64::MAX,
-            approx: true,
-        });
-    }
-
-    let buckets = reader
-        .list_buckets()
-        .await
-        .map_err(|e| internal_err(e.to_string()))?;
-
-    let mut total: u64 = 0;
-    for bucket in buckets
-        .into_iter()
-        .filter(|b| bucket_overlaps(*b, time_range))
-    {
-        let inverted = reader
-            .inverted_index(&bucket, &positive_terms)
-            .await
-            .map_err(|e| internal_err(e.to_string()))?;
-        let count = inverted.intersect(positive_terms.clone()).len();
-        total = total.saturating_add(count);
-    }
-
-    // Lower bound: 0 when we may have overcounted with regex/negative
-    // filters, else the sum itself (plain-equality selector already
-    // matches what resolve() would return up to bucket dedup).
-    let lower = if approx { 0 } else { total };
-
-    Ok(CardinalityEstimate {
-        series_lower_bound: lower,
-        series_upper_bound: total,
-        approx,
-    })
-}
-
-// ---------------------------------------------------------------------------
 // samples()
 // ---------------------------------------------------------------------------
 
 /// Stream [`SampleBatch`]es for the post-resolution series set.
 ///
-/// Batch emission strategy: **per-bucket**. The hint's `series` slice is
+/// Batch emission strategy: **per-bucket**. The request's `series` slice is
 /// grouped by bucket (preserving the caller's series ordering), and one
 /// batch is emitted per contiguous same-bucket run. Series that span
 /// multiple buckets therefore produce one batch per bucket — operators
 /// own cross-bucket merging (same split as `shape_matrix_results`).
 fn samples_stream<R: QueryReader + 'static>(
     reader: Arc<R>,
-    hint: SampleHint,
+    request: SamplesRequest,
 ) -> impl Stream<Item = Result<SampleBatch, QueryError>> + Send {
     stream::once(async move {
-        match build_sample_batches(reader.as_ref(), &hint).await {
+        match build_sample_batches(reader.as_ref(), &request).await {
             Ok(batches) => batches.into_iter().map(Ok).collect::<Vec<_>>(),
             Err(e) => vec![Err(e)],
         }
@@ -355,28 +286,28 @@ fn samples_stream<R: QueryReader + 'static>(
     .flat_map(stream::iter)
 }
 
-/// Build the full list of per-bucket [`SampleBatch`]es for a hint.
+/// Build the full list of per-bucket [`SampleBatch`]es for a request.
 ///
 /// Broken out as an async fn (not a generator) so it's straightforward to
 /// unit-test future extensions. The function:
-/// 1. Walks the hint's series slice to identify contiguous same-bucket
+/// 1. Walks the request's series slice to identify contiguous same-bucket
 ///    runs — each run becomes one batch covering a
-///    `series_range` into `hint.series`.
+///    `series_range` into `request.series`.
 /// 2. For each bucket that appears in a run, loads the forward index
 ///    once to resolve `series_id → metric_name`.
-/// 3. Calls `QueryReader::samples` per series with the hint's time
+/// 3. Calls `QueryReader::samples` per series with the request's time
 ///    range and pushes the columnar data into the batch's `SampleBlock`.
 async fn build_sample_batches<R: QueryReader + ?Sized>(
     reader: &R,
-    hint: &SampleHint,
+    request: &SamplesRequest,
 ) -> Result<Vec<SampleBatch>, QueryError> {
-    if hint.series.is_empty() || hint.time_range.is_empty() {
+    if request.series.is_empty() || request.time_range.is_empty() {
         return Ok(Vec::new());
     }
 
     // Group contiguous same-bucket series into runs, preserving the
     // caller's order inside each run.
-    let runs = contiguous_bucket_runs(&hint.series);
+    let runs = contiguous_bucket_runs(&request.series);
 
     // Pre-load forward index per distinct bucket (for metric_name).
     let mut per_bucket_forward: HashMap<
@@ -391,7 +322,7 @@ async fn build_sample_batches<R: QueryReader + ?Sized>(
             .ok_or_else(|| internal_err(format!("invalid bucket id: {}", run.bucket_id)))?;
         // Collect unique SeriesIds touched inside this bucket across
         // all runs (typically one run per bucket, but be correct).
-        let mut ids: Vec<SeriesId> = hint
+        let mut ids: Vec<SeriesId> = request
             .series
             .iter()
             .filter(|r| r.bucket_id == run.bucket_id)
@@ -427,10 +358,10 @@ async fn build_sample_batches<R: QueryReader + ?Sized>(
         // `start_ms = time_range.start_ms - 1` and
         // `end_ms = time_range.end_ms_exclusive - 1`. See §5 Decisions
         // Log 2.2 for this quirk.
-        let start_ms = hint.time_range.start_ms.saturating_sub(1);
-        let end_ms = hint.time_range.end_ms_exclusive.saturating_sub(1);
+        let start_ms = request.time_range.start_ms.saturating_sub(1);
+        let end_ms = request.time_range.end_ms_exclusive.saturating_sub(1);
 
-        for (col_idx, series_ref) in hint.series[run.range.clone()].iter().enumerate() {
+        for (col_idx, series_ref) in request.series[run.range.clone()].iter().enumerate() {
             let sid = series_ref.series_id as SeriesId;
             let spec = forward.get_spec(&sid).ok_or_else(|| {
                 internal_err(format!(
@@ -472,10 +403,10 @@ async fn build_sample_batches<R: QueryReader + ?Sized>(
     Ok(out)
 }
 
-/// A contiguous sub-slice of `hint.series` whose entries all share a
+/// A contiguous sub-slice of `request.series` whose entries all share a
 /// single bucket. Produced by [`contiguous_bucket_runs`] so that
 /// `series_range` in each emitted batch is a single `Range<usize>` that
-/// indexes directly into the caller's hint.
+/// indexes directly into the caller's request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BucketRun {
     bucket_id: u64,
@@ -485,7 +416,7 @@ struct BucketRun {
 /// Partition `series` into contiguous runs with the same `bucket_id`.
 ///
 /// Preserves the caller's ordering — crucial for the `SampleBatch`
-/// contract that `series_range` indexes into the caller-supplied hint.
+/// contract that `series_range` indexes into the caller-supplied request.
 fn contiguous_bucket_runs(series: &[ResolvedSeriesRef]) -> Vec<BucketRun> {
     if series.is_empty() {
         return Vec::new();
@@ -531,7 +462,8 @@ fn internal_err(msg: impl Into<String>) -> QueryError {
 
 mod selector_util {
     use super::{
-        Label, QueryError, QueryReader, SeriesId, TimeBucket, VectorSelector, internal_err,
+        Label, QueryError, QueryReader, SeriesId, TimeBucket, V2IndexCache, VectorSelector,
+        internal_err,
     };
     use crate::index::ForwardIndexLookup;
     use promql_parser::label::{METRIC_NAME, MatchOp};
@@ -583,35 +515,6 @@ mod selector_util {
         }
     }
 
-    /// Positive equality terms (metric name + `label="literal"`
-    /// matchers). Used as the upper-bound cheap estimator in
-    /// `estimate_cardinality`.
-    pub(super) fn positive_equality_terms(selector: &VectorSelector) -> Vec<Label> {
-        let mut terms = Vec::new();
-        if let Some(name) = &selector.name {
-            terms.push(Label {
-                name: METRIC_NAME.to_string(),
-                value: name.clone(),
-            });
-        }
-        for m in &selector.matchers.matchers {
-            if matches!(m.op, MatchOp::Equal) && !m.value.is_empty() {
-                terms.push(Label {
-                    name: m.name.clone(),
-                    value: m.value.clone(),
-                });
-            }
-        }
-        terms
-    }
-
-    pub(super) fn has_non_equality_matchers(selector: &VectorSelector) -> bool {
-        selector.matchers.matchers.iter().any(|m| {
-            matches!(m.op, MatchOp::Re(_) | MatchOp::NotEqual | MatchOp::NotRe(_))
-                || (matches!(m.op, MatchOp::Equal) && m.value.is_empty())
-        })
-    }
-
     pub(super) fn has_negative_matchers(selector: &VectorSelector) -> bool {
         selector
             .matchers
@@ -634,6 +537,7 @@ mod selector_util {
     /// `CachedQueryReader`).
     pub(super) async fn find_candidates<R: QueryReader + ?Sized>(
         reader: &R,
+        index_cache: &V2IndexCache,
         bucket: &TimeBucket,
         selector: &VectorSelector,
     ) -> Result<Vec<SeriesId>, QueryError> {
@@ -680,8 +584,8 @@ mod selector_util {
                     name: METRIC_NAME.to_string(),
                     value: name.clone(),
                 };
-                let inv = reader
-                    .inverted_index(bucket, std::slice::from_ref(&metric_term))
+                let inv = index_cache
+                    .inverted_index(reader, bucket, std::slice::from_ref(&metric_term))
                     .await
                     .map_err(|e| internal_err(e.to_string()))?;
                 let res: Vec<SeriesId> = inv.intersect(vec![metric_term]).iter().collect();
@@ -697,8 +601,8 @@ mod selector_util {
             .flat_map(|t| t.iter().cloned())
             .chain(and_terms.iter().cloned())
             .collect();
-        let inv = reader
-            .inverted_index(bucket, &all_terms)
+        let inv = index_cache
+            .inverted_index(reader, bucket, &all_terms)
             .await
             .map_err(|e| internal_err(e.to_string()))?;
 
@@ -875,7 +779,7 @@ mod tests {
 
     #[test]
     fn should_group_contiguous_bucket_runs_preserving_order() {
-        // given: a hint-series slice with three buckets in mixed order
+        // given: a request-series slice with three buckets in mixed order
         let series = vec![
             ResolvedSeriesRef::new(encode_bucket(TimeBucket { start: 0, size: 1 }), 1),
             ResolvedSeriesRef::new(encode_bucket(TimeBucket { start: 0, size: 1 }), 2),
@@ -948,7 +852,6 @@ mod tests {
 //     start / exclusive end translation over `QueryReader`'s `(start, end]`
 //     contract).
 //   - Cross-bucket stitching (per-bucket batches in chronological order).
-//   - Cardinality-estimate monotonicity + the `u64::MAX` sentinel case.
 //   - `selector_util` matcher parity with the shapes covered in
 //     `promql/selector.rs`: metric-only, equality, negation, regex OR,
 //     empty-string, AND-combination.
@@ -1099,13 +1002,13 @@ mod integration_tests {
         let chunks = collect_ok(src.resolve(&sel_metric("m"), TimeRange::new(0, 3_600_000))).await;
         assert_eq!(chunks.len(), 1);
         let series: Arc<[ResolvedSeriesRef]> = chunks[0].series.clone();
-        let batches = collect_ok(src.samples(SampleHint::new(
+        let batches = collect_ok(src.samples(SamplesRequest::new(
             series.clone(),
             TimeRange::new(0, 3_600_000),
         )))
         .await;
 
-        // then: each batch's series_range is a contiguous slice of the hint
+        // then: each batch's series_range is a contiguous slice of the request
         assert!(!batches.is_empty());
         let total: usize = batches.iter().map(|b| b.series_range.len()).sum();
         assert_eq!(total, series.len());
@@ -1136,8 +1039,8 @@ mod integration_tests {
 
         // when: resolve and fetch samples
         let chunks = collect_ok(src.resolve(&sel_metric("m"), TimeRange::new(0, 3_600_000))).await;
-        let hint = SampleHint::new(chunks[0].series.clone(), TimeRange::new(0, 3_600_000));
-        let batches = collect_ok(src.samples(hint)).await;
+        let request = SamplesRequest::new(chunks[0].series.clone(), TimeRange::new(0, 3_600_000));
+        let batches = collect_ok(src.samples(request)).await;
 
         // then: per-series timestamps are monotone non-decreasing, in
         // the order the backing store produced them — the adapter did
@@ -1165,8 +1068,8 @@ mod integration_tests {
 
         // when: resolve + fetch the full bucket window
         let chunks = collect_ok(src.resolve(&sel_metric("m"), TimeRange::new(0, 3_600_000))).await;
-        let hint = SampleHint::new(chunks[0].series.clone(), TimeRange::new(0, 3_600_000));
-        let batches = collect_ok(src.samples(hint)).await;
+        let request = SamplesRequest::new(chunks[0].series.clone(), TimeRange::new(0, 3_600_000));
+        let batches = collect_ok(src.samples(request)).await;
 
         // then: the stale bit pattern round-trips verbatim, not normalised
         // to NaN or dropped
@@ -1222,8 +1125,8 @@ mod integration_tests {
 
         // when: query window [1_000, 2_000)
         let chunks = collect_ok(src.resolve(&sel_metric("m"), TimeRange::new(0, 3_600_000))).await;
-        let hint = SampleHint::new(chunks[0].series.clone(), TimeRange::new(1_000, 2_000));
-        let batches = collect_ok(src.samples(hint)).await;
+        let request = SamplesRequest::new(chunks[0].series.clone(), TimeRange::new(1_000, 2_000));
+        let batches = collect_ok(src.samples(request)).await;
 
         // then: only the sample at 1_500 survives — 500 is before the
         // window and 2_500 is after
@@ -1241,8 +1144,8 @@ mod integration_tests {
 
         // when: request [1_000, 2_000)
         let chunks = collect_ok(src.resolve(&sel_metric("m"), TimeRange::new(0, 3_600_000))).await;
-        let hint = SampleHint::new(chunks[0].series.clone(), TimeRange::new(1_000, 2_000));
-        let batches = collect_ok(src.samples(hint)).await;
+        let request = SamplesRequest::new(chunks[0].series.clone(), TimeRange::new(1_000, 2_000));
+        let batches = collect_ok(src.samples(request)).await;
 
         // then: sample at 1_000 is included (inclusive start)
         let ts = &batches[0].samples.timestamps[0];
@@ -1257,8 +1160,8 @@ mod integration_tests {
 
         // when: request [1_000, 2_000) — note exclusive end
         let chunks = collect_ok(src.resolve(&sel_metric("m"), TimeRange::new(0, 3_600_000))).await;
-        let hint = SampleHint::new(chunks[0].series.clone(), TimeRange::new(1_000, 2_000));
-        let batches = collect_ok(src.samples(hint)).await;
+        let request = SamplesRequest::new(chunks[0].series.clone(), TimeRange::new(1_000, 2_000));
+        let batches = collect_ok(src.samples(request)).await;
 
         // then: the sample is NOT included
         let ts = &batches[0].samples.timestamps[0];
@@ -1274,8 +1177,8 @@ mod integration_tests {
 
         // when: request [1_000, 2_000)
         let chunks = collect_ok(src.resolve(&sel_metric("m"), TimeRange::new(0, 3_600_000))).await;
-        let hint = SampleHint::new(chunks[0].series.clone(), TimeRange::new(1_000, 2_000));
-        let batches = collect_ok(src.samples(hint)).await;
+        let request = SamplesRequest::new(chunks[0].series.clone(), TimeRange::new(1_000, 2_000));
+        let batches = collect_ok(src.samples(request)).await;
 
         // then: sanity pair with the excluded-end test above — 1_999 IS
         // included
@@ -1294,8 +1197,8 @@ mod integration_tests {
         let series = chunks[0].series.clone();
 
         // when: ask for samples over an empty window [1_500, 1_500)
-        let hint = SampleHint::new(series, TimeRange::new(1_500, 1_500));
-        let batches = collect_ok(src.samples(hint)).await;
+        let request = SamplesRequest::new(series, TimeRange::new(1_500, 1_500));
+        let batches = collect_ok(src.samples(request)).await;
 
         // then: the stream terminates immediately with no batches
         assert!(
@@ -1339,8 +1242,8 @@ mod integration_tests {
         for c in &chunks {
             merged.extend(c.series.iter().copied());
         }
-        let hint = SampleHint::new(Arc::from(merged), TimeRange::new(0, 7_200_000));
-        let batches = collect_ok(src.samples(hint)).await;
+        let request = SamplesRequest::new(Arc::from(merged), TimeRange::new(0, 7_200_000));
+        let batches = collect_ok(src.samples(request)).await;
 
         // then: one batch per bucket in the order the caller supplied the
         // runs (which was chronological after our merge)
@@ -1377,110 +1280,6 @@ mod integration_tests {
             ids
         );
         assert_eq!(chunks.len(), 2);
-    }
-
-    // ---------- Cardinality estimate ------------------------------------
-
-    #[tokio::test]
-    async fn should_return_monotone_upper_bound_for_estimate_cardinality() {
-        // given: three distinct series under one metric name
-        let mut b = MockMultiBucketQueryReaderBuilder::new();
-        for env in ["a", "b", "c"] {
-            b.add_sample(
-                h0(),
-                labels("m", &[("env", env)]),
-                MetricType::Gauge,
-                Sample::new(1_000, 1.0),
-            );
-        }
-        let src = source(b.build());
-
-        // when: ask for an estimate over the same selector that resolve
-        // will use
-        let tr = TimeRange::new(0, 3_600_000);
-        let est = src
-            .estimate_cardinality(&sel_metric("m"), tr)
-            .await
-            .expect("estimate_cardinality should succeed");
-        let resolved = collect_ok(src.resolve(&sel_metric("m"), tr)).await;
-        let final_count: u64 = resolved.iter().map(|c| c.series.len() as u64).sum();
-
-        // then: upper bound is ≥ the final resolved cardinality (the
-        // monotonicity RFC §"Execution Model" relies on for the gate)
-        assert!(
-            est.series_upper_bound >= final_count,
-            "upper bound {} < resolved {}",
-            est.series_upper_bound,
-            final_count
-        );
-        // No regex/negative/empty-string matchers → plain equality →
-        // not flagged approx, bounds collapse.
-        assert!(!est.approx);
-        assert_eq!(est.series_lower_bound, final_count);
-    }
-
-    #[tokio::test]
-    async fn should_return_u64_max_upper_bound_when_selector_has_no_positive_terms() {
-        // given: a selector with no metric name and only a regex OR
-        // matcher (no positive-equality term for the adapter to
-        // intersect on).
-        let selector = VectorSelector {
-            name: None,
-            matchers: Matchers {
-                matchers: vec![re_matcher("foo", ".*")],
-                or_matchers: vec![],
-            },
-            offset: None,
-            at: None,
-        };
-        let mut b = MockMultiBucketQueryReaderBuilder::new();
-        b.add_sample(
-            h0(),
-            labels("m", &[("foo", "bar")]),
-            MetricType::Gauge,
-            Sample::new(1_000, 1.0),
-        );
-        let src = source(b.build());
-
-        // when: ask for the estimate
-        let est = src
-            .estimate_cardinality(&selector, TimeRange::new(0, 3_600_000))
-            .await
-            .expect("estimate_cardinality should succeed");
-
-        // then: sentinel: upper = u64::MAX, lower = 0, approx
-        assert_eq!(est.series_upper_bound, u64::MAX);
-        assert_eq!(est.series_lower_bound, 0);
-        assert!(est.approx);
-    }
-
-    #[tokio::test]
-    async fn should_flag_approx_when_regex_or_negative_matchers_present() {
-        // given: a selector with a metric name AND a regex matcher
-        let selector = sel_with("m", vec![re_matcher("env", "prod|staging")]);
-        let mut b = MockMultiBucketQueryReaderBuilder::new();
-        b.add_sample(
-            h0(),
-            labels("m", &[("env", "prod")]),
-            MetricType::Gauge,
-            Sample::new(1_000, 1.0),
-        );
-        let src = source(b.build());
-
-        // when: estimate
-        let est = src
-            .estimate_cardinality(&selector, TimeRange::new(0, 3_600_000))
-            .await
-            .expect("estimate_cardinality should succeed");
-
-        // then: positive-equality path yields a finite upper bound, but
-        // the non-equality matcher forces `approx: true` and
-        // `series_lower_bound = 0` (since the regex / negative / empty
-        // filter may shrink the set further than positive-only counting
-        // suggests).
-        assert!(est.approx);
-        assert_eq!(est.series_lower_bound, 0);
-        assert!(est.series_upper_bound < u64::MAX);
     }
 
     // ---------- Selector-matcher parity --------------------------------

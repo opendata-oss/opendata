@@ -161,9 +161,9 @@ async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
 }
 
 /// Translate a v2 [`PlanError`](crate::promql::v2::plan::PlanError) into
-/// the crate-wide [`QueryError`]. `TooLarge` / parser-level issues map
-/// onto the v1 surface's existing variants so the HTTP handler does not
-/// need a v2-specific branch.
+/// the crate-wide [`QueryError`]. Parser-level issues map onto the v1
+/// surface's existing variants so the HTTP handler does not need a
+/// v2-specific branch.
 #[cfg(feature = "promql-v2")]
 fn plan_error_to_query_error(e: crate::promql::v2::plan::PlanError) -> QueryError {
     use crate::promql::v2::plan::PlanError;
@@ -173,8 +173,7 @@ fn plan_error_to_query_error(e: crate::promql::v2::plan::PlanError) -> QueryErro
         | PlanError::InvalidTopLevelString
         | PlanError::UnsupportedExpression(_)
         | PlanError::UnsupportedFeature(_) => QueryError::InvalidQuery(e.to_string()),
-        PlanError::TooLarge { .. }
-        | PlanError::MemoryLimit(_)
+        PlanError::MemoryLimit(_)
         | PlanError::SourceError(_)
         | PlanError::InvalidMatching(_)
         | PlanError::PhysicalPlanFailed(_) => QueryError::Execution(e.to_string()),
@@ -2483,44 +2482,6 @@ mod tests {
                 samples[0].value > 0.0 && samples[0].value < 10.0,
                 "rate should be plausible (>0 and <10), got {}",
                 samples[0].value
-            );
-        }
-
-        #[tokio::test]
-        async fn should_reject_query_exceeding_cardinality_limit() {
-            // given: a fixture with at least one matching series and a
-            // cardinality gate set impossibly low via the
-            // LoweringContext (not exposed through QueryOptions, so drive
-            // the plan pipeline directly).
-            let tsdb = create_tsdb_with_data().await;
-            let at_ms = 4_100_000i64;
-            let lookback = Duration::from_secs(300);
-            let ctx = crate::promql::v2::plan::LoweringContext::for_instant(
-                at_ms,
-                lookback.as_millis() as i64,
-            )
-            .with_cardinality_limits(
-                crate::promql::v2::plan::cardinality::CardinalityLimits::new(1),
-            );
-            let reader = tsdb.query_reader_for_ranges(&[(0, 10_000)]).await.unwrap();
-            let source = Arc::new(crate::promql::v2::source_adapter::QueryReaderSource::new(
-                Arc::new(reader),
-            ));
-            let reservation = crate::promql::v2::memory::MemoryReservation::new(1024 * 1024 * 1024);
-            let expr = promql_parser::parser::parse("http_requests").unwrap();
-            let plan = crate::promql::v2::plan::lower(&expr, &ctx).unwrap();
-
-            // when
-            let result =
-                crate::promql::v2::plan::build_physical_plan(plan, &source, reservation, &ctx)
-                    .await;
-
-            // then
-            let err = result.unwrap_err();
-            assert!(
-                matches!(err, crate::promql::v2::plan::PlanError::TooLarge { .. }),
-                "expected PlanError::TooLarge, got {:?}",
-                err
             );
         }
 

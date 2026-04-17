@@ -69,10 +69,6 @@ pub struct LoweringContext {
     pub step_ms: i64,
     /// PromQL lookback window in milliseconds.
     pub lookback_delta_ms: i64,
-    /// Limits consulted by the physical planner's fail-fast gates. Kept on
-    /// the lowering context so callers configure the whole plan pipeline
-    /// from a single struct; lowering itself ignores these fields.
-    pub cardinality_limits: super::cardinality::CardinalityLimits,
     /// Exchange-operator insertion knobs (unit 4.5). Consulted by the
     /// physical planner when wrapping I/O-bound leaves in `ConcurrentOp`.
     /// Lowering ignores this field.
@@ -87,7 +83,6 @@ impl LoweringContext {
             end_ms,
             step_ms,
             lookback_delta_ms,
-            cardinality_limits: super::cardinality::CardinalityLimits::default(),
             parallelism: super::parallelism::Parallelism::default(),
         }
     }
@@ -101,24 +96,12 @@ impl LoweringContext {
             end_ms: t_ms,
             step_ms: 1,
             lookback_delta_ms,
-            cardinality_limits: super::cardinality::CardinalityLimits::default(),
             parallelism: super::parallelism::Parallelism::default(),
         }
     }
 
-    /// Return a new context with the given cardinality limits. Chainable so
-    /// callers can keep construction compact:
-    /// `LoweringContext::new(...).with_cardinality_limits(limits)`.
-    pub fn with_cardinality_limits(
-        mut self,
-        limits: super::cardinality::CardinalityLimits,
-    ) -> Self {
-        self.cardinality_limits = limits;
-        self
-    }
-
     /// Return a new context with the given exchange-operator insertion
-    /// knobs. Chainable; mirrors [`Self::with_cardinality_limits`].
+    /// knobs. Chainable.
     pub fn with_parallelism(mut self, parallelism: super::parallelism::Parallelism) -> Self {
         self.parallelism = parallelism;
         self

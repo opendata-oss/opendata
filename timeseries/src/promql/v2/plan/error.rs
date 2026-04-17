@@ -80,21 +80,4 @@ pub enum PlanError {
     /// in without adding a new variant per case.
     #[error("physical plan binding failed: {0}")]
     PhysicalPlanFailed(String),
-
-    /// The planner's fail-fast cardinality gate rejected the query because
-    /// `sum(series × steps)` across selectors exceeded the configured
-    /// `max_series_x_steps` limit. Carries the gate-computed estimate and
-    /// the limit it exceeded so the wiring layer (phase 5) can translate
-    /// into [`crate::promql::v2::memory::QueryError::TooLarge`] without
-    /// re-parsing.
-    #[error(
-        "query too large: estimated {estimated_cells} cells exceeds limit \
-         {limit} (series × steps)"
-    )]
-    TooLarge {
-        /// `sum(series_estimate × step_count)` the gate computed.
-        estimated_cells: u64,
-        /// The configured `max_series_x_steps` limit.
-        limit: u64,
-    },
 }

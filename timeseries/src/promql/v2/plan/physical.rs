@@ -5,7 +5,7 @@
 //!
 //! - Leaves: calls [`SeriesSource::resolve`] to materialise the post-
 //!   resolution series roster (`Arc<SeriesSchema>` + parallel
-//!   `Arc<[ResolvedSeriesRef]>` hint slice) and wires them into the leaf
+//!   `Arc<[ResolvedSeriesRef]>` request slice) and wires them into the leaf
 //!   operator.
 //! - Intermediate nodes: pre-computes the plan-time artifacts operators
 //!   need at construction time — [`GroupMap`] for `Aggregate` /
@@ -16,7 +16,6 @@
 //!
 //! # Scope (unit 4.3 strict)
 //!
-//! - Does **not** perform cardinality gating — that is unit 4.4.
 //! - Does **not** insert `Concurrent` / `Coalesce` — that is unit 4.5.
 //! - Does **not** modify `LogicalPlan` / operators / `SeriesSource`.
 //!
@@ -159,17 +158,6 @@ where
     let root_is_scalar = plan.produces_scalar();
     let root_instant_vector_sort = root_instant_vector_sort(&plan);
 
-    // Fail-fast cardinality gate (unit 4.4 / RFC §"Execution Model").
-    // Runs before any `SeriesSource::resolve` so an oversized query never
-    // materialises sample state. No-op when limits are disabled.
-    super::cardinality::enforce_cardinality_gate(
-        &plan,
-        source.as_ref(),
-        grid.step_count,
-        ctx.cardinality_limits,
-    )
-    .await?;
-
     let mut stats = ExchangeStats::default();
     let root = build_node(
         plan,
@@ -259,7 +247,7 @@ fn map_construct_err(err: QueryError) -> PlanError {
 /// selectors we fold in the effective lookback (vector) or range (matrix)
 /// plus the `@`/offset modifiers so the source returns every sample an
 /// operator could consume. Conservative is fine — the source does not
-/// widen, and any extra samples land inside the hint's window.
+/// widen, and any extra samples land inside the request's window.
 fn selector_time_range(
     grid: StepGrid,
     lookback_ms: i64,
@@ -300,7 +288,7 @@ fn selector_time_range(
 
 struct ResolvedLeaf {
     schema: Arc<SeriesSchema>,
-    hint_series: Arc<[Arc<[ResolvedSeriesRef]>]>,
+    request_series: Arc<[Arc<[ResolvedSeriesRef]>]>,
 }
 
 /// Drain [`SeriesSource::resolve`] into a unique-per-labelset series roster
@@ -363,14 +351,14 @@ where
         Arc::from(labels),
         Arc::from(fingerprints),
     ));
-    let hint_series: Arc<[Arc<[ResolvedSeriesRef]>]> = Arc::from(
+    let request_series: Arc<[Arc<[ResolvedSeriesRef]>]> = Arc::from(
         refs.into_iter()
             .map(Arc::<[ResolvedSeriesRef]>::from)
             .collect::<Vec<_>>(),
     );
     Ok(ResolvedLeaf {
         schema,
-        hint_series,
+        request_series,
     })
 }
 
@@ -818,7 +806,7 @@ where
             let op = VectorSelectorOp::<'static, S>::new(
                 source.clone(),
                 resolved.schema,
-                resolved.hint_series,
+                resolved.request_series,
                 grid,
                 at_parser,
                 Some(off_parser),
@@ -882,7 +870,7 @@ where
                     let matrix = MatrixSelectorOp::<'static, S>::new(
                         source.clone(),
                         resolved.schema.clone(),
-                        resolved.hint_series,
+                        resolved.request_series,
                         grid,
                         at_parser,
                         Some(off_parser),
@@ -1442,12 +1430,11 @@ mod tests {
     use futures::stream;
     use promql_parser::label::{MatchOp, Matcher, Matchers};
     use promql_parser::parser as pparser;
-    use std::future::ready;
     use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 
     use crate::model::{Label, Labels};
     use crate::promql::v2::source::{
-        CardinalityEstimate, ResolvedSeriesChunk, SampleBatch, SampleBlock, SampleHint,
+        ResolvedSeriesChunk, SampleBatch, SampleBlock, SamplesRequest,
     };
 
     // ---- mock source -----------------------------------------------------
@@ -1499,31 +1486,23 @@ mod tests {
             stream::iter(vec![Ok(chunk)]).right_stream()
         }
 
-        fn estimate_cardinality(
-            &self,
-            _selector: &pparser::VectorSelector,
-            _time_range: TimeRange,
-        ) -> impl std::future::Future<Output = Result<CardinalityEstimate, QueryError>> + Send
-        {
-            ready(Ok(CardinalityEstimate::exact(self.series.len() as u64)))
-        }
-
         fn samples(
             &self,
-            hint: SampleHint,
+            request: SamplesRequest,
         ) -> impl futures::Stream<Item = Result<SampleBatch, QueryError>> + Send {
-            let mut block = SampleBlock::with_series_count(hint.series.len());
-            for (col, sref) in hint.series.iter().enumerate() {
+            let mut block = SampleBlock::with_series_count(request.series.len());
+            for (col, sref) in request.series.iter().enumerate() {
                 let samples = &self.series[sref.series_id as usize].1;
                 for (t, v) in samples {
-                    if *t >= hint.time_range.start_ms && *t < hint.time_range.end_ms_exclusive {
+                    if *t >= request.time_range.start_ms && *t < request.time_range.end_ms_exclusive
+                    {
                         block.timestamps[col].push(*t);
                         block.values[col].push(*v);
                     }
                 }
             }
             stream::iter(vec![Ok(SampleBatch {
-                series_range: 0..hint.series.len(),
+                series_range: 0..request.series.len(),
                 samples: block,
             })])
         }
@@ -1548,27 +1527,13 @@ mod tests {
             stream::iter(self.chunks.clone().into_iter().map(Ok))
         }
 
-        fn estimate_cardinality(
-            &self,
-            _selector: &pparser::VectorSelector,
-            _time_range: TimeRange,
-        ) -> impl std::future::Future<Output = Result<CardinalityEstimate, QueryError>> + Send
-        {
-            let total = self
-                .chunks
-                .iter()
-                .map(|chunk| chunk.series.len() as u64)
-                .sum::<u64>();
-            ready(Ok(CardinalityEstimate::exact(total)))
-        }
-
         fn samples(
             &self,
-            hint: SampleHint,
+            request: SamplesRequest,
         ) -> impl futures::Stream<Item = Result<SampleBatch, QueryError>> + Send {
-            let block = SampleBlock::with_series_count(hint.series.len());
+            let block = SampleBlock::with_series_count(request.series.len());
             stream::iter(vec![Ok(SampleBatch {
-                series_range: 0..hint.series.len(),
+                series_range: 0..request.series.len(),
                 samples: block,
             })])
         }
@@ -1663,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn should_dedup_leaf_roster_by_fingerprint_and_group_bucket_hints() {
+    fn should_dedup_leaf_roster_by_fingerprint_and_group_bucket_requests() {
         // given: the same logical series appears in two bucket-scoped resolve
         // chunks, plus one distinct series in only the newer bucket.
         let source = Arc::new(ChunkedResolveSource::new(vec![
@@ -1700,7 +1665,7 @@ mod tests {
         // then: one logical roster row per unique labelset, but the `pod=a`
         // row keeps both bucket-local handles for sample loading.
         assert_eq!(resolved.schema.len(), 2);
-        assert_eq!(resolved.hint_series.len(), 2);
+        assert_eq!(resolved.request_series.len(), 2);
         assert_eq!(
             resolved.schema.labels(0),
             &labels_of(&[("__name__", "m"), ("pod", "a")])
@@ -1710,14 +1675,14 @@ mod tests {
             &labels_of(&[("__name__", "m"), ("pod", "b")])
         );
         assert_eq!(
-            resolved.hint_series[0].as_ref(),
+            resolved.request_series[0].as_ref(),
             &[
                 ResolvedSeriesRef::new(10, 7),
                 ResolvedSeriesRef::new(20, 11),
             ]
         );
         assert_eq!(
-            resolved.hint_series[1].as_ref(),
+            resolved.request_series[1].as_ref(),
             &[ResolvedSeriesRef::new(20, 12)]
         );
         assert_ne!(

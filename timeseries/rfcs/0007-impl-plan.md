@@ -114,10 +114,9 @@ behind a feature flag `promql-v2` (off by default) so nothing on `main` breaks.
 ### 3.3 Storage Implementor
 
 **Scope**: phase 2. Implements `SeriesSource` (RFC §"Storage Contract") as a thin adapter
-over the existing `QueryReader` trait. No PromQL semantics — pure range+series fetch and
-cardinality estimate.
+over the existing `QueryReader` trait. No PromQL semantics — pure range+series fetch.
 
-**Does**: define `SeriesSource`, `SampleHint`, `ResolvedSeriesChunk`, `CardinalityEstimate`;
+**Does**: define `SeriesSource`, `SamplesRequest`, `ResolvedSeriesChunk`;
 implement one adapter over the current `BucketQueryReader` fan-out; write integration tests
 that exercise the contract guarantees from the RFC.
 
@@ -146,7 +145,7 @@ memory-accounting contracts. Unit-test each operator against hand-built `StepBat
 **Does**: implement the logical-plan representation, the (minimal, rule-based) optimizer
 pass, and the physical planner that binds `SeriesSource`, pre-computes series schemas, builds
 group maps and binary-match tables, and inserts `Concurrent`/`Coalesce` where heuristics say
-so. Plan-time cardinality gate goes here (RFC §"Memory accounting").
+so.
 
 **Does not**: implement operators, change wire types, or touch existing HTTP wiring yet.
 
@@ -205,9 +204,9 @@ Phases run in order. Within a phase, units may be parallelizable — note in `de
 
 | # | Unit | Owner | Status | Deps | Artifacts | Blocker |
 |---|---|---|---|---|---|---|
-| 2.1 | Define `SeriesSource` trait + `SampleHint` + `CardinalityEstimate` | Storage Implementor | done | 1.5 | `timeseries/src/promql/v2/source.rs`, `timeseries/src/promql/v2/mod.rs` | |
+| 2.1 | Define `SeriesSource` trait + `SamplesRequest` | Storage Implementor | done | 1.5 | `timeseries/src/promql/v2/source.rs`, `timeseries/src/promql/v2/mod.rs` | |
 | 2.2 | Adapter impl over existing `QueryReader` (cross-bucket stitching inside) | Storage Implementor | done | 2.1 | `timeseries/src/promql/v2/source_adapter.rs`, `timeseries/src/promql/v2/mod.rs`, `timeseries/src/promql/v2/memory.rs` | |
-| 2.3 | Integration tests: resolve, estimate, sample-stream ordering, stale markers | Storage Implementor | done | 2.2 | `timeseries/src/promql/v2/source_adapter.rs` (new `#[cfg(test)] mod integration_tests`) | |
+| 2.3 | Integration tests: resolve, sample-stream ordering, stale markers | Storage Implementor | done | 2.2 | `timeseries/src/promql/v2/source_adapter.rs` (new `#[cfg(test)] mod integration_tests`) | |
 
 **Acceptance**: adapter serves the RFC's caller/source contract guarantees; tests cover
 cross-bucket series with staleness; no PromQL semantics leaked into the source.
@@ -238,11 +237,10 @@ respects `MemoryReservation`; schema contract is explicit (Static vs Deferred).
 | 4.1 | Logical plan representation + AST → logical lowering | Planner Implementor | done | 3c.* | `timeseries/src/promql/v2/plan/{mod,plan_types,error,lowering}.rs`, `timeseries/src/promql/v2/mod.rs` | |
 | 4.2 | Rule-based optimizer (constant fold, selector label pushdown, CSE if cheap) | Planner Implementor | done | 4.1 | `timeseries/src/promql/v2/plan/optimize.rs`, `timeseries/src/promql/v2/plan/mod.rs` | |
 | 4.3 | Physical planner: bind `SeriesSource`, resolve series schemas, build group maps | Planner Implementor | done | 4.1 | `timeseries/src/promql/v2/plan/physical.rs`, `timeseries/src/promql/v2/plan/mod.rs`, `timeseries/src/promql/v2/plan/error.rs`, `timeseries/src/promql/v2/mod.rs` | |
-| 4.4 | Plan-time cardinality gate (`estimate_cardinality` → `QueryError::TooLarge`) | Planner Implementor | done | 4.3 | `timeseries/src/promql/v2/plan/cardinality.rs`, `timeseries/src/promql/v2/plan/mod.rs`, `timeseries/src/promql/v2/plan/error.rs`, `timeseries/src/promql/v2/plan/lowering.rs`, `timeseries/src/promql/v2/plan/physical.rs` | |
+| 4.4 | Plan-time cardinality gate | Planner Implementor | removed 2026-04-17 (see §5.4) | 4.3 | — | |
 | 4.5 | Insertion of `Concurrent`/`Coalesce` based on series-count heuristics | Planner Implementor | done | 4.3 | `timeseries/src/promql/v2/plan/parallelism.rs`, `timeseries/src/promql/v2/plan/physical.rs`, `timeseries/src/promql/v2/plan/lowering.rs`, `timeseries/src/promql/v2/plan/mod.rs` | |
 
-**Acceptance**: small PromQL expressions produce expected plans in unit tests;
-cardinality-gate rejects oversized queries before resolve.
+**Acceptance**: small PromQL expressions produce expected plans in unit tests.
 
 ### Phase 5 — Wiring
 
@@ -263,11 +261,11 @@ return structurally-identical `QueryValue`s.
 | 6.2 | Triage and file each failure class in Decisions Log | Architect | done | 6.1 | §5 Decisions Log entries from 6.1 (triage table, critical-bug flags) | |
 | 6.3 | Re-run until green; no fixture edits | Architect | done | 6.2 | `timeseries/rfcs/0007-impl-plan.md` | All sub-units 6.3.1–6.3.8 landed; full `promqltest` corpus passes under `--features promql-v2`. |
 | 6.3.1 | Aggregate panic + leaf-roster dedup by unique `SeriesFingerprint` | Operator/Planner Implementor | done | 6.2 | `timeseries/src/promql/v2/plan/physical.rs`, `timeseries/src/promql/v2/operators/{aggregate,vector_selector,matrix_selector}.rs`, `timeseries/src/promql/v2/operators/instant_fn.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
-| 6.3.2 | Add nullary/scalar/calendar function surface (`scalar`, `vector`, `pi`, `time`, `minute`/calendar funcs) | Architect | done | 6.2 | `timeseries/src/promql/v2/{plan/{plan_types,lowering,optimize,cardinality,physical}.rs,operators/{coercion,instant_fn,mod}.rs,reshape.rs,mod.rs}`, `timeseries/src/tsdb.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
-| 6.3.3 | Add label-manipulation functions (`label_replace`, `label_join`) | Architect | done | 6.2 | `timeseries/src/promql/v2/{operators/{label_manip,mod}.rs,plan/{plan_types,lowering,optimize,cardinality,physical}.rs,mod.rs}`, `timeseries/src/tsdb.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
+| 6.3.2 | Add nullary/scalar/calendar function surface (`scalar`, `vector`, `pi`, `time`, `minute`/calendar funcs) | Architect | done | 6.2 | `timeseries/src/promql/v2/{plan/{plan_types,lowering,optimize,physical}.rs,operators/{coercion,instant_fn,mod}.rs,reshape.rs,mod.rs}`, `timeseries/src/tsdb.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
+| 6.3.3 | Add label-manipulation functions (`label_replace`, `label_join`) | Architect | done | 6.2 | `timeseries/src/promql/v2/{operators/{label_manip,mod}.rs,plan/{plan_types,lowering,optimize,physical}.rs,mod.rs}`, `timeseries/src/tsdb.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
 | 6.3.4 | Fix `VectorSelector` offset / `@` instant emission to one sample per series | Architect | done | 6.2 | `timeseries/rfcs/0007-impl-plan.md` (see §5 Decisions Log 6.3.4) — subsumed by 6.3.1's leaf-roster dedup; `offset.test` corpus passes clean. | |
 | 6.3.5 | Fix subquery inner-grid and `@` / offset semantics | Architect | done | 6.2 | `timeseries/src/promql/v2/operators/subquery.rs`, `timeseries/src/promql/v2/plan/physical.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
-| 6.3.6 | Small correctness cluster: topk tie-break, `by(__name__)`, `clamp(min>max)`, `topk(scalar(...), ...)`, binary `on()` schema | Architect | done | 6.2 | `timeseries/src/promql/v2/{operators/{aggregate,instant_fn}.rs,plan/{lowering,optimize,physical,cardinality}.rs,reshape.rs,plan/mod.rs,mod.rs}`, `timeseries/rfcs/0007-impl-plan.md` | |
+| 6.3.6 | Small correctness cluster: topk tie-break, `by(__name__)`, `clamp(min>max)`, `topk(scalar(...), ...)`, binary `on()` schema | Architect | done | 6.2 | `timeseries/src/promql/v2/{operators/{aggregate,instant_fn}.rs,plan/{lowering,optimize,physical}.rs,reshape.rs,plan/mod.rs,mod.rs}`, `timeseries/rfcs/0007-impl-plan.md` | |
 | 6.3.7 | Restore `timestamp()` source-sample semantics (StepBatch ABI extension) | Architect | done | 6.2 | `timeseries/src/promql/v2/batch.rs`, `timeseries/src/promql/v2/operators/{vector_selector,instant_fn}.rs`, `timeseries/src/promql/v2/reshape.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
 | 6.3.8 | Fix `MatrixSelectorOp` + `rate()` + `@` / `offset` window math (per-step effective-time threaded into `RollupOp`) | Architect | done | 6.2 | `timeseries/src/promql/v2/operators/{matrix_selector,subquery,rollup}.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
 | 6.3.9 | Stress-test every operator against `>series_chunk` (>512-series) inputs; fix any latent tile-boundary bugs surfaced | Operator Implementor | done | 6.3.8 | `timeseries/src/promql/v2/operators/{aggregate,binary,instant_fn,coercion,rechunk,concurrent,coalesce,label_manip,count_values,rollup}.rs`, `timeseries/src/tsdb.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
@@ -300,7 +298,7 @@ layouts) lives in git history — use `git log -- <path>` to retrieve it.
 
 - **Native histograms deferred.** `ColumnBlock` / `StepBatch` are float-only in
   v1. Adding histograms is a follow-up RFC.
-- **Storage contract is PromQL-unaware.** `SampleHint` carries only
+- **Storage contract is PromQL-unaware.** `SamplesRequest` carries only
   `{ series, time_range }`. Lookback / `@` / offset / step / func pushdown
   lives in operators, not in the source.
 - **`count_values` is the only deferred-schema escape hatch.** Every other
@@ -382,8 +380,13 @@ layouts) lives in git history — use `git log -- <path>` to retrieve it.
   add a `ReservedBytes` RAII guard tied to the resolved schema's bytes so
   `Drop` pairs the `try_grow` — no global-counter deltas, no interaction
   with concurrent operators. **Owner for next unit.**
-- **Hardcoded limits, no runtime config.** Cardinality gate = 20M series×steps;
-  memory cap = 1 GiB. Both require a rebuild to change. Phase 7 cleanup.
+- **Cardinality gate removed (2026-04-17).** v1 had no equivalent and
+  `MemoryReservation` (§1.4) catches mid-exec overruns. `SeriesSource` trait
+  returns to two methods (`resolve`, `samples`); `LoweringContext` drops
+  `cardinality_limits`; `plan/cardinality.rs` deleted. On object storage the
+  gate was doubling per-bucket index RTTs without real safety benefit.
+- **Hardcoded limits, no runtime config.** Memory cap = 1 GiB. Requires a
+  rebuild to change. Phase 7 cleanup.
 - **`timestamp()` with scalar child.** `InstantFnKind::Timestamp` falls back to
   step time when `source_timestamps` is absent. Nested `timestamp(timestamp(X))`
   returns step time for the outer call — matches Prometheus but worth a
@@ -413,8 +416,9 @@ lives in the git commits; use `git log --oneline --grep="RFC 0007"` to browse.
   214 tests total.
 - **Phase 4 — Planner** (`17f10f9`): IR (`plan_types.rs`), `lower` (4.1),
   `optimize` constant folding + matcher dedup (4.2), `build_physical_plan`
-  (4.3), `CardinalityLimits` preflight gate (4.4), `Parallelism` /
-  `ConcurrentOp` insertion (4.5). Phase 4 complete: 284 tests.
+  (4.3), `Parallelism` / `ConcurrentOp` insertion (4.5). Phase 4 complete:
+  284 tests. 4.4 `CardinalityLimits` preflight gate removed 2026-04-17 —
+  see §5.4.
 - **Phase 5 — Wiring** (`d5ef229`): `Tsdb::eval_query_v2` / `eval_query_range_v2`
   (5.1), HTTP dispatch in `server/http.rs` under `#[cfg(feature = "promql-v2")]`
   (5.2), `reshape_instant` / `reshape_range` polish (5.3). 1029 lib tests

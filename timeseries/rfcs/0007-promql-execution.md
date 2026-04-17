@@ -196,21 +196,16 @@ evaluator inside every storage backend. The source's job is bytes → samples.
 
 ```rust
 trait SeriesSource {
-    // Resolve selector → series metadata. Streamed per bucket. Includes a
-    // cardinality estimate up front so the planner can reject oversized
-    // queries before materializing sample state.
+    // Resolve selector → series metadata. Streamed per bucket.
     fn resolve(&self, selector: &VectorSelector, time_range: TimeRange)
         -> impl Stream<Item = Result<ResolvedSeriesChunk>>;
 
-    fn estimate_cardinality(&self, selector: &VectorSelector, time_range: TimeRange)
-        -> impl Future<Output = Result<CardinalityEstimate>>;
-
     // Stream raw samples for a resolved series set over an absolute time
     // range. No step, no lookback, no rollup. One series id → dense column.
-    fn samples(&self, hint: SampleHint) -> impl Stream<Item = Result<SampleBatch>>;
+    fn samples(&self, hint: SamplesRequest) -> impl Stream<Item = Result<SampleBatch>>;
 }
 
-struct SampleHint {
+struct SamplesRequest {
     series: Arc<[ResolvedSeriesRef]>,
     time_range: TimeRange,                // inclusive-exclusive, absolute ms
     // No step, lookback, @, offset, or func. Those are executor concerns.
@@ -268,12 +263,6 @@ allocating:
 - Group maps and binary-match tables computed at plan time from series labels.
 - Pipeline-breaker buffers (topk, quantile, `Rechunk`, `CountValues`).
 - Per-batch value/validity columns (the original scope).
-
-**Fail-fast cardinality gate.** Before materializing sample blocks, the planner calls
-`SeriesSource::estimate_cardinality()` for each selector. If `sum(resolved_series × steps)`
-exceeds a configurable threshold, the query rejects with `QueryError::TooLarge` before any
-heavy allocation. This catches the common "accidental high-cardinality match" case without
-waiting for the reservation to trip mid-execution.
 
 **Reservation enforcement.** All allocating calls go through
 `MemoryReservation::try_grow(bytes)`, returning `QueryError::MemoryLimit` on exceed. No
@@ -377,11 +366,8 @@ explicit concurrency semantics.
    support (including mixed float/histogram series) is a separate RFC that extends the batch ABI.
 4. **Cache key canonicalization.** What fingerprint for a plan subtree is cheap and stable across
    logically-equivalent expressions (e.g., `a+b` vs `b+a` under commutative ops)?
-5. **Cardinality estimate fidelity.** `SeriesSource::estimate_cardinality()` must be cheap
-   (sub-millisecond) to be worth calling before resolve. How tight does the bound need to be —
-   is per-bucket series-count summation enough, or do we need a matcher-aware estimate?
-6. **Spilling vs rejecting large queries.** v1 rejects on memory limit; is spill worth the
+5. **Spilling vs rejecting large queries.** v1 rejects on memory limit; is spill worth the
    complexity in v2?
-7. **Writer-side queryability.** Today `Tsdb` and `TimeSeriesDbReader` both implement
+6. **Writer-side queryability.** Today `Tsdb` and `TimeSeriesDbReader` both implement
    `TsdbReadEngine`. Does the new engine need both, or can we unify them behind
    `SeriesSource`?

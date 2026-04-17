@@ -16,6 +16,7 @@
 //! - [`source_adapter`]: adapter over the existing `QueryReader` (unit 2.2).
 
 pub(crate) mod batch;
+pub(crate) mod index_cache;
 pub(crate) mod memory;
 pub(crate) mod operator;
 pub(crate) mod operators;
@@ -65,8 +66,8 @@ pub(crate) use plan::{
 };
 #[allow(unused_imports)]
 pub(crate) use source::{
-    CardinalityEstimate, ResolvedSeriesChunk, ResolvedSeriesRef, SampleBatch, SampleBlock,
-    SampleHint, SeriesSource, TimeRange,
+    ResolvedSeriesChunk, ResolvedSeriesRef, SampleBatch, SampleBlock, SamplesRequest, SeriesSource,
+    TimeRange,
 };
 #[allow(unused_imports)]
 pub(crate) use source_adapter::QueryReaderSource;
