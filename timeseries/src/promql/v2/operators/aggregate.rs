@@ -1,0 +1,2067 @@
+//! `Aggregate` operator — units 3b.4 (streaming) and 3c.1 (breakers).
+//!
+//! Reduces an upstream [`Operator`]'s step batches by collapsing input
+//! series into output groups. The group map — the input-series-index →
+//! output-group-index lookup — is a **plan-time artifact** (RFC 0007
+//! §"Core Data Model" / §"Execution Model"): the planner builds it from
+//! the query's `by (labels)` / `without (labels)` modifiers and the
+//! input series schema, and hands it to the operator as a constructor
+//! argument. This operator performs no grouping at runtime.
+//!
+//! # Aggregations covered
+//!
+//! ## Streaming (3b.4)
+//!
+//! Single-pass per step with a per-group running accumulator — no
+//! buffering of full step or full series. Memory is
+//! `O(output_groups × accumulator)`.
+//!
+//! | kind     | reducer                                     | min-valid |
+//! |----------|---------------------------------------------|-----------|
+//! | `Sum`    | Kahan–Neumaier compensated sum              | 1         |
+//! | `Avg`    | compensated incremental mean (overflow-safe)| 1         |
+//! | `Min`    | NaN-safe min (first real initialises)       | 1         |
+//! | `Max`    | NaN-safe max (first real initialises)       | 1         |
+//! | `Count`  | integer count of valid input cells          | 1         |
+//! | `Stddev` | Welford single-pass, Kahan-compensated      | 1         |
+//! | `Stdvar` | Welford single-pass, Kahan-compensated      | 1         |
+//! | `Group`  | `1.0` iff any input contributed             | 1         |
+//!
+//! ## Breakers (3c.1) — `topk`, `bottomk`, `quantile`
+//!
+//! These buffer a whole step before emitting: you cannot decide whether
+//! a given `(step, series)` cell belongs in the top K until every input
+//! for that step has been seen. The breaker paths run inside the same
+//! [`AggregateOp`] — the variant on [`AggregateKind`] selects the code
+//! path — and share the same [`GroupMap`] shape as the streaming ops.
+//!
+//! | kind         | output schema     | per-step memory         |
+//! |--------------|-------------------|-------------------------|
+//! | `Topk(k)`    | **input** series  | `k × group_count` heap  |
+//! | `Bottomk(k)` | **input** series  | `k × group_count` heap  |
+//! | `Quantile(q)`| group series      | per-group sort buffer   |
+//!
+//! ### Output schema asymmetry (planner contract)
+//!
+//! `topk` / `bottomk` act as **filters**: they pick the K largest /
+//! smallest values per group per step and preserve the **input** series
+//! as output, flipping validity=0 for cells that didn't make the cut.
+//! `quantile` is a **reducer**: it emits one output cell per group per
+//! step, same shape as the streaming kinds.
+//!
+//! The planner decides the output schema and hands the correct one in
+//! to [`AggregateOp::new`] (see §5 Decisions Log 3c.1). The operator
+//! debug-asserts the schema size matches the variant's expectation:
+//!
+//! - streaming / `Quantile`: `output_schema.len() == group_count`
+//! - `Topk` / `Bottomk`: `output_schema.len() == input_series_count`
+//!
+//! ### Tie-break rule (topk / bottomk)
+//!
+//! Matches the existing engine (`evaluator.rs:649-693`
+//! `compare_k_values` + `KHeapEntry::cmp`): equal-valued cells are
+//! ordered by **lower input-series index wins** (deterministic,
+//! first-seen preference). NaN inputs rank "worst" — they are
+//! selected only when K ≥ (valid non-NaN count in group) and some
+//! NaN-bearing cells remain; matches legacy behavior.
+//!
+//! ### K semantics (topk / bottomk)
+//!
+//! K is an `i64`. Per `evaluator.rs:2249-2253` `coerce_k_size`:
+//! K < 1 ⇒ no cells selected. K ≥ group size ⇒ all valid inputs
+//! selected. The planner is expected to coerce the PromQL scalar
+//! parameter to `i64` at plan time.
+//!
+//! ### q semantics (quantile)
+//!
+//! Matches `rollup::rollup_fns::quantile` linear-interpolation rule
+//! (cited Prometheus `quantile_over_time`): `q < 0` ⇒ `-inf`, `q > 1`
+//! ⇒ `+inf`, `q == NaN` ⇒ `NaN`. Validity=1 for the group whenever
+//! at least one valid input contributed.
+//!
+//! # Group map semantics
+//!
+//! The constructor takes a [`GroupMap`] with an `input_to_group:
+//! Vec<Option<u32>>` of length equal to the input series count. Entry `i`
+//! is the output group index for input series `i`, or `None` to drop
+//! that input from all aggregations (edge case; the planner only emits
+//! `None` if it ever needs to exclude a series without trimming the
+//! input schema — see §5 Decisions Log for discussion).
+//!
+//! - `by ()` ⇒ all input series map to group 0, `group_count == 1`.
+//! - `without ()` ⇒ each input series gets its own group, `group_count
+//!   == input_series_count`.
+//! - The output [`SeriesSchema`] (`group_count` entries) is built by the
+//!   planner from the selected grouping labels and passed in via
+//!   [`AggregateOp::new`].
+//!
+//! # Validity rules
+//!
+//! - `Sum` / `Avg` / `Min` / `Max` / `Stddev` / `Stdvar` — output cell is
+//!   valid iff at least one valid input contributed to its group.
+//! - `Count` — output cell is valid iff at least one valid input
+//!   contributed (value is the count, always ≥ 1 in that case). A group
+//!   with zero valid inputs emits `validity = 0` (matches the existing
+//!   engine — `count()` over no samples drops the group, and within an
+//!   existing group with no valid cells the result is absent).
+//! - `Group` — output cell is valid iff at least one input contributed;
+//!   value is always `1.0`.
+//!
+//! # Memory accounting
+//!
+//! - **Scratch accumulators** — `group_count` per-step accumulators are
+//!   allocated once at operator construction; bytes are charged to the
+//!   reservation and released on `Drop`.
+//! - **Per-batch output** — `Vec<f64>` + `BitSet` for the output batch,
+//!   charged on each poll and transferred to the consumer via
+//!   [`StepBatch::new`]. The input batch's reservation belongs to the
+//!   child operator.
+//!
+//! # Schema contract
+//!
+//! [`SchemaRef::Static`] — the output schema is pre-computed by the
+//! planner.
+
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use super::super::batch::{BitSet, SchemaRef, SeriesSchema, StepBatch};
+use super::super::memory::{MemoryReservation, QueryError};
+use super::super::operator::{Operator, OperatorSchema};
+
+// ---------------------------------------------------------------------------
+// AggregateKind — function selection as data
+// ---------------------------------------------------------------------------
+
+/// Discriminant selecting the per-group reducer.
+///
+/// A `Copy` enum so dispatch is a single match per step. Streaming
+/// variants (3b.4) are single-pass per cell; breaker variants (3c.1:
+/// `Topk` / `Bottomk` / `Quantile`) buffer a whole step before emitting
+/// and dispatch to a separate code path inside [`AggregateOp`]. Keeping
+/// them all in one enum (vs. one-enum-per-operator) lets the planner
+/// lower every aggregation to a single `AggregateKind`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AggregateKind {
+    /// Kahan-compensated sum over valid input cells.
+    Sum,
+    /// Overflow-resistant running mean.
+    Avg,
+    /// NaN-safe minimum — NaN is ignored when a real value is available.
+    Min,
+    /// NaN-safe maximum — NaN is ignored when a real value is available.
+    Max,
+    /// Integer count of valid input cells, emitted as `f64`.
+    Count,
+    /// Population standard deviation (Welford single-pass).
+    Stddev,
+    /// Population variance (Welford single-pass).
+    Stdvar,
+    /// Always emits `1.0` when at least one input contributed.
+    Group,
+    /// `topk(k, v)` — select the K largest values per group per step.
+    ///
+    /// Output schema is the **input series** (see §"Breakers" in the
+    /// module docs). Cells not selected get `validity = 0`. `k < 1`
+    /// selects nothing. Matches the existing engine's
+    /// `select_k_from_group` with `KAggregationOrder::Top`.
+    Topk(i64),
+    /// `bottomk(k, v)` — smallest-K counterpart to [`Self::Topk`].
+    Bottomk(i64),
+    /// `quantile(q, v)` — per-group, per-step q-th quantile with linear
+    /// interpolation between ranks. Shares the streaming output-schema
+    /// shape (one cell per group). See [`rollup_fns::quantile`] in
+    /// `operators::rollup` for the canonical reducer; this operator
+    /// calls into the same implementation.
+    Quantile(f64),
+}
+
+impl AggregateKind {
+    /// True for variants that buffer the whole step before emitting
+    /// (pipeline breakers).
+    #[inline]
+    fn is_breaker(self) -> bool {
+        matches!(self, Self::Topk(_) | Self::Bottomk(_) | Self::Quantile(_))
+    }
+
+    /// True for variants whose output-series count equals the input
+    /// series count (filter-shaped). False for reducer-shaped variants
+    /// (output-series count == group_count).
+    #[inline]
+    fn output_is_inputs(self) -> bool {
+        matches!(self, Self::Topk(_) | Self::Bottomk(_))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GroupMap — the planner-built series-index → group-index mapping
+// ---------------------------------------------------------------------------
+
+/// Plan-time mapping from input series index to output group index.
+///
+/// Built by the planner from the input series' labels and the query's
+/// `by` / `without` modifier. The operator treats this as an opaque
+/// lookup — it does not interpret labels or recompute grouping at
+/// runtime (RFC §"Execution Model").
+///
+/// # Encoding choice
+///
+/// `input_to_group` uses `Vec<Option<u32>>` rather than a sentinel value
+/// (e.g. `u32::MAX`). Rationale: the `None` case is rare (the planner
+/// almost always emits `Some(_)` for every input; a `None` happens only
+/// when the planner explicitly wants to drop an input from the
+/// aggregation). `Option<u32>` makes the intent explicit at the cost of
+/// 4 bytes of padding per entry — negligible compared to the per-batch
+/// values/validity column this operator already pays for. See §5
+/// Decisions Log.
+///
+/// # Invariants (planner-guaranteed)
+///
+/// - `input_to_group.len()` equals the input operator's series count.
+/// - Every `Some(g)` value satisfies `g < group_count`.
+#[derive(Debug, Clone)]
+pub struct GroupMap {
+    /// For each input-series index, the output group index (or `None`
+    /// to drop from aggregation).
+    pub input_to_group: Vec<Option<u32>>,
+    /// Number of output groups. The output [`SeriesSchema`] has exactly
+    /// this many rows.
+    pub group_count: usize,
+}
+
+impl GroupMap {
+    /// Build a group map. Panics in debug if any `Some(g)` exceeds
+    /// `group_count` (planner contract).
+    pub fn new(input_to_group: Vec<Option<u32>>, group_count: usize) -> Self {
+        debug_assert!(input_to_group.iter().all(|slot| match slot {
+            Some(g) => (*g as usize) < group_count,
+            None => true,
+        }));
+        Self {
+            input_to_group,
+            group_count,
+        }
+    }
+
+    /// Number of input series this map covers.
+    #[inline]
+    pub fn input_series_count(&self) -> usize {
+        self.input_to_group.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-group accumulator
+// ---------------------------------------------------------------------------
+
+/// Single-pass accumulator for one group, used by every kind above.
+///
+/// Fields fall into three orthogonal lanes:
+/// - Sum/Avg: Kahan-compensated `sum` / `c`.
+/// - Min/Max: `extremum` tracks the running value; the `any_valid` flag
+///   distinguishes "no valid input yet" from "first valid was NaN".
+/// - Welford (Stddev/Stdvar): `mean` / `c_mean` / `m2` / `c_m2` /
+///   `count` evolve together on every update.
+///
+/// All fields are always updated regardless of kind (the update cost is
+/// trivially overlapped with the per-cell work). The reducer reads only
+/// the lane it needs.
+#[derive(Debug, Clone, Copy)]
+struct Accumulator {
+    /// Count of valid inputs that contributed. Also the Welford `n`.
+    count: u64,
+    /// Kahan sum and its compensation term.
+    sum: f64,
+    c_sum: f64,
+    /// Min / max running extremum — `any_real` tracks whether we've
+    /// absorbed a non-NaN value. When `any_real == false` and
+    /// `count > 0`, every contribution so far has been NaN; the
+    /// extremum stays NaN and the output is NaN (Prometheus semantics).
+    min: f64,
+    max: f64,
+    /// True once at least one **non-NaN** valid value has been absorbed.
+    /// Used by Min/Max to decide "first real initialises".
+    any_real: bool,
+    /// Welford accumulators (Kahan-compensated on both mean and M2).
+    mean: f64,
+    c_mean: f64,
+    m2: f64,
+    c_m2: f64,
+}
+
+impl Accumulator {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            count: 0,
+            sum: 0.0,
+            c_sum: 0.0,
+            min: f64::NAN,
+            max: f64::NAN,
+            any_real: false,
+            mean: 0.0,
+            c_mean: 0.0,
+            m2: 0.0,
+            c_m2: 0.0,
+        }
+    }
+
+    #[inline]
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Absorb one valid input cell.
+    #[inline]
+    fn absorb(&mut self, v: f64) {
+        self.count = self.count.saturating_add(1);
+
+        // Kahan sum lane.
+        let (new_sum, new_c) = kahan_inc(v, self.sum, self.c_sum);
+        self.sum = new_sum;
+        self.c_sum = new_c;
+
+        // Min/Max lane — NaN-safe: first real value initialises, NaN
+        // inputs are ignored once any real value is present. When every
+        // contribution is NaN, `min`/`max` stay NaN.
+        if !v.is_nan() {
+            if !self.any_real {
+                self.min = v;
+                self.max = v;
+                self.any_real = true;
+            } else {
+                if v < self.min {
+                    self.min = v;
+                }
+                if v > self.max {
+                    self.max = v;
+                }
+            }
+        }
+
+        // Welford lane with Kahan compensation on both mean and M2.
+        let n = self.count as f64;
+        let delta = v - (self.mean + self.c_mean);
+        let (new_mean, new_c_mean) = kahan_inc(delta / n, self.mean, self.c_mean);
+        self.mean = new_mean;
+        self.c_mean = new_c_mean;
+        let new_delta = v - (self.mean + self.c_mean);
+        let (new_m2, new_c_m2) = kahan_inc(delta * new_delta, self.m2, self.c_m2);
+        self.m2 = new_m2;
+        self.c_m2 = new_c_m2;
+    }
+
+    #[inline]
+    fn sum_value(&self) -> f64 {
+        if self.sum.is_infinite() {
+            self.sum
+        } else {
+            self.sum + self.c_sum
+        }
+    }
+
+    #[inline]
+    fn avg_value(&self) -> f64 {
+        // Mean via Welford is numerically robust. For groups where the
+        // Kahan sum hasn't overflowed, sum/count and mean agree to
+        // within the compensation term; we emit the Welford mean for
+        // the overflow-resistance the task spec mandates.
+        self.mean + self.c_mean
+    }
+
+    #[inline]
+    fn variance_value(&self) -> f64 {
+        // Population variance: M2 / n.
+        let n = self.count as f64;
+        (self.m2 + self.c_m2) / n
+    }
+}
+
+/// Kahan–Neumaier compensated summation step. Matches the implementation
+/// in [`super::rollup`] bit-for-bit so sum / avg across streaming and
+/// range aggregates round identically.
+#[inline(never)]
+fn kahan_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
+    let t = sum + inc;
+    let new_c = if t.is_infinite() {
+        0.0
+    } else if sum.abs() >= inc.abs() {
+        c + ((sum - t) + inc)
+    } else {
+        c + ((inc - t) + sum)
+    };
+    (t, new_c)
+}
+
+// ---------------------------------------------------------------------------
+// Memory-accounted output buffers
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn out_bytes(cells: usize) -> usize {
+    let values = cells.saturating_mul(std::mem::size_of::<f64>());
+    let validity = cells
+        .div_ceil(64)
+        .saturating_mul(std::mem::size_of::<u64>());
+    values.saturating_add(validity)
+}
+
+#[inline]
+fn accum_bytes(group_count: usize) -> usize {
+    group_count.saturating_mul(std::mem::size_of::<Accumulator>())
+}
+
+/// Upper-bound bytes for the per-group min-heap scratch used by
+/// topk/bottomk. Each of the `group_count` groups holds at most `k`
+/// entries; when `k` exceeds the input series count the loop caps the
+/// actual length, but we reserve on the naïve product as a conservative
+/// upper bound. `k <= 0` ⇒ zero bytes (no selection happens).
+#[inline]
+fn heap_scratch_bytes(k: i64, group_count: usize, input_series: usize) -> usize {
+    if k <= 0 {
+        return 0;
+    }
+    let k = (k as usize).min(input_series);
+    group_count
+        .saturating_mul(k)
+        .saturating_mul(std::mem::size_of::<KHeapEntry>())
+}
+
+/// Upper-bound bytes for the per-group sort buffer used by `quantile`.
+/// Sum of per-group capacities is at most `input_series_count` (each
+/// input belongs to at most one group), so reserve `input_series ×
+/// sizeof(f64)` + the `Vec<Vec<f64>>` outer skeleton.
+#[inline]
+fn sort_scratch_bytes(group_count: usize, input_series: usize) -> usize {
+    let values = input_series.saturating_mul(std::mem::size_of::<f64>());
+    let outer = group_count.saturating_mul(std::mem::size_of::<Vec<f64>>());
+    values.saturating_add(outer)
+}
+
+// ---------------------------------------------------------------------------
+// Topk / Bottomk heap entry
+// ---------------------------------------------------------------------------
+//
+// Mirrors `evaluator.rs::KHeapEntry` (lines 664-694): a max-heap whose
+// ordering treats "greater" as "more likely to be evicted". For topk,
+// `SmallestFirst` = min-heap on value (so `peek()` is the smallest
+// currently-selected). For bottomk, `LargestFirst` = max-heap on value.
+// Ties break by **larger index first** so the lower index wins selection
+// (first-seen preference — matches legacy).
+
+#[derive(Clone, Copy, Debug)]
+enum KOrder {
+    /// For `topk`: peek() returns the smallest value in the K winners.
+    SmallestFirst,
+    /// For `bottomk`: peek() returns the largest value in the K winners.
+    LargestFirst,
+}
+
+/// NaN-aware comparison mirroring `evaluator.rs:652-662`.
+///
+/// Returns the [`Ordering`] used inside the `BinaryHeap`: `Greater`
+/// means "more evictable" (pops first). The heap's `peek()` therefore
+/// returns the worst currently-kept candidate, and a new candidate
+/// replaces it iff the new cmp vs peek is `Less` ("strictly better").
+///
+/// NaN always ranks "worse" than any real value — a NaN entry will be
+/// the first to be evicted when a real candidate arrives.
+///
+/// | order              | operation   | "worse" = more evictable |
+/// |--------------------|-------------|--------------------------|
+/// | `SmallestFirst`    | topk (keep K largest)  | smaller values  |
+/// | `LargestFirst`     | bottomk (keep K smallest) | larger values |
+#[inline]
+fn k_cmp(a: f64, b: f64, order: KOrder) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => match order {
+            // topk: smaller value ⇒ "worse" ⇒ ordered greater.
+            KOrder::SmallestFirst => b.partial_cmp(&a).unwrap_or(Ordering::Equal),
+            // bottomk: larger value ⇒ "worse" ⇒ ordered greater.
+            KOrder::LargestFirst => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+        },
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct KHeapEntry {
+    value: f64,
+    /// Input-series index (roster-wide). Used as a deterministic
+    /// tie-breaker and also as the output cell column for topk/bottomk.
+    series_idx: u32,
+    order: KOrder,
+}
+
+impl PartialEq for KHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.series_idx == other.series_idx && self.value.to_bits() == other.value.to_bits()
+    }
+}
+impl Eq for KHeapEntry {}
+impl PartialOrd for KHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for KHeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // `BinaryHeap` is a max-heap. "Greater" = more evictable.
+        // Equal values: larger index is more evictable so the smaller
+        // index stays in the winners (first-seen preference; matches
+        // `evaluator.rs:687-694`).
+        k_cmp(self.value, other.value, self.order)
+            .then_with(|| self.series_idx.cmp(&other.series_idx))
+    }
+}
+
+struct OutBuffers {
+    reservation: MemoryReservation,
+    bytes: usize,
+    values: Vec<f64>,
+    validity: BitSet,
+}
+
+impl OutBuffers {
+    fn allocate(reservation: &MemoryReservation, cells: usize) -> Result<Self, QueryError> {
+        let bytes = out_bytes(cells);
+        reservation.try_grow(bytes)?;
+        Ok(Self {
+            reservation: reservation.clone(),
+            bytes,
+            values: vec![0.0; cells],
+            validity: BitSet::with_len(cells),
+        })
+    }
+
+    fn finish(mut self) -> (Vec<f64>, BitSet) {
+        let values = std::mem::take(&mut self.values);
+        let validity = std::mem::replace(&mut self.validity, BitSet::with_len(0));
+        self.reservation.release(self.bytes);
+        self.bytes = 0;
+        (values, validity)
+    }
+}
+
+impl Drop for OutBuffers {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.reservation.release(self.bytes);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AggregateOp — the operator
+// ---------------------------------------------------------------------------
+
+/// Streaming aggregation operator.
+///
+/// See module docs for supported kinds, group-map semantics, validity
+/// rules, and memory accounting.
+pub struct AggregateOp<C: Operator> {
+    child: C,
+    kind: AggregateKind,
+    group_map: GroupMap,
+    output_schema: Arc<SeriesSchema>,
+    reservation: MemoryReservation,
+    schema: OperatorSchema,
+    /// Pre-allocated per-group accumulator scratch used by the streaming
+    /// kinds; reused across every step (reset between steps). Empty for
+    /// breaker kinds.
+    accums: Vec<Accumulator>,
+    /// Per-group min-heap scratch for `Topk`/`Bottomk`; one heap per
+    /// group, drained between steps. Empty for other kinds.
+    heaps: Vec<BinaryHeap<KHeapEntry>>,
+    /// Per-group sort buffer for `Quantile`; one Vec per group, drained
+    /// between steps. Empty for other kinds.
+    sort_bufs: Vec<Vec<f64>>,
+    /// Bytes reserved for the per-kind scratch (accums | heaps |
+    /// sort_bufs); released on `Drop`.
+    scratch_bytes: usize,
+    done: bool,
+    errored: bool,
+}
+
+impl<C: Operator> AggregateOp<C> {
+    /// Construct a streaming aggregate.
+    ///
+    /// * `child` — upstream operator.
+    /// * `kind` — plan-time-selected reducer.
+    /// * `group_map` — planner-built input-series → output-group
+    ///   mapping; `group_map.input_series_count()` must match the
+    ///   child's series count.
+    /// * `output_schema` — planner-built output series roster; must
+    ///   have `group_map.group_count` entries.
+    /// * `reservation` — per-query reservation; charged for the per-
+    ///   group scratch and every output batch.
+    pub fn new(
+        child: C,
+        kind: AggregateKind,
+        group_map: GroupMap,
+        output_schema: Arc<SeriesSchema>,
+        reservation: MemoryReservation,
+    ) -> Result<Self, QueryError> {
+        // Output schema shape depends on the variant. Planner is the
+        // authority (see module docs §"Breakers / output schema
+        // asymmetry"); these debug asserts catch planner bugs in tests.
+        if kind.output_is_inputs() {
+            debug_assert_eq!(
+                group_map.input_series_count(),
+                output_schema.len(),
+                "topk/bottomk output schema must equal input series count",
+            );
+        } else {
+            debug_assert_eq!(
+                group_map.group_count,
+                output_schema.len(),
+                "streaming / quantile output schema must equal group_count",
+            );
+        }
+
+        let grid = child.schema().step_grid;
+        let schema = OperatorSchema::new(SchemaRef::Static(output_schema.clone()), grid);
+
+        // Per-kind scratch allocation. Reserve up front for the hot
+        // path; release on `Drop`. Breakers skip the accumulator column
+        // entirely (cheaper than paying for unused lanes).
+        let (accums, heaps, sort_bufs, bytes) = match kind {
+            AggregateKind::Topk(k) | AggregateKind::Bottomk(k) => {
+                let bytes =
+                    heap_scratch_bytes(k, group_map.group_count, group_map.input_series_count());
+                reservation.try_grow(bytes)?;
+                // One heap per group — capacity is clamped to effective
+                // K (≤ input_series_count) to keep the allocation tight.
+                let cap = if k <= 0 {
+                    0
+                } else {
+                    (k as usize).min(group_map.input_series_count())
+                };
+                let heaps = (0..group_map.group_count)
+                    .map(|_| BinaryHeap::with_capacity(cap))
+                    .collect();
+                (Vec::new(), heaps, Vec::new(), bytes)
+            }
+            AggregateKind::Quantile(_) => {
+                let bytes =
+                    sort_scratch_bytes(group_map.group_count, group_map.input_series_count());
+                reservation.try_grow(bytes)?;
+                let sort_bufs: Vec<Vec<f64>> =
+                    (0..group_map.group_count).map(|_| Vec::new()).collect();
+                (Vec::new(), Vec::new(), sort_bufs, bytes)
+            }
+            _ => {
+                let bytes = accum_bytes(group_map.group_count);
+                reservation.try_grow(bytes)?;
+                let accums = vec![Accumulator::new(); group_map.group_count];
+                (accums, Vec::new(), Vec::new(), bytes)
+            }
+        };
+
+        Ok(Self {
+            child,
+            kind,
+            group_map,
+            output_schema,
+            reservation,
+            schema,
+            accums,
+            heaps,
+            sort_bufs,
+            scratch_bytes: bytes,
+            done: false,
+            errored: false,
+        })
+    }
+
+    fn reduce_batch(&mut self, input: &StepBatch) -> Result<StepBatch, QueryError> {
+        if self.kind.is_breaker() {
+            self.reduce_batch_breaker(input)
+        } else {
+            self.reduce_batch_streaming(input)
+        }
+    }
+
+    fn reduce_batch_streaming(&mut self, input: &StepBatch) -> Result<StepBatch, QueryError> {
+        let step_count = input.step_count();
+        let in_series_count = input.series_count();
+        let group_count = self.group_map.group_count;
+        let out_cells = step_count * group_count;
+
+        debug_assert_eq!(
+            in_series_count,
+            self.group_map.input_series_count(),
+            "child series count does not match group map",
+        );
+
+        let mut out = OutBuffers::allocate(&self.reservation, out_cells)?;
+
+        // Per step: reset accumulators, walk series, finalise.
+        for step_off in 0..step_count {
+            for slot in &mut self.accums {
+                slot.reset();
+            }
+            // Stride into input: row-major by step, so step `step_off`
+            // starts at `step_off * in_series_count`.
+            let step_base = step_off * in_series_count;
+            for in_series in 0..in_series_count {
+                let cell = step_base + in_series;
+                if !input.validity.get(cell) {
+                    continue;
+                }
+                let group = match self.group_map.input_to_group[in_series] {
+                    Some(g) => g as usize,
+                    None => continue,
+                };
+                let v = input.values[cell];
+                self.accums[group].absorb(v);
+            }
+            // Finalise every group for this step.
+            let out_base = step_off * group_count;
+            for (g, accum) in self.accums.iter().enumerate() {
+                if accum.count == 0 {
+                    continue;
+                }
+                let value = match self.kind {
+                    AggregateKind::Sum => accum.sum_value(),
+                    AggregateKind::Avg => accum.avg_value(),
+                    AggregateKind::Min => accum.min,
+                    AggregateKind::Max => accum.max,
+                    AggregateKind::Count => accum.count as f64,
+                    AggregateKind::Stddev => accum.variance_value().sqrt(),
+                    AggregateKind::Stdvar => accum.variance_value(),
+                    AggregateKind::Group => 1.0,
+                    // Unreachable: `reduce_batch` routes breakers away
+                    // before entering this path. Panic rather than
+                    // silently miscomputing — this is a planner bug.
+                    AggregateKind::Topk(_)
+                    | AggregateKind::Bottomk(_)
+                    | AggregateKind::Quantile(_) => {
+                        unreachable!("breaker kind routed to streaming reducer")
+                    }
+                };
+                let idx = out_base + g;
+                out.values[idx] = value;
+                out.validity.set(idx);
+            }
+        }
+
+        let (values, validity) = out.finish();
+        Ok(StepBatch::new(
+            input.step_timestamps.clone(),
+            input.step_range.clone(),
+            SchemaRef::Static(self.output_schema.clone()),
+            0..group_count,
+            values,
+            validity,
+        ))
+    }
+
+    /// Buffered per-step reduction for `Topk` / `Bottomk` / `Quantile`.
+    ///
+    /// Memory: the per-step scratch (heap or sort buffer) was reserved
+    /// up front in `new`. The per-batch output column is charged here
+    /// via `OutBuffers`.
+    fn reduce_batch_breaker(&mut self, input: &StepBatch) -> Result<StepBatch, QueryError> {
+        let step_count = input.step_count();
+        let in_series_count = input.series_count();
+
+        debug_assert_eq!(
+            in_series_count,
+            self.group_map.input_series_count(),
+            "child series count does not match group map",
+        );
+
+        match self.kind {
+            AggregateKind::Topk(k) => self.reduce_topk_or_bottomk(input, k, KOrder::SmallestFirst),
+            AggregateKind::Bottomk(k) => {
+                self.reduce_topk_or_bottomk(input, k, KOrder::LargestFirst)
+            }
+            AggregateKind::Quantile(q) => self.reduce_quantile(input, q),
+            _ => {
+                debug_assert!(false, "non-breaker kind routed to breaker reducer");
+                // Fall back to streaming path so we never produce bogus
+                // output if debug-asserts are off.
+                let _ = step_count;
+                self.reduce_batch_streaming(input)
+            }
+        }
+    }
+
+    /// `topk(k)` / `bottomk(k)` per-step selection.
+    ///
+    /// Output schema is the **input series** — cells not in the top-K
+    /// (bottom-K) of their group get `validity = 0`. Selected cells
+    /// carry the input value through unchanged.
+    fn reduce_topk_or_bottomk(
+        &mut self,
+        input: &StepBatch,
+        k: i64,
+        order: KOrder,
+    ) -> Result<StepBatch, QueryError> {
+        let step_count = input.step_count();
+        let in_series_count = input.series_count();
+        // Output column width equals input column width (filter-shape).
+        let out_cells = step_count * in_series_count;
+
+        let mut out = OutBuffers::allocate(&self.reservation, out_cells)?;
+
+        // K ≤ 0 ⇒ no cell is ever selected; every output cell has
+        // validity=0 (fresh `BitSet`). Matches
+        // `evaluator.rs::coerce_k_size` (`< 1 ⇒ 0`).
+        if k <= 0 {
+            let (values, validity) = out.finish();
+            return Ok(StepBatch::new(
+                input.step_timestamps.clone(),
+                input.step_range.clone(),
+                SchemaRef::Static(self.output_schema.clone()),
+                0..in_series_count,
+                values,
+                validity,
+            ));
+        }
+        let k_usize = k as usize;
+
+        for step_off in 0..step_count {
+            // Reset heaps for this step. `clear()` retains capacity.
+            for heap in &mut self.heaps {
+                heap.clear();
+            }
+
+            let step_base = step_off * in_series_count;
+            for in_series in 0..in_series_count {
+                let cell = step_base + in_series;
+                if !input.validity.get(cell) {
+                    continue;
+                }
+                let group = match self.group_map.input_to_group[in_series] {
+                    Some(g) => g as usize,
+                    None => continue,
+                };
+                let v = input.values[cell];
+                let entry = KHeapEntry {
+                    value: v,
+                    series_idx: in_series as u32,
+                    order,
+                };
+                let heap = &mut self.heaps[group];
+                if heap.len() < k_usize {
+                    heap.push(entry);
+                } else if let Some(worst) = heap.peek() {
+                    // Only displace when the candidate is strictly
+                    // better than the current worst (stable-ish —
+                    // equal values keep first-seen preference via the
+                    // index tie-break already baked into `KHeapEntry`).
+                    if entry.cmp(worst) == Ordering::Less {
+                        heap.pop();
+                        heap.push(entry);
+                    }
+                }
+            }
+
+            // Emit the survivors' cells with validity=1; all other
+            // cells for this step stay at validity=0.
+            let out_base = step_off * in_series_count;
+            for heap in &mut self.heaps {
+                for entry in heap.drain() {
+                    let idx = out_base + entry.series_idx as usize;
+                    out.values[idx] = entry.value;
+                    out.validity.set(idx);
+                }
+            }
+        }
+
+        let (values, validity) = out.finish();
+        Ok(StepBatch::new(
+            input.step_timestamps.clone(),
+            input.step_range.clone(),
+            SchemaRef::Static(self.output_schema.clone()),
+            0..in_series_count,
+            values,
+            validity,
+        ))
+    }
+
+    /// `quantile(q)` per-step reduction — one cell per group per step,
+    /// linear interpolation between ranks.
+    fn reduce_quantile(&mut self, input: &StepBatch, q: f64) -> Result<StepBatch, QueryError> {
+        let step_count = input.step_count();
+        let in_series_count = input.series_count();
+        let group_count = self.group_map.group_count;
+        let out_cells = step_count * group_count;
+
+        let mut out = OutBuffers::allocate(&self.reservation, out_cells)?;
+
+        for step_off in 0..step_count {
+            for buf in &mut self.sort_bufs {
+                buf.clear();
+            }
+
+            let step_base = step_off * in_series_count;
+            for in_series in 0..in_series_count {
+                let cell = step_base + in_series;
+                if !input.validity.get(cell) {
+                    continue;
+                }
+                let group = match self.group_map.input_to_group[in_series] {
+                    Some(g) => g as usize,
+                    None => continue,
+                };
+                self.sort_bufs[group].push(input.values[cell]);
+            }
+
+            let out_base = step_off * group_count;
+            for (g, buf) in self.sort_bufs.iter_mut().enumerate() {
+                if buf.is_empty() {
+                    continue;
+                }
+                let idx = out_base + g;
+                out.values[idx] = quantile_linear_interp(q, buf);
+                out.validity.set(idx);
+            }
+        }
+
+        let (values, validity) = out.finish();
+        Ok(StepBatch::new(
+            input.step_timestamps.clone(),
+            input.step_range.clone(),
+            SchemaRef::Static(self.output_schema.clone()),
+            0..group_count,
+            values,
+            validity,
+        ))
+    }
+}
+
+/// Linear-interpolation quantile matching
+/// `super::rollup::rollup_fns::quantile` (Prometheus
+/// `quantile_over_time`).
+///
+/// Sort is in-place on the caller's buffer to avoid a second
+/// allocation. Out-of-range `q` matches the rollup citation:
+/// `q < 0 ⇒ -inf`, `q > 1 ⇒ +inf`, `NaN ⇒ NaN`.
+fn quantile_linear_interp(q: f64, buf: &mut [f64]) -> f64 {
+    if buf.is_empty() {
+        return f64::NAN;
+    }
+    if q.is_nan() {
+        return f64::NAN;
+    }
+    if q < 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if q > 1.0 {
+        return f64::INFINITY;
+    }
+    buf.sort_by(|a, b| a.total_cmp(b));
+    let n = buf.len();
+    if n == 1 {
+        return buf[0];
+    }
+    let rank = q * (n - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    if lo == hi {
+        return buf[lo];
+    }
+    let weight = rank - lo as f64;
+    buf[lo] * (1.0 - weight) + buf[hi] * weight
+}
+
+impl<C: Operator> Operator for AggregateOp<C> {
+    fn schema(&self) -> &OperatorSchema {
+        &self.schema
+    }
+
+    fn next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<StepBatch, QueryError>>> {
+        if self.done || self.errored {
+            return Poll::Ready(None);
+        }
+        match self.child.next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                self.done = true;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(err))) => {
+                self.errored = true;
+                Poll::Ready(Some(Err(err)))
+            }
+            Poll::Ready(Some(Ok(input))) => match self.reduce_batch(&input) {
+                Ok(batch) => Poll::Ready(Some(Ok(batch))),
+                Err(err) => {
+                    self.errored = true;
+                    Poll::Ready(Some(Err(err)))
+                }
+            },
+        }
+    }
+}
+
+impl<C: Operator> Drop for AggregateOp<C> {
+    fn drop(&mut self) {
+        if self.scratch_bytes > 0 {
+            self.reservation.release(self.scratch_bytes);
+            self.scratch_bytes = 0;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Label, Labels};
+    use crate::promql::v2::batch::{SchemaRef, SeriesSchema};
+    use crate::promql::v2::operator::StepGrid;
+    use std::sync::Arc;
+    use std::task::{RawWaker, RawWakerVTable, Waker};
+
+    // ---- waker + mock child -------------------------------------------------
+
+    fn noop_waker() -> Waker {
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |_| RawWaker::new(std::ptr::null(), &VTABLE),
+            |_| {},
+            |_| {},
+            |_| {},
+        );
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    struct MockOp {
+        schema: OperatorSchema,
+        queue: Vec<Result<StepBatch, QueryError>>,
+    }
+
+    impl MockOp {
+        fn with_queue(
+            schema: Arc<SeriesSchema>,
+            grid: StepGrid,
+            queue: Vec<Result<StepBatch, QueryError>>,
+        ) -> Self {
+            Self {
+                schema: OperatorSchema::new(SchemaRef::Static(schema), grid),
+                queue,
+            }
+        }
+
+        fn new(schema: Arc<SeriesSchema>, grid: StepGrid, batches: Vec<StepBatch>) -> Self {
+            Self::with_queue(schema, grid, batches.into_iter().map(Ok).collect())
+        }
+    }
+
+    impl Operator for MockOp {
+        fn schema(&self) -> &OperatorSchema {
+            &self.schema
+        }
+        fn next(&mut self, _cx: &mut Context<'_>) -> Poll<Option<Result<StepBatch, QueryError>>> {
+            if self.queue.is_empty() {
+                Poll::Ready(None)
+            } else {
+                Poll::Ready(Some(self.queue.remove(0)))
+            }
+        }
+    }
+
+    // ---- fixtures -----------------------------------------------------------
+
+    fn mk_schema(prefix: &str, n: usize) -> Arc<SeriesSchema> {
+        let labels: Vec<Labels> = (0..n)
+            .map(|i| {
+                Labels::new(vec![
+                    Label {
+                        name: "__name__".to_string(),
+                        value: prefix.to_string(),
+                    },
+                    Label {
+                        name: "i".to_string(),
+                        value: i.to_string(),
+                    },
+                ])
+            })
+            .collect();
+        let fps: Vec<u128> = (0..n as u128).collect();
+        Arc::new(SeriesSchema::new(Arc::from(labels), Arc::from(fps)))
+    }
+
+    fn mk_grid(step_count: usize) -> StepGrid {
+        StepGrid {
+            start_ms: 0,
+            end_ms: 10 * (step_count.max(1) as i64 - 1),
+            step_ms: 10,
+            step_count,
+        }
+    }
+
+    fn mk_batch(
+        schema: Arc<SeriesSchema>,
+        step_count: usize,
+        series_count: usize,
+        values: Vec<f64>,
+        validity: Vec<bool>,
+    ) -> StepBatch {
+        assert_eq!(values.len(), step_count * series_count);
+        assert_eq!(validity.len(), step_count * series_count);
+        let ts: Arc<[i64]> =
+            Arc::from((0..step_count).map(|i| (i as i64) * 10).collect::<Vec<_>>());
+        let mut bits = BitSet::with_len(step_count * series_count);
+        for (i, &b) in validity.iter().enumerate() {
+            if b {
+                bits.set(i);
+            }
+        }
+        StepBatch::new(
+            ts,
+            0..step_count,
+            SchemaRef::Static(schema),
+            0..series_count,
+            values,
+            bits,
+        )
+    }
+
+    fn drive<C: Operator>(op: &mut AggregateOp<C>) -> Vec<Result<StepBatch, QueryError>> {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut out = Vec::new();
+        loop {
+            match op.next(&mut cx) {
+                Poll::Ready(None) => return out,
+                Poll::Ready(Some(r)) => out.push(r),
+                Poll::Pending => panic!("unexpected Pending from sync mock"),
+            }
+        }
+    }
+
+    fn approx_eq(a: f64, b: f64, eps: f64) -> bool {
+        if a.is_nan() && b.is_nan() {
+            return true;
+        }
+        if a.is_infinite() || b.is_infinite() {
+            return a == b;
+        }
+        (a - b).abs() <= eps * (1.0 + a.abs().max(b.abs()))
+    }
+
+    // ========================================================================
+    // required tests
+    // ========================================================================
+
+    #[test]
+    fn should_sum_across_grouped_series_per_step() {
+        // given: 4 input series, 2 steps, grouped 2+2 into 2 output groups.
+        //   step 0: values [1,2,3,4]  group 0 = s0+s1 = 3; group 1 = s2+s3 = 7
+        //   step 1: values [10,20,30,40] group 0 = 30; group 1 = 70
+        let in_schema = mk_schema("in", 4);
+        let out_schema = mk_schema("out", 2);
+        let grid = mk_grid(2);
+        let values = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+        let valid = vec![true; 8];
+        let batch = mk_batch(in_schema.clone(), 2, 4, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0), Some(0), Some(1), Some(1)], 2);
+
+        // when
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Sum,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .expect("operator constructs");
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then
+        assert_eq!(outs.len(), 1);
+        let b = &outs[0];
+        assert_eq!(b.step_count(), 2);
+        assert_eq!(b.series_count(), 2);
+        assert_eq!(b.get(0, 0), Some(3.0));
+        assert_eq!(b.get(0, 1), Some(7.0));
+        assert_eq!(b.get(1, 0), Some(30.0));
+        assert_eq!(b.get(1, 1), Some(70.0));
+    }
+
+    #[test]
+    fn should_compute_avg_ignoring_invalid_cells() {
+        // given: 3 input series in one group. Cell validity pattern:
+        //   step 0: [v,v,_]  values 2,4,99 → mean = (2+4)/2 = 3
+        //   step 1: [_,_,_]  validity all 0 → output absent
+        //   step 2: [v,v,v]  values 5,10,15 → mean = 10
+        let in_schema = mk_schema("in", 3);
+        let out_schema = mk_schema("out", 1);
+        let grid = mk_grid(3);
+        let values = vec![2.0, 4.0, 99.0, 0.0, 0.0, 0.0, 5.0, 10.0, 15.0];
+        let valid = vec![true, true, false, false, false, false, true, true, true];
+        let batch = mk_batch(in_schema.clone(), 3, 3, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0), Some(0), Some(0)], 1);
+
+        // when
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Avg,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then
+        let b = &outs[0];
+        assert!(approx_eq(b.get(0, 0).unwrap(), 3.0, 1e-12));
+        assert_eq!(b.get(1, 0), None);
+        assert!(approx_eq(b.get(2, 0).unwrap(), 10.0, 1e-12));
+    }
+
+    #[test]
+    fn should_compute_min_and_max_ignoring_nan() {
+        // given: 4 series, one group.
+        //   step 0: NaN, 5, 3, NaN → min=3, max=5
+        //   step 1: NaN, NaN, NaN, NaN → all NaN. The group still has
+        //       "count>0 valid contributions" because validity bits are
+        //       set; output min/max = NaN (Prometheus: preserves NaN when
+        //       nothing else is seen).
+        let in_schema = mk_schema("in", 4);
+        let out_schema = mk_schema("out", 1);
+        let grid = mk_grid(2);
+        let values = vec![
+            f64::NAN,
+            5.0,
+            3.0,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        ];
+        let valid = vec![true; 8];
+        let batch = mk_batch(in_schema.clone(), 2, 4, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 4], 1);
+
+        let mut op_min = AggregateOp::new(
+            child,
+            AggregateKind::Min,
+            gmap.clone(),
+            out_schema.clone(),
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op_min).into_iter().map(|r| r.unwrap()).collect();
+        let b = &outs[0];
+        assert_eq!(b.get(0, 0), Some(3.0));
+        // step 1 had all NaN contributions — output is NaN with validity=1
+        assert!(b.validity.get(b.cell_index(1, 0)));
+        assert!(b.values[b.cell_index(1, 0)].is_nan());
+
+        // max
+        let in_schema = mk_schema("in", 4);
+        let grid2 = mk_grid(2);
+        let values = vec![
+            f64::NAN,
+            5.0,
+            3.0,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        ];
+        let valid = vec![true; 8];
+        let batch2 = mk_batch(in_schema.clone(), 2, 4, values, valid);
+        let child2 = MockOp::new(in_schema, grid2, vec![batch2]);
+        let mut op_max = AggregateOp::new(
+            child2,
+            AggregateKind::Max,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op_max).into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(outs[0].get(0, 0), Some(5.0));
+    }
+
+    #[test]
+    fn should_count_valid_cells_per_group() {
+        // given: 3 series, 2 groups (s0,s1 → g0; s2 → g1), 2 steps
+        //   step 0: [v,v,v] → counts g0=2, g1=1
+        //   step 1: [_,v,_] → counts g0=1, g1 absent (validity=0)
+        let in_schema = mk_schema("in", 3);
+        let out_schema = mk_schema("out", 2);
+        let grid = mk_grid(2);
+        let values = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let valid = vec![true, true, true, false, true, false];
+        let batch = mk_batch(in_schema.clone(), 2, 3, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0), Some(0), Some(1)], 2);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Count,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+        let b = &outs[0];
+        assert_eq!(b.get(0, 0), Some(2.0));
+        assert_eq!(b.get(0, 1), Some(1.0));
+        assert_eq!(b.get(1, 0), Some(1.0));
+        assert_eq!(b.get(1, 1), None);
+    }
+
+    #[test]
+    fn should_compute_stddev_and_stdvar_with_welford() {
+        // given: 8 series, one group, values 2,4,4,4,5,5,7,9
+        //   population variance = 4, stddev = 2.
+        let in_schema = mk_schema("in", 8);
+        let out_schema = mk_schema("out", 1);
+        let grid = mk_grid(1);
+        let values = vec![2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
+        let valid = vec![true; 8];
+        let batch = mk_batch(in_schema.clone(), 1, 8, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 8], 1);
+
+        let mut op_var = AggregateOp::new(
+            child,
+            AggregateKind::Stdvar,
+            gmap.clone(),
+            out_schema.clone(),
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op_var).into_iter().map(|r| r.unwrap()).collect();
+        assert!(approx_eq(outs[0].get(0, 0).unwrap(), 4.0, 1e-12));
+
+        // and: stddev
+        let in_schema = mk_schema("in", 8);
+        let grid2 = mk_grid(1);
+        let values = vec![2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
+        let valid = vec![true; 8];
+        let batch = mk_batch(in_schema.clone(), 1, 8, values, valid);
+        let child2 = MockOp::new(in_schema, grid2, vec![batch]);
+        let mut op_stddev = AggregateOp::new(
+            child2,
+            AggregateKind::Stddev,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op_stddev)
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(approx_eq(outs[0].get(0, 0).unwrap(), 2.0, 1e-12));
+    }
+
+    #[test]
+    fn should_emit_group_one_when_any_input_contributed() {
+        // given: 3 series, 2 groups (s0→g0, s1,s2→g1). Step 0 valid only
+        // in s0 and s2 → g0 has 1 contribution, g1 has 1 contribution,
+        // both emit 1.0.
+        let in_schema = mk_schema("in", 3);
+        let out_schema = mk_schema("out", 2);
+        let grid = mk_grid(1);
+        let values = vec![42.0, 0.0, 7.0];
+        let valid = vec![true, false, true];
+        let batch = mk_batch(in_schema.clone(), 1, 3, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0), Some(1), Some(1)], 2);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Group,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(outs[0].get(0, 0), Some(1.0));
+        assert_eq!(outs[0].get(0, 1), Some(1.0));
+    }
+
+    #[test]
+    fn should_set_validity_zero_when_group_empty() {
+        // given: 2 series → 1 group; step has all inputs invalid.
+        let out_schema = mk_schema("out", 1);
+
+        for kind in [
+            AggregateKind::Sum,
+            AggregateKind::Avg,
+            AggregateKind::Min,
+            AggregateKind::Max,
+            AggregateKind::Count,
+            AggregateKind::Stddev,
+            AggregateKind::Stdvar,
+            AggregateKind::Group,
+        ] {
+            // Rebuild everything since operator + child are consumed.
+            let in_schema = mk_schema("in", 2);
+            let grid = mk_grid(1);
+            let batch = mk_batch(
+                in_schema.clone(),
+                1,
+                2,
+                vec![99.0, 99.0],
+                vec![false, false],
+            );
+            let child = MockOp::new(in_schema, grid, vec![batch]);
+            let gmap = GroupMap::new(vec![Some(0), Some(0)], 1);
+
+            let mut op = AggregateOp::new(
+                child,
+                kind,
+                gmap,
+                out_schema.clone(),
+                MemoryReservation::new(1 << 20),
+            )
+            .unwrap();
+            let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+            assert_eq!(outs[0].get(0, 0), None, "kind={kind:?}");
+        }
+    }
+
+    #[test]
+    fn should_handle_by_empty_single_group() {
+        // given: 5 series → 1 group (all map to 0). `sum by ()` semantics.
+        let in_schema = mk_schema("in", 5);
+        let out_schema = mk_schema("out", 1);
+        let grid = mk_grid(1);
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let valid = vec![true; 5];
+        let batch = mk_batch(in_schema.clone(), 1, 5, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 5], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Sum,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(outs[0].series_count(), 1);
+        assert_eq!(outs[0].get(0, 0), Some(15.0));
+    }
+
+    #[test]
+    fn should_handle_without_degenerate_each_series_its_own_group() {
+        // given: `sum without ()` — every input series is its own group.
+        let in_schema = mk_schema("in", 3);
+        let out_schema = mk_schema("out", 3);
+        let grid = mk_grid(1);
+        let values = vec![7.0, 11.0, 13.0];
+        let valid = vec![true; 3];
+        let batch = mk_batch(in_schema.clone(), 1, 3, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0), Some(1), Some(2)], 3);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Sum,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+        let b = &outs[0];
+        assert_eq!(b.series_count(), 3);
+        assert_eq!(b.get(0, 0), Some(7.0));
+        assert_eq!(b.get(0, 1), Some(11.0));
+        assert_eq!(b.get(0, 2), Some(13.0));
+    }
+
+    #[test]
+    fn should_span_multiple_step_batches() {
+        // given: child emits two batches, each 1 step × 2 series → sum
+        // into 1 group. First batch sums 1+2=3; second 10+20=30.
+        let in_schema = mk_schema("in", 2);
+        let out_schema = mk_schema("out", 1);
+        let grid = mk_grid(2);
+        let batch_a = mk_batch(in_schema.clone(), 1, 2, vec![1.0, 2.0], vec![true, true]);
+        let batch_b = mk_batch(in_schema.clone(), 1, 2, vec![10.0, 20.0], vec![true, true]);
+
+        let child = MockOp::new(in_schema, grid, vec![batch_a, batch_b]);
+        let gmap = GroupMap::new(vec![Some(0), Some(0)], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Sum,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(outs.len(), 2);
+        assert_eq!(outs[0].get(0, 0), Some(3.0));
+        assert_eq!(outs[1].get(0, 0), Some(30.0));
+    }
+
+    #[test]
+    fn should_respect_memory_reservation() {
+        // given: a tiny reservation that the accumulator alone doesn't
+        // fit into.
+        let in_schema = mk_schema("in", 4);
+        let out_schema = mk_schema("out", 4);
+        let grid = mk_grid(1);
+        let batch = mk_batch(in_schema.clone(), 1, 4, vec![1.0; 4], vec![true; 4]);
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0), Some(1), Some(2), Some(3)], 4);
+
+        // Cap too small even for the per-group scratch.
+        let result = AggregateOp::new(
+            child,
+            AggregateKind::Sum,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1),
+        );
+        match result {
+            Err(QueryError::MemoryLimit { .. }) => {}
+            _ => panic!("expected MemoryLimit on constructor"),
+        }
+    }
+
+    #[test]
+    fn should_return_static_schema() {
+        // given: a minimal aggregate.
+        let in_schema = mk_schema("in", 2);
+        let out_schema = mk_schema("out", 1);
+        let grid = mk_grid(1);
+        let batch = mk_batch(in_schema.clone(), 1, 2, vec![1.0, 2.0], vec![true, true]);
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0), Some(0)], 1);
+
+        let op = AggregateOp::new(
+            child,
+            AggregateKind::Sum,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+
+        // when/then
+        assert!(!op.schema().series.is_deferred());
+        assert!(op.schema().series.as_static().is_some());
+        assert_eq!(
+            op.schema().series.as_static().unwrap().len(),
+            1,
+            "output schema must equal group_count",
+        );
+    }
+
+    #[test]
+    fn should_propagate_error_from_upstream() {
+        let in_schema = mk_schema("in", 1);
+        let out_schema = mk_schema("out", 1);
+        let grid = mk_grid(1);
+        let child = MockOp::with_queue(
+            in_schema,
+            grid,
+            vec![Err(QueryError::MemoryLimit {
+                requested: 10,
+                cap: 0,
+                already_reserved: 0,
+            })],
+        );
+        let gmap = GroupMap::new(vec![Some(0)], 1);
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Sum,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let results = drive(&mut op);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], Err(QueryError::MemoryLimit { .. })));
+    }
+
+    #[test]
+    fn should_handle_child_end_of_stream() {
+        // given: child emits no batches.
+        let in_schema = mk_schema("in", 1);
+        let out_schema = mk_schema("out", 1);
+        let grid = mk_grid(1);
+        let child = MockOp::new(in_schema, grid, vec![]);
+        let gmap = GroupMap::new(vec![Some(0)], 1);
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Sum,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let results = drive(&mut op);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn should_drop_inputs_with_none_group_assignment() {
+        // given: 3 series, 2 groups; s1 has `None` assignment (dropped).
+        //   step 0: [1, 99, 2] → g0 sums s0=1, g1 sums s2=2 (s1 dropped)
+        let in_schema = mk_schema("in", 3);
+        let out_schema = mk_schema("out", 2);
+        let grid = mk_grid(1);
+        let values = vec![1.0, 99.0, 2.0];
+        let valid = vec![true; 3];
+        let batch = mk_batch(in_schema.clone(), 1, 3, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0), None, Some(1)], 2);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Sum,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(outs[0].get(0, 0), Some(1.0));
+        assert_eq!(outs[0].get(0, 1), Some(2.0));
+    }
+
+    // ========================================================================
+    // 3c.1 breaker tests — topk / bottomk / quantile
+    // ========================================================================
+
+    #[test]
+    fn should_select_top_k_values_per_group() {
+        // given: 5 input series in one group. Values 1..=5. topk(2) → two
+        // largest values (4, 5) selected; other cells validity=0.
+        let in_schema = mk_schema("in", 5);
+        // Output schema for topk = input schema shape (5 series).
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let valid = vec![true; 5];
+        let batch = mk_batch(in_schema.clone(), 1, 5, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 5], 1);
+
+        // when
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Topk(2),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .expect("operator constructs");
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then: output preserves the 5-series shape; only s3 and s4 valid.
+        assert_eq!(outs.len(), 1);
+        let b = &outs[0];
+        assert_eq!(b.series_count(), 5);
+        assert_eq!(b.get(0, 0), None);
+        assert_eq!(b.get(0, 1), None);
+        assert_eq!(b.get(0, 2), None);
+        assert_eq!(b.get(0, 3), Some(4.0));
+        assert_eq!(b.get(0, 4), Some(5.0));
+    }
+
+    #[test]
+    fn should_select_bottom_k_values_per_group() {
+        // given: 5 input series in one group. Values 1..=5. bottomk(2) →
+        // two smallest (1, 2); other cells validity=0.
+        let in_schema = mk_schema("in", 5);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let valid = vec![true; 5];
+        let batch = mk_batch(in_schema.clone(), 1, 5, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 5], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Bottomk(2),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        let b = &outs[0];
+        assert_eq!(b.get(0, 0), Some(1.0));
+        assert_eq!(b.get(0, 1), Some(2.0));
+        assert_eq!(b.get(0, 2), None);
+        assert_eq!(b.get(0, 3), None);
+        assert_eq!(b.get(0, 4), None);
+    }
+
+    #[test]
+    fn should_select_all_when_k_ge_group_size() {
+        // given: 3 series in one group; topk(10) → every valid input
+        // selected (K ≥ group size).
+        let in_schema = mk_schema("in", 3);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let values = vec![7.0, 3.0, 9.0];
+        let valid = vec![true; 3];
+        let batch = mk_batch(in_schema.clone(), 1, 3, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 3], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Topk(10),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        let b = &outs[0];
+        assert_eq!(b.get(0, 0), Some(7.0));
+        assert_eq!(b.get(0, 1), Some(3.0));
+        assert_eq!(b.get(0, 2), Some(9.0));
+    }
+
+    #[test]
+    fn should_select_nothing_when_k_zero() {
+        // given: 3 valid series; topk(0) ⇒ empty selection; every output
+        // cell has validity=0.
+        let in_schema = mk_schema("in", 3);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let values = vec![7.0, 3.0, 9.0];
+        let valid = vec![true; 3];
+        let batch = mk_batch(in_schema.clone(), 1, 3, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 3], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Topk(0),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        let b = &outs[0];
+        assert_eq!(b.series_count(), 3);
+        assert_eq!(b.get(0, 0), None);
+        assert_eq!(b.get(0, 1), None);
+        assert_eq!(b.get(0, 2), None);
+    }
+
+    #[test]
+    fn should_handle_negative_k_as_empty() {
+        // given: Negative K ⇒ no output cells selected (matches
+        // `evaluator.rs::coerce_k_size`).
+        let in_schema = mk_schema("in", 3);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let values = vec![7.0, 3.0, 9.0];
+        let valid = vec![true; 3];
+        let batch = mk_batch(in_schema.clone(), 1, 3, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 3], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Bottomk(-5),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        let b = &outs[0];
+        assert_eq!(b.get(0, 0), None);
+        assert_eq!(b.get(0, 1), None);
+        assert_eq!(b.get(0, 2), None);
+    }
+
+    #[test]
+    fn should_ignore_nan_inputs_in_topk() {
+        // given: 5 valid inputs; s0 and s4 are NaN. topk(2) on real
+        // values picks the two largest reals (s2=3, s3=4). NaNs rank
+        // "worst" per the engine's `compare_k_values` and are only
+        // selected when K exceeds the non-NaN count.
+        let in_schema = mk_schema("in", 5);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let values = vec![f64::NAN, 2.0, 3.0, 4.0, f64::NAN];
+        let valid = vec![true; 5];
+        let batch = mk_batch(in_schema.clone(), 1, 5, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 5], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Topk(2),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        let b = &outs[0];
+        assert_eq!(b.get(0, 0), None);
+        assert_eq!(b.get(0, 1), None);
+        assert_eq!(b.get(0, 2), Some(3.0));
+        assert_eq!(b.get(0, 3), Some(4.0));
+        assert_eq!(b.get(0, 4), None);
+    }
+
+    #[test]
+    fn should_tiebreak_topk_deterministically_by_series_index() {
+        // given: 4 series all valued 5.0; topk(2) must pick 2. The
+        // engine's tie-break (`evaluator.rs:687-694`) breaks ties by
+        // lower index wins — so s0 and s1 are the survivors.
+        let in_schema = mk_schema("in", 4);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let values = vec![5.0; 4];
+        let valid = vec![true; 4];
+        let batch = mk_batch(in_schema.clone(), 1, 4, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 4], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Topk(2),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        let b = &outs[0];
+        assert_eq!(b.get(0, 0), Some(5.0));
+        assert_eq!(b.get(0, 1), Some(5.0));
+        assert_eq!(b.get(0, 2), None);
+        assert_eq!(b.get(0, 3), None);
+    }
+
+    #[test]
+    fn should_compute_quantile_with_linear_interpolation() {
+        // given: 5 input series in one group, values 1..=5.
+        //   q=0.5 → median = 3.0
+        //   q=0.75 → between 4 and 5 → rank = 0.75 * 4 = 3.0 → exactly 4.0
+        //   q=0.25 → rank 1.0 → exactly 2.0
+        for (q, expected) in [(0.5_f64, 3.0_f64), (0.75, 4.0), (0.25, 2.0)] {
+            let in_schema = mk_schema("in", 5);
+            let out_schema = mk_schema("out", 1);
+            let grid = mk_grid(1);
+            let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+            let valid = vec![true; 5];
+            let batch = mk_batch(in_schema.clone(), 1, 5, values, valid);
+
+            let child = MockOp::new(in_schema, grid, vec![batch]);
+            let gmap = GroupMap::new(vec![Some(0); 5], 1);
+
+            let mut op = AggregateOp::new(
+                child,
+                AggregateKind::Quantile(q),
+                gmap,
+                out_schema,
+                MemoryReservation::new(1 << 20),
+            )
+            .unwrap();
+            let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+            let b = &outs[0];
+            assert!(
+                approx_eq(b.get(0, 0).unwrap(), expected, 1e-12),
+                "q={q}: got {:?} expected {expected}",
+                b.get(0, 0),
+            );
+        }
+    }
+
+    #[test]
+    fn should_handle_quantile_out_of_range() {
+        // given: matches rollup_fns::quantile — q<0 → -inf, q>1 → +inf.
+        for (q, expected) in [(-0.5_f64, f64::NEG_INFINITY), (1.5, f64::INFINITY)] {
+            let in_schema = mk_schema("in", 3);
+            let out_schema = mk_schema("out", 1);
+            let grid = mk_grid(1);
+            let values = vec![1.0, 2.0, 3.0];
+            let valid = vec![true; 3];
+            let batch = mk_batch(in_schema.clone(), 1, 3, values, valid);
+
+            let child = MockOp::new(in_schema, grid, vec![batch]);
+            let gmap = GroupMap::new(vec![Some(0); 3], 1);
+
+            let mut op = AggregateOp::new(
+                child,
+                AggregateKind::Quantile(q),
+                gmap,
+                out_schema,
+                MemoryReservation::new(1 << 20),
+            )
+            .unwrap();
+            let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+            let b = &outs[0];
+            let got = b.get(0, 0).expect("valid when group non-empty");
+            assert_eq!(got, expected, "q={q}");
+        }
+    }
+
+    #[test]
+    fn should_compute_quantile_per_group() {
+        // given: 6 series, 2 groups (s0..s2 → g0; s3..s5 → g1).
+        //   group 0 values: 1, 2, 3 → q=0.5 median = 2.0
+        //   group 1 values: 10, 20, 30 → q=0.5 median = 20.0
+        let in_schema = mk_schema("in", 6);
+        let out_schema = mk_schema("out", 2);
+        let grid = mk_grid(1);
+        let values = vec![1.0, 2.0, 3.0, 10.0, 20.0, 30.0];
+        let valid = vec![true; 6];
+        let batch = mk_batch(in_schema.clone(), 1, 6, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(
+            vec![Some(0), Some(0), Some(0), Some(1), Some(1), Some(1)],
+            2,
+        );
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Quantile(0.5),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        let b = &outs[0];
+        assert!(approx_eq(b.get(0, 0).unwrap(), 2.0, 1e-12));
+        assert!(approx_eq(b.get(0, 1).unwrap(), 20.0, 1e-12));
+    }
+
+    #[test]
+    fn should_respect_memory_reservation_for_topk_heap() {
+        // given: 4 input series, K=2, but reservation only holds 1 byte
+        // — nowhere near the per-group heap scratch.
+        let in_schema = mk_schema("in", 4);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let batch = mk_batch(in_schema.clone(), 1, 4, vec![1.0; 4], vec![true; 4]);
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 4], 1);
+
+        let result = AggregateOp::new(
+            child,
+            AggregateKind::Topk(2),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1),
+        );
+        match result {
+            Err(QueryError::MemoryLimit { .. }) => {}
+            _ => panic!("expected MemoryLimit on constructor"),
+        }
+    }
+
+    #[test]
+    fn should_preserve_input_schema_for_topk_bottomk() {
+        // given: the operator's published schema for topk/bottomk is the
+        // input shape (filter-semantics), not group_count.
+        let in_schema = mk_schema("in", 5);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let batch = mk_batch(in_schema.clone(), 1, 5, vec![1.0; 5], vec![true; 5]);
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        // 5 inputs into 1 group; topk preserves 5 output series.
+        let gmap = GroupMap::new(vec![Some(0); 5], 1);
+
+        let op = AggregateOp::new(
+            child,
+            AggregateKind::Topk(3),
+            gmap,
+            out_schema.clone(),
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+
+        // when/then
+        let static_schema = op
+            .schema()
+            .series
+            .as_static()
+            .expect("topk publishes a static schema");
+        assert_eq!(static_schema.len(), 5);
+    }
+
+    #[test]
+    fn should_use_groups_schema_for_quantile() {
+        // given: quantile is a reducer — output series = group_count.
+        let in_schema = mk_schema("in", 6);
+        let out_schema = mk_schema("out", 2);
+        let grid = mk_grid(1);
+        let batch = mk_batch(in_schema.clone(), 1, 6, vec![1.0; 6], vec![true; 6]);
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(
+            vec![Some(0), Some(0), Some(0), Some(1), Some(1), Some(1)],
+            2,
+        );
+
+        let op = AggregateOp::new(
+            child,
+            AggregateKind::Quantile(0.5),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+
+        let static_schema = op
+            .schema()
+            .series
+            .as_static()
+            .expect("quantile publishes a static schema");
+        assert_eq!(static_schema.len(), 2);
+    }
+}

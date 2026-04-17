@@ -18,6 +18,7 @@
 pub(crate) mod batch;
 pub(crate) mod memory;
 pub(crate) mod operator;
+pub(crate) mod operators;
 pub(crate) mod source;
 pub(crate) mod source_adapter;
 
@@ -27,6 +28,20 @@ pub(crate) use batch::{BitSet, SchemaRef, SeriesSchema, StepBatch};
 pub(crate) use memory::{MemoryReservation, QueryError};
 #[allow(unused_imports)]
 pub(crate) use operator::{Operator, OperatorSchema, StepGrid};
+#[allow(unused_imports)]
+pub(crate) use operators::aggregate::{AggregateKind, AggregateOp, GroupMap};
+#[allow(unused_imports)]
+pub(crate) use operators::binary::{
+    BinaryOp, BinaryOpKind, BinaryShape, ConstScalarOp, MatchTable,
+};
+#[allow(unused_imports)]
+pub(crate) use operators::instant_fn::{InstantFnKind, InstantFnOp};
+#[allow(unused_imports)]
+pub(crate) use operators::matrix_selector::{CellIndex, MatrixSelectorOp, MatrixWindowBatch};
+#[allow(unused_imports)]
+pub(crate) use operators::rollup::{MatrixWindowSource, RollupKind, RollupOp, WindowStream};
+#[allow(unused_imports)]
+pub(crate) use operators::vector_selector::VectorSelectorOp;
 #[allow(unused_imports)]
 pub(crate) use source::{
     CardinalityEstimate, ResolvedSeriesChunk, ResolvedSeriesRef, SampleBatch, SampleBlock,
