@@ -453,6 +453,19 @@ fn sort_scratch_bytes(group_count: usize, input_series: usize) -> usize {
     values.saturating_add(outer)
 }
 
+/// Bytes for the full `(step × input_series)` breaker grid (values +
+/// validity bit). Reserved up front so an undersize reservation surfaces
+/// `QueryError::MemoryLimit` at construction rather than deep in the
+/// hot path.
+#[inline]
+fn breaker_grid_bytes(cells: usize) -> usize {
+    let values = cells.saturating_mul(std::mem::size_of::<f64>());
+    let validity = cells
+        .div_ceil(64)
+        .saturating_mul(std::mem::size_of::<u64>());
+    values.saturating_add(validity)
+}
+
 // ---------------------------------------------------------------------------
 // Topk / Bottomk heap entry
 // ---------------------------------------------------------------------------
@@ -629,6 +642,25 @@ pub struct AggregateOp<C: Operator> {
     /// Bytes reserved for the per-kind scratch (accums | heaps |
     /// sort_bufs); released on `Drop`.
     scratch_bytes: usize,
+    /// Full input grid `step_count × input_series_count` used by the
+    /// breaker kinds to absorb every child batch before running the
+    /// selection / quantile per step. `values` is row-major
+    /// (`values[step * input_series + series]`); `validity` runs
+    /// parallel. Allocated alongside the per-kind heap/sort buffers so
+    /// breakers remain correct under arbitrary input tiling (RFC 0007
+    /// §4 unit 6.3.9). Empty for streaming kinds.
+    breaker_values: Vec<f64>,
+    breaker_validity: BitSet,
+    /// Bytes reserved for [`Self::breaker_values`] / `breaker_validity`;
+    /// released on `Drop`. Tracked separately from [`Self::scratch_bytes`]
+    /// so construction can fail-fast on an undersize reservation.
+    breaker_grid_bytes: usize,
+    /// Step timestamps captured from the first child batch observed on
+    /// the breaker path. Reused for the output batches emitted on EOS.
+    /// Breaker kinds only.
+    breaker_step_timestamps: Option<Arc<[i64]>>,
+    /// `true` once the breaker path has emitted its final output batch.
+    breaker_emitted: bool,
     done: bool,
     errored: bool,
 }
@@ -713,6 +745,22 @@ impl<C: Operator> AggregateOp<C> {
             (None, 0)
         };
 
+        // Breaker kinds need a full-grid (step × input_series) buffer
+        // so `topk` / `bottomk` / `quantile` select globally against the
+        // full input at each step rather than per-tile (see RFC 0007 §4
+        // unit 6.3.9). Allocated alongside the per-kind scratch so
+        // construction fails fast on undersize reservations.
+        let (breaker_values, breaker_validity, breaker_grid_bytes) = if kind.is_breaker() {
+            let cells = grid
+                .step_count
+                .saturating_mul(group_map.input_series_count());
+            let bytes = breaker_grid_bytes(cells);
+            reservation.try_grow(bytes)?;
+            (vec![f64::NAN; cells], BitSet::with_len(cells), bytes)
+        } else {
+            (Vec::new(), BitSet::with_len(0), 0)
+        };
+
         // Per-kind scratch allocation. Reserve up front for the hot
         // path; release on `Drop`. Breakers skip the accumulator column
         // entirely (cheaper than paying for unused lanes).
@@ -778,6 +826,11 @@ impl<C: Operator> AggregateOp<C> {
             heaps,
             sort_bufs,
             scratch_bytes: bytes,
+            breaker_values,
+            breaker_validity,
+            breaker_grid_bytes,
+            breaker_step_timestamps: None,
+            breaker_emitted: false,
             done: false,
             errored: false,
         })
@@ -948,11 +1001,198 @@ impl<C: Operator> AggregateOp<C> {
         ))
     }
 
+    /// Absorb one child batch into the breaker full-grid buffer.
+    /// Row-major by step: `breaker_values[global_step * input_series +
+    /// global_series]`. Idempotent across arbitrary batch ordering —
+    /// step tiles × series tiles × Concurrent/Coalesce interleaving all
+    /// funnel into the same grid (RFC 0007 §4 unit 6.3.9).
+    fn absorb_batch_breaker(&mut self, input: &StepBatch) {
+        debug_assert!(self.kind.is_breaker());
+        self.debug_assert_batch_within_input_roster(input);
+
+        // Capture the step-timestamp `Arc<[i64]>` once (first non-empty
+        // batch is authoritative; the outer grid is shared).
+        if self.breaker_step_timestamps.is_none() {
+            self.breaker_step_timestamps = Some(input.step_timestamps.clone());
+        }
+
+        let step_count_in = input.step_count();
+        let in_series_count = input.series_count();
+        let input_series_total = self.group_map.input_series_count();
+        for step_off in 0..step_count_in {
+            let global_step = input.step_range.start + step_off;
+            let step_base = step_off * in_series_count;
+            let grid_base = global_step * input_series_total;
+            for in_series in 0..in_series_count {
+                let cell = step_base + in_series;
+                if !input.validity.get(cell) {
+                    continue;
+                }
+                let global_series = input.series_range.start + in_series;
+                if global_series >= input_series_total {
+                    continue;
+                }
+                let grid_cell = grid_base + global_series;
+                self.breaker_values[grid_cell] = input.values[cell];
+                self.breaker_validity.set(grid_cell);
+            }
+        }
+    }
+
+    /// Finalise breaker output from the buffered full grid. Routes to
+    /// the kind-specific `finalise_topk_or_bottomk` / `finalise_quantile`
+    /// helpers, each of which runs its per-step selection / quantile
+    /// against the complete `(step_count × input_series_count)` grid.
+    fn finalise_breaker(&mut self) -> Result<StepBatch, QueryError> {
+        match self.kind {
+            AggregateKind::Topk(k) => self.finalise_topk_or_bottomk(k, KOrder::SmallestFirst),
+            AggregateKind::Bottomk(k) => self.finalise_topk_or_bottomk(k, KOrder::LargestFirst),
+            AggregateKind::Quantile(q) => self.finalise_quantile(q),
+            _ => unreachable!("non-breaker kind routed to finalise_breaker"),
+        }
+    }
+
+    /// Global-scope topk / bottomk: for each step, push every valid
+    /// `(group, series, value)` triple into the per-group heap, then
+    /// emit the survivors' input cells with validity=1. Output shape =
+    /// `(step_count × input_series_count)` filter batch.
+    fn finalise_topk_or_bottomk(&mut self, k: i64, order: KOrder) -> Result<StepBatch, QueryError> {
+        let grid = self.schema.step_grid;
+        let step_count = grid.step_count;
+        let in_series_count = self.group_map.input_series_count();
+        let out_cells = step_count * in_series_count;
+
+        let mut out = OutBuffers::allocate(&self.reservation, out_cells)?;
+
+        for global_step in 0..step_count {
+            let k_usize = self.k_for_step(global_step, in_series_count, k);
+            for heap in &mut self.heaps {
+                heap.clear();
+            }
+            if k_usize == 0 {
+                continue;
+            }
+            let grid_base = global_step * in_series_count;
+            for global_series in 0..in_series_count {
+                let cell = grid_base + global_series;
+                if !self.breaker_validity.get(cell) {
+                    continue;
+                }
+                let group = match self.group_map.input_to_group[global_series] {
+                    Some(g) => g as usize,
+                    None => continue,
+                };
+                let v = self.breaker_values[cell];
+                let entry = KHeapEntry {
+                    value: v,
+                    global_series_idx: global_series as u32,
+                    local_series_idx: global_series as u32,
+                    order,
+                };
+                let heap = &mut self.heaps[group];
+                if heap.len() < k_usize {
+                    heap.push(entry);
+                } else if let Some(worst) = heap.peek() {
+                    if entry.cmp(worst) == Ordering::Less {
+                        heap.pop();
+                        heap.push(entry);
+                    }
+                }
+            }
+            let out_base = global_step * in_series_count;
+            for heap in &mut self.heaps {
+                for entry in heap.drain() {
+                    let idx = out_base + entry.local_series_idx as usize;
+                    out.values[idx] = entry.value;
+                    out.validity.set(idx);
+                }
+            }
+        }
+
+        let step_timestamps = self.breaker_step_timestamps.take().unwrap_or_else(|| {
+            Arc::from(
+                (0..step_count)
+                    .map(|i| grid.start_ms + (i as i64) * grid.step_ms)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )
+        });
+        let (values, validity) = out.finish();
+        Ok(StepBatch::new(
+            step_timestamps,
+            0..step_count,
+            SchemaRef::Static(self.output_schema.clone()),
+            0..in_series_count,
+            values,
+            validity,
+        ))
+    }
+
+    /// Global-scope quantile: for each step, collect every valid
+    /// `(group, value)` pair into the per-group sort buffer, then emit
+    /// one reducer-shape cell per group with the q-th quantile.
+    /// Output shape = `(step_count × group_count)`.
+    fn finalise_quantile(&mut self, q: f64) -> Result<StepBatch, QueryError> {
+        let grid = self.schema.step_grid;
+        let step_count = grid.step_count;
+        let in_series_count = self.group_map.input_series_count();
+        let group_count = self.group_map.group_count;
+        let out_cells = step_count * group_count;
+
+        let mut out = OutBuffers::allocate(&self.reservation, out_cells)?;
+
+        for global_step in 0..step_count {
+            for buf in &mut self.sort_bufs {
+                buf.clear();
+            }
+            let grid_base = global_step * in_series_count;
+            for global_series in 0..in_series_count {
+                let cell = grid_base + global_series;
+                if !self.breaker_validity.get(cell) {
+                    continue;
+                }
+                let group = match self.group_map.input_to_group[global_series] {
+                    Some(g) => g as usize,
+                    None => continue,
+                };
+                self.sort_bufs[group].push(self.breaker_values[cell]);
+            }
+            let out_base = global_step * group_count;
+            for (g, buf) in self.sort_bufs.iter_mut().enumerate() {
+                if buf.is_empty() {
+                    continue;
+                }
+                let idx = out_base + g;
+                out.values[idx] = quantile_linear_interp(q, buf);
+                out.validity.set(idx);
+            }
+        }
+
+        let step_timestamps = self.breaker_step_timestamps.take().unwrap_or_else(|| {
+            Arc::from(
+                (0..step_count)
+                    .map(|i| grid.start_ms + (i as i64) * grid.step_ms)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )
+        });
+        let (values, validity) = out.finish();
+        Ok(StepBatch::new(
+            step_timestamps,
+            0..step_count,
+            SchemaRef::Static(self.output_schema.clone()),
+            0..group_count,
+            values,
+            validity,
+        ))
+    }
+
     /// Buffered per-step reduction for `Topk` / `Bottomk` / `Quantile`.
     ///
     /// Memory: the per-step scratch (heap or sort buffer) was reserved
     /// up front in `new`. The per-batch output column is charged here
     /// via `OutBuffers`.
+    #[allow(dead_code)]
     fn reduce_batch_breaker(&mut self, input: &StepBatch) -> Result<StepBatch, QueryError> {
         let step_count = input.step_count();
         self.debug_assert_batch_within_input_roster(input);
@@ -1166,27 +1406,42 @@ impl<C: Operator> Operator for AggregateOp<C> {
         }
 
         if self.kind.is_breaker() {
-            // Breaker kinds reduce batch-by-batch (existing per-step
-            // buffering inside each batch is sufficient for their current
-            // call sites — see §5 Decisions Log for the scope of this
-            // fix).
-            match self.child.next(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(None) => {
-                    self.done = true;
-                    Poll::Ready(None)
-                }
-                Poll::Ready(Some(Err(err))) => {
-                    self.errored = true;
-                    Poll::Ready(Some(Err(err)))
-                }
-                Poll::Ready(Some(Ok(input))) => match self.reduce_batch_breaker(&input) {
-                    Ok(batch) => Poll::Ready(Some(Ok(batch))),
-                    Err(err) => {
-                        self.errored = true;
-                        Poll::Ready(Some(Err(err)))
+            // Breaker kinds: drain every child batch into the full
+            // `(step × input_series)` grid, then on EOS run the per-step
+            // selection / quantile globally. Correct under arbitrary
+            // child tile ordering (step tiles × series tiles, Concurrent
+            // / Coalesce reordering). See RFC 0007 §4 unit 6.3.9.
+            if self.breaker_emitted {
+                self.done = true;
+                return Poll::Ready(None);
+            }
+            let mut saw_any_batch = false;
+            loop {
+                match self.child.next(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(None) => {
+                        self.breaker_emitted = true;
+                        if !saw_any_batch {
+                            self.done = true;
+                            return Poll::Ready(None);
+                        }
+                        return match self.finalise_breaker() {
+                            Ok(batch) => Poll::Ready(Some(Ok(batch))),
+                            Err(err) => {
+                                self.errored = true;
+                                Poll::Ready(Some(Err(err)))
+                            }
+                        };
                     }
-                },
+                    Poll::Ready(Some(Err(err))) => {
+                        self.errored = true;
+                        return Poll::Ready(Some(Err(err)));
+                    }
+                    Poll::Ready(Some(Ok(input))) => {
+                        saw_any_batch = true;
+                        self.absorb_batch_breaker(&input);
+                    }
+                }
             }
         } else {
             // Streaming kinds: drain every child batch into the
@@ -1244,6 +1499,10 @@ impl<C: Operator> Drop for AggregateOp<C> {
         if self.scratch_bytes > 0 {
             self.reservation.release(self.scratch_bytes);
             self.scratch_bytes = 0;
+        }
+        if self.breaker_grid_bytes > 0 {
+            self.reservation.release(self.breaker_grid_bytes);
+            self.breaker_grid_bytes = 0;
         }
     }
 }
@@ -2356,6 +2615,10 @@ mod tests {
         // given: a filter-shaped topk over the tail slice of a 6-series roster.
         // The global lower-index tie-break and output `series_range` must both
         // be based on the child's absolute roster position, not batch-local 0..n.
+        // Under the RFC 0007 §4 unit 6.3.9 fix the breaker kinds emit a single
+        // filter-shape output covering the full input roster, so the
+        // selected cells land at their global indices (series 3 and 4)
+        // and the leading 0..3 cells are all invalid.
         let in_schema = mk_schema("in", 6);
         let out_schema = in_schema.clone();
         let grid = mk_grid(1);
@@ -2381,11 +2644,19 @@ mod tests {
         let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
 
         // then
+        assert_eq!(outs.len(), 1);
         let b = &outs[0];
-        assert_eq!(b.series_range, 3..6);
-        assert_eq!(b.get(0, 0), Some(5.0));
-        assert_eq!(b.get(0, 1), Some(5.0));
+        assert_eq!(b.series_range, 0..6);
+        // Leading slots (0..3) were never emitted by the child — invalid.
+        assert_eq!(b.get(0, 0), None);
+        assert_eq!(b.get(0, 1), None);
         assert_eq!(b.get(0, 2), None);
+        // Global series 3 and 4 tie at value 5.0 and are selected
+        // (lower-index tie-break keeps the first two); series 5 has
+        // value 1.0 and drops out.
+        assert_eq!(b.get(0, 3), Some(5.0));
+        assert_eq!(b.get(0, 4), Some(5.0));
+        assert_eq!(b.get(0, 5), None);
     }
 
     #[test]
