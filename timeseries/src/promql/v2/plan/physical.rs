@@ -2492,4 +2492,108 @@ mod tests {
         assert_eq!(stats.concurrent_wrapped, 1);
         assert_eq!(stats.concurrent_skipped, 0);
     }
+
+    // ---- Drift guard: describe_physical vs build_node ------------------
+    //
+    // `describe_physical` (in `super::super::explain`) duplicates the
+    // per-variant dispatch in `build_node`. The risk is that a future
+    // refactor teaches one path a new trick without touching the other.
+    // These tests build the real plan against a mock source and then
+    // assert that the describer's ConcurrentOp node count matches
+    // `ExchangeStats::concurrent_wrapped` — the only observable side of
+    // the dispatch divergence we expect to catch here.
+
+    fn count_op(node: &super::super::explain::PlanNode, op: &str) -> usize {
+        let mut total = if node.op == op { 1 } else { 0 };
+        for child in &node.children {
+            total += count_op(child, op);
+        }
+        total
+    }
+
+    #[test]
+    fn should_describe_physical_agrees_with_build_node_over_threshold() {
+        // given: 128 series — selector will be wrapped in ConcurrentOp
+        let source = mock_source_with_n_series(128);
+        let ctx = make_ctx();
+        let plan = LogicalPlan::VectorSelector {
+            selector: make_selector("m"),
+            offset: Offset::Pos(0),
+            at: None,
+            lookback_ms: Some(ctx.lookback_delta_ms),
+        };
+        let reservation = MemoryReservation::new(1 << 22);
+        let rt = mk_rt();
+
+        // when: build the real plan and describe the same logical plan
+        let (_, stats) = rt
+            .block_on(build_with_stats(plan.clone(), &source, &reservation, &ctx))
+            .expect("physical plan");
+        let described = super::super::explain::describe_physical(&plan, &ctx);
+
+        // then: describer's ConcurrentOp count equals the planner's wrap count
+        assert_eq!(
+            count_op(&described, "ConcurrentOp"),
+            stats.concurrent_wrapped
+        );
+    }
+
+    #[test]
+    fn should_describe_physical_agrees_with_build_node_under_threshold() {
+        // given: 16 series and threshold = u64::MAX so no wraps ever happen
+        let source = mock_source_with_n_series(16);
+        let mut ctx = make_ctx();
+        ctx.parallelism = super::super::parallelism::Parallelism::new(u64::MAX, 0, 4);
+        let plan = LogicalPlan::VectorSelector {
+            selector: make_selector("m"),
+            offset: Offset::Pos(0),
+            at: None,
+            lookback_ms: Some(ctx.lookback_delta_ms),
+        };
+        let reservation = MemoryReservation::new(1 << 22);
+        let rt = mk_rt();
+
+        // when: build + describe under the disabled-gate config
+        let (_, stats) = rt
+            .block_on(build_with_stats(plan.clone(), &source, &reservation, &ctx))
+            .expect("physical plan");
+        let described = super::super::explain::describe_physical(&plan, &ctx);
+
+        // then: both sides agree — zero wraps, zero describer ConcurrentOp nodes
+        assert_eq!(stats.concurrent_wrapped, 0);
+        assert_eq!(count_op(&described, "ConcurrentOp"), 0);
+    }
+
+    #[test]
+    fn should_describe_physical_agrees_with_build_node_for_rollup_of_matrix() {
+        // given: rate(m[5m]) over 128 series triggers the matrix-leaf ConcurrentOp wrap
+        let source = mock_source_with_n_series(128);
+        let ctx = make_ctx();
+        let plan = LogicalPlan::Rollup {
+            kind: super::super::super::operators::rollup::RollupKind::Rate,
+            child: Box::new(LogicalPlan::MatrixSelector {
+                selector: make_selector("m"),
+                range_ms: 5 * 60_000,
+                offset: Offset::Pos(0),
+                at: None,
+            }),
+        };
+        let reservation = MemoryReservation::new(1 << 22);
+        let rt = mk_rt();
+
+        // when
+        let (_, stats) = rt
+            .block_on(build_with_stats(plan.clone(), &source, &reservation, &ctx))
+            .expect("physical plan");
+        let described = super::super::explain::describe_physical(&plan, &ctx);
+
+        // then: the describer places ConcurrentOp at the RollupOp boundary,
+        // matching where `build_node` wraps it.
+        assert_eq!(stats.concurrent_wrapped, 1);
+        assert_eq!(count_op(&described, "ConcurrentOp"), 1);
+        // The describer's root must be ConcurrentOp with RollupOp beneath it,
+        // mirroring build_node's shape.
+        assert_eq!(described.op, "ConcurrentOp");
+        assert_eq!(described.children[0].op, "RollupOp");
+    }
 }

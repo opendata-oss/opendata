@@ -160,6 +160,31 @@ async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
     reshaped.map_err(|e| QueryError::Execution(e.to_string()))
 }
 
+/// Dry-run: parse, lower, optimize, and describe the physical plan
+/// for `query` without opening a reader or executing any operator.
+/// Backs both [`TsdbEngine::explain_query_v2`] and
+/// [`TsdbEngine::explain_query_range_v2`].
+#[cfg(feature = "promql-v2")]
+fn explain_v2(
+    query: &str,
+    ctx: &crate::promql::v2::plan::LoweringContext,
+) -> std::result::Result<crate::promql::v2::plan::ExplainResult, QueryError> {
+    let expr =
+        promql_parser::parser::parse(query).map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
+    let unoptimized =
+        crate::promql::v2::plan::lower(&expr, ctx).map_err(plan_error_to_query_error)?;
+    let logical_unoptimized = crate::promql::v2::plan::describe_logical(&unoptimized);
+    let optimized = crate::promql::v2::plan::optimize(unoptimized.clone());
+    let logical_optimized = crate::promql::v2::plan::describe_logical(&optimized);
+    let physical = crate::promql::v2::plan::describe_physical(&optimized, ctx);
+    Ok(crate::promql::v2::plan::ExplainResult {
+        schema_version: crate::promql::v2::plan::SCHEMA_VERSION,
+        logical_unoptimized,
+        logical_optimized,
+        physical,
+    })
+}
+
 /// Translate a v2 [`PlanError`](crate::promql::v2::plan::PlanError) into
 /// the crate-wide [`QueryError`]. Parser-level issues map onto the v1
 /// surface's existing variants so the HTTP handler does not need a
@@ -1122,6 +1147,55 @@ impl TsdbEngine {
             Self::ReadWrite(tsdb) => tsdb.eval_query_range_v2(query, range, step, opts).await,
             Self::ReadOnly(reader) => reader.eval_query_range_v2(query, range, step, opts).await,
         }
+    }
+
+    /// Dry-run EXPLAIN for instant queries. Parses, lowers, optimises,
+    /// and describes the physical plan — does not open a reader or
+    /// touch the index cache.
+    #[cfg(feature = "promql-v2")]
+    pub(crate) fn explain_query_v2(
+        &self,
+        query: &str,
+        time: Option<SystemTime>,
+        opts: &QueryOptions,
+    ) -> std::result::Result<crate::promql::v2::plan::ExplainResult, QueryError> {
+        let query_time = time.unwrap_or_else(SystemTime::now);
+        let at_ms = system_time_to_ms(query_time);
+        let ctx = crate::promql::v2::plan::LoweringContext::for_instant(
+            at_ms,
+            duration_to_ms(opts.lookback_delta),
+        );
+        explain_v2(query, &ctx)
+    }
+
+    /// Dry-run EXPLAIN for range queries. Same dispatch surface as
+    /// [`Self::eval_query_range_v2`] but returns an
+    /// [`ExplainResult`](crate::promql::v2::plan::ExplainResult) without
+    /// executing the plan.
+    #[cfg(feature = "promql-v2")]
+    pub(crate) fn explain_query_range_v2(
+        &self,
+        query: &str,
+        range: impl RangeBounds<SystemTime>,
+        step: Duration,
+        opts: &QueryOptions,
+    ) -> std::result::Result<crate::promql::v2::plan::ExplainResult, QueryError> {
+        let (start, end) = crate::util::range_bounds_to_system_time(range);
+        let start_ms = system_time_to_ms(start);
+        let end_ms = system_time_to_ms(end);
+        let step_ms = duration_to_ms(step);
+        if step_ms <= 0 {
+            return Err(QueryError::InvalidQuery(
+                "step must be greater than zero".to_string(),
+            ));
+        }
+        let ctx = crate::promql::v2::plan::LoweringContext::new(
+            start_ms,
+            end_ms,
+            step_ms,
+            duration_to_ms(opts.lookback_delta),
+        );
+        explain_v2(query, &ctx)
     }
 
     pub(crate) async fn find_series(

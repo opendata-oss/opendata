@@ -13,6 +13,7 @@
 //!   its plan-time [`LoweringContext`].
 
 pub mod error;
+pub mod explain;
 pub mod lowering;
 pub mod optimize;
 pub mod parallelism;
@@ -20,6 +21,10 @@ pub mod physical;
 pub mod plan_types;
 
 pub use error::PlanError;
+#[allow(unused_imports)]
+pub use explain::{
+    ExplainResult, PlanNode, SCHEMA_VERSION, describe_logical, describe_physical, pretty_print,
+};
 pub use lowering::{LoweringContext, lower};
 #[allow(unused_imports)]
 pub use optimize::optimize;

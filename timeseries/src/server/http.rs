@@ -20,11 +20,10 @@ use crate::otel::{OtelConfig, OtelConverter};
 use crate::promql::config::{OtelServerConfig, PrometheusConfig};
 use crate::promql::request::{
     FederateParams, LabelValuesParams, LabelsParams, MetadataParams, QueryParams, QueryRangeParams,
-    SeriesParams,
+    SeriesParams, is_flag_set,
 };
 use crate::promql::response::{
-    self, FederateResponse, LabelValuesResponse, LabelsResponse, MetadataResponse,
-    QueryRangeResponse, QueryResponse, SeriesResponse,
+    self, FederateResponse, LabelValuesResponse, LabelsResponse, MetadataResponse, SeriesResponse,
 };
 use crate::promql::scraper::Scraper;
 use crate::tsdb::TsdbEngine;
@@ -318,12 +317,28 @@ async fn extract_params<T: serde::de::DeserializeOwned>(
 /// (columnar) engines at **compile time** via `#[cfg(feature = "promql-v2")]`.
 /// Wire shape is unchanged across the A/B boundary: both paths return
 /// `QueryValue`.
+///
+/// When `?explain=true` is set and the v2 engine is enabled, the
+/// handler short-circuits to a dry-run plan description. `?pretty=true`
+/// alongside `explain` switches the response to `text/plain` with a
+/// DataFusion-style indented tree; without `pretty`, the response is
+/// `application/json` wrapping an `ExplainResult`.
 async fn handle_query(
     State(state): State<AppState>,
     request: Request,
-) -> Result<Json<QueryResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let params: QueryParams = extract_params(request, &state).await?;
-    let time = params.time.map(|s| parse_timestamp(&s)).transpose()?;
+    let time = params.time.as_deref().map(parse_timestamp).transpose()?;
+    #[cfg(feature = "promql-v2")]
+    if is_flag_set(params.explain.as_deref()) {
+        let result = state
+            .tsdb
+            .explain_query_v2(&params.query, time, &QueryOptions::default());
+        return Ok(render_explain(
+            result,
+            is_flag_set(params.pretty.as_deref()),
+        ));
+    }
     #[cfg(not(feature = "promql-v2"))]
     let result = state
         .tsdb
@@ -334,7 +349,7 @@ async fn handle_query(
         .tsdb
         .eval_query_v2(&params.query, time, &QueryOptions::default())
         .await;
-    Ok(Json(response::query_value_to_response(result)))
+    Ok(Json(response::query_value_to_response(result)).into_response())
 }
 
 /// Handle /api/v1/query_range
@@ -346,14 +361,30 @@ async fn handle_query(
 /// `QueryValue` back onto the `Vec<RangeSample>` wire contract that
 /// `range_result_to_response` expects, keeping the JSON response shape
 /// identical regardless of feature flag.
+///
+/// `?explain=true` (with optional `?pretty=true`) returns a dry-run
+/// plan description — see [`handle_query`] for the contract.
 async fn handle_query_range(
     State(state): State<AppState>,
     request: Request,
-) -> Result<Json<QueryRangeResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let params: QueryRangeParams = extract_params(request, &state).await?;
     let start = parse_timestamp(&params.start)?;
     let end = parse_timestamp(&params.end)?;
     let step = parse_duration(&params.step)?;
+    #[cfg(feature = "promql-v2")]
+    if is_flag_set(params.explain.as_deref()) {
+        let result = state.tsdb.explain_query_range_v2(
+            &params.query,
+            start..=end,
+            step,
+            &QueryOptions::default(),
+        );
+        return Ok(render_explain(
+            result,
+            is_flag_set(params.pretty.as_deref()),
+        ));
+    }
     #[cfg(not(feature = "promql-v2"))]
     let result = state
         .tsdb
@@ -365,7 +396,41 @@ async fn handle_query_range(
         .eval_query_range_v2(&params.query, start..=end, step, &QueryOptions::default())
         .await
         .and_then(query_value_to_range_samples);
-    Ok(Json(response::range_result_to_response(result)))
+    Ok(Json(response::range_result_to_response(result)).into_response())
+}
+
+/// Render an EXPLAIN result as either JSON (`pretty=false`) or
+/// `text/plain` (`pretty=true`). Errors are rendered as the normal
+/// `ExplainResponse` error shape regardless of `pretty`.
+#[cfg(feature = "promql-v2")]
+fn render_explain(
+    result: Result<crate::promql::v2::plan::ExplainResult, crate::error::QueryError>,
+    pretty: bool,
+) -> Response {
+    use crate::promql::v2::plan::pretty_print;
+
+    if pretty {
+        match result {
+            Ok(explain) => {
+                let mut body = String::new();
+                body.push_str("=== Logical (unoptimized) ===\n");
+                body.push_str(&pretty_print(&explain.logical_unoptimized));
+                body.push_str("\n=== Logical (optimized) ===\n");
+                body.push_str(&pretty_print(&explain.logical_optimized));
+                body.push_str("\n=== Physical ===\n");
+                body.push_str(&pretty_print(&explain.physical));
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    body,
+                )
+                    .into_response()
+            }
+            Err(e) => Json(response::explain_result_to_response(Err(e))).into_response(),
+        }
+    } else {
+        Json(response::explain_result_to_response(result)).into_response()
+    }
 }
 
 /// Collapse a v2 [`QueryValue`] into the `Vec<RangeSample>` wire shape

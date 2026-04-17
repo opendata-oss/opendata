@@ -108,6 +108,31 @@ HTTP / embedded API
 Every stage is a separate module with a crisp contract. Today all of this is tangled inside
 `evaluator.rs` + `pipeline.rs`.
 
+## EXPLAIN contract
+
+**Decision:** `?explain=true` on `/api/v1/query` and `/api/v1/query_range` returns a three-stage
+dry-run plan. The query is parsed, lowered, and optimized; `build_physical_plan` is **not**
+invoked. No reader is opened, no index cache is warmed, no operator runs.
+
+| Stage                 | Source                        | Purpose                           |
+|-----------------------|-------------------------------|-----------------------------------|
+| `logicalUnoptimized`  | after `lower(expr, ctx)`      | Debug lowering bugs               |
+| `logicalOptimized`    | after `optimize(plan)`        | Inspect rewrite rules             |
+| `physical`            | `describe_physical` (no I/O)  | Operator + exchange decisions     |
+
+**Wire shape:** each stage is a `PlanNode { op: String, args: Object, children: [PlanNode] }`
+tree. JSON keys are camelCase. `schemaVersion` is pinned; bump only on a breaking change to
+node names or args shapes. Trigger: `explain=true` or `explain=1`. Add `pretty=true` to receive
+`text/plain` with three `=== <stage> ===` sections rendered by `pretty_print` instead of JSON.
+
+**Non-goals:** cost annotations, cardinality estimates, per-operator timings. Those ship with
+the query profiler (future RFC).
+
+**Drift guard:** `describe_physical` mirrors `build_node`'s dispatch. Paired tests
+(`should_describe_physical_agrees_with_build_node_*`) assert that the describer's
+`ConcurrentOp` count equals `ExchangeStats::concurrent_wrapped` for representative queries;
+divergence is the first signal that one path drifted from the other.
+
 ## Core Data Model
 
 The universal on-the-wire shape between operators is a **StepBatch**: a contiguous range of

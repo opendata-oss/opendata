@@ -845,3 +845,138 @@ mod v2_dispatch {
         assert!(parsed.data.is_none());
     }
 }
+
+// ---------------------------------------------------------------------------
+// /api/v1/query[_range]?explain=true (dry-run EXPLAIN)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "promql-v2")]
+mod explain {
+    use super::*;
+    use timeseries::testing::{ExplainResponse, ExplainResult};
+
+    #[tokio::test]
+    async fn should_return_explain_response_on_instant_query() {
+        // given: a fresh TSDB with no data — EXPLAIN must not touch the reader
+        let (app, _) = setup().await;
+
+        // when: GET /api/v1/query?query=...&explain=true&time=100
+        let req = Request::get(
+            "/api/v1/query?query=sum+by(job)(rate(http_requests_total[1m]))&explain=true&time=100",
+        )
+        .body(Body::empty())
+        .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then: JSON response carries all three stages and schemaVersion=1
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let parsed: ExplainResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.status, "success");
+        let data: ExplainResult = parsed.data.expect("explain response has data");
+        assert_eq!(data.schema_version, 1);
+        assert_eq!(data.logical_unoptimized.op, "Aggregate");
+        assert_eq!(data.logical_optimized.op, "Aggregate");
+        assert!(
+            data.physical.op == "AggregateOp" || data.physical.op == "ConcurrentOp",
+            "unexpected physical root: {}",
+            data.physical.op
+        );
+    }
+
+    #[tokio::test]
+    async fn should_return_pretty_explain_as_text_plain() {
+        // given: a query with explain=true&pretty=true
+        let (app, _) = setup().await;
+
+        // when: GET with both flags
+        let req = Request::get("/api/v1/query?query=foo&explain=true&pretty=true&time=100")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then: Content-Type is text/plain and body has three stage headers
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            content_type.starts_with("text/plain"),
+            "unexpected content-type: {content_type}"
+        );
+        let body = body_string(resp).await;
+        assert!(body.contains("=== Logical (unoptimized) ==="));
+        assert!(body.contains("=== Logical (optimized) ==="));
+        assert!(body.contains("=== Physical ==="));
+        assert!(body.contains("VectorSelector"));
+    }
+
+    #[tokio::test]
+    async fn should_return_explain_response_on_range_query() {
+        // given: no data — EXPLAIN is a dry-run
+        let (app, _) = setup().await;
+
+        // when: GET /api/v1/query_range with explain=true
+        let req = Request::get(
+            "/api/v1/query_range?query=rate(http_requests_total[5m])&start=100&end=200&step=60s&explain=true",
+        )
+        .body(Body::empty())
+        .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then: JSON body carries the three stages
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let parsed: ExplainResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.status, "success");
+        let data = parsed.data.expect("range explain has data");
+        assert_eq!(data.logical_unoptimized.op, "Rollup");
+        // physical root wraps MatrixSelectorOp in RollupOp (possibly under ConcurrentOp)
+        let root_op = data.physical.op.as_str();
+        assert!(
+            root_op == "RollupOp" || root_op == "ConcurrentOp",
+            "unexpected physical root: {root_op}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_accept_explain_one_as_true() {
+        // given: ?explain=1 (numeric-style boolean) — widely used variant
+        let (app, _) = setup().await;
+
+        // when
+        let req = Request::get("/api/v1/query?query=foo&explain=1&time=100")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then: JSON response with schemaVersion (i.e. actual explain path taken)
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed: ExplainResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(parsed.status, "success");
+        assert_eq!(parsed.data.unwrap().schema_version, 1);
+    }
+
+    #[tokio::test]
+    async fn should_return_explain_error_for_invalid_query() {
+        // given: an invalid query with explain=true
+        let (app, _) = setup().await;
+
+        // when: planner rejects the query; dry-run should still return a
+        // structured error with explain-response shape.
+        let req = Request::get("/api/v1/query?query=does_not_exist(foo)&explain=true&time=100")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then: status=error, error_type populated, data omitted.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed: ExplainResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(parsed.status, "error");
+        assert!(parsed.error_type.is_some());
+        assert!(parsed.data.is_none());
+    }
+}

@@ -305,6 +305,50 @@ impl ErrorResponse {
 }
 
 // ---------------------------------------------------------------------------
+// EXPLAIN response
+// ---------------------------------------------------------------------------
+
+/// Dry-run EXPLAIN response for `/api/v1/query[?explain=true]` and
+/// `/api/v1/query_range[?explain=true]`. Mirrors the shape of
+/// [`QueryResponse`] so the HTTP handler can unify error rendering.
+#[cfg(feature = "promql-v2")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExplainResponse {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<crate::promql::v2::plan::ExplainResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(rename = "errorType", skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+}
+
+/// Wrap an [`ExplainResult`](crate::promql::v2::plan::ExplainResult)
+/// (or error) into an [`ExplainResponse`].
+#[cfg(feature = "promql-v2")]
+pub fn explain_result_to_response(
+    result: Result<crate::promql::v2::plan::ExplainResult, QueryError>,
+) -> ExplainResponse {
+    match result {
+        Ok(data) => ExplainResponse {
+            status: "success".to_string(),
+            data: Some(data),
+            error: None,
+            error_type: None,
+        },
+        Err(e) => {
+            let err = query_error_response(e);
+            ExplainResponse {
+                status: err.status,
+                data: None,
+                error: Some(err.error),
+                error_type: Some(err.error_type),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // /api/v1/query (instant query)
 // ---------------------------------------------------------------------------
 

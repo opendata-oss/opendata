@@ -42,11 +42,15 @@ use crate::tsdb::Tsdb;
 pub use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig};
 
 // Re-export production types so integration tests use the real types.
+#[cfg(feature = "promql-v2")]
+pub use crate::promql::response::ExplainResponse;
 pub use crate::promql::response::{
     ErrorResponse, LabelValuesResponse, LabelsResponse, MatrixSeries, MetadataResponse,
     QueryRangeResponse, QueryRangeResult, QueryResponse, QueryResult, QueryResultValue,
     SeriesResponse, VectorSeries,
 };
+#[cfg(feature = "promql-v2")]
+pub use crate::promql::v2::plan::{ExplainResult, PlanNode};
 
 // Re-export conversion functions for benchmarks.
 pub use crate::promql::response::{query_value_to_response, range_result_to_response};
