@@ -25,7 +25,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use futures::Stream;
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use promql_parser::parser::VectorSelector;
 
 use crate::model::{Label, Labels, Sample, SeriesId, TimeBucket};
@@ -37,6 +37,37 @@ use super::source::{
     ResolvedSeriesChunk, ResolvedSeriesRef, SampleBatch, SampleBlock, SamplesRequest, SeriesSource,
     TimeRange,
 };
+
+// ---------------------------------------------------------------------------
+// Concurrency
+// ---------------------------------------------------------------------------
+//
+// Buckets are fully independent keyspaces in RFC 0001's layout (all record
+// keys are bucket-prefixed, series IDs are bucket-scoped), so cross-bucket
+// fan-out cannot affect correctness. The constants below mirror the v1
+// pipeline's stage-level readahead (see `promql/pipeline.rs`
+// `METADATA_STAGE_READAHEAD` / `SAMPLE_STAGE_READAHEAD`, both 32) so
+// observed concurrency is comparable.
+//
+// Two gaps vs. v1 worth flagging:
+//   - V1 also amplifies within a bucket via `PER_BUCKET_SAMPLE_READAHEAD`
+//     (64 per-series futures in flight). V2 does not — RFC 0007
+//     §"Execution Model" (line 256) prohibits implicit spawn-per-series.
+//     A future "range-coalesced samples" API can close this gap without
+//     breaking the rule (see §5 discussion on selective-scan trade-offs).
+//   - V1 has a separate global permit layer (`QueryReaderEvalCache`
+//     metadata/sample semaphores) that throttles real I/O independent of
+//     scheduler readahead. V2 has no such layer; the constants below act
+//     as both scheduler and I/O ceiling.
+
+/// Cross-bucket readahead for [`async_stream_resolve`] — mirrors v1
+/// `METADATA_STAGE_READAHEAD` (pipeline.rs).
+const METADATA_STAGE_READAHEAD: usize = 32;
+
+/// Cross-bucket readahead for [`build_sample_batches`] (both forward-index
+/// preload and per-run batch construction) — mirrors v1
+/// `SAMPLE_STAGE_READAHEAD` (pipeline.rs).
+const SAMPLE_STAGE_READAHEAD: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Bucket-id encoding
@@ -152,10 +183,9 @@ impl<R: QueryReader + 'static> SeriesSource for QueryReaderSource<R> {
 // ---------------------------------------------------------------------------
 
 /// Fan out selector resolution across overlapping buckets and emit one
-/// [`ResolvedSeriesChunk`] per non-empty bucket. Buckets are polled
-/// serially here — matches the "no implicit spawn-per-series" rule
-/// (RFC §"Concurrency Model"); `Concurrent` / `Coalesce` at the operator
-/// layer can parallelise across buckets when the planner chooses.
+/// [`ResolvedSeriesChunk`] per non-empty bucket. Up to
+/// [`METADATA_STAGE_READAHEAD`] buckets resolve in parallel; see
+/// [`async_stream_resolve`] for details.
 fn resolve_stream<R: QueryReader + 'static>(
     reader: Arc<R>,
     index_cache: Arc<V2IndexCache>,
@@ -170,6 +200,12 @@ fn resolve_stream<R: QueryReader + 'static>(
 /// the caller does not need to look at empty chunks (callers of the
 /// 2.1 trait treat `series: Arc<[]>` as "no match" already, but
 /// skipping keeps the stream tidy).
+///
+/// Up to [`METADATA_STAGE_READAHEAD`] buckets are resolved in parallel —
+/// each bucket is an independent keyspace in RFC 0001, so concurrent
+/// fetches cannot interfere. Emission order stays chronological via
+/// [`StreamExt::buffered`]: later buckets' results wait for earlier ones
+/// to yield, but the I/O overlaps.
 fn async_stream_resolve<R: QueryReader + 'static>(
     reader: Arc<R>,
     index_cache: Arc<V2IndexCache>,
@@ -182,7 +218,6 @@ fn async_stream_resolve<R: QueryReader + 'static>(
             Err(e) => return vec![Err(internal_err(e.to_string()))],
         };
 
-        let mut out: Vec<Result<ResolvedSeriesChunk, QueryError>> = Vec::new();
         let mut filtered: Vec<TimeBucket> = buckets
             .into_iter()
             .filter(|b| bucket_overlaps(*b, time_range))
@@ -191,11 +226,29 @@ fn async_stream_resolve<R: QueryReader + 'static>(
         // see stable ordering across calls; chronological (oldest first).
         filtered.sort_by_key(|b| b.start);
 
-        for bucket in filtered {
-            match resolve_one_bucket(reader.as_ref(), &index_cache, bucket, &selector).await {
+        let selector = Arc::new(selector);
+        let mut fut_stream =
+            stream::iter(
+                filtered.into_iter().map(|bucket| {
+                    let reader = reader.clone();
+                    let index_cache = index_cache.clone();
+                    let selector = selector.clone();
+                    async move {
+                        resolve_one_bucket(reader.as_ref(), &index_cache, bucket, &selector).await
+                    }
+                }),
+            )
+            .buffered(METADATA_STAGE_READAHEAD);
+
+        let mut out: Vec<Result<ResolvedSeriesChunk, QueryError>> = Vec::new();
+        while let Some(r) = fut_stream.next().await {
+            match r {
                 Ok(Some(chunk)) => out.push(Ok(chunk)),
                 Ok(None) => {}
                 Err(e) => {
+                    // On error we stop consuming; the remaining in-flight
+                    // buckets are dropped (their futures cancel) when
+                    // `fut_stream` goes out of scope.
                     out.push(Err(e));
                     break;
                 }
@@ -294,9 +347,15 @@ fn samples_stream<R: QueryReader + 'static>(
 ///    runs — each run becomes one batch covering a
 ///    `series_range` into `request.series`.
 /// 2. For each bucket that appears in a run, loads the forward index
-///    once to resolve `series_id → metric_name`.
-/// 3. Calls `QueryReader::samples` per series with the request's time
-///    range and pushes the columnar data into the batch's `SampleBlock`.
+///    once to resolve `series_id → metric_name`. Distinct buckets are
+///    loaded concurrently (up to [`SAMPLE_STAGE_READAHEAD`]) via
+///    [`StreamExt::buffer_unordered`] — order doesn't matter since we
+///    just fill a `HashMap`.
+/// 3. Builds one batch per run concurrently (up to
+///    [`SAMPLE_STAGE_READAHEAD`]). Order is preserved with
+///    [`StreamExt::buffered`] because tests and the
+///    `SampleBatch::series_range` contract index into the caller's
+///    `request.series` slice.
 async fn build_sample_batches<R: QueryReader + ?Sized>(
     reader: &R,
     request: &SamplesRequest,
@@ -309,98 +368,133 @@ async fn build_sample_batches<R: QueryReader + ?Sized>(
     // caller's order inside each run.
     let runs = contiguous_bucket_runs(&request.series);
 
-    // Pre-load forward index per distinct bucket (for metric_name).
-    let mut per_bucket_forward: HashMap<
-        u64,
-        Arc<dyn crate::index::ForwardIndexLookup + Send + Sync>,
-    > = HashMap::new();
-    for run in &runs {
-        if per_bucket_forward.contains_key(&run.bucket_id) {
+    let per_bucket_forward = preload_forward_indices(reader, &runs, &request.series).await?;
+
+    let time_range = request.time_range;
+    let out: Vec<SampleBatch> = stream::iter(runs.into_iter().map(|run| {
+        let forward = per_bucket_forward
+            .get(&run.bucket_id)
+            .expect("forward index pre-loaded above")
+            .clone();
+        let series = request.series.clone();
+        async move { build_batch_for_run(reader, run, forward, series, time_range).await }
+    }))
+    .buffered(SAMPLE_STAGE_READAHEAD)
+    .try_collect()
+    .await?;
+
+    Ok(out)
+}
+
+/// Load the forward index for every distinct bucket referenced by `runs`,
+/// fanning out up to [`SAMPLE_STAGE_READAHEAD`] fetches in parallel.
+///
+/// Buckets are independent keyspaces (RFC 0001), so concurrent
+/// `QueryReader::forward_index` calls share nothing. The returned map is
+/// keyed by the opaque `bucket_id` used throughout the adapter.
+async fn preload_forward_indices<R: QueryReader + ?Sized>(
+    reader: &R,
+    runs: &[BucketRun],
+    series: &[ResolvedSeriesRef],
+) -> Result<HashMap<u64, Arc<dyn crate::index::ForwardIndexLookup + Send + Sync>>, QueryError> {
+    // Dedupe buckets and gather the distinct series IDs touched inside each.
+    let mut distinct: HashMap<u64, (TimeBucket, Vec<SeriesId>)> = HashMap::new();
+    for run in runs {
+        if distinct.contains_key(&run.bucket_id) {
             continue;
         }
         let bucket = decode_bucket(run.bucket_id)
             .ok_or_else(|| internal_err(format!("invalid bucket id: {}", run.bucket_id)))?;
-        // Collect unique SeriesIds touched inside this bucket across
-        // all runs (typically one run per bucket, but be correct).
-        let mut ids: Vec<SeriesId> = request
-            .series
+        let mut ids: Vec<SeriesId> = series
             .iter()
             .filter(|r| r.bucket_id == run.bucket_id)
             .map(|r| r.series_id as SeriesId)
             .collect();
         ids.sort_unstable();
         ids.dedup();
+        distinct.insert(run.bucket_id, (bucket, ids));
+    }
+
+    // Fan out. `forward_index` returns `Box<dyn ... + 'static>`; upgrade
+    // to `Arc<dyn ...>` so multiple runs for the same bucket can share one
+    // lookup. Box → Arc conversion is free.
+    stream::iter(distinct.into_iter().map(|(bid, (bucket, ids))| async move {
         let forward = reader
             .forward_index(&bucket, &ids)
             .await
             .map_err(|e| internal_err(e.to_string()))?;
-        // `forward_index` returns `Box<dyn ... + 'static>`. Upgrade to
-        // `Arc<dyn ...>` so multiple runs for the same bucket share one
-        // lookup without re-loading. Box → Arc conversion is free.
-        per_bucket_forward.insert(run.bucket_id, Arc::from(forward));
-    }
+        Ok::<_, QueryError>((bid, Arc::from(forward)))
+    }))
+    .buffer_unordered(SAMPLE_STAGE_READAHEAD)
+    .try_collect()
+    .await
+}
 
-    let mut out = Vec::with_capacity(runs.len());
-    for run in runs {
-        let bucket = decode_bucket(run.bucket_id)
-            .ok_or_else(|| internal_err(format!("invalid bucket id: {}", run.bucket_id)))?;
-        let forward = per_bucket_forward
-            .get(&run.bucket_id)
-            .expect("forward index pre-loaded above");
+/// Build a single [`SampleBatch`] for one bucket-run.
+///
+/// The per-series inner loop stays sequential by design — RFC 0007
+/// §"Execution Model" (line 256) prohibits implicit spawn-per-series.
+/// Concurrency at this layer is the per-run dispatch above.
+async fn build_batch_for_run<R: QueryReader + ?Sized>(
+    reader: &R,
+    run: BucketRun,
+    forward: Arc<dyn crate::index::ForwardIndexLookup + Send + Sync>,
+    series: Arc<[ResolvedSeriesRef]>,
+    time_range: TimeRange,
+) -> Result<SampleBatch, QueryError> {
+    let bucket = decode_bucket(run.bucket_id)
+        .ok_or_else(|| internal_err(format!("invalid bucket id: {}", run.bucket_id)))?;
 
-        let series_count = run.range.end - run.range.start;
-        let mut block = SampleBlock::with_series_count(series_count);
+    let series_count = run.range.end - run.range.start;
+    let mut block = SampleBlock::with_series_count(series_count);
 
-        // The source's time_range is inclusive-exclusive. The existing
-        // QueryReader::samples contract is inclusive/inclusive with
-        // `timestamp > start_ms && timestamp <= end_ms`
-        // (see mock + MiniQueryReader). Translate by passing
-        // `start_ms = time_range.start_ms - 1` and
-        // `end_ms = time_range.end_ms_exclusive - 1`. See §5 Decisions
-        // Log 2.2 for this quirk.
-        let start_ms = request.time_range.start_ms.saturating_sub(1);
-        let end_ms = request.time_range.end_ms_exclusive.saturating_sub(1);
+    // The source's time_range is inclusive-exclusive. The existing
+    // QueryReader::samples contract is inclusive/inclusive with
+    // `timestamp > start_ms && timestamp <= end_ms`
+    // (see mock + MiniQueryReader). Translate by passing
+    // `start_ms = time_range.start_ms - 1` and
+    // `end_ms = time_range.end_ms_exclusive - 1`. See §5 Decisions
+    // Log 2.2 for this quirk.
+    let start_ms = time_range.start_ms.saturating_sub(1);
+    let end_ms = time_range.end_ms_exclusive.saturating_sub(1);
 
-        for (col_idx, series_ref) in request.series[run.range.clone()].iter().enumerate() {
-            let sid = series_ref.series_id as SeriesId;
-            let spec = forward.get_spec(&sid).ok_or_else(|| {
-                internal_err(format!(
-                    "series {} missing from forward index in bucket {:?}",
-                    sid, bucket
-                ))
-            })?;
-            let metric_name = spec
-                .labels
-                .iter()
-                .find(|l| l.name == "__name__")
-                .map(|l| l.value.as_str())
-                .unwrap_or("");
-            let samples: Vec<Sample> = reader
-                .samples(&bucket, sid, metric_name, start_ms, end_ms)
-                .await
-                .map_err(|e| internal_err(e.to_string()))?;
+    for (col_idx, series_ref) in series[run.range.clone()].iter().enumerate() {
+        let sid = series_ref.series_id as SeriesId;
+        let spec = forward.get_spec(&sid).ok_or_else(|| {
+            internal_err(format!(
+                "series {} missing from forward index in bucket {:?}",
+                sid, bucket
+            ))
+        })?;
+        let metric_name = spec
+            .labels
+            .iter()
+            .find(|l| l.name == "__name__")
+            .map(|l| l.value.as_str())
+            .unwrap_or("");
+        let samples: Vec<Sample> = reader
+            .samples(&bucket, sid, metric_name, start_ms, end_ms)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?;
 
-            let (ts_col, val_col) = (&mut block.timestamps[col_idx], &mut block.values[col_idx]);
-            ts_col.reserve(samples.len());
-            val_col.reserve(samples.len());
-            // Preserve stale markers verbatim as STALE_NAN — the
-            // storage layer encodes them as `f64::from_bits(STALE_NAN)`,
-            // which survives the unmodified `s.value` copy below
-            // (see `crate::model::is_stale_nan` and RFC 0007 source→caller
-            // contract).
-            for s in samples {
-                ts_col.push(s.timestamp_ms);
-                val_col.push(s.value);
-            }
+        let (ts_col, val_col) = (&mut block.timestamps[col_idx], &mut block.values[col_idx]);
+        ts_col.reserve(samples.len());
+        val_col.reserve(samples.len());
+        // Preserve stale markers verbatim as STALE_NAN — the
+        // storage layer encodes them as `f64::from_bits(STALE_NAN)`,
+        // which survives the unmodified `s.value` copy below
+        // (see `crate::model::is_stale_nan` and RFC 0007 source→caller
+        // contract).
+        for s in samples {
+            ts_col.push(s.timestamp_ms);
+            val_col.push(s.value);
         }
-
-        out.push(SampleBatch {
-            series_range: run.range,
-            samples: block,
-        });
     }
 
-    Ok(out)
+    Ok(SampleBatch {
+        series_range: run.range,
+        samples: block,
+    })
 }
 
 /// A contiguous sub-slice of `request.series` whose entries all share a
