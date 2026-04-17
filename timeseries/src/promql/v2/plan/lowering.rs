@@ -36,7 +36,9 @@ use promql_parser::parser::token::{
 use crate::promql::v2::operators::aggregate::AggregateKind;
 use crate::promql::v2::operators::binary::BinaryOpKind;
 use crate::promql::v2::operators::instant_fn::InstantFnKind;
+use crate::promql::v2::operators::label_manip::LabelManipKind;
 use crate::promql::v2::operators::rollup::RollupKind;
+use regex::Regex;
 
 use super::error::PlanError;
 use super::plan_types::{
@@ -225,6 +227,74 @@ fn lower_call(call: &parser::Call, ctx: &LoweringContext) -> Result<LogicalPlan,
     let name = call.func.name;
     let args: &[Box<parser::Expr>] = &call.args.args;
 
+    match name {
+        "pi" => {
+            if !args.is_empty() {
+                return Err(PlanError::InvalidArgument {
+                    function: "pi".to_string(),
+                    expected: "no arguments".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            return Ok(LogicalPlan::Scalar(std::f64::consts::PI));
+        }
+        "time" => {
+            if !args.is_empty() {
+                return Err(PlanError::InvalidArgument {
+                    function: "time".to_string(),
+                    expected: "no arguments".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            return Ok(LogicalPlan::Time);
+        }
+        "vector" => {
+            if args.len() != 1 {
+                return Err(PlanError::InvalidArgument {
+                    function: "vector".to_string(),
+                    expected: "exactly one scalar argument".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            let child = lower(&args[0], ctx)?;
+            if !child.produces_scalar() {
+                return Err(PlanError::InvalidArgument {
+                    function: "vector".to_string(),
+                    expected: "scalar argument".to_string(),
+                    got: describe_logical_plan(&child),
+                });
+            }
+            return Ok(LogicalPlan::Vectorize {
+                child: Box::new(child),
+            });
+        }
+        "scalar" => {
+            if args.len() != 1 {
+                return Err(PlanError::InvalidArgument {
+                    function: "scalar".to_string(),
+                    expected: "exactly one instant-vector argument".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            let child = lower(&args[0], ctx)?;
+            if child.produces_matrix() {
+                return Err(PlanError::InvalidArgument {
+                    function: "scalar".to_string(),
+                    expected: "instant-vector argument".to_string(),
+                    got: describe_logical_plan(&child),
+                });
+            }
+            return Ok(if child.produces_scalar() {
+                child
+            } else {
+                LogicalPlan::Scalarize {
+                    child: Box::new(child),
+                }
+            });
+        }
+        _ => {}
+    }
+
     // ---- Range-vector functions (→ Rollup) -----------------------------
     if let Some(kind) = rollup_kind_for(name, args)? {
         if args.is_empty() {
@@ -254,20 +324,41 @@ fn lower_call(call: &parser::Call, ctx: &LoweringContext) -> Result<LogicalPlan,
         });
     }
 
-    // ---- Instant scalar functions (→ InstantFn) ------------------------
-    if let Some(kind) = instant_fn_kind_for(name, args)? {
-        // The value argument is always args[0] for every instant-fn we support
-        // (`round`, `clamp*`, `timestamp`, and every unary math / trig fn).
-        // Scalar plan-time bounds (e.g. clamp's `min`/`max`) live in later
-        // arg slots and are folded into the kind via `instant_fn_kind_for`.
-        if args.is_empty() {
+    // ---- Label-manipulation functions ----------------------------------
+    if let Some(kind) = label_manip_kind_for(name, args)? {
+        let child = lower(&args[0], ctx)?;
+        if child.produces_matrix() || child.produces_scalar() {
             return Err(PlanError::InvalidArgument {
                 function: name.to_string(),
-                expected: "one instant-vector argument".to_string(),
-                got: "no arguments".to_string(),
+                expected: "instant-vector argument".to_string(),
+                got: describe_logical_plan(&child),
             });
         }
-        let child = lower(&args[0], ctx)?;
+        return Ok(LogicalPlan::LabelManip {
+            kind,
+            child: Box::new(child),
+        });
+    }
+
+    // ---- Instant scalar functions (→ InstantFn) ------------------------
+    if let Some(kind) = instant_fn_kind_for(name, args)? {
+        let child = if args.is_empty() {
+            // Calendar/date functions default to `vector(time())` when no
+            // argument is supplied. `time()` itself is scalar in PromQL;
+            // `vector()` is the explicit coercion to a one-series vector.
+            LogicalPlan::Vectorize {
+                child: Box::new(LogicalPlan::Time),
+            }
+        } else {
+            lower(&args[0], ctx)?
+        };
+        if child.produces_matrix() {
+            return Err(PlanError::InvalidArgument {
+                function: name.to_string(),
+                expected: "instant-vector argument".to_string(),
+                got: describe_logical_plan(&child),
+            });
+        }
         return Ok(LogicalPlan::InstantFn {
             kind,
             child: Box::new(child),
@@ -275,6 +366,74 @@ fn lower_call(call: &parser::Call, ctx: &LoweringContext) -> Result<LogicalPlan,
     }
 
     Err(PlanError::UnknownFunction(name.to_string()))
+}
+
+fn label_manip_kind_for(
+    name: &str,
+    args: &[Box<parser::Expr>],
+) -> Result<Option<LabelManipKind>, PlanError> {
+    let kind = match name {
+        "label_replace" => {
+            if args.len() != 5 {
+                return Err(PlanError::InvalidArgument {
+                    function: "label_replace".to_string(),
+                    expected: "exactly five arguments".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            let dst_label = expect_string_literal(&args[1], "label_replace")?;
+            if !is_valid_label_name(&dst_label) {
+                return Err(PlanError::InvalidArgument {
+                    function: "label_replace".to_string(),
+                    expected: "non-empty destination label name".to_string(),
+                    got: format!("label {:?}", dst_label),
+                });
+            }
+            let replacement = expect_string_literal(&args[2], "label_replace")?;
+            let src_label = expect_string_literal(&args[3], "label_replace")?;
+            let regex = expect_string_literal(&args[4], "label_replace")?;
+            Regex::new(&format!("^(?s:{regex})$")).map_err(|err| PlanError::InvalidArgument {
+                function: "label_replace".to_string(),
+                expected: "valid regular expression".to_string(),
+                got: err.to_string(),
+            })?;
+            LabelManipKind::Replace {
+                dst_label,
+                replacement,
+                src_label,
+                regex,
+            }
+        }
+        "label_join" => {
+            if args.len() < 3 {
+                return Err(PlanError::InvalidArgument {
+                    function: "label_join".to_string(),
+                    expected: "at least three arguments".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            let dst_label = expect_string_literal(&args[1], "label_join")?;
+            if !is_valid_label_name(&dst_label) {
+                return Err(PlanError::InvalidArgument {
+                    function: "label_join".to_string(),
+                    expected: "non-empty destination label name".to_string(),
+                    got: format!("label {:?}", dst_label),
+                });
+            }
+            let separator = expect_string_literal(&args[2], "label_join")?;
+            let src_labels = args[3..]
+                .iter()
+                .map(|arg| expect_string_literal(arg, "label_join"))
+                .collect::<Result<Vec<_>, _>>()?;
+            LabelManipKind::Join {
+                dst_label,
+                separator,
+                src_labels: Arc::from(src_labels),
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(kind))
 }
 
 /// If `name` names a range-vector function, return the `RollupKind` to
@@ -349,6 +508,86 @@ fn instant_fn_kind_for(
         "rad" => InstantFnKind::Rad,
         "sgn" => InstantFnKind::Sgn,
         "timestamp" => InstantFnKind::Timestamp,
+        "year" => {
+            if args.len() > 1 {
+                return Err(PlanError::InvalidArgument {
+                    function: "year".to_string(),
+                    expected: "zero or one instant-vector argument".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            InstantFnKind::Year
+        }
+        "month" => {
+            if args.len() > 1 {
+                return Err(PlanError::InvalidArgument {
+                    function: "month".to_string(),
+                    expected: "zero or one instant-vector argument".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            InstantFnKind::Month
+        }
+        "day_of_month" => {
+            if args.len() > 1 {
+                return Err(PlanError::InvalidArgument {
+                    function: "day_of_month".to_string(),
+                    expected: "zero or one instant-vector argument".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            InstantFnKind::DayOfMonth
+        }
+        "day_of_year" => {
+            if args.len() > 1 {
+                return Err(PlanError::InvalidArgument {
+                    function: "day_of_year".to_string(),
+                    expected: "zero or one instant-vector argument".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            InstantFnKind::DayOfYear
+        }
+        "day_of_week" => {
+            if args.len() > 1 {
+                return Err(PlanError::InvalidArgument {
+                    function: "day_of_week".to_string(),
+                    expected: "zero or one instant-vector argument".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            InstantFnKind::DayOfWeek
+        }
+        "hour" => {
+            if args.len() > 1 {
+                return Err(PlanError::InvalidArgument {
+                    function: "hour".to_string(),
+                    expected: "zero or one instant-vector argument".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            InstantFnKind::Hour
+        }
+        "minute" => {
+            if args.len() > 1 {
+                return Err(PlanError::InvalidArgument {
+                    function: "minute".to_string(),
+                    expected: "zero or one instant-vector argument".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            InstantFnKind::Minute
+        }
+        "days_in_month" => {
+            if args.len() > 1 {
+                return Err(PlanError::InvalidArgument {
+                    function: "days_in_month".to_string(),
+                    expected: "zero or one instant-vector argument".to_string(),
+                    got: format!("{} arguments", args.len()),
+                });
+            }
+            InstantFnKind::DaysInMonth
+        }
         "round" => {
             // `round(v)` or `round(v, to_nearest)`. `to_nearest` defaults to 1.
             let to_nearest = if args.len() == 1 {
@@ -461,13 +700,24 @@ fn lower_aggregate(
                     expected: "integer `k` parameter".to_string(),
                     got: "missing parameter".to_string(),
                 })?;
-            let k_f =
-                expect_number_literal(param, aggregate_op_name(op_id), "literal numeric `k`")?;
-            // Match the existing engine at `evaluator.rs::coerce_k_size` — cast
-            // `f64 → i64` with `as`, accepting platform-defined overflow on
-            // very large inputs. `k < 1` is treated as "no selection" by the
-            // breaker operator; we do not reject it here.
-            let k = k_f as i64;
+            let (k, param_plan) = match lower(param, ctx)? {
+                LogicalPlan::Scalar(k_f) => {
+                    // Match the existing engine at `evaluator.rs::coerce_k_size`
+                    // — cast `f64 → i64` with `as`, accepting platform-defined
+                    // overflow on very large inputs. `k < 1` is treated as "no
+                    // selection" by the breaker operator; we do not reject it
+                    // here.
+                    (k_f as i64, None)
+                }
+                lowered if lowered.produces_scalar() => (0, Some(Box::new(lowered))),
+                lowered => {
+                    return Err(PlanError::InvalidArgument {
+                        function: aggregate_op_name(op_id).to_string(),
+                        expected: "scalar `k` parameter".to_string(),
+                        got: describe_logical_plan(&lowered),
+                    });
+                }
+            };
             let kind = if op_id == T_TOPK {
                 AggregateKind::Topk(k)
             } else {
@@ -476,6 +726,7 @@ fn lower_aggregate(
             Ok(LogicalPlan::Aggregate {
                 kind,
                 child: Box::new(child),
+                param: param_plan,
                 grouping,
             })
         }
@@ -492,6 +743,7 @@ fn lower_aggregate(
             Ok(LogicalPlan::Aggregate {
                 kind: AggregateKind::Quantile(q),
                 child: Box::new(child),
+                param: None,
                 grouping,
             })
         }
@@ -525,6 +777,7 @@ fn aggregate_streaming(
     LogicalPlan::Aggregate {
         kind,
         child: Box::new(child),
+        param: None,
         grouping,
     }
 }
@@ -557,6 +810,10 @@ fn expect_string_literal(expr: &parser::Expr, function: &str) -> Result<String, 
             got: describe_parser_expr(other),
         }),
     }
+}
+
+fn is_valid_label_name(label: &str) -> bool {
+    !label.is_empty()
 }
 
 // ---------------------------------------------------------------------------
@@ -690,7 +947,11 @@ fn describe_logical_plan(plan: &LogicalPlan) -> String {
         LogicalPlan::VectorSelector { .. } => "instant-vector".to_string(),
         LogicalPlan::MatrixSelector { .. } => "range-vector (matrix)".to_string(),
         LogicalPlan::Scalar(v) => format!("scalar {v}"),
+        LogicalPlan::Time => "scalar (time)".to_string(),
+        LogicalPlan::Scalarize { .. } => "scalar (from scalar())".to_string(),
+        LogicalPlan::Vectorize { .. } => "instant-vector (from vector())".to_string(),
         LogicalPlan::InstantFn { .. } => "instant-vector (from instant fn)".to_string(),
+        LogicalPlan::LabelManip { .. } => "instant-vector (from label manipulation)".to_string(),
         LogicalPlan::Rollup { .. } => "instant-vector (from rollup)".to_string(),
         LogicalPlan::Binary { .. } => "vector (from binary op)".to_string(),
         LogicalPlan::Aggregate { .. } => "vector (from aggregate)".to_string(),
@@ -796,6 +1057,164 @@ mod tests {
     }
 
     #[test]
+    fn should_lower_pi_as_scalar_literal() {
+        // given
+        let expr = parse("pi()");
+
+        // when
+        let plan = lower(&expr, &ctx()).unwrap();
+
+        // then
+        assert_eq!(plan, LogicalPlan::Scalar(std::f64::consts::PI));
+    }
+
+    #[test]
+    fn should_lower_time_as_scalar_leaf() {
+        // given
+        let expr = parse("time()");
+
+        // when
+        let plan = lower(&expr, &ctx()).unwrap();
+
+        // then
+        assert_eq!(plan, LogicalPlan::Time);
+    }
+
+    #[test]
+    fn should_lower_vector_over_scalar_expression() {
+        // given
+        let expr = parse("vector(1 + 1)");
+
+        // when
+        let plan = lower(&expr, &ctx()).unwrap();
+
+        // then
+        match plan {
+            LogicalPlan::Vectorize { child } => match *child {
+                LogicalPlan::Binary { .. } => {}
+                other => panic!("unexpected vector child: {other:?}"),
+            },
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_lower_scalar_over_vector_expression() {
+        // given
+        let expr = parse("scalar(foo)");
+
+        // when
+        let plan = lower(&expr, &ctx()).unwrap();
+
+        // then
+        match plan {
+            LogicalPlan::Scalarize { child } => {
+                assert!(matches!(*child, LogicalPlan::VectorSelector { .. }));
+            }
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_lower_zero_arg_calendar_function_via_vectorized_time() {
+        // given
+        let expr = parse("minute()");
+
+        // when
+        let plan = lower(&expr, &ctx()).unwrap();
+
+        // then
+        match plan {
+            LogicalPlan::InstantFn {
+                kind: InstantFnKind::Minute,
+                child,
+            } => match *child {
+                LogicalPlan::Vectorize { child } => {
+                    assert!(matches!(*child, LogicalPlan::Time));
+                }
+                other => panic!("unexpected calendar default arg: {other:?}"),
+            },
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_lower_label_replace_as_label_manip() {
+        // given
+        let expr = parse(r#"label_replace(foo, "dst", "$1", "src", "(.*)")"#);
+
+        // when
+        let plan = lower(&expr, &ctx()).unwrap();
+
+        // then
+        match plan {
+            LogicalPlan::LabelManip {
+                kind:
+                    LabelManipKind::Replace {
+                        dst_label,
+                        replacement,
+                        src_label,
+                        regex,
+                    },
+                child,
+            } => {
+                assert_eq!(dst_label, "dst");
+                assert_eq!(replacement, "$1");
+                assert_eq!(src_label, "src");
+                assert_eq!(regex, "(.*)");
+                assert!(matches!(*child, LogicalPlan::VectorSelector { .. }));
+            }
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_lower_label_join_as_label_manip() {
+        // given
+        let expr = parse(r#"label_join(foo, "dst", "-", "src", "src1")"#);
+
+        // when
+        let plan = lower(&expr, &ctx()).unwrap();
+
+        // then
+        match plan {
+            LogicalPlan::LabelManip {
+                kind:
+                    LabelManipKind::Join {
+                        dst_label,
+                        separator,
+                        src_labels,
+                    },
+                child,
+            } => {
+                assert_eq!(dst_label, "dst");
+                assert_eq!(separator, "-");
+                assert_eq!(
+                    src_labels.as_ref(),
+                    &["src".to_string(), "src1".to_string()]
+                );
+                assert!(matches!(*child, LogicalPlan::VectorSelector { .. }));
+            }
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_label_replace_with_invalid_regex() {
+        // given
+        let expr = parse(r#"label_replace(foo, "dst", "$1", "src", "(.*")"#);
+
+        // when
+        let err = lower(&expr, &ctx()).unwrap_err();
+
+        // then
+        match err {
+            PlanError::InvalidArgument { function, .. } => assert_eq!(function, "label_replace"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn should_lower_rate_as_rollup_over_matrix_selector() {
         // given: `rate(foo[5m])`
         let expr = parse("rate(foo[5m])");
@@ -879,9 +1298,11 @@ mod tests {
             LogicalPlan::Aggregate {
                 kind,
                 child,
+                param,
                 grouping,
             } => {
                 assert_eq!(kind, AggregateKind::Sum);
+                assert!(param.is_none());
                 assert!(matches!(*child, LogicalPlan::VectorSelector { .. }));
                 match grouping {
                     AggregateGrouping::By(labels) => {
@@ -900,10 +1321,11 @@ mod tests {
         let expr = parse("topk(5, foo)");
         // when: lowered
         let plan = lower(&expr, &ctx()).unwrap();
-        // then: AggregateKind::Topk(5)
+        // then: AggregateKind::Topk(5) with no dynamic param child
         match plan {
-            LogicalPlan::Aggregate { kind, .. } => {
+            LogicalPlan::Aggregate { kind, param, .. } => {
                 assert_eq!(kind, AggregateKind::Topk(5));
+                assert!(param.is_none());
             }
             other => panic!("unexpected lowering: {other:?}"),
         }
@@ -1029,9 +1451,11 @@ mod tests {
             LogicalPlan::Aggregate {
                 kind,
                 child,
+                param,
                 grouping,
             } => {
                 assert_eq!(kind, AggregateKind::Sum);
+                assert!(param.is_none());
                 match grouping {
                     AggregateGrouping::By(labels) => {
                         assert_eq!(labels.as_ref(), &["pod".to_string()]);
@@ -1048,6 +1472,37 @@ mod tests {
                     }
                     other => panic!("unexpected Rollup child: {other:?}"),
                 }
+            }
+            other => panic!("unexpected lowering: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_lower_topk_with_scalar_param_expression() {
+        // given: `topk(scalar(foo), bar)`
+        let expr = parse("topk(scalar(foo), bar)");
+
+        // when
+        let plan = lower(&expr, &ctx()).unwrap();
+
+        // then
+        match plan {
+            LogicalPlan::Aggregate {
+                kind,
+                child,
+                param,
+                grouping,
+            } => {
+                assert_eq!(kind, AggregateKind::Topk(0));
+                assert!(matches!(*child, LogicalPlan::VectorSelector { .. }));
+                assert!(matches!(
+                    *param.expect("dynamic param"),
+                    LogicalPlan::Scalarize { .. }
+                ));
+                assert_eq!(
+                    grouping,
+                    AggregateGrouping::By(Arc::from(Vec::<String>::new()))
+                );
             }
             other => panic!("unexpected lowering: {other:?}"),
         }

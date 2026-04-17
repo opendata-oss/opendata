@@ -22,6 +22,7 @@ use std::sync::Arc;
 use crate::promql::v2::operators::aggregate::AggregateKind;
 use crate::promql::v2::operators::binary::BinaryOpKind;
 use crate::promql::v2::operators::instant_fn::InstantFnKind;
+use crate::promql::v2::operators::label_manip::LabelManipKind;
 use crate::promql::v2::operators::rollup::RollupKind;
 use promql_parser::parser;
 
@@ -198,10 +199,32 @@ pub enum LogicalPlan {
     /// distinction at plan time.
     Scalar(f64),
 
+    /// Scalar leaf whose value is the current evaluation step timestamp in
+    /// seconds. Used for `time()` and as the default argument carrier for the
+    /// zero-arg calendar functions.
+    Time,
+
+    /// Scalar coercion: `scalar(v)` collapses an instant-vector child to one
+    /// scalar value per step (`exactly one sample => that value`, otherwise
+    /// `NaN`).
+    Scalarize { child: Box<LogicalPlan> },
+
+    /// Vector coercion: `vector(s)` re-interprets a scalar-producing child as
+    /// a single anonymous instant-vector series. This is a logical typing
+    /// wrapper; the physical planner may lower it to the child op unchanged.
+    Vectorize { child: Box<LogicalPlan> },
+
     // --- stateless middle -------------------------------------------------
     /// Pointwise instant-vector function (`abs`, `ln`, `clamp`, ...).
     InstantFn {
         kind: InstantFnKind,
+        child: Box<LogicalPlan>,
+    },
+
+    /// Label-rewriting instant-vector functions (`label_replace`,
+    /// `label_join`).
+    LabelManip {
+        kind: LabelManipKind,
         child: Box<LogicalPlan>,
     },
 
@@ -226,6 +249,9 @@ pub enum LogicalPlan {
     Aggregate {
         kind: AggregateKind,
         child: Box<LogicalPlan>,
+        /// Optional scalar parameter expression for `topk` / `bottomk`
+        /// when the argument is not a foldable numeric literal.
+        param: Option<Box<LogicalPlan>>,
         grouping: AggregateGrouping,
     },
 
@@ -273,7 +299,10 @@ impl LogicalPlan {
     pub fn is_leaf(&self) -> bool {
         matches!(
             self,
-            Self::VectorSelector { .. } | Self::MatrixSelector { .. } | Self::Scalar(_)
+            Self::VectorSelector { .. }
+                | Self::MatrixSelector { .. }
+                | Self::Scalar(_)
+                | Self::Time
         )
     }
 
@@ -281,5 +310,27 @@ impl LogicalPlan {
     /// physical planner's type-checking pass.
     pub fn produces_matrix(&self) -> bool {
         matches!(self, Self::MatrixSelector { .. } | Self::Subquery { .. })
+    }
+
+    /// `true` iff this node produces a scalar shape (one anonymous value per
+    /// step rather than a vector/matrix).
+    pub fn produces_scalar(&self) -> bool {
+        match self {
+            Self::Scalar(_) | Self::Time => true,
+            Self::Scalarize { .. } => true,
+            Self::Vectorize { .. } => false,
+            Self::VectorSelector { .. }
+            | Self::MatrixSelector { .. }
+            | Self::Rollup { .. }
+            | Self::LabelManip { .. }
+            | Self::Aggregate { .. }
+            | Self::Subquery { .. }
+            | Self::Rechunk { .. }
+            | Self::CountValues { .. }
+            | Self::Concurrent { .. }
+            | Self::Coalesce { .. } => false,
+            Self::InstantFn { child, .. } => child.produces_scalar(),
+            Self::Binary { lhs, rhs, .. } => lhs.produces_scalar() && rhs.produces_scalar(),
+        }
     }
 }

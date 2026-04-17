@@ -39,11 +39,15 @@ pub(crate) use operators::binary::{
 #[allow(unused_imports)]
 pub(crate) use operators::coalesce::CoalesceOp;
 #[allow(unused_imports)]
+pub(crate) use operators::coercion::{ScalarizeOp, TimeScalarOp};
+#[allow(unused_imports)]
 pub(crate) use operators::concurrent::{ConcurrentOp, DEFAULT_CHANNEL_BOUND};
 #[allow(unused_imports)]
 pub(crate) use operators::count_values::CountValuesOp;
 #[allow(unused_imports)]
 pub(crate) use operators::instant_fn::{InstantFnKind, InstantFnOp};
+#[allow(unused_imports)]
+pub(crate) use operators::label_manip::{LabelManipKind, LabelManipOp};
 #[allow(unused_imports)]
 pub(crate) use operators::matrix_selector::{CellIndex, MatrixSelectorOp, MatrixWindowBatch};
 #[allow(unused_imports)]
@@ -56,8 +60,8 @@ pub(crate) use operators::subquery::{ChildFactory, SubqueryOp};
 pub(crate) use operators::vector_selector::VectorSelectorOp;
 #[allow(unused_imports)]
 pub(crate) use plan::{
-    AggregateGrouping, AtModifier, BinaryMatching, Cardinality, LogicalPlan, LoweringContext,
-    MatchingAxis, Offset, PhysicalPlan, PlanError, build_physical_plan, lower,
+    AggregateGrouping, AtModifier, BinaryMatching, Cardinality, InstantVectorSort, LogicalPlan,
+    LoweringContext, MatchingAxis, Offset, PhysicalPlan, PlanError, build_physical_plan, lower,
 };
 #[allow(unused_imports)]
 pub(crate) use source::{

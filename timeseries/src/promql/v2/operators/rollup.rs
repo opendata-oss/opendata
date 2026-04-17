@@ -311,10 +311,18 @@ impl<W: WindowStream> RollupOp<W> {
         let mut out = OutBuffers::allocate(&self.reservation, cell_count)?;
 
         // Pre-slice the step timestamps covered by this window for
-        // per-cell (window_start, window_end) math.
-        let step_ts = &window.step_timestamps[window.step_range.clone()];
+        // per-cell (window_start, window_end) math. Prefer the
+        // `effective_times` column when present — the upstream operator
+        // has folded `@` / offset into those, so the samples actually
+        // live in `(effective - range, effective]` rather than the
+        // `(step_t - range, step_t]` window that `step_timestamps`
+        // would imply (RFC 0007 §6.3.8; at_modifier #21).
+        let window_end_ts: &[i64] = match &window.effective_times {
+            Some(eff) => &eff[window.step_range.clone()],
+            None => &window.step_timestamps[window.step_range.clone()],
+        };
 
-        for (step_off, &window_end) in step_ts.iter().enumerate().take(step_count) {
+        for (step_off, &window_end) in window_end_ts.iter().enumerate().take(step_count) {
             let window_start = window_end.saturating_sub(self.range_ms);
             for series_off in 0..series_count {
                 let (ts, vs) = window.cell_samples(step_off, series_off);
@@ -846,6 +854,7 @@ mod tests {
             timestamps,
             values,
             cells: cell_idx,
+            effective_times: None,
         }
     }
 
@@ -1360,6 +1369,55 @@ mod tests {
         );
         let batches: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
         assert_eq!(batches[0].get(0, 0), Some(1.0));
+    }
+
+    #[test]
+    fn should_use_effective_times_for_window_math_when_present() {
+        // given: outer step is t=25 (= `step_timestamps[0]`) but samples
+        // live in the `(0, 100]` window (folded `@ 100`) — same shape as
+        // `rate(metric[100s] @ 100)` at outer t=25s. With
+        // `effective_times = Some([100])` the rollup must compute over
+        // `(0, 100]`, not `(-75, 25]`.
+        let step_ts = vec![25i64];
+        let effective = vec![100i64];
+        let mut window = build_window(
+            step_ts.clone(),
+            1,
+            vec![vec![
+                (10, 1.0),
+                (20, 2.0),
+                (30, 3.0),
+                (40, 4.0),
+                (50, 5.0),
+                (60, 6.0),
+                (70, 7.0),
+                (80, 8.0),
+                (90, 9.0),
+                (100, 10.0),
+            ]],
+        );
+        window.effective_times = Some(Arc::from(effective));
+        let schema = build_schema(step_ts, 10, 1);
+
+        let mock = MockWindows::new(schema, vec![window]);
+        let mut op = RollupOp::new(mock, RollupKind::Rate, 100, MemoryReservation::new(1 << 20));
+
+        // when
+        let batches: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then: Prometheus extrapolated rate over (0, 100] with samples
+        // at 10..100 (avg interval 10ms):
+        //   last - first = 9; time_diff = 90ms = 0.09s
+        //   dur_to_start = 10ms = 0.01s (< 1.1 * avg = 0.011 → keep)
+        //   dur_to_end = 0
+        //   factor = (0.09 + 0.01 + 0) / 0.09 = 10/9
+        //   scaled = 9 * 10/9 = 10
+        //   rate = 10 / 0.1 = 100/s  (legacy v1 evaluator matches)
+        let v = batches[0].get(0, 0).expect("rate valid");
+        assert!(
+            approx_eq(v, 100.0, 1e-9),
+            "rate over effective window (0, 100]: {v}"
+        );
     }
 
     #[test]

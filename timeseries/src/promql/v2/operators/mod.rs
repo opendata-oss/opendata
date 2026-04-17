@@ -21,9 +21,11 @@
 pub(crate) mod aggregate;
 pub(crate) mod binary;
 pub(crate) mod coalesce;
+pub(crate) mod coercion;
 pub(crate) mod concurrent;
 pub(crate) mod count_values;
 pub(crate) mod instant_fn;
+pub(crate) mod label_manip;
 pub(crate) mod matrix_selector;
 pub(crate) mod rechunk;
 pub(crate) mod rollup;
@@ -40,9 +42,11 @@ pub(crate) mod prelude {
         BinaryOp, BinaryOpKind, BinaryShape, ConstScalarOp, MatchTable,
     };
     pub(crate) use super::coalesce::CoalesceOp;
+    pub(crate) use super::coercion::{ScalarizeOp, TimeScalarOp};
     pub(crate) use super::concurrent::{ConcurrentOp, DEFAULT_CHANNEL_BOUND};
     pub(crate) use super::count_values::CountValuesOp;
     pub(crate) use super::instant_fn::{InstantFnKind, InstantFnOp};
+    pub(crate) use super::label_manip::{LabelManipKind, LabelManipOp};
     pub(crate) use super::matrix_selector::{CellIndex, MatrixSelectorOp, MatrixWindowBatch};
     pub(crate) use super::rechunk::RechunkOp;
     pub(crate) use super::rollup::{MatrixWindowSource, RollupKind, RollupOp, WindowStream};

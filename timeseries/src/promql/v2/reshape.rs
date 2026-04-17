@@ -32,7 +32,9 @@
 //! iteration (non-deterministic); v1's `evaluate_instant` preserves the
 //! evaluator's emission order. Prometheus clients don't rely on order
 //! (the wire field is an unordered array), so v2's deterministic
-//! `series_idx`-order is structurally compatible with v1.
+//! `series_idx`-order is structurally compatible with v1. Root `topk` /
+//! `bottomk` instant queries are the exception: they are re-sorted by
+//! value so `promqltest`'s ordered expectations still match PromQL.
 //!
 //! Deferred schemas: operators like `CountValuesOp` publish
 //! [`SchemaRef::Deferred`] on their `Operator::schema()` but stamp
@@ -54,7 +56,7 @@
 use crate::model::{InstantSample, Labels, QueryValue, RangeSample};
 
 use super::batch::{SchemaRef, SeriesSchema, StepBatch};
-use super::plan::PhysicalPlan;
+use super::plan::{InstantVectorSort, PhysicalPlan};
 
 /// Error surfaced when the executor produces a shape the reshape layer
 /// does not know how to interpret. The wiring layer translates this
@@ -99,7 +101,7 @@ pub fn reshape_instant(
     // `ConstScalarOp` (and plans whose root collapsed to one) publish
     // exactly this shape. v1 surfaces such results as `QueryValue::Scalar`
     // rather than `Vector([{ labels: {}, .. }])`.
-    if is_scalar_schema(&plan.output_schema) {
+    if plan.root_is_scalar {
         for batch in &batches {
             check_batch_shape(batch)?;
             if batch.series_count() == 1 && batch.step_count() == 1 && batch.validity.get(0) {
@@ -151,7 +153,26 @@ pub fn reshape_instant(
             });
         }
     }
+    if let Some(sort) = plan.root_instant_vector_sort {
+        samples.sort_by(|left, right| compare_instant_values(left.value, right.value, sort));
+    }
     Ok(QueryValue::Vector(samples))
+}
+
+fn compare_instant_values(left: f64, right: f64, sort: InstantVectorSort) -> std::cmp::Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => match sort {
+            InstantVectorSort::DescendingValue => right
+                .partial_cmp(&left)
+                .unwrap_or(std::cmp::Ordering::Equal),
+            InstantVectorSort::AscendingValue => left
+                .partial_cmp(&right)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        },
+    }
 }
 
 /// Reshape a set of collected [`StepBatch`]es into the range-query
@@ -169,7 +190,7 @@ pub fn reshape_range(
     batches: Vec<StepBatch>,
 ) -> Result<QueryValue, ReshapeError> {
     // Scalar-root path.
-    if is_scalar_schema(&plan.output_schema) {
+    if plan.root_is_scalar {
         let mut samples: Vec<(i64, f64)> = Vec::new();
         for batch in &batches {
             check_batch_shape(batch)?;
@@ -241,18 +262,6 @@ pub fn reshape_range(
         out.push(RangeSample { labels, samples });
     }
     Ok(QueryValue::Matrix(out))
-}
-
-/// `true` when a schema describes a single unlabelled series — v2's
-/// canonical shape for a pure-scalar plan root (see
-/// [`crate::promql::v2::operators::binary::ConstScalarOp`]).
-fn is_scalar_schema(schema: &SchemaRef) -> bool {
-    if let SchemaRef::Static(s) = schema
-        && s.len() == 1
-    {
-        return s.labels(0).is_empty();
-    }
-    false
 }
 
 /// Defensive dimension check. `StepBatch::new` enforces these invariants
@@ -339,6 +348,18 @@ mod tests {
     }
 
     fn mk_plan(schema: SchemaRef, grid: StepGrid) -> PhysicalPlan {
+        mk_plan_with_scalar_flag(schema, grid, false)
+    }
+
+    fn mk_scalar_plan(schema: SchemaRef, grid: StepGrid) -> PhysicalPlan {
+        mk_plan_with_scalar_flag(schema, grid, true)
+    }
+
+    fn mk_plan_with_scalar_flag(
+        schema: SchemaRef,
+        grid: StepGrid,
+        root_is_scalar: bool,
+    ) -> PhysicalPlan {
         // Test-only builder — the tests never poll `root`, they just
         // consume `step_grid` and `output_schema` for the reshape call.
         struct Stub {
@@ -362,6 +383,8 @@ mod tests {
             }),
             output_schema: schema,
             step_grid: grid,
+            root_is_scalar,
+            root_instant_vector_sort: None,
         }
     }
 
@@ -477,7 +500,7 @@ mod tests {
             vec![2.0],
             validity,
         );
-        let plan = mk_plan(SchemaRef::Static(schema), instant_grid(50_000));
+        let plan = mk_scalar_plan(SchemaRef::Static(schema), instant_grid(50_000));
 
         // when
         let value = reshape_instant(&plan, vec![batch]).unwrap();
@@ -845,8 +868,8 @@ mod tests {
     fn should_return_empty_vector_when_no_batches() {
         // given: no batches at all
         let schema = mk_schema(vec![mk_labels("http_requests", "prod")]);
-        let plan_instant = mk_plan(SchemaRef::Static(schema.clone()), instant_grid(0));
-        let plan_range = mk_plan(SchemaRef::Static(schema), range_grid(0, 1, 5));
+        let plan_instant = mk_scalar_plan(SchemaRef::Static(schema.clone()), instant_grid(0));
+        let plan_range = mk_scalar_plan(SchemaRef::Static(schema), range_grid(0, 1, 5));
 
         // when / then (instant)
         match reshape_instant(&plan_instant, vec![]).unwrap() {
@@ -878,6 +901,7 @@ mod tests {
             // expected 2 cells, supplied 1 — dimension mismatch
             values: vec![1.0],
             validity,
+            source_timestamps: None,
         };
         let plan = mk_plan(SchemaRef::Static(schema), range_grid(100, 100, 2));
 
@@ -906,6 +930,7 @@ mod tests {
             series_range: 0..1,
             values: vec![1.0],
             validity,
+            source_timestamps: None,
         };
         let plan = mk_plan(SchemaRef::Deferred, instant_grid(100));
 

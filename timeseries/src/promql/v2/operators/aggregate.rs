@@ -68,9 +68,10 @@
 //! ### K semantics (topk / bottomk)
 //!
 //! K is an `i64`. Per `evaluator.rs:2249-2253` `coerce_k_size`:
-//! K < 1 ⇒ no cells selected. K ≥ group size ⇒ all valid inputs
-//! selected. The planner is expected to coerce the PromQL scalar
-//! parameter to `i64` at plan time.
+//! K < 1 ⇒ no cells selected. K ≥ input width ⇒ every valid input cell
+//! is eligible for selection. Literal `k` values are coerced at plan
+//! time; scalar expression params (e.g. `topk(scalar(foo), bar)`) are
+//! drained once onto the query step grid and coerced per step.
 //!
 //! ### q semantics (quantile)
 //!
@@ -491,15 +492,20 @@ fn k_cmp(a: f64, b: f64, order: KOrder) -> Ordering {
 #[derive(Clone, Copy, Debug)]
 struct KHeapEntry {
     value: f64,
-    /// Input-series index (roster-wide). Used as a deterministic
-    /// tie-breaker and also as the output cell column for topk/bottomk.
-    series_idx: u32,
+    /// Input-series index in the full child roster. Used for deterministic
+    /// tie-breaks and group-map lookup under tiled input batches.
+    global_series_idx: u32,
+    /// Input-series offset within the current batch's `series_range`.
+    /// Filter-shaped outputs (`topk` / `bottomk`) write back into this local
+    /// slice, not the full input roster.
+    local_series_idx: u32,
     order: KOrder,
 }
 
 impl PartialEq for KHeapEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.series_idx == other.series_idx && self.value.to_bits() == other.value.to_bits()
+        self.global_series_idx == other.global_series_idx
+            && self.value.to_bits() == other.value.to_bits()
     }
 }
 impl Eq for KHeapEntry {}
@@ -515,7 +521,7 @@ impl Ord for KHeapEntry {
         // index stays in the winners (first-seen preference; matches
         // `evaluator.rs:687-694`).
         k_cmp(self.value, other.value, self.order)
-            .then_with(|| self.series_idx.cmp(&other.series_idx))
+            .then_with(|| self.global_series_idx.cmp(&other.global_series_idx))
     }
 }
 
@@ -565,11 +571,20 @@ impl Drop for OutBuffers {
 /// rules, and memory accounting.
 pub struct AggregateOp<C: Operator> {
     child: C,
+    param_child: Option<Box<dyn Operator + Send>>,
     kind: AggregateKind,
     group_map: GroupMap,
     output_schema: Arc<SeriesSchema>,
     reservation: MemoryReservation,
     schema: OperatorSchema,
+    /// Optional per-step `k` values for dynamic `topk` / `bottomk`
+    /// parameters. Present only when lowering supplied a scalar child.
+    param_values: Option<Vec<i64>>,
+    /// Bytes reserved for `param_values`; released on `Drop`.
+    param_bytes: usize,
+    /// `true` once the optional scalar parameter child has been fully
+    /// drained into [`Self::param_values`].
+    param_loaded: bool,
     /// Pre-allocated per-group accumulator scratch used by the streaming
     /// kinds; reused across every step (reset between steps). Empty for
     /// breaker kinds.
@@ -588,6 +603,16 @@ pub struct AggregateOp<C: Operator> {
 }
 
 impl<C: Operator> AggregateOp<C> {
+    #[inline]
+    fn debug_assert_batch_within_input_roster(&self, input: &StepBatch) {
+        debug_assert!(
+            input.series_range.end <= self.group_map.input_series_count(),
+            "child series_range {:?} exceeds group map input count {}",
+            input.series_range,
+            self.group_map.input_series_count(),
+        );
+    }
+
     /// Construct a streaming aggregate.
     ///
     /// * `child` — upstream operator.
@@ -601,6 +626,17 @@ impl<C: Operator> AggregateOp<C> {
     ///   group scratch and every output batch.
     pub fn new(
         child: C,
+        kind: AggregateKind,
+        group_map: GroupMap,
+        output_schema: Arc<SeriesSchema>,
+        reservation: MemoryReservation,
+    ) -> Result<Self, QueryError> {
+        Self::new_with_param(child, None, kind, group_map, output_schema, reservation)
+    }
+
+    pub fn new_with_param(
+        child: C,
+        param_child: Option<Box<dyn Operator + Send>>,
         kind: AggregateKind,
         group_map: GroupMap,
         output_schema: Arc<SeriesSchema>,
@@ -625,21 +661,49 @@ impl<C: Operator> AggregateOp<C> {
 
         let grid = child.schema().step_grid;
         let schema = OperatorSchema::new(SchemaRef::Static(output_schema.clone()), grid);
+        debug_assert!(
+            param_child.is_none()
+                || matches!(kind, AggregateKind::Topk(_) | AggregateKind::Bottomk(_)),
+            "dynamic aggregate params are only supported for topk/bottomk",
+        );
+        if let Some(param_child) = &param_child {
+            debug_assert_eq!(
+                param_child.schema().step_grid,
+                grid,
+                "scalar aggregate param must share the main child step grid",
+            );
+        }
+
+        let (param_values, param_bytes) = if param_child.is_some() {
+            let bytes = grid.step_count.saturating_mul(std::mem::size_of::<i64>());
+            reservation.try_grow(bytes)?;
+            (Some(vec![0; grid.step_count]), bytes)
+        } else {
+            (None, 0)
+        };
 
         // Per-kind scratch allocation. Reserve up front for the hot
         // path; release on `Drop`. Breakers skip the accumulator column
         // entirely (cheaper than paying for unused lanes).
         let (accums, heaps, sort_bufs, bytes) = match kind {
             AggregateKind::Topk(k) | AggregateKind::Bottomk(k) => {
-                let bytes =
-                    heap_scratch_bytes(k, group_map.group_count, group_map.input_series_count());
+                let heap_k = if param_child.is_some() {
+                    group_map.input_series_count() as i64
+                } else {
+                    k
+                };
+                let bytes = heap_scratch_bytes(
+                    heap_k,
+                    group_map.group_count,
+                    group_map.input_series_count(),
+                );
                 reservation.try_grow(bytes)?;
                 // One heap per group — capacity is clamped to effective
                 // K (≤ input_series_count) to keep the allocation tight.
-                let cap = if k <= 0 {
+                let cap = if heap_k <= 0 {
                     0
                 } else {
-                    (k as usize).min(group_map.input_series_count())
+                    (heap_k as usize).min(group_map.input_series_count())
                 };
                 let heaps = (0..group_map.group_count)
                     .map(|_| BinaryHeap::with_capacity(cap))
@@ -664,11 +728,15 @@ impl<C: Operator> AggregateOp<C> {
 
         Ok(Self {
             child,
+            param_child,
             kind,
             group_map,
             output_schema,
             reservation,
             schema,
+            param_values,
+            param_bytes,
+            param_loaded: false,
             accums,
             heaps,
             sort_bufs,
@@ -676,6 +744,57 @@ impl<C: Operator> AggregateOp<C> {
             done: false,
             errored: false,
         })
+    }
+
+    fn load_param_values(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), QueryError>> {
+        if self.param_loaded {
+            return Poll::Ready(Ok(()));
+        }
+        let Some(param_child) = self.param_child.as_mut() else {
+            self.param_loaded = true;
+            return Poll::Ready(Ok(()));
+        };
+
+        loop {
+            match param_child.next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    self.param_child = None;
+                    self.param_loaded = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err)),
+                Poll::Ready(Some(Ok(batch))) => {
+                    debug_assert_eq!(
+                        batch.series_count(),
+                        1,
+                        "aggregate scalar param must produce exactly one series",
+                    );
+                    for step_off in 0..batch.step_count() {
+                        let global_step = batch.step_range.start + step_off;
+                        let cell = batch.cell_index(step_off, 0);
+                        let value = if batch.validity.get(cell) {
+                            batch.values[cell] as i64
+                        } else {
+                            0
+                        };
+                        if let Some(param_values) = self.param_values.as_mut() {
+                            param_values[global_step] = value;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn k_for_step(&self, step_idx: usize, input_len: usize, static_k: i64) -> usize {
+        let k_param = self
+            .param_values
+            .as_ref()
+            .map(|values| values[step_idx])
+            .unwrap_or(static_k);
+        coerce_k_size(k_param, input_len)
     }
 
     fn reduce_batch(&mut self, input: &StepBatch) -> Result<StepBatch, QueryError> {
@@ -692,11 +811,7 @@ impl<C: Operator> AggregateOp<C> {
         let group_count = self.group_map.group_count;
         let out_cells = step_count * group_count;
 
-        debug_assert_eq!(
-            in_series_count,
-            self.group_map.input_series_count(),
-            "child series count does not match group map",
-        );
+        self.debug_assert_batch_within_input_roster(input);
 
         let mut out = OutBuffers::allocate(&self.reservation, out_cells)?;
 
@@ -713,7 +828,8 @@ impl<C: Operator> AggregateOp<C> {
                 if !input.validity.get(cell) {
                     continue;
                 }
-                let group = match self.group_map.input_to_group[in_series] {
+                let global_series = input.series_range.start + in_series;
+                let group = match self.group_map.input_to_group[global_series] {
                     Some(g) => g as usize,
                     None => continue,
                 };
@@ -768,13 +884,7 @@ impl<C: Operator> AggregateOp<C> {
     /// via `OutBuffers`.
     fn reduce_batch_breaker(&mut self, input: &StepBatch) -> Result<StepBatch, QueryError> {
         let step_count = input.step_count();
-        let in_series_count = input.series_count();
-
-        debug_assert_eq!(
-            in_series_count,
-            self.group_map.input_series_count(),
-            "child series count does not match group map",
-        );
+        self.debug_assert_batch_within_input_roster(input);
 
         match self.kind {
             AggregateKind::Topk(k) => self.reduce_topk_or_bottomk(input, k, KOrder::SmallestFirst),
@@ -810,26 +920,14 @@ impl<C: Operator> AggregateOp<C> {
 
         let mut out = OutBuffers::allocate(&self.reservation, out_cells)?;
 
-        // K ≤ 0 ⇒ no cell is ever selected; every output cell has
-        // validity=0 (fresh `BitSet`). Matches
-        // `evaluator.rs::coerce_k_size` (`< 1 ⇒ 0`).
-        if k <= 0 {
-            let (values, validity) = out.finish();
-            return Ok(StepBatch::new(
-                input.step_timestamps.clone(),
-                input.step_range.clone(),
-                SchemaRef::Static(self.output_schema.clone()),
-                0..in_series_count,
-                values,
-                validity,
-            ));
-        }
-        let k_usize = k as usize;
-
         for step_off in 0..step_count {
+            let k_usize = self.k_for_step(input.step_range.start + step_off, in_series_count, k);
             // Reset heaps for this step. `clear()` retains capacity.
             for heap in &mut self.heaps {
                 heap.clear();
+            }
+            if k_usize == 0 {
+                continue;
             }
 
             let step_base = step_off * in_series_count;
@@ -838,14 +936,16 @@ impl<C: Operator> AggregateOp<C> {
                 if !input.validity.get(cell) {
                     continue;
                 }
-                let group = match self.group_map.input_to_group[in_series] {
+                let global_series = input.series_range.start + in_series;
+                let group = match self.group_map.input_to_group[global_series] {
                     Some(g) => g as usize,
                     None => continue,
                 };
                 let v = input.values[cell];
                 let entry = KHeapEntry {
                     value: v,
-                    series_idx: in_series as u32,
+                    global_series_idx: global_series as u32,
+                    local_series_idx: in_series as u32,
                     order,
                 };
                 let heap = &mut self.heaps[group];
@@ -868,7 +968,7 @@ impl<C: Operator> AggregateOp<C> {
             let out_base = step_off * in_series_count;
             for heap in &mut self.heaps {
                 for entry in heap.drain() {
-                    let idx = out_base + entry.series_idx as usize;
+                    let idx = out_base + entry.local_series_idx as usize;
                     out.values[idx] = entry.value;
                     out.validity.set(idx);
                 }
@@ -880,7 +980,7 @@ impl<C: Operator> AggregateOp<C> {
             input.step_timestamps.clone(),
             input.step_range.clone(),
             SchemaRef::Static(self.output_schema.clone()),
-            0..in_series_count,
+            input.series_range.clone(),
             values,
             validity,
         ))
@@ -907,7 +1007,8 @@ impl<C: Operator> AggregateOp<C> {
                 if !input.validity.get(cell) {
                     continue;
                 }
-                let group = match self.group_map.input_to_group[in_series] {
+                let global_series = input.series_range.start + in_series;
+                let group = match self.group_map.input_to_group[global_series] {
                     Some(g) => g as usize,
                     None => continue,
                 };
@@ -981,6 +1082,14 @@ impl<C: Operator> Operator for AggregateOp<C> {
         if self.done || self.errored {
             return Poll::Ready(None);
         }
+        match self.load_param_values(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(err)) => {
+                self.errored = true;
+                return Poll::Ready(Some(Err(err)));
+            }
+            Poll::Ready(Ok(())) => {}
+        }
         match self.child.next(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
@@ -1004,11 +1113,22 @@ impl<C: Operator> Operator for AggregateOp<C> {
 
 impl<C: Operator> Drop for AggregateOp<C> {
     fn drop(&mut self) {
+        if self.param_bytes > 0 {
+            self.reservation.release(self.param_bytes);
+            self.param_bytes = 0;
+        }
         if self.scratch_bytes > 0 {
             self.reservation.release(self.scratch_bytes);
             self.scratch_bytes = 0;
         }
     }
+}
+
+#[inline]
+fn coerce_k_size(k_param: i64, input_len: usize) -> usize {
+    let max_k = input_len as i64;
+    let coerced = k_param.min(max_k);
+    if coerced < 1 { 0 } else { coerced as usize }
 }
 
 // ---------------------------------------------------------------------------
@@ -1108,6 +1228,17 @@ mod tests {
         values: Vec<f64>,
         validity: Vec<bool>,
     ) -> StepBatch {
+        mk_batch_with_series_range(schema, step_count, 0..series_count, values, validity)
+    }
+
+    fn mk_batch_with_series_range(
+        schema: Arc<SeriesSchema>,
+        step_count: usize,
+        series_range: std::ops::Range<usize>,
+        values: Vec<f64>,
+        validity: Vec<bool>,
+    ) -> StepBatch {
+        let series_count = series_range.len();
         assert_eq!(values.len(), step_count * series_count);
         assert_eq!(validity.len(), step_count * series_count);
         let ts: Arc<[i64]> =
@@ -1122,7 +1253,7 @@ mod tests {
             ts,
             0..step_count,
             SchemaRef::Static(schema),
-            0..series_count,
+            series_range,
             values,
             bits,
         )
@@ -1526,6 +1657,40 @@ mod tests {
     }
 
     #[test]
+    fn should_use_absolute_series_indices_for_streaming_batches() {
+        // given: the child publishes only the tail slice of a 4-series roster.
+        // The group map still indexes the full roster, so the operator must
+        // offset by `input.series_range.start` before looking up groups.
+        let in_schema = mk_schema("in", 4);
+        let out_schema = mk_schema("out", 2);
+        let grid = mk_grid(1);
+        let batch = mk_batch_with_series_range(
+            in_schema.clone(),
+            1,
+            2..4,
+            vec![3.0, 5.0],
+            vec![true, true],
+        );
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0), Some(0), Some(1), Some(1)], 2);
+
+        // when
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Sum,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then
+        assert_eq!(outs[0].get(0, 0), None);
+        assert_eq!(outs[0].get(0, 1), Some(8.0));
+    }
+
+    #[test]
     fn should_respect_memory_reservation() {
         // given: a tiny reservation that the accumulator alone doesn't
         // fit into.
@@ -1885,6 +2050,43 @@ mod tests {
     }
 
     #[test]
+    fn should_use_absolute_series_indices_for_topk_batches() {
+        // given: a filter-shaped topk over the tail slice of a 6-series roster.
+        // The global lower-index tie-break and output `series_range` must both
+        // be based on the child's absolute roster position, not batch-local 0..n.
+        let in_schema = mk_schema("in", 6);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let batch = mk_batch_with_series_range(
+            in_schema.clone(),
+            1,
+            3..6,
+            vec![5.0, 5.0, 1.0],
+            vec![true, true, true],
+        );
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 6], 1);
+
+        // when
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Topk(2),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then
+        let b = &outs[0];
+        assert_eq!(b.series_range, 3..6);
+        assert_eq!(b.get(0, 0), Some(5.0));
+        assert_eq!(b.get(0, 1), Some(5.0));
+        assert_eq!(b.get(0, 2), None);
+    }
+
+    #[test]
     fn should_compute_quantile_with_linear_interpolation() {
         // given: 5 input series in one group, values 1..=5.
         //   q=0.5 → median = 3.0
@@ -1979,6 +2181,40 @@ mod tests {
         let b = &outs[0];
         assert!(approx_eq(b.get(0, 0).unwrap(), 2.0, 1e-12));
         assert!(approx_eq(b.get(0, 1).unwrap(), 20.0, 1e-12));
+    }
+
+    #[test]
+    fn should_use_absolute_series_indices_for_quantile_batches() {
+        // given: only the tail slice of a 5-series roster is present in this
+        // batch; quantile must still bucket values by their absolute series ids.
+        let in_schema = mk_schema("in", 5);
+        let out_schema = mk_schema("out", 2);
+        let grid = mk_grid(1);
+        let batch = mk_batch_with_series_range(
+            in_schema.clone(),
+            1,
+            2..5,
+            vec![7.0, 11.0, 13.0],
+            vec![true, true, true],
+        );
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0), Some(0), Some(0), Some(1), Some(1)], 2);
+
+        // when
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Quantile(0.5),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then
+        let b = &outs[0];
+        assert_eq!(b.get(0, 0), Some(7.0));
+        assert_eq!(b.get(0, 1), Some(12.0));
     }
 
     #[test]

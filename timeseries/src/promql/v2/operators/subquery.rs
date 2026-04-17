@@ -189,6 +189,18 @@ pub struct SubqueryOp {
     factory: ChildFactory,
     schema: OperatorSchema,
     outer_step_timestamps: Arc<[i64]>,
+    /// Per-outer-step effective evaluation timestamp after folding the
+    /// subquery's `@` and `offset` modifiers. `effective_times[k]` is what
+    /// the child sub-tree should be evaluated at for outer step `k`; the
+    /// inner range window is `(effective_times[k] - range_ms,
+    /// effective_times[k]]`.
+    effective_times: Arc<[i64]>,
+    /// `true` when the subquery has a non-trivial `@` or `offset`
+    /// modifier and `effective_times` differs from `outer_step_timestamps`.
+    /// Propagated to the emitted [`MatrixWindowBatch`] so the enclosing
+    /// `RollupOp` computes window math over the actual sample window
+    /// (RFC 0007 §6.3.8).
+    has_effective_shift: bool,
     series: Arc<SeriesSchema>,
     range_ms: i64,
     inner_step_ms: i64,
@@ -220,6 +232,54 @@ impl SubqueryOp {
     /// * `reservation` — per-query reservation; **shared** with the
     ///   parent (no nested scope — see §5 Decisions Log 3c.2 for RFC
     ///   Open Question #2 resolution).
+    /// * `effective_times` — per-outer-step effective evaluation times
+    ///   with the subquery's `@` / `offset` already folded in. Must be the
+    ///   same length as `outer_grid.step_count`. Use [`Self::new`] when
+    ///   no `@` / `offset` modifiers are present — it defaults
+    ///   `effective_times` to the outer step grid.
+    pub fn with_effective_times(
+        factory: ChildFactory,
+        series: Arc<SeriesSchema>,
+        outer_grid: StepGrid,
+        range_ms: i64,
+        inner_step_ms: i64,
+        effective_times: Arc<[i64]>,
+        reservation: MemoryReservation,
+    ) -> Self {
+        assert!(range_ms > 0, "subquery range must be > 0 ms");
+        assert!(inner_step_ms > 0, "subquery inner step must be > 0 ms");
+        assert_eq!(
+            effective_times.len(),
+            outer_grid.step_count,
+            "effective_times must be length-aligned with outer grid",
+        );
+        let outer_step_timestamps: Arc<[i64]> = Arc::from(
+            (0..outer_grid.step_count)
+                .map(|k| outer_grid.start_ms + (k as i64) * outer_grid.step_ms)
+                .collect::<Vec<_>>(),
+        );
+        let has_effective_shift = outer_step_timestamps
+            .iter()
+            .zip(effective_times.iter())
+            .any(|(o, e)| o != e);
+        let schema = OperatorSchema::new(SchemaRef::Static(series.clone()), outer_grid);
+        Self {
+            factory,
+            schema,
+            outer_step_timestamps,
+            effective_times,
+            has_effective_shift,
+            series,
+            range_ms,
+            inner_step_ms,
+            reservation,
+            next_outer_step: 0,
+            errored: false,
+        }
+    }
+
+    /// Convenience constructor for subqueries without `@` / `offset`
+    /// modifiers — the effective evaluation times equal the outer step grid.
     pub fn new(
         factory: ChildFactory,
         series: Arc<SeriesSchema>,
@@ -228,25 +288,20 @@ impl SubqueryOp {
         inner_step_ms: i64,
         reservation: MemoryReservation,
     ) -> Self {
-        assert!(range_ms > 0, "subquery range must be > 0 ms");
-        assert!(inner_step_ms > 0, "subquery inner step must be > 0 ms");
-        let outer_step_timestamps: Arc<[i64]> = Arc::from(
+        let outer_ts: Arc<[i64]> = Arc::from(
             (0..outer_grid.step_count)
                 .map(|k| outer_grid.start_ms + (k as i64) * outer_grid.step_ms)
                 .collect::<Vec<_>>(),
         );
-        let schema = OperatorSchema::new(SchemaRef::Static(series.clone()), outer_grid);
-        Self {
+        Self::with_effective_times(
             factory,
-            schema,
-            outer_step_timestamps,
             series,
+            outer_grid,
             range_ms,
             inner_step_ms,
+            outer_ts,
             reservation,
-            next_outer_step: 0,
-            errored: false,
-        }
+        )
     }
 
     /// Drive the child operator to completion, packing its emitted
@@ -257,15 +312,14 @@ impl SubqueryOp {
         outer_step_idx: usize,
         cx: &mut Context<'_>,
     ) -> Poll<Result<MatrixWindowBatch, QueryError>> {
-        let outer_t = self.outer_step_timestamps[outer_step_idx];
-        // Window `(outer_t - range, outer_t]`. `TimeRange` is
-        // inclusive-exclusive, so the effective range we need the child
-        // to cover is `[outer_t - range + 1, outer_t + 1)`. This matches
-        // 3a.2's `time_range_with_range` convention (matrix selector
-        // expresses the same window against raw storage).
+        let effective_t = self.effective_times[outer_step_idx];
+        // Window `(effective - range, effective]`, encoded as the
+        // inclusive-exclusive `TimeRange` `[effective - range + 1,
+        // effective + 1)`. `effective_t` already folds in the subquery's
+        // `@` / `offset` modifiers (see `SubqueryOp::with_effective_times`).
         let inner_window = TimeRange::new(
-            outer_t.saturating_sub(self.range_ms).saturating_add(1),
-            outer_t.saturating_add(1),
+            effective_t.saturating_sub(self.range_ms).saturating_add(1),
+            effective_t.saturating_add(1),
         );
 
         // Build the child. Factory failure is terminal for the subquery.
@@ -349,6 +403,11 @@ impl SubqueryOp {
 
         let (timestamps, values, cells) = buffers.finish();
 
+        let effective_times = if self.has_effective_shift {
+            Some(self.effective_times.clone())
+        } else {
+            None
+        };
         Poll::Ready(Ok(MatrixWindowBatch {
             step_timestamps: self.outer_step_timestamps.clone(),
             step_range: outer_step_idx..(outer_step_idx + 1),
@@ -357,6 +416,7 @@ impl SubqueryOp {
             timestamps,
             values,
             cells,
+            effective_times,
         }))
     }
 
@@ -435,6 +495,7 @@ impl SubqueryOp {
                 timestamps: Vec::new(),
                 values: Vec::new(),
                 cells: Vec::new(),
+                effective_times: None,
             })));
         }
         let idx = self.next_outer_step;
@@ -1182,5 +1243,56 @@ mod tests {
         let b = batches[1].get(0, 0).expect("rate valid");
         assert!((a - 100.0).abs() < 1e-9, "first rate = {a}");
         assert!((b - 100.0).abs() < 1e-9, "second rate = {b}");
+    }
+
+    #[test]
+    fn should_use_effective_times_for_inner_window() {
+        // given: one outer step with `effective_times[0] = 200` — the
+        // inner window must cover `(200 - range, 200]` even though the
+        // outer step timestamp is `100`. This models an `@ 200` subquery
+        // evaluated at `outer_t = 100`.
+        let outer_grid = StepGrid {
+            start_ms: 100,
+            end_ms: 100,
+            step_ms: 60,
+            step_count: 1,
+        };
+        let series = mk_labels(1);
+        let series_clone = series.clone();
+        let received_range: Arc<Mutex<Option<TimeRange>>> = Arc::new(Mutex::new(None));
+        let received_range_clone = received_range.clone();
+
+        let factory: ChildFactory = Box::new(move |tr: TimeRange, step_ms: i64| {
+            *received_range_clone.lock().unwrap() = Some(tr);
+            let (ts_arc, inner_grid) = mk_inner_grid(tr.end_ms_exclusive - 1, 30, step_ms);
+            let batches: Vec<StepBatch> = ts_arc
+                .iter()
+                .enumerate()
+                .map(|(i, _)| mk_batch(ts_arc.clone(), i, series_clone.clone(), &[Some(1.0)]))
+                .collect();
+            let schema = OperatorSchema::new(SchemaRef::Static(series_clone.clone()), inner_grid);
+            Ok(Box::new(ScriptedChild::new(schema, batches)) as Box<dyn Operator + Send>)
+        });
+
+        let mut op = SubqueryOp::with_effective_times(
+            factory,
+            series,
+            outer_grid,
+            30,
+            10,
+            Arc::from(vec![200i64]),
+            MemoryReservation::new(1 << 20),
+        );
+
+        // when
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let _ = op.windows(&mut cx);
+
+        // then: inner window covers `(170, 200]` — i.e. `start=171,
+        // end_exclusive=201` — ignoring the outer step timestamp entirely.
+        let tr = received_range.lock().unwrap().expect("factory invoked");
+        assert_eq!(tr.start_ms, 171);
+        assert_eq!(tr.end_ms_exclusive, 201);
     }
 }

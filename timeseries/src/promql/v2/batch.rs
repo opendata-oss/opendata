@@ -66,6 +66,22 @@ pub struct StepBatch {
     /// `STALE_NAN`, which is a real explicit marker preserved by the
     /// source).
     pub validity: BitSet,
+
+    /// Optional per-cell source-sample timestamps (ms). Populated only by
+    /// [`super::operators::VectorSelectorOp`] — the sole operator that
+    /// reads raw samples from storage — and dropped by every operator
+    /// that derives a new value (arithmetic, aggregation, rollup, etc.),
+    /// which matches Prometheus' `timestamp()` semantics: the function
+    /// returns the time of the underlying sample for a bare vector
+    /// selector and the evaluation time otherwise (at_modifier.test:193).
+    ///
+    /// When `Some`, has the same layout and length as [`Self::values`] /
+    /// [`Self::validity`]; only cells with validity bit set carry a
+    /// meaningful timestamp. [`InstantFnKind::Timestamp`] consults this
+    /// column before falling back to the step timestamp.
+    ///
+    /// [`InstantFnKind::Timestamp`]: super::operators::instant_fn::InstantFnKind::Timestamp
+    pub source_timestamps: Option<Arc<[i64]>>,
 }
 
 impl StepBatch {
@@ -123,7 +139,24 @@ impl StepBatch {
             series_range,
             values,
             validity,
+            source_timestamps: None,
         }
+    }
+
+    /// Attach per-cell source-sample timestamps (`ms`). Builder-style;
+    /// only [`super::operators::VectorSelectorOp`] should call this, so
+    /// the rest of the pipeline pays nothing for the column when it
+    /// isn't in use. Length must equal `self.values.len()`.
+    pub fn with_source_timestamps(mut self, source_timestamps: Arc<[i64]>) -> Self {
+        debug_assert_eq!(
+            source_timestamps.len(),
+            self.values.len(),
+            "source_timestamps.len()={} but values.len()={}",
+            source_timestamps.len(),
+            self.values.len(),
+        );
+        self.source_timestamps = Some(source_timestamps);
+        self
     }
 
     /// Number of steps covered by this batch.

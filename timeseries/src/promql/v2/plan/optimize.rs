@@ -131,6 +131,16 @@ fn fold_constants(plan: LogicalPlan) -> LogicalPlan {
             kind,
             child: Box::new(fold_constants(*child)),
         },
+        LogicalPlan::LabelManip { kind, child } => LogicalPlan::LabelManip {
+            kind,
+            child: Box::new(fold_constants(*child)),
+        },
+        LogicalPlan::Scalarize { child } => LogicalPlan::Scalarize {
+            child: Box::new(fold_constants(*child)),
+        },
+        LogicalPlan::Vectorize { child } => LogicalPlan::Vectorize {
+            child: Box::new(fold_constants(*child)),
+        },
         LogicalPlan::Rollup { kind, child } => LogicalPlan::Rollup {
             kind,
             child: Box::new(fold_constants(*child)),
@@ -138,10 +148,12 @@ fn fold_constants(plan: LogicalPlan) -> LogicalPlan {
         LogicalPlan::Aggregate {
             kind,
             child,
+            param,
             grouping,
         } => LogicalPlan::Aggregate {
             kind,
             child: Box::new(fold_constants(*child)),
+            param: param.map(|param| Box::new(fold_constants(*param))),
             grouping,
         },
         LogicalPlan::Subquery {
@@ -188,7 +200,8 @@ fn fold_constants(plan: LogicalPlan) -> LogicalPlan {
         // Leaves — no children to recurse into.
         leaf @ (LogicalPlan::VectorSelector { .. }
         | LogicalPlan::MatrixSelector { .. }
-        | LogicalPlan::Scalar(_)) => leaf,
+        | LogicalPlan::Scalar(_)
+        | LogicalPlan::Time) => leaf,
     }
 }
 
@@ -266,6 +279,16 @@ fn dedupe_vector_selector_matchers(plan: LogicalPlan) -> LogicalPlan {
             kind,
             child: Box::new(dedupe_vector_selector_matchers(*child)),
         },
+        LogicalPlan::LabelManip { kind, child } => LogicalPlan::LabelManip {
+            kind,
+            child: Box::new(dedupe_vector_selector_matchers(*child)),
+        },
+        LogicalPlan::Scalarize { child } => LogicalPlan::Scalarize {
+            child: Box::new(dedupe_vector_selector_matchers(*child)),
+        },
+        LogicalPlan::Vectorize { child } => LogicalPlan::Vectorize {
+            child: Box::new(dedupe_vector_selector_matchers(*child)),
+        },
         LogicalPlan::Rollup { kind, child } => LogicalPlan::Rollup {
             kind,
             child: Box::new(dedupe_vector_selector_matchers(*child)),
@@ -284,10 +307,12 @@ fn dedupe_vector_selector_matchers(plan: LogicalPlan) -> LogicalPlan {
         LogicalPlan::Aggregate {
             kind,
             child,
+            param,
             grouping,
         } => LogicalPlan::Aggregate {
             kind,
             child: Box::new(dedupe_vector_selector_matchers(*child)),
+            param: param.map(|param| Box::new(dedupe_vector_selector_matchers(*param))),
             grouping,
         },
         LogicalPlan::Subquery {
@@ -334,7 +359,7 @@ fn dedupe_vector_selector_matchers(plan: LogicalPlan) -> LogicalPlan {
                 .map(dedupe_vector_selector_matchers)
                 .collect(),
         },
-        leaf @ LogicalPlan::Scalar(_) => leaf,
+        leaf @ (LogicalPlan::Scalar(_) | LogicalPlan::Time) => leaf,
     }
 }
 
@@ -651,6 +676,7 @@ mod tests {
                 kind: AggregateKind::Sum,
                 child,
                 grouping: AggregateGrouping::By(ref labels),
+                ..
             } if labels.is_empty() => match *child {
                 LogicalPlan::Binary {
                     op: BinaryOpKind::Add,

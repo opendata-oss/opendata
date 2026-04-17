@@ -37,15 +37,18 @@ use futures::stream::BoxStream;
 use promql_parser::parser;
 
 use crate::model::{Label, Labels};
+use crate::util::Fingerprint;
 
 use super::super::batch::{SchemaRef, SeriesSchema};
 use super::super::memory::{MemoryReservation, QueryError};
 use super::super::operator::{Operator, OperatorSchema, StepGrid};
 use super::super::operators::aggregate::{AggregateKind, AggregateOp, GroupMap};
 use super::super::operators::binary::{BinaryOp, BinaryOpKind, ConstScalarOp, MatchTable};
+use super::super::operators::coercion::{ScalarizeOp, TimeScalarOp};
 use super::super::operators::concurrent::ConcurrentOp;
 use super::super::operators::count_values::CountValuesOp;
 use super::super::operators::instant_fn::InstantFnOp;
+use super::super::operators::label_manip::{LabelManipKind, LabelManipOp};
 use super::super::operators::matrix_selector::MatrixSelectorOp;
 use super::super::operators::rollup::{MatrixWindowSource, RollupOp};
 use super::super::operators::subquery::{ChildFactory, SubqueryOp};
@@ -91,6 +94,13 @@ pub struct PhysicalPlan {
     pub output_schema: SchemaRef,
     /// Step grid the root emits on.
     pub step_grid: StepGrid,
+    /// `true` when the logical-plan root is scalar-typed. Needed because
+    /// `vector(scalar)` and scalar roots share the same one-series anonymous
+    /// runtime schema but reshape must preserve the top-level query type.
+    pub root_is_scalar: bool,
+    /// Optional final instant-vector ordering required by the root plan.
+    /// Used for ordered `topk` / `bottomk` outputs.
+    pub root_instant_vector_sort: Option<InstantVectorSort>,
 }
 
 impl std::fmt::Debug for PhysicalPlan {
@@ -98,8 +108,16 @@ impl std::fmt::Debug for PhysicalPlan {
         f.debug_struct("PhysicalPlan")
             .field("output_schema", &self.output_schema)
             .field("step_grid", &self.step_grid)
+            .field("root_is_scalar", &self.root_is_scalar)
+            .field("root_instant_vector_sort", &self.root_instant_vector_sort)
             .finish_non_exhaustive()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstantVectorSort {
+    DescendingValue,
+    AscendingValue,
 }
 
 /// Build a physical plan from an (already-lowered and optionally optimised)
@@ -138,6 +156,8 @@ where
     S: SeriesSource + Send + Sync + 'static,
 {
     let grid = step_grid_from_ctx(ctx);
+    let root_is_scalar = plan.produces_scalar();
+    let root_instant_vector_sort = root_instant_vector_sort(&plan);
 
     // Fail-fast cardinality gate (unit 4.4 / RFC §"Execution Model").
     // Runs before any `SeriesSource::resolve` so an oversized query never
@@ -168,6 +188,8 @@ where
             root,
             output_schema,
             step_grid,
+            root_is_scalar,
+            root_instant_vector_sort,
         },
         stats,
     ))
@@ -191,6 +213,20 @@ fn step_grid_from_ctx(ctx: &LoweringContext) -> StepGrid {
         end_ms: ctx.end_ms,
         step_ms: ctx.step_ms.max(1),
         step_count,
+    }
+}
+
+fn root_instant_vector_sort(plan: &LogicalPlan) -> Option<InstantVectorSort> {
+    match plan {
+        LogicalPlan::Aggregate {
+            kind: AggregateKind::Topk(_),
+            ..
+        } => Some(InstantVectorSort::DescendingValue),
+        LogicalPlan::Aggregate {
+            kind: AggregateKind::Bottomk(_),
+            ..
+        } => Some(InstantVectorSort::AscendingValue),
+        _ => None,
     }
 }
 
@@ -264,14 +300,18 @@ fn selector_time_range(
 
 struct ResolvedLeaf {
     schema: Arc<SeriesSchema>,
-    hint_series: Arc<[ResolvedSeriesRef]>,
+    hint_series: Arc<[Arc<[ResolvedSeriesRef]>]>,
 }
 
-/// Drain [`SeriesSource::resolve`] into a flat series roster (labels +
-/// fingerprints) plus a parallel hint slice. Fingerprints are a simple
-/// deterministic FxHash over `(bucket_id, series_id)` — enough for the v1
-/// deduplication contract the operator layer expects; cross-query cache
-/// fingerprinting is deferred to the cross-query cache unit.
+/// Drain [`SeriesSource::resolve`] into a unique-per-labelset series roster
+/// (`labels` + stable fingerprint) plus the per-logical-series grouped source
+/// handles needed to load samples across buckets.
+///
+/// `SeriesSource::resolve` is bucket-scoped by design and may therefore emit
+/// one `(labels, ResolvedSeriesRef)` pair per bucket for the same logical
+/// series. The execution RFC's core data model expects the planner to collapse
+/// these onto one schema row per logical series while preserving every bucket
+/// handle for the leaf operator's raw-sample fetch path.
 async fn resolve_leaf<S>(
     source: &Arc<S>,
     selector: &parser::VectorSelector,
@@ -284,18 +324,30 @@ where
     let mut stream: BoxStream<'_, Result<ResolvedSeriesChunk, QueryError>> =
         Box::pin(source.resolve(selector, time_range));
 
+    let mut roster_index: HashMap<Labels, usize> = HashMap::new();
     let mut labels: Vec<Labels> = Vec::new();
     let mut fingerprints: Vec<u128> = Vec::new();
-    let mut refs: Vec<ResolvedSeriesRef> = Vec::new();
+    let mut refs: Vec<Vec<ResolvedSeriesRef>> = Vec::new();
 
     while let Some(chunk_res) = stream.next().await {
         let chunk = chunk_res.map_err(map_source_err)?;
         debug_assert_eq!(chunk.labels.len(), chunk.series.len());
         for (label, sref) in chunk.labels.iter().zip(chunk.series.iter()) {
-            labels.push(label.clone());
-            fingerprints.push(series_fingerprint(sref));
-            refs.push(*sref);
+            let canonical = canonicalize_labels(label);
+            match roster_index.get(&canonical).copied() {
+                Some(idx) => refs[idx].push(*sref),
+                None => {
+                    roster_index.insert(canonical.clone(), labels.len());
+                    fingerprints.push(labels_fingerprint(&canonical));
+                    labels.push(canonical);
+                    refs.push(vec![*sref]);
+                }
+            }
         }
+    }
+
+    for series_refs in &mut refs {
+        series_refs.sort_unstable_by_key(|sref| (sref.bucket_id, sref.series_id));
     }
 
     // Conservative label-storage reservation: one `Label` struct per label,
@@ -311,7 +363,11 @@ where
         Arc::from(labels),
         Arc::from(fingerprints),
     ));
-    let hint_series: Arc<[ResolvedSeriesRef]> = Arc::from(refs);
+    let hint_series: Arc<[Arc<[ResolvedSeriesRef]>]> = Arc::from(
+        refs.into_iter()
+            .map(Arc::<[ResolvedSeriesRef]>::from)
+            .collect::<Vec<_>>(),
+    );
     Ok(ResolvedLeaf {
         schema,
         hint_series,
@@ -319,12 +375,16 @@ where
 }
 
 #[inline]
-fn series_fingerprint(sref: &ResolvedSeriesRef) -> u128 {
-    // Mix bucket_id into the high half, series_id into the low half. Unique
-    // for any given (bucket, series) pair the source emits. Deterministic
-    // but not cross-query stable — the cross-query cache unit will replace
-    // this.
-    ((sref.bucket_id as u128) << 32) | (sref.series_id as u128)
+fn canonicalize_labels(labels: &Labels) -> Labels {
+    let mut canonical: Vec<Label> = labels.iter().cloned().collect();
+    canonical.sort();
+    Labels::new(canonical)
+}
+
+#[inline]
+fn labels_fingerprint(labels: &Labels) -> u128 {
+    let canonical: Vec<Label> = labels.iter().cloned().collect();
+    canonical.fingerprint()
 }
 
 // ---------------------------------------------------------------------------
@@ -332,13 +392,13 @@ fn series_fingerprint(sref: &ResolvedSeriesRef) -> u128 {
 // ---------------------------------------------------------------------------
 
 /// Project a labelset onto the grouping keys — either keep only `by(…)` or
-/// drop `without(…)` labels. Always drops `__name__` per Prometheus
-/// convention (aggregates do not carry the source metric name forward).
+/// drop `without(…)` labels. `by(__name__, …)` explicitly preserves the
+/// metric name; every other aggregate shape drops it.
 fn group_key_labels(labels: &Labels, grouping: &AggregateGrouping) -> Vec<Label> {
     match grouping {
         AggregateGrouping::By(keep) => labels
             .iter()
-            .filter(|l| l.name != "__name__" && keep.iter().any(|k| k == &l.name))
+            .filter(|l| keep.iter().any(|k| k == &l.name))
             .cloned()
             .collect(),
         AggregateGrouping::Without(drop) => labels
@@ -479,7 +539,12 @@ fn build_one_to_one(
         let lab = lhs.labels(i as u32);
         let key = matching_key(lab, axis, match_labels);
         map.push(rhs_by_key.get(&key).copied());
-        out_labels.push(result_labels_for_output(lab, include_name_on_output));
+        out_labels.push(result_labels_for_one_to_one(
+            lab,
+            axis,
+            match_labels,
+            include_name_on_output,
+        ));
     }
     let output_schema = build_output_schema_from_labels(out_labels);
     Ok(MatchBuild {
@@ -575,6 +640,31 @@ fn result_labels_for_output(input: &Labels, include_name: bool) -> Labels {
     }
 }
 
+fn result_labels_for_one_to_one(
+    input: &Labels,
+    axis: MatchingAxis,
+    match_labels: &[String],
+    include_name_on_output: bool,
+) -> Labels {
+    let projected = result_labels_for_output(input, include_name_on_output);
+    match axis {
+        MatchingAxis::On => Labels::new(
+            projected
+                .iter()
+                .filter(|label| match_labels.iter().any(|name| name == &label.name))
+                .cloned()
+                .collect(),
+        ),
+        MatchingAxis::Ignoring => Labels::new(
+            projected
+                .iter()
+                .filter(|label| !match_labels.iter().any(|name| name == &label.name))
+                .cloned()
+                .collect(),
+        ),
+    }
+}
+
 /// Compose the output labels for a group_left / group_right row: the
 /// "many" side's full labelset (drop `__name__` unless requested), plus
 /// the `include(...)` labels copied from the "one" side (if matched).
@@ -606,6 +696,41 @@ fn compose_group_labels(
 fn build_output_schema_from_labels(labels: Vec<Labels>) -> Arc<SeriesSchema> {
     let fps: Vec<u128> = (0..labels.len() as u128).collect();
     Arc::new(SeriesSchema::new(Arc::from(labels), Arc::from(fps)))
+}
+
+struct LabelManipBuild {
+    input_to_output: Arc<[u32]>,
+    output_schema: Arc<SeriesSchema>,
+}
+
+fn build_label_manip(
+    kind: &LabelManipKind,
+    input: &SeriesSchema,
+) -> Result<LabelManipBuild, PlanError> {
+    let mut input_to_output: Vec<u32> = Vec::with_capacity(input.len());
+    let mut seen: HashMap<Labels, u32> = HashMap::new();
+    let mut output_labels: Vec<Labels> = Vec::new();
+
+    for index in 0..input.len() {
+        let transformed = kind
+            .apply_to_labels(input.labels(index as u32))
+            .map_err(map_construct_err)?;
+        let out_idx = match seen.get(&transformed) {
+            Some(idx) => *idx,
+            None => {
+                let idx = output_labels.len() as u32;
+                seen.insert(transformed.clone(), idx);
+                output_labels.push(transformed);
+                idx
+            }
+        };
+        input_to_output.push(out_idx);
+    }
+
+    Ok(LabelManipBuild {
+        input_to_output: Arc::from(input_to_output),
+        output_schema: build_output_schema_from_labels(output_labels),
+    })
 }
 
 /// `true` when a binary op preserves the source metric's `__name__` label.
@@ -665,6 +790,19 @@ where
             let op = ConstScalarOp::new(v, grid, reservation.clone());
             Ok(Box::new(op))
         }
+        LogicalPlan::Time => {
+            let op = TimeScalarOp::new(grid, reservation.clone());
+            Ok(Box::new(op))
+        }
+        LogicalPlan::Scalarize { child } => {
+            let child_op = build_node(*child, source, reservation, ctx, grid, false, stats).await?;
+            let _ = static_schema(&child_op.schema().series)?;
+            let op = ScalarizeOp::new(BoxedOp(child_op), reservation.clone());
+            Ok(Box::new(op))
+        }
+        LogicalPlan::Vectorize { child } => {
+            build_node(*child, source, reservation, ctx, grid, false, stats).await
+        }
         LogicalPlan::VectorSelector {
             selector,
             offset,
@@ -713,6 +851,18 @@ where
             let child_op = build_node(*child, source, reservation, ctx, grid, false, stats).await?;
             let _ = static_schema(&child_op.schema().series)?;
             let op = InstantFnOp::new(BoxedOp(child_op), kind, reservation.clone());
+            Ok(Box::new(op))
+        }
+        LogicalPlan::LabelManip { kind, child } => {
+            let child_op = build_node(*child, source, reservation, ctx, grid, false, stats).await?;
+            let input_schema = static_schema(&child_op.schema().series)?.clone();
+            let built = build_label_manip(&kind, &input_schema)?;
+            let op = LabelManipOp::new(
+                BoxedOp(child_op),
+                built.input_to_output,
+                built.output_schema,
+                reservation.clone(),
+            );
             Ok(Box::new(op))
         }
         LogicalPlan::Rollup { kind, child } => {
@@ -806,11 +956,13 @@ where
         LogicalPlan::Aggregate {
             kind,
             child,
+            param,
             grouping,
         } => {
             build_aggregate(
                 kind,
                 *child,
+                param.map(|param| *param),
                 grouping,
                 source,
                 reservation,
@@ -870,8 +1022,8 @@ async fn build_binary<S>(
 where
     S: SeriesSource + Send + Sync + 'static,
 {
-    let lhs_is_scalar = matches!(lhs, LogicalPlan::Scalar(_));
-    let rhs_is_scalar = matches!(rhs, LogicalPlan::Scalar(_));
+    let lhs_is_scalar = lhs.produces_scalar();
+    let rhs_is_scalar = rhs.produces_scalar();
 
     let lhs_op = build_node(lhs, source, reservation, ctx, grid, false, stats).await?;
     let rhs_op = build_node(rhs, source, reservation, ctx, grid, false, stats).await?;
@@ -931,6 +1083,7 @@ where
 async fn build_aggregate<S>(
     kind: AggregateKind,
     child: LogicalPlan,
+    param: Option<LogicalPlan>,
     grouping: AggregateGrouping,
     source: &Arc<S>,
     reservation: &MemoryReservation,
@@ -942,6 +1095,11 @@ where
     S: SeriesSource + Send + Sync + 'static,
 {
     let child_op = build_node(child, source, reservation, ctx, grid, false, stats).await?;
+    let param_op = if let Some(param) = param {
+        Some(build_node(param, source, reservation, ctx, grid, false, stats).await?)
+    } else {
+        None
+    };
     let input_schema = static_schema(&child_op.schema().series)?.clone();
 
     // topk/bottomk are filter-shaped: output schema == input schema.
@@ -955,8 +1113,9 @@ where
         build_group_schema(&built.group_labels)
     };
 
-    let op = AggregateOp::new(
+    let op = AggregateOp::new_with_param(
         BoxedOp(child_op),
+        param_op,
         kind,
         built.map,
         output_schema,
@@ -1042,10 +1201,21 @@ where
     // deferred schemas, and that is rejected under schema-sensitive
     // parents — which `Rollup` is).
 
+    // Precompute per-outer-step effective evaluation times so the
+    // operator can apply `@` / `offset` uniformly per step without
+    // re-dispatching on the at/offset shape at runtime.
+    let effective_times: Arc<[i64]> = Arc::from(
+        (0..outer_grid.step_count)
+            .map(|k| outer_step_window(outer_grid, k, range_ms, offset, at).1)
+            .collect::<Vec<_>>(),
+    );
+
     // Build a probe child to snapshot the output schema.
-    let (probe_start, probe_end) = outer_step_window(outer_grid, 0, range_ms, offset, at);
-    let probe_range = TimeRange::new(probe_start, probe_end.saturating_add(1));
-    let probe_grid = inner_grid(probe_range, step_ms);
+    let probe_effective = effective_times
+        .first()
+        .copied()
+        .unwrap_or(outer_grid.start_ms);
+    let probe_grid = inner_grid(probe_effective, range_ms, step_ms);
     // Probe the inner subtree once to snapshot its output schema. Stats
     // bookkeeping for the probe is intentionally discarded — the factory
     // will rebuild the subtree (possibly with its own wraps) per outer
@@ -1078,13 +1248,21 @@ where
     let ctx_copy = *ctx;
     let reservation_inner = reservation.clone();
     let inner_plan = inner;
+    let sub_range_ms = range_ms;
     let factory: ChildFactory = Box::new(move |tr: TimeRange, inner_step_ms: i64| {
         // Use a blocking task-local poll for the factory's sync-Future
         // surface: the factory's return type is sync, but the planner
         // walk is async. Real wiring will replace this with a planner-
         // cached precomputed tree per unique (range, step); for v1 the
         // factory just re-invokes the planner synchronously.
-        let grid = inner_grid(tr, inner_step_ms);
+        //
+        // The subquery encodes the outer effective time in `tr` as
+        // `tr.end_ms_exclusive - 1` (inclusive upper bound). Align the
+        // inner grid descending from that point so the inner evaluation
+        // timestamps are `{effective, effective - step, …}` rather than
+        // the raw range-start the old inner-grid builder produced.
+        let effective_t = tr.end_ms_exclusive.saturating_sub(1);
+        let grid = inner_grid(effective_t, sub_range_ms, inner_step_ms);
         let src = source_arc.clone();
         let res = reservation_inner.clone();
         let ctx_cp = ctx_copy;
@@ -1123,12 +1301,13 @@ where
         }
     });
 
-    let sub = SubqueryOp::new(
+    let sub = SubqueryOp::with_effective_times(
         factory,
         inner_schema,
         outer_grid,
         range_ms,
         step_ms,
+        effective_times,
         reservation.clone(),
     );
     Ok(sub)
@@ -1153,13 +1332,46 @@ fn outer_step_window(
     (start, effective)
 }
 
-fn inner_grid(range: TimeRange, step_ms: i64) -> StepGrid {
-    let span = (range.end_ms_exclusive - 1 - range.start_ms).max(0);
-    let step = step_ms.max(1);
-    let step_count = (span / step) as usize + 1;
+/// Build the inner step grid for a subquery's `(range, step)` bracket
+/// evaluated at effective time `outer_t`.
+///
+/// Inner evaluation points are the **absolute multiples of
+/// `inner_step_ms`** (i.e. `k * step_ms` for integer `k`) that fall in
+/// the half-open window `(outer_t - range, outer_t]`. This matches
+/// Prometheus' step-aligned subquery layout: when `range < step` and no
+/// multiple of `step` lands in the window, the inner grid is empty and
+/// the subquery emits no samples (`subquery.test:196` —
+/// `min_over_time((topk(1, foo))[1m:5m])` at 12m is `empty`).
+///
+/// The previous forward-walk from `outer_t - range + 1` produced
+/// non-aligned inner timestamps (e.g. `-39999` instead of `-30000` for a
+/// `50s:10s` subquery at `t=10s`), and a plain descending walk from
+/// `outer_t` always produced at least one inner point regardless of step
+/// — wrong for the "range < resolution" fixture above.
+fn inner_grid(effective_t: i64, range_ms: i64, inner_step_ms: i64) -> StepGrid {
+    let range = range_ms.max(1);
+    let step = inner_step_ms.max(1);
+    let window_lo = effective_t.saturating_sub(range).saturating_add(1); // inclusive
+    // `first` = smallest multiple of `step` ≥ `window_lo`, i.e. ceil-div
+    // on a positive divisor. `-(-x).div_euclid(s)` gives the Euclidean
+    // ceiling for any signed `x`.
+    let first = -((-window_lo).div_euclid(step)) * step;
+    // `last` = largest multiple of `step` ≤ `effective_t`.
+    let last = effective_t.div_euclid(step) * step;
+    if first > last {
+        // Window contains no multiple of `step` — emit an empty grid so
+        // the subquery propagates `absent` through the enclosing rollup.
+        return StepGrid {
+            start_ms: effective_t,
+            end_ms: effective_t,
+            step_ms: step,
+            step_count: 0,
+        };
+    }
+    let step_count = ((last - first) / step + 1) as usize;
     StepGrid {
-        start_ms: range.start_ms,
-        end_ms: range.start_ms + (step_count as i64 - 1) * step,
+        start_ms: first,
+        end_ms: last,
         step_ms: step,
         step_count,
     }
@@ -1317,6 +1529,51 @@ mod tests {
         }
     }
 
+    struct ChunkedResolveSource {
+        chunks: Vec<ResolvedSeriesChunk>,
+    }
+
+    impl ChunkedResolveSource {
+        fn new(chunks: Vec<ResolvedSeriesChunk>) -> Self {
+            Self { chunks }
+        }
+    }
+
+    impl SeriesSource for ChunkedResolveSource {
+        fn resolve(
+            &self,
+            _selector: &pparser::VectorSelector,
+            _time_range: TimeRange,
+        ) -> impl futures::Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send {
+            stream::iter(self.chunks.clone().into_iter().map(Ok))
+        }
+
+        fn estimate_cardinality(
+            &self,
+            _selector: &pparser::VectorSelector,
+            _time_range: TimeRange,
+        ) -> impl std::future::Future<Output = Result<CardinalityEstimate, QueryError>> + Send
+        {
+            let total = self
+                .chunks
+                .iter()
+                .map(|chunk| chunk.series.len() as u64)
+                .sum::<u64>();
+            ready(Ok(CardinalityEstimate::exact(total)))
+        }
+
+        fn samples(
+            &self,
+            hint: SampleHint,
+        ) -> impl futures::Stream<Item = Result<SampleBatch, QueryError>> + Send {
+            let block = SampleBlock::with_series_count(hint.series.len());
+            stream::iter(vec![Ok(SampleBatch {
+                series_range: 0..hint.series.len(),
+                samples: block,
+            })])
+        }
+    }
+
     fn noop_waker() -> Waker {
         const VTABLE: RawWakerVTable = RawWakerVTable::new(
             |_| RawWaker::new(std::ptr::null(), &VTABLE),
@@ -1403,6 +1660,70 @@ mod tests {
             .clone();
         assert_eq!(schema.len(), 2);
         assert_eq!(physical.step_grid.step_count, 11);
+    }
+
+    #[test]
+    fn should_dedup_leaf_roster_by_fingerprint_and_group_bucket_hints() {
+        // given: the same logical series appears in two bucket-scoped resolve
+        // chunks, plus one distinct series in only the newer bucket.
+        let source = Arc::new(ChunkedResolveSource::new(vec![
+            ResolvedSeriesChunk {
+                bucket_id: 10,
+                labels: Arc::from(vec![labels_of(&[("__name__", "m"), ("pod", "a")])]),
+                series: Arc::from(vec![ResolvedSeriesRef::new(10, 7)]),
+            },
+            ResolvedSeriesChunk {
+                bucket_id: 20,
+                labels: Arc::from(vec![
+                    labels_of(&[("__name__", "m"), ("pod", "a")]),
+                    labels_of(&[("__name__", "m"), ("pod", "b")]),
+                ]),
+                series: Arc::from(vec![
+                    ResolvedSeriesRef::new(20, 11),
+                    ResolvedSeriesRef::new(20, 12),
+                ]),
+            },
+        ]));
+        let reservation = MemoryReservation::new(1 << 20);
+        let rt = mk_rt();
+
+        // when
+        let resolved = rt
+            .block_on(resolve_leaf(
+                &source,
+                &make_selector("m"),
+                TimeRange::new(0, 1_000),
+                &reservation,
+            ))
+            .expect("resolved leaf");
+
+        // then: one logical roster row per unique labelset, but the `pod=a`
+        // row keeps both bucket-local handles for sample loading.
+        assert_eq!(resolved.schema.len(), 2);
+        assert_eq!(resolved.hint_series.len(), 2);
+        assert_eq!(
+            resolved.schema.labels(0),
+            &labels_of(&[("__name__", "m"), ("pod", "a")])
+        );
+        assert_eq!(
+            resolved.schema.labels(1),
+            &labels_of(&[("__name__", "m"), ("pod", "b")])
+        );
+        assert_eq!(
+            resolved.hint_series[0].as_ref(),
+            &[
+                ResolvedSeriesRef::new(10, 7),
+                ResolvedSeriesRef::new(20, 11),
+            ]
+        );
+        assert_eq!(
+            resolved.hint_series[1].as_ref(),
+            &[ResolvedSeriesRef::new(20, 12)]
+        );
+        assert_ne!(
+            resolved.schema.fingerprint(0),
+            resolved.schema.fingerprint(1)
+        );
     }
 
     #[test]
@@ -1501,6 +1822,7 @@ mod tests {
         let plan = LogicalPlan::Aggregate {
             kind: AggregateKind::Topk(2),
             child: Box::new(child),
+            param: None,
             grouping: AggregateGrouping::by_empty(),
         };
         let reservation = MemoryReservation::new(1 << 20);
@@ -1547,6 +1869,7 @@ mod tests {
         let plan = LogicalPlan::Aggregate {
             kind: AggregateKind::Sum,
             child: Box::new(child),
+            param: None,
             grouping: AggregateGrouping::By(Arc::from(vec!["pod".to_string()])),
         };
         let reservation = MemoryReservation::new(1 << 20);
@@ -1564,6 +1887,30 @@ mod tests {
             .expect("static schema")
             .clone();
         assert_eq!(schema.len(), 2);
+    }
+
+    #[test]
+    fn should_preserve_name_label_when_grouping_by_name() {
+        // given
+        let input = SeriesSchema::new(
+            Arc::from(vec![
+                labels_of(&[("__name__", "m"), ("env", "prod"), ("inst", "0")]),
+                labels_of(&[("__name__", "m"), ("env", "prod"), ("inst", "1")]),
+            ]),
+            Arc::from(vec![0u128, 1]),
+        );
+
+        // when
+        let built = build_group_map(
+            &input,
+            &AggregateGrouping::By(Arc::from(vec!["__name__".to_string(), "env".to_string()])),
+        )
+        .unwrap();
+
+        // then
+        assert_eq!(built.group_labels.len(), 1);
+        assert_eq!(built.group_labels[0].get("__name__"), Some("m"));
+        assert_eq!(built.group_labels[0].get("env"), Some("prod"));
     }
 
     #[test]
@@ -1596,6 +1943,38 @@ mod tests {
     }
 
     #[test]
+    fn should_project_output_labels_for_on_matching() {
+        // given
+        let lhs = SeriesSchema::new(
+            Arc::from(vec![labels_of(&[
+                ("__name__", "foo"),
+                ("env", "prod"),
+                ("instance", "i0"),
+            ])]),
+            Arc::from(vec![0u128]),
+        );
+        let rhs = SeriesSchema::new(
+            Arc::from(vec![labels_of(&[
+                ("__name__", "bar"),
+                ("env", "prod"),
+                ("instance", "i9"),
+            ])]),
+            Arc::from(vec![1u128]),
+        );
+
+        // when
+        let built =
+            build_one_to_one(&lhs, &rhs, MatchingAxis::On, &["env".to_string()], false).unwrap();
+
+        // then
+        assert_eq!(built.output_schema.len(), 1);
+        let labels = built.output_schema.labels(0);
+        assert_eq!(labels.get("env"), Some("prod"));
+        assert_eq!(labels.get("instance"), None);
+        assert_eq!(labels.get("__name__"), None);
+    }
+
+    #[test]
     fn should_mark_unmatched_series_as_none_in_match_table() {
         // given: LHS has inst=3 not present on RHS
         let lhs = SeriesSchema::new(
@@ -1616,6 +1995,37 @@ mod tests {
             MatchTable::OneToOne(map) => assert_eq!(map, vec![Some(0), None]),
             other => panic!("unexpected table: {other:?}"),
         }
+    }
+
+    #[test]
+    fn should_align_inner_grid_to_multiples_of_inner_step() {
+        // `[50s:10s]` at effective_t = 10s produces inner ts aligned to
+        // multiples of 10s in `(-40s, 10s]`: {-30, -20, -10, 0, 10}.
+        let grid = super::inner_grid(10_000, 50_000, 10_000);
+        assert_eq!(grid.start_ms, -30_000);
+        assert_eq!(grid.end_ms, 10_000);
+        assert_eq!(grid.step_ms, 10_000);
+        assert_eq!(grid.step_count, 5);
+    }
+
+    #[test]
+    fn should_produce_empty_inner_grid_when_range_smaller_than_step() {
+        // `[1m:5m]` at effective_t = 12m: window `(11m, 12m]` contains no
+        // multiple of 5m, so the inner grid is empty (matches Prometheus
+        // `subquery.test:196` expected-empty semantics).
+        let grid = super::inner_grid(12 * 60_000, 60_000, 5 * 60_000);
+        assert_eq!(grid.step_count, 0);
+    }
+
+    #[test]
+    fn should_align_inner_grid_on_subquery_offset_window() {
+        // `[30s:10s] offset 3s` at outer_t = 1010s shifts effective to
+        // 1007s. Window `(977s, 1007s]` → multiples of 10s: {980, 990,
+        // 1000}. (`subquery.test:78`.)
+        let grid = super::inner_grid(1_007_000, 30_000, 10_000);
+        assert_eq!(grid.start_ms, 980_000);
+        assert_eq!(grid.end_ms, 1_000_000);
+        assert_eq!(grid.step_count, 3);
     }
 
     #[test]
@@ -1775,6 +2185,7 @@ mod tests {
                 child: Box::new(inner),
                 grouping: AggregateGrouping::by_empty(),
             }),
+            param: None,
             grouping: AggregateGrouping::by_empty(),
         };
         let reservation = MemoryReservation::new(1 << 20);
@@ -1788,6 +2199,32 @@ mod tests {
             PlanError::InvalidMatching(_) => {}
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn should_build_label_manip_schema_deduplicating_output_labels() {
+        // given
+        let input = Arc::new(SeriesSchema::new(
+            Arc::from(vec![
+                labels_of(&[("__name__", "m"), ("src", "a")]),
+                labels_of(&[("__name__", "m"), ("src", "b")]),
+            ]),
+            Arc::from(vec![1u128, 2u128]),
+        ));
+        let kind = LabelManipKind::Replace {
+            dst_label: "src".to_string(),
+            replacement: "same".to_string(),
+            src_label: "".to_string(),
+            regex: "".to_string(),
+        };
+
+        // when
+        let built = build_label_manip(&kind, &input).unwrap();
+
+        // then
+        assert_eq!(built.input_to_output.as_ref(), &[0, 0]);
+        assert_eq!(built.output_schema.len(), 1);
+        assert_eq!(built.output_schema.labels(0).get("src"), Some("same"));
     }
 
     #[test]
@@ -1936,6 +2373,7 @@ mod tests {
         let plan = LogicalPlan::Aggregate {
             kind: AggregateKind::Sum,
             child: Box::new(child),
+            param: None,
             grouping: AggregateGrouping::By(Arc::from(vec!["i".to_string()])),
         };
         let reservation = MemoryReservation::new(1 << 22);

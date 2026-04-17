@@ -29,7 +29,9 @@ pub use optimize::optimize;
 #[allow(unused_imports)]
 pub use parallelism::{ExchangeStats, Parallelism};
 #[allow(unused_imports)]
-pub use physical::{PhysicalPlan, build_physical_plan, build_physical_plan_with_stats};
+pub use physical::{
+    InstantVectorSort, PhysicalPlan, build_physical_plan, build_physical_plan_with_stats,
+};
 pub use plan_types::{
     AggregateGrouping, AtModifier, BinaryMatching, Cardinality, LogicalPlan, MatchingAxis, Offset,
 };

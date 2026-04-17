@@ -185,13 +185,22 @@ fn collect_leaves<'a>(plan: &'a LogicalPlan, out: &mut Vec<LeafRef<'a>>) {
             selector,
             time_range: TimeRange::new(0, i64::MAX),
         }),
-        LogicalPlan::Scalar(_) => {}
+        LogicalPlan::Scalar(_) | LogicalPlan::Time => {}
+        LogicalPlan::Scalarize { child, .. } | LogicalPlan::Vectorize { child, .. } => {
+            collect_leaves(child, out)
+        }
         LogicalPlan::InstantFn { child, .. }
+        | LogicalPlan::LabelManip { child, .. }
         | LogicalPlan::Rollup { child, .. }
-        | LogicalPlan::Aggregate { child, .. }
         | LogicalPlan::Rechunk { child, .. }
         | LogicalPlan::CountValues { child, .. }
         | LogicalPlan::Concurrent { child, .. } => collect_leaves(child, out),
+        LogicalPlan::Aggregate { child, param, .. } => {
+            collect_leaves(child, out);
+            if let Some(param) = param {
+                collect_leaves(param, out);
+            }
+        }
         LogicalPlan::Binary { lhs, rhs, .. } => {
             collect_leaves(lhs, out);
             collect_leaves(rhs, out);

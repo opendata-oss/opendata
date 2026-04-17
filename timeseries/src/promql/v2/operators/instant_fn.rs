@@ -36,13 +36,9 @@
 //! `absent`/`absent_over_time` (schema-derivation; separate unit),
 //! `histogram_quantile` (out of scope per RFC non-goals: native
 //! histograms), `scalar`/`vector` (planner-level type coercions),
-//! `pi`/`time` (nullary planner constants), `day_of_*`/`hour`/`minute`/
-//! `month`/`year`/`days_in_month`/`day_of_week`/`day_of_year`
-//! (date/time extractions on an input vector — pointwise but each needs
-//! `chrono`-style calendar math; deferred to a later unit to keep the 3b.2
-//! surface focused on float-pointwise cases). `label_replace` / `label_join`
-//! mutate labels and are handled by a separate operator (not pointwise in
-//! the "cell → cell" sense).
+//! `pi`/`time` (planner-level scalar leaves / coercions). `label_replace` /
+//! `label_join` mutate labels and are handled by a separate operator (not
+//! pointwise in the "cell → cell" sense).
 //!
 //! # Timestamp semantics
 //!
@@ -94,7 +90,9 @@
 
 use std::task::{Context, Poll};
 
-use super::super::batch::StepBatch;
+use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
+
+use super::super::batch::{BitSet, StepBatch};
 use super::super::memory::{MemoryReservation, QueryError};
 use super::super::operator::{Operator, OperatorSchema};
 
@@ -168,11 +166,27 @@ pub enum InstantFnKind {
         max: f64,
     },
 
-    /// `timestamp(v)` — see the module-level "Timestamp semantics" note.
-    /// Returns the output step timestamp in seconds regardless of the
-    /// input value (the input's validity bit still gates the output
-    /// validity).
+    /// `timestamp(v)` — returns the matching **source sample's**
+    /// timestamp in seconds when the input cell carries one (the common
+    /// case: `timestamp(metric @ t)` and similar bare-selector inputs,
+    /// populated by `VectorSelectorOp` into
+    /// `StepBatch::source_timestamps`). Falls back to the output step
+    /// timestamp when the input is derived (e.g. `timestamp(rate(…))` —
+    /// any operator between the source and `timestamp()` drops the
+    /// source-timestamp column, matching Prometheus semantics at
+    /// `at_modifier.test:193–201`).
     Timestamp,
+
+    /// Calendar/date extraction functions operating on seconds-since-epoch
+    /// values (or `vector(time())` for the zero-arg forms).
+    Year,
+    Month,
+    DayOfMonth,
+    DayOfYear,
+    DayOfWeek,
+    Hour,
+    Minute,
+    DaysInMonth,
 }
 
 impl InstantFnKind {
@@ -223,8 +237,61 @@ impl InstantFnKind {
             Self::ClampMin { min } => max_nan_aware(v, min),
             Self::ClampMax { max } => min_nan_aware(v, max),
             Self::Timestamp => step_timestamp_ms as f64 / 1000.0,
+            Self::Year => datetime_from_seconds(v)
+                .map(|dt| dt.year() as f64)
+                .unwrap_or(f64::NAN),
+            Self::Month => datetime_from_seconds(v)
+                .map(|dt| dt.month() as f64)
+                .unwrap_or(f64::NAN),
+            Self::DayOfMonth => datetime_from_seconds(v)
+                .map(|dt| dt.day() as f64)
+                .unwrap_or(f64::NAN),
+            Self::DayOfYear => datetime_from_seconds(v)
+                .map(|dt| dt.ordinal() as f64)
+                .unwrap_or(f64::NAN),
+            Self::DayOfWeek => datetime_from_seconds(v)
+                .map(|dt| dt.weekday().num_days_from_sunday() as f64)
+                .unwrap_or(f64::NAN),
+            Self::Hour => datetime_from_seconds(v)
+                .map(|dt| dt.hour() as f64)
+                .unwrap_or(f64::NAN),
+            Self::Minute => datetime_from_seconds(v)
+                .map(|dt| dt.minute() as f64)
+                .unwrap_or(f64::NAN),
+            Self::DaysInMonth => datetime_from_seconds(v)
+                .map(|dt| days_in_month(dt) as f64)
+                .unwrap_or(f64::NAN),
         }
     }
+}
+
+#[inline]
+fn datetime_from_seconds(value: f64) -> Option<DateTime<Utc>> {
+    if !value.is_finite() {
+        return None;
+    }
+
+    let seconds = value.trunc();
+    if !(i64::MIN as f64..=i64::MAX as f64).contains(&seconds) {
+        return None;
+    }
+
+    DateTime::from_timestamp(seconds as i64, 0)
+}
+
+#[inline]
+fn days_in_month(dt: DateTime<Utc>) -> u32 {
+    let start_of_month =
+        NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1).expect("valid start of month");
+    let start_of_next_month = if dt.month() == 12 {
+        NaiveDate::from_ymd_opt(dt.year() + 1, 1, 1).expect("valid start of next month")
+    } else {
+        NaiveDate::from_ymd_opt(dt.year(), dt.month() + 1, 1).expect("valid start of next month")
+    };
+
+    start_of_next_month
+        .signed_duration_since(start_of_month)
+        .num_days() as u32
 }
 
 /// `round(v, to_nearest)` — ported from
@@ -365,17 +432,40 @@ impl<C: Operator> InstantFnOp<C> {
     fn apply_batch(&self, batch: StepBatch) -> Result<StepBatch, QueryError> {
         let cell_count = batch.len();
         let mut out = OutValues::allocate(&self.reservation, cell_count)?;
+
+        if let InstantFnKind::Clamp { min, max } = self.kind
+            && min > max
+        {
+            let values = out.finish();
+            return Ok(StepBatch::new(
+                batch.step_timestamps.clone(),
+                batch.step_range.clone(),
+                batch.series.clone(),
+                batch.series_range.clone(),
+                values,
+                BitSet::with_len(cell_count),
+            ));
+        }
+
         let series_count = batch.series_count();
         let step_ts = batch.step_timestamps_slice();
 
         // Iterate cells in row-major (step, series) order — matches
         // `StepBatch`'s layout. Only touch valid cells; invalid cells
         // keep the NaN fill and the pointer-cloned validity bit clear.
+        // `timestamp()` prefers the source-sample timestamp when the
+        // input batch carries one (RFC 0007 §6.3.7); all other kinds
+        // ignore the column.
+        let source_ts: Option<&[i64]> = batch.source_timestamps.as_deref();
         for (step_off, &step_ms) in step_ts.iter().enumerate().take(batch.step_count()) {
             for series_off in 0..series_count {
                 let idx = step_off * series_count + series_off;
                 if batch.validity.get(idx) {
-                    out.values[idx] = self.kind.compute(batch.values[idx], step_ms);
+                    let per_cell_ts = match (self.kind, source_ts) {
+                        (InstantFnKind::Timestamp, Some(ts)) => ts[idx],
+                        _ => step_ms,
+                    };
+                    out.values[idx] = self.kind.compute(batch.values[idx], per_cell_ts);
                 }
             }
         }
@@ -643,6 +733,34 @@ mod tests {
     }
 
     #[test]
+    fn should_emit_no_samples_for_clamp_when_min_exceeds_max() {
+        // given
+        let ts = vec![1_000];
+        let values = vec![1.0, 3.0, 6.0];
+        let validity = vec![true; 3];
+        let batch = mk_batch(ts.clone(), 3, values, validity);
+        let schema = mk_operator_schema(&ts, 1_000, 3);
+        let child = MockChild::new(schema, vec![batch]);
+
+        // when
+        let mut op = InstantFnOp::new(
+            child,
+            InstantFnKind::Clamp {
+                min: 5.0,
+                max: -5.0,
+            },
+            MemoryReservation::new(1 << 20),
+        );
+        let batches: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then
+        let batch = &batches[0];
+        assert_eq!(batch.get(0, 0), None);
+        assert_eq!(batch.get(0, 1), None);
+        assert_eq!(batch.get(0, 2), None);
+    }
+
+    #[test]
     fn should_apply_clamp_min_and_clamp_max() {
         // given: 4 values exercising both tails
         let ts = vec![1_000];
@@ -713,10 +831,12 @@ mod tests {
     }
 
     #[test]
-    fn should_apply_timestamp_emitting_step_timestamps() {
-        // given: two steps at t=1_500 ms and 3_000 ms; timestamp() should
-        // emit step_ms / 1000 regardless of the input value (the value
-        // just needs to have validity=1).
+    fn should_apply_timestamp_falling_back_to_step_time_without_source_column() {
+        // given: two steps at t=1_500 ms and 3_000 ms; the input batch
+        // carries no `source_timestamps` column (the producer was a
+        // derived operator, e.g. `rate` or a binary op). `timestamp()`
+        // therefore returns the step timestamp in seconds, matching
+        // Prometheus' behaviour for derived inputs.
         let ts = vec![1_500, 3_000];
         let values = vec![7.0, -42.0];
         let validity = vec![true, true];
@@ -732,12 +852,136 @@ mod tests {
         );
         let batches: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
 
-        // then: v2 step-timestamp semantics — see module-level note for
-        // the divergence from the legacy engine's source-sample-timestamp
-        // behaviour.
+        // then
         let b = &batches[0];
         assert!(approx_eq(b.get(0, 0).unwrap(), 1.5, 1e-9));
         assert!(approx_eq(b.get(1, 0).unwrap(), 3.0, 1e-9));
+    }
+
+    #[test]
+    fn should_apply_timestamp_returning_source_sample_timestamp_when_available() {
+        // given: two steps at step_ms 1_500 / 3_000, but the input
+        // batch was produced by a bare vector selector which stamped
+        // per-cell source timestamps (the actual matching-sample times,
+        // e.g. from an `@ t` pin). `timestamp()` must prefer those over
+        // the step timestamp.
+        let ts = vec![1_500, 3_000];
+        let values = vec![7.0, -42.0];
+        let validity = vec![true, true];
+        let batch = mk_batch(ts.clone(), 1, values, validity)
+            .with_source_timestamps(Arc::from(vec![10_000i64, 10_000]));
+        let schema = mk_operator_schema(&ts, 1_500, 1);
+        let child = MockChild::new(schema, vec![batch]);
+
+        // when
+        let mut op = InstantFnOp::new(
+            child,
+            InstantFnKind::Timestamp,
+            MemoryReservation::new(1 << 20),
+        );
+        let batches: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then: both cells return the source sample timestamp (10s),
+        // not the step time.
+        let b = &batches[0];
+        assert!(approx_eq(b.get(0, 0).unwrap(), 10.0, 1e-9));
+        assert!(approx_eq(b.get(1, 0).unwrap(), 10.0, 1e-9));
+        // and: the operator's own output does NOT carry source
+        // timestamps — derived values have no source-timestamp concept,
+        // so a wrapping `timestamp()` falls back to step time.
+        assert!(b.source_timestamps.is_none());
+    }
+
+    #[test]
+    fn should_apply_calendar_extractions_from_epoch_seconds() {
+        // given: 2006-01-02 22:04:05 UTC, the canonical timestamp used by the
+        // legacy function tests.
+        let ts = vec![0];
+        let values = vec![1_136_239_445.0];
+        let validity = vec![true];
+        let schema = mk_operator_schema(&ts, 0, 1);
+
+        let batch = mk_batch(ts.clone(), 1, values.clone(), validity.clone());
+        let child = MockChild::new(schema.clone(), vec![batch]);
+        let mut year =
+            InstantFnOp::new(child, InstantFnKind::Year, MemoryReservation::new(1 << 20));
+        let b = &drive(&mut year)
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()[0];
+        assert_eq!(b.get(0, 0), Some(2006.0));
+
+        let batch = mk_batch(ts.clone(), 1, values.clone(), validity.clone());
+        let child = MockChild::new(schema.clone(), vec![batch]);
+        let mut month =
+            InstantFnOp::new(child, InstantFnKind::Month, MemoryReservation::new(1 << 20));
+        let b = &drive(&mut month)
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()[0];
+        assert_eq!(b.get(0, 0), Some(1.0));
+
+        let batch = mk_batch(ts.clone(), 1, values.clone(), validity.clone());
+        let child = MockChild::new(schema.clone(), vec![batch]);
+        let mut dom = InstantFnOp::new(
+            child,
+            InstantFnKind::DayOfMonth,
+            MemoryReservation::new(1 << 20),
+        );
+        let b = &drive(&mut dom)
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()[0];
+        assert_eq!(b.get(0, 0), Some(2.0));
+
+        let batch = mk_batch(ts.clone(), 1, values.clone(), validity.clone());
+        let child = MockChild::new(schema.clone(), vec![batch]);
+        let mut dow = InstantFnOp::new(
+            child,
+            InstantFnKind::DayOfWeek,
+            MemoryReservation::new(1 << 20),
+        );
+        let b = &drive(&mut dow)
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()[0];
+        assert_eq!(b.get(0, 0), Some(1.0));
+
+        let batch = mk_batch(ts.clone(), 1, values.clone(), validity.clone());
+        let child = MockChild::new(schema.clone(), vec![batch]);
+        let mut hour =
+            InstantFnOp::new(child, InstantFnKind::Hour, MemoryReservation::new(1 << 20));
+        let b = &drive(&mut hour)
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()[0];
+        assert_eq!(b.get(0, 0), Some(22.0));
+
+        let batch = mk_batch(ts.clone(), 1, values.clone(), validity.clone());
+        let child = MockChild::new(schema.clone(), vec![batch]);
+        let mut minute = InstantFnOp::new(
+            child,
+            InstantFnKind::Minute,
+            MemoryReservation::new(1 << 20),
+        );
+        let b = &drive(&mut minute)
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()[0];
+        assert_eq!(b.get(0, 0), Some(4.0));
+
+        let batch = mk_batch(ts, 1, values, validity);
+        let child = MockChild::new(schema, vec![batch]);
+        let mut dim = InstantFnOp::new(
+            child,
+            InstantFnKind::DaysInMonth,
+            MemoryReservation::new(1 << 20),
+        );
+        let b = &drive(&mut dim)
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()[0];
+        assert_eq!(b.get(0, 0), Some(31.0));
     }
 
     #[test]
@@ -996,9 +1240,9 @@ mod tests {
             ],
         });
         let schema = mk_schema(2);
-        let hint_series: Arc<[ResolvedSeriesRef]> = Arc::from(vec![
-            ResolvedSeriesRef::new(1, 0),
-            ResolvedSeriesRef::new(1, 1),
+        let hint_series: Arc<[Arc<[ResolvedSeriesRef]>]> = Arc::from(vec![
+            Arc::from(vec![ResolvedSeriesRef::new(1, 0)]),
+            Arc::from(vec![ResolvedSeriesRef::new(1, 1)]),
         ]);
         let grid = StepGrid {
             start_ms: 10,

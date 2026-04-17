@@ -309,10 +309,10 @@ impl ChunkSamples {
         }
     }
 
-    /// Absorb a `SampleBatch` whose `series_range` indexes into the
-    /// chunk-local `SampleHint::series` (i.e. `0..chunk_len`), not the
-    /// full roster.
-    fn absorb(&mut self, batch: SampleBatch) -> Result<(), QueryError> {
+    /// Absorb a `SampleBatch` whose `series_range` indexes into the flattened
+    /// chunk-local `SampleHint::series`. `hint_to_series[hint_idx]` resolves
+    /// each sample column back onto the logical output series it belongs to.
+    fn absorb(&mut self, batch: SampleBatch, hint_to_series: &[usize]) -> Result<(), QueryError> {
         let mut total_new = 0usize;
         for col in batch.samples.timestamps.iter() {
             total_new = total_new.saturating_add(col.len());
@@ -321,7 +321,6 @@ impl ChunkSamples {
         self.reservation.try_grow(bytes)?;
         self.bytes = self.bytes.saturating_add(bytes);
 
-        let chunk_offset = batch.series_range.start;
         for (block_idx, (mut ts_col, mut val_col)) in batch
             .samples
             .timestamps
@@ -329,7 +328,8 @@ impl ChunkSamples {
             .zip(batch.samples.values)
             .enumerate()
         {
-            let local_idx = chunk_offset + block_idx;
+            let hint_idx = batch.series_range.start + block_idx;
+            let local_idx = hint_to_series[hint_idx];
             // Append rather than replace — a series may span several
             // SampleBatches (one per bucket for cross-bucket series).
             self.timestamps[local_idx].append(&mut ts_col);
@@ -395,7 +395,7 @@ enum State<'a> {
 pub(crate) struct VectorSelectorOp<'a, S: SeriesSource + 'a> {
     // Plan-time inputs ------------------------------------------------------
     source: Arc<S>,
-    hint_series: Arc<[ResolvedSeriesRef]>,
+    hint_series: Arc<[Arc<[ResolvedSeriesRef]>]>,
     schema: OperatorSchema,
     step_timestamps: Arc<[i64]>,
     effective_times: EffectiveTimes,
@@ -416,8 +416,10 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
     /// * `series` — post-resolve series roster in the order the planner
     ///   wants samples to land. `schema.series` is a
     ///   [`SchemaRef::Static`] handle over the same roster.
-    /// * `hint_series` — parallel slice of opaque source handles aligned
-    ///   with `schema.series`.
+    /// * `hint_series` — parallel slice of per-logical-series opaque source
+    ///   handle groups aligned with `schema.series`. A single logical series
+    ///   may carry several bucket-local refs when the planner deduplicates the
+    ///   resolved roster by fingerprint.
     /// * `grid` — step grid the query runs on.
     /// * `at` / `offset` — selector modifiers; may both be `None`.
     /// * `lookback_ms` — Prometheus lookback delta in ms. Use
@@ -428,7 +430,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
     pub(crate) fn new(
         source: Arc<S>,
         series: Arc<SeriesSchema>,
-        hint_series: Arc<[ResolvedSeriesRef]>,
+        hint_series: Arc<[Arc<[ResolvedSeriesRef]>]>,
         grid: StepGrid,
         at: Option<AtModifier>,
         offset: Option<Offset>,
@@ -466,18 +468,33 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
         self.hint_series.len()
     }
 
+    fn chunk_hint(&self, chunk_start: usize, chunk_end: usize) -> (SampleHint, Vec<usize>) {
+        let mut flat: Vec<ResolvedSeriesRef> = Vec::new();
+        let mut hint_to_series: Vec<usize> = Vec::new();
+        for (series_off, series_refs) in self.hint_series[chunk_start..chunk_end].iter().enumerate()
+        {
+            debug_assert!(
+                !series_refs.is_empty(),
+                "every logical series must have at least one source handle",
+            );
+            for sref in series_refs.iter() {
+                flat.push(*sref);
+                hint_to_series.push(series_off);
+            }
+        }
+        let window = self
+            .effective_times
+            .time_range_with_lookback(self.lookback_ms);
+        (SampleHint::new(Arc::from(flat), window), hint_to_series)
+    }
+
     fn start_chunk_load(&mut self, chunk_start: usize) -> State<'a>
     where
         S: 'a,
     {
         let chunk_end = (chunk_start + self.shape.series_chunk).min(self.total_series());
         let chunk_len = chunk_end - chunk_start;
-        let hint_slice: Arc<[ResolvedSeriesRef]> =
-            Arc::from(&self.hint_series[chunk_start..chunk_end]);
-        let window = self
-            .effective_times
-            .time_range_with_lookback(self.lookback_ms);
-        let hint = SampleHint::new(hint_slice, window);
+        let (hint, hint_to_series) = self.chunk_hint(chunk_start, chunk_end);
         let source = self.source.clone();
         let reservation = self.reservation.clone();
 
@@ -487,7 +504,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
             let mut stream: SampleStream<'_> = Box::pin(stream);
             while let Some(item) = stream.next().await {
                 let batch = item?;
-                samples.absorb(batch)?;
+                samples.absorb(batch, &hint_to_series)?;
             }
             // Silence "unused variable" when chunk_start isn't read
             // by absorb — it's threaded into the state machine as an
@@ -516,6 +533,12 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
         let cell_count = step_count * chunk_len;
 
         let mut buffers = BatchBuffers::allocate(&self.reservation, cell_count)?;
+        // Per-cell source-sample timestamp (0 is a safe placeholder when
+        // the cell is absent — callers must consult validity before
+        // reading). RFC 0007 §6.3.7 / at_modifier.test `timestamp()`
+        // semantics require the matching sample's actual timestamp, not
+        // the step timestamp.
+        let mut source_timestamps = vec![0i64; cell_count];
 
         for step_off in 0..step_count {
             let step_idx = step_chunk_start + step_off;
@@ -530,7 +553,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
                 // sorted per-series samples ascending by timestamp, so we
                 // scan from the end and stop at the first in-window
                 // non-stale sample.
-                let mut selected: Option<f64> = None;
+                let mut selected: Option<(f64, i64)> = None;
                 for i in (0..ts.len()).rev() {
                     let t = ts[i];
                     if t > window_hi {
@@ -545,14 +568,15 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
                         // treat this cell as absent.
                         break;
                     }
-                    selected = Some(v);
+                    selected = Some((v, t));
                     break;
                 }
 
                 let cell = step_off * chunk_len + series_off;
-                if let Some(v) = selected {
+                if let Some((v, t)) = selected {
                     buffers.values[cell] = v;
                     buffers.validity.set(cell);
+                    source_timestamps[cell] = t;
                 }
                 // else: values[cell] stays NaN, validity bit stays clear.
             }
@@ -568,7 +592,8 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
             series_range,
             values,
             validity,
-        ))
+        )
+        .with_source_timestamps(Arc::from(source_timestamps)))
     }
 }
 
@@ -774,10 +799,12 @@ mod tests {
         Arc::new(SeriesSchema::new(Arc::from(labels), Arc::from(fps)))
     }
 
-    fn mk_hint_series(n: usize) -> Arc<[ResolvedSeriesRef]> {
+    fn mk_hint_series(n: usize) -> Arc<[Arc<[ResolvedSeriesRef]>]> {
         Arc::from(
             (0..n)
-                .map(|i| ResolvedSeriesRef::new(1, i as u32))
+                .map(|i| {
+                    Arc::<[ResolvedSeriesRef]>::from(vec![ResolvedSeriesRef::new(1, i as u32)])
+                })
                 .collect::<Vec<_>>(),
         )
     }
@@ -899,6 +926,43 @@ mod tests {
         assert_eq!(cells[1][0], Some(2.0));
         assert_eq!(cells[2][0], Some(3.0));
         assert_eq!(cells[3][0], None, "no sample in (35, 40]");
+    }
+
+    #[test]
+    fn should_merge_cross_bucket_refs_for_one_logical_series() {
+        // given: one logical output series backed by two bucket-local refs.
+        // The older bucket contributes the earlier sample and the newer bucket
+        // contributes the later one.
+        let source = Arc::new(MockSource::new(vec![
+            (vec![10], vec![1.0]),
+            (vec![20], vec![2.0]),
+        ]));
+        let schema = mk_schema(1);
+        let hint_series: Arc<[Arc<[ResolvedSeriesRef]>]> = Arc::from(vec![Arc::from(vec![
+            ResolvedSeriesRef::new(1, 0),
+            ResolvedSeriesRef::new(2, 1),
+        ])]);
+        let grid = mk_grid(10, 10, 2);
+        let reservation = MemoryReservation::new(1 << 20);
+        let mut op = VectorSelectorOp::new(
+            source,
+            schema,
+            hint_series,
+            grid,
+            None,
+            None,
+            15,
+            reservation,
+            BatchShape::new(2, 1),
+        );
+
+        // when
+        let batches: Vec<StepBatch> = drain(&mut op).into_iter().map(|r| r.unwrap()).collect();
+        let cells = materialise(&batches, 2, 1);
+
+        // then
+        assert_eq!(cells[0][0], Some(1.0));
+        assert_eq!(cells[1][0], Some(2.0));
     }
 
     #[test]

@@ -2570,7 +2570,7 @@ mod tests {
             // when
             let opts = QueryOptions::default();
             let result = tsdb
-                .eval_query_v2("day_of_month(http_requests)", None, &opts)
+                .eval_query_v2("histogram_quantile(0.9, http_requests)", None, &opts)
                 .await;
             // then
             let err = result.unwrap_err();
@@ -2578,6 +2578,138 @@ mod tests {
                 matches!(err, QueryError::InvalidQuery(_)),
                 "expected InvalidQuery, got {:?}",
                 err
+            );
+        }
+
+        #[tokio::test]
+        async fn should_eval_time_function_v2_as_scalar() {
+            // given
+            let tsdb = create_tsdb_with_data().await;
+            let query_time = UNIX_EPOCH + Duration::from_millis(1);
+
+            // when
+            let opts = QueryOptions::default();
+            let result = tsdb
+                .eval_query_v2("time()", Some(query_time), &opts)
+                .await
+                .unwrap();
+
+            // then
+            match result {
+                QueryValue::Scalar {
+                    timestamp_ms,
+                    value,
+                } => {
+                    assert_eq!(timestamp_ms, 1);
+                    assert_eq!(value, 0.001);
+                }
+                other => panic!("expected Scalar, got {:?}", other),
+            }
+        }
+
+        #[tokio::test]
+        async fn should_eval_vector_time_v2_as_vector() {
+            // given
+            let tsdb = create_tsdb_with_data().await;
+            let query_time = UNIX_EPOCH + Duration::from_secs(5);
+
+            // when
+            let opts = QueryOptions::default();
+            let result = tsdb
+                .eval_query_v2("vector(time())", Some(query_time), &opts)
+                .await
+                .unwrap();
+
+            // then
+            match result {
+                QueryValue::Vector(samples) => {
+                    assert_eq!(samples.len(), 1);
+                    assert!(samples[0].labels.is_empty());
+                    assert_eq!(samples[0].value, 5.0);
+                }
+                other => panic!("expected Vector, got {:?}", other),
+            }
+        }
+
+        #[tokio::test]
+        async fn should_eval_calendar_function_v2() {
+            // given
+            let tsdb = create_tsdb_with_data().await;
+            let query_time = UNIX_EPOCH;
+
+            // when
+            let opts = QueryOptions::default();
+            let result = tsdb
+                .eval_query_v2("minute(vector(1136239445))", Some(query_time), &opts)
+                .await
+                .unwrap();
+
+            // then
+            match result {
+                QueryValue::Vector(samples) => {
+                    assert_eq!(samples.len(), 1);
+                    assert_eq!(samples[0].value, 4.0);
+                }
+                other => panic!("expected Vector, got {:?}", other),
+            }
+        }
+
+        #[tokio::test]
+        async fn should_eval_label_replace_v2() {
+            // given
+            let tsdb = create_tsdb_with_data().await;
+            let query_time = UNIX_EPOCH + Duration::from_secs(4100);
+
+            // when
+            let opts = QueryOptions::default();
+            let result = tsdb
+                .eval_query_v2(
+                    r#"label_replace(http_requests, "tier", "$1-app", "env", "(.*)")"#,
+                    Some(query_time),
+                    &opts,
+                )
+                .await
+                .unwrap();
+
+            // then
+            let mut samples = match result {
+                QueryValue::Vector(samples) => samples,
+                other => panic!("expected Vector, got {:?}", other),
+            };
+            samples.sort_by(|a, b| a.labels.get("env").cmp(&b.labels.get("env")));
+            assert_eq!(samples.len(), 2);
+            assert_eq!(samples[0].labels.get("tier"), Some("prod-app"));
+            assert_eq!(samples[1].labels.get("tier"), Some("staging-app"));
+        }
+
+        #[tokio::test]
+        async fn should_eval_label_join_v2() {
+            // given
+            let tsdb = create_tsdb_with_data().await;
+            let query_time = UNIX_EPOCH + Duration::from_secs(4100);
+
+            // when
+            let opts = QueryOptions::default();
+            let result = tsdb
+                .eval_query_v2(
+                    r#"label_join(http_requests, "joined", "/", "__name__", "env")"#,
+                    Some(query_time),
+                    &opts,
+                )
+                .await
+                .unwrap();
+
+            // then
+            let mut samples = match result {
+                QueryValue::Vector(samples) => samples,
+                other => panic!("expected Vector, got {:?}", other),
+            };
+            samples.sort_by(|a, b| a.labels.get("env").cmp(&b.labels.get("env")));
+            assert_eq!(samples.len(), 2);
+            assert_eq!(samples[0].labels.get("joined"), Some("http_requests/prod"));
+            assert_eq!(
+                samples[1].labels.get("joined"),
+                Some("http_requests/staging")
             );
         }
 

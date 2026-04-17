@@ -259,9 +259,17 @@ return structurally-identical `QueryValue`s.
 
 | # | Unit | Owner | Status | Deps | Artifacts | Blocker |
 |---|---|---|---|---|---|---|
-| 6.1 | Full `promqltest` corpus run against v2 with flag on | | ready | 5.* | | |
-| 6.2 | Triage and file each failure class in Decisions Log | | ready | 6.1 | | |
-| 6.3 | Re-run until green; no fixture edits | | ready | 6.2 | | |
+| 6.1 | Full `promqltest` corpus run against v2 with flag on | Tester | done | 5.* | `timeseries/src/promql/promqltest/v2_harness.rs`, `timeseries/src/promql/promqltest/mod.rs` | |
+| 6.2 | Triage and file each failure class in Decisions Log | Architect | done | 6.1 | §5 Decisions Log entries from 6.1 (triage table, critical-bug flags) | |
+| 6.3 | Re-run until green; no fixture edits | Architect | done | 6.2 | `timeseries/rfcs/0007-impl-plan.md` | All sub-units 6.3.1–6.3.8 landed; full `promqltest` corpus passes under `--features promql-v2`. |
+| 6.3.1 | Aggregate panic + leaf-roster dedup by unique `SeriesFingerprint` | Operator/Planner Implementor | done | 6.2 | `timeseries/src/promql/v2/plan/physical.rs`, `timeseries/src/promql/v2/operators/{aggregate,vector_selector,matrix_selector}.rs`, `timeseries/src/promql/v2/operators/instant_fn.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
+| 6.3.2 | Add nullary/scalar/calendar function surface (`scalar`, `vector`, `pi`, `time`, `minute`/calendar funcs) | Architect | done | 6.2 | `timeseries/src/promql/v2/{plan/{plan_types,lowering,optimize,cardinality,physical}.rs,operators/{coercion,instant_fn,mod}.rs,reshape.rs,mod.rs}`, `timeseries/src/tsdb.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
+| 6.3.3 | Add label-manipulation functions (`label_replace`, `label_join`) | Architect | done | 6.2 | `timeseries/src/promql/v2/{operators/{label_manip,mod}.rs,plan/{plan_types,lowering,optimize,cardinality,physical}.rs,mod.rs}`, `timeseries/src/tsdb.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
+| 6.3.4 | Fix `VectorSelector` offset / `@` instant emission to one sample per series | Architect | done | 6.2 | `timeseries/rfcs/0007-impl-plan.md` (see §5 Decisions Log 6.3.4) — subsumed by 6.3.1's leaf-roster dedup; `offset.test` corpus passes clean. | |
+| 6.3.5 | Fix subquery inner-grid and `@` / offset semantics | Architect | done | 6.2 | `timeseries/src/promql/v2/operators/subquery.rs`, `timeseries/src/promql/v2/plan/physical.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
+| 6.3.6 | Small correctness cluster: topk tie-break, `by(__name__)`, `clamp(min>max)`, `topk(scalar(...), ...)`, binary `on()` schema | Architect | done | 6.2 | `timeseries/src/promql/v2/{operators/{aggregate,instant_fn}.rs,plan/{lowering,optimize,physical,cardinality}.rs,reshape.rs,plan/mod.rs,mod.rs}`, `timeseries/rfcs/0007-impl-plan.md` | |
+| 6.3.7 | Restore `timestamp()` source-sample semantics (StepBatch ABI extension) | Architect | done | 6.2 | `timeseries/src/promql/v2/batch.rs`, `timeseries/src/promql/v2/operators/{vector_selector,instant_fn}.rs`, `timeseries/src/promql/v2/reshape.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
+| 6.3.8 | Fix `MatrixSelectorOp` + `rate()` + `@` / `offset` window math (per-step effective-time threaded into `RollupOp`) | Architect | done | 6.2 | `timeseries/src/promql/v2/operators/{matrix_selector,subquery,rollup}.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
 
 **Acceptance**: zero failures on the unmodified `promqltest` corpus. Perf profile taken on a
 representative range query (e.g., `sum by (pod) (rate(http_requests_total[5m]))` over 6h) —
@@ -271,7 +279,7 @@ numbers recorded in Decisions Log.
 
 | # | Unit | Owner | Status | Deps | Artifacts | Blocker |
 |---|---|---|---|---|---|---|
-| 7.1 | Flip `promql-v2` to default-on or remove the flag | | ready | 6.3 | | |
+| 7.1 | Flip `promql-v2` to default-on or remove the flag | | ready | 6.3.1–6.3.7 | | |
 | 7.2 | Delete `evaluator.rs`, `pipeline.rs`; remove dead types | | ready | 7.1 | | |
 | 7.3 | `cargo test --all` + clippy green across workspace | | ready | 7.2 | | |
 
@@ -1763,6 +1771,218 @@ RFC section touched.
   branch, and the `Scalar` arm is cheap to keep for safety. Removing
   it would require proving the reshape contract across all paths; not
   worth the churn. Adapter kept unchanged.
+- 2026-04-16 — Tester (unit 6.1) — **Harness shape: option (a) — separate
+  `#[cfg(feature = "promql-v2")] mod v2_harness`** under
+  `timeseries/src/promql/promqltest/`. Re-parses each fixture via the v1
+  harness's existing `dsl::parse_test_file`, reuses v1 `load_series` and
+  `assert_results`, but routes `EvalInstant` through a new
+  `eval_instant_v2` that calls `Tsdb::eval_query_v2`. One
+  `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` per
+  fixture file (9 fixtures) + a smoke test + a `should_cover_every_fixture_file`
+  drift-guard. Multi-thread runtime is required because the subquery
+  factory uses `tokio::task::block_in_place` (§5 Decisions Log 4.3);
+  `#[tokio::test]` defaults to single-thread and panics there.
+  `run_test_v2` **collects** eval failures rather than short-circuiting
+  on the first — one run surfaces every failure per file so Phase 6.2
+  triage has complete data. No v1 code path or fixture edited; the
+  generated v1 harness from `build.rs` still runs untouched.
+- 2026-04-16 — Tester (unit 6.1) — **Corpus outcome: 61 failures across 7
+  of 9 fixtures.** `operators.test` and `selectors.test` pass clean.
+  Bucketed triage input for 6.2:
+
+  | Bucket | Count | Representative fixtures | Root-cause note |
+  |---|---|---|---|
+  | Parser/Planner — unknown PromQL function | 28 | `functions:1` (`vector(1)`), `functions:17` (`label_join(...)`), `at_modifier:21` (`label_replace(...)`), `at_modifier:36` (`minute(...)`) | `label_replace`, `label_join`, `vector`, `minute` — the coverage gaps flagged in §5 Decisions Log 3b.2 / 4.1. Error path surfaces as `PlanError::UnknownFunction`. |
+  | Planner — `scalar()` as topk `k` arg rejected | 1 | `aggregators:13` (`topk(scalar(foo), http_requests)`) | Lowerer's `expect_number_literal` on topk `k` arg rejects the `scalar(expr)` form. Legacy `coerce_k_size` evaluates it as an inner expression. |
+  | Operator — Aggregate (breaker) topk tie-break | 5 | `aggregators:1` (`topk(3, http_requests)`), `aggregators:3` (`topk(5, http_requests{group="canary",job="app-server"})`) | Wrong series selected on ties — reported "Label group mismatch: expected 'canary', got 'production'" and "instance '1' vs '0'". §5 3c.1 claims first-seen-wins matches legacy; goldens disagree, so either (a) the legacy-parity claim is wrong or (b) v2's "first-seen" order differs from v1's due to the new source-ordering path. |
+  | Operator — Aggregate (streaming) `__name__` retention in `by(__name__)` | 3 | `name_label_dropping:14` (`sum by (__name__, env) (metric_total{env="1"})`), `name_label_dropping:16`, `name_label_dropping:18` | Group-key projection strips `__name__` unconditionally (4.3 `build_group_map` "both `By` and `Without` drop `__name__`"), but when the user explicitly names `__name__` in `by(...)`, Prometheus keeps it. Planner rule is too aggressive. |
+  | Operator — InstantFn `clamp` with `min > max` | 1 | `functions:32` (`clamp(test_clamp, 5, -5)`) | Legacy (and Prometheus) emits empty when `min > max`; v2 currently emits 3 samples. `InstantFnKind::Clamp` doesn't gate on bound ordering. |
+  | Operator — InstantFn `timestamp()` divergence | 3 | `at_modifier:33` (`timestamp(metric{job="1"} @ 10)` — expected 10, got 600), `at_modifier:41`, `at_modifier:42` | Known divergence per §5 Decisions Log 3b.2: v2 returns step-timestamp; legacy/goldens expect source-sample-timestamp. Fixing requires propagating per-cell source-ts through `StepBatch`, or the fixture's expectation is wrong — escalate to Architect. |
+  | Operator — VectorSelector / offset emits duplicate samples | 5 | `offset:1` (`metric{job="test"} offset 1h`), `offset:3` (`metric{job="test"} @ 7200`), `offset:4`, `offset:5`, `offset:6` | All five report "Expected 1 samples, got 2" — the instant query is emitting two matching cells per series. Likely the operator's `(effective - lookback, effective]` window spans two adjacent load samples and emits both, or reshape is not collapsing a two-step range into one instant result. Tight reproducer: load_series of `metric{job="test"}` at two-sample spacing, then `eval instant at ... / metric{job="test"} offset 1h`. |
+  | Operator — Subquery sum/rate arithmetic | 7 | `subquery:1` (`sum_over_time(metric_total[50s:10s])` — 3 vs 1), `subquery:2` (`sum_over_time(metric_total[50s:5s])` — 4 vs 2), `subquery:4` (60s:10s — 2 vs 4), `subquery:5` (`rate(metric_total[20s:10s])` — 0 samples), `subquery:8`, `subquery:9`, `subquery:27` | `SubqueryOp`'s inner-grid walks produce the wrong sample count per outer window. Could be off-by-one on the inclusive/exclusive boundary (§5 3c.2 Decisions Log `(outer_t - range, outer_t]`) or the factory's `TimeRange` encoding swapping start/end. |
+  | Operator — Subquery with `@` / `offset` at outer or inner step | 7 | `at_modifier:24` (`sum_over_time(metric{job="1"}[100s:1s] @ 100)` — 460 vs 20), `at_modifier:25–27`, `at_modifier:30–32` | Subquery `@`/offset composition underreports drastically (460 expected → 20 got) or produces zero samples for nested subqueries. Likely the factory doesn't thread `@` / offset into the inner `TimeRange` correctly. |
+  | Operator — Binary `on(env)` match-table label projection | 1 | `vector_matching:15` (`foo + on(env) bar`) | Output label set wrong: expected `env='dev'`, got `env='prod'`. `build_match_table` / `build_one_to_one` likely joins on RHS's label value when LHS and RHS disagree on non-match-key labels. |
+
+  Full run output captured at `/tmp/rfc0007_phase6_run.log` for 6.2.
+- 2026-04-16 — Tester (unit 6.1) — **Critical v2 bug observed outside the
+  corpus** (not yet a corpus failure; exposed by the perf smoke at higher
+  cardinality). At ~300-series × 6 buckets the plan root assertion
+  `assert_eq!(child_series_count, group_map.len())` at
+  `v2/operators/aggregate.rs:695` panics with left=512 (default K=512
+  series-tile) right=1800 (series × buckets). Indicates the planner's
+  `GroupMap` length is being sized over `bucket_count × series_count`
+  rather than unique `series_count` when `SeriesSource::resolve`
+  emits multiple per-bucket chunks for the same series. None of the
+  current 9 fixtures reach this scale (largest is vector_matching with
+  single-bucket data), so the corpus did not trip the assertion — but
+  production workloads will. Logged separately because it's a panic,
+  not a mismatch, and the escalation rule in the task spec requires
+  flagging panics immediately. Reproducer: 300 series × 720 samples
+  × 6 h range → `sum by (pod) (rate(http_requests_total[5m]))`.
+- 2026-04-16 — Tester (unit 6.1) — **Subquery test requires multi-thread
+  runtime**. `SubqueryOp`'s factory uses `tokio::task::block_in_place`
+  (§5 Decisions Log 4.3), which panics under the default
+  `#[tokio::test]` single-thread runtime with "can call blocking only
+  when running on the multi-threaded runtime". Not a production v2
+  bug — the HTTP handler and CLI both run multi-threaded — but it
+  means any caller-spawned integration test must use
+  `#[tokio::test(flavor = "multi_thread", ...)]`. All v2 harness
+  fixture tests were set multi-thread. Flagged here so Phase 7
+  migration remembers to audit test call sites before deleting v1.
+- 2026-04-16 — Tester (unit 6.1) — **Perf snapshot: v2 at 30 series ×
+  720 steps, 6 h range, `sum by (pod) (rate(http_requests_total[5m]))`**
+  in `InMemoryStorage` test TSDB: **median 29 ms** across 5 runs
+  (samples: 28, 28, 29, 29, 29 ms). Test: `v2_harness_perf_smoke`
+  (ignored; invoke with `cargo test -p opendata-timeseries --features
+  promql-v2 v2_harness_perf_smoke -- --ignored --nocapture`). Not a
+  criterion benchmark — a smoke (`std::time::Instant`, 5 samples).
+  Scale was clipped from 300 series to 30 series because at 300-series
+  the aggregate-operator panic above prevents the query from completing
+  — so the recorded number is an under-scale signal and must be
+  re-taken once the aggregate planner bug is fixed. Documented here
+  in lieu of capturing an unfair v1 baseline.
+- 2026-04-16 — Architect — **Phase 6.3 is split into seven bounded fix
+  units; no scope cut accepted.** Chosen path is option (1) from the
+  handoff: keep Phase 6 acceptance at full-corpus green, but decompose
+  the fix work so it can be dispatched safely. Priority order:
+  **6.3.1 first** (aggregate panic + unique-series roster dedup, a real
+  production panic and perf blocker), then **6.3.2/6.3.3** to clear the
+  28 "unknown function" planner failures and unmask any deeper semantic
+  bugs they are currently hiding, then the semantic/correctness units
+  6.3.4–6.3.7. RFC sections touched: plan §4 state board only; no spec
+  change.
+- 2026-04-16 — Operator/Planner Implementor (unit 6.3.1) — `resolve_leaf`
+  now canonicalises labelsets, deduplicates the leaf roster to one schema
+  row per logical series fingerprint, and retains all bucket-local
+  `ResolvedSeriesRef`s in a per-series hint group. `VectorSelectorOp` and
+  `MatrixSelectorOp` flatten those groups back into `SampleHint`s per series
+  chunk and merge returned sample columns onto the logical series, so planner
+  dedup does not lose cross-bucket sample loading. RFC sections touched:
+  §"Core Data Model", §"Storage Contract".
+- 2026-04-16 — Operator/Planner Implementor (unit 6.3.1) — `AggregateOp`
+  no longer assumes an input batch covers the full child roster. Streaming,
+  `topk`/`bottomk`, and `quantile` reducers now look up `GroupMap` entries
+  with `input.series_range.start + local_series_off`; breaker tie-breaks keep
+  using the absolute child-series index, while filter-shaped outputs preserve
+  the child's `series_range` on emit. RFC sections touched: §"Core Data
+  Model".
+- 2026-04-16 — Architect (unit 6.3.2) — Added explicit scalar/vector
+  coercion to the logical plan: `Time` (scalar `time()` leaf),
+  `Scalarize { child }` (`scalar(v)`), and `Vectorize { child }`
+  (`vector(s)`). `PhysicalPlan` now carries a `root_is_scalar` flag so
+  reshape does not infer top-level scalar-ness from the one-series empty-label
+  runtime schema alone; this keeps `vector(1)` / `vector(time())` as vectors
+  while `pi()` / `time()` / `scalar(v)` remain scalar roots. RFC sections
+  touched: §"Core Data Model", §"Result Shape".
+- 2026-04-16 — Architect (unit 6.3.2) — Extended `InstantFnKind` and
+  lowering to cover the calendar/date functions (`year`, `month`,
+  `day_of_month`, `day_of_year`, `day_of_week`, `hour`, `minute`,
+  `days_in_month`). Zero-arg calendar calls lower to `InstantFn(kind,
+  Vectorize(Time))`, matching the legacy engine's default-argument semantics
+  (`vector(time())`). One-arg forms keep the input-vector semantics. RFC
+  sections touched: §"Operator Taxonomy".
+- 2026-04-16 — Architect (unit 6.3.3) — `label_replace` / `label_join`
+  lower to a dedicated `LogicalPlan::LabelManip` node rather than
+  `InstantFn`: they rewrite series labels, not cell values. Lowering now
+  validates the string arguments at plan time (non-empty destination label
+  names and compilable regexes for `label_replace`), while the physical
+  planner computes a deduplicated output roster and an `input_series ->
+  output_series` map from the child schema. RFC sections touched:
+  §"Operator Taxonomy", §"Core Data Model".
+- 2026-04-16 — Architect (unit 6.3.3) — Execution strategy for label
+  manipulation is a **static-schema breaker**: `LabelManipOp` drains its
+  child, merges input cells onto the deduplicated output roster, allows
+  distinct input series to collapse to the same output series when they are
+  step-disjoint, and errors with `vector cannot contain metrics with the same
+  labelset` on same-step collisions. This keeps `label_replace` /
+  `label_join` composable under binary ops and aggregates without introducing
+  a second deferred-schema path beyond `count_values`. RFC sections touched:
+  §"Core Data Model", §"Execution Model".
+- 2026-04-16 — Architect (unit 6.3.6) — Dynamic `topk` / `bottomk`
+  parameters lower as `LogicalPlan::Aggregate { kind: Topk(0)|Bottomk(0),
+  param: Some(scalar_plan) }` rather than inventing a second aggregate node
+  shape or forcing runtime expression evaluation back into the planner.
+  `AggregateOp` drains the scalar child once onto the query step grid,
+  coerces each step's value with the legacy `coerce_k_size` rule, and keeps
+  the existing literal fast path (`param: None`). The cardinality gate now
+  also walks aggregate param subtrees so selector-bearing `scalar(...)`
+  params count toward preflight estimates. RFC sections touched:
+  §"Execution Model", §"Memory accounting".
+- 2026-04-16 — Architect (unit 6.3.6) — Root `topk` / `bottomk` ordering is
+  enforced in reshape, not inside `AggregateOp`. The operator keeps its
+  filter-shaped, schema-preserving output; the physical plan carries a small
+  `root_instant_vector_sort` flag so `reshape_instant` can apply Prometheus-
+  style ordered instant-vector presentation only at the top level. This keeps
+  non-root aggregates composable while fixing the corpus-visible ordering
+  expectation. RFC sections touched: §"Result Shape".
+- 2026-04-17 — Architect (unit 6.3.7) — Extended `StepBatch` with an
+  optional `source_timestamps: Option<Arc<[i64]>>` column: one `i64` per
+  cell, matching `values` / `validity` layout. Only `VectorSelectorOp`
+  populates it (the sole operator that reads raw samples from storage);
+  every derived operator (`InstantFnOp`, `BinaryOp`, `AggregateOp`,
+  `RollupOp`, …) leaves it `None` on the output batch, which exactly
+  models Prometheus' `timestamp()` behaviour: "timestamp of the
+  underlying sample" for a bare vector selector, "evaluation time
+  otherwise" (at_modifier.test:193–201). `InstantFnKind::Timestamp` now
+  consults `source_timestamps[idx]` when present and falls back to the
+  step timestamp otherwise; no other kind reads the column. Picked the
+  `Arc<[i64]>` column shape over per-cell `SourceSampleMeta` structs or
+  a sidecar map because (a) it pointer-clones for free through
+  pass-through operators that choose to propagate (none do in v1), (b)
+  it keeps the invalid-cell case cheap (zero sentinel, callers must
+  consult validity anyway), and (c) the allocation cost is only paid
+  when a `VectorSelectorOp` is live. RFC sections touched: §"Core Data
+  Model" (StepBatch shape), §"Operator Taxonomy" (`timestamp()` semantics).
+- 2026-04-17 — Architect (unit 6.3.8) — Added an optional
+  `effective_times: Option<Arc<[i64]>>` column to `MatrixWindowBatch`
+  carrying the per-step **window-end** for rollup consumers. Picked this
+  over "shift emitted `step_timestamps` to `effective_t`" because the
+  step-timestamp column doubles as the downstream result-time axis
+  (reshape, subsequent operators), so shifting it would silently
+  mislabel output samples. Keeping `step_timestamps` canonical and
+  adding a sibling column for the window math is also cheaper — the new
+  column is only populated when the leaf has a non-trivial `@` / offset
+  (`MatrixSelectorOp::has_effective_shift`, `SubqueryOp::has_effective_shift`),
+  so the no-modifier hot path is unchanged. `RollupOp::reduce_batch` now
+  prefers `effective_times` when present and falls back to
+  `step_timestamps` otherwise. RFC sections touched: §"Core Data Model"
+  (MatrixWindowBatch shape).
+- 2026-04-17 — Architect (unit 6.3.5) — Subquery inner-grid alignment moved
+  from "forward-walk from `outer_t - range + 1`" to "**absolute multiples of
+  `inner_step_ms` within `(effective_t - range, effective_t]`**". The prior
+  shape produced inner timestamps like `{-39999, -29999, …, 1}` for
+  `[50s:10s]` at `t=10s` — off by one from the sample grid — and always
+  emitted at least one inner point even when `range < step` (e.g.
+  `[1m:5m]`), so `min_over_time((topk(1, foo))[1m:5m])` at `12m` returned 1
+  instead of empty. The new shape uses Euclidean ceil/floor to find the
+  first/last multiple of `step` in window and emits zero inner points when
+  the window spans no multiple, which matches Prometheus'
+  `promql/engine.go::subqueryTimes` step-alignment contract and is the
+  shape assumed by every sub-*-over-time fixture. Separately, `@`/offset
+  composition moved into the operator: `SubqueryOp` now owns a
+  per-outer-step `effective_times: Arc<[i64]>` (planner-precomputed) and
+  computes the inner window from that rather than the raw outer-grid
+  timestamp. The existing factory closure continues to receive the
+  `(TimeRange, inner_step_ms)` shape it had — the only change is that
+  `TimeRange::end_ms_exclusive - 1 = effective_t` now, which the factory
+  uses to align `inner_grid`. RFC sections touched: plan §4 state board
+  only; no spec change. Unit 6.3.8 added to track the matrix-selector
+  rate+@ rollup-window bug (at_modifier #21) surfaced while triaging
+  residual at_modifier failures — same root cause as the subquery bug
+  but in the `MatrixSelectorOp` / `RollupOp` seam, which this unit did
+  not touch.
+- 2026-04-17 — Architect (unit 6.3.4) — Closed without new code. The five
+  `offset:*` failures from 6.1's triage ("Expected 1 samples, got 2") were a
+  pre-dedup symptom: `SeriesSource::resolve` emits one `ResolvedSeriesChunk`
+  per overlapping bucket, and before 6.3.1 the planner concatenated those into
+  the schema roster without deduping. Each cross-bucket query therefore
+  produced one schema row per bucket rather than one per fingerprint, which
+  `reshape_instant` surfaced as N samples per logical series at the `instant`
+  shape. 6.3.1's fingerprint-dedup of `resolve_leaf` fixed this at the
+  planner; `VectorSelectorOp::build_batch` always selected a single sample
+  per `(step, series)` cell, so no operator change was needed. `offset.test`
+  corpus passes clean as of this closure. RFC sections touched: §4 state
+  board only; no spec change.
 
 ## 6. Activity Log
 
@@ -1797,6 +2017,18 @@ Append-only, one line per agent invocation. Format:
 - 2026-04-16 Wiring Implementor 5.1 in-progress→done — added `Tsdb::eval_query_v2` and `Tsdb::eval_query_range_v2` in `timeseries/src/tsdb.rs` (both `#[cfg(feature = "promql-v2")]`); created `timeseries/src/promql/v2/reshape.rs` with `reshape_instant` / `reshape_range` (plus a `ReshapeError` wrapper) and registered the module in `promql/v2/mod.rs`. Shared private `execute_v2(query, reader, ctx, is_instant)` drives parse → lower → optimize → build_physical_plan → `poll_fn(|cx| plan.root.next(cx))` loop → reshape; wrapped the reader through `Arc<QueryReaderSource<TsdbQueryReader>>` re-using the existing `Tsdb::query_reader_for_ranges` path. Memory cap default: **1 GiB** (`DEFAULT_V2_MEMORY_CAP_BYTES`, §5). `PlanError → crate::error::QueryError` mapping: parse/shape variants → `InvalidQuery`, structural/runtime variants → `Execution` (§5). `v2::QueryError → QueryError::Execution` for streaming errors. Pure-scalar detection uses the `ConstScalarOp` canonical shape (single-series roster, empty labels). Signatures mirror v1 so Phase 5.2 HTTP A/B swap is trivial; the v1 `eval_query` / `eval_query_range` methods and `TsdbReadEngine` trait are **untouched**. 7 new v2 wiring tests (inside a `#[cfg(feature = "promql-v2")] mod v2_wiring_tests` sub-module of `tsdb::tests`): `should_eval_instant_query_v2_selector_returns_one_sample_per_series`, `should_eval_range_query_v2_produces_samples_per_step`, `should_eval_rate_over_counter_v2_matches_expected_rate`, `should_reject_query_exceeding_cardinality_limit`, `should_propagate_memory_limit_at_exec_time`, `should_return_query_error_for_unknown_function`, `should_eval_sum_by_label_v2`. Plus 4 new reshape unit tests in `promql/v2/reshape.rs` (instant, elide-invalid, range, scalar). `cargo check -p opendata-timeseries` (both feature configurations), `cargo test -p opendata-timeseries` (724 passed — v1 path untouched), `cargo test -p opendata-timeseries --features promql-v2` (1019 passed), `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (288 passed — 284 prior + 4 reshape), `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
 - 2026-04-16 Wiring Implementor 5.2 in-progress→done — wired compile-time `#[cfg(feature = "promql-v2")]` dispatch inside `timeseries/src/server/http.rs` at `handle_query` / `handle_query_range` / `handle_federate`; added `TsdbEngine::eval_query_v2` + `TsdbEngine::eval_query_range_v2` (both gated, both fall back to v1 for `ReadOnly(reader)`); added a local `query_value_to_range_samples` adapter in the handler so the v2 `QueryValue` (including the `Scalar` range-grid case) projects cleanly onto the `Vec<RangeSample>` wire shape consumed by `range_result_to_response`. 4 new integration tests in `timeseries/tests/http_server.rs::v2_dispatch` behind `#[cfg(feature = "promql-v2")]` via `tower::ServiceExt::oneshot`: instant dispatch, range dispatch, scalar-range-adapter, `PlanError::UnknownFunction` → `bad_data`. `cargo check -p opendata-timeseries` / `--features promql-v2` / `--features http-server` / `--features http-server,promql-v2` all pass; `cargo test -p opendata-timeseries` (724 passed), `--features promql-v2` (1019 passed — unchanged from 5.1), `--features testing,http-server --test http_server` (26 passed), `--features testing,http-server,promql-v2 --test http_server` (30 passed = 26 prior + 4 new); `cargo fmt` and `cargo clippy --all-targets --all-features -- -D warnings` clean.
 - 2026-04-16 Wiring Implementor 5.3 in-progress→done — polished `timeseries/src/promql/v2/reshape.rs` end-to-end. Label-copy strategy: one `Labels::clone` per output series (instant — implicit via one-sample-per-valid-series; range — explicit via `BTreeMap<series_idx, (Labels, _)>::or_insert_with`), never per step or per batch (§5). Series ordering: deterministic by global `series_idx` (v1 range uses `HashMap<Labels, _>` iteration — non-deterministic; v1 instant uses evaluator emission order; Prometheus wire contract is unordered so v2's order is structurally compatible — §5). Defensive `check_batch_shape` guards values/validity length and range-end bounds in release builds, returning `ReshapeError` rather than panicking (covers 5.1 placeholder's gap where `debug_assert`s were the only safety net). Added explicit `step_count!=1` guard inside `reshape_instant`'s batch loop. Scalar-root range query now produces a single anonymous `RangeSample` with samples sorted by timestamp (batches may arrive out-of-order from Coalesce). 5.2's `query_value_to_range_samples` adapter is **still required** for the `Scalar` over range-grid case (§5). Streaming reshape noted as a future optimisation — collected-batches path retained for clarity. 10 new `should_*` tests (replaced 4 placeholder tests; 14 total): `should_reshape_instant_vector_dropping_invalid_cells`, `should_reshape_range_matrix_preserving_sparse_timestamps`, `should_reshape_scalar_root_for_instant_query`, `should_reshape_scalar_root_for_range_query`, `should_clone_labels_once_per_series_not_per_step`, `should_drop_series_with_no_valid_samples_in_range_query`, `should_handle_deferred_schema_from_count_values`, `should_return_empty_vector_when_no_batches`, `should_return_query_error_on_dimension_mismatch`, `should_return_query_error_on_deferred_batch_schema`, `should_preserve_step_timestamps_in_range_output`, `should_handle_multi_batch_range_query` (+ the 2 carried-over tests from 5.1's placeholder). No `tsdb.rs` signature changes. `cargo check -p opendata-timeseries` (no-feature / `promql-v2` / `http-server` / `http-server,promql-v2` — all clean); `cargo test -p opendata-timeseries --lib` (724 passed — unchanged); `cargo test -p opendata-timeseries --features promql-v2 --lib` (1029 passed = 1019 prior + 10 new); `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (298 passed = 288 prior + 14 new − 4 replaced); `cargo test -p opendata-timeseries --features testing,http-server,promql-v2 --test http_server` (30 passed — unchanged); `cargo fmt` + `cargo clippy --all-targets --all-features -- -D warnings` clean. Phase 5 complete.
+- 2026-04-16 Tester 6.1 in-progress→done — added `timeseries/src/promql/promqltest/v2_harness.rs` (separate v2 harness per §5 Decisions Log option-a) and registered `#[cfg(feature = "promql-v2")] mod v2_harness;` in `timeseries/src/promql/promqltest/mod.rs`. Ran the 9-file `.test` corpus through `Tsdb::eval_query_v2` — **2 files pass clean (`operators`, `selectors`); 7 files fail with 61 total eval failures** (see §5 Decisions Log for per-bucket breakdown, counts, and representative fixture citations — 10 buckets total, largest is 28 "unknown function" gaps, and a cross-bucket aggregate-operator panic is flagged separately as a critical out-of-corpus bug). Perf smoke snapshot at 30 series × 720 steps × 6 h range for `sum by (pod) (rate(http_requests_total[5m]))`: **median 29 ms** (InMemoryStorage test TSDB; clipped from 300 series by the aggregate panic — re-take after 6.3 fixes land). No `.test` fixture edited; no v1 code path touched; no new deps. `cargo check -p opendata-timeseries` / `--features promql-v2` clean; `cargo clippy --all-targets --all-features -- -D warnings` clean; v2 harness test run captured at `/tmp/rfc0007_phase6_run.log`. Handing off to 6.2 for triage dispatch.
+- 2026-04-16 Architect 6.3 ready→in-progress — accepted full-scope Phase 6 verification (no fixture edits, no acceptance cut), split 6.3 into sub-units 6.3.1–6.3.7, and prioritised 6.3.1 first because the aggregate cardinality panic is a production bug and currently blocks the full-scale perf snapshot.
+- 2026-04-16 Architect 6.2 ready→done — triage already captured in §5 Decisions Log by 6.1 (10 failure buckets + 2 critical out-of-corpus bugs: aggregate multi-bucket panic, subquery multi-thread-runtime requirement). No separate triage artifact; 6.1's output is authoritative.
+- 2026-04-16 Operator/Planner Implementor 6.3.1 ready→done — fixed the unique-series leaf roster bug by deduplicating `resolve_leaf` output to one schema row per canonical labelset / fingerprint while grouping bucket-local `ResolvedSeriesRef`s per logical series, then updated `VectorSelectorOp` / `MatrixSelectorOp` to flatten and merge those grouped refs during chunk loads. Fixed `AggregateOp`'s streaming, `topk` / `bottomk`, and `quantile` reducers to index `GroupMap` with absolute series positions from `input.series_range`, and preserved the child's `series_range` for filter-shaped breaker outputs. Added focused regressions in planner, aggregate, vector-selector, and matrix-selector tests. Verification: `cargo fmt`; `cargo test -p opendata-timeseries --features promql-v2 promql::v2::operators::aggregate::tests`; `cargo test -p opendata-timeseries --features promql-v2 promql::v2::operators::vector_selector::tests`; `cargo test -p opendata-timeseries --features promql-v2 promql::v2::operators::matrix_selector::tests`; `cargo test -p opendata-timeseries --features promql-v2 promql::v2::plan::physical::tests`; `cargo clippy --all-targets --all-features -- -D warnings`.
+- 2026-04-16 Architect 6.3.2 ready→done — added the nullary/scalar/calendar function surface: planner support for `pi()`, `time()`, `vector(s)`, `scalar(v)`, and the zero/one-arg calendar functions; new coercion operators (`TimeScalarOp`, `ScalarizeOp`); scalar-root tracking in `PhysicalPlan` / reshape so vectorized scalars keep vector result types; and end-to-end v2 wiring coverage for `time()`, `vector(time())`, and `minute(vector(...))`. Verification: `cargo fmt`; `cargo test -p opendata-timeseries --features promql-v2 promql::v2`; `cargo test -p opendata-timeseries --features promql-v2 tsdb::tests::v2_wiring_tests`; `cargo clippy --all-targets --all-features -- -D warnings`.
+- 2026-04-16 Architect 6.3.3 ready→done — added `label_replace` / `label_join` support via a new `LabelManip` logical node and `LabelManipOp` breaker. Planner now precomputes the rewritten output schema and input→output row map from child labels; runtime merges step-disjoint duplicate rewrites and rejects same-step duplicate labelsets. Added lowering / planner / operator regressions plus v2 wiring tests for both functions. Corpus spot-check: `functions.test` is reduced to the known `clamp(min > max)` failure; `at_modifier.test` no longer reports unknown-function gaps and now exposes the remaining subquery / `@` / `timestamp()` semantics; `name_label_dropping.test` is now isolated to the known `by(__name__)` retention bug. Verification: `cargo fmt`; `cargo test -p opendata-timeseries --features promql-v2 promql::v2`; `cargo test -p opendata-timeseries --features promql-v2 tsdb::tests::v2_wiring_tests`; `cargo test -p opendata-timeseries --features promql-v2 promql::promqltest::v2_harness::tests::should_pass_functions_v2 -- --nocapture`; `cargo test -p opendata-timeseries --features promql-v2 promql::promqltest::v2_harness::tests::should_pass_at_modifier_v2 -- --nocapture`; `cargo test -p opendata-timeseries --features promql-v2 promql::promqltest::v2_harness::tests::should_pass_name_label_dropping_v2 -- --nocapture`; `cargo clippy --all-targets --all-features -- -D warnings`.
+- 2026-04-16 Architect 6.3.6 ready→done — fixed the small correctness cluster: `clamp(v, min, max)` now emits empty when `min > max`; aggregate grouping retains `__name__` when explicitly listed in `by(__name__, ...)`; one-to-one binary `on(...)` output schemas now keep only the matching labels; root instant-vector `topk` / `bottomk` results are sorted into Prometheus presentation order during reshape; and `topk(scalar(...), ...)` / `bottomk(scalar(...), ...)` now lower and execute with a dynamic scalar param child drained onto the step grid. Added lowering regression coverage for dynamic `k`, threaded aggregate-param recursion through optimize/cardinality/planning, and re-verified the previously failing corpus buckets (`functions`, `name_label_dropping`, `vector_matching`, `aggregators`). Verification: `cargo fmt`; `cargo test -p opendata-timeseries --features promql-v2 promql::v2`; `cargo test -p opendata-timeseries --features promql-v2 promql::promqltest::v2_harness::tests::should_pass_functions_v2 -- --nocapture`; `cargo test -p opendata-timeseries --features promql-v2 promql::promqltest::v2_harness::tests::should_pass_name_label_dropping_v2 -- --nocapture`; `cargo test -p opendata-timeseries --features promql-v2 promql::promqltest::v2_harness::tests::should_pass_vector_matching_v2 -- --nocapture`; `cargo test -p opendata-timeseries --features promql-v2 promql::promqltest::v2_harness::tests::should_pass_aggregators_v2 -- --nocapture`; `cargo clippy --all-targets --all-features -- -D warnings`.
+- 2026-04-17 Architect 6.3.4 ready→done — no new code; unit closed after confirming the five `offset:*` failures ("Expected 1 samples, got 2") were a pre-dedup symptom fixed in-flight by 6.3.1's fingerprint-dedup of `resolve_leaf`. `VectorSelectorOp::build_batch` always emitted a single in-window sample per `(step, series)` cell; the duplication was the planner stacking one schema row per overlapping bucket, which reshape surfaced as N samples per logical series. Verification: `cargo test -p opendata-timeseries --features promql-v2 promql::promqltest::v2_harness::tests::should_pass_offset_v2` passes clean. See §5 Decisions Log 6.3.4.
+- 2026-04-17 Architect 6.3.8 ready→done — added optional `effective_times` column to `MatrixWindowBatch`; `MatrixSelectorOp` / `SubqueryOp` populate it when `@` / offset shifts the per-step evaluation time away from the outer grid, and `RollupOp::reduce_batch` prefers it over `step_timestamps` for `(window_start, window_end)` math. Fixes at_modifier #21 (`rate(metric[100s] @ 100) + label_replace(rate(metric[123s] @ 200), …)`); no other corpus bucket affected. Added rollup regression `should_use_effective_times_for_window_math_when_present`. Verification: `cargo fmt`; `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (328 passed); `cargo test -p opendata-timeseries --features promql-v2 promql::promqltest::v2_harness` (9/10 fixtures green — only at_modifier #33 / #41 `timestamp()` remain, under 6.3.7); `cargo clippy --all-targets --all-features -- -D warnings` clean.
+- 2026-04-17 Architect 6.3.7 ready→done — extended `StepBatch` with optional per-cell `source_timestamps: Option<Arc<[i64]>>`; `VectorSelectorOp` stamps the matching-sample timestamp per cell, every derived operator leaves `None` on output (so a wrapping `timestamp()` falls back to step time, matching Prometheus). `InstantFnKind::Timestamp` reads `source_timestamps[idx]` when present. Fixes at_modifier #33 (`timestamp(metric @ 10)` → 10) and #41 (`sum_over_time(timestamp(metric @ 10)[100s:10s] @ 3000)` → 100). Updated the two in-test struct-literal `StepBatch` constructions in `reshape.rs` to pass `source_timestamps: None`; `StepBatch::new` callers are unchanged (field defaults to `None`, builder `with_source_timestamps(ts)` attaches it). Added instant-fn regressions `should_apply_timestamp_returning_source_sample_timestamp_when_available` + renamed-and-clarified fallback test, replacing the prior "step-timestamp semantics" test that documented the v1-known divergence. Corpus: **all 9 fixture files pass clean** under `--features promql-v2`. Verification: `cargo fmt`; `cargo test -p opendata-timeseries --features promql-v2` (1076 passed); `cargo test -p opendata-timeseries --features promql-v2 promql::promqltest::v2_harness` (11/11 green); `cargo clippy --all-targets --all-features -- -D warnings` clean.
+- 2026-04-17 Architect 6.3 in-progress→done — Phase 6 acceptance met. All 9 `promqltest` corpus fixtures pass unmodified under `--features promql-v2` (`cargo test -p opendata-timeseries --features promql-v2 promql::promqltest::v2_harness`). Perf snapshot retaken at 300 series × 6h range (`sum by (pod) (rate(http_requests_total[5m]))` via `v2_harness_perf_smoke`): **median 207 ms** over 5 runs, samples=[206, 207, 207, 207, 209] — up from the 29 ms 30-series baseline once 6.3.1 unblocked the 300-series cardinality. No fixture edited; v1 code path untouched. Phase 7 (migration) unblocked.
+- 2026-04-17 Architect 6.3.5 ready→done — fixed subquery inner-grid alignment (`plan/physical.rs::inner_grid`) to emit inner evaluation timestamps at absolute multiples of `inner_step_ms` within `(effective_t - range, effective_t]` rather than the previous forward-walk; empty-grid case (`range < step` with no aligned multiple) now correctly produces zero inner evaluations so the enclosing rollup emits `absent`. Threaded per-outer-step `effective_times: Arc<[i64]>` through `SubqueryOp` via a new `SubqueryOp::with_effective_times` constructor; `build_subquery` now precomputes effective times from `@` / `offset` and passes them in, so each outer step's inner window uses `(effective - range, effective]` instead of the raw outer timestamp. Added operator regression `should_use_effective_times_for_inner_window` and three planner regressions covering the `[50s:10s]` / `[1m:5m]` / `[30s:10s] offset 3s` alignment cases. Corpus: `should_pass_subquery_v2` now passes clean; `should_pass_at_modifier_v2` reduced to the three residual failures — #21 (matrix selector `rate + @`, tracked as new unit 6.3.8) and #33 / #41 (`timestamp()` source-sample semantics, still 6.3.7). Verification: `cargo fmt`; `cargo test -p opendata-timeseries --features promql-v2 promql::v2` (327 passed); `cargo test -p opendata-timeseries --features promql-v2 promql::promqltest::v2_harness::tests::should_pass_subquery_v2`; `cargo clippy --all-targets --all-features -- -D warnings` clean.
 
 ---
 

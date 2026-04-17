@@ -204,6 +204,23 @@ pub struct MatrixWindowBatch {
     /// by step (cell `(t_off, s_off)` lives at `t_off * series_count +
     /// s_off`).
     pub cells: Vec<CellIndex>,
+
+    /// Optional per-step **effective** timestamps — the window-end each
+    /// step's samples actually live under after folding `@` / `offset`.
+    /// `None` means the effective time equals the step timestamp (the
+    /// common no-modifier case). When present, shares layout with
+    /// [`Self::step_timestamps`] (absolute, indexed by global step idx)
+    /// so consumers slice via `step_range` the same way.
+    ///
+    /// [`RollupOp`] prefers this over `step_timestamps` when computing
+    /// `(window_start, window_end)` for rate-family extrapolation; without
+    /// it, `rate(metric[100s] @ 100)` at outer step `t=25s` would compute
+    /// rate over the window `(-75s, 25s]` while the packed samples
+    /// actually cover `(0, 100s]`, producing a negative rate disjoint
+    /// from the data (at_modifier #21 / RFC 0007 §6.3.8).
+    ///
+    /// [`RollupOp`]: super::rollup::RollupOp
+    pub effective_times: Option<Arc<[i64]>>,
 }
 
 impl MatrixWindowBatch {
@@ -422,7 +439,7 @@ impl ChunkSamples {
         }
     }
 
-    fn absorb(&mut self, batch: SampleBatch) -> Result<(), QueryError> {
+    fn absorb(&mut self, batch: SampleBatch, hint_to_series: &[usize]) -> Result<(), QueryError> {
         let mut total_new = 0usize;
         for col in batch.samples.timestamps.iter() {
             total_new = total_new.saturating_add(col.len());
@@ -431,7 +448,6 @@ impl ChunkSamples {
         self.reservation.try_grow(bytes)?;
         self.bytes = self.bytes.saturating_add(bytes);
 
-        let chunk_offset = batch.series_range.start;
         for (block_idx, (mut ts_col, mut val_col)) in batch
             .samples
             .timestamps
@@ -439,7 +455,8 @@ impl ChunkSamples {
             .zip(batch.samples.values)
             .enumerate()
         {
-            let local_idx = chunk_offset + block_idx;
+            let hint_idx = batch.series_range.start + block_idx;
+            let local_idx = hint_to_series[hint_idx];
             self.timestamps[local_idx].append(&mut ts_col);
             self.values[local_idx].append(&mut val_col);
         }
@@ -575,10 +592,16 @@ enum State<'a> {
 pub(crate) struct MatrixSelectorOp<'a, S: SeriesSource + 'a> {
     // Plan-time inputs ------------------------------------------------------
     source: Arc<S>,
-    hint_series: Arc<[ResolvedSeriesRef]>,
+    hint_series: Arc<[Arc<[ResolvedSeriesRef]>]>,
     schema: OperatorSchema,
     step_timestamps: Arc<[i64]>,
     effective_times: EffectiveTimes,
+    /// `true` when `@` or `offset` shifts the per-step effective time away
+    /// from `step_timestamps`. When set, [`MatrixWindowBatch`] carries the
+    /// `effective_times` array so the enclosing `RollupOp` can compute
+    /// rate-family extrapolation over the window the samples actually
+    /// live in (RFC 0007 §6.3.8).
+    has_effective_shift: bool,
     range_ms: i64,
     shape: BatchShape,
     reservation: MemoryReservation,
@@ -592,7 +615,9 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
     ///
     /// * `source` — storage handle.
     /// * `series` — post-resolve series roster.
-    /// * `hint_series` — parallel opaque source handles.
+    /// * `hint_series` — parallel per-logical-series opaque source handle
+    ///   groups. A single logical series may map to several bucket-local refs
+    ///   after planner-side roster deduplication.
     /// * `grid` — **outer** step grid the query runs on. Downstream
     ///   operators that fuse (`Rollup`, `Subquery`) still see this grid
     ///   via [`Operator::schema`].
@@ -605,7 +630,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
     pub(crate) fn new(
         source: Arc<S>,
         series: Arc<SeriesSchema>,
-        hint_series: Arc<[ResolvedSeriesRef]>,
+        hint_series: Arc<[Arc<[ResolvedSeriesRef]>]>,
         grid: StepGrid,
         at: Option<AtModifier>,
         offset: Option<Offset>,
@@ -626,6 +651,11 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
         );
         let effective_times =
             EffectiveTimes::compute(&step_timestamps, &grid, at.as_ref(), offset.as_ref());
+        let has_effective_shift = at.is_some()
+            || matches!(
+                offset,
+                Some(Offset::Pos(d)) | Some(Offset::Neg(d)) if d.as_millis() > 0
+            );
         let schema = OperatorSchema::new(SchemaRef::Static(series), grid);
         Self {
             source,
@@ -633,6 +663,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
             schema,
             step_timestamps,
             effective_times,
+            has_effective_shift,
             range_ms,
             shape,
             reservation,
@@ -644,16 +675,31 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
         self.hint_series.len()
     }
 
+    fn chunk_hint(&self, chunk_start: usize, chunk_end: usize) -> (SampleHint, Vec<usize>) {
+        let mut flat: Vec<ResolvedSeriesRef> = Vec::new();
+        let mut hint_to_series: Vec<usize> = Vec::new();
+        for (series_off, series_refs) in self.hint_series[chunk_start..chunk_end].iter().enumerate()
+        {
+            debug_assert!(
+                !series_refs.is_empty(),
+                "every logical series must have at least one source handle",
+            );
+            for sref in series_refs.iter() {
+                flat.push(*sref);
+                hint_to_series.push(series_off);
+            }
+        }
+        let window = self.effective_times.time_range_with_range(self.range_ms);
+        (SampleHint::new(Arc::from(flat), window), hint_to_series)
+    }
+
     fn start_chunk_load(&mut self, chunk_start: usize) -> State<'a>
     where
         S: 'a,
     {
         let chunk_end = (chunk_start + self.shape.series_chunk).min(self.total_series());
         let chunk_len = chunk_end - chunk_start;
-        let hint_slice: Arc<[ResolvedSeriesRef]> =
-            Arc::from(&self.hint_series[chunk_start..chunk_end]);
-        let window = self.effective_times.time_range_with_range(self.range_ms);
-        let hint = SampleHint::new(hint_slice, window);
+        let (hint, hint_to_series) = self.chunk_hint(chunk_start, chunk_end);
         let source = self.source.clone();
         let reservation = self.reservation.clone();
 
@@ -663,7 +709,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
             let mut stream: SampleStream<'_> = Box::pin(stream);
             while let Some(item) = stream.next().await {
                 let batch = item?;
-                samples.absorb(batch)?;
+                samples.absorb(batch, &hint_to_series)?;
             }
             let _ = chunk_start;
             Ok(samples)
@@ -735,6 +781,11 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
         let (timestamps, values, cells) = buffers.finish();
         let series_range = chunk_start..(chunk_start + chunk_len);
         let step_range = step_chunk_start..step_chunk_end;
+        let effective_times = if self.has_effective_shift {
+            Some(self.effective_times.times.clone())
+        } else {
+            None
+        };
         Ok(MatrixWindowBatch {
             step_timestamps: self.step_timestamps.clone(),
             step_range,
@@ -743,6 +794,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
             timestamps,
             values,
             cells,
+            effective_times,
         })
     }
 
@@ -953,10 +1005,12 @@ mod tests {
         Arc::new(SeriesSchema::new(Arc::from(labels), Arc::from(fps)))
     }
 
-    fn mk_hint_series(n: usize) -> Arc<[ResolvedSeriesRef]> {
+    fn mk_hint_series(n: usize) -> Arc<[Arc<[ResolvedSeriesRef]>]> {
         Arc::from(
             (0..n)
-                .map(|i| ResolvedSeriesRef::new(1, i as u32))
+                .map(|i| {
+                    Arc::<[ResolvedSeriesRef]>::from(vec![ResolvedSeriesRef::new(1, i as u32)])
+                })
                 .collect::<Vec<_>>(),
         )
     }
@@ -1081,6 +1135,47 @@ mod tests {
         // then: cell (step 0, series 0) = [(20, 2.0), (30, 3.0)]
         let cell = cell_samples(&batches, 0, 0);
         assert_eq!(cell, vec![(20, 2.0), (30, 3.0)]);
+    }
+
+    #[test]
+    fn should_merge_cross_bucket_refs_into_one_window_series() {
+        // given: one logical output series backed by two bucket-local refs.
+        let source = Arc::new(MockSource::new(vec![
+            (vec![10], vec![1.0]),
+            (vec![20], vec![2.0]),
+        ]));
+        let schema = mk_schema(1);
+        let hint_series: Arc<[Arc<[ResolvedSeriesRef]>]> = Arc::from(vec![Arc::from(vec![
+            ResolvedSeriesRef::new(1, 0),
+            ResolvedSeriesRef::new(2, 1),
+        ])]);
+        let grid = StepGrid {
+            start_ms: 20,
+            end_ms: 20,
+            step_ms: 10,
+            step_count: 1,
+        };
+        let reservation = MemoryReservation::new(1 << 20);
+        let mut op = MatrixSelectorOp::new(
+            source,
+            schema,
+            hint_series,
+            grid,
+            None,
+            None,
+            15,
+            reservation,
+            BatchShape::new(1, 1),
+        );
+
+        // when
+        let batches: Vec<MatrixWindowBatch> = drain_windows(&mut op)
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        // then
+        assert_eq!(cell_samples(&batches, 0, 0), vec![(10, 1.0), (20, 2.0)]);
     }
 
     #[test]
