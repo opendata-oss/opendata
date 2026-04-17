@@ -12,9 +12,14 @@
 //!
 //! ## Streaming (3b.4)
 //!
-//! Single-pass per step with a per-group running accumulator — no
-//! buffering of full step or full series. Memory is
-//! `O(output_groups × accumulator)`.
+//! Named "streaming" for the per-cell single-pass reducer. Correctness
+//! under arbitrary child tiling (`step_tile × series_tile` emission from
+//! `VectorSelectorOp`, plus `Concurrent` / `Coalesce` interleaving)
+//! requires buffering every input cell into a `(step × group)`
+//! accumulator grid and emitting a single output batch on child-EOS.
+//! The per-cell reducer stays cheap; the grid's footprint is
+//! `O(step_count × output_groups × sizeof(Accumulator))`. See §5
+//! Decisions Log for why an earlier per-batch emit path was incorrect.
 //!
 //! | kind     | reducer                                     | min-valid |
 //! |----------|---------------------------------------------|-----------|
@@ -110,9 +115,14 @@
 //!
 //! # Memory accounting
 //!
-//! - **Scratch accumulators** — `group_count` per-step accumulators are
-//!   allocated once at operator construction; bytes are charged to the
-//!   reservation and released on `Drop`.
+//! - **Scratch accumulators** — `step_count × group_count` accumulators
+//!   for streaming kinds, allocated once at operator construction; bytes
+//!   are charged to the reservation and released on `Drop`. Construction
+//!   fails with [`QueryError::MemoryLimit`] if the grid does not fit
+//!   the query reservation.
+//! - **Breaker scratch** — `Topk` / `Bottomk` reserve a per-group heap;
+//!   `Quantile` reserves a per-group sort buffer. Both are per-step
+//!   (drained between steps) because breaker paths still emit per-batch.
 //! - **Per-batch output** — `Vec<f64>` + `BitSet` for the output batch,
 //!   charged on each poll and transferred to the consumer via
 //!   [`StepBatch::new`]. The input batch's reservation belongs to the
@@ -410,8 +420,10 @@ fn out_bytes(cells: usize) -> usize {
 }
 
 #[inline]
-fn accum_bytes(group_count: usize) -> usize {
-    group_count.saturating_mul(std::mem::size_of::<Accumulator>())
+fn accum_bytes(step_count: usize, group_count: usize) -> usize {
+    step_count
+        .saturating_mul(group_count)
+        .saturating_mul(std::mem::size_of::<Accumulator>())
 }
 
 /// Upper-bound bytes for the per-group min-heap scratch used by
@@ -585,10 +597,29 @@ pub struct AggregateOp<C: Operator> {
     /// `true` once the optional scalar parameter child has been fully
     /// drained into [`Self::param_values`].
     param_loaded: bool,
-    /// Pre-allocated per-group accumulator scratch used by the streaming
-    /// kinds; reused across every step (reset between steps). Empty for
-    /// breaker kinds.
+    /// Per-step-per-group accumulator grid used by the streaming kinds.
+    ///
+    /// Length = `step_count × group_count`, indexed row-major:
+    /// `accums[global_step * group_count + group]`. Allocated once at
+    /// construction and absorbed-into across every input batch, regardless
+    /// of how the child tiles its emission (step tiles × series tiles).
+    /// Empty for breaker kinds.
+    ///
+    /// See §5 Decisions Log: streaming aggregate is a step-bounded breaker
+    /// — it must see every series tile for a given step before it can
+    /// emit, because aggregations are associative across input rows but
+    /// not decomposable into "partial tile sums" without a downstream
+    /// merge. Buffering the whole grid keeps the operator correct under
+    /// arbitrary batch ordering (step/series tiles interleaved, or split
+    /// by `Concurrent`/`Coalesce`).
     accums: Vec<Accumulator>,
+    /// Step timestamps captured from the first child batch. Reused for the
+    /// single output batch this operator emits on EOS. Streaming kinds
+    /// only; breaker kinds echo the child batch's timestamps directly.
+    streaming_step_timestamps: Option<Arc<[i64]>>,
+    /// `true` once the streaming path has emitted its single output batch.
+    /// Streaming kinds only.
+    streaming_emitted: bool,
     /// Per-group min-heap scratch for `Topk`/`Bottomk`; one heap per
     /// group, drained between steps. Empty for other kinds.
     heaps: Vec<BinaryHeap<KHeapEntry>>,
@@ -719,9 +750,13 @@ impl<C: Operator> AggregateOp<C> {
                 (Vec::new(), Vec::new(), sort_bufs, bytes)
             }
             _ => {
-                let bytes = accum_bytes(group_map.group_count);
+                // Streaming kinds buffer a (step × group) accumulator grid
+                // so they remain correct under arbitrary input tiling
+                // (series tiles × step tiles). See §5 Decisions Log.
+                let bytes = accum_bytes(grid.step_count, group_map.group_count);
                 reservation.try_grow(bytes)?;
-                let accums = vec![Accumulator::new(); group_map.group_count];
+                let cells = grid.step_count.saturating_mul(group_map.group_count);
+                let accums = vec![Accumulator::new(); cells];
                 (accums, Vec::new(), Vec::new(), bytes)
             }
         };
@@ -738,6 +773,8 @@ impl<C: Operator> AggregateOp<C> {
             param_bytes,
             param_loaded: false,
             accums,
+            streaming_step_timestamps: None,
+            streaming_emitted: false,
             heaps,
             sort_bufs,
             scratch_bytes: bytes,
@@ -797,32 +834,41 @@ impl<C: Operator> AggregateOp<C> {
         coerce_k_size(k_param, input_len)
     }
 
-    fn reduce_batch(&mut self, input: &StepBatch) -> Result<StepBatch, QueryError> {
-        if self.kind.is_breaker() {
-            self.reduce_batch_breaker(input)
-        } else {
-            self.reduce_batch_streaming(input)
-        }
-    }
-
-    fn reduce_batch_streaming(&mut self, input: &StepBatch) -> Result<StepBatch, QueryError> {
-        let step_count = input.step_count();
-        let in_series_count = input.series_count();
-        let group_count = self.group_map.group_count;
-        let out_cells = step_count * group_count;
-
+    /// Absorb one child batch into the streaming-kind per-(step, group)
+    /// accumulator grid. Idempotent across arbitrary batch ordering:
+    /// step tiles × series tiles × `Concurrent`/`Coalesce` interleaving
+    /// all funnel into the same buffered grid, and the final aggregate is
+    /// associative on insertion order (modulo floating-point rounding,
+    /// which the Kahan lane caps).
+    fn absorb_batch_streaming(&mut self, input: &StepBatch) {
+        debug_assert!(!self.kind.is_breaker());
         self.debug_assert_batch_within_input_roster(input);
 
-        let mut out = OutBuffers::allocate(&self.reservation, out_cells)?;
+        // Capture the step-timestamp `Arc<[i64]>` from the first non-empty
+        // batch we see. Every child batch shares the same outer grid, so
+        // any single batch's slice is authoritative for its own step span;
+        // we only need one source of truth because the output batch covers
+        // the entire grid (`0..step_count`). If the child never emits any
+        // batches we synthesise a fresh timestamps array in
+        // `finalise_streaming` from the plan-time grid.
+        if self.streaming_step_timestamps.is_none()
+            && input.step_range.start == 0
+            && input.step_count() == self.schema.step_grid.step_count
+        {
+            self.streaming_step_timestamps = Some(input.step_timestamps.clone());
+        }
 
-        // Per step: reset accumulators, walk series, finalise.
-        for step_off in 0..step_count {
-            for slot in &mut self.accums {
-                slot.reset();
-            }
-            // Stride into input: row-major by step, so step `step_off`
-            // starts at `step_off * in_series_count`.
+        let step_count_in = input.step_count();
+        let in_series_count = input.series_count();
+        let group_count = self.group_map.group_count;
+
+        // Row-major: for each step in the input batch, offset to the
+        // global step index and absorb every valid cell into
+        // `accums[global_step * group_count + group]`.
+        for step_off in 0..step_count_in {
+            let global_step = input.step_range.start + step_off;
             let step_base = step_off * in_series_count;
+            let accum_base = global_step * group_count;
             for in_series in 0..in_series_count {
                 let cell = step_base + in_series;
                 if !input.validity.get(cell) {
@@ -834,11 +880,28 @@ impl<C: Operator> AggregateOp<C> {
                     None => continue,
                 };
                 let v = input.values[cell];
-                self.accums[group].absorb(v);
+                self.accums[accum_base + group].absorb(v);
             }
-            // Finalise every group for this step.
-            let out_base = step_off * group_count;
-            for (g, accum) in self.accums.iter().enumerate() {
+        }
+    }
+
+    /// Produce the single output batch covering the full outer grid for
+    /// streaming kinds. Called once, on child-EOS, after every batch has
+    /// been absorbed via [`Self::absorb_batch_streaming`].
+    fn finalise_streaming(&mut self) -> Result<StepBatch, QueryError> {
+        debug_assert!(!self.kind.is_breaker());
+        let grid = self.schema.step_grid;
+        let step_count = grid.step_count;
+        let group_count = self.group_map.group_count;
+        let out_cells = step_count.saturating_mul(group_count);
+
+        let mut out = OutBuffers::allocate(&self.reservation, out_cells)?;
+
+        for step in 0..step_count {
+            let accum_base = step * group_count;
+            let out_base = step * group_count;
+            for g in 0..group_count {
+                let accum = &self.accums[accum_base + g];
                 if accum.count == 0 {
                     continue;
                 }
@@ -851,13 +914,12 @@ impl<C: Operator> AggregateOp<C> {
                     AggregateKind::Stddev => accum.variance_value().sqrt(),
                     AggregateKind::Stdvar => accum.variance_value(),
                     AggregateKind::Group => 1.0,
-                    // Unreachable: `reduce_batch` routes breakers away
-                    // before entering this path. Panic rather than
-                    // silently miscomputing — this is a planner bug.
+                    // Unreachable: breakers are routed through
+                    // `reduce_batch_breaker` and never visit this path.
                     AggregateKind::Topk(_)
                     | AggregateKind::Bottomk(_)
                     | AggregateKind::Quantile(_) => {
-                        unreachable!("breaker kind routed to streaming reducer")
+                        unreachable!("breaker kind routed to streaming finaliser")
                     }
                 };
                 let idx = out_base + g;
@@ -866,10 +928,19 @@ impl<C: Operator> AggregateOp<C> {
             }
         }
 
+        let step_timestamps = self.streaming_step_timestamps.take().unwrap_or_else(|| {
+            Arc::from(
+                (0..step_count)
+                    .map(|i| grid.start_ms + (i as i64) * grid.step_ms)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )
+        });
+
         let (values, validity) = out.finish();
         Ok(StepBatch::new(
-            input.step_timestamps.clone(),
-            input.step_range.clone(),
+            step_timestamps,
+            0..step_count,
             SchemaRef::Static(self.output_schema.clone()),
             0..group_count,
             values,
@@ -894,10 +965,13 @@ impl<C: Operator> AggregateOp<C> {
             AggregateKind::Quantile(q) => self.reduce_quantile(input, q),
             _ => {
                 debug_assert!(false, "non-breaker kind routed to breaker reducer");
-                // Fall back to streaming path so we never produce bogus
-                // output if debug-asserts are off.
+                // Unreachable: the top-level `next()` dispatch branches
+                // on `kind.is_breaker()` and the streaming kinds never
+                // reach this method. If a new variant is added without
+                // updating the dispatch, surface a planner bug loudly
+                // in release builds rather than silently misrouting.
                 let _ = step_count;
-                self.reduce_batch_streaming(input)
+                unreachable!("non-breaker kind routed to breaker reducer")
             }
         }
     }
@@ -1090,23 +1164,73 @@ impl<C: Operator> Operator for AggregateOp<C> {
             }
             Poll::Ready(Ok(())) => {}
         }
-        match self.child.next(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => {
-                self.done = true;
-                Poll::Ready(None)
-            }
-            Poll::Ready(Some(Err(err))) => {
-                self.errored = true;
-                Poll::Ready(Some(Err(err)))
-            }
-            Poll::Ready(Some(Ok(input))) => match self.reduce_batch(&input) {
-                Ok(batch) => Poll::Ready(Some(Ok(batch))),
-                Err(err) => {
+
+        if self.kind.is_breaker() {
+            // Breaker kinds reduce batch-by-batch (existing per-step
+            // buffering inside each batch is sufficient for their current
+            // call sites — see §5 Decisions Log for the scope of this
+            // fix).
+            match self.child.next(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(None) => {
+                    self.done = true;
+                    Poll::Ready(None)
+                }
+                Poll::Ready(Some(Err(err))) => {
                     self.errored = true;
                     Poll::Ready(Some(Err(err)))
                 }
-            },
+                Poll::Ready(Some(Ok(input))) => match self.reduce_batch_breaker(&input) {
+                    Ok(batch) => Poll::Ready(Some(Ok(batch))),
+                    Err(err) => {
+                        self.errored = true;
+                        Poll::Ready(Some(Err(err)))
+                    }
+                },
+            }
+        } else {
+            // Streaming kinds: drain every child batch into the
+            // per-(step, group) accumulator grid, then emit a single
+            // output batch covering the full grid on EOS. This is
+            // correct under arbitrary tile ordering (the child may
+            // interleave step tiles × series tiles).
+            if self.streaming_emitted {
+                self.done = true;
+                return Poll::Ready(None);
+            }
+            let mut saw_any_batch = false;
+            loop {
+                match self.child.next(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(None) => {
+                        self.streaming_emitted = true;
+                        // If the child produced zero batches, there is
+                        // nothing to emit — matches Prometheus behaviour
+                        // when a selector has no series and preserves
+                        // parity with the v1 engine (no empty grid
+                        // trailing after an empty selector).
+                        if !saw_any_batch {
+                            self.done = true;
+                            return Poll::Ready(None);
+                        }
+                        return match self.finalise_streaming() {
+                            Ok(batch) => Poll::Ready(Some(Ok(batch))),
+                            Err(err) => {
+                                self.errored = true;
+                                Poll::Ready(Some(Err(err)))
+                            }
+                        };
+                    }
+                    Poll::Ready(Some(Err(err))) => {
+                        self.errored = true;
+                        return Poll::Ready(Some(Err(err)));
+                    }
+                    Poll::Ready(Some(Ok(input))) => {
+                        saw_any_batch = true;
+                        self.absorb_batch_streaming(&input);
+                    }
+                }
+            }
         }
     }
 }
@@ -1630,14 +1754,46 @@ mod tests {
     }
 
     #[test]
-    fn should_span_multiple_step_batches() {
-        // given: child emits two batches, each 1 step × 2 series → sum
-        // into 1 group. First batch sums 1+2=3; second 10+20=30.
+    fn should_span_multiple_step_tile_batches() {
+        // given: child emits two step-tile batches covering disjoint step
+        // ranges of the same outer grid. Batch A = step 0 (values 1, 2),
+        // batch B = step 1 (values 10, 20). Both tile into the same
+        // output group.
+        //
+        // After the tile-boundary fix, streaming aggregate is a
+        // step-bounded breaker — it buffers the whole grid and emits a
+        // single output batch covering every step. Expected output: one
+        // batch, step 0 sum = 3, step 1 sum = 30.
         let in_schema = mk_schema("in", 2);
         let out_schema = mk_schema("out", 1);
         let grid = mk_grid(2);
-        let batch_a = mk_batch(in_schema.clone(), 1, 2, vec![1.0, 2.0], vec![true, true]);
-        let batch_b = mk_batch(in_schema.clone(), 1, 2, vec![10.0, 20.0], vec![true, true]);
+        let ts: Arc<[i64]> = Arc::from(vec![0i64, 10].into_boxed_slice());
+
+        // Build the two tiles with disjoint step_range — the mk_batch
+        // helper always uses `0..step_count`, so assemble the batch
+        // directly to get `step_range = 1..2` for batch B.
+        let mut bits_a = BitSet::with_len(2);
+        bits_a.set(0);
+        bits_a.set(1);
+        let batch_a = StepBatch::new(
+            ts.clone(),
+            0..1,
+            SchemaRef::Static(in_schema.clone()),
+            0..2,
+            vec![1.0, 2.0],
+            bits_a,
+        );
+        let mut bits_b = BitSet::with_len(2);
+        bits_b.set(0);
+        bits_b.set(1);
+        let batch_b = StepBatch::new(
+            ts,
+            1..2,
+            SchemaRef::Static(in_schema.clone()),
+            0..2,
+            vec![10.0, 20.0],
+            bits_b,
+        );
 
         let child = MockOp::new(in_schema, grid, vec![batch_a, batch_b]);
         let gmap = GroupMap::new(vec![Some(0), Some(0)], 1);
@@ -1651,9 +1807,11 @@ mod tests {
         )
         .unwrap();
         let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
-        assert_eq!(outs.len(), 2);
-        assert_eq!(outs[0].get(0, 0), Some(3.0));
-        assert_eq!(outs[1].get(0, 0), Some(30.0));
+        assert_eq!(outs.len(), 1);
+        let b = &outs[0];
+        assert_eq!(b.step_count(), 2);
+        assert_eq!(b.get(0, 0), Some(3.0));
+        assert_eq!(b.get(1, 0), Some(30.0));
     }
 
     #[test]
@@ -1874,6 +2032,93 @@ mod tests {
             Some(5.0),
             "step 1 sum must be 5.0 (3 + 2 tiles)"
         );
+    }
+
+    #[test]
+    fn should_aggregate_many_series_through_default_tile_shape() {
+        // given: end-to-end shape reproducing the production symptom —
+        // 1500 input series across 3 groups, 4 steps, with the child
+        // emitting one batch per (step_tile × series_tile) using the
+        // default `series_chunk = 512`. Every valid cell contributes 1.0;
+        // correct `sum by (group)` per step is therefore 500.
+        const SERIES: usize = 1500;
+        const GROUPS: usize = 3;
+        const STEPS: usize = 4;
+        const SERIES_CHUNK: usize = 512;
+        // Split steps into arbitrary step-tiles too (2 + 2) to exercise
+        // the (step_tile × series_tile) cross product.
+        const STEP_TILES: &[std::ops::Range<usize>] = &[0..2, 2..4];
+
+        let in_schema = mk_schema("in", SERIES);
+        let out_schema = mk_schema("out", GROUPS);
+        let grid = mk_grid(STEPS);
+        let ts: Arc<[i64]> = Arc::from(
+            (0..STEPS)
+                .map(|i| (i as i64) * 10)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+
+        // Round-robin groups (s0→g0, s1→g1, s2→g2, s3→g0, ...). With
+        // SERIES=1500 each group gets exactly 500 series.
+        let group_assignments: Vec<Option<u32>> =
+            (0..SERIES).map(|s| Some((s % GROUPS) as u32)).collect();
+
+        // Assemble the batches: for every step tile × series tile, emit
+        // one batch with values=1.0 and validity=1. Series tiling uses
+        // `SERIES_CHUNK` matching `VectorSelectorOp`'s default.
+        let mut batches: Vec<StepBatch> = Vec::new();
+        for step_tile in STEP_TILES {
+            let step_count_tile = step_tile.len();
+            let mut series_start = 0usize;
+            while series_start < SERIES {
+                let series_end = (series_start + SERIES_CHUNK).min(SERIES);
+                let series_count_tile = series_end - series_start;
+                let cells = step_count_tile * series_count_tile;
+                let mut bits = BitSet::with_len(cells);
+                for i in 0..cells {
+                    bits.set(i);
+                }
+                batches.push(StepBatch::new(
+                    ts.clone(),
+                    step_tile.clone(),
+                    SchemaRef::Static(in_schema.clone()),
+                    series_start..series_end,
+                    vec![1.0; cells],
+                    bits,
+                ));
+                series_start = series_end;
+            }
+        }
+
+        let child = MockOp::new(in_schema, grid, batches);
+        let gmap = GroupMap::new(group_assignments, GROUPS);
+
+        // when
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Sum,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .expect("operator constructs");
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then: one output batch, 4 steps × 3 groups, each cell = 500.
+        assert_eq!(outs.len(), 1, "expected one aggregated output batch");
+        let b = &outs[0];
+        assert_eq!(b.step_count(), STEPS);
+        assert_eq!(b.series_count(), GROUPS);
+        for step in 0..STEPS {
+            for group in 0..GROUPS {
+                assert_eq!(
+                    b.get(step, group),
+                    Some(500.0),
+                    "step={step} group={group} expected 500",
+                );
+            }
+        }
     }
 
     // ========================================================================
