@@ -19,7 +19,7 @@ use crate::promql::promqltest::assert::assert_results;
 use crate::promql::promqltest::dsl::*;
 use crate::promql::promqltest::loader::load_series;
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
-use crate::tsdb::Tsdb;
+use crate::tsdb::{Tsdb, TsdbReadEngine};
 use common::storage::in_memory::InMemoryStorage;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

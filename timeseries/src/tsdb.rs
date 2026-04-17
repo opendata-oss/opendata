@@ -111,12 +111,15 @@ fn preload_ranges_for_v2(
 }
 
 /// Drive the v2 operator tree to completion and reshape into a
-/// [`QueryValue`]. Shared by [`Tsdb::eval_query_v2`] and
-/// [`Tsdb::eval_query_range_v2`]; keeps the dispatch logic in one place.
+/// [`QueryValue`]. Shared by [`TsdbReadEngine::eval_query_v2`] and
+/// [`TsdbReadEngine::eval_query_range_v2`]; keeps the dispatch logic in
+/// one place. Generic over the [`QueryReader`] type so both the writer's
+/// `TsdbQueryReader` and the reader's `ReaderQueryReader` flow through
+/// the same pipeline without duplication.
 #[cfg(feature = "promql-v2")]
-async fn execute_v2(
+async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
     query: &str,
-    reader: TsdbQueryReader,
+    reader: R,
     ctx: crate::promql::v2::plan::LoweringContext,
     is_instant: bool,
 ) -> std::result::Result<QueryValue, QueryError> {
@@ -339,6 +342,91 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
     ) -> std::result::Result<Vec<String>, QueryError> {
         let reader = self.make_query_reader(start_secs, end_secs).await?;
         discover_label_values(&reader, label_name, matchers).await
+    }
+
+    /// A/B parallel entry point for the v2 (columnar) engine — instant
+    /// query. See RFC 0007 §"Migration Strategy"; gated behind the
+    /// `promql-v2` feature flag so the baseline build is untouched.
+    ///
+    /// Parses the query, lowers it to the v2 logical plan, runs the
+    /// rule-based optimiser, builds a physical plan over a
+    /// [`crate::promql::v2::QueryReaderSource`] wrapping this engine's
+    /// existing `QueryReader`, drives the operator tree to completion
+    /// and reshapes the collected batches into a [`QueryValue`].
+    ///
+    /// Signatures match [`Self::eval_query`] so HTTP dispatch can swap
+    /// on the feature flag without reshaping call sites.
+    #[cfg(feature = "promql-v2")]
+    async fn eval_query_v2(
+        &self,
+        query: &str,
+        time: Option<SystemTime>,
+        opts: &QueryOptions,
+    ) -> std::result::Result<QueryValue, QueryError>
+    where
+        Self::QR: 'static,
+    {
+        let query_time = time.unwrap_or_else(SystemTime::now);
+        let at_ms = system_time_to_ms(query_time);
+        let plan_ctx = crate::promql::v2::plan::LoweringContext::for_instant(
+            at_ms,
+            duration_to_ms(opts.lookback_delta),
+        );
+
+        let reader = self
+            .make_query_reader_for_ranges(&preload_ranges_for_v2(
+                query,
+                at_ms,
+                at_ms,
+                opts.lookback_delta,
+            )?)
+            .await?;
+        execute_v2(query, reader, plan_ctx, /*is_instant=*/ true).await
+    }
+
+    /// A/B parallel entry point for the v2 engine — range query. Mirrors
+    /// [`Self::eval_query_range`] in shape so the HTTP handler can A/B
+    /// swap cleanly. Unlike the v1 path, v2 returns a full [`QueryValue`]
+    /// because the plan root may produce a scalar (e.g. `1+1` over a
+    /// range grid); the embedded boundary can still collapse that back
+    /// into `Vec<RangeSample>` if desired.
+    #[cfg(feature = "promql-v2")]
+    async fn eval_query_range_v2(
+        &self,
+        query: &str,
+        range: impl RangeBounds<SystemTime> + Send,
+        step: Duration,
+        opts: &QueryOptions,
+    ) -> std::result::Result<QueryValue, QueryError>
+    where
+        Self::QR: 'static,
+    {
+        let (start, end) = crate::util::range_bounds_to_system_time(range);
+        let start_ms = system_time_to_ms(start);
+        let end_ms = system_time_to_ms(end);
+        let step_ms = duration_to_ms(step);
+        if step_ms <= 0 {
+            return Err(QueryError::InvalidQuery(
+                "step must be greater than zero".to_string(),
+            ));
+        }
+
+        let plan_ctx = crate::promql::v2::plan::LoweringContext::new(
+            start_ms,
+            end_ms,
+            step_ms,
+            duration_to_ms(opts.lookback_delta),
+        );
+
+        let reader = self
+            .make_query_reader_for_ranges(&preload_ranges_for_v2(
+                query,
+                start_ms,
+                end_ms,
+                opts.lookback_delta,
+            )?)
+            .await?;
+        execute_v2(query, reader, plan_ctx, /*is_instant=*/ false).await
     }
 }
 
@@ -909,85 +997,6 @@ impl Tsdb {
         eval_query_range_bounds(self, query, range, step, opts).await
     }
 
-    /// A/B parallel entry point for the v2 (columnar) engine — instant
-    /// query. See RFC 0007 §"Migration Strategy"; gated behind the
-    /// `promql-v2` feature flag so the baseline build is untouched.
-    ///
-    /// Parses the query, lowers it to the v2 logical plan, runs the
-    /// rule-based optimiser, builds a physical plan over a
-    /// [`crate::promql::v2::QueryReaderSource`] wrapping this Tsdb's
-    /// existing `QueryReader`, drives the operator tree to completion
-    /// and reshapes the collected batches into a [`QueryValue`].
-    ///
-    /// Signatures match [`Self::eval_query`] so Phase 5.2 HTTP dispatch
-    /// can swap on the feature flag without reshaping call sites.
-    #[cfg(feature = "promql-v2")]
-    pub(crate) async fn eval_query_v2(
-        &self,
-        query: &str,
-        time: Option<SystemTime>,
-        opts: &QueryOptions,
-    ) -> std::result::Result<QueryValue, QueryError> {
-        let query_time = time.unwrap_or_else(SystemTime::now);
-        let at_ms = system_time_to_ms(query_time);
-        let plan_ctx = crate::promql::v2::plan::LoweringContext::for_instant(
-            at_ms,
-            duration_to_ms(opts.lookback_delta),
-        );
-
-        let reader = self
-            .query_reader_for_ranges(&preload_ranges_for_v2(
-                query,
-                at_ms,
-                at_ms,
-                opts.lookback_delta,
-            )?)
-            .await?;
-        execute_v2(query, reader, plan_ctx, /*is_instant=*/ true).await
-    }
-
-    /// A/B parallel entry point for the v2 engine — range query. Mirrors
-    /// [`Self::eval_query_range`] in shape so phase 5.2 can A/B swap
-    /// cleanly. Unlike the v1 path, v2 returns a full [`QueryValue`]
-    /// because the plan root may produce a scalar (e.g. `1+1` over a
-    /// range grid); the embedded boundary can still collapse that back
-    /// into `Vec<RangeSample>` if desired.
-    #[cfg(feature = "promql-v2")]
-    pub(crate) async fn eval_query_range_v2(
-        &self,
-        query: &str,
-        range: impl std::ops::RangeBounds<SystemTime>,
-        step: Duration,
-        opts: &QueryOptions,
-    ) -> std::result::Result<QueryValue, QueryError> {
-        let (start, end) = crate::util::range_bounds_to_system_time(range);
-        let start_ms = system_time_to_ms(start);
-        let end_ms = system_time_to_ms(end);
-        let step_ms = duration_to_ms(step);
-        if step_ms <= 0 {
-            return Err(QueryError::InvalidQuery(
-                "step must be greater than zero".to_string(),
-            ));
-        }
-
-        let plan_ctx = crate::promql::v2::plan::LoweringContext::new(
-            start_ms,
-            end_ms,
-            step_ms,
-            duration_to_ms(opts.lookback_delta),
-        );
-
-        let reader = self
-            .query_reader_for_ranges(&preload_ranges_for_v2(
-                query,
-                start_ms,
-                end_ms,
-                opts.lookback_delta,
-            )?)
-            .await?;
-        execute_v2(query, reader, plan_ctx, /*is_instant=*/ false).await
-    }
-
     /// Return metadata for all (or a specific) metric.
     pub(crate) async fn find_metadata(
         &self,
@@ -1081,9 +1090,8 @@ impl TsdbEngine {
 
     /// A/B v2 entry point for instant queries, dispatched from the HTTP
     /// handler at compile time via `#[cfg(feature = "promql-v2")]` in
-    /// `server/http.rs`. Read-only mode falls back to the v1 path because
-    /// v2 wiring currently lives on [`Tsdb`] only (see RFC 0007 §"Migration
-    /// Strategy" — the read-only reader will gain v2 in phase 7).
+    /// `server/http.rs`. Routes through the `TsdbReadEngine` trait on
+    /// both arms so read-only deployments exercise the columnar engine.
     #[cfg(feature = "promql-v2")]
     pub(crate) async fn eval_query_v2(
         &self,
@@ -1093,32 +1101,27 @@ impl TsdbEngine {
     ) -> std::result::Result<QueryValue, QueryError> {
         match self {
             Self::ReadWrite(tsdb) => tsdb.eval_query_v2(query, time, opts).await,
-            Self::ReadOnly(reader) => reader.eval_query(query, time, opts).await,
+            Self::ReadOnly(reader) => reader.eval_query_v2(query, time, opts).await,
         }
     }
 
     /// A/B v2 entry point for range queries. Unlike v1 (`Vec<RangeSample>`),
     /// v2 returns a full [`QueryValue`] because the plan root may emit a
     /// [`QueryValue::Scalar`] over a range grid (e.g. `1+1`). The HTTP
-    /// handler keeps the wire shape unchanged via a thin adapter.
+    /// handler keeps the wire shape unchanged via a thin adapter. Both
+    /// read-write and read-only engines route through the columnar v2
+    /// pipeline via the shared `TsdbReadEngine` trait default.
     #[cfg(feature = "promql-v2")]
     pub(crate) async fn eval_query_range_v2(
         &self,
         query: &str,
-        range: impl RangeBounds<SystemTime>,
+        range: impl RangeBounds<SystemTime> + Send,
         step: Duration,
         opts: &QueryOptions,
     ) -> std::result::Result<QueryValue, QueryError> {
         match self {
             Self::ReadWrite(tsdb) => tsdb.eval_query_range_v2(query, range, step, opts).await,
-            Self::ReadOnly(reader) => {
-                // v2 is not yet wired on the reader (phase 7 scope) — fall
-                // back to v1 and wrap the `Vec<RangeSample>` in a matrix so
-                // the HTTP handler's v2 path sees a uniform `QueryValue`.
-                eval_query_range_bounds(reader.as_ref(), query, range, step, opts)
-                    .await
-                    .map(QueryValue::Matrix)
-            }
+            Self::ReadOnly(reader) => reader.eval_query_range_v2(query, range, step, opts).await,
         }
     }
 
@@ -2737,6 +2740,126 @@ mod tests {
             assert_eq!(samples[0].value, 42.0);
             assert_eq!(samples[1].labels.get("env"), Some("staging"));
             assert_eq!(samples[1].value, 10.0);
+        }
+
+        // ── Read-only reader v2 tests (RFC 0007 unit 7.0) ────────────
+        //
+        // These verify that the v2 engine runs through the
+        // `TsdbReadEngine` trait defaults on both the writer (`Tsdb`)
+        // and the read-only `TimeSeriesDbReader`, so reader-only prod
+        // binaries built with `--features promql-v2` exercise the
+        // columnar engine instead of silently falling back to v1.
+
+        /// Build a writer + reader pair on shared storage, ingest a
+        /// counter spanning 3 samples, flush, and return both handles.
+        async fn create_writer_and_reader_with_counter() -> (Tsdb, crate::reader::TimeSeriesDbReader)
+        {
+            let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+                OpenTsdbMergeOperator,
+            )));
+            let tsdb = Tsdb::new(storage.clone());
+            let series = vec![
+                create_sample("req_total", vec![("env", "prod")], 4_000_000, 10.0),
+                create_sample("req_total", vec![("env", "prod")], 4_010_000, 20.0),
+                create_sample("req_total", vec![("env", "prod")], 4_020_000, 30.0),
+            ];
+            tsdb.ingest_samples(series, None).await.unwrap();
+            tsdb.flush().await.unwrap();
+            let reader = crate::reader::TimeSeriesDbReader::from_storage(storage);
+            (tsdb, reader)
+        }
+
+        #[tokio::test]
+        async fn should_eval_instant_query_v2_on_read_only_reader_returns_one_sample_per_series() {
+            // given: counter ingested via writer, read through a reader
+            let (_tsdb, reader) = create_writer_and_reader_with_counter().await;
+            let query_time = UNIX_EPOCH + Duration::from_secs(4_020);
+
+            // when: the reader's v2 entry point evaluates the selector
+            let opts = QueryOptions::default();
+            let result = reader
+                .eval_query_v2("req_total", Some(query_time), &opts)
+                .await
+                .unwrap();
+
+            // then: one instant sample at the evaluation timestamp
+            let samples = match result {
+                QueryValue::Vector(s) => s,
+                other => panic!("expected Vector, got {:?}", other),
+            };
+            assert_eq!(samples.len(), 1);
+            assert_eq!(samples[0].timestamp_ms, 4_020_000);
+            assert_eq!(samples[0].labels.get("env"), Some("prod"));
+            assert_eq!(samples[0].value, 30.0);
+        }
+
+        #[tokio::test]
+        async fn should_eval_range_query_v2_on_read_only_reader_produces_samples_per_step() {
+            // given: counter ingested via writer, read through a reader
+            let (_tsdb, reader) = create_writer_and_reader_with_counter().await;
+            let start = UNIX_EPOCH + Duration::from_secs(4_000);
+            let end = UNIX_EPOCH + Duration::from_secs(4_020);
+            let step = Duration::from_secs(10);
+
+            // when: the reader's v2 range entry point evaluates the query
+            let opts = QueryOptions::default();
+            let result = reader
+                .eval_query_range_v2("req_total", start..=end, step, &opts)
+                .await
+                .unwrap();
+
+            // then: one range sample (one series) with 3 points
+            let series = match result {
+                QueryValue::Matrix(m) => m,
+                other => panic!("expected Matrix, got {:?}", other),
+            };
+            assert_eq!(series.len(), 1);
+            assert_eq!(series[0].labels.get("env"), Some("prod"));
+            assert_eq!(series[0].samples.len(), 3);
+            assert_eq!(series[0].samples[0].1, 10.0);
+            assert_eq!(series[0].samples[1].1, 20.0);
+            assert_eq!(series[0].samples[2].1, 30.0);
+        }
+
+        #[tokio::test]
+        async fn should_return_identical_results_for_read_write_and_read_only_paths_on_same_storage()
+         {
+            // given: writer and reader on the same in-memory storage
+            let (tsdb, reader) = create_writer_and_reader_with_counter().await;
+            let start = UNIX_EPOCH + Duration::from_secs(4_000);
+            let end = UNIX_EPOCH + Duration::from_secs(4_020);
+            let step = Duration::from_secs(10);
+
+            // when: both engines run the identical v2 range query
+            let opts = QueryOptions::default();
+            let query = "rate(req_total[1m])";
+            let writer_result = tsdb
+                .eval_query_range_v2(query, start..=end, step, &opts)
+                .await
+                .unwrap();
+            let reader_result = reader
+                .eval_query_range_v2(query, start..=end, step, &opts)
+                .await
+                .unwrap();
+
+            // then: both produce matrices that agree on labels and samples
+            let writer_matrix = match writer_result {
+                QueryValue::Matrix(m) => m,
+                other => panic!("expected Matrix from writer, got {:?}", other),
+            };
+            let reader_matrix = match reader_result {
+                QueryValue::Matrix(m) => m,
+                other => panic!("expected Matrix from reader, got {:?}", other),
+            };
+            assert_eq!(writer_matrix.len(), reader_matrix.len());
+            let mut w_sorted = writer_matrix.clone();
+            let mut r_sorted = reader_matrix.clone();
+            w_sorted.sort_by(|a, b| a.labels.cmp(&b.labels));
+            r_sorted.sort_by(|a, b| a.labels.cmp(&b.labels));
+            for (w, r) in w_sorted.iter().zip(r_sorted.iter()) {
+                assert_eq!(w.labels, r.labels);
+                assert_eq!(w.samples, r.samples);
+            }
         }
     }
 }
